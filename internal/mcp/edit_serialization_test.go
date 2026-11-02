@@ -3,15 +3,16 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -28,7 +29,7 @@ func (mutationTestWatcher) HistorySince(time.Time) []indexer.GraphChangeEvent {
 	return nil
 }
 func (mutationTestWatcher) OnSymbolChange(indexer.SymbolChangeCallback) {}
-func (w mutationTestWatcher) EnqueueFileMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
+func (w mutationTestWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -67,7 +68,7 @@ type degradedMutationTestWatcher struct {
 func (w degradedMutationTestWatcher) DegradedReason() string { return w.reason }
 
 func mutationRefs(path string) int {
-	path = filepath.Clean(path)
+	path = pathkey.MutationKey(path)
 	mutationPathLocks.Lock()
 	defer mutationPathLocks.Unlock()
 	if entry := mutationPathLocks.byPath[path]; entry != nil {
@@ -90,7 +91,7 @@ func waitForMutationRefs(t *testing.T, path string, want int) {
 
 func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "same.go")
-	firstRelease, err := acquireMutationPath(context.Background(), path)
+	_, firstRelease, err := acquireMutationPath(context.Background(), path)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 	acquired := make(chan func(), 1)
 	errs := make(chan error, 1)
 	go func() {
-		release, acquireErr := acquireMutationPath(context.Background(), path)
+		_, release, acquireErr := acquireMutationPath(context.Background(), path)
 		if acquireErr != nil {
 			errs <- acquireErr
 			return
@@ -127,7 +128,7 @@ func TestAcquireMutationPathSerializesAndCleansUp(t *testing.T) {
 
 func TestAcquireMutationPathCancellationReleasesQueueReference(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cancel.go")
-	ownerRelease, err := acquireMutationPath(context.Background(), path)
+	_, ownerRelease, err := acquireMutationPath(context.Background(), path)
 	if err != nil {
 		t.Fatalf("owner acquire: %v", err)
 	}
@@ -135,7 +136,7 @@ func TestAcquireMutationPathCancellationReleasesQueueReference(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errs := make(chan error, 1)
 	go func() {
-		_, acquireErr := acquireMutationPath(ctx, path)
+		_, _, acquireErr := acquireMutationPath(ctx, path)
 		errs <- acquireErr
 	}()
 	waitForMutationRefs(t, path, 2)
@@ -160,7 +161,7 @@ func TestAcquireMutationPathsCancellationReleasesEarlierLocks(t *testing.T) {
 		first, second = second, first
 	}
 
-	releaseSecond, err := acquireMutationPath(context.Background(), second)
+	_, releaseSecond, err := acquireMutationPath(context.Background(), second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +170,7 @@ func TestAcquireMutationPathsCancellationReleasesEarlierLocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		release, lockErr := acquireMutationPaths(ctx, []string{second, first, first})
+		_, release, lockErr := acquireMutationPaths(ctx, []string{second, first, first})
 		if release != nil {
 			release()
 		}
@@ -230,7 +231,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	s := &Server{
 		watcher:             mutationTestWatcher{done: done, generation: 7},
 		mutationReindexWait: 5 * time.Millisecond,
-		mutationSafetyWait:  5 * time.Millisecond,
 	}
 	outcome := s.mutationReindexState(context.Background(), "/tmp/slow.go")
 	if outcome.Reindexed || !outcome.Pending || outcome.Receipt == "" || outcome.Generation != 7 {
@@ -238,9 +238,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	}
 	if status, ok := s.mutationReceiptState(outcome.Receipt); !ok || !status.Pending || status.Generation != 7 {
 		t.Fatalf("pending receipt state = %+v, ok=%v", status, ok)
-	}
-	if err := s.awaitMutationFreshness(context.Background()); err == nil || !strings.Contains(err.Error(), "pending receipt=") {
-		t.Fatalf("pending safety barrier error = %v", err)
 	}
 
 	done <- indexer.MutationResult{
@@ -253,9 +250,6 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	for time.Now().Before(deadline) {
 		status, ok := s.mutationReceiptState(outcome.Receipt)
 		if ok && status.Reindexed && !status.Pending && status.AppliedGeneration == 8 {
-			if err := s.awaitMutationFreshness(context.Background()); err != nil {
-				t.Fatalf("completed safety barrier: %v", err)
-			}
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -263,7 +257,7 @@ func TestMutationReindexStateSlowTicketReceiptCompletes(t *testing.T) {
 	t.Fatal("mutation receipt did not reach a terminal reindexed state")
 }
 
-func TestMutationReindexStateFailureBlocksSafetyReads(t *testing.T) {
+func TestMutationReindexStatePreservesFailure(t *testing.T) {
 	patchFailure := errors.New("patch failed")
 	done := make(chan indexer.MutationResult, 1)
 	done <- indexer.MutationResult{RequestedGeneration: 3, AppliedGeneration: 3, Err: patchFailure}
@@ -272,9 +266,6 @@ func TestMutationReindexStateFailureBlocksSafetyReads(t *testing.T) {
 	outcome := s.mutationReindexState(context.Background(), "/tmp/broken.go")
 	if !errors.Is(outcome.Err, patchFailure) || outcome.Reindexed || outcome.Pending {
 		t.Fatalf("failed ticket outcome = %+v", outcome)
-	}
-	if err := s.awaitMutationFreshness(context.Background()); err == nil || !strings.Contains(err.Error(), "patch failed") {
-		t.Fatalf("failed safety barrier error = %v", err)
 	}
 }
 
@@ -299,23 +290,28 @@ func TestAttachMutationFreshnessPendingOmitsStaleSyntaxHealth(t *testing.T) {
 	}
 }
 
-func TestApplyBatchFileEditSerializesConcurrentWrites(t *testing.T) {
+func TestAtomicBatchSerializesConcurrentFileEdits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "concurrent.txt")
 	if err := os.WriteFile(path, []byte("alpha beta\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{watcher: mutationTestWatcher{}, session: newSessionState()}
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
 
 	start := make(chan struct{})
 	results := make(chan batchEditResult, 2)
-	for _, edit := range []batchEditItem{
-		{Path: path, OldString: "alpha", NewString: "ALPHA"},
-		{Path: path, OldString: "beta", NewString: "BETA"},
+	for i, edit := range []batchEditItem{
+		{Op: "edit_file", Path: path, OldString: "alpha", NewString: "ALPHA"},
+		{Op: "edit_file", Path: path, OldString: "beta", NewString: "BETA"},
 	} {
 		edit := edit
 		go func() {
 			<-start
-			results <- s.applyBatchFileEdit(context.Background(), edit, true)
+			receipt, err := s.runBatchTransaction(context.Background(), []batchEditItem{edit}, fmt.Sprintf("concurrent-file-%d", i))
+			if err != nil {
+				results <- batchEditResult{Status: "failed", Error: err.Error()}
+				return
+			}
+			results <- receipt.Results[0]
 		}()
 	}
 	close(start)
@@ -334,7 +330,7 @@ func TestApplyBatchFileEditSerializesConcurrentWrites(t *testing.T) {
 	}
 }
 
-func TestApplyBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
+func TestAtomicBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "shifted.go")
 	content := "package sample\n\nfunc target() {\n\tprintln(\"old\")\n}\n\nfunc other() {}\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -351,17 +347,18 @@ func TestApplyBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 		EndLine:   7,
 	}
 	g.AddNode(node)
-	s := &Server{
-		engine:  query.NewEngine(g),
-		graph:   g,
-		watcher: mutationTestWatcher{},
-		session: newSessionState(),
-	}
-	result := s.applyBatchSymbolEdit(context.Background(), batchEditItem{
+	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
+	s.engine, s.graph = query.NewEngine(g), g
+	receipt, runErr := s.runBatchTransaction(context.Background(), []batchEditItem{{
+		Op:        "edit_symbol",
 		SymbolID:  node.ID,
 		OldSource: "println(\"old\")",
 		NewSource: "println(\"new\")",
-	}, true)
+	}}, "shifted-symbol")
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	result := receipt.Results[0]
 	if result.Status != "applied" || !result.Reindexed || result.ReindexPending || result.ReindexError != "" {
 		t.Fatalf("unexpected result: %+v", result)
 	}

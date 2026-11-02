@@ -98,7 +98,7 @@ func TestFinishColdDeferredPassesDoesNotRepeatFullCrossRepoResolve(t *testing.T)
 	store := &coldOrchestrationProbeStore{Graph: graph.New()}
 	mi := newColdOrchestrationMulti(store, zap.NewNop())
 
-	result := mi.finishColdDeferredPasses(t.Context(), nil)
+	result := mi.finishFixtureDeferredPasses(t.Context(), nil)
 
 	assert.True(t, result.ExactCrossRepoComplete)
 	assert.Zero(t, store.unresolvedScans.Load(),
@@ -112,7 +112,7 @@ func TestIndexMultiRepoUsesOneCoordinatedBaseResolve(t *testing.T) {
 	mi := newColdOrchestrationMulti(graph.New(), zap.New(core))
 	repos := coldOrchestrationRepos(t, 8)
 
-	results, err := mi.indexMultiRepo(repos)
+	results, err := mi.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	require.Len(t, results, len(repos))
 
@@ -139,7 +139,7 @@ func TestIndexMultiRepoAllFailuresDoNotRunCompletionPipeline(t *testing.T) {
 		})
 	}
 
-	results, err := mi.indexMultiRepo(repos)
+	results, err := mi.indexFixtureRepos(repos)
 	require.Error(t, err)
 	assert.Nil(t, results)
 	assert.Empty(t, logs.FilterMessage("DEFERRED-TIMING master.ResolveAll").All())
@@ -332,7 +332,7 @@ func snapshotColdGraph(store graph.Store, repos []config.RepoEntry) coldGraphSha
 func TestCoordinatedColdPipelineMatchesSerialReferenceGraph(t *testing.T) {
 	repos := coldOrchestrationRepos(t, 5)
 	coordinated := newColdOrchestrationMulti(graph.New(), zap.NewNop())
-	_, err := coordinated.indexMultiRepo(repos)
+	_, err := coordinated.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	serial := serialColdReference(t, repos)
 
@@ -407,7 +407,7 @@ func TestIndexMultiRepoRefFactsMatchesSingleFullAndUsesOneSetRebuild(t *testing.
 	counting := &coldRefFactsCountingStore{Store: store}
 	multi := newColdOrchestrationMulti(counting, zap.NewNop())
 
-	results, err := multi.indexMultiRepo(requested)
+	results, err := multi.indexFixtureRepos(requested)
 	require.NoError(t, err)
 	require.Len(t, results, len(repos))
 	require.Equal(t, 1, counting.rebuildCalls,
@@ -449,11 +449,11 @@ func TestColdRefFactRebuildPreservesFailureAndCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err := mi.rebuildColdRefFacts(ctx, []string{"repo-a", "repo-b"})
+	err := mi.rebuildFixtureRefFacts(ctx, []string{"repo-a", "repo-b"})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, probe.rebuildCalls, "cancellation before the boundary must skip the rebuild")
 
-	err = mi.rebuildColdRefFacts(t.Context(), []string{"repo-a", "repo-b"})
+	err = mi.rebuildFixtureRefFacts(t.Context(), []string{"repo-a", "repo-b"})
 	require.ErrorIs(t, err, sentinel)
 	require.Equal(t, 1, probe.rebuildCalls)
 	require.Equal(t, []string{"repo-a", "repo-b"}, probe.rebuildPrefixes)
@@ -465,12 +465,42 @@ func TestIndexMultiRepoRefFactFailureStopsGlobalConsumers(t *testing.T) {
 	probe := &coldRefFactsProbeStore{Store: graph.New(), rebuildErr: sentinel}
 	mi := newColdOrchestrationMulti(probe, zap.New(core))
 
-	results, err := mi.indexMultiRepo(coldRefFactRepos(t, 2))
+	results, err := mi.indexFixtureRepos(coldRefFactRepos(t, 2))
 	require.ErrorIs(t, err, sentinel)
 	require.Len(t, results, 2, "successful parse results remain available with the completion error")
 	require.Equal(t, 1, probe.rebuildCalls)
 	assert.Empty(t, logs.FilterMessage("global passes complete").All(),
 		"a failed reference-fact boundary must not publish global completion")
+}
+
+// TestIndexMultiRepoFailedFinalSealGivesUpTheWindow: when the coordinated
+// window's final seal keeps failing, the cold pass reports the failure and then
+// gives the window up instead of leaving it open behind the error. The writer
+// is back at its own durability, the planner probe no longer sees a live
+// window, and the store's repair rebuilds the index the seal could not.
+func TestIndexMultiRepoFailedFinalSealGivesUpTheWindow(t *testing.T) {
+	store, db := newFirstIndexStore(t)
+	indexes := firstIndexSchemaIndexes(t, db)
+	writerSync := firstIndexWriterSynchronous(t, store)
+	injected := errors.New("injected final seal failure")
+	restore := store.SetBulkSealHookForTest(func(index string) error {
+		if index == "nodes_by_kind" {
+			return injected
+		}
+		return nil
+	})
+	mi := newColdOrchestrationMulti(store, zap.NewNop())
+
+	_, err := mi.indexFixtureRepos(coldRefFactRepos(t, 2))
+	restore()
+	require.ErrorIs(t, err, injected)
+	assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store), "writer durability must be restored")
+	assert.False(t, firstIndexBulkActive(t, store), "the failed window must not stay open")
+	deadline := time.Now().Add(10 * time.Second)
+	for !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Equal(t, indexes, firstIndexSchemaIndexes(t, db), "the repair must rebuild the index the seal left out")
 }
 
 // TestBeginDeferredPassesOverlapSplitsPoolFromTail pins the overlap contract:

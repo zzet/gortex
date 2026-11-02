@@ -5,6 +5,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/zzet/gortex/internal/graph"
 	"io"
 	"time"
 )
@@ -96,6 +97,7 @@ const (
 	ErrUnsupportedMode  = "unsupported_mode"
 	ErrRepoNotTracked   = "repo_not_tracked"
 	ErrPrefixCollision  = "prefix_collision"
+	ErrRepoLoading      = "repo_loading"
 	ErrInternal         = "internal"
 	// ErrTimeout means the daemon accepted the control request but did not
 	// finish it inside the kind's budget — almost always because a
@@ -118,6 +120,7 @@ type ControlResponse struct {
 	OK        bool            `json:"ok"`
 	ErrorCode string          `json:"error_code,omitempty"`
 	ErrorMsg  string          `json:"error_msg,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 	// Warnings report cleanup errors after shutdown was accepted. OK does not
 	// certify store-close success or process exit; callers still wait for exit.
@@ -126,9 +129,11 @@ type ControlResponse struct {
 
 // Control operation kinds. One constant per kind so callers can't typo.
 const (
-	ControlTrack   = "track"
-	ControlUntrack = "untrack"
-	ControlReload  = "reload"
+	ControlTrack = "track"
+	// ControlTrackPreflight observes ownership without registering or saving.
+	ControlTrackPreflight = "track_preflight"
+	ControlUntrack        = "untrack"
+	ControlReload         = "reload"
 	// ControlProxy reloads servers.toml and rebuilds + atomically swaps
 	// the daemon's multi-server Router, then invalidates the roster
 	// cache — so `gortex proxy on/off/add/remove` apply to a running
@@ -316,6 +321,9 @@ type ProbeRepo struct {
 	State string `json:"state,omitempty"`
 	// StateReason explains a failed or missing repo.
 	StateReason string `json:"state_reason,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	OwnerPath   string `json:"owner_path,omitempty"`
+	OwnerState  string `json:"owner_state,omitempty"`
 }
 
 // Per-repo states a probe or coverage reply reports.
@@ -323,17 +331,24 @@ const (
 	// RepoStateLoading: configured, and the daemon has not registered it
 	// since it started. Graph calls answer repo_loading until it is ready.
 	RepoStateLoading = "loading"
+	// RepoStateIdentityPending means configured identities are unresolved; it
+	// does not claim that the requested path belongs to a repository.
+	RepoStateIdentityPending = "identity_pending"
 	// RepoStateReady: registered; graph calls answer.
 	RepoStateReady = "ready"
 	// RepoStateFailed: its load ended without registering it.
 	RepoStateFailed = "failed"
 	// RepoStateMissing: the configured path does not exist.
 	RepoStateMissing = "missing"
+	// RepoStatePrefixCollision is a configured root whose prefix belongs to
+	// another root. It cannot gain admission by waiting for warmup.
+	RepoStatePrefixCollision = "prefix_collision"
 )
 
 // StatusResponse is the payload returned under Result on a successful
 // ControlStatus call.
 type StatusResponse struct {
+	MCPDispatch   *MCPDispatchStatus  `json:"mcp_dispatch,omitempty"`
 	Version       string              `json:"version"`
 	PID           int                 `json:"pid"`
 	UptimeSeconds int64               `json:"uptime_seconds"`
@@ -513,8 +528,10 @@ type PublicationPhaseOffset struct {
 
 // StorageStatus is the store's write-ahead-log state for daemon status.
 type StorageStatus struct {
-	DBBytes  int64 `json:"db_bytes"`
-	WALBytes int64 `json:"wal_bytes"`
+	DenseIndexesMissing []string                         `json:"dense_indexes_missing,omitempty"`
+	LastFirstIndexDrain map[string]graph.FirstIndexDrain `json:"last_first_index_drain,omitempty"`
+	DBBytes             int64                            `json:"db_bytes"`
+	WALBytes            int64                            `json:"wal_bytes"`
 	// WALPendingFrames is the backlog not yet copied into the database
 	// (mxFrame - nBackfill), -1 when the wal-index could not be read.
 	WALPendingFrames int64 `json:"wal_pending_frames"`
@@ -525,8 +542,9 @@ type StorageStatus struct {
 	// CloseCheckpointPolicy is skip/full for stores reporting their effective
 	// policy. Empty means an older or unknown backend; callers must not infer
 	// the daemon's choice from their own environment.
-	CloseCheckpointPolicy string            `json:"close_checkpoint_policy,omitempty"`
-	WALReclaim            *WALReclaimStatus `json:"wal_reclaim,omitempty"`
+	CloseCheckpointPolicy string               `json:"close_checkpoint_policy,omitempty"`
+	WALReclaim            *WALReclaimStatus    `json:"wal_reclaim,omitempty"`
+	WALCheckpoint         *WALCheckpointStatus `json:"wal_checkpoint,omitempty"`
 	// RowCounters is the writer-maintained per-generation node/edge counts:
 	// whether NodeCount/EdgeCount read them, and — on an exact status only —
 	// the drift check against a recount.
@@ -547,12 +565,59 @@ type RowCounterStatus struct {
 	FirstDrift string `json:"first_drift,omitempty"`
 }
 
+// WALCheckpointStatus reports the periodic producer separately from reclaim.
+// Missing capability omits this block; unobserved frame work remains explicit.
+type WALCheckpointStatus struct {
+	Attempts                   int64   `json:"attempts"`
+	Complete                   int64   `json:"complete"`
+	Incomplete                 int64   `json:"incomplete"`
+	ZeroProgress               int64   `json:"zero_progress"`
+	DeferredBuildLane          int64   `json:"deferred_build_lane"`
+	LongestBuildLaneDeferralMS float64 `json:"longest_build_lane_deferral_ms"`
+	RefusedLease               int64   `json:"refused_lease"`
+	RefusedInflight            int64   `json:"refused_inflight"`
+	StoodAsideReclaim          int64   `json:"stood_aside_reclaim"`
+	YieldCancelled             int64   `json:"yield_cancelled"`
+	Failed                     int64   `json:"failed"`
+	FramesBackfilledTotal      int64   `json:"frames_backfilled_total"`
+	FramesUnobserved           int64   `json:"frames_unobserved"`
+	LastOKAt                   string  `json:"last_ok_at,omitempty"`
+	LastOutcome                string  `json:"last_outcome"`
+}
+
 // WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is
 // the time the read gate was closed for a reset; ReaderWait is the time new
 // reads spent waiting at it.
+// WALDurationHistogramStatus is a since-store-open distribution. Bucket counts
+// are disjoint so callers can subtract snapshots for a measured window.
+type WALDurationHistogramStatus struct {
+	Count        int64     `json:"count"`
+	TotalMS      float64   `json:"total_ms"`
+	MaxMS        float64   `json:"max_ms"`
+	P50MS        float64   `json:"p50_ms"`
+	P95MS        float64   `json:"p95_ms"`
+	BucketLeMS   []float64 `json:"bucket_le_ms"`
+	BucketCounts []int64   `json:"bucket_counts"`
+}
+
 type WALReclaimStatus struct {
+	WriterHold    WALDurationHistogramStatus `json:"writer_hold"`
+	WriterWait    WALDurationHistogramStatus `json:"writer_wait"`
+	PauseDrain    WALDurationHistogramStatus `json:"pause_drain"`
+	PauseTruncate WALDurationHistogramStatus `json:"pause_truncate"`
+
+	// Same since-store-open observations exposed by graph_stats. The peak is
+	// a sampled lower bound and remains null until actually observed; reads
+	// and WAL resets never clear it or the cancellation counters.
+	CancelledWriterParked int64  `json:"cancelled_writer_parked"`
+	CancelledWriteIntent  int64  `json:"cancelled_write_intent"`
+	CancelledOther        int64  `json:"cancelled_other"`
+	ObservedPeakWALBytes  *int64 `json:"observed_peak_wal_bytes"`
+	WALPeakObserved       bool   `json:"wal_peak_observed"`
+
 	ThresholdBytes int64 `json:"threshold_bytes"`
 	Attempts       int64 `json:"attempts"`
+	UrgentAttempts int64 `json:"urgent_attempts"`
 	Resets         int64 `json:"resets"`
 	// OpenGateResets counts resets reached without closing the read gate;
 	// WriterHold* is how long the reclaim held the application writer.
@@ -718,6 +783,19 @@ type RuntimeStats struct {
 	StackInuse   uint64 `json:"stack_inuse"`   // goroutine stacks
 	NumGC        uint32 `json:"num_gc"`        // completed GC cycles
 	NumGoroutine int    `json:"num_goroutine"` // live goroutines
+
+	// What the Go runtime cannot see. Most of a daemon's footprint can be
+	// outside the Go heap: SQLite's page caches and parser allocations come
+	// from C allocators, and memory-mapped store files are file pages. The
+	// operating-system figures are omitted where the platform has no reader.
+	RSS                 uint64 `json:"rss,omitempty"`                    // resident set now
+	RSSPeak             uint64 `json:"rss_peak,omitempty"`               // lifetime maximum resident set
+	PSS                 uint64 `json:"pss,omitempty"`                    // Linux proportional set: shared pages divided among sharers
+	PSSFile             uint64 `json:"pss_file,omitempty"`               // file-backed part of PSS: mapped store files, executable
+	Footprint           uint64 `json:"footprint,omitempty"`              // macOS physical footprint now
+	FootprintPeak       uint64 `json:"footprint_peak,omitempty"`         // macOS lifetime maximum physical footprint
+	SQLitePageCache     uint64 `json:"sqlite_page_cache,omitempty"`      // every SQLite connection's page cache, process-wide
+	SQLitePageCachePeak uint64 `json:"sqlite_page_cache_peak,omitempty"` // lifetime maximum of the above
 }
 
 // TrigramCacheStats reports the process-wide trigram searcher cache: how
@@ -1024,6 +1102,8 @@ type FileCoverageResult struct {
 	// Graph calls for such a repo answer repo_loading, so a coverage verdict
 	// read from its persisted rows must not turn into a deny of the native
 	// tool: the agent would have no read path at all. Repo names it.
+	// RepoStateIdentityPending instead reports unresolved configured identities
+	// without asserting ownership of Path; Repo is empty and no graph is read.
 	RepoState string `json:"repo_state,omitempty"`
 	Repo      string `json:"repo,omitempty"`
 	// MutationState is read_only while the current checkout's exact route has
@@ -1249,7 +1329,10 @@ type TrackedRepoStatus struct {
 	// Loading is true when the repo is configured and its path exists, but
 	// the daemon has not finished warmup, so its index is not loaded yet.
 	// Unloaded remains true so older clients keep their existing behaviour.
-	Loading bool `json:"loading,omitempty"`
+	Loading    bool   `json:"loading,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	OwnerPath  string `json:"owner_path,omitempty"`
+	OwnerState string `json:"owner_state,omitempty"`
 	// File indexing health includes unresolved failures and ledger read errors.
 	IndexHealthError string `json:"index_health_error,omitempty"`
 	FailedFiles      int    `json:"failed_files,omitempty"`

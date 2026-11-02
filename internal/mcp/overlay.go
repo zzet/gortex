@@ -96,6 +96,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
 	return s.boundToolHandler(s.retryFreshSymbolSearch(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+		s.noteAcknowledgementMiddleware(ctx)
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
@@ -228,11 +229,6 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
-		// A source mutation preempts background writers while it selects and
-		// enters its mutation lane. Publication waits temporarily release that
-		// intent so the previous edit can finish the route this one needs.
-		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, req.Params.Name)
-		defer releaseWriteIntent()
 		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		byteCtx, byteView, releaseByte, byteRefusal := s.prepareByteEditAuthority(ctx, &req, selector, freshness, capabilities)
 		if byteRefusal != nil {
@@ -264,6 +260,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
+		// The selected route identifies whether this handler writes the view
+		// store. File-only canonical edits never announce a store writer.
+		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, legacyName)
+		defer releaseWriteIntent()
 		indexer.StampPublicationPhase(ctx, indexer.PublicationViewResolved)
 		// Tell the deadline firewall what this call is reading and what
 		// repositories it is admitted to. If it stops waiting for this handler
@@ -275,6 +275,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Publishing is a no-op when no firewall frame is above us (an
 		// unbounded call).
 		noteRetainedRequest(ctx, view, scope)
+		if refusal := s.awaitWatchedFreshness(ctx, legacyName, req, freshness); refusal != nil {
+			return refusal, nil
+		}
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
 			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
 				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil
@@ -353,7 +356,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
-		res, hErr := h(ctx, req)
+		ctx, releaseExplicitFreshness := s.captureExplicitFreshness(ctx, req)
+		if releaseExplicitFreshness != nil {
+			defer releaseExplicitFreshness()
+		}
+		ctx = s.captureToolFreshness(ctx)
+		ctx, req = s.reserveToolFreshnessBudget(ctx, req.Params.Name, req)
+		res, hErr := s.invokeAcknowledgedLeaf(ctx, req, h)
 		if hErr == nil && res != nil && !res.IsError && lateExactnessRefusalIsSafe(req.Params.Name) {
 			if err := contractCoreReadError(ctx); err != nil {
 				res = mcp.NewToolResultError(err.Error())
@@ -434,13 +443,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
-			if rider := s.freshnessRiderFor(req.Params.Name, req); rider != nil {
-				res = decorateResultWithFreshness(res, rider)
-			} else if isFreshnessListTool(req.Params.Name) {
-				// List tools get a per-file sweep: any hit whose file drifted
-				// or vanished on disk is flagged with per-repo provenance.
-				res = s.decorateListResultWithFreshness(res)
-			}
+			res = s.decorateToolFreshness(ctx, req.Params.Name, req, res)
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
 			// must say so where the caller already looks for provenance.
@@ -466,6 +469,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// (momentum.go). No-op for non-read tools and error results.
 		if hErr == nil {
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
+			if _, reserved := ctx.Value(toolFreshnessBudgetKey{}).(int); reserved {
+				res = fitToolFreshnessBudget(ctx, req, res)
+			}
 		}
 		return res, hErr
 	}))

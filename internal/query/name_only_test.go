@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -188,6 +189,71 @@ func TestFindNameOnlyCandidates_ScopeFilterShrinksTheCount(t *testing.T) {
 	scoped := eng.FindNameOnlyCandidates(target, nil, QueryOptions{RepoAllow: map[string]bool{"svcA": true}})
 	assert.Equal(t, 1, scoped.Total)
 	assert.Len(t, scoped.Edges, 1)
+}
+
+// repoNarrowSpy narrows placeholder reads the way the SQLite store does and
+// records the repositories each narrowed read named.
+type repoNarrowSpy struct {
+	*graph.Graph
+	narrowed [][]string
+}
+
+func (s *repoNarrowSpy) GetInEdgesByNodeIDsFromRepos(ids, repos []string) (map[string][]*graph.Edge, bool, error) {
+	s.narrowed = append(s.narrowed, slices.Sorted(slices.Values(repos)))
+	out := make(map[string][]*graph.Edge)
+	for to, edges := range s.GetInEdgesByNodeIDs(ids) {
+		for _, edge := range edges {
+			if source := s.GetNode(edge.From); source != nil && slices.Contains(repos, source.RepoPrefix) {
+				out[to] = append(out[to], edge)
+			}
+		}
+	}
+	return out, true, nil
+}
+
+// TestFindNameOnlyCandidates_NarrowsPlaceholderReadOnlyForFewRepos: a scope
+// naming a few repositories reads only their call sites, while a wider one,
+// up to every repository that calls the name, reads every site instead of
+// probing each against a long repository list. Both answer exactly as the
+// unnarrowed read does.
+func TestFindNameOnlyCandidates_NarrowsPlaceholderReadOnlyForFewRepos(t *testing.T) {
+	g := graph.New()
+	target := &graph.Node{
+		ID: "r0/lib/util.go::Helper", Kind: graph.KindFunction, Name: "Helper",
+		FilePath: "r0/lib/util.go", RepoPrefix: "r0",
+	}
+	g.AddNode(target)
+	var repos []string
+	for i := range 2*nameOnlyRepoNarrowMax + 1 {
+		repo := fmt.Sprintf("r%d", i)
+		repos = append(repos, repo)
+		g.AddNode(&graph.Node{
+			ID: repo + "/app/main.go::run", Kind: graph.KindFunction, Name: "run",
+			FilePath: repo + "/app/main.go", RepoPrefix: repo,
+		})
+		g.AddEdge(&graph.Edge{
+			From: repo + "/app/main.go::run", To: "unresolved::Helper",
+			Kind: graph.EdgeCalls, FilePath: repo + "/app/main.go", Line: 3,
+		})
+	}
+
+	spy := &repoNarrowSpy{Graph: g}
+	for _, allowed := range []int{1, nameOnlyRepoNarrowMax, nameOnlyRepoNarrowMax + 1, len(repos)} {
+		allow := map[string]bool{}
+		for _, repo := range repos[:allowed] {
+			allow[repo] = true
+		}
+		opts := QueryOptions{RepoAllow: allow}
+		spy.narrowed = nil
+		got := NewEngine(spy).FindNameOnlyCandidates(target, nil, opts)
+		require.Equal(t, NewEngine(g).FindNameOnlyCandidates(target, nil, opts), got, "allowed=%d", allowed)
+		require.Equal(t, allowed, got.Total)
+		if allowed <= nameOnlyRepoNarrowMax {
+			require.Equal(t, [][]string{append([]string{""}, repos[:allowed]...)}, spy.narrowed, "allowed=%d", allowed)
+		} else {
+			require.Empty(t, spy.narrowed, "allowed=%d", allowed)
+		}
+	}
 }
 
 // TestAttachNameOnlyCandidates_CountAlwaysRowsOnlyOnOptIn is the

@@ -77,6 +77,12 @@ func TestResolveFamilyDirsMatchesMainLinkedAndSubdirectory(t *testing.T) {
 			}
 			familyDirsSameDirectory(t, gitDir, inv.GitDir)
 			familyDirsSameDirectory(t, commonDir, filepath.Join(primary, ".git"))
+			// The marker read must name the same family key without Git.
+			markerRoot, markerCommonDir, ok := MarkerCommonDir(path)
+			if !ok || markerCommonDir != commonDir {
+				t.Fatalf("marker of %q names common dir %q (ok=%v), Git names %q", path, markerCommonDir, ok, commonDir)
+			}
+			familyDirsSameDirectory(t, markerRoot, root)
 		}
 	}
 }
@@ -87,6 +93,9 @@ func TestResolveFamilyDirsUnavailableHasNoBinding(t *testing.T) {
 		gitDir, commonDir, err := ResolveFamilyDirs(t.Context(), path)
 		if !errors.Is(err, ErrInventoryUnavailable) || gitDir != "" || commonDir != "" {
 			t.Fatalf("unavailable path %q returned %q, %q, %v", path, gitDir, commonDir, err)
+		}
+		if root, commonDir, ok := MarkerCommonDir(path); ok {
+			t.Fatalf("path %q outside Git has a marker at %q naming %q", path, root, commonDir)
 		}
 	}
 }

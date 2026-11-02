@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ import (
 // graph, test fixtures — simply do not implement it.
 type storeCompactor interface {
 	CompactStats() (freeBytes, totalBytes int64)
-	Compact() error
+	CompactContext(context.Context) error
 	Path() string
 }
 
@@ -66,15 +67,23 @@ func shouldCompactStore(freeBytes, totalBytes int64, diskAvailBytes uint64) bool
 
 // maybeCompactStore probes the store for the compaction capability and runs
 // a one-time VACUUM when shouldCompactStore says the file is mostly dead
-// space. Called from warmupDaemonState right after the orphan-prefix purge
-// (so the purge's freshly-freed pages are measured and reclaimed in the same
-// pass) and before the warmup re-index loop (whose writes would start
-// reusing freelist pages and whose readers would contend with VACUUM's
-// exclusive lock). Every failure path degrades to "skip": freelist pages
-// stay reusable, so a missed compaction costs disk, never correctness.
+// space. Production calls the context-aware form only after the entire warmup
+// producer has joined and enrichment is published. Pages reused by indexing
+// therefore reduce the measured freelist before this decision.
 func maybeCompactStore(g graph.Store, logger *zap.Logger) {
+	maybeCompactStoreContext(context.Background(), g, false, logger)
+}
+
+func maybeCompactStoreContext(ctx context.Context, g graph.Store, migrated bool, logger *zap.Logger) {
+	if ctx.Err() != nil {
+		return
+	}
+	if migrated {
+		logger.Info("daemon: store compaction deferred to next boot", zap.String("reason", "after_migration"))
+		return
+	}
 	if os.Getenv("GORTEX_SKIP_STORE_COMPACT") == "1" {
-		logger.Debug("daemon: store compaction disabled (GORTEX_SKIP_STORE_COMPACT=1)")
+		logger.Debug("daemon: store compaction disabled (GORTEX_SKIP_STORE_COMPACT=1)", zap.String("reason", "disabled"))
 		return
 	}
 	c, ok := g.(storeCompactor)
@@ -91,11 +100,12 @@ func maybeCompactStore(g graph.Store, logger *zap.Logger) {
 		// Unknown headroom means the ×1.5 guard cannot hold; VACUUM without it
 		// risks filling the volume mid-rewrite, so skip.
 		logger.Debug("daemon: store compaction skipped — disk headroom unknown",
-			zap.String("path", path), zap.Error(err))
+			zap.String("reason", "disk_headroom_unknown"), zap.String("path", path), zap.Error(err))
 		return
 	}
 	if !shouldCompactStore(free, total, avail) {
 		logger.Debug("daemon: store compaction not warranted",
+			zap.String("reason", "below_threshold_after_warmup"),
 			zap.Int64("reclaimable_bytes", free),
 			zap.Int64("store_bytes", total),
 			zap.Uint64("disk_avail_bytes", avail))
@@ -106,7 +116,7 @@ func maybeCompactStore(g graph.Store, logger *zap.Logger) {
 		zap.Int64("store_bytes", total),
 		zap.Uint64("disk_avail_bytes", avail))
 	start := time.Now()
-	if err := c.Compact(); err != nil {
+	if err := c.CompactContext(ctx); err != nil {
 		// A deferral is not a failure and must not be logged as one: the store
 		// was mid-publish or mid-build, the maintenance lane declined to
 		// rewrite the file underneath it, and the freelist is still there to
@@ -115,7 +125,16 @@ func maybeCompactStore(g graph.Store, logger *zap.Logger) {
 		// that VACUUM actually tried and lost.
 		if errors.Is(err, store_sqlite.ErrMaintenanceBusy) {
 			logger.Info("daemon: store compaction deferred — the store was busy",
-				zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+				zap.String("reason", "busy"), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+			return
+		}
+		if errors.Is(err, store_sqlite.ErrVacuumTempDirectory) {
+			logger.Info("daemon: store compaction skipped — temporary volume unconfirmed",
+				zap.String("reason", "temp_directory_unconfirmed"), zap.Error(err))
+			return
+		}
+		if ctx.Err() != nil {
+			logger.Info("daemon: store compaction canceled", zap.Error(err))
 			return
 		}
 		// Non-fatal by design: a failed VACUUM leaves the store exactly as it
@@ -129,4 +148,22 @@ func maybeCompactStore(g graph.Store, logger *zap.Logger) {
 		zap.Duration("elapsed", time.Since(start)),
 		zap.Int64("store_bytes", after),
 		zap.Int64("reclaimed_bytes", total-after))
+}
+
+// scheduleDaemonCompaction admits at most one owned task. Even the warmup's
+// deferred memory-release tail finishes before it measures or rewrites the
+// store. Cancellation and joining use the existing startup owner, so teardown
+// cannot close the backend beneath the dedicated connection.
+func scheduleDaemonCompaction(task, warmup *daemonWarmup, state *daemonState, logger *zap.Logger) bool {
+	return task.start(func(ctx context.Context) {
+		warmup.wait()
+		maybeCompactStoreContext(ctx, state.graph, state.migratedStore, logger)
+	})
+}
+
+func joinDaemonCompaction(task *daemonWarmup, logger *zap.Logger) {
+	started := time.Now()
+	logger.Info("daemon: shutdown phase start", zap.String("phase", "post_warmup_compaction"))
+	task.wait()
+	logger.Info("daemon: shutdown phase complete", zap.String("phase", "post_warmup_compaction"), zap.Duration("elapsed", time.Since(started)))
 }

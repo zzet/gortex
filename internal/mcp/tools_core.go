@@ -1549,6 +1549,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		// the cutoff declines some safe resolutions, which is the right way
 		// to be wrong here.
 		eligible map[string]struct{}
+		repair   func()
 	)
 
 	// Multi-repo mode: route through the per-repo indexer so nodes keep
@@ -1580,6 +1581,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 			return mcp.NewToolResultError(scopeErr.Error()), nil
 		}
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.multiIndexer.IncrementalReindexRepo(prefix, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1602,6 +1604,7 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 		}
 		reindexRoot = root
 		eligible = s.failedReceiptsBefore(paths, reindexRoot)
+		repair = s.captureWatcherTierRepair(paths, reindexRoot)
 		result, err = s.indexer.IncrementalReindexPaths(root, paths)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -1622,6 +1625,9 @@ func (s *Server) handleReindexRepository(ctx context.Context, req mcp.CallToolRe
 	// prevent — so anything wider is left alone.
 	if resolved, ok := reindexedReceiptPath(paths, reindexRoot, result); ok {
 		s.resolveReindexedPathReceipts(resolved, eligible)
+		if repair != nil {
+			repair()
+		}
 	}
 
 	s.startBackgroundAnalysis("reindex")
@@ -1719,7 +1725,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 
 	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		s.ensureFreshContext(ctx, []string{parts[0]})
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
@@ -2748,7 +2754,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	fp = s.graphRelPath(ctx, fp)
 
 	// Auto re-index stale file before querying.
-	s.ensureFresh([]string{fp})
+	s.ensureFreshContext(ctx, []string{fp})
 
 	// gcx is the high-volume agent format and only emits total_edges
 	// in its meta header — never per-edge rows. Route gcx-only calls
@@ -3771,6 +3777,22 @@ func (s *Server) buildGraphStatsPayloadFromStats(ctx context.Context, stats *gra
 	}
 
 	result["token_savings"] = s.tokenStatsFor(ctx).snapshot()
+	// Watcher totals describe the active instances, independently of the
+	// selected graph view. Unsupported watchers do not invent zero readings.
+	if observer, ok := s.currentWatcher().(interface{ MutationCounters() map[string]uint64 }); ok {
+		if counters := observer.MutationCounters(); counters != nil {
+			observation := make(map[string]any, len(counters)+1)
+			observation["scope"] = "active_watchers"
+			for name, count := range counters {
+				observation[name] = count
+			}
+			result["watcher_mutation_counters"] = observation
+		}
+	}
+	// Process CPU and this Server's logical edit outcomes span all views and
+	// clients. Keep that scope explicit beside the view-derived graph stats.
+	result["process_edit_window"] = s.processEditWindow()
+	result["wal_reclaim_observation"] = s.walReclaimObservation()
 
 	if cs := s.cumulativeSavingsSnapshot(); cs != nil {
 		result["cumulative_savings"] = cs

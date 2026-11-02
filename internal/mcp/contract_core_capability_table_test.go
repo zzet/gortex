@@ -118,6 +118,9 @@ type (
 	capBFSContext interface {
 		BFSContext(context.Context, []string, graph.Direction, []graph.EdgeKind, int, int) ([]graph.BFSHop, error)
 	}
+	capLastFirstIndexDrains interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}
 	capRepoPrefixes interface{ RepoPrefixes() []string }
 )
 
@@ -128,6 +131,7 @@ type (
 func contractCoreCapabilityTable() []contractCoreCapRow {
 	rows := []contractCoreCapRow{
 		// Kept by the wrapper itself.
+		{"CallAncestorReader", capOf[graph.CallAncestorReader], capWrapper, "candidate-anchored calls/references closure through exact selected edge exclusions"},
 		{"Reader", capOf[graph.Reader], capWrapper, "adjacency filtered, node reads promoted"},
 		{"NodeGetter", capOf[graph.NodeGetter], capWrapper, "node reads promoted"},
 		{"BoundaryReader", capOf[graph.BoundaryReader], capWrapper, "satisfied by the filtered Reader methods"},
@@ -140,6 +144,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FilteredContainingNameReader", capOf[graph.FilteredContainingNameReader], capWrapper, "conditional variant"},
 		{"ScopedNodeProjectionSequencer", capOf[graph.ScopedNodeProjectionSequencer], capWrapper, "conditional variant"},
 		{"ScopedKindSummarySequencer", capOf[graph.ScopedKindSummarySequencer], capWrapper, "conditional variant"},
+		{"ScopedFileLocationSequencer", capOf[graph.ScopedFileLocationSequencer], capWrapper, "rides on the conditional summary variant"},
 		{"ReadContextBinder", capOf[graph.ReadContextBinder], capWrapper, "binds the selected reader and wraps it again"},
 		{"local:GetNodeContext", capOf[capNodeContext], capWrapper, "checked forwarder"},
 		{"local:GetNodesByIDsContext", capOf[capNodesByIDsContext], capWrapper, "checked forwarder"},
@@ -161,6 +166,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"ReleaseEnrichmentReader", capOf[graph.ReleaseEnrichmentReader], capSelected, ""},
 		{"BlameEnrichmentReader", capOf[graph.BlameEnrichmentReader], capSelected, ""},
 		{"BoundedExactNameReader", capOf[graph.BoundedExactNameReader], capSelected, ""},
+		{"RepoNamesNodeFinder", capOf[graph.RepoNamesNodeFinder], capSelected, "bound-session symbol shorthand"},
 		{"local:FindNodesByNames", capOf[namesReader], capSelected, "search assist's exact-name rescue"},
 		{"local:SearchContent", capOf[contentQuerier], capSelected, "composed-view content corpus"},
 		{"local:GetFileNodesByPaths", capOf[fileNodesBatchReader], capSelected, "base-narrowed site prefetch"},
@@ -169,17 +175,20 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileEditingContext", capOf[graph.FileEditingContext], capFiltered, "the store reads raw imports and calls"},
 
 		// Deliberate drops.
-		{"BFSCapable", capOf[graph.BFSCapable], capDropped, capReasonTraversal},
+		{"FilteredBFSAdmissionReader", capOf[graph.FilteredBFSAdmissionReader], capDropped, "private scoped admission adapter supplies exact wrapper exclusions"},
+		{"FilteredCallAncestorReader", capOf[graph.FilteredCallAncestorReader], capDropped, "private candidate coverage adapter supplies this wrapper's exact exclusions"},
+		{"BFSCapable", capOf[graph.BFSCapable], capWrapper, "canonical hops recomputed over selected filtered adjacency; engine admission remains the Go contract"},
 		{"FrontierExpander", capOf[graph.FrontierExpander], capDropped, capReasonTraversal},
 		{"ReachableForwardByKinds", capOf[graph.ReachableForwardByKinds], capDropped, capReasonTraversal},
 		{"ClassHierarchyTraverser", capOf[graph.ClassHierarchyTraverser], capDropped, capReasonTraversal},
-		{"local:BFSContext", capOf[capBFSContext], capDropped, capReasonTraversal},
+		{"local:BFSContext", capOf[capBFSContext], capWrapper, "canonical selected-adjacency BFS honors request cancellation"},
 		{"local:GetInEdgesByNodeIDsContext", capOf[capInEdgesByNodeIDsContext], capDropped, capReasonEdges + " (the bound counts hidden edges; callers fall back to the filtered GetInEdgesByNodeIDs and bound visible ones)"},
 		{"local:GetOutEdgesByNodeIDsContext", capOf[memoContextEdgeReader], capDropped, capReasonEdges + " (the bound counts hidden edges; callers fall back to the filtered GetOutEdgesByNodeIDs)"},
 		{"NodeDegreeAggregator", capOf[graph.NodeDegreeAggregator], capDropped, capReasonEdges + " (degrees count hidden endpoints; callers walk filtered edges)"},
 		{"NodeDegreeByKinds", capOf[graph.NodeDegreeByKinds], capDropped, capReasonEdges + " (degrees count hidden endpoints)"},
 		{"EdgeKindCounter", capOf[graph.EdgeKindCounter], capDropped, capReasonEdges + " (counts include hidden kinds, endpoints and spring.Bean calls)"},
-		{"InEdgeCounter", capOf[graph.InEdgeCounter], capDropped, capReasonEdges},
+		{"InEdgeCounter", capOf[graph.InEdgeCounter], capWrapper, "requested kind counts recomputed through filtered kind iterators"},
+		{"RepoScopedInEdgeReader", capOf[graph.RepoScopedInEdgeReader], capWrapper, "repository-narrowed incoming rows pass the same edge mask; declines when the selected reader lacks it"},
 		{"EdgesByKindsScanner", capOf[graph.EdgesByKindsScanner], capDropped, capReasonEdges},
 		{"BoundedEdgeExistenceReader", capOf[graph.BoundedEdgeExistenceReader], capDropped, capReasonEdges},
 		{"BoundedIncomingEdgeIdentityReader", capOf[graph.BoundedIncomingEdgeIdentityReader], capDropped, capReasonEdges},
@@ -190,10 +199,10 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"CrossRepoEdgeAggregator", capOf[graph.CrossRepoEdgeAggregator], capDropped, capReasonEdges},
 		{"ExtractCandidatesScanner", capOf[graph.ExtractCandidatesScanner], capDropped, capReasonEdges},
 		{"FileImportAggregator", capOf[graph.FileImportAggregator], capDropped, capReasonEdges},
-		{"ScopedOutlineNodeReader", capOf[graph.ScopedOutlineNodeReader], capSelected, "node-only membership and scoped exact-name reads retain selected-view visibility"},
+		{"ScopedOutlineNodeReader", capOf[graph.ScopedOutlineNodeReader], capWrapper, "node-only membership and scoped exact-name reads retain selected-view visibility"},
 		{"ScopedOutlineAggregator", capOf[graph.ScopedOutlineAggregator], capDropped, capReasonEdges + " (scopedOutlineCountsFor uses the private filtered adapter instead)"},
 		{"FilteredScopedOutlineAggregator", capOf[graph.FilteredScopedOutlineAggregator], capDropped, "served only by the private outline adapter, which supplies this wrapper's exact exclusions"},
-		{"FileImporters", capOf[graph.FileImporters], capDropped, capReasonEdges},
+		{"FileImporters", capOf[graph.FileImporters], capWrapper, "file-anchored selected imports recomputed through the exact edge mask"},
 		{"FileSubGraphReader", capOf[graph.FileSubGraphReader], capDropped, capReasonEdges},
 		{"FileSubGraphCountReader", capOf[graph.FileSubGraphCountReader], capDropped, capReasonEdges},
 		{"ThrowerErrorSurfacer", capOf[graph.ThrowerErrorSurfacer], capDropped, capReasonEdges},
@@ -211,6 +220,9 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"LightEdgeSequencer", capOf[graph.LightEdgeSequencer], capDropped, capReasonEdges + " (graph.EdgesLightSeq falls back to the filtered EdgesByKind)"},
 		{"NodeLightSequencer", capOf[graph.NodeLightSequencer], capDropped, "node-only streaming; graph.NodesLightSeq falls back to the AllNodesLight forwarder, the same rows materialised"},
 		{"Store", capOf[graph.Store], capDropped, "the whole backend contract; a request reader is never the store"},
+		{"local:WALReclaimStats", capOf[walReclaimSnapshotReader], capDropped, capReasonBackend + " (physical store counters, never selected graph state)"},
+		{"local:LastFirstIndexDrains", capOf[capLastFirstIndexDrains], capDropped, capReasonBackend + " (shared-store drain observations, never selected graph state)"},
+		{"local:WALPassiveStats", capOf[walPassiveSnapshotReader], capDropped, capReasonBackend + " (physical checkpoint counters, never selected graph state)"},
 		{"AnalysisGenerationStore", capOf[graph.AnalysisGenerationStore], capDropped, capReasonBackend},
 		{"AnalysisQueryStore", capOf[graph.AnalysisQueryStore], capDropped, capReasonBackend},
 		{"TryAnalysisQueryStore", capOf[graph.TryAnalysisQueryStore], capDropped, capReasonBackend},
@@ -220,6 +232,9 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"OverlayLayerContractFileNodesReader", capOf[graph.OverlayLayerContractFileNodesReader], capDropped, "checked physical-layer file nodes; graph.ContractFileNodesContext unwraps and composes the selected reader with its ownership masks instead of forwarding physical rows on the request wrapper"},
 		{"ContractStateStore", capOf[graph.ContractStateStore], capDropped, capReasonBackend},
 		{"FileMetaReader", capOf[graph.FileMetaReader], capDropped, capReasonBackend},
+		{"FileMetaPathReader", capOf[graph.FileMetaPathReader], capDropped, "projection retirement reads durable content evidence on the backend, never a request reader"},
+		{"local:FileMetasByPaths+GetFileNodes", capOf[projectionStore], capDropped, capReasonBackend},
+		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader], capDropped, "selected retirement reads checked metadata through the same leased handoff; never forwarded through contract-core request readers"},
 		{"RepoIndexStateReader", capOf[graph.RepoIndexStateReader], capDropped, capReasonBackend},
 		{"StructuralIntegrityAuditor", capOf[graph.StructuralIntegrityAuditor], capDropped, capReasonBackend},
 		{"StructuralIntegritySnapshotter", capOf[graph.StructuralIntegritySnapshotter], capDropped, capReasonBackend},
@@ -262,7 +277,6 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"CloneShingleWriter", capOf[graph.CloneShingleWriter]},
 		{"ConfigNodeBatchEvicter", capOf[graph.ConfigNodeBatchEvicter]},
 		{"ConstantValueContextReader", capOf[graph.ConstantValueContextReader]},
-		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader]},
 		{"ConstantValueReader", capOf[graph.ConstantValueReader]},
 		{"ConstantValueRepoReplacer", capOf[graph.ConstantValueRepoReplacer]},
 		{"ConstantValueWriter", capOf[graph.ConstantValueWriter]},
@@ -302,7 +316,6 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"FileIndexFailureReader", capOf[graph.FileIndexFailureReader]},
 		{"FileIndexFailureWriter", capOf[graph.FileIndexFailureWriter]},
 		{"FileLanguageNodeSequencer", capOf[graph.FileLanguageNodeSequencer]},
-		{"FileMetaPathReader", capOf[graph.FileMetaPathReader]},
 		{"FileMetaRepoReplacer", capOf[graph.FileMetaRepoReplacer]},
 		{"FileMetaWriter", capOf[graph.FileMetaWriter]},
 		{"FileMtimeDeleter", capOf[graph.FileMtimeDeleter]},
@@ -360,7 +373,6 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"RepoLanguageSymbolCounter", capOf[graph.RepoLanguageSymbolCounter]},
 		{"RepoLightNodeReader", capOf[graph.RepoLightNodeReader]},
 		{"RepoMetaNodeReader", capOf[graph.RepoMetaNodeReader]},
-		{"RepoNamesNodeFinder", capOf[graph.RepoNamesNodeFinder]},
 		{"RepoNodeIdentitySequencer", capOf[graph.RepoNodeIdentitySequencer]},
 		{"RepoNodeKindIDReader", capOf[graph.RepoNodeKindIDReader]},
 		{"ResolverNameScopeFinder", capOf[graph.ResolverNameScopeFinder]},
@@ -401,6 +413,7 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 // store does not implement, so no request can lose them to the wrapper.
 func contractCoreNonStoreInterfaces() []contractCoreCapName {
 	return []contractCoreCapName{
+		{"BFSAdmissionReader", capOf[graph.BFSAdmissionReader]},
 		{"BackendResolver", capOf[graph.BackendResolver]},
 		{"BelowFileRows", capOf[graph.BelowFileRows]},
 		{"CommunityDetector", capOf[graph.CommunityDetector]},
@@ -413,6 +426,7 @@ func contractCoreNonStoreInterfaces() []contractCoreCapName {
 		{"GenerationLayerIdentity", capOf[graph.GenerationLayerIdentity]},
 		{"IncomingSourceNodeQuery", capOf[graph.IncomingSourceNodeQuery]},
 		{"KCorer", capOf[graph.KCorer]},
+		{"KindAdjacencyReader", capOf[graph.KindAdjacencyReader]},
 		{"OverlayDetachedFileSummaryReader", capOf[graph.OverlayDetachedFileSummaryReader]},
 		{"OverlayDetachedNodeReader", capOf[graph.OverlayDetachedNodeReader]},
 		{"OverlayDetachedSummaryReader", capOf[graph.OverlayDetachedSummaryReader]},

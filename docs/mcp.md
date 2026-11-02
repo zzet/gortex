@@ -241,7 +241,7 @@ Four additional push channels modeled on `subscribe_diagnostics` — per-session
 |------|-------------|
 | `subscribe_workspace_readiness` | `notifications/workspace_readiness` — daemon warmup phase transitions (snapshot_loaded → parallel_parse → deferred_passes_all → global_resolve → end_batch → watcher_started → ready), plus one `{event:"repo_state", repo, repo_path, state:"ready"}` event each time a configured repository registers. Last-known phase replayed to late subscribers. A graph tool *called during warmup* does not need this subscription to cope: for a session whose repository is already registered it returns an in-band `warming` block plus best-effort partial results; for a session whose repository warmup has not registered yet it returns `repo_loading` (see [Startup states](#startup-states)) |
 | `unsubscribe_workspace_readiness` | Opt back out — idempotent |
-| `subscribe_daemon_health` | `notifications/daemon_health` — periodic ticker (default 15 s, `interval_ms` clamped to 1 s..5 min) snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges. Ticker only runs while ≥1 subscriber is attached |
+| `subscribe_daemon_health` | `notifications/daemon_health` — periodic ticker (default 15 s, `interval_ms` clamped to 1 s..5 min) snapshots uptime, alloc/sys/heap, num_goroutine, num_gc, tracked_repos, sessions, lsp_alive, graph nodes/edges, live checkout `coordinators`, the process-wide SQLite page cache (`sqlite_page_cache_bytes`, `sqlite_page_cache_peak_bytes`) and the OS view of the process: resident set (`rss_bytes`, `rss_peak_bytes`), Linux proportional set (`pss_bytes`, `pss_file_bytes`), macOS physical footprint (`footprint_bytes`, `footprint_peak_bytes`); an OS figure is omitted where the platform has no reader. Ticker only runs while ≥1 subscriber is attached |
 | `unsubscribe_daemon_health` | Opt back out — idempotent |
 | `subscribe_stale_refs` | `notifications/stale_refs` — per-session intersect of watcher symbol-change events against the session's viewed/modified working set. Fires only when a change actually touches what *this* session has consumed |
 | `unsubscribe_stale_refs` | Opt back out — idempotent |
@@ -255,20 +255,35 @@ After a daemon start, a repository is served once warmup registers it, which on 
 | State | When | `tools/call` | `initialize` instructions |
 |---|---|---|---|
 | loading | configured, warmup job queued or running | `repo_loading`, `retryable:true`, with `phase`, `percent`, `repo`, `repo_path` | a LOADING preamble ahead of the ordinary instructions |
+| prefix collision | the configured root's prefix belongs to another root | `prefix_collision`, `retryable:false`, with `prefix`, `owner_path`, `owner_state` | owner-specific naming guidance |
 | failed | the warmup job ended without registering it | `repo_unavailable`, `retryable:false`, with `reason` | how to repair it |
 | missing | the configured path does not exist | `repo_unavailable`, `retryable:false` | how to repair it |
 | ready | registered | served normally | ordinary |
 
 While loading, `index_health` (also `workspace(operation:"index")`), `capabilities`, `tools_search` and the `subscribe_*` / `unsubscribe_*` tools answer; `index_health` lists only the caller's repository. `track_repository`, `index_repository` and `workspace_admin(operation:"track")` for the repository answer `{status:"already_configured", state:"loading"}`; once its load has failed they run normally, because tracking it again is the repair. Every other tool call, `resources/read` and `prompts/get` returns `repo_loading`, and mutations stay refused.
 
-Tools start working **in place** when the repository registers: no reconnect is needed. The session's cached scope is dropped at registration, and a session whose `initialize` reported the repository as loading receives one `notifications/message` saying it is ready. A directory outside every configured repository still gets `repo_not_tracked`. The control-socket probe that hooks and the CLI pre-flight read reports the same per-repository `state` (`loading`, `ready`, `failed`, `missing`), the hook lets native Read/Grep/Edit through for a loading repository instead of denying them, and the CLI maps `repo_loading` to "the daemon is still loading <repo>": on a terminal it waits up to `--loading-wait` (default 30 s), otherwise it exits with code 75 (`EX_TEMPFAIL`).
+Tools start working **in place** when the repository registers: no reconnect is needed. The session's cached scope is dropped at registration, and a session whose `initialize` reported the repository as loading receives one `notifications/message` saying it is ready. A directory outside every configured repository still gets `repo_not_tracked`. The control-socket probe that hooks and the CLI pre-flight read reports the same per-repository `state` (`loading`, `ready`, `failed`, `missing`, `prefix_collision`), the hook lets native Read/Grep/Edit through for a loading repository instead of denying them, and the CLI maps `repo_loading` to "the daemon is still loading <repo>": on a terminal it waits up to `--loading-wait` (default 30 s), otherwise it exits with code 75 (`EX_TEMPFAIL`).
+
+A known prefix collision takes precedence over loading guidance: re-tracking
+that configured root returns `prefix_collision`, never `already_configured`.
+Use `name` for a new root, or edit the configured root's `name` and reload.
+`owner_state` is `present`, `missing` or `unknown`; only `missing` suggests
+inspecting an untrack of the owner.
+
+`track_repository` may answer `accepted` while its detached initial index
+continues. Its final outcome is retained for ten minutes under the canonical
+root and the request's `name`, `as_worktree` and `force` options. A retry reads
+that outcome without starting another index. Collision outcomes are errors with
+structured `error_code: prefix_collision`, `prefix`, `owner_path` and
+`owner_state` fields. Changing the options, configured ownership or live owner
+invalidates reuse, so choosing a different name can repair the request. Native
+file reads and edits remain available while a collision prevents graph access.
 
 ## Request lifetime (why a call can never hang)
 
 Every tool call and resource read is bounded, on every transport. A request that
 overruns its budget is **abandoned**: the client gets a terminal, structured
-error and the transport's slot is released immediately, so the session keeps
-serving later requests. The handler itself keeps running — it may be inside a
+error so the session keeps serving later requests. The handler itself can keep running — it may be inside a
 store call that cannot be interrupted — so treat any side effect of an abandoned
 call as *unknown* and re-read before assuming it did or did not land.
 
@@ -276,17 +291,49 @@ call as *unknown* and re-read before assuming it did or did not land.
 |---|---|---|
 | Tool call / resource read / prompt fetch (all transports) | 60 s | `GORTEX_MCP_TOOL_TIMEOUT` (Go duration; `off` disables) |
 | Daemon socket, per JSON-RPC request | 60 s, terminal `-32001` | — |
-| Daemon socket, concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
-| Daemon socket, dispatch queue wait | 5 s, then terminal `-32002` with `queue_wait_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
+| Daemon socket and HTTP `/mcp`, shared concurrent dispatches | 8 | `GORTEX_MCP_MAX_CONCURRENT_DISPATCHES` (max 64) |
+| Daemon socket and HTTP `/mcp`, tool dispatch queue wait | Up to 5 s, clamped to the request deadline minus 100 ms; terminal `-32002` includes `queue_wait_ms` and `retry_after_ms` | `GORTEX_MCP_DISPATCH_QUEUE_WAIT` (Go duration, max 30 s; `0`/`off` restores the instant refusal) |
 | Control RPC (`daemon status` / `search_symbols` / `proxy`) | 30 s, terminal `timeout` | — |
 | Control RPC (`shutdown`) | unbounded on the daemon — the store flush precedes the ack. `gortex daemon stop` bounds its own wait at 30 s, then watches the process for up to 2 min and force-kills | — |
 | Control RPC (`track` / `untrack` / `reload` / `enrich_*`) | unbounded by design | — |
 
-When every dispatch slot is busy, a request waits up to the queue budget for
-one; at most 16× the dispatch cap may wait, and the wait counts against the
-request timeout. A source edit gives its slot back while it waits for its graph
-refresh to publish, so editing agents do not hold slots that other requests
-need.
+MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
+lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
+admitted through these lanes. Mutating calls have two reserved slots and can
+also use free shared slots. Slow calls (`outline`, `dead_code`
+and analysis) hold at most two slots; other calls use the fast lane. Free slots
+serve queued mutating calls first, then fast, then slow. Sessions take turns
+within each lane; a session holding four slots yields to another waiting
+session. For small cap overrides, the reservation is `min(2, cap-1)` and the
+slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
+
+Each lane permits at most 16× the total dispatch cap to wait. Queue time counts
+against the request timeout, leaving 100 ms for a refusal to reach the client.
+Busy replies are retryable and include `retry_after_ms`, estimated from the
+lane's observed drain rate and clamped to 100–5,000 ms (1 s before observations).
+An edit that waits for graph publication returns mutation capacity before
+entering the slow lane, and stops queueing for it once publication lands: a
+finished publication never waits for a slot. If slow admission fails after the
+disk commit, the edit returns its pending receipt instead of a retryable busy
+refusal.
+
+Cancellation returns logical lane capacity within 100 ms while the process
+has room in its four-handler draining allowance. Abandoned handlers, including
+inner tool handlers whose middleware has already returned, stay counted until
+they actually return. When all four drains are occupied, further cancelled
+handlers remain capacity-charged; physical dispatcher work stays bounded by
+the configured cap plus four. Initialization (`initialize` or `server/discover`)
+and notifications share total capacity but are exempt from tool reservations;
+notifications wait without a queue budget. `notifications/cancelled` takes no
+slot on either transport, so a full pool cannot hold back the cancellation that
+frees it. `subscriptions/listen` stays unbounded and consumes no dispatch slot.
+
+Daemon status exposes `mcp_dispatch`: lane in-flight, queued, draining and
+cancelled-but-held counts, refusals, reserved-slot use and queue-wait histograms
+for admitted, refused and cancelled calls. Histogram buckets are disjoint
+upper bounds in milliseconds and include zero-wait admissions. The metrics
+surface reports the corresponding `views_mcp_dispatch_*` series without
+session or request identifiers.
 
 The handler bound fires just inside any deadline the transport already imposed,
 so the client receives the tool-shaped diagnosis rather than an opaque transport
@@ -425,6 +472,70 @@ the first attests *what bytes* are on disk, the second whether the write
 happened at all. A call abandoned before its response returns no evidence block
 — only the receipt — which is exactly when `disk_status` is the field you need.
 
+### Source mutation acknowledgement policy
+
+Set the daemon's startup configuration to choose when source edits acknowledge:
+
+```yaml
+edit:
+  ack: full
+```
+
+`full` is the default. It waits for the complete admitted patch, for up to the
+existing three-second publication budget. `local` returns after the disk commit,
+exact file projection when available, and watcher admission. Both policies
+release source path locks before waiting; a graph failure never reverses a disk
+commit. Invalid modes are rejected. This is daemon configuration, not a tool
+argument, and the response's `ack_mode` records the policy used for the operation.
+Existing `require_fresh`, `freshness_scope`, and `wait_deadline` metadata can
+request a specific tier under either policy.
+
+Each committed source-file response adds `commit_seq`, the actual raw-byte
+`content_sha256` when known, `readback_exact`, and `graph_status_hint`.
+`file_view` is an object: `state`, `delta_state`, `counts`, `symbols`,
+`truncated`, and `syntax_health`. Available counts include `before`, `after`,
+`added`, `removed`, `changed`, and `total_changes`; they remain complete when
+`symbols` displays only the first 20 deterministic changes. Each displayed row
+has `change`, `id`, `kind`, `start_line`, `end_line`, and `signature`.
+An unauthenticated prior symbol set yields an unavailable delta and null counts.
+Syntax health is checked only when the acknowledgement's parse supplies an exact
+verdict; unknown health has `checked:false` and null `errors`.
+
+`readback_exact:true` requires that this write's projection is still live.
+`tier_state.file` describes that physical file view independently of the
+watcher-owned `file_graph`, `relations`, and `derived` stages. A newer write or
+invalidation can make a replay's file view unavailable or historical. Replays
+and `mutation_status` refresh live receipt evidence without parsing or writing
+again. Transactional batches retain journal authority and report per-file
+`file_views`; restarting does not reconstruct an original process-local
+projection sequence from the journal. Report full/default and explicit-local
+measurements separately; changing the mode does not establish a latency target.
+
+### Publication tiers and freshness
+
+`readback_exact:true` means the written bytes can be used immediately; continue
+without polling. Graph relations and derived analyses can publish later. Check
+`graph_freshness` before acting on callers, usages, impact, or rename plans.
+Before a rename, deletion, or signature change, send `require_fresh:true`,
+`freshness_scope:"relations"`, and an absolute RFC3339 `wait_deadline`.
+`freshness_scope` accepts `file`, `relations`, and `derived` as request metadata;
+it is intentionally absent from tool schemas. Text and declaration capability
+scopes do not select a publication tier.
+
+Pending or failed answers carry a visible tier line in text/TOON/compact output;
+GCX preserves its `GCX1` header and places the line immediately after it. JSON
+carries the same fields in its freshness block. An idle fresh answer gains no
+fields. Never classify a symbol as dead while its file is pending.
+
+`mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
+`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
+unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+a lost receipt cannot certify freshness. After restart, relation queries remain
+pending until the shared startup resolver has published. File reads still check
+current disk state. CLI verbs print the freshness line on stderr;
+`--require-fresh` exits with code 4 when the requested tier remains pending or
+failed.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |
@@ -465,6 +576,8 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `search_artifacts` | Full-text search over the context-artifacts manifest — DB schemas, API specs, infra configs, ADRs registered via `.gortex.yaml::artifacts` |
 | `get_artifact` | Fetch one context artifact by id, with its content and the symbols it references |
 
+`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
+
 ## Proactive safety
 
 | Tool | Description |
@@ -479,7 +592,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 |------|-------------|
 | `analyze` | Unified graph analysis dispatcher. `kind` ∈ `dead_code`, `hotspots`, `cycles`, `would_create_cycle`, `connectivity_health`, `todos`, `blame`, `coverage`, `coverage_gaps`, `coverage_summary`, `stale_code`, `stale_flags`, `ownership`, `releases`, `cgo_users`, `wasm_users`, `orphan_tables`, `unreferenced_tables`, `channel_ops`, `goroutine_spawns`, `field_writers`, `race_writes`, `unclosed_channels`, `unsafe_patterns`, `health_score`, `impact`, `annotation_users`, `config_readers`, `env_var_users`, `sql_call_sites`, `fixes_history`, `edge_audit`, `domain`, `named`, `tests_as_edges`, `clusters`, `event_emitters`, `pubsub`, `string_emitters`, `error_surface`, `log_events`, `sql_rebuild`, `external_calls`, `routes`, `models`, `components`, `k8s_resources`, `images`, `kustomize`, `cross_repo`, `dbt_models`, `synthesizers`, `resolution_outcomes`. `clusters` takes an `algorithm` arg (`leiden` / `louvain` / `spectral`). `impact` takes an optional `target` (`{symbol}` or `{file}`): with one it ranks that target's blast radius — the target row first, then its transitive dependents with their `depth` — and reports the closure width plus whether it is exact; without one it ranks the whole repo. An unresolvable target is a structured error, never a silent fall-back to the repo-wide ranking. `synthesizers` rolls up every framework-dispatch-synthesized edge by the pass that produced it; `resolution_outcomes` classifies unresolved call/reference edges by why the resolver gave up (`ambiguous_multi_match` / `candidate_out_of_scope` / `cross_language_only` / `stub_only` / `no_definition`) |
 | `find_clones` | Near-duplicate function/method clusters from the MinHash + LSH `similar_to` layer; `dead_only: true` finds dead duplicates of live code |
-| `index_health` | Health score, parse failures, stale files, language coverage, tracked-repo path liveness (`tracked_repo_paths_ok` + `missing_repo_paths` — a repo whose directory was deleted still holds its registration and silently drops out of workspace-wide answers), per-(repo, provider) semantic-enrichment lifecycle (`semantic_enrichment`: running / completed / partial / abandoned / failed with edge counts, plus a `semantic_enrichment_ok` rollup) — a green file count with a `partial` enrichment state means LSP-tier edges are incomplete. `path_liveness` asks the same question one level down, per file: it stats the paths the graph itself claims and reports how many indexed files no longer exist on disk (`orphan_files` / `orphan_rate` / `orphans_by_repo`, sampled with `truncated: true` past 20k files). `stale_files` only covers files the daemon still tracks, so a deletion it never witnessed shows up here and nowhere else; a non-zero `orphan_files` caps `health_score`. On a SQLite-backed daemon a `planner_stats` object reports the query planner's own view of the store: `nodes` / `edges` carry `believed` (the leading token of the index's `sqlite_stat1` row) against `actual_from_counters` (the `repo_index_state` counter sum across ALL view generations, flagged by `counters_known`; no counter row describes the external-call bucket or nodes carrying no repo prefix, and a leftover empty-prefix row on a store that later became multi-repo is summed on top of the per-repo rows, so the pair is an approximation of index cardinality and a difference between the two is not a measured discrepancy), `receivers` carries a `bounded: true` LIMIT-capped probe of the Go receiver index plus `complete` (false means the probe stopped at its cap, so `actual` is a lower bound and must not be compared with `believed`) and is omitted entirely when the receiver index is not in the schema — a bulk load has dropped it, or this store never had it, and a `believed: 0` there would read as the poisoned near-zero row rather than as an absent index. `stale` says whether the graph has outgrown what the planner believes — which can invert join order on receiver/edge queries — while `reason` names every verdict, staleness or not: `bulk_window_active` is why a cold load in progress reports zeros. `last_refresh_at` / `last_refresh_reason` appear once this process has rebuilt them. The field is read-only: statistics refresh at the next repository index, commit/HEAD move, whole-graph resolve or generation build, never from reading this payload — and that refresh is cooperative, so a busy writer, a spent per-pass budget or a per-index timeout defers the rest of the work to the following boundary (which resumes where the last one stopped) rather than stalling the pipeline that noticed |
+| `index_health` | Health score, parse failures, stale files, language coverage, tracked-repo path liveness (`tracked_repo_paths_ok` + `missing_repo_paths` — a repo whose directory was deleted still holds its registration and silently drops out of workspace-wide answers), per-(repo, provider) semantic-enrichment lifecycle (`semantic_enrichment`: running / completed / partial / abandoned / failed with edge counts, plus a `semantic_enrichment_ok` rollup) — a green file count with a `partial` enrichment state means LSP-tier edges are incomplete. `path_liveness` asks the same question one level down, per file: it stats the paths the graph itself claims and reports how many indexed files no longer exist on disk (`orphan_files` / `orphan_rate` / `orphans_by_repo`, sampled with `truncated: true` past 20k files). `stale_files` only covers files the daemon still tracks, so a deletion it never witnessed shows up here and nowhere else; a non-zero `orphan_files` caps `health_score`. On a SQLite-backed daemon a `planner_stats` object reports the query planner's own view of the store: `nodes` / `edges` carry `believed` (the leading token of the index's `sqlite_stat1` row) against `actual_from_counters` (the `repo_index_state` counter sum across ALL view generations, flagged by `counters_known`; no counter row describes the external-call bucket or nodes carrying no repo prefix, and a leftover empty-prefix row on a store that later became multi-repo is summed on top of the per-repo rows, so the pair is an approximation of index cardinality and a difference between the two is not a measured discrepancy), `receivers` carries a `bounded: true` LIMIT-capped probe of the Go receiver index plus `complete` (false means the probe stopped at its cap, so `actual` is a lower bound and must not be compared with `believed`) and is omitted entirely when the receiver index is not in the schema — a bulk load has dropped it, or this store never had it, and a `believed: 0` there would read as the poisoned near-zero row rather than as an absent index. `stale` says whether the graph has outgrown what the planner believes — which can invert join order on receiver/edge queries — while `reason` names every verdict, staleness or not: `bulk_window_active` is why a cold load in progress reports zeros, and `dense_indexes_missing` means a cold load closed without rebuilding some of its dense indexes (typically because the volume filled up during the final index rebuild): `dense_indexes_missing` in the same object names them, lookups that use them scan until they are back, and the store rebuilds them in the background once its volume has free space at least the size of the store (a daemon restart also rebuilds them). `last_refresh_at` / `last_refresh_reason` appear once this process has rebuilt them. The field is read-only: statistics refresh at the next repository index, commit/HEAD move, whole-graph resolve or generation build, never from reading this payload — and that refresh is cooperative, so a busy writer, a spent per-pass budget or a per-index timeout defers the rest of the work to the following boundary (which resumes where the last one stopped) rather than stalling the pipeline that noticed |
 | `get_symbol_history` | Symbols modified this session with counts; flags churning (3+ edits) |
 The `analyze` dispatcher also accepts a set of **facade-aliased kinds** that route to the captured legacy handler instead of the dispatcher switch: `processes` → `get_processes`, `communities` → `get_communities`, `contracts` → `contracts`, `architecture` → `get_architecture`, `clones` → `find_clones`, `health` → `audit_health`, `inspections` → `run_inspections`, `recent_changes` → `get_recent_changes`, and the other entries of the facade analyze migration table (see `mcp-facade-v1.md`). These aliases are **surface-independent**: they work for client (facade-v1), explicitly legacy-preset, and session-less HTTP callers alike, with no `tools_search` promotion — the HTTP dashboard endpoints depend on this under the `core`/`defer` default.
 
@@ -727,3 +840,15 @@ Read-only, URI-addressable, no args. Clients that speak resources can `resources
 | `pre_commit` | Review uncommitted changes — shows changed symbols, blast radius, risk level, affected tests |
 | `orientation` | Orient in an unfamiliar codebase — graph stats, communities, execution flows, key symbols |
 | `safe_to_change` | Analyze whether it's safe to change specific symbols — blast radius, edit plan, affected tests |
+
+`index_health` includes `last_first_index_drain` after a full shadow index has
+persisted, keyed by repository prefix. Daemon status exposes the same snapshot
+under `storage`, together with `dense_indexes_missing` when a failed seal owes
+index repair. A drain records its actual window kind, node/edge counts, drain
+and seal-call durations, completion time and any seal error. A coordinated
+window seals at its outer boundary, so its per-repository seal call can be a
+no-op. `wal_peak_scope=shared_store_drain_chunk_samples` identifies physical WAL
+observations at the start, bounded graph/FTS chunks and seal boundaries. This
+is a sampled peak on the shared store; concurrent repository work can contribute
+and a peak between samples can be missed. Missing observations
+are omitted, and these process-local snapshots reset when the store reopens.

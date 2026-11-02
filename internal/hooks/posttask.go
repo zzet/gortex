@@ -69,7 +69,6 @@ func codexStopBriefing(briefing string) HookOutput {
 // diagnostics briefing. The claim-check block (decision/reason) is valid
 // on every host, so it does not go through wrap.
 func runPostTaskWith(data []byte, port int, wrap func(briefing string) HookOutput) {
-	started := time.Now()
 	var input PostTaskInput
 	if err := json.Unmarshal(data, &input); err != nil {
 		return
@@ -77,39 +76,43 @@ func runPostTaskWith(data []byte, port int, wrap func(briefing string) HookOutpu
 	if input.HookEventName != "Stop" {
 		return
 	}
-	_ = clearLocalizationProblemStatementForTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
-	emitted := false
-	defer func() {
-		logHookEffectiveness("Stop", emitted, daemonReachableFn(), 0, time.Since(started))
-	}()
-	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
-	if input.StopHookActive {
+	claimCheck, briefing := postTaskFindings(input, port)
+	var output HookOutput
+	switch {
+	case claimCheck != "":
+		output = HookOutput{Decision: "block", Reason: claimCheck}
+	case briefing != "":
+		output = wrap(briefing)
+	default:
 		return
 	}
-	if claimCheck := localizationClaimCheck(input); claimCheck != "" {
-		output := HookOutput{Decision: "block", Reason: claimCheck}
-		out, err := json.Marshal(output)
-		if err == nil {
-			emitted = true
-			fmt.Print(string(out))
-		}
-		return
-	}
-
-	briefing := buildPostTaskBriefing(port, sessionScope{
-		SessionID: input.SessionID,
-		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
-	})
-	if briefing == "" {
-		return
-	}
-
-	out, err := json.Marshal(wrap(briefing))
+	out, err := json.Marshal(output)
 	if err != nil {
 		return
 	}
-	emitted = true
 	fmt.Print(string(out))
+}
+
+// postTaskFindings runs the Stop checks every host shares: the claim check,
+// which asks the agent to keep working, and otherwise the diagnostics
+// briefing. At most one is non-empty, and both are empty on a rerun Stop.
+func postTaskFindings(input PostTaskInput, port int) (claimCheck, briefing string) {
+	started := time.Now()
+	_ = clearLocalizationProblemStatementForTurn(input.SessionID, input.PromptID, input.AgentID, input.CWD)
+	defer func() {
+		logHookEffectiveness("Stop", claimCheck != "" || briefing != "", daemonReachableFn(), 0, time.Since(started))
+	}()
+	// Prevent recursion — if we're already rerunning a Stop hook, don't fire again.
+	if input.StopHookActive {
+		return "", ""
+	}
+	if claimCheck = localizationClaimCheck(input); claimCheck != "" {
+		return claimCheck, ""
+	}
+	return "", buildPostTaskBriefing(port, sessionScope{
+		SessionID: input.SessionID,
+		CWD:       firstNonEmpty(input.CWD, loadHookCWD()),
+	})
 }
 
 // changedSymbol is one entry of detect_changes' changed_symbols list.
@@ -133,25 +136,106 @@ type changeSet struct {
 	Scope          string          `json:"scope"`
 	Repo           string          `json:"repo"`
 	RepoRoot       string          `json:"repo_root"`
+	// The label of an answer whose relations lag: graph_freshness on a
+	// primary checkout, graph_status on a worktree.
+	GraphFreshness   string `json:"graph_freshness"`
+	GraphStatus      string `json:"graph_status"`
+	PendingFileCount int    `json:"pending_file_count"`
 }
 
+// detectChangesBudget bounds the detect_changes round trip of a briefing. A
+// daemon still publishing edits answers inside it with a labelled partial; a
+// stalled one is reported rather than waited on.
+const detectChangesBudget = 300 * time.Millisecond
+
+// detectChangesWait is how far into the budget the briefing's wait_deadline
+// lets the daemon wait for pending edits before it labels them. The rest of
+// the budget is for the diff walk and the transport.
+const detectChangesWait = detectChangesBudget / 2
+
 // detectChangeSet asks the bridge for the current diff and decodes it.
-// Returns nil when the bridge is unreachable or the payload is unusable.
-func detectChangeSet(port int) *changeSet {
-	raw := callServerTool(port, "detect_changes", map[string]any{
+// answered is false when the bridge did not reply within detectChangesBudget,
+// or replied with nothing once detectChangesWait had passed; changes is nil
+// when it is unreachable or the payload is unusable.
+func detectChangeSet(port int) (changes *changeSet, answered bool) {
+	started := time.Now()
+	raw, answered := callServerToolWithin(port, "detect_changes", map[string]any{
 		"scope": postTaskDiffScope,
 		// The briefings never read by_depth; summary_only drops the
 		// largest part of the response.
-		"summary_only": true,
-	})
+		"summary_only":  true,
+		"wait_deadline": started.Add(detectChangesWait).UTC().Format(time.RFC3339Nano),
+	}, detectChangesBudget)
 	if raw == "" {
-		return nil
+		// The daemon refuses a wait_deadline that passed before it took
+		// the call up: a busy daemon, not an unreachable one.
+		return nil, answered && time.Since(started) < detectChangesWait
 	}
-	var changes changeSet
 	if err := json.Unmarshal([]byte(raw), &changes); err != nil {
-		return nil
+		return nil, true
 	}
-	return &changes
+	return changes, true
+}
+
+// relationsLine is the label line of a change set whose relations lag, or ""
+// when the graph has published every change it reports.
+func (c *changeSet) relationsLine() string {
+	state := c.GraphFreshness
+	if state == "" && c.GraphStatus != "" && c.GraphStatus != "ready" {
+		state = c.GraphStatus
+	}
+	if state == "" {
+		return ""
+	}
+	files := c.PendingFileCount
+	if files == 0 {
+		files = len(c.ChangedFiles)
+	}
+	return fmt.Sprintf("relations: %s (%d files)", state, files)
+}
+
+// laggingChangesBriefing is the briefing for a change set the graph has not
+// caught up with: the relations line and the changed files, with the
+// symbol-level diagnostics left to a turn that can trust them. A stalled
+// detect_changes (nil changes) is reported the same way instead of as
+// silence, except to a session that recorded no writes: it has no change set
+// to warn about. lagging is false when the change set is complete.
+func laggingChangesBriefing(heading string, scope sessionScope, changes *changeSet) (briefing string, lagging bool) {
+	line := fmt.Sprintf("relations: pending (detect_changes did not answer within %v)", detectChangesBudget)
+	why := ""
+	var files []string
+	if changes == nil {
+		if scope.SessionID != "" && len(loadSessionState(scope.SessionID).WrittenPaths) == 0 {
+			return "", true
+		}
+	} else {
+		if line = changes.relationsLine(); line == "" {
+			return "", false
+		}
+		why = " the graph is still publishing edits, so"
+		files = changes.ChangedFiles
+		if attr := attributeChanges(scope, changes); attr.Attributed {
+			if len(attr.OwnedFiles) == 0 {
+				return "", true
+			}
+			files = attr.OwnedFiles
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(heading + "\n\n")
+	sb.WriteString(line + " —" + why + " symbol-level diagnostics are skipped; run detect_changes again before handoff.\n")
+	if len(files) > 0 {
+		sb.WriteString("\nChanged files:\n")
+		const show = 10
+		for i, f := range files {
+			if i == show {
+				fmt.Fprintf(&sb, "- (+%d more)\n", len(files)-show)
+				break
+			}
+			fmt.Fprintf(&sb, "- `%s`\n", f)
+		}
+	}
+	return sb.String(), true
 }
 
 // briefingScope names the working tree detect_changes actually diffed.
@@ -245,9 +329,12 @@ func renderUnattributedFiles(files []string, capped bool) string {
 // named rather than dropped. When the session cannot be identified at all the
 // briefing falls back to the whole tree and labels itself as such.
 func buildPostTaskBriefing(port int, scope sessionScope) string {
-	changes := detectChangeSet(port)
-	if changes == nil {
+	changes, answered := detectChangeSet(port)
+	if answered && changes == nil {
 		return ""
+	}
+	if briefing, lagging := laggingChangesBriefing("## Gortex Working-Tree Diagnostics", scope, changes); lagging {
+		return briefing
 	}
 
 	if len(changes.ChangedSymbols) == 0 {
@@ -365,8 +452,14 @@ func buildPostTaskBriefing(port int, scope sessionScope) string {
 // so nothing is ever recorded for it and it always resolves to the labeled
 // whole-tree fallback — this does not give Codex attribution coverage.
 func buildMutationBriefing(port int, scope sessionScope) string {
-	changes := detectChangeSet(port)
-	if changes == nil || len(changes.ChangedSymbols) == 0 {
+	changes, answered := detectChangeSet(port)
+	if answered && changes == nil {
+		return ""
+	}
+	if briefing, lagging := laggingChangesBriefing("## Gortex mutation follow-up", scope, changes); lagging {
+		return briefing
+	}
+	if len(changes.ChangedSymbols) == 0 {
 		return ""
 	}
 
@@ -461,7 +554,9 @@ func renderGuardViolations(port int, idsCSV string) string {
 
 // renderDeadCodeHits filters analyze:dead_code results to the intersection
 // with the currently-changed symbols (i.e. "did this task leave anything
-// orphaned"). Emits nothing when the intersection is empty.
+// orphaned"). Emits nothing when the intersection is empty. A symbol listed
+// on a "pending_unknown " line has unknown liveness while edits are pending
+// and is never reported as dead.
 func renderDeadCodeHits(port int, ids []string) string {
 	raw := callServerTool(port, "analyze", map[string]any{
 		"kind":    "dead_code",
@@ -472,14 +567,22 @@ func renderDeadCodeHits(port int, ids []string) string {
 		return ""
 	}
 
+	lines := strings.Split(raw, "\n")
 	idSet := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		idSet[id] = true
 	}
+	for _, line := range lines {
+		if rest, unknown := strings.CutPrefix(line, "pending_unknown "); unknown {
+			for _, field := range strings.Fields(rest) {
+				delete(idSet, field)
+			}
+		}
+	}
 
 	var hits []string
-	for _, line := range strings.Split(raw, "\n") {
-		if line == "" {
+	for _, line := range lines {
+		if line == "" || strings.HasPrefix(line, "pending_unknown ") {
 			continue
 		}
 		// Each compact line starts with the symbol descriptor including the

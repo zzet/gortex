@@ -107,8 +107,7 @@ func setupContractMultiRepoServer(t *testing.T, names ...string) (*Server, *grap
 
 	g := graph.New()
 	multi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), manager, zap.NewNop())
-	_, err = multi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, multi, manager)
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil)
 	srv.multiIndexer = multi

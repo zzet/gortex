@@ -34,6 +34,16 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"anonymous{DBStats}": "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
+
+	"anonymous{BulkLoadWindow}":        "physical durable-store full-shadow window telemetry; DeltaWriter stages per-file changes and does not own a cold or generation bulk window",
+	"anonymous{RecordFirstIndexDrain}": "physical durable-store full-shadow completion telemetry; a per-file DeltaWriter has no full-shadow drain to record and must not forward writes to its base",
+
+	"graph.BFSAdmissionReader":            "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
+	"graph.FilteredBFSAdmissionReader":    "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
+	"graph.KindAdjacencyReader":           "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",
+	"graph.CallAncestorReader":            "optional native recursive closure; CallAncestorsOf walks the delta's composed incoming adjacency and hydrates selected source identities",
+	"graph.ScopedOutlineNodeReader":       "optional indexed scoped names/membership; the scoped-name helper keeps composed FindNodesByName and intersects NodeScope without reaching a physical store",
 	"graph.ExternalCallCandidateIterator": "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
 	"anonymous{ReindexEdgesApplied}":      "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
 	"anonymous{AddBatchChecked}":          "checked durable publication: DeltaWriter stages non-failing writes in its local work graph through AddBatch; its owner checks final layer publication, and forwarding this capability would bypass the delta",
@@ -100,7 +110,6 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.ContractOwnerScalarInvalidator":                 "optional companion of ContractOwnerReplacer; the fallback re-derives the scalars through ordinary node writes",
 	"graph.ContractOwnerScalarLiveness":                    "optional companion of ContractOwnerReplacer; absent, the fallback does not assume liveness and checks it through reads",
 	"graph.ContractStateStore":                             "per-repository ledger read (index state, file metadata, mtimes, failures, receipts): absent, the engine treats nothing as recorded and takes its conservative path; a delta forces its explicit paths",
-	"graph.CoordinatedBulkLoader":                          "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"graph.CoverageEnrichmentWriter":                       "node-keyed enrichment side tables (blame, churn, coverage, releases): their rows for an evicted node are the layer below's, hidden with the node; a delta writes none",
 	"graph.CrossRepoFlagMarker":                            "cross-repository edge flagging; single-repository delta",
 	"graph.CurrentGenerationRepoEvicter":                   "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
@@ -211,6 +220,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"indexer.repoSemanticStateReleaser":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repoSemanticStateRetainer":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repositoryCleanupPayload":                     "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
+	"indexer.drainCheckedWriter":                           "checked write of the whole-repository shadow drain into the durable store (full index, shadow replacement); not on a file delta's per-save path, and a store without it takes the void AddBatch",
 	"resolver.backendResolveWorkIndicator":                 "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"resolver.batchClaimingResolver":                       "framework synthesizer contract, asserted on synthesizers",
 	"resolver.claimEdgeVocabulary":                         "framework synthesizer contract, asserted on synthesizers",

@@ -835,6 +835,83 @@ func TestUncoordinatedBulkSealFailureRetriesAtFlushBoundary(t *testing.T) {
 	integrityOK(t, s.db)
 }
 
+// TestFlushBulkSealPanicDoesNotDeadlock: a seal that panics with a non-error
+// value must unwind with the write gate released and the window still
+// retryable, so the owner's next exit call seals, restores and closes it.
+func TestFlushBulkSealPanicDoesNotDeadlock(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		begin func(*Store) bool
+		end   func(*Store) error
+	}{
+		{"standalone", func(s *Store) bool { s.BeginBulkLoad(); return s.bulkConn != nil }, (*Store).FlushBulk},
+		{"coordinated", (*Store).BeginCoordinatedBulkLoad, (*Store).EndCoordinatedBulkLoad},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := openTempStore(t)
+			syncBefore := pragmaIntDB(t, s.writerDB, "synchronous")
+			if !tc.begin(s) {
+				t.Fatal("bulk fast path did not engage")
+			}
+			s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+			calls := 0
+			defer s.SetBulkSealHookForTest(func(string) error {
+				calls++
+				if calls == 1 {
+					panic("injected seal panic")
+				}
+				return nil
+			})()
+
+			recovered := func() (r any) {
+				defer func() { r = recover() }()
+				_ = tc.end(s)
+				return nil
+			}()
+			if recovered != "injected seal panic" {
+				t.Fatalf("recovered %v, want the injected seal panic", recovered)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := s.writeMu.LockContext(ctx); err != nil {
+				// Hand the leaked hold back so cleanup's Close cannot hang too.
+				s.writeMu.Unlock()
+				t.Fatalf("write gate still held after the seal panic: %v", err)
+			}
+			retryable := s.bulkConn != nil && s.bulkIndexesDeferred && s.bulkWindowOpen.Load() &&
+				s.coordinatedBulkLoad == (tc.name == "coordinated")
+			s.writeMu.Unlock()
+			if !retryable {
+				t.Fatal("seal panic lost the window's retryable state")
+			}
+
+			if err := tc.end(s); err != nil {
+				t.Fatalf("exit retry after the seal panic: %v", err)
+			}
+			if calls <= 1 {
+				t.Fatalf("seal hook calls = %d, want the retry to seal again", calls)
+			}
+			if s.bulkConn != nil || s.bulkIndexesDeferred || s.coordinatedBulkLoad || s.bulkWindowOpen.Load() {
+				t.Fatalf("retry left bulk state: conn=%v deferred=%v coordinated=%v open=%v",
+					s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad, s.bulkWindowOpen.Load())
+			}
+			if got := pragmaIntDB(t, s.writerDB, "synchronous"); got != syncBefore {
+				t.Fatalf("writer synchronous = %d, want restored %d", got, syncBefore)
+			}
+			present := indexNames(t, s.db)
+			for _, idx := range bulkDroppableIndexes {
+				if !present[idx.name] {
+					t.Fatalf("index %s missing after the retried seal", idx.name)
+				}
+			}
+			if got := s.NodeCount(); got != 1 {
+				t.Fatalf("node count = %d, want 1", got)
+			}
+			integrityOK(t, s.db)
+		})
+	}
+}
+
 func TestCoordinatedBulkLoadRoutesSingleRowSidecarsOnPinnedConnection(t *testing.T) {
 	s, _ := openTempStore(t)
 	s.db.SetMaxOpenConns(1)

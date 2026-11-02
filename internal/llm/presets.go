@@ -38,6 +38,16 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// CloudGPU (https://cloudgpu.app/api/docs) serves DeepSeek, Kimi,
+	// GLM and other models over the OpenAI Chat Completions API; model
+	// ids are bare (list: GET /v1/models).
+	"cloudgpu": {
+		BaseURL:       "https://cloudgpu.app/v1",
+		Model:         "deepseek-v4.1-flash",
+		APIKeyEnv:     "CLOUDGPU_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// llm.buzz (https://llm.buzz) is an OpenAI-compatible gateway; model
 	// ids carry a vendor prefix (list: GET /api/v1/models).
 	"llm-buzz": {
@@ -64,6 +74,16 @@ var gatewayPresets = map[string]CustomProvider{
 		BaseURL:       "https://router.requesty.ai/v1",
 		Model:         "openai/gpt-4o-mini",
 		APIKeyEnv:     "REQUESTY_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
+	// Runcrate (https://www.runcrate.ai/inference/pricing) serves open
+	// models over the OpenAI Chat Completions API; model ids carry a
+	// vendor prefix.
+	"runcrate": {
+		BaseURL:       "https://api.runcrate.ai/v1",
+		Model:         "deepseek-ai/DeepSeek-V4.1-Flash",
+		APIKeyEnv:     "RUNCRATE_API_KEY",
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},

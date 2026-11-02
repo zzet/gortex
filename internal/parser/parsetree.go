@@ -140,9 +140,22 @@ func (pt *ParseTree) CountParseErrors() int {
 	if root == nil {
 		return 0
 	}
-	count := 0
-	walkParseErrors(root, &count)
+	_, count := ParseErrorVerdict(root)
 	return count
+}
+
+// ParseErrorVerdict captures the syntax verdict of a successful full parse
+// while its root is live. The clean path is one native HasError query; only
+// error trees are walked. A missing root is unknown rather than checked zero.
+func ParseErrorVerdict(root *sitter.Node) (checked bool, count int) {
+	if root == nil {
+		return false, 0
+	}
+	if !root.HasError() {
+		return true, 0
+	}
+	walkParseErrors(root, &count)
+	return true, count
 }
 
 func walkParseErrors(n *sitter.Node, count *int) {

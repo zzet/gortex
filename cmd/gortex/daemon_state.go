@@ -84,6 +84,9 @@ type daemonState struct {
 	// record so out-of-band readers (`gortex repos`) can find the same store
 	// instead of assuming the platform default.
 	backendPath string
+	// migratedStore is scoped to this open/boot, not persisted. A migration
+	// gets one complete re-index/enrichment boot before VACUUM is reconsidered.
+	migratedStore bool
 }
 
 // buildDaemonState builds the daemon's stack through the shared
@@ -104,6 +107,15 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 	if len(observers) > 0 {
 		migrationObserver = observers[0]
 	}
+	migrated := false
+	observeMigration := func(progress store_sqlite.MigrationProgress) {
+		if progress.Phase == store_sqlite.MigrationStarted {
+			migrated = true
+		}
+		if migrationObserver != nil {
+			migrationObserver(progress)
+		}
+	}
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
 		Backend:           daemonBackend,
@@ -112,7 +124,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		Global:            gc,
 		Logger:            logger,
 		Version:           version,
-		MigrationObserver: migrationObserver,
+		MigrationObserver: observeMigration,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
@@ -143,6 +155,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		overlays:            ss.Overlays,
 		shared:              ss,
 		backendPath:         ss.StorePath,
+		migratedStore:       migrated || storeNeedsRebuild(ss.Graph),
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
 	}
@@ -607,24 +620,9 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		return nil, timings
 	}
 
-	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
-	// on purpose: after the orphan purge, so the pages it just freed are
-	// measured and reclaimed in the same pass; before the warmup re-index loop
-	// and the resolver/enrichment passes, whose writes would reuse freelist
-	// pages mid-measurement and whose readers would contend with VACUUM's
-	// exclusive lock. The socket is already listening (it opens before this
-	// goroutine by design), but at this point in boot the daemon's own
-	// workload is quiet and a rare early client query either finishes first or
-	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
-	// Running before the socket opened instead would hold the daemon
-	// unreachable for the whole VACUUM, turning a compacting boot into an
-	// apparent hang.
-	finishCompact := startWarmupStep(logger, "store_compaction_check")
-	maybeCompactStore(state.graph, logger)
-	finishCompact()
-	if ctx.Err() != nil {
-		return nil, timings
-	}
+	// Re-index and resolver writes can reuse pages freed by the purge. Boot
+	// compaction measures again only after enrichment and the warmup producer
+	// have finished; a VACUUM must never delay this startup path.
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
@@ -738,12 +736,16 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
 	deltaFrontier := newWarmupDeltaFrontier()
+	accounting := warmupRepoAccounting{
+		changed: &changedRepos, files: &filesReindexed, unknown: &scopeUnknown,
+		prefixes: &changedPrefixes, frontier: deltaFrontier,
+	}
 	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
 		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 		defer func() {
 			if coordinatedBulkActive {
-				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
 				}
 			}
@@ -811,82 +813,8 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 							}
 							priorMtimes = nil
 						}
-						pathFn := "track"
-						// indexed names the repo prefix whose generation-0
-						// index this dispatch just brought up to date, and is
-						// empty when it did not. It is the completion signal
-						// the committed-base publication waits on: a base is
-						// published from a Git tree, not from generation 0,
-						// but its identity names the checkout's committed tree
-						// and its builder runs against this repository's own
-						// admissions, so both must be settled first.
-						indexed := ""
-						if priorMtimes != nil {
-							pathFn = "reconcile"
-							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
-							switch {
-							case err != nil:
-								jobErr = err
-								logger.Warn("daemon: startup reconcile failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								// Treat a failed reconcile as "changed" so the global
-								// passes still run — degrade toward correctness, not
-								// toward the fast path, when we can't trust the delta.
-								changedRepos.Add(1)
-								scopeUnknown.Store(true)
-								deltaFrontier.invalidate()
-							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
-								changedRepos.Add(1)
-								filesReindexed.Add(int64(reconcileFileCount(res)))
-								deltaFrontier.record(res)
-								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
-								if res.RepoPrefix != "" {
-									changedPrefixes.Store(res.RepoPrefix, struct{}{})
-								} else {
-									scopeUnknown.Store(true)
-								}
-							default:
-								// Warm no-op path: the repo re-indexed nothing, so its
-								// graph is served straight from the persisted store and
-								// no global pass has to re-run for it.
-								prefix := ""
-								if res != nil {
-									prefix = res.RepoPrefix
-								}
-								indexed = warmupRepoPrefix(state, entry, prefix)
-							}
-						} else {
-							// No prior mtimes → full cold (re)index of this repo,
-							// which is "changed" by definition.
-							deltaFrontier.invalidate()
-							changedRepos.Add(1)
-							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
-								jobErr = err
-								logger.Warn("daemon: startup track failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								scopeUnknown.Store(true)
-							} else if res != nil && res.RepoPrefix != "" {
-								// A cold TrackRepoCtx is itself a full retrack — its
-								// FileCount is the whole repo's file-level work.
-								filesReindexed.Add(int64(res.FileCount))
-								changedPrefixes.Store(res.RepoPrefix, struct{}{})
-								indexed = warmupRepoPrefix(state, entry, res.RepoPrefix)
-							} else {
-								scopeUnknown.Store(true)
-							}
-						}
-						// Schedule, do not publish. A committed base is a full
-						// index of a committed tree; running it here would put
-						// a second whole-repository index in front of the
-						// readiness flip. Schedule only appends to an unbounded
-						// pending list — it cannot park this worker, whatever
-						// the repository count — and nothing is drained until
-						// BeginDraining below, which runs after markReady. The
-						// runtime cancels the publisher the moment publisher
-						// admission closes, so shutdown stays bounded.
-						if indexed != "" {
-							state.basePublisher.Schedule(indexed)
-						}
+						pathFn, loadErr := accounting.load(batchCtx, state, entry, priorMtimes, logger)
+						jobErr = loadErr
 						elapsed := time.Since(repoStart)
 						if elapsed > 2*time.Second {
 							logger.Info("daemon: warmup repo elapsed",
@@ -916,9 +844,14 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		// final seal includes them in bulk index creation, checkpointing, and
 		// planner statistics instead of reopening ordinary write transactions
 		// immediately after a large cold load.
+		// The finalize is the window's last call: the deferred end above is
+		// skipped once it has run, and nothing retries a failed seal. So a
+		// failed end is followed by an abort, which closes the window and
+		// leaves the indexes it could not rebuild to the store's repair, rather
+		// than keeping the warmup's relaxed-durability writer until shutdown.
 		var finalizeBulk func() error
 		if coordinatedBulkActive {
-			finalizeBulk = coordinatedBulk.EndCoordinatedBulkLoad
+			finalizeBulk = func() error { return graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk) }
 		}
 		drain := state.multiIndexer.RunDeferredGoModAll
 		if batchCtx.Err() != nil {
@@ -1385,8 +1318,11 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		logger.Info("daemon: reconciled post-batch contract edges",
 			zap.Int("contract_edges", reconciled))
 	case warmGlobalResolveFull:
-		if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil && ctx.Err() == nil {
-			logger.Warn("daemon: warmup post-batch resolve incomplete", zap.Error(err))
+		if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil {
+			resolveOK = false
+			if ctx.Err() == nil {
+				logger.Warn("daemon: warmup post-batch resolve incomplete", zap.Error(err))
+			}
 		}
 		logger.Info("daemon: post-batch workspace eligibility change forced full cross-repo catch-up")
 	}
@@ -1431,6 +1367,9 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 	// readiness is what publication must not precede, not what it depends on.
 	if ctx.Err() != nil {
 		return nil, timings
+	}
+	if resolveOK {
+		state.multiIndexer.CompleteStartupRelations()
 	}
 	state.basePublisher.BeginDraining()
 

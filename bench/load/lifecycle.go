@@ -22,20 +22,22 @@ type privateRepo struct {
 }
 
 type privateRun struct {
-	Root       string
-	SocketDir  string
-	Socket     string
-	Store      string
-	Config     string
-	Env        []string
-	Repos      []privateRepo
-	Binary     string
-	process    *exec.Cmd
-	done       chan struct{}
-	exitErr    error
-	stdout     *os.File
-	stderr     *os.File
-	startCount int
+	discoveryCatalog map[string]discoveryCatalogIdentity // discovery-only observed seed identities
+	Root             string
+	SocketDir        string
+	Socket           string
+	Store            string
+	Config           string
+	Env              []string
+	daemonEnv        []string // optional owned scenario shim; harness Git keeps Env
+	Repos            []privateRepo
+	Binary           string
+	process          *exec.Cmd
+	done             chan struct{}
+	exitErr          error
+	stdout           *os.File
+	stderr           *os.File
+	startCount       int
 }
 
 func inside(root, path string) bool {
@@ -280,20 +282,30 @@ func (p *privateRun) addWorktrees(ctx context.Context, count int) error {
 	if len(p.Repos) != 1 {
 		return errors.New("worktree scenario requires exactly one primary corpus")
 	}
-	primary := p.Repos[0]
-	for i := range count {
-		path := filepath.Join(p.Root, "repos", fmt.Sprintf("linked-%d", i+1))
-		if _, err := p.git(ctx, primary.Path, "worktree", "add", "--detach", path, primary.Corpus.Commit); err != nil {
+	for range count {
+		if err := p.addWorktree(ctx); err != nil {
 			return err
 		}
-		file, err := ownedFile(path, primary.Corpus.File)
-		if err != nil {
-			return err
-		}
-		corpus := primary.Corpus
-		corpus.Label = fmt.Sprintf("linked-%d", i+1)
-		p.Repos = append(p.Repos, privateRepo{Corpus: corpus, Path: path, File: file})
 	}
+	return nil
+}
+
+// addWorktree links the next detached worktree of the primary at its pinned
+// commit; the Nth linked checkout is labelled linked-N.
+func (p *privateRun) addWorktree(ctx context.Context) error {
+	primary := p.Repos[0]
+	label := fmt.Sprintf("linked-%d", len(p.Repos))
+	path := filepath.Join(p.Root, "repos", label)
+	if _, err := p.git(ctx, primary.Path, "worktree", "add", "--detach", path, primary.Corpus.Commit); err != nil {
+		return err
+	}
+	file, err := ownedFile(path, primary.Corpus.File)
+	if err != nil {
+		return err
+	}
+	corpus := primary.Corpus
+	corpus.Label = label
+	p.Repos = append(p.Repos, privateRepo{Corpus: corpus, Path: path, File: file})
 	return nil
 }
 
@@ -333,7 +345,11 @@ func (p *privateRun) start() error {
 	}
 	cmd := exec.Command(p.Binary, "--config", p.Config, "daemon", "start", "--backend-path", p.Store, "--tools", "facade-v1", "--tools-mode", "hide")
 	configureOwnedProcess(cmd)
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = p.Root, p.Env, p.stdout, p.stderr
+	env := p.Env
+	if p.daemonEnv != nil {
+		env = p.daemonEnv
+	}
+	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = p.Root, env, p.stdout, p.stderr
 	if err := cmd.Start(); err != nil {
 		_ = p.stdout.Close()
 		_ = p.stderr.Close()
@@ -376,9 +392,22 @@ func (p *privateRun) stop(ctx context.Context) (elapsed time.Duration, forced bo
 }
 
 func (p *privateRun) removeState() error {
+	if p.Root == "" || !filepath.IsAbs(p.Root) || filepath.Dir(p.Root) == p.Root {
+		return errors.New("refused cleanup without an owned run directory")
+	}
+	info, err := os.Lstat(p.Root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refused cleanup through a replaced run directory")
+	}
 	var result error
 	for _, name := range []string{"repos", "cache", "data", "home", "config", "runtime", "tmp", "store.db", "store.db-wal", "store.db-shm"} {
-		result = errors.Join(result, os.RemoveAll(filepath.Join(p.Root, name)))
+		result = errors.Join(result, removeOwnedState(filepath.Join(p.Root, name)))
 	}
 	return result
 }
