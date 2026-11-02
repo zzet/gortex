@@ -1727,6 +1727,9 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
 		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
 		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 	}
@@ -2772,6 +2775,9 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 
 	ctx, err = s.ensureProjected(ctx, []string{fp})
 	if err != nil {
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
