@@ -82,9 +82,10 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 			session := "registered-preselection-" + tool
 			require.NoError(t, s.ConnectSession(session, func([]byte) error { return nil }))
 			t.Cleanup(func() { s.DisconnectSession(session) })
-			initializeSession(t, s, session)
+			ctx := s.WithClientSession(WithSessionID(t.Context(), session), session)
+			require.Equal(t, session, SessionIDFromContext(ctx))
+			require.NotNil(t, s.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"registered-readback","version":"1"}}}`)))
 			s.NoteSessionToolPolicy(session, "all", "defer")
-			ctx := s.WithClientSession(t.Context(), session)
 			ack := preselectionRegisteredCall(t, s, ctx, 10, "edit_file", map[string]any{"path": path, "old_string": "func Target() int { return 1 }", "new_string": "func Target() int {\n\tvalue := 7\n\treturn value\n}", "format": "json"})
 			require.False(t, ack.IsError, resultText(ack))
 			fields := extractTextResult(t, ack)
