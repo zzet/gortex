@@ -131,7 +131,7 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
- sharedIdentity sharedServerIdentity
+	sharedIdentity   sharedServerIdentity
 	editAckMode      config.EditAckMode
 	editAckConfigErr error
 	// editOperations covers actual source-edit handler completions across this

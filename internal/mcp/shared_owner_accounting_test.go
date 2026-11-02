@@ -79,7 +79,12 @@ func sharedOwnerStatusWire(t *testing.T, status map[string]any) map[string]any {
 
 func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	s, records := sharedOwnerPhysicalSetFixture(t)
- t.Cleanup(func(){if t.Failed(){body,_:=json.Marshal(s.mutationStatusPayload(records[0]));t.Logf("shared owner status: %s",body)}})
+	t.Cleanup(func() {
+		if t.Failed() {
+			body, _ := json.Marshal(s.mutationStatusPayload(records[0]))
+			t.Logf("shared owner status: %s", body)
+		}
+	})
 	var definition map[string]any
 	for _, record := range records {
 		var proof map[string]any
@@ -131,6 +136,17 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 		execution, ok := definition["execution"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, true, execution["observed_partition_complete"])
+		require.Equal(t, "direct_shared_set", execution["entry_disposition"])
+		dispositions := execution["phase_dispositions"].(map[string]any)
+		states := execution["phase_states"].(map[string]any)
+		require.Equal(t, "no_batch_gate_or_hook", dispositions["batch_admission"])
+		require.Equal(t, "not_applicable", states["batch_admission"])
+		if states["patch_analysis"] == "not_applicable" {
+			require.Equal(t, "resolution_catchup_not_entered", dispositions["patch_analysis"])
+		} else {
+			require.Equal(t, "measured", states["patch_analysis"])
+			require.NotContains(t, dispositions, "patch_analysis")
+		}
 		wire := sharedOwnerStatusWire(t, s.mutationStatusPayload(record))
 		phase := wire["phase_timing"].(map[string]any)
 		require.Nil(t, phase["patch_wall_ms"])
@@ -162,25 +178,35 @@ func TestSharedOwnerAccountingBindsBothActualPhysicalReceipts(t *testing.T) {
 	originalApplied := peer.appliedGeneration
 	peer.appliedGeneration++
 	peer.mu.Unlock()
-	for _, record := range records { require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
+	for _, record := range records {
+		require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
 	peer.mu.Lock()
 	peer.appliedGeneration = originalApplied
 	peer.graphRecorded = false
 	peer.mu.Unlock()
-	for _, record := range records { require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
+	for _, record := range records {
+		require.Nil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
 	peer.mu.Lock()
 	peer.graphRecorded = true
 	peer.mu.Unlock()
-	for _, record := range records { require.NotNil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"]) }
+	for _, record := range records {
+		require.NotNil(t, s.mutationStatusPayload(record)["shared_owner_accounting_v1"])
+	}
 	// An aliased ledger in another actual Server cannot borrow the proof.
 	other := NewServer(s.engine, s.graph, s.indexer, nil, zap.NewNop(), nil)
 	other.mutationCommits.put(records[0])
 	require.Same(t, s, records[0].owner, "ledger alias must not change the actual original owner")
 	require.Nil(t, s.mutationStatusPayload(records[0])["error"])
 	require.Nil(t, other.mutationStatusPayload(records[0])["shared_owner_accounting_v1"])
+	other.sharedIdentity.name = s.sharedIdentity.name
+	require.Nil(t, other.mutationStatusPayload(records[0])["shared_owner_accounting_v1"], "copied constructor name is not the original Server")
 	literal := newMutationServer()
 	literal.mutationCommits.put(records[0])
 	require.Nil(t, literal.mutationStatusPayload(records[0])["shared_owner_accounting_v1"], "literal/unnamed Server cannot gain proof from retained records")
+	literal.sharedIdentity = s.sharedIdentity
+	require.Nil(t, literal.mutationStatusPayload(records[0])["shared_owner_accounting_v1"], "copied identity cannot change its weak original object")
 	// Restoring an old key after a post-freeze alias must not revive an anchor.
 	key := originalPublication.Key()
 	recorder := indexer.DefaultPublicationPhases()

@@ -43,10 +43,10 @@ type canonicalLapTotal struct {
 }
 
 type canonicalPatchLaps struct {
- sharedDirectEntry bool
- sharedOptionalDispositions map[string]string
- sharedIntervalLimit int
- sharedIntervals []sharedOwnerInterval
+	sharedDirectEntry                bool
+	sharedOptionalDispositions       map[string]string
+	sharedIntervalLimit              int
+	sharedIntervals                  []sharedOwnerInterval
 	laps                             [canonicalPatchLapCount]canonicalLapTotal
 	lastEnd                          time.Time
 	active                           int
@@ -138,9 +138,14 @@ func (p *canonicalPatchLaps) endLapLocked(lap canonicalPatchLap, start, at time.
 	} else {
 		v.total += elapsed
 	}
- if p.sharedIntervalLimit>0 {
-  if len(p.sharedIntervals)>=p.sharedIntervalLimit { p.sharedIntervalLimit=-1;p.sharedIntervals=nil } else { p.sharedIntervals=append(p.sharedIntervals,sharedOwnerInterval{Phase:canonicalAttemptLapNames[lap],Start:start.Sub(p.origin).Nanoseconds(),End:at.Sub(p.origin).Nanoseconds()}) }
- }
+	if p.sharedIntervalLimit > 0 {
+		if len(p.sharedIntervals) >= p.sharedIntervalLimit {
+			p.sharedIntervalLimit = -1
+			p.sharedIntervals = nil
+		} else {
+			p.sharedIntervals = append(p.sharedIntervals, sharedOwnerInterval{Phase: canonicalAttemptLapNames[lap], Start: start.Sub(p.origin).Nanoseconds(), End: at.Sub(p.origin).Nanoseconds()})
+		}
+	}
 	v.last = at
 	v.done++
 	p.active--

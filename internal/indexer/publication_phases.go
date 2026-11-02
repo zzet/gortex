@@ -134,14 +134,14 @@ const (
 // the first instant the record reached it, which is the only reading a latency
 // breakdown can use when a coalesced cycle serves several records.
 type PublicationPhaseRecorder struct {
- sharedInstance string
- sharedSelf weak.Pointer[PublicationPhaseRecorder]
-	mu          sync.Mutex
-	perCheckout int
-	checkouts   int
-	byCheckout  map[string][]*PublicationPhaseRecord
-	byKey       map[string]*PublicationPhaseRecord
-	lastTouched map[string]time.Time
+	sharedInstance string
+	sharedSelf     weak.Pointer[PublicationPhaseRecorder]
+	mu             sync.Mutex
+	perCheckout    int
+	checkouts      int
+	byCheckout     map[string][]*PublicationPhaseRecord
+	byKey          map[string]*PublicationPhaseRecord
+	lastTouched    map[string]time.Time
 }
 
 // NewPublicationPhaseRecorder returns a recorder that keeps at most
@@ -161,8 +161,8 @@ func NewPublicationPhaseRecorder(perCheckout, checkouts int) *PublicationPhaseRe
 		byKey:       make(map[string]*PublicationPhaseRecord),
 		lastTouched: make(map[string]time.Time),
 	}
- r.initializeSharedIdentity()
- return r
+	r.initializeSharedIdentity()
+	return r
 }
 
 var defaultPublicationPhases = NewPublicationPhaseRecorder(0, 0)
@@ -175,8 +175,8 @@ func DefaultPublicationPhases() *PublicationPhaseRecorder { return defaultPublic
 // PublicationPhaseRecord is one edit's (or one fresh request's) path to
 // publication.
 type PublicationPhaseRecord struct {
- sharedPhysical *SharedPhysicalOwner
- sharedProofRevoked bool
+	sharedPhysical        *SharedPhysicalOwner
+	sharedProofRevoked    bool
 	mu                    sync.Mutex
 	key                   string
 	checkoutID            string

@@ -11,7 +11,7 @@ import (
 // creates a publication record nor grants an older waiter the span of a newer
 // executor. The frontier remains the sole graph-completion authority.
 type mutationSetPublicationMember struct {
- invocation *sharedSetInvocation
+	invocation         *sharedSetInvocation
 	path               string
 	generation         uint64
 	record             *PublicationPhaseRecord
@@ -39,7 +39,7 @@ func (w *Watcher) mutationSetPublicationMembers(frontier map[string]uint64) []mu
 			continue
 		}
 		if record.ownsMutationSetGeneration(generation) {
-			members = append(members, mutationSetPublicationMember{invocation:waiter.sharedInvocation,path: path, generation: generation, record: record, schedulingEntered: waiter.schedulingEntered, backgroundEligible: waiter.backgroundEligible})
+			members = append(members, mutationSetPublicationMember{invocation: waiter.sharedInvocation, path: path, generation: generation, record: record, schedulingEntered: waiter.schedulingEntered, backgroundEligible: waiter.backgroundEligible})
 		}
 	}
 	return members
@@ -62,26 +62,26 @@ func (p *PublicationPhaseRecord) ownsMutationSetGeneration(generation uint64) bo
 // The shared executor owns one accumulator, not one fabricated executor per
 // member. No member record or unrelated request clock supplies its origin.
 type mutationSetPublicationAttempt struct {
- sharedInvocation *sharedSetInvocation
- proofFailure string
- executionReturned time.Time
- sharedWindow canonicalAttemptWindow
-	members       []mutationSetPublicationMember
-	stamps        *PublicationStamps
-	entered       time.Time
-	retry         int
-	executorFiles int
+	sharedInvocation  *sharedSetInvocation
+	proofFailure      string
+	executionReturned time.Time
+	sharedWindow      canonicalAttemptWindow
+	members           []mutationSetPublicationMember
+	stamps            *PublicationStamps
+	entered           time.Time
+	retry             int
+	executorFiles     int
 }
 
 type sharedMutationSetExecution struct {
- ownerProof *sharedOwnerFrozen
- ownerProofState string
- ownerProofReason string
-	generation    uint64
-	members       int
-	executorFiles int
-	window        canonicalAttemptWindow
-	background    *SharedSetBackground
+	ownerProof       *sharedOwnerFrozen
+	ownerProofState  string
+	ownerProofReason string
+	generation       uint64
+	members          int
+	executorFiles    int
+	window           canonicalAttemptWindow
+	background       *SharedSetBackground
 }
 
 func (w *Watcher) beginMutationSetPublication(frontier map[string]uint64, entered time.Time, retry int) *mutationSetPublicationAttempt {
@@ -93,8 +93,8 @@ func (w *Watcher) beginMutationSetPublication(frontier map[string]uint64, entere
 	stamps.markAt(PublicationCycleStarted, entered)
 	stamps.startAttemptControl(entered)
 	a := &mutationSetPublicationAttempt{members: members, stamps: stamps, entered: entered, retry: retry, executorFiles: len(frontier)}
- w.prepareSharedOwnerAttempt(a)
- return a
+	w.prepareSharedOwnerAttempt(a)
+	return a
 }
 
 // Reject failed, stale, stopped and evicted members without changing graph
@@ -113,8 +113,8 @@ func (w *Watcher) finishMutationSetPublication(attempt *mutationSetPublicationAt
 	accounting := attempt.stamps.freezeAttemptEvidence(attempt.entered)
 	attempt.stamps.mu.Unlock()
 	window := canonicalAttemptWindow{endNS: returned.Sub(attempt.entered).Nanoseconds(), retry: attempt.retry, accounting: accounting}
-	attempt.executionReturned=returned
- attempt.sharedWindow=window
+	attempt.executionReturned = returned
+	attempt.sharedWindow = window
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopping {
@@ -181,7 +181,7 @@ func (s PublicationPhaseSnapshot) SharedSetExecution() *SharedSetExecution {
 // synchronizing with the actual arm caller's unlock; invalidation is atomic
 // because a later failed Stop can occur while the callback is executing.
 type mutationSetTimerObservation struct {
- invocation *sharedSetInvocation
+	invocation              *sharedSetInvocation
 	watcher                 weak.Pointer[Watcher]
 	armStarted, armFinished time.Time
 	frontier                uint64
@@ -204,7 +204,9 @@ type SharedSetBackground struct {
 }
 
 func (w *Watcher) finishMutationSetBackground(attempt *mutationSetPublicationAttempt, timer *mutationSetTimerObservation, returned time.Time) {
- if w.sharedOwnerLegacyFinalizing!=nil {w.sharedOwnerLegacyFinalizing(returned)}
+	if w.sharedOwnerLegacyFinalizing != nil {
+		w.sharedOwnerLegacyFinalizing(returned)
+	}
 	if attempt == nil || timer == nil || timer.watcher.Value() != w || timer.invalid.Load() || attempt.retry != 0 || timer.armStarted.IsZero() || timer.armFinished.Before(timer.armStarted) || attempt.entered.Before(timer.armFinished) || returned.Before(attempt.entered) {
 		return
 	}

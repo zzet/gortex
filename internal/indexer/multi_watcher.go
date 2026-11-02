@@ -1,7 +1,6 @@
 package indexer
 
 import (
- "weak"
 	"context"
 	"fmt"
 	"os"
@@ -9,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"weak"
 
 	"go.uber.org/zap"
 
@@ -1168,7 +1168,7 @@ func (mw *MultiWatcher) enqueueFileMutation(ctx context.Context, filePath string
 // EnqueueFileMutations keeps a single owner's complete frontier together.
 // Mixed owners retain the existing point admission path in the caller.
 func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string) (map[string]*MutationTicket, error) {
- originalEntry:=time.Now()
+	originalEntry := time.Now()
 	ctx, _ = canonicalSchedulingEntry(ctx)
 	if len(paths) == 1 {
 		ticket, err := mw.EnqueueToolMutation(ctx, paths[0])
@@ -1205,8 +1205,9 @@ func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string
 	if owner == nil {
 		return nil, nil
 	}
-	call:=newSharedSetInvocation(originalEntry,len(paths));call.forward=weak.Make(owner)
- ctx=context.WithValue(ctx,sharedSetInvocationKey{},call)
+	call := newSharedSetInvocation(originalEntry, len(paths))
+	call.forward = weak.Make(owner)
+	ctx = context.WithValue(ctx, sharedSetInvocationKey{}, call)
 	return owner.EnqueueFileMutations(ctx, paths)
 }
 

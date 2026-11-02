@@ -104,7 +104,7 @@ func (w canonicalAttemptWindow) evaluateAccounting() canonicalAttemptProjection 
 // Read repair begins after admission/lane acquisition and cannot borrow those
 // P intervals. Its one actual control interval surrounds the named operations.
 func (w canonicalAttemptWindow) evaluateAccountingFor(readRepair bool) canonicalAttemptProjection {
- return w.evaluateAccountingScope(readRepair,false)
+	return w.evaluateAccountingScope(readRepair, false)
 }
 
 func (w canonicalAttemptWindow) evaluateAccountingScope(readRepair, directShared bool) canonicalAttemptProjection {
@@ -138,11 +138,13 @@ func (w canonicalAttemptWindow) evaluateAccountingScope(readRepair, directShared
 	}
 	for i, v := range p.laps {
 		kind := canonicalPatchLap(i)
- if directShared && (kind==patchCohortAdmission || kind==patchInspection) {
- if v!=(canonicalLapEvidence{}) {invalid=true}
- out.states[i]="not_applicable"
- continue
- }
+		if directShared && (kind == patchCohortAdmission || kind == patchInspection) {
+			if v != (canonicalLapEvidence{}) {
+				invalid = true
+			}
+			out.states[i] = "not_applicable"
+			continue
+		}
 		if readRepair && kind >= canonicalDeepLapCount && kind != patchExecutorControl {
 			if v != (canonicalLapEvidence{}) {
 				invalid = true
@@ -231,10 +233,12 @@ type EditPatchAccounting struct {
 	UnattributedMS       *float64            `json:"unattributed_ms"`
 }
 
-func (w canonicalAttemptWindow) projectAccounting() *EditPatchAccounting {return w.projectAccountingScope(false)}
+func (w canonicalAttemptWindow) projectAccounting() *EditPatchAccounting {
+	return w.projectAccountingScope(false)
+}
 
 func (w canonicalAttemptWindow) projectAccountingScope(directShared bool) *EditPatchAccounting {
-	p := w.evaluateAccountingScope(false,directShared)
+	p := w.evaluateAccountingScope(false, directShared)
 	out := &EditPatchAccounting{AttemptTicket: w.ticket, AttemptRetry: w.retry, Scope: "accepted_winning_physical_attempt", BackgroundCoverage: "not_established", SumState: p.state, PartitionComplete: p.complete,
 		PhasesMS: make(map[string]*float64, canonicalPatchLapCount), PhaseStates: make(map[string]string, canonicalPatchLapCount)}
 	out.ExecutionDisposition = w.executionDisposition()

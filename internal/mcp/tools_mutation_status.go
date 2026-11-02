@@ -266,7 +266,7 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		}
 	}
 	record.attachFileProjection(payload)
- s.attachSharedOwnerAccounting(payload,record,retained)
+	s.attachSharedOwnerAccounting(payload, record, retained)
 	return payload
 }
 

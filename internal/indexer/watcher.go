@@ -74,7 +74,7 @@ type MutationTicket struct {
 // released with the same completion/stop paths as its existing result channel;
 // it is not a separate tracing registry or completed-history collection.
 type mutationWaiter struct {
- sharedInvocation *sharedSetInvocation
+	sharedInvocation   *sharedSetInvocation
 	ticket             *MutationTicket
 	tool               bool
 	done               chan MutationResult
@@ -259,25 +259,25 @@ type Watcher struct {
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu                  sync.Mutex
-	eventTimes               []time.Time           // sliding window of recent event timestamps
-	stormBatch               map[string]ChangeKind // dirty set during an event storm
-	stormGenerations         map[string]uint64     // newest debounced generation adopted per path
-	stormTimerObservation    *mutationSetTimerObservation
-	stormPublicationObserved bool
-	stormTimer               *time.Timer         // fires after the quiet period
-	stormActive              bool                // true while waiting to drain
-	stormExplicit            bool                // admitted complete explicit frontier requires forced reads
-	stormStopped             bool                // Stop has closed storm admission
+	stormMu                     sync.Mutex
+	eventTimes                  []time.Time           // sliding window of recent event timestamps
+	stormBatch                  map[string]ChangeKind // dirty set during an event storm
+	stormGenerations            map[string]uint64     // newest debounced generation adopted per path
+	stormTimerObservation       *mutationSetTimerObservation
+	stormPublicationObserved    bool
+	stormTimer                  *time.Timer // fires after the quiet period
+	stormActive                 bool        // true while waiting to drain
+	stormExplicit               bool        // admitted complete explicit frontier requires forced reads
+	stormStopped                bool        // Stop has closed storm admission
 	sharedOwnerLegacyFinalizing func(time.Time)
- sharedOwnerBeforeProjection func(time.Time)
-	stormSharedInvocation *sharedSetInvocation
-	stormRetryAttempt        int                 // retry ordinal for the published storm timer
-	stormWork                sync.WaitGroup      // scheduled/running timer callbacks
-	stormDrained             func(int)           // test hook: batch drained; batch size arg
-	stormBeforeLock          func()              // test hook: immediately before repository-lane admission
-	batchReindex             watcherBatchReindex // one bounded batch; MultiWatcher installs shared catch-up
-	discoverReindex          watcherBatchReindex // additive directory discovery with the same complete tail
+	sharedOwnerBeforeProjection func(time.Time)
+	stormSharedInvocation       *sharedSetInvocation
+	stormRetryAttempt           int                 // retry ordinal for the published storm timer
+	stormWork                   sync.WaitGroup      // scheduled/running timer callbacks
+	stormDrained                func(int)           // test hook: batch drained; batch size arg
+	stormBeforeLock             func()              // test hook: immediately before repository-lane admission
+	batchReindex                watcherBatchReindex // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex             watcherBatchReindex // additive directory discovery with the same complete tail
 	// pointReindexRaw runs the complete exact-path pipeline after the watcher
 	// already owns the repository lane. MultiWatcher installs its raw tail here.
 	pointReindexRaw func(string, *PublicationStamps) (*IndexResult, error)
@@ -1909,7 +1909,7 @@ func (w *Watcher) enqueueFileMutation(ctx context.Context, filePath string, tool
 // EnqueueFileMutations admits one committed frontier before any drain can run.
 // A nil map means the owner cannot schedule this set; no member was admitted.
 func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map[string]*MutationTicket, error) {
- originalEntry:=time.Now()
+	originalEntry := time.Now()
 	ctx, schedulingEntered := canonicalSchedulingEntry(ctx)
 	if len(files) == 1 {
 		ticket, err := w.EnqueueToolMutation(ctx, files[0])
@@ -1918,7 +1918,7 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 		}
 		return map[string]*MutationTicket{ticket.Path: ticket}, err
 	}
-	call:=sharedSetInvocationFor(ctx,w,originalEntry,len(files))
+	call := sharedSetInvocationFor(ctx, w, originalEntry, len(files))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1974,14 +1974,21 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 		w.mutationWaiters = make(map[string]map[uint64]mutationWaiter)
 	}
 	freshSet := !w.stormActive && len(w.stormBatch) == 0
- if !freshSet || len(paths)!=call.count { call.invalid.Store(true) }
- if w.stormSharedInvocation!=nil { w.stormSharedInvocation.invalid.Store(true) }
- call.root=w.indexer.RootPath();call.prefix=w.indexer.RepoPrefix()
- w.stormSharedInvocation=call
+	if !freshSet || len(paths) != call.count {
+		call.invalid.Store(true)
+	}
+	if w.stormSharedInvocation != nil {
+		w.stormSharedInvocation.invalid.Store(true)
+	}
+	call.root = w.indexer.RootPath()
+	call.prefix = w.indexer.RepoPrefix()
+	w.stormSharedInvocation = call
 	tickets := make(map[string]*MutationTicket, len(paths))
 	for path := range paths {
 		backgroundEligible := freshSet && w.pendingGeneration[path] == 0 && w.observedMutationGeneration[path] == 0
- if !backgroundEligible { call.invalid.Store(true) }
+		if !backgroundEligible {
+			call.invalid.Store(true)
+		}
 		if timer, ok := w.pending[path]; ok {
 			if observation := w.mutationWaiters[path][w.pendingGeneration[path]].timerObservation; observation != nil && observation.background != nil {
 				observation.background.invalidate("superseded_by_mutation_set")
@@ -2011,7 +2018,7 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 		// Set admission is not a point timer. Carry the actual entry and owner;
 		// background coverage stays unavailable until the storm executor proves it.
 		w.mutationWaiters[path][generation] = mutationWaiter{done: done, tool: true, ticket: ticket,
-			publication: ticket.PublicationRecord, schedulingEntered: schedulingEntered, backgroundEligible: backgroundEligible,sharedInvocation:call}
+			publication: ticket.PublicationRecord, schedulingEntered: schedulingEntered, backgroundEligible: backgroundEligible, sharedInvocation: call}
 		w.pendingGeneration[path] = generation
 		w.stormGenerations[path] = generation
 		w.stormBatch[path] = ChangeModified
@@ -2636,8 +2643,10 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 	}
 	var observation *mutationSetTimerObservation
 	if w.stormExplicit && w.stormPublicationObserved {
-		observation = &mutationSetTimerObservation{invocation:w.stormSharedInvocation,watcher: weak.Make(w), armStarted: time.Now()}
- if observation.invocation!=nil && observation.invocation.arms.Add(1)!=1 { observation.invocation.invalid.Store(true) }
+		observation = &mutationSetTimerObservation{invocation: w.stormSharedInvocation, watcher: weak.Make(w), armStarted: time.Now()}
+		if observation.invocation != nil && observation.invocation.arms.Add(1) != 1 {
+			observation.invocation.invalid.Store(true)
+		}
 		for _, generation := range w.stormGenerations {
 			if generation > observation.frontier {
 				observation.frontier = generation
@@ -2647,10 +2656,12 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 	w.stormTimerObservation = observation
 	w.stormTimer = time.AfterFunc(delay, func() {
 		defer w.stormWork.Done()
-		attempt:=w.drainStormObserved(observation)
- returned:=time.Now()
- if w.sharedOwnerBeforeProjection!=nil {w.sharedOwnerBeforeProjection(returned)}
- w.finishSharedOwnerProof(attempt,observation,returned)
+		attempt := w.drainStormObserved(observation)
+		returned := time.Now()
+		if w.sharedOwnerBeforeProjection != nil {
+			w.sharedOwnerBeforeProjection(returned)
+		}
+		w.finishSharedOwnerProof(attempt, observation, returned)
 	})
 	if observation != nil {
 		observation.armFinished = time.Now()
@@ -2709,7 +2720,7 @@ func (w *Watcher) drainStormObserved(timer *mutationSetTimerObservation) (finish
 	explicit := w.stormExplicit
 	w.stormExplicit = false
 	w.stormPublicationObserved = false
- w.stormSharedInvocation=nil
+	w.stormSharedInvocation = nil
 	retryAttempt := w.stormRetryAttempt
 	w.stormBatch = make(map[string]ChangeKind)
 	w.stormGenerations = make(map[string]uint64)
@@ -2789,8 +2800,10 @@ func (w *Watcher) drainStormObserved(timer *mutationSetTimerObservation) (finish
 	}
 	w.completeStormMutationWaiters(generations, result, err, fanout)
 	completed = err == nil && result != nil
- if completed {finished=publication}
- return
+	if completed {
+		finished = publication
+	}
+	return
 }
 
 func (w *Watcher) scheduleStormMutationRetry(batch map[string]ChangeKind, generations map[string]uint64, attempt int, explicit bool) bool {
