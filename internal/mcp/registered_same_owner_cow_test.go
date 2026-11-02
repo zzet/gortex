@@ -162,3 +162,36 @@ func TestConcurrentRegisteredReadsRevalidateSameACKOwner(t *testing.T) {
 		t.Run(tool, func(t *testing.T) { requireCanonicalDefinitionRows(t, tool, results[tool], raw) })
 	}
 }
+
+// The newly enabled full-metadata allowance stops at early selection errors.
+// A later withdrawal must not replay recordSymbol or on-demand enrichment.
+func TestFullSymbolCASAllowanceDoesNotGrantAfterLeafReplay(t *testing.T) {
+	selectedProjectionRegistry(t)
+	s, path, entry, _ := acknowledgedCanonicalFile(t)
+	retirement := s.canonicalProjectionRetirement(path)
+	require.NotNil(t, retirement)
+	calls := 0
+	var selected context.Context
+	leaf := func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		calls++
+		selected = ctx
+		result, err := s.handleGetSymbol(ctx, req)
+		require.NoError(t, err)
+		require.False(t, result.IsError, resultText(result))
+		require.EqualValues(t, 8, extractTextResult(t, result)["node"].(map[string]any)["start_line"])
+		require.NoError(t, s.indexer.IndexFile(path))
+		retirement.run()
+		require.True(t, entry.checkedRetired.Load())
+		return result, nil
+	}
+	result, err := s.wrapToolHandler(leaf)(t.Context(), makeReq("get_symbol", map[string]any{"id": "main.go::Neighbor", "detail": "full", "format": "json"}))
+	require.NoError(t, err)
+	require.True(t, result.IsError, resultText(result))
+	require.Equal(t, 1, calls)
+	require.Error(t, validateRequestProjections(selected), "a late old selection remains unusable")
+	facts := selected.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	facts.mu.RLock()
+	old := facts.entries[entry.key]
+	facts.mu.RUnlock()
+	require.Same(t, entry, old)
+}

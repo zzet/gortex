@@ -59,7 +59,10 @@ func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
 func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		legacy, known := s.legacyToolName(&req)
-		if !known || !auditedProjectionReadRetry(legacy, req) {
+		// Full symbol metadata may restart only its early projection selection,
+		// before recordSymbol/enrichNodeOnDemand. Keep it out of the audited
+		// after-leaf replay set, which would include those response side effects.
+		if !known || !auditedProjectionReadRetry(legacy, req) && legacy != "get_symbol" {
 			return next(ctx, req)
 		}
 		if _, exists := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !exists {
