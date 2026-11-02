@@ -131,9 +131,6 @@ func (p *privateRun) writeBootRepos(worktrees bool) ([]privateRepo, error) {
 	if p.editACKMode != "" {
 		payload["edit"] = map[string]string{"ack": p.editACKMode}
 	}
-	if p.searchReadbackAcceptance {
-		payload["edit"] = map[string]string{"ack": "local"}
-	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err

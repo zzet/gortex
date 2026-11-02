@@ -22,24 +22,23 @@ type privateRepo struct {
 }
 
 type privateRun struct {
-	editACKMode              string
-	searchReadbackAcceptance bool                                // explicit owned-daemon policy; ordinary runs omit it
-	discoveryCatalog         map[string]discoveryCatalogIdentity // discovery-only observed seed identities
-	Root                     string
-	SocketDir                string
-	Socket                   string
-	Store                    string
-	Config                   string
-	Env                      []string
-	daemonEnv                []string // optional owned scenario shim; harness Git keeps Env
-	Repos                    []privateRepo
-	Binary                   string
-	process                  *exec.Cmd
-	done                     chan struct{}
-	exitErr                  error
-	stdout                   *os.File
-	stderr                   *os.File
-	startCount               int
+	editACKMode      string
+	discoveryCatalog map[string]discoveryCatalogIdentity // discovery-only observed seed identities
+	Root             string
+	SocketDir        string
+	Socket           string
+	Store            string
+	Config           string
+	Env              []string
+	daemonEnv        []string // optional owned scenario shim; harness Git keeps Env
+	Repos            []privateRepo
+	Binary           string
+	process          *exec.Cmd
+	done             chan struct{}
+	exitErr          error
+	stdout           *os.File
+	stderr           *os.File
+	startCount       int
 }
 
 func inside(root, path string) bool {

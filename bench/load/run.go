@@ -106,9 +106,21 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
+// The explicit search profile measures the first read after a local ACK.
+// Use the same effective policy for owned startup and workload identity.
+func (o runOptions) editACKPolicy() string {
+	if o.SearchReadbackAcceptance {
+		return "local"
+	}
+	return o.EditACKMode
+}
+
 func validateRunOptions(o runOptions) error {
 	if o.EditACKMode != "" && o.EditACKMode != "local" && o.EditACKMode != "full" {
 		return errors.New("--edit-ack must be local or full when explicitly set")
+	}
+	if o.SearchReadbackAcceptance && o.EditACKMode == "full" {
+		return errors.New("--search-readback-acceptance requires local ACKs; --edit-ack full conflicts with that profile")
 	}
 	if o.SearchReadbackAcceptance && (o.Scenario != editProbeScenario || o.EditCount != 1000 || o.Editors != 1 && o.Editors != 4 && o.Editors != 8 || o.Agents != 0 || o.Worktrees != 0 || o.EditRepos != 1) {
 		return errors.New("--search-readback-acceptance requires edit-and-probe, 1000 edits, 1/4/8 editors, one primary repository and no pure readers or worktrees")
@@ -326,7 +338,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	report.Workload.EditGateSeed = o.EditGateSeed
-	report.Workload.EditACKMode = o.EditACKMode
+	report.Workload.EditACKMode = o.editACKPolicy()
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {
