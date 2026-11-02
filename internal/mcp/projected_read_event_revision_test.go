@@ -63,11 +63,21 @@ func TestSourceEventDuringProjectionCannotBeClearedByOldObservation(t *testing.T
 		err   error
 	}
 	done := make(chan reply, 1)
+	joined := make(chan struct{})
 	go func() {
+		defer close(joined)
 		entry, err := s.projectCurrentTrackedFile(ctx, ctx, path, "main.go", "main.go")
 		done <- reply{entry, err}
 	}()
-	t.Cleanup(func() { release(); <-extractor.finished })
+	t.Cleanup(func() {
+		release()
+		<-joined
+		select {
+		case <-extractor.entered:
+			<-extractor.finished
+		default:
+		}
+	})
 	select {
 	case <-extractor.entered:
 	case <-ctx.Done():
@@ -105,8 +115,21 @@ func TestDeferredOldProjectionInvalidationCannotPoisonNewerPublisher(t *testing.
 	var once sync.Once
 	release := func() { once.Do(func() { close(extractor.release) }) }
 	done := make(chan error, 1)
-	go func() { _, err := s.projectCurrentTrackedFile(ctx, ctx, path, "main.go", "main.go"); done <- err }()
-	t.Cleanup(func() { release(); <-extractor.finished })
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		_, err := s.projectCurrentTrackedFile(ctx, ctx, path, "main.go", "main.go")
+		done <- err
+	}()
+	t.Cleanup(func() {
+		release()
+		<-joined
+		select {
+		case <-extractor.entered:
+			<-extractor.finished
+		default:
+		}
+	})
 	select {
 	case <-extractor.entered:
 	case <-ctx.Done():

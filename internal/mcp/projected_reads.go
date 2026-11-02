@@ -178,7 +178,8 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	expected := pendingFileProjections.snap.Load().entries[key]
+	observed := pendingFileProjections.captureReadExpectation(key)
+	expected := observed.entry
 	before, err := statDiskStamp(abs)
 	if err != nil {
 		return nil, err
@@ -195,7 +196,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		if err != nil || latest.info != nil || pathkey.MutationKey(abs) != key {
 			return nil, errors.Join(err, errProjectionExternalWrite)
 		}
-		if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
+		if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
 			return nil, err
 		}
 		s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
@@ -231,13 +232,25 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if expected != nil {
 		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
 			pathkey.MutationKey(abs) == key && pendingFileProjections.snap.Load().entries[key] == expected {
-			return expected, nil
+			if !expected.suspect.Load() {
+				return expected, nil
+			}
+			// Reuse the immutable parse only after bounded current-byte checks.
+			// This unpublished copy has no physical sequence or old invalidation;
+			// the old pointer stays suspect and the revision is checked at publish.
+			entry := expected.committedCopy(0, after)
+			entry.suspect.Store(false)
+			if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
+				return nil, err
+			}
+			s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
+			return entry, nil
 		}
 		// Invalidate the old bytes on every exit, including cache refusal.
 		// Do it after admission so this read's own old-version invalidation
 		// cannot be inherited as an event against the newly verified bytes.
-		// Actual concurrent watcher events still set the old flag before
-		// publishExpected and are conservatively inherited by that publish.
+		// Actual concurrent watcher events advance its captured revision;
+		// read publication refuses them rather than clearing their evidence.
 		defer expected.suspect.Store(true)
 	}
 	// Use the registered parser identity while retaining the physical
@@ -261,7 +274,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
 	}
-	if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
+	if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
 		return nil, err
 	}
 	s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
