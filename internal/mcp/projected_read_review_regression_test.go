@@ -168,7 +168,7 @@ func TestExternalWriteAfterToolEdit(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.IsError, "%s", resultText(result))
 	ack := extractTextResult(t, result)
-	require.Equal(t, true, ack["committed"])
+	require.Equal(t, "committed", ack["disk_status"])
 	require.Equal(t, "local", ack["ack_mode"])
 	old := pendingFileProjections.snap.Load().entries[pathkey.MutationKey(path)]
 	require.NotNil(t, old)
