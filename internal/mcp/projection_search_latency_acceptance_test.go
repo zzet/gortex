@@ -150,6 +150,9 @@ func projectionLatencyProbes(t *testing.T, fixture *projectionLatencyFixture) []
 }
 
 func validateProjectionLatencyResult(probe projectionLatencyProbe, result *mcplib.CallToolResult) error {
+	if result == nil || result.IsError {
+		return errors.New("missing or refused search response")
+	}
 	var body map[string]any
 	decoded := false
 	for _, raw := range result.Content {
@@ -164,11 +167,35 @@ func validateProjectionLatencyResult(probe projectionLatencyProbe, result *mcpli
 	if !decoded {
 		return errors.New("missing JSON text response")
 	}
-	key := "results"
-	if probe.Tool == "search_text" {
-		key = "matches"
+	key, countKey := "results", "total"
+	switch probe.Tool {
+	case "search_symbols":
+		if body["truncated"] != false {
+			return errors.New("symbol response has no complete page declaration")
+		}
+	case "search_text":
+		key, countKey = "matches", "count"
+	default:
+		return errors.New("unknown search comparison tool")
 	}
-	rows, _ := body[key].([]any)
+	rows, collectionOK := body[key].([]any)
+	count, countOK := body[countKey].(float64)
+	if !collectionOK || !countOK || count != float64(len(rows)) {
+		return errors.New("search response collection/count is missing or inconsistent")
+	}
+	// Complete text responses omit false truncation metadata. Only declared
+	// cuts are tested; missing optional flags cannot fabricate a refusal.
+	for _, flag := range []string{"truncated", "_truncated_by_limit", "_truncated_by_budget", "_truncated_by_tokens"} {
+		if value, present := body[flag]; present && value != false {
+			return fmt.Errorf("search response has a cut or invalid declaration: %s", flag)
+		}
+	}
+	if value, present := body["count_is_exact"]; present && value != true {
+		return errors.New("search response count is not declared exact")
+	}
+	if value, present := body["next_cursor"]; present && value != "" {
+		return errors.New("search response has an unreturned or invalid next page")
+	}
 	for _, raw := range rows {
 		row, ok := raw.(map[string]any)
 		if !ok {
