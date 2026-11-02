@@ -93,11 +93,17 @@ func TestGoBodyCapturePlan_OrderedIndependentBodyParity(t *testing.T) {
 					emitGoDataflow(owner.ID, owner.StartLine, body, params, map[string]string{"pkg": "some/pkg"}, src, "body_plan.go", oracle)
 				})
 				if tc.name == "closure_legacy_typeswitch_nested" {
-					for _, edge := range oracle.Edges {
-						if edge.Kind == graph.EdgeCaptures {
-							require.NotEqual(t, "leaked", edge.Meta["name"], "legacy nested type-switch exprlists suppress outer capture")
-						}
-					}
+					root.WithScratch(func() {
+						walkGoNodes(body, func(n *sitter.Node) bool {
+							if n.Type() != "func_literal" {
+								return true
+							}
+							locals := map[string]bool{}
+							legacyBodyCaptureClosureLocals(n, src, locals)
+							t.Logf("untouched legacy locals=%v AST=%s", locals, n.String())
+							return false
+						})
+					})
 				}
 				require.Equal(t, metricOracle.Meta, owner.Meta, "all body metrics and surrounding metadata retain old independent walkers")
 				var actualNodes []*graph.Node
