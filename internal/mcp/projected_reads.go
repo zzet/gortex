@@ -12,6 +12,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer/source"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -26,7 +27,7 @@ func requestProjectionLayers(ctx context.Context) []graph.OverlayLayerReader {
 	return layers
 }
 
-// ensureProjected reads current tracked bytes without publishing graph/store
+// ensureProjected reads current admitted bytes without publishing graph/store
 // state. Failure is explicit: an old graph must never masquerade as a current
 // answer after the checked file could not be projected.
 func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.Context, error) {
@@ -66,8 +67,8 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			continue
 		}
 		idx, rel := s.indexerForRel(graphPath)
-		if idx == nil || !idx.IsTracked(rel) {
-			continue // untracked-file tools retain their raw-source guidance
+		if idx == nil {
+			continue
 		}
 		abs, err := s.resolveGraphPath(ctx, graphPath)
 		if err != nil {
@@ -119,13 +120,29 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 
 func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
 	idx, _ := s.indexerForRel(graphPath)
+	root := idx.RootPath()
+	if selected := requestViewPathRoot(requestCtx); selected.serves(idx.RepoPrefix()) {
+		root = selected.root
+	}
+	readPath, confined := relativeWithinRoot(root, abs)
+	if !confined {
+		return nil, errors.New("file is outside the selected checkout")
+	}
 	key := pathkey.MutationKey(abs)
+	// Mutation keys resolve parent aliases. Refuse an escaping parent even
+	// for absence/tombstone handling, which does not open a file descriptor.
+	if !pathguard.WithinRoot(key, pathkey.IdentityKey(pathguard.ResolveRoot(root))) {
+		return nil, errors.New("file parent is outside the selected checkout")
+	}
 	expected := pendingFileProjections.snap.Load().entries[key]
 	before, err := statDiskStamp(abs)
 	if err != nil {
 		return nil, err
 	}
 	if before.info == nil {
+		if !idx.IsTracked(rel) && expected == nil {
+			return nil, nil
+		}
 		entry := newProjectionTombstone(abs, graphPath, idx.RepoPrefix(), 0)
 		latest, err := statDiskStamp(abs)
 		if err != nil || latest.info != nil || pathkey.MutationKey(abs) != key {
@@ -138,14 +155,20 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	}
 	// Reuse the confined, bounded, nonblocking regular-file reader. A FIFO,
 	// symlink or unsupported platform is a refusal, never an unsafe Open.
-	files, err := source.NewFilesystemSource(filepath.Dir(abs))
+	files, err := source.NewFilesystemSource(root)
 	if err != nil {
 		return nil, err
 	}
 	defer files.Close()
-	raw, _, err := files.ReadRegularFile(buildCtx, filepath.Base(abs), 1<<20)
+	raw, _, err := files.ReadRegularFile(buildCtx, filepath.ToSlash(readPath), 1<<20)
 	if err != nil {
 		return nil, err
+	}
+	// The existing buffer admission applies the owning indexer's exclusions,
+	// selected checkout's ignore files, language and content gates to these
+	// already-confined bytes. A new file need not have a watcher inventory row.
+	if !idx.IsTracked(rel) && !idx.AdmitSourceSearchBuffer(buildCtx, root, abs, raw, nil) {
+		return nil, errors.New("file is not admitted source")
 	}
 	after, err := statDiskStamp(abs)
 	if err != nil || !before.matches(after) {
@@ -175,6 +198,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	if !idx.IsTracked(rel) && !projection.ParseChecked {
+		return nil, errors.New("untracked source parse health is unavailable")
+	}
 	entry := newProjectionEntry(abs, idx.RepoPrefix(), projection, raw, 0, after)
 	latest, err := statDiskStamp(abs)
 	if err != nil || !after.matches(latest) {
@@ -182,7 +208,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	}
 	// Stat identity alone misses equal-size in-place edits with restored mtime,
 	// including a newer version that retired while this extraction was running.
-	current, _, readErr := files.ReadRegularFile(buildCtx, filepath.Base(abs), 1<<20)
+	current, _, readErr := files.ReadRegularFile(buildCtx, filepath.ToSlash(readPath), 1<<20)
 	finalStamp, statErr := statDiskStamp(abs)
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
