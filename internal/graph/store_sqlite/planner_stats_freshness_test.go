@@ -320,13 +320,14 @@ func TestEnsurePlannerStatsFresh_RecyclesReadPool(t *testing.T) {
 		seedNamedGoReceiverFixture(s, "b", 150)
 		writeIndexStateCounters(t, s, 0, "repo", 500, 250)
 
+		before := warmPlannerReadPool(t, s)
 		h := mustEnsure(t, s)
 		if !h.Refreshed {
 			t.Fatalf("grown store did not refresh: reason=%q", h.Reason)
 		}
 		stats := s.db.Stats()
-		if stats.MaxIdleClosed == 0 {
-			t.Errorf("read pool kept its pre-refresh connections (MaxIdleClosed=0, Idle=%d); "+
+		if stats.MaxIdleClosed <= before {
+			t.Errorf("read pool kept its pre-refresh connections (no new idle close, Idle=%d); "+
 				"they would plan against the pre-growth statistics for the life of the store", stats.Idle)
 		}
 		if stats.Idle != 0 {
@@ -334,16 +335,75 @@ func TestEnsurePlannerStatsFresh_RecyclesReadPool(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh", func(t *testing.T) {
-		s := freshStatsStore(t, "stats_recycle_fresh.sqlite", 100)
+	for _, priorClose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fresh/prior_close=%t", priorClose), func(t *testing.T) {
+			s := freshStatsStore(t, "stats_recycle_fresh.sqlite", 100)
+			warmPlannerReadPool(t, s)
+			if priorClose {
+				before := s.db.Stats().MaxIdleClosed
+				s.db.SetMaxIdleConns(0)
+				s.db.SetMaxIdleConns(1)
+				if s.db.Stats().MaxIdleClosed != before+1 {
+					t.Fatal("prior-close control did not close exactly one warm idle connection")
+				}
+				if err := s.db.Ping(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := warmPlannerReadPool(t, s)
+			if h := mustEnsure(t, s); h.Refreshed {
+				t.Fatalf("fresh store refreshed: reason=%q", h.Reason)
+			}
+			if stats := s.db.Stats(); stats.MaxIdleClosed != before {
+				t.Errorf("fresh store recycled the read pool (idle closes before=%d after=%d); the recycle is only "+
+					"owed by a store that actually rewrote its statistics", before, stats.MaxIdleClosed)
+			}
+		})
+	}
+	t.Run("fresh_oracle_rejects_real_recycle", func(t *testing.T) {
+		s := freshStatsStore(t, "stats_recycle_negative.sqlite", 100)
+		before := warmPlannerReadPool(t, s)
 		if h := mustEnsure(t, s); h.Refreshed {
-			t.Fatalf("fresh store refreshed: reason=%q", h.Reason)
+			t.Fatalf("fresh negative-control store refreshed: reason=%q", h.Reason)
 		}
-		if stats := s.db.Stats(); stats.MaxIdleClosed != 0 {
-			t.Errorf("fresh store recycled the read pool (MaxIdleClosed=%d); the recycle is only "+
-				"owed by a store that actually rewrote its statistics", stats.MaxIdleClosed)
+		// Semantic negative: the same zero-delta predicate used above MUST
+		// reject an actual recycle of the controlled warm read connection.
+		recycleStatsReadPool(s.db, s.writerDB)
+		if after := s.db.Stats(); after.MaxIdleClosed != before+1 || after.Idle != 0 {
+			t.Fatalf("real recycle not detected: before=%d after=%+v", before, after)
 		}
 	})
+}
+
+// warmPlannerReadPool excludes ordinary surplus-idle closure from the measured
+// interval: one physical read connection may exist, and its idle slot is kept.
+// The returned counter is captured only after setup has returned that connection.
+func warmPlannerReadPool(t *testing.T, s *Store) int64 {
+	t.Helper()
+	s.stopCheckpointLoop()
+	s.stopMaintenanceLane()
+	// stopMaintenanceLane has a bounded wait. Refuse to observe the pool
+	// unless its actual worker has finished, rather than assuming a join.
+	s.maintenanceSched.Lock()
+	done := s.maintenanceDone
+	s.maintenanceSched.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			t.Fatal("maintenance worker has not finished before pool observation")
+		}
+	}
+	s.db.SetMaxOpenConns(1)
+	s.db.SetMaxIdleConns(1)
+	if err := s.db.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	stats := s.db.Stats()
+	if stats.InUse != 0 || stats.Idle != 1 || stats.OpenConnections != 1 {
+		t.Fatalf("read pool is not a single warm idle connection: %+v", stats)
+	}
+	return stats.MaxIdleClosed
 }
 
 // The payload index_health publishes is read straight off this struct, so what

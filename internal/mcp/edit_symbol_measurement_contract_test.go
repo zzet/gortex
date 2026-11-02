@@ -106,7 +106,11 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 				parse, present := ack.ObservedExecutionMS["parse"]
 				require.True(t, present)
 				require.NotNil(t, parse)
-				require.Positive(t, *parse)
+				require.GreaterOrEqual(t, *parse, 0.0, "actual completed work may have equal monotonic endpoints")
+				require.Positive(t, ack.Counts["parse"].Started)
+				require.Equal(t, ack.Counts["parse"].Started, ack.Counts["parse"].Completed)
+				require.Zero(t, ack.Counts["parse"].NotApplicable)
+				require.True(t, ack.Disjoint)
 				actual, err := os.ReadFile(path)
 				require.NoError(t, err)
 				require.Equal(t, strings.Replace(source, declaration, replacement, 1), string(actual))

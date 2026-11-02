@@ -125,6 +125,7 @@ func prepareDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) 
 	if err != nil {
 		return err
 	}
+	p.editACKMode = o.EditACKMode
 	defer os.RemoveAll(p.SocketDir)
 	complete := false
 	defer func() {

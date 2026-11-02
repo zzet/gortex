@@ -213,6 +213,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	warmCtx, cancelWarm := context.WithTimeout(ctx, o.WarmTimeout)
 	defer cancelWarm()
+	p.editACKMode = o.EditACKMode
 	var configured []privateRepo
 	if scenario == checkoutDiscoveryScenario {
 		configured, err = p.writeDiscoveryBootRepos()
