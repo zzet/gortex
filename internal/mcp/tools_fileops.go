@@ -1091,6 +1091,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
@@ -1264,6 +1265,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, priorContent, fileExists)
 	}
@@ -1565,6 +1567,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
+	releaseInteractiveRead := func() {}
+	defer func() { releaseInteractiveRead() }()
 	var (
 		absPath, relPath  string
 		viewURI           string
@@ -1623,6 +1627,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			if overlayDeleted {
 				return mcp.NewToolResultError("file is deleted in the current editor buffer"), nil
 			}
+		}
+		if !overlayPresent {
+			releaseInteractiveRead = s.beginEditedFileRead(ctx, absPath)
 		}
 		info, statErr := os.Stat(absPath)
 		if statErr != nil && (sourceView == nil || !overlayPresent || physicalEvidenceRequested) {
@@ -1687,6 +1694,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		}
 	}
 
+	releaseInteractiveRead() // before graph/projection queries; this marker covered physical read-back only
+	releaseInteractiveRead = func() {}
 	originalBytes := len(content)
 	sourceHead := content[:min(512, len(content))]
 

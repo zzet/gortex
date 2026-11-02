@@ -3176,6 +3176,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}

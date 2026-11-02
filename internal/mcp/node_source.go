@@ -149,7 +149,11 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 		return nodeSource{}, err
 	}
 	defer files.Close()
-	raw, _, err := files.ReadRegularFile(ctx, filepath.ToSlash(rel), 1<<20)
+	raw, _, err := func() ([]byte, source.FileMeta, error) {
+		release := s.beginEditedFileRead(ctx, absPath)
+		defer release()
+		return files.ReadRegularFile(ctx, filepath.ToSlash(rel), 1<<20)
+	}()
 	if err != nil {
 		if caller.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nodeSource{}, errProjectedSourceDeferred
