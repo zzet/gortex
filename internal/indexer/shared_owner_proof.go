@@ -89,7 +89,7 @@ func (w *Watcher) prepareSharedOwnerAttempt(a *mutationSetPublicationAttempt) {
   r:=m.record.owner.Value()
   if r==nil || r.sharedSelf.Value()!=r || r.sharedInstance=="" || recorder!=nil && r!=recorder { return }
   recorder=r
-  m.record.mu.Lock(); physical:=m.record.sharedPhysical; valid:=physical!=nil && physical.Receipt==m.record.key && physical.Path==m.path && physical.Checkout=="" && physical.Incarnation==""; m.record.mu.Unlock()
+  m.record.mu.Lock(); physical:=m.record.sharedPhysical; valid:=physical!=nil && physical.Path==m.path && physical.Checkout=="" && physical.Incarnation==""; m.record.mu.Unlock()
   if !valid { return }
  }
  a.proofFailure=""
@@ -109,7 +109,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  call:=a.sharedInvocation
  if a.executorFiles!=call.count || len(a.members)!=call.count { return }
  a.stamps.mu.Lock()
- if a.stamps.patchLaps.sharedIntervalLimit<=0 { a.stamps.mu.Unlock(); return }
+ if a.stamps.patchLaps.sharedIntervalLimit<=0 || !a.stamps.patchLaps.sharedDirectEntry { a.stamps.mu.Unlock(); return }
  intervals:=append([]sharedOwnerInterval(nil),a.stamps.patchLaps.sharedIntervals...)
  a.stamps.mu.Unlock()
  members:=make([]sharedOwnerMember,0,len(a.members))
@@ -125,7 +125,7 @@ func (w *Watcher) finishSharedOwnerProof(a *mutationSetPublicationAttempt, timer
  if owner==nil || owner.sharedSelf.Value()!=owner || owner.sharedInstance=="" { return }
  first:=members[0].physical
  for i,m:=range members {
-  if m.key!=m.physical.Receipt || m.physical.Server!=first.Server || m.physical.PID!=first.PID || m.physical.Birth!=first.Birth || m.physical.Checkout!="" || m.physical.Incarnation!="" || i>0 && (m.path==members[i-1].path || m.key==members[i-1].key) { return }
+  if m.physical.Server!=first.Server || m.physical.PID!=first.PID || m.physical.Birth!=first.Birth || m.physical.Checkout!="" || m.physical.Incarnation!="" || i>0 && (m.path==members[i-1].path || m.key==members[i-1].key) { return }
  }
  frozen:=&sharedOwnerFrozen{members:members,recorder:weak.Make(owner),recorderName:owner.sharedInstance,invocation:call,arm:timer.frontier,retry:a.retry,execution:a.sharedWindow,intervals:intervals,callbackEntry:a.entered,executionReturn:a.executionReturned,drainReturn:returned,timerStart:timer.armStarted,timerEnd:timer.armFinished}
  if timer.armStarted.Before(call.entered) || timer.armFinished.Before(timer.armStarted) || a.entered.Before(timer.armFinished) { frozen.backgroundReason="overlapping_or_invalid_arm" }
@@ -149,11 +149,11 @@ func (f *sharedOwnerFrozen) ownerWire() map[string]any {
 }
 func intervalWire(phase string,start,end int64) map[string]any { return map[string]any{"phase":phase,"start_ns":start,"end_ns":end} }
 func (f *sharedOwnerFrozen) definitionWire() map[string]any {
- accounting:=f.execution.projectAccounting()
+ accounting:=f.execution.projectAccountingScope(true)
  phases:=make(map[string]any,len(accounting.PhasesMS));states:=make(map[string]string,len(accounting.PhaseStates))
  for name,value:=range accounting.PhasesMS { phases[name]=value;states[name]=accounting.PhaseStates[name]; if value==nil && (name=="patch_analysis" || name=="batch_admission") { states[name]="not_applicable" } }
  intervals:=make([]map[string]any,0,len(f.intervals));for _,v:=range f.intervals { intervals=append(intervals,intervalWire(v.Phase,v.Start,v.End)) }
- execution:=map[string]any{"clock":"monotonic","origin":"actual_callback_entry","start_ns":int64(0),"end_ns":f.execution.endNS,"observed_partition_complete":accounting.PartitionComplete,"phases_ms":phases,"phase_states":states,"intervals":intervals}
+ execution:=map[string]any{"entry_disposition":"direct_shared_set","clock":"monotonic","origin":"actual_callback_entry","start_ns":int64(0),"end_ns":f.execution.endNS,"observed_partition_complete":accounting.PartitionComplete,"phases_ms":phases,"phase_states":states,"intervals":intervals}
  members:=make([]map[string]any,0,len(f.members));for _,m:=range f.members { members=append(members,sharedMemberWire(m)) }
  var background any
  if f.backgroundReason=="" {
@@ -198,4 +198,11 @@ func (p *PublicationPhaseRecord) SharedOwnerProofAvailability() (string,string) 
 func (p *SharedOwnerProjection) MatchesPublication(receipt string, publication *PublicationPhaseRecord, applied uint64) bool {
  for _,m:=range p.originals {if m.physical.Receipt==receipt {return m.record.Value()==publication && m.ticket==applied}}
  return false
+}
+
+func (s *PublicationStamps) markDirectSharedOwnerEntry() {
+ s.mu.Lock();defer s.mu.Unlock()
+ if s.patchLaps==nil || s.patchLaps.sharedIntervalLimit<=0 {return}
+ if s.patchLaps.sharedDirectEntry {s.patchLaps.sharedIntervalLimit=-1;s.patchLaps.sharedIntervals=nil;return}
+ s.patchLaps.sharedDirectEntry=true
 }

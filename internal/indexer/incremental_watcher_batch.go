@@ -502,6 +502,7 @@ func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, front
 	ctx, cancel := w.mutationLaneContext()
 	defer cancel()
 	if stamps != nil {
+ stamps.markDirectSharedOwnerEntry()
 		ctx = context.WithValue(ctx, publicationStampsKey{}, stamps)
 	}
 	err := w.indexer.coordinateRepositoryMutation(ctx, OutputEntryWatcherPatchGraph, func() error {

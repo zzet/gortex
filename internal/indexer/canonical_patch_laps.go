@@ -43,6 +43,7 @@ type canonicalLapTotal struct {
 }
 
 type canonicalPatchLaps struct {
+ sharedDirectEntry bool
  sharedIntervalLimit int
  sharedIntervals []sharedOwnerInterval
 	laps                             [canonicalPatchLapCount]canonicalLapTotal
