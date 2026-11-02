@@ -30,12 +30,13 @@ import (
 )
 
 type projectionLatencyFixture struct {
-	server   *Server
-	registry *pendingProjections
-	snapshot *projectionSnapshot
-	root     string
-	covered  map[string]bool
-	files    int
+	server        *Server
+	registry      *pendingProjections
+	snapshot      *projectionSnapshot
+	root          string
+	covered       map[string]bool
+	files         int
+	nativeSymbols int
 }
 
 func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entries int) *projectionLatencyFixture {
@@ -63,6 +64,9 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 	t.Cleanup(idx.Close)
 	indexed, err := idx.Index(root)
 	require.NoError(t, err)
+	nativeSymbols, err := store.SymbolFTSCount()
+	require.NoError(t, err, "native symbol FTS is mandatory; substring fallback cannot satisfy this comparison")
+	require.Greater(t, nativeSymbols, 0, "native symbol FTS corpus must be populated")
 	engine := query.NewEngine(store)
 	engine.SetSearch(search.NewSymbolSearcherBackend(store))
 	server := NewServer(engine, store, idx, nil, zap.NewNop(), nil)
@@ -70,7 +74,7 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 	// or read gate. This inert watcher also prevents legacy read repair from
 	// changing the population being compared.
 	server.SetWatcher(mutationTestWatcher{done: make(chan indexer.MutationResult)})
-	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount}
+	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount, nativeSymbols: nativeSymbols}
 	if entries != 0 {
 		var paths []string
 		err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -210,6 +214,8 @@ func TestProjectionSearchHandlerLatencyAcceptance(t *testing.T) {
 	previous := pendingFileProjections
 	t.Cleanup(func() { pendingFileProjections = previous })
 	fixtures := map[int]*projectionLatencyFixture{0: prepareProjectionLatencyFixture(t, source, revision, 0), 512: prepareProjectionLatencyFixture(t, source, revision, 512)}
+	require.Equal(t, fixtures[0].files, fixtures[512].files, "matched fixture indexing populations")
+	require.Equal(t, fixtures[0].nativeSymbols, fixtures[512].nativeSymbols, "matched native FTS populations before comment-only projections")
 	probes := projectionLatencyProbes(t, fixtures[512])
 	selectPopulation := func(entries int) (func() error, error) {
 		fixture := fixtures[entries]
@@ -277,7 +283,7 @@ func TestProjectionSearchHandlerLatencyAcceptance(t *testing.T) {
 		pass = pass && row.Pass
 		comparisons = append(comparisons, row)
 	}
-	receipt := map[string]any{"schema_version": 1, "source_revision": revision, "go": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0), "samples": len(samples), "warmup_samples": len(warmup), "comparisons": comparisons, "pass": pass, "indexed_files": fixtures[0].files, "projection_entries": len(fixtures[512].snapshot.entries), "projection_charged_bytes": fixtures[512].snapshot.bytes, "fixture": "same pinned configured corpus;512 path-ordered tracked Go files with appended comments; actual native SQLite handlers; setup/warmup/validation excluded equally; alternating adjacent matched requests"}
+	receipt := map[string]any{"schema_version": 1, "source_revision": revision, "go": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0), "samples": len(samples), "warmup_samples": len(warmup), "comparisons": comparisons, "pass": pass, "indexed_files": fixtures[0].files, "indexed_files_512": fixtures[512].files, "native_fts_symbols_0": fixtures[0].nativeSymbols, "native_fts_symbols_512": fixtures[512].nativeSymbols, "projection_entries": len(fixtures[512].snapshot.entries), "projection_charged_bytes": fixtures[512].snapshot.bytes, "fixture": "same pinned configured corpus;512 path-ordered tracked Go files with appended comments; actual native SQLite handlers; setup/warmup/validation excluded equally; alternating adjacent matched requests"}
 	if runErr != nil {
 		receipt["error"] = runErr.Error()
 	}
