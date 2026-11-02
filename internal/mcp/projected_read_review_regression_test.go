@@ -133,8 +133,8 @@ func TestSymbolSourceMixedRetryPathsShareTwoActualAttempts(t *testing.T) {
 	result, err := s.wrapToolHandler(leaf)(t.Context(), makeReq("get_symbol_source", args))
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	require.True(t, result.IsError, "%s", resultText(result))
 	require.Equal(t, 2, calls, "typed mismatch plus late withdrawal cannot permit a third actual handler invocation")
+	require.True(t, result.IsError, "%s", resultText(result))
 	for _, deadline := range deadlines {
 		require.Equal(t, deadlines[0], deadline, "outer replay cannot renew the original projection budget")
 	}
