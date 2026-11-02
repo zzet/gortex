@@ -847,12 +847,12 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 	defer cancel()
 
 	for {
-		releaseTopology, ok := beginTopologyReadContext(ctx)
+		releaseTopology, ok := observedTopologyRead(ctx)
 		if !ok {
 			return nil, nil, nil, false, true
 		}
 		mu := g.ResolveMutex()
-		if !lockContext(ctx, mu) {
+		if !observedResolveLock(ctx, mu) {
 			releaseTopology()
 			return nil, nil, nil, false, true
 		}

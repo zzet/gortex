@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	EditACKMode       string
 	Binary            string
 	Manifest          string
 	Scratch           string
@@ -40,6 +41,8 @@ type runOptions struct {
 	SweepBudget       time.Duration
 	EditMean          time.Duration
 	EditCount         int
+	EditGateModes     bool
+	EditGateSeed      string
 	EditRepos         int
 	EditProbeRole     string
 	editProbeBaseline bool
@@ -69,6 +72,7 @@ func parseRun(args []string) (runOptions, error) {
 }
 
 func bindRunFlags(f *flag.FlagSet, o *runOptions) {
+	f.StringVar(&o.EditACKMode, "edit-ack", "", "owned daemon edit.ack policy: local or full; omit to preserve the full default")
 	f.StringVar(&o.Binary, "binary", "", "Gortex binary (never an existing daemon)")
 	f.StringVar(&o.Manifest, "manifest", "", "pinned JSON corpus manifest; source roots are read-only")
 	f.StringVar(&o.Scratch, "scratch", "", "artifact/private-clone parent outside all source roots")
@@ -95,10 +99,21 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditRepos, "edit-repos", 1, "edit-and-probe: one repository (default), or exactly six distinct pinned repositories")
 	bindDiscoveryFlags(f, &o.Discovery)
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
+	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
+	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditACKMode != "" && o.EditACKMode != "local" && o.EditACKMode != "full" {
+		return errors.New("--edit-ack must be local or full when explicitly set")
+	}
+	if o.EditGateSeed != "" && (!o.EditGateModes || o.EditGateSeed != "ack-wait" && o.EditGateSeed != "closed-read-gate") {
+		return errors.New("--edit-gate-seed requires --edit-gate-modes and ack-wait or closed-read-gate")
+	}
+	if o.EditGateModes && (o.Scenario != editProbeScenario || o.EditCount != 100 || o.Agents != 0) {
+		return errors.New("--edit-gate-modes requires edit-and-probe, 100 total edits and no extra pure readers")
+	}
 	if o.EditMean < 0 || o.EditMean > 0 && o.Scenario != editProbeScenario {
 		return errors.New("--edit-mean requires edit-and-probe and a nonnegative duration; 0 uses the 15s default")
 	}
@@ -305,6 +320,8 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		}
 		report.Workload.SessionModel = plan.SessionModel
 	}
+	report.Workload.EditGateSeed = o.EditGateSeed
+	report.Workload.EditACKMode = o.EditACKMode
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {

@@ -472,6 +472,70 @@ the first attests *what bytes* are on disk, the second whether the write
 happened at all. A call abandoned before its response returns no evidence block
 — only the receipt — which is exactly when `disk_status` is the field you need.
 
+### Source mutation acknowledgement policy
+
+Set the daemon's startup configuration to choose when source edits acknowledge:
+
+```yaml
+edit:
+  ack: full
+```
+
+`full` is the default. It waits for the complete admitted patch, for up to the
+existing three-second publication budget. `local` returns after the disk commit,
+exact file projection when available, and watcher admission. Both policies
+release source path locks before waiting; a graph failure never reverses a disk
+commit. Invalid modes are rejected. This is daemon configuration, not a tool
+argument, and the response's `ack_mode` records the policy used for the operation.
+Existing `require_fresh`, `freshness_scope`, and `wait_deadline` metadata can
+request a specific tier under either policy.
+
+Each committed source-file response adds `commit_seq`, the actual raw-byte
+`content_sha256` when known, `readback_exact`, and `graph_status_hint`.
+`file_view` is an object: `state`, `delta_state`, `counts`, `symbols`,
+`truncated`, and `syntax_health`. Available counts include `before`, `after`,
+`added`, `removed`, `changed`, and `total_changes`; they remain complete when
+`symbols` displays only the first 20 deterministic changes. Each displayed row
+has `change`, `id`, `kind`, `start_line`, `end_line`, and `signature`.
+An unauthenticated prior symbol set yields an unavailable delta and null counts.
+Syntax health is checked only when the acknowledgement's parse supplies an exact
+verdict; unknown health has `checked:false` and null `errors`.
+
+`readback_exact:true` requires that this write's projection is still live.
+`tier_state.file` describes that physical file view independently of the
+watcher-owned `file_graph`, `relations`, and `derived` stages. A newer write or
+invalidation can make a replay's file view unavailable or historical. Replays
+and `mutation_status` refresh live receipt evidence without parsing or writing
+again. Transactional batches retain journal authority and report per-file
+`file_views`; restarting does not reconstruct an original process-local
+projection sequence from the journal. Report full/default and explicit-local
+measurements separately; changing the mode does not establish a latency target.
+
+### Publication tiers and freshness
+
+`readback_exact:true` means the written bytes can be used immediately; continue
+without polling. Graph relations and derived analyses can publish later. Check
+`graph_freshness` before acting on callers, usages, impact, or rename plans.
+Before a rename, deletion, or signature change, send `require_fresh:true`,
+`freshness_scope:"relations"`, and an absolute RFC3339 `wait_deadline`.
+`freshness_scope` accepts `file`, `relations`, and `derived` as request metadata;
+it is intentionally absent from tool schemas. Text and declaration capability
+scopes do not select a publication tier.
+
+Pending or failed answers carry a visible tier line in text/TOON/compact output;
+GCX preserves its `GCX1` header and places the line immediately after it. JSON
+carries the same fields in its freshness block. An idle fresh answer gains no
+fields. Never classify a symbol as dead while its file is pending.
+
+`mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
+`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
+unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+a lost receipt cannot certify freshness. After restart, relation queries remain
+pending until the shared startup resolver has published. File reads still check
+current disk state. CLI verbs print the freshness line on stderr;
+`--require-fresh` exits with code 4 when the requested tier remains pending or
+failed.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |

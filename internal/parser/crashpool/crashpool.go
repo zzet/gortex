@@ -44,11 +44,12 @@ type extractRequest struct {
 
 // extractResponse is the worker → parent reply for one request.
 type extractResponse struct {
-	Seq         uint64
-	Nodes       []*graph.Node
-	Edges       []*graph.Edge
-	ParseErrors int
-	HasParseErr bool
+	Seq          uint64
+	Nodes        []*graph.Node
+	Edges        []*graph.Edge
+	ParseErrors  int
+	ParseChecked bool
+	HasParseErr  bool
 	// Err is non-empty when the extractor returned an error or
 	// panicked. Panicked distinguishes a recovered Go panic (the
 	// worker survives) from a plain error return.
@@ -58,10 +59,11 @@ type extractResponse struct {
 
 // Result is the parent-side outcome of one Submit call.
 type Result struct {
-	Nodes       []*graph.Node
-	Edges       []*graph.Edge
-	ParseErrors int
-	HasParseErr bool
+	Nodes        []*graph.Node
+	Edges        []*graph.Edge
+	ParseErrors  int
+	ParseChecked bool
+	HasParseErr  bool
 	// Crashed is true when the worker subprocess died or hung
 	// (SIGSEGV / OOM / kill / deadline). The file should be
 	// quarantined and skipped.

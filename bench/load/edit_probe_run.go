@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,11 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	AdmittedTargetLines      *int                      `json:"admitted_target_lines,omitempty"`
+	MutationTiers            *editProbeLiveTiers       `json:"mutation_tiers,omitempty"`
+	GateReadback             *Metric                   `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact         *bool                     `json:"ack_readback_exact,omitempty"`
+	ProbeMode                string                    `json:"probe_mode,omitempty"`
 	Ordinal                  int                       `json:"ordinal"`
 	Editor                   int                       `json:"editor,omitempty"`
 	Route                    string                    `json:"route,omitempty"`
@@ -137,7 +143,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{ProbeMode: step.ProbeMode, Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
@@ -628,13 +634,14 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	if !identity.WriteStarted.IsZero() {
 		sent = identity.WriteStarted
 	}
-	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle), oracle.call.name())
+	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle, s.step), oracle.call.name())
 	absence, exactRefusal := err.(*editProbeExpectedAbsence)
 	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+oracle.call.ExpectedAbsentSymbol
 	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, repo.Corpus, s.step, r.calleeFor(repo))
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
 	stale, precommit := false, false
 	s.mu.Lock()
+	postACK := !s.acknowledged.IsZero() && !sent.Before(s.acknowledged)
 	if expectedAbsence {
 		s.record.ExpectedRefusals++
 	} else if err != nil {
@@ -661,8 +668,9 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 		}
 	}
 	s.mu.Unlock()
-	r.countMode(r.probeOutput(oracle), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
-	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
+	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
+	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
+	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 
 // Activation only starts owned loops and returns. It never waits for a probe
@@ -681,7 +689,13 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 		cancel()
 		return
 	}
-	for index, oracle := range editProbeOracles(repo.Corpus, s.step) {
+	corpus := repo.Corpus
+	corpus.EditOutput = r.stepProbeMode(s.step)
+	for index, oracle := range editProbeOracles(corpus, s.step) {
+		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" {
+			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
+			oracle.call.Arguments["require_fresh"] = true
+		}
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
@@ -691,7 +705,7 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 				var data json.RawMessage
 				var identity wireCallIdentity
 				var err error
-				if r.plan.Mode == "cli" {
+				if r.stepProbeMode(s.step) == "cli" {
 					data, identity, err = r.performCLI(probeCtx, s, oracle.call, "oracle:"+oracle.name, 10+index)
 				} else {
 					data, identity, err = r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
@@ -730,6 +744,22 @@ func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*
 	s.record.StartedNS = &ns
 	s.record.StartLatenessNS = &late
 	s.record.Outcome = "in_flight"
+	if r.plan.GateModes {
+		initial := r.original
+		if len(r.p.Repos) > 1 {
+			initial = nil
+			if repo, err := r.repoFor(step); err == nil {
+				initial = r.originals[repo.Path]
+			}
+		}
+		if initial != nil {
+			lines := bytes.Count(initial, []byte{'\n'})
+			if len(initial) > 0 && initial[len(initial)-1] != '\n' {
+				lines++
+			}
+			s.record.AdmittedTargetLines = &lines
+		}
+	}
 	if s.record.ActivatedNS == nil {
 		s.record.Errors = append(s.record.Errors, "missing pre-edit activation")
 	}
@@ -823,6 +853,13 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 		return
 	}
+	if r.plan.GateModes {
+		s.mu.Lock()
+		if exact, ok := body["readback_exact"].(bool); ok {
+			s.record.ACKReadbackExact = &exact
+		}
+		s.mu.Unlock()
+	}
 	receipt, _ := body["mutation_receipt"].(string)
 	var move *editProbeMoveReferences
 	var batch *editProbeBatchReferences
@@ -882,6 +919,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 	s.signalAck()
 	readbackKinds := []string{"file", "source"}
+	if r.plan.GateModes {
+		readbackKinds = []string{"source", "file", "summary", "search_visible", "text"}
+	}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
@@ -924,6 +964,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.record.Accounting = accounting
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
+					s.record.MutationTiers = editProbeStatusTiers(status)
+					if s.record.MutationTiers != nil && s.record.MutationTiers.State == "invalid" {
+						s.record.Errors = append(s.record.Errors, "invalid live tier observation: "+s.record.MutationTiers.Reason)
+					}
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					if s.record.GraphTerminal {
 						r.settlePendingLocked(s)
@@ -1019,6 +1063,13 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			}
 		}
 		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		if kind == "search_visible" || kind == "text" {
+			operation := "symbols"
+			if kind == "text" {
+				operation = "text"
+			}
+			req = request{Tool: "search", Operation: operation, Arguments: map[string]any{"operation": operation, "query": step.Marker}}
+		}
 		if kind == "source" && step.TargetSymbol != "" {
 			req.Arguments["options"] = map[string]any{"context_lines": 0}
 		}
@@ -1054,6 +1105,13 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		}
 		back.ObservationOnly = observeOnly[kind]
 		s.mu.Lock()
+		if r.plan.GateModes && index == 0 {
+			metric := unavailable("ms", "first same-editor symbol-source readback endpoint missing or incorrect")
+			if back.Correct && !identity.Finished.IsZero() && !s.started.IsZero() && !identity.Finished.Before(s.started) {
+				metric = measured(float64(identity.Finished.Sub(s.started))/float64(time.Millisecond), "ms")
+			}
+			s.record.GateReadback = &metric
+		}
 		s.record.Readbacks = append(s.record.Readbacks, back)
 		if !back.Correct && !back.ObservationOnly {
 			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
@@ -1147,7 +1205,11 @@ func (r *editProbeRuntime) finish() error {
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
 	r.mu.Lock()
 	r.phase.EditProbe.Reads = summarizeEditProbeReads(r.reads, r.plan.Seed)
-	r.phase.EditProbe.OutputModes = editProbeOutputCoverage(r.plan.Mode, r.modeCounts)
+	selected := r.plan.Mode
+	if r.plan.GateModes {
+		selected = "gate"
+	}
+	r.phase.EditProbe.OutputModes = editProbeOutputCoverage(selected, r.modeCounts)
 	r.mu.Unlock()
 	return errors.Join(failures...)
 }

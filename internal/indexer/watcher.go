@@ -65,12 +65,15 @@ type MutationTicket struct {
 	// events have none. The watcher binds it before waking work; the existing
 	// consumer of Done records completion, never a second channel reader.
 	PublicationRecord *PublicationPhaseRecord `json:"-"`
+	tierMu            sync.RWMutex
+	tiers             MutationTierState
 }
 
 // mutationWaiter owns only outstanding ticket state. Publication metadata is
 // released with the same completion/stop paths as its existing result channel;
 // it is not a separate tracing registry or completed-history collection.
 type mutationWaiter struct {
+	ticket             *MutationTicket
 	tool               bool
 	done               chan MutationResult
 	publication        *PublicationPhaseRecord
@@ -189,7 +192,8 @@ type Watcher struct {
 	pending                    map[string]*time.Timer
 	pendingGeneration          map[string]uint64
 	mutationWaiters            map[string]map[uint64]mutationWaiter
-	heldNative                 map[string]ChangeKind // native echoes awaiting outstanding tool receipts; guarded by mu
+	failedPaths                map[string]MutationTierState // retained failures only; guarded by mu
+	heldNative                 map[string]ChangeKind        // native echoes awaiting outstanding tool receipts; guarded by mu
 	mutationEchoesAttached     uint64
 	mutationSuperseded         uint64
 	mutationWaitersLater       uint64
@@ -218,6 +222,8 @@ type Watcher struct {
 	stoppedOnce      sync.Once
 	symbolChangeCb   SymbolChangeCallback
 	symbolChangeCbMu sync.RWMutex
+	sourceEventCb    func(string)
+	sourceEventCbMu  sync.RWMutex
 
 	// Degraded-watch state: set when the OS can't fully cover the tree —
 	// inotify watch exhaustion (ENOSPC) or FD exhaustion (EMFILE/ENFILE).
@@ -251,21 +257,20 @@ type Watcher struct {
 
 	// Storm-mode state. Guarded by stormMu so the hot per-file
 	// debounce path (mu) doesn't contend with rate-tracking.
-	stormMu            sync.Mutex
-	eventTimes         []time.Time           // sliding window of recent event timestamps
-	stormBatch         map[string]ChangeKind // dirty set during an event storm
-	stormGenerations   map[string]uint64     // newest debounced generation adopted per path
-	stormTimer         *time.Timer           // fires after the quiet period
-	stormActive        bool                  // true while waiting to drain
-	stormExplicit      bool                  // admitted complete explicit frontier requires forced reads
-	stormStopped       bool                  // Stop has closed storm admission
-	stormRetryAttempt  int                   // retry ordinal for the published storm timer
-	stormWork          sync.WaitGroup        // scheduled/running timer callbacks
-	stormDrained       func(int)             // test hook: batch drained; batch size arg
-	stormBeforeLock    func()                // test hook: immediately before repository-lane admission
-	explicitReindexRaw watcherBatchReindex   // complete forced frontier; caller already holds repository lane
-	batchReindex       watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
-	discoverReindex    watcherBatchReindex   // additive directory discovery with the same complete tail
+	stormMu           sync.Mutex
+	eventTimes        []time.Time           // sliding window of recent event timestamps
+	stormBatch        map[string]ChangeKind // dirty set during an event storm
+	stormGenerations  map[string]uint64     // newest debounced generation adopted per path
+	stormTimer        *time.Timer           // fires after the quiet period
+	stormActive       bool                  // true while waiting to drain
+	stormExplicit     bool                  // admitted complete explicit frontier requires forced reads
+	stormStopped      bool                  // Stop has closed storm admission
+	stormRetryAttempt int                   // retry ordinal for the published storm timer
+	stormWork         sync.WaitGroup        // scheduled/running timer callbacks
+	stormDrained      func(int)             // test hook: batch drained; batch size arg
+	stormBeforeLock   func()                // test hook: immediately before repository-lane admission
+	batchReindex      watcherBatchReindex   // one bounded batch; MultiWatcher installs shared catch-up
+	discoverReindex   watcherBatchReindex   // additive directory discovery with the same complete tail
 	// pointReindexRaw runs the complete exact-path pipeline after the watcher
 	// already owns the repository lane. MultiWatcher installs its raw tail here.
 	pointReindexRaw func(string, *PublicationStamps) (*IndexResult, error)
@@ -1311,6 +1316,23 @@ func (w *Watcher) OnSymbolChange(cb SymbolChangeCallback) {
 	w.symbolChangeCb = cb
 }
 
+// OnSourceEvent replaces the callback invoked synchronously for a source path
+// before storm handling or debounce. The callback must return promptly.
+func (w *Watcher) OnSourceEvent(cb func(string)) {
+	w.sourceEventCbMu.Lock()
+	w.sourceEventCb = cb
+	w.sourceEventCbMu.Unlock()
+}
+
+func (w *Watcher) notifySourceEvent(path string) {
+	w.sourceEventCbMu.RLock()
+	cb := w.sourceEventCb
+	w.sourceEventCbMu.RUnlock()
+	if cb != nil {
+		cb(path)
+	}
+}
+
 // OnDegraded registers a callback invoked once when the file watcher first
 // enters a degraded state (inotify / FD exhaustion, a stopped backend, an
 // incomplete startup barrier). The daemon wires it to its health
@@ -1735,6 +1757,7 @@ func (w *Watcher) handleEvent(event fswatcher.WatchEvent) {
 		}
 		return
 	}
+	w.notifySourceEvent(path)
 
 	// Before the exclusion check: an ignore file can sit in a folder whose
 	// own events are excluded, and its rules apply all the same.
@@ -1856,6 +1879,7 @@ func (w *Watcher) mutationAdmissionPath(ctx context.Context, filePath string) (s
 		return "", errWatcherStopped
 	default:
 	}
+	w.indexer.noteToolWrite(rel)
 	return absPath, nil
 }
 
@@ -1947,11 +1971,12 @@ func (w *Watcher) EnqueueFileMutations(ctx context.Context, files []string) (map
 			w.mutationWaiters[path] = make(map[uint64]mutationWaiter)
 		}
 		done := make(chan MutationResult, 1)
-		w.mutationWaiters[path][generation] = mutationWaiter{done: done, tool: true}
+		ticket := newMutationTierTicket(path, generation, done)
+		w.mutationWaiters[path][generation] = mutationWaiter{done: done, tool: true, ticket: ticket}
 		w.pendingGeneration[path] = generation
 		w.stormGenerations[path] = generation
 		w.stormBatch[path] = ChangeModified
-		tickets[path] = &MutationTicket{Path: path, Generation: generation, Done: done}
+		tickets[path] = ticket
 	}
 	w.stormActive = true
 	w.stormExplicit = true
@@ -2041,7 +2066,7 @@ func (w *Watcher) scheduleMutationEnteredEvent(path string, kind ChangeKind, rec
 	}
 	done := make(chan MutationResult, 1)
 	w.pendingGeneration[path] = generation
-	ticket := &MutationTicket{Path: path, Generation: generation, Done: done}
+	ticket := newMutationTierTicket(path, generation, done)
 	if record != nil && record.bindCanonicalTicket(generation, time.Now()) {
 		ticket.PublicationRecord = record
 		if w.observedMutationGeneration == nil {
@@ -2049,7 +2074,7 @@ func (w *Watcher) scheduleMutationEnteredEvent(path string, kind ChangeKind, rec
 		}
 		w.observedMutationGeneration[path] = generation
 	}
-	w.mutationWaiters[path][generation] = mutationWaiter{done: done, publication: ticket.PublicationRecord, schedulingEntered: entered, backgroundEligible: backgroundEligible, tool: tool}
+	w.mutationWaiters[path][generation] = mutationWaiter{done: done, ticket: ticket, publication: ticket.PublicationRecord, schedulingEntered: entered, backgroundEligible: backgroundEligible, tool: tool}
 	delay := time.Duration(w.config.DebounceMs) * time.Millisecond
 	if tool {
 		delay = 0
@@ -2367,6 +2392,7 @@ func (w *Watcher) completeMutationWaitersObserved(
 	var accepted *PublicationPhaseRecord
 	for generation, waiter := range w.mutationWaiters[path] {
 		if generation <= appliedGeneration {
+			w.finishMutationTierLocked(path, waiter.ticket, err, fanout)
 			if err == nil && generation < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2415,6 +2441,11 @@ func (w *Watcher) completeMutationWaitersObserved(
 func (w *Watcher) failMutationWaiters(err error) {
 	w.mu.Lock()
 	waiters := w.mutationWaiters
+	for path, byGeneration := range waiters {
+		for _, waiter := range byGeneration {
+			w.finishMutationTierLocked(path, waiter.ticket, err, DerivedFanoutCompleteness{})
+		}
+	}
 	w.mutationWaiters = nil
 	w.heldNative = nil
 	w.observedMutationGeneration = nil
@@ -2527,6 +2558,29 @@ func (w *Watcher) recordInStormEvent(path string, kind ChangeKind, native bool) 
 			w.stormGenerations[path] = generation
 		}
 	}
+	// A native-only storm path has no stopped point timer to adopt. Give it
+	// the same path generation and live ticket evidence as point admission.
+	if w.stormGenerations[path] == 0 {
+		w.nextGeneration++
+		generation := w.nextGeneration
+		if w.stormGenerations == nil {
+			w.stormGenerations = make(map[string]uint64)
+		}
+		if w.pendingGeneration == nil {
+			w.pendingGeneration = make(map[string]uint64)
+		}
+		if w.mutationWaiters == nil {
+			w.mutationWaiters = make(map[string]map[uint64]mutationWaiter)
+		}
+		if w.mutationWaiters[path] == nil {
+			w.mutationWaiters[path] = make(map[uint64]mutationWaiter)
+		}
+		done := make(chan MutationResult, 1)
+		ticket := newMutationTierTicket(path, generation, done)
+		w.mutationWaiters[path][generation] = mutationWaiter{done: done, ticket: ticket}
+		w.pendingGeneration[path] = generation
+		w.stormGenerations[path] = generation
+	}
 	w.mu.Unlock()
 	w.stormBatch[path] = kind
 	w.stormRetryAttempt = 0
@@ -2624,9 +2678,9 @@ func (w *Watcher) drainStorm() {
 	var err error
 	var fanout DerivedFanoutCompleteness
 	if explicit {
-		result, fanout, err = w.reindexExplicitMutationPaths(paths)
+		result, fanout, err = w.reindexExplicitMutationPaths(paths, generations)
 	} else {
-		result, err = w.reindexStormPaths(paths)
+		result, fanout, err = w.reindexStormPathsObserved(paths, generations)
 	}
 
 	reindexed, deleted, failed := 0, 0, 0
@@ -2751,6 +2805,7 @@ func (w *Watcher) completeStormMutationWaiters(
 			if requestedGeneration > appliedGeneration {
 				continue
 			}
+			w.finishMutationTierLocked(path, waiter.ticket, pathErr, pathFanout)
 			if pathErr == nil && requestedGeneration < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2946,14 +3001,21 @@ func pointMutationClassification(
 // reindexPointPathRaw runs after the caller has acquired the repository lane.
 // MultiWatcher supplies the cross-repository resolver and derived tail; a
 // standalone Watcher falls back to the equivalent single-repository tail.
-func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, stamps *PublicationStamps) (*IndexResult, error) {
+func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, generation uint64, stamps *PublicationStamps) (*IndexResult, error) {
 	if w.pointReindexRaw != nil {
 		return w.pointReindexRaw(path, stamps)
 	}
 	if idx == nil || idx.rootPath == "" {
 		return nil, errWatcherIndexerMissing
 	}
-	return idx.incrementalPointWatcherPathObserved(idx.rootPath, path, stamps)
+	mode := incrementalPathMode{
+		detectDeletions: true, forceExplicitFiles: true, publication: stamps,
+		onRelations: func() { w.markRelations(path, generation) },
+	}
+	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+		return owner.incrementalReindexRepoRawMode(idx.repoPrefix, []string{path}, mode)
+	}
+	return idx.incrementalWatcherPaths(idx.rootPath, []string{path}, mode)
 }
 
 // patchGraphWithReceiptStateRawModern replaces the historical hand-built point
@@ -3038,7 +3100,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	observation := beginDerivedFanoutObservation(idx)
 	defer observation.close()
 	stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
-	result, err := w.reindexPointPathRaw(idx, path, PublicationStampsFrom(ctx))
+	result, err := w.reindexPointPathRaw(idx, path, generation, PublicationStampsFrom(ctx))
 	stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
 	observed := observation.close()
 	if err != nil {

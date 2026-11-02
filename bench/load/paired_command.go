@@ -50,6 +50,9 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		return o, nil, err
 	}
 	o.Binary = builds[0].binary
+	if o.EditGateSeed != "" {
+		return o, nil, errors.New("edit gate fault seeds are standalone candidate runs only")
+	}
 	if err := validateRunOptions(o); err != nil {
 		return o, nil, err
 	}

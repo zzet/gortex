@@ -22,7 +22,7 @@ type mockSourceReader struct {
 	rootPath string
 }
 
-func (m *mockSourceReader) Graph() graph.Store { return m.g }
+func (m *mockSourceReader) Graph() graph.Reader { return m.g }
 func (m *mockSourceReader) ResolveFilePath(relPath string) string {
 	if filepath.IsAbs(relPath) {
 		return relPath

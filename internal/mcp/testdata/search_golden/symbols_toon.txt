@@ -1,0 +1,5 @@
+results[2]{id,kind,name,file_path,start_line,enclosing,enclosing_id,is_test,test_role}:
+  "server/server.go::Server.HandleRequest",method,HandleRequest,server/server.go,14,Server,"server/server.go::Server",false,""
+  "server/server.go::Server.HandleHealth",method,HandleHealth,server/server.go,22,Server,"server/server.go::Server",false,""
+total: 2
+truncated: false

@@ -482,6 +482,7 @@ type Config struct {
 	// workspaces. Only `mode: read-only` is accepted in iteration 1.
 	CrossWorkspaceDeps []CrossWorkspaceDep `mapstructure:"cross_workspace_deps" yaml:"cross_workspace_deps,omitempty"`
 
+	Edit   EditConfig   `mapstructure:"edit" yaml:"edit,omitempty"`
 	Index  IndexConfig  `mapstructure:"index"    yaml:"index,omitempty"`
 	Watch  WatchConfig  `mapstructure:"watch"    yaml:"watch,omitempty"`
 	Query  QueryConfig  `mapstructure:"query"    yaml:"query,omitempty"`
@@ -1965,6 +1966,9 @@ func Load(configPath string) (*Config, error) {
 // in one pass rather than one round-trip per fix.
 func (c *Config) validateWorkspaceSchema() error {
 	var errs []string
+	if _, err := c.Edit.AckMode(); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if c.Project != "" && len(c.Projects) > 0 {
 		errs = append(errs, "config: 'project' and 'projects' are mutually exclusive — pick one")
 	}

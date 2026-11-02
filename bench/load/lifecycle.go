@@ -22,6 +22,7 @@ type privateRepo struct {
 }
 
 type privateRun struct {
+	editACKMode      string
 	discoveryRuntime *discoveryRuntimeLease              // optional fresh resume root; nil preserves ordinary ownership
 	discoveryCatalog map[string]discoveryCatalogIdentity // discovery-only observed seed identities
 	Root             string

@@ -17,7 +17,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"golang.org/x/tools/go/ast/astutil"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -378,41 +377,76 @@ func (s *Server) handleMoveSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		return s.respondJSONOrTOON(ctx, req, resp)
 	}
 
+	plans := []plannedSource{{path: srcAbs, before: srcContent, existed: true}, {path: tgtAbs, before: tgtContent, existed: tgtExists}}
+	for _, edit := range callerEdits {
+		plans = append(plans, plannedSource{path: edit.absPath, before: edit.origContent, existed: true})
+	}
+	ctx, release, lockErr := lockPlannedSources(ctx, plans)
+	if lockErr != nil {
+		return mcp.NewToolResultError(lockErr.Error()), nil
+	}
+	defer release()
+	// Preserve the move's existing terminal write sequence after the complete
+	// CAS/cancellation boundary; do not strand its target half on cancellation.
+	ctx = context.WithoutCancel(ctx)
+	physical := make(map[string]*mutationCommitRecord, len(plans))
 	measurement := s.beginMoveObservation(ctx, id, resp["target_id"].(string), srcAbs, tgtAbs, srcRel, tgtRelOut, samePackage && len(callerEdits) == 0)
 	defer measurement.finishWrites(false)
+	var targets []sourceMutationTarget
+	completed := false
+	finish := func() {
+		if completed {
+			return
+		}
+		completed = true
+		// Writes remain target-first. Preserve the embedded adapter's
+		// historical source-before-target reconcile order after unlocking.
+		if len(targets) >= 2 && targets[0].path == tgtAbs && targets[1].path == srcAbs {
+			targets[0], targets[1] = targets[1], targets[0]
+		}
+		admissions := s.admitSourceMutationFrontier(ctx, targets)
+		for i, target := range targets {
+			measurement.observeAdmission(target.path, &admissions[i])
+		}
+		release()
+		for i, outcome := range s.awaitSourceMutationFrontier(ctx, admissions) {
+			physical[targets[i].path].recordGraph(outcome)
+		}
+	}
+	defer finish() // Admit an already-committed subset even after a later I/O fault.
+	write := func(path string, content []byte) error {
+		record, err := measurement.write(ctx, s, path, content)
+		if record != nil {
+			physical[path] = record
+			if err == nil {
+				targets = append(targets, captureSourceMutationTarget(ctx, path))
+			}
+		}
+		return err
+	}
 	// Apply writes atomically. Order: target first (so file exists for any
 	// caller that triggers a follow-up open), then source, then callers.
-	if err := measurement.write(editAcknowledgementFrom(ctx, s), tgtAbs, newTgtContent); err != nil {
+	if err := write(tgtAbs, newTgtContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	observeEditSourceReplacement(ctx, tgtContent, newTgtContent, tgtExists, true)
-	if err := measurement.write(editAcknowledgementFrom(ctx, s), srcAbs, newSrcContent); err != nil {
+	if err := write(srcAbs, newSrcContent); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	observeEditSourceReplacement(ctx, srcContent, newSrcContent, true, true)
 	for _, ce := range callerEdits {
-		if err := measurement.write(editAcknowledgementFrom(ctx, s), ce.absPath, ce.newContent); err != nil {
+		if err := write(ce.absPath, ce.newContent); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		observeEditSourceReplacement(ctx, ce.origContent, ce.newContent, true, true)
 	}
 	measurement.finishWrites(true)
 	observeEditSourceComplete(ctx)
+	finish()
 
-	// Re-index every touched file so the graph picks up the new location.
 	sess := s.sessionFor(ctx)
 	for _, t := range touched {
 		sess.recordModified(t.Path)
-	}
-	if measurement != nil {
-		_ = measurement.reindex(ctx, srcAbs)
-		_ = measurement.reindex(ctx, tgtAbs)
-	} else {
-		_ = s.reindexFile(srcAbs)
-		_ = s.reindexFile(tgtAbs)
-	}
-	for _, ce := range callerEdits {
-		_ = s.reindexFile(ce.absPath)
 	}
 
 	if measurement != nil {
@@ -464,25 +498,15 @@ func buildMovedSymbolID(s *Server, tgtAbs, name string) string {
 	return rel + "::" + name
 }
 
-func writeMoveFile(absPath string, content []byte) error {
-	return writeMoveFileObserved(nil, absPath, content)
-}
-
-func writeMoveFileObserved(a *editAcknowledgement, absPath string, content []byte) error {
+func (s *Server) writeMoveFile(ctx context.Context, tool, absPath string, content []byte) (*mutationCommitRecord, error) {
 	perm := os.FileMode(0o644)
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-		return fmt.Errorf("could not create parent dir for %s: %w", absPath, err)
+		return nil, fmt.Errorf("could not create parent dir for %s: %w", absPath, err)
 	}
-	lap := beginEditAcknowledgementLap(a, editAckDiskWrite)
-	err := agents.AtomicWriteFile(absPath, content, perm)
-	lap.finish()
-	if err != nil {
-		return fmt.Errorf("could not write %s: %w", absPath, err)
-	}
-	return nil
+	return s.commitFileMutation(ctx, tool, "", "", s.repoRelative(absPath), absPath, content, perm)
 }
 
 // extractGoTopLevelDecl finds the top-level declaration named `name` inside
@@ -1243,18 +1267,41 @@ func (s *Server) handleInlineSymbol(ctx context.Context, req mcp.CallToolRequest
 		})
 	}
 
-	// Optionally delete the callee.
+	// A caller in the callee's own file is one physical source plan. Remove
+	// the declaration from the rewritten candidate, never from its old bytes.
 	var calleeNewContent []byte
-	calleeDeleted := false
+	calleeDeleted, calleeInCaller := false, false
 	if deleteAfter {
-		spliced, derr := spliceOutGoDecl(calleeContent, calleeFset, calleeDocless)
-		if derr != nil {
-			return mcp.NewToolResultError(derr.Error()), nil
+		for i := range patches {
+			if patches[i].absPath != calleeAbs {
+				continue
+			}
+			patchedFset := token.NewFileSet()
+			patchedFile, parseErr := parser.ParseFile(patchedFset, calleeAbs, patches[i].patched, parser.ParseComments)
+			if parseErr != nil {
+				return mcp.NewToolResultError(parseErr.Error()), nil
+			}
+			_, declaration, locateErr := findGoFunc(patchedFile, node.Name)
+			if locateErr != nil {
+				return mcp.NewToolResultError(locateErr.Error()), nil
+			}
+			spliced, spliceErr := spliceOutGoDecl(patches[i].patched, patchedFset, declaration)
+			if spliceErr != nil {
+				return mcp.NewToolResultError(spliceErr.Error()), nil
+			}
+			patches[i].patched = spliced
+			calleeInCaller = true
+			break
 		}
-		calleeNewContent = spliced
+		if !calleeInCaller {
+			spliced, spliceErr := spliceOutGoDecl(calleeContent, calleeFset, calleeDocless)
+			if spliceErr != nil {
+				return mcp.NewToolResultError(spliceErr.Error()), nil
+			}
+			calleeNewContent = spliced
+		}
 		calleeDeleted = true
 	}
-
 	type touched struct {
 		Path        string `json:"path"`
 		Role        string `json:"role"`
@@ -1274,7 +1321,7 @@ func (s *Server) handleInlineSymbol(ctx context.Context, req mcp.CallToolRequest
 			ImportRem:   p.removedImp,
 		})
 	}
-	if calleeDeleted {
+	if calleeDeleted && !calleeInCaller {
 		touchedList = append(touchedList, touched{
 			Path:        s.repoRelative(calleeAbs),
 			Role:        "callee_deleted",
@@ -1302,25 +1349,59 @@ func (s *Server) handleInlineSymbol(ctx context.Context, req mcp.CallToolRequest
 		return s.respondJSONOrTOON(ctx, req, resp)
 	}
 
-	for _, p := range patches {
-		if err := writeMoveFile(p.absPath, p.patched); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+	plans := make([]plannedSource, 0, len(patches)+1)
+	for _, patch := range patches {
+		plans = append(plans, plannedSource{path: patch.absPath, before: patch.orig, existed: true})
+	}
+	if calleeDeleted && !calleeInCaller {
+		plans = append(plans, plannedSource{path: calleeAbs, before: calleeContent, existed: true})
+	}
+	ctx, release, lockErr := lockPlannedSources(ctx, plans)
+	if lockErr != nil {
+		return mcp.NewToolResultError(lockErr.Error()), nil
+	}
+	defer release()
+	ctx = context.WithoutCancel(ctx)
+	physical := make(map[string]*mutationCommitRecord, len(plans))
+	var targets []sourceMutationTarget
+	completed := false
+	finish := func() {
+		if completed {
+			return
+		}
+		completed = true
+		admissions := s.admitSourceMutationFrontier(ctx, targets)
+		release()
+		for i, outcome := range s.awaitSourceMutationFrontier(ctx, admissions) {
+			physical[targets[i].path].recordGraph(outcome)
 		}
 	}
-	if calleeDeleted {
-		if err := writeMoveFile(calleeAbs, calleeNewContent); err != nil {
+	defer finish()
+
+	for _, patch := range patches {
+		record, err := s.writeMoveFile(ctx, "inline_symbol", patch.absPath, patch.patched)
+		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		physical[patch.absPath] = record
+		targets = append(targets, captureSourceMutationTarget(ctx, patch.absPath))
 	}
+	if calleeDeleted && !calleeInCaller {
+		record, err := s.writeMoveFile(ctx, "inline_symbol", calleeAbs, calleeNewContent)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		physical[calleeAbs] = record
+		targets = append(targets, captureSourceMutationTarget(ctx, calleeAbs))
+	}
+	finish()
 
 	sess := s.sessionFor(ctx)
 	for _, p := range patches {
 		sess.recordModified(s.repoRelative(p.absPath))
-		_ = s.reindexFile(p.absPath)
 	}
-	if calleeDeleted {
+	if calleeDeleted && !calleeInCaller {
 		sess.recordModified(s.repoRelative(calleeAbs))
-		_ = s.reindexFile(calleeAbs)
 	}
 
 	return s.respondJSONOrTOON(ctx, req, resp)

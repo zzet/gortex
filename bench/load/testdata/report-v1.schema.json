@@ -622,7 +622,27 @@
                           ],
                           "type": "object"
                         },
+                        "ack_readback_exact": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "activated_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "admitted_target_lines": {
                           "anyOf": [
                             {
                               "type": "integer"
@@ -1025,6 +1045,49 @@
                         "mutation_receipt": {
                           "type": "string"
                         },
+                        "mutation_tiers": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "ack_at": {
+                                  "type": "string"
+                                },
+                                "derived_at": {
+                                  "type": "string"
+                                },
+                                "file_graph_at": {
+                                  "type": "string"
+                                },
+                                "observation_state": {
+                                  "type": "string"
+                                },
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "relations_at": {
+                                  "type": "string"
+                                },
+                                "tier_state": {
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "observation_state"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "native_write": {
                           "anyOf": [
                             {
@@ -1235,6 +1298,9 @@
                         },
                         "probe_errors": {
                           "type": "integer"
+                        },
+                        "probe_mode": {
+                          "type": "string"
                         },
                         "raw_evidence": {
                           "type": "string"
@@ -1563,6 +1629,40 @@
                           ],
                           "type": "object"
                         },
+                        "t_gate_readback_ms": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "t_readback_ms": {
                           "additionalProperties": false,
                           "properties": {
@@ -1700,6 +1800,16 @@
                         "decode_failures": {
                           "type": "integer"
                         },
+                        "observed_edits": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "precommit_fresh_mismatches_unassessed": {
                           "type": "integer"
                         },
@@ -1738,6 +1848,67 @@
                         },
                         "state": {
                           "type": "string"
+                        },
+                        "tools": {
+                          "additionalProperties": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "claims_fresh": {
+                                "type": "integer"
+                              },
+                              "correct_edits": {
+                                "type": "integer"
+                              },
+                              "decode_failures": {
+                                "type": "integer"
+                              },
+                              "fallback_answers": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "observed_edits": {
+                                "type": "integer"
+                              },
+                              "probe_answers": {
+                                "type": "integer"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "refused_edits": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "state": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "state",
+                              "correct_edits",
+                              "probe_answers",
+                              "observed_edits",
+                              "decode_failures",
+                              "claims_fresh"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
                         }
                       },
                       "required": [
@@ -1776,6 +1947,9 @@
                       },
                       "file": {
                         "type": "string"
+                      },
+                      "gate_modes": {
+                        "type": "boolean"
                       },
                       "kind": {
                         "type": "string"
@@ -1927,6 +2101,9 @@
                             },
                             "ordinal": {
                               "type": "integer"
+                            },
+                            "probe_mode": {
+                              "type": "string"
                             },
                             "relocated": {
                               "type": "boolean"
@@ -3592,8 +3769,14 @@
         "duration_seconds": {
           "type": "number"
         },
+        "edit_ack_mode": {
+          "type": "string"
+        },
         "edit_agents": {
           "type": "integer"
+        },
+        "edit_gate_seed": {
+          "type": "string"
         },
         "edit_probe": {
           "anyOf": [
@@ -3617,6 +3800,9 @@
                 },
                 "file": {
                   "type": "string"
+                },
+                "gate_modes": {
+                  "type": "boolean"
                 },
                 "kind": {
                   "type": "string"
@@ -3768,6 +3954,9 @@
                       },
                       "ordinal": {
                         "type": "integer"
+                      },
+                      "probe_mode": {
+                        "type": "string"
                       },
                       "relocated": {
                         "type": "boolean"

@@ -53,7 +53,7 @@ func canonicalTimingContext() context.Context {
 
 func commitTimingFixture(t *testing.T, s *Server, ctx context.Context, path, content string) *mutationCommitRecord {
 	t.Helper()
-	record, err := s.commitFileMutation(ctx, "write_file", "", "", filepath.Base(path), path, []byte(content), 0o600)
+	record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", filepath.Base(path), path, []byte(content), 0o600)
 	require.NoError(t, err)
 	return record
 }
