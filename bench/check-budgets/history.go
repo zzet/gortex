@@ -151,7 +151,7 @@ func historyVerdict(evidence []nightlyEvidence, through time.Time, hosts []strin
 		complete := true
 		for _, host := range hosts {
 			item, ok := cohorts[key][host]
-			good := ok && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
+			good := ok && item.receipt.Plan.NightlySeed == nil && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
 			fmt.Fprintf(out, "%s / %s: complete main nightly-equivalent = %t\n", host, key, good)
 			complete = complete && good
 		}
