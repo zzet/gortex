@@ -2,10 +2,20 @@ package hooks
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// stubPath resolves p against cwd as a slash path, so the stubs below see
+// the same /repo paths on every OS.
+func stubPath(cwd, p string) string {
+	if p = filepath.ToSlash(p); !strings.HasPrefix(p, "/") {
+		p = path.Join(filepath.ToSlash(cwd), p)
+	}
+	return path.Clean(p)
+}
 
 // stubWalkScopes makes /repo, /repo/internal and /abs/src directory scopes
 // that hold indexed source, and every other directory one that does not;
@@ -16,10 +26,7 @@ func stubWalkScopes(t *testing.T) *[]string {
 	probed := &[]string{}
 	old := scopeTrackedFn
 	scopeTrackedFn = func(cwd, scope string) (bool, bool) {
-		if !filepath.IsAbs(scope) {
-			scope = filepath.Join(cwd, scope)
-		}
-		scope = filepath.Clean(scope)
+		scope = stubPath(cwd, scope)
 		*probed = append(*probed, scope)
 		switch scope {
 		case "/repo", "/repo/internal", "/abs/src":
@@ -29,7 +36,7 @@ func stubWalkScopes(t *testing.T) *[]string {
 	}
 	oldHolds := holdsSourceFn
 	holdsSourceFn = func(cwd, dir string) bool {
-		return filepath.Join(cwd, dir) != "/repo/internal" && dir != "/repo/internal"
+		return stubPath(cwd, dir) != "/repo/internal"
 	}
 	t.Cleanup(func() { scopeTrackedFn, holdsSourceFn = old, oldHolds })
 	return probed
