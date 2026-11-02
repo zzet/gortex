@@ -89,6 +89,10 @@ type daemonState struct {
 	migratedStore bool
 }
 
+// buildDaemonStateForStart keeps the foreground startup boundary injectable for
+// owned-process migration/listener regressions. Production uses the same builder.
+var buildDaemonStateForStart = buildDaemonState
+
 // buildDaemonState builds the daemon's stack through the shared
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.
@@ -256,6 +260,16 @@ func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.Migration
 			zap.Duration("elapsed", progress.Elapsed), zap.Error(progress.Error))
 		r.state.StartupPhase = daemon.StartupFailed
 		r.state.StartupError = boundedStartupError(progress.Error)
+	case store_sqlite.MigrationBackupCreated:
+		r.logger.Info("daemon: backed up the store before its schema upgrade",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail),
+			zap.Duration("elapsed", progress.Elapsed))
+	case store_sqlite.MigrationBackupKept:
+		r.logger.Info("daemon: kept the existing pre-upgrade store backup",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail))
+	case store_sqlite.MigrationBackupSkipped:
+		r.logger.Warn("daemon: upgrading the store schema without a backup",
+			zap.Int("from_version", progress.Version), zap.String("reason", progress.Detail))
 	}
 	r.publishLocked()
 }
@@ -304,14 +318,27 @@ func (r *daemonStartupReporter) publishLocked() {
 	}
 }
 
+// startupFailedMessage is the recorded reason for every startup failure that
+// has no typed, safe rendering of its own.
+const startupFailedMessage = "startup failed; check the daemon log"
+
 func boundedStartupError(err error) string {
 	if err == nil {
 		return ""
 	}
+	// A refused store upgrade is the one failure the user has to act on
+	// before a restart can succeed, so it is recorded with its numbers. It is
+	// rendered from the typed fields only, never from the wrapped chain; the
+	// path is this daemon's own resolved store, the same value BackendPath
+	// records once it serves.
+	var short *store_sqlite.InsufficientUpgradeSpaceError
+	if errors.As(err, &short) {
+		return short.Error() + " (--backend-path starts the daemon on another volume)"
+	}
 	// Runtime state is consumed out of band and must not become a side
 	// channel for SQL text, filesystem paths, DSNs, or credentials embedded in
 	// wrapped errors. The daemon log retains the full structured error.
-	return "startup failed; check the daemon log"
+	return startupFailedMessage
 }
 
 // warmupTimings collects the per-phase costs of one warmupDaemonState run so
@@ -599,7 +626,13 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 					return nil, timings
 				}
 				finishPurge := startWarmupStep(logger, "orphan_prefix_purge", zap.String("repo", prefix))
-				if err := purger.PurgeRepo(prefix); err != nil {
+				purge := purger.PurgeRepo
+				if scoped, ok := state.graph.(interface {
+					PurgeRepoContext(context.Context, string) error
+				}); ok {
+					purge = func(prefix string) error { return scoped.PurgeRepoContext(ctx, prefix) }
+				}
+				if err := purge(prefix); err != nil {
 					purgeFailures++
 					finishPurge(zap.String("outcome", "error"), zap.Error(err))
 					logger.Warn("daemon: purging orphaned repo prefix failed",
