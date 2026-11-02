@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
@@ -649,6 +650,9 @@ func runUntrack(cmd *cobra.Command, args []string) error {
 	if err := gc.Save(); err != nil {
 		return fmt.Errorf("saving global config: %w", err)
 	}
+	logger := newLogger().WithOptions(zap.WithCaller(false))
+	logger.Info("config: removed tracked repo", zap.String("root", target), zap.String("cause", "untrack"), zap.String("caller", "runUntrack"))
+	_ = logger.Sync()
 	notifyDaemonReload()
 	emitUntrackSummary(w, target, untrackResult{configOnly: true, repoCount: len(gc.Repos)})
 	return nil

@@ -86,6 +86,16 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 	if err := validateAuthorizeUntrackRequest(req); err != nil {
 		return AuthorizeUntrackResult{}, err
 	}
+	// The explicit catalog authorization also covers direct callers: a newly
+	// proposed journal always records its cause in the same transaction. Existing
+	// journal token, phase and cause remain immutable and must pass the proof below.
+	if req.Cleanup != nil {
+		entry, err := explicitCleanupEntry(*req.Cleanup)
+		if err != nil {
+			return AuthorizeUntrackResult{}, err
+		}
+		req.Cleanup = &entry
+	}
 	var out AuthorizeUntrackResult
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		if req.Cleanup != nil {
@@ -94,6 +104,9 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 				return err
 			}
 			if found {
+				if err := requireExplicitCleanupCauseTx(ctx, tx, entry, req.CheckoutID); err != nil {
+					return err
+				}
 				if entry.Reason != req.Cleanup.Reason {
 					return fmt.Errorf("%w: cleanup %s is %q, not %q", ErrCatalogStaleGuard,
 						req.Cleanup.CleanupID, entry.Reason, req.Cleanup.Reason)

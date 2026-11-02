@@ -38,7 +38,7 @@ func (h *cleanupAttemptHooks) PurgeCheckoutLayers(ctx context.Context, _, _ stri
 	}
 }
 
-func (h *cleanupAttemptHooks) ReleaseGraph(context.Context, string) error {
+func (h *cleanupAttemptHooks) ReleaseGraph(context.Context, string, string) error {
 	h.releaseCalls.Add(1)
 	if h.failRelease.Load() {
 		return errCleanupAttemptRetry
@@ -209,6 +209,10 @@ func TestCleanupAttemptLegacyRecoveryRetainsIdentityAcrossRetry(t *testing.T) {
 	hooks := &cleanupAttemptHooks{}
 	hooks.failRelease.Store(true)
 	r := &Reconciler{catalog: f.catalog, hooks: hooks, now: time.Now}
+	// The prior explicit untrack revoked intent before the legacy crash.
+	if err := f.catalog.UpsertTrackingIntent(ctx, store_sqlite.TrackingIntent{IntentID: "revoked", CheckoutID: f.owner.CheckoutID, SourceKind: store_sqlite.IntentSourceCLITrack, SourceLocator: "cli", Active: false, RevokedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
 	target := f.target()
 	payload, err := json.Marshal(target)
 	if err != nil {

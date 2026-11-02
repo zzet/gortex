@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.uber.org/zap"
 	"slices"
 	"strings"
 
@@ -108,6 +109,8 @@ var sagaPhases = map[sagaKind][]sagaPhase{
 // left to read them back from.
 type sagaTarget struct {
 	AttemptID string `json:"cleanup_attempt_id,omitempty"`
+	Cause     string `json:"cause,omitempty"`
+	Root      string `json:"root,omitempty"`
 	// Exact persisted snapshot for one-time legacy recovery; never serialized.
 	journalSnapshot *store_sqlite.CleanupEntry
 	Kind            sagaKind  `json:"kind"`
@@ -156,10 +159,14 @@ func (t sagaTarget) purgeCleanupID() string {
 // error — the saga runs anyway and cleans up whatever the interrupted attempt
 // left behind.
 func (r *Reconciler) ForgetCheckout(ctx context.Context, checkoutID, incarnation string) error {
+	return r.forgetCheckout(ctx, checkoutID, incarnation, CauseForget)
+}
+
+func (r *Reconciler) forgetCheckout(ctx context.Context, checkoutID, incarnation, cause string) error {
 	if checkoutID == "" || incarnation == "" {
 		return fmt.Errorf("%w: forget_checkout needs a checkout id and an incarnation", ErrSagaTarget)
 	}
-	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: checkoutID, Incarnation: incarnation}
+	target := sagaTarget{Kind: sagaForgetCheckout, CheckoutID: checkoutID, Incarnation: incarnation, Cause: cause}
 
 	existing, ok, err := r.catalog.GetCheckout(ctx, checkoutID)
 	if err != nil {
@@ -195,10 +202,14 @@ func (r *Reconciler) ForgetCheckout(ctx context.Context, checkoutID, incarnation
 // retirement leaves the family with no dedicated graph at all, the closure
 // continues into ForgetFamily.
 func (r *Reconciler) RetirePrimaryClosure(ctx context.Context, graphID string, primaryEpoch int64) error {
+	return r.retirePrimaryClosure(ctx, graphID, primaryEpoch, CauseForget)
+}
+
+func (r *Reconciler) retirePrimaryClosure(ctx context.Context, graphID string, primaryEpoch int64, cause string) error {
 	if graphID == "" {
 		return fmt.Errorf("%w: retire_primary_closure needs a graph id", ErrSagaTarget)
 	}
-	target := sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: graphID, PrimaryEpoch: primaryEpoch}
+	target := sagaTarget{Kind: sagaRetirePrimaryClosure, GraphID: graphID, PrimaryEpoch: primaryEpoch, Cause: cause}
 
 	graph, ok, err := r.catalog.GetDedicatedGraph(ctx, graphID)
 	if err != nil {
@@ -235,7 +246,7 @@ func (r *Reconciler) ForgetFamily(ctx context.Context, familyID string) error {
 	if familyID == "" {
 		return fmt.Errorf("%w: forget_family needs a family id", ErrSagaTarget)
 	}
-	return r.enterSaga(ctx, sagaTarget{Kind: sagaForgetFamily, FamilyID: familyID})
+	return r.enterSaga(ctx, sagaTarget{Kind: sagaForgetFamily, FamilyID: familyID, Cause: CauseForget})
 }
 
 // Resume re-runs every teardown the journal still shows as unfinished.
@@ -281,6 +292,7 @@ func (r *Reconciler) enterSaga(ctx context.Context, target sagaTarget) error {
 		return err
 	}
 	if found {
+		target.Cause = resumed.Cause
 		target.AttemptID = resumed.AttemptID
 		target.journalSnapshot = resumed.journalSnapshot
 		// The journal is the authority on progress. Ids the caller supplied
@@ -319,6 +331,34 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 		return err
 	}
 	defer releaseExecution()
+	target.Cause, err = r.inferCleanupCause(ctx, target)
+	if err != nil {
+		return err
+	}
+	if target.CheckoutID == "" && target.GraphID != "" {
+		if graph, found, err := r.catalog.GetDedicatedGraph(ctx, target.GraphID); err != nil {
+			return err
+		} else if found {
+			target.CheckoutID = graph.OwnerCheckoutID
+			if target.FamilyID == "" {
+				target.FamilyID = graph.FamilyID
+			}
+		}
+	}
+	if target.Root == "" && target.CheckoutID != "" {
+		if checkout, found, err := r.catalog.GetCheckout(ctx, target.CheckoutID); err != nil {
+			return err
+		} else if found {
+			target.Root = checkout.RootPath
+		}
+	}
+	if r.logger != nil {
+		r.logger.Info("checkout cleanup: entered", zap.String("family", target.FamilyID), zap.String("checkout", target.CheckoutID), zap.String("graph", target.GraphID), zap.String("cause", target.Cause), zap.String("kind", string(target.Kind)), zap.String("root", target.Root), zap.String("disposition", "cleanup"), zap.String("evidence", string(EvidenceNone)), zap.String("detail", string(target.Phase)))
+	}
+
+	if refused, err := r.refuseAutomaticCleanup(ctx, target); refused || err != nil {
+		return err
+	}
 
 	// LIFO is intentional: final graph notifications precede release of the
 	// stable-ID gate, so an old finish callback cannot mark a successor done.
@@ -339,7 +379,7 @@ func (r *Reconciler) runSaga(ctx context.Context, target sagaTarget) error {
 			return err
 		}
 		if target.Kind != sagaPurgeLayers {
-			if err := r.beginRepositoryCleanup(ctx, target.GraphID); err != nil {
+			if err := r.beginRepositoryCleanup(ctx, target.GraphID, target.Cause); err != nil {
 				return errors.Join(err, r.persistPhase(ctx, id, target, store_sqlite.CleanupPhaseFailed))
 			}
 		}
@@ -372,7 +412,7 @@ func (r *Reconciler) runPhase(ctx context.Context, target sagaTarget) error {
 	case phaseDeleteRefViews:
 		return r.deleteRefViews(ctx, target.GraphID)
 	case phaseReleaseGraph:
-		return r.releaseGraph(ctx, target.GraphID)
+		return r.releaseGraph(ctx, target.GraphID, target.Cause)
 	case phaseDeleteCheckoutRow:
 		return r.deleteCheckoutRow(ctx, target)
 	case phaseVerifyCheckoutGone:
@@ -438,7 +478,7 @@ func (r *Reconciler) deleteRefViews(ctx context.Context, graphID string) error {
 }
 
 // releaseGraph hands the graph back to its owner and drops its row.
-func (r *Reconciler) releaseGraph(ctx context.Context, graphID string) error {
+func (r *Reconciler) releaseGraph(ctx context.Context, graphID, cause string) error {
 	if graphID == "" {
 		return nil
 	}
@@ -449,7 +489,7 @@ func (r *Reconciler) releaseGraph(ctx context.Context, graphID string) error {
 	if !present {
 		return nil
 	}
-	if err := r.hooks.ReleaseGraph(ctx, graphID); err != nil {
+	if err := r.hooks.ReleaseGraph(ctx, graphID, cause); err != nil {
 		return err
 	}
 	return ignoreNotFound(r.catalog.DeleteDedicatedGraph(ctx, graphID))
@@ -466,7 +506,13 @@ func (r *Reconciler) deleteCheckoutRow(ctx context.Context, target sagaTarget) e
 	if target.CheckoutID == "" {
 		return nil
 	}
-	if err := ignoreNotFound(r.catalog.DeleteCheckout(ctx, target.CheckoutID)); err != nil {
+	var err error
+	if ConfigRemovalAllowed(target.Cause) {
+		err = r.catalog.DeleteCheckout(ctx, target.CheckoutID)
+	} else {
+		err = r.catalog.DeleteAutomaticCheckout(ctx, target.CheckoutID, target.Incarnation)
+	}
+	if err := ignoreNotFound(err); err != nil {
 		return err
 	}
 	return ignoreNotFound(r.catalog.DeleteCleanupEntry(ctx, target.purgeCleanupID()))
@@ -547,7 +593,7 @@ func (r *Reconciler) forgetDependents(ctx context.Context, target sagaTarget) er
 		if checkout.EffectiveMode != store_sqlite.CheckoutModeAutomatic {
 			continue
 		}
-		if err := r.ForgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation); err != nil {
+		if err := r.forgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation, target.Cause); err != nil {
 			return err
 		}
 	}
@@ -565,10 +611,10 @@ func (r *Reconciler) forgetPrimaryOwner(ctx context.Context, target sagaTarget) 
 			return err
 		}
 		if present {
-			return r.ForgetCheckout(ctx, owner.CheckoutID, owner.Incarnation)
+			return r.forgetCheckout(ctx, owner.CheckoutID, owner.Incarnation, target.Cause)
 		}
 	}
-	return r.releaseGraph(ctx, target.GraphID)
+	return r.releaseGraph(ctx, target.GraphID, target.Cause)
 }
 
 // verifyClosureGone checks the family really has no primary left, and carries
@@ -592,7 +638,7 @@ func (r *Reconciler) verifyClosureGone(ctx context.Context, target sagaTarget) e
 		}
 	}
 	if len(graphs) == 0 {
-		return r.ForgetFamily(ctx, target.FamilyID)
+		return r.enterSaga(ctx, sagaTarget{Kind: sagaForgetFamily, FamilyID: target.FamilyID, Cause: target.Cause})
 	}
 	return nil
 }
@@ -612,7 +658,7 @@ func (r *Reconciler) forgetFamilyCheckouts(ctx context.Context, target sagaTarge
 		return boolOrder(a.AdminName == gitstate.MainAdminName) - boolOrder(b.AdminName == gitstate.MainAdminName)
 	})
 	for _, checkout := range checkouts {
-		if err := r.ForgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation); err != nil {
+		if err := r.forgetCheckout(ctx, checkout.CheckoutID, checkout.Incarnation, target.Cause); err != nil {
 			return err
 		}
 	}
@@ -633,9 +679,14 @@ func (r *Reconciler) deleteFamilyRow(ctx context.Context, target sagaTarget) err
 // records it as done for this exact incarnation. It is what an expiring
 // availability grace calls, and the journal entry is what stops a restart from
 // purging the same incarnation a second time.
-func (r *Reconciler) purgeLayersOnce(ctx context.Context, checkout store_sqlite.Checkout) error {
+func (r *Reconciler) purgeLayersOnce(ctx context.Context, checkout store_sqlite.Checkout, causes ...string) error {
+	cause := CauseReconcileAvailability
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
 	target := sagaTarget{
 		Kind:        sagaPurgeLayers,
+		Cause:       cause,
 		CheckoutID:  checkout.CheckoutID,
 		Incarnation: checkout.Incarnation,
 		FamilyID:    checkout.FamilyID,
