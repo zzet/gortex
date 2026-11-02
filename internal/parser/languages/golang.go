@@ -1289,17 +1289,17 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 
 	// Same-file constant/variable value references → impact-radius reads.
 	root.WithScratch(func() { captureValueRefCandidates(result, root, filePath, src) })
-	root.WithScratch(func() { captureFnValueCandidates(result, root, filePath, src) })
 
-	// Gin middleware-chain dispatcher + route registrations → resolver hints.
-	mineGinMiddleware(src, result)
-
-	// Composite/generic element type references — generic arguments,
-	// map key/value, channel element. These positions are dropped by the
-	// bare-name type passes, so without this find_usages of a type misses
-	// every place it appears only as an argument/element type.
+	// Collect once before the original tail emission phases. Function values
+	// still precede Gin metadata, type references and GoFrame routes.
 	root.WithScratch(func() {
 		work := collectGoTailWork(root, src)
+		captureFnValueCandidatesWithGoWork(result, root, filePath, src, &work)
+
+		// Gin middleware-chain dispatcher + route registrations → resolver hints.
+		mineGinMiddleware(src, result)
+
+		// Composite/generic element type references preserve later parameters.
 		emitGoTypeArgReferences(work, src, filePath, fileID, funcRanges, result)
 
 		// GoFrame reflective routes retain their original tail emission order.

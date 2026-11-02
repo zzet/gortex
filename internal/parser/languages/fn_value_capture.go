@@ -77,6 +77,13 @@ type FnValueCandidate struct {
 // the file actually declares means it never emits a candidate that cannot bind.
 // Call it once at the end of an extractor's Extract with the parse-tree root.
 func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte) {
+	captureFnValueCandidatesWithGoWork(result, root, filePath, src, nil)
+}
+
+// captureFnValueCandidatesWithGoWork retains the common semantic callback.
+// Only Go supplies the two qualifying grammar kinds from its existing tail
+// preorder; other extractors keep the original all-node walk through the wrapper.
+func captureFnValueCandidatesWithGoWork(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte, goWork *goTailWork) {
 	if root == nil || result == nil {
 		return
 	}
@@ -105,7 +112,7 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 	spec := fnRefSpecFor(lang)
 	var cands []FnValueCandidate
 	seen := map[string]bool{}
-	walkNodes(root, func(n *sitter.Node) {
+	visit := func(n *sitter.Node) {
 		// Special whole-node forms (method references, this.m / self.m,
 		// Ruby symbol callables, selectors) are normalised to a (member,
 		// receiver-hint) pair before the plain-identifier path.
@@ -194,7 +201,14 @@ func captureFnValueCandidates(result *parser.ExtractionResult, root *sitter.Node
 			FromID: fromID, Name: name, FilePath: filePath, Line: line,
 			Form: spec.fnRefForm(n), Lang: lang, Ungated: ungated,
 		})
-	})
+	}
+	if goWork == nil {
+		walkNodes(root, visit)
+	} else {
+		for _, n := range goWork.fnValueNodes {
+			visit(n)
+		}
+	}
 	EmitFnValueCandidates(result, cands)
 }
 

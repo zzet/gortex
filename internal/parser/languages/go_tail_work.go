@@ -2,13 +2,14 @@ package languages
 
 import sitter "github.com/zzet/gortex/internal/parser/tsitter"
 
-// goTailWork shares the existing Go type-reference preorder with GoFrame's
-// three unpruned whole-tree scans. Each queue retains the named-node preorder;
+// goTailWork shares the existing Go type-reference preorder with function-value
+// capture and GoFrame's three unpruned whole-tree scans. Each queue retains the named-node preorder;
 // unnamed nodes cannot match these grammar kinds. Emission remains staged so
 // later type parameters and Bind calls are known before their consumers run.
 // Wrappers stay inside the caller's single scratch lifetime and never escape
 // into the owned graph.
 type goTailWork struct {
+	fnValueNodes   []*sitter.Node
 	typeParams     map[string]bool
 	typeContainers []*sitter.Node
 	goframeCalls   []*sitter.Node
@@ -24,6 +25,10 @@ func collectGoTailWork(root *sitter.Node, src []byte) goTailWork {
 	walkNodes(root, func(n *sitter.Node) {
 		t := n.Type()
 		switch t {
+		// These are the only Go grammar kinds accepted by FnValue's ID spec
+		// or special-form normalizer; its semantic callback remains unchanged.
+		case "identifier", "selector_expression":
+			work.fnValueNodes = append(work.fnValueNodes, n)
 		case "call_expression":
 			work.goframeCalls = append(work.goframeCalls, n)
 		case "type_spec":
