@@ -52,6 +52,8 @@ type pyBinding struct {
 
 type pyAnalysis struct {
 	src        []byte
+	tree       *sitter.Node      // the parsed script
+	literals   map[string]string // the walk analysis: names assigned a string
 	bindings   map[pyBindingKey][]pyBinding
 	scopeOf    map[uintptr]uintptr
 	compr      map[uintptr]bool
@@ -101,12 +103,37 @@ var (
 // command lines the script runs; without, it does no work for them at all,
 // so the reads and edits the hook has always answered cost what they did.
 func analyzePythonScript(code string, deadline time.Time, extra bool) (pyScriptFacts, bool) {
-	if len(code) > maxInlineScript || !time.Now().Before(deadline) {
+	a, done, ok := newPyAnalysis(code, deadline, extra)
+	if !ok {
 		return pyScriptFacts{}, false
+	}
+	defer done()
+	a.collect(a.tree, a.root, 0)
+	if a.aborted {
+		return pyScriptFacts{}, false
+	}
+	// A write the script cannot name may be any file it read.
+	if a.unresolved {
+		for _, p := range a.facts.reads {
+			if !a.facts.writeBack[p] {
+				a.facts.writeBack[p] = true
+				a.facts.guessed[p] = true
+			}
+		}
+	}
+	return a.facts, true
+}
+
+// newPyAnalysis parses one script and records its bindings; done releases
+// the syntax tree. ok is false when the script does not parse cleanly or
+// exceeds the analysis budget.
+func newPyAnalysis(code string, deadline time.Time, extra bool) (a *pyAnalysis, done func(), ok bool) {
+	if len(code) > maxInlineScript || !time.Now().Before(deadline) {
+		return nil, nil, false
 	}
 	src := []byte(code)
 	if parser.LooksBinary(src) {
-		return pyScriptFacts{}, false
+		return nil, nil, false
 	}
 	// The parse runs under the same deadline as the analysis. A parser
 	// whose parse was cancelled cannot be reused, so this one is not pooled.
@@ -117,15 +144,16 @@ func analyzePythonScript(code string, deadline time.Time, extra bool) (pyScriptF
 	p.SetLanguage(pylang.GetLanguage())
 	tree, err := p.ParseCtx(ctx, nil, src)
 	if err != nil || tree == nil {
-		return pyScriptFacts{}, false
+		return nil, nil, false
 	}
-	defer tree.Close()
 	root := tree.RootNode()
 	if root == nil || root.HasError() {
-		return pyScriptFacts{}, false
+		tree.Close()
+		return nil, nil, false
 	}
-	a := &pyAnalysis{
+	a = &pyAnalysis{
 		src:       src,
+		tree:      root,
 		bindings:  map[pyBindingKey][]pyBinding{},
 		scopeOf:   map[uintptr]uintptr{},
 		compr:     map[uintptr]bool{},
@@ -140,20 +168,11 @@ func analyzePythonScript(code string, deadline time.Time, extra bool) (pyScriptF
 		facts:     pyScriptFacts{writeBack: map[string]bool{}, guessed: map[string]bool{}, seen: map[string]bool{}},
 	}
 	a.bind(root, a.root, 0)
-	a.collect(root, a.root, 0)
 	if a.aborted {
-		return pyScriptFacts{}, false
+		tree.Close()
+		return nil, nil, false
 	}
-	// A write the script cannot name may be any file it read.
-	if a.unresolved {
-		for _, p := range a.facts.reads {
-			if !a.facts.writeBack[p] {
-				a.facts.writeBack[p] = true
-				a.facts.guessed[p] = true
-			}
-		}
-	}
-	return a.facts, true
+	return a, tree.Close, true
 }
 
 // step charges one unit of work; past the budget the analysis aborts.

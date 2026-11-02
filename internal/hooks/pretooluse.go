@@ -1478,11 +1478,31 @@ func enrichBashCommand(cmd, cwd string, probe fileScopeProbe, depth int, deadlin
 		deadline = time.Now().Add(inlineScriptTime)
 	}
 	pyScripts, shells := inlineScriptsAt(cmd, true)
+	if len(pyScripts) == 0 && len(shells) == 0 {
+		return r
+	}
 	scripts := analyzeInlineScripts(pyScripts, deadline, true)
+	dirs := newCommandDirs(cmd)
+	var nested []nestedCommand
+	if depth == 0 {
+		nested = nestedCommands(shells, scripts, dirs, cwd)
+	}
+	r = enrichBashExtra(r, cwd, probe, deadline, scripts, shells, dirs, nested)
+	if depth > 0 {
+		return r
+	}
+	// A walk that reads the files it finds is answered last, after
+	// everything else, nested commands included, and only ever adds a
+	// deny.
+	return enrichBashWalks(r, walkCandidates(pyScripts, dirs, cwd, nested), deadline)
+}
+
+// enrichBashExtra answers what the shapes cannot see: os.open, scripts
+// behind a wrapper and the nested commands.
+func enrichBashExtra(r enrichResult, cwd string, probe fileScopeProbe, deadline time.Time, scripts []analyzedScript, shells []inlineScript, dirs commandDirs, nested []nestedCommand) enrichResult {
 	if len(scripts) == 0 && len(shells) == 0 {
 		return r
 	}
-	dirs := newCommandDirs(cmd)
 	if extra, ok := scriptReadAnswer(scripts, true, dirs, cwd, probe, time.Now()); ok {
 		if extra.deny {
 			return extra
@@ -1501,10 +1521,7 @@ func enrichBashCommand(cmd, cwd string, probe fileScopeProbe, depth int, deadlin
 			r = w
 		}
 	}
-	if depth > 0 {
-		return r
-	}
-	return enrichNestedCommands(r, nestedCommands(shells, scripts, dirs, cwd), probe, depth, deadline)
+	return enrichNestedCommands(r, nested, probe, 0, deadline)
 }
 
 // enrichBashShapes answers the shell shapes and inline Python of a command.
