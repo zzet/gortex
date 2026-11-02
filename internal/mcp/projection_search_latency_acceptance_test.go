@@ -4,6 +4,8 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +39,7 @@ type projectionLatencyFixture struct {
 	covered       map[string]bool
 	files         int
 	nativeSymbols int
+	indexer       *indexer.Indexer
 }
 
 func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entries int) *projectionLatencyFixture {
@@ -74,45 +77,48 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 	// or read gate. This inert watcher also prevents legacy read repair from
 	// changing the population being compared.
 	server.SetWatcher(mutationTestWatcher{done: make(chan indexer.MutationResult)})
-	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount, nativeSymbols: nativeSymbols}
+	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount, nativeSymbols: nativeSymbols, indexer: idx}
+	failure := ""
+	defer writeProjectionLatencySetup(t, fixture, entries, &failure)
 	if entries != 0 {
-		var paths []string
-		err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			if entry.Type()&os.ModeSymlink != 0 || !strings.HasSuffix(path, ".go") {
-				return nil
-			}
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return err
-			}
-			if idx.IsTracked(filepath.ToSlash(rel)) {
-				paths = append(paths, path)
-			}
-			return nil
-		})
-		require.NoError(t, err)
-		sort.Strings(paths)
-		require.GreaterOrEqual(t, len(paths), entries, "do not substitute a smaller projection population")
-		for _, path := range paths[:entries] {
+		manifest, manifestErr := readProjectionLatencyPopulationManifest(revision, entries)
+		if manifestErr != nil {
+			failure = manifestErr.Error()
+		}
+		require.NoError(t, manifestErr)
+		failure = "validating pinned native corpus census"
+		require.Equal(t, fixture.files, manifest.IndexedFiles, "same full corpus index scope")
+		require.Equal(t, fixture.nativeSymbols, manifest.NativeSymbols, "same native FTS population")
+		for _, candidate := range manifest.Entries {
+			failure = "validating pinned member " + candidate.Path
+			path := filepath.Join(root, filepath.FromSlash(candidate.Path))
+			require.True(t, idx.IsTracked(candidate.Path), "pinned member must belong to the original native index scope")
 			raw, err := os.ReadFile(path)
 			require.NoError(t, err)
 			// Existing declaration coordinates and query literals stay
 			// identical while the disk bytes are genuinely ahead of base.
-			raw = append(raw, []byte("\n// pending search comparison fixture\n")...)
+			raw = append(raw, []byte(projectionLatencyPendingComment)...)
+			hash := sha256.Sum256(raw)
+			require.Equal(t, candidate.RawSHA256, hex.EncodeToString(hash[:]), "pinned pending afterimage changed")
+			require.Equal(t, candidate.SourceBytes, len(raw))
 			require.NoError(t, os.WriteFile(path, raw, 0o600))
 			stamp, err := statDiskStamp(path)
 			require.NoError(t, err)
 			entry, err := projectFile(t.Context(), idx, path, raw, 0, stamp)
+			if err != nil {
+				failure = err.Error()
+			}
 			require.NoError(t, err, "a refused projection cannot be skipped")
-			require.NoError(t, fixture.registry.publish(entry), "all512 entries must fit existing caps")
+			require.Equal(t, candidate.ChargedBytes, entry.size, "actual current constructor charge must match the pinned manifest")
+			publishErr := fixture.registry.publish(entry)
+			if publishErr != nil {
+				failure = publishErr.Error()
+			}
+			require.NoError(t, publishErr, "all512 entries must fit existing caps")
 			fixture.covered[entry.graphPath] = true
+			failure = ""
 		}
+		require.Equal(t, manifest.ChargedBytes, fixture.registry.snap.Load().bytes)
 	}
 	fixture.snapshot = fixture.registry.snap.Load()
 	require.Len(t, fixture.snapshot.entries, entries)
