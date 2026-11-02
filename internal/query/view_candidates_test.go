@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -564,6 +565,47 @@ func TestRequestViewTextBatchPreservesPositionsAndSliceOwnership(t *testing.T) {
 	}
 	if batch.searchCalls != 0 || peer.searchCalls != 0 {
 		t.Fatalf("batch path issued sequential searches: first=%d peer=%d", batch.searchCalls, peer.searchCalls)
+	}
+}
+
+func TestViewTextCandidatesKeepsNativeBatchBesidePendingNameSources(t *testing.T) {
+	for _, pendingFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(pendingFirst), func(t *testing.T) {
+			batch := &viewBatchFixtureBackend{handled: true, responses: map[int][][]search.SearchResult{
+				4: {{{ID: "commit"}}, {{ID: "dirty"}}},
+			}}
+			peer := &viewBatchFixtureBackend{}
+			pending := &contextPlainBackend{results: []search.SearchResult{{ID: "pending"}}}
+			layers := []ViewLayerSource{{Search: batch}, {Search: pending}, {Search: peer}}
+			if pendingFirst {
+				layers = []ViewLayerSource{{Search: pending}, {Search: batch}, {Search: peer}}
+			}
+			e := &Engine{viewLayers: layers}
+			got := e.viewTextCandidatesContext(context.Background(), "query", 4, nil, nil)
+			ids := make(map[string]bool)
+			for _, hit := range got {
+				ids[hit.ID] = true
+			}
+			if !ids["commit"] || !ids["dirty"] || !ids["pending"] {
+				t.Fatalf("native generation answers were replaced by sequential fallback: %#v", got)
+			}
+			if len(batch.batchCalls) != 1 || batch.searchCalls != 0 || peer.searchCalls != 0 || pending.calls != 1 {
+				t.Fatalf("mixed sources bypassed native batch: widths=%v searches=%d/%d", batch.batchCalls, batch.searchCalls, peer.searchCalls)
+			}
+		})
+	}
+}
+
+func TestMixedViewTextBatchCancellationDoesNotStartPendingNameSearch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := &viewBatchFixtureBackend{handled: true, cancel: cancel}
+	pending := &contextPlainBackend{results: []search.SearchResult{{ID: "late-pending"}}}
+	e := &Engine{viewLayers: []ViewLayerSource{{Search: pending}, {Search: batch}}}
+	if got := e.viewTextCandidatesContext(ctx, "query", 2, nil, nil); got != nil {
+		t.Fatalf("canceled mixed batch returned candidates: %#v", got)
+	}
+	if pending.calls != 0 || batch.searchCalls != 0 || len(batch.batchCalls) != 1 {
+		t.Fatalf("canceled batch retried sources: pending=%d sequential=%d batch=%v", pending.calls, batch.searchCalls, batch.batchCalls)
 	}
 }
 
