@@ -1172,6 +1172,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	if refusal := s.awaitWatchedFreshness(ctx, spec.Legacy, forwarded, takeRequestFreshness(&forwarded)); refusal != nil {
 		return refusal, nil
 	}
+	ctx = withProjectedReadToolFacts(ctx, spec.Legacy)
 	ctx = s.captureToolFreshness(ctx)
 	ctx, forwarded = s.reserveToolFreshnessBudget(ctx, spec.Legacy, forwarded)
 	result, err = legacy.handler(ctx, forwarded)

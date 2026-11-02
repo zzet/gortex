@@ -27,10 +27,11 @@ const maxLabelledPendingFiles = 16
 // relationFreshness labels an answer read from graph relations while edits in
 // its scope are still being published. The zero value is a fresh scope.
 type relationFreshness struct {
-	scope  string
-	state  string   // Empty is fresh internally; explicit responses may render fresh or unknown.
-	files  []string // graph-keyed paths of the lagging in-scope edits, sorted
-	waited time.Duration
+	projected bool // current request served an exact file-local projection
+	scope     string
+	state     string   // Empty is fresh internally; explicit responses may render fresh or unknown.
+	files     []string // graph-keyed paths of the lagging in-scope edits, sorted
+	waited    time.Duration
 }
 
 // relationWaitDeadline is when a change tool stops waiting for its relation
@@ -248,7 +249,7 @@ func (s *Server) labelRelations(ctx context.Context, gaps []*mutationReceipt, id
 // being re-read as its JSON object first. A fresh scope returns payload
 // unchanged.
 func (f relationFreshness) labelled(payload any) any {
-	if f.state == "" {
+	if f.state == "" && !f.projected {
 		return payload
 	}
 	data, err := json.Marshal(payload)

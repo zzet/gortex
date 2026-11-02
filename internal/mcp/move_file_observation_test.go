@@ -382,14 +382,12 @@ func TestMoveOriginalDirectAdmissionCannotBeReissued(t *testing.T) {
 	require.Equal(t, before["direct_reconcile"], after["direct_reconcile"], "completed original owner changed after re-admission attempt")
 }
 
-// The source and target are written before either direct reconciliation.
-// An independent public reader may therefore publish the target first. The
-// later direct no-op cannot donate a new acceptance window to that write.
-func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
+// A projected read serves current bytes without borrowing publication credit.
+func TestMovePublicReadProjectsBeforeDirectAdmission(t *testing.T) {
 	s, observation, ctx, _, _, target := moveObservationExecutionFixture(t)
 	idx := s.multiIndexer.GetIndexer("fixture")
 	const movedID = "fixture/target.go::Moved"
-	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID), "fixture must require an actual target publication")
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID))
 	root, ok := s.multiIndexer.RepoRoot("fixture")
 	require.True(t, ok)
 	readerCtx := WithSessionCWD(WithSessionID(ctx, "move-independent-reader"), root)
@@ -399,16 +397,16 @@ func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.IsError)
 	require.Contains(t, unmarshalResult(t, result)["source"], "func Moved()")
-	require.NotNil(t, s.engineFor(t.Context()).GetSymbol(movedID), "actual public read did not apply the target")
-	// Keep real executor proof: unchanged direct work cannot be relabeled as
-	// applied acceptance, regardless of how the earlier reader is retained.
-	later := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
-	require.False(t, later.AcceptedFor(idx, observation.records[target].newSHA), "fixture must exercise the later no-op, not another actual apply")
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID), "read must not publish target into shared base")
+	before, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
+	require.Equal(t, "not_applicable_projected_reads", before["read_assisted_reconcile_state"])
+	require.NotContains(t, before, "read_assisted_reconcile", "projection is not a numeric publication window")
+	actual := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
+	require.True(t, actual.AcceptedFor(idx, observation.records[target].newSHA), "only the later direct execution publishes target")
 	status, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
-	require.Equal(t, "observed", status["read_assisted_reconcile_state"], "the actual earlier public publisher must retain its own independent window")
-	require.Contains(t, status, "read_assisted_reconcile")
-	require.NotEqual(t, "observed", status["direct_reconcile_state"], "read-assisted publication must not relabel the later direct no-op")
-	require.NotContains(t, status, "direct_reconcile")
+	require.Equal(t, "observed", status["direct_reconcile_state"])
+	require.Equal(t, "not_applicable_projected_reads", status["read_assisted_reconcile_state"])
+	require.NotContains(t, status, "read_assisted_reconcile")
 }
 
 func TestMoveFileWriteTimingPreservesEqualClockReadings(t *testing.T) {

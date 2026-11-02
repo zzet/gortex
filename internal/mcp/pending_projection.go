@@ -221,6 +221,32 @@ func (p *pendingProjections) publish(e *projectionEntry) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if prev := p.snap.Load().entries[e.key]; prev != nil && prev.commitSeq > e.commitSeq {
+		p.refused[projectionSuperseded]++
+		return projectionSuperseded
+	}
+	return p.publishLocked(e)
+}
+
+// Read-through has no physical sequence to borrow. It may replace exactly the
+// immutable entry it checked, including an old physical entry, after checking
+// the current bytes again. A new/retired pointer cannot authorize that replace.
+func (p *pendingProjections) publishExpected(e, expected *projectionEntry) error {
+	if !p.enabled {
+		return projectionDisabled
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e.commitSeq != 0 || p.snap.Load().entries[e.key] != expected {
+		p.refused[projectionSuperseded]++
+		return projectionSuperseded
+	}
+	return p.publishLocked(e)
+}
+
+// Callers prove ordering by physical sequence or the exact checked pointer.
+// Path-case and global file/byte caps apply equally to both publication paths.
+func (p *pendingProjections) publishLocked(e *projectionEntry) error {
 	cur := p.snap.Load()
 	prev := cur.entries[e.key]
 	bytes := cur.bytes + e.size
@@ -231,8 +257,6 @@ func (p *pendingProjections) publish(e *projectionEntry) error {
 	switch {
 	case prev != nil && prev.graphPath != e.graphPath:
 		refusal = projectionPathCase
-	case prev != nil && prev.commitSeq > e.commitSeq:
-		refusal = projectionSuperseded
 	case prev == nil && len(cur.entries) >= projectionMaxFiles:
 		refusal = projectionOverFiles
 	case bytes > projectionMaxBytes:
@@ -387,6 +411,12 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 				p.divergence.Add(1)
 			}
 			caughtUp = append(caughtUp, e)
+		}
+	}
+	// Checked selected adapters must finish all I/O before dropAll takes mu.
+	if checked, ok := store.(interface{ validateProjectionRetirement() error }); ok {
+		if checked.validateProjectionRetirement() != nil {
+			return 0
 		}
 	}
 	retired := p.dropAll(caughtUp)

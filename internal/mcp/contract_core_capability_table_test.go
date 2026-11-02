@@ -175,6 +175,8 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileEditingContext", capOf[graph.FileEditingContext], capFiltered, "the store reads raw imports and calls"},
 
 		// Deliberate drops.
+		{"FileEditingContextRows", capOf[graph.FileEditingContextRows], capWrapper, "raw adjacency; the contextual helper recomputes through filtered rows"},
+		{"FileEditingContextReadScope", capOf[graph.FileEditingContextReadScope], capDropped, "raw scoped rows; resolved only by the filtered editing-context helper"},
 		{"FilteredBFSAdmissionReader", capOf[graph.FilteredBFSAdmissionReader], capDropped, "private scoped admission adapter supplies exact wrapper exclusions"},
 		{"FilteredCallAncestorReader", capOf[graph.FilteredCallAncestorReader], capDropped, "private candidate coverage adapter supplies this wrapper's exact exclusions"},
 		{"BFSCapable", capOf[graph.BFSCapable], capWrapper, "canonical hops recomputed over selected filtered adjacency; engine admission remains the Go contract"},
@@ -421,6 +423,7 @@ func contractCoreNonStoreInterfaces() []contractCoreCapName {
 		{"ConstantValueReadStatus", capOf[graph.ConstantValueReadStatus]},
 		{"ContractOwnerScalarInvalidator", capOf[graph.ContractOwnerScalarInvalidator]},
 		{"EdgeEndpointProvider", capOf[graph.EdgeEndpointProvider]},
+		{"FileEditingContextLayerScope", capOf[graph.FileEditingContextLayerScope]},
 		{"FileIndexFailureLayerReader", capOf[graph.FileIndexFailureLayerReader]},
 		{"FileNodeReadCounter", capOf[graph.FileNodeReadCounter]},
 		{"GenerationLayerIdentity", capOf[graph.GenerationLayerIdentity]},
