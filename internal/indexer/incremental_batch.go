@@ -502,9 +502,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 	var fallbackTiming *reconcilePhaseTiming
 	if len(fallbacks) > 0 {
-		markerBatch.publicationStamps().incompletePatchLaps()
-		// Legacy fallback combines extraction and graph mutation; do not label
-		// this interval as parse-only or silently charge it to graph apply.
+		// indexFile observes successful extraction/commit/search boundaries.
+		// Its unknown, skipped and failed exits retain incomplete evidence.
 		fallbackTiming = idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_fallback_parse_apply",
 			zap.Int("files", len(fallbacks)))
 		defer fallbackTiming.abort()

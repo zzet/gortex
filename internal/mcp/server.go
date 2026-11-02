@@ -131,6 +131,7 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
+	sharedIdentity   sharedServerIdentity
 	editAckMode      config.EditAckMode
 	editAckConfigErr error
 	// editOperations covers actual source-edit handler completions across this
@@ -1909,6 +1910,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		prCache:    newPRCache(prCacheTTL),
 		facades:    newFacadeRegistry(),
 	}
+	s.initializeSharedIdentity()
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
 	s.sessions.setParentTokenStats(s.tokenStats)
