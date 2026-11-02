@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -73,4 +74,30 @@ func TestReadProjectionDoesNotAdmitWithoutPublicationOrAcrossCheckouts(t *testin
 			require.Zero(t, admitted.Load(), "no canonical-sibling admission or admission without accepted publication")
 		})
 	}
+}
+
+func TestReadProjectionAdmissionFailureKeepsExactFileAndPendingBackground(t *testing.T) {
+	selectedProjectionRegistry(t)
+	s, root := setupTestServer(t)
+	var admitted atomic.Int64
+	s.SetWatcher(mutationTestWatcher{scheduled: &admitted, scheduleErr: errors.New("admission refused")})
+	path := filepath.Join(root, "main.go")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc StillReadable() {}\n")...), 0600))
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "get_file_summary"
+	req.Params.Arguments = map[string]any{"path": "main.go", "format": "json"}
+	result, err := s.wrapToolHandler(s.handleGetFileSummary)(t.Context(), req)
+	require.NoError(t, err)
+	require.False(t, result.IsError, "refused background admission cannot erase exact available file rows: %s", resultText(result))
+	require.EqualValues(t, 1, admitted.Load())
+	fields := extractTextResult(t, result)
+	freshness := fields["freshness"].(map[string]any)
+	require.Equal(t, true, freshness["readback_exact"])
+	require.Equal(t, "projected", freshness["file_view"])
+	require.Equal(t, "pending", freshness["graph_freshness"])
+	require.Equal(t, "unavailable", freshness["background_admission"])
+	require.Equal(t, "pending", freshness["background_state"])
+	require.Nil(t, s.graph.GetNode("main.go::StillReadable"))
 }

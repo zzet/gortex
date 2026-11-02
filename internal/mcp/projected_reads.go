@@ -90,7 +90,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
-			if projectionBudgetUnavailable(ctx, err) {
+			if projectionBudgetUnavailable(ctx, err) || ctx.Err() == nil && (errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded)) {
 				markRequestProjectionDeferred(ctx, graphPath, "external_write")
 				continue
 			}
@@ -124,6 +124,10 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			}
 			ctx, err = retainRequestProjection(ctx, entry)
 			if err != nil {
+				if ctx.Err() == nil && errors.Is(err, projectionSuperseded) {
+					markRequestProjectionDeferred(ctx, graphPath, "external_write")
+					continue
+				}
 				return ctx, err
 			}
 			layers = append(layers, layer)
@@ -169,6 +173,7 @@ func selectedProjectionReadPath(ctx context.Context, root, prefix, abs string) (
 
 func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
 	idx, _ := s.indexerForRel(graphPath)
+	tracked := idx.IsTracked(rel)
 	root, readPath, key, err := selectedProjectionReadPath(requestCtx, idx.RootPath(), idx.RepoPrefix(), abs)
 	if err != nil {
 		return nil, err
@@ -179,7 +184,10 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		return nil, err
 	}
 	if before.info == nil {
-		if !idx.IsTracked(rel) && expected == nil {
+		if expected != nil && expected.tombstone && liveProjectionForAcknowledgement(expected) {
+			return expected, nil
+		}
+		if !tracked && expected == nil {
 			return nil, nil
 		}
 		entry := newProjectionTombstone(abs, graphPath, idx.RepoPrefix(), 0)
@@ -190,6 +198,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
 			return nil, err
 		}
+		s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
 		return entry, nil
 	}
 	// Reuse the confined, bounded, nonblocking regular-file reader. A FIFO,
@@ -206,7 +215,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	// The existing buffer admission applies the owning indexer's exclusions,
 	// selected checkout's ignore files, language and content gates to these
 	// already-confined bytes. A new file need not have a watcher inventory row.
-	if !idx.IsTracked(rel) && !idx.AdmitSourceSearchBuffer(buildCtx, root, abs, raw, nil) {
+	if !tracked && !idx.AdmitSourceSearchBuffer(buildCtx, root, abs, raw, nil) {
 		return nil, errors.New("file is not admitted source")
 	}
 	after, err := statDiskStamp(abs)
@@ -237,7 +246,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	if !idx.IsTracked(rel) && !projection.ParseChecked {
+	if !tracked && !projection.ParseChecked {
 		return nil, errors.New("untracked source parse health is unavailable")
 	}
 	entry := newProjectionEntry(abs, idx.RepoPrefix(), projection, raw, 0, after)
@@ -255,6 +264,7 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err := pendingFileProjections.publishExpected(entry, expected); err != nil {
 		return nil, err
 	}
+	s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
 	return entry, nil
 }
 

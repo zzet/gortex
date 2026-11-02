@@ -137,7 +137,7 @@ func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath s
 	if owner == nil {
 		return nodeSource{}, fmt.Errorf("no indexer owns %s", node.FilePath)
 	}
-	if requestDeferredProjectionFiles(ctx)[node.FilePath] != "" {
+	if reason := requestDeferredProjectionFiles(ctx)[node.FilePath]; reason == "storm" || reason == "external_write" {
 		return nodeSource{}, errProjectedSourceDeferred
 	}
 	root, rel, key, err := selectedProjectionReadPath(ctx, owner.RootPath(), owner.RepoPrefix(), absPath)
