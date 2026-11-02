@@ -33,12 +33,20 @@ func (s *Server) readFileCompressionSymbols(ctx context.Context, absPath, graphP
 	if view := requestViewFromContext(ctx); view.routed() && view.materialized != nil {
 		sources = view.materialized.GenerationSources()
 	}
-	revision, revisioned := reader.(interface{ MutationRevision() uint64 })
-	var before uint64
-	if revisioned {
-		before = revision.MutationRevision()
-	} else if len(sources) == 0 {
-		return nil, false // A hash ABA alone is not a stable reader witness.
+	baseRevision := func() (uint64, bool) {
+		if revision, ok := reader.(interface{ MutationRevision() uint64 }); ok {
+			return revision.MutationRevision(), true
+		}
+		if revision, ok := reader.(interface{ SearchMutationRevision() (uint64, bool) }); ok {
+			return revision.SearchMutationRevision()
+		}
+		return 0, false
+	}
+	before, known := baseRevision()
+	if !known {
+		// GenerationSources excludes the mutable shared gen0 beneath the
+		// composed layers. Its SAME-reader base witness is required too.
+		return nil, false
 	}
 	budget, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer cancel()
@@ -54,8 +62,11 @@ func (s *Server) readFileCompressionSymbols(ctx context.Context, absPath, graphP
 		return nil, false
 	}
 	nodes := proof.GetFileNodes(graphPath)
-	if proof.err != nil || proof.validateProjectionRetirement() != nil || budget.Err() != nil ||
-		revisioned && revision.MutationRevision() != before || pendingFileProjections.snap.Load() != owners {
+	if proof.err != nil || proof.validateProjectionRetirement() != nil || budget.Err() != nil {
+		return nil, false
+	}
+	after, stillKnown := baseRevision()
+	if !stillKnown || after != before || pendingFileProjections.snap.Load() != owners {
 		return nil, false
 	}
 	return nodes, true
