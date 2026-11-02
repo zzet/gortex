@@ -54,22 +54,38 @@ func registeredCOWCall(s *Server, ctx context.Context, id int, name string, args
 	return envelope.Result, nil
 }
 
-// Initially retain the old barrier's capture-only behavior as a regression
-// witness. The diagnostic control exposes a real early completion it ignores.
-func awaitRegisteredCOWMetadata(ctx context.Context, captured <-chan *projectionEntry, answers <-chan registeredCOWReply, want int, release func()) ([]registeredCOWReply, error) {
+// A completed public refusal is the first failing stage, not evidence that
+// more callbacks will arrive. Always release held test work before reporting it.
+func awaitRegisteredCOWMetadata(ctx context.Context, captured <-chan *projectionEntry, answers <-chan registeredCOWReply, want int, release func(), onCapture func(*projectionEntry)) ([]registeredCOWReply, error) {
 	defer release()
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
-	for range want {
+	early := []registeredCOWReply{}
+	count := 0
+	for count < want {
 		select {
-		case <-captured:
+		case entry := <-captured:
+			count++
+			if onCapture != nil {
+				onCapture(entry)
+			}
+		case reply := <-answers:
+			early = append(early, reply)
+			if reply.tool == "read_file" && reply.err == nil {
+				continue
+			}
+			text := "no tool result"
+			if reply.result != nil {
+				text = resultText(reply.result)
+			}
+			return early, fmt.Errorf("%s returned before metadata barrier: arrivals=%d/%d remaining_original_budget=%s protocol_error=%v result=%s", reply.tool, count, want, reply.remaining, reply.err, text)
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return early, ctx.Err()
 		case <-timer.C:
-			return nil, errors.New("owned registered reads did not reach the common metadata barrier")
+			return early, fmt.Errorf("owned registered metadata arrivals=%d/%d; no early public answer observed", count, want)
 		}
 	}
-	return nil, nil
+	return early, nil
 }
 
 func TestRegisteredCOWBarrierReportsEarlyRefusalAndReleases(t *testing.T) {
@@ -90,8 +106,39 @@ func TestRegisteredCOWBarrierReportsEarlyRefusalAndReleases(t *testing.T) {
 	answers := make(chan registeredCOWReply, 1)
 	answers <- registeredCOWReply{tool: "get_file_summary", result: result, err: err, remaining: -time.Millisecond}
 	released := false
-	_, failure := awaitRegisteredCOWMetadata(t.Context(), make(chan *projectionEntry), answers, 4, func() { released = true })
+	_, failure := awaitRegisteredCOWMetadata(t.Context(), make(chan *projectionEntry), answers, 4, func() { released = true }, nil)
 	require.True(t, released, "every diagnostic exit releases the owned barrier")
 	require.ErrorContains(t, failure, "get_file_summary returned before metadata", "the first public failure must not be replaced by a later barrier timeout")
 	require.ErrorContains(t, failure, "remaining_original_budget=-1ms")
+}
+
+func TestRegisteredCOWBarrierKeepsCompletedRawReadAndCapturedOwners(t *testing.T) {
+	captures := make(chan *projectionEntry, 4)
+	owner := &projectionEntry{}
+	for range 4 {
+		captures <- owner
+	}
+	answers := make(chan registeredCOWReply, 1)
+	answers <- registeredCOWReply{tool: "read_file", result: mcplib.NewToolResultText("actual current raw bytes")}
+	released := false
+	seen := 0
+	early, err := awaitRegisteredCOWMetadata(t.Context(), captures, answers, 4, func() { released = true }, func(entry *projectionEntry) { require.Same(t, owner, entry); seen++ })
+	require.NoError(t, err)
+	require.True(t, released)
+	require.Equal(t, 4, seen)
+	// Whichever select branch ran first, the raw answer is preserved exactly once.
+	if len(early) == 0 {
+		early = append(early, <-answers)
+	}
+	require.Len(t, early, 1)
+	require.Equal(t, "read_file", early[0].tool)
+}
+
+func TestRegisteredCOWBarrierCallerCancellationReleases(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	released := false
+	_, err := awaitRegisteredCOWMetadata(ctx, make(chan *projectionEntry), make(chan registeredCOWReply), 4, func() { released = true }, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, released)
 }

@@ -88,6 +88,35 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	require.NoError(t, err)
 	s := NewServer(query.NewEngine(backend), backend, idx, nil, zap.NewNop(), nil)
 	s.editAckMode = config.EditAckLocal
+	type stage struct {
+		tool, at  string
+		remaining time.Duration
+		err       error
+	}
+	stages := make(chan stage, 64)
+	t.Cleanup(func() {
+		for {
+			select {
+			case event := <-stages:
+				t.Logf("registered tool=%s stage=%s remaining_original_budget=%s error=%v", event.tool, event.at, event.remaining, event.err)
+			default:
+				return
+			}
+		}
+	})
+	for _, name := range tools {
+		s.facades.mu.RLock()
+		captured := s.facades.captured[name]
+		s.facades.mu.RUnlock()
+		leaf, tool := captured.handler, name
+		s.addTool(captured.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+			deadline, _ := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+			stages <- stage{tool: tool, at: "leaf_enter", remaining: time.Until(deadline)}
+			result, err := leaf(ctx, req)
+			stages <- stage{tool: tool, at: "leaf_return", remaining: time.Until(deadline), err: err}
+			return result, err
+		})
+	}
 	borrowed := make(chan registeredBorrowObservation, 8)
 	releaseBorrowed := make(chan struct{})
 	releaseBorrowedOnce := sync.OnceFunc(func() { close(releaseBorrowed) })
@@ -171,11 +200,7 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, originalDeadline)
 	backend.armed.Store(!afterBorrow)
 	release := sync.OnceFunc(func() { close(backend.release) })
-	type answer struct {
-		tool   string
-		result *mcplib.CallToolResult
-	}
-	answers := make(chan answer, len(tools))
+	answers := make(chan registeredCOWReply, len(tools))
 	allowances := make(map[string]*projectedSourceAllowance)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { release(); releaseBorrowedOnce(); workers.Wait() })
@@ -198,20 +223,18 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 			if allowance != nil {
 				requestCtx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 			}
-			result := preselectionRegisteredCall(t, s, requestCtx, 20+i, tool, args)
-			answers <- answer{tool: tool, result: result}
+			t.Logf("registered tool=%s stage=worker_dispatch remaining_original_budget=%s", tool, time.Until(originalDeadline))
+			result, callErr := registeredCOWCall(s, requestCtx, 20+i, tool, args)
+			answers <- registeredCOWReply{tool: tool, result: result, err: callErr, remaining: time.Until(originalDeadline)}
 		}()
 	}
+	collected := []registeredCOWReply{}
 	if !afterBorrow {
-		for range gateReads {
-			select {
-			case captured := <-backend.captured:
-				require.Same(t, entry, captured, "both metadata reads and source must capture the same old pointer before the actual CAS")
-			case <-time.After(3 * time.Second):
-				t.Fatal("owned registered reads did not reach the common metadata barrier")
-			}
-		}
-		release()
+		var barrierErr error
+		collected, barrierErr = awaitRegisteredCOWMetadata(t.Context(), backend.captured, answers, int(gateReads), release, func(captured *projectionEntry) {
+			require.Same(t, entry, captured, "all metadata readers must capture the same old owner before CAS")
+		})
+		require.NoError(t, barrierErr, "first registered failure must remain visible; original150ms was never reset")
 	} else {
 		selected := make(map[string]context.Context)
 		for range 4 {
@@ -251,15 +274,20 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 		releaseBorrowedOnce()
 	}
 	results := map[string]*mcplib.CallToolResult{}
-	for range tools {
+	for len(collected) < len(tools) {
 		select {
 		case a := <-answers:
-			results[a.tool] = a.result
+			collected = append(collected, a)
 		case <-time.After(3 * time.Second):
 			t.Fatal("owned registered read did not join")
 		}
 	}
 	workers.Wait()
+	for _, a := range collected {
+		require.NoError(t, a.err, "tool=%s remaining_original_budget=%s", a.tool, a.remaining)
+		require.NotNil(t, a.result, "tool=%s returned no original SDK result", a.tool)
+		results[a.tool] = a.result
+	}
 	winner := liveEntry(pendingFileProjections, path)
 	require.NotNil(t, winner)
 	require.NotSame(t, entry, winner)
