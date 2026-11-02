@@ -2,7 +2,6 @@ package reach
 
 import (
 	"context"
-	"sync"
 	"time"
 )
 
@@ -31,26 +30,13 @@ func coordinationWaitObserver(ctx context.Context) func(CoordinationWait) {
 	return observer
 }
 
-func observedTopologyRead(ctx context.Context) (func(), bool) {
+func observedTopologyRead(ctx context.Context, scope []string) (func(), bool) {
 	observer := coordinationWaitObserver(ctx)
 	if observer == nil {
-		return beginTopologyReadContext(ctx)
+		return beginTopologyRead(ctx, scope)
 	}
 	started := time.Now()
-	release, ok := beginTopologyReadContext(ctx)
+	release, ok := beginTopologyRead(ctx, scope)
 	observer(CoordinationWait{Phase: "gate_wait", Duration: time.Since(started), Attempted: true, Acquired: ok})
 	return release, ok
-}
-
-// observedResolveLock reports the existing mutex admission without changing
-// which readers acquire it or the cancellation policy.
-func observedResolveLock(ctx context.Context, mu *sync.Mutex) bool {
-	observer := coordinationWaitObserver(ctx)
-	if observer == nil {
-		return lockContext(ctx, mu)
-	}
-	started := time.Now()
-	ok := lockContext(ctx, mu)
-	observer(CoordinationWait{Phase: "resolve_mutex_wait", Duration: time.Since(started), Attempted: true, Acquired: ok})
-	return ok
 }
