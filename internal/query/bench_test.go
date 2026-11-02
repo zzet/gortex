@@ -1,10 +1,13 @@
 package query
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -38,6 +41,30 @@ const (
 func buildTestEngine(b testing.TB) *Engine {
 	b.Helper()
 	benchmarkEngineOnce.Do(func() {
+		// Optional diagnostic sidecars cover setup excluded by ResetTimer.
+		// An interrupted process leaves its start receipt without inventing a
+		// completed setup. Neither the benchmark bodies nor their budgets change.
+		tracePrefix := os.Getenv("GORTEX_BENCH_QUERY_SETUP_TRACE")
+		var trace queryBenchmarkSetupTrace
+		var setupStarted, indexStarted time.Time
+		if tracePrefix != "" {
+			setupStarted = time.Now()
+			trace.Version, trace.Started = 1, setupStarted.UTC()
+			if err := writeQueryBenchmarkSetupTrace(tracePrefix, "start", trace); err != nil {
+				benchmarkEngineErr = err
+				return
+			}
+			defer func() {
+				finished := time.Now()
+				trace.Finished = finished.UTC()
+				trace.ElapsedSeconds = finished.Sub(setupStarted).Seconds()
+				trace.Files, trace.Workers = benchmarkFiles, benchmarkWorkers
+				if benchmarkEngineErr != nil {
+					trace.Error = benchmarkEngineErr.Error()
+				}
+				benchmarkEngineErr = errors.Join(benchmarkEngineErr, writeQueryBenchmarkSetupTrace(tracePrefix, "finish", trace))
+			}()
+		}
 		root, err := filepath.Abs("../..")
 		if err != nil {
 			benchmarkEngineErr = err
@@ -53,7 +80,16 @@ func buildTestEngine(b testing.TB) *Engine {
 		languages.RegisterAll(reg)
 		idx := indexer.New(g, reg, cfg, zap.NewNop())
 		var result *indexer.IndexResult
+		if tracePrefix != "" {
+			indexStarted = time.Now()
+			trace.IndexStarted = indexStarted.UTC()
+		}
 		result, benchmarkEngineErr = idx.Index(root)
+		if tracePrefix != "" {
+			finished := time.Now()
+			trace.IndexFinished = finished.UTC()
+			trace.IndexSeconds = finished.Sub(indexStarted).Seconds()
+		}
 		if benchmarkEngineErr == nil {
 			benchmarkEngine = NewEngine(g)
 			benchmarkFiles, benchmarkWorkers = result.FileCount, cfg.Workers

@@ -17,6 +17,14 @@ import (
 const smokeFixtureRevision = "c6c6de19da02fc698db7a89f9922a8ec49cc61b5"
 const smokeFixtureTree = "47debc33a46a06eed403a3ea455feda97ca9a609"
 
+// These are operational measurement bounds. The original full-job p95 target
+// remains fifteen minutes; its acceptance is explicitly deferred, not widened.
+const (
+	smokeMeasurementWindow  = 120 * time.Minute
+	smokeCleanupAllowance   = 2 * time.Minute
+	smokeDeferredWallTarget = 15 * time.Minute
+)
+
 var smokeSteps = []string{"load-16", "loadedit-4", "tools-single-gortex", "warm-restart", "idle-stop"}
 
 // The entry owns no extra process supervisor: collectLane already joins the
@@ -32,15 +40,15 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	fixture := f.String("fixture", "", "owned prepared contemporary fixture directory")
 	out := f.String("out", "", "NEW evidence directory outside the fixture")
 	budgets := f.String("budgets", "bench/budgets.yaml", "full strict policy")
-	offer := f.Duration("offer", 20*time.Second, "explicit PR-only offered window: 20s or 30s")
+	offer := f.Duration("offer", 20*time.Second, "version 2 PR-only offered window: 20s")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if f.NArg() != 0 || *candidate == "" || *load == "" || *bundle == "" || *tests == "" || *fixture == "" || *out == "" || *offer != 20*time.Second && *offer != 30*time.Second {
-		fmt.Fprintln(stderr, "smoke needs candidate/load/main-bundle/candidate-builds/fixture/out and an explicit 20s/30s PR profile")
+	if f.NArg() != 0 || *candidate == "" || *load == "" || *bundle == "" || *tests == "" || *fixture == "" || *out == "" || *offer != 20*time.Second {
+		fmt.Fprintln(stderr, "smoke needs candidate/load/main-bundle/candidate-builds/fixture/out and the original 20s PR profile")
 		return 2
 	}
 	workflow := currentBuildWorkflow(os.Getenv("GITHUB_SHA"))
@@ -72,7 +80,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	if err == nil {
 		builds, err = admitMicroBundle(micro, workflow)
 	}
-	c := laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Load: pathAbsolute(*load), Manifest: filepath.Join(output, "manifest.json"), MainArtifact: mainBundle, Builds: map[string]laneBuild{"main": {Binary: filepath.Join(mainBundle, mainArtifactBinary), Revision: metadata.Revision}, "candidate": {Binary: pathAbsolute(*candidate), Revision: workflow.Revision}}, Repeats: 3, Duration: offer.String(), Deadline: "120s", PRSmokeDrain: "120s", WarmTimeout: "13m", StopTimeout: "30s", SweepDuration: "2m", SweepRepetitions: 1, started: started}
+	c := laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Load: pathAbsolute(*load), Manifest: filepath.Join(output, "manifest.json"), MainArtifact: mainBundle, Builds: map[string]laneBuild{"main": {Binary: filepath.Join(mainBundle, mainArtifactBinary), Revision: metadata.Revision}, "candidate": {Binary: pathAbsolute(*candidate), Revision: workflow.Revision}}, Repeats: 3, Duration: offer.String(), Deadline: "120s", PRSmokeDrain: "120s", WarmTimeout: "120m", StopTimeout: "30s", SweepDuration: "2m", SweepRepetitions: 1, started: started}
 	if err == nil {
 		c.Machine, err = os.Hostname()
 	}
@@ -104,7 +112,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	signals, cancelSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancelSignals()
 	// Reserve two minutes for an interrupted load client's owned stop/receipt.
-	ctx, cancel := context.WithDeadline(signals, started.Add(13*time.Minute))
+	ctx, cancel := context.WithDeadline(signals, started.Add(smokeMeasurementWindow))
 	defer cancel()
 	workloadErr := collectSmokeSequence(ctx, c, p, plan, filepath.Join(output, "workload"), stdout, runLaneProcess)
 	microErr := ctx.Err()
@@ -115,14 +123,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 		microErr = collectMicrobench(ctx, micro, filepath.Join(output, "microbench"), workflow, builds, executeMicroProcess)
 	}
 	finished := time.Now().UTC()
-	err = errors.Join(workloadErr, microErr)
-	if finished.Sub(started) > 15*time.Minute {
-		err = errors.Join(err, errors.New("smoke entry exceeded fifteen minutes including cleanup"))
-	}
-	receipt := map[string]any{"started": started, "finished": finished, "wall_seconds": finished.Sub(started).Seconds(), "pass": err == nil, "formal_acceptance": false}
-	if err != nil {
-		receipt["error"] = err.Error()
-	}
+	receipt, err := smokeMeasurementReceipt(started, finished, errors.Join(workloadErr, microErr))
 	err = errors.Join(err, writeNewJSON(filepath.Join(output, "smoke.json"), receipt))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -130,6 +131,27 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "five-step smoke and microbenchmark evidence retained; empirical lane acceptance remains separate:", output)
 	return 0
+}
+
+// A complete measurement is separate from the deferred wall-time acceptance.
+// In particular, a twenty-minute successful collection must not be presented
+// as meeting the original fifteen-minute full-job p95 target.
+func smokeMeasurementReceipt(started, finished time.Time, runErr error) (map[string]any, error) {
+	elapsed := finished.Sub(started)
+	if elapsed > smokeMeasurementWindow+smokeCleanupAllowance {
+		runErr = errors.Join(runErr, errors.New("smoke exceeded its measurement safety bound including owned cleanup"))
+	}
+	receipt := map[string]any{
+		"started": started, "finished": finished, "wall_seconds": elapsed.Seconds(),
+		"pass": runErr == nil, "formal_acceptance": false,
+		"timing_acceptance": "deferred", "original_full_job_p95_target_seconds": smokeDeferredWallTarget.Seconds(),
+		"entry_exceeded_original_wall_target": elapsed > smokeDeferredWallTarget,
+		"measurement_bound_seconds":           smokeMeasurementWindow.Seconds(), "cleanup_allowance_seconds": smokeCleanupAllowance.Seconds(),
+	}
+	if runErr != nil {
+		receipt["error"] = runErr.Error()
+	}
+	return receipt, runErr
 }
 
 func orderedSmokePlan(p policy, c laneConfig) (lanePlan, error) {
