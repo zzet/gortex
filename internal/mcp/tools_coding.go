@@ -869,6 +869,16 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		removed, err := s.removedByPendingProjection(ctx, req, id)
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if removed {
+			return removedProjectedSymbolGuidance(id, true), nil
+		}
 		return mcp.NewToolResultError("symbol not found: " + id + s.suggestSymbolIDs(ctx, id)), nil
 	}
 	// A by-id fetch must not cross the session's workspace boundary —
@@ -939,6 +949,12 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		}
 		ns, err := s.readNodeSource(ctx, node, absPath)
 		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
+			if errors.Is(err, errProjectedSourceDeferred) {
+				return s.respondJSONOrTOON(ctx, req, map[string]any{"id": node.ID, "source_state": "pending", "source_reason": "external_write", "complete": false})
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 		}
 		resolved := *node

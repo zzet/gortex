@@ -40,7 +40,11 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	if err := validateRequestProjections(ctx); err != nil {
 		return ctx, err
 	}
-	buildCtx, cancel := context.WithTimeout(ctx, projectedReadBudget)
+	deadline := time.Now().Add(projectedReadBudget)
+	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
+		deadline = original
+	}
+	buildCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	layers := append([]graph.OverlayLayerReader(nil), requestProjectionLayers(ctx)...)
 	for _, graphPath := range paths {
@@ -147,21 +151,27 @@ func projectionBudgetUnavailable(caller context.Context, err error) bool {
 	return caller.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, indexer.ErrProjectionDeadline) || errors.Is(err, indexer.ErrProjectionNoSlot))
 }
 
-func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
-	idx, _ := s.indexerForRel(graphPath)
-	root := idx.RootPath()
-	if selected := requestViewPathRoot(requestCtx); selected.serves(idx.RepoPrefix()) {
+// Both projection and source slicing use this same selected-root boundary.
+func selectedProjectionReadPath(ctx context.Context, root, prefix, abs string) (string, string, string, error) {
+	if selected := requestViewPathRoot(ctx); selected.serves(prefix) {
 		root = selected.root
 	}
-	readPath, confined := relativeWithinRoot(root, abs)
-	if !confined {
-		return nil, errors.New("file is outside the selected checkout")
+	rel, ok := relativeWithinRoot(root, abs)
+	if !ok {
+		return "", "", "", errors.New("file is outside the selected checkout")
 	}
 	key := pathkey.MutationKey(abs)
-	// Mutation keys resolve parent aliases. Refuse an escaping parent even
-	// for absence/tombstone handling, which does not open a file descriptor.
 	if !pathguard.WithinRoot(key, pathkey.IdentityKey(pathguard.ResolveRoot(root))) {
-		return nil, errors.New("file parent is outside the selected checkout")
+		return "", "", "", errors.New("file parent is outside the selected checkout")
+	}
+	return root, rel, key, nil
+}
+
+func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
+	idx, _ := s.indexerForRel(graphPath)
+	root, readPath, key, err := selectedProjectionReadPath(requestCtx, idx.RootPath(), idx.RepoPrefix(), abs)
+	if err != nil {
+		return nil, err
 	}
 	expected := pendingFileProjections.snap.Load().entries[key]
 	before, err := statDiskStamp(abs)
@@ -365,7 +375,7 @@ func validateRequestProjections(ctx context.Context) error {
 
 func withProjectedReadToolFacts(ctx context.Context, name string) context.Context {
 	switch name {
-	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg", "search_symbols":
+	case "get_symbol", "get_symbol_source", "get_file_summary", "get_editing_context", "get_cfg", "search_symbols", "read_file":
 		return withRequestProjectionFacts(ctx)
 	default:
 		return ctx
