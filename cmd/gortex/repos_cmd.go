@@ -3,10 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -17,7 +15,6 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
-	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/tui"
 )
@@ -209,13 +206,7 @@ func loadRepoIndexStates() (map[string]graph.RepoIndexState, error) {
 //  3. The platform default, which is where a daemon started without the flag
 //     put its store anyway.
 func resolveReposBackendPath() string {
-	if path := strings.TrimSpace(reposBackendPath); path != "" {
-		return path
-	}
-	if st, ok := daemon.ReadRuntimeState(); ok && st.BackendPath != "" {
-		return st.BackendPath
-	}
-	return filepath.Join(platform.StoreDir(), "store.sqlite")
+	return resolveStoreBackendPath(reposBackendPath)
 }
 
 // describeRepo resolves one RepoEntry into a repoStatus by reading the

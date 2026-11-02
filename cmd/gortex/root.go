@@ -251,6 +251,7 @@ func assignCommandGroups() {
 		"mcp":    "serve",
 		"daemon": "engine", "track": "engine", "untrack": "engine",
 		"repos": "engine", "status": "engine", "proxy": "engine", "workspace": "engine",
+		"store": "engine",
 		"query": "query", "context": "query", "audit": "query", "wiki": "query",
 		"docs": "query", "export": "query", "wakeup": "query", "prs": "query",
 		"review": "query", "call": "query", "tools": "query",
