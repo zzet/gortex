@@ -33,38 +33,11 @@ func (s *Server) handleSourceSearchText(ctx context.Context, req mcp.CallToolReq
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if len(file.content) == 0 || len(file.content) > 64<<20 {
-			continue
+		current, err := s.scanSourceSearchText(ctx, idx, file.abs, sourceSearchGraphPath(view, file.path), file.content, query, expression, limit-len(matches))
+		if err != nil {
+			return nil, err
 		}
-		source := idx.DecodeSourceSearchText(file.abs, file.content)
-		if trigram.IsBinary(source) || len(source) > 64<<20 {
-			continue
-		}
-		path := sourceSearchGraphPath(view, file.path)
-		lang := s.detectLanguageForContent(file.abs, source[:min(512, len(source))])
-		content, _ := s.maybeRedactConfigLeaf(lang, path, false, string(source))
-		lines := strings.Split(content, "\n")
-		if strings.HasSuffix(content, "\n") {
-			lines = lines[:len(lines)-1]
-		}
-		for line, text := range lines {
-			if line%256 == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-			}
-			text = strings.TrimSuffix(text, "\r")
-			found := strings.Contains(text, query)
-			if expression != nil {
-				found = expression.MatchString(text)
-			}
-			if found {
-				matches = append(matches, enrichedTextMatch{Path: path, Line: line + 1, Text: text})
-				if len(matches) >= limit {
-					break
-				}
-			}
-		}
+		matches = append(matches, current...)
 		if len(matches) >= limit {
 			break
 		}
@@ -92,4 +65,42 @@ func (s *Server) handleSourceSearchText(ctx context.Context, req mcp.CallToolReq
 		}
 	}
 	return s.respondScopedJSONOrTOON(ctx, req, resp, resolved)
+}
+
+// Shared by the automatic source lane and canonical pending-file merge. Keep
+// the byte decoder, binary guard, redaction and line semantics identical.
+func (s *Server) scanSourceSearchText(ctx context.Context, idx *indexer.Indexer, abs, path string, raw []byte, query string, expression *regexp.Regexp, limit int) ([]enrichedTextMatch, error) {
+	matches := make([]enrichedTextMatch, 0)
+	if len(raw) == 0 || len(raw) > 64<<20 {
+		return nil, nil
+	}
+	source := idx.DecodeSourceSearchText(abs, raw)
+	if trigram.IsBinary(source) || len(source) > 64<<20 {
+		return nil, nil
+	}
+	lang := s.detectLanguageForContent(abs, source[:min(512, len(source))])
+	content, _ := s.maybeRedactConfigLeaf(lang, path, false, string(source))
+	lines := strings.Split(content, "\n")
+	if strings.HasSuffix(content, "\n") {
+		lines = lines[:len(lines)-1]
+	}
+	for line, text := range lines {
+		if line%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		text = strings.TrimSuffix(text, "\r")
+		found := strings.Contains(text, query)
+		if expression != nil {
+			found = expression.MatchString(text)
+		}
+		if found {
+			matches = append(matches, enrichedTextMatch{Path: path, Line: line + 1, Text: text})
+			if len(matches) >= limit {
+				break
+			}
+		}
+	}
+	return matches, nil
 }
