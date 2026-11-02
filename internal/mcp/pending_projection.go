@@ -84,6 +84,8 @@ type projectionEntry struct {
 	// re-reads the file before serving the entry.
 	suspect      atomic.Bool
 	sourceEvents uint64 // source-event revision, guarded by pendingProjections.mu
+	// Permission for one fresh source attempt, never freshness of this old owner.
+	checkedRetired atomic.Bool
 }
 
 // projectionRefusal is why a publish left the live entries as they were.
@@ -186,7 +188,7 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		parseErrors:  projection.ParseErrors,
 		parseChecked: projection.ParseChecked,
 		buildTime:    projection.BuildTime,
-		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + 8,
+		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + 16,
 	}
 }
 
@@ -218,7 +220,7 @@ func newProjectionTombstone(absPath, graphPath, repoPrefix string, commitSeq uin
 		repoPrefix: repoPrefix,
 		commitSeq:  commitSeq,
 		layer:      layer,
-		size:       8, // charge the bounded source-event revision
+		size:       16, // charge the source-event revision and checked-retirement hint
 		tombstone:  true,
 	}
 }
@@ -285,6 +287,8 @@ func (p *pendingProjections) projectionReplacementLocked(e *projectionEntry) (*p
 	}
 	var refusal projectionRefusal
 	switch {
+	case e.checkedRetired.Load():
+		refusal = projectionSuperseded // historical owners cannot be republished
 	case prev != nil && prev.graphPath != e.graphPath:
 		refusal = projectionPathCase
 	case prev == nil && len(cur.entries) >= projectionMaxFiles:
@@ -471,11 +475,14 @@ func (p *pendingProjections) retire(store projectionStore) int {
 // A receipt alone is never retirement evidence. Both entry points preserve
 // durable hash -> node comparison -> durable hash and pointer-fenced COW drop.
 func (p *pendingProjections) retireSelected(store projectionStore, selected map[string]struct{}) int {
+	p.mu.Lock()
 	snap := p.snap.Load()
 	if len(snap.entries) == 0 {
+		p.mu.Unlock()
 		return 0
 	}
 	byRepo := make(map[string][]*projectionEntry)
+	revisions := make(map[*projectionEntry]uint64, len(snap.entries))
 	for key, e := range snap.entries {
 		if selected != nil {
 			if _, ok := selected[key]; !ok {
@@ -483,7 +490,9 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 			}
 		}
 		byRepo[e.repoPrefix] = append(byRepo[e.repoPrefix], e)
+		revisions[e] = e.sourceEvents
 	}
+	p.mu.Unlock() // metadata/node/layer reads stay outside the registry lock
 	var caughtUp []*projectionEntry
 	for prefix, entries := range byRepo {
 		candidates := storeHolds(store, prefix, entries)
@@ -495,6 +504,7 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 		for _, e := range storeHolds(store, prefix, candidates) {
 			if diverged[e] {
 				p.divergence.Add(1)
+				delete(revisions, e) // dropping a divergent payload grants no retry hint
 			}
 			caughtUp = append(caughtUp, e)
 		}
@@ -505,9 +515,25 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 			return 0
 		}
 	}
-	retired := p.dropAll(caughtUp)
+	retired := p.dropCheckedRetired(caughtUp, revisions)
 	p.retired.Add(int64(retired))
 	return retired
+}
+
+func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revisions map[*projectionEntry]uint64) int {
+	if len(entries) == 0 {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.snap.Load()
+	for _, entry := range entries {
+		if revision, observed := revisions[entry]; observed && current.entries[entry.key] == entry &&
+			entry.sourceEvents == revision && !entry.suspect.Load() {
+			entry.checkedRetired.Store(true)
+		}
+	}
+	return p.dropAllLocked(entries)
 }
 
 // storeHolds returns the entries whose content the store holds now.

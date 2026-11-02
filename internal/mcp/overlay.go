@@ -444,6 +444,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
+			if legacyName == "get_symbol_source" && res != nil && !res.IsError && retrySourceAfterCheckedRetirement(ctx) {
+				return nil, errProjectedSourceMoved
+			}
 			res = s.decorateToolFreshness(ctx, req.Params.Name, req, res)
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —

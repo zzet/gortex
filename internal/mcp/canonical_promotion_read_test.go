@@ -15,10 +15,14 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/tokens"
 )
 
 func canonicalPromotionReadFixture(t *testing.T) (*Server, *store_sqlite.Store, string) {
 	t.Helper()
+	// Daemon startup warms token counting before it serves source requests.
+	// Keep that one-time encoder initialization outside the read allowance.
+	require.True(t, tokens.EncoderReady())
 	root := t.TempDir()
 	path := filepath.Join(root, "main.go")
 	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc Target() int { return 1 }\n\nfunc Neighbor() int { return 9 }\n"), 0600))
@@ -38,7 +42,7 @@ func canonicalPromotionReadFixture(t *testing.T) (*Server, *store_sqlite.Store, 
 // owner or native invalidation. The leaf-return seam deterministically places
 // real publication/retirement before the existing final freshness decorator.
 func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testing.T) {
-	for _, transition := range []string{"canonical_promotion", "receipt_only", "peer_same_bytes_commit", "same_bytes_event"} {
+	for _, transition := range []string{"canonical_promotion", "receipt_only", "unchecked_eviction", "peer_same_bytes_commit", "peer_retired", "same_bytes_event", "event_then_retire", "canonical_cancelled"} {
 		t.Run(transition, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			s, store, path := canonicalPromotionReadFixture(t)
@@ -81,7 +85,9 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 			require.NotNil(t, retirement)
 
 			originalDeadline := time.Now().Add(projectedReadBudget)
-			ctx := context.WithValue(t.Context(), projectedSourceDeadlineKey{}, originalDeadline)
+			caller, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ctx := context.WithValue(caller, projectedSourceDeadlineKey{}, originalDeadline)
 			calls := 0
 			var first context.Context
 			var deadlines []time.Time
@@ -99,7 +105,7 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 				first = ctx
 				require.True(t, s.hasRequestProjectionFact(ctx, "main.go"), "the real source handler must borrow the ACK owner before the transition")
 				switch transition {
-				case "canonical_promotion":
+				case "canonical_promotion", "canonical_cancelled":
 					// Actual parser/store publication, not a fabricated Done result,
 					// matching hash alone, peer edit or manual registry deletion.
 					require.NoError(t, s.indexer.IndexFile(path))
@@ -111,11 +117,20 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 					require.Nil(t, liveEntry(pendingFileProjections, path))
 					require.Positive(t, pendingFileProjections.retired.Load())
 					require.False(t, entry.suspect.Load(), "canonical promotion is not a native invalidation")
+					require.True(t, time.Now().Before(originalDeadline), "canonical retirement must fit the original read allowance")
+					require.True(t, entry.checkedRetired.Load())
+					if transition == "canonical_cancelled" {
+						cancel()
+					}
 				case "receipt_only":
 					retirement.run()
 					require.Same(t, entry, liveEntry(pendingFileProjections, path), "an unadvanced canonical store cannot retire the acknowledged bytes")
 					require.Zero(t, pendingFileProjections.retired.Load())
-				case "peer_same_bytes_commit":
+				case "unchecked_eviction":
+					pendingFileProjections.drop(entry)
+					require.Nil(t, liveEntry(pendingFileProjections, path))
+					require.False(t, entry.checkedRetired.Load())
+				case "peer_same_bytes_commit", "peer_retired":
 					held, release, lockErr := acquireMutationPath(t.Context(), path)
 					require.NoError(t, lockErr)
 					commit, writeErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, after, 0600)
@@ -124,17 +139,31 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 					require.Greater(t, commit.commitSeq, sequence)
 					require.NotSame(t, entry, liveEntry(pendingFileProjections, path))
 					require.Equal(t, entry.rawHash, liveEntry(pendingFileProjections, path).rawHash)
-				case "same_bytes_event":
+					if transition == "peer_retired" {
+						newer := liveEntry(pendingFileProjections, path)
+						require.NoError(t, s.indexer.IndexFile(path))
+						retirement.run()
+						require.Nil(t, liveEntry(pendingFileProjections, path))
+						require.True(t, newer.checkedRetired.Load())
+						require.False(t, entry.checkedRetired.Load(), "another owner's retirement cannot authorize this old selection")
+					}
+				case "same_bytes_event", "event_then_retire":
 					pendingFileProjections.markSuspect(path)
 					require.Same(t, entry, liveEntry(pendingFileProjections, path))
 					require.True(t, entry.suspect.Load())
+					if transition == "event_then_retire" {
+						require.NoError(t, s.indexer.IndexFile(path))
+						retirement.run()
+						require.Nil(t, liveEntry(pendingFileProjections, path))
+						require.False(t, entry.checkedRetired.Load())
+					}
 				}
 				require.Equal(t, sequence, entry.commitSeq)
 				require.Same(t, layer, entry.layer)
 				current, diskErr := os.ReadFile(path)
 				require.NoError(t, diskErr)
 				require.Equal(t, after, current, "the retirement/event controls must never introduce another physical edit")
-				if transition != "receipt_only" {
+				if transition != "receipt_only" && transition != "canonical_cancelled" {
 					require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded, "the old context must remain unusable; a fresh attempt cannot rebind its facts")
 				}
 				return result, nil
@@ -142,6 +171,12 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 			result, err := s.wrapToolHandler(leaf)(ctx, makeReq("get_symbol_source", map[string]any{
 				"id": "main.go::Target", "context_lines": 0, "format": "json",
 			}))
+			if transition == "canonical_cancelled" {
+				require.True(t, err != nil || result != nil && result.IsError, "cancellation cannot become an accepted result")
+				require.Equal(t, 1, calls)
+				require.ErrorIs(t, caller.Err(), context.Canceled)
+				return
+			}
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			t.Logf("transition=%s handler_attempts=%d final_is_error=%v", transition, calls, result.IsError)
@@ -159,7 +194,12 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 				require.False(t, result.IsError, "verified canonical promotion should allow one coherent fresh source attempt: %s", resultText(result))
 				require.Equal(t, 2, calls, "the old selection stays invalid; the successful response must come from a new whole attempt")
 				require.Equal(t, body, extractTextResult(t, result)["source"])
-				require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
+				if first.Err() != nil {
+					require.ErrorIs(t, first.Err(), context.Canceled, "the discarded attempt's lease was released")
+					require.ErrorIs(t, validateRequestProjections(first), context.Canceled)
+				} else {
+					require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
+				}
 			case "receipt_only":
 				require.False(t, result.IsError, resultText(result))
 				require.Equal(t, 1, calls)
