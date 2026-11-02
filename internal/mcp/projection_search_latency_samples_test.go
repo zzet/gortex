@@ -26,9 +26,11 @@ type projectionLatencySample struct {
 	Error     string                 `json:"error,omitempty"`
 }
 
-// Each adjacent pair uses the identical request; its order alternates. Setup,
-// population switching and response validation sit outside the timed handler
-// interval. Every refusal, error and wrong answer retains its offered sample.
+// Each adjacent pair uses the identical request; its order alternates. Fixture
+// setup, population switching and validation sit outside the timed call. The
+// call includes per-request deadline/request assembly, registered-tool lookup
+// and the public handler equally for both populations. Every refusal, error
+// and wrong answer retains its offered sample.
 func sampleProjectionHandlers(probes []projectionLatencyProbe, repeats int, selectPopulation func(int) (func() error, error), call func(int, projectionLatencyProbe) (*mcplib.CallToolResult, error), validate func(projectionLatencyProbe, *mcplib.CallToolResult) error, emitters ...func(projectionLatencySample) error) ([]projectionLatencySample, error) {
 	if len(probes) == 0 || repeats < 1 {
 		return nil, errors.New("matched projection comparison requires probes and positive repetitions")
