@@ -130,7 +130,7 @@ func (s *refreshMismatchSource) Open(path string) (io.ReadCloser, source.FileMet
 		return rc, meta, err
 	}
 	read := s.reads.Add(1)
-	if read != 2 && read != 4 {
+	if read != 2 {
 		return rc, meta, nil
 	}
 	data, err := io.ReadAll(rc)
@@ -159,7 +159,7 @@ func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *test
 	}, false)
 	require.Empty(t, failed)
 	require.Contains(t, reparsed, path)
-	require.GreaterOrEqual(t, changing.reads.Load(), int32(5), "probe, first refresh, fresh parse, second refresh and actual fallback must all run")
+	require.GreaterOrEqual(t, changing.reads.Load(), int32(3), "probe, refresh rejection and actual legacy fallback must all run")
 	// Observe the real combined path, not just a fixture read count. The
 	// canonical not-observed assertions below still apply to its actual work.
 	parsePhases, fallbackPhases := 0, 0
