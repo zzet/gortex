@@ -154,11 +154,17 @@ func startupRuntimeOwnerMatches(state daemon.RuntimeState) bool {
 }
 
 func startupHeartbeatWaiterWithOwnerProof(ownerMatches func(daemon.RuntimeState) bool) func(time.Time) bool {
+	return startupHeartbeatWaiterWithRuntimeReader(ownerMatches, daemon.ReadRuntimeState)
+}
+
+// The reader seam lets isolated proxy fixtures record the actual read used by
+// the waiter. A second read cannot explain a failed first observation.
+func startupHeartbeatWaiterWithRuntimeReader(ownerMatches func(daemon.RuntimeState) bool, readState func() (daemon.RuntimeState, bool)) func(time.Time) bool {
 	var ownerPID int
 	var ownerBirth string
 	var handoffUntil time.Time
 	return func(now time.Time) bool {
-		state, ok := daemon.ReadRuntimeState()
+		state, ok := readState()
 		if !ok {
 			return false
 		}

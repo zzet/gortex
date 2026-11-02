@@ -33,7 +33,7 @@ func (*storageGoldenReporter) WALReclaimStats() store_sqlite.WALReclaimStats {
 	drain.Counts[1] = 1
 	reset := store_sqlite.DurationHistogram{Total: time.Millisecond, Max: time.Millisecond}
 	reset.Counts[0] = 1
-	return store_sqlite.WALReclaimStats{ThresholdBytes: 256 << 20, Attempts: 3, UrgentAttempts: 2, Resets: 1, CancelledWriterParked: 2, CancelledWriteIntent: 1, CancelledOther: 1, ObservedPeakWALBytes: 512 << 20, WALPeakObserved: true, WriterHold: hold, WriterWait: wait, PauseDrain: drain, PauseTruncate: reset, PauseCount: 1, PauseTotal: 3 * time.Millisecond, PauseLast: 3 * time.Millisecond, PauseMax: 3 * time.Millisecond}
+	return store_sqlite.WALReclaimStats{ThresholdBytes: 256 << 20, Attempts: 3, UrgentAttempts: 2, Resets: 1, CancelledWriterParked: 2, CancelledWriteIntent: 1, CancelledOther: 1, ObservedPeakWALBytes: 512 << 20, WALPeakObserved: true, WriterHold: hold, EditBurstWriterHold: hold, DeferredEditBurst: 2, DeferredInteractiveRead: 1, BulkExceptionHolds: 1, HardCapExceptionHolds: 2, WriterWait: wait, PauseDrain: drain, PauseTruncate: reset, PauseCount: 1, PauseTotal: 3 * time.Millisecond, PauseLast: 3 * time.Millisecond, PauseMax: 3 * time.Millisecond}
 }
 
 func TestStatusStorageBlockGolden(t *testing.T) {

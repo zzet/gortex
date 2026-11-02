@@ -753,11 +753,12 @@ func (s *Server) ReleaseSession(id string) {
 
 // sessionState tracks recent agent activity for context recovery after compaction.
 type sessionState struct {
-	mu             sync.Mutex
-	viewedSymbols  []string // recently viewed symbol IDs (most recent first)
-	viewedFiles    []string // recently viewed file paths
-	modifiedFiles  []string // files modified via edit_symbol
-	recentSearches []string // recent search queries
+	mu                     sync.Mutex
+	viewedSymbols          []string                // recently viewed symbol IDs (most recent first)
+	viewedFiles            []string                // recently viewed file paths
+	modifiedFiles          []string                // files modified via edit_symbol
+	interactiveEditedFiles []interactiveEditedFile // bounded physical identities, no in-flight store marker
+	recentSearches         []string                // recent search queries
 	// clientName is the MCP client identifier (claude-code / cursor / vscode /
 	// zed / …) captured from the protocol's `initialize.clientInfo.name`
 	// field by the daemon dispatcher. Drives the per-session default
