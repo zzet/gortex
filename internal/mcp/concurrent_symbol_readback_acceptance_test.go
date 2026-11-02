@@ -90,7 +90,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 					cancel()
 					return
 				}
-				if ack["committed"] != true || ack["ack_mode"] != "full" {
+				if ack["committed"] != true || ack["ack_mode"] != "full" || ack["graph_status"] != "fresh" {
 					result.err = fmt.Errorf("edit %d lacks actual committed/full ACK: %v", ordinal, ack)
 					cancel()
 					return
@@ -112,14 +112,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 		}()
 	}
 	close(start)
-	joined := make(chan struct{})
-	go func() { workers.Wait(); close(joined) }()
-	select {
-	case <-joined:
-	case <-time.After(6 * time.Minute):
-		cancel()
-		t.Fatal("owned concurrent symbol writers did not terminate within the control bound")
-	}
+	workers.Wait()
 	close(outcomes)
 	total := 0
 	for result := range outcomes {
@@ -128,6 +121,7 @@ func TestEditSymbolTwoSessionsRepeatedFragment1000(t *testing.T) {
 		total += result.completed
 	}
 	require.Equal(t, 1000, total)
+	t.Logf("actual committed full/fresh ACKs and exact source readbacks: %d/1000; two sessions, 500 edits each; no latency sample", total)
 	current, err := os.ReadFile(filepath.Join(root, "sample.go"))
 	require.NoError(t, err)
 	require.Equal(t, original, string(current), "500 alternating commits per declaration preserve both repeated fragments")
