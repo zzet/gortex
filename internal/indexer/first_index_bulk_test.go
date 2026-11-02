@@ -6,12 +6,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -19,18 +20,14 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // Embed the real store so the shadow and its optional persistence capabilities
 // stay intact. Only the drain boundaries are intercepted.
 type firstIndexBulkProbe struct {
 	*store_sqlite.Store
-	beforeBegin func()
 	duringDrain func()
-	ftsErr      error
-	panicDrain  bool
-	panicFlush  bool
-	flushMu     sync.Mutex
 	begins      int
 	flushes     int
 	batches     int
@@ -38,41 +35,41 @@ type firstIndexBulkProbe struct {
 
 func (s *firstIndexBulkProbe) BeginBulkLoad() {
 	s.begins++
-	if s.beforeBegin != nil {
-		s.beforeBegin()
-	}
 	s.Store.BeginBulkLoad()
 }
 
-func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+func (s *firstIndexBulkProbe) beforeBatch() {
 	s.batches++
 	if s.duringDrain != nil {
 		s.duringDrain()
 	}
-	if s.panicDrain {
-		panic("injected drain panic")
-	}
+}
+
+func (s *firstIndexBulkProbe) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	s.beforeBatch()
 	s.Store.AddBatch(nodes, edges)
 }
 
-func (s *firstIndexBulkProbe) BatchUpsertSymbolFTS(items []graph.SymbolFTSItem) error {
-	if s.ftsErr != nil {
-		return s.ftsErr
-	}
-	return s.Store.BatchUpsertSymbolFTS(items)
+// The drain writes through the checked path when the target has one.
+func (s *firstIndexBulkProbe) AddBatchCheckedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) error {
+	s.beforeBatch()
+	return s.Store.AddBatchCheckedContext(ctx, nodes, edges)
 }
 
 func (s *firstIndexBulkProbe) FlushBulk() error {
 	s.flushes++
-	if s.panicFlush {
-		// Model a FlushBulk panic that leaves its writer lock held.
-		s.flushMu.Lock()
-		panic("injected flush panic")
-	}
 	return s.Store.FlushBulk()
 }
 
 func newFirstIndexBulkFixture(t *testing.T) (*firstIndexBulkProbe, *sql.DB) {
+	t.Helper()
+	store, db := newFirstIndexStore(t)
+	return &firstIndexBulkProbe{Store: store}, db
+}
+
+// newFirstIndexStore opens a fresh on-disk store for the shadow route with a
+// read-only pool beside it for schema probes.
+func newFirstIndexStore(t *testing.T) (*store_sqlite.Store, *sql.DB) {
 	t.Helper()
 	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
 	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
@@ -84,7 +81,19 @@ func newFirstIndexBulkFixture(t *testing.T) (*firstIndexBulkProbe, *sql.DB) {
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=synchronous(NORMAL)")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	return &firstIndexBulkProbe{Store: store}, db
+	return store, db
+}
+
+// firstIndexWriterSynchronous reads PRAGMA synchronous off the store's writer
+// connection. It takes the write gate under a deadline, so it also fails,
+// rather than hangs, when a failure path leaked the gate.
+func firstIndexWriterSynchronous(t *testing.T, store *store_sqlite.Store) int64 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sync, err := store.WriterPragmaForTest(ctx, "synchronous")
+	require.NoError(t, err, "the store's write gate is still held")
+	return sync
 }
 
 func firstIndexFixtureRepo(t *testing.T) string {
@@ -141,33 +150,194 @@ func assertFirstIndexRestored(t *testing.T, store *store_sqlite.Store, db *sql.D
 	require.False(t, firstIndexBulkActive(t, store), "standalone window must be closed before restoration probes")
 	assert.Equal(t, indexes, firstIndexSchemaIndexes(t, db))
 	// PRAGMA synchronous is connection-local, so this read-only pool cannot
-	// check writer restoration. TestBulkLoadDropsAndRebuildsIndexes in
-	// store_sqlite checks the actual writer connection instead.
+	// check writer restoration; firstIndexWriterSynchronous reads the writer.
 }
 
-func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {
-	probe, db := newFirstIndexBulkFixture(t)
-	indexes := firstIndexSchemaIndexes(t, db)
-	probe.beforeBegin = func() { assertFirstIndexNoReceipts(t, probe.Store, "repo") }
-	probe.duringDrain = func() {
-		assert.True(t, firstIndexBulkActive(t, probe.Store), "cold shadow drain must engage standalone bulk mode")
-		assertFirstIndexNoReceipts(t, probe.Store, "repo")
-		assert.NotEqual(t, indexes, firstIndexSchemaIndexes(t, db), "dense indexes must be deferred during drain")
-	}
-	idx := newFirstIndexBulkIndexer(t, probe, "repo")
-	result, err := idx.IndexCtx(context.Background(), firstIndexFixtureRepo(t))
+// sqliteFullError provokes a genuine SQLITE_FULL from the driver on a
+// throwaway in-memory database capped at a few pages, so a test can hand a
+// store the exact error a full volume produces without filling a disk.
+func sqliteFullError(t *testing.T) error {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
-	require.Positive(t, result.NodeCount)
-	require.Positive(t, probe.batches, "test must observe the shadow drain")
-	assert.Equal(t, 1, probe.begins)
-	assert.Equal(t, 1, probe.flushes)
-	state, found, err := probe.GetRepoIndexState("repo")
+	defer func() { require.NoError(t, db.Close()) }()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`PRAGMA max_page_count = 2`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE filler(v BLOB)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO filler VALUES (randomblob(65536))`)
+	require.Error(t, err)
+	return err
+}
+
+// A drain chunk the store refuses comes back as a typed storage error, for an
+// ordinary drain and for the initial claimed one, instead of panicking out of
+// the void AddBatch, and none of the refused chunk is committed.
+func TestDrainAddBatchReturnsStorageFailure(t *testing.T) {
+	full := sqliteFullError(t)
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"ordinary", context.Background()},
+		{"initial claimed", withInitialDrainCooperation(context.Background(), func() bool { return false })},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			defer store.SetBatchWriteHookForTest(func(int, int) error { return full })()
+			nodes := []*graph.Node{{
+				ID: "app.py::fetch", Name: "fetch", Kind: graph.KindFunction,
+				RepoPrefix: "repo", FilePath: "app.py", Language: "python",
+			}}
+
+			var drainErr error
+			require.NotPanics(t, func() { drainErr = drainAddBatch(tc.ctx, store, nodes, nil) })
+			var storageErr *store_sqlite.StorageError
+			require.ErrorAs(t, drainErr, &storageErr)
+			assert.Contains(t, store_sqlite.SafeStorageFailureReason(drainErr), "SQLite code 13")
+			assert.Contains(t, drainBatchError(tc.ctx, drainErr).Error(), "indexer: persist bulk graph batch:")
+			assert.Zero(t, store.NodeCount(), "the refused chunk must roll back")
+		})
+	}
+}
+
+// firstIndexWindowWitness counts a store's batch writes, how many of them
+// landed inside an engaged bulk window with the dense indexes deferred, and how
+// often each dense index was sealed. fail, when set, decides whether the store
+// refuses a batch.
+type firstIndexWindowWitness struct {
+	batches, engaged, deferred int
+	seals                      map[string]int
+	fail                       func(edgeRows int) error
+}
+
+func watchFirstIndexWindow(t *testing.T, store *store_sqlite.Store, db *sql.DB, indexes []string) *firstIndexWindowWitness {
+	t.Helper()
+	w := &firstIndexWindowWitness{seals: map[string]int{}}
+	t.Cleanup(store.SetBulkSealHookForTest(func(index string) error {
+		w.seals[index]++
+		return nil
+	}))
+	t.Cleanup(store.SetBatchWriteHookForTest(func(_, edgeRows int) error {
+		w.batches++
+		if firstIndexBulkActive(t, store) {
+			w.engaged++
+		}
+		if !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) {
+			w.deferred++
+		}
+		if w.fail != nil {
+			return w.fail(edgeRows)
+		}
+		return nil
+	}))
+	// The eviction runs just before the window opens, so this is the last
+	// point at which a receipt could wrongly precede the drain.
+	shadowEvictionBranchHook = func(retirement bool) {
+		assert.True(t, retirement, "a SQLite target must take the shadow-replacement retirement")
+		assertFirstIndexNoReceipts(t, store, "repo")
+	}
+	t.Cleanup(func() { shadowEvictionBranchHook = nil })
+	return w
+}
+
+func (w *firstIndexWindowWitness) assertEngaged(t *testing.T) {
+	t.Helper()
+	require.Positive(t, w.batches, "test must observe the shadow drain")
+	assert.Positive(t, w.engaged, "cold shadow drain must engage standalone bulk mode")
+	assert.Positive(t, w.deferred, "dense indexes must be deferred during drain")
+	// One window per drain: a second one would seal every index again.
+	require.NotEmpty(t, w.seals, "the window must seal the indexes it deferred")
+	for index, n := range w.seals {
+		assert.Equal(t, 1, n, "index %s sealed %d times", index, n)
+	}
+}
+
+func assertFirstIndexReceipts(t *testing.T, store *store_sqlite.Store, result *IndexResult) {
+	t.Helper()
+	state, found, err := store.GetRepoIndexState("repo")
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, result.NodeCount, state.NodeCount)
 	assert.Equal(t, result.EdgeCount, state.EdgeCount)
-	assert.Contains(t, probe.LoadFileMtimes("repo"), "app.py")
-	assertFirstIndexRestored(t, probe.Store, db, indexes)
+	assert.NotEmpty(t, store.LoadFileMtimes("repo"))
+}
+
+// A cold first index drains through a standalone bulk window on every route
+// into it, and again on a retry after a failed drain left rows behind.
+func TestFirstIndexDrainUsesBulkWindow(t *testing.T) {
+	t.Run("IndexCtx on a fresh store", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+
+		result, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), firstIndexFixtureRepo(t))
+		require.NoError(t, err)
+		require.Positive(t, result.NodeCount)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Contains(t, store.LoadFileMtimes("repo"), "app.py")
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
+
+	t.Run("TrackRepoCtx on an empty multi-repo store", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, "main.go"), "package app\n\nfunc Fetch(url string) string { return url }\n")
+		mi := NewMultiIndexer(store, newTestRegistry(), search.NewNull(), newTestConfigManager(t), zap.NewNop())
+		t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+		result, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "repo", Path: dir})
+		require.NoError(t, err)
+		require.Positive(t, result.NodeCount)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
+
+	t.Run("a retry after a failed drain engages the window again", func(t *testing.T) {
+		store, db := newFirstIndexStore(t)
+		indexes := firstIndexSchemaIndexes(t, db)
+		writerSync := firstIndexWriterSynchronous(t, store)
+		w := watchFirstIndexWindow(t, store, db, indexes)
+		injected := errors.New("injected edge batch failure")
+		refused := false
+		w.fail = func(edgeRows int) error {
+			if edgeRows > 0 && !refused {
+				refused = true
+				return injected
+			}
+			return nil
+		}
+		dir := firstIndexFixtureRepo(t)
+
+		// The node batches land; the first edge batch is refused.
+		_, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), dir)
+		require.ErrorIs(t, err, injected)
+		require.True(t, refused, "the drain never reached an edge batch")
+		w.assertEngaged(t)
+		require.Positive(t, store.NodeCount(), "the failed drain must leave rows for the retry to evict")
+		assertFirstIndexNoReceipts(t, store, "repo")
+		assertFirstIndexRestored(t, store, db, indexes)
+
+		// The retry evicts them, which leaves the store cold again.
+		w.batches, w.engaged, w.deferred, w.seals = 0, 0, 0, map[string]int{}
+		result, err := newFirstIndexBulkIndexer(t, store, "repo").IndexCtx(context.Background(), dir)
+		require.NoError(t, err)
+		w.assertEngaged(t)
+		assertFirstIndexReceipts(t, store, result)
+		assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store))
+		assertFirstIndexRestored(t, store, db, indexes)
+	})
 }
 
 func TestSecondRepoWarmStoreNoBulkWindow(t *testing.T) {
@@ -227,79 +397,136 @@ func (firstIndexPanicReporter) Report(stage string, _, _ int) {
 	}
 }
 
+// firstIndexDrainFTSTrigger makes every symbol FTS append on store fail, the
+// way a storage error inside the drain's FTS writes would.
+func firstIndexDrainFTSTrigger(t *testing.T, store *store_sqlite.Store) {
+	t.Helper()
+	writer, err := sql.Open("sqlite", "file:"+filepath.ToSlash(store.Path()))
+	require.NoError(t, err)
+	_, err = writer.Exec(`CREATE TRIGGER fail_first_index_fts BEFORE INSERT ON symbol_fts_rowid
+BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+}
+
+// Every way a first index can fail, on the real store: the bulk window must
+// close (no leaked write gate, writer durability back, the dense indexes back),
+// no success receipt may be written, and the indexer must hand its disk target
+// back. Faults inside the store come from its own test hooks, so the eviction
+// the drain picks is the production one for a SQLite target.
 func TestFirstIndexFailureRestoresStore(t *testing.T) {
-	for _, mode := range []string{"drain error", "cancel before drain", "panic in body", "panic in drain"} {
+	for _, mode := range []string{
+		"drain error", "cancel before drain", "panic in body", "panic in drain",
+		"storage full", "seal panic", "seal panic after a drain panic", "seal error",
+	} {
 		t.Run(mode, func(t *testing.T) {
-			probe, db := newFirstIndexBulkFixture(t)
+			store, db := newFirstIndexStore(t)
 			indexes := firstIndexSchemaIndexes(t, db)
-			injected := errors.New("injected drain FTS error")
+			writerSync := firstIndexWriterSynchronous(t, store)
+			var evictions []bool
+			shadowEvictionBranchHook = func(retirement bool) { evictions = append(evictions, retirement) }
+			t.Cleanup(func() { shadowEvictionBranchHook = nil })
+			var fault func() error
+			batches, engaged := 0, false
+			defer store.SetBatchWriteHookForTest(func(int, int) error {
+				batches++
+				engaged = engaged || firstIndexBulkActive(t, store)
+				if fault != nil {
+					return fault()
+				}
+				return nil
+			})()
+			seals := 0
+			defer store.SetBulkSealHookForTest(func(index string) error {
+				seals++
+				switch {
+				case (mode == "seal panic" || mode == "seal panic after a drain panic") && seals == 1:
+					panic("injected seal panic")
+				case mode == "seal error" && index == "nodes_by_kind":
+					return errors.New("injected seal failure")
+				}
+				return nil
+			})()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch mode {
 			case "drain error":
-				probe.ftsErr = injected
-			case "panic in drain":
-				probe.panicDrain = true
+				firstIndexDrainFTSTrigger(t, store)
+			case "panic in drain", "seal panic after a drain panic":
+				fault = func() error { panic("injected drain panic") }
+			case "storage full":
+				full := sqliteFullError(t)
+				fault = func() error { return full }
 			case "cancel before drain":
 				ctx = progress.WithReporter(ctx, firstIndexCancelReporter{cancel: cancel})
 			case "panic in body":
 				ctx = progress.WithReporter(ctx, firstIndexPanicReporter{})
 			}
-			probe.duringDrain = func() {
-				assert.True(t, firstIndexBulkActive(t, probe.Store), "failure fixture must exercise an engaged bulk window")
+			idx := newFirstIndexBulkIndexer(t, store, "repo")
+			if mode == "seal panic" {
+				idx.indexMemoryAdmission = newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
 			}
-			idx := newFirstIndexBulkIndexer(t, probe, "repo")
 			dir := firstIndexFixtureRepo(t)
+
 			switch mode {
 			case "panic in body":
 				assert.PanicsWithValue(t, "injected body panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
-				assert.Zero(t, probe.NodeCount(), "body panic must not drain shadow nodes")
-				assert.Zero(t, probe.EdgeCount(), "body panic must not drain shadow edges")
+				assert.Zero(t, store.NodeCount(), "body panic must not drain shadow nodes")
+				assert.Zero(t, store.EdgeCount(), "body panic must not drain shadow edges")
 			case "panic in drain":
 				require.PanicsWithValue(t, "injected drain panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
-			case "drain error":
-				_, err := idx.IndexCtx(ctx, dir)
-				require.ErrorIs(t, err, injected)
-			default:
+			case "seal panic":
+				require.PanicsWithValue(t, "injected seal panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
+				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
+				assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
+				assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
+			case "seal panic after a drain panic":
+				// The flush the drain panic's unwind runs panics too; it is
+				// retried the same way, and the later panic reaches the caller.
+				require.PanicsWithValue(t, "injected seal panic", func() { _, _ = idx.IndexCtx(ctx, dir) })
+				assert.Greater(t, seals, 1, "the backstop did not retry the panicked flush")
+			case "cancel before drain":
 				_, err := idx.IndexCtx(ctx, dir)
 				require.ErrorIs(t, err, context.Canceled)
+			case "drain error":
+				_, err := idx.IndexCtx(ctx, dir)
+				require.ErrorContains(t, err, "injected drain FTS error")
+			case "storage full":
+				_, err := idx.IndexCtx(ctx, dir)
+				var storageErr *store_sqlite.StorageError
+				require.ErrorAs(t, err, &storageErr)
+				assert.Contains(t, store_sqlite.SafeStorageFailureReason(err), "SQLite code 13")
+				assert.Equal(t, 1, batches, "a refused write must be the drain's last")
+			case "seal error":
+				_, err := idx.IndexCtx(ctx, dir)
+				require.ErrorContains(t, err, "nodes_by_kind")
+				// Either still owed or already rebuilt by the maintenance lane,
+				// which runs as soon as the window closes on a volume with room.
+				health, healthErr := store.PlannerStatsHealth(context.Background())
+				require.NoError(t, healthErr)
+				if health.Reason == "dense_indexes_missing" {
+					assert.Equal(t, []string{"nodes_by_kind"}, health.DenseIndexesMissing)
+				}
+				deadline := time.Now().Add(10 * time.Second)
+				for !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
+
 			if mode == "cancel before drain" || mode == "panic in body" {
-				assert.Zero(t, probe.begins)
-				assert.Zero(t, probe.batches)
+				assert.Empty(t, evictions, "a failure before the drain must not evict")
+				assert.Zero(t, batches, "a failure before the drain must not write")
 			} else {
-				require.Positive(t, probe.batches)
-				assert.Equal(t, 1, probe.begins)
+				assert.Equal(t, []bool{true}, evictions, "a SQLite target must take the shadow-replacement retirement")
+				require.Positive(t, batches, "test must observe the shadow drain")
+				assert.True(t, engaged, "failure fixture must exercise an engaged bulk window")
 			}
-			assertFirstIndexRestored(t, probe.Store, db, indexes)
-			assertFirstIndexNoReceipts(t, probe.Store, "repo")
-			assert.Same(t, probe, idx.graph, "panic and error paths must restore disk target")
+			assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store), "writer durability must be restored")
+			assertFirstIndexRestored(t, store, db, indexes)
+			assertFirstIndexNoReceipts(t, store, "repo")
+			assert.Same(t, store, idx.graph, "panic and error paths must restore disk target")
 		})
 	}
-}
-
-func TestFirstIndexFlushPanicPropagates(t *testing.T) {
-	// Given a FlushBulk implementation that panics while holding its writer lock.
-	probe, _ := newFirstIndexBulkFixture(t)
-	probe.panicFlush = true
-	idx := newFirstIndexBulkIndexer(t, probe, "repo")
-	idx.indexMemoryAdmission = newIndexMemoryAdmissionBudget(defaultIndexMemoryAdmissionBytes)
-	// The probe's lock is independent of Store; close the real bulk window at cleanup.
-	t.Cleanup(func() { require.NoError(t, probe.Store.FlushBulk()) })
-
-	// When the completed shadow drain flushes, it must not retry that locked call.
-	require.PanicsWithValue(t, "injected flush panic", func() {
-		_, _ = idx.IndexCtx(context.Background(), firstIndexFixtureRepo(t))
-	})
-
-	// Then the panic propagates and the backstop does not re-enter FlushBulk.
-	// This fixture has no failure-ledger rows, so it does not cover a real
-	// store whose FlushBulk panics with writeMu held while the ledger is dirty.
-	assert.Equal(t, 1, probe.flushes)
-	assert.Same(t, probe, idx.graph)
-	assert.Positive(t, idx.indexMemoryAdmission.snapshot().peak, "fixture must acquire the memory lease")
-	assert.Zero(t, idx.indexMemoryAdmission.snapshot().used, "earlier defers must release the memory lease")
-	assertFirstIndexNoReceipts(t, probe.Store, "repo")
 }
 
 type firstIndexDrainPanicReporter struct{}
@@ -327,12 +554,7 @@ func TestFirstIndexFailureRestoresSQLiteReplacement(t *testing.T) {
 			writeFile(t, baseline, "old replacement baseline")
 			ctx := context.Background()
 			if mode == "drain error" {
-				writer, err := sql.Open("sqlite", "file:"+filepath.ToSlash(probe.Path()))
-				require.NoError(t, err)
-				_, err = writer.Exec(`CREATE TRIGGER fail_first_index_fts BEFORE INSERT ON symbol_fts_rowid
-BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
-				require.NoError(t, err)
-				require.NoError(t, writer.Close())
+				firstIndexDrainFTSTrigger(t, probe.Store)
 			} else {
 				ctx = progress.WithReporter(ctx, firstIndexDrainPanicReporter{})
 			}
@@ -355,4 +577,19 @@ BEGIN SELECT RAISE(ABORT, 'injected drain FTS error'); END`)
 			assert.Nil(t, probe.GetNode("repo::stale"), "replacement must evict stale graph rows")
 		})
 	}
+}
+
+func TestFirstIndexDrainReportsWindowAndSeal(t *testing.T) {
+	store, _ := newFirstIndexStore(t)
+	core, observed := observer.New(zap.InfoLevel)
+	idx := newFirstIndexBulkIndexer(t, store, "repo")
+	idx.logger = zap.New(core)
+	result, err := idx.IndexCtx(t.Context(), firstIndexFixtureRepo(t))
+	require.NoError(t, err)
+	entries := observed.FilterMessage("indexer: FlushBulk complete").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "cold", fields["window"])
+	assert.Contains(t, fields, "seal_elapsed")
+	assert.EqualValues(t, result.NodeCount, fields["nodes"])
 }

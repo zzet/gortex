@@ -473,6 +473,36 @@ func TestIndexMultiRepoRefFactFailureStopsGlobalConsumers(t *testing.T) {
 		"a failed reference-fact boundary must not publish global completion")
 }
 
+// TestIndexMultiRepoFailedFinalSealGivesUpTheWindow: when the coordinated
+// window's final seal keeps failing, the cold pass reports the failure and then
+// gives the window up instead of leaving it open behind the error. The writer
+// is back at its own durability, the planner probe no longer sees a live
+// window, and the store's repair rebuilds the index the seal could not.
+func TestIndexMultiRepoFailedFinalSealGivesUpTheWindow(t *testing.T) {
+	store, db := newFirstIndexStore(t)
+	indexes := firstIndexSchemaIndexes(t, db)
+	writerSync := firstIndexWriterSynchronous(t, store)
+	injected := errors.New("injected final seal failure")
+	restore := store.SetBulkSealHookForTest(func(index string) error {
+		if index == "nodes_by_kind" {
+			return injected
+		}
+		return nil
+	})
+	mi := newColdOrchestrationMulti(store, zap.NewNop())
+
+	_, err := mi.indexFixtureRepos(coldRefFactRepos(t, 2))
+	restore()
+	require.ErrorIs(t, err, injected)
+	assert.Equal(t, writerSync, firstIndexWriterSynchronous(t, store), "writer durability must be restored")
+	assert.False(t, firstIndexBulkActive(t, store), "the failed window must not stay open")
+	deadline := time.Now().Add(10 * time.Second)
+	for !assert.ObjectsAreEqual(indexes, firstIndexSchemaIndexes(t, db)) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Equal(t, indexes, firstIndexSchemaIndexes(t, db), "the repair must rebuild the index the seal left out")
+}
+
 // TestBeginDeferredPassesOverlapSplitsPoolFromTail pins the overlap contract:
 // BeginDeferredPasses drains the enrichment pool on its own goroutine while
 // the caller is free to run the resolve phase; contracts and the catch-up

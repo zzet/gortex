@@ -29,6 +29,11 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 		silent  = "silent"  // nothing at all
 		allow   = "allow"   // no deny (another door may still advise)
 		catDeny = "catDeny" // the shell read's own deny
+		readA   = "readA"   // the shell read's deny, for a.go
+		sedA    = "sedA"    // the shell-write advisory, for sed -i a.go
+		scriptW = "scriptW" // the shell-write advisory, for a script write to a.go
+
+		pyRead = `python3 -c "print(open('a.go').read())"`
 	)
 	for _, tc := range []struct {
 		name, cmd, want string
@@ -69,6 +74,7 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 
 		// Everything else passes.
 		{"pure write", `python3 -c "open('a.go', \"w\").write('package a')"`, allow},
+		{"pure write, plain quotes", `python3 -c "open('a.go', 'w').write('package a')"`, scriptW},
 		{"syntax check", `python -c 'import ast; ast.parse(open("a.go").read()); print("syntax ok")'`, silent},
 		{"data file", `python3 -c "import json; print(json.load(open('package.json')))"`, silent},
 		{"unindexed source", `python3 -c "print(open('c.go').read())"`, silent},
@@ -119,6 +125,110 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 		{"env -C", `env -C /tmp python3 -c "print(open('a.go').read())"`, silent},
 		{"uv run --directory", `uv run --directory=/tmp python -c "print(open('a.go').read())"`, silent},
 		{"env -C attached", `env -iC/tmp python3 -c "print(open('a.go').read())"`, silent},
+
+		// Wrappers that run the command in the same filesystem and directory
+		// are looked through; those that run it against another root, and
+		// `command -v`, which runs nothing, are not.
+		{"exec", "exec " + pyRead, deny},
+		{"nohup", "nohup " + pyRead, deny},
+		{"setsid", "setsid -f " + pyRead, deny},
+		{"nice -n", "nice -n 5 " + pyRead, deny},
+		{"nice -N", "nice -5 " + pyRead, deny},
+		{"nice --adjustment", "nice --adjustment=3 " + pyRead, deny},
+		{"command", "command " + pyRead, deny},
+		{"nvm exec", "nvm exec 20 " + pyRead, deny},
+		{"nvm exec without a version", "nvm exec " + pyRead, deny},
+		{"direnv exec", "direnv exec . " + pyRead, deny},
+		{"wrapped launcher", "timeout 5 nohup " + pyRead, deny},
+		{"command -v", "command -v " + pyRead, silent},
+		// The shell read and write shapes do not look through them: a wrapped
+		// first statement must not stop the classification before a later one.
+		// What the hook newly sees (os.open reads, wrapped scripts) has its
+		// own probe budget: it never spends the one a later read needs.
+		{"os.open reads before a read", `python3 -c "import os; os.open('x0.py', os.O_RDONLY); os.open('x1.py', os.O_RDONLY); os.open('x2.py', os.O_RDONLY); print(open('a.go').read())"`, deny},
+		{"os.open creates before a read", `python3 -c "import os; os.open('/tmp/x0.py', os.O_CREAT); os.open('/tmp/x1.py', os.O_CREAT); os.open('/tmp/x2.py', os.O_CREAT); print(open('a.go').read())"`, deny},
+		{"os.open reads, then a read", `python3 -c "import os; os.open('x0.py', os.O_RDONLY); os.open('x1.py', os.O_RDONLY); os.open('x2.py', os.O_RDONLY)" && ` + pyRead, deny},
+		{"wrapped reads before a read", `nohup python3 -c "print(open('x0.py').read())"; nohup python3 -c "print(open('x1.py').read())"; nohup python3 -c "print(open('x2.py').read())"; ` + pyRead, deny},
+		{"wrapped script reading three files before a read", `nice -n 5 python3 -c "print(open('x0.py').read(), open('x1.py').read(), open('x2.py').read())"; ` + pyRead, deny},
+		{"wrapped rewrites before a rewrite", `exec python3 -c "p='x0.py'; s=open(p).read(); open(p,'w').write(s)"; exec python3 -c "p='x1.py'; s=open(p).read(); open(p,'w').write(s)"; exec python3 -c "p='x2.py'; s=open(p).read(); open(p,'w').write(s)"; python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`, edit},
+		{"wrapped command, then a cat", `nohup ls && cat a.go`, readA},
+		{"command, then a tail", `command ls; tail a.go`, readA},
+		{"wrapped cat of other source, then a cat", `nice -n 5 cat c.go && cat a.go`, readA},
+		{"wrapped cat", `nohup cat a.go`, silent},
+		{"chroot", "chroot /x " + pyRead, silent},
+
+		// os.open reads and writes by its literal flags.
+		{"os.open read", `python3 -c "import os; fd = os.open('a.go', os.O_RDONLY); print(os.read(fd, 99))"`, deny},
+		{"aliased os.open", `python3 -c "from os import open as o, read, O_RDONLY; print(read(o('a.go', O_RDONLY), 99))"`, silent},
+		{"os.open bare flag", `python3 -c "import os; from os import O_RDONLY, O_CLOEXEC; print(os.read(os.open('a.go', O_RDONLY | O_CLOEXEC), 99))"`, deny},
+		// An os.open write is a write target only: never a read, never what
+		// turns a read into an edit, so it hides no Read deny.
+		{"os.open write and a read of the same file", `python3 -c "import os; print(open('a.go').read()); os.open('a.go', os.O_WRONLY)"`, deny},
+		{"os.open read-write and a read of another file", `python3 -c "import os; os.open('a.go', os.O_RDWR); print(open('b.go').read())"`, deny},
+		{"Python read, then an os.open read-write", `python3 -c "print(open('b.go').read())" && python3 -c "import os; os.open('a.go', os.O_RDWR)"`, deny},
+		{"os.open O_PATH", `python3 -c "import os; os.open('a.go', os.O_RDONLY | os.O_PATH)"`, silent},
+		{"os.open O_DIRECTORY", `python3 -c "import os; os.open('a.go', os.O_DIRECTORY)"`, silent},
+		{"os.open read-modify-write", "python3 - <<'PY'\nimport os\nfd = os.open('a.go', os.O_RDWR)\ns = os.read(fd, 1 << 20)\nos.lseek(fd, 0, 0)\nos.write(fd, s)\nPY", scriptW},
+		{"os.open write", `python3 -c "import os; os.write(os.open('a.go', os.O_WRONLY | os.O_TRUNC), b'package a')"`, scriptW},
+		{"os.open variable flags", `python3 -c "import os, sys; f = int(sys.argv[1]); print(os.read(os.open('a.go', f), 99))"`, silent},
+		{"os.open flag not from os", `python3 -c "import os; print(os.read(os.open('a.go', O_RDONLY), 99))"`, silent},
+		{"os.open create", `python3 -c "import os; print(os.read(os.open('a.go', os.O_RDONLY | os.O_CREAT), 99))"`, deny},
+		{"os.open dir_fd", `python3 -c "import os; d = os.open('src', os.O_RDONLY); print(os.read(os.open('a.go', os.O_RDONLY, dir_fd=d), 99))"`, silent},
+		{"os aliased onto another module", `python3 -c "import mymod as os; print(os.read(os.open('a.go', os.O_RDONLY), 99))"`, silent},
+
+		// An os.open write never softens a deny the rest of the command earns.
+		{"os.open write, then a cat", `python3 -c "import os; os.open('a.go', os.O_WRONLY)" && cat b.go`, catDeny},
+		{"os.open write after a cat", `cat b.go && python3 -c "import os; os.open('a.go', os.O_WRONLY)"`, catDeny},
+		{"os.open write, then a head", `python3 -c "import os; os.open('a.go', os.O_WRONLY)" && head b.go`, deny},
+		{"os.open write and a read", `python3 -c "import os; os.open('a.go', os.O_WRONLY); print(open('b.go').read())"`, deny},
+		{"os.open write, then a Python read", `python3 -c "import os; os.open('a.go', os.O_WRONLY)" && python3 -c "print(open('b.go').read())"`, deny},
+		{"open write, then a cat", `python3 -c "open('a.go', 'w').write('x')" && cat b.go`, scriptW},
+		{"os.open write, unindexed", `python3 -c "import os; os.write(os.open('c.go', os.O_WRONLY), b'x')"`, silent},
+
+		// A command run as text gets the answer it would get typed: the
+		// -c string of a shell, and a literal command line Python runs.
+		{"bash -c", `bash -c "cat a.go"`, readA},
+		{"bash -lc", `bash -lc 'head -5 a.go'`, readA},
+		{"sh with options", `sh -o pipefail -ec 'cat a.go'`, readA},
+		{"wrapped shell", `nohup bash -c 'cat a.go'`, readA},
+		{"python in a shell", `sh -c 'python3 -c "print(open(\"a.go\").read())"'`, deny},
+		{"shell write in a shell", `bash -c "sed -i s/x/y/ a.go"`, sedA},
+		{"nested deny beats an outer advisory", `sed -i s/x/y/ a.go && bash -c 'cat b.go'`, catDeny},
+		{"os.popen", `python3 -c "import os; print(os.popen('cat a.go').read())"`, readA},
+		{"os.system", `python3 -c "import os; os.system('cat a.go')"`, readA},
+		{"subprocess list", `python3 -c "import subprocess; subprocess.run(['cat', 'a.go'])"`, readA},
+		{"check_output tuple", `python3 -c "import subprocess; print(subprocess.check_output(('tail', '-n', '5', 'a.go')))"`, readA},
+		{"getoutput", `python3 -c "import subprocess; print(subprocess.getoutput('head a.go'))"`, readA},
+		{"subprocess shell write", `python3 -c "import subprocess; subprocess.run('sed -i s/x/y/ a.go', shell=True)"`, sedA},
+		{"subprocess python", `python3 -c "import subprocess; subprocess.run(['python3', '-c', 'print(open(\'a.go\').read())'])"`, silent},
+		{"subprocess python, quoted", "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['python3', '-c', \"print(open('a.go').read())\"])\nPY", deny},
+
+		{"module imported with a submodule", `python3 -c "import os, os.path; os.system('cat a.go')"`, readA},
+		{"subprocess string with shell=True", `python3 -c "import subprocess; print(subprocess.check_output('cat a.go', shell=True))"`, readA},
+		{"subprocess string without a shell", `python3 -c "import subprocess; subprocess.run('cat a.go')"`, silent},
+		{"os.system list", `python3 -c "import os; os.system(['cat', 'a.go'])"`, silent},
+		{"os aliased onto another module, system", `python3 -c "import mylib as os; os.system('cat a.go')"`, silent},
+		{"subprocess rebound", "python3 - <<'PY'\nimport subprocess\nsubprocess = None\nsubprocess.run(['cat', 'a.go'])\nPY", silent},
+		{"local class os", "python3 - <<'PY'\nclass os:\n    def system(c): pass\nos.system('cat a.go')\nPY", silent},
+		{"os never imported", `python3 -c "os.system('cat a.go')"`, silent},
+		{"nested script file", `bash run.sh a.go`, silent},
+		{"nested unindexed", `bash -c "cat c.go" && python3 -c "import os; os.system('cat c.go')"`, silent},
+		{"two levels", `bash -c "bash -c 'cat a.go'"`, silent},
+		{"two levels through python", `bash -c 'python3 -c "import os; os.system(\"cat a.go\")"'`, silent},
+		{"shell list from python", `python3 -c "import subprocess; subprocess.run(['bash', '-c', 'cat a.go'])"`, silent},
+		{"subprocess cwd", `python3 -c "import subprocess; subprocess.run(['cat', 'a.go'], cwd='/tmp')"`, silent},
+		{"subprocess executable", `python3 -c "import subprocess; subprocess.run('cat a.go', shell=True, executable='/bin/zsh')"`, silent},
+		{"subprocess *args", `python3 -c "import subprocess, sys; subprocess.run(['cat', 'a.go'], *sys.argv[1:])"`, silent},
+		{"subprocess **kwargs", `python3 -c "import subprocess; kw = {'cwd': '/tmp'}; subprocess.run(['cat', 'a.go'], **kw)"`, silent},
+		{"subprocess variable", `python3 -c "import subprocess; c = ['cat', 'a.go']; subprocess.run(c)"`, silent},
+		{"os.system f-string", `python3 -c "import os; f = 'a.go'; os.system(f'cat {f}')"`, silent},
+		{"list handed to the shell", `python3 -c "import subprocess; subprocess.run(['cat a.go'], shell=True)"`, silent},
+		{"nested after cd to a variable", `cd $V && bash -c "cat a.go"`, silent},
+		{"python nested after cd to a variable", `cd $V && python3 -c "import os; os.system('cat a.go')"`, silent},
+		{"nested after chdir", `python3 -c "import os; os.chdir('/tmp'); os.system('cat a.go')"`, silent},
+		{"nested under env -C", `env -C /tmp bash -c "cat a.go"`, silent},
+		{"within the nested bound", strings.Repeat(`bash -c "cat c.go"; `, 7) + `bash -c "cat a.go"`, readA},
+		{"past the nested bound", strings.Repeat(`bash -c "cat c.go"; `, 8) + `bash -c "cat a.go"`, silent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			redirectTelemetry(t)
@@ -137,6 +247,15 @@ func TestEnrichBash_InlinePython(t *testing.T) {
 			case catDeny:
 				if !r.deny || !strings.Contains(r.reason, "Bash `cat b.go` reads indexed source") {
 					t.Errorf("want the cat deny, got %+v", r)
+				}
+			case readA:
+				if !r.deny || !strings.Contains(r.reason, " a.go` reads indexed source") {
+					t.Errorf("want the shell read deny, got %+v", r)
+				}
+			case sedA, scriptW:
+				shape := map[string]string{sedA: "sed -i", scriptW: "script write"}[tc.want]
+				if r.deny || !strings.Contains(r.context, "Bash `"+shape+"` writes a.go") {
+					t.Errorf("want the %s advisory, got %+v", shape, r)
 				}
 			case maybe:
 				if r.deny || !strings.Contains(r.context, "Python script may rewrite") {
@@ -164,6 +283,51 @@ func TestEnrichBash_InlinePythonEditBlocking(t *testing.T) {
 	r := enrichBash(map[string]any{"command": `python3 -c "p='a.go'; s=open(p).read(); open(p,'w').write(s)"`}, "/repo")
 	if !r.deny || !strings.Contains(r.reason, "rewrites a.go") {
 		t.Errorf("want the edit deny, got %+v", r)
+	}
+}
+
+// A write-only os.open gets the shell-write deny under edit blocking, as
+// open(p, 'w') does.
+func TestEnrichBash_InlinePythonOSOpenEditBlocking(t *testing.T) {
+	redirectTelemetry(t)
+	stubIndexedPaths(t, "a.go")
+	t.Setenv("GORTEX_HOOK_BLOCK_EDIT", "1")
+	for _, cmd := range []string{
+		`python3 -c "open('a.go', 'w').write('x')"`,
+		`python3 -c "import os; os.open('a.go', os.O_WRONLY)"`,
+	} {
+		r := enrichBash(map[string]any{"command": cmd}, "/repo")
+		if !r.deny || !strings.Contains(r.reason, "Bash `script write` writes a.go") {
+			t.Errorf("%s: want the shell-write deny, got %+v", cmd, r)
+		}
+	}
+}
+
+// What only the extra analysis looks for (os.open, command lines) costs
+// the read analysis nothing: a script it covers just under its step budget
+// keeps the Read deny however many os.open calls it carries.
+func TestEnrichBash_InlinePythonExtraAnalysisBudget(t *testing.T) {
+	redirectTelemetry(t)
+	stubIndexedPaths(t, "a.go")
+	t.Setenv("GORTEX_HOOK_BLOCK_EDIT", "")
+	lines := []string{"import os", "print(open('a.go').read())"}
+	for i := 0; i < 90; i++ {
+		lines = append(lines, "os.open("+strings.Repeat("'a'+", 199)+"'a', os.O_RDONLY)")
+	}
+	code := strings.Join(lines, "\n")
+	if _, ok := analyzePythonScript(code, time.Now().Add(time.Minute), true); ok {
+		t.Fatal("the extra analysis of this script should exceed its own step budget")
+	}
+	facts, ok := analyzePythonScript(code, time.Now().Add(time.Minute), false)
+	if !ok || len(facts.reads) != 1 || facts.reads[0] != "a.go" {
+		t.Fatalf("the read analysis must cover the script, got %v %+v", ok, facts)
+	}
+	// The whole policy, under a deadline that a slow (-race) build cannot
+	// miss.
+	cmd := "python3 - <<'EOF'\n" + code + "\nEOF"
+	r := enrichBashCommand(cmd, "/repo", queryFileIndexScope, 0, time.Now().Add(time.Minute))
+	if !r.deny || !strings.Contains(r.reason, "reads indexed source") {
+		t.Errorf("want the Read deny, got %+v", r)
 	}
 }
 

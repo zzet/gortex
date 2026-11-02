@@ -200,6 +200,10 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		if readers < 1 || editors < 1 {
 			return errors.New("all scenarios require at least one pure reader and one combined edit/readback agent")
 		}
+	case checkoutDiscoveryScenario:
+		if readers+editors < 2 {
+			return errors.New("worktree discovery needs sessions in both initial repositories")
+		}
 	case "read", "many", "worktrees", "sweep", "cold", "restart":
 		if readers < 1 {
 			return errors.New("zero pure readers are supported only for edit/many-edit")
