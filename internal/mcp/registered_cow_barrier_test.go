@@ -76,7 +76,13 @@ func TestRegisteredCOWBarrierReportsEarlyRefusalAndReleases(t *testing.T) {
 	// A real registered SDK call with original caller cancellation cannot reach
 	// the metadata hook. Its result must be visible before waiting for arrivals.
 	s, _, _ := canonicalPromotionReadFixture(t)
-	ctx := guardE2ESession(t, s, "early-cow-refusal")
+	const session = "early-cow-refusal"
+	require.NoError(t, s.ConnectSession(session, func([]byte) error { return nil }))
+	t.Cleanup(func() { s.DisconnectSession(session) })
+	ctx := s.WithClientSession(WithSessionID(t.Context(), session), session)
+	require.NotNil(t, s.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"registered-cow-negative","version":"1"}}}`)))
+	s.NoteSessionToolPolicy(session, "all", "defer")
+	require.True(t, s.IsToolEnabledForSession(ctx, "get_file_summary"))
 	ctx, cancel := context.WithCancel(ctx)
 	cancel()
 	result, err := registeredCOWCall(s, ctx, 80, "get_file_summary", map[string]any{"path": "main.go", "format": "json"})
