@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -105,6 +104,10 @@ func newPrivateRun(ctx context.Context, scratch, binary string, corpora []Corpus
 	if len(corpora) == 0 {
 		return nil, errors.New("private run requires a corpus")
 	}
+	socketBase, err := privateRunSocketBase()
+	if err != nil {
+		return nil, err
+	}
 	scratch, err = canonicalPath(scratch)
 	if err != nil {
 		return nil, err
@@ -133,10 +136,6 @@ func newPrivateRun(ctx context.Context, scratch, binary string, corpora []Corpus
 	p := &privateRun{Root: root, Binary: binary, Store: filepath.Join(root, "store.db"), Config: filepath.Join(root, "config.yaml")}
 	// Short sockets are the sole exception to the caller-selected artifact
 	// root. This freshly owned directory is removed after the process exits.
-	socketBase := os.TempDir()
-	if runtime.GOOS != "windows" {
-		socketBase = "/tmp"
-	}
 	p.SocketDir, err = os.MkdirTemp(socketBase, "gl-")
 	if err != nil {
 		return nil, err
