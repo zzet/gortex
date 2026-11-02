@@ -2473,9 +2473,14 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 	}
 
 	// cwd neither lives inside nor contains a tracked repo. The daemon
-	// dispatcher rejects unreachable cwds before dispatch, so this is
-	// defensive: the sentinel matches no node, so the session sees
-	// nothing rather than the whole global graph.
+	// dispatcher (cmd/gortex/daemon_mcp.go) rejects ordinary tools/call
+	// frames from such a cwd with notTrackedError, but that guard does not
+	// cover every request: the untrackedBootstrapCall tools, non-tools/call
+	// methods, a router-reachable cwd whose proxy attempt falls back to
+	// local dispatch, and any other entrypoint that reaches sessionScope
+	// with an uncovered cwd all still land here. So this must fail closed:
+	// the sentinel matches no node, so the session sees nothing rather
+	// than the whole global graph.
 	//
 	// A cwd in a configured repository that is still loading resolves here
 	// too, but only for now. Caching the sentinel would leave the session
