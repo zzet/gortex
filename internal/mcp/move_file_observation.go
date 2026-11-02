@@ -126,10 +126,86 @@ func linkedMovePhysicalLocked(ledger *mutationCommitLedger, s *Server, record *m
 	}
 	physical.mu.RLock()
 	defer physical.mu.RUnlock()
-	if ledger.byID[record.id] != record || ledger.byID[physical.id] != physical || record.owner != s || physical.owner != s || record.kind != moveFileObservationCommit || physical.kind != physicalMutationCommit || physical.moveTimingOwner.Value() != record || record.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != record.absPath || physical.disk != mutationDiskCommitted || physical.commitSeq == 0 || physical.commitSeq != record.commitSeq || physical.newSHA == "" || physical.newSHA != record.newSHA || !physical.committedAt.Equal(record.committedAt) || !physical.diskWriteStartedAt.Equal(record.diskWriteStartedAt) {
+	if ledger.byID[record.id] != record || ledger.byID[physical.id] != physical || record.owner != s || physical.owner != s || record.kind != moveFileObservationCommit || physical.kind != physicalMutationCommit || physical.moveTimingOwner.Value() != record || record.acknowledgement == nil || physical.acknowledgement != record.acknowledgement || physical.absPath != record.absPath || physical.checkoutID != record.checkoutID || physical.checkoutIncarnation != record.checkoutIncarnation || physical.disk != mutationDiskCommitted || physical.commitSeq == 0 || physical.commitSeq != record.commitSeq || physical.newSHA == "" || physical.newSHA != record.newSHA || !physical.committedAt.Equal(record.committedAt) || !physical.diskWriteStartedAt.Equal(record.diskWriteStartedAt) {
 		return nil
 	}
 	return physical
+}
+
+// A status witness adds no authority: it only authenticates the existing weak
+// physical child across rendering, which refreshes and reacquires the ledger.
+type movePhysicalStatusWitness struct {
+	ack *editAcknowledgement
+	path, blob, checkout, incarnation string
+	sequence uint64
+	committed, writeStarted time.Time
+}
+
+// Caller holds ledger then timing record. Keep the existing newest-owner and
+// actual-write fences; never search past an unrelated newer same-path owner.
+func movePhysicalStatusLocked(ledger *mutationCommitLedger, s *Server, record *mutationCommitRecord) *mutationCommitRecord {
+	physical := linkedMovePhysicalLocked(ledger, s, record)
+	if physical == nil {
+		return nil
+	}
+	firstPath := true
+	for i := len(ledger.ordered)-1; i >= 0; i-- {
+		candidate := ledger.ordered[i]
+		if candidate == physical || (!candidate.isPublicationOwner() && candidate.kind != moveFileObservationCommit) || candidate.absPath != record.absPath {
+			continue
+		}
+		if firstPath {
+			firstPath = false
+			if candidate != record {
+				return nil
+			}
+		}
+		if candidate == record {
+			continue
+		}
+		candidate.mu.RLock()
+		competing := candidate.disk == mutationDiskCommitted && candidate.commitSeq > record.commitSeq ||
+			candidate.disk == mutationDiskInFlight && !candidate.diskWriteStartedAt.IsZero()
+		candidate.mu.RUnlock()
+		if competing {
+			return nil
+		}
+	}
+	return physical
+}
+
+func (s *Server) movePhysicalStatusChild(record *mutationCommitRecord, checkout, incarnation string, render func(*mutationCommitRecord) map[string]any) map[string]any {
+	ledger := &s.mutationCommits
+	ledger.mu.Lock()
+	record.mu.RLock()
+	physical := movePhysicalStatusLocked(ledger, s, record)
+	if physical == nil || !mutationCheckoutScopeMatches(checkout, incarnation, record.checkoutID, record.checkoutIncarnation) {
+		record.mu.RUnlock()
+		ledger.mu.Unlock()
+		return nil
+	}
+	witness := movePhysicalStatusWitness{ack: record.acknowledgement, path: record.absPath, blob: record.newSHA,
+		checkout: record.checkoutID, incarnation: record.checkoutIncarnation, sequence: record.commitSeq,
+		committed: record.committedAt, writeStarted: record.diskWriteStartedAt}
+	record.mu.RUnlock()
+	ledger.mu.Unlock()
+
+	// This refresh may itself take ledger/record locks. No timing/ledger lock
+	// crosses it, and no P/B/graph fact is borrowed from the shared RPC clock.
+	child := render(physical)
+
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	record.mu.RLock()
+	defer record.mu.RUnlock()
+	if movePhysicalStatusLocked(ledger, s, record) != physical || record.acknowledgement != witness.ack ||
+		record.absPath != witness.path || record.newSHA != witness.blob || record.commitSeq != witness.sequence ||
+		record.checkoutID != witness.checkout || record.checkoutIncarnation != witness.incarnation ||
+		!record.committedAt.Equal(witness.committed) || !record.diskWriteStartedAt.Equal(witness.writeStarted) ||
+		!mutationCheckoutScopeMatches(checkout, incarnation, record.checkoutID, record.checkoutIncarnation) {
+		return nil
+	}
+	return child
 }
 
 func (o *moveObservation) finishWrites(success bool) {
@@ -467,7 +543,7 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 	if !strings.HasPrefix(id, "move-file-") {
 		return nil, false
 	}
-	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "move_file_observation", "guidance": "observation only; source_id/target_id/touched and real write outcomes remain the move authority"}
+	payload := map[string]any{"found": false, "receipt": id, "receipt_kind": "move_file_observation", "guidance": "observation only; source_id/target_id/touched and real write outcomes remain the move authority", "physical_commit_state": "unavailable"}
 	checkout, incarnation := mutationCheckoutScope(ctx)
 	var ack *editAcknowledgement
 	var direct, readAssisted *moveDirectObservation
@@ -534,6 +610,14 @@ func (s *Server) moveFileObservationPayload(ctx context.Context, id string) (map
 		snapshot = &copy
 	}
 	payload["acknowledgement"] = buildAcknowledgementPayload(snapshot, "unavailable_ledger_entry_or_scope")
+	if payload["found"] == true && record != nil {
+		if child := s.movePhysicalStatusChild(record, checkout, incarnation, s.mutationStatusPayload); child != nil {
+			payload["physical_commit"] = child
+			payload["physical_commit_state"] = "observed"
+			payload["physical_commit_shared_acknowledgement"] = true
+			payload["physical_commit_additive_with_acknowledgement"] = false
+		}
+	}
 	return payload, true
 }
 
