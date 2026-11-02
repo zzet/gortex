@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -862,7 +863,7 @@ func namedDirs(pattern string) bool {
 	if i < 0 {
 		return false
 	}
-	for _, d := range strings.Split(filepath.Dir(pattern[strings.LastIndex(pattern[:i], "/")+1:]), "/") {
+	for _, d := range strings.Split(path.Dir(pattern[strings.LastIndex(pattern[:i], "/")+1:]), "/") {
 		if d != "." && strings.Trim(d, "*") != "" {
 			return true
 		}
@@ -876,7 +877,7 @@ func globRoot(pattern string) string {
 	if !strings.ContainsAny(pattern, "*?[{") {
 		return ""
 	}
-	return globLiteralPrefix(pattern)
+	return globLiteralPrefix(filepath.FromSlash(pattern)) // Python takes / on every OS
 }
 
 // unparen looks through parentheses.
