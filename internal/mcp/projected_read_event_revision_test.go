@@ -89,7 +89,7 @@ func TestSourceEventDuringProjectionCannotBeClearedByOldObservation(t *testing.T
 	select {
 	case result = <-done:
 	case <-ctx.Done():
-		result = <-done
+		<-done
 		t.Fatal(ctx.Err())
 	}
 	require.ErrorIs(t, result.err, projectionSuperseded, "an event after bytes were selected cannot be acknowledged by the older observation")
@@ -143,7 +143,7 @@ func TestDeferredOldProjectionInvalidationCannotPoisonNewerPublisher(t *testing.
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		err = <-done
+		<-done
 		t.Fatal(ctx.Err())
 	}
 	require.ErrorIs(t, err, projectionSuperseded)
