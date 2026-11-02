@@ -3,7 +3,6 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,12 +97,40 @@ func TestWALAdaptiveEntryKeepsStateAndCancellationFences(t *testing.T) {
 			}
 			budget := r.takeAdaptiveWriterBudget()
 			require.Positive(t, budget)
+			beforeFrontier, ok := readWALReclaimFrontier(s.dbPath)
+			require.True(t, ok)
+			beforeIO := vfsIOMark()
+			var checkpointCalls atomic.Int64
+			oldObserver := walCheckpointCallObserver
+			walCheckpointCallObserver = func(string, time.Time, time.Duration) { checkpointCalls.Add(1) }
+			t.Cleanup(func() { walCheckpointCallObserver = oldObserver })
 			done, err := s.reclaimWALResetHoldOnce(ctx, walReclaimConfig{}, db, r, false, true, budget)
+			walCheckpointCallObserver = oldObserver
 			require.False(t, done)
-			if kind == "cancelled" {
-				require.True(t, errors.Is(err, context.Canceled))
+			switch kind {
+			case "new_wal":
+				require.ErrorIs(t, err, errWALReclaimReadersInFlight)
+			case "bulk":
+				require.ErrorIs(t, err, errWALCheckpointDeferredBulk)
+			case "lane":
+				require.ErrorIs(t, err, errWALReclaimEditBurst)
+			case "cancelled":
+				require.ErrorIs(t, err, context.Canceled)
 			}
-			require.Less(t, r.writerSpent, walReclaimResetHold)
+			// Rejected entry must not consume the adaptive opportunity or run
+			// SQL. Wall time also includes scheduling and the release callback;
+			// it does not identify whether the copy/reset boundary was crossed.
+			require.False(t, r.adaptiveUsed)
+			require.Zero(t, r.adaptiveBudget)
+			require.Zero(t, r.adaptiveHold)
+			require.Nil(t, r.resetReaders)
+			require.Zero(t, checkpointCalls.Load())
+			require.Zero(t, vfsIOMark().Since(beforeIO).OtherMainWriteBytes)
+			afterFrontier, ok := readWALReclaimFrontier(s.dbPath)
+			require.True(t, ok)
+			require.Equal(t, beforeFrontier, afterFrontier)
+			require.True(t, s.writeMu.TryLock(), "rejected entry must release the actual writer")
+			s.writeMu.Unlock()
 		})
 	}
 }
@@ -262,6 +289,14 @@ func TestWALAdaptiveNewFrontierFenceAfterDelayedEntry(t *testing.T) {
 		t.Logf("done=%t err=%v adaptive_used=%t PASSIVE_calls=%d main_write_bytes=%d spent=%s", done, err, r.adaptiveUsed, calls.Load(), vfsIOMark().Since(beforeIO).OtherMainWriteBytes, r.writerSpent)
 		require.False(t, done)
 		require.ErrorIs(t, err, errWALReclaimReadersInFlight)
-		require.Less(t, r.writerSpent, walReclaimResetHold)
+		require.False(t, r.adaptiveUsed)
+		require.Zero(t, r.adaptiveBudget)
+		require.Zero(t, r.adaptiveHold)
+		require.Nil(t, r.resetReaders)
+		require.Zero(t, calls.Load())
+		require.Zero(t, vfsIOMark().Since(beforeIO).OtherMainWriteBytes)
+		require.Equal(t, 75*time.Millisecond, r.writerSpent, "elapsed hold accounting still includes the admission pause")
+		require.True(t, s.writeMu.TryLock(), "stale frontier must release the actual writer")
+		s.writeMu.Unlock()
 	})
 }
