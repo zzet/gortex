@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 var graphFreshnessReceiptID = regexp.MustCompile(`^mutation-\d+$`)
@@ -27,14 +29,24 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	case receipt != "":
 		record, ok := s.mutationCommits.byReceipt(receipt)
 		if !ok {
+			if payload, handled := s.moveFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+			if payload, handled := s.batchAcknowledgementReceiptPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+			if payload, handled := s.batchFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
 			if payload, found := s.graphRefreshReceiptPayload(ctx, receipt); found {
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
-			return mcp.NewToolResultError(
-				"no mutation receipt " + receipt + " — receipts are kept for " + mutationCommitRetention.String() +
-					"; query by path instead, or read the file to see its current state"), nil
+		if ok && !mutationCommitInScope(ctx, record) {
+			return mcp.NewToolResultError("no mutation receipt " + receipt), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("receipt", receipt))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -45,11 +57,13 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 				payload["note"] = "this is a graph freshness receipt id, not a caller mutation_id"
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
-			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID +
-				" — use change.receipt options.receipt=" + mutationID + " to query a graph freshness receipt"), nil
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
+		if ok && !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -136,13 +150,30 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	if outcome.Err != nil {
 		payload["error"] = outcome.Err.Error()
 	}
-	if phases := publicationPhasesPayload(receipt.id, time.Time{}); phases != nil {
-		payload["publication_phases"] = phases
+	var retained *indexer.PublicationPhaseRecord
+	var acknowledgement *editAcknowledgementSnapshot
+	acknowledgementState := "not_applicable"
+	if commit, found := s.mutationCommits.byFreshnessReceipt(receipt.id); found && mutationCommitInScope(ctx, commit) {
+		acknowledgementState = "unavailable_recording_or_evicted"
+		retained, _ = retainedMutationPublication(commit)
+		if ack := retainedMutationAcknowledgement(commit); ack != nil {
+			snapshot := ack.snapshot()
+			acknowledgement = &snapshot
+		}
+		if retained != nil && retained.Key() != receipt.id {
+			retained = nil
+		}
 	}
+	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
+	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
+	attachReceiptTiers(payload, receipt)
 	return payload, true
 }
 
 func mutationCommitInScope(ctx context.Context, record *mutationCommitRecord) bool {
+	if !record.isPhysicalCommit() {
+		return false
+	}
 	checkoutID, incarnation := mutationCheckoutScope(ctx)
 	record.mu.RLock()
 	defer record.mu.RUnlock()
@@ -169,6 +200,9 @@ func (s *Server) recentMutationCommitInScope(ctx context.Context, path string) (
 // pending receipt would read as pending forever, which is precisely the stale
 // answer this tool exists to avoid.
 func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]any {
+	if !record.isPhysicalCommit() {
+		return map[string]any{"found": false, "reason": "not_physical_commit"}
+	}
 	s.refreshPendingSourceRecord(record)
 	snap := record.snapshot()
 	payload := map[string]any{
@@ -180,6 +214,9 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		"graph_status": snap.GraphStatus,
 	}
 	attachMutationRefreshSnapshot(payload, snap)
+	if snap.readRepair != nil {
+		payload["read_assisted_publication"] = snap.readRepair.payload()
+	}
 	if snap.MutationID != "" {
 		payload["mutation_id"] = snap.MutationID
 	}
@@ -207,12 +244,17 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		payload["graph_note"] = note
 	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
-	if snap.ReindexReceipt != "" {
-		record.mu.RLock()
-		committedAt := record.committedAt
-		record.mu.RUnlock()
-		if phases := publicationPhasesPayload(snap.ReindexReceipt, committedAt); phases != nil {
-			payload["publication_phases"] = phases
+	retained, committedAt := retainedMutationPublication(record)
+	attachMutationPhaseTimings(payload, snap.ReindexReceipt, committedAt, indexer.PublicationSourceMCPEdit, retained)
+	var acknowledgement *editAcknowledgementSnapshot
+	if ack := retainedMutationAcknowledgement(record); ack != nil {
+		snapshot := ack.snapshot()
+		acknowledgement = &snapshot
+	}
+	attachAcknowledgementPayload(payload, acknowledgement, "unavailable_recording_or_evicted")
+	if value, found := s.mutationReceipts.Load(snap.ReindexReceipt); found {
+		if receipt, ok := value.(*mutationReceipt); ok {
+			attachReceiptTiers(payload, receipt)
 		}
 	}
 	return payload

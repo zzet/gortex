@@ -352,6 +352,8 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	}
 	warmupTask := newDaemonWarmup(cmd.Context())
 	defer warmupTask.cancel()
+	compactionTask := newDaemonWarmup(cmd.Context())
+	defer compactionTask.cancel()
 	// Teardown is wired into every exit path, not just the control-socket
 	// one. A SIGINT/SIGTERM is handled inside the daemon server: it calls
 	// Server.Shutdown directly, Serve returns, and the controller's hook is
@@ -393,6 +395,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// Revoke every independent producer before the first ownership join.
 		startupReporter.Cancel()
 		warmupTask.cancel()
+		compactionTask.cancel()
 		contractAnalysis.Cancel()
 		state.shared.BeginSemanticClose()
 		state.shared.BeginBackgroundClose()
@@ -409,6 +412,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		// the watcher handoff barrier: startup cannot attach/publish another
 		// watcher after StopWatcher has finished.
 		stopDaemonWarmup(warmupTask, controller, logger)
+		joinDaemonCompaction(compactionTask, logger)
 		if stopJanitor != nil {
 			started := time.Now()
 			logger.Info("daemon: shutdown phase start", zap.String("phase", "reconcile_janitor"))
@@ -652,7 +656,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		state.lifecycle.EnableDeferredSeedRetirements()
 	}
 
-	if err := srv.Listen(); err != nil {
+	if err := listenConfiguredDaemon(srv, state); err != nil {
 		startupReporter.Fail(err)
 		return err
 	}
@@ -834,12 +838,14 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			state.mcpServer.MigrateSymbolAnchors(logger)
 			migrationStep()
 		}
+		scheduleDaemonCompaction(compactionTask, warmupTask, state, logger)
 	})
 
 	// Serve returns directly on the signal path. Register this last so startup
 	// is canceled before deferred health/janitor joins, not only when the later
 	// once-guarded backend teardown is reached.
 	defer warmupTask.cancel()
+	defer compactionTask.cancel()
 	serveErr := srv.Serve()
 	// Record a real error before deferred cleanup can complete both receipts.
 	// The watchdog must preserve normal error exit codes if an outer finalizer
@@ -1073,11 +1079,15 @@ func spawnDetachedDaemon(childArgs []string) error {
 	}
 	child := exec.Command(exe, append([]string{"daemon", "start"}, childArgs...)...)
 	// The child re-parses the forwarded flags itself, so nothing has to
-	// travel by env any more except the marker that stops it detaching
-	// again (and stops it clearing a stop-intent written meanwhile).
+	// travel by env except the child marker and SQLite's process-start temp
+	// directory. Resolve that with the stack's own store-path rules.
 	// Inherited GORTEX_* overrides keep the precedence they have on a
 	// foreground start rather than being re-injected from a flag here.
-	child.Env = append(os.Environ(), "GORTEX_DAEMON_CHILD=1")
+	child.Env, err = detachedDaemonEnv(os.Environ(), daemonBackendPath)
+	if err != nil {
+		_ = logFile.Close()
+		return err
+	}
 	child.Stdout = logFile
 	child.Stderr = logFile
 	child.Stdin = nil
@@ -2398,12 +2408,17 @@ func renderDaemonStorage(w io.Writer, st daemon.StatusResponse) {
 			fmt.Fprintf(w, "    first drift: %s\n", rc.FirstDrift)
 		}
 	}
+	if p := s.WALCheckpoint; p != nil {
+		fmt.Fprintf(w, "  wal checkpoint: attempts=%d complete=%d incomplete=%d zero-progress=%d failures=%d last=%s\n", p.Attempts, p.Complete, p.Incomplete, p.ZeroProgress, p.Failed, orDash(p.LastOutcome))
+		fmt.Fprintf(w, "    deferred build lane=%d longest=%.1fms lease refusals=%d in-flight refusals=%d reclaim stand-asides=%d yields=%d frames=%d unobserved=%d\n", p.DeferredBuildLane, p.LongestBuildLaneDeferralMS, p.RefusedLease, p.RefusedInflight, p.StoodAsideReclaim, p.YieldCancelled, p.FramesBackfilledTotal, p.FramesUnobserved)
+	}
 	r := s.WALReclaim
 	if r == nil {
 		return
 	}
 	fmt.Fprintf(w, "  wal reclaim: threshold=%s  attempts=%d  resets=%d  deferrals=%d  skips=%d  failures=%d\n",
 		formatBytes(nonNegative(r.ThresholdBytes)), r.Attempts, r.Resets, r.Deferrals, r.Skips, r.Failures)
+	fmt.Fprintf(w, "    urgent attempts=%d writer hold p95=%.1fms writer wait p95=%.1fms closed-admission drain=%.1fms final-reset=%.1fms\n", r.UrgentAttempts, r.WriterHold.P95MS, r.WriterWait.P95MS, r.PauseDrain.TotalMS, r.PauseTruncate.TotalMS)
 	fmt.Fprintf(w, "    reclaimed frames=%d  bytes=%s\n", r.FramesReclaimed, formatBytes(nonNegative(r.BytesReclaimed)))
 	fmt.Fprintf(w, "    open-gate resets=%d  writer hold max=%.1fms  last=%.1fms\n",
 		r.OpenGateResets, r.WriterHoldMaxMS, r.WriterHoldLastMS)

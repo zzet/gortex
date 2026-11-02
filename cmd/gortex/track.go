@@ -247,7 +247,17 @@ func runTrack(cmd *cobra.Command, args []string) error {
 			}
 		}
 		if owner, held := owners[prefix]; held && !pathkey.SamePathIdentity(pathkey.CanonicalPath(owner), absPath) {
-			return indexer.NewPrefixCollisionError(prefix, owner, absPath)
+			collision := indexer.NewPrefixCollisionError(prefix, owner, absPath)
+			// Let a running daemon make its own read-only ownership decision,
+			// including its deduplicated warning, before refusing locally.
+			// Never send a mutating Track or persist this rejected entry.
+			if err := preflightDaemonTrack(cmd.Context(), absPath, daemonName); err != nil {
+				var authoritative *trackPrefixCollisionError
+				if errors.As(err, &authoritative) {
+					return authoritative
+				}
+			}
+			return collision
 		}
 		if err := gc.AddRepo(entry); err != nil {
 			return err
@@ -292,7 +302,8 @@ func runTrack(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		var collision *trackPrefixCollisionError
-		if errors.As(notifyErr, &collision) {
+		var loading *repoLoadingError
+		if errors.As(notifyErr, &collision) || errors.As(notifyErr, &loading) {
 			if !already {
 				if err := removeAddedRepoEntry(absPath); err != nil {
 					return fmt.Errorf("%w; removing rejected entry from config: %v", notifyErr, err)
@@ -512,6 +523,9 @@ func notifyDaemonTrack(absPath, name string, deadline time.Time) error {
 		return err
 	}
 	if !resp.OK {
+		if resp.ErrorCode == daemon.ErrRepoLoading {
+			return &repoLoadingError{admissionReason: "identity_pending", phase: "identity_resolution"}
+		}
 		if resp.ErrorCode == daemon.ErrPrefixCollision {
 			return &trackPrefixCollisionError{message: resp.ErrorMsg}
 		}
@@ -790,4 +804,50 @@ func emitUntrackSummary(w io.Writer, target string, r untrackResult) {
 	fmt.Fprintln(w, "  "+progress.StyleOK.Render("✓")+"  "+progress.StyleStrong.Render(target))
 	fmt.Fprintln(w, "     "+progress.StatStrip(stats...))
 	fmt.Fprintln(w)
+}
+
+// preflightDaemonTrack never starts a daemon or authorizes a mutation. Its
+// deadline includes dialing/handshake, and stays below the CLI refusal budget.
+// Older daemons reject the distinct verb instead of treating it as Track.
+func preflightDaemonTrack(ctx context.Context, path, name string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(750 * time.Millisecond)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	if trackWait && trackWaitTimeout > 0 {
+		if waitDeadline := time.Now().Add(trackWaitTimeout); waitDeadline.Before(deadline) {
+			deadline = waitDeadline
+		}
+	}
+	client, err := daemon.DialToWithDeadline(daemon.SocketPath(), daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"}, deadline)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
+	defer stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.DeadlineExceeded
+	}
+	response, err := client.ControlWithTimeout(daemon.ControlTrackPreflight, daemon.TrackParams{Path: path, Name: name, AsWorktree: trackAsWorktree}, remaining)
+	if err != nil {
+		return err
+	}
+	if !response.OK {
+		if response.ErrorCode == daemon.ErrPrefixCollision {
+			return &trackPrefixCollisionError{message: response.ErrorMsg}
+		}
+		return fmt.Errorf("track preflight rejected: %s %s", response.ErrorCode, response.ErrorMsg)
+	}
+	return nil
 }

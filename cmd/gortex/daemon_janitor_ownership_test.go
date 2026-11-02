@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"sync"
@@ -46,7 +47,7 @@ func TestJanitorCanceledCallerRetainsAdmittedWorkerUntilRealStackClose(t *testin
 	state, err := buildDaemonState(zap.New(core)) // Actual shared cleanup registration.
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = state.shared.Close() })
-	_, err = state.multiIndexer.IndexAll()
+	_, err = state.multiIndexer.TrackRepoCtx(context.Background(), gc.Repos[0])
 	require.NoError(t, err)
 	nodes := state.graph.GetFileNodes("tracked/main.go")
 	require.NotEmpty(t, nodes)

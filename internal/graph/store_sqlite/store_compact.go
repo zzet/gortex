@@ -27,7 +27,7 @@ import (
 //	             Store.PublishPayloadGeneration, whose tail schedules the
 //	             planner-statistics refresh the publish owes; the direct
 //	             publish+route API asks below its own route flip instead.
-//	VACUUM       cmd/gortex/daemon_state.go -> maybeCompactStore -> Compact.
+//	VACUUM       cmd/gortex's owned post-warmup task -> CompactContext.
 //	TRUNCATE     internal/indexer/multi.go's read boundary -> CheckpointWAL,
 //	             and Compact's own tail through the ungated inner path.
 //
@@ -92,6 +92,9 @@ const (
 	maintenancePlannerStats maintenanceJob = "planner_stats"
 	maintenanceVacuum       maintenanceJob = "vacuum"
 	maintenanceCheckpoint   maintenanceJob = "wal_checkpoint_truncate"
+	// maintenanceDenseIndexRepair rebuilds the dense indexes an unsealed cold
+	// window left missing (dense_index_repair.go).
+	maintenanceDenseIndexRepair maintenanceJob = "dense_index_repair"
 )
 
 // preemptible reports whether a job in flight may be asked to yield the lane.
@@ -111,8 +114,7 @@ func (j maintenanceJob) priority() bool { return !j.preemptible() }
 // token itself. Generous on purpose — the point of the wait is that
 // maintenance yields to real work, and a job that gives up simply runs at the
 // next boundary — but finite in every direction, because Compact runs on the
-// daemon's warmup path with context.Background() and must never be able to
-// stall a boot behind another job.
+// daemon's post-warmup task and must yield when maintenance remains busy.
 //
 // A var, not a const, only so the in-package cases can shorten the budget
 // instead of spending it; production never assigns it.
@@ -641,8 +643,16 @@ func (s *Store) runMaintenanceLane(ctx context.Context, signal <-chan struct{}, 
 				return
 			}
 		}
+		// Ahead of the pass for the same reason as the drain, and because a
+		// completed repair owes the pass that analyzes what it rebuilt.
+		if s.takeDenseIndexRepair() {
+			s.runDenseIndexRepair(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+		}
 		if !s.statsPassOwed() {
-			// The wakeup carried a drain and nothing else.
+			// The wakeup carried a drain or a repair and nothing else.
 			continue
 		}
 		if !s.claimMaintenancePass() {
@@ -732,6 +742,8 @@ func (s *Store) stopMaintenanceLane() {
 	s.maintenanceClosed = true
 	s.maintenanceOwed = false
 	s.maintenanceDrainOwed = false
+	s.denseRepairOwed = false
+	s.stopDenseIndexRepairTimerLocked()
 	cancel := s.maintenanceCancel
 	done := s.maintenanceDone
 	s.maintenanceSched.Unlock()
@@ -810,7 +822,17 @@ func (s *Store) CompactStats() (freeBytes, totalBytes int64) {
 // same lane hold, through the ungated inner path, because re-entering the lane
 // from inside it would deadlock on its own token.
 func (s *Store) Compact() error {
-	return s.runMaintenance(context.Background(), maintenanceVacuum, true, func(ctx context.Context) error {
+	return s.CompactContext(context.Background())
+}
+
+// CompactContext retains Compact's maintenance admission and actual completion
+// boundary while allowing its owner to cancel lane waits and the VACUUM SQL.
+// Returning an error never certifies that the file was compacted.
+func (s *Store) CompactContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("compact: nil context")
+	}
+	return s.runMaintenance(ctx, maintenanceVacuum, true, func(ctx context.Context) error {
 		if err := s.vacuum(ctx); err != nil {
 			return err
 		}
@@ -833,8 +855,14 @@ func (s *Store) vacuum(ctx context.Context) error {
 	if s.bulkConn != nil {
 		return fmt.Errorf("%w: %s: bulk writer pinned", ErrMaintenanceBusy, maintenanceVacuum)
 	}
-	_, err := s.writerDB.ExecContext(ctx, `VACUUM`)
-	return err
+	if isMemoryPath(s.dbPath) {
+		_, err := s.writerDB.ExecContext(ctx, `VACUUM`)
+		return err
+	}
+	return s.withVacuumConnection(ctx, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `VACUUM`)
+		return err
+	})
 }
 
 // errWALResidueHandedOff reports that a residue drain found the log held by a

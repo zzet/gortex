@@ -14,6 +14,13 @@ import (
 
 func TestFindFilesAutoPrimaryUsesSelectedProjectionAndDebugPhases(t *testing.T) {
 	v := newViewStack(t)
+	// Unowned files on the requested path: the session's workspace check
+	// keeps the one in its workspace and drops the other, which only works
+	// when the location rows carry their workspace.
+	require.NoError(t, v.store.AddBatchChecked([]*graph.Node{
+		{ID: "unowned-main-ws", Kind: graph.KindFile, FilePath: "edit.go", WorkspaceID: "main-ws", Language: "go"},
+		{ID: "unowned-other-ws", Kind: graph.KindFile, FilePath: "edit.go", WorkspaceID: "other-ws", Language: "go"},
+	}, nil))
 	tracked := &findFilesProjectionStore{Store: v.store}
 	v.srv.graph = tracked
 	installContractCoreKindTestRuntime(t, v.srv)
@@ -31,15 +38,23 @@ func TestFindFilesAutoPrimaryUsesSelectedProjectionAndDebugPhases(t *testing.T) 
 	require.NoError(t, err)
 	require.False(t, res.IsError)
 	require.Zero(t, tracked.globalReads)
-	require.Equal(t, 1, tracked.summaryReads)
-	require.Zero(t, tracked.fullReads, "Auto primary must use selected kind summaries")
+	require.Equal(t, 1, tracked.locationReads)
+	require.Zero(t, tracked.summaryReads, "no project narrows the scope, so file locations suffice")
+	require.Zero(t, tracked.fullReads, "Auto primary must use selected file locations")
 	require.Equal(t, []string{"", "repo"}, tracked.projectedRepos)
+	var ids []string
+	for _, file := range decodeFindFiles(t, res).Files {
+		ids = append(ids, file.ID)
+	}
+	require.Contains(t, ids, "unowned-main-ws")
+	require.NotContains(t, ids, "unowned-other-ws", "the workspace-bound session excludes another workspace's file")
 	phases := observed.FilterMessage("find_files phases").All()
 	require.Len(t, phases, 1)
 	fields := phases[0].ContextMap()
 	require.Equal(t, true, fields["node_projection_used"])
 	require.Equal(t, true, fields["node_projection_supported"])
-	require.Equal(t, true, fields["summary_projection_used"])
+	require.Equal(t, true, fields["location_projection_used"])
+	require.Equal(t, false, fields["summary_projection_used"])
 	require.Greater(t, fields["visited"].(int64), int64(0))
 	v.srv.logger = zap.NewNop()
 	before := tracked.globalReads
@@ -60,4 +75,5 @@ func TestFindFilesAutoPrimaryUsesSelectedProjectionAndDebugPhases(t *testing.T) 
 	fields = phases[1].ContextMap()
 	require.Equal(t, true, fields["node_projection_used"])
 	require.Equal(t, false, fields["summary_projection_used"])
+	require.Equal(t, false, fields["location_projection_used"])
 }

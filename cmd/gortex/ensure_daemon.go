@@ -24,16 +24,19 @@ const (
 	daemonUnavailable                       // autostart off, or spawn failed/timed out
 )
 
+// spawnLockInactivityTimeout is deliberately an inactivity budget, not a
+// total startup budget. The lock winner holds the spawn lock until the
+// detached child's socket is live; a schema migration can legitimately keep
+// that socket closed for longer than a minute. Fresh PID-bound startup state
+// extends this deadline in the same way spawnDetachedDaemon extends its own
+// wait, while a missing/stale heartbeat still releases callers promptly.
+// Tests shorten it only in an isolated helper process; there is no user
+// configuration or environment override for this production budget.
+var spawnLockInactivityTimeout = 60 * time.Second
+
 const (
-	// spawnLockInactivityTimeout is deliberately an inactivity budget, not a
-	// total startup budget. The lock winner holds the spawn lock until the
-	// detached child's socket is live; a schema migration can legitimately keep
-	// that socket closed for longer than a minute. Fresh PID-bound startup state
-	// extends this deadline in the same way spawnDetachedDaemon extends its own
-	// wait, while a missing/stale heartbeat still releases callers promptly.
-	spawnLockInactivityTimeout = 60 * time.Second
-	spawnLockPollInterval      = 100 * time.Millisecond
-	spawnProgressFreshness     = 10 * time.Second
+	spawnLockPollInterval  = 100 * time.Millisecond
+	spawnProgressFreshness = 10 * time.Second
 	// spawnFailCooldown bounds serial retries of a broken spawn: within
 	// the window at most one spawn attempt runs across contending callers.
 	spawnFailCooldown = 5 * time.Second

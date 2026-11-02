@@ -70,26 +70,11 @@ var sectionCompactMemory = bt(`Use §recall§ before revisiting prior work; §re
 // this constant rather than paraphrase it; routing is safety policy, and two
 // almost-equivalent copies eventually teach agents different destructive
 // actions.
-const WorktreeBranchRoutingPolicy = "- The session/CWD selects the view. A session-discovered checkout (a linked worktree included) is an automatic overlay; do not `track` it. Only an explicit user request to track creates a dedicated logical graph.\n" +
-	"- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate identity the overlay wins, and deletion/tombstone masks hide the base copy.\n" +
-	// The `require_fresh` clause is qualified because the wait only advances a
-	// routed automatic checkout: a shared corpus, a dedicated/primary checkout
-	// and a labelled base/ref/commit view all answer fresh:false with a
-	// fresh_reason rather than waiting (internal/mcp/checkout_binding.go's
-	// freshReasonCommittedBaseAdvance). "absolute" is dropped from the
-	// deadline clause because RFC3339 names an absolute timestamp by
-	// definition; the refusal message and the views guide both still say it in
-	// full.
-	//
-	// Paying for that qualification out of this bullet alone left the core
-	// body 3 bytes under its ceiling, which is a ceiling that cannot absorb
-	// the next correction. The elaboration around every section of the body
-	// was trimmed instead — never a rule, a tool name or a contract — so the
-	// ceilings in profiles_test.go keep real head-room and none of them is
-	// re-based upward.
-	"- Freshness `exact:false` = the requested view was not served. Every fallback is read-only. `require_exact:true` refuses substitution; `require_fresh:true` awaits filesystem state under RFC3339 `wait_deadline`, routed automatic checkouts only; else `fresh:false`.\n" +
-	"- Select explicitly when CWD is not the target: `view:{kind:\"worktree\",checkout_id:\"…\"}` or `view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.\n" +
-	"- Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
+const WorktreeBranchRoutingPolicy = "- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.\n" +
+	"- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.\n" +
+	"- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:\"relations\"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.\n" +
+	"- Target another CWD: `view:{kind:\"worktree\",checkout_id:\"…\"}` or `view:{kind:\"git_ref\",value:\"refs/heads/release\",graph_id:\"…\"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.\n" +
+	"- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.\n"
 
 // sectionWorktreeViews teaches agents the ownership boundary that keeps
 // ordinary linked-worktree use cheap. It is shared by every profile so a lean

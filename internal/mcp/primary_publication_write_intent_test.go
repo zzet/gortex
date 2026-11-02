@@ -26,7 +26,7 @@ type publicationIntentWatcher struct {
 	reject    bool
 }
 
-func (w *publicationIntentWatcher) EnqueueFileMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
+func (w *publicationIntentWatcher) EnqueueToolMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
 	w.protected.Store(w.store.WriteWanted())
 	if w.reject {
 		return nil, nil

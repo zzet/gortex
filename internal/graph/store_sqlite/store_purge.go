@@ -141,6 +141,9 @@ func (s *Store) PurgeRepo(prefix string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.firstIndexDrainsMu.Lock()
+	delete(s.firstIndexDrains, prefix)
+	s.firstIndexDrainsMu.Unlock()
 	s.finishAnalysisMutationLocked(len(ids) > 0)
 	if changed {
 		s.payloadInputAdminRevision.Add(1)
@@ -351,6 +354,14 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.firstIndexDrainsMu.Lock()
+	if observation, ok := s.firstIndexDrains[oldPrefix]; ok {
+		if current, exists := s.firstIndexDrains[newPrefix]; !exists || current.CompletedAt.Before(observation.CompletedAt) {
+			s.firstIndexDrains[newPrefix] = observation
+		}
+		delete(s.firstIndexDrains, oldPrefix)
+	}
+	s.firstIndexDrainsMu.Unlock()
 	if changed {
 		s.payloadInputAdminRevision.Add(1)
 		s.markMutationReceiptsIncompleteLocked()

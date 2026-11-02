@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -53,10 +54,19 @@ func TestDecorateResultWithFreshness(t *testing.T) {
 	require.Equal(t, float64(1), obj["x"])
 	require.NotNil(t, obj["freshness"])
 
-	// Non-JSON-object payload (GCX/TOON) is left untouched.
-	got2 := decorateResultWithFreshness(mcp.NewToolResultText("GCX1 tool=foo\nrow1"), rider)
-	text2, _ := singleTextContent(got2)
-	require.Equal(t, "GCX1 tool=foo\nrow1", text2)
+	// The shared renderer labels compact formats too, retaining their rows.
+	for _, test := range []struct{ body, want string }{
+		{"GCX1 tool=foo\nrow1", "GCX1 tool=foo file=a.go stale=true\n# file: pending (1 files)\nrow1"},
+		{"items[1]{id}:\n  one", "file: pending (1 files)\nitems[1]{id}:\n  one"},
+		{"row1", "file: pending (1 files)\nrow1"},
+	} {
+		labelled := decorateResultWithFreshness(mcp.NewToolResultText(test.body), rider)
+		text, _ := singleTextContent(labelled)
+		require.Equal(t, test.want, text)
+		idle := decorateResultWithFreshness(mcp.NewToolResultText(test.body), nil)
+		idleText, _ := singleTextContent(idle)
+		require.Equal(t, test.body, idleText, "an idle response remains byte-identical")
+	}
 
 	// Empty rider is a no-op.
 	got3 := decorateResultWithFreshness(mcp.NewToolResultText(`{"x":1}`), nil)
@@ -106,8 +116,12 @@ func TestMultiRepoRiderAndMissingFileFlag(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	// These fixtures test path ownership/freshness, not cross-repo batch
+	// resolution. Register their explicit roots through the production path.
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,

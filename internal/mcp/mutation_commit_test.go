@@ -312,15 +312,14 @@ func TestMutationStatusResolvesReceiptPathAndListing(t *testing.T) {
 	require.Equal(t, "unrecorded", unknown["disk_status"])
 }
 
-func TestMutationStatusUnknownReceiptIsAnError(t *testing.T) {
+func TestMutationStatusUnknownReceiptIsLost(t *testing.T) {
 	s := newMutationServer()
 	req := mcp.CallToolRequest{}
 	req.Params.Name = "mutation_status"
 	req.Params.Arguments = map[string]any{"receipt": "commit-does-not-exist"}
 	res, err := s.handleMutationStatus(context.Background(), req)
 	require.NoError(t, err)
-	require.True(t, res.IsError)
-	require.Contains(t, resultText(res), "no mutation receipt")
+	require.Equal(t, "lost", resultJSON(t, res)["state"])
 }
 
 // --- Criterion: retrying after a timeout is idempotent ---------------------

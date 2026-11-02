@@ -163,12 +163,20 @@ type daemonWatcherSlot struct {
 	ready   bool
 }
 
+// PreflightTrack checks authoritative ownership without indexing, persisting,
+// or taking the controller mutation lock. A clear answer grants no registration.
+func (c *realController) PreflightTrack(ctx context.Context, p daemon.TrackParams) error {
+	if c.multiIndexer == nil || c.lifecycle == nil {
+		return fmt.Errorf("checkout lifecycle not initialized")
+	}
+	return c.lifecycle.PreflightTrack(ctx, config.RepoEntry{
+		Path: p.Path, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree,
+	})
+}
+
 // Track indexes a new repository and persists it to the global config.
 // Path is resolved to an absolute form before the MultiIndexer sees it.
 func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.RawMessage, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.multiIndexer == nil {
 		return nil, fmt.Errorf("multi-repo indexer not initialized")
 	}
@@ -180,6 +188,11 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree}
+	if err := c.lifecycle.PreflightTrack(ctx, entry); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
@@ -935,6 +948,10 @@ func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error
 		if rec, ok := c.multiIndexer.RepoLoadFor(path); ok {
 			repo.State = publicRepoState(rec.State)
 			repo.StateReason = rec.Reason
+			if rec.ErrorCode == daemon.ErrPrefixCollision {
+				repo.State = daemon.RepoStatePrefixCollision
+				repo.ErrorCode, repo.OwnerPath, repo.OwnerState = rec.ErrorCode, rec.OwnerPath, rec.OwnerState
+			}
 		}
 		resp.TrackedRepos = append(resp.TrackedRepos, repo)
 	}
@@ -1083,6 +1100,20 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// every queued control request wait out the pause as well.
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
+	// The operating system's and SQLite's figures are read in the same breath,
+	// so the runtime block describes one moment. Read after the view census
+	// and the aggregate, which can wait seconds for the mutex, they would
+	// describe a later process than the Go heap beside them.
+	runtimeStats := withProcessGauges(daemon.RuntimeStats{
+		Alloc:        mem.Alloc,
+		Sys:          mem.Sys,
+		HeapInuse:    mem.HeapInuse,
+		HeapIdle:     mem.HeapIdle,
+		HeapReleased: mem.HeapReleased,
+		StackInuse:   mem.StackInuse,
+		NumGC:        mem.NumGC,
+		NumGoroutine: runtime.NumGoroutine(),
+	})
 
 	// Stat every configured repo path before taking c.mu. A stat is cheap
 	// on a live path and on a deleted one, but an unresponsive network
@@ -1132,26 +1163,23 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// subsequent busy pass.
 	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
 	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked, ready)...)
+	for i := range tracked {
+		if rec, ok := c.multiIndexer.RepoLoadFor(tracked[i].Path); ok && rec.ErrorCode == daemon.ErrPrefixCollision {
+			tracked[i].Unloaded, tracked[i].Loading = true, false
+			tracked[i].ErrorCode, tracked[i].OwnerPath, tracked[i].OwnerState = rec.ErrorCode, rec.OwnerPath, rec.OwnerState
+		}
+	}
 
-	// mem was sampled before the mutex was taken — see the note at the top
-	// of status.
+	// mem and the runtime block were sampled before the mutex was taken —
+	// see the note at the top of status.
 
 	resp := daemon.StatusResponse{
-		TrackedRepos:   tracked,
-		MemoryBytes:    mem.Alloc,
-		SearchBackend:  agg.searchBackend,
-		TrigramCache:   trigramCacheForResponse(),
-		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
-		Runtime: daemon.RuntimeStats{
-			Alloc:        mem.Alloc,
-			Sys:          mem.Sys,
-			HeapInuse:    mem.HeapInuse,
-			HeapIdle:     mem.HeapIdle,
-			HeapReleased: mem.HeapReleased,
-			StackInuse:   mem.StackInuse,
-			NumGC:        mem.NumGC,
-			NumGoroutine: runtime.NumGoroutine(),
-		},
+		TrackedRepos:       tracked,
+		MemoryBytes:        mem.Alloc,
+		SearchBackend:      agg.searchBackend,
+		TrigramCache:       trigramCacheForResponse(),
+		GraphIntegrity:     daemon.GraphIntegrityStatusFor(g),
+		Runtime:            runtimeStats,
 		PProfAddr:          daemonPProfAddr(),
 		Ready:              ready,
 		WarmupSeconds:      c.warmupSeconds.Load(),
@@ -1599,9 +1627,8 @@ func lookupRepoMissing(missing map[string]bool, root string) bool {
 
 // reconcileUnloadedRepos returns a synthetic row for every configured
 // repo the daemon holds no index for. Matching is by path first (what
-// track resolves and persists) and by resolved prefix second, so a repo
-// registered under a derived worktree-instance prefix still matches its
-// config entry.
+// track resolves and persists). Prefix-only matching is reserved for entries
+// without a path: another root under the same prefix is not a loaded entry.
 func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus, ready bool) []daemon.TrackedRepoStatus {
 	if len(entries) == 0 {
 		return nil
@@ -1611,7 +1638,7 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 		prefix := config.ResolvePrefix(e)
 		isLoaded := false
 		for _, r := range loaded {
-			if (e.Path != "" && pathkey.EqualPaths(r.Path, e.Path)) || (prefix != "" && r.Prefix == prefix) {
+			if e.Path != "" && pathkey.EqualPaths(r.Path, e.Path) || e.Path == "" && prefix != "" && r.Prefix == prefix {
 				isLoaded = true
 				break
 			}
@@ -1766,6 +1793,19 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
 	}
+	if reporter, ok := g.(interface{ DenseIndexesMissing() []string }); ok {
+		out.DenseIndexesMissing = reporter.DenseIndexesMissing()
+	}
+	if reporter, ok := g.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		out.LastFirstIndexDrain = reporter.LastFirstIndexDrains()
+	}
+	if passive, ok := g.(interface {
+		WALPassiveStats() store_sqlite.WALPassiveStats
+	}); ok {
+		out.WALCheckpoint = daemon.WALCheckpointStatusFrom(passive.WALPassiveStats())
+	}
 	if policy, ok := g.(interface{ CloseCheckpointPolicy() string }); ok {
 		out.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
 	}
@@ -1804,50 +1844,7 @@ func checkRowCounters(ctx context.Context, g graph.Store) *daemon.RowCounterStat
 }
 
 func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {
-	out := &daemon.WALReclaimStatus{
-		ThresholdBytes:   st.ThresholdBytes,
-		Attempts:         st.Attempts,
-		Resets:           st.Resets,
-		OpenGateResets:   st.OpenGateResets,
-		WriterHoldMaxMS:  durationMS(st.WriterHoldMax),
-		WriterHoldLastMS: durationMS(st.WriterHoldLast),
-		Deferrals:        st.Deferrals,
-		Skips:            st.Skips,
-		Failures:         st.Failures,
-		FramesReclaimed:  st.FramesReclaimed,
-		BytesReclaimed:   st.BytesReclaimed,
-		PauseCount:       st.PauseCount,
-		PauseMaxMS:       durationMS(st.PauseMax),
-		PauseLastMS:      durationMS(st.PauseLast),
-		ReaderWaits:      st.ReaderWaits,
-		ReaderWaitMaxMS:  durationMS(st.ReaderWaitMax),
-		BackoffMS:        st.Backoff.Milliseconds(),
-		LastOutcome:      st.LastOutcome,
-		LastReason:       st.LastReason,
-		CycleDeferrals:   st.CycleDeferrals,
-		CycleRefusals:    st.CycleRefusals,
-		CycleYields:      st.CycleYields,
-		CycleForced:      st.CycleForced,
-		CycleCeilingRuns: st.CycleCeilingRuns,
-		CeilingBytes:     st.CeilingBytes,
-
-		RetirementEditYields:        st.RetirementEditYields,
-		RetirementEditYieldTimeouts: st.RetirementEditYieldTimeouts,
-		RetirementWaits:             st.RetirementWaits,
-		RetirementWaitTimeouts:      st.RetirementWaitTimeouts,
-		LeaseOverrides:              st.LeaseOverrides,
-		ShrinkInPlaceResets:         st.ShrinkInPlaceResets,
-		ShrinkSlices:                st.ShrinkSlices,
-		ShrinkBytes:                 st.ShrinkBytes,
-		ShrinkSliceHoldMaxMS:        durationMS(st.ShrinkSliceHoldMax),
-	}
-	if st.PauseCount > 0 {
-		out.PauseAvgMS = durationMS(st.PauseTotal / time.Duration(st.PauseCount))
-	}
-	if st.ReaderWaits > 0 {
-		out.ReaderWaitAvgMS = durationMS(st.ReaderWaitTotal / time.Duration(st.ReaderWaits))
-	}
-	return out
+	return daemon.WALReclaimStatusFrom(st)
 }
 
 // buildLaneStatusFor renders the view-build lane: its holder (kind, checkout,

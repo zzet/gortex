@@ -2,9 +2,14 @@ package indexer
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"regexp/syntax"
 	"sort"
+	"sync"
 
 	"github.com/zzet/gortex/internal/search/trigram"
 )
@@ -105,6 +110,7 @@ func (idx *Indexer) warmTrigramSearcher() *trigram.Searcher {
 	var release func()
 	var bytes int64
 	if searcher != nil {
+		idx.applyToolWritesLocked()
 		release = idx.trigramReleaseLocked()
 		bytes = searcher.ApproxIndexBytes()
 	}
@@ -139,6 +145,10 @@ func (idx *Indexer) canPatchTrigramLocked() bool {
 //
 // Paths accumulate only while a searcher is live; with none built there is
 // nothing to patch and the next search builds from the current corpus.
+//
+// Tool-write notes outlive this call: the pass moves the generation only
+// after it returns, and until then a live searcher learns of an edit from
+// its note alone. With no searcher, a settled note has nothing left to do.
 func (idx *Indexer) noteTrigramDirty(paths ...string) {
 	if idx == nil || len(paths) == 0 {
 		return
@@ -146,6 +156,7 @@ func (idx *Indexer) noteTrigramDirty(paths ...string) {
 	idx.trigramMu.Lock()
 	defer idx.trigramMu.Unlock()
 	if idx.trigramSearcher == nil {
+		idx.toolWrites.retire(idx.toolWrites.snapshot(), idx.toolWriteSettled)
 		return
 	}
 	if idx.trigramDirty == nil {
@@ -155,6 +166,95 @@ func (idx *Indexer) noteTrigramDirty(paths ...string) {
 		if p != "" {
 			idx.trigramDirty[p] = struct{}{}
 		}
+	}
+}
+
+// noteToolWrite records that a tool has just written a repo-relative path
+// that no index pass has read yet. The next search reads the file's current
+// bytes: a live searcher patches its postings first, and a streaming search
+// walks the file even before the index tracks it.
+func (idx *Indexer) noteToolWrite(rel string) {
+	if idx == nil || rel == "" {
+		return
+	}
+	idx.toolWrites.note(filepath.ToSlash(rel))
+}
+
+// applyToolWritesLocked reads every noted tool write into the live searcher,
+// then retires the notes that have settled. The caller holds trigramMu and a
+// live searcher.
+func (idx *Indexer) applyToolWritesLocked() {
+	applied := idx.toolWrites.snapshot()
+	if len(applied) == 0 {
+		return
+	}
+	for rel := range applied {
+		idx.trigramSearcher.Update(rel)
+	}
+	idx.toolWrites.retire(applied, idx.toolWriteSettled)
+}
+
+// toolWriteSettled reports whether a note on rel is no longer needed once the
+// searcher holds its bytes, or once there is no searcher: a tracked file is
+// covered by its reindex, which marks it dirty, and by every build, and a
+// missing file has nothing left to find. A file no pass has tracked yet keeps
+// its note, so knownFilePaths still offers it to streaming searches and
+// rebuilds.
+func (idx *Indexer) toolWriteSettled(rel string) bool {
+	idx.mtimeMu.RLock()
+	_, tracked := idx.fileMtimes[rel]
+	idx.mtimeMu.RUnlock()
+	if tracked {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(idx.rootPath, filepath.FromSlash(rel)))
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// toolWriteSet holds the paths tools wrote that the text index has not read
+// yet, each with the sequence number of its newest note, so a note made
+// while a search applied an older one is not retired with it.
+type toolWriteSet struct {
+	mu    sync.Mutex
+	seq   uint64
+	paths map[string]uint64
+}
+
+func (s *toolWriteSet) note(rel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paths == nil {
+		s.paths = make(map[string]uint64)
+	}
+	s.seq++
+	s.paths[rel] = s.seq
+}
+
+func (s *toolWriteSet) snapshot() map[string]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.paths) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(s.paths))
+	for rel, seq := range s.paths {
+		out[rel] = seq
+	}
+	return out
+}
+
+// retire drops each applied note that has not been made again since and that
+// done says is no longer needed.
+func (s *toolWriteSet) retire(applied map[string]uint64, done func(rel string) bool) {
+	for rel, seq := range applied {
+		if !done(rel) {
+			continue
+		}
+		s.mu.Lock()
+		if s.paths[rel] == seq {
+			delete(s.paths, rel)
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -275,19 +375,26 @@ func (idx *Indexer) GrepRegexpPaths(pattern string, prefixes []string, limit int
 	return matches, nil
 }
 
-// knownFilePaths returns a sorted snapshot of the repo's indexed files —
-// the corpus every streaming search walks, and the one Build indexes.
+// knownFilePaths returns a sorted snapshot of the repo's indexed files plus
+// the files tools wrote that no pass has tracked yet — the corpus every
+// streaming search walks, and the one Build indexes.
 //
-// Safe to call while holding trigramMu: mtimeMu is a leaf lock, and the
-// build path took it in exactly this order before.
+// Safe to call while holding trigramMu: mtimeMu and the tool-write lock are
+// leaf locks, and the build path took mtimeMu in exactly this order before.
 func (idx *Indexer) knownFilePaths() []string {
 	if idx == nil {
 		return nil
 	}
+	pending := idx.toolWrites.snapshot()
 	idx.mtimeMu.RLock()
-	paths := make([]string, 0, len(idx.fileMtimes))
+	paths := make([]string, 0, len(idx.fileMtimes)+len(pending))
 	for rel := range idx.fileMtimes {
 		paths = append(paths, rel)
+	}
+	for rel := range pending {
+		if _, tracked := idx.fileMtimes[rel]; !tracked {
+			paths = append(paths, rel)
+		}
 	}
 	idx.mtimeMu.RUnlock()
 	sort.Strings(paths)

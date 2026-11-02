@@ -44,13 +44,15 @@ func TestStatusStorageReportsTheStoreWAL(t *testing.T) {
 	assert.Equal(t, wantEstimate.Milliseconds(), st.CloseCheckpointEstimateMS)
 	assert.Equal(t, wantPending, st.WALPendingFrames)
 	assert.Positive(t, st.CloseCheckpointEstimateMS)
+	require.NotNil(t, st.WALCheckpoint)
+	assert.Equal(t, store.WALPassiveStats().LastOutcome, st.WALCheckpoint.LastOutcome)
 	require.NotNil(t, st.WALReclaim)
 	assert.Equal(t, store.WALReclaimStats().ThresholdBytes, st.WALReclaim.ThresholdBytes)
 
 	body, err := json.Marshal(daemon.StatusResponse{Storage: st})
 	require.NoError(t, err)
 	for _, key := range []string{`"storage"`, `"wal_bytes"`, `"wal_pending_frames"`,
-		`"close_checkpoint_estimate_ms"`, `"wal_reclaim"`, `"resets"`, `"deferrals"`, `"pause_max_ms"`} {
+		`"close_checkpoint_estimate_ms"`, `"wal_checkpoint"`, `"frames_unobserved"`, `"wal_reclaim"`, `"urgent_attempts"`, `"pause_drain"`, `"pause_truncate"`, `"resets"`, `"deferrals"`, `"pause_max_ms"`} {
 		assert.Contains(t, string(body), key)
 	}
 }
@@ -191,6 +193,33 @@ func TestStatusCarriesStorageAndBuildLaneWhileBusy(t *testing.T) {
 	assert.Equal(t, "checkout_cycle", st.BuildLane.Holder.Kind)
 	assert.Equal(t, "checkout-3", st.BuildLane.Holder.CheckoutID)
 	assert.Nil(t, st.Views, "the holder's identity is its own block, never the views census")
+}
+
+func TestStatusWALObservationCausesAndNullablePeak(t *testing.T) {
+	for _, observed := range []bool{false, true} {
+		snapshot := store_sqlite.WALReclaimStats{
+			CancelledWriterParked: 3, CancelledWriteIntent: 2, CancelledOther: 1,
+			WALPeakObserved: observed,
+		}
+		got := walReclaimStatus(snapshot)
+		require.EqualValues(t, 3, got.CancelledWriterParked)
+		require.EqualValues(t, 2, got.CancelledWriteIntent)
+		require.EqualValues(t, 1, got.CancelledOther)
+		require.Equal(t, observed, got.WALPeakObserved)
+		encoded, err := json.Marshal(got)
+		require.NoError(t, err)
+		var wire map[string]any
+		require.NoError(t, json.Unmarshal(encoded, &wire))
+		require.Contains(t, wire, "observed_peak_wal_bytes")
+		if observed {
+			require.NotNil(t, got.ObservedPeakWALBytes)
+			require.Zero(t, *got.ObservedPeakWALBytes)
+			require.Equal(t, float64(0), wire["observed_peak_wal_bytes"])
+		} else {
+			require.Nil(t, got.ObservedPeakWALBytes)
+			require.Nil(t, wire["observed_peak_wal_bytes"])
+		}
+	}
 }
 
 func TestStatusStorageReportsTheDaemonsClosePolicy(t *testing.T) {

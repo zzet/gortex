@@ -131,7 +131,12 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
-	mcpServer *server.MCPServer
+	// editOperations covers actual source-edit handler completions across this
+	// Server's sessions/views, including handlers that outlive their caller.
+	// Native filesystem stimuli remain harness-owned, not inferred from events.
+	editOperations editOperationCounters
+	editCPU        *editCPUObservation
+	mcpServer      *server.MCPServer
 	// connSessions tracks daemon-socket connections registered as live
 	// mcp-go client sessions so server-initiated notifications reach
 	// them (ConnectSession / DisconnectSession / WithClientSession in
@@ -159,7 +164,9 @@ type Server struct {
 	// resetTestIndexProbe clears it on every analysis pass rather than
 	// pinning the first (possibly mid-warmup) answer for the daemon's life.
 	testIndexProbe sync.Map
-	// trackInFlight guards first-index runs by absolute repo path.
+	// trackInFlight guards first-index runs by canonical root and request
+	// options, retaining final outcomes for ten minutes while owner/config
+	// witnesses remain current. Lexical aliases share the same job pointer.
 	// track answers before the index finishes (#326), so without this a
 	// second call for the same path would start a duplicate full index:
 	// TrackRepoCtx's already-tracked check only sees repos that finished.
@@ -367,12 +374,10 @@ type Server struct {
 	equivalence      *search.EquivalenceTable
 	contractRegistry *contracts.Registry
 	semanticMgr      *semantic.Manager
-	// refsConfirmed is the lazy-enrichment ledger: symbol IDs whose incoming
-	// references have been confirmed on demand (via ConfirmSymbolRefs) this
-	// daemon session, so a repeat usages query serves from the confirmed graph
-	// instead of re-spawning the language server. An entry is recorded after
-	// the first attempt (success or empty) to bound per-query LSP work.
-	refsConfirmed sync.Map // symbolID → struct{}
+	// refsConfirmed bounds on-demand incoming-reference work per symbol. Entries
+	// hold an active claim, a retry deadline, or an accepted positive result for
+	// this analysis epoch. Failed/empty attempts never permanently suppress retry.
+	refsConfirmed sync.Map // symbolID → *referenceConfirmation
 	feedback      *feedbackManager
 	notes         *notesManager
 	memories      *memoryManager
@@ -406,15 +411,14 @@ type Server struct {
 	// defaults. sync.Map keeps directly-constructed servers usable.
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
-	mutationSafetyWait  time.Duration
 	// mutationReceiptAfterFunc replaces retention scheduling in deterministic
 	// tests. Nil uses time.AfterFunc with the unchanged retention windows.
 	mutationReceiptAfterFunc func(time.Duration, func())
 	// mutationRouteWaitEntered observes a real pending source-mutation route
 	// after selection and before polling. Nil outside deterministic tests.
 	mutationRouteWaitEntered func(context.Context)
-	// releaseDispatchSlot replaces daemon.ReleaseMCPDispatchSlot in tests.
-	releaseDispatchSlot func(context.Context) bool
+	// releaseDispatchSlot replaces daemon.MoveMCPDispatchToSlowLane in tests.
+	releaseDispatchSlot func(context.Context, <-chan struct{}) bool
 
 	// mutationCommits is the durable disk-commit ledger for the single-file
 	// mutating tools (mutation_commit.go). It answers the question the
@@ -1577,6 +1581,16 @@ func ServerInstructionsPendingAutomaticCheckout(cwd string, roots ...string) str
 	return appendTrackedRootsDiagnostic(msg+"\n\n"+toolref.TransportClause()+" "+toolref.DegradedModeLine(), roots)
 }
 
+// PendingAutomaticCheckoutInstructions captures the verified family verdict
+// with its canonical rendered guidance. A later reader must not re-probe the
+// filesystem and accidentally turn this pending result into untracked advice.
+func PendingAutomaticCheckoutInstructions(cwd string, roots ...string) (string, bool) {
+	if !agents.PendingAutomaticCheckout(cwd, roots) {
+		return "", false
+	}
+	return ServerInstructionsPendingAutomaticCheckout(cwd, roots...), true
+}
+
 // ServerInstructionsPendingFamilyLoad retains the terminal load failure as
 // context, without suggesting a second track operation for a declared family.
 func ServerInstructionsPendingFamilyLoad(cwd string, load indexer.RepoLoad, roots ...string) string {
@@ -1672,6 +1686,12 @@ func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 }
 
 func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base string) string {
+	return s.stateAwareInstructionsWithCheckout(ctx, cwd, base, s.CheckoutServesCWDChecked)
+}
+
+// Keep the existing checkout lookup explicit so publication during that
+// lookup can be exercised without a global hook or changing the transport.
+func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, base string, lookup func(context.Context, string) (bool, error)) string {
 	// The reachability test must match the dispatcher's gate exactly.
 	// Telling a session it is INACTIVE while every call succeeds is the
 	// same divergence as the reverse, just quieter.
@@ -1683,23 +1703,32 @@ func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base st
 			// untracked: telling it to track itself and reconnect is the
 			// advice that made agents re-track or stop on every restart.
 			if rec, pending := s.multiIndexer.PendingRepoForPath(cwd); pending {
-				if !rec.State.Loading() {
-					roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
-					if agents.PendingAutomaticCheckout(cwd, roots) {
-						return ServerInstructionsPendingFamilyLoad(cwd, rec, roots...)
-					}
-					return ServerInstructionsUnavailable(rec.Root, rec.Reason)
-				}
-				// The ordinary instructions follow the loading preamble: the
-				// client reads them once, and they must still be right after
-				// the repository is ready.
-				phase, percent := s.WarmupProgress()
-				return ServerInstructionsLoading(rec.Label(), phase, percent) + "\n\n" + base
+				return s.instructionsForRepoLoad(cwd, base, rec)
 			}
-			if serves, err := s.CheckoutServesCWDChecked(ctx, cwd); err != nil {
+			if serves, err := lookup(ctx, cwd); err != nil {
 				return CheckoutAdmissionInstructions(cwd, err)
 			} else if serves {
 				return s.appendLiveInstructions(cwd, base)
+			}
+			if rec, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+				if rec.State.Ready() {
+					_, _, _, inside = s.multiIndexer.ScopeForCWD(cwd)
+					_, _, contains = s.multiIndexer.ContainedReposScope(cwd)
+					if inside || contains {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					if serves, err := lookup(ctx, cwd); err != nil {
+						return CheckoutAdmissionInstructions(cwd, err)
+					} else if serves {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+					if instructions, known := PendingAutomaticCheckoutInstructions(cwd, roots...); known {
+						return instructions
+					}
+					return ServerInstructionsScopeBindingPending() + "\n\n" + base
+				}
+				return s.instructionsForRepoLoad(cwd, base, rec)
 			}
 			roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
 			if agents.PendingAutomaticCheckout(cwd, roots) {
@@ -1709,6 +1738,24 @@ func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base st
 		}
 	}
 	return s.appendLiveInstructions(cwd, base)
+}
+
+func (s *Server) instructionsForRepoLoad(cwd, base string, rec indexer.RepoLoad) string {
+	if rec.ErrorCode == string(ErrCodePrefixCollision) {
+		return ServerInstructionsPrefixCollision(rec)
+	}
+	if rec.State == indexer.RepoLoadIdentityPending {
+		return ServerInstructionsIdentityPending() + "\n\n" + base
+	}
+	if !rec.State.Loading() {
+		roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+		if agents.PendingAutomaticCheckout(cwd, roots) {
+			return ServerInstructionsPendingFamilyLoad(cwd, rec, roots...)
+		}
+		return ServerInstructionsUnavailable(rec.Root, rec.Reason)
+	}
+	phase, percent := s.WarmupProgress()
+	return ServerInstructionsLoading(rec.Label(), phase, percent) + "\n\n" + base
 }
 
 func (s *Server) appendLiveInstructions(cwd, base string) string {
@@ -2065,6 +2112,9 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 
 	s.applyDefaultToolScopes()
 
+	// Capture process CPU/count0 together, after construction and before this
+	// Server's registered handlers can be called. Never reset on stats reads.
+	s.initializeEditCPUObservation(platform.ProcessCPUTime)
 	return s
 }
 
@@ -2431,7 +2481,7 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 	// too, but only for now. Caching the sentinel would leave the session
 	// blind after the repository registers, so it is not cached: the next
 	// call resolves again.
-	if rec, pending := s.multiIndexer.PendingRepoForPath(cwd); pending && rec.State.Loading() {
+	if _, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
 		ss.scopeResolved = false
 	}
 	ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd
@@ -3176,22 +3226,16 @@ func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
 	go runScheduledMCPMemoryRelease(logger, reason)
 }
 
-// resetConfirmedRefs clears the lazy-enrichment ledger (see the
-// refsConfirmed field). sync.Map has no clear-all, so this ranges and
-// deletes; it is safe against concurrent confirmSymbolRefsOnDemand
-// readers because a racing miss just re-confirms the symbol, which is
-// idempotent — it re-lands the same lsp_resolved edges.
+// resetConfirmedRefs starts a new reference-confirmation epoch. Finishers use
+// pointer CAS, so an attempt admitted before Clear cannot revive its old entry.
 func (s *Server) resetConfirmedRefs() {
-	s.refsConfirmed.Range(func(k, _ any) bool {
-		s.refsConfirmed.Delete(k)
-		return true
-	})
+	s.refsConfirmed.Clear()
 }
 
 // resetTestIndexProbe clears the per-repo-prefix test-symbol probe (see the
-// testIndexProbe field) so the next review re-scans the rebuilt graph. Like
-// resetConfirmedRefs it ranges-and-deletes because sync.Map has no clear-all,
-// and it is safe against a concurrent testLangsIndexed reader: a racing miss
+// testIndexProbe field) so the next review re-scans the rebuilt graph.
+// Ranging and deleting is safe against a concurrent testLangsIndexed reader:
+// a racing miss
 // just re-scans, which is idempotent.
 func (s *Server) resetTestIndexProbe() {
 	s.testIndexProbe.Range(func(k, _ any) bool {

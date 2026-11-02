@@ -227,11 +227,15 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 		for _, analysis := range binding.views {
 			layers = append(layers, query.ViewLayerSource{Search: analysis.SearchBackend(), Layer: binding.composedLayer})
 		}
-		return s.engine.WithComposedView(reader, layers, ctx, view.excludesBaseCorpus())
+		ownership := s.requestLayers(ctx)
+		if binding.composedLayer != nil {
+			ownership = append(ownership, binding.composedLayer)
+		}
+		return s.engine.WithComposedView(reader, layers, ctx, view.excludesBaseCorpus()).WithLayers(ownership)
 	}
 	if s.contractAnalysisRuntime != nil {
 		view := requestViewFromContext(ctx)
-		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus())
+		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	// A routed or overlaid request engine is already a per-request clone, and
 	// it carries the request's lifetime so its long graph walks stop when the
@@ -240,10 +244,10 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	// context through QueryOptions.Context instead.
 	view := requestViewFromContext(ctx)
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx)
+		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx).WithLayers(s.requestLayers(ctx))
 	}
 	if view.routed() {
-		return s.engine.WithComposedView(view.reader, view.candidateLayers(), ctx, view.excludesBaseCorpus())
+		return s.engine.WithComposedView(view.reader, view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	return s.engine
 }
@@ -1526,4 +1530,19 @@ func (s *Server) validateOverlaySnapshotDrift(ctx context.Context, snapshot *ove
 	}
 
 	return nil
+}
+
+// requestLayers carries the same ownership claims as readerFor, independently
+// of runtime wrappers. Candidate corpora and row ownership are separate inputs.
+func (s *Server) requestLayers(ctx context.Context) []graph.OverlayLayerReader {
+	var layers []graph.OverlayLayerReader
+	for _, source := range requestViewFromContext(ctx).candidateLayers() {
+		if source.Layer != nil {
+			layers = append(layers, source.Layer)
+		}
+	}
+	if overlay := OverlayViewFromContext(ctx); overlay != nil && overlay.Layer() != nil {
+		layers = append(layers, overlay.Layer())
+	}
+	return layers
 }

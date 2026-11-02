@@ -54,30 +54,34 @@ func busyBackoff(retry int) time.Duration {
 }
 
 type request struct {
-	Tool      string         `json:"tool"`
-	Operation string         `json:"operation"`
-	Arguments map[string]any `json:"arguments"`
+	Tool                 string         `json:"tool"`
+	Operation            string         `json:"operation"`
+	Arguments            map[string]any `json:"arguments"`
+	ExpectedAbsentSymbol string         `json:"expected_absent_symbol,omitempty"`
 }
 
 // Workload is the complete normalized offered load. Binary paths, private
 // clone paths and revisions belong to the run identity, never the plan hash.
 type Workload struct {
-	Scenario         string    `json:"scenario"`
-	Agents           int       `json:"agents"`
-	EditAgents       int       `json:"edit_agents"`
-	LinkedWorktrees  int       `json:"linked_worktrees"`
-	DurationSec      float64   `json:"duration_seconds"`
-	DeadlineSec      float64   `json:"product_deadline_seconds"`
-	Seed             int64     `json:"seed"`
-	Profile          string    `json:"profile"`
-	Operations       []request `json:"operations"`
-	CPUProfileSec    float64   `json:"cpu_profile_seconds"`
-	WarmTimeoutSec   float64   `json:"warm_timeout_seconds"`
-	StopTimeoutSec   float64   `json:"stop_timeout_seconds"`
-	KeepState        bool      `json:"keep_state"`
-	SessionModel     string    `json:"session_model"`
-	SweepRepetitions int       `json:"sweep_repetitions"`
-	SweepBudgetSec   float64   `json:"sweep_budget_seconds"`
+	EditGateSeed     string         `json:"edit_gate_seed,omitempty"`
+	PRSmokeDrain     *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
+	Scenario         string         `json:"scenario"`
+	Agents           int            `json:"agents"`
+	EditAgents       int            `json:"edit_agents"`
+	LinkedWorktrees  int            `json:"linked_worktrees"`
+	DurationSec      float64        `json:"duration_seconds"`
+	DeadlineSec      float64        `json:"product_deadline_seconds"`
+	Seed             int64          `json:"seed"`
+	Profile          string         `json:"profile"`
+	Operations       []request      `json:"operations"`
+	CPUProfileSec    float64        `json:"cpu_profile_seconds"`
+	WarmTimeoutSec   float64        `json:"warm_timeout_seconds"`
+	StopTimeoutSec   float64        `json:"stop_timeout_seconds"`
+	KeepState        bool           `json:"keep_state"`
+	SessionModel     string         `json:"session_model"`
+	SweepRepetitions int            `json:"sweep_repetitions"`
+	SweepBudgetSec   float64        `json:"sweep_budget_seconds"`
+	EditProbe        *editProbePlan `json:"edit_probe,omitempty"`
 }
 
 func (r request) name() string {
@@ -181,6 +185,14 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		return errors.New("reader/editor counts must be nonnegative")
 	}
 	switch scenario {
+	case "idle-stop":
+		if readers != 0 || editors != 0 {
+			return errors.New("idle-stop requires exactly zero reading/editing agents")
+		}
+	case editProbeScenario:
+		if readers > editProbeMaxReaders || editors < 1 || editors > editProbeMaxEditors {
+			return fmt.Errorf("edit-and-probe has 1..%d fixed editors and 0..%d pure readers", editProbeMaxEditors, editProbeMaxReaders)
+		}
 	case "edit", "many-edit":
 		if editors < 1 {
 			return errors.New("edit scenarios require at least one combined edit/readback agent")
@@ -189,10 +201,15 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 		if readers < 1 || editors < 1 {
 			return errors.New("all scenarios require at least one pure reader and one combined edit/readback agent")
 		}
+	case checkoutDiscoveryScenario:
+		if readers+editors < 2 {
+			return errors.New("worktree discovery needs sessions in both initial repositories")
+		}
 	case "read", "many", "worktrees", "sweep", "cold", "restart":
 		if readers < 1 {
 			return errors.New("zero pure readers are supported only for edit/many-edit")
 		}
+	case startupScenario: // probes only; reader and editor counts are unused
 	default:
 		return fmt.Errorf("unknown scenario %q", scenario)
 	}
