@@ -170,12 +170,15 @@ A gateway preset is a built-in, ready-made custom provider for a well-known Open
 | Preset | Base URL | Default model | Key | Prompt tier |
 |--------|----------|---------------|-----|-------------|
 | `api-route` | `https://global.api-route.com/v1` | `gpt-6.1-sol` | `API_ROUTE_API_KEY` | `frontier` |
+| `cheapaimodel` | `https://api.cheapaimodel.ai/v1` | `deepseek-v4-1-flash` | `CHEAPAIMODEL_API_KEY` | `frontier` |
 | `cheaperinference` | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini` | `CHEAPER_INFERENCE_API_KEY` | `frontier` |
 | `cloudgpu` | `https://cloudgpu.app/v1` | `deepseek-v4.1-flash` | `CLOUDGPU_API_KEY` | `frontier` |
 | `llm-buzz` | `https://api.llm.buzz/api/v1` | `openai/gpt-5.4-mini` | `LLM_BUZZ_API_KEY` | `frontier` |
 | `opper` | `https://api.opper.ai/v3/compat` | `gpt-6.1-terra` | `OPPER_API_KEY` | `frontier` |
 | `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
 | `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
+
+The `cheapaimodel` preset also sends `reasoning_effort: none`: its default model reasons by default, and the reasoning can use up the small output budget of the `assist` passes before any JSON is written. Kimi models accept `none` too. GLM models always reason: with `none` they returned HTTP 400 or an empty answer, and with the default effort they used up the 192-token expand budget, so they are not a good fit for `assist`.
 
 When `llm.provider` names `X`, gortex resolves it in this order: a true built-in provider `X` → your custom provider `X` (global `providers.json`, the opt-in repo-local one, or inline `llm.custom.X`) → the preset `X`. Your own entry always wins over a same-named preset, as a whole — no preset field leaks into it. `GORTEX_LLM_MODEL` / `GORTEX_LLM_EFFORT` apply on top of whichever entry is resolved.
 
