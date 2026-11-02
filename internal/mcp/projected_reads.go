@@ -31,8 +31,9 @@ func auditedSourceProjectionMismatch(ctx context.Context, err error) bool {
 	if ctx.Err() != nil || projectionBudgetUnavailable(ctx, err) || errors.Is(err, context.Canceled) {
 		return false
 	}
-	_, audited := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
-	return audited && (errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded))
+	allowance, audited := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	return audited && (allowance.tool == "" || allowance.tool == "get_symbol_source") &&
+		(errors.Is(err, errProjectionExternalWrite) || errors.Is(err, projectionSuperseded))
 }
 
 // Each request retains only the immutable file layers it actually checked in

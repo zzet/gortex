@@ -20,12 +20,46 @@ func invalidateProjectedSource(entry *projectionEntry) error {
 
 type projectedSourceDeadlineKey struct{}
 type projectedSourceAllowanceKey struct{}
-type projectedSourceAllowance struct{ attempts atomic.Int32 }
+type projectedSourceAllowance struct {
+	attempts atomic.Int32
+	tool     string
+}
+
+// Only these nonpaginated file reads have audited replay-safe response work.
+// Editing-context compression still uses its legacy physical source reader;
+// it keeps the existing refusal behavior rather than gaining another attempt.
+func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
+	switch tool {
+	case "get_symbol_source", "get_file_summary":
+		return true
+	case "get_editing_context":
+		args := req.GetArguments()
+		var options map[string]any
+		if value, present := args["options"]; present {
+			var valid bool
+			options, valid = value.(map[string]any)
+			if !valid {
+				return false
+			}
+		}
+		for _, values := range []map[string]any{args, options} {
+			if value, present := values["compress_bodies"]; present {
+				compressed, valid := value.(bool)
+				if !valid || compressed {
+					return false
+				}
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		legacy, known := s.legacyToolName(&req)
-		if !known || legacy != "get_symbol_source" {
+		if !known || !auditedProjectionReadRetry(legacy, req) {
 			return next(ctx, req)
 		}
 		if _, exists := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !exists {
@@ -34,7 +68,7 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 				deadline = prior
 			}
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
-			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{})
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy})
 		}
 		return next(ctx, req)
 	}
@@ -52,9 +86,45 @@ func (a *projectedSourceAllowance) claim() bool {
 	}
 }
 
-// Only this audited source read retries, once, for a typed byte mismatch. Each
-// attempt runs the whole middleware with fresh facts/layers and releases its
-// leases before the next; the first attempt's projection deadline is retained.
+// Permission to revalidate from scratch, not freshness authority for an old
+// response. Peer owners, invalidation and unchecked eviction remain refusals.
+func retrySourceAfterCheckedRetirement(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if _, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !ok {
+		return false
+	}
+	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+	if !ok || !time.Now().Before(deadline) {
+		return false
+	}
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return false
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	retired := false
+	for _, entry := range facts.entries {
+		if entry == nil {
+			return false
+		}
+		current := pendingFileProjections.snap.Load().entries[entry.key]
+		if current == entry && liveProjectionForAcknowledgement(entry) {
+			continue
+		}
+		if current != nil || !entry.checkedRetired.Load() || entry.suspect.Load() {
+			return false
+		}
+		retired = true
+	}
+	return retired
+}
+
+// Audited file reads retry once after checked retirement; source also retains
+// its typed byte-mismatch retry. Every attempt has fresh facts/layers/leases
+// under the original shared deadline and two-attempt allowance.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)

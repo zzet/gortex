@@ -36,6 +36,9 @@ func (p *pendingProjections) publishCohort(members []projectionCohortMember) err
 		if entry == nil || entry.key == "" || entry.graphPath == "" || entry.size < 0 {
 			return errors.New("projection cohort contains invalid entry")
 		}
+		if entry.checkedRetired.Load() {
+			return refuse(projectionSuperseded)
+		}
 		if _, duplicate := seen[entry.key]; duplicate {
 			return errors.New("projection cohort contains duplicate physical path")
 		}

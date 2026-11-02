@@ -773,8 +773,11 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 	// This charges the whole file as the counterfactual, so claim it for the
 	// session: a later retrieval page that merely cites the file must not
 	// bill it a second time (savings_retrieval.go).
-	stats.creditFile(abs)
-	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
+	node := s.fileAttributionNode(relPath, language)
+	afterFreshSymbolAcceptance(ctx, func() {
+		stats.creditFile(abs)
+		stats.record(node, tool, returned, fullFile)
+	})
 }
 
 // pendingSavings is one source-read observation assembled before an
