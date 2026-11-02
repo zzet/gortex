@@ -588,8 +588,9 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	if len(snapshots) > 0 {
 		snapshot, _ = ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot)
 	}
-	stormFiles := requestProjectionStormFiles(ctx)
-	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles) + len(stormFiles)
+	deferredFiles := requestDeferredProjectionFiles(ctx)
+	storeBusyFiles := requestStoreBusyFiles(ctx)
+	gapCount := len(paths) + len(receipts) + len(snapshot.paths) + len(projectedFiles) + len(deferredFiles) + len(storeBusyFiles)
 	if len(snapshots) > 0 {
 		gapCount += len(snapshots[0])
 	}
@@ -628,11 +629,27 @@ func (s *Server) freshnessFor(ctx context.Context, scope string, ids, files []st
 	for _, file := range projectedFiles {
 		put(file, "pending", 0)
 	}
-	for _, file := range stormFiles {
+	for file, reason := range deferredFiles {
 		put(file, "pending", 0)
 		if _, included := states[s.repoRelative(file)]; included {
-			label.fileReason = "storm"
+			label.fileReason = reason
 		}
+	}
+	for _, file := range storeBusyFiles {
+		if len(ids)+len(files) > 0 && !inScope(file) {
+			continue
+		}
+		if len(ids)+len(files) == 0 {
+			if prefix := baseNarrowedRepoPrefix(requestViewFromContext(ctx)); prefix != "" && !strings.HasPrefix(s.repoRelative(file), prefix+"/") {
+				continue
+			}
+		}
+		key := s.repoRelative(file)
+		prior := states[key]
+		if prior.state != "failed" {
+			states[key] = pathState{"pending", prior.generation}
+		}
+		label.storeBusy = true
 	}
 	putTiers := func(path string, tiers indexer.MutationTierState) {
 		at := tiers.RelationsAt
@@ -1099,6 +1116,9 @@ func (f relationFreshness) apply(result map[string]any) {
 	result["graph_freshness"] = f.state
 	if f.state == "pending" && f.fileReason != "" {
 		result["file_reason"] = f.fileReason
+	}
+	if f.state == "pending" && f.storeBusy {
+		result["reason"] = "store_busy"
 	}
 	scope := f.scope
 	if scope == "" {

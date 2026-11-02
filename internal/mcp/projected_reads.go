@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sync"
 	"time"
@@ -228,9 +229,10 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu         sync.RWMutex
-	entries    map[string]*projectionEntry
-	stormFiles map[string]struct{} // queued storm observations, not publication authority
+	mu             sync.RWMutex
+	entries        map[string]*projectionEntry
+	deferredFiles  map[string]string   // projection deferral observations, not publication authority
+	storeBusyFiles map[string]struct{} // selected store sections were unavailable
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {
@@ -244,16 +246,45 @@ func withRequestProjectionFacts(ctx context.Context) context.Context {
 // pending file in the same request-local facts consumed by the tier producer;
 // detached background work has no storm witness and retains generic labels.
 func markRequestProjectionStorm(ctx context.Context, path string) {
+	markRequestProjectionDeferred(ctx, path, "storm")
+}
+
+func markRequestProjectionDeferred(ctx context.Context, path, reason string) {
 	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	facts.mu.Lock()
 	defer facts.mu.Unlock()
-	if facts.stormFiles == nil {
-		facts.stormFiles = make(map[string]struct{})
+	if facts.deferredFiles == nil {
+		facts.deferredFiles = make(map[string]string)
 	}
-	facts.stormFiles[path] = struct{}{}
+	facts.deferredFiles[path] = reason
 }
 
-func requestProjectionStormFiles(ctx context.Context) []string {
+// markRequestStoreBusy records a failed selected-store section in the same
+// request facts consumed by freshnessFor. It does not authorize fallback to a
+// canonical reader or certify any omitted rows. Callers pass a graph-keyed path.
+func markRequestStoreBusy(ctx context.Context, path string) context.Context {
+	ctx = withRequestProjectionFacts(ctx)
+	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	facts.mu.Lock()
+	defer facts.mu.Unlock()
+	if facts.storeBusyFiles == nil {
+		facts.storeBusyFiles = make(map[string]struct{})
+	}
+	facts.storeBusyFiles[path] = struct{}{}
+	return ctx
+}
+
+func requestDeferredProjectionFiles(ctx context.Context) map[string]string {
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return nil
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	return maps.Clone(facts.deferredFiles)
+}
+
+func requestStoreBusyFiles(ctx context.Context) []string {
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
 		return nil
@@ -261,7 +292,7 @@ func requestProjectionStormFiles(ctx context.Context) []string {
 	facts.mu.RLock()
 	defer facts.mu.RUnlock()
 	var paths []string
-	for path := range facts.stormFiles {
+	for path := range facts.storeBusyFiles {
 		paths = append(paths, path)
 	}
 	return paths
