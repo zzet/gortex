@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 
 	"github.com/zzet/gortex/internal/viewmetrics"
@@ -44,6 +45,16 @@ func (s *Server) admitSourceMutationFrontier(ctx context.Context, targets []sour
 			for i, target := range targets {
 				paths[i] = target.path
 			}
+			// Reuse the same exact note/path/ledger owner selection as point
+			// admission. The context is ephemeral; tickets retain only their own
+			// existing record, never another file's or the whole map.
+			records := make(map[string]*indexer.PublicationPhaseRecord, len(paths))
+			for _, path := range paths {
+				if record := s.committedPublicationRecord(ctx, path); record != nil {
+					records[path] = record
+				}
+			}
+			ctx = indexer.WithFilePublicationRecords(ctx, records)
 			lap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
 			tickets, err := scheduler.EnqueueFileMutations(context.WithoutCancel(ctx), paths)
 			lap.finish()
@@ -57,6 +68,9 @@ func (s *Server) admitSourceMutationFrontier(ctx context.Context, targets []sour
 				}
 			}
 			if err != nil {
+				for _, record := range records {
+					failMutationPhases(record)
+				}
 				for i := range admissions {
 					admissions[i].immediate.Err = err
 				}
