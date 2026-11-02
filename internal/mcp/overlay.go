@@ -95,7 +95,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// of this function) so it bounds the whole middleware chain, not just the
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
-	return s.boundToolHandler(s.withProjectedSourceReadBudget(s.retryFreshSymbolSearch(s.retryProjectedSymbolSource(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	return s.boundToolHandler(s.retryFreshSymbolSearch(s.retryProjectedSymbolSource(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
 		s.noteAcknowledgementMiddleware(ctx)
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
@@ -475,7 +475,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			}
 		}
 		return res, hErr
-	}))))
+	})))
 }
 
 // refuseWithdrawnExactness is require_exact's post-handler half: it refuses an
