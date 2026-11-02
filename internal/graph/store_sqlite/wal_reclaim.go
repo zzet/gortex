@@ -747,7 +747,9 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 		probe := res
 		knownRefusal := standalone && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil
 		s.writeMu.Unlock()
-		if knownRefusal {
+		// Release callbacks can cancel the attempt or expose new demand.
+		probe = res
+		if knownRefusal && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil {
 			res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
 			res.bytesAfter = s.observedWALFileSize(walPath)
 			return res
