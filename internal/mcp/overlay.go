@@ -445,7 +445,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
-			if auditedProjectionRead && res != nil && !res.IsError && retrySourceAfterCheckedRetirement(ctx) {
+			if auditedProjectionRead && res != nil && !res.IsError && retryAfterCheckedProjectionChange(ctx) {
 				return nil, errProjectedSourceMoved
 			}
 			res = s.decorateToolFreshness(ctx, req.Params.Name, req, res)
@@ -460,7 +460,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// only after the last ownership check, including decorator-time I/O.
 		if auditedProjectionRead && hErr == nil && res != nil && !res.IsError {
 			if err := validateRequestProjections(ctx); err != nil {
-				if retrySourceAfterCheckedRetirement(ctx) {
+				if retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
 				res = mcp.NewToolResultError(err.Error())

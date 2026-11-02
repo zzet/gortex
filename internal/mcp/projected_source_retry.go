@@ -89,13 +89,15 @@ func (a *projectedSourceAllowance) claim() bool {
 	}
 }
 
-// Permission to revalidate from scratch, not freshness authority for an old
-// response. Peer owners, invalidation and unchecked eviction remain refusals.
-func retrySourceAfterCheckedRetirement(ctx context.Context) bool {
+// Permission for a fresh bounded attempt, never freshness of the old context.
+// Checked canonical retirement and a checked same-version read-COW are distinct
+// from another physical execution, content change or an unobserved source event.
+func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if _, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !ok {
+	allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	if !ok || allowance.tool == "get_symbol" {
 		return false
 	}
 	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
@@ -108,24 +110,40 @@ func retrySourceAfterCheckedRetirement(ctx context.Context) bool {
 	}
 	facts.mu.RLock()
 	defer facts.mu.RUnlock()
-	retired := false
+	changed := false
 	for _, entry := range facts.entries {
-		if entry == nil {
+		if entry == nil || ctx.Err() != nil || !time.Now().Before(deadline) {
 			return false
 		}
+		candidate := pendingFileProjections.snap.Load().entries[entry.key]
+		// Stat remains outside the registry mutex. Under the mutex, bind the
+		// observed disk check to the exact current pointer/event revision.
+		live := candidate != nil && liveProjectionForAcknowledgement(candidate)
+		sameDisk := candidate != nil && candidate.disk.matches(entry.disk)
+		pendingFileProjections.mu.Lock()
 		current := pendingFileProjections.snap.Load().entries[entry.key]
-		if current == entry && liveProjectionForAcknowledgement(entry) {
+		unchanged := current == entry && current == candidate && live
+		retired := current == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+		readCOW := current != nil && current != entry && current == candidate && live &&
+			current.commitSeq == 0 && current.sourceCommitSeq != 0 && current.sourceCommitSeq == entry.sourceCommitSeq &&
+			!current.suspect.Load() && current.sourceEvents == 0 && !current.checkedRetired.Load() &&
+			!current.tombstone && !entry.tombstone && current.layer != nil && current.layer == entry.layer &&
+			current.key == entry.key && current.graphPath == entry.graphPath && current.repoPrefix == entry.repoPrefix &&
+			current.hash == entry.hash && current.rawHash == entry.rawHash && current.contentSHA256 == entry.contentSHA256 &&
+			sameDisk
+		pendingFileProjections.mu.Unlock()
+		if unchanged {
 			continue
 		}
-		if current != nil || !entry.checkedRetired.Load() || entry.suspect.Load() {
+		if !retired && !readCOW {
 			return false
 		}
-		retired = true
+		changed = true
 	}
-	return retired
+	return changed
 }
 
-// Audited file reads retry once after checked retirement; source also retains
+// Audited file reads retry once after a checked version transition; source retains
 // its typed byte-mismatch retry. Every attempt has fresh facts/layers/leases
 // under the original shared deadline and two-attempt allowance.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
