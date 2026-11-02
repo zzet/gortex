@@ -79,6 +79,9 @@ func TestIncrementalFallbackUsesAppliedSourceProvenance(t *testing.T) {
 			require.Empty(t, failed)
 			require.Contains(t, reparsed, path)
 			require.GreaterOrEqual(t, changing.reads.Load(), int32(3), "probe A, refresh B, and fallback B must all execute")
+			// The authoritative legacy read already owns B; avoid an extra
+			// speculative preparation and confirmation of the same newer bytes.
+			require.Equal(t, int32(3), changing.reads.Load(), "one moved save needs probe A, refresh B, then the authoritative legacy B read")
 			require.NotNil(t, nodeByName(t, idx, file, "Latest"), "prove the fallback actually applied B")
 			current, err := os.ReadFile(path)
 			require.NoError(t, err)

@@ -14,9 +14,9 @@ import (
 )
 
 // A real editor save lands after the original bytes were read for extraction.
-// Check the production chunk's graph/derived provenance and its staged work
-// path, rather than treating an unused helper as a latency improvement.
-func TestMovedRefreshChunkUsesFreshStagedApply(t *testing.T) {
+// Check the production chunk's graph/derived provenance and completed legacy
+// application after it discards the obsolete speculative parse.
+func TestMovedRefreshChunkUsesFreshLegacyApply(t *testing.T) {
 	for _, forcedInert := range []bool{false, true} {
 		name, file := "changed-probe", "edit.go"
 		if forcedInert {
@@ -54,7 +54,7 @@ func TestMovedRefreshChunkUsesFreshStagedApply(t *testing.T) {
 			_, saveErr := mover.saved()
 			require.NoError(t, saveErr)
 			require.Empty(t, failed)
-			require.Empty(t, changed, "the staged receipt must belong to the fresh B read")
+			require.Empty(t, changed, "the legacy receipt must belong to the fresh B read")
 			require.Contains(t, reparsed, path)
 			require.NotNil(t, nodeByName(t, idx, file, "Latest"), "the production chunk must apply B, never obsolete A")
 			current, err := os.ReadFile(path)
@@ -63,19 +63,24 @@ func TestMovedRefreshChunkUsesFreshStagedApply(t *testing.T) {
 			require.NotContains(t, plan.HierarchyUnchanged, file, "new interface must invalidate hierarchy")
 			if forcedInert {
 				require.True(t, plan.Flags.Has(DerivedInvalidatesTests))
-				require.NotContains(t, idx.inertReparsed, file, "no obsolete A restatement may overwrite staged B")
+				require.NotContains(t, idx.inertReparsed, file, "no obsolete A restatement may overwrite applied B")
 			}
-			parsePhases := 0
+			parsePhases, fallbackPhases := 0, 0
 			for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
 				fields := entry.ContextMap()
-				require.NotEqual(t, "chunk_fallback_parse_apply", fields["phase"], "one newer read must not take the combined legacy apply tail")
+				if fields["phase"] == "chunk_fallback_parse_apply" {
+					fallbackPhases++
+					require.EqualValues(t, 1, fields["files"])
+					require.EqualValues(t, 0, fields["failed_files"])
+				}
 				if fields["phase"] == "chunk_parse" {
 					parsePhases++
-					require.EqualValues(t, 0, fields["fallback_files"])
-					require.EqualValues(t, 1, fields["staged_files"], "production must use the fresh paired probe/parse")
+					require.EqualValues(t, 1, fields["fallback_files"])
+					require.EqualValues(t, 0, fields["staged_files"], "the obsolete parse must be discarded")
 				}
 			}
 			require.Equal(t, 1, parsePhases)
+			require.Equal(t, 1, fallbackPhases, "the authoritative legacy parse/apply must complete")
 		})
 	}
 }
