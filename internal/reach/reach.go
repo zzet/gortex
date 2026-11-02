@@ -123,13 +123,14 @@ type Stats struct {
 	EntriesD1    int    // total reach_d1 IDs across all indexed nodes
 	EntriesD2    int    // total reach_d2 IDs
 	EntriesD3    int    // total reach_d3 IDs
-	Build        uint64 // generation tag stamped on every indexed node
+	Build        uint64 // generation the build read the graph at
 }
 
-// buildCounter is a process-wide monotonic generation counter used to
-// invalidate cached reach sets after graph mutations and incremental rebuilds.
-// reachProcessEpoch prevents a counter value reused by a restarted process from
-// matching a record persisted by the previous process.
+// buildCounter is the process-wide source of reach generations: every
+// invalidation, of the whole graph or of some repositories, takes its next
+// value, so a generation never repeats within a process. reachProcessEpoch
+// prevents a counter value reused by a restarted process from matching a
+// record persisted by the previous process.
 var (
 	buildCounter      uint64
 	reachProcessEpoch = newReachProcessEpoch()
@@ -145,81 +146,214 @@ func newReachProcessEpoch() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
-// topologyGate serialises impact readers/eager reach maintenance with a
-// watcher topology transaction. It is separate from Store.ResolveMutex:
-// watcher indexing calls resolver methods that acquire ResolveMutex
-// internally, so holding that non-reentrant mutex around the whole patch would
-// deadlock. Readers always acquire this gate before ResolveMutex; a watcher
-// holds the writer side while its nested resolver calls take ResolveMutex.
+// topologyGate is the writer-preferring reader/writer state of one scope: the
+// whole graph, or one repository prefix.
 type topologyGate struct {
-	mu             sync.Mutex
-	cond           *sync.Cond
 	readers        int
-	writer         bool
+	writers        int
 	writersWaiting int
 }
 
-// buildCounter is already process-global, so topology publication uses one
-// process-global gate as well. This avoids retaining one registry entry per
-// short-lived Store forever (notably across tests and workspace reloads).
-// Production multi-repo indexers share one Store, and the conservative
-// cross-store serialization is preferable to an unbounded coordination
-// registry — but only while what passes through it stays scarce. Every
-// checkout coordinator, ref view and warmup tail in the daemon queues on this
-// one gate, so a pass that cannot change what the records describe must not
-// enter it at all: see WritesBaseTopology.
-var globalTopologyGate = func() *topologyGate {
-	gate := &topologyGate{}
-	gate.cond = sync.NewCond(&gate.mu)
-	return gate
-}()
+// topologyState serialises impact readers and eager reach maintenance with
+// watcher topology transactions, per repository. It is separate from
+// Store.ResolveMutex: watcher indexing calls resolver methods that acquire
+// ResolveMutex internally, so holding that non-reentrant mutex around the
+// whole patch would deadlock. Readers always acquire a gate before
+// ResolveMutex; a watcher holds the writer side while its nested resolver
+// calls take ResolveMutex.
+//
+// A scope is nil for the whole graph, or a sorted list of repository
+// prefixes. One mutex guards every gate, so a mutation takes all of its gates
+// in one step and gates need no lock order among themselves. Waiters sleep on
+// wake, which is allocated only while callers are waiting and cleared on
+// broadcast or when its last waiter leaves. In particular, an idle state must
+// not retain a channel owned by a caller's synctest bubble.
+//
+// The state is process-global, like buildCounter. Repository gates are created
+// on first use and dropped once idle, so the map holds only work in flight.
+// Production multi-repo indexers share one Store; tests that reuse a prefix
+// across stores only over-serialise.
+type topologyState struct {
+	mu               sync.Mutex
+	wake             chan struct{}
+	wakeWaitersCount int // Waiters of wake only; broadcast generations retire independently.
+	all              topologyGate
+	repos            map[string]*topologyGate
+	// Readers, writers and waiting writers of repository scopes, so that
+	// whole-graph admission need not scan repos.
+	repoReaders, repoWriters, repoWritersWaiting int
 
-func beginTopologyRead(_ graph.Store) func() {
-	gate := globalTopologyGate
-	gate.mu.Lock()
-	for gate.writer || gate.writersWaiting > 0 {
-		gate.cond.Wait()
+	// allBuild is the generation of the last whole-graph invalidation, and
+	// repoBuild the generation of each repository invalidated since.
+	allBuild  uint64
+	repoBuild map[string]uint64
+
+	coupling repoCoupling
+}
+
+var topology = &topologyState{
+	repos:     make(map[string]*topologyGate),
+	repoBuild: make(map[string]uint64),
+}
+
+// readable reports whether a reader of scope may enter: no writer holds or
+// awaits any gate the reader needs. t.mu is held.
+func (t *topologyState) readable(scope []string) bool {
+	if t.all.writers > 0 || t.all.writersWaiting > 0 {
+		return false
 	}
-	gate.readers++
-	gate.mu.Unlock()
-
-	return func() {
-		gate.mu.Lock()
-		gate.readers--
-		if gate.readers == 0 {
-			gate.cond.Broadcast()
+	if scope == nil {
+		return t.repoWriters == 0 && t.repoWritersWaiting == 0
+	}
+	for _, prefix := range scope {
+		if gate := t.repos[prefix]; gate != nil && (gate.writers > 0 || gate.writersWaiting > 0) {
+			return false
 		}
-		gate.mu.Unlock()
+	}
+	return true
+}
+
+// writable reports whether a writer of scope may enter. A repository writer
+// also yields to a waiting whole-graph writer so the latter cannot starve.
+// t.mu is held.
+func (t *topologyState) writable(scope []string) bool {
+	if t.all.writers > 0 || t.all.readers > 0 {
+		return false
+	}
+	if scope == nil {
+		return t.repoReaders == 0 && t.repoWriters == 0
+	}
+	if t.all.writersWaiting > 0 {
+		return false
+	}
+	for _, prefix := range scope {
+		if gate := t.repos[prefix]; gate != nil && (gate.writers > 0 || gate.readers > 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// add moves every gate of scope by the given deltas. t.mu is held.
+func (t *topologyState) add(scope []string, readers, writers, waiting int) {
+	if scope == nil {
+		t.all.readers += readers
+		t.all.writers += writers
+		t.all.writersWaiting += waiting
+		return
+	}
+	t.repoReaders += readers
+	t.repoWriters += writers
+	t.repoWritersWaiting += waiting
+	for _, prefix := range scope {
+		gate := t.repos[prefix]
+		if gate == nil {
+			gate = &topologyGate{}
+			t.repos[prefix] = gate
+		}
+		gate.readers += readers
+		gate.writers += writers
+		gate.writersWaiting += waiting
+		if *gate == (topologyGate{}) {
+			delete(t.repos, prefix)
+		}
 	}
 }
 
-// beginTopologyReadContext is the cancellable counterpart used by lazy
-// impact lookups. It never waits on sync.Cond (which has no cancellation
-// channel); a short poll keeps the writer-preference semantics while allowing
-// an expired tool request to stop waiting.
-func beginTopologyReadContext(ctx context.Context) (func(), bool) {
-	gate := globalTopologyGate
-	for {
-		gate.mu.Lock()
-		if !gate.writer && gate.writersWaiting == 0 {
-			gate.readers++
-			gate.mu.Unlock()
-			return func() {
-				gate.mu.Lock()
-				gate.readers--
-				if gate.readers == 0 {
-					gate.cond.Broadcast()
-				}
-				gate.mu.Unlock()
-			}, true
+// wait sleeps until a holder leaves and reports false when ctx ends first.
+// t.mu is held on entry and on return.
+func (t *topologyState) wait(ctx context.Context) bool {
+	if t.wake == nil {
+		t.wake = make(chan struct{})
+	}
+	wake := t.wake
+	t.wakeWaitersCount++
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		if t.wake == wake {
+			t.wakeWaitersCount--
+			if t.wakeWaitersCount == 0 {
+				t.wake = nil
+			}
 		}
-		gate.mu.Unlock()
-		select {
-		case <-ctx.Done():
+	}()
+	select {
+	case <-wake:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// wakeWaiters lets every waiter re-check its admission. t.mu is held. A
+// replacement is created by the next actual waiter, never by the releaser.
+func (t *topologyState) wakeWaiters() {
+	if t.wake != nil {
+		close(t.wake)
+		t.wake = nil
+		t.wakeWaitersCount = 0
+	}
+}
+
+// retire moves the reach generation of scope past every value issued so far.
+// t.mu is held.
+func (t *topologyState) retire(scope []string) {
+	build := atomic.AddUint64(&buildCounter, 1)
+	if scope == nil {
+		t.allBuild = build
+		clear(t.repoBuild)
+		return
+	}
+	for _, prefix := range scope {
+		t.repoBuild[prefix] = build
+	}
+}
+
+// retireWhole is retire for the whole graph, taking t.mu.
+func retireWhole() {
+	topology.mu.Lock()
+	defer topology.mu.Unlock()
+	topology.retire(nil)
+}
+
+// generation is the build a current record of a seed in scope carries. A seed
+// no repository owns follows every invalidation.
+func generation(scope []string) uint64 {
+	if scope == nil {
+		return atomic.LoadUint64(&buildCounter)
+	}
+	t := topology
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	build := t.allBuild
+	for _, prefix := range scope {
+		build = max(build, t.repoBuild[prefix])
+	}
+	return build
+}
+
+// beginTopologyRead waits until no writer holds or awaits a gate of scope, or
+// until ctx ends.
+func beginTopologyRead(ctx context.Context, scope []string) (func(), bool) {
+	t := topology
+	t.mu.Lock()
+	for !t.readable(scope) {
+		if !t.wait(ctx) {
+			t.mu.Unlock()
 			return nil, false
-		case <-time.After(lockPoll):
 		}
 	}
+	t.add(scope, 1, 0, 0)
+	t.mu.Unlock()
+	return func() {
+		t.mu.Lock()
+		t.add(scope, -1, 0, 0)
+		if t.all.writersWaiting > 0 || t.repoWritersWaiting > 0 {
+			t.wakeWaiters()
+		}
+		t.mu.Unlock()
+	}, true
 }
 
 func lockContext(ctx context.Context, mu *sync.Mutex) bool {
@@ -231,6 +365,39 @@ func lockContext(ctx context.Context, mu *sync.Mutex) bool {
 		}
 	}
 	return true
+}
+
+// detachedNodeReader is a store whose reads stay consistent without its
+// ResolveMutex, so a lookup does not wait behind a resolver or enrichment pass
+// that holds it.
+type detachedNodeReader interface {
+	NodeReadsDetached() bool
+}
+
+// lockResolve takes g's ResolveMutex for a read, unless g's reads are detached
+// from it. A record write always takes the mutex: it rewrites whole node rows
+// that a pass holding the mutex may be rewriting too.
+func lockResolve(ctx context.Context, g graph.Store) (unlock func(), ok bool) {
+	observer := coordinationWaitObserver(ctx)
+	if detached, isDetached := g.(detachedNodeReader); isDetached && detached.NodeReadsDetached() {
+		if observer != nil {
+			observer(CoordinationWait{Phase: "resolve_mutex_wait", Acquired: true})
+		}
+		return func() {}, true
+	}
+	var started time.Time
+	if observer != nil {
+		started = time.Now()
+	}
+	mu := g.ResolveMutex()
+	ok = lockContext(ctx, mu)
+	if observer != nil {
+		observer(CoordinationWait{Phase: "resolve_mutex_wait", Duration: time.Since(started), Attempted: true, Acquired: ok})
+	}
+	if !ok {
+		return nil, false
+	}
+	return mu.Unlock, true
 }
 
 // viewGenerationPinned is implemented by a store handle bound to one payload
@@ -263,41 +430,276 @@ func WritesBaseTopology(g graph.Store) bool {
 }
 
 // BeginTopologyMutation prevents reach lookups/builds from observing a
-// watcher's parse-then-swap and resolver work half-applied. The returned
-// function must be called exactly once; changed=true invalidates every cached
-// generation before waiting readers are released. A separate gate is required
-// because the mutation body itself invokes resolver methods that acquire the
-// store's non-reentrant ResolveMutex.
+// watcher's parse-then-swap and resolver work half-applied. It holds the whole
+// graph: use BeginRepoTopologyMutation when the mutation belongs to one
+// repository. The returned function must be called exactly once; changed=true
+// invalidates every cached generation, and the repository coupling, before
+// waiting readers are released. A separate gate is required because the
+// mutation body itself invokes resolver methods that acquire the store's
+// non-reentrant ResolveMutex.
 //
 // A mutation that cannot reach the base corpus takes nothing and invalidates
-// nothing. The gate is process-global, so a generation-pinned build that held
-// it would serialise every unrelated store and pass in the daemon behind a
+// nothing. The gates are process-global, so a generation-pinned build that held
+// them would serialise every unrelated store and pass in the daemon behind a
 // pass whose duration is its payload's, not the corpus's.
 func BeginTopologyMutation(g graph.Store) func(changed bool) {
 	if !WritesBaseTopology(g) {
 		return func(bool) {}
 	}
-	gate := globalTopologyGate
-	gate.mu.Lock()
-	gate.writersWaiting++
-	for gate.writer || gate.readers > 0 {
-		gate.cond.Wait()
+	finish := beginTopologyWrite(g, "")
+	return func(changed bool) { finish(changed, nil) }
+}
+
+// BeginRepoTopologyMutation is BeginTopologyMutation for a mutation of the
+// rows of repository prefix. It waits only for the readers and writers of the
+// repositories coupled with prefix. The whole graph is held instead for an
+// empty prefix, and while the store's coupling is unknown; the first mutation
+// that needs it starts reading it in the background.
+//
+// The returned function must be called exactly once. frontier lists the files
+// the mutation may have added or rebound edges in or at the nodes of. With
+// changed=true, the couplings those edges make are learned first, and then the
+// records of every repository coupled with prefix are invalidated. A nil
+// frontier says edges anywhere may have moved: every record is invalidated and
+// the coupling forgotten.
+func BeginRepoTopologyMutation(g graph.Store, prefix string) func(changed bool, frontier []string) {
+	if !WritesBaseTopology(g) {
+		return func(bool, []string) {}
 	}
-	gate.writersWaiting--
-	gate.writer = true
-	gate.mu.Unlock()
+	if prefix != "" {
+		ensureRepoCoupling(g)
+	}
+	return beginTopologyWrite(g, prefix)
+}
+
+func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontier []string) {
+	t := topology
+	t.mu.Lock()
+	scope, epoch := t.writeScope(g, prefix)
+	t.add(scope, 0, 0, 1)
+	for !t.writable(scope) {
+		t.wait(context.Background())
+		if epoch != t.coupling.epoch {
+			// The coupling the scope came from was retired while this writer
+			// waited.
+			t.add(scope, 0, 0, -1)
+			scope, epoch = t.writeScope(g, prefix)
+			t.add(scope, 0, 0, 1)
+		}
+	}
+	t.add(scope, 0, 1, -1)
+	t.mu.Unlock()
 
 	var once sync.Once
-	return func(changed bool) {
+	return func(changed bool, frontier []string) {
 		once.Do(func() {
-			if changed {
-				InvalidateIndex()
+			if changed && prefix != "" && frontier != nil {
+				learnRepoCoupling(g, frontier)
 			}
-			gate.mu.Lock()
-			gate.writer = false
-			gate.cond.Broadcast()
-			gate.mu.Unlock()
+			t.mu.Lock()
+			if changed {
+				if prefix == "" || frontier == nil {
+					// Edges anywhere may have moved.
+					t.coupling.forget(g)
+				}
+				// What the mutation held, widened by the couplings it bound; the
+				// whole graph when either is unknown.
+				retired, _ := t.writeScope(g, prefix)
+				if scope == nil || retired == nil {
+					retired = nil
+				} else {
+					retired = append(retired, scope...)
+				}
+				t.retire(retired)
+			}
+			t.add(scope, 0, -1, 0)
+			t.wakeWaiters()
+			t.mu.Unlock()
 		})
+	}
+}
+
+// writeScope is the gate set a mutation of prefix holds: the repositories
+// coupled with it, or the whole graph (nil) for an empty prefix or while the
+// coupling of g is unknown. The epoch tells a waiting writer when to ask
+// again. t.mu is held.
+func (t *topologyState) writeScope(g graph.Store, prefix string) ([]string, uint64) {
+	c := &t.coupling
+	if prefix == "" || !c.ready || c.store != g {
+		return nil, c.epoch
+	}
+	return c.component(prefix), c.epoch
+}
+
+// repoCoupling groups the repositories of one store whose reach records can
+// cross: an edge joins them, directly or through a node no repository owns. A
+// mutation of one member can change the records of every member of its group.
+//
+// It is read from the store in the background once per epoch, grows with what
+// each repository mutation learns from its frontier, and is forgotten by any
+// mutation that may have moved edges anywhere. A store whose read fails is not
+// read again. Only one store is tracked; a mutation of another store holds the
+// whole graph until it is read again.
+type repoCoupling struct {
+	store   graph.Store
+	epoch   uint64
+	ready   bool
+	seeding bool
+	missed  bool
+	// pending holds what mutations learned while the read was in flight.
+	pending [][2]string
+	parent  map[string]string
+}
+
+// couplingReadBudget bounds each coupling read. A store whose read misses it
+// keeps whole-graph mutations until the process restarts.
+const couplingReadBudget = 2 * time.Second
+
+// repoCouplingSource reports the distinct repository pairs the store's edges
+// join: all of them, or those at the nodes of some files.
+type repoCouplingSource interface {
+	RepoCouplingPairs(ctx context.Context) ([][2]string, error)
+	RepoCouplingPairsForFiles(ctx context.Context, files []string) ([][2]string, error)
+}
+
+func (c *repoCoupling) find(prefix string) string {
+	for {
+		parent, ok := c.parent[prefix]
+		if !ok || parent == prefix {
+			return prefix
+		}
+		prefix = parent
+	}
+}
+
+func (c *repoCoupling) union(a, b string) {
+	ra, rb := c.find(a), c.find(b)
+	if ra == rb {
+		return
+	}
+	if c.parent == nil {
+		c.parent = make(map[string]string)
+	}
+	c.parent[ra] = rb
+	c.parent[rb] = rb
+	// Queued writers must recompute their gate set when components grow.
+	c.epoch++
+}
+
+// component lists prefix and every repository coupled with it, sorted.
+func (c *repoCoupling) component(prefix string) []string {
+	root := c.find(prefix)
+	scope := []string{prefix}
+	for member := range c.parent {
+		if member != prefix && c.find(member) == root {
+			scope = append(scope, member)
+		}
+	}
+	sort.Strings(scope)
+	return scope
+}
+
+// reset starts a new epoch for g with nothing known. A store whose read failed
+// stays missed.
+func (c *repoCoupling) reset(g graph.Store) {
+	if c.store != g {
+		c.missed = false
+	}
+	c.store, c.epoch = g, c.epoch+1
+	c.ready, c.seeding, c.pending, c.parent = false, false, nil, nil
+}
+
+// forget drops what is known about g's coupling.
+func (c *repoCoupling) forget(g graph.Store) {
+	if c.store == g {
+		c.reset(g)
+	}
+}
+
+// miss gives up on the current store's coupling for the life of the process.
+func (c *repoCoupling) miss() {
+	c.reset(c.store)
+	c.missed = true
+}
+
+// ensureRepoCoupling starts reading g's coupling in the background, once per
+// epoch. Nothing waits for the read.
+func ensureRepoCoupling(g graph.Store) {
+	source, ok := g.(repoCouplingSource)
+	if !ok {
+		return
+	}
+	t := topology
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := &t.coupling
+	if c.store != g {
+		c.reset(g)
+	}
+	if c.ready || c.seeding || c.missed {
+		return
+	}
+	c.seeding = true
+	go readRepoCoupling(g, source, c.epoch)
+}
+
+// readRepoCoupling reads g's coupling for epoch. It takes no gate, so its
+// snapshot can miss edges of a mutation that runs beside it; such a mutation
+// learns its own couplings into pending, which the read adds on landing.
+func readRepoCoupling(g graph.Store, source repoCouplingSource, epoch uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
+	pairs, err := source.RepoCouplingPairs(ctx)
+	cancel()
+	t := topology
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c := &t.coupling
+	if c.store != g || c.epoch != epoch {
+		return
+	}
+	if err != nil {
+		c.miss()
+		return
+	}
+	for _, pair := range append(pairs, c.pending...) {
+		c.union(pair[0], pair[1])
+	}
+	c.ready, c.seeding, c.pending = true, false, nil
+}
+
+// learnRepoCoupling adds the couplings that the edges at frontier make to g's
+// coupling, while it is known or being read. A failed read gives the coupling
+// up, since what the mutation bound is then unknown.
+func learnRepoCoupling(g graph.Store, frontier []string) {
+	source, ok := g.(repoCouplingSource)
+	if !ok || len(frontier) == 0 {
+		return
+	}
+	t := topology
+	t.mu.Lock()
+	c := &t.coupling
+	epoch, wanted := c.epoch, c.store == g && (c.ready || c.seeding)
+	t.mu.Unlock()
+	if !wanted {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
+	pairs, err := source.RepoCouplingPairsForFiles(ctx, frontier)
+	cancel()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case c.store != g || c.epoch != epoch:
+		// Forgotten meanwhile: the next read sees these edges.
+	case err != nil:
+		c.miss()
+	case c.seeding:
+		c.pending = append(c.pending, pairs...)
+	default:
+		for _, pair := range pairs {
+			c.union(pair[0], pair[1])
+		}
 	}
 }
 
@@ -314,9 +716,11 @@ func BeginTopologyMutation(g graph.Store) func(changed bool) {
 // graph-shaping passes settle (resolver, semantic enrichment, cross-
 // repo edges, gRPC stub resolution).
 //
-// Safe to call repeatedly: existing reach_d* entries are overwritten
-// and the build counter advances each time so any consumer that read
-// an entry from a prior generation will fall back to a live walk.
+// Safe to call repeatedly: existing reach_d* entries are overwritten.
+// Each record carries its repository's generation as of the build, which
+// the build does not advance: the records of an unchanged graph are as
+// current as their rebuild, and advancing it would make every concurrent
+// lookup recompute.
 func BuildIndex(g graph.Store) *Stats {
 	return BuildIndexCtx(context.Background(), g)
 }
@@ -333,17 +737,17 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 		return &Stats{}
 	}
 	reporter := progress.FromContext(ctx)
-	releaseTopology, ok := beginTopologyReadContext(ctx)
+	releaseTopology, ok := beginTopologyRead(ctx, nil)
 	if !ok {
 		return &Stats{}
 	}
-	mu := g.ResolveMutex()
-	if !lockContext(ctx, mu) {
+	unlock, ok := lockResolve(ctx, g)
+	if !ok {
 		releaseTopology()
 		return &Stats{}
 	}
-	build := atomic.AddUint64(&buildCounter, 1)
-	mu.Unlock()
+	build := atomic.LoadUint64(&buildCounter)
+	unlock()
 	releaseTopology()
 	stats := &Stats{Build: build}
 
@@ -384,11 +788,12 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 	}
 	batchCap := min(seedTotal, reachPublishBatchSize)
 	pending := make([]pendingRecord, 0, batchCap)
+	mu := g.ResolveMutex()
 	publish := func() bool {
 		if len(pending) == 0 {
 			return true
 		}
-		release, acquired := beginTopologyReadContext(ctx)
+		release, acquired := beginTopologyRead(ctx, nil)
 		if !acquired {
 			return false
 		}
@@ -408,7 +813,7 @@ func BuildIndexCtx(ctx context.Context, g graph.Store) *Stats {
 				continue
 			}
 			published := cloneNodeWithMeta(n)
-			writeRecord(published.Meta, build, record.tiers, record.truncated)
+			writeRecord(published.Meta, generation(nodeScope(n)), record.tiers, record.truncated)
 			stamped = append(stamped, published)
 		}
 		if len(stamped) > 0 {
@@ -701,12 +1106,12 @@ func ClearIndex(g graph.Store) {
 	if g == nil {
 		return
 	}
-	releaseTopology := beginTopologyRead(g)
+	releaseTopology, _ := beginTopologyRead(context.Background(), nil)
 	defer releaseTopology()
 	mu := g.ResolveMutex()
 	mu.Lock()
 	defer mu.Unlock()
-	atomic.AddUint64(&buildCounter, 1)
+	retireWhole()
 	cleared := make([]*graph.Node, 0, reachPublishBatchSize)
 	for _, n := range g.AllNodes() {
 		if n == nil || !hasReachMeta(n.Meta) {
@@ -777,22 +1182,23 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
-	releaseTopology, ok := beginTopologyReadContext(ctx)
+	scope := seedScope(ctx, g, seedID)
+	releaseTopology, ok := beginTopologyRead(ctx, scope)
 	if !ok {
 		return nil, nil, nil, false, true
 	}
-	mu := g.ResolveMutex()
-	if !lockContext(ctx, mu) {
+	unlock, ok := lockResolve(ctx, g)
+	if !ok {
 		releaseTopology()
 		return nil, nil, nil, false, true
 	}
-	build := atomic.LoadUint64(&buildCounter)
+	build := generation(scope)
 	n := g.GetNode(seedID)
 	if n != nil && ImpactSeedKind(n.Kind) {
 		d1, d2, d3, truncated, hit = readCached(n, build)
 	}
-	stable := build == atomic.LoadUint64(&buildCounter)
-	mu.Unlock()
+	stable := build == generation(scope)
+	unlock()
 	releaseTopology()
 	if !stable {
 		return nil, nil, nil, false, true
@@ -803,7 +1209,7 @@ func LookupCached(g graph.Store, seedID string) (d1, d2, d3 []Entry, hit, trunca
 // LookupContext returns a complete reach record or a bounded lower-bound
 // record. Expensive BFS work deliberately happens outside topology and
 // resolver locks. Publication re-enters both locks, verifies the generation,
-// and retries if a mutation crossed the optimistic compute window. This keeps
+// and retries once if a mutation crossed the optimistic compute window. This keeps
 // synchronous edits from waiting behind breadth-first graph traversal.
 type contextNodeGetter interface {
 	GetNodeContext(context.Context, string) (*graph.Node, error)
@@ -846,42 +1252,39 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 	ctx, cancel := context.WithTimeout(parent, lookupTimeout)
 	defer cancel()
 
-	for {
-		releaseTopology, ok := observedTopologyRead(ctx)
+	scope := seedScope(ctx, g, seedID)
+	for retried := false; ; retried = true {
+		releaseTopology, ok := observedTopologyRead(ctx, scope)
 		if !ok {
 			return nil, nil, nil, false, true
 		}
-		mu := g.ResolveMutex()
-		if !observedResolveLock(ctx, mu) {
+		unlock, ok := lockResolve(ctx, g)
+		if !ok {
 			releaseTopology()
 			return nil, nil, nil, false, true
 		}
-		currentBuild := atomic.LoadUint64(&buildCounter)
+		currentBuild := generation(scope)
 		n, nodeErr := getNodeContext(ctx, g, seedID)
 		if nodeErr != nil {
-			mu.Unlock()
+			unlock()
 			releaseTopology()
 			return nil, nil, nil, true, true
 		}
 		if n == nil || !ImpactSeedKind(n.Kind) {
-			mu.Unlock()
+			unlock()
 			releaseTopology()
 			return nil, nil, nil, false, false
 		}
 		// A published record describes unfiltered adjacency, so a filtered
 		// lookup always computes.
 		if keep == nil {
-			if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached {
-				stable := currentBuild == atomic.LoadUint64(&buildCounter)
-				mu.Unlock()
+			if d1, d2, d3, cachedTruncated, cached := readCached(n, currentBuild); cached && currentBuild == generation(scope) {
+				unlock()
 				releaseTopology()
-				if stable {
-					return d1, d2, d3, true, cachedTruncated
-				}
-				continue
+				return d1, d2, d3, true, cachedTruncated
 			}
 		}
-		mu.Unlock()
+		unlock()
 		releaseTopology()
 
 		// The expensive portion is optimistic and lock-free with respect to
@@ -892,18 +1295,42 @@ func lookupContext(parent context.Context, g graph.Store, seedID string, keep Ed
 		// also retaining topology/resolve coordination, starving the daemon.
 		//
 		// BuildIndexCtx is the sole persistent reach-cache writer. A lazy miss
-		// returns its bounded lower-bound evidence directly; a concurrent graph
-		// generation change marks that evidence truncated rather than retrying
-		// or publishing a mixed snapshot.
+		// returns its bounded lower-bound evidence directly. A traversal that a
+		// topology change crossed is retried once; a second crossing returns
+		// what it read marked truncated, rather than chasing a repository that
+		// keeps changing until the deadline.
 		tiers, traversalTruncated := compute(ctx, g, seedID, keep)
 		if ctx.Err() != nil {
 			return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, true
 		}
-		if currentBuild != atomic.LoadUint64(&buildCounter) {
-			continue
+		if currentBuild != generation(scope) {
+			if !retried {
+				continue
+			}
+			traversalTruncated = true
 		}
 		return entriesForTier(tiers[0]), entriesForTier(tiers[1]), entriesForTier(tiers[2]), true, traversalTruncated
 	}
+}
+
+// seedScope is the gate scope a lookup of seedID waits on: the seed's
+// repository, or the whole graph for a seed no repository owns or that is
+// missing. It only routes the lookup, so it reads the metadata-free projection
+// outside any gate; the lookup reads the seed itself under the gate.
+func seedScope(ctx context.Context, g graph.Store, seedID string) []string {
+	rows, err := graph.GetNodeKindsByIDsContext(ctx, g, []string{seedID})
+	if err != nil || rows[seedID].RepoPrefix == "" {
+		return nil
+	}
+	return []string{rows[seedID].RepoPrefix}
+}
+
+// nodeScope is the scope whose generation a record on n follows.
+func nodeScope(n *graph.Node) []string {
+	if n == nil || n.RepoPrefix == "" {
+		return nil
+	}
+	return []string{n.RepoPrefix}
 }
 
 func entriesForTier(t tier) []Entry {
@@ -1015,8 +1442,8 @@ func safeUint64(v any) (uint64, bool) {
 	return 0, false
 }
 
-// InvalidateIndex advances the global build counter so every future
-// Lookup recomputes against the new graph state. Call this whenever
+// InvalidateIndex advances the generation of every repository so every
+// future Lookup recomputes against the new graph state. Call this whenever
 // the graph mutates in a way that could change reach sets — at the
 // end of every IndexCtx / IncrementalReindexPaths / global-pass run.
 //
@@ -1027,7 +1454,7 @@ func safeUint64(v any) (uint64, bool) {
 // invalidation is O(1) and only the seeds actually queried pay the
 // recompute cost.
 func InvalidateIndex() {
-	atomic.AddUint64(&buildCounter, 1)
+	retireWhole()
 }
 
 // readTier reconstructs an []Entry from the parallel arrays. Missing
