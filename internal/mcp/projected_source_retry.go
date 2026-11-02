@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -13,24 +14,57 @@ var errProjectedSourceMoved = errors.New("selected source bytes changed during t
 var errProjectedSourceDeferred = errors.New("source is pending after the projection budget expired")
 
 func invalidateProjectedSource(entry *projectionEntry) error {
-	entry.suspect.Store(true)
-	pendingFileProjections.drop(entry)
+	pendingFileProjections.invalidateCurrent(entry)
 	return errProjectedSourceMoved
 }
 
 type projectedSourceDeadlineKey struct{}
+type projectedSourceAllowanceKey struct{}
+type projectedSourceAllowance struct{ attempts atomic.Int32 }
+
+func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		legacy, known := s.legacyToolName(&req)
+		if !known || legacy != "get_symbol_source" {
+			return next(ctx, req)
+		}
+		if _, exists := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !exists {
+			deadline := time.Now().Add(projectedReadBudget)
+			if prior, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && prior.Before(deadline) {
+				deadline = prior
+			}
+			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{})
+		}
+		return next(ctx, req)
+	}
+}
+
+func (a *projectedSourceAllowance) claim() bool {
+	for {
+		before := a.attempts.Load()
+		if before >= 2 {
+			return false
+		}
+		if a.attempts.CompareAndSwap(before, before+1) {
+			return true
+		}
+	}
+}
 
 // Only this audited source read retries, once, for a typed byte mismatch. Each
 // attempt runs the whole middleware with fresh facts/layers and releases its
 // leases before the next; the first attempt's projection deadline is retained.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-		legacy, known := s.legacyToolName(&req)
-		if !known || legacy != "get_symbol_source" {
+		allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+		if !ok {
 			return attempt(ctx, req)
 		}
-		ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, time.Now().Add(projectedReadBudget))
-		for ordinal := 0; ordinal < 2; ordinal++ {
+		for {
+			if !allowance.claim() {
+				return mcplib.NewToolResultError(errProjectedSourceMoved.Error()), nil
+			}
 			copy := req
 			copy.Params.Arguments = cloneFreshSymbolArguments(req.GetArguments())
 			result, err := runProjectedSourceAttempt(ctx, copy, attempt)
@@ -41,11 +75,10 @@ func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) m
 				return nil, ctx.Err()
 			}
 			// A caller-owned selection cannot be rebound by this nested invocation.
-			if ordinal == 1 || ctx.Value(requestProjectionFactsKey{}) != nil {
+			if ctx.Value(requestProjectionFactsKey{}) != nil {
 				return mcplib.NewToolResultError(errProjectedSourceMoved.Error()), nil
 			}
 		}
-		panic("unreachable source retry")
 	}
 }
 

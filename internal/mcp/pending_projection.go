@@ -335,6 +335,11 @@ func (p *pendingProjections) dropAll(entries []*projectionEntry) int {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.dropAllLocked(entries)
+}
+
+// dropAllLocked requires p.mu; callers already checked pointer ownership.
+func (p *pendingProjections) dropAllLocked(entries []*projectionEntry) int {
 	cur := p.snap.Load()
 	next := &projectionSnapshot{bytes: cur.bytes}
 	dropped := 0
@@ -353,6 +358,21 @@ func (p *pendingProjections) dropAll(entries []*projectionEntry) int {
 		p.snap.Store(next)
 	}
 	return dropped
+}
+
+// Invalidation and expected-pointer publication share one linearization
+// boundary. An already-published newer owner is never marked or removed.
+func (p *pendingProjections) invalidateCurrent(entry *projectionEntry) {
+	if entry == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snap.Load().entries[entry.key] != entry {
+		return
+	}
+	entry.suspect.Store(true)
+	p.dropAllLocked([]*projectionEntry{entry})
 }
 
 // projectionStore is what retirement reads: a file's content identity, then

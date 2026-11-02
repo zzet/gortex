@@ -165,7 +165,7 @@ func TestSymbolSourceRetryIsBoundedAndCancellationDoesNotReplay(t *testing.T) {
 			req.Params.Arguments = map[string]any{"id": "sample.go::Probe", "context_lines": 0, "format": "json"}
 			// Audit the retry controller over the actual source handler synchronously;
 			// the public middleware race is covered by the positive test above.
-			result, err := s.retryProjectedSymbolSource(actual)(ctx, req)
+			result, err := s.withProjectedSourceReadBudget(s.retryProjectedSymbolSource(actual))(ctx, req)
 			if cancelFirst {
 				require.True(t, errors.Is(err, context.Canceled) || result != nil && result.IsError)
 				require.EqualValues(t, 1, calls.Load())
