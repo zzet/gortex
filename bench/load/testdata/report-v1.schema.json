@@ -1534,6 +1534,13 @@
                         "route": {
                           "type": "string"
                         },
+                        "search_ack": {
+                          "additionalProperties": {},
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "stale_claimed_fresh": {
                           "type": "boolean"
                         },
@@ -2617,7 +2624,25 @@
                           "acknowledged": {
                             "type": "integer"
                           },
+                          "actual_ack_modes": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
                           "actual_edits_by_editor": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "actual_file_view_states": {
                             "additionalProperties": {
                               "type": "integer"
                             },
@@ -2663,6 +2688,9 @@
                               "null"
                             ]
                           },
+                          "local_object_acks": {
+                            "type": "integer"
+                          },
                           "offered": {
                             "type": "integer"
                           },
@@ -2674,6 +2702,9 @@
                           }
                         },
                         "required": [
+                          "local_object_acks",
+                          "actual_ack_modes",
+                          "actual_file_view_states",
                           "offered",
                           "editors",
                           "acknowledged",
