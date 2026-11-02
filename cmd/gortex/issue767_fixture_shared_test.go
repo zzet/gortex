@@ -44,6 +44,7 @@ type issue767Fixture struct {
 	t                                    *testing.T
 	binary, root, primary, linked, store string
 	env                                  []string
+	removalFailure                       sync.Once
 
 	// mu guards every field a concurrent reader may touch while the fixture
 	// starts, stops or restarts the child. The sustained harness samples the
@@ -215,7 +216,17 @@ func (f *issue767Fixture) tryGit(dir string, args ...string) ([]byte, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir, cmd.Env = dir, f.env
-	return cmd.CombinedOutput()
+	liveRemoval := len(args) == 4 && args[0] == "worktree" && args[1] == "remove" && args[2] == "--force" && args[3] == f.linked
+	if liveRemoval {
+		cmd.Env = append(append([]string(nil), f.env...), "GIT_TRACE2_EVENT="+filepath.Join(f.root, "worktree-remove-trace.jsonl"))
+	}
+	output, err := cmd.CombinedOutput()
+	if liveRemoval && err != nil {
+		// Capture before the caller's Fatal starts normal daemon cleanup. The
+		// original Git failure remains authoritative even if diagnostics fail.
+		f.removalFailure.Do(func() { f.retainRemovalFailure(dir, args, output, err) })
+	}
+	return output, err
 }
 
 func (f *issue767Fixture) command(timeout time.Duration, dir string, args ...string) []byte {
@@ -264,6 +275,11 @@ func (f *issue767Fixture) lastResponse() string {
 	return f.lastOutput
 }
 
+// issue767GracefulStopOwner binds one child's two cleanup entry points.
+func issue767GracefulStopOwner(request func() error) func() error {
+	return sync.OnceValue(request)
+}
+
 func (f *issue767Fixture) start() {
 	f.t.Helper()
 	run := f.nextRun()
@@ -277,10 +293,10 @@ func (f *issue767Fixture) start() {
 		ctx, cancel = context.WithDeadline(f.t.Context(), deadline.Add(-time.Minute))
 	}
 	cmd := exec.CommandContext(ctx, f.binary, "daemon", "start", "--embeddings=false", "--backend", "sqlite", "--backend-path", f.store, "--no-progress")
-	// Global testing timeout bypasses Cleanup. Request the same private,
-	// graceful shutdown as stop before exec's bounded last-resort kill.
+	// Context cancellation runs before testing cleanup. Both entry points
+	// share this child-specific stop owner, including its first result.
 	// os.Interrupt cannot be sent to a process on native Windows.
-	cmd.Cancel = func() error { return f.requestGracefulStop(cmd, "cancel") }
+	cmd.Cancel = issue767GracefulStopOwner(func() error { return f.requestGracefulStop(cmd, "stop") })
 	cmd.WaitDelay = 10 * time.Second
 	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = f.primary, f.env, log, log
 	if err := cmd.Start(); err != nil {
@@ -327,7 +343,12 @@ func (f *issue767Fixture) stop() {
 	if cmd == nil {
 		return
 	}
-	if err := f.requestGracefulStop(cmd, "stop"); err != nil {
+	requestStop := cmd.Cancel
+	if requestStop == nil {
+		f.t.Errorf("isolated child %d has no graceful-stop owner", cmd.Process.Pid)
+		requestStop = func() error { return f.requestGracefulStop(cmd, "stop") }
+	}
+	if err := requestStop(); err != nil {
 		f.t.Errorf("isolated child %d graceful stop request: %v", cmd.Process.Pid, err)
 	}
 	select {

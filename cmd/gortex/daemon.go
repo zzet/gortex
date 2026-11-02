@@ -286,15 +286,52 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// the parent did.
 	daemonEmbeddingsChanged = cmd.Flags().Changed("embeddings")
 
-	// Fast path: open the store + wire the indexer and MCP server. The
-	// per-repo TrackRepoCtx loop and MultiWatcher init are deferred to
-	// warmupDaemonState below so the socket opens immediately instead
-	// of waiting 30–60s for contract re-extraction across every tracked
-	// repo.
-	state, err := buildDaemonState(logger, startupReporter.ObserveMigration)
+	// The existing socket owner serves metadata before Store.Open can
+	// migrate. No graph/catalog/CWD admission runs in this temporary gate.
+	metadataConfig, err := config.Load(cfgFile)
+	if err != nil {
+		startupReporter.Fail(err)
+		return fmt.Errorf("build daemon state: load config: %w", err)
+	}
+	applyToolPresetFlags(metadataConfig, daemonTools, daemonToolsMode)
+	metadata := newMigrationMetadataDispatcher(metadataConfig, logger, startupReporter)
+	srv.MCPDispatcher = metadata
+	srv.Ready = func() (bool, string) { return false, metadata.phase() }
+	srv.CancelShutdownOwners, srv.JoinRuntimeWriter = startupReporter.Cancel, startupReporter.Stop
+	srv.EnableStartupMetadata()
+	httpAddr := resolveDaemonHTTPAddr(daemonHTTPAddr, os.Getenv("GORTEX_DAEMON_HTTP_ADDR"), gc)
+	var httpHandoff *migrationHTTPHandler
+	if httpAddr != "" {
+		token := daemonHTTPAuthToken
+		if token == "" {
+			token = os.Getenv("GORTEX_DAEMON_HTTP_TOKEN")
+		}
+		if err := httpTokenRequirementError(httpAddr, token); err != nil {
+			startupReporter.Fail(err)
+			return err
+		}
+		httpHandoff = &migrationHTTPHandler{available: srv.StartupPublished}
+		srv.HTTPAddr, srv.HTTPHandler = httpAddr, httpHandoff
+	}
+	if err := srv.Listen(); err != nil {
+		startupReporter.Fail(err)
+		return err
+	}
+	serveDone := make(chan struct{})
+	var serveErr error
+	go func() { serveErr = srv.Serve(); close(serveDone) }()
+	defer func() { _ = srv.Shutdown(); <-serveDone }()
+
+	state, err := buildDaemonStateForStart(logger, startupReporter.ObserveMigration)
 	if err != nil {
 		startupReporter.Fail(err)
 		return fmt.Errorf("build daemon state: %w", err)
+	}
+	if srv.StartupClosed() {
+		if state.shared != nil {
+			return state.shared.Close()
+		}
+		return nil
 	}
 
 	// Install the standing soft memory limit now — logging and config are
@@ -421,9 +458,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 		retirementWorker.Stop()
 	}
-	srv.CancelShutdownOwners = cancelBackground
-	srv.JoinRuntimeWriter = joinStartupReporter
-	srv.RuntimeStateFile = daemon.RuntimeStatePath()
 	runTeardown := installDaemonTeardown(controller, stopBackground, func() error {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelShutdown()
@@ -450,12 +484,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}, logger)
 	})
 	defer runTeardown()
-	srv.Controller = controller
 	// Surface warmup state on the handshake ack: a proxy / CLI that connects
 	// during the (minutes-long) warmup should know the graph is still filling
 	// instead of guessing. controller.IsReady() is authoritative for the bool;
 	// the readiness broadcaster carries the fine-grained phase name.
-	srv.Ready = func() (bool, string) {
+	readyRuntime := func() (bool, string) {
 		ready := controller.IsReady()
 		phase := "warming"
 		if ready {
@@ -520,7 +553,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 			router:   disp.Router,
 		})
 	}
-	srv.MCPDispatcher = disp
 
 	// Event hub feeding the /v1 REST surface's graph-change SSE stream
 	// (/v1/events). Created lazily when the HTTP surface is enabled below
@@ -540,7 +572,6 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// it. The auth token is mandatory for non-localhost binds —
 	// exposing an unauthenticated MCP server on an external
 	// interface is a footgun, not a feature.
-	httpAddr := resolveDaemonHTTPAddr(daemonHTTPAddr, os.Getenv("GORTEX_DAEMON_HTTP_ADDR"), state.configManager.Global())
 	if httpAddr != "" {
 		token := daemonHTTPAuthToken
 		if token == "" {
@@ -602,8 +633,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		v1.SetConversationDir(conversationlog.DirFromEnv())
 		v1.SetConversationGuard(daemonHTTPConversationAllow, tokenFn)
 
-		srv.HTTPHandler = composeDaemonHTTPHandler(streamH, v1, tokenFn, daemonHTTPCORSOrigin)
-		srv.HTTPAddr = httpAddr
+		httpHandoff.publish(composeDaemonHTTPHandler(streamH, v1, tokenFn, daemonHTTPCORSOrigin))
 		logger.Info("daemon: HTTP surface configured (/mcp + /v1)",
 			zap.String("addr", httpAddr),
 			zap.Bool("authenticated", token != ""),
@@ -656,15 +686,11 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		state.lifecycle.EnableDeferredSeedRetirements()
 	}
 
-	if err := listenConfiguredDaemon(srv, state); err != nil {
+	declareConfiguredDaemonRepos(state)
+	if err := srv.PublishStartupRuntime(controller, metadata.handoff(disp), readyRuntime, cancelBackground, joinStartupReporter, daemon.RuntimeStatePath()); err != nil {
 		startupReporter.Fail(err)
 		return err
 	}
-	defer func() {
-		if err := srv.Shutdown(); err != nil {
-			logger.Warn("daemon: runtime teardown failed", zap.Error(err))
-		}
-	}()
 	// The socket remains the authoritative readiness signal. The runtime
 	// record now transitions from pre-socket progress to serving only after
 	// Listen succeeds, and keeps the resolved backend path for out-of-band
@@ -846,7 +872,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	// once-guarded backend teardown is reached.
 	defer warmupTask.cancel()
 	defer compactionTask.cancel()
-	serveErr := srv.Serve()
+	<-serveDone
 	// Record a real error before deferred cleanup can complete both receipts.
 	// The watchdog must preserve normal error exit codes if an outer finalizer
 	// subsequently blocks. The usual execute error path remains unchanged.
@@ -1145,6 +1171,11 @@ func spawnDetachedDaemon(childArgs []string) error {
 		case werr := <-exited:
 			failMsg := fmt.Errorf("daemon exited during startup (%v); check %s and %s",
 				werr, daemon.LogFilePath(), daemon.StderrLogFilePath())
+			st, stateOK := daemon.ReadRuntimeStateOf(child.Process.Pid)
+			if reason, recorded := daemonStartupFailure(st, stateOK, child.Process.Pid); recorded {
+				failMsg = fmt.Errorf("daemon exited during startup: %s (%v); check %s and %s",
+					reason, werr, daemon.LogFilePath(), daemon.StderrLogFilePath())
+			}
 			if sp != nil {
 				sp.Fail(failMsg)
 			}
@@ -1158,6 +1189,18 @@ func spawnDetachedDaemon(childArgs []string) error {
 		sp.Fail(timeoutErr)
 	}
 	return timeoutErr
+}
+
+// daemonStartupFailure returns the reason a startup child recorded before it
+// exited, when that reason says more than the generic pointer to the log.
+func daemonStartupFailure(st daemon.RuntimeState, ok bool, childPID int) (string, bool) {
+	if !ok || st.PID != childPID || st.StartupPhase != daemon.StartupFailed {
+		return "", false
+	}
+	if st.StartupError == "" || st.StartupError == startupFailedMessage {
+		return "", false
+	}
+	return st.StartupError, true
 }
 
 func daemonStartupProgress(st daemon.RuntimeState, ok bool, childPID int, now time.Time, freshness time.Duration) (string, bool) {

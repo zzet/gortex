@@ -38,27 +38,28 @@ type discoverySeedDescriptor struct {
 	TotalCount       int                 `json:"total_checkout_count"`
 }
 type discoverySeedLineage struct {
-	State                 string              `json:"state"`
-	Descriptor            string              `json:"descriptor"`
-	DescriptorSHA256      string              `json:"descriptor_sha256"`
-	OwnedRoot             string              `json:"owned_root"`
-	SourceGeneration      string              `json:"source_generation"`
-	OldVersion            string              `json:"old_version"`
-	OldBinarySHA256       string              `json:"old_binary_sha256"`
-	UpgradeSourceCommit   string              `json:"upgrade_source_commit"`
-	UpgradeBinarySHA256   string              `json:"upgrade_binary_sha256"`
-	Snapshot              string              `json:"snapshot"`
-	MainSHA256            string              `json:"main_sha256"`
-	WALSHA256             string              `json:"wal_sha256"`
-	SchemaVersion         int                 `json:"schema_version"`
-	NormalStop            bool                `json:"normal_stop"`
-	OwnersExited          bool                `json:"owners_exited"`
-	OwnerPID              int                 `json:"owner_pid"`
-	StopReceipt           string              `json:"stop_receipt"`
-	StopReceiptSHA256     string              `json:"stop_receipt_sha256"`
-	IdentityReceipt       string              `json:"identity_receipt"`
-	IdentityReceiptSHA256 string              `json:"identity_receipt_sha256"`
-	Repos                 []discoverySeedRepo `json:"repositories"`
+	State                 string                     `json:"state"`
+	Descriptor            string                     `json:"descriptor"`
+	DescriptorSHA256      string                     `json:"descriptor_sha256"`
+	OwnedRoot             string                     `json:"owned_root"`
+	SourceGeneration      string                     `json:"source_generation"`
+	OldVersion            string                     `json:"old_version"`
+	OldBinarySHA256       string                     `json:"old_binary_sha256"`
+	UpgradeSourceCommit   string                     `json:"upgrade_source_commit"`
+	UpgradeBinarySHA256   string                     `json:"upgrade_binary_sha256"`
+	Snapshot              string                     `json:"snapshot"`
+	MainSHA256            string                     `json:"main_sha256"`
+	WALSHA256             string                     `json:"wal_sha256"`
+	SchemaVersion         int                        `json:"schema_version"`
+	NormalStop            bool                       `json:"normal_stop"`
+	OwnersExited          bool                       `json:"owners_exited"`
+	OwnerPID              int                        `json:"owner_pid"`
+	StopReceipt           string                     `json:"stop_receipt"`
+	StopReceiptSHA256     string                     `json:"stop_receipt_sha256"`
+	IdentityReceipt       string                     `json:"identity_receipt"`
+	IdentityReceiptSHA256 string                     `json:"identity_receipt_sha256"`
+	Repos                 []discoverySeedRepo        `json:"repositories"`
+	NormalizationProof    *discoveryNormalizationRef `json:"normalization_proof,omitempty"`
 }
 
 func discoveryFileSHA(path string) (string, error) {
@@ -244,13 +245,21 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 			return nil, errors.New("discovery configuration/producer proof digest mismatch")
 		}
 	}
+	normalization, err := readDiscoveryNormalization(root, l)
+	if err != nil {
+		return nil, err
+	}
+	sourceMain, sourceWAL := l.MainSHA256, l.WALSHA256
+	if normalization != nil {
+		sourceMain, sourceWAL = normalization.SourceMainSHA256, normalization.SourceWALSHA256
+	}
 	var catalog map[string]discoveryCatalogIdentity
 	for _, proofPath := range []string{l.StopReceipt, l.IdentityReceipt} {
 		var proof discoverySeedProof
 		if err := discoveryReadJSON(proofPath, &proof); err != nil {
 			return nil, err
 		}
-		if proof.State != "OBSERVED_OWNED_UPGRADE" || proof.ObservedAt.IsZero() || proof.OwnedRoot != root || proof.OwnerPID != l.OwnerPID || !proof.NormalStop || !proof.OwnersExited || proof.MainSHA256 != l.MainSHA256 || proof.WALSHA256 != l.WALSHA256 || proof.SchemaVersion != 44 || proof.UpgradeBinarySHA256 != l.UpgradeBinarySHA256 || !reflect.DeepEqual(proof.Repos, d.Repos) {
+		if proof.State != "OBSERVED_OWNED_UPGRADE" || proof.ObservedAt.IsZero() || proof.OwnedRoot != root || proof.OwnerPID != l.OwnerPID || !proof.NormalStop || !proof.OwnersExited || proof.MainSHA256 != sourceMain || proof.WALSHA256 != sourceWAL || proof.SchemaVersion != 44 || proof.UpgradeBinarySHA256 != l.UpgradeBinarySHA256 || !reflect.DeepEqual(proof.Repos, d.Repos) {
 			return nil, errors.New("discovery producer proof is unknown or does not bind this stopped snapshot and identity topology")
 		}
 		observed, err := discoveryReadCatalogReceipt(root, proof, d.Repos)
@@ -262,14 +271,26 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		}
 		catalog = observed
 	}
-	process, err := os.FindProcess(l.OwnerPID)
-	if err != nil {
+	if err := validateDiscoveryNormalization(root, l, normalization, catalog); err != nil {
 		return nil, err
 	}
-	err = process.Signal(syscall.Signal(0))
-	_ = process.Release()
-	if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
-		return nil, errors.New("discovery upgrade owner is live or cannot be proven exited")
+	owners := []int{l.OwnerPID}
+	if normalization != nil {
+		owners = append(owners, normalization.NormalizerPID)
+	}
+	for _, ownerPID := range owners {
+		process, err := os.FindProcess(ownerPID)
+		if err != nil {
+			return nil, err
+		}
+		err = process.Signal(syscall.Signal(0))
+		_ = process.Release()
+		if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+			if ownerPID != l.OwnerPID {
+				return nil, errors.New("discovery normalizer owner is live or cannot be proven exited")
+			}
+			return nil, errors.New("discovery upgrade owner is live or cannot be proven exited")
+		}
 	}
 	binaryPath, err := filepath.Abs(o.Binary)
 	if err != nil {
@@ -304,11 +325,6 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 	if err := discoveryOwnedFile(root, l.Snapshot); err != nil {
 		return nil, err
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, err := os.Lstat(p.Store + suffix); !errors.Is(err, os.ErrNotExist) {
-			return nil, errors.New("discovery destination store must be absent before one-shot resume")
-		}
-	}
 	before, err := discoverySeedPair(l.Snapshot)
 	if err != nil || before[0] != l.MainSHA256 || before[1] != l.WALSHA256 {
 		return nil, errors.New("discovery quiescent snapshot digest mismatch")
@@ -323,7 +339,25 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 	if err != nil || string(header[:16]) != "SQLite format 3\x00" || binary.BigEndian.Uint32(header[60:64]) != 44 {
 		return nil, errors.New("discovery snapshot is not a checkpointed schema44 SQLite main")
 	}
-	if err := discoveryWriteJSON(filepath.Join(root, "discovery-consumed.json"), map[string]string{"descriptor_sha256": sha, "upgrade_binary_sha256": l.UpgradeBinarySHA256}); err != nil {
+	if o.Discovery.RuntimeRoot != "" {
+		if err := validateOutputRoots(corpora, o.Discovery.RuntimeRoot); err != nil {
+			return nil, err
+		}
+		lease, err := newDiscoveryRuntimeRoot(scratch, o.Discovery.RuntimeRoot, d, sha)
+		if err != nil {
+			return nil, err
+		}
+		p.discoveryRuntime = lease
+		p.Root = lease.identity.Root
+		p.Store = filepath.Join(p.Root, "store.db")
+		p.Config = filepath.Join(p.Root, "config.yaml")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := os.Lstat(p.Store + suffix); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("discovery destination store must be absent before one-shot resume")
+		}
+	}
+	if err := discoveryWriteJSON(filepath.Join(p.Root, "discovery-consumed.json"), map[string]string{"descriptor_sha256": sha, "upgrade_binary_sha256": l.UpgradeBinarySHA256}); err != nil {
 		return nil, err
 	}
 	if err := copySeedStore(l.Snapshot, p.Store); err != nil {
@@ -343,7 +377,7 @@ func resumeDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) (
 		return nil, err
 	}
 	p.Socket = filepath.Join(p.SocketDir, "d.sock")
-	p.Env = privateEnv(root, p.Socket, filepath.Join(root, "gitconfig"))
+	p.Env = privateEnv(p.Root, p.Socket, filepath.Join(p.Root, "gitconfig"))
 	return p, nil
 }
 func discoverySeedPair(path string) ([2]string, error) {

@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/embedding"
 	"github.com/zzet/gortex/internal/entrypoints"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -3209,6 +3210,14 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
+	if store, ok := mi.graph.(*store_sqlite.Store); ok {
+		idx.warmupWriteBoundary = func() error { return store.AwaitWarmupWAL(ctx) }
+		defer func() {
+			if idx.warmupWriteBoundary != nil {
+				idx.warmupWriteBoundary = nil
+			}
+		}()
+	}
 	restoreTiming.complete(nil)
 
 	var result *IndexResult
@@ -3350,6 +3359,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		result.RepoPrefix = prefix
 
 		fileMtimes := idx.publishFileMtimes()
+		idx.warmupWriteBoundary = nil
 		// Restore the winner's config after any competing prefix resolution.
 		_, publish := mi.configMgr.PrepareWorkspaceConfig(prefix, absPath, nil)
 		isWorktree := ResolveWorktree(absPath).IsWorktree
