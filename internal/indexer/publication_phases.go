@@ -175,6 +175,7 @@ func DefaultPublicationPhases() *PublicationPhaseRecorder { return defaultPublic
 // PublicationPhaseRecord is one edit's (or one fresh request's) path to
 // publication.
 type PublicationPhaseRecord struct {
+ sharedPhysical *SharedPhysicalOwner
 	mu                    sync.Mutex
 	key                   string
 	checkoutID            string

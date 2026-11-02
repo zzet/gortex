@@ -88,6 +88,7 @@ func (s *Server) openOwnedPublicationRecord(ctx context.Context, record *mutatio
 	selected := record.publication
 	record.mu.Unlock()
 	ledger.mu.Unlock()
+ if selected==publication && record.isPhysicalCommit() {s.bindOpenedSharedOwner(ctx,record,selected)}
 	return selected
 }
 

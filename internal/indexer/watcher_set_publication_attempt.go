@@ -11,6 +11,7 @@ import (
 // creates a publication record nor grants an older waiter the span of a newer
 // executor. The frontier remains the sole graph-completion authority.
 type mutationSetPublicationMember struct {
+ invocation *sharedSetInvocation
 	path               string
 	generation         uint64
 	record             *PublicationPhaseRecord
@@ -38,7 +39,7 @@ func (w *Watcher) mutationSetPublicationMembers(frontier map[string]uint64) []mu
 			continue
 		}
 		if record.ownsMutationSetGeneration(generation) {
-			members = append(members, mutationSetPublicationMember{path: path, generation: generation, record: record, schedulingEntered: waiter.schedulingEntered, backgroundEligible: waiter.backgroundEligible})
+			members = append(members, mutationSetPublicationMember{invocation:waiter.sharedInvocation,path: path, generation: generation, record: record, schedulingEntered: waiter.schedulingEntered, backgroundEligible: waiter.backgroundEligible})
 		}
 	}
 	return members
@@ -61,6 +62,9 @@ func (p *PublicationPhaseRecord) ownsMutationSetGeneration(generation uint64) bo
 // The shared executor owns one accumulator, not one fabricated executor per
 // member. No member record or unrelated request clock supplies its origin.
 type mutationSetPublicationAttempt struct {
+ sharedInvocation *sharedSetInvocation
+ executionReturned time.Time
+ sharedWindow canonicalAttemptWindow
 	members       []mutationSetPublicationMember
 	stamps        *PublicationStamps
 	entered       time.Time
@@ -69,6 +73,7 @@ type mutationSetPublicationAttempt struct {
 }
 
 type sharedMutationSetExecution struct {
+ ownerProof *sharedOwnerFrozen
 	generation    uint64
 	members       int
 	executorFiles int
@@ -84,7 +89,9 @@ func (w *Watcher) beginMutationSetPublication(frontier map[string]uint64, entere
 	stamps := &PublicationStamps{patchLaps: &canonicalPatchLaps{origin: entered}}
 	stamps.markAt(PublicationCycleStarted, entered)
 	stamps.startAttemptControl(entered)
-	return &mutationSetPublicationAttempt{members: members, stamps: stamps, entered: entered, retry: retry, executorFiles: len(frontier)}
+	a := &mutationSetPublicationAttempt{members: members, stamps: stamps, entered: entered, retry: retry, executorFiles: len(frontier)}
+ w.prepareSharedOwnerAttempt(a)
+ return a
 }
 
 // Reject failed, stale, stopped and evicted members without changing graph
@@ -103,6 +110,8 @@ func (w *Watcher) finishMutationSetPublication(attempt *mutationSetPublicationAt
 	accounting := attempt.stamps.freezeAttemptEvidence(attempt.entered)
 	attempt.stamps.mu.Unlock()
 	window := canonicalAttemptWindow{endNS: returned.Sub(attempt.entered).Nanoseconds(), retry: attempt.retry, accounting: accounting}
+	attempt.executionReturned=returned
+ attempt.sharedWindow=window
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopping {
@@ -169,6 +178,7 @@ func (s PublicationPhaseSnapshot) SharedSetExecution() *SharedSetExecution {
 // synchronizing with the actual arm caller's unlock; invalidation is atomic
 // because a later failed Stop can occur while the callback is executing.
 type mutationSetTimerObservation struct {
+ invocation *sharedSetInvocation
 	watcher                 weak.Pointer[Watcher]
 	armStarted, armFinished time.Time
 	frontier                uint64
