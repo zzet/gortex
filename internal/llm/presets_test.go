@@ -93,6 +93,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("runcrate preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(rc))
 	}
 
+	cam := Config{Provider: "cheapaimodel"}
+	cp, ok = cam.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.cheapaimodel.ai/v1" || cp.Model != "deepseek-v4-1-flash" || cp.APIKeyEnv != "CHEAPAIMODEL_API_KEY" || cp.SchemaMode != "json_schema" || cp.ReasoningEffort != "none" || ProfileFor(cam) != ProfileFrontier {
+		t.Errorf("cheapaimodel preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(cam))
+	}
+
 	// A user custom provider of the same name always wins, wholesale —
 	// no preset field leaks into it.
 	c.Custom = map[string]CustomProvider{"testgw": {BaseURL: "https://mine/v1", Model: "my-model"}}

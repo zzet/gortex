@@ -225,6 +225,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"local:WALReclaimStats", capOf[walReclaimSnapshotReader], capDropped, capReasonBackend + " (physical store counters, never selected graph state)"},
 		{"local:LastFirstIndexDrains", capOf[capLastFirstIndexDrains], capDropped, capReasonBackend + " (shared-store drain observations, never selected graph state)"},
 		{"local:WALPassiveStats", capOf[walPassiveSnapshotReader], capDropped, capReasonBackend + " (physical checkpoint counters, never selected graph state)"},
+		{"local:AnnounceInteractiveRead", capOf[interactiveReadAnnouncer], capDropped, capReasonBackend + " (call-scoped physical store cooperation, never selected graph authority)"},
 		{"AnalysisGenerationStore", capOf[graph.AnalysisGenerationStore], capDropped, capReasonBackend},
 		{"AnalysisQueryStore", capOf[graph.AnalysisQueryStore], capDropped, capReasonBackend},
 		{"TryAnalysisQueryStore", capOf[graph.TryAnalysisQueryStore], capDropped, capReasonBackend},

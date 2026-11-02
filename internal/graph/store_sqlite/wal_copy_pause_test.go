@@ -285,52 +285,97 @@ func pressureStore(t *testing.T, copyBytesPerMinute int64) (*Store, string, *fak
 // slow reset gives up at the cap, and an edit admitted meanwhile waits no
 // longer than that.
 func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
-	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0") // drive the step directly
-	s, path := openWALReclaimStore(t)
-	defer func() { _ = s.Close() }()
-	seedWALChurnTable(t, s)
-	lane := &fakeBuildLane{}
-	lane.install(s)
-	growWAL(t, s, 24)
-	ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
-	require.NoError(t, err)
-	defer func() { _ = ckpt.Close() }()
-	_, _ = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE") // the copy is complete
-	lane.held.Store(true)
-	defer lane.held.Store(false)
-	walPressureResetHook = func(ctx context.Context) { // a reset that would take 300 ms
-		select {
-		case <-ctx.Done():
-		case <-time.After(300 * time.Millisecond):
+	for _, queued := range []bool{false, true} {
+		name := "cap_without_edit"
+		if queued {
+			name = "yield_to_queued_edit"
 		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0") // drive the step directly
+			s, path := openWALReclaimStore(t)
+			defer func() { _ = s.Close() }()
+			seedWALChurnTable(t, s)
+			lane := &fakeBuildLane{}
+			lane.install(s)
+			growWAL(t, s, 24)
+			ckpt, err := openWALReclaimCheckpointDB(s.dbPath)
+			require.NoError(t, err)
+			defer func() { _ = ckpt.Close() }()
+			_, _ = checkpointWALOnceOn(context.Background(), ckpt, "PASSIVE") // the copy is complete
+			lane.held.Store(true)
+			defer lane.held.Store(false)
+			resetEntered := make(chan struct{})
+			var resetEnteredOnce sync.Once
+			walPressureResetHook = func(ctx context.Context) { // a reset that would take 300 ms
+				resetEnteredOnce.Do(func() { close(resetEntered) })
+				select {
+				case <-ctx.Done():
+				case <-time.After(300 * time.Millisecond):
+				}
+			}
+			t.Cleanup(func() { walPressureResetHook = nil })
+			var editCalls, editAcquisitions int
+			var reclaimHeldAtEdit bool
+			beforeHold := s.WALReclaimStats().WriterHold.Count()
+			var editAcquireErr error
+			var wait time.Duration
+			resetFinished := make(chan struct{})
+			editCtx, cancelEdit := context.WithTimeout(t.Context(), time.Second)
+			defer cancelEdit()
+			var wg sync.WaitGroup
+			if queued {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					select {
+					case <-resetEntered:
+					case <-resetFinished:
+						return
+					case <-editCtx.Done():
+						return
+					}
+					editCalls++
+					reclaimHeldAtEdit = s.writeMu.reclaimSince.Load() != 0
+					release := s.AnnounceWrite()
+					defer release()
+					started := time.Now()
+					editAcquireErr = s.writeMu.LockContext(editCtx)
+					if editAcquireErr != nil {
+						return
+					}
+					wait = time.Since(started)
+					editAcquisitions++
+					s.writeMu.Unlock()
+				}()
+			}
+			var res walReclaimResult
+			err = s.reclaimWALPressureReset(context.Background(), ckpt, &res)
+			close(resetFinished)
+			wg.Wait()
+			t.Logf("slow pressure reset: err=%v reason=%q writer_hold=%s edit_wait=%s", err, res.reason, res.writerHold, wait)
+			require.ErrorIs(t, err, errWALPressureHold)
+			limit := walReclaimPressureHold + testTimingSlack(20*time.Millisecond)
+			if queued {
+				require.True(t, res.deferredEditBurst, "the held reset must observe and yield to edit demand")
+			} else {
+				require.GreaterOrEqual(t, res.writerHold, walReclaimPressureHold-5*time.Millisecond, "precondition: without an edit the slow reset reaches its own cap")
+			}
+			require.Less(t, res.writerHold, limit)
+			if queued {
+				t.Logf("edit calls=%d acquisitions=%d reclaim_held_at_edit=%v hold_samples=%d wait=%s", editCalls, editAcquisitions, reclaimHeldAtEdit, s.WALReclaimStats().WriterHold.Count()-beforeHold, wait)
+				require.NoError(t, editAcquireErr)
+				require.Equal(t, 1, editCalls)
+				require.Equal(t, 1, editAcquisitions)
+				require.True(t, reclaimHeldAtEdit)
+				require.EqualValues(t, 1, s.WALReclaimStats().WriterHold.Count()-beforeHold)
+				require.GreaterOrEqual(t, wait, time.Duration(0), "a witnessed acquisition can have a zero-duration clock sample")
+				require.Less(t, wait, limit, "the edit waited longer than the pressure hold")
+			}
+			require.Equal(t, int64(1), s.WALCopyStats().PressureGiveUps)
+			require.Zero(t, s.WALCopyStats().PressureLaneResets)
+			_ = path
+		})
 	}
-	t.Cleanup(func() { walPressureResetHook = nil })
-	var wait time.Duration
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(10 * time.Millisecond)
-		release := s.AnnounceWrite()
-		defer release()
-		started := time.Now()
-		s.writeMu.Lock()
-		wait = time.Since(started)
-		s.writeMu.Unlock()
-	}()
-	var res walReclaimResult
-	err = s.reclaimWALPressureReset(context.Background(), ckpt, &res)
-	wg.Wait()
-	t.Logf("slow pressure reset: err=%v reason=%q writer_hold=%s edit_wait=%s", err, res.reason, res.writerHold, wait)
-	require.ErrorIs(t, err, errWALPressureHold)
-	limit := walReclaimPressureHold + testTimingSlack(20*time.Millisecond)
-	require.GreaterOrEqual(t, res.writerHold, walReclaimPressureHold-5*time.Millisecond, "precondition: the slow reset held the writer to the cap")
-	require.Less(t, res.writerHold, limit)
-	require.Greater(t, wait, time.Duration(0))
-	require.Less(t, wait, limit, "the edit waited longer than the pressure hold")
-	require.Equal(t, int64(1), s.WALCopyStats().PressureGiveUps)
-	require.Zero(t, s.WALCopyStats().PressureLaneResets)
-	_ = path
 }
 
 // Below the pressure mark a held lane still refuses the reclaim, as in the
