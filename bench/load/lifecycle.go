@@ -22,6 +22,7 @@ type privateRepo struct {
 }
 
 type privateRun struct {
+	discoveryRuntime *discoveryRuntimeLease              // optional fresh resume root; nil preserves ordinary ownership
 	discoveryCatalog map[string]discoveryCatalogIdentity // discovery-only observed seed identities
 	Root             string
 	SocketDir        string
@@ -392,6 +393,11 @@ func (p *privateRun) stop(ctx context.Context) (elapsed time.Duration, forced bo
 }
 
 func (p *privateRun) removeState() error {
+	if p.discoveryRuntime != nil {
+		if err := p.discoveryRuntime.validate(p.Root); err != nil {
+			return err
+		}
+	}
 	if p.Root == "" || !filepath.IsAbs(p.Root) || filepath.Dir(p.Root) == p.Root {
 		return errors.New("refused cleanup without an owned run directory")
 	}
