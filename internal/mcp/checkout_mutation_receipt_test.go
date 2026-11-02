@@ -278,7 +278,7 @@ func TestCheckoutMutationReceiptBindsBytesActuallyCommitted(t *testing.T) {
 			s := &Server{}
 			ctx := withCheckoutMutation(context.Background(), mutation, filepath.Dir(path))
 			data := []byte("package committed\n")
-			record, err := s.commitFileMutation(ctx, "write_file", "", "", "edit.go", path, data, 0o600)
+			record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "edit.go", path, data, 0o600)
 			if err != nil {
 				t.Fatal(err)
 			}

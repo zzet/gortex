@@ -26,7 +26,7 @@ var reindexSinks = map[string]bool{
 
 // readPathGuardEnforced turns the guard from a report into a gate once read
 // handlers read through pending edits instead of reindexing.
-const readPathGuardEnforced = false
+const readPathGuardEnforced = true
 
 // packageRefs maps every function declared in files, by bare name, to the
 // names its body references, called or passed as a value, and every tool

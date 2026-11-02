@@ -55,6 +55,11 @@ type PlannerStatsFreshness struct {
 	Refreshed bool
 	Reason    string
 
+	// DenseIndexesMissing names secondary indexes the backend knows are absent
+	// and owes a rebuild for (an interrupted bulk load), reported with its own
+	// Reason instead of a verdict. Empty in the ordinary case.
+	DenseIndexesMissing []string
+
 	LastRefreshAt     time.Time
 	LastRefreshReason string
 

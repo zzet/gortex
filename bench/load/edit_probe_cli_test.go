@@ -177,3 +177,48 @@ func TestEditProbeCLIModeRefusesAbsenceKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestEditGateCLIUsesItsAssignedCheckoutAndRejectsUnknownEditor(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(fmt.Sprint(invalid), func(t *testing.T) {
+			argvFile := filepath.Join(t.TempDir(), "argv.json")
+			run, state, oracle := editProbeCLIFixture(t, 10*time.Second, "LOAD_EDIT_PROBE_CLI_FIXTURE=reply", "LOAD_EDIT_PROBE_CLI_ARGV="+argvFile, "LOAD_EDIT_PROBE_CLI_STDOUT={}")
+			defer state.finishRaw()
+			second := run.p.Repos[0]
+			second.Path, second.Prefix, second.Corpus.Label = filepath.Join(run.p.Root, "second-clone"), "second", "second"
+			run.p.Repos = append(run.p.Repos, second)
+			run.editors = []*socketClient{{cwd: second.Path}}
+			if invalid {
+				state.step.Editor = 7
+			}
+			_, _, err := run.performCLI(t.Context(), state, oracle.call, "oracle:summary", 11)
+			if invalid {
+				if err == nil {
+					t.Error("unknown route started a CLI process against the first repository")
+				}
+				if _, err := os.Stat(argvFile); !errors.Is(err, os.ErrNotExist) {
+					t.Error("foreign editor launched a process")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(argvFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var argv []string
+			if err := json.Unmarshal(raw, &argv); err != nil {
+				t.Fatal(err)
+			}
+			lowered, err := json.Marshal(dispatchArgs(oracle.call, second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(argv) != 11 || argv[9] != second.Path || argv[5] != string(lowered) {
+				t.Errorf("CLI borrowed another checkout's index/arguments: %q", argv)
+			}
+		})
+	}
+}

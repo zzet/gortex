@@ -383,10 +383,8 @@ func (s *Store) activeWriteConnLocked(ctx context.Context) (*sql.Conn, func(), e
 func (s *Store) BeginBulkLoad() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.coordinatedBulkLoad {
-		return
-	}
-	s.beginBulkLoadLocked()
+	outcome, reason := s.beginBulkLoadLocked()
+	log.Printf("store_sqlite: bulk begin window=standalone outcome=%s reason=%s", outcome, reason)
 }
 
 // BeginCoordinatedBulkLoad opens one outer cold-load window around a set of
@@ -398,11 +396,9 @@ func (s *Store) BeginBulkLoad() {
 func (s *Store) BeginCoordinatedBulkLoad() bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.coordinatedBulkLoad || s.bulkConn != nil {
-		return false
-	}
-	s.beginBulkLoadLocked()
-	if s.bulkConn == nil {
+	outcome, reason := s.beginBulkLoadLocked()
+	log.Printf("store_sqlite: bulk begin window=coordinated outcome=%s reason=%s", outcome, reason)
+	if outcome != "engaged" {
 		return false
 	}
 	s.coordinatedBulkLoad = true
@@ -410,14 +406,17 @@ func (s *Store) BeginCoordinatedBulkLoad() bool {
 	return true
 }
 
-func (s *Store) beginBulkLoadLocked() {
-
-	// Re-entrancy / non-disk guard: a second BeginBulkLoad without an
-	// intervening FlushBulk, or an in-memory store, stays a no-op.
-	if s.bulkConn != nil || isMemoryPath(s.dbPath) {
-		return
+func (s *Store) beginBulkLoadLocked() (outcome, reason string) {
+	if s.generationBulkLoad != 0 {
+		return "refused_generation_window", "generation_window"
 	}
-
+	if s.coordinatedBulkLoad || s.bulkConn != nil {
+		return "nested_noop", "active_window"
+	}
+	if isMemoryPath(s.dbPath) {
+		return "memory_store", "memory_store"
+	}
+	outcome, reason = "refused_setup", "writer_connection"
 	ctx := context.Background()
 	conn, err := s.writerDB.Conn(ctx)
 	if err != nil {
@@ -427,10 +426,11 @@ func (s *Store) beginBulkLoadLocked() {
 	// Nodes alone are not a cold-store proof. A degraded warm store can have
 	// zero nodes while retaining millions of edges, and sidecar receipts prove
 	// an incremental lifecycle even when both graph tables happen to be empty.
-	if !coldGraphStoreEmpty(ctx, conn) {
+	if predicate := coldGraphStoreRefusal(ctx, conn); predicate != "" {
 		_ = conn.Close()
-		return
+		return "refused_not_cold", predicate
 	}
+	reason = "pragma_setup"
 
 	// Capture prior pragma values so FlushBulk (and every early-return /
 	// error path) can restore them. If they can't be read, don't engage —
@@ -500,6 +500,7 @@ func (s *Store) beginBulkLoadLocked() {
 	// The bulk path changes durability and secondary-index maintenance outside
 	// the ordinary row mutation protocol. Active receipts therefore fail closed.
 	s.markMutationReceiptsIncompleteLocked()
+	return "engaged", "cold_store"
 }
 
 // ErrGenerationBulkLoadPopulated refuses a generation-scoped bulk window over
@@ -924,13 +925,62 @@ func (s *Store) scheduleWALDrainAboveLine(result walCheckpointResult, boundary s
 	s.scheduleWALDrain(boundary)
 }
 
+// bulkWindowExit is what a bulk-window exit still owes once the write gate is
+// released. The locked half of FlushBulk / EndCoordinatedBulkLoad releases the
+// gate with a defer, so a panic anywhere under it (a seal DDL, an FTS merge, a
+// test hook) unwinds with the gate free and every later writer can still get
+// in; the owed work below is then skipped along with the rest of the caller.
+type bulkWindowExit struct {
+	// durabilityCheckpoint: a standalone window closed, so the frames it
+	// committed at synchronous=OFF are synced by one TRUNCATE on a NORMAL
+	// connection (checkpointBulkWAL).
+	durabilityCheckpoint bool
+	// residue is what a coordinated window's final PASSIVE left in the WAL;
+	// residueBoundary names that boundary for the residue gate, and is empty
+	// when no such PASSIVE ran.
+	residue         walCheckpointResult
+	residueBoundary string
+	// repairDenseIndexes: the window closed with its seal still owed, so it
+	// recorded missing dense indexes and the maintenance lane owes a repair.
+	repairDenseIndexes bool
+}
+
+// finishBulkWindowExit runs what exit owes after writeMu is released, in the
+// order the exits have always run it. The durability checkpoint must run on a
+// NORMAL connection, and it must not wait for a second writer slot while the
+// bulk connection is still pinned, so neither step may move under the gate.
+func (s *Store) finishBulkWindowExit(exit bulkWindowExit) error {
+	if exit.residueBoundary != "" {
+		s.scheduleWALDrainAboveLine(exit.residue, exit.residueBoundary)
+	}
+	var err error
+	if exit.durabilityCheckpoint {
+		err = s.checkpointBulkWAL()
+	}
+	if exit.repairDenseIndexes {
+		s.scheduleDenseIndexRepair()
+	}
+	return err
+}
+
 // FlushBulk exits the bulk-load fast path: it rebuilds every dropped index,
 // restores synchronous + cache_size + wal_autocheckpoint, releases the pinned writer and write gate,
 // then performs one bounded TRUNCATE checkpoint. The ordering matters: the
 // durability checkpoint must run on a NORMAL connection, and it must not wait
 // for a second writer slot while the bulk connection is still pinned.
 func (s *Store) FlushBulk() error {
+	exit, err := s.flushBulkLocked()
+	return errors.Join(err, s.finishBulkWindowExit(exit))
+}
+
+// flushBulkLocked is FlushBulk's write-gate half. A seal that panics leaves the
+// pinned writer and its deferred indexes in place, so the next FlushBulk
+// retries the same window. A seal that returns an error closes the window
+// anyway: the writer is restored and released, and the indexes it could not
+// rebuild stay recorded as missing for the maintenance lane's repair.
+func (s *Store) flushBulkLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.coordinatedBulkLoad {
 		// The outer coordinated window owns index sealing and its final
 		// durability checkpoint. WAL pressure inside that window is already
@@ -938,8 +988,7 @@ func (s *Store) FlushBulk() error {
 		// repository boundary can coincide with an unrelated read snapshot and
 		// spend the full passive-checkpoint timeout without advancing the WAL;
 		// repeating that timeout once per repository only stalls the cold path.
-		s.writeMu.Unlock()
-		return nil
+		return bulkWindowExit{}, nil
 	}
 	if s.generationBulkLoad != 0 {
 		// A generation-scoped window belongs to whoever opened it, exactly as
@@ -959,31 +1008,47 @@ func (s *Store) FlushBulk() error {
 		// index (bulkIndexesDeferred is false for it) and its WAL is already
 		// bounded inside the payload by noteBulkRowsLocked's row intervals, so
 		// leaving it open costs the pass nothing it would otherwise have paid.
-		s.writeMu.Unlock()
-		return nil
+		return bulkWindowExit{}, nil
 	}
 	hadBulk := s.bulkConn != nil
 	sealErr := s.sealBulkIndexesLocked("flush")
+	repair := s.bulkIndexesDeferred
 	closeErr := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
-	s.writeMu.Unlock()
-	if !hadBulk {
-		return errors.Join(sealErr, closeErr)
-	}
-	return errors.Join(sealErr, closeErr, s.checkpointBulkWAL())
+	return bulkWindowExit{durabilityCheckpoint: hadBulk, repairDenseIndexes: repair}, errors.Join(sealErr, closeErr)
 }
 
 // EndCoordinatedBulkLoad closes an outer multi-repository cold-load window.
 // It is idempotent and safe to defer: durability/cache restoration and index
 // rebuild happen even when one repository failed or panicked.
 func (s *Store) EndCoordinatedBulkLoad() error {
+	exit, err := s.endCoordinatedBulkLoadLocked()
+	return errors.Join(err, s.finishBulkWindowExit(exit))
+}
+
+// endCoordinatedBulkLoadLocked is EndCoordinatedBulkLoad's write-gate half.
+func (s *Store) endCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if !s.coordinatedBulkLoad {
-		s.writeMu.Unlock()
-		return nil
+		return bulkWindowExit{}, nil
 	}
 	s.coordinatedBulkLoad = false
 	s.syncBulkWindowLocked()
+	// The flag is cleared above, before the FTS merges and the seal, so a panic
+	// in either would otherwise leave the pinned writer live behind a window
+	// nobody owns: the owner's next End would find no coordinated load and
+	// return nil, and the store would keep synchronous=OFF until Close. Put the
+	// window back the way the seal-error branch below keeps it, retryable by
+	// the same owner. Registered after the early return so it never claims a
+	// standalone window, and inert once closeBulkConnectionLocked has released
+	// the connection or the seal-error branch has restored the flag itself.
+	defer func() {
+		if s.bulkConn != nil && !s.coordinatedBulkLoad {
+			s.coordinatedBulkLoad = true
+			s.syncBulkWindowLocked()
+		}
+	}()
 	if s.deferredFTSOptimize {
 		// A full FTS5 optimize is unbounded and previously sat directly on the
 		// cold-start critical path. One bounded merge keeps segment growth in
@@ -1008,8 +1073,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		// sealBulkIndexesLocked intentionally requires the pinned bulk writer.
 		s.coordinatedBulkLoad = true
 		s.syncBulkWindowLocked()
-		s.writeMu.Unlock()
-		return sealErr
+		return bulkWindowExit{}, sealErr
 	}
 	// Give the accumulated WAL one longer, still-bounded PASSIVE drain before
 	// planner statistics traverse the large graph indexes. This runs on the
@@ -1044,7 +1108,7 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 	// waiting for readers. Committed WAL frames are durable either way; later
 	// passive checkpoints plus SQLite's next WAL reset/journal_size_limit reclaim
 	// the file after the reader leaves.
-	var residue walCheckpointResult
+	var exit bulkWindowExit
 	if hadBulk {
 		ctx, cancel := context.WithTimeout(context.Background(), bulkFinalCheckpointTimeout)
 		started := time.Now()
@@ -1066,26 +1130,40 @@ func (s *Store) EndCoordinatedBulkLoad() error {
 		// readers allowed. Hand that number to the residue gate rather than
 		// treating "we tried once" as a drained log — the follow-up TRUNCATE
 		// runs on the lane, after this window's readers are gone.
-		residue = result
+		exit.residue = result
 	}
+	exit.residueBoundary = "cold_load_finalize"
 	s.jsonbIngestBuffers.release()
-	s.writeMu.Unlock()
-	s.scheduleWALDrainAboveLine(residue, "cold_load_finalize")
-	return errors.Join(sealErr, statsErr, closeErr)
+	return exit, errors.Join(sealErr, statsErr, closeErr)
 }
 
 // AbortCoordinatedBulkLoad gives up retryable finalization and restores the
-// writer connection unconditionally. It is for terminal owners only: dense
-// indexes whose rebuild failed may remain absent until normal schema repair or
-// restart, but the store no longer holds synchronous=OFF, disabled automatic
-// checkpoints, or a pinned writer indefinitely.
+// writer connection unconditionally, unless a generation window holds it. It
+// is for terminal owners only: dense indexes whose rebuild failed stay absent,
+// recorded as missing, until the maintenance lane's repair or a restart
+// rebuilds them, but the store no longer holds synchronous=OFF, disabled
+// automatic checkpoints, or a pinned writer indefinitely.
 func (s *Store) AbortCoordinatedBulkLoad() error {
+	exit, err := s.abortCoordinatedBulkLoadLocked()
+	return errors.Join(err, s.finishBulkWindowExit(exit))
+}
+
+func (s *Store) abortCoordinatedBulkLoadLocked() (bulkWindowExit, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.generationBulkLoad != 0 {
+		// Never a coordinated window (the two refuse each other), and not this
+		// caller's to close. An owner that aborts after an end which failed
+		// once the window was already closed can find the writer pinned by a
+		// payload generation opened since; closing that connection would leave
+		// its checkpoint lease bound and its EndGenerationBulkLoad inert.
+		return bulkWindowExit{}, nil
+	}
 	s.coordinatedBulkLoad = false
+	repair := s.bulkIndexesDeferred
 	err := s.closeBulkConnectionLocked()
 	s.jsonbIngestBuffers.release()
-	return err
+	return bulkWindowExit{repairDenseIndexes: repair}, err
 }
 
 // noteBulkRowsLocked advances independent index-seal and WAL-checkpoint budgets
@@ -1206,7 +1284,10 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 	_ = s.checkpointBulkWALPassiveLocked("index_seal_before")
 	for _, idx := range bulkDroppableIndexes {
 		indexStarted := time.Now()
-		_, err := conn.ExecContext(ctx, idx.ddl)
+		err := s.runBulkSealHook(idx.name)
+		if err == nil {
+			_, err = conn.ExecContext(ctx, idx.ddl)
+		}
 		s.emitBulkFinalizeEvent(bulkFinalizeEvent{Stage: "index", Name: idx.name, Elapsed: time.Since(indexStarted), Err: err})
 		if err != nil {
 			sealErr = errors.Join(sealErr, fmt.Errorf("store_sqlite: rebuild index %s: %w", idx.name, err))
@@ -1229,7 +1310,27 @@ func (s *Store) sealBulkIndexesLocked(reason string) error {
 		return sealErr
 	}
 	s.bulkIndexesDeferred = false
+	// Every dense index is back, including any an earlier window left missing.
+	s.setDenseIndexesMissingLocked(nil)
 	return nil
+}
+
+// SetBulkSealHookForTest installs a hook this store's dense-index seal calls
+// before each index's DDL, with the index name. A returned error stands in for
+// that DDL failing (the DDL is skipped and the seal stays retryable, as on a
+// real failure); a panic unwinds the seal. The hook runs under the write gate
+// and must not call back into the store. restore puts the previous hook back.
+func (s *Store) SetBulkSealHookForTest(hook func(index string) error) (restore func()) {
+	previous := s.bulkSealHook.Swap(&hook)
+	return func() { s.bulkSealHook.Store(previous) }
+}
+
+func (s *Store) runBulkSealHook(index string) error {
+	hook := s.bulkSealHook.Load()
+	if hook == nil || *hook == nil {
+		return nil
+	}
+	return (*hook)(index)
 }
 
 // closeBulkConnectionLocked restores connection-local pragmas and releases the
@@ -1250,6 +1351,14 @@ func (s *Store) closeBulkConnectionLocked() error {
 	_, syncErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA synchronous = %d", s.bulkPrevSync))
 	_, cacheErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", s.bulkPrevCacheSize))
 	_, autoCheckpointErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", s.bulkPrevAutoCheckpoint))
+	if s.bulkIndexesDeferred {
+		// The window is closing with its seal still owed: a failed seal at
+		// FlushBulk or Close, or an abort that never sealed. The indexes it
+		// dropped stay absent, so say which ones before the connection that
+		// can still read the schema goes. Asked after the PRAGMA restores so
+		// it can never delay durability coming back.
+		s.noteDenseIndexesMissingLocked(ctx, conn)
+	}
 	closeErr := conn.Close()
 	s.bulkIndexesDeferred = false
 	s.bulkDeferredNodeRows = 0
@@ -1266,6 +1375,77 @@ func (s *Store) closeBulkConnectionLocked() error {
 		wrapBulkRestoreError("wal_autocheckpoint", autoCheckpointErr),
 		closeErr,
 	)
+}
+
+// noteDenseIndexesMissingLocked records which bulkDroppableIndexes are absent
+// from the schema as a cold window closes unsealed. One schema read on the
+// pinned connection gives the exact set even after a partial seal; when that
+// read fails every droppable index is listed instead, which only costs the
+// repair a few CREATE INDEX IF NOT EXISTS that find the index already there.
+// Only a cold window defers indexes (a generation window opens with
+// bulkIndexesDeferred false), so this never runs for one.
+func (s *Store) noteDenseIndexesMissingLocked(ctx context.Context, conn *sql.Conn) {
+	present, err := schemaIndexNames(ctx, conn)
+	var missing []bulkDroppableIndex
+	for _, idx := range bulkDroppableIndexes {
+		if err != nil || !present[idx.name] {
+			missing = append(missing, idx)
+		}
+	}
+	s.setDenseIndexesMissingLocked(missing)
+	if len(missing) > 0 {
+		log.Printf("store_sqlite: dense indexes missing after bulk window close indexes=%s", strings.Join(s.denseIndexesMissingNames(), ","))
+	}
+}
+
+// setDenseIndexesMissingLocked replaces the missing-index record. The caller
+// holds writeMu; the slice is never modified after it is published.
+func (s *Store) setDenseIndexesMissingLocked(missing []bulkDroppableIndex) {
+	if len(missing) == 0 {
+		s.denseIndexesMissing.Store(nil)
+		return
+	}
+	s.denseIndexesMissing.Store(&missing)
+}
+
+// denseIndexesMissingRecord returns a copy of the missing-index record, or nil.
+func (s *storeCore) denseIndexesMissingRecord() []bulkDroppableIndex {
+	missing := s.denseIndexesMissing.Load()
+	if missing == nil {
+		return nil
+	}
+	return append([]bulkDroppableIndex(nil), (*missing)...)
+}
+
+// denseIndexesMissingNames returns the names in the missing-index record, or
+// nil.
+func (s *storeCore) denseIndexesMissingNames() []string {
+	missing := s.denseIndexesMissing.Load()
+	if missing == nil {
+		return nil
+	}
+	names := make([]string, 0, len(*missing))
+	for _, idx := range *missing {
+		names = append(names, idx.name)
+	}
+	return names
+}
+
+func schemaIndexNames(ctx context.Context, conn *sql.Conn) (map[string]bool, error) {
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM sqlite_schema WHERE type = 'index'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	present := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		present[name] = true
+	}
+	return present, rows.Err()
 }
 
 func wrapBulkRestoreError(pragma string, err error) error {
@@ -1381,14 +1561,48 @@ func shouldBackoffBulkRowCheckpoint(err error) bool {
 // rows has been indexed before, whichever view wrote them, so it is not the
 // cold store this fast path is for.
 func coldGraphStoreEmpty(ctx context.Context, conn *sql.Conn) bool {
-	var empty int
+	return coldGraphStoreRefusal(ctx, conn) == ""
+}
+
+// One bounded probe retains the cold-store proof and identifies its first
+// failed predicate without counting or hydrating any graph rows.
+func coldGraphStoreRefusal(ctx context.Context, conn *sql.Conn) string {
+	var reason string
 	err := conn.QueryRowContext(ctx, `
-SELECT NOT EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?)
-   AND NOT EXISTS(SELECT 1 FROM edges WHERE view_gen = ?)
-   AND NOT EXISTS(SELECT 1 FROM file_mtimes)
-   AND NOT EXISTS(SELECT 1 FROM repo_index_state)`,
-		baseViewGeneration, baseViewGeneration).Scan(&empty)
-	return err == nil && empty == 1
+SELECT CASE
+ WHEN EXISTS(SELECT 1 FROM nodes WHERE view_gen = ?) THEN 'nodes'
+ WHEN EXISTS(SELECT 1 FROM edges WHERE view_gen = ?) THEN 'edges'
+ WHEN EXISTS(SELECT 1 FROM file_mtimes) THEN 'file_mtimes'
+ WHEN EXISTS(SELECT 1 FROM repo_index_state) THEN 'repo_index_state'
+ ELSE '' END`, baseViewGeneration, baseViewGeneration).Scan(&reason)
+	if err != nil {
+		return "cold_probe_error"
+	}
+	return reason
+}
+
+// WriterPragmaForTest reads an integer PRAGMA off the store's writer
+// connection: the pinned bulk connection while a window holds one, the single
+// writer-pool connection otherwise. PRAGMAs such as synchronous are
+// connection-local, so a read-pool connection cannot show what the writer runs
+// with. It takes the write gate under ctx, so a deadline also proves the gate
+// is free. name must be a bare PRAGMA name.
+func (s *Store) WriterPragmaForTest(ctx context.Context, name string) (int64, error) {
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && r != '_' {
+			return 0, fmt.Errorf("store_sqlite: not a pragma name: %q", name)
+		}
+	}
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return 0, err
+	}
+	defer s.writeMu.Unlock()
+	conn, release, err := s.activeWriteConnLocked(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return pragmaInt(ctx, conn, name)
 }
 
 // pragmaInt reads a single-integer PRAGMA (synchronous, cache_size, wal_autocheckpoint) off the

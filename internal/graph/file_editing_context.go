@@ -11,7 +11,7 @@ import "sort"
 //
 // Every read is a batched Reader call, so a reader wrapper that narrows
 // adjacency gets the same fixed round-trip count with its own edge semantics.
-func FileEditingContextOf(r Reader, filePath string, kinds []NodeKind) *FileEditingContextResult {
+func FileEditingContextOf(r FileEditingContextRows, filePath string, kinds []NodeKind) *FileEditingContextResult {
 	if filePath == "" {
 		return nil
 	}

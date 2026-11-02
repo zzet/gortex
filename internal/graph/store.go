@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync"
 )
@@ -525,9 +526,27 @@ type BulkLoader interface {
 // multi-repository cold load. Implementations engage only on an empty store;
 // nested per-repository BulkLoader calls must leave the outer window open so
 // secondary indexes are rebuilt once after every repository drains.
+//
+// A failed EndCoordinatedBulkLoad may leave the window open so its owner can
+// retry it. AbortCoordinatedBulkLoad is how an owner that will not retry gives
+// it up: the window closes unfinished, ordinary durability comes back, and
+// whatever the end could not rebuild is left to the backend to repair.
 type CoordinatedBulkLoader interface {
 	BeginCoordinatedBulkLoad() bool
 	EndCoordinatedBulkLoad() error
+	AbortCoordinatedBulkLoad() error
+}
+
+// EndOrAbortCoordinatedBulkLoad ends l's coordinated window and, when the end
+// fails, aborts it. It is for an owner's last call on the window: an end that
+// fails with the window still open would otherwise leave it open until the
+// store closes, with every later write at the window's relaxed durability.
+func EndOrAbortCoordinatedBulkLoad(l CoordinatedBulkLoader) error {
+	err := l.EndCoordinatedBulkLoad()
+	if err == nil {
+		return nil
+	}
+	return errors.Join(err, l.AbortCoordinatedBulkLoad())
 }
 
 // SymbolHit is a single full-text-search result: the matched node ID
@@ -2602,8 +2621,9 @@ type ClassHierarchyTraverser interface {
 // any defines node, filtered to symbols outside the file). All five
 // projections are scoped to the input file in one round-trip each.
 //
-// Optional capability — handleGetEditingContext falls back to the
-// per-symbol loop when the backend doesn't implement it.
+// Legacy synchronous capability. The MCP handler uses FileEditingContextReadScope
+// so cancellation, incomplete reads and selected-layer revisions are checked
+// before accepting a bundle; it never falls back to this errorless interface.
 type FileEditingContextResult struct {
 	FileNode *Node
 	Defines  []*Node

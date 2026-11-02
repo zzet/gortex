@@ -472,6 +472,45 @@ the first attests *what bytes* are on disk, the second whether the write
 happened at all. A call abandoned before its response returns no evidence block
 — only the receipt — which is exactly when `disk_status` is the field you need.
 
+### Source mutation acknowledgement policy
+
+Set the daemon's startup configuration to choose when source edits acknowledge:
+
+```yaml
+edit:
+  ack: full
+```
+
+`full` is the default. It waits for the complete admitted patch, for up to the
+existing three-second publication budget. `local` returns after the disk commit,
+exact file projection when available, and watcher admission. Both policies
+release source path locks before waiting; a graph failure never reverses a disk
+commit. Invalid modes are rejected. This is daemon configuration, not a tool
+argument, and the response's `ack_mode` records the policy used for the operation.
+Existing `require_fresh`, `freshness_scope`, and `wait_deadline` metadata can
+request a specific tier under either policy.
+
+Each committed source-file response adds `commit_seq`, the actual raw-byte
+`content_sha256` when known, `readback_exact`, and `graph_status_hint`.
+`file_view` is an object: `state`, `delta_state`, `counts`, `symbols`,
+`truncated`, and `syntax_health`. Available counts include `before`, `after`,
+`added`, `removed`, `changed`, and `total_changes`; they remain complete when
+`symbols` displays only the first 20 deterministic changes. Each displayed row
+has `change`, `id`, `kind`, `start_line`, `end_line`, and `signature`.
+An unauthenticated prior symbol set yields an unavailable delta and null counts.
+Syntax health is checked only when the acknowledgement's parse supplies an exact
+verdict; unknown health has `checked:false` and null `errors`.
+
+`readback_exact:true` requires that this write's projection is still live.
+`tier_state.file` describes that physical file view independently of the
+watcher-owned `file_graph`, `relations`, and `derived` stages. A newer write or
+invalidation can make a replay's file view unavailable or historical. Replays
+and `mutation_status` refresh live receipt evidence without parsing or writing
+again. Transactional batches retain journal authority and report per-file
+`file_views`; restarting does not reconstruct an original process-local
+projection sequence from the journal. Report full/default and explicit-local
+measurements separately; changing the mode does not establish a latency target.
+
 ### Publication tiers and freshness
 
 `readback_exact:true` means the written bytes can be used immediately; continue
@@ -553,7 +592,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 |------|-------------|
 | `analyze` | Unified graph analysis dispatcher. `kind` ∈ `dead_code`, `hotspots`, `cycles`, `would_create_cycle`, `connectivity_health`, `todos`, `blame`, `coverage`, `coverage_gaps`, `coverage_summary`, `stale_code`, `stale_flags`, `ownership`, `releases`, `cgo_users`, `wasm_users`, `orphan_tables`, `unreferenced_tables`, `channel_ops`, `goroutine_spawns`, `field_writers`, `race_writes`, `unclosed_channels`, `unsafe_patterns`, `health_score`, `impact`, `annotation_users`, `config_readers`, `env_var_users`, `sql_call_sites`, `fixes_history`, `edge_audit`, `domain`, `named`, `tests_as_edges`, `clusters`, `event_emitters`, `pubsub`, `string_emitters`, `error_surface`, `log_events`, `sql_rebuild`, `external_calls`, `routes`, `models`, `components`, `k8s_resources`, `images`, `kustomize`, `cross_repo`, `dbt_models`, `synthesizers`, `resolution_outcomes`. `clusters` takes an `algorithm` arg (`leiden` / `louvain` / `spectral`). `impact` takes an optional `target` (`{symbol}` or `{file}`): with one it ranks that target's blast radius — the target row first, then its transitive dependents with their `depth` — and reports the closure width plus whether it is exact; without one it ranks the whole repo. An unresolvable target is a structured error, never a silent fall-back to the repo-wide ranking. `synthesizers` rolls up every framework-dispatch-synthesized edge by the pass that produced it; `resolution_outcomes` classifies unresolved call/reference edges by why the resolver gave up (`ambiguous_multi_match` / `candidate_out_of_scope` / `cross_language_only` / `stub_only` / `no_definition`) |
 | `find_clones` | Near-duplicate function/method clusters from the MinHash + LSH `similar_to` layer; `dead_only: true` finds dead duplicates of live code |
-| `index_health` | Health score, parse failures, stale files, language coverage, tracked-repo path liveness (`tracked_repo_paths_ok` + `missing_repo_paths` — a repo whose directory was deleted still holds its registration and silently drops out of workspace-wide answers), per-(repo, provider) semantic-enrichment lifecycle (`semantic_enrichment`: running / completed / partial / abandoned / failed with edge counts, plus a `semantic_enrichment_ok` rollup) — a green file count with a `partial` enrichment state means LSP-tier edges are incomplete. `path_liveness` asks the same question one level down, per file: it stats the paths the graph itself claims and reports how many indexed files no longer exist on disk (`orphan_files` / `orphan_rate` / `orphans_by_repo`, sampled with `truncated: true` past 20k files). `stale_files` only covers files the daemon still tracks, so a deletion it never witnessed shows up here and nowhere else; a non-zero `orphan_files` caps `health_score`. On a SQLite-backed daemon a `planner_stats` object reports the query planner's own view of the store: `nodes` / `edges` carry `believed` (the leading token of the index's `sqlite_stat1` row) against `actual_from_counters` (the `repo_index_state` counter sum across ALL view generations, flagged by `counters_known`; no counter row describes the external-call bucket or nodes carrying no repo prefix, and a leftover empty-prefix row on a store that later became multi-repo is summed on top of the per-repo rows, so the pair is an approximation of index cardinality and a difference between the two is not a measured discrepancy), `receivers` carries a `bounded: true` LIMIT-capped probe of the Go receiver index plus `complete` (false means the probe stopped at its cap, so `actual` is a lower bound and must not be compared with `believed`) and is omitted entirely when the receiver index is not in the schema — a bulk load has dropped it, or this store never had it, and a `believed: 0` there would read as the poisoned near-zero row rather than as an absent index. `stale` says whether the graph has outgrown what the planner believes — which can invert join order on receiver/edge queries — while `reason` names every verdict, staleness or not: `bulk_window_active` is why a cold load in progress reports zeros. `last_refresh_at` / `last_refresh_reason` appear once this process has rebuilt them. The field is read-only: statistics refresh at the next repository index, commit/HEAD move, whole-graph resolve or generation build, never from reading this payload — and that refresh is cooperative, so a busy writer, a spent per-pass budget or a per-index timeout defers the rest of the work to the following boundary (which resumes where the last one stopped) rather than stalling the pipeline that noticed |
+| `index_health` | Health score, parse failures, stale files, language coverage, tracked-repo path liveness (`tracked_repo_paths_ok` + `missing_repo_paths` — a repo whose directory was deleted still holds its registration and silently drops out of workspace-wide answers), per-(repo, provider) semantic-enrichment lifecycle (`semantic_enrichment`: running / completed / partial / abandoned / failed with edge counts, plus a `semantic_enrichment_ok` rollup) — a green file count with a `partial` enrichment state means LSP-tier edges are incomplete. `path_liveness` asks the same question one level down, per file: it stats the paths the graph itself claims and reports how many indexed files no longer exist on disk (`orphan_files` / `orphan_rate` / `orphans_by_repo`, sampled with `truncated: true` past 20k files). `stale_files` only covers files the daemon still tracks, so a deletion it never witnessed shows up here and nowhere else; a non-zero `orphan_files` caps `health_score`. On a SQLite-backed daemon a `planner_stats` object reports the query planner's own view of the store: `nodes` / `edges` carry `believed` (the leading token of the index's `sqlite_stat1` row) against `actual_from_counters` (the `repo_index_state` counter sum across ALL view generations, flagged by `counters_known`; no counter row describes the external-call bucket or nodes carrying no repo prefix, and a leftover empty-prefix row on a store that later became multi-repo is summed on top of the per-repo rows, so the pair is an approximation of index cardinality and a difference between the two is not a measured discrepancy), `receivers` carries a `bounded: true` LIMIT-capped probe of the Go receiver index plus `complete` (false means the probe stopped at its cap, so `actual` is a lower bound and must not be compared with `believed`) and is omitted entirely when the receiver index is not in the schema — a bulk load has dropped it, or this store never had it, and a `believed: 0` there would read as the poisoned near-zero row rather than as an absent index. `stale` says whether the graph has outgrown what the planner believes — which can invert join order on receiver/edge queries — while `reason` names every verdict, staleness or not: `bulk_window_active` is why a cold load in progress reports zeros, and `dense_indexes_missing` means a cold load closed without rebuilding some of its dense indexes (typically because the volume filled up during the final index rebuild): `dense_indexes_missing` in the same object names them, lookups that use them scan until they are back, and the store rebuilds them in the background once its volume has free space at least the size of the store (a daemon restart also rebuilds them). `last_refresh_at` / `last_refresh_reason` appear once this process has rebuilt them. The field is read-only: statistics refresh at the next repository index, commit/HEAD move, whole-graph resolve or generation build, never from reading this payload — and that refresh is cooperative, so a busy writer, a spent per-pass budget or a per-index timeout defers the rest of the work to the following boundary (which resumes where the last one stopped) rather than stalling the pipeline that noticed |
 | `get_symbol_history` | Symbols modified this session with counts; flags churning (3+ edits) |
 The `analyze` dispatcher also accepts a set of **facade-aliased kinds** that route to the captured legacy handler instead of the dispatcher switch: `processes` → `get_processes`, `communities` → `get_communities`, `contracts` → `contracts`, `architecture` → `get_architecture`, `clones` → `find_clones`, `health` → `audit_health`, `inspections` → `run_inspections`, `recent_changes` → `get_recent_changes`, and the other entries of the facade analyze migration table (see `mcp-facade-v1.md`). These aliases are **surface-independent**: they work for client (facade-v1), explicitly legacy-preset, and session-less HTTP callers alike, with no `tools_search` promotion — the HTTP dashboard endpoints depend on this under the `core`/`defer` default.
 
@@ -801,3 +840,15 @@ Read-only, URI-addressable, no args. Clients that speak resources can `resources
 | `pre_commit` | Review uncommitted changes — shows changed symbols, blast radius, risk level, affected tests |
 | `orientation` | Orient in an unfamiliar codebase — graph stats, communities, execution flows, key symbols |
 | `safe_to_change` | Analyze whether it's safe to change specific symbols — blast radius, edit plan, affected tests |
+
+`index_health` includes `last_first_index_drain` after a full shadow index has
+persisted, keyed by repository prefix. Daemon status exposes the same snapshot
+under `storage`, together with `dense_indexes_missing` when a failed seal owes
+index repair. A drain records its actual window kind, node/edge counts, drain
+and seal-call durations, completion time and any seal error. A coordinated
+window seals at its outer boundary, so its per-repository seal call can be a
+no-op. `wal_peak_scope=shared_store_drain_chunk_samples` identifies physical WAL
+observations at the start, bounded graph/FTS chunks and seal boundaries. This
+is a sampled peak on the shared store; concurrent repository work can contribute
+and a peak between samples can be missed. Missing observations
+are omitted, and these process-local snapshots reset when the store reopens.

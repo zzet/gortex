@@ -204,6 +204,8 @@ func TestProjectSourceGoldenParity(t *testing.T) {
 			graphPath := "parity/" + rel
 			require.Equal(t, graphPath, projection.GraphPath)
 			require.NotEmpty(t, projection.Nodes)
+			require.True(t, projection.ParseChecked)
+			require.Zero(t, projection.ParseErrors)
 			require.Empty(t, DiffProjectedNodes(projection.Nodes, g.GetFileNodes(graphPath)))
 			for _, n := range projection.Nodes {
 				require.Equal(t, "parity", n.RepoPrefix, n.ID)
@@ -305,4 +307,15 @@ func TestInteractiveExtractionNotBlockedByFullSharedParseAdmission(t *testing.T)
 		require.True(t, strings.HasSuffix(projection.GraphPath, rel))
 		require.NotEmpty(t, projection.Nodes)
 	}
+}
+
+func TestProjectSourceUnknownVerdictCannotCertifyClean(t *testing.T) {
+	idx := newProjectionTestIndexer(t, graph.New(), config.Default().Index)
+	root := t.TempDir()
+	idx.SetRootPath(root)
+	idx.registry.Register(slowGoExtractor{})
+	projection, err := idx.ProjectSource(context.Background(), filepath.Join(root, "main.go"), []byte("package p\n"))
+	require.NoError(t, err)
+	require.False(t, projection.ParseChecked)
+	require.Zero(t, projection.ParseErrors)
 }

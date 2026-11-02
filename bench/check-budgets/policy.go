@@ -151,10 +151,13 @@ func (p policy) validate() error {
 			return fmt.Errorf("budget %d: %w", i+1, err)
 		}
 		key := b.HostClass + "/" + b.Scenario + "/" + b.Metric
-		if seen[key] {
-			return fmt.Errorf("duplicate budget %s", key)
+		for _, lane := range b.Lane {
+			laneKey := key + "/" + lane
+			if seen[laneKey] {
+				return fmt.Errorf("duplicate budget %s", laneKey)
+			}
+			seen[laneKey] = true
 		}
-		seen[key] = true
 	}
 	return nil
 }
@@ -181,7 +184,7 @@ func validateBudget(b budget, allowances map[string]allowance) error {
 		return errors.New("min_repeats cannot weaken the three-repeat minimum")
 	}
 	for i, lane := range b.Lane {
-		if !slices.Contains([]string{"smoke", "nightly", "release"}, lane) || slices.Contains(b.Lane[:i], lane) {
+		if !slices.Contains([]string{"smoke", "nightly", "release", "edit-smoke"}, lane) || slices.Contains(b.Lane[:i], lane) {
 			return fmt.Errorf("unknown or repeated lane %s", lane)
 		}
 	}

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	wire "github.com/gortexhq/gcx-go"
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -205,7 +207,7 @@ func normalizeSearchGoldenRoots(got string, roots []string) string {
 				}
 				fields := strings.Split(line, "\t")
 				if column < len(fields) {
-					fields[column] = normalizeSearchGoldenPath(fields[column], roots)
+					fields[column] = normalizeSearchGoldenGCXPath(fields[column], roots)
 					lines[i+1] = strings.Join(fields, "\t")
 				}
 			}
@@ -216,6 +218,27 @@ func normalizeSearchGoldenRoots(got string, roots []string) string {
 		got = strings.ReplaceAll(got, root, "$ROOT")
 	}
 	return got
+}
+
+func normalizeSearchGoldenGCXPath(field string, roots []string) string {
+	// A GCX cell escapes backslashes itself. Decode ONLY this declared path
+	// cell; rebuilding the row would rewrite unrelated source/signature bytes.
+	decoder := wire.NewDecoder(strings.NewReader("GCX1 tool=golden fields=path_abs\n" + field + "\n"))
+	if row, err := decoder.NextRow(); err == nil {
+		path := row["path_abs"]
+		if normalized := normalizeSearchGoldenPath(path, roots); normalized != path {
+			var encoded bytes.Buffer
+			encoder := wire.NewEncoder(&encoded, wire.Header{Tool: "golden", Fields: []string{"path_abs"}})
+			if encoder.WriteRow(normalized) == nil && encoder.Close() == nil {
+				if _, row, ok := strings.Cut(encoded.String(), "\n"); ok {
+					return strings.TrimSuffix(row, "\n")
+				}
+			}
+		}
+	}
+	// Retain compatibility with older hand-written raw-path fixtures. A
+	// non-owned path keeps its original escaped spelling byte for byte.
+	return normalizeSearchGoldenPath(field, roots)
 }
 
 func normalizeSearchGoldenPath(path string, roots []string) string {

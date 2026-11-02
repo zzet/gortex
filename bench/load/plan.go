@@ -63,6 +63,7 @@ type request struct {
 // Workload is the complete normalized offered load. Binary paths, private
 // clone paths and revisions belong to the run identity, never the plan hash.
 type Workload struct {
+	EditGateSeed     string         `json:"edit_gate_seed,omitempty"`
 	PRSmokeDrain     *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
 	Scenario         string         `json:"scenario"`
 	Agents           int            `json:"agents"`
@@ -199,6 +200,10 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 	case "all":
 		if readers < 1 || editors < 1 {
 			return errors.New("all scenarios require at least one pure reader and one combined edit/readback agent")
+		}
+	case checkoutDiscoveryScenario:
+		if readers+editors < 2 {
+			return errors.New("worktree discovery needs sessions in both initial repositories")
 		}
 	case "read", "many", "worktrees", "sweep", "cold", "restart":
 		if readers < 1 {

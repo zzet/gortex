@@ -66,6 +66,9 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	firstIndexDrainsMu sync.Mutex
+	firstIndexDrains   map[string]graph.FirstIndexDrain
+
 	// baseFTSPages retains only exact ranked rows keyed by same-transaction
 	// global FTS state and mutable base ownership revision.
 	baseFTSPages symbolFTSPageCache
@@ -341,6 +344,22 @@ type storeCore struct {
 	maintenanceDrainRunning bool
 	maintenanceDrainReason  string
 
+	// Dense-index repair (dense_index_repair.go). denseRepairOwed is the
+	// one-slot request the lane worker consumes, posted by a bulk-window exit
+	// that left indexes missing or by the backoff timer; denseRepairDelay is
+	// the backoff the next retry waits and denseRepairTimer that pending
+	// retry. All three are guarded by maintenanceSched. The counters record
+	// attempts that reached their DDL, attempts skipped for free space, and
+	// completed repairs; denseRepairDiskAvail is a test override of the
+	// free-space probe.
+	denseRepairOwed          bool
+	denseRepairDelay         time.Duration
+	denseRepairTimer         *time.Timer
+	denseIndexRepairAttempts atomic.Int64
+	denseIndexRepairSkips    atomic.Int64
+	denseIndexRepairs        atomic.Int64
+	denseRepairDiskAvail     atomic.Pointer[func(dir string) (uint64, error)]
+
 	// Lane counters. Requests counts scheduling calls, passes counts lane
 	// passes actually started (so a burst of requests collapsing into one
 	// pass is observable), jobs counts actions that reached their SQL,
@@ -437,6 +456,11 @@ type storeCore struct {
 	// synchronously under writeMu on cold paths; live FTS finalize emits after
 	// releasing the gate. Cold observers must not call back into Store.
 	bulkFinalizeObserver func(bulkFinalizeEvent)
+	// bulkSealHook and batchWriteHook are SetBulkSealHookForTest's and
+	// SetBatchWriteHookForTest's hooks. Per store rather than package-wide so
+	// parallel tests that each own a store do not share them.
+	bulkSealHook   atomic.Pointer[func(index string) error]
+	batchWriteHook atomic.Pointer[func(nodeRows, edgeRows int) error]
 	// Live FTS-finalize statement trace for tests; invoked only on those two
 	// maintenance calls, never on ordinary graph/edit writes.
 	ftsMaintenanceObserver func(string, []any)
@@ -507,6 +531,16 @@ type storeCore struct {
 	// one reader that must not take writeMu to ask: the planner-statistics
 	// health probe. Written only under writeMu, by syncBulkWindowLocked.
 	bulkWindowOpen atomic.Bool
+
+	// denseIndexesMissing holds the dense indexes a cold bulk window closed
+	// without rebuilding (its seal failed, or it was aborted before sealing),
+	// in bulkDroppableIndexes order and each with the DDL that builds it; nil
+	// when none are owed. Written only under writeMu and replaced, never
+	// mutated in place, so the health probe reads it without a lock for the
+	// same reason it reads bulkWindowOpen, and the maintenance lane's repair
+	// builds from it rather than reading bulkDroppableIndexes itself.
+	// Not persisted: Open's createGraphCoreIndexes rebuilds them on restart.
+	denseIndexesMissing atomic.Pointer[[]bulkDroppableIndex]
 
 	// Prepared statements (compiled once in Open, closed in Close).
 	stmtInsertNode          *sql.Stmt

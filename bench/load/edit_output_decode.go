@@ -31,6 +31,13 @@ const editProbeTOONWireKey = "\x00load.toon.wire"
 var errEditOutputGCXUnavailable = errors.New("GCX output unavailable: no GCX decoder, and read_file answers a GCX request with TOON")
 
 func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[string]any, error) {
+	facade := format == "facade"
+	if facade {
+		if err := verifyEditProbeFacade(raw, operation); err != nil {
+			return nil, err
+		}
+		format = "json"
+	}
 	switch format {
 	case "", "json":
 	case "toon":
@@ -39,13 +46,21 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	case "cli":
 		return decodeEditProbeCLIOutput(raw)
 	case "gcx":
-		return nil, errEditOutputGCXUnavailable
+		fields, err := editProbeGCXTierFields(raw, operation)
+		return fields, errors.Join(errEditOutputGCXUnavailable, err)
 	default:
 		return nil, errors.New("unsupported edit output mode")
 	}
 	text, err := editOutputPayload(raw, false)
 	if err != nil {
 		return nil, err
+	}
+	var tierFields map[string]any
+	if format == "toon" {
+		text, tierFields, err = editProbeTierPrefix(text)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if format == "" || format == "json" {
 		decoder := json.NewDecoder(bytes.NewReader(text))
@@ -56,6 +71,12 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 		}
 		if err := decoder.Decode(&body); err != nil {
 			return nil, err
+		}
+		if body == nil {
+			return nil, errors.New("requested JSON must return an object, not null")
+		}
+		if facade {
+			body[editProbeFacadeWireKey] = editProbeFacadeWire{operation: operation}
 		}
 		return body, nil
 	}
@@ -83,6 +104,9 @@ func decodeEditProbeOutput(raw json.RawMessage, format, operation string) (map[s
 	decoder.UseNumber()
 	var body map[string]any
 	if err := decoder.Decode(&body); err != nil {
+		return nil, err
+	}
+	if err := editProbeKeepTierFields(body, tierFields); err != nil {
 		return nil, err
 	}
 	body[editProbeTOONWireKey] = editProbeTOONWire{operation: operation}
@@ -158,6 +182,10 @@ func decodeEditProbeCompactOutput(raw json.RawMessage, operation string) (map[st
 	if err != nil {
 		return nil, err
 	}
+	text, tierFields, err := editProbeTierPrefix(text)
+	if err != nil {
+		return nil, err
+	}
 	if json.Valid(text) {
 		return nil, errors.New("requested compact text returned JSON; no format credit")
 	}
@@ -189,7 +217,11 @@ func decodeEditProbeCompactOutput(raw json.RawMessage, operation string) (map[st
 			return nil, fmt.Errorf("compact line outside the %s grammar: %q", operation, line)
 		}
 	}
-	return map[string]any{editProbeCompactKey: answer}, nil
+	body := map[string]any{editProbeCompactKey: answer}
+	if err := editProbeKeepTierFields(body, tierFields); err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 // `gortex call --format json` prints the tool's first text payload as JSON,

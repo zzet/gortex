@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
@@ -41,12 +44,17 @@ type mutationPathLock struct {
 // mutation. A receipt identifies admitted publication work that can outlive the
 // request, either on a watcher or on the selected checkout's coordinator.
 type mutationReindexOutcome struct {
-	Reindexed         bool
-	Pending           bool
-	Receipt           string
-	Generation        uint64
-	AppliedGeneration uint64
-	Err               error
+	Reindexed bool
+	Pending   bool
+	Receipt   string
+	// Same existing receipt ID retained internally when full ACK omits it.
+	publicationReceipt string
+	Generation         uint64
+	AppliedGeneration  uint64
+	Err                error
+	// tiers is the immutable snapshot from the existing ticket owner. Never
+	// expose a mutable receipt (and its mutex/history) through an outcome.
+	tiers indexer.MutationTierState
 	// DerivedFanout is the completeness fact for the bounded derived passes
 	// the reindex ran. Additive and independent of Reindexed: the graph can
 	// have read these bytes while the affected-by re-resolution over them was
@@ -129,14 +137,33 @@ type mutationSetScheduler interface {
 	EnqueueFileMutations(context.Context, []string) (map[string]*indexer.MutationTicket, error)
 }
 
-// acquireMutationPath waits for exclusive mutation access to path. Waiting is
-// context-aware: a cancelled MCP request leaves the queue immediately, which
-// lets its dispatcher goroutine finish and release admission capacity.
-func acquireMutationPath(ctx context.Context, path string) (func(), error) {
-	if err := guardCheckoutMutationPath(ctx, path); err != nil {
-		return nil, err
+type mutationPathAdmissionKey struct{}
+
+// A context proves ownership only while the captured lock set is held. The
+// release bit is shared with every derived context, so saved contexts cannot
+// authorize a later write after their owner returned the token.
+type mutationPathAdmission struct {
+	keys     map[string]struct{}
+	parent   *mutationPathAdmission
+	released atomic.Bool
+}
+
+func mutationPathAdmitted(ctx context.Context, key string) bool {
+	admission, _ := ctx.Value(mutationPathAdmissionKey{}).(*mutationPathAdmission)
+	for ; admission != nil; admission = admission.parent {
+		if !admission.released.Load() {
+			if _, ok := admission.keys[key]; ok {
+				return true
+			}
+		}
 	}
-	return acquireMutationPathKey(ctx, pathkey.MutationKey(path))
+	return false
+}
+
+// acquireMutationPath waits for exclusive mutation access and returns the
+// context proving ownership of that captured path identity until release.
+func acquireMutationPath(ctx context.Context, path string) (context.Context, func(), error) {
+	return acquireMutationPaths(ctx, []string{path})
 }
 
 // acquireMutationPathKey acquires an already-admitted, captured path identity.
@@ -177,15 +204,17 @@ func acquireMutationPathKey(ctx context.Context, path string) (func(), error) {
 // acquireMutationPaths locks a mutation set in lexical path order. A stable
 // order prevents deadlock between overlapping batches; cancellation while
 // waiting releases every previously acquired path in reverse order.
-func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
+func acquireMutationPaths(ctx context.Context, paths []string) (context.Context, func(), error) {
 	unique := make(map[string]struct{}, len(paths))
 	ordered := make([]string, 0, len(paths))
 	for _, path := range paths {
+		// Admission applies to every spelling, even when two names resolve
+		// to the same lock. A denied alias must never disappear in dedupe.
 		if err := guardCheckoutMutationPath(ctx, path); err != nil {
-			return nil, err
+			return ctx, nil, err
 		}
 		key := pathkey.MutationKey(path)
-		if _, exists := unique[key]; exists {
+		if _, exists := unique[key]; exists || mutationPathAdmitted(ctx, key) {
 			continue
 		}
 		unique[key] = struct{}{}
@@ -200,14 +229,17 @@ func acquireMutationPaths(ctx context.Context, paths []string) (func(), error) {
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
 			}
-			return nil, err
+			return ctx, nil, err
 		}
 		releases = append(releases, release)
 	}
-
+	parent, _ := ctx.Value(mutationPathAdmissionKey{}).(*mutationPathAdmission)
+	admission := &mutationPathAdmission{keys: unique, parent: parent}
+	ctx = context.WithValue(ctx, mutationPathAdmissionKey{}, admission)
 	var once sync.Once
-	return func() {
+	return ctx, func() {
 		once.Do(func() {
+			admission.released.Store(true)
 			for i := len(releases) - 1; i >= 0; i-- {
 				releases[i]()
 			}
@@ -229,7 +261,7 @@ func (s *Server) trackMutationTicket(ticket *indexer.MutationTicket) *mutationRe
 	if s.multiIndexer != nil {
 		repo = s.multiIndexer.RepoForFile(ticket.Path)
 	}
-	return s.trackScopedMutationTicket(ticket, repo, "", "", nil)
+	return s.trackScopedMutationTicket(ticket, repo, "", "", nil, s.canonicalProjectionRetirement(ticket.Path))
 }
 
 func (s *Server) trackCheckoutRefreshTicket(ticket *indexer.CheckoutRefreshTicket) *mutationReceipt {
@@ -250,7 +282,7 @@ func (s *Server) trackCheckoutRecoveryTicket(ticket *indexer.CheckoutRefreshTick
 	return s.trackScopedMutationTicket(ticket.Ticket, ticket.RepoPrefix, ticket.CheckoutID, ticket.Incarnation, captured)
 }
 
-func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}) *mutationReceipt {
+func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo, checkoutID, incarnation string, recoveryCandidates map[string]struct{}, retirements ...*sourceProjectionRetirement) *mutationReceipt {
 	receipt := &mutationReceipt{
 		ticket:              ticket,
 		id:                  fmt.Sprintf("mutation-%d", mutationReceiptSequence.Add(1)),
@@ -307,6 +339,12 @@ func (s *Server) trackScopedMutationTicket(ticket *indexer.MutationTicket, repo,
 		}
 		s.scheduleMutationReceiptExpiry(receipt, retention)
 		close(receipt.done)
+		// Read-only content verification is outside ACK completion and the
+		// repository lane. Canonical backend ownership needs no departed view pin.
+		// A successful notification merely triggers verification, never proves it.
+		if result.Err == nil && len(retirements) == 1 {
+			retirements[0].run()
+		}
 	}()
 	return receipt
 }
@@ -499,10 +537,14 @@ func (r *mutationReceipt) outcome(pending bool) mutationReindexOutcome {
 	outcome := mutationReindexOutcome{
 		Pending:             pending,
 		Receipt:             r.id,
+		publicationReceipt:  r.id,
 		Generation:          r.generation,
 		checkoutScoped:      r.checkoutScoped,
 		checkoutID:          r.checkoutID,
 		checkoutIncarnation: r.checkoutIncarnation,
+	}
+	if r.ticket != nil {
+		outcome.tiers = r.ticket.TierState()
 	}
 	if r.completed {
 		outcome.Reindexed = r.result.Reindexed
@@ -554,75 +596,126 @@ func (s *Server) mutationWaitDuration() time.Duration {
 	return defaultMutationReindexWait
 }
 
-// mutationReindexState returns the graph-freshness state to expose after a
-// successful disk mutation. A live watcher already owns debouncing, patch
-// serialization, and latest-bytes reconciliation, so duplicating IndexFile in
-// the request path both blocks the response and races the watcher. Embedded
-// servers have no watcher and retain the synchronous freshness contract.
-func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+// sourceMutationAdmission separates committing/admitting under the path lock
+// from passive graph waiting after the lock has been returned.
+type sourceMutationAdmission struct {
+	policy     sourceAckPolicy
+	receipt    *mutationReceipt
+	immediate  mutationReindexOutcome
+	inlinePath string
+	checkout   *checkoutMutationState
+	move       *moveObservation
+}
+
+// admitSourceMutations captures publication ownership before another writer
+// can commit this path. It never waits for a queued watcher publication.
+func (s *Server) admitSourceMutations(ctx context.Context, absPath string) (admission sourceMutationAdmission) {
+	defer func() { admission.policy = s.sourceAckPolicy(ctx) }()
 	if state := checkoutMutationFromContext(ctx); state != nil {
-		return s.refreshCheckoutMutation(ctx, absPath, state)
-	}
-	if watcher := s.currentWatcher(); watcher != nil {
-		// Admission is path-scoped and authoritative. Scheduling uses a detached
-		// context because the disk commit already happened; client cancellation
-		// must not leave the graph permanently stale.
-		if scheduler, ok := watcher.(mutationScheduler); ok {
-			// The reindex is detached from this request, so the request's own
-			// lease cannot be what keeps its payload alive: join it for the
-			// admitted work and let the receipt hold the pin until the ticket
-			// reports. Nil whenever no generation stack answered this request.
-			pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
-			publication := s.committedPublicationRecord(ctx, absPath)
-			admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
-			ticket, scheduleErr := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
-			admissionLap.finish()
-			if scheduleErr != nil {
-				failMutationPhases(publication)
-				pin.release()
-				return mutationReindexOutcome{Err: scheduleErr}
-			}
-			if ticket == nil {
-				failMutationPhases(publication)
-				// Admission declined to schedule anything, so nothing outlives
-				// this frame and the fall-through below reindexes inline.
-				pin.release()
-			}
-			if ticket != nil {
-				receipt := s.trackMutationTicket(ticket)
-				s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
-				receipt.pinView(pin)
-				// The disk write and ticket admission are complete. This wait
-				// must not announce another ordinary writer while the watcher
-				// publishes; actual queued writes still preempt chain folds.
-				resumeIntent := suspendSourceMutationWriteIntent(ctx)
-				defer resumeIntent()
-				// Only waiting from here on: let other requests use this
-				// dispatch slot. A publication that lands first needs none.
-				waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
-				defer cancel()
-				waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
-				if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
-					waitLap.finish()
-					return receipt.outcome(true)
-				}
-				select {
-				case <-receipt.done:
-					waitLap.finish()
-					outcome := receipt.outcome(false)
-					outcome.Receipt = ""
-					return outcome
-				case <-waitCtx.Done():
-					waitLap.finish()
-					return receipt.outcome(true)
-				}
-			}
+		if _, queued := state.mutation.(checkoutMutationScheduler); queued {
+			return sourceMutationAdmission{immediate: s.refreshCheckoutMutation(ctx, absPath, state)}
 		}
+		return sourceMutationAdmission{inlinePath: absPath, checkout: state}
 	}
-	if err := ctx.Err(); err != nil {
-		return mutationReindexOutcome{Err: err}
+	if scheduler, ok := s.currentWatcher().(mutationScheduler); ok {
+		pin := handoffRequestView(ctx, viewmetrics.HandoffFileMutation)
+		publication := s.committedPublicationRecord(ctx, absPath)
+		admissionLap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
+		ticket, err := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(context.WithoutCancel(ctx), publication), absPath)
+		admissionLap.finish()
+		if err != nil {
+			failMutationPhases(publication)
+			pin.release()
+			return sourceMutationAdmission{immediate: mutationReindexOutcome{Err: err}}
+		}
+		if ticket != nil {
+			receipt := s.trackMutationTicket(ticket)
+			s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
+			receipt.pinView(pin)
+			return sourceMutationAdmission{receipt: receipt}
+		}
+		failMutationPhases(publication)
+		pin.release()
 	}
-	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
+	return sourceMutationAdmission{inlinePath: absPath}
+}
+
+// awaitSourceMutations performs only the admitted publication wait for a live
+// watcher. Embedded adapters retain their synchronous refresh after unlocking.
+func (s *Server) awaitSourceMutations(ctx context.Context, admission sourceMutationAdmission) mutationReindexOutcome {
+	if admission.receipt == nil {
+		if admission.checkout != nil {
+			return s.refreshCheckoutMutation(ctx, admission.inlinePath, admission.checkout)
+		}
+		if admission.inlinePath == "" {
+			outcome := admission.immediate
+			if outcome.Err == nil && outcome.Receipt != "" {
+				outcome.Err = editGateCheckoutACKSeed(ctx, s)
+			}
+			return outcome
+		}
+		if err := ctx.Err(); err != nil {
+			return mutationReindexOutcome{Err: err}
+		}
+		retirement := s.canonicalProjectionRetirement(admission.inlinePath)
+		var reindexed bool
+		if admission.move != nil {
+			reindexed = admission.move.reindex(ctx, admission.inlinePath)
+		} else {
+			reindexed = s.reindexFile(admission.inlinePath)
+		}
+		if reindexed {
+			retirement.run()
+		}
+		return mutationReindexOutcome{Reindexed: reindexed}
+	}
+	receipt := admission.receipt
+	resumeIntent := suspendSourceMutationWriteIntent(ctx)
+	defer resumeIntent()
+	if admission.policy.freshness.requireFresh {
+		err := s.awaitSourceAckTier(ctx, admission.policy, []string{receipt.path}, receipt.done)
+		outcome := receipt.outcome(true)
+		if err != nil {
+			outcome.Err = err
+		}
+		return outcome
+	}
+	if admission.policy.local() {
+		outcome := receipt.outcome(true)
+		if err := editGateCheckoutACKSeed(ctx, s); err != nil {
+			outcome.Err = err
+		}
+		return outcome
+	}
+	waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+	if err := editGateACKSeed(ctx, s); err != nil {
+		waitLap.finish()
+		outcome := receipt.outcome(true)
+		outcome.Err = err
+		return outcome
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, s.mutationWaitDuration())
+	defer cancel()
+	if !s.releaseDispatchSlotForWait(waitCtx, receipt.done) {
+		waitLap.finish()
+		return receipt.outcome(true)
+	}
+	select {
+	case <-receipt.done:
+		waitLap.finish()
+		outcome := receipt.outcome(false)
+		outcome.Receipt = ""
+		return outcome
+	case <-waitCtx.Done():
+		waitLap.finish()
+		return receipt.outcome(true)
+	}
+}
+
+// Keep the combined entry for callers that have no source path lock. Source
+// handlers admit first and explicitly release their locks before awaiting.
+func (s *Server) mutationReindexState(ctx context.Context, absPath string) mutationReindexOutcome {
+	return s.awaitSourceMutations(ctx, s.admitSourceMutations(ctx, absPath))
 }
 
 // mutationCheckoutScope is metadata-only so receipts remain inspectable while
@@ -814,12 +907,16 @@ func (s *Server) mutationReceiptState(id string) (mutationReindexOutcome, bool) 
 // health is only authoritative after completed reindex; reading it while a
 // watcher patch is pending would surface stale parse errors and provoke an
 // unnecessary source re-read.
-func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
+func attachMutationFreshnessFields(resp map[string]any, outcome mutationReindexOutcome) {
+	for _, key := range []string{"reindex_pending", "reindex_error", "reindex_receipt", "reindex_generation", "applied_generation", "syntax_health", "derived_fanout"} {
+		delete(resp, key)
+	}
 	resp["reindexed"] = outcome.Reindexed
 	// graph_status is the freshness half of the mutation contract, named so it
 	// reads next to disk_status (mutation_commit.go) rather than having to be
 	// inferred from the reindexed / reindex_pending / reindex_error triple.
 	resp["graph_status"] = graphStatusFor(outcome)
+	attachMutationTierState(resp, outcome.tiers)
 	attachDerivedFanout(resp, outcome.DerivedFanout)
 	if outcome.Generation > 0 {
 		resp["reindex_generation"] = outcome.Generation
@@ -830,6 +927,10 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 	if outcome.Receipt != "" {
 		resp["reindex_receipt"] = outcome.Receipt
 	}
+}
+
+func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath string, outcome mutationReindexOutcome) {
+	attachMutationFreshnessFields(resp, outcome)
 	if outcome.Pending {
 		resp["reindex_pending"] = true
 		return
@@ -839,4 +940,38 @@ func (s *Server) attachMutationFreshness(resp map[string]any, relPath, absPath s
 			resp["syntax_health"] = health
 		}
 	}
+}
+
+// plannedSource retains the bytes used to calculate a multi-file rewrite.
+// Admission verifies the complete set before the first physical effect.
+type plannedSource struct {
+	path    string
+	before  []byte
+	existed bool
+}
+
+func lockPlannedSources(ctx context.Context, plans []plannedSource) (context.Context, func(), error) {
+	paths := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		paths = append(paths, plan.path)
+	}
+	ctx, release, err := acquireMutationPaths(ctx, paths)
+	if err != nil {
+		return ctx, nil, err
+	}
+	for _, plan := range plans {
+		current, readErr := os.ReadFile(plan.path)
+		if !plan.existed && errors.Is(readErr, os.ErrNotExist) {
+			continue
+		}
+		if readErr != nil || !plan.existed || !bytes.Equal(current, plan.before) {
+			release()
+			return ctx, nil, fmt.Errorf("%w: planned source changed before admission: %s", errMutationNotApplied, plan.path)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return ctx, nil, err
+	}
+	return ctx, release, nil
 }

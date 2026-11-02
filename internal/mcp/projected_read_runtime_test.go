@@ -2,11 +2,15 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -126,4 +130,141 @@ func TestPinnedEditorFileNeedsNoDiskProjection(t *testing.T) {
 	require.Same(t, pinned, OverlayViewFromContext(ctx))
 	require.Empty(t, requestProjectionLayers(ctx))
 	require.Same(t, bufferNode, srv.readerFor(ctx).GetNode(bufferNode.ID))
+}
+
+func TestProjectedFileFactsDoNotClaimRelationsPublished(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	done := make(chan indexer.MutationResult, 1)
+	t.Cleanup(func() { close(done) })
+	srv.SetWatcher(mutationTestWatcher{done: done})
+	srv.mutationReindexWait = time.Nanosecond
+	ack := extractTextResult(t, callTool(t, srv, "edit_file", map[string]any{
+		"path": filepath.Join(dir, "main.go"), "old_string": "func helper() {}", "new_string": "func helper() {}\nfunc AddedForFacts() {}", "format": "json",
+	}))
+	require.Equal(t, true, ack["reindex_pending"])
+	parent := srv.captureToolFreshness(t.Context())
+	ctx, err := srv.ensureProjected(parent, []string{"main.go"})
+	require.NoError(t, err)
+	require.NotNil(t, srv.readerFor(ctx).GetNode("main.go::AddedForFacts"))
+	require.Equal(t, "pending", srv.freshnessFor(parent, "relations", nil, []string{"main.go"}).state, "file projection does not publish cross-file relations")
+	file := srv.freshnessFor(parent, "file", nil, []string{"main.go"})
+	require.Empty(t, file.state, "current projected bytes satisfy only the file tier")
+	fields := make(map[string]any)
+	file.apply(fields)
+	require.Equal(t, "projected", fields["file_view"])
+	require.Equal(t, true, fields["readback_exact"])
+}
+
+func TestProjectedReadRendersExactFileFacts(t *testing.T) {
+	srv, dir := setupTestServer(t)
+	srv.SetWatcher(mutationTestWatcher{})
+	path := filepath.Join(dir, "main.go")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc AddedForFacts() {}\n")...), 0o644))
+	result := projectedSourceThroughMiddleware(t, srv, map[string]any{"id": "main.go::AddedForFacts", "format": "json", "context_lines": float64(0)})
+	require.False(t, result.IsError)
+	payload := extractTextResult(t, result)
+	facts, ok := payload["freshness"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "projected", facts["file_view"])
+	require.Equal(t, true, facts["readback_exact"])
+	require.NotContains(t, facts, "stale", "the old stat-only rider must not contradict a current projected file answer")
+}
+
+func TestProjectedFileFactsUseExistingRendererInEveryMode(t *testing.T) {
+	for _, format := range []string{"json", "gcx", "toon"} {
+		for _, compact := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/compact_%t", format, compact), func(t *testing.T) {
+				srv, dir := setupTestServer(t)
+				srv.SetWatcher(mutationTestWatcher{})
+				path := filepath.Join(dir, "main.go")
+				before, err := os.ReadFile(path)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc AddedForFacts() {}\n")...), 0o644))
+				result := projectedSourceThroughMiddleware(t, srv, map[string]any{"id": "main.go::AddedForFacts", "format": format, "compact": compact, "context_lines": float64(0)})
+				require.False(t, result.IsError, "%v", result.Content)
+				text := resultText(result)
+				var payload map[string]any
+				if json.Unmarshal([]byte(text), &payload) == nil && payload != nil {
+					facts, ok := payload["freshness"].(map[string]any)
+					require.True(t, ok)
+					require.Equal(t, "projected", facts["file_view"])
+					require.Equal(t, true, facts["readback_exact"])
+				} else {
+					require.Contains(t, text, "file: projected (readback exact)")
+					require.Equal(t, 1, strings.Count(text, "file: projected (readback exact)"))
+				}
+				require.Nil(t, srv.graph.GetNode("main.go::AddedForFacts"))
+			})
+		}
+	}
+}
+
+func TestUnchangedFileReadAddsNoProjectionFacts(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	result := projectedSourceThroughMiddleware(t, srv, map[string]any{"id": "main.go::helper", "format": "json", "context_lines": float64(0)})
+	require.False(t, result.IsError)
+	require.NotContains(t, extractTextResult(t, result), "freshness", "unchanged indexed answers retain the existing bytes")
+}
+
+func projectedSourceThroughMiddleware(t *testing.T, s *Server, arguments map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	req := editFileRequest(arguments)
+	req.Params.Name = "get_symbol_source"
+	result, err := s.wrapToolHandler(s.handleGetSymbolSource)(t.Context(), req)
+	require.NoError(t, err)
+	return result
+}
+
+// A file projection contains local edges, but it does not resolve the changed
+// file's cross-file relations. This remains true for an external write with no
+// watcher or mutation receipt supplying an independent pending label.
+func TestProjectedRelationRichAnswersKeepRelationsPending(t *testing.T) {
+	for _, tool := range []string{"get_symbol", "get_file_summary", "get_editing_context"} {
+		t.Run(tool, func(t *testing.T) {
+			srv, dir := setupTestServer(t)
+			path := filepath.Join(dir, "main.go")
+			before, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc AddedRelation() { helper() }\n")...), 0o644))
+			req := editFileRequest(map[string]any{"id": "main.go::AddedRelation", "path": "main.go", "detail": "full", "format": "json"})
+			req.Params.Name = tool
+			handlers := map[string]func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error){
+				"get_symbol": srv.handleGetSymbol, "get_file_summary": srv.handleGetFileSummary, "get_editing_context": srv.handleGetEditingContext,
+			}
+			result, err := srv.wrapToolHandler(handlers[tool])(t.Context(), req)
+			require.NoError(t, err)
+			require.False(t, result.IsError, "%v", result.Content)
+			facts, ok := extractTextResult(t, result)["freshness"].(map[string]any)
+			require.True(t, ok, "exact file facts and unresolved relation scope must use the same rider")
+			require.Equal(t, "relations", facts["freshness_scope"])
+			require.Equal(t, "pending", facts["graph_freshness"])
+			require.Equal(t, "projected", facts["file_view"])
+			require.Equal(t, true, facts["readback_exact"])
+			require.Nil(t, srv.graph.GetNode("main.go::AddedRelation"), "read must leave the shared graph unchanged")
+		})
+	}
+}
+
+func TestExternalProjectionSatisfiesOnlyExplicitFileTier(t *testing.T) {
+	s, root := setupTestServer(t)
+	path := filepath.Join(root, "main.go")
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(before, []byte("\nfunc AddedForTiers() {}\n")...), 0o644))
+	parent := withRequestProjectionFacts(t.Context())
+	_, err = s.ensureProjected(parent, []string{"main.go"})
+	require.NoError(t, err)
+	for _, scope := range []string{"file", "relations", "derived"} {
+		facts := s.freshnessFor(parent, scope, nil, []string{"main.go"})
+		require.True(t, facts.projected)
+		if scope == "file" {
+			require.Empty(t, facts.state, "explicit file scope may describe exact local bytes")
+		} else {
+			require.Equal(t, "pending", facts.state, "a file projection cannot certify %s publication", scope)
+			require.Equal(t, []string{"main.go"}, facts.files)
+		}
+	}
+	require.Nil(t, s.graph.GetNode("main.go::AddedForTiers"))
 }

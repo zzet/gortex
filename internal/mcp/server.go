@@ -131,6 +131,8 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
+	editAckMode      config.EditAckMode
+	editAckConfigErr error
 	// editOperations covers actual source-edit handler completions across this
 	// Server's sessions/views, including handlers that outlive their caller.
 	// Native filesystem stimuli remain harness-owned, not inferred from events.
@@ -374,12 +376,10 @@ type Server struct {
 	equivalence      *search.EquivalenceTable
 	contractRegistry *contracts.Registry
 	semanticMgr      *semantic.Manager
-	// refsConfirmed is the lazy-enrichment ledger: symbol IDs whose incoming
-	// references have been confirmed on demand (via ConfirmSymbolRefs) this
-	// daemon session, so a repeat usages query serves from the confirmed graph
-	// instead of re-spawning the language server. An entry is recorded after
-	// the first attempt (success or empty) to bound per-query LSP work.
-	refsConfirmed sync.Map // symbolID → struct{}
+	// refsConfirmed bounds on-demand incoming-reference work per symbol. Entries
+	// hold an active claim, a retry deadline, or an accepted positive result for
+	// this analysis epoch. Failed/empty attempts never permanently suppress retry.
+	refsConfirmed sync.Map // symbolID → *referenceConfirmation
 	feedback      *feedbackManager
 	notes         *notesManager
 	memories      *memoryManager
@@ -1489,6 +1489,8 @@ func prependUnique(slice []string, item string, maxLen int) []string {
 // MultiRepoOptions holds optional multi-repo components for the Server.
 // When nil or zero-valued, the server operates in single-repo mode.
 type MultiRepoOptions struct {
+	// EditAckMode is startup policy; empty inherits global config, then full.
+	EditAckMode   config.EditAckMode
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
 	// CheckoutLifecycle owns every side effect of tracking and forgetting a
@@ -1953,6 +1955,17 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	if watcher != nil {
 		s.watcher = watcher
 	}
+
+	ackConfig := config.EditConfig{}
+	if len(opts) > 0 {
+		if opts[0].ConfigManager != nil {
+			ackConfig = opts[0].ConfigManager.Global().Edit
+		}
+		if opts[0].EditAckMode != "" {
+			ackConfig.Ack = opts[0].EditAckMode
+		}
+	}
+	s.editAckMode, s.editAckConfigErr = ackConfig.AckMode()
 
 	// Apply multi-repo options if provided.
 	if len(opts) > 0 {
@@ -3228,22 +3241,16 @@ func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
 	go runScheduledMCPMemoryRelease(logger, reason)
 }
 
-// resetConfirmedRefs clears the lazy-enrichment ledger (see the
-// refsConfirmed field). sync.Map has no clear-all, so this ranges and
-// deletes; it is safe against concurrent confirmSymbolRefsOnDemand
-// readers because a racing miss just re-confirms the symbol, which is
-// idempotent — it re-lands the same lsp_resolved edges.
+// resetConfirmedRefs starts a new reference-confirmation epoch. Finishers use
+// pointer CAS, so an attempt admitted before Clear cannot revive its old entry.
 func (s *Server) resetConfirmedRefs() {
-	s.refsConfirmed.Range(func(k, _ any) bool {
-		s.refsConfirmed.Delete(k)
-		return true
-	})
+	s.refsConfirmed.Clear()
 }
 
 // resetTestIndexProbe clears the per-repo-prefix test-symbol probe (see the
-// testIndexProbe field) so the next review re-scans the rebuilt graph. Like
-// resetConfirmedRefs it ranges-and-deletes because sync.Map has no clear-all,
-// and it is safe against a concurrent testLangsIndexed reader: a racing miss
+// testIndexProbe field) so the next review re-scans the rebuilt graph.
+// Ranging and deleting is safe against a concurrent testLangsIndexed reader:
+// a racing miss
 // just re-scans, which is idempotent.
 func (s *Server) resetTestIndexProbe() {
 	s.testIndexProbe.Range(func(k, _ any) bool {

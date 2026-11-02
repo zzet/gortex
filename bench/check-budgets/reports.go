@@ -61,6 +61,7 @@ type attempt struct {
 }
 
 type phase struct {
+	EditProbe    json.RawMessage            `json:"edit_probe,omitempty"`
 	SessionModel string                     `json:"session_model"`
 	Name         string                     `json:"name"`
 	Duration     float64                    `json:"duration_seconds"`
@@ -110,7 +111,9 @@ type dataset struct {
 	runs   []observation
 }
 
-func loadInputs(path string) (dataset, error) {
+func loadInputs(path string) (dataset, error) { return loadInputsChecked(path, validateReport) }
+
+func loadInputsChecked(path string, validate func(inputs, runInput, report) error) (dataset, error) {
 	var out dataset
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -166,7 +169,7 @@ func loadInputs(path string) (dataset, error) {
 		if err != nil {
 			return out, fmt.Errorf("%s: %w", cell, err)
 		}
-		if err := validateReport(c, input, r); err != nil {
+		if err := validate(c, input, r); err != nil {
 			return out, fmt.Errorf("%s: %w", cell, err)
 		}
 		if ids[r.RunID] {

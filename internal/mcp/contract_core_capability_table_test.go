@@ -118,6 +118,9 @@ type (
 	capBFSContext interface {
 		BFSContext(context.Context, []string, graph.Direction, []graph.EdgeKind, int, int) ([]graph.BFSHop, error)
 	}
+	capLastFirstIndexDrains interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}
 	capRepoPrefixes interface{ RepoPrefixes() []string }
 )
 
@@ -172,6 +175,8 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"FileEditingContext", capOf[graph.FileEditingContext], capFiltered, "the store reads raw imports and calls"},
 
 		// Deliberate drops.
+		{"FileEditingContextRows", capOf[graph.FileEditingContextRows], capWrapper, "raw adjacency; the contextual helper recomputes through filtered rows"},
+		{"FileEditingContextReadScope", capOf[graph.FileEditingContextReadScope], capDropped, "raw scoped rows; resolved only by the filtered editing-context helper"},
 		{"FilteredBFSAdmissionReader", capOf[graph.FilteredBFSAdmissionReader], capDropped, "private scoped admission adapter supplies exact wrapper exclusions"},
 		{"FilteredCallAncestorReader", capOf[graph.FilteredCallAncestorReader], capDropped, "private candidate coverage adapter supplies this wrapper's exact exclusions"},
 		{"BFSCapable", capOf[graph.BFSCapable], capWrapper, "canonical hops recomputed over selected filtered adjacency; engine admission remains the Go contract"},
@@ -218,6 +223,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"NodeLightSequencer", capOf[graph.NodeLightSequencer], capDropped, "node-only streaming; graph.NodesLightSeq falls back to the AllNodesLight forwarder, the same rows materialised"},
 		{"Store", capOf[graph.Store], capDropped, "the whole backend contract; a request reader is never the store"},
 		{"local:WALReclaimStats", capOf[walReclaimSnapshotReader], capDropped, capReasonBackend + " (physical store counters, never selected graph state)"},
+		{"local:LastFirstIndexDrains", capOf[capLastFirstIndexDrains], capDropped, capReasonBackend + " (shared-store drain observations, never selected graph state)"},
 		{"local:WALPassiveStats", capOf[walPassiveSnapshotReader], capDropped, capReasonBackend + " (physical checkpoint counters, never selected graph state)"},
 		{"AnalysisGenerationStore", capOf[graph.AnalysisGenerationStore], capDropped, capReasonBackend},
 		{"AnalysisQueryStore", capOf[graph.AnalysisQueryStore], capDropped, capReasonBackend},
@@ -229,6 +235,8 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"ContractStateStore", capOf[graph.ContractStateStore], capDropped, capReasonBackend},
 		{"FileMetaReader", capOf[graph.FileMetaReader], capDropped, capReasonBackend},
 		{"FileMetaPathReader", capOf[graph.FileMetaPathReader], capDropped, "projection retirement reads durable content evidence on the backend, never a request reader"},
+		{"local:FileMetasByPaths+GetFileNodes", capOf[projectionStore], capDropped, capReasonBackend},
+		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader], capDropped, "selected retirement reads checked metadata through the same leased handoff; never forwarded through contract-core request readers"},
 		{"RepoIndexStateReader", capOf[graph.RepoIndexStateReader], capDropped, capReasonBackend},
 		{"StructuralIntegrityAuditor", capOf[graph.StructuralIntegrityAuditor], capDropped, capReasonBackend},
 		{"StructuralIntegritySnapshotter", capOf[graph.StructuralIntegritySnapshotter], capDropped, capReasonBackend},
@@ -271,7 +279,6 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"CloneShingleWriter", capOf[graph.CloneShingleWriter]},
 		{"ConfigNodeBatchEvicter", capOf[graph.ConfigNodeBatchEvicter]},
 		{"ConstantValueContextReader", capOf[graph.ConstantValueContextReader]},
-		{"ConstantValueProjectionReader", capOf[graph.ConstantValueProjectionReader]},
 		{"ConstantValueReader", capOf[graph.ConstantValueReader]},
 		{"ConstantValueRepoReplacer", capOf[graph.ConstantValueRepoReplacer]},
 		{"ConstantValueWriter", capOf[graph.ConstantValueWriter]},
@@ -416,6 +423,7 @@ func contractCoreNonStoreInterfaces() []contractCoreCapName {
 		{"ConstantValueReadStatus", capOf[graph.ConstantValueReadStatus]},
 		{"ContractOwnerScalarInvalidator", capOf[graph.ContractOwnerScalarInvalidator]},
 		{"EdgeEndpointProvider", capOf[graph.EdgeEndpointProvider]},
+		{"FileEditingContextLayerScope", capOf[graph.FileEditingContextLayerScope]},
 		{"FileIndexFailureLayerReader", capOf[graph.FileIndexFailureLayerReader]},
 		{"FileNodeReadCounter", capOf[graph.FileNodeReadCounter]},
 		{"GenerationLayerIdentity", capOf[graph.GenerationLayerIdentity]},

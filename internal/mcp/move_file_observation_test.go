@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
@@ -131,8 +132,8 @@ func moveObservationExecutionFixture(t *testing.T) (*Server, *moveObservation, c
 	t.Cleanup(ack.finishActual)
 	observation := s.beginMoveObservation(ctx, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
 	require.NotNil(t, observation)
-	require.NoError(t, observation.write(ack, target, []byte("package main\nfunc Moved() {}\n")))
-	require.NoError(t, observation.write(ack, source, []byte("package main\nfunc After() { Existing() }\n")))
+	require.NoError(t, writeObservedMoveForTest(t, observation, ack, target, []byte("package main\nfunc Moved() {}\n")))
+	require.NoError(t, writeObservedMoveForTest(t, observation, ack, source, []byte("package main\nfunc After() { Existing() }\n")))
 	observation.finishWrites(true)
 	return s, observation, ctx, ack, source, target
 }
@@ -159,38 +160,52 @@ func captureMoveActualExecution(t *testing.T, s *Server, path string, observer *
 	}
 }
 
-func TestMoveDirectRefusesOlderAdmissionWhichActuallyCommitsLaterSameBytes(t *testing.T) {
+func TestMoveWaitsForOlderHeldPhysicalWrite(t *testing.T) {
 	s, _ := setupContractMultiRepoServer(t, "fixture")
 	t.Cleanup(func() { s.DrainBackground(); require.NoError(t, s.multiIndexer.Close(context.Background())) })
 	root, ok := s.multiIndexer.RepoRoot("fixture")
 	require.True(t, ok)
 	source, target := filepath.Join(root, "source.go"), filepath.Join(root, "target.go")
 	bytes := []byte("package main\nfunc After() { Existing() }\n")
-	require.NoError(t, os.WriteFile(source, []byte("package main\nfunc Before() {}\n"), 0600))
-	require.NoError(t, os.WriteFile(target, []byte("package main\nfunc OldTarget() {}\n"), 0600))
+	require.NoError(t, os.WriteFile(source, []byte("package main\nfunc Before() {}\n"), 0o600))
+	require.NoError(t, os.WriteFile(target, []byte("package main\nfunc OldTarget() {}\n"), 0o600))
 	_, err := s.multiIndexer.IncrementalReindexRepo("fixture", []string{source, target})
 	require.NoError(t, err)
 	entered, release := make(chan *mutationCommitRecord, 1), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
-	s.mutationPreCommitHook = func(record *mutationCommitRecord) { entered <- record; <-release }
+	s.mutationPreCommitHook = func(record *mutationCommitRecord) {
+		if record.key == "older-admission" {
+			entered <- record
+			<-release
+		}
+	}
 	type result struct {
 		record *mutationCommitRecord
 		err    error
 	}
 	done := make(chan result, 1)
-	joined := false
 	go func() {
-		record, err := s.commitFileMutation(t.Context(), "edit_file", "older-admission", "same-bytes", "fixture/source.go", source, bytes, 0600)
+		record, err := s.commitHeldFileMutationForTest(t, t.Context(), "edit_file", "older-admission", "same-bytes", "fixture/source.go", source, bytes, 0o600)
 		done <- result{record, err}
 	}()
+	joined := false
+	var moveDone chan error
+	moveJoined := false
 	t.Cleanup(func() {
 		unblock()
 		if !joined {
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
-				t.Error("competing real writer was not joined")
+				t.Error("older writer did not join")
+			}
+		}
+		if moveDone != nil && !moveJoined {
+			select {
+			case <-moveDone:
+			case <-time.After(5 * time.Second):
+				t.Error("move writer did not join")
 			}
 		}
 	})
@@ -198,36 +213,66 @@ func TestMoveDirectRefusesOlderAdmissionWhichActuallyCommitsLaterSameBytes(t *te
 	select {
 	case older = <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("older writer not admitted")
+		t.Fatal("older writer was not admitted")
 	}
 	ctx, ack, _ := s.withEditAcknowledgement(t.Context())
 	defer ack.finishActual()
 	observation := s.beginMoveObservation(ctx, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
-	require.NoError(t, observation.write(ack, target, []byte("package main\nfunc Moved() {}\n")))
-	require.NoError(t, observation.write(ack, source, bytes))
+	require.NoError(t, writeObservedMoveForTest(t, observation, ack, target, []byte("package main\nfunc Moved() {}\n")))
+	moveDone = make(chan error, 1)
+	attempted := make(chan struct{})
+	go func() { close(attempted); moveDone <- writeObservedMoveForTest(t, observation, ack, source, bytes) }()
+	<-attempted
+	select {
+	case err := <-moveDone:
+		moveJoined = true
+		t.Fatalf("move overtook a held source writer: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	unblock()
+	finished := <-done
+	joined = true
+	require.NoError(t, finished.err)
+	require.Same(t, older, finished.record)
+	require.NoError(t, <-moveDone)
+	moveJoined = true
 	observation.finishWrites(true)
+	record := observation.records[source]
+	require.Greater(t, record.commitSeq, older.commitSeq, "the later source write must follow actual lock release")
 	idx := s.multiIndexer.GetIndexer("fixture")
 	observer := observation.observer(ctx, source, idx)
 	require.NotNil(t, observer)
-	unblock()
-	var finished result
-	select {
-	case finished = <-done:
-		joined = true
-	case <-time.After(5 * time.Second):
-		t.Fatal("older actual writer did not return")
-	}
-	require.NoError(t, finished.err)
-	require.Same(t, older, finished.record)
-	record := observation.records[source]
-	require.Greater(t, older.commitSeq, record.commitSeq, "guard must exercise actual commit order opposite admission order")
 	actual := captureMoveActualExecution(t, s, source, observer)
-	require.True(t, actual.AcceptedFor(idx, gitBlobSHA(bytes)), "wrong-stage rejection would not test competing commit fence")
+	require.True(t, actual.AcceptedFor(idx, gitBlobSHA(bytes)))
+	status, _ := s.moveFileObservationPayload(t.Context(), record.id)
+	require.Equal(t, "observed", status["direct_reconcile_state"])
+}
+
+func TestMoveDirectRejectsModeledLegacyReorderedCommit(t *testing.T) {
+	s, move, ctx, _, source, _ := moveObservationExecutionFixture(t)
+	record := move.records[source]
+	idx := s.multiIndexer.GetIndexer("fixture")
+	observer := move.observer(ctx, source, idx)
+	require.NotNil(t, observer)
+	// The old unguarded admission/commit inversion is now unreachable through
+	// source writers. Model only its ledger evidence to retain the defensive
+	// compatibility fence; this is not an actual-write/performance claim.
+	older := s.beginMutationCommit(t.Context(), "edit_file", "modeled-legacy", "same-bytes", "fixture/source.go", source)
+	older.mu.Lock()
+	older.startedAt = record.startedAt.Add(-time.Nanosecond)
+	older.mu.Unlock()
+	s.mutationCommits.mu.Lock()
+	ordered := s.mutationCommits.ordered
+	copy(ordered[1:], ordered[:len(ordered)-1])
+	ordered[0] = older
+	s.mutationCommits.mu.Unlock()
+	older.markCommitted(record.newSHA, record.bytesWritten)
+	require.Greater(t, older.commitSeq, record.commitSeq)
+	actual := captureMoveActualExecution(t, s, source, observer)
+	require.True(t, actual.AcceptedFor(idx, record.newSHA))
 	status, _ := s.moveFileObservationPayload(t.Context(), record.id)
 	require.Equal(t, "unavailable_competing_commit", status["direct_reconcile_state"])
 	require.NotContains(t, status, "direct_reconcile")
-	// A repeated callback must not revise the first final refusal even when
-	// competing evidence has since changed from committed to in-flight.
 	older.mu.Lock()
 	older.disk = mutationDiskInFlight
 	older.diskWriteStartedAt = actual.AcceptedAt()
@@ -235,7 +280,6 @@ func TestMoveDirectRefusesOlderAdmissionWhichActuallyCommitsLaterSameBytes(t *te
 	observer.Complete(actual)
 	repeated, _ := s.moveFileObservationPayload(t.Context(), record.id)
 	require.Equal(t, "unavailable_competing_commit", repeated["direct_reconcile_state"])
-	require.NotContains(t, repeated, "direct_reconcile")
 }
 
 func TestMoveDirectRejectsActualEarlyAcceptanceForeignOwnerBytesAndEviction(t *testing.T) {
@@ -251,15 +295,15 @@ func TestMoveDirectRejectsActualEarlyAcceptanceForeignOwnerBytesAndEviction(t *t
 			require.NotNil(t, observer)
 			record := observation.records[source]
 			if kind == "foreign_bytes" {
-				require.NoError(t, writeMoveFileObserved(nil, source, []byte("package main\nfunc OtherBytes() { Existing() }\n")))
+				require.NoError(t, writeMoveFileForTest(t, s, nil, source, []byte("package main\nfunc OtherBytes() { Existing() }\n")))
 			}
 			actual := captureMoveActualExecution(t, s, source, nil)
 			if kind == "early_acceptance" {
 				ctx2, ack2, _ := s.withEditAcknowledgement(t.Context())
 				defer ack2.finishActual()
 				second := s.beginMoveObservation(ctx2, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
-				require.NoError(t, second.write(ack2, target, []byte("package main\nfunc Moved() {}\n")))
-				require.NoError(t, second.write(ack2, source, []byte("package main\nfunc After() { Existing() }\n")))
+				require.NoError(t, writeObservedMoveForTest(t, second, ack2, target, []byte("package main\nfunc Moved() {}\n")))
+				require.NoError(t, writeObservedMoveForTest(t, second, ack2, source, []byte("package main\nfunc After() { Existing() }\n")))
 				second.finishWrites(true)
 				observation, record = second, second.records[source]
 				observer = second.observer(ctx2, source, idx)
@@ -295,10 +339,10 @@ func TestMoveFileWriteWindowsPartialFailureAndUnobservedIsolation(t *testing.T) 
 	s, _, ctx, ack, source, target := moveObservationExecutionFixture(t)
 	observation := s.beginMoveObservation(ctx, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
 	targetBytes := []byte("package main\nfunc ActuallyWritten() {}\n")
-	require.NoError(t, observation.write(ack, target, targetBytes))
+	require.NoError(t, writeObservedMoveForTest(t, observation, ack, target, targetBytes))
 	require.NoError(t, os.Remove(source))
 	require.NoError(t, os.Mkdir(source, 0700))
-	require.Error(t, observation.write(ack, source, []byte("package main\nfunc CannotReplaceDirectory() {}\n")))
+	require.Error(t, writeObservedMoveForTest(t, observation, ack, source, []byte("package main\nfunc CannotReplaceDirectory() {}\n")))
 	observation.finishWrites(false)
 	targetStatus, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
 	sourceStatus, _ := s.moveFileObservationPayload(t.Context(), observation.records[source].id)
@@ -338,14 +382,12 @@ func TestMoveOriginalDirectAdmissionCannotBeReissued(t *testing.T) {
 	require.Equal(t, before["direct_reconcile"], after["direct_reconcile"], "completed original owner changed after re-admission attempt")
 }
 
-// The source and target are written before either direct reconciliation.
-// An independent public reader may therefore publish the target first. The
-// later direct no-op cannot donate a new acceptance window to that write.
-func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
+// A projected read serves current bytes without borrowing publication credit.
+func TestMovePublicReadProjectsBeforeDirectAdmission(t *testing.T) {
 	s, observation, ctx, _, _, target := moveObservationExecutionFixture(t)
 	idx := s.multiIndexer.GetIndexer("fixture")
 	const movedID = "fixture/target.go::Moved"
-	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID), "fixture must require an actual target publication")
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID))
 	root, ok := s.multiIndexer.RepoRoot("fixture")
 	require.True(t, ok)
 	readerCtx := WithSessionCWD(WithSessionID(ctx, "move-independent-reader"), root)
@@ -355,16 +397,16 @@ func TestMovePublicReadPublishesTargetBeforeDirectAdmission(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.IsError)
 	require.Contains(t, unmarshalResult(t, result)["source"], "func Moved()")
-	require.NotNil(t, s.engineFor(t.Context()).GetSymbol(movedID), "actual public read did not apply the target")
-	// Keep real executor proof: unchanged direct work cannot be relabeled as
-	// applied acceptance, regardless of how the earlier reader is retained.
-	later := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
-	require.False(t, later.AcceptedFor(idx, observation.records[target].newSHA), "fixture must exercise the later no-op, not another actual apply")
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol(movedID), "read must not publish target into shared base")
+	before, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
+	require.Equal(t, "not_applicable_projected_reads", before["read_assisted_reconcile_state"])
+	require.NotContains(t, before, "read_assisted_reconcile", "projection is not a numeric publication window")
+	actual := captureMoveActualExecution(t, s, target, observation.observer(ctx, target, idx))
+	require.True(t, actual.AcceptedFor(idx, observation.records[target].newSHA), "only the later direct execution publishes target")
 	status, _ := s.moveFileObservationPayload(t.Context(), observation.records[target].id)
-	require.Equal(t, "observed", status["read_assisted_reconcile_state"], "the actual earlier public publisher must retain its own independent window")
-	require.Contains(t, status, "read_assisted_reconcile")
-	require.NotEqual(t, "observed", status["direct_reconcile_state"], "read-assisted publication must not relabel the later direct no-op")
-	require.NotContains(t, status, "direct_reconcile")
+	require.Equal(t, "observed", status["direct_reconcile_state"])
+	require.Equal(t, "not_applicable_projected_reads", status["read_assisted_reconcile_state"])
+	require.NotContains(t, status, "read_assisted_reconcile")
 }
 
 func TestMoveFileWriteTimingPreservesEqualClockReadings(t *testing.T) {
@@ -386,7 +428,7 @@ func TestMoveFileWriteTimingPreservesEqualClockReadings(t *testing.T) {
 			source, target := filepath.Join(root, "source.go"), filepath.Join(root, "target.go")
 			observation := s.beginMoveObservation(ctx, "fixture/source.go::Before", "fixture/target.go::Before", source, target, "fixture/source.go", "fixture/target.go", true)
 			require.NotNil(t, observation)
-			require.NoError(t, observation.write(ack, target, []byte("package main\n")))
+			require.NoError(t, writeObservedMoveForTest(t, observation, ack, target, []byte("package main\n")))
 			record := observation.records[target]
 			// Model clock resolution at the report boundary after a real write.
 			// No producer value is rounded up or replaced by a timing sleep.
@@ -408,6 +450,74 @@ func TestMoveFileWriteTimingPreservesEqualClockReadings(t *testing.T) {
 			} else {
 				require.NotContains(t, timing, "window_ns")
 				require.NotContains(t, timing, "returned_ns")
+			}
+		})
+	}
+}
+
+// Fixture writes acquire real admission too; production callers retain their
+// complete CAS set instead of reacquiring a path around individual effects.
+func writeObservedMoveForTest(t *testing.T, observation *moveObservation, ack *editAcknowledgement, path string, content []byte) error {
+	t.Helper()
+	ctx := context.WithValue(t.Context(), editAcknowledgementKey{}, ack)
+	ctx, release, err := acquireMutationPath(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, err = observation.write(ctx, observation.server, path, content)
+	return err
+}
+
+func writeMoveFileForTest(t *testing.T, s *Server, ack *editAcknowledgement, path string, content []byte) error {
+	t.Helper()
+	ctx := context.WithValue(t.Context(), editAcknowledgementKey{}, ack)
+	ctx, release, err := acquireMutationPath(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, err = s.writeMoveFile(ctx, "move_symbol", path, content)
+	return err
+}
+
+func TestMoveTimingRequiresItsExactRetainedPhysicalEvent(t *testing.T) {
+	for _, kind := range []string{"owned", "different_ack", "foreign_server", "expired_physical", "reset_link", "wrong_path"} {
+		t.Run(kind, func(t *testing.T) {
+			s, move, ctx, _, _, target := moveObservationExecutionFixture(t)
+			timing := move.records[target]
+			physical := timing.moveFile.physical.Value()
+			require.NotNil(t, physical)
+			s.mutationCommits.mu.Lock()
+			timing.mu.Lock()
+			physical.mu.Lock()
+			switch kind {
+			case "different_ack":
+				physical.acknowledgement = &editAcknowledgement{}
+			case "foreign_server":
+				physical.owner = &Server{}
+			case "expired_physical":
+				delete(s.mutationCommits.byID, physical.id)
+			case "reset_link":
+				timing.moveFile.physical = weak.Pointer[mutationCommitRecord]{}
+			case "wrong_path":
+				physical.absPath = target + ".foreign"
+			}
+			physical.mu.Unlock()
+			timing.mu.Unlock()
+			s.mutationCommits.mu.Unlock()
+			idx := s.multiIndexer.GetIndexer("fixture")
+			direct := move.observer(ctx, target, idx)
+			read, _ := s.moveReadRepairObserver(ctx, target, idx)
+			if kind == "owned" {
+				require.NotNil(t, direct)
+				require.NotNil(t, read)
+				require.Equal(t, physical.commitSeq, timing.commitSeq)
+				require.Equal(t, physical.diskWriteStartedAt, timing.diskWriteStartedAt)
+				require.Equal(t, physical.committedAt, timing.committedAt)
+			} else {
+				require.Nil(t, direct)
+				require.Nil(t, read)
 			}
 		})
 	}

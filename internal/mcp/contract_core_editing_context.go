@@ -1,6 +1,11 @@
 package mcp
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"context"
+	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // contractCoreEditingContext serves the get_editing_context fast path through
 // a contract-core wrapper. The selected reader's own FileEditingContext reads
@@ -26,4 +31,88 @@ func fileEditingContextFor(reader graph.Reader) (graph.FileEditingContext, bool)
 	}
 	fc, ok := reader.(graph.FileEditingContext)
 	return fc, ok
+}
+
+// fileEditingContextContext performs the entire bundle inside the selected
+// reader's checked scope. A refused or canceled scope never falls through to
+// errorless per-symbol reads. The RepoView lease remains owned by the request.
+func fileEditingContextContext(ctx context.Context, reader graph.Reader, path string, kinds []graph.NodeKind) (*graph.FileEditingContextResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	selected := reader
+	var core *contractCoreEdges
+	if wrapped, ok := reader.(contractCoreWrapped); ok {
+		core = wrapped.contractCore()
+		selected = core.Reader
+	}
+	var result *graph.FileEditingContextResult
+	err := graph.WithFileEditingContextReader(ctx, selected, func(_ context.Context, rows graph.FileEditingContextRows) error {
+		if core != nil {
+			rows = &editingContextCoreRows{FileEditingContextRows: rows, core: core}
+		}
+		result = graph.FileEditingContextOf(rows, path, kinds)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+type editingContextCoreRows struct {
+	graph.FileEditingContextRows
+	core *contractCoreEdges
+}
+
+func (r *editingContextCoreRows) filter(rows []*graph.Edge) []*graph.Edge {
+	var ids []string
+	for _, edge := range rows {
+		if r.core.visible(edge) {
+			ids = append(ids, edge.From, edge.To)
+		}
+	}
+	var nodes map[string]*graph.Node
+	if r.core.contractIDs == nil {
+		nodes = r.GetNodesByIDs(ids)
+	}
+	owned := func(id string) bool {
+		n := nodes[id]
+		return n != nil && (n.Kind == graph.KindContract || n.Kind == graph.KindContractBridge || n.Kind == graph.KindConfigKey)
+	}
+	var out []*graph.Edge
+	for _, edge := range rows {
+		if r.core.visible(edge) && !owned(edge.From) && !owned(edge.To) {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+func (r *editingContextCoreRows) GetOutEdges(id string) []*graph.Edge {
+	return r.filter(r.FileEditingContextRows.GetOutEdges(id))
+}
+func (r *editingContextCoreRows) filterBatch(rows map[string][]*graph.Edge) map[string][]*graph.Edge {
+	var all []*graph.Edge
+	for _, edges := range rows {
+		all = append(all, edges...)
+	}
+	visible := make(map[*graph.Edge]bool)
+	for _, edge := range r.filter(all) {
+		visible[edge] = true
+	}
+	out := make(map[string][]*graph.Edge, len(rows))
+	for id, edges := range rows {
+		for _, edge := range edges {
+			if visible[edge] {
+				out[id] = append(out[id], edge)
+			}
+		}
+	}
+	return out
+}
+
+func (r *editingContextCoreRows) GetOutEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	return r.filterBatch(r.FileEditingContextRows.GetOutEdgesByNodeIDs(ids))
+}
+func (r *editingContextCoreRows) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	return r.filterBatch(r.FileEditingContextRows.GetInEdgesByNodeIDs(ids))
 }

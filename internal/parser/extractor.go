@@ -171,9 +171,14 @@ func AssetClassOf(e Extractor) AssetClass {
 // own trees internally — the contract pipeline degrades to its regex
 // fallback for those languages.
 type ExtractionResult struct {
-	Nodes []*graph.Node
-	Edges []*graph.Edge
-	Tree  *ParseTree
+	// ParseChecked is a successful full native parse's explicit syntax
+	// verdict. A zero error count without this bit is unknown, never clean.
+	// Producers set both scalars before releasing their native tree.
+	ParseChecked bool
+	ParseErrors  int
+	Nodes        []*graph.Node
+	Edges        []*graph.Edge
+	Tree         *ParseTree
 	// ConstValues carries the literal value of each KindConstant node
 	// whose RHS is a string / numeric literal, for the indexer to persist
 	// in the queryable constant_values sidecar (kept out of the gob Meta

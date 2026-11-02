@@ -320,14 +320,15 @@ func splitLinesKeepEnds(content string) []string {
 // renameFileWrite is one file's fully-computed rewrite, held in memory until
 // every affected file has passed verification.
 type renameFileWrite struct {
-	RelPath  string
-	AbsPath  string
-	Old      []byte
-	New      []byte
-	Edits    int
-	NewSHA   string
-	Gate     parseGateResult
-	GateInfo map[string]any
+	RelPath    string
+	AbsPath    string
+	Old        []byte
+	New        []byte
+	Edits      int
+	NewSHA     string
+	Gate       parseGateResult
+	GateInfo   map[string]any
+	projection *preparedFileProjection
 }
 
 // planRenameWrites resolves every affected file, re-verifies each target line
@@ -353,17 +354,17 @@ func (s *Server) planRenameWrites(ctx context.Context, edits []renameEdit, allow
 	for _, relPath := range files {
 		absPath, err := s.resolveGraphPath(ctx, relPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not resolve %s: %w", relPath, err)
+			return s.finishRenamePlans(ctx, writes, allowParseErrors, fmt.Errorf("could not resolve %s: %w", relPath, err))
 		}
 		content, err := os.ReadFile(absPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", relPath, err)
+			return s.finishRenamePlans(ctx, writes, allowParseErrors, fmt.Errorf("could not read %s: %w", relPath, err))
 		}
 		// The rename rewrites graph lines into the raw bytes. On a UTF-16
 		// source that splices UTF-8 into NUL-interleaved text (#846); refuse
 		// at plan time so even a dry run shows the encoding refusal.
 		if indexer.LooksUTF16Source(content) {
-			return nil, refuseUTF16Edit("rename_symbol", relPath)
+			return s.finishRenamePlans(ctx, writes, allowParseErrors, refuseUTF16Edit("rename_symbol", relPath))
 		}
 		lines := splitLinesKeepEnds(string(content))
 
@@ -371,18 +372,18 @@ func (s *Server) planRenameWrites(ctx context.Context, edits []renameEdit, allow
 		sort.Slice(fileEdits, func(i, j int) bool { return fileEdits[i].Line < fileEdits[j].Line })
 		for _, e := range fileEdits {
 			if e.Line < 1 || e.Line > len(lines) {
-				return nil, fmt.Errorf(
+				return s.finishRenamePlans(ctx, writes, allowParseErrors, fmt.Errorf(
 					"%s:%d is outside the file (%d lines) — the index is stale relative to disk; re-run after reindexing",
-					relPath, e.Line, len(lines))
+					relPath, e.Line, len(lines)))
 			}
 			body, term := splitLineTerminator(lines[e.Line-1])
 			if body != e.OldText {
 				// The graph and disk disagree, so the planned replacement was
 				// computed against content that is no longer there. Refuse
 				// rather than write a line we never actually inspected.
-				return nil, fmt.Errorf(
+				return s.finishRenamePlans(ctx, writes, allowParseErrors, fmt.Errorf(
 					"%s:%d changed on disk since it was planned — refusing the rename so no unreviewed line is rewritten. Re-run rename after the file settles",
-					relPath, e.Line)
+					relPath, e.Line))
 			}
 			lines[e.Line-1] = e.NewText + term
 		}
@@ -396,25 +397,23 @@ func (s *Server) planRenameWrites(ctx context.Context, edits []renameEdit, allow
 			Edits:   len(fileEdits),
 			NewSHA:  gitBlobSHA(newContent),
 		}
-		if parseGateEnabled() {
-			w.Gate = checkParseGate(relPath, content, newContent)
-			if w.Gate.Blocked && !allowParseErrors {
-				return nil, fmt.Errorf("%s", parseGateError(relPath, w.Gate))
-			}
-		}
-		w.GateInfo = parseGateInfo(w.Gate, allowParseErrors)
 		writes = append(writes, w)
 	}
-	return writes, nil
+	return s.finishRenamePlans(ctx, writes, allowParseErrors, nil)
 }
 
 // commitRenameWrites writes each verified file atomically and reports the
 // per-file outcome. Callers must already hold the mutation locks for every
-// path in writes.
-func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWrite) []map[string]any {
+// path in writes. The supplied release returns that entire set after admission
+// and before any publication wait; callers also defer it for early failures.
+func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWrite, releasePaths func()) []map[string]any {
 	sess := s.sessionFor(ctx)
 	results := make([]map[string]any, 0, len(writes))
-	for i, w := range writes {
+	var targets []sourceMutationTarget
+	var records []*mutationCommitRecord
+	var projections []committedFileProjection
+	var applied []map[string]any
+	for _, w := range writes {
 		entry := map[string]any{
 			"file":          w.RelPath,
 			"edits":         w.Edits,
@@ -432,33 +431,52 @@ func (s *Server) commitRenameWrites(ctx context.Context, writes []*renameFileWri
 		// grinding through the rest: every remaining file would be refused
 		// anyway, and the receipts already recorded say exactly how far the
 		// rename got.
-		commit, err := s.commitFileMutation(ctx, "rename_symbol", "", "", w.RelPath, w.AbsPath, w.New, perm)
+		if w.projection == nil {
+			before := baselineForPreparedWrite(w.AbsPath, w.Old)
+			if before == nil {
+				before = captureFileViewBaseline(ctx, w.AbsPath)
+			}
+			if s.indexer == nil && s.multiIndexer == nil {
+				w.projection, _ = s.buildFileProjection(ctx, w.AbsPath, w.New)
+			} else {
+				s.noteAcknowledgementParser(ctx, "source_projection")
+				lap := s.beginAcknowledgementLap(ctx, editAckParseGate)
+				w.projection, _ = s.buildFileProjection(ctx, w.AbsPath, w.New)
+				lap.finish()
+			}
+			s.prepareFileViewEvidence(ctx, w.projection, before, w.New)
+		}
+		commit, err := s.commitFileMutation(ctx, "rename_symbol", "", "", w.RelPath, w.AbsPath, w.New, perm, sourceMutationOperation{kind: sourceCohortWrite, projection: w.projection})
 		if err != nil {
 			entry["status"] = "failed"
 			entry["error"] = err.Error()
 			attachMutationCommit(entry, commit)
 			results = append(results, entry)
 			if errors.Is(err, errMutationNotApplied) {
-				return results
+				break
 			}
 			continue
 		}
 		entry["status"] = "applied"
 		sess.recordModified(w.RelPath)
-		// Later files still write and may reindex inline, so only the last
-		// file's wait gives the dispatch slot back.
-		waitCtx := ctx
-		if i < len(writes)-1 {
-			waitCtx = withoutDispatchSlotRelease(ctx)
-		}
-		outcome := s.mutationReindexState(waitCtx, w.AbsPath)
+		targets = append(targets, captureSourceMutationTarget(ctx, w.AbsPath))
+		records = append(records, commit)
+		projections = append(projections, committedFileProjection{record: commit, prepared: w.projection})
+		applied = append(applied, entry)
+		results = append(results, entry)
+	}
+	s.publishCommittedProjectionCohort(ctx, projections)
+	admissions := s.admitSourceMutationFrontier(ctx, targets)
+	releasePaths()
+	outcomes := s.awaitSourceMutationFrontier(ctx, admissions)
+	for i, outcome := range outcomes {
+		entry, target, commit := applied[i], targets[i], records[i]
 		commit.recordGraph(outcome)
 		if outcome.Err != nil {
 			entry["reindex_error"] = outcome.Err.Error()
 		}
-		s.attachMutationFreshness(entry, w.RelPath, w.AbsPath, outcome)
+		s.attachMutationFreshness(entry, entry["file"].(string), target.path, outcome)
 		attachMutationCommit(entry, commit)
-		results = append(results, entry)
 	}
 	return results
 }
