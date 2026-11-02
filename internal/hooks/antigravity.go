@@ -213,20 +213,20 @@ func RunAntigravity(port int, mode Mode, eventFlag string) {
 }
 
 func handleAntigravity(data []byte, port int, mode Mode, eventFlag string) (string, int) {
+	// No --event: a legacy `gortex hook --agent antigravity` entry in
+	// ~/.gemini/settings.json, written before the hooks moved to
+	// ~/.gemini/config/hooks.json (whose entries always pass --event). Only
+	// Gemini CLI reads that file, so answer exactly as before.
+	if strings.TrimSpace(eventFlag) == "" {
+		return externalAgentResponse(data), 0
+	}
+
 	var in antigravityInput
 	if err := json.Unmarshal(data, &in); err != nil {
 		if strings.EqualFold(strings.TrimSpace(eventFlag), "PreToolUse") {
 			return marshalAntigravity(antigravityDecisionResponse{Decision: "allow"}), 0
 		}
 		return "{}", 0
-	}
-
-	// No --event plus Gemini's snake_case hook_event_name: a legacy
-	// `gortex hook --agent antigravity` entry in ~/.gemini/settings.json,
-	// written before the hooks moved to ~/.gemini/config/hooks.json. Only
-	// Gemini CLI reads that file, so answer in its wire shape.
-	if strings.TrimSpace(eventFlag) == "" && in.HookEventNameSnake != "" {
-		return externalAgentResponse(data), 0
 	}
 
 	rawEvent := firstNonEmpty(eventFlag, in.HookEventName, in.HookEventNameSnake, in.EventName)
@@ -343,10 +343,11 @@ func antigravityPreInvocation(in antigravityInput, cwd string) (string, int) {
 	// counts up as the model takes tool steps. A later invocation belongs to
 	// the turn already in progress, so it must not discard that turn's
 	// localization state or repeat the prompt briefing. With no turn on
-	// record (a missed first invocation), fall through and start one.
+	// record (a missed first invocation), fall through and start one. A
+	// continuation is not logged as a run: the effectiveness log counts
+	// UserPromptSubmit once per prompt, as on the other hosts.
 	if in.InvocationNum > 0 {
 		if _, inTurn := currentLocalizationTurnState(in.sessionID(), "", "", cwd); inTurn {
-			logHookEffectiveness("UserPromptSubmit", false, daemonReachableFn(), 0, time.Since(started))
 			return "{}", 0
 		}
 	}

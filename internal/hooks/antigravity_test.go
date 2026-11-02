@@ -415,4 +415,12 @@ func TestHandleAntigravityLegacyGeminiSettingsEntryAnswersInGeminiShape(t *testi
 		!strings.Contains(resp.HookSpecificOutput.AdditionalContext, "Gortex Session Orientation") {
 		t.Fatalf("expected Gemini hookSpecificOutput SessionStart orientation, got %s", out)
 	}
+
+	// Any payload without --event gets exactly RunExternalAgent's answer,
+	// including fields agy's own payload types differently.
+	odd := copilotPayload(t, map[string]any{"hook_event_name": "AfterTool", "cwd": repoTmpFixtureRoot,
+		"error": map[string]any{"message": "boom"}, "stepIdx": "3"})
+	if got, _ := handleAntigravity(odd, 0, ModeDeny, ""); got != externalAgentResponse(odd) {
+		t.Fatalf("legacy AfterTool = %q, want RunExternalAgent's %q", got, externalAgentResponse(odd))
+	}
 }
