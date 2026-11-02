@@ -122,9 +122,18 @@ func summarizeCheckoutDiscovery(attempts []Attempt, checkouts []checkoutDiscover
 // The existing readers keep their original sessions and repository assignment
 // throughout the additions. Discovery probes own separate root/subdirectory
 // sessions; every refusal remains an attempt instead of being retried away.
-func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase) (resultErr error) {
-	phase.SessionModel = "per_agent_plus_new_worktree_root_and_subdirectory_probes"
+func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase) error {
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
+	defer cancel()
+	return observeCheckoutDiscoveryWindow(parent, ctx, o, p, clients, phase, o.Duration/time.Duration(o.Worktrees+1))
+}
+
+// Keep the offered-window source separate from its observer so lifecycle tests
+// can end on actual add/read/probe witnesses, without making Git speed an oracle.
+// Campaigns still supply exactly the original duration-bound context above.
+func observeCheckoutDiscoveryWindow(parent, offered context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase, addInterval time.Duration) (resultErr error) {
+	phase.SessionModel = "per_agent_plus_new_worktree_root_and_subdirectory_probes"
+	ctx, cancel := context.WithCancel(offered)
 	defer cancel()
 	frozen := *p
 	frozen.Repos = append([]privateRepo(nil), p.Repos...)
@@ -158,8 +167,7 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 	}()
 	// Additions are spread over the offered window, including a baseline with
 	// --worktrees=0. Timing is recorded as observed, never inferred from count.
-	interval := o.Duration / time.Duration(o.Worktrees+1)
-	nextAdd := time.Now().Add(interval)
+	nextAdd := time.Now().Add(addInterval)
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -180,7 +188,7 @@ func measureCheckoutDiscovery(parent context.Context, o runOptions, p *privateRu
 			}
 			entry := checkoutDiscoveryObservation{Root: repo.Path, FamilyRole: role, Prefix: repo.Prefix, Query: repo.Corpus.Query, Added: time.Now(), ExactViewLag: unavailable("ms", "no exact worktree view observed before phase end")}
 			checkouts = append(checkouts, entry)
-			nextAdd = nextAdd.Add(interval)
+			nextAdd = nextAdd.Add(addInterval)
 			subdir := filepath.Join(repo.Path, ".discovery-probe")
 			if err := os.Mkdir(subdir, 0o700); err != nil {
 				return err
