@@ -64,6 +64,23 @@ func migrationProxyOwnedEnv(root string) map[string]string {
 	}
 }
 
+// This positive fixture supplies a continuously observable runtime record.
+// Windows does not promise an atomic replacement for os.Rename; publication
+// availability gaps have their own strict inactivity/deadline control. This
+// guard is fixture-only and never participates in the production spawn lock.
+func migrationProxyStateAccess(ctx context.Context, root string, access func() error) error {
+	guard := flock.New(filepath.Join(root, "runtime-publication.guard"))
+	defer guard.Close() //nolint:errcheck // Fixture ownership ends after its bounded access.
+	locked, err := guard.TryLockContext(ctx, time.Millisecond)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return context.DeadlineExceeded
+	}
+	return access()
+}
+
 // This helper runs the real MCP selection and proxy in a fresh process. Only
 // that process shortens the private inactivity budget. Its liveness seam still
 // returns the actual socket result; the extra lock/heartbeat reads only record
@@ -98,11 +115,23 @@ func TestMigrationWindowMCPProxyHelper(t *testing.T) {
 		}
 	}()
 	waitForDaemonSpawnLock = func(ctx context.Context, lock spawnLockTryer, opts spawnLockWaitOptions) (bool, error) {
-		progress := opts.startupProgress
+		var firstState daemon.RuntimeState
+		var firstOK bool
+		var firstAccessError string
+		progress := startupHeartbeatWaiterWithRuntimeReader(startupRuntimeOwnerMatches, func() (daemon.RuntimeState, bool) {
+			firstState, firstOK, firstAccessError = daemon.RuntimeState{}, false, ""
+			if err := migrationProxyStateAccess(ctx, input.Root, func() error {
+				firstState, firstOK = daemon.ReadRuntimeState()
+				return nil
+			}); err != nil {
+				firstAccessError = err.Error()
+			}
+			return firstState, firstOK
+		})
 		opts.startupProgress = func(now time.Time) bool {
 			fresh := progress(now)
 			state, ok := daemon.ReadRuntimeState()
-			trace = append(trace, map[string]any{"kind": "startup_progress", "at": time.Now(), "now": now, "fresh": fresh, "state_read": ok, "state": state})
+			trace = append(trace, map[string]any{"kind": "startup_progress", "at": time.Now(), "now": now, "fresh": fresh, "first_state_read": firstOK, "first_state": firstState, "first_access_error": firstAccessError, "state_read": ok, "state": state})
 			if ok && state.StartupPhase == daemon.StartupServing && !servingRecorded {
 				event := map[string]any{"fresh": fresh, "state": state, "lock_contended": true, "at": time.Now()}
 				body, err := json.Marshal(event)
@@ -215,7 +244,13 @@ func testMCPStartupWindow(t *testing.T, holdServing bool) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(daemon.SpawnLockPath()), 0o700))
 	require.NoError(t, lock.Lock())
 	t.Cleanup(func() { require.NoError(t, lock.Close()) })
-	reporter := newDaemonStartupReporter(zap.NewNop())
+	publicationContext, stopPublication := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(stopPublication)
+	reporter := newDaemonStartupReporterWithWriter(zap.NewNop(), func(state daemon.RuntimeState) error {
+		return migrationProxyStateAccess(publicationContext, base, func() error {
+			return daemon.WriteRuntimeState(state)
+		})
+	})
 	t.Cleanup(reporter.Stop)
 	entered, release := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
