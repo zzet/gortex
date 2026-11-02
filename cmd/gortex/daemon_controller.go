@@ -163,6 +163,17 @@ type daemonWatcherSlot struct {
 	ready   bool
 }
 
+// PreflightTrack checks authoritative ownership without indexing, persisting,
+// or taking the controller mutation lock. A clear answer grants no registration.
+func (c *realController) PreflightTrack(ctx context.Context, p daemon.TrackParams) error {
+	if c.multiIndexer == nil || c.lifecycle == nil {
+		return fmt.Errorf("checkout lifecycle not initialized")
+	}
+	return c.lifecycle.PreflightTrack(ctx, config.RepoEntry{
+		Path: p.Path, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree,
+	})
+}
+
 // Track indexes a new repository and persists it to the global config.
 // Path is resolved to an absolute form before the MultiIndexer sees it.
 func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.RawMessage, error) {
@@ -1781,6 +1792,14 @@ func storageStatusFor(g graph.Store) *daemon.StorageStatus {
 		WALPendingFrames:          pending,
 		CloseCheckpointEstimateMS: estimate.Milliseconds(),
 		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
+	}
+	if reporter, ok := g.(interface{ DenseIndexesMissing() []string }); ok {
+		out.DenseIndexesMissing = reporter.DenseIndexesMissing()
+	}
+	if reporter, ok := g.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		out.LastFirstIndexDrain = reporter.LastFirstIndexDrains()
 	}
 	if passive, ok := g.(interface {
 		WALPassiveStats() store_sqlite.WALPassiveStats

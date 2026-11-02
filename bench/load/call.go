@@ -112,18 +112,33 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 				}
 			}
 		}
-		if err == nil && callCtx.Err() != nil {
-			err = callCtx.Err()
+		// A socket deadline can fire before the context timer goroutine runs.
+		// Classify against the actual call deadline as well, so a clipped
+		// offered window does not invent a product/checkout failure.
+		expired := callCtx.Err() != nil
+		if deadline, ok := callCtx.Deadline(); ok && !returned.Before(deadline) {
+			expired = true
+		}
+		expiry := callCtx.Err()
+		if expired && expiry == nil {
+			expiry = context.DeadlineExceeded
+		}
+		if err == nil && expired {
+			err = expiry
 		}
 		if err == nil {
 			err = checkToolResult(data)
 		}
 		a := Attempt{Tool: r.name(), Role: role, Request: hash, Agent: agent, Step: step, Slot: slot, Retry: retry, Started: start, DurationMS: float64(returned.Sub(start)) / float64(time.Millisecond), LogicalMS: float64(returned.Sub(logicalStart)) / float64(time.Millisecond), Outcome: "success"}
+		if session, ok := client.(*socketClient); ok {
+			a.CWD = session.cwd
+		}
 		var remote *rpcError
 		if err != nil {
 			a.Outcome, a.Error = "error", err.Error()
 			if errors.As(err, &remote) {
 				a.Code = remote.Code
+				a.ErrorData = copyRPCErrorData(remote.Data)
 			}
 			if remote != nil && remote.Code == -32002 && (!retryTyped || remote.retryEditProbe()) {
 				a.Outcome = "busy"
@@ -135,9 +150,9 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 				a.Code = -32000
 				a.ExpectedOutcome = "symbol_absent"
 			}
-			if callCtx.Err() != nil {
+			if expired {
 				a.Outcome = terminalOutcome()
-				err = errors.Join(err, callCtx.Err())
+				err = errors.Join(err, expiry)
 			}
 			if retryTyped && errors.Is(err, errEditProbeEvidenceIncomplete) {
 				a.Outcome = "harness_incomplete"

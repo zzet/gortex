@@ -29,6 +29,11 @@ import (
 
 func startCatalogTrackDaemon(t *testing.T, entries, loaded []config.RepoEntry) (*config.ConfigManager, *indexer.MultiIndexer) {
 	t.Helper()
+	return startCatalogTrackDaemonWithLogger(t, entries, loaded, zap.NewNop())
+}
+
+func startCatalogTrackDaemonWithLogger(t *testing.T, entries, loaded []config.RepoEntry, logger *zap.Logger) (*config.ConfigManager, *indexer.MultiIndexer) {
+	t.Helper()
 	dir := testenv.ShortTempDir(t)
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
@@ -43,9 +48,9 @@ func startCatalogTrackDaemon(t *testing.T, entries, loaded []config.RepoEntry) (
 	languages.RegisterAll(reg)
 	cm, err := config.NewConfigManager(gc.ConfigPath())
 	require.NoError(t, err)
-	idx := indexer.New(store, reg, config.Default().Index, zap.NewNop())
-	mi := indexer.NewMultiIndexer(store, reg, idx.Search(), cm, zap.NewNop())
-	lc, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{MultiIndexer: mi, ConfigManager: cm, Graph: store, Logger: zap.NewNop()})
+	idx := indexer.New(store, reg, config.Default().Index, logger)
+	mi := indexer.NewMultiIndexer(store, reg, idx.Search(), cm, logger)
+	lc, err := indexer.NewCheckoutLifecycle(indexer.CheckoutLifecycleConfig{MultiIndexer: mi, ConfigManager: cm, Graph: store, Logger: logger})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, lc.Close())
@@ -58,10 +63,10 @@ func startCatalogTrackDaemon(t *testing.T, entries, loaded []config.RepoEntry) (
 		require.NoError(t, err)
 		require.NoError(t, result.CatalogErr)
 	}
-	srv := gortexmcp.NewServer(query.NewEngine(store), store, idx, nil, zap.NewNop(), nil, gortexmcp.MultiRepoOptions{MultiIndexer: mi, ConfigManager: cm})
-	d := daemon.New(socket, "test", zap.NewNop())
-	d.Controller = &realController{graph: store, multiIndexer: mi, configManager: cm, lifecycle: lc, logger: zap.NewNop()}
-	d.MCPDispatcher = newMCPDispatcher(srv, mi, zap.NewNop())
+	srv := gortexmcp.NewServer(query.NewEngine(store), store, idx, nil, logger, nil, gortexmcp.MultiRepoOptions{MultiIndexer: mi, ConfigManager: cm})
+	d := daemon.New(socket, "test", logger)
+	d.Controller = &realController{graph: store, multiIndexer: mi, configManager: cm, lifecycle: lc, logger: logger}
+	d.MCPDispatcher = newMCPDispatcher(srv, mi, logger)
 	require.NoError(t, d.Listen())
 	done := make(chan error, 1)
 	go func() { done <- d.Serve() }()

@@ -396,7 +396,13 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if acceptPreparedSnapshot {
 			prepared, ok = idx.takePreparedSnapshot(filePath)
 		} else {
-			prepared, ok = idx.takePreparedRefresh(filePath)
+			var reprepared bool
+			probe, prepared, reprepared, ok = idx.currentPreparedDelta(filePath, probe, len(stages) > 0, repair)
+			if reprepared {
+				// The old inert decision belongs to A. The stage below now
+				// carries B's probe and parse, including its derived inputs.
+				delete(idx.inertReparsed, graphPath)
+			}
 		}
 		if !ok || prepared == nil || prepared.result == nil {
 			prepared.release()

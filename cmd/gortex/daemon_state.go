@@ -745,7 +745,7 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 		defer func() {
 			if coordinatedBulkActive {
-				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
 				}
 			}
@@ -844,9 +844,14 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		// final seal includes them in bulk index creation, checkpointing, and
 		// planner statistics instead of reopening ordinary write transactions
 		// immediately after a large cold load.
+		// The finalize is the window's last call: the deferred end above is
+		// skipped once it has run, and nothing retries a failed seal. So a
+		// failed end is followed by an abort, which closes the window and
+		// leaves the indexes it could not rebuild to the store's repair, rather
+		// than keeping the warmup's relaxed-durability writer until shutdown.
 		var finalizeBulk func() error
 		if coordinatedBulkActive {
-			finalizeBulk = coordinatedBulk.EndCoordinatedBulkLoad
+			finalizeBulk = func() error { return graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk) }
 		}
 		drain := state.multiIndexer.RunDeferredGoModAll
 		if batchCtx.Err() != nil {
