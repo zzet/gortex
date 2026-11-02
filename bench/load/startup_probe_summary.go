@@ -223,12 +223,13 @@ func (sum startupSummary) metrics() map[string]Metric {
 	}
 	m["startup_coordinators_within_2s_min"] = unavailable("count", "no boot")
 	for i, boot := range census {
-		if boot.Coordinators == nil {
-			m["startup_coordinators_within_2s_min"] = unavailable("count", fmt.Sprintf("boot %d has no coordinator census", boot.Boot))
+		verified := analyzeStartupTransitionCensus(boot.TransitionEvidence)
+		if verified.Value == nil {
+			m["startup_coordinators_within_2s_min"] = unavailable("count", fmt.Sprintf("boot %d: %s", boot.Boot, verified.Reason))
 			break
 		}
-		if value := float64(*boot.Coordinators); i == 0 || value < *m["startup_coordinators_within_2s_min"].Value {
-			m["startup_coordinators_within_2s_min"] = measured(value, "count")
+		if i == 0 || *verified.Value < *m["startup_coordinators_within_2s_min"].Value {
+			m["startup_coordinators_within_2s_min"] = verified
 		}
 	}
 	return m

@@ -235,7 +235,6 @@ func TestSummarizeStartupCountsPerWindowAndRestart(t *testing.T) {
 		"startup_initial_first_ok_ms":              5600,
 		"startup_restart_time_to_ready_p95_ms":     1000,
 		"startup_restart_ready_to_first_ok_p95_ms": 1050,
-		"startup_coordinators_within_2s_min":       2,
 	} {
 		if m := metrics[name]; m.Value == nil || *m.Value != want {
 			t.Errorf("%s = %+v, want %v", name, m, want)
@@ -311,7 +310,7 @@ func TestStartupScenarioProbesAcrossARestart(t *testing.T) {
 			t.Errorf("%s unavailable: %s", name, phase.Metrics[name].Reason)
 		}
 	}
-	if m := phase.Metrics["startup_coordinators_within_2s_min"]; m.Value == nil || *m.Value != 1 || *phase.Metrics["startup_linked_worktrees"].Value != 1 {
+	if m := phase.Metrics["startup_coordinators_within_2s_min"]; m.Value != nil || *phase.Metrics["startup_linked_worktrees"].Value != 1 {
 		t.Errorf("coordinator census = %+v", m)
 	}
 	log, err := os.ReadFile(artifacts["startup_probe_log"])
