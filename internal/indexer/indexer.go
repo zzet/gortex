@@ -3408,6 +3408,19 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				return
 			}
 			drainStart := time.Now()
+			var drainWALPeak int64
+			var drainWALObserved bool
+			walReporter, hasWALReporter := diskTarget.(interface{ DBStats() (int64, int64) })
+			sampleDrainWAL := func() {
+				if hasWALReporter {
+					_, walBytes := walReporter.DBStats()
+					if walBytes > 0 {
+						drainWALObserved = true
+					}
+					drainWALPeak = max(drainWALPeak, walBytes)
+				}
+			}
+			sampleDrainWAL()
 			shadowNodeCount := inMemShadow.NodeCount()
 			shadowEdgeCount := inMemShadow.EdgeCount()
 			if !shadowEstimateReady {
@@ -3438,11 +3451,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				restubGoModuleRepoIncoming(diskTarget, idx.RepoPrefix())
 			}
 			var evictedNodes, evictedEdges int
-			if sqlite, ok := diskTarget.(*store_sqlite.Store); ok && sqlite.SupportsShadowReplacementRetirement() {
+			sqliteTarget, isSQLite := diskTarget.(*store_sqlite.Store)
+			retirement := isSQLite && sqliteTarget.SupportsShadowReplacementRetirement()
+			if shadowEvictionBranchHook != nil {
+				shadowEvictionBranchHook(retirement)
+			}
+			if retirement {
 				var err error
 				shadowReplacementStarted = true
 				restubTrackedNpmRepoIncoming(diskTarget, idx.RepoPrefix())
-				evictedNodes, evictedEdges, err = sqlite.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
+				evictedNodes, evictedEdges, err = sqliteTarget.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
 				if err != nil {
 					retErr = fmt.Errorf("indexer: retire shadow replacement rows: %w", err)
 					return
@@ -3461,17 +3479,34 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				return
 			}
 			bl.BeginBulkLoad()
+			bulkWindow := "unknown"
+			if reporter, ok := diskTarget.(interface{ BulkLoadWindow() string }); ok {
+				bulkWindow = reporter.BulkLoadWindow()
+			}
 			// FlushBulk is a no-op under an outer coordinated window. Otherwise
 			// it must also restore the standalone window if a drain write panics.
 			bulkFlushPending := true
 			bulkFlushInProgress := false
 			defer func() {
-				// A FlushBulk panic may leave the store's writer lock held.
-				// Do not re-enter it; let the panic unwind the earlier defers.
-				if bulkFlushPending && !bulkFlushInProgress {
-					if err := bl.FlushBulk(); err != nil && retErr == nil {
-						retErr = fmt.Errorf("indexer: persist bulk graph: %w", err)
-					}
+				// A FlushBulk panicked: the explicit one below, or the one the
+				// next defer runs while a drain panic unwinds. The store releases
+				// its write gate on every exit and keeps a window whose seal did
+				// not finish retryable, so one more flush closes it (restoring
+				// durability, or recording the indexes it could not rebuild)
+				// instead of leaving a pinned synchronous=OFF writer behind.
+				if bulkFlushPending && bulkFlushInProgress {
+					retryBulkFlushAfterPanic(bl, idx.logger, idx.RepoPrefix())
+				}
+			}()
+			defer func() {
+				if !bulkFlushPending || bulkFlushInProgress {
+					return
+				}
+				bulkFlushInProgress = true
+				err := bl.FlushBulk()
+				bulkFlushPending = false
+				if err != nil && retErr == nil {
+					retErr = fmt.Errorf("indexer: persist bulk graph: %w", err)
 				}
 			}()
 			// Transfer the shadow in explicit row/byte-capped batches. The
@@ -3506,6 +3541,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// The builtin sentinels the drain is about to move, kept aside for
 			// the re-assert below. See restampedBuiltins.
 			var restampedBuiltins []*graph.Node
+			nodeDrainStopped := false
 			for nodes := range inMemShadow.DrainNodeBatches(persistChunkRows, persistChunkBytes) {
 				for _, node := range nodes {
 					if node != nil && graph.IsBuiltinStub(node.ID) {
@@ -3513,9 +3549,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						restampedBuiltins = append(restampedBuiltins, &copied)
 					}
 				}
-				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil && retErr == nil {
-					retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
+				if err := drainAddBatch(ctx, diskTarget, nodes, nil); err != nil {
+					// A refused write fails every later batch the same way, and
+					// a cooperative stop is final; either ends the drain, so the
+					// edge drain below writes nothing for this failed build.
+					if retErr == nil {
+						retErr = drainBatchError(ctx, err)
+					}
+					nodeDrainStopped = true
+					break
 				}
+				sampleDrainWAL()
 				if retErr != nil && drainChecksCancellation(ctx) && ctx.Err() != nil {
 					break
 				}
@@ -3536,6 +3580,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						ftsReady = false
 						return false
 					}
+					sampleDrainWAL()
 					ftsItemCount += len(ftsItems)
 					ftsItems = make([]graph.SymbolFTSItem, 0, min(len(nodes), persistFTSChunkRows))
 					ftsBytes = 0
@@ -3568,6 +3613,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				drainPressure.afterNodeBatch(nodeRows)
 			}
 			for edges := range inMemShadow.DrainEdgeBatches(persistChunkRows, persistChunkBytes) {
+				if nodeDrainStopped {
+					break
+				}
 				if drainChecksCancellation(ctx) && ctx.Err() != nil {
 					if retErr == nil {
 						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", ctx.Err())
@@ -3576,10 +3624,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 				}
 				if err := drainAddBatch(ctx, diskTarget, nil, edges); err != nil {
 					if retErr == nil {
-						retErr = fmt.Errorf("indexer: cooperative drain stopped: %w", err)
+						retErr = drainBatchError(ctx, err)
 					}
 					break
 				}
+				sampleDrainWAL()
 				edgeRows := len(edges)
 				drainPressure.afterEdgeBatch(edgeRows)
 			}
@@ -3605,10 +3654,17 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			// row or no composed view can equal it. The set is one row per
 			// distinct builtin the repository references, so the copy is
 			// bounded by the language's builtin vocabulary, not by corpus size.
-			if len(restampedBuiltins) > 0 {
-				diskTarget.AddBatch(restampedBuiltins, nil)
+			//
+			// Only after a drain that is still succeeding: a failed one publishes
+			// nothing and is evicted before its retry, and after a refused write
+			// this one would only be refused again.
+			if len(restampedBuiltins) > 0 && retErr == nil {
+				if err := drainWrite(ctx, diskTarget, restampedBuiltins, nil); err != nil {
+					retErr = drainBatchError(ctx, err)
+				}
 			}
 
+			sampleDrainWAL()
 			flushStart := time.Now()
 			idx.logger.Info("indexer: FlushBulk start",
 				zap.String("repo", idx.RepoPrefix()),
@@ -3621,7 +3677,26 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			if ferr != nil && retErr == nil {
 				retErr = fmt.Errorf("indexer: persist bulk graph: %w", ferr)
 			}
+			sealElapsed := time.Since(flushStart)
+			sampleDrainWAL()
+			drainElapsed := time.Since(drainStart)
+			if recorder, ok := diskTarget.(interface {
+				RecordFirstIndexDrain(string, graph.FirstIndexDrain)
+			}); ok {
+				observation := graph.FirstIndexDrain{
+					Window: bulkWindow, Nodes: shadowNodeCount, Edges: shadowEdgeCount,
+					DrainMS: float64(drainElapsed) / float64(time.Millisecond),
+					SealMS:  float64(sealElapsed) / float64(time.Millisecond), CompletedAt: time.Now(),
+					WALPeakBytes: drainWALPeak, WALPeakObserved: drainWALObserved, WALPeakScope: "shared_store_drain_chunk_samples",
+				}
+				if retErr != nil {
+					observation.Error = retErr.Error()
+				}
+				recorder.RecordFirstIndexDrain(idx.RepoPrefix(), observation)
+			}
 			idx.logger.Info("indexer: FlushBulk complete",
+				zap.String("window", bulkWindow),
+				zap.Duration("seal_elapsed", sealElapsed),
 				zap.String("repo", idx.RepoPrefix()),
 				zap.Duration("flush_elapsed", time.Since(flushStart)),
 				zap.Duration("total_drain", time.Since(drainStart)),

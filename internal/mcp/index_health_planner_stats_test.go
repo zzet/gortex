@@ -199,6 +199,30 @@ func TestIndexHealth_SurfacesPlannerStats(t *testing.T) {
 			"published a receiver cardinality for an index that is not in the schema")
 	})
 
+	// Dense indexes an interrupted bulk load left out are named, with the
+	// sentence that says what they cost and how they come back. The real
+	// state repairs itself on the store's maintenance lane as soon as the
+	// volume has room, so the verdict is fixed here rather than raced.
+	t.Run("missing dense indexes are named", func(t *testing.T) {
+		_, store := newEmptySQLiteBackedServer(t)
+		missing := []string{"nodes_by_kind", "edges_by_kind"}
+		wrapped := plannerHealthOverride{Store: store, health: graph.PlannerStatsFreshness{
+			Reason: "dense_indexes_missing", DenseIndexesMissing: missing,
+		}}
+		idx := indexer.New(wrapped, testRegistry(), config.Default().Index, zap.NewNop())
+		missingSrv := NewServer(query.NewEngine(wrapped), wrapped, idx, nil, zap.NewNop(), nil)
+
+		payload, err := missingSrv.buildIndexHealthPayloadCtx(context.Background())
+		require.NoError(t, err)
+		stats, ok := payload["planner_stats"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "dense_indexes_missing", stats["reason"])
+		assert.Equal(t, missing, stats["dense_indexes_missing"])
+		recommendation, _ := payload["recommendation"].(string)
+		assert.Contains(t, recommendation, "nodes_by_kind, edges_by_kind")
+		assert.NotContains(t, recommendation, "planner statistics are stale")
+	})
+
 	// The window between a deferred cooperative pass and the boundary that
 	// finishes it, seen from the side an agent reads.
 	//
@@ -304,6 +328,16 @@ func TestIndexHealth_SurfacesPlannerStats(t *testing.T) {
 	})
 }
 
+// plannerHealthOverride reports a fixed planner verdict over a real store.
+type plannerHealthOverride struct {
+	*store_sqlite.Store
+	health graph.PlannerStatsFreshness
+}
+
+func (s plannerHealthOverride) PlannerStatsHealth(context.Context) (graph.PlannerStatsFreshness, error) {
+	return s.health, nil
+}
+
 // A backend without the capability must omit the key rather than publish a
 // struct of zeros, which would read as "the planner believes nothing".
 func TestIndexHealth_PlannerStatsAbsentOnBackendWithoutCapability(t *testing.T) {
@@ -313,4 +347,27 @@ func TestIndexHealth_PlannerStatsAbsentOnBackendWithoutCapability(t *testing.T) 
 	require.NotNil(t, payload)
 	assert.NotContains(t, payload, "planner_stats",
 		"the in-memory graph has no planner statistics; reporting zeros would invent a defect")
+}
+
+func TestIndexHealthReportsLastFirstIndexDrain(t *testing.T) {
+	t.Setenv("GORTEX_STREAMING_FLUSH", "0")
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "1000000")
+	t.Setenv("GORTEX_SHADOW_MAX_BYTES", "1073741824")
+	srv, _ := newSQLiteBackedServer(t)
+	payload, err := srv.buildIndexHealthPayloadCtx(t.Context())
+	require.NoError(t, err)
+	observations, ok := payload["last_first_index_drain"].(map[string]graph.FirstIndexDrain)
+	require.True(t, ok, "a completed first index must publish its actual drain observation")
+	require.Len(t, observations, 1)
+	for _, observation := range observations {
+		assert.Equal(t, "cold", observation.Window)
+		assert.Greater(t, observation.Nodes, 0)
+		assert.GreaterOrEqual(t, observation.DrainMS, observation.SealMS)
+		assert.False(t, observation.CompletedAt.IsZero())
+		assert.Equal(t, "shared_store_drain_chunk_samples", observation.WALPeakScope)
+	}
+	empty, _ := newEmptySQLiteBackedServer(t)
+	noDrain, err := empty.buildIndexHealthPayloadCtx(t.Context())
+	require.NoError(t, err)
+	assert.NotContains(t, noDrain, "last_first_index_drain", "absence is not a fabricated completed zero drain")
 }

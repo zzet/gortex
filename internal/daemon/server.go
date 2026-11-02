@@ -777,6 +777,31 @@ func (s *Server) handleControlBounded(sess *Session, req ControlRequest) Control
 
 func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlRequest) ControlResponse {
 	switch req.Kind {
+	case ControlTrackPreflight:
+		// Separate from Track so an unsupported/older controller cannot
+		// accidentally register a root for a read-only ownership observation.
+		preflight, ok := s.Controller.(interface {
+			PreflightTrack(context.Context, TrackParams) error
+		})
+		if !ok {
+			return controlErr(ErrInternal, "track preflight is not supported")
+		}
+		var p TrackParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		if err := preflight.PreflightTrack(ctx, p); err != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return controlErr(ErrPrefixCollision, err.Error())
+			}
+			if errors.Is(err, indexer.ErrRepoIdentityPending) {
+				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
+			}
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true}
+
 	case ControlTrack:
 		var p TrackParams
 		if err := unmarshalParams(req.Params, &p); err != nil {

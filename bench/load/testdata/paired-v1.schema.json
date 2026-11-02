@@ -258,11 +258,21 @@
                       "code": {
                         "type": "integer"
                       },
+                      "cwd": {
+                        "type": "string"
+                      },
                       "duration_ms": {
                         "type": "number"
                       },
                       "error": {
                         "type": "string"
+                      },
+                      "error_data": {
+                        "additionalProperties": {},
+                        "type": [
+                          "object",
+                          "null"
+                        ]
                       },
                       "expected_outcome": {
                         "type": "string"

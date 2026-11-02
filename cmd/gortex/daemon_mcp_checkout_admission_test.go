@@ -65,6 +65,22 @@ func TestDispatcher_CheckoutAdmissionFailurePreservesClassification(t *testing.T
 	}
 }
 
+// Hooks and agents key on this refusal to tell one pending worktree from an
+// unavailable daemon.
+func TestCheckoutAdmissionErrorPendingDiscoveryGolden(t *testing.T) {
+	err := fmt.Errorf("observe checkout: %w", &indexer.CheckoutDiscoveryPendingError{Root: "/repos/app-wt", Family: "family-0123", Reason: "family_capacity"})
+	got := checkoutAdmissionError("/repos/app-wt/internal", []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call"}`), err)
+	const want = `{"error":{"code":-32000,"data":{"error_code":"view_building","family":"family-0123","path":"/repos/app-wt","reason":"family_capacity","retryable":true,"state":"discovery_pending"},` +
+		`"message":"checkout discovery unavailable: observe checkout: indexer: checkout mutation lane is busy; retry: checkout discovery is pending for /repos/app-wt (family family-0123, reason family_capacity)"},"id":7,"jsonrpc":"2.0"}`
+	require.Equal(t, want, string(got))
+
+	// A refusal that names no checkout root keeps the session's path.
+	got = checkoutAdmissionError("/repos/app-wt/internal", []byte(`{"jsonrpc":"2.0","id":8,"method":"tools/call"}`), &indexer.CheckoutDiscoveryPendingError{Reason: "in_progress"})
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(got, &parsed))
+	require.Equal(t, "/repos/app-wt/internal", errorData(t, parsed)["path"], "%s", got)
+}
+
 type checkoutAdmissionSQLiteError int
 
 func (e checkoutAdmissionSQLiteError) Error() string { return fmt.Sprintf("SQLite error %d", e) }

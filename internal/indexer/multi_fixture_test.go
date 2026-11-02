@@ -272,7 +272,7 @@ func (mi *MultiIndexer) indexFixtureRepos(repos []config.RepoEntry) (map[string]
 				coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 				defer func() {
 					if coordinatedBulkActive {
-						if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+						if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 							mi.logger.Error("multi-repo bulk-load cleanup failed", zap.Error(err))
 						}
 					}
@@ -364,7 +364,7 @@ func (mi *MultiIndexer) indexFixtureRepos(repos []config.RepoEntry) (map[string]
 					old.Close()
 				}
 				if coordinatedBulkActive {
-					if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+					if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 						return nil, fmt.Errorf("multi-repo bulk-load finalize: %w", err)
 					}
 					coordinatedBulkActive = false
