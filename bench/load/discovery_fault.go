@@ -15,6 +15,7 @@ type discoveryOptions struct {
 	StallFirst        bool
 	Prepare           string
 	Resume            string
+	RuntimeRoot       string
 	ExistingWorktrees int
 	ExistingNested    int
 }
@@ -22,11 +23,15 @@ type discoveryOptions struct {
 func bindDiscoveryFlags(f *flag.FlagSet, o *discoveryOptions) {
 	f.StringVar(&o.Prepare, "discovery-prepare", "", "worktree-discovery: prepare owned roots and write a descriptor without launching a daemon")
 	f.StringVar(&o.Resume, "discovery-resume", "", "worktree-discovery: consume exact owned upgraded-store lineage at unchanged prepared roots")
+	f.StringVar(&o.RuntimeRoot, "discovery-runtime-root", "", "discovery resume: fresh canonical runtime directory directly under scratch; prepared repository roots stay fixed")
 	f.IntVar(&o.ExistingNested, "discovery-existing-nested", 0, "discovery preparation: existing linked checkouts placed inside the primary repository")
 	f.IntVar(&o.ExistingWorktrees, "discovery-existing-worktrees", 0, "discovery preparation: existing linked checkouts of the first family")
 	f.BoolVar(&o.StallFirst, "discovery-stall-first", false, "worktree-discovery: hold Git stdout for the first new owned checkout, ignoring TERM with a 60-second child bound")
 }
 func (o discoveryOptions) validate(scenario string, count int) error {
+	if o.RuntimeRoot != "" && o.Resume == "" {
+		return errors.New("discovery runtime root requires discovery resume")
+	}
 	if o.ExistingNested < 0 || o.ExistingNested > o.ExistingWorktrees {
 		return errors.New("discovery existing nested count must fit the existing topology")
 	}

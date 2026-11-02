@@ -422,6 +422,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 		s.addCleanup("store_lock", lock.Unlock)
 		storeLockHeld = true
+		// Expired pre-upgrade backups go before the store opens, so the space
+		// they free counts toward an upgrade's free-space check. Only under
+		// the lock: a partial copy can be in progress only while some process
+		// holds it.
+		pruneStoreUpgradeBackups(storePath, logger, time.Now())
 	}
 
 	// allowRebuild is gated on actually holding the store lock: only then may

@@ -126,6 +126,22 @@ func RemoveRuntimeState() {
 	_ = os.Remove(RuntimeStatePath())
 }
 
+// ReadRuntimeStateOf returns the record process pid wrote, whether or not
+// pid is still alive. A parent that spawned pid uses it to explain why that
+// child exited during startup; the PID binding keeps it from reporting a
+// record some other daemon left behind.
+func ReadRuntimeStateOf(pid int) (RuntimeState, bool) {
+	var st RuntimeState
+	blob, err := os.ReadFile(RuntimeStatePath())
+	if err != nil || pid <= 0 {
+		return RuntimeState{}, false
+	}
+	if err := json.Unmarshal(blob, &st); err != nil || st.PID != pid {
+		return RuntimeState{}, false
+	}
+	return st, true
+}
+
 // ReadRuntimeState returns the running daemon's recorded state. It reports
 // false when there is no record, when the record cannot be parsed, or when the
 // process that wrote it is gone — a record a killed daemon left behind names a

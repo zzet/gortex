@@ -35,8 +35,39 @@ func (e *SchemaTooNewError) Unwrap() error { return ErrSchemaTooNew }
 // the second check prevents a rebuild, but cannot undo writer PRAGMAs if another
 // process swaps or upgrades the database after this read-only probe.
 func checkSchemaDowngrade(path string, supported int) error {
+	probe, err := probeStoreSchema(path)
+	if err != nil {
+		return err
+	}
+	return probe.refuseNewer(supported)
+}
+
+// storeProbe is what the read-only schema probe learned about an on-disk
+// store before Open reaches it with a writer connection. The zero value
+// describes an in-memory database or a file that does not exist yet.
+type storeProbe struct {
+	filename string // main database file; empty for an in-memory database
+	uri      string // read-only, WAL-aware URI over filename
+	exists   bool   // filename was present when the probe ran
+	stored   int    // PRAGMA user_version, including a version held in WAL
+}
+
+// refuseNewer rejects a stored schema this binary cannot interpret.
+func (p storeProbe) refuseNewer(supported int) error {
+	if p.exists && p.stored > supported {
+		return &SchemaTooNewError{Stored: p.stored, Supported: supported}
+	}
+	return nil
+}
+
+// probeStoreSchema reads the stored schema version of the database at path
+// through a read-only connection, so nothing about the file (journal mode,
+// WAL contents, size) changes. Open uses the result to refuse a newer schema
+// and to size a pending upgrade before its writer connection exists.
+func probeStoreSchema(path string) (storeProbe, error) {
+	var probe storeProbe
 	if path == ":memory:" {
-		return nil
+		return probe, nil
 	}
 	var uri *url.URL
 	var filename string
@@ -44,26 +75,26 @@ func checkSchemaDowngrade(path string, supported int) error {
 		var err error
 		uri, err = url.Parse(path)
 		if err != nil {
-			return fmt.Errorf("sqlite schema probe URI: %w", err)
+			return storeProbe{}, fmt.Errorf("sqlite schema probe URI: %w", err)
 		}
 		query, err := url.ParseQuery(uri.RawQuery)
 		if err != nil {
-			return fmt.Errorf("sqlite schema probe query: %w", err)
+			return storeProbe{}, fmt.Errorf("sqlite schema probe query: %w", err)
 		}
 		if len(query["mode"]) > 1 {
-			return errors.New("sqlite schema probe: duplicate mode parameters")
+			return storeProbe{}, errors.New("sqlite schema probe: duplicate mode parameters")
 		}
 		if uri.Opaque == ":memory:" || query.Get("mode") == "memory" {
-			return nil
+			return probe, nil
 		}
 		if uri.Host != "" && uri.Host != "localhost" {
-			return fmt.Errorf("sqlite schema probe: unsupported file authority %q", uri.Host)
+			return storeProbe{}, fmt.Errorf("sqlite schema probe: unsupported file authority %q", uri.Host)
 		}
 		filename = uri.Path
 		if uri.Opaque != "" {
 			filename, err = url.PathUnescape(uri.Opaque)
 			if err != nil {
-				return fmt.Errorf("sqlite schema probe path: %w", err)
+				return storeProbe{}, fmt.Errorf("sqlite schema probe path: %w", err)
 			}
 		}
 		if trimmed := strings.TrimPrefix(filename, "/"); filepath.VolumeName(trimmed) != "" {
@@ -82,7 +113,7 @@ func checkSchemaDowngrade(path string, supported int) error {
 	} else {
 		absolute, err := filepath.Abs(path)
 		if err != nil {
-			return fmt.Errorf("sqlite schema probe path: %w", err)
+			return storeProbe{}, fmt.Errorf("sqlite schema probe path: %w", err)
 		}
 		filename = absolute
 		slashed := filepath.ToSlash(absolute)
@@ -91,25 +122,25 @@ func checkSchemaDowngrade(path string, supported int) error {
 		}
 		uri = &url.URL{Scheme: "file", Path: slashed, RawQuery: "mode=ro&_pragma=busy_timeout(5000)"}
 	}
+	uri.Fragment = ""
+	probe.filename = filename
+	probe.uri = uri.String()
 	if _, err := os.Stat(filename); err != nil {
 		if os.IsNotExist(err) {
-			return nil // A new store has no on-disk schema to reject.
+			return probe, nil // A new store has no on-disk schema to reject.
 		}
-		return fmt.Errorf("sqlite schema probe stat: %w", err)
+		return storeProbe{}, fmt.Errorf("sqlite schema probe stat: %w", err)
 	}
-	uri.Fragment = ""
-	db, err := openSQLiteStoreDB(uri.String())
+	probe.exists = true
+	db, err := openSQLiteStoreDB(probe.uri)
 	if err != nil {
-		return fmt.Errorf("sqlite schema probe open: %w", err)
+		return storeProbe{}, fmt.Errorf("sqlite schema probe open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	defer db.Close()
-	stored, err := readUserVersion(db)
+	probe.stored, err = readUserVersion(db)
 	if err != nil {
-		return fmt.Errorf("sqlite schema probe version: %w", err)
+		return storeProbe{}, fmt.Errorf("sqlite schema probe version: %w", err)
 	}
-	if stored > supported {
-		return &SchemaTooNewError{Stored: stored, Supported: supported}
-	}
-	return nil
+	return probe, nil
 }
