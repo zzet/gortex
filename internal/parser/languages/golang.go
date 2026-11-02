@@ -1350,8 +1350,9 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	var bodyPlan *goBodyCapturePlan
 	if body := goFuncBody(def.Node); body != nil {
-		stampGoBodyMetrics(node, body, src)
+		bodyPlan = collectGoBodyCapturePlan(node, body, src)
 	}
 	scanGoPragmasAboveByte(src, declStartByte, node)
 	result.Nodes = append(result.Nodes, node)
@@ -1365,8 +1366,8 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitGoThrowsEdges(node, m.Captures["func.result"], filePath, result)
-	emitGoFunctionShape(id, def.Node, m.Captures["func.params"], m.Captures["func.result"],
-		src, filePath, def.StartLine+1, imports, result)
+	emitGoFunctionShapeWithCapturePlan(id, def.Node, m.Captures["func.params"], m.Captures["func.result"],
+		src, filePath, def.StartLine+1, imports, result, bodyPlan)
 }
 
 // goFuncBody returns the `block` body child of a function/method
@@ -1467,8 +1468,9 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	var bodyPlan *goBodyCapturePlan
 	if body := goFuncBody(def.Node); body != nil {
-		stampGoBodyMetrics(node, body, src)
+		bodyPlan = collectGoBodyCapturePlan(node, body, src)
 	}
 	scanGoPragmasAboveByte(src, declStartByte, node)
 	result.Nodes = append(result.Nodes, node)
@@ -1487,8 +1489,8 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitGoThrowsEdges(node, m.Captures["method.result"], filePath, result)
-	emitGoFunctionShape(id, def.Node, m.Captures["method.params"], m.Captures["method.result"],
-		src, filePath, def.StartLine+1, imports, result)
+	emitGoFunctionShapeWithCapturePlan(id, def.Node, m.Captures["method.params"], m.Captures["method.result"],
+		src, filePath, def.StartLine+1, imports, result, bodyPlan)
 }
 
 // goTypeParams reads the `type_parameters` child of a Go declaration
