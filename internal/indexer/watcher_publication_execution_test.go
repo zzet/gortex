@@ -100,7 +100,16 @@ func TestCanonicalPublicationObservesMultiWatcherExecutor(t *testing.T) {
 		})
 	}
 	w := mw.watchers["repo-a"]
-	require.NotNil(t, w.pointReindexRaw, "production MultiWatcher must install the daemon's MultiIndexer executor")
+	idx := w.currentMutationIndexer()
+	require.NotNil(t, idx, "production MultiWatcher must select its registered Indexer")
+	require.NotNil(t, idx.repositoryMutationOwner, "production Indexer must bind the daemon executor")
+	require.Same(t, mi, idx.repositoryMutationOwner)
+	var crossCalls atomic.Int32
+	idx.incrementalCatchupHook = func(kind string, _ []string) {
+		if kind == "cross_repo" {
+			crossCalls.Add(1)
+		}
+	}
 	path := filepath.Join(root, "main.go")
 	bumpMtime(t, path, "package main\n\nfunc ChangedByDaemonPath() {}\n")
 	record := newPointPublication(t, "multi")
@@ -108,6 +117,7 @@ func TestCanonicalPublicationObservesMultiWatcherExecutor(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, awaitMutationRetryResult(t, ticket).Err)
 	require.NotNil(t, nodeByName(t, mi.GetIndexer("repo-a"), "repo-a/main.go", "ChangedByDaemonPath"))
+	require.EqualValues(t, 1, crossCalls.Load(), "the real daemon resolver tail must run, not the standalone fallback")
 	requirePointExecution(t, record, true)
 }
 
