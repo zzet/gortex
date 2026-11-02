@@ -81,3 +81,49 @@ func TestSharedRuntimeCompletionRequiresDistinctOwnerSuccess(t *testing.T) {
 		}
 	}
 }
+
+// The preparation-policy control separately proves that search-only and baseline
+// runs disable required accounting. Exercise the actual final-record path here:
+// optional timing evidence may lose credit without changing a semantic result.
+func TestSharedRuntimeOptionalAccountingCannotPoisonCompletedSearch(t *testing.T) {
+	for _, kind := range []string{"point", "move"} {
+		t.Run(kind, func(t *testing.T) {
+			var report editProbeSharedOwnerReport
+			proof := sharedReportProofFixture()
+			ref, err := report.observe(proof, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := sharedReportProofFixture()
+			changed.definition = []byte(`{"test_definition":2}`)
+			if _, err := report.observe(changed, nil); err == nil {
+				t.Fatal("contradiction not established")
+			}
+			ack := &editProbeWindow{WallNS: 2_000_000, SumNS: 2_000_000, WithinFivePercent: true}
+			record := editProbeRecord{Ordinal: 0, Outcome: "complete", GraphTerminal: true, Ack: measured(2, "ms")}
+			if kind == "point" {
+				record.Accounting = editProbeAccounting{State: "observed_shared_owner_windows_checks_pass", A: ack, Shared: ref}
+			} else {
+				record.MoveAccounting = &editProbeMoveAccounting{State: "observed_move_shared_owner_windows_checks_pass", A: ack, Files: []editProbeMoveFileAccounting{{Shared: ref}}}
+			}
+			run := &editProbeRuntime{requireAccounting: false, sharedReport: report, phase: &Phase{EditProbe: &editProbeReport{}}, plan: editProbePlan{Count: 1, Mode: "json", Steps: []editProbeStep{{Ordinal: 0}}}, states: []*editProbeState{{record: record}}}
+			if err := run.finish(); err != nil {
+				t.Fatalf("optional accounting poisoned completed semantics: %v", err)
+			}
+			got := run.phase.EditProbe.Records[0]
+			if got.Outcome != "complete" || len(got.Errors) != 0 || got.Ack.Value == nil || *got.Ack.Value != 2 || !got.GraphTerminal {
+				t.Fatalf("semantic/ACK result changed: %+v", got)
+			}
+			if kind == "point" {
+				if got.Accounting.State != "terminal_unavailable_shared_owner" || len(got.Accounting.Reasons) == 0 || got.Accounting.Shared != ref || got.Accounting.A != ack || got.Accounting.P != nil || got.Accounting.B != nil {
+					t.Fatalf("invalid optional timing retained credit or erased original facts: %+v", got.Accounting)
+				}
+			} else if got.MoveAccounting.State != "unavailable_move_shared_owner" || len(got.MoveAccounting.Reasons) == 0 || got.MoveAccounting.A != ack || got.MoveAccounting.Files[0].Shared != ref {
+				t.Fatalf("invalid optional move timing retained credit or erased original facts: %+v", got.MoveAccounting)
+			}
+			if run.phase.EditProbe.SharedOwners.Execution.Count != 0 || run.phase.EditProbe.SharedOwners.Background.Count != 0 {
+				t.Fatal("contradictory owner earned numeric credit")
+			}
+		})
+	}
+}
