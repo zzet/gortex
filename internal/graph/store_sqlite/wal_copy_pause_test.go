@@ -317,6 +317,7 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			var editCalls, editAcquisitions int
 			var reclaimHeldAtEdit bool
 			beforeHold := s.WALReclaimStats().WriterHold.Count()
+			var editAcquireErr error
 			var wait time.Duration
 			resetFinished := make(chan struct{})
 			editCtx, cancelEdit := context.WithTimeout(t.Context(), time.Second)
@@ -336,7 +337,8 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 					release := s.AnnounceWrite()
 					defer release()
 					started := time.Now()
-					s.writeMu.Lock()
+					editAcquireErr = s.writeMu.LockContext(editCtx)
+					if editAcquireErr != nil { return }
 					wait = time.Since(started)
 					editAcquisitions++
 					s.writeMu.Unlock()
@@ -357,6 +359,7 @@ func TestPressureResetHoldsTheWriterAtMostItsCap(t *testing.T) {
 			require.Less(t, res.writerHold, limit)
 			if queued {
 				t.Logf("edit calls=%d acquisitions=%d reclaim_held_at_edit=%v hold_samples=%d wait=%s", editCalls, editAcquisitions, reclaimHeldAtEdit, s.WALReclaimStats().WriterHold.Count()-beforeHold, wait)
+				require.NoError(t, editAcquireErr)
 				require.Equal(t, 1, editCalls)
 				require.Equal(t, 1, editAcquisitions)
 				require.True(t, reclaimHeldAtEdit)

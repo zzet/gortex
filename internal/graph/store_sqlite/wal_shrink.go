@@ -437,6 +437,16 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 		}
 		step, serr := s.shrinkWALSliceOnce(ctx, ckptDB, slice)
 		if serr != nil {
+			// A foreground writer can arrive after the outer idle check but
+			// before admission. Yield through the same writer-free wait, not
+			// a failed shrink; interactive/build refusals still stop this pass.
+			if errors.Is(serr, errWALReclaimWriterWaiting) && ctx.Err() == nil {
+				select {
+				case <-ctx.Done(): return slices, shrunk, ctx.Err()
+				case <-time.After(walReclaimYieldPoll):
+				}
+				continue
+			}
 			log.Printf("store_sqlite: wal shrink paused after %d slices error=%q wal_bytes=%d", slices, serr, s.observedWALFileSize(walPath))
 			return slices, shrunk, serr
 		}
@@ -468,7 +478,18 @@ func (s *Store) shrinkWAL(ctx context.Context, ckptDB *sql.DB) (slices int, shru
 	if hook := walShrinkBeforeRestore; hook != nil {
 		hook()
 	}
-	if lerr := s.restoreWriterJournalLimit(ctx); lerr != nil {
+	for {
+		lerr := s.restoreWriterJournalLimit(ctx)
+		if lerr == nil { break }
+		if errors.Is(lerr, errWALReclaimWriterWaiting) && ctx.Err() == nil {
+			// Restoration is still pending. Wait without the writer, just as
+			// between slices, and retry only this actual demand refusal.
+			select {
+			case <-ctx.Done(): return slices, shrunk, ctx.Err()
+			case <-time.After(walReclaimYieldPoll):
+			}
+			continue
+		}
 		log.Printf("store_sqlite: wal shrink could not restore the writer's journal_size_limit error=%q", lerr)
 		return slices, shrunk, lerr
 	}
