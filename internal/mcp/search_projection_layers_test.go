@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
@@ -105,19 +106,25 @@ func TestProjectedSearchOwnershipRetainsImmutableSnapshotVersions(t *testing.T) 
 	require.NoError(t, os.WriteFile(path, append([]byte("\n\n"), original...), 0o644))
 	first, err := srv.ensureProjected(t.Context(), []string{"main.go"})
 	require.NoError(t, err)
+	sourceEntry := liveEntry(pendingFileProjections, path)
+	require.NotNil(t, sourceEntry)
+	before := parser.ParseCount()
 	repeated, err := srv.ensureProjected(t.Context(), []string{"main.go"})
 	require.NoError(t, err)
 	firstLayers := srv.requestLayers(first)
 	repeatedLayers := srv.requestLayers(repeated)
 	require.Len(t, firstLayers, 1, "projection ownership must be attached even without an editor")
 	require.Len(t, repeatedLayers, 1)
-	require.Same(t, firstLayers[0], repeatedLayers[0], "unchanged immutable snapshot reuses its ownership layer")
+	require.Equal(t, before, parser.ParseCount(), "an unchanged immutable source snapshot is not parsed again")
+	require.Same(t, sourceEntry, liveEntry(pendingFileProjections, path), "reuse the immutable registry entry, even when request-local carried-edge wrappers differ")
+	require.Same(t, srv.readerFor(first).GetNode(old.ID), srv.readerFor(repeated).GetNode(old.ID), "both visibility wrappers borrow exactly the same immutable nodes")
 	require.NoError(t, os.WriteFile(path, append([]byte("\n\n\n\n"), original...), 0o644))
 	newer, err := srv.ensureProjected(t.Context(), []string{"main.go"})
 	require.NoError(t, err)
 	newerLayers := srv.requestLayers(newer)
 	require.Len(t, newerLayers, 1)
 	require.NotSame(t, firstLayers[0], newerLayers[0], "new bytes require a new immutable snapshot version")
+	require.NotSame(t, sourceEntry, liveEntry(pendingFileProjections, path), "new bytes must have a distinct source owner, not just a new visibility wrapper")
 	for _, item := range []struct {
 		ctx   context.Context
 		shift int

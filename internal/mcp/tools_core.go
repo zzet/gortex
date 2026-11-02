@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -1829,6 +1830,9 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	}
 	ctx, err = s.bindPendingSearch(ctx)
 	if err != nil {
+		if errors.Is(err, projectionSuperseded) {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		return nil, err
 	}
 	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {

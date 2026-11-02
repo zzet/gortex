@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -111,8 +110,11 @@ func requestSearchCandidates(ctx context.Context) []query.ViewLayerSource {
 // Prefix equality alone is insufficient: another daemon or linked checkout
 // can publish the same graph path from a different physical source root.
 func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error) {
-	if requestReadsCommittedTree(ctx) || ctx.Value(pendingSearchKey{}) != nil {
+	if requestReadsCommittedTree(ctx) {
 		return ctx, nil
+	}
+	if ctx.Value(pendingSearchKey{}) != nil {
+		return ctx, validateRequestProjections(ctx)
 	}
 	snapshot := pendingFileProjections.snap.Load()
 	if len(snapshot.entries) == 0 {
@@ -147,7 +149,11 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 			return ctx, err
 		}
 		if current != entry {
-			return ctx, errors.New("pending search projection changed during request capture")
+			return ctx, projectionSuperseded
+		}
+		ctx, err = retainRequestProjection(ctx, entry)
+		if err != nil {
+			return ctx, err
 		}
 		layers = append(layers, entry.layer)
 		var backend search.Backend
@@ -155,6 +161,9 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 			backend = entry.names
 		}
 		sources = append(sources, query.ViewLayerSource{Search: backend, Layer: entry.layer})
+	}
+	if err := validateRequestProjections(ctx); err != nil {
+		return ctx, err
 	}
 	if len(layers) == 0 {
 		return ctx, nil
