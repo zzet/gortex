@@ -1287,13 +1287,11 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// WebSocket upgrade handlers → real-time endpoint edges.
 	emitGoWebSocketEdges(src, filePath, result)
 
-	// Same-file constant/variable value references → impact-radius reads.
-	root.WithScratch(func() { captureValueRefCandidates(result, root, filePath, src) })
-
 	// Collect once before the original tail emission phases. Function values
 	// still precede Gin metadata, type references and GoFrame routes.
 	root.WithScratch(func() {
-		work := collectGoTailWork(root, src)
+		work := collectGoTailWork(root, src, result, filePath, funcRanges)
+		captureValueRefCandidatesWithGoWork(result, root, filePath, src, &work)
 		captureFnValueCandidatesWithGoWork(result, root, filePath, src, &work)
 
 		// Gin middleware-chain dispatcher + route registrations → resolver hints.

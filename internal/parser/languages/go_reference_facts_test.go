@@ -156,6 +156,53 @@ func(c *Ctrl) Handle() { _=Shared_Value; _=Future }
 				}
 				visit(root, nil)
 			})
+
+			// Compare the candidate's filtered queue to an independent original full
+			// walk, including parent identities, name bytes and duplicate preorder.
+			root.WithScratch(func() {
+				functions, values := map[string]bool{}, map[string]bool{}
+				for _, node := range result.Nodes {
+					if node == nil || node.FilePath != "facts.go" {
+						continue
+					}
+					if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
+						functions[node.Name] = true
+					}
+					if (node.Kind == graph.KindConstant || node.Kind == graph.KindVariable) && isDistinctiveConstName(node.Name) {
+						values[node.Name] = true
+					}
+				}
+				type factRow struct {
+					node, parent           uintptr
+					kind, parentKind, name string
+				}
+				var want, got []factRow
+				walkNodes(root, func(n *sitter.Node) {
+					kind := n.Type()
+					if kind != "identifier" && kind != "selector_expression" {
+						return
+					}
+					name := fnRefNodeName(n, src)
+					if kind == "identifier" && !functions[name] && !values[name] {
+						return
+					}
+					row := factRow{node: n.Id(), kind: kind, name: name}
+					if parent := n.Parent(); parent != nil {
+						row.parent = parent.Id()
+						row.parentKind = parent.Type()
+					}
+					want = append(want, row)
+				})
+				work := collectGoTailWork(root, src, result, "facts.go", buildFuncRanges(result))
+				for _, fact := range work.references {
+					row := factRow{node: fact.node.Id(), kind: fact.kind, parentKind: fact.parentKind, name: fact.name}
+					if fact.parent != nil {
+						row.parent = fact.parent.Id()
+					}
+					got = append(got, row)
+				}
+				require.Equal(t, want, got, "full unpruned all-child reference preorder, duplicates and parent context")
+			})
 			require.Equal(t, string(before), string(goScratchSemantics(t, result)), "owned values survive both consumers and scratch reuse")
 		})
 	}
