@@ -1703,6 +1703,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	isBinary := looksBinary(content)
 	bodiesElided := false
 	compressionPending := false
+	compressionBound := false
+	var compressionSymbols []*graph.Node
 	var keptSymbols []string
 	var language string
 	if sourceRequestView(ctx) != nil {
@@ -1718,16 +1720,22 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		if !servedFromOverlay {
-			compressionPending = true
+			var entry *projectionEntry
 			if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
 				facts.mu.RLock()
-				entry := facts.entries[pathkey.MutationKey(absPath)]
+				entry = facts.entries[pathkey.MutationKey(absPath)]
 				facts.mu.RUnlock()
-				compressionPending = entry == nil
 				if entry != nil && (!liveProjectionForAcknowledgement(entry) || entry.rawHash != blake3.Sum256(diskContent)) {
 					return mcp.NewToolResultError(errProjectedSourceMoved.Error()), nil
 				}
 			}
+			if entry != nil {
+				compressionSymbols = entry.layer.FileNodes(relPath)
+				compressionBound = true
+			} else {
+				compressionSymbols, compressionBound = s.readFileCompressionSymbols(ctx, absPath, relPath, content)
+			}
+			compressionPending = !compressionBound
 		}
 	}
 	// Tool-call observer: credit the recent search for the symbols in
@@ -1741,6 +1749,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		var symbols []*graph.Node
 		if sg != nil {
 			symbols = sg.Nodes
+		}
+		if compressionBound {
+			symbols = compressionSymbols // Never re-query ranges after their proof.
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
 		decide := fidelityDecideForPath(fidelityRules, relPath)

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -116,10 +117,18 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 	if ctx.Value(pendingSearchKey{}) != nil {
 		return ctx, validateRequestProjections(ctx)
 	}
+	if err := validateRequestProjections(ctx); err != nil {
+		return ctx, err
+	}
 	snapshot := pendingFileProjections.snap.Load()
 	if len(snapshot.entries) == 0 {
 		return ctx, nil
 	}
+	refreshDeadline := time.Now().Add(projectedReadBudget)
+	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(refreshDeadline) {
+		refreshDeadline = original
+	}
+	var refreshCtx context.Context
 	keys := make([]string, 0, len(snapshot.entries))
 	for key := range snapshot.entries {
 		keys = append(keys, key)
@@ -144,17 +153,33 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 		if root == "" || pathkey.MutationKey(filepath.Join(root, filepath.FromSlash(rel))) != entry.key {
 			continue
 		}
-		current, err := pendingFileProjections.lookup(entry.absPath)
-		if err != nil {
-			return ctx, err
-		}
-		if current != entry {
+		if pendingFileProjections.snap.Load().entries[key] != entry {
 			return ctx, projectionSuperseded
 		}
-		ctx, err = retainRequestProjection(ctx, entry)
+		if entry.suspect.Load() {
+			// Legacy lookup consumes an old pointer's invalidation on equal
+			// bytes. Reuse the existing bounded COW path instead: old readers
+			// stay invalid, and this request borrows only its checked successor.
+			if refreshCtx == nil {
+				ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, refreshDeadline)
+				var cancel context.CancelFunc
+				refreshCtx, cancel = context.WithDeadline(ctx, refreshDeadline)
+				defer cancel() // initialized at most once for the entire selection
+			}
+			current, err := s.projectCurrentTrackedFile(refreshCtx, ctx, entry.absPath, entry.graphPath, rel)
+			if err != nil {
+				return ctx, err
+			}
+			if current == nil {
+				continue // the existing helper checked actual canonical content
+			}
+			entry = current
+		}
+		borrowed, err := retainRequestProjection(ctx, entry)
 		if err != nil {
 			return ctx, err
 		}
+		ctx = borrowed
 		layers = append(layers, entry.layer)
 		var backend search.Backend
 		if entry.names != nil {
