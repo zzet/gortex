@@ -370,10 +370,11 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	s.sessionFor(ctx).recordFile(fp)
-	// Tool-call observer: credit the recent search for the symbols in
-	// the file the agent is about to edit.
-	s.creditFileConsumption(ctx, fp)
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.sessionFor(ctx).recordFile(fp)
+		// Credit the file consume only if this response is accepted.
+		s.creditFileConsumption(ctx, fp)
+	})
 	out := editingContext{}
 	var fileNodeForScope *graph.Node
 	callerCap := 20
@@ -398,9 +399,15 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	if fileNodeForScope != nil && !s.nodeInSessionScope(ctx, fileNodeForScope) {
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
-	for _, n := range bundle.Defines {
-		s.frecency.Record(n.ID)
+	consumedIDs := make([]string, len(bundle.Defines))
+	for i, n := range bundle.Defines {
+		consumedIDs[i] = n.ID
 	}
+	afterFreshSymbolAcceptance(ctx, func() {
+		for _, id := range consumedIDs {
+			s.frecency.Record(id)
+		}
+	})
 	if bundle.FileNode != nil {
 		out.File = map[string]any{"id": bundle.FileNode.ID, "language": bundle.FileNode.Language}
 	}

@@ -53,7 +53,11 @@ func fileEditingContextContext(ctx context.Context, reader graph.Reader, path st
 // withFileStoreRows gives every section of one file response the SAME 30ms
 // cancellable, coherent selected-store scope. No legacy API is a fallback.
 func withFileStoreRows(ctx context.Context, reader graph.Reader, consume func(graph.FileEditingContextRows) error) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	deadline := time.Now().Add(30 * time.Millisecond)
+	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
+		deadline = original
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	selected := reader
 	var core *contractCoreEdges
