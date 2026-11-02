@@ -61,8 +61,19 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			resultErr = errors.New(strings.Join(phase.Errors, "; "))
 		}
 	}()
+	worktreeViews := scenario == "worktrees" || scenario == editProbeScenario && o.Worktrees > 0
+	if scenario == editProbeScenario && (o.EditRepos > 1 || o.Worktrees > 0) {
+		if _, err := planEditProbeRoutes(corpora, o); err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		if o.EditRepos > 1 {
+			if err := validateEditProbeSourceRepos(ctx, corpora, outputRoot); err != nil {
+				return phase, nil, artifacts, crashes, "", err
+			}
+		}
+	}
 	selected := corpora[:1]
-	if scenario == "many" || scenario == "many-edit" {
+	if scenario == "many" || scenario == "many-edit" || scenario == editProbeScenario && o.EditRepos > 1 {
 		if len(corpora) < 2 {
 			return phase, nil, artifacts, crashes, "", errors.New("many-repository scenarios require at least two pinned repositories")
 		}
@@ -87,11 +98,14 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}
 	if scenario == editProbeScenario {
-		plan, err := planEditProbe(selected[0], o)
+		plan, err := planEditProbeRoutes(selected, o)
 		if err != nil {
 			return phase, nil, artifacts, crashes, "", err
 		}
-		phase.Operations = editProbeOperations(plan, selected[0])
+		phase.Operations, err = editProbeRouteOperations(plan, selected)
+		if err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
 		phase.EditProbe = newEditProbeReport(plan, selected[0], !o.editProbeBaseline)
 		phase.SessionModel = plan.SessionModel
 	}
@@ -151,7 +165,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			resultErr = errors.Join(resultErr, p.removeState())
 		}
 	}()
-	if scenario == "worktrees" {
+	if worktreeViews {
 		if err := p.addWorktrees(ctx, bootWorktrees(o)); err != nil {
 			return phase, nil, artifacts, crashes, "", err
 		}
@@ -164,7 +178,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	}
 	warmCtx, cancelWarm := context.WithTimeout(ctx, o.WarmTimeout)
 	defer cancelWarm()
-	configured, err := p.writeBootRepos(scenario == "worktrees")
+	configured, err := p.writeBootRepos(worktreeViews)
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
@@ -230,7 +244,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 				p.Repos[i].Prefix = tracked.Prefix
 			}
 		}
-		if i > 0 && scenario == "worktrees" {
+		if i > 0 && worktreeViews {
 			p.Repos[i].Prefix = p.Repos[0].Prefix
 		}
 		if p.Repos[i].Prefix == "" {
@@ -260,7 +274,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		version = client.version
 		if i < len(p.Repos) {
 			subscribeInvalidations(warmCtx, client, repo.Corpus.Label, o.Deadline, &phase)
-			if err := preflightRoot(warmCtx, p, client, repo, scenario == "worktrees" && i > 0, o.Deadline, &phase); err != nil {
+			if err := preflightRoot(warmCtx, p, client, repo, worktreeViews && i > 0, o.Deadline, &phase); err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
 			gate, rows, err := warmAnalysis(warmCtx, client, o.Deadline)
