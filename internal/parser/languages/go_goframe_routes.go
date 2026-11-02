@@ -23,7 +23,7 @@ const goframeRouteViaTag = "goframe-route"
 
 // captureGoFrameRoutes materialises GoFrame route nodes and tags controller
 // methods. Runs at the tail of Extract so the method nodes exist.
-func captureGoFrameRoutes(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte) {
+func captureGoFrameRoutes(result *parser.ExtractionResult, root *sitter.Node, work goTailWork, filePath string, src []byte) {
 	if root == nil || result == nil {
 		return
 	}
@@ -41,21 +41,21 @@ func captureGoFrameRoutes(result *parser.ExtractionResult, root *sitter.Node, fi
 	filePkg := goframePackageName(root, src)
 
 	// Controllers bound via `g.Bind(new(Ctrl))` — the addonRoot tiebreak set.
-	bound := goframeBoundControllers(root, src)
+	bound := goframeBoundControllers(work.goframeCalls, src)
 
 	// Pass 1: request structs → route nodes + placeholders.
-	goframeWalk(root, func(n *sitter.Node) {
+	for _, n := range work.goframeTypes {
 		if n.Type() != "type_spec" {
-			return
+			continue
 		}
 		nameNode := n.ChildByFieldName("name")
 		st := goframeStructType(n)
 		if nameNode == nil || st == nil {
-			return
+			continue
 		}
 		method, path, ok := goframeMetaTag(st, src)
 		if !ok {
-			return
+			continue
 		}
 		reqType := nameNode.Content(src)
 		routeID := "route::goframe::" + method + "::" + path
@@ -78,16 +78,16 @@ func captureGoFrameRoutes(result *parser.ExtractionResult, root *sitter.Node, fi
 			FilePath: filePath, Line: int(n.StartPoint().Row) + 1,
 			Meta: edgeMeta,
 		})
-	})
+	}
 
 	// Pass 2: tag controller methods by request-struct pointer parameter.
-	goframeWalk(root, func(n *sitter.Node) {
+	for _, n := range work.goframeMethods {
 		if n.Type() != "method_declaration" {
-			return
+			continue
 		}
 		name, recvType, reqType, reqPkg, ok := goframeMethodParts(n, src)
 		if !ok {
-			return
+			continue
 		}
 		// A bare `*CreateReq` param names a struct in this file's package; a
 		// qualified `*api.CreateReq` carries its own package qualifier.
@@ -111,7 +111,7 @@ func captureGoFrameRoutes(result *parser.ExtractionResult, root *sitter.Node, fi
 			}
 			break
 		}
-	})
+	}
 }
 
 // goframeStructType returns the struct_type of a type_spec, or nil.
@@ -341,22 +341,22 @@ func goframePointerParamType(pd *sitter.Node, src []byte) (typeName, pkg string)
 
 // goframeBoundControllers collects controller types registered via
 // `g.Bind(new(Ctrl))` (the addonRoot tiebreak set).
-func goframeBoundControllers(root *sitter.Node, src []byte) map[string]bool {
+func goframeBoundControllers(calls []*sitter.Node, src []byte) map[string]bool {
 	out := map[string]bool{}
-	goframeWalk(root, func(n *sitter.Node) {
+	for _, n := range calls {
 		if n.Type() != "call_expression" {
-			return
+			continue
 		}
 		fn := n.ChildByFieldName("function")
 		if fn == nil || fn.Type() != "selector_expression" {
-			return
+			continue
 		}
 		if f := fn.ChildByFieldName("field"); f == nil || f.Content(src) != "Bind" {
-			return
+			continue
 		}
 		args := n.ChildByFieldName("arguments")
 		if args == nil {
-			return
+			continue
 		}
 		for i, _nc := 0, int(args.NamedChildCount()); i < _nc; i++ {
 			a := args.NamedChild(i)
@@ -374,7 +374,7 @@ func goframeBoundControllers(root *sitter.Node, src []byte) map[string]bool {
 				}
 			}
 		}
-	})
+	}
 	return out
 }
 
