@@ -3,7 +3,7 @@ package mcp
 import (
 	"context"
 	"crypto/sha256"
- "encoding/json"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -16,7 +16,7 @@ import (
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
- "github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/require"
 	"github.com/zeebo/blake3"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -199,26 +199,46 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 					}
 					return nil
 				}
+				// A canceled SDK call can return before its bounded middleware
+				// worker. Join existing activity accounting before observing
+				// results or restoring the per-test registry; this is cleanup,
+				// never an outcome retry or additional read.
+				joinCancelledWorker := func() {
+					if transition == "cancelled_scope" {
+						require.Eventually(t, func() bool { return !foregroundMCPToolCallActiveForTest() }, 3*time.Second, time.Millisecond, "canceled registered middleware must finish before fixture cleanup")
+					}
+				}
+				t.Cleanup(joinCancelledWorker)
 				backend.armed.Store(true)
 				var result *mcplib.CallToolResult
-                var protocolError *struct { Code int `json:"code"`; Message string `json:"message"` }
-                if transition == "cancelled_scope" {
-                    // Cancellation may be returned by the registered SDK as a
-                    // JSON-RPC error instead of a tool result. Inspect the real
-                    // envelope rather than manufacturing a successful call.
-                    require.True(t, s.IsToolEnabledForSession(caller, tool))
-                    s.EnsureToolPromotedForSession(caller, tool)
-                    frame, marshalErr := json.Marshal(map[string]any{"jsonrpc":"2.0", "id":20, "method":"tools/call", "params":map[string]any{"name":tool, "arguments":map[string]any{"path":"main.go", "format":"json"}}})
-                    require.NoError(t, marshalErr)
-                    reply := s.MCPServer().HandleMessage(WithAuthorizedToolCall(caller, tool), frame)
-                    raw, marshalErr := json.Marshal(reply)
-                    require.NoError(t, marshalErr)
-                    var envelope struct { Error *struct { Code int `json:"code"`; Message string `json:"message"` } `json:"error"`; Result *mcplib.CallToolResult `json:"result"` }
-                    require.NoError(t, json.Unmarshal(raw, &envelope))
-                    protocolError, result = envelope.Error, envelope.Result
-                } else {
-                    result = preselectionRegisteredCall(t, s, caller, 20, tool, map[string]any{"path":"main.go", "format":"json"})
-                }
+				var protocolError *struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				}
+				if transition == "cancelled_scope" {
+					// Cancellation may be returned by the registered SDK as a
+					// JSON-RPC error instead of a tool result. Inspect the real
+					// envelope rather than manufacturing a successful call.
+					require.True(t, s.IsToolEnabledForSession(caller, tool))
+					s.EnsureToolPromotedForSession(caller, tool)
+					frame, marshalErr := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": map[string]any{"name": tool, "arguments": map[string]any{"path": "main.go", "format": "json"}}})
+					require.NoError(t, marshalErr)
+					reply := s.MCPServer().HandleMessage(WithAuthorizedToolCall(caller, tool), frame)
+					raw, marshalErr := json.Marshal(reply)
+					require.NoError(t, marshalErr)
+					var envelope struct {
+						Error *struct {
+							Code    int    `json:"code"`
+							Message string `json:"message"`
+						} `json:"error"`
+						Result *mcplib.CallToolResult `json:"result"`
+					}
+					require.NoError(t, json.Unmarshal(raw, &envelope))
+					protocolError, result = envelope.Error, envelope.Result
+				} else {
+					result = preselectionRegisteredCall(t, s, caller, 20, tool, map[string]any{"path": "main.go", "format": "json"})
+				}
+				joinCancelledWorker()
 				observed := backend.observation()
 				require.Equal(t, int32(1), backend.calls.Load(), "the real checked file scope must be reached once; no outcome retry")
 				t.Logf("scope stage=entry remaining_original=%s scope_elapsed=%s err=%v remaining_after=%s attempts=%d", observed.remainingAtEntry, observed.elapsed, observed.err, time.Until(deadline), allowance.attempts.Load())
@@ -230,11 +250,11 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 					require.ErrorIs(t, observed.err, graph.ErrContractProjectionStale, "the checked SQL scope, not a fake error, must refuse changed ownership revision")
 				}
 				switch transition {
-                case "cancelled_scope":
-                    require.ErrorIs(t, caller.Err(), context.Canceled)
-                    require.NotNil(t, protocolError)
-                    require.Equal(t, "context canceled", protocolError.Message)
-                    require.Nil(t, result)
+				case "cancelled_scope":
+					require.ErrorIs(t, caller.Err(), context.Canceled)
+					require.NotNil(t, protocolError)
+					require.Equal(t, "context canceled", protocolError.Message)
+					require.Nil(t, result)
 				case "revision_only", "unchanged_scope":
 					require.NotNil(t, observed.entry, "the actual registered handler must borrow a current file projection")
 					requireCanonicalDefinitionRows(t, tool, result, expected)

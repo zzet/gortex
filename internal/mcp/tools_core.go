@@ -2786,7 +2786,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// never an errorless count/subgraph fallback outside the store scope.
 	gcxOnly := s.isGCX(ctx, req) && !isCompact(req)
 	sg, dependents, storeErr := fileSummaryContext(ctx, s.readerFor(ctx), fp, gcxOnly, !gcxOnly && !isCompact(req))
-	storeBusy := errors.Is(storeErr, context.DeadlineExceeded) && ctx.Err() == nil
+	storeBusy := (errors.Is(storeErr, context.DeadlineExceeded) && ctx.Err() == nil) || s.checkedFileScopeFallback(ctx, fp, storeErr)
 	if storeBusy {
 		ctx = markRequestStoreBusy(ctx, fp)
 		sg = requestLocalFileSummary(ctx, fp, gcxOnly)
