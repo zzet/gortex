@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 
@@ -133,6 +134,16 @@ func (r *editingContextCoreRows) GetOutEdgesByNodeIDs(ids []string) map[string][
 }
 func (r *editingContextCoreRows) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	return r.filterBatch(r.FileEditingContextRows.GetInEdgesByNodeIDs(ids))
+}
+
+// checkedFileScopeFallback permits only the request's independently checked
+// immutable file rows after a selected-store revision change. The rejected SQL
+// bundle is discarded; canonical rows and cross-file relations earn no credit.
+// This is not a new projection attempt, and old or canceled facts stay invalid.
+func (s *Server) checkedFileScopeFallback(ctx context.Context, path string, scopeErr error) bool {
+	return errors.Is(scopeErr, graph.ErrContractProjectionStale) && ctx.Err() == nil &&
+		validateRequestProjections(ctx) == nil && s.hasRequestProjectionFact(ctx, path) &&
+		requestLocalFileLayer(ctx, path) != nil
 }
 
 // requestLocalEditingContext borrows only the request's already captured

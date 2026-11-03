@@ -104,6 +104,14 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	if !ok || !time.Now().Before(deadline) {
 		return false
 	}
+	return checkedProjectionChange(ctx) && ctx.Err() == nil && time.Now().Before(deadline)
+}
+
+// Structural ownership proof, independent of permission or time for another attempt.
+func checkedProjectionChange(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
 		return false
@@ -112,7 +120,7 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	defer facts.mu.RUnlock()
 	changed := false
 	for _, entry := range facts.entries {
-		if entry == nil || ctx.Err() != nil || !time.Now().Before(deadline) {
+		if entry == nil || ctx.Err() != nil {
 			return false
 		}
 		candidate := pendingFileProjections.snap.Load().entries[entry.key]
@@ -124,8 +132,13 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 		current := pendingFileProjections.snap.Load().entries[entry.key]
 		unchanged := current == entry && current == candidate && live
 		retired := current == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+		// A zero sequence never becomes a physical receipt. An externally
+		// built version may authorize a new attempt only when BOTH owners
+		// earned checked-read publication and share this immutable version.
+		versionChecked := current != nil && current.sourceCommitSeq == entry.sourceCommitSeq &&
+			(current.sourceCommitSeq != 0 || entry.commitSeq == 0 && current.readVersionChecked && entry.readVersionChecked)
 		readCOW := current != nil && current != entry && current == candidate && live &&
-			current.commitSeq == 0 && current.sourceCommitSeq != 0 && current.sourceCommitSeq == entry.sourceCommitSeq &&
+			current.commitSeq == 0 && versionChecked &&
 			!current.suspect.Load() && current.sourceEvents == 0 && !current.checkedRetired.Load() &&
 			!current.tombstone && !entry.tombstone && current.layer != nil && current.layer == entry.layer &&
 			current.key == entry.key && current.graphPath == entry.graphPath && current.repoPrefix == entry.repoPrefix &&
