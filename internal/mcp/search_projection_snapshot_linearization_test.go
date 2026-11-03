@@ -292,3 +292,73 @@ func TestSearchCallerOwnedOldFactsCannotHideANewerOwnACK(t *testing.T) {
 	require.True(t, text.IsError, "a symbol capture cannot exempt a later text scan: %s", resultText(text))
 	require.Contains(t, resultText(text), "superseded")
 }
+
+func TestSymbolCaptureDoesNotExemptLiteralContentFallback(t *testing.T) {
+	s, _, base, path, _ := snapshotFacadeFixture(t)
+	ack := snapshotRegisteredCall(t, s, base, 12, "edit", snapshotEditArgs(path, "return 2", "return 2 /* SnapshotLiteralOnly */"))
+	require.False(t, ack.IsError, resultText(ack))
+	require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
+	leaf, ok := s.facades.legacy("search_symbols")
+	require.True(t, ok)
+	type answer struct {
+		ctx    context.Context
+		result *mcplib.CallToolResult
+		err    error
+	}
+	selected, answered := make(chan answer, 1), make(chan answer, 1)
+	released := make(chan struct{})
+	release := sync.OnceFunc(func() { close(released) })
+	s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		result, err := leaf.handler(ctx, req)
+		selected <- answer{ctx, result, err}
+		<-released
+		return result, err
+	})
+	args := snapshotSearchArgs()
+	args["query"] = "SnapshotLiteralOnly"
+	var worker sync.WaitGroup
+	worker.Add(1)
+	t.Cleanup(func() { release(); worker.Wait() })
+	go func() {
+		defer worker.Done()
+		result, err := externalVersionRegisteredCall(s, base, 20, "search", args)
+		answered <- answer{result: result, err: err}
+	}()
+	var owned answer
+	select {
+	case owned = <-selected:
+	case early := <-answered:
+		t.Fatalf("registered literal fallback returned before leaf: result=%v error=%v", early.result, early.err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("registered symbol miss did not reach its real literal fallback")
+	}
+	leafJSON, marshalErr := json.Marshal(owned.result)
+	t.Logf("literal_leaf_json=%s marshal_error=%v leaf_error=%v", leafJSON, marshalErr, owned.err)
+	require.NoError(t, marshalErr)
+	require.NoError(t, owned.err)
+	require.False(t, owned.result.IsError, resultText(owned.result))
+	fields := extractTextResult(t, owned.result)
+	require.Empty(t, fields["results"], "the marker is a physical comment, never a symbol node")
+	content, ok := fields["content_matches"].(map[string]any)
+	require.True(t, ok, "prove actual physical literal-content fallback, not a fabricated result")
+	count, ok := content["count"].(float64)
+	require.True(t, ok)
+	require.Positive(t, count)
+	require.NoError(t, validateRequestProjections(owned.ctx))
+	peer := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "NeighborBefore", "Neighbor"))
+	require.False(t, peer.IsError, resultText(peer))
+	require.Equal(t, true, extractTextResult(t, peer)["readback_exact"])
+	require.ErrorIs(t, validateRequestProjections(owned.ctx), projectionSuperseded)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "SnapshotLiteralOnly")
+	release()
+	worker.Wait()
+	final := <-answered
+	finalJSON, finalMarshalErr := json.Marshal(final.result)
+	t.Logf("literal_final_json=%s marshal_error=%v protocol_error=%v physical_sha=%x", finalJSON, finalMarshalErr, final.err, sha256.Sum256(raw))
+	require.NoError(t, finalMarshalErr)
+	require.NoError(t, final.err)
+	require.True(t, final.result.IsError, "a pending-symbol capture cannot certify later literal-byte work: %s", resultText(final.result))
+	require.Contains(t, resultText(final.result), "superseded")
+}
