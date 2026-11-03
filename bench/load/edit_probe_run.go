@@ -471,7 +471,19 @@ func (s *editProbeState) emit(value any) error {
 		return fmt.Errorf("%w: raw writer already closing", errEditProbeEvidenceIncomplete)
 	}
 	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
-		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded", errEditProbeEvidenceIncomplete)
+		// Preserve only first-refusal scalar facts in the existing error path.
+		// The rejected payload is never queued and the original cap is unchanged.
+		row, _ := value.(map[string]any)
+		event, _ := row["event"].(string)
+		purpose, _ := row["purpose"].(string)
+		wireID, payloadBytes := "unavailable", -1
+		if id, known := row["wire_id"].(int64); known {
+			wireID = strconv.FormatInt(id, 10)
+		}
+		if payload, known := row["payload"].(json.RawMessage); known {
+			payloadBytes = len(payload)
+		}
+		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
 		return s.sinkErr
 	}
 	// Pending and in-flight payloads share the unchanged total byte cap. A
