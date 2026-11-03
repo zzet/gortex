@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,7 +28,21 @@ func TestSearchAcceptancePreparationBoundsActualInitializedClients(t *testing.T)
 			}
 			var mu sync.Mutex
 			connections := make(map[int]bool)
-			fallback := editProbeDiskStub(t, corpus, root)
+			// This control observes initialized transport topology, not repeated
+			// AST parsing. Derive every immutable pre-edit reply once from the
+			// actual fixture bytes written above; every offered admission still
+			// makes its real framed request and verifies its named declaration.
+			before := make(map[string]map[string]any)
+			for i, line := range strings.Split(corpus.EditInitialContent, "\n") {
+				if !strings.HasPrefix(line, "func ") {
+					continue
+				}
+				name, _, found := strings.Cut(strings.TrimPrefix(line, "func "), "(")
+				if found {
+					id := "fixture/" + corpus.File + "::" + name
+					before[id] = map[string]any{"id": id, "file_path": "fixture/" + corpus.File, "source": line, "start_line": i + 1, "end_line": i + 1}
+				}
+			}
 			socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
 				mu.Lock()
 				connections[frame.Connection] = true
@@ -35,7 +50,10 @@ func TestSearchAcceptancePreparationBoundsActualInitializedClients(t *testing.T)
 				if frame.Method == "ping" {
 					return map[string]any{}, nil
 				}
-				return fallback(frame)
+				args, _ := frame.Params["arguments"].(map[string]any)
+				target, _ := args["target"].(map[string]any)
+				id, _ := target["symbol"].(string)
+				return stubContent(before[id]), nil
 			})
 			var editors []*socketClient
 			for range 8 {
