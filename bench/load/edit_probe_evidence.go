@@ -346,6 +346,12 @@ func checkEditProbeAccountingForTool(status map[string]any, receipt, tool string
 // checkEditProbeAcknowledgement validates A and receipt/generation identities only.
 // Callers retain every reason before validating their distinct execution owner.
 func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+	return checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
+}
+
+// Existing callers stay strict. The batch-bound route may select an executed
+// local no-wait disposition only after original journal/ACK identity checks.
+func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	if status["receipt"] != receipt {
@@ -372,6 +378,19 @@ func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedFiel
 	aPhases, _ := ack["observed_execution_ms"].(map[string]any)
 	aStates, _ := ack["phase_states"].(map[string]any)
 	for _, name := range []string{"caller_result", "disk_write", "edit_control", "middleware", "parse", "publish", "reindex_wait", "reply_prepare"} {
+		if name == "reindex_wait" && countedNoWait {
+			counts, _ := ack["counts"].(map[string]any)
+			count, _ := counts[name].(map[string]any)
+			started, se := strconvEditProbeUint(count["started"])
+			completed, ce := strconvEditProbeUint(count["completed"])
+			na, ne := strconvEditProbeUint(count["not_applicable"])
+			_, present := aPhases[name]
+			ackPhases, _ := ack["phases_ms"].(map[string]any)
+			_, ackPresent := ackPhases[name]
+			if present && ackPresent && ackPhases[name] == nil && aPhases[name] == nil && aStates[name] == "not_applicable" && se == nil && ce == nil && ne == nil && started > 0 && completed == started && na == started {
+				continue
+			}
+		}
 		// The actual batch text-splice handler explicitly records that it
 		// performs no parser gate. Preserve that null applicability state;
 		// missing/unknown work and an applicable parse never get this escape.
@@ -396,7 +415,11 @@ func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedFiel
 // owner. The windows remain independent; no map is merged into a synthetic
 // physical mutation_status reply and A is never added to background work.
 func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
-	out := checkEditProbeAcknowledgement(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable)
+	return checkEditProbeAccountingWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
+}
+
+func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
+	out := checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, countedNoWait)
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	requested, applied := out.Requested, out.Applied
 	// Shared execution has a distinct owner/domain proof. Even malformed or

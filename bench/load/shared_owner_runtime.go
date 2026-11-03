@@ -45,6 +45,10 @@ func (r *editProbeRuntime) accountingForStatus(ctx context.Context, status map[s
 // Both physical point-status and exact move-child callers use this same
 // current-domain/member validator. The report dictionary is never authority.
 func (r *editProbeRuntime) referenceForSharedStatus(ctx context.Context, status map[string]any, receipt, originalMovePath string) (*editProbeSharedReference, bool, error) {
+	return r.referenceForSharedBatchStatus(ctx, status, receipt, originalMovePath, nil)
+}
+
+func (r *editProbeRuntime) referenceForSharedBatchStatus(ctx context.Context, status map[string]any, receipt, originalMovePath string, batch *editProbeBatchSetReferences) (*editProbeSharedReference, bool, error) {
 	if _, ok := status["shared_owner_accounting_v1"].(map[string]any); !ok {
 		return nil, false, errors.New("complete typed shared owner proof unavailable")
 	}
@@ -63,7 +67,7 @@ func (r *editProbeRuntime) referenceForSharedStatus(ctx context.Context, status 
 		}
 		r.sharedBinding = binding
 	}
-	proof, proofErr := checkEditProbeSharedProof(status, receipt, r.sharedBinding, r.p, role)
+	proof, proofErr := checkEditProbeSharedProofForBatch(status, receipt, r.sharedBinding, r.p, role, batch)
 	if originalMovePath != "" && proof.member.Path != "" {
 		relative, err := filepath.Rel(r.sharedBinding.root, proof.member.Path)
 		want := editProbeMovePath{Relative: filepath.ToSlash(relative), Qualified: r.sharedBinding.prefix + "/" + filepath.ToSlash(relative), Absolute: proof.member.Path}
@@ -88,6 +92,25 @@ func (r *editProbeRuntime) finishSharedOwners() *editProbeSharedOwnerReport {
 }
 
 func invalidateSharedAccounting(record *editProbeRecord, report *editProbeSharedOwnerReport, required bool) {
+	if record.BatchAccounting != nil {
+		for _, file := range record.BatchAccounting.Files {
+			if file.Shared == nil {
+				continue
+			}
+			if err := report.definitionError(file.Shared); err != nil {
+				record.BatchAccounting.State = "unavailable_batch_shared_owner"
+				record.BatchAccounting.Reasons = append(record.BatchAccounting.Reasons, err.Error())
+				record.Accounting.State = "terminal_unavailable_shared_owner"
+				record.Accounting.Reasons = append(record.Accounting.Reasons, err.Error())
+				if required {
+					record.Errors = append(record.Errors, "batch shared owner accounting invalidated: "+err.Error())
+					if record.Outcome == "complete" {
+						record.Outcome = "diagnostic_failure"
+					}
+				}
+			}
+		}
+	}
 	if record.MoveAccounting != nil {
 		for _, file := range record.MoveAccounting.Files {
 			if file.Shared == nil {

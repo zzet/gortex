@@ -741,6 +741,9 @@
                                   {
                                     "additionalProperties": false,
                                     "properties": {
+                                      "ack_mode": {
+                                        "type": "string"
+                                      },
                                       "acknowledgement_receipt": {
                                         "type": "string"
                                       },
@@ -752,6 +755,9 @@
                                       },
                                       "file_observation_receipt": {
                                         "type": "string"
+                                      },
+                                      "original_request_no_require_fresh": {
+                                        "type": "boolean"
                                       },
                                       "path": {
                                         "type": "string"
@@ -790,6 +796,246 @@
                                       "result_reindex_receipt",
                                       "result_reindex_generation",
                                       "acknowledgement_state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "batch_accounting": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "files": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "acknowledgement_state": {
+                                              "type": "string"
+                                            },
+                                            "path": {
+                                              "type": "string"
+                                            },
+                                            "reasons": {
+                                              "items": {
+                                                "type": "string"
+                                              },
+                                              "type": [
+                                                "array",
+                                                "null"
+                                              ]
+                                            },
+                                            "receipt": {
+                                              "type": "string"
+                                            },
+                                            "shared_owner": {
+                                              "anyOf": [
+                                                {
+                                                  "additionalProperties": false,
+                                                  "properties": {
+                                                    "definition_key": {
+                                                      "type": "string"
+                                                    },
+                                                    "member": {
+                                                      "additionalProperties": false,
+                                                      "properties": {
+                                                        "checkout_id": {
+                                                          "type": "string"
+                                                        },
+                                                        "checkout_incarnation": {
+                                                          "type": "string"
+                                                        },
+                                                        "content_sha256": {
+                                                          "type": "string"
+                                                        },
+                                                        "path": {
+                                                          "type": "string"
+                                                        },
+                                                        "physical_commit_sequence": {
+                                                          "type": "integer"
+                                                        },
+                                                        "publication_key": {
+                                                          "type": "string"
+                                                        },
+                                                        "receipt": {
+                                                          "type": "string"
+                                                        },
+                                                        "ticket": {
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "receipt",
+                                                        "publication_key",
+                                                        "path",
+                                                        "ticket",
+                                                        "physical_commit_sequence",
+                                                        "content_sha256",
+                                                        "checkout_id",
+                                                        "checkout_incarnation"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "same_status_membership": {}
+                                                  },
+                                                  "required": [
+                                                    "definition_key",
+                                                    "member",
+                                                    "same_status_membership"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "receipt",
+                                            "path",
+                                            "acknowledgement_state"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "reasons": {
+                                        "items": {
+                                          "type": "string"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "state": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "state",
+                                      "files"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "batch_set": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "ack_mode": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement_receipt": {
+                                        "type": "string"
+                                      },
+                                      "actual_wire_id": {
+                                        "type": "string"
+                                      },
+                                      "bound_server_rpc_id": {
+                                        "type": "string"
+                                      },
+                                      "files": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "ack_mode": {
+                                              "type": "string"
+                                            },
+                                            "acknowledgement_receipt": {
+                                              "type": "string"
+                                            },
+                                            "acknowledgement_state": {
+                                              "type": "string"
+                                            },
+                                            "after_sha256": {
+                                              "type": "string"
+                                            },
+                                            "file_observation_receipt": {
+                                              "type": "string"
+                                            },
+                                            "original_request_no_require_fresh": {
+                                              "type": "boolean"
+                                            },
+                                            "path": {
+                                              "type": "string"
+                                            },
+                                            "reindex_generation": {
+                                              "type": "integer"
+                                            },
+                                            "reindex_receipt": {
+                                              "type": "string"
+                                            },
+                                            "relative_path": {
+                                              "type": "string"
+                                            },
+                                            "result_reindex_generation": {
+                                              "type": "integer"
+                                            },
+                                            "result_reindex_receipt": {
+                                              "type": "string"
+                                            },
+                                            "transaction_error": {
+                                              "type": "string"
+                                            },
+                                            "transaction_id": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "transaction_id",
+                                            "file_observation_receipt",
+                                            "acknowledgement_receipt",
+                                            "path",
+                                            "relative_path",
+                                            "after_sha256",
+                                            "reindex_receipt",
+                                            "reindex_generation",
+                                            "result_reindex_receipt",
+                                            "result_reindex_generation",
+                                            "acknowledgement_state"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "fingerprint": {
+                                        "type": "string"
+                                      },
+                                      "original_request_no_require_fresh": {
+                                        "type": "boolean"
+                                      },
+                                      "reference_error": {
+                                        "type": "string"
+                                      },
+                                      "transaction_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "transaction_id",
+                                      "fingerprint",
+                                      "ack_mode",
+                                      "original_request_no_require_fresh",
+                                      "acknowledgement_receipt",
+                                      "bound_server_rpc_id",
+                                      "actual_wire_id",
+                                      "files"
                                     ],
                                     "type": "object"
                                   },
