@@ -327,6 +327,11 @@ func TestAntigravityGlobalInstallKeepsUserState(t *testing.T) {
 	if _, err := os.Stat(GlobalPluginManifestPath(env.Home)); err != nil {
 		t.Errorf("plugin.json missing: %v", err)
 	}
+	state := Inspect(env.Home)
+	if !state.HooksDisabled || state.Hooks["PreToolUse"] != 1 || !state.MCPServer ||
+		!state.InstructionsWired || !state.PostToolUseDenyPosture {
+		t.Errorf("Inspect does not see the install: %+v", state)
+	}
 	for _, id := range CuratedSkillNames() {
 		if _, err := os.Stat(curatedSkillPath(env.Home, id)); err != nil {
 			t.Errorf("curated skill %s missing: %v", id, err)

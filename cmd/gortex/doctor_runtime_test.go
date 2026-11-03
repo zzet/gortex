@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/antigravity"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
@@ -140,7 +141,7 @@ func TestDoctorRuntimeReportsInstallStateForEveryHost(t *testing.T) {
 		InstallGlobalInstructions: true,
 		InstructionsDir:           filepath.Join(home, ".gortex", "instructions"),
 	}
-	for _, a := range []agents.Adapter{claudecode.New(), codex.New(), copilotcli.New(), opencode.New()} {
+	for _, a := range []agents.Adapter{claudecode.New(), codex.New(), copilotcli.New(), opencode.New(), antigravity.New()} {
 		if _, err := a.Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
 			t.Fatalf("%s apply: %v", a.Name(), err)
 		}
@@ -161,6 +162,7 @@ func TestDoctorRuntimeReportsInstallStateForEveryHost(t *testing.T) {
 		{hooks.AgentClaudeCode, true, ""},
 		{copilotcli.Name, true, filepath.Join(home, ".copilot", "hooks", "gortex.json")},
 		{opencode.Name, true, opencode.PluginPath(home)},
+		{antigravity.Name, true, antigravity.HookConfigPath(home)},
 	} {
 		t.Run(tc.agent, func(t *testing.T) {
 			got, ok := byAgent[tc.agent]
@@ -208,7 +210,7 @@ func TestDoctorRuntimeReportsInstallStateForEveryHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal report: %v", err)
 	}
-	for _, agent := range []string{codex.Name, hooks.AgentClaudeCode, copilotcli.Name, opencode.Name} {
+	for _, agent := range []string{codex.Name, hooks.AgentClaudeCode, copilotcli.Name, opencode.Name, antigravity.Name} {
 		if !strings.Contains(string(blob), `"agent":"`+agent+`"`) {
 			t.Errorf("the --json report never names %s", agent)
 		}

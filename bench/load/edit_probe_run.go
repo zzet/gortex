@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1365,6 +1366,22 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	// A terminal batch authorizes restoring only its retained owned after-image.
+	// The public conditional transaction still checks these bytes again at write time.
+	if r.plan.Tool == "edit.batch" {
+		var last *editProbeBatchReferences
+		for _, record := range r.phase.EditProbe.Records {
+			if record.Batch != nil {
+				last = record.Batch
+			}
+		}
+		if last == nil || last.TransactionID == "" || last.Observation == "" || last.Acknowledgement == "" ||
+			last.Path != filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)) ||
+			last.RelativePath != r.p.Repos[0].Prefix+"/"+r.plan.File ||
+			last.AfterSHA256 != fmt.Sprintf("%x", sha256.Sum256(current)) {
+			return errors.New("batch restore refused: retained source identity or owned after-image differs")
+		}
 	}
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {
