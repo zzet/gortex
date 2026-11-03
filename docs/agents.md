@@ -32,7 +32,7 @@ Checkout removal and primary changes are destructive administration. Preview pri
 | --------------- | ----------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------- |
 | `claude-code`   | `.mcp.json`, `.claude/*`, `AGENTS.md` communities block, `CLAUDE.md` import/overview, `.claude/skills/generated/*`, `~/.claude/skills/gortex-*`, `~/.claude/commands/gortex-*.md`, `~/.claude.json` | both       | https://docs.claude.com/en/docs/claude-code/overview                |
 | `aider`         | `.aiderignore` block, `CONVENTIONS.md` communities block                                        | project    | https://aider.chat/docs/config/aider_conf.html                      |
-| `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + Knowledge Item                                        | user       | https://antigravity.google/docs/mcp                                 |
+| `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + `~/.gemini/config/mcp_config.json`, Knowledge Item, `~/.gemini/config/hooks.json`, `~/.gemini/config/plugins/gortex/rules/AGENTS.md` rule block, `~/.gemini/config/skills/gortex-*`, repo `AGENTS.md` (or `GEMINI.md`) communities block, repo `.agents/skills/gortex-*` | both       | https://antigravity.google/docs/mcp                                 |
 | `cline`         | `cline_mcp_settings.json` (per VS Code / Cursor globalStorage), `.clinerules/gortex-communities.md` | both     | https://docs.cline.bot/mcp/mcp-overview                             |
 | `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]` + `SessionStart`, `UserPromptSubmit`, Bash/Gortex-read `PreToolUse`, and Bash/`apply_patch` `PostToolUse` hooks), `~/.codex/AGENTS.md` rule block, `~/.agents/skills/gortex-*`, `~/.codex/agents/gortex-*.toml`, repo `AGENTS.md` communities block, repo `.agents/skills/gortex-*` | both       | https://learn.chatgpt.com/docs/extend/mcp                           |
 | `copilot-cli`   | `~/.copilot/mcp-config.json` (`mcpServers`), `~/.copilot/copilot-instructions.md` rule block, `~/.copilot/skills/gortex-*`, `~/.copilot/agents/gortex-*.agent.md`, `~/.copilot/hooks/gortex.json`, repo `.github/copilot-instructions.md` communities block, repo `.github/skills/gortex-*` | both       | https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers |
@@ -335,11 +335,34 @@ tokens ingesting them.
 
 ### antigravity
 
-Two artifacts: a native MCP registration at
-`~/.gemini/antigravity/mcp_config.json` (new in 2026) plus a
-Knowledge Item at `~/.gemini/antigravity/knowledge/gortex-workflow/`
-that documents how to use Gortex via `run_command`. The KI stays
-because it gives workflow intent the raw MCP registration doesn't.
+MCP is registered in both `~/.gemini/antigravity/mcp_config.json`
+(IDE) and `~/.gemini/config/mcp_config.json` (agy CLI / Antigravity
+2.0), and a Knowledge Item at
+`~/.gemini/antigravity/knowledge/gortex-workflow/` feeds the IDE's
+knowledge panel.
+
+`gortex install` also writes the user-level pieces: a `gortex` entry in
+`~/.gemini/config/hooks.json` (SessionStart, PreInvocation, PreToolUse,
+PostToolUse and Stop, each running `gortex hook --agent=antigravity
+--event=<event>`; `--hook-mode` is honoured), the rule block in
+`~/.gemini/config/plugins/gortex/rules/AGENTS.md`, and the curated
+skills under `~/.gemini/config/skills/`. PreToolUse matches every tool;
+PostToolUse matches MCP calls only, since it just watches Gortex
+localization results. A `"enabled": false` you set on the `gortex` hook
+entry is kept across re-installs.
+
+Antigravity's MCP config has no working-directory field, so `gortex
+mcp` inherits the directory of the process that starts it. When that is
+`$HOME` or `/` (as seen with the IDE), graph tools answer
+`repo_not_tracked` rather than guess a repo. If you work in one repo,
+start Antigravity with `ANTIGRAVITY_WORKSPACE=/path/to/repo` in its
+environment; the MCP server inherits it.
+
+`gortex init` merges the communities block into `AGENTS.md` (or into an
+existing `GEMINI.md` when the repo has no `AGENTS.md`) and writes the
+generated skills to `.agents/skills/`. `gortex uninstall --global`
+removes the hook entry, rule block, plugin manifest, unedited skills and
+the shipped KI, keeping anything you changed.
 
 ### cline
 
