@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +22,10 @@ import (
 // ranker, measured with the runtime's heap statistics.
 func TestPerformanceKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	ctx := context.Background()
+	// Hold the identical complete corpus on both sides of a comparison.
+	// Otherwise the large fixture can cross the default cap and compare a
+	// partially evicted old corpus against a fully retained smaller one.
+	t.Cleanup(search.SetFTSKeptMaxBytesForTest(512 << 20))
 	o := newOwnedFTSTable(t)
 	docs := 20_000
 	if raw := os.Getenv("GORTEX_FTS_KEPT_DOCS"); raw != "" { // a larger run, e.g. 240000
@@ -44,21 +49,26 @@ func TestPerformanceKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	var generations []int64
 	gen, left := int64(50), sizes[0]
 	generations = append(generations, gen)
-	for i := 0; i < docs; i++ {
-		if left == 0 {
-			sizes = sizes[1:]
-			gen++
-			left = sizes[0]
-			generations = append(generations, gen)
+	o.load(t, func(add func(int64, [3]string)) {
+		for i := 0; i < docs; i++ {
+			if left == 0 {
+				sizes = sizes[1:]
+				gen++
+				left = sizes[0]
+				generations = append(generations, gen)
+			}
+			left--
+			tokens := []string{
+				"internal", "indexer", fmt.Sprintf("checkout%d", i%97), "coordinator", "go",
+				fmt.Sprintf("flip%d", i), "checkout", "coordinator", "flip", "route",
+				"generations", "context", "error", "func", "ctx", "store", "sqlite", "view",
+				"generation", "publication", "applied", "ownership", "masks", "commit", "dirty",
+			}
+			add(gen, [3]string{fmt.Sprintf("gortex/internal/indexer/checkout_coordinator%d.go::CheckoutCoordinator.flip%d", i%97, i), "gortex", strings.Join(tokens, " ")})
 		}
-		left--
-		tokens := []string{
-			"internal", "indexer", fmt.Sprintf("checkout%d", i%97), "coordinator", "go",
-			fmt.Sprintf("flip%d", i), "checkout", "coordinator", "flip", "route",
-			"generations", "context", "error", "func", "ctx", "store", "sqlite", "view",
-			"generation", "publication", "applied", "ownership", "masks", "commit", "dirty",
-		}
-		o.insert(t, gen, [3]string{fmt.Sprintf("gortex/internal/indexer/checkout_coordinator%d.go::CheckoutCoordinator.flip%d", i%97, i), "gortex", strings.Join(tokens, " ")})
+	})
+	if _, err := o.db.Exec("PRAGMA query_only = ON"); err != nil {
+		t.Fatal(err)
 	}
 	ranker := search.NewFTSRanker(o)
 	// The table's own rows are read by the double into fresh strings too;
@@ -67,7 +77,7 @@ func TestPerformanceKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	_, estimateBefore := search.FTSKeptDocs()
+	docsBefore, estimateBefore := search.FTSKeptDocs()
 	started := time.Now()
 	if _, err := ranker.WarmGenerations(ctx, generations); err != nil {
 		t.Fatal(err)
@@ -75,7 +85,10 @@ func TestPerformanceKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	warm := time.Since(started)
 	runtime.GC()
 	runtime.ReadMemStats(&after)
-	_, estimateAfter := search.FTSKeptDocs()
+	docsAfter, estimateAfter := search.FTSKeptDocs()
+	if kept := docsAfter - docsBefore; kept != int64(docs) {
+		t.Fatalf("kept %d documents, want the complete %d-document fixture", kept, docs)
+	}
 	estimate := estimateAfter - estimateBefore
 	measured := int64(after.HeapAlloc) - int64(before.HeapAlloc)
 	runtime.KeepAlive(ranker)
@@ -84,4 +97,27 @@ func TestPerformanceKeptBytesEstimateAgainstTheHeap(t *testing.T) {
 	if estimate <= 0 || measured <= 0 || float64(estimate) < 0.5*float64(measured) || float64(estimate) > 2*float64(measured) {
 		t.Fatalf("fts_kept_bytes %d is not within a factor of two of the heap held, %d", estimate, measured)
 	}
+
+	// Different queries exercise the warmed documents, not repeated hits in
+	// the per-query match cache. These are ranker timings including the SQL
+	// statistics reads, not public search RPC or end-to-end daemon latency.
+	latencies := make([]time.Duration, 100)
+	for i := range latencies {
+		generation := generations[i%len(generations)]
+		query := fmt.Sprintf("flip%d", (i*7919)%docs)
+		started := time.Now()
+		got, ok, err := ranker.Rank(ctx, generation, true, query, nil, 20)
+		latencies[i] = time.Since(started)
+		if err != nil || !ok {
+			t.Fatalf("query %d: ok=%v err=%v", i, ok, err)
+		}
+		if i%25 == 0 {
+			want := o.storeRankOwnedLarge(t, generation, query, 20)
+			if renderHits(got) != renderHits(want) {
+				t.Fatalf("query %d differs from FTS5", i)
+			}
+		}
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	t.Logf("100 distinct warmed ranker queries: p50 %s, p95 %s", latencies[49], latencies[94])
 }
