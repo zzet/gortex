@@ -54,8 +54,11 @@ func (w *registeredLateStormWatcher) TierPaths() map[string]indexer.MutationTier
 // read allowance starts. Only actual watcher admission is released after the
 // leaf has selected its checked version and before response finalization.
 func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *testing.T) {
-	for _, scenario := range []string{"victim_storm", "other_path", "point_queue", "cancelled", "new_physical_owner", "caller_owned", "unchecked_eviction"} {
-		t.Run(scenario, func(t *testing.T) {
+	for _, scenario := range []string{"victim_storm", "other_path", "point_queue", "cancelled", "new_physical_owner", "caller_owned", "unchecked_eviction", "point_queue_startup_reconcile"} {
+		name := scenario
+		forceStartupReconcile := scenario == "point_queue_startup_reconcile"
+		if forceStartupReconcile { scenario = "point_queue" }
+		t.Run(name, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			s, path, _, raw := acknowledgedCanonicalFile(t)
 			external := []byte(strings.Replace(string(raw), "func Target()", "// external version\n\nfunc Target()", 1))
@@ -98,6 +101,12 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 			require.NoError(t, watcher.Start([]string{root}))
 			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
 			t.Cleanup(unblock)
+			if forceStartupReconcile {
+				// Deterministic real publication at the allowed startup stage. This
+				// models startup reconciliation, not the historical CI cause.
+				require.NoError(t, s.indexer.IndexFile(path))
+				require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine, "fixture startup must not publish the later external version")
+			}
 			if scenario != "point_queue" {
 				require.NoError(t, os.WriteFile(auxA, []byte("package probe\nfunc AuxiliaryA() int { return 1 }\n"), 0600))
 				require.NoError(t, os.WriteFile(auxB, []byte("package probe\nfunc AuxiliaryB() int { return 1 }\n"), 0600))
