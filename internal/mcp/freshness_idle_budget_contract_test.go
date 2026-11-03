@@ -105,7 +105,7 @@ func TestFreshnessResponseContractFinalPayloadHonorsByteBudget(t *testing.T) {
 				fields, ok := resultJSON(t, res)["freshness"].(map[string]any)
 				require.True(t, ok, "budget must preserve structured freshness")
 				require.Equal(t, "pending", fields["graph_freshness"])
-				require.Equal(t, "file", fields["freshness_scope"])
+				require.Equal(t, "relations", fields["freshness_scope"])
 			} else {
 				require.True(t, strings.HasPrefix(text, "relations: pending (1 files)\n"),
 					"budget must preserve the relations label: %s", text)

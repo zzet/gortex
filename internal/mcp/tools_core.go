@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -1723,13 +1724,25 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		removed, err := s.removedByPendingProjection(ctx, req, id)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if removed {
+			return removedProjectedSymbolGuidance(id, false), nil
+		}
 		return symbolNotFoundGuidance(id), nil
 	}
 
@@ -1824,6 +1837,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	resolved, errResult := s.resolveScope(ctx, scopeReq, IntentLocate)
 	if errResult != nil {
 		return errResult, nil
+	}
+	ctx, err = s.bindPendingSearch(ctx)
+	if err != nil {
+		if errors.Is(err, projectionSuperseded) {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return nil, err
 	}
 	if offset == 0 && !isCompact(req) && !s.isGCX(ctx, req) && !s.isTOON(ctx, req) {
 		ctx = context.WithValue(ctx, symbolPageOwnerKey{}, sess)
@@ -2753,25 +2773,27 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// mode — the cause of spurious file_not_indexed misses.
 	fp = s.graphRelPath(ctx, fp)
 
-	// Auto re-index stale file before querying.
-	s.ensureFreshContext(ctx, []string{fp})
-
-	// gcx is the high-volume agent format and only emits total_edges
-	// in its meta header — never per-edge rows. Route gcx-only calls
-	// through the count-only path so the disk backends skip
-	// materialising every adjacent edge across cgo (a 4 000-row
-	// round-trip on a 500-symbol file becomes two scalar aggregates).
-	// compact + json paths still take the full SubGraph because
-	// compact summarises edges per confidence label and json ships
-	// every edge in the body.
-	gcxOnly := s.isGCX(ctx, req) && !isCompact(req)
-	var sg *query.SubGraph
-	if gcxOnly {
-		sg = s.engineFor(ctx).GetFileSymbolsCounts(fp)
-	} else {
-		sg = s.engineFor(ctx).GetFileSymbols(fp)
+	ctx, err = s.ensureProjected(ctx, []string{fp})
+	if err != nil {
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if len(sg.Nodes) == 0 {
+
+	// GCX emits an adjacent-edge count; other formats retain the full rows.
+	// Both shapes must come from the same checked, deadline-bound snapshot,
+	// never an errorless count/subgraph fallback outside the store scope.
+	gcxOnly := s.isGCX(ctx, req) && !isCompact(req)
+	sg, dependents, storeErr := fileSummaryContext(ctx, s.readerFor(ctx), fp, gcxOnly, !gcxOnly && !isCompact(req))
+	storeBusy := errors.Is(storeErr, context.DeadlineExceeded) && ctx.Err() == nil
+	if storeBusy {
+		ctx = markRequestStoreBusy(ctx, fp)
+		sg = requestLocalFileSummary(ctx, fp, gcxOnly)
+	} else if storeErr != nil {
+		return mcp.NewToolResultError("get_file_summary: " + storeErr.Error()), nil
+	}
+	if len(sg.Nodes) == 0 && !storeBusy {
 		// Not in the graph. Say whether the walk will EVER hold it — an
 		// exclude rule, a language with no extractor, or the size cap all mean
 		// no graph tool can answer for this path, so the guidance names
@@ -2785,7 +2807,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(filterErr.Error()), nil
 	}
 	sg = filterSubGraph(sg, allowed)
-	if len(sg.Nodes) == 0 {
+	if len(sg.Nodes) == 0 && !storeBusy {
 		// Filtered out by the repo/ref filter: indexed, just not in scope.
 		// OutOfScope rather than a bare Indexed — the same filter applies to
 		// the locators, so they have no rows for it either and the guidance
@@ -2801,7 +2823,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// here so every output format (compact, gcx, json, toon) sees the
 	// same shape.
 	sg = stripNonDefinitionNodes(sg)
-	if len(sg.Nodes) == 0 {
+	if len(sg.Nodes) == 0 && !storeBusy {
 		// Only file/import nodes survived: the file IS indexed, it just defines
 		// no symbols (a package-doc-only doc.go, a constants file, a shell or
 		// SQL file with no function definitions). The locators still have rows
@@ -2816,7 +2838,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// every call was the dominant cost on large files (~2 ms / call on
 	// a 500-symbol file).
 	etag := etagSubGraph(sg)
-	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+	if ifNoneMatch := req.GetString("if_none_match", ""); !storeBusy && ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
 
@@ -2853,7 +2875,10 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		"truncated":   sg.Truncated,
 		"etag":        etag,
 	}
-	s.attachFileDependents(ctx, result, fp)
+	if len(dependents) > 0 {
+		result["dependents"] = dependents
+		result["dependents_header"] = fileDependentsNote(dependents)
+	}
 	if payload, merr := json.Marshal(result); merr == nil {
 		s.recordFileBaselineSavings(ctx, "get_file_summary", fp, summaryLang, string(payload))
 	}

@@ -40,7 +40,7 @@ func checkInMemoryFTSRankerEqualsFTS5(t *testing.T, mode search.FTSViewMatchMode
 	// The daemon's backend: the store's own full-text search behind the
 	// indexer's swappable wrapper (indexer.initialSearchBackend).
 	f.srv.engine.SetSearch(search.NewSwappable(search.NewSymbolSearcherBackend(f.store)))
-	searchOnce := func(query string) string {
+	searchOnce := func(query string) map[string]any {
 		req := mcplib.CallToolRequest{}
 		req.Params.Name = "search_symbols"
 		req.Params.Arguments = map[string]any{
@@ -51,7 +51,7 @@ func checkInMemoryFTSRankerEqualsFTS5(t *testing.T, mode search.FTSViewMatchMode
 		result, err := f.srv.wrapToolHandler(f.srv.handleSearchSymbols)(ctx, req)
 		require.NoError(t, err)
 		require.False(t, result.IsError, viewResultText(t, result))
-		return viewResultText(t, result)
+		return symbolSearchComparableReply(t, viewResultText(t, result))
 	}
 	compare := func(label string) {
 		for _, q := range []string{"Widget", "RenderWidget3", "BuildWidget", "render widget", "widget build", "New", "Extra", "RenderWidgetRenamed5"} {
@@ -62,7 +62,7 @@ func checkInMemoryFTSRankerEqualsFTS5(t *testing.T, mode search.FTSViewMatchMode
 			viaFTS5 := searchOnce(q)
 			restore()
 			require.Equal(t, viaFTS5, inMemory, "%s: %q answered differently through the in-memory ranker", label, q)
-			require.NotContains(t, inMemory, `"results":null`, "%s: %q found nothing; the comparison would be vacuous", label, q)
+			require.NotNil(t, inMemory["results"], "%s: %q found nothing; the comparison would be vacuous", label, q)
 			t.Logf("%s %q: %d generation ranking(s) in memory", label, q, ranked)
 		}
 	}

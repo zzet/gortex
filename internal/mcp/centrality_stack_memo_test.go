@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -367,7 +368,7 @@ func TestStackedAdjacencyMemoRanksLikeTheViewReader(t *testing.T) {
 func TestSymbolSearchRanksAlikeThroughTheStackedMemo(t *testing.T) {
 	f, _ := newAdjacencyMemoFixture(t)
 	f.srv.pprCache.enabled = false // compare fresh walks, never a cached one
-	search := func(query string) string {
+	search := func(query string) map[string]any {
 		req := mcplib.CallToolRequest{}
 		req.Params.Name = "search_symbols"
 		req.Params.Arguments = map[string]any{
@@ -378,18 +379,29 @@ func TestSymbolSearchRanksAlikeThroughTheStackedMemo(t *testing.T) {
 		result, err := f.srv.wrapToolHandler(f.srv.handleSearchSymbols)(ctx, req)
 		require.NoError(t, err)
 		require.False(t, result.IsError, viewResultText(t, result))
-		return viewResultText(t, result)
+		return symbolSearchComparableReply(t, viewResultText(t, result))
 	}
 	compare := func(label string) {
 		for _, q := range []string{"Widget", "RenderWidget3", "BuildWidget", "render widget"} {
+			borrowedProjection := false
+			for _, entry := range pendingFileProjections.snap.Load().entries {
+				if _, owned := relativeWithinRoot(f.worktree, entry.absPath); owned {
+					borrowedProjection = true
+				}
+			}
 			hitsBefore, missesBefore, edgeHitsBefore, edgeMissesBefore := f.srv.stackAdjacencyMemoFor().counts()
 			withMemo := search(q)
 			restoreRows := graphview.DisableGenerationRowsForTest()
 			hitsAfter, missesAfter, edgeHitsAfter, edgeMissesAfter := f.srv.stackAdjacencyMemoFor().counts()
 			// The fixture's null text backend answers a multi-word query with
 			// no candidates, so only the identifier queries reach the rerank.
-			require.True(t, strings.Contains(q, " ") || (hitsAfter-hitsBefore)+(missesAfter-missesBefore)+(edgeHitsAfter-edgeHitsBefore)+(edgeMissesAfter-edgeMissesBefore) > 0,
-				"%s: query %q never read through the stacked memo", label, q)
+			memoReads := (hitsAfter - hitsBefore) + (missesAfter - missesBefore) + (edgeHitsAfter - edgeHitsBefore) + (edgeMissesAfter - edgeMissesBefore)
+			if borrowedProjection {
+				require.Zero(t, memoReads, "%s: query %q used generation-only adjacency for a borrowed disk projection", label, q)
+			} else {
+				require.True(t, strings.Contains(q, " ") || memoReads > 0,
+					"%s: query %q never read through the stacked memo", label, q)
+			}
 			stackedAdjacencyDisabledForTest = true
 			withoutMemo := search(q)
 			stackedAdjacencyDisabledForTest = false
@@ -404,6 +416,25 @@ func TestSymbolSearchRanksAlikeThroughTheStackedMemo(t *testing.T) {
 	require.False(t, written.IsError, viewResultText(t, written))
 	f.awaitMutation(t, f.worktree, written)
 	compare("after the edit")
+}
+
+// Independent searches mint independent continuation sequences. Keep cursor
+// validity, page/version, ordered rows and all other response fields in parity.
+func symbolSearchComparableReply(t *testing.T, text string) map[string]any {
+	t.Helper()
+	var answer map[string]any
+	require.NoError(t, json.Unmarshal([]byte(text), &answer))
+	if raw, exists := answer["next_cursor"]; exists {
+		encoded, ok := raw.(string)
+		require.True(t, ok)
+		cursor, valid := parseSymbolCursor(encoded)
+		require.True(t, valid, "a continuation must remain a valid sequence cursor")
+		require.NotEmpty(t, cursor.Sequence)
+		require.Equal(t, 1, cursor.Page)
+		cursor.Sequence = "independent-search"
+		answer["next_cursor"] = cursor
+	}
+	return answer
 }
 
 // failingLevelReader answers a batch partially and reports an error, the shape

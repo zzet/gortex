@@ -619,6 +619,68 @@
                                   "requested_generation": {
                                     "type": "integer"
                                   },
+                                  "shared_owner": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "definition_key": {
+                                            "type": "string"
+                                          },
+                                          "member": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "checkout_id": {
+                                                "type": "string"
+                                              },
+                                              "checkout_incarnation": {
+                                                "type": "string"
+                                              },
+                                              "content_sha256": {
+                                                "type": "string"
+                                              },
+                                              "path": {
+                                                "type": "string"
+                                              },
+                                              "physical_commit_sequence": {
+                                                "type": "integer"
+                                              },
+                                              "publication_key": {
+                                                "type": "string"
+                                              },
+                                              "receipt": {
+                                                "type": "string"
+                                              },
+                                              "ticket": {
+                                                "type": "integer"
+                                              }
+                                            },
+                                            "required": [
+                                              "receipt",
+                                              "publication_key",
+                                              "path",
+                                              "ticket",
+                                              "physical_commit_sequence",
+                                              "content_sha256",
+                                              "checkout_id",
+                                              "checkout_incarnation"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "same_status_membership": {}
+                                        },
+                                        "required": [
+                                          "definition_key",
+                                          "member",
+                                          "same_status_membership"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
                                   "state": {
                                     "type": "string"
                                   }
@@ -979,6 +1041,68 @@
                                             "role": {
                                               "type": "string"
                                             },
+                                            "shared_owner": {
+                                              "anyOf": [
+                                                {
+                                                  "additionalProperties": false,
+                                                  "properties": {
+                                                    "definition_key": {
+                                                      "type": "string"
+                                                    },
+                                                    "member": {
+                                                      "additionalProperties": false,
+                                                      "properties": {
+                                                        "checkout_id": {
+                                                          "type": "string"
+                                                        },
+                                                        "checkout_incarnation": {
+                                                          "type": "string"
+                                                        },
+                                                        "content_sha256": {
+                                                          "type": "string"
+                                                        },
+                                                        "path": {
+                                                          "type": "string"
+                                                        },
+                                                        "physical_commit_sequence": {
+                                                          "type": "integer"
+                                                        },
+                                                        "publication_key": {
+                                                          "type": "string"
+                                                        },
+                                                        "receipt": {
+                                                          "type": "string"
+                                                        },
+                                                        "ticket": {
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "receipt",
+                                                        "publication_key",
+                                                        "path",
+                                                        "ticket",
+                                                        "physical_commit_sequence",
+                                                        "content_sha256",
+                                                        "checkout_id",
+                                                        "checkout_incarnation"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "same_status_membership": {}
+                                                  },
+                                                  "required": [
+                                                    "definition_key",
+                                                    "member",
+                                                    "same_status_membership"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
                                             "write_returned_ns": {
                                               "anyOf": [
                                                 {
@@ -1328,7 +1452,16 @@
                                     "error": {
                                       "type": "string"
                                     },
+                                    "expected_id": {
+                                      "type": "string"
+                                    },
+                                    "expected_line": {
+                                      "type": "integer"
+                                    },
                                     "expected_outcome": {
+                                      "type": "string"
+                                    },
+                                    "expected_path": {
                                       "type": "string"
                                     },
                                     "kind": {
@@ -1537,6 +1670,13 @@
                               },
                               "route": {
                                 "type": "string"
+                              },
+                              "search_ack": {
+                                "additionalProperties": {},
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
                               },
                               "stale_claimed_fresh": {
                                 "type": "boolean"
@@ -2050,6 +2190,9 @@
                                 "null"
                               ]
                             },
+                            "search_readback_acceptance": {
+                              "type": "boolean"
+                            },
                             "seed": {
                               "type": "integer"
                             },
@@ -2099,6 +2242,9 @@
                                   },
                                   "expected_refusal": {
                                     "type": "boolean"
+                                  },
+                                  "expected_search_line": {
+                                    "type": "integer"
                                   },
                                   "file": {
                                     "type": "string"
@@ -2606,6 +2752,486 @@
                         },
                         "role": {
                           "type": "string"
+                        },
+                        "search_readback_acceptance": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "acknowledged": {
+                                  "type": "integer"
+                                },
+                                "actual_ack_modes": {
+                                  "additionalProperties": {
+                                    "type": "integer"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "actual_edits_by_editor": {
+                                  "additionalProperties": {
+                                    "type": "integer"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "actual_file_view_states": {
+                                  "additionalProperties": {
+                                    "type": "integer"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "editors": {
+                                  "type": "integer"
+                                },
+                                "immediate_witnesses": {
+                                  "additionalProperties": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "correct": {
+                                        "type": "integer"
+                                      },
+                                      "errors": {
+                                        "type": "integer"
+                                      },
+                                      "missing": {
+                                        "type": "integer"
+                                      },
+                                      "observed": {
+                                        "type": "integer"
+                                      },
+                                      "refusals": {
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "observed",
+                                      "correct",
+                                      "errors",
+                                      "refusals",
+                                      "missing"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "local_object_acks": {
+                                  "type": "integer"
+                                },
+                                "offered": {
+                                  "type": "integer"
+                                },
+                                "pass": {
+                                  "type": "boolean"
+                                },
+                                "records": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "local_object_acks",
+                                "actual_ack_modes",
+                                "actual_file_view_states",
+                                "offered",
+                                "editors",
+                                "acknowledged",
+                                "records",
+                                "pass",
+                                "immediate_witnesses",
+                                "actual_edits_by_editor"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "shared_owners": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "background_wall_ms": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "count": {
+                                      "type": "integer"
+                                    },
+                                    "max": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p50": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p95": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p99": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "count",
+                                    "p50",
+                                    "p95",
+                                    "p99",
+                                    "max"
+                                  ],
+                                  "type": "object"
+                                },
+                                "complete_owner_windows": {
+                                  "type": "integer"
+                                },
+                                "definitions": {
+                                  "additionalProperties": {
+                                    "anyOf": [
+                                      {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "background": {
+                                            "anyOf": [
+                                              {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "residual_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "sum_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "wall_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "within_five_percent": {
+                                                    "type": "boolean"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "wall_ns",
+                                                  "sum_ns",
+                                                  "residual_ns",
+                                                  "within_five_percent"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "definition": {},
+                                          "execution": {
+                                            "anyOf": [
+                                              {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "residual_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "sum_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "wall_ns": {
+                                                    "type": "integer"
+                                                  },
+                                                  "within_five_percent": {
+                                                    "type": "boolean"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "wall_ns",
+                                                  "sum_ns",
+                                                  "residual_ns",
+                                                  "within_five_percent"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "first_conflicting_definition": {},
+                                          "reasons": {
+                                            "items": {
+                                              "type": "string"
+                                            },
+                                            "type": [
+                                              "array",
+                                              "null"
+                                            ]
+                                          },
+                                          "state": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "required": [
+                                          "state",
+                                          "definition",
+                                          "execution",
+                                          "background",
+                                          "reasons"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "distinct_observed_owners": {
+                                  "type": "integer"
+                                },
+                                "execution_wall_ms": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "count": {
+                                      "type": "integer"
+                                    },
+                                    "max": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p50": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p95": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "p99": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "count",
+                                    "p50",
+                                    "p95",
+                                    "p99",
+                                    "max"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "definitions",
+                                "distinct_observed_owners",
+                                "complete_owner_windows",
+                                "execution_wall_ms",
+                                "background_wall_ms"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "stats_after": {},
                         "stats_before": {},
@@ -3903,6 +4529,9 @@
                           "null"
                         ]
                       },
+                      "search_readback_acceptance": {
+                        "type": "boolean"
+                      },
                       "seed": {
                         "type": "integer"
                       },
@@ -3952,6 +4581,9 @@
                             },
                             "expected_refusal": {
                               "type": "boolean"
+                            },
+                            "expected_search_line": {
+                              "type": "integer"
                             },
                             "file": {
                               "type": "string"

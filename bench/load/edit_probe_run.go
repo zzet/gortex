@@ -21,6 +21,9 @@ const editProbeRawLimit = 8 << 20
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
 type editProbeReadback struct {
+	ExpectedLine    int    `json:"expected_line,omitempty"`
+	ExpectedPath    string `json:"expected_path,omitempty"`
+	ExpectedID      string `json:"expected_id,omitempty"`
 	Kind            string `json:"kind"`
 	Latency         Metric `json:"latency_ms"`
 	Correct         bool   `json:"correct"`
@@ -30,6 +33,7 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	SearchACK                map[string]any            `json:"search_ack,omitempty"`
 	AdmittedTargetLines      *int                      `json:"admitted_target_lines,omitempty"`
 	MutationTiers            *editProbeLiveTiers       `json:"mutation_tiers,omitempty"`
 	GateReadback             *Metric                   `json:"t_gate_readback_ms,omitempty"`
@@ -77,19 +81,21 @@ type editProbeRecord struct {
 	Errors                   []string                  `json:"errors"`
 }
 type editProbeReport struct {
-	Role               string            `json:"role,omitempty"`
-	Plan               editProbePlan     `json:"plan"`
-	PlanHash           string            `json:"plan_sha256"`
-	AccountingRequired bool              `json:"accounting_required"`
-	Records            []editProbeRecord `json:"edits"`
-	Summary            *editProbeSummary `json:"summary,omitempty"`
-	OutputModes        editProbeModes    `json:"output_modes,omitempty"`
-	Reads              editProbeReads    `json:"reads,omitempty"`
-	RestoreMS          Metric            `json:"restore_batch_ms"`
-	Restore            json.RawMessage   `json:"restore_batch"`
-	StatsBefore        json.RawMessage   `json:"stats_before"`
-	StatsAfter         json.RawMessage   `json:"stats_after"`
-	Limitations        []string          `json:"limitations"`
+	SharedOwners       *editProbeSharedOwnerReport `json:"shared_owners,omitempty"`
+	SearchReadbacks    *searchReadbackAcceptance   `json:"search_readback_acceptance,omitempty"`
+	Role               string                      `json:"role,omitempty"`
+	Plan               editProbePlan               `json:"plan"`
+	PlanHash           string                      `json:"plan_sha256"`
+	AccountingRequired bool                        `json:"accounting_required"`
+	Records            []editProbeRecord           `json:"edits"`
+	Summary            *editProbeSummary           `json:"summary,omitempty"`
+	OutputModes        editProbeModes              `json:"output_modes,omitempty"`
+	Reads              editProbeReads              `json:"reads,omitempty"`
+	RestoreMS          Metric                      `json:"restore_batch_ms"`
+	Restore            json.RawMessage             `json:"restore_batch"`
+	StatsBefore        json.RawMessage             `json:"stats_before"`
+	StatsAfter         json.RawMessage             `json:"stats_after"`
+	Limitations        []string                    `json:"limitations"`
 }
 
 type editProbeState struct {
@@ -120,6 +126,9 @@ type editProbeState struct {
 }
 
 type editProbeRuntime struct {
+	sharedMu          sync.Mutex // optional shared report evidence only; never serializes ordinary requests
+	sharedBinding     *editProbeSharedBinding
+	sharedReport      editProbeSharedOwnerReport
 	options           runOptions
 	p                 *privateRun
 	phase             *Phase
@@ -272,7 +281,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -301,7 +310,13 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		}
 	}
 	r.original = original
-	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
+	// The search-only profile requires actual immediate search witnesses, not
+	// the separate edit gate's full phase accounting. Binary role is unchanged.
+	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
+	phase.EditProbe.AccountingRequired = r.requireAccounting
+	if plan.SearchReadbackAcceptance {
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable")
+	}
 	if len(p.Repos) > 1 {
 		r.originals = make(map[string][]byte, len(p.Repos))
 		for _, repo := range p.Repos {
@@ -894,6 +909,16 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		move = &refs
 	}
 	s.mu.Lock()
+	if r.plan.SearchReadbackAcceptance {
+		// Retain only this response's owned metadata; do not encode, hash or
+		// perform another read before the first semantic search witness.
+		s.record.SearchACK = make(map[string]any, 5)
+		for _, key := range []string{"ack_mode", "content_sha256", "readback_exact", "file_view", "graph_status_hint"} {
+			if value, present := body[key]; present {
+				s.record.SearchACK[key] = value
+			}
+		}
+	}
 	s.record.Receipt = receipt
 	if batch != nil {
 		s.record.Batch = batch
@@ -919,7 +944,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 	s.signalAck()
 	readbackKinds := []string{"file", "source"}
-	if r.plan.GateModes {
+	if r.plan.SearchReadbackAcceptance {
+		readbackKinds = []string{"search_visible", "text", "old_search_absent", "old_text_absent", "file", "source"}
+	} else if r.plan.GateModes {
 		readbackKinds = []string{"source", "file", "summary", "search_visible", "text"}
 	}
 	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
@@ -959,7 +986,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break // Foreign terminal/accounting fields cannot settle this edit.
 					}
-					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
+					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
@@ -1014,10 +1041,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if !s.record.GraphTerminal && (move == nil || r.requireAccounting || !movePublicFactsComplete(s.record)) {
 		s.record.Errors = append(s.record.Errors, "graph receipt terminal unavailable")
 	}
-	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
+	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || !editProbeMoveAccountingComplete(*s.record.MoveAccounting)) {
 		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
 	}
-	if r.requireAccounting && move == nil && s.record.Accounting.State != "observed_single_window_checks_pass" {
+	if r.requireAccounting && move == nil && !editProbeAccountingComplete(s.record.Accounting) {
 		s.record.Errors = append(s.record.Errors, "A/P/B accounting unavailable: "+strings.Join(s.record.Accounting.Reasons, "; "))
 	}
 	if s.record.StaleClaimedFresh {
@@ -1082,11 +1109,25 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			req.Operation = "file"
 			req.Arguments["operation"] = "file"
 		}
+		searchWitness := r.plan.SearchReadbackAcceptance && (kind == "search_visible" || kind == "text" || kind == "old_search_absent" || kind == "old_text_absent")
+		if searchWitness {
+			req = searchReadbackRequest(kind, repo, step)
+		}
 		req = editProbeWithOutput(req, r.plan.Mode)
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
 		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, repo.Corpus, step, r.calleeFor(repo))}
+		if searchWitness {
+			back.ExpectedLine = step.ExpectedSearchLine
+			back.ExpectedPath = repo.Prefix + "/" + repo.Corpus.File
+			back.ExpectedID = back.ExpectedPath + "::" + step.Marker
+			back.Correct = readErr == nil && decodeErr == nil && exactSearchReadback(kind, payload, repo, step, r.calleeFor(repo))
+			var refused *rpcError
+			if errors.As(readErr, &refused) {
+				back.Refusal = refused.Message
+			}
+		}
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 		}
@@ -1163,6 +1204,11 @@ func (r *editProbeRuntime) finish() error {
 		return nil
 	}
 	r.finalized = true
+	for _, s := range r.states {
+		s.stopProbes()
+		s.finishRaw()
+	}
+	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
 	r.phase.EditProbe.Records = nil
 	for _, s := range r.states {
 		s.stopProbes()
@@ -1180,6 +1226,7 @@ func (r *editProbeRuntime) finish() error {
 		}
 		record := s.record
 		s.mu.Unlock()
+		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners, r.requireAccounting)
 		record.groupTimes()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
@@ -1203,6 +1250,10 @@ func (r *editProbeRuntime) finish() error {
 	}
 	finishEditProbeMetrics(r.phase)
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
+	r.phase.EditProbe.SearchReadbacks = summarizeSearchReadbacks(r.plan, r.phase.EditProbe.Records)
+	if r.phase.EditProbe.SearchReadbacks != nil && !r.phase.EditProbe.SearchReadbacks.Pass {
+		failures = append(failures, errors.New("immediate search readback acceptance incomplete or incorrect"))
+	}
 	r.mu.Lock()
 	r.phase.EditProbe.Reads = summarizeEditProbeReads(r.reads, r.plan.Seed)
 	selected := r.plan.Mode

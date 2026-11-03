@@ -73,14 +73,22 @@ func requestViewTextBatch(
 	aligned := make([][]search.SearchResult, len(layers))
 	peers := make([]search.Backend, 0, len(layers))
 	positions := make([]int, 0, len(layers))
+	var sequential []int
 	for i, layer := range layers {
 		if layer.Search == nil {
+			continue
+		}
+		if _, ok := layer.Search.(search.ContextViewBatchSearcherBackend); !ok {
+			sequential = append(sequential, i)
 			continue
 		}
 		peers = append(peers, layer.Search)
 		positions = append(positions, i)
 	}
 	if len(peers) == 0 {
+		if len(sequential) != 0 {
+			return nil, false
+		}
 		return aligned, true
 	}
 	batcher, ok := peers[0].(search.ContextViewBatchSearcherBackend)
@@ -96,6 +104,15 @@ func requestViewTextBatch(
 	}
 	for i, results := range batched {
 		aligned[positions[i]] = append([]search.SearchResult(nil), results...)
+	}
+	// Immutable pending-name corpora do not implement the store batch. They
+	// must not disable batching/ranking of the persisted generations beside
+	// them, and still occupy their original positions in the composed stack.
+	for _, position := range sequential {
+		if ctx.Err() != nil {
+			return aligned, true
+		}
+		aligned[position] = requestTextSearch(ctx, layers[position].Search, query, limit)
 	}
 	return aligned, true
 }

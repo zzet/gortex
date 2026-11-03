@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
@@ -152,6 +153,10 @@ func (s *Server) PublishRepoReadiness(rec indexer.RepoLoad) {
 	payload["repo"] = rec.Prefix
 	payload["repo_path"] = rec.Root
 	payload["state"] = string(rec.State)
+	delete(payload, "repo_state_since")
+	if !rec.Since.IsZero() {
+		payload["repo_state_since"] = rec.Since.UTC().Format(time.RFC3339Nano)
+	}
 	s.readinessBroadcaster.announce(payload)
 }
 

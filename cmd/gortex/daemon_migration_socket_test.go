@@ -50,6 +50,9 @@ func TestMigrationSocketOwnedHelper(t *testing.T) {
 		t.Setenv(key, "")
 	}
 	buildDaemonStateForStart = func(logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
+		if state, err, handled := migrationSocketAcceptanceBuild(t, root, logger, observers...); handled {
+			return state, err
+		}
 		return buildDaemonState(logger, func(progress store_sqlite.MigrationProgress) {
 			if len(observers) > 0 {
 				observers[0](progress)

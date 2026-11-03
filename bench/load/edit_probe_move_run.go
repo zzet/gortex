@@ -46,6 +46,11 @@ func moveProbesComplete(record editProbeRecord) bool {
 // Only the original, exactly identified per-file owner can freeze a terminal
 // refusal. Missing/foreign rows and late pending callbacks remain collecting.
 func moveOwnedRefusal(row map[string]any, refs editProbeMoveReferences, file editProbeMoveFileReference) bool {
+	child, _ := row["physical_commit"].(map[string]any)
+	availability, _ := child["shared_owner_accounting_v1_availability"].(map[string]any)
+	if availability["state"] == "pending" {
+		return false // graph completion does not freeze the actual owner's C1 yet
+	}
 	direct, _ := row["direct_reconcile_state"].(string)
 	repair, _ := row["read_assisted_reconcile_state"].(string)
 	immutable := direct == "observed" || repair == "observed" || strings.HasPrefix(direct, "unavailable_") && strings.HasPrefix(repair, "unavailable_")
@@ -74,20 +79,23 @@ func (r *editProbeRuntime) collectMoveEvidence(ctx context.Context, s *editProbe
 				}
 			}
 		}
-		accounting := checkEditProbeMoveAccounting(statuses, refs, wireID)
+		accounting := r.accountingForMoveStatuses(ctx, statuses, refs, wireID)
 		s.mu.Lock()
 		s.record.MoveAccounting = &accounting
 		all := movePublicFactsComplete(s.record)
-		if accounting.State == "observed_move_windows_checks_pass" {
+		if editProbeMoveAccountingComplete(accounting) {
 			s.record.GraphTerminal = true
 			r.settlePendingLocked(s)
 			s.record.GraphTerminalBasis = "original_move_files_actual_accepted_reconcile"
+			if accounting.State == "observed_move_shared_owner_windows_checks_pass" {
+				s.record.GraphTerminalBasis = "original_move_files_actual_shared_execution"
+			}
 		} else if !r.requireAccounting && all {
 			// Old controls may have no instrumentation. Public facts establish only
 			// functional completion, never an observed graph receipt or zero phases.
 			s.record.GraphTerminalBasis = "baseline_complete_public_move_facts_no_receipt_proof"
 		}
-		done := moveProbesComplete(s.record) && (!r.requireAccounting || accounting.State == "observed_move_windows_checks_pass" || refused || refs.ReferenceError != "")
+		done := moveProbesComplete(s.record) && (!r.requireAccounting || editProbeMoveAccountingComplete(accounting) || refused || refs.ReferenceError != "")
 		s.mu.Unlock()
 		if done {
 			return
@@ -96,4 +104,8 @@ func (r *editProbeRuntime) collectMoveEvidence(ctx context.Context, s *editProbe
 			return
 		}
 	}
+}
+
+func editProbeMoveAccountingComplete(accounting editProbeMoveAccounting) bool {
+	return accounting.State == "observed_move_windows_checks_pass" || accounting.State == "observed_move_shared_owner_windows_checks_pass"
 }

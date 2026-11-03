@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -77,6 +79,26 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	if view := sourceRequestView(ctx); view != nil {
 		return s.handleSourceSearchText(ctx, req, view, query, useRegexp, limit, requestedLimit, resolved, pathFilter)
 	}
+	pendingFiles, pendingErr := s.pendingTextFiles(ctx, resolved, pathFilter)
+	if pendingErr != nil {
+		return mcp.NewToolResultError("search_text: " + pendingErr.Error()), nil
+	}
+	var pendingMatches []enrichedTextMatch
+	var excluded map[string]map[string]struct{}
+	if len(pendingFiles) > 0 {
+		var expression *regexp.Regexp
+		if useRegexp {
+			expression, pendingErr = regexp.Compile(query)
+			if pendingErr != nil {
+				return mcp.NewToolResultError("search_text: invalid regexp: " + pendingErr.Error()), nil
+			}
+		}
+		pendingMatches, excluded, pendingErr = s.scanPendingTextFiles(ctx, pendingFiles, query, expression, limit)
+		if pendingErr != nil {
+			return mcp.NewToolResultError("search_text: " + pendingErr.Error()), nil
+		}
+	}
+
 	scopedMultiGrep := s.multiIndexer != nil && (resolved.RepoAllow != nil || len(pathFilter) > 0)
 	// Normalise and route the raw `path` filters before they ride into
 	// the search (#845): the in-search restriction matches repo-relative
@@ -92,7 +114,23 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	var matches []trigram.Match
 	needsFinalLimit := false
-	if view := requestViewFromContext(ctx); view.routed() {
+	if len(pendingFiles) > 0 {
+		if s.multiIndexer != nil {
+			if useRegexp {
+				matches, pendingErr = s.multiIndexer.GrepRegexpForReposPathsExcept(query, resolved.RepoAllow, sharedPathPrefixes, perRepoPathPrefixes, excluded, limit)
+			} else {
+				matches = s.multiIndexer.GrepTextForReposPathsExcept(query, resolved.RepoAllow, sharedPathPrefixes, perRepoPathPrefixes, excluded, limit)
+			}
+		} else if useRegexp {
+			matches, pendingErr = s.indexer.GrepRegexpPathsExcept(query, normalizePathPrefixes(pathFilter), excluded[s.indexer.RepoPrefix()], limit)
+		} else {
+			matches = s.indexer.GrepTextPathsExcept(query, normalizePathPrefixes(pathFilter), excluded[s.indexer.RepoPrefix()], limit)
+		}
+		if pendingErr != nil {
+			return mcp.NewToolResultError("search_text: " + pendingErr.Error()), nil
+		}
+		needsFinalLimit = true
+	} else if view := requestViewFromContext(ctx); view.routed() {
 		// A request reading through a view answers out of that view's own
 		// working copy, or not at all. The canonical searchers below are built
 		// over a different tree.
@@ -128,7 +166,7 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	// what survived, so a response holding 952 matches can be a truncated
 	// 1000 rather than a complete 952. Measuring after the filters would miss
 	// exactly the case a caller cannot detect on its own.
-	rawMatches := len(matches)
+	rawMatches := len(matches) + len(pendingMatches)
 
 	// Sub-path scoping: a `path` argument or a `scope:`-named saved
 	// scope's paths narrow the literal hits to a monorepo service
@@ -148,6 +186,19 @@ func (s *Server) handleSearchText(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	enriched, fileIndexes := s.enrichTextMatchesContext(ctx, matches, queryOptionsForResolvedScope(resolved))
+	if len(pendingFiles) > 0 {
+		// Current-byte rows carry no stale canonical enclosing-symbol label.
+		enriched = append(enriched, pendingMatches...)
+		sort.SliceStable(enriched, func(i, j int) bool {
+			if enriched[i].Path != enriched[j].Path {
+				return enriched[i].Path < enriched[j].Path
+			}
+			return enriched[i].Line < enriched[j].Line
+		})
+		if len(enriched) > limit {
+			enriched = enriched[:limit]
+		}
+	}
 	s.captureLocalizationSearchText(ctx, enriched, fileIndexes)
 	resp := map[string]any{
 		"query":   query,

@@ -261,6 +261,12 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 // matches when the path equals it exactly or continues past it at a
 // slash, so "pkg/su" does not match "pkg/sub/x.go" (#845).
 func (s *Searcher) GrepPaths(query string, prefixes []string, limit int) []Match {
+	return s.GrepPathsExcept(query, prefixes, nil, limit)
+}
+
+// GrepPathsExcept removes owned pending files before opening candidates or
+// applying the result limit. Their caller supplies current-byte matches.
+func (s *Searcher) GrepPathsExcept(query string, prefixes []string, excluded map[string]struct{}, limit int) []Match {
 	if query == "" {
 		return nil
 	}
@@ -271,7 +277,7 @@ func (s *Searcher) GrepPaths(query string, prefixes []string, limit int) []Match
 			continue
 		}
 		rel := paths[docID]
-		if !PathUnderAnyPrefix(rel, prefixes) {
+		if _, skip := excluded[rel]; skip || !PathUnderAnyPrefix(rel, prefixes) {
 			continue
 		}
 		f, err := s.openConfined(rel)
@@ -346,6 +352,14 @@ func (s *Searcher) GrepRegexp(re *regexp.Regexp, requiredLiterals []string, path
 func (s *Searcher) GrepRegexpPaths(re *regexp.Regexp, requiredLiterals []string, prefixes []string, limit int) []Match {
 	return s.grepRegexpUnder(re, requiredLiterals, limit, func(rel string) bool {
 		return PathUnderAnyPrefix(rel, prefixes)
+	})
+}
+
+// GrepRegexpPathsExcept is the regexp counterpart of GrepPathsExcept.
+func (s *Searcher) GrepRegexpPathsExcept(re *regexp.Regexp, requiredLiterals []string, prefixes []string, excluded map[string]struct{}, limit int) []Match {
+	return s.grepRegexpUnder(re, requiredLiterals, limit, func(rel string) bool {
+		_, skip := excluded[rel]
+		return !skip && PathUnderAnyPrefix(rel, prefixes)
 	})
 }
 

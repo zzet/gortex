@@ -20,12 +20,8 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
-// TestEnsureFresh_MultiRepoSelfHealsStaleFile is the regression test for the
-// stale-read class: in multi-repo mode ensureFresh used to return early and do
-// nothing, so a file changed on disk since indexing kept serving its old body
-// through the index-backed read tools. It must now route the path to its owning
-// per-repo indexer, detect the drift, and re-index — leaving the graph current.
-func TestEnsureFresh_MultiRepoSelfHealsStaleFile(t *testing.T) {
+// A drifted read is current in its own view without advancing either base.
+func TestDriftedMultiRepoReadProjectsWithoutPublishingBase(t *testing.T) {
 	repoA := setupMiniRepo(t, "repo-a")
 	repoB := setupMiniRepo(t, "repo-b")
 
@@ -67,22 +63,21 @@ func TestEnsureFresh_MultiRepoSelfHealsStaleFile(t *testing.T) {
 	bumpFile(t, filepath.Join(repoA, "main.go"),
 		"package main\n\nfunc Hello() {}\n\nfunc HelloAgain() {}\n")
 
-	refreshed := srv.ensureFresh([]string{"repo-a/main.go"})
-	assert.Equal(t, []string{"repo-a/main.go"}, refreshed,
-		"multi-repo ensureFresh must re-index the drifted file (pre-fix it returned nil)")
-	assert.NotEmpty(t, g.FindNodesByName("HelloAgain"),
-		"the graph reflects the new on-disk content after self-heal")
+	t.Cleanup(func() { srv.DrainBackground(); require.NoError(t, mi.Close(context.Background())) })
+	ctx, err := srv.ensureProjected(t.Context(), []string{"repo-a/main.go"})
+	require.NoError(t, err)
+	require.NotNil(t, srv.readerFor(ctx).GetNode("repo-a/main.go::HelloAgain"))
+	assert.Empty(t, g.FindNodesByName("HelloAgain"), "read must not publish the shared base")
+	assert.True(t, mi.GetIndexer("repo-a").IsTrackedStale("main.go"), "read must not advance indexed file identity")
+	assert.Equal(t, g.GetFileNodes("repo-b/main.go"), srv.readerFor(ctx).GetFileNodes("repo-b/main.go"), "unrelated repository is unchanged")
+	next, err := srv.ensureProjected(t.Context(), []string{"repo-a/main.go"})
+	require.NoError(t, err)
+	require.Same(t, requestProjectionLayers(ctx)[0], requestProjectionLayers(next)[0], "reuse the same checked immutable file layer")
 
-	// A follow-up call is a no-op: the recorded mtime advanced, so the file is
-	// no longer classified stale and is not re-indexed again.
-	assert.Empty(t, srv.ensureFresh([]string{"repo-a/main.go"}),
-		"an already-fresh file is not re-indexed a second time")
 }
 
-// TestEnsureFresh_SingleRepoSelfHealsStaleFile covers the single-repo path with
-// no active watcher: the on-read freshness check still re-indexes a drifted
-// file so the graph does not serve a stale body.
-func TestEnsureFresh_SingleRepoSelfHealsStaleFile(t *testing.T) {
+// A standalone server uses the same projection path, without a watcher.
+func TestDriftedStandaloneReadProjectsWithoutPublishingBase(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"),
 		[]byte("package main\n\nfunc Hello() {}\n"), 0o644))
@@ -94,15 +89,17 @@ func TestEnsureFresh_SingleRepoSelfHealsStaleFile(t *testing.T) {
 	require.NoError(t, err)
 
 	eng := query.NewEngine(g)
-	srv := NewServer(eng, g, idx, nil, zap.NewNop(), nil) // watcher nil → on-read refresh active
+	srv := NewServer(eng, g, idx, nil, zap.NewNop(), nil) // no watcher owns publication
 
 	require.Empty(t, g.FindNodesByName("HelloAgain"))
 
 	bumpFile(t, filepath.Join(dir, "main.go"),
 		"package main\n\nfunc Hello() {}\n\nfunc HelloAgain() {}\n")
 
-	refreshed := srv.ensureFresh([]string{"main.go"})
-	assert.Equal(t, []string{"main.go"}, refreshed)
-	assert.NotEmpty(t, g.FindNodesByName("HelloAgain"),
-		"single-repo self-heal re-indexed the drifted file")
+	ctx, err := srv.ensureProjected(t.Context(), []string{"main.go"})
+	require.NoError(t, err)
+	require.NotNil(t, srv.readerFor(ctx).GetNode("main.go::HelloAgain"))
+	assert.Empty(t, g.FindNodesByName("HelloAgain"))
+	assert.True(t, idx.IsTrackedStale("main.go"))
+
 }

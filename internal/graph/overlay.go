@@ -304,6 +304,95 @@ func (l *OverlayLayer) RebuildInEdges() {
 	}
 }
 
+// CarryBaseEdges returns provisional copies of the call edges base recorded in
+// file that layerEdges, the file's re-parse, still make. A layer that covers a
+// file hides every base edge recorded there, while the re-parse holds its calls
+// as unresolved references until relations are rebuilt, so an edited function
+// would otherwise lose its callees and drop out of its callees' callers. A base
+// call is carried when the re-parse has an unresolved call from the same
+// source to the target's name; the copy takes that call's line. Repeated calls
+// pair up in line order, and a call the re-parse no longer makes is dropped.
+func CarryBaseEdges(base Reader, file string, layerEdges []*Edge) []*Edge {
+	type site struct{ from, name string }
+	refs := make(map[site][]*Edge)
+	for _, e := range layerEdges {
+		if e == nil || e.Kind != EdgeCalls || !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
+			continue
+		}
+		key := site{e.From, unresolvedCallName(e.To)}
+		refs[key] = append(refs[key], e)
+	}
+	if base == nil || len(refs) == 0 {
+		return nil
+	}
+	for _, at := range refs {
+		sortEdgesByLine(at)
+	}
+	var ids []string
+	for _, n := range base.GetFileNodes(file) {
+		ids = append(ids, n.ID)
+	}
+	var recorded []*Edge
+	var targets []string
+	for _, edges := range base.GetOutEdgesByNodeIDs(ids) {
+		for _, e := range edges {
+			if e != nil && e.Kind == EdgeCalls && e.FilePath == file && !IsUnresolvedTarget(e.To) {
+				recorded = append(recorded, e)
+				targets = append(targets, e.To)
+			}
+		}
+	}
+	sortEdgesByLine(recorded)
+	names := base.GetNodesByIDs(targets)
+	used := make(map[site]int, len(refs))
+	var carried []*Edge
+	for _, e := range recorded {
+		target := names[e.To]
+		if target == nil {
+			continue
+		}
+		key := site{e.From, target.Name}
+		at := refs[key]
+		if used[key] >= len(at) {
+			continue
+		}
+		c := *e
+		c.Line = at[used[key]].Line
+		c.Provisional = true
+		used[key]++
+		carried = append(carried, &c)
+	}
+	return carried
+}
+
+// unresolvedCallName is the bare callee name of an unresolved call target:
+// `unresolved::Name`, `unresolved::*.name` and qualified forms all name their
+// last segment.
+func unresolvedCallName(id string) string {
+	name := UnresolvedName(id)
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+// sortEdgesByLine orders edges by source, line and target.
+func sortEdgesByLine(edges []*Edge) {
+	sort.Slice(edges, func(i, j int) bool {
+		a, b := edges[i], edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.To < b.To
+	})
+}
+
 // OverlaidView composes an immutable base Reader with a per-session
 // overlay layer. Every read path consults the layer first for paths
 // the overlay covers; falls through to base otherwise. The base is
