@@ -237,7 +237,6 @@ jobs:
       GOMEMLIMIT: 4GiB
       TEST_WINDOWS: "true"
       TEST_RACE: "false"
-      DIAG_DIR: ${{ runner.temp }}/registered-cow-first-reply
       WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
     defaults:
       run:
@@ -246,6 +245,8 @@ jobs:
       - name: Record diagnostic intent before checkout or build
         run: |
           set -euo pipefail
+          DIAG_DIR="$RUNNER_TEMP/registered-cow-first-reply"
+          printf 'DIAG_DIR=%s\n' "$DIAG_DIR" >> "$GITHUB_ENV"
           mkdir -p "$DIAG_DIR"
           printf 'DIAGNOSTIC_ONLY\nsource=beb01dd9a5ce49ac0e50df448103debfd4bb69f7\ntest=TestRegisteredConcurrentNativeReadPopulationKeepsCurrentRows\ncount=1\nrace=false\nno_acceptance_or_final_CI_waiver=true\n' > "$DIAG_DIR/intent.txt"
           printf 'workflow_sha=%s\nworkflow_ref=%s\nrun_id=%s\nattempt=%s\n' "$WORKFLOW_SOURCE_SHA" "$GITHUB_WORKFLOW_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$DIAG_DIR/intent.txt"
