@@ -16,7 +16,69 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/tokens"
+	"go.uber.org/zap"
 )
+
+func snapshotRegisteredCall(t *testing.T, s *Server, ctx context.Context, id int, name string, args map[string]any) *mcplib.CallToolResult {
+	t.Helper()
+	result, err := externalVersionRegisteredCall(s, ctx, id, name, args)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	return result
+}
+
+func snapshotEditArgs(path, old, replacement string) map[string]any {
+	return map[string]any{"operation": "file", "target": map[string]any{"file": path}, "old_string": old, "new_string": replacement, "output": map[string]any{"format": "json"}}
+}
+
+// The retained first Linux wire call is search/symbols on facade-v1/hide,
+// negotiated before initialize. Keep that profile for every ACK and read in
+// this connection, instead of borrowing a legacy all/defer fixture.
+func snapshotFacadeFixture(t *testing.T) (*Server, *searchMetadataPoolStore, context.Context, string, *projectionEntry) {
+	t.Helper()
+	selectedProjectionRegistry(t)
+	require.True(t, tokens.EncoderReady())
+	root := t.TempDir()
+	path := filepath.Join(root, "main.go")
+	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc TargetBefore() int { return 1 }\n\nfunc NeighborBefore() int { return 2 }\n"), 0o600))
+	sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "snapshot-search.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sql.Close()) })
+	backend := &searchMetadataPoolStore{Store: sql}
+	idx := newProjectionTestIndexer(t, backend)
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	s := NewServer(query.NewEngine(backend), backend, idx, nil, zap.NewNop(), nil)
+	s.editAckMode = config.EditAckLocal
+	pending := make(chan indexer.MutationResult)
+	s.SetWatcher(mutationTestWatcher{done: pending})
+	t.Cleanup(func() { close(pending) })
+	const session = "snapshot-search-facade"
+	require.NoError(t, s.ConnectSession(session, func([]byte) error { return nil }))
+	t.Cleanup(func() { s.DisconnectSession(session) })
+	ctx := s.WithClientSession(WithSessionID(t.Context(), session), session)
+	s.NoteSessionToolPolicy(session, FacadeSurfaceVersion, "hide")
+	require.NotNil(t, s.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"gortex-load","version":"1"}}}`)))
+	s.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	ack := snapshotRegisteredCall(t, s, ctx, 10, "edit", snapshotEditArgs(path, "TargetBefore", "Target"))
+	require.False(t, ack.IsError, resultText(ack))
+	fields := extractTextResult(t, ack)
+	require.Equal(t, "local", fields["ack_mode"])
+	require.Equal(t, true, fields["readback_exact"])
+	entry := liveEntry(pendingFileProjections, path)
+	require.NotNil(t, entry)
+	require.Positive(t, entry.commitSeq)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(raw)), fields["content_sha256"])
+	require.Nil(t, sql.GetNode("main.go::Target"), "canonical publication must remain held")
+	return s, backend, ctx, path, entry
+}
 
 func snapshotSearchArgs() map[string]any {
 	return map[string]any{"operation": "symbols", "query": "Target", "options": map[string]any{"limit": 10000, "max_bytes": 0, "query_class": "symbol", "expand": "off", "max_per_file": 0}, "output": map[string]any{"format": "json", "max_bytes": 0}}
@@ -68,11 +130,11 @@ func snapshotPhysicalTarget(t *testing.T, path string) [32]byte {
 func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 	for _, transition := range []string{"same_file_distinct_symbol", "sibling_file_distinct_symbol", "checked_same_bytes_COW", "caller_cancellation"} {
 		t.Run(transition, func(t *testing.T) {
-			s, backend, base, path, original := searchReaderWaitFixture(t)
+			s, backend, base, path, original := snapshotFacadeFixture(t)
 			peer := path
 			if transition == "sibling_file_distinct_symbol" {
 				peer = filepath.Join(filepath.Dir(path), "peer.go")
-				ack := preselectionRegisteredCall(t, s, base, 12, "write_file", map[string]any{"path": peer, "content": "package probe\n\nfunc NeighborBefore() int { return 2 }\n", "format": "json"})
+				ack := snapshotRegisteredCall(t, s, base, 12, "edit", map[string]any{"operation": "write", "target": map[string]any{"file": peer}, "content": "package probe\n\nfunc NeighborBefore() int { return 2 }\n", "output": map[string]any{"format": "json"}})
 				require.False(t, ack.IsError, resultText(ack))
 				require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
 			}
@@ -112,6 +174,9 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 			var owned selection
 			select {
 			case owned = <-selected:
+			case early := <-answered:
+				raw, marshalErr := json.Marshal(early.result)
+				t.Fatalf("registered search returned before its capture barrier: result_json=%s marshal_error=%v protocol_error=%v", raw, marshalErr, early.err)
 			case <-time.After(3 * time.Second):
 				t.Fatal("actual registered search did not reach its completed leaf")
 			}
@@ -134,7 +199,7 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 				cancel()
 			case "checked_same_bytes_COW":
 				pendingFileProjections.markSuspect(path)
-				current := preselectionRegisteredCall(t, s, base, 30, "get_symbol_source", map[string]any{"id": "main.go::Target", "context_lines": 0, "format": "json"})
+				current := snapshotRegisteredCall(t, s, base, 30, "read", map[string]any{"operation": "source", "target": map[string]any{"symbol": "main.go::Target"}, "context": map[string]any{"context_lines": 0}, "output": map[string]any{"format": "json"}})
 				require.False(t, current.IsError, resultText(current))
 				latest := liveEntry(pendingFileProjections, path)
 				require.NotSame(t, original, latest)
@@ -142,7 +207,7 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 				require.Same(t, original.layer, latest.layer)
 				require.True(t, latest.readVersionChecked)
 			default:
-				ack := preselectionRegisteredCall(t, s, base, 30, "edit_file", map[string]any{"path": peer, "old_string": "NeighborBefore", "new_string": "Neighbor", "format": "json"})
+				ack := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(peer, "NeighborBefore", "Neighbor"))
 				require.False(t, ack.IsError, resultText(ack))
 				fields := extractTextResult(t, ack)
 				require.Equal(t, true, fields["readback_exact"])
@@ -182,15 +247,15 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 }
 
 func TestSearchCallerOwnedOldFactsCannotHideANewerOwnACK(t *testing.T) {
-	s, _, base, path, _ := searchReaderWaitFixture(t)
+	s, _, base, path, _ := snapshotFacadeFixture(t)
 	old, err := s.bindPendingSearch(base)
 	require.NoError(t, err)
-	ack := preselectionRegisteredCall(t, s, base, 30, "edit_file", map[string]any{"path": path, "old_string": "func Target()", "new_string": "func TargetLater()", "format": "json"})
+	ack := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "func Target()", "func TargetLater()"))
 	require.False(t, ack.IsError, resultText(ack))
 	require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
 	args := snapshotSearchArgs()
 	args["query"] = "TargetLater"
-	result := preselectionRegisteredCall(t, s, old, 40, "search", args)
+	result := snapshotRegisteredCall(t, s, old, 40, "search", args)
 	require.True(t, result.IsError, "a context captured before the newer own ACK cannot be reused as a fresh request: %s", resultText(result))
 	require.Contains(t, resultText(result), "superseded")
 	require.NotContains(t, resultText(result), fmt.Sprintf(`"id":%q`, "main.go::TargetLater"))
