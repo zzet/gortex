@@ -260,8 +260,17 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil || !before.matches(after) {
 		return nil, errors.Join(err, errProjectionExternalWrite)
 	}
-	if !requestViewFromContext(requestCtx).routed() && idx.IndexedContentMatches(rel, raw) {
-		return nil, nil
+	if !requestViewFromContext(requestCtx).routed() {
+		matches, err := idx.IndexedContentMatchesContext(buildCtx, rel, raw)
+		if err != nil {
+			return nil, err
+		}
+		if matches {
+			return nil, nil
+		}
+	}
+	if err := buildCtx.Err(); err != nil {
+		return nil, err
 	}
 	// This path already read the bounded, confined current bytes. Never call
 	// legacy lookup/onDisk here: its suspect rehash performs another raw read.
