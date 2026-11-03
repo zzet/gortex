@@ -16,6 +16,14 @@ import (
 // It checks the actual transport/domain/membership boundary, not latency or a
 // corpus/campaign acceptance population. No retained wire can satisfy it.
 func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
+	runSharedOwnerNativeBatchFixture(t, false)
+}
+func TestSharedOwnerNativeOneFileBatchUsesActualWaitDisposition(t *testing.T) {
+	runSharedOwnerNativeBatchFixture(t, true)
+}
+
+func runSharedOwnerNativeBatchFixture(t *testing.T, oneOnly bool) {
+	t.Helper()
 	binary := os.Getenv("GORTEX_SHARED_OWNER_NATIVE_BINARY")
 	expectCountedNoWait := os.Getenv("GORTEX_SHARED_OWNER_EXPECT_LOCAL_WAIT_NA") == "1"
 	wantOutcome, wantAccounting := "diagnostic_failure", "terminal_unavailable_shared_owner"
@@ -151,6 +159,55 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = prober.Close() })
+	if oneOnly {
+		// A separate fresh one-file transaction is not gated on whether a
+		// different multi-file invocation happened to remain fresh/coalesced.
+		oneBefore, err := os.ReadFile(filepath.Join(repo, "a.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Repos[0].Corpus.EditKind, p.Repos[0].Corpus.EditTool = "append_leaf", "edit.batch"
+		_, oneProbe, err := prober.callWithIdentity(ctx, "tools/call", map[string]any{"name": "read", "arguments": map[string]any{"operation": "file", "target": map[string]any{"file": "a.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		oneAfter := string(oneBefore) + "func SingleBatchAdded() int { return 5 }\n"
+		oneRequest := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"changes": []any{map[string]any{"op": "edit_file", "path": filepath.Join(repo, "a.go"), "old_string": string(oneBefore), "new_string": oneAfter}}, "options": map[string]any{"transaction_id": "actual-one-file-journal-batch"}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
+		oneRaw, oneIdentity, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "edit", "arguments": map[string]any{"operation": "batch", "changes": oneRequest.Arguments["changes"], "options": oneRequest.Arguments["options"], "output": oneRequest.Arguments["output"]}})
+		keep("one-file-ack.json", oneRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oneSink, err := os.Create(filepath.Join(evidence, "one-file-continuation-raw.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer oneSink.Close()
+		oneStep := editProbeStep{Request: oneRequest, Marker: "SingleBatchAdded"}
+		oneState := &editProbeState{step: oneStep, client: prober, sink: oneSink, record: editProbeRecord{FirstCorrect: map[string]Metric{}}, firstProbeWrite: oneProbe.WriteStarted, editWrite: oneIdentity.WriteStarted}
+		oneState.startRaw()
+		defer oneState.finishRaw()
+		runtime := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "edit.batch", Mode: "json", File: "a.go"}, origin: oneIdentity.Started, options: runOptions{Deadline: 5 * time.Second}, requireAccounting: true}
+		runtime.finishEditAfterACK(ctx, ctx, oneState, oneStep, oneIdentity.Started, oneRaw, oneIdentity, nil)
+		if expectCountedNoWait {
+			if oneState.record.Outcome != "complete" || oneState.record.Accounting.State != "observed_single_window_checks_pass" || oneState.record.Accounting.A == nil || oneState.record.Accounting.P == nil || oneState.record.Accounting.B == nil || oneState.record.Accounting.Shared != nil || oneState.record.Ack.Value == nil {
+				t.Fatalf("actual one-file counted-NA route did not preserve strict independent A/P/B: %+v", oneState.record)
+			}
+		} else if oneState.record.Accounting.State == "observed_single_window_checks_pass" {
+			t.Fatal("old missing wait applicability acquired complete one-file accounting")
+		}
+		oneEncoded, err := json.MarshalIndent(oneState.record, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		keep("normalized-one-file-record.json", oneEncoded)
+		actualOne, err := os.ReadFile(filepath.Join(repo, "a.go"))
+		if err != nil || string(actualOne) != oneAfter {
+			t.Fatalf("actual one-file source bytes: %v", err)
+		}
+		t.Log("actual one-file journal/NA accounting component only; no benchmark credit")
+		return
+	}
 	_, probeIdentity, err := prober.callWithIdentity(ctx, "tools/call", map[string]any{"name": "read", "arguments": map[string]any{"operation": "file", "target": map[string]any{"file": "a.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +236,7 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 		t.Fatalf("actual offered frontier: %v", err)
 	}
 	refs, err := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
-	refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(offered)
+	refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(offered)
 	if err != nil {
 		t.Fatalf("real complete two-file journal batch cannot enter report decoder: %v", err)
 	}
@@ -288,7 +345,8 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 					shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("7")
 				case "ack_ms_missing":
 					delete(shared["phases_ms"].(map[string]any), "reindex_wait")
-				case "original_requires_fresh":badRefs.OriginalNoRequireFresh=false
+				case "original_requires_fresh":
+					badRefs.OriginalNoRequireFresh = false
 				}
 				fresh := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
 				got, batch := fresh.accountingForBatchSetStatuses(ctx, statuses, ackCopy, badRefs)
@@ -471,60 +529,85 @@ func TestBatchACKWaitNAGuardRequiresBothNullWireMaps(t *testing.T) {
 // Synthetic one-file compatibility control. The direct P/B fixtures stay
 // independent; only the original local typed ACK may supply counted wait NA.
 func TestBatchOneFileCountedNoWaitPreservesPhysicalAccounting(t *testing.T) {
-	body:=editProbeBatchACKFixture()
-	body["ack_mode"]="local"
-	refs,err:=decodeEditProbeBatchAcknowledgement(body,"transaction-1",editProbeBatchACKAbsPath(),"repo/file.go",editProbeBatchOfferedBytes())
-	if err!=nil { t.Fatal(err) }
-	refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(request{Tool:"edit",Operation:"batch",Arguments:map[string]any{"options":map[string]any{"transaction_id":"transaction-1"}}})
-	refs.GraphGeneration,refs.ResultGeneration=1,1
-	file:=editProbeAccountingFixture()
-	ack:=file["acknowledgement"].(map[string]any)
-	ack["rpc_id"],ack["clock"],ack["scope"]="rpc-2","monotonic","shared_rpc_mcp_bound_call"
-	ack["caller_response_ready_ms"]=json.Number("7")
-	ack["observed_execution_ms"].(map[string]any)["reindex_wait"]=nil
-	ack["phase_states"].(map[string]any)["reindex_wait"]="not_applicable"
-	ack["phases_ms"]=map[string]any{"reindex_wait":nil}
-	ack["counts"]=map[string]any{"reindex_wait":map[string]any{"started":json.Number("1"),"completed":json.Number("1"),"not_applicable":json.Number("1")}}
-	shared:=map[string]any{"found":true,"receipt":refs.Acknowledgement,"receipt_kind":"batch_acknowledgement","acknowledgement":ack}
-	file["acknowledgement"]=nil
-	file["found"],file["receipt_kind"],file["receipt"]=true,"batch_file_observation",refs.Observation
-	file["transaction_id"],file["path"],file["batch_disk_verdict"]=refs.TransactionID,refs.RelativePath,"committed"
-	file["after_sha256"],file["publication_receipt"],file["publication_generation"]=refs.AfterSHA256,refs.GraphReceipt,json.Number("1")
-	file["writer_return_observed"],file["acknowledgement_state"]=true,"not_applicable_shared_transaction_rpc"
-	got:=refs.accounting(file,shared)
-	if got.State!="observed_single_window_checks_pass" || got.A==nil || got.P==nil || got.B==nil || got.Shared!=nil { t.Fatalf("one-file original windows lost: %+v",got) }
-	for _,fault:=range []string{"full_mode","missing_mode","foreign_server_rpc","missing_ack_ms","numeric_ack_ms","missing_original_blob","original_requires_fresh"} {
-		t.Run(fault,func(t *testing.T) {
-			r:=refs;row:=cloneSharedOwnerModel(t,file);owner:=cloneSharedOwnerModel(t,shared)
+	body := editProbeBatchACKFixture()
+	body["ack_mode"] = "local"
+	refs, err := decodeEditProbeBatchAcknowledgement(body, "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"options": map[string]any{"transaction_id": "transaction-1"}}})
+	refs.GraphGeneration, refs.ResultGeneration = 1, 1
+	file := editProbeAccountingFixture()
+	ack := file["acknowledgement"].(map[string]any)
+	ack["rpc_id"], ack["clock"], ack["scope"] = "rpc-2", "monotonic", "shared_rpc_mcp_bound_call"
+	ack["caller_response_ready_ms"] = json.Number("7")
+	ack["observed_execution_ms"].(map[string]any)["reindex_wait"] = nil
+	ack["phase_states"].(map[string]any)["reindex_wait"] = "not_applicable"
+	ack["phases_ms"] = map[string]any{"reindex_wait": nil}
+	ack["counts"] = map[string]any{"reindex_wait": map[string]any{"started": json.Number("1"), "completed": json.Number("1"), "not_applicable": json.Number("1")}}
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": ack}
+	file["acknowledgement"] = nil
+	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
+	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	got := refs.accounting(file, shared)
+	if got.State != "observed_single_window_checks_pass" || got.A == nil || got.P == nil || got.B == nil || got.Shared != nil {
+		t.Fatalf("one-file original windows lost: %+v", got)
+	}
+	for _, fault := range []string{"full_mode", "missing_mode", "foreign_server_rpc", "missing_ack_ms", "numeric_ack_ms", "missing_original_blob", "original_requires_fresh"} {
+		t.Run(fault, func(t *testing.T) {
+			r := refs
+			row := cloneSharedOwnerModel(t, file)
+			owner := cloneSharedOwnerModel(t, shared)
 			switch fault {
-			case "full_mode":r.AckMode="full"
-			case "missing_mode":r.AckMode=""
-			case "foreign_server_rpc":owner["acknowledgement"].(map[string]any)["rpc_id"]="rpc-foreign"
-			case "missing_ack_ms":delete(owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any),"reindex_wait")
-			case "numeric_ack_ms":owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any)["reindex_wait"]=json.Number("0")
-			case "missing_original_blob":delete(row,"after_sha256")
-			case "original_requires_fresh":r.OriginalNoRequireFresh=false
+			case "full_mode":
+				r.AckMode = "full"
+			case "missing_mode":
+				r.AckMode = ""
+			case "foreign_server_rpc":
+				owner["acknowledgement"].(map[string]any)["rpc_id"] = "rpc-foreign"
+			case "missing_ack_ms":
+				delete(owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any), "reindex_wait")
+			case "numeric_ack_ms":
+				owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "missing_original_blob":
+				delete(row, "after_sha256")
+			case "original_requires_fresh":
+				r.OriginalNoRequireFresh = false
 			}
-			if got:=r.accounting(row,owner);got.State=="observed_single_window_checks_pass" { t.Fatal("unproved one-file applicability/source acquired full accounting") }
+			if got := r.accounting(row, owner); got.State == "observed_single_window_checks_pass" {
+				t.Fatal("unproved one-file applicability/source acquired full accounting")
+			}
 		})
 	}
 }
 
 func TestBatchOriginalNoFreshnessProofUsesAllActualRequestContainers(t *testing.T) {
-	for _,tc:=range []struct{name string;args map[string]any;want bool}{
-		{"absent_default_false",map[string]any{"options":map[string]any{"transaction_id":"owned"}},true},
-		{"top_false",map[string]any{"require_fresh":false},true},
-		{"top_true",map[string]any{"require_fresh":true},false},
-		{"options_false",map[string]any{"options":map[string]any{"require_fresh":false}},true},
-		{"options_true",map[string]any{"options":map[string]any{"require_fresh":true}},false},
-		{"arguments_false",map[string]any{"arguments":map[string]any{"require_fresh":false}},true},
-		{"arguments_true",map[string]any{"arguments":map[string]any{"require_fresh":true}},false},
-		{"top_false_does_not_override_nested_true",map[string]any{"require_fresh":false,"options":map[string]any{"require_fresh":true}},false},
-		{"malformed_top",map[string]any{"require_fresh":"false"},false},
-		{"malformed_nested",map[string]any{"options":map[string]any{"require_fresh":"false"}},false},
-		{"malformed_container",map[string]any{"options":"unknown"},false},
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want bool
+	}{
+		{"absent_default_false", map[string]any{"options": map[string]any{"transaction_id": "owned"}}, true},
+		{"top_false", map[string]any{"require_fresh": false}, true},
+		{"top_true", map[string]any{"require_fresh": true}, false},
+		{"options_false", map[string]any{"options": map[string]any{"require_fresh": false}}, true},
+		{"options_true", map[string]any{"options": map[string]any{"require_fresh": true}}, false},
+		{"arguments_false", map[string]any{"arguments": map[string]any{"require_fresh": false}}, true},
+		{"arguments_true", map[string]any{"arguments": map[string]any{"require_fresh": true}}, false},
+		{"top_false_does_not_override_nested_true", map[string]any{"require_fresh": false, "options": map[string]any{"require_fresh": true}}, false},
+		{"malformed_top", map[string]any{"require_fresh": "false"}, false},
+		{"malformed_nested", map[string]any{"options": map[string]any{"require_fresh": "false"}}, false},
+		{"malformed_container", map[string]any{"options": "unknown"}, false},
 	} {
-		t.Run(tc.name,func(t *testing.T){ if got:=originalBatchNoRequireFresh(request{Tool:"edit",Operation:"batch",Arguments:tc.args});got!=tc.want { t.Fatalf("original request no-freshness witness=%t want%t",got,tc.want) } })
+		t.Run(tc.name, func(t *testing.T) {
+			if got := originalBatchNoRequireFresh(request{Tool: "edit", Operation: "batch", Arguments: tc.args}); got != tc.want {
+				t.Fatalf("original request no-freshness witness=%t want%t", got, tc.want)
+			}
+		})
 	}
-	if originalBatchNoRequireFresh(request{}) { t.Fatal("unretained original request granted a no-wait exemption") }
+	if originalBatchNoRequireFresh(request{}) {
+		t.Fatal("unretained original request granted a no-wait exemption")
+	}
 }

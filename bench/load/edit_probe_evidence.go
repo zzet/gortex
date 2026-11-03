@@ -415,11 +415,11 @@ func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, rec
 // owner. The windows remain independent; no map is merged into a synthetic
 // physical mutation_status reply and A is never added to background work.
 func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
-	return checkEditProbeAccountingWithWaitDisposition(status,receipt,requestedField,sharedAcknowledgement,parseMayBeInapplicable,false)
+	return checkEditProbeAccountingWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
 }
 
-func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable,countedNoWait bool) editProbeAccounting {
-	out := checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable,countedNoWait)
+func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
+	out := checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, countedNoWait)
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	requested, applied := out.Requested, out.Applied
 	// Shared execution has a distinct owner/domain proof. Even malformed or

@@ -14,20 +14,20 @@ import (
 // and this file's graph ticket have separate clocks/retention and are never
 // represented as one synthetic mutation_receipt.
 type editProbeBatchReferences struct {
-	TransactionID        string `json:"transaction_id"`
-	AckMode string `json:"ack_mode,omitempty"`
-	OriginalNoRequireFresh bool `json:"original_request_no_require_fresh,omitempty"`
-	Observation          string `json:"file_observation_receipt"`
-	Acknowledgement      string `json:"acknowledgement_receipt"`
-	Path                 string `json:"path"`
-	RelativePath         string `json:"relative_path"`
-	AfterSHA256          string `json:"after_sha256"`
-	GraphReceipt         string `json:"reindex_receipt"`
-	GraphGeneration      uint64 `json:"reindex_generation"`
-	ResultReceipt        string `json:"result_reindex_receipt"`
-	ResultGeneration     uint64 `json:"result_reindex_generation"`
-	AcknowledgementState string `json:"acknowledgement_state"`
-	TransactionError     string `json:"transaction_error,omitempty"`
+	TransactionID          string `json:"transaction_id"`
+	AckMode                string `json:"ack_mode,omitempty"`
+	OriginalNoRequireFresh bool   `json:"original_request_no_require_fresh,omitempty"`
+	Observation            string `json:"file_observation_receipt"`
+	Acknowledgement        string `json:"acknowledgement_receipt"`
+	Path                   string `json:"path"`
+	RelativePath           string `json:"relative_path"`
+	AfterSHA256            string `json:"after_sha256"`
+	GraphReceipt           string `json:"reindex_receipt"`
+	GraphGeneration        uint64 `json:"reindex_generation"`
+	ResultReceipt          string `json:"result_reindex_receipt"`
+	ResultGeneration       uint64 `json:"result_reindex_generation"`
+	AcknowledgementState   string `json:"acknowledgement_state"`
+	TransactionError       string `json:"transaction_error,omitempty"`
 }
 
 // This explicit fixture offers whole-file before/after bytes. It is not the
@@ -104,7 +104,7 @@ func decodeEditProbeBatchMember(body map[string]any, fileValue, resultValue, obs
 		return out, errors.New("batch durable after-image does not match exact offered whole-file bytes")
 	}
 	out.TransactionID, out.Path, out.RelativePath, out.AfterSHA256 = transactionID, path, rel, after
-	out.AckMode,_=body["ack_mode"].(string)
+	out.AckMode, _ = body["ack_mode"].(string)
 	if value, present := body["error"]; present {
 		message, ok := value.(string)
 		if !ok {
@@ -191,10 +191,10 @@ func (r editProbeBatchReferences) accounting(fileStatus, acknowledgementStatus m
 	if shared == nil {
 		return editProbeAccounting{State: "unavailable", Reasons: []string{"shared batch ACK intervals unavailable"}}
 	}
-	if r.AckMode!="" && !batchAcknowledgementMatches(r.Acknowledgement,shared) {
-		return editProbeAccounting{State:"unavailable",Reasons:[]string{"original batch server RPC owner unavailable"}}
+	if r.AckMode != "" && !batchAcknowledgementMatches(r.Acknowledgement, shared) {
+		return editProbeAccounting{State: "unavailable", Reasons: []string{"original batch server RPC owner unavailable"}}
 	}
-	return checkEditProbeAccountingWithWaitDisposition(fileStatus, r.Observation, "publication_generation", shared, true,r.AckMode=="local" && r.OriginalNoRequireFresh && batchAcknowledgementMatches(r.Acknowledgement,shared))
+	return checkEditProbeAccountingWithWaitDisposition(fileStatus, r.Observation, "publication_generation", shared, true, r.AckMode == "local" && r.OriginalNoRequireFresh && batchAcknowledgementMatches(r.Acknowledgement, shared))
 }
 
 func editProbeBatchIntent(req request) (string, []byte, error) {
@@ -302,15 +302,15 @@ type editProbeBatchIntentMember struct {
 }
 
 type editProbeBatchSetReferences struct {
-	TransactionID   string                     `json:"transaction_id"`
-	Fingerprint     string                     `json:"fingerprint"`
-	AckMode         string                     `json:"ack_mode"`
-	OriginalNoRequireFresh bool `json:"original_request_no_require_fresh"`
-	Acknowledgement string                     `json:"acknowledgement_receipt"`
-	RPCID           string                     `json:"bound_server_rpc_id"`
-	WireID          string                     `json:"actual_wire_id"`
-	ReferenceError  string                     `json:"reference_error,omitempty"`
-	Files           []editProbeBatchReferences `json:"files"`
+	TransactionID          string                     `json:"transaction_id"`
+	Fingerprint            string                     `json:"fingerprint"`
+	AckMode                string                     `json:"ack_mode"`
+	OriginalNoRequireFresh bool                       `json:"original_request_no_require_fresh"`
+	Acknowledgement        string                     `json:"acknowledgement_receipt"`
+	RPCID                  string                     `json:"bound_server_rpc_id"`
+	WireID                 string                     `json:"actual_wire_id"`
+	ReferenceError         string                     `json:"reference_error,omitempty"`
+	Files                  []editProbeBatchReferences `json:"files"`
 }
 
 type editProbeBatchMemberAccounting struct {
@@ -331,15 +331,26 @@ type editProbeBatchSetAccounting struct {
 // freshness parsing ORs top-level, options and arguments booleans. Unknown
 // or malformed values cannot grant a no-freshness applicability exemption.
 func originalBatchNoRequireFresh(req request) bool {
-	if req.Tool!="edit" || req.Operation!="batch" || req.Arguments==nil { return false }
-	containers:=[]map[string]any{req.Arguments}
-	for _,name:=range []string{"options","arguments"} {
-		if raw,present:=req.Arguments[name];present {
-			values,ok:=raw.(map[string]any);if !ok { return false };containers=append(containers,values)
+	if req.Tool != "edit" || req.Operation != "batch" || req.Arguments == nil {
+		return false
+	}
+	containers := []map[string]any{req.Arguments}
+	for _, name := range []string{"options", "arguments"} {
+		if raw, present := req.Arguments[name]; present {
+			values, ok := raw.(map[string]any)
+			if !ok {
+				return false
+			}
+			containers = append(containers, values)
 		}
 	}
-	for _,values:=range containers {
-		if raw,present:=values["require_fresh"];present { value,ok:=raw.(bool);if !ok || value { return false } }
+	for _, values := range containers {
+		if raw, present := values["require_fresh"]; present {
+			value, ok := raw.(bool)
+			if !ok || value {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -525,9 +536,9 @@ func (r editProbeBatchSetReferences) validateSharedMember(status map[string]any,
 }
 
 func batchAcknowledgementMatches(receipt string, shared map[string]any) bool {
-	counter:=strings.TrimPrefix(receipt,"batch-ack-")
-	n,err:=strconv.ParseUint(counter,10,64)
-	return err==nil && n>0 && counter!=receipt && counter==strconv.FormatUint(n,10) && shared["rpc_id"]=="rpc-"+counter && shared["clock"]=="monotonic" && shared["scope"]=="shared_rpc_mcp_bound_call"
+	counter := strings.TrimPrefix(receipt, "batch-ack-")
+	n, err := strconv.ParseUint(counter, 10, 64)
+	return err == nil && n > 0 && counter != receipt && counter == strconv.FormatUint(n, 10) && shared["rpc_id"] == "rpc-"+counter && shared["clock"] == "monotonic" && shared["scope"] == "shared_rpc_mcp_bound_call"
 }
 
 func (r *editProbeRuntime) accountingForBatchSetStatuses(ctx context.Context, statuses map[string]map[string]any, ack map[string]any, refs editProbeBatchSetReferences) (editProbeAccounting, *editProbeBatchSetAccounting) {
@@ -550,14 +561,14 @@ func (r *editProbeRuntime) accountingForBatchSetStatuses(ctx context.Context, st
 		return out, batch
 	}
 	shared, _ := ack["acknowledgement"].(map[string]any)
-	if shared == nil || shared["rpc_id"] != refs.RPCID || refs.RPCID == "" || !batchAcknowledgementMatches(refs.Acknowledgement,shared) {
+	if shared == nil || shared["rpc_id"] != refs.RPCID || refs.RPCID == "" || !batchAcknowledgementMatches(refs.Acknowledgement, shared) {
 		fail("transaction ACK does not match actual offered RPC")
 		return out, batch
 	}
 	// Validate the actual shared RPC once using the existing independent A
 	// accounting rules; never put its intervals in a file or shared E/B owner.
 	first := refs.Files[0]
-	countedNoWait := refs.AckMode == "local" && refs.OriginalNoRequireFresh && refs.validateReferences() == nil && batchAcknowledgementMatches(refs.Acknowledgement,shared)
+	countedNoWait := refs.AckMode == "local" && refs.OriginalNoRequireFresh && refs.validateReferences() == nil && batchAcknowledgementMatches(refs.Acknowledgement, shared)
 	out = checkEditProbeAcknowledgementWithWaitDisposition(statuses[first.Observation], first.Observation, "publication_generation", shared, true, countedNoWait)
 	out.State = "unavailable_shared_owner"
 	// A's applicability failures remain in the overall result. They cannot
