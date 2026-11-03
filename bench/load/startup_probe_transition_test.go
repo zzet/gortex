@@ -104,3 +104,31 @@ func TestStartupTransitionCensusKeepsObservedNonLiveAsFailureCount(t *testing.T)
 		t.Fatalf("summary lost verified member count: %+v", metric)
 	}
 }
+
+// A catalog selection must have strictly earlier native time, not merely a
+// sequence of calls that a coarse platform clock can stamp identically.
+func TestStartupTransitionCensusMembershipMustStrictlyPrecedeRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset time.Duration
+		known  bool
+	}{
+		{name: "strictly_before", offset: -time.Nanosecond, known: true},
+		{name: "equal_coarse_clock", offset: 0},
+		{name: "strictly_after", offset: time.Nanosecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := startupTransitionFixture(t)
+			origin := e.BootStarted.Add(time.Second)
+			e.BaselineAt = origin.Add(tc.offset)
+			metric := analyzeStartupTransitionCensus(e)
+			if tc.known {
+				if metric.Value == nil || *metric.Value != 24 {
+					t.Fatalf("strict native before-registration proof unavailable: %+v", metric)
+				}
+			} else if metric.Value != nil {
+				t.Fatalf("equal/late membership must remain unknown: %+v", metric)
+			}
+		})
+	}
+}
