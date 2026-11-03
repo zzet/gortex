@@ -109,9 +109,9 @@ func TestStartupTransitionCensusKeepsObservedNonLiveAsFailureCount(t *testing.T)
 // sequence of calls that a coarse platform clock can stamp identically.
 func TestStartupTransitionCensusMembershipMustStrictlyPrecedeRegistration(t *testing.T) {
 	for _, tc := range []struct {
-		name string
+		name   string
 		offset time.Duration
-		known bool
+		known  bool
 	}{
 		{name: "strictly_before", offset: -time.Nanosecond, known: true},
 		{name: "equal_coarse_clock", offset: 0},
