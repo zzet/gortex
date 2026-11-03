@@ -6,8 +6,9 @@ on:
       suite:
         description: Explicit flow to run (native acceptance starts private daemons)
         type: choice
-        default: benchmarks
+        default: registered-cow-diagnostic-windows
         options:
+          - registered-cow-diagnostic-windows
           - benchmarks
           - performance
           - acceptance-helpers
@@ -220,3 +221,110 @@ jobs:
           name: acceptance-native-windows-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gortex-windows-readiness-artifacts
           retention-days: 90
+
+  registered-cow-diagnostic-windows:
+    if: inputs.suite == 'registered-cow-diagnostic-windows'
+    name: DIAGNOSTIC_ONLY registered COW first reply (one test)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      CGO_ENABLED: "1"
+      CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+      CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+      GOTOOLCHAIN: local
+      GOFLAGS: -p=2
+      GOMAXPROCS: "3"
+      GOMEMLIMIT: 4GiB
+      TEST_WINDOWS: "true"
+      TEST_RACE: "false"
+      DIAG_DIR: ${{ runner.temp }}/registered-cow-first-reply
+      WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record diagnostic intent before checkout or build
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIAG_DIR"
+          printf 'DIAGNOSTIC_ONLY\nsource=beb01dd9a5ce49ac0e50df448103debfd4bb69f7\ntest=TestRegisteredConcurrentNativeReadPopulationKeepsCurrentRows\ncount=1\nrace=false\nno_acceptance_or_final_CI_waiver=true\n' > "$DIAG_DIR/intent.txt"
+          printf 'workflow_sha=%s\nworkflow_ref=%s\nrun_id=%s\nattempt=%s\n' "$WORKFLOW_SOURCE_SHA" "$GITHUB_WORKFLOW_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$DIAG_DIR/intent.txt"
+          uname -a > "$DIAG_DIR/host.txt"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: beb01dd9a5ce49ac0e50df448103debfd4bb69f7
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.3
+          cache: true
+      - name: Bind exact qualified source and actual Windows tools
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = beb01dd9a5ce49ac0e50df448103debfd4bb69f7
+          test "$(git rev-parse 'HEAD^{tree}')" = 0dbe5a8938726c35771de76192f1b5b29a02026a
+          test -z "$(git status --porcelain)"
+          git show --no-patch --format=fuller HEAD > "$DIAG_DIR/source.txt"
+          git status --porcelain > "$DIAG_DIR/source-status.txt"
+          git ls-tree HEAD internal/mcp/registered_cow_barrier_test.go internal/mcp/registered_same_owner_cow_test.go >> "$DIAG_DIR/source.txt"
+          cp internal/mcp/registered_cow_barrier_test.go internal/mcp/registered_same_owner_cow_test.go go.mod go.sum "$DIAG_DIR/"
+          go version > "$DIAG_DIR/tools.txt"
+          go version | grep -F 'go1.27.3 windows/'
+          test "$(go env GOOS)" = windows
+          test "$(go env CGO_ENABLED)" = 1
+          go env -json > "$DIAG_DIR/go-env.json"
+          gcc --version >> "$DIAG_DIR/tools.txt"
+          g++ --version >> "$DIAG_DIR/tools.txt"
+          powershell.exe -NoProfile -Command '$PSVersionTable; Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber; Get-CimInstance Win32_ComputerSystem | Select-Object NumberOfLogicalProcessors,TotalPhysicalMemory' >> "$DIAG_DIR/host.txt"
+          printf 'runner_os=%s\nrunner_arch=%s\nGOMAXPROCS=%s\nGOMEMLIMIT=%s\nGOFLAGS=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$GOMAXPROCS" "$GOMEMLIMIT" "$GOFLAGS" >> "$DIAG_DIR/host.txt"
+      - name: Compile one nonrace test binary with prescribed build flags
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+          set +e
+          go test -c -o "$DIAG_DIR/registered-read.test.exe" ./internal/mcp > "$DIAG_DIR/build.stdout" 2> "$DIAG_DIR/build.stderr"
+          code=$?
+          set -e
+          printf '%s\n' "$code" > "$DIAG_DIR/build.exit"
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          go version -m "$DIAG_DIR/registered-read.test.exe" > "$DIAG_DIR/buildinfo.txt"
+          sha256sum "$DIAG_DIR/registered-read.test.exe" > "$DIAG_DIR/binary-sha256.txt"
+      - name: Execute exactly one fixed test and preserve original exit
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$DIAG_DIR/test.started"
+          set +e
+          "$DIAG_DIR/registered-read.test.exe" -test.run '^TestRegisteredConcurrentNativeReadPopulationKeepsCurrentRows$' -test.count=1 -test.v -test.timeout=5m > "$DIAG_DIR/test.raw.stdout" 2> "$DIAG_DIR/test.raw.stderr"
+          original_code=$?
+          printf '%s\n' "$original_code" > "$DIAG_DIR/test.original.exit"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$DIAG_DIR/test.finished"
+          # Conversion is AFTER the single original execution; no fabricated event timestamps.
+          go tool test2json -p github.com/zzet/gortex/internal/mcp < "$DIAG_DIR/test.raw.stdout" > "$DIAG_DIR/test.jsonl" 2> "$DIAG_DIR/converter.stderr"
+          converter_code=$?
+          printf '%s\n' "$converter_code" > "$DIAG_DIR/converter.exit"
+          set -e
+          python - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['DIAG_DIR'])
+          name = 'TestRegisteredConcurrentNativeReadPopulationKeepsCurrentRows'
+          rows = [json.loads(line) for line in (root/'test.jsonl').read_text().splitlines() if line.strip()]
+          terminal = [row for row in rows if row.get('Test') == name and row.get('Action') in ['pass', 'fail', 'skip']]
+          observed = sorted({row['Test'] for row in rows if row.get('Test')})
+          code = int((root/'test.original.exit').read_text())
+          value = dict(scope='DIAGNOSTIC_ONLY_NO_ACCEPTANCE_OR_FINAL_CI_WAIVER', source='beb01dd9a5ce49ac0e50df448103debfd4bb69f7', original_exit=code, observed_tests=observed, terminal=terminal, execution_count=1, timestamp_scope='start/finish wall only; JSON converted after run', raw_preserved=True)
+          (root/'TEST-CENSUS.json').write_text(json.dumps(value, indent=2)+'\n')
+          if observed != [name] or len(terminal) != 1 or terminal[0]['Action'] == 'skip':
+              raise SystemExit('Unavailable: fixed single-test census missing/foreign/skipped; preserve raw diagnostic')
+          PYCODE
+          if [ "$original_code" -ne 0 ]; then exit "$original_code"; fi
+          if [ "$converter_code" -ne 0 ]; then exit "$converter_code"; fi
+      - name: Preserve all diagnostic evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DIAGNOSTIC-ONLY-registered-cow-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/registered-cow-first-reply
+          retention-days: 30
+          if-no-files-found: error
