@@ -123,6 +123,8 @@ func extract(name, host string, r report) (float64, error) {
 	}
 	p := r.Phases[0]
 	switch name {
+	case "reclaim_hold_p95":
+		return measureReclaimHoldP95(p)
 	case "read_gate_closures":
 		return measureReadGateClosures(p)
 	case "wal_p95_mib":

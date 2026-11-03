@@ -20,7 +20,7 @@ type statusCaptureWire struct {
 	Captures []statusCapture `json:"captures"`
 }
 
-func measureReadGateClosures(p phase) (float64, error) {
+func validateOwnedStatusCensus(p phase) (int, error) {
 	var wire statusCaptureWire
 	d := json.NewDecoder(bytes.NewReader(p.Gate["status_capture_v1"]))
 	d.DisallowUnknownFields()
@@ -34,7 +34,6 @@ func measureReadGateClosures(p phase) (float64, error) {
 	if json.Unmarshal(p.Gate["process_counter_window"], &window) != nil || window.Started.IsZero() || !window.Ended.After(window.Started) {
 		return 0, errors.New("missing phase counter window")
 	}
-	var first, last int64
 	pid := wire.Captures[0].PID
 	previous := wire.Captures[0].Started
 	for i, c := range wire.Captures {
@@ -43,15 +42,33 @@ func measureReadGateClosures(p phase) (float64, error) {
 		}
 		previous = c.Finished
 		var status struct {
-			PID     int `json:"pid"`
+			PID int `json:"pid"`
+		}
+		if json.Unmarshal(p.Status[i], &status) != nil || status.PID != pid {
+			return 0, errors.New("foreign daemon status identity")
+		}
+	}
+	if wire.Captures[0].Finished.After(window.Started) || wire.Captures[len(wire.Captures)-1].Started.Before(window.Ended) {
+		return 0, errors.New("owned status captures do not bracket phase counter window")
+	}
+	return pid, nil
+}
+
+func measureReadGateClosures(p phase) (float64, error) {
+	if _, err := validateOwnedStatusCensus(p); err != nil {
+		return 0, err
+	}
+	var first, last int64
+	for i, raw := range p.Status {
+		var status struct {
 			Storage struct {
 				Reclaim struct {
 					PauseCount *int64 `json:"pause_count"`
 				} `json:"wal_reclaim"`
 			} `json:"storage"`
 		}
-		if json.Unmarshal(p.Status[i], &status) != nil || status.PID != pid || status.Storage.Reclaim.PauseCount == nil || *status.Storage.Reclaim.PauseCount < 0 {
-			return 0, errors.New("missing or foreign daemon read-gate counter")
+		if json.Unmarshal(raw, &status) != nil || status.Storage.Reclaim.PauseCount == nil || *status.Storage.Reclaim.PauseCount < 0 {
+			return 0, errors.New("missing daemon read-gate counter")
 		}
 		count := *status.Storage.Reclaim.PauseCount
 		if i == 0 {
@@ -60,9 +77,6 @@ func measureReadGateClosures(p phase) (float64, error) {
 			return 0, errors.New("read-gate counter reset during phase")
 		}
 		last = count
-	}
-	if wire.Captures[0].Finished.After(window.Started) || wire.Captures[len(wire.Captures)-1].Started.Before(window.Ended) {
-		return 0, errors.New("owned status captures do not bracket phase counter window")
 	}
 	if last-first > 1<<53 {
 		return 0, errors.New("read-gate delta exceeds exact metric integer range")
