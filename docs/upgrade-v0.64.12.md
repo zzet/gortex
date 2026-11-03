@@ -31,6 +31,32 @@ An older build ignores `Cause` when reading that journal and does not enforce
 this cleanup policy. Finish pending cleanup with the newer build before a
 downgrade. See [tracking and temporary outages](multi-repo.md#tracking-and-temporary-outages).
 
+## Contract analysis in linked worktrees waits for idle time
+
+Contract analysis of linked git worktrees now runs only while the daemon is
+idle: a worktree's job starts once the daemon has seen no tool call and no edit
+for 5 s, and a fill that is running when work comes back stops at its next
+checkpoint and resumes later. The primary checkout is not affected, and a
+request that waits for fresh contract results still starts its worktree's
+analysis at once.
+
+While a worktree's analysis waits, an ordinary read there answers from the
+worktree's last published contract analysis, with `contract_analysis.state`
+`building` and reason `contract_analysis_pending`, or reports that no
+attachment exists yet. It does not block.
+
+To restore the earlier behavior, set the policy to `eager` in the daemon's own
+config file (not a repository's `.gortex.yaml`):
+
+```yaml
+contract_analysis:
+  linked_policy: eager
+```
+
+or start the daemon with `GORTEX_CONTRACT_LINKED_POLICY=eager`. `throttled`
+runs one linked job at a time instead. See
+[Contract analysis in linked worktrees](multi-repo.md#contract-analysis-in-linked-worktrees).
+
 ## The store schema upgrade
 
 The first daemon start after upgrading from v0.64.10 (store schema v21) or

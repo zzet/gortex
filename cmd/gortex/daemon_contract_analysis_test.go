@@ -7,7 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/indexer"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestInstallDaemonContractAnalysisGate(t *testing.T) {
@@ -55,5 +60,39 @@ func TestContractAnalysisYieldParksForDemandAndCancels(t *testing.T) {
 	stop()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("yield cancellation=%v", err)
+	}
+}
+
+// TestDaemonContractLinkedScheduleFollowsConfigAndEnvironment: the daemon
+// takes the linked policy from the contract_analysis block, lets the
+// environment override it, and starts on the defaults with a warning when a
+// setting does not parse.
+func TestDaemonContractLinkedScheduleFollowsConfigAndEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  config.ContractAnalysisConfig
+		env  string
+		want indexer.ContractLinkedSchedule
+		warn bool
+	}{
+		{name: "default", want: indexer.DefaultContractLinkedSchedule()},
+		{name: "file", cfg: config.ContractAnalysisConfig{LinkedPolicy: "throttled", LinkedThrottleInterval: "1m"}, want: indexer.ContractLinkedSchedule{Policy: indexer.ContractLinkedThrottled, IdleWindow: 5 * time.Second, ThrottleInterval: time.Minute}},
+		{name: "environment", cfg: config.ContractAnalysisConfig{LinkedPolicy: "throttled"}, env: "eager", want: indexer.ContractLinkedSchedule{Policy: indexer.ContractLinkedEager, IdleWindow: 5 * time.Second, ThrottleInterval: 30 * time.Second}},
+		{name: "typo", cfg: config.ContractAnalysisConfig{LinkedPolicy: "idel"}, want: indexer.DefaultContractLinkedSchedule(), warn: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.InfoLevel)
+			got := contractLinkedSchedule(tc.cfg, func(name string) string {
+				if name == indexer.ContractLinkedPolicyEnv {
+					return tc.env
+				}
+				return ""
+			}, zap.New(core))
+			require.Equal(t, tc.want, got)
+			require.Len(t, logs.FilterMessage("contract analysis linked policy setting ignored").All(), map[bool]int{true: 1}[tc.warn])
+			lines := logs.FilterMessage("contract analysis linked policy").All()
+			require.Len(t, lines, 1)
+			require.Equal(t, string(tc.want.Policy), lines[0].ContextMap()["policy"])
+		})
 	}
 }
