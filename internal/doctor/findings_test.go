@@ -618,6 +618,85 @@ func TestPostToolUseSilenceUnderDenyPostureIsExpected(t *testing.T) {
 	assertNoFindingWith(t, findings, "nothing to say")
 }
 
+// TestPostToolUseNeverRunUnderDenyPostureIsExpected: under the deny posture
+// PostToolUse only watches Gortex tool calls, so when the window's
+// transcripts show none, zero runs beside running siblings is not a broken
+// entry. With no transcripts, or once they show Gortex calls, zero runs may
+// mean the matcher missed them, so the warning stands; enrich keeps it too.
+func TestPostToolUseNeverRunUnderDenyPostureIsExpected(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		agent       string
+		deny        bool
+		sessions    int
+		gortexCalls int
+		want        Severity
+	}{
+		{"deny, transcripts show no Gortex calls", "antigravity", true, 3, 0, SeverityInfo},
+		{"deny, Gortex calls missed", "antigravity", true, 3, 25, SeverityWarn},
+		{"deny, no transcripts to confirm", "antigravity", true, 0, 0, SeverityWarn},
+		{"enrich", "claude-code", false, 3, 0, SeverityWarn},
+		// Claude Code's scan misses plugin-prefixed Gortex tools, so its
+		// zero proves nothing.
+		{"deny, Claude Code transcripts", "claude-code", true, 3, 0, SeverityWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := codexAgent()
+			agent.Agent = tc.agent
+			agent.RequiresTrust = false
+			agent.PostToolUseDenyPosture = tc.deny
+
+			findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+				"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+				"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PreToolUse":       {Runs: 40, Emitted: 3, DaemonKnown: 40, DaemonUp: 40},
+			}), Adoption{FilesFound: tc.sessions, InWindow: tc.sessions, GortexCalls: tc.gortexCalls, ShellCalls: 9}, time.Now())
+
+			got := findingWith(t, findings, "PostToolUse is configured but never ran")
+			if got.Severity != tc.want {
+				t.Errorf("severity=%s want %s", got.Severity, tc.want)
+			}
+			if tc.want == SeverityInfo && got.Remedy != "" {
+				t.Errorf("expected silence needs no remedy, got %q", got.Remedy)
+			}
+		})
+	}
+}
+
+// TestAntigravityStopSilenceIsExpected: Antigravity's Stop only ever emits
+// the claim-check correction, so zero injections on a healthy install is the
+// steady state. Claude Code's Stop carries the post-task briefing, so its
+// silence keeps the warning.
+func TestAntigravityStopSilenceIsExpected(t *testing.T) {
+	for _, tc := range []struct {
+		agent string
+		want  Severity
+	}{{"antigravity", SeverityInfo}, {"claude-code", SeverityWarn}} {
+		t.Run(tc.agent, func(t *testing.T) {
+			agent := codexAgent()
+			agent.Agent = tc.agent
+			agent.RequiresTrust = false
+			agent.Configured["Stop"] = 1
+
+			findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+				"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+				"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PreToolUse":       {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PostToolUse":      {Runs: 9, Emitted: 1, DaemonKnown: 9, DaemonUp: 9},
+				"Stop":             {Runs: 6, Emitted: 0, DaemonKnown: 6, DaemonUp: 6},
+			}), Adoption{GortexCalls: 20, ShellCalls: 2}, time.Now())
+
+			got := findingWith(t, findings, "Stop ran 6 time(s) and injected context 0 times")
+			if got.Severity != tc.want {
+				t.Errorf("severity=%s want %s", got.Severity, tc.want)
+			}
+			if tc.want == SeverityInfo && !strings.Contains(got.Summary, "claim") && !strings.Contains(got.Summary, "correct") {
+				t.Errorf("summary should say why the silence is expected: %q", got.Summary)
+			}
+		})
+	}
+}
+
 // TestPostToolUseSilenceStillWarnsUnderEnrich is the guard the downgrade
 // must not swallow: under enrich the matcher names the native read-shaped
 // tools, so zero emissions genuinely means the enrichment path broke.

@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/antigravity"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
@@ -102,17 +103,17 @@ func TestDeliveryCapabilitySets(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{
-		claudecode.Name, codex.Name, copilotcli.Name, opencode.Name,
+		antigravity.Name, claudecode.Name, codex.Name, copilotcli.Name, opencode.Name,
 	}, skillFiles, "adapters claiming generated skill files drifted")
 
 	assert.ElementsMatch(t, []string{
-		claudecode.Name, codex.Name, copilotcli.Name, opencode.Name,
+		antigravity.Name, claudecode.Name, codex.Name, copilotcli.Name, opencode.Name,
 		"aider", "cline", "continue", "cursor", "gemini", "kilocode",
 		"pi", "vscode", "windsurf", "zed",
 	}, routing, "adapters claiming the communities routing block drifted")
 
 	assert.ElementsMatch(t, []string{
-		"antigravity", "hermes", "kimi", "kiro", "oh-my-pi", "openclaw",
+		"hermes", "kimi", "kiro", "oh-my-pi", "openclaw",
 	}, neither, "adapters consuming neither mechanism drifted")
 }
 
