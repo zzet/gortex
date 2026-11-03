@@ -33,6 +33,9 @@ type externalScopeObservation struct {
 	originalDeadline time.Time
 	remainingAtEntry time.Duration
 	elapsed          time.Duration
+	scopeDeadline    time.Time
+	scopeErr         error
+	finished         time.Time
 	entry            *projectionEntry
 }
 
@@ -56,6 +59,7 @@ func (s *externalRevisionScopeStore) WithFileEditingContextReader(ctx context.Co
 	started := time.Now()
 	deadline, _ := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
 	observed := externalScopeObservation{originalDeadline: deadline, remainingAtEntry: time.Until(deadline)}
+	observed.scopeDeadline, _ = ctx.Deadline()
 	if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
 		facts.mu.RLock()
 		for _, entry := range facts.entries {
@@ -72,7 +76,8 @@ func (s *externalRevisionScopeStore) WithFileEditingContextReader(ctx context.Co
 		observed.writeErr = s.mutate(ctx)
 		return observed.writeErr
 	})
-	observed.err, observed.elapsed = err, time.Since(started)
+	observed.finished = time.Now()
+	observed.err, observed.elapsed, observed.scopeErr = err, observed.finished.Sub(started), ctx.Err()
 	s.mu.Lock()
 	s.observed = observed
 	s.mu.Unlock()
@@ -240,6 +245,7 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 				}
 				joinCancelledWorker()
 				observed := backend.observation()
+				t.Logf("scope result before assertions: tool=%s transition=%s scope_deadline=%s scope_context_error=%v finished=%s result=%v protocol_error=%v", tool, transition, observed.scopeDeadline.Format(time.RFC3339Nano), observed.scopeErr, observed.finished.Format(time.RFC3339Nano), result, protocolError)
 				require.Equal(t, int32(1), backend.calls.Load(), "the real checked file scope must be reached once; no outcome retry")
 				t.Logf("scope stage=entry remaining_original=%s scope_elapsed=%s err=%v remaining_after=%s attempts=%d", observed.remainingAtEntry, observed.elapsed, observed.err, time.Until(deadline), allowance.attempts.Load())
 				require.Equal(t, deadline, observed.originalDeadline, "no deadline or allowance replacement")
@@ -247,7 +253,15 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 				require.Equal(t, ackEntry.contentSHA256, ackFields["content_sha256"], "old immutable source payload cannot be rebound")
 				if transition != "unchanged_scope" && transition != "unknown_scope_error" && transition != "cancelled_scope" {
 					require.NoError(t, observed.writeErr)
-					require.ErrorIs(t, observed.err, graph.ErrContractProjectionStale, "the checked SQL scope, not a fake error, must refuse changed ownership revision")
+					negative := transition == "source_event" || transition == "unchecked_eviction" || transition == "canonical_no_projection"
+					if negative && errors.Is(observed.err, context.DeadlineExceeded) {
+						require.ErrorIs(t, observed.scopeErr, context.DeadlineExceeded, "only proven real SQL-scope expiry may explain its deadline refusal")
+						require.False(t, observed.scopeDeadline.IsZero())
+						require.False(t, observed.finished.Before(observed.scopeDeadline))
+						require.NoError(t, caller.Err(), "private SQL expiry must not be confused with caller cancellation")
+					} else {
+						require.ErrorIs(t, observed.err, graph.ErrContractProjectionStale, "a live checked SQL scope must prove real ownership-revision refusal")
+					}
 				}
 				switch transition {
 				case "cancelled_scope":
@@ -268,11 +282,13 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 				default:
 					require.True(t, result.IsError, "unknown scope/source ownership/cancellation cannot gain current data or an invented external-write reason: %s", resultText(result))
 					require.NotContains(t, resultText(result), `"file_reason":"external_write"`)
+					require.NotContains(t, resultText(result), `"readback_exact":true`)
 				}
 				if transition == "canonical_no_projection" {
 					require.Nil(t, observed.entry)
 				}
 				if transition == "source_event" {
+					require.NotNil(t, observed.entry, "the negative must still invalidate an actually borrowed file owner")
 					require.True(t, observed.entry.suspect.Load())
 				}
 				require.ErrorIs(t, validateRequestProjections(oldFacts), projectionSuperseded, "the original ACK facts remain unusable after replacement/publication")

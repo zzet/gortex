@@ -85,6 +85,15 @@ func runExternalVersionReadCOWProof(t *testing.T, external bool) {
 	releaseBorrowed := make(chan struct{})
 	releaseBorrowedOnce := sync.OnceFunc(func() { close(releaseBorrowed) })
 	t.Cleanup(releaseBorrowedOnce)
+	var originalDeadline time.Time
+	allowances := make(map[string]*projectedSourceAllowance)
+	for _, tool := range tools {
+		if tool != "read_file" {
+			allowances[tool] = &projectedSourceAllowance{tool: tool}
+		}
+	}
+	var selectedBudgetMu sync.Mutex
+	var selectedBudgets []registeredBorrowObservation
 	if afterBorrow {
 		for _, name := range tools {
 			if name != "get_symbol_source" && name != "get_file_summary" {
@@ -96,6 +105,11 @@ func runExternalVersionReadCOWProof(t *testing.T, external bool) {
 			leaf := captured.handler
 			tool := name
 			s.addTool(captured.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+				if ctx.Value(registeredReadCOWActorKey{}) != true {
+					selectedBudgetMu.Lock()
+					selectedBudgets = append(selectedBudgets, registeredBorrowObservation{tool: tool, ctx: ctx})
+					selectedBudgetMu.Unlock()
+				}
 				result, err := leaf(ctx, req)
 				if err == nil && result != nil && !result.IsError && ctx.Value(registeredReadCOWActorKey{}) != true {
 					borrowed <- registeredBorrowObservation{tool: tool, ctx: ctx}
@@ -172,7 +186,10 @@ func runExternalVersionReadCOWProof(t *testing.T, external bool) {
 			require.Positive(t, borrowedOwner.sourceCommitSeq)
 		}
 	}
-	originalDeadline := time.Now().Add(projectedReadBudget)
+	// This lifecycle component deliberately holds two real handlers until three
+	// peer calls and a separate real refresh finish. Select one original fixture
+	// allowance before the burst; production150ms/expiry is tested separately.
+	originalDeadline = time.Now().Add(canonicalLifecycleFixtureBudget)
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, originalDeadline)
 	backend.armed.Store(!afterBorrow)
 	release := sync.OnceFunc(func() { close(backend.release) })
@@ -182,13 +199,9 @@ func runExternalVersionReadCOWProof(t *testing.T, external bool) {
 		err    error
 	}
 	answers := make(chan answer, len(tools))
-	allowances := make(map[string]*projectedSourceAllowance)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { release(); releaseBorrowedOnce(); workers.Wait() })
 	for i, tool := range tools {
-		if tool != "read_file" {
-			allowances[tool] = &projectedSourceAllowance{tool: tool}
-		}
 		allowance := allowances[tool]
 		workers.Add(1)
 		go func() {
@@ -281,6 +294,11 @@ func runExternalVersionReadCOWProof(t *testing.T, external bool) {
 		}
 	}
 	workers.Wait()
+	require.GreaterOrEqual(t, len(selectedBudgets), 2, "both deliberately held registered leaves must expose their original allowance")
+	for _, observed := range selectedBudgets {
+		require.Equal(t, originalDeadline, observed.ctx.Value(projectedSourceDeadlineKey{}), "a COW retry cannot reset the original fixture deadline")
+		require.Same(t, allowances[observed.tool], observed.ctx.Value(projectedSourceAllowanceKey{}), "all attempts keep the original two-attempt allowance")
+	}
 	physical, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	require.Equal(t, raw, physical, "physical witness follows the controlled registered burst")
