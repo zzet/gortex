@@ -124,8 +124,13 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 		current := pendingFileProjections.snap.Load().entries[entry.key]
 		unchanged := current == entry && current == candidate && live
 		retired := current == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+		// A zero sequence never becomes a physical receipt. An externally
+		// built version may authorize a new attempt only when BOTH owners
+		// earned checked-read publication and share this immutable version.
+		versionChecked := current != nil && current.sourceCommitSeq == entry.sourceCommitSeq &&
+			(current.sourceCommitSeq != 0 || entry.commitSeq == 0 && current.readVersionChecked && entry.readVersionChecked)
 		readCOW := current != nil && current != entry && current == candidate && live &&
-			current.commitSeq == 0 && current.sourceCommitSeq != 0 && current.sourceCommitSeq == entry.sourceCommitSeq &&
+			current.commitSeq == 0 && versionChecked &&
 			!current.suspect.Load() && current.sourceEvents == 0 && !current.checkedRetired.Load() &&
 			!current.tombstone && !entry.tombstone && current.layer != nil && current.layer == entry.layer &&
 			current.key == entry.key && current.graphPath == entry.graphPath && current.repoPrefix == entry.repoPrefix &&
