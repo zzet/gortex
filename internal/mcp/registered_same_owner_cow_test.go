@@ -31,7 +31,11 @@ type sameOwnerReadCOWStore struct {
 }
 
 func (s *sameOwnerReadCOWStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPaths(prefix, paths)
+	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
+}
+
+func (s *sameOwnerReadCOWStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
 	if err == nil && s.armed.Load() && s.arrivals.Add(1) <= s.gateReads {
 		s.captured <- liveEntry(pendingFileProjections, s.path)
 		<-s.release

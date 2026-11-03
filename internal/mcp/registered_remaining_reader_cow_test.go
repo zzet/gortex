@@ -30,7 +30,11 @@ type remainingReaderCOWStore struct {
 }
 
 func (s *remainingReaderCOWStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPaths(prefix, paths)
+	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
+}
+
+func (s *remainingReaderCOWStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
 	ordinal := int32(0)
 	if err == nil && s.armed.Load() {
 		ordinal = s.arrivals.Add(1)
