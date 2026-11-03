@@ -35,11 +35,21 @@ func TestRegisteredLocalBatchImmediateRelationsUseCurrentPendingFile(t *testing.
 		if crossFile {
 			name = "distinct_callee_file"
 		}
-		t.Run(name, func(t *testing.T) { runRegisteredLocalBatchImmediateRelations(t, crossFile) })
+		t.Run(name, func(t *testing.T) { runRegisteredLocalBatchImmediateRelations(t, crossFile, false) })
 	}
 }
 
-func runRegisteredLocalBatchImmediateRelations(t *testing.T, crossFile bool) {
+func TestRegisteredLocalBatchRemovedCallDoesNotCarry(t *testing.T) {
+	for _, crossFile := range []bool{false, true} {
+		name := "same_file"
+		if crossFile {
+			name = "distinct_callee_file"
+		}
+		t.Run(name, func(t *testing.T) { runRegisteredLocalBatchImmediateRelations(t, crossFile, true) })
+	}
+}
+
+func runRegisteredLocalBatchImmediateRelations(t *testing.T, crossFile, removeCall bool) {
 	selectedProjectionRegistry(t)
 	root := t.TempDir()
 	path := filepath.Join(root, "main.go")
@@ -51,6 +61,9 @@ func runRegisteredLocalBatchImmediateRelations(t *testing.T, crossFile bool) {
 		before = strings.Split(before, "\n\nfunc Callee")[0] + "\n"
 		after = strings.Split(after, "\n\nfunc Callee")[0] + "\n"
 		require.NoError(t, os.WriteFile(filepath.Join(root, calleeFile), []byte("package probe\n\nfunc Callee() int { return 7 }\n"), 0600))
+	}
+	if removeCall {
+		after = strings.Replace(after, "value + Callee()", "value + 1", 1)
 	}
 	require.NoError(t, os.WriteFile(path, []byte(before), 0600))
 	sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "relations.sqlite"))
@@ -160,7 +173,11 @@ func runRegisteredLocalBatchImmediateRelations(t *testing.T, crossFile bool) {
 		}
 		return true
 	})
-	require.Equal(t, 5, callLine)
+	if removeCall {
+		require.Zero(t, callLine)
+	} else {
+		require.Equal(t, 5, callLine)
+	}
 	require.False(t, ack.IsError, resultText(ack))
 	ackBody := extractTextResult(t, ack)
 	require.Equal(t, "committed", ackBody["disk_status"])
@@ -180,11 +197,21 @@ func runRegisteredLocalBatchImmediateRelations(t *testing.T, crossFile bool) {
 			body := extractTextResult(t, answer.result)
 			t.Logf("public %s response=%s", answer.tool, resultText(answer.result))
 			var matches []map[string]any
-			for _, raw := range body["edges"].([]any) {
+			var edges []any
+			if raw := body["edges"]; raw != nil {
+				require.IsType(t, edges, raw)
+				edges = raw.([]any)
+			}
+			require.EqualValues(t, len(edges), body["total_edges"], "null edges are valid only with an explicit zero count")
+			for _, raw := range edges {
 				edge := raw.(map[string]any)
 				if edge["from"] == caller && edge["to"] == callee && edge["kind"] == "calls" {
 					matches = append(matches, edge)
 				}
+			}
+			if removeCall {
+				require.Empty(t, matches, "a removed call cannot be carried from the old canonical rows")
+				return
 			}
 			require.Len(t, matches, 1)
 			require.EqualValues(t, callLine, matches[0]["line"])
