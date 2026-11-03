@@ -104,7 +104,7 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 				require.NoError(t, os.WriteFile(file, []byte("package probe\nfunc Auxiliary() int { return 0 }\n"), 0600))
 			}
 			if watcher == nil {
-				watcher, unblock, stopWatcher = startRegisteredLateStormFixtureWatcher(t, s, path, scenario, false)
+				watcher, unblock, _ = startRegisteredLateStormFixtureWatcher(t, s, path, scenario, false)
 			} else {
 				// The held-ACK helper installs its receipt watcher; restore the
 				// already-started native watcher for the actual registered read.
