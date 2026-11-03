@@ -34,6 +34,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 	candidateRevision := f.String("candidate-revision", "", "full candidate revision")
 	manifest := f.String("manifest", "", "one pinned contemporary corpus")
 	out := f.String("out", "", "NEW owned stores/report directory outside source")
+	editACK := f.String("edit-ack", "", "explicit local or full owned edit policy; omission preserves the product default")
 	offer := f.Duration("offer", 20*time.Second, "version 2 PR smoke offered window: 20s")
 	deadline := f.Duration("deadline", 120*time.Second, "original product deadline")
 	warm := f.Duration("warm-timeout", 5*time.Minute, "each ready/enriched/public-analysis gate budget")
@@ -41,6 +42,9 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 	sweep := f.Duration("sweep-duration", 2*time.Minute, "all 21 operations, one repetition")
 	if err := f.Parse(args); err != nil {
 		return err
+	}
+	if *editACK != "" && *editACK != "local" && *editACK != "full" {
+		return errors.New("smoke edit ACK mode must be local or full when explicit")
 	}
 	if f.NArg() != 0 || *manifest == "" || *out == "" || *offer != 20*time.Second || *deadline != 120*time.Second || *warm <= 0 || *stop <= 0 || *stop > 2*time.Minute || *sweep <= 0 {
 		return errors.New("version 2 smoke requires fixed two-build inputs, one corpus, original 20s offers/120s product budgets and bounded positive safety budgets")
@@ -96,6 +100,9 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 			result = errors.Join(result, stopErr, os.RemoveAll(p.SocketDir), p.removeState())
 		}
 		value := map[string]any{"schema_version": 1, "started": started, "finished": time.Now().UTC(), "tasks": tasks, "fresh_store_count": len(states), "process_starts": starts, "complete": result == nil}
+		if *editACK != "" {
+			value["edit_ack_mode"] = *editACK
+		}
 		if result != nil {
 			value["error"] = result.Error()
 		}
@@ -131,7 +138,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 					return errors.Join(result, err)
 				}
 				build := builds[role]
-				o := runOptions{Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
+				o := runOptions{EditACKMode: *editACK, Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
 				if step.wire == "read" {
 					o.PRSmokeDrain = *deadline
 				}

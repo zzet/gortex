@@ -574,3 +574,11 @@ Raw seed/delay provenance is required; a missing observation or unrelated
 collector failure is not an observed latency regression. Seeded reports never
 supply GREEN history. Actual targeted seed-off/seed-on evidence remains separate
 from source tests and from full nightly automation.
+
+The fixed PR smoke entry explicitly selects `edit.ack=local` for both builds.
+The child sequence, smoke provenance, and each workload retain that selection;
+every actual edit ACK must report the same effective mode. Missing/mismatched
+mode evidence fails rather than being labeled local. Existing implicit/full
+runs retain their original identity and failures. This is an explicit future
+measurement configuration, not a waiver or relabeling of full-mode latency.
+The 0.20-second p95 and one-second hard maximum remain unchanged.
