@@ -68,7 +68,7 @@ func analyzeStartupTransitionCensus(e *startupTransitionEvidence) Metric {
 	if len(e.Registration) > 64<<10 || json.Unmarshal(e.Registration, &registration) != nil || registration.State != "ready" || registration.Root != e.PrimaryRoot || registration.Prefix != e.Prefix || registration.Since.IsZero() || registration.Since.Before(e.BootStarted) || e.RegistrationPID != e.PID || e.RegistrationBirth != e.ProcessBirthToken {
 		return unknown("missing/mismatched native repo_state_since registration anchor")
 	}
-	if e.BaselineAt.After(registration.Since) {
+	if !e.BaselineAt.Before(registration.Since) {
 		return unknown("no exact membership captured before native registration")
 	}
 	if len(e.Observations) == 0 || len(e.Observations) > 64 || len(e.BaselineCatalog) > 8<<20 {

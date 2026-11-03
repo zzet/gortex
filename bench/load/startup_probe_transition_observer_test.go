@@ -107,9 +107,19 @@ func TestStartupTransitionObserverCapturesCatalogBeforeNativeOrigin(t *testing.T
 	if len(e.BaselineCatalog) == 0 {
 		t.Fatal("actual control response did not bind membership")
 	}
-	o.registrationFrame(startupRegistrationFrame(t, e, time.Now()))
+	// Compare the wire clock (without Go monotonic metadata), exactly as the
+	// analyzer does. A coarse-clock tie cannot establish strictly-before.
+	origin := time.Now().UTC()
+	o.registrationFrame(startupRegistrationFrame(t, e, origin))
 	o.observeCatalog(t.Context(), p)
-	if m := analyzeStartupTransitionCensus(e); m.Value == nil || *m.Value != 24 {
+	m := analyzeStartupTransitionCensus(e)
+	if !e.BaselineAt.Before(origin) {
+		if m.Value != nil || m.Reason != "no exact membership captured before native registration" {
+			t.Fatalf("coarse wire-clock tie must retain the strict ordering refusal: %+v", m)
+		}
+		return
+	}
+	if m.Value == nil || *m.Value != 24 {
 		t.Fatalf("native control/notification sequence did not preserve proof: %+v", m)
 	}
 }
