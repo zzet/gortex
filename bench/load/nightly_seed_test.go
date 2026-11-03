@@ -51,7 +51,28 @@ func TestNightlySeedNormalOffAndOtherToolsUnchanged(t *testing.T) {
 	if err := validateNightlyWorkloadSeed(runOptions{NightlySeed: "unknown"}); err == nil {
 		t.Fatal("unknown seed accepted")
 	}
-	if err := validateNightlyWorkloadSeed(runOptions{NightlySeed: "search-delay-v1", Scenario: "edit", Agents: 8}); err == nil {
+	if err := validateNightlyWorkloadSeed(runOptions{NightlySeed: "search-delay-v1", Scenario: "read", Agents: 8}); err == nil {
 		t.Fatal("unsupported scenario accepted")
+	}
+}
+
+func TestNightlySeedFourEditorContractAndProbeExclusion(t *testing.T) {
+	if err := validateNightlyWorkloadSeed(runOptions{NightlySeed: "search-delay-v1", Scenario: "edit", Editors: 4}); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []runOptions{
+		{NightlySeed: "search-delay-v1", Scenario: "edit", Agents: 1, Editors: 4},
+		{NightlySeed: "search-delay-v1", Scenario: "edit", Editors: 3},
+		{NightlySeed: "search-delay-v1", Scenario: "edit", Editors: 4, Worktrees: 1},
+	} {
+		if err := validateNightlyWorkloadSeed(o); err == nil {
+			t.Fatalf("foreign workload accepted: %+v", o)
+		}
+	}
+	c := &nightlySeedCaller{}
+	ctx := context.WithValue(context.Background(), nightlySeedKey{}, "search-delay-v1")
+	_, rows, err := callTool(ctx, c, request{Tool: "search", Operation: "symbols"}, nil, "probe", 0, 0, 0, time.Second, waitContext)
+	if err != nil || c.calls != 1 || len(rows) != 1 || rows[0].NightlySeed != "" || rows[0].NightlyDelayNS != 0 {
+		t.Fatalf("visibility probe inherited workload fault: %+v %v", rows, err)
 	}
 }

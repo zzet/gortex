@@ -564,3 +564,13 @@ no forced daemons, and 20-PR CI wall-time comparison. None is simulated by unit
 tests. #996 and #998 implementations are merged; baseline acceptance remains separate. #1000's deferred 400-task
 harness is not recreated here. A small release scripted-agent fixture remains
 separate future work, requiring its own reviewed plan.
+
+The opt-in `nightly_workload_seed` schema1 `search-delay-v1` targets only the
+candidate `loadedit-4` cell. It delays actual workload `search.symbols` calls
+inside their existing measured interval by one cancellable second, so the
+unchanged 0.4-second absolute search p95 budget can observe the regression.
+MAIN/tag, visibility probes, other cells and ordinary seed-off runs stay clean.
+Raw seed/delay provenance is required; a missing observation or unrelated
+collector failure is not an observed latency regression. Seeded reports never
+supply GREEN history. Actual targeted seed-off/seed-on evidence remains separate
+from source tests and from full nightly automation.
