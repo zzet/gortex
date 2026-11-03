@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPendingSearchPublicResponseRefusesLatePhysicalSupersession(t *testing.T) {
+func TestPendingSearchPublicResponseKeepsCapturedVersionAfterLaterPublication(t *testing.T) {
 	for _, facade := range []bool{false, true} {
 		name := "legacy"
 		if facade {
@@ -32,6 +32,7 @@ func TestPendingSearchPublicResponseRefusesLatePhysicalSupersession(t *testing.T
 			require.Empty(t, server.laggingMutationReceipts(t.Context()), "quiet read-built projections have no pending publication receipt")
 			require.Nil(t, server.captureToolFreshness(t.Context()).Value(requestProjectionFactsKey{}), "prove the ordinary freshness capture does not already allocate shared projection facts")
 			leafRan := false
+			var selected context.Context
 			leaf := func(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 				result, readErr := server.handleSearchSymbols(ctx, request)
 				require.NoError(t, readErr)
@@ -43,12 +44,14 @@ func TestPendingSearchPublicResponseRefusesLatePhysicalSupersession(t *testing.T
 				}
 				require.True(t, found, "the actual leaf must have selected the pending symbol before supersession")
 				leafRan = true
+				selected = ctx
 				held, release, lockErr := acquireMutationPath(t.Context(), path)
 				require.NoError(t, lockErr)
 				commit, writeErr := server.commitFileMutation(held, "write_file", "", "", "main.go", path, raw, 0o600)
 				release()
 				require.NoError(t, writeErr)
 				require.Positive(t, commit.commitSeq, "actual same-byte newer physical execution")
+				require.ErrorIs(t, validateRequestProjections(ctx), projectionSuperseded, "captured search completion never revives shared old facts")
 				return result, nil
 			}
 			var result *mcplib.CallToolResult
@@ -68,8 +71,9 @@ func TestPendingSearchPublicResponseRefusesLatePhysicalSupersession(t *testing.T
 				require.NoError(t, err)
 			}
 			require.True(t, leafRan, "the actual dispatcher must reach its leaf: %v", result.Content)
-			require.True(t, result.IsError, "the entire public response must refuse ownership superseded between leaf and decoration: %v", result.Content)
-			require.Contains(t, toolResultText(result), "superseded")
+			require.False(t, result.IsError, "the answer linearizes at its checked immutable capture: %v", result.Content)
+			require.Contains(t, toolResultText(result), "main.go::LateSearchOwner")
+			require.ErrorIs(t, validateRequestProjections(context.WithoutCancel(selected)), projectionSuperseded)
 		})
 	}
 }

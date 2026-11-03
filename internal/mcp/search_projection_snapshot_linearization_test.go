@@ -241,6 +241,12 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 			}
 			require.NoError(t, response.err)
 			require.Equal(t, rows, snapshotTargetRows(t, response.result), "the answer must retain its one authorized immutable selection")
+			require.Equal(t, extractTextResult(t, owned.result), extractTextResult(t, response.result), "capture does not fabricate latest/current freshness or alter the selected answer")
+			require.NotNil(t, response.result.Meta)
+			for key, value := range owned.result.Meta.AdditionalFields {
+				require.Equal(t, value, response.result.Meta.AdditionalFields[key], "selected scope metadata must survive: %s", key)
+			}
+			require.Equal(t, map[string]any{"canonical_tool": "search_symbols", "facade": "search", "operation": "symbols", "surface_version": "facade-v1"}, response.result.Meta.AdditionalFields["gortex_facade"])
 			require.ErrorIs(t, validateRequestProjections(context.WithoutCancel(owned.ctx)), projectionSuperseded, "a successful captured answer must not revive old shared facts")
 		})
 	}
@@ -248,8 +254,20 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 
 func TestSearchCallerOwnedOldFactsCannotHideANewerOwnACK(t *testing.T) {
 	s, _, base, path, _ := snapshotFacadeFixture(t)
-	old, err := s.bindPendingSearch(base)
-	require.NoError(t, err)
+	leaf, ok := s.facades.legacy("search_symbols")
+	require.True(t, ok)
+	selected := make(chan context.Context, 2)
+	s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		result, err := leaf.handler(ctx, req)
+		selected <- ctx
+		return result, err
+	})
+	first := snapshotRegisteredCall(t, s, base, 20, "search", snapshotSearchArgs())
+	snapshotTargetRows(t, first)
+	old := context.WithoutCancel(<-selected) // Remove normal SDK-return cancellation only, retaining the actual sealed slot and old facts.
+	capture, _ := old.Value(pendingSymbolCaptureKey{}).(*pendingSymbolCapture)
+	require.NotNil(t, capture)
+	require.NotEmpty(t, capture.entries, "the first real dispatch must have sealed a capture")
 	ack := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "func Target()", "func TargetLater()"))
 	require.False(t, ack.IsError, resultText(ack))
 	require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
@@ -259,4 +277,7 @@ func TestSearchCallerOwnedOldFactsCannotHideANewerOwnACK(t *testing.T) {
 	require.True(t, result.IsError, "a context captured before the newer own ACK cannot be reused as a fresh request: %s", resultText(result))
 	require.Contains(t, resultText(result), "superseded")
 	require.NotContains(t, resultText(result), fmt.Sprintf(`"id":%q`, "main.go::TargetLater"))
+	text := snapshotRegisteredCall(t, s, old, 41, "search", map[string]any{"operation": "text", "query": "TargetLater", "output": map[string]any{"format": "json", "max_bytes": 0}})
+	require.True(t, text.IsError, "a symbol capture cannot exempt a later text scan: %s", resultText(text))
+	require.Contains(t, resultText(text), "superseded")
 }
