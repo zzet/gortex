@@ -5,18 +5,43 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
+
+type sameOwnerReadCOWStore struct {
+	*store_sqlite.Store
+	armed     atomic.Bool
+	arrivals  atomic.Int32
+	gateReads int32
+	captured  chan *projectionEntry
+	release   chan struct{}
+	path      string
+}
+
+func (s *sameOwnerReadCOWStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
+}
+
+func (s *sameOwnerReadCOWStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
+	if err == nil && s.armed.Load() && s.arrivals.Add(1) <= s.gateReads {
+		s.captured <- liveEntry(pendingFileProjections, s.path)
+		<-s.release
+	}
+	return rows, err
+}
 
 type checkedReadObservation struct {
 	tool  string
