@@ -39,6 +39,10 @@ import (
 // hold the store lock. NewSharedServer passes true only after acquiring the
 // exclusive flock.
 func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
+	return openBackendWithUpgradeOption(name, path, logger, allowRebuild, nil, observers...)
+}
+
+func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRebuild bool, upgradeOption store_sqlite.Option, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
 	}
@@ -49,7 +53,10 @@ func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, obser
 	if logger != nil {
 		logger.Info("opening sqlite backend", zap.String("path", resolved))
 	}
-	return openSqliteBackend(resolved, allowRebuild, observers...)
+	if upgradeOption == nil {
+		return openSqliteBackend(resolved, allowRebuild, observers...)
+	}
+	return openSqliteBackendWithUpgradeOption(resolved, allowRebuild, upgradeOption, observers...)
 }
 
 // checkBackend validates a requested backend name. It is split out of
@@ -106,6 +113,10 @@ func ResolveStorePath(path string) (string, error) {
 // pure-Go modernc.org/sqlite driver keeps the binary CGo-free while still
 // getting a real query planner that drives the graph's secondary indexes.
 func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
+	return openSqliteBackendWithUpgradeOption(path, allowRebuild, nil, observers...)
+}
+
+func openSqliteBackendWithUpgradeOption(path string, allowRebuild bool, upgradeOption store_sqlite.Option, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	var opts []store_sqlite.Option
 	if len(observers) > 0 && observers[0] != nil {
 		opts = append(opts, store_sqlite.WithMigrationObserver(observers[0]))
@@ -113,6 +124,9 @@ func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite
 	if allowRebuild {
 		// Both need exclusive access to the store, which allowRebuild attests.
 		opts = append(opts, store_sqlite.WithRebuild(), store_sqlite.WithUpgradeBackup())
+	}
+	if upgradeOption != nil {
+		opts = append(opts, upgradeOption)
 	}
 	s, err := store_sqlite.Open(path, opts...)
 	if err != nil {

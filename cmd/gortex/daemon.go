@@ -333,6 +333,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		}
 		return nil
 	}
+	startupReporter.StoreOpened()
 
 	// Install the standing soft memory limit now — logging and config are
 	// up and no warmup / indexing has allocated yet, so the cold-index
