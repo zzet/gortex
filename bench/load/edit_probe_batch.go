@@ -15,6 +15,8 @@ import (
 // represented as one synthetic mutation_receipt.
 type editProbeBatchReferences struct {
 	TransactionID        string `json:"transaction_id"`
+	AckMode string `json:"ack_mode,omitempty"`
+	OriginalNoRequireFresh bool `json:"original_request_no_require_fresh,omitempty"`
 	Observation          string `json:"file_observation_receipt"`
 	Acknowledgement      string `json:"acknowledgement_receipt"`
 	Path                 string `json:"path"`
@@ -102,6 +104,7 @@ func decodeEditProbeBatchMember(body map[string]any, fileValue, resultValue, obs
 		return out, errors.New("batch durable after-image does not match exact offered whole-file bytes")
 	}
 	out.TransactionID, out.Path, out.RelativePath, out.AfterSHA256 = transactionID, path, rel, after
+	out.AckMode,_=body["ack_mode"].(string)
 	if value, present := body["error"]; present {
 		message, ok := value.(string)
 		if !ok {
@@ -188,7 +191,10 @@ func (r editProbeBatchReferences) accounting(fileStatus, acknowledgementStatus m
 	if shared == nil {
 		return editProbeAccounting{State: "unavailable", Reasons: []string{"shared batch ACK intervals unavailable"}}
 	}
-	return checkEditProbeAccountingWithAcknowledgement(fileStatus, r.Observation, "publication_generation", shared, true)
+	if r.AckMode!="" && !batchAcknowledgementMatches(r.Acknowledgement,shared) {
+		return editProbeAccounting{State:"unavailable",Reasons:[]string{"original batch server RPC owner unavailable"}}
+	}
+	return checkEditProbeAccountingWithWaitDisposition(fileStatus, r.Observation, "publication_generation", shared, true,r.AckMode=="local" && r.OriginalNoRequireFresh && batchAcknowledgementMatches(r.Acknowledgement,shared))
 }
 
 func editProbeBatchIntent(req request) (string, []byte, error) {
@@ -298,6 +304,8 @@ type editProbeBatchIntentMember struct {
 type editProbeBatchSetReferences struct {
 	TransactionID   string                     `json:"transaction_id"`
 	Fingerprint     string                     `json:"fingerprint"`
+	AckMode         string                     `json:"ack_mode"`
+	OriginalNoRequireFresh bool `json:"original_request_no_require_fresh"`
 	Acknowledgement string                     `json:"acknowledgement_receipt"`
 	RPCID           string                     `json:"bound_server_rpc_id"`
 	WireID          string                     `json:"actual_wire_id"`
@@ -317,6 +325,23 @@ type editProbeBatchSetAccounting struct {
 	State   string                           `json:"state"`
 	Files   []editProbeBatchMemberAccounting `json:"files"`
 	Reasons []string                         `json:"reasons,omitempty"`
+}
+
+// The actual client request is retained before status polling. Server
+// freshness parsing ORs top-level, options and arguments booleans. Unknown
+// or malformed values cannot grant a no-freshness applicability exemption.
+func originalBatchNoRequireFresh(req request) bool {
+	if req.Tool!="edit" || req.Operation!="batch" || req.Arguments==nil { return false }
+	containers:=[]map[string]any{req.Arguments}
+	for _,name:=range []string{"options","arguments"} {
+		if raw,present:=req.Arguments[name];present {
+			values,ok:=raw.(map[string]any);if !ok { return false };containers=append(containers,values)
+		}
+	}
+	for _,values:=range containers {
+		if raw,present:=values["require_fresh"];present { value,ok:=raw.(bool);if !ok || value { return false } }
+	}
+	return true
 }
 
 func editProbeBatchSetIntent(req request, root, prefix string) (string, []editProbeBatchIntentMember, error) {
@@ -358,7 +383,8 @@ func editProbeBatchSetIntent(req request, root, prefix string) (string, []editPr
 
 func decodeEditProbeBatchSetAcknowledgement(body map[string]any, transaction string, intents []editProbeBatchIntentMember, rpcID string) (editProbeBatchSetReferences, error) {
 	fingerprint, _ := body["fingerprint"].(string)
-	out := editProbeBatchSetReferences{TransactionID: transaction, Fingerprint: fingerprint, WireID: rpcID}
+	ackMode, _ := body["ack_mode"].(string)
+	out := editProbeBatchSetReferences{TransactionID: transaction, Fingerprint: fingerprint, AckMode: ackMode, WireID: rpcID}
 	if err := editProbeSharedReplyError(body); err != nil {
 		return out, err
 	}
@@ -498,6 +524,12 @@ func (r editProbeBatchSetReferences) validateSharedMember(status map[string]any,
 	return nil
 }
 
+func batchAcknowledgementMatches(receipt string, shared map[string]any) bool {
+	counter:=strings.TrimPrefix(receipt,"batch-ack-")
+	n,err:=strconv.ParseUint(counter,10,64)
+	return err==nil && n>0 && counter!=receipt && counter==strconv.FormatUint(n,10) && shared["rpc_id"]=="rpc-"+counter && shared["clock"]=="monotonic" && shared["scope"]=="shared_rpc_mcp_bound_call"
+}
+
 func (r *editProbeRuntime) accountingForBatchSetStatuses(ctx context.Context, statuses map[string]map[string]any, ack map[string]any, refs editProbeBatchSetReferences) (editProbeAccounting, *editProbeBatchSetAccounting) {
 	out := editProbeAccounting{State: "unavailable_shared_owner"}
 	batch := &editProbeBatchSetAccounting{State: "unavailable_batch_shared_owner"}
@@ -518,14 +550,15 @@ func (r *editProbeRuntime) accountingForBatchSetStatuses(ctx context.Context, st
 		return out, batch
 	}
 	shared, _ := ack["acknowledgement"].(map[string]any)
-	if shared == nil || shared["rpc_id"] != refs.RPCID || refs.RPCID == "" {
+	if shared == nil || shared["rpc_id"] != refs.RPCID || refs.RPCID == "" || !batchAcknowledgementMatches(refs.Acknowledgement,shared) {
 		fail("transaction ACK does not match actual offered RPC")
 		return out, batch
 	}
 	// Validate the actual shared RPC once using the existing independent A
 	// accounting rules; never put its intervals in a file or shared E/B owner.
 	first := refs.Files[0]
-	out = checkEditProbeAcknowledgement(statuses[first.Observation], first.Observation, "publication_generation", shared, true)
+	countedNoWait := refs.AckMode == "local" && refs.OriginalNoRequireFresh && refs.validateReferences() == nil && batchAcknowledgementMatches(refs.Acknowledgement,shared)
+	out = checkEditProbeAcknowledgementWithWaitDisposition(statuses[first.Observation], first.Observation, "publication_generation", shared, true, countedNoWait)
 	out.State = "unavailable_shared_owner"
 	// A's applicability failures remain in the overall result. They cannot
 	// erase or manufacture independently observed shared execution evidence.
@@ -601,7 +634,7 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				s.mu.Unlock()
 				return
 			}
-			if current.Fingerprint != refs.Fingerprint || current.Acknowledgement != refs.Acknowledgement {
+			if current.Fingerprint != refs.Fingerprint || current.Acknowledgement != refs.Acknowledgement || current.AckMode != refs.AckMode {
 				s.mu.Lock()
 				s.record.Errors = append(s.record.Errors, "batch journal identity changed")
 				s.mu.Unlock()

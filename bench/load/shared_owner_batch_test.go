@@ -17,6 +17,11 @@ import (
 // corpus/campaign acceptance population. No retained wire can satisfy it.
 func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 	binary := os.Getenv("GORTEX_SHARED_OWNER_NATIVE_BINARY")
+	expectCountedNoWait := os.Getenv("GORTEX_SHARED_OWNER_EXPECT_LOCAL_WAIT_NA") == "1"
+	wantOutcome, wantAccounting := "diagnostic_failure", "terminal_unavailable_shared_owner"
+	if expectCountedNoWait {
+		wantOutcome, wantAccounting = "complete", "observed_shared_owner_windows_checks_pass"
+	}
 	if binary == "" {
 		t.Skip("requires an explicitly pinned native shared-owner producer")
 	}
@@ -174,6 +179,7 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 		t.Fatalf("actual offered frontier: %v", err)
 	}
 	refs, err := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
+	refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(offered)
 	if err != nil {
 		t.Fatalf("real complete two-file journal batch cannot enter report decoder: %v", err)
 	}
@@ -188,10 +194,10 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 	defer state.finishRaw()
 	runtime := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "edit.batch", Mode: "json", File: "a.go"}, origin: identity.Started, options: runOptions{Deadline: 5 * time.Second}, requireAccounting: true}
 	runtime.finishEditAfterACK(ctx, ctx, state, step, identity.Started, raw, identity, nil)
-	if state.record.Outcome != "diagnostic_failure" || state.record.Ack.Value == nil || state.record.BatchSet == nil || state.record.BatchAccounting == nil || state.record.BatchAccounting.State != "observed_batch_shared_owner_windows_checks_pass" || !state.record.GraphTerminal {
+	if state.record.Outcome != wantOutcome || state.record.Ack.Value == nil || state.record.BatchSet == nil || state.record.BatchAccounting == nil || state.record.BatchAccounting.State != "observed_batch_shared_owner_windows_checks_pass" || !state.record.GraphTerminal {
 		t.Fatalf("actual post-ACK continuation did not dispatch batch set/report: %+v", state.record)
 	}
-	if state.record.Accounting.State != "terminal_unavailable_shared_owner" || !strings.Contains(strings.Join(state.record.Accounting.Reasons, ";"), "reindex_wait is unobserved with counts 0/0/0") {
+	if state.record.Accounting.State != wantAccounting || !expectCountedNoWait && !strings.Contains(strings.Join(state.record.Accounting.Reasons, ";"), "reindex_wait is unobserved with counts 0/0/0") {
 		t.Fatalf("missing real A applicability was waived: %+v", state.record.Accounting)
 	}
 	if len(state.record.Readbacks) != 2 || !state.record.Readbacks[0].Correct || !state.record.Readbacks[1].Correct {
@@ -247,7 +253,7 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	accounting, batch := runtime.accountingForBatchSetStatuses(ctx, statuses, ack, refs)
-	if accounting.State != "terminal_unavailable_shared_owner" || accounting.A == nil || accounting.P != nil || accounting.B != nil || accounting.Shared != nil || batch.State != "observed_batch_shared_owner_windows_checks_pass" || len(batch.Files) != 2 {
+	if accounting.State != wantAccounting || accounting.A == nil || accounting.P != nil || accounting.B != nil || accounting.Shared != nil || batch.State != "observed_batch_shared_owner_windows_checks_pass" || len(batch.Files) != 2 {
 		t.Fatalf("actual batch report unavailable or invented per-file windows: %+v %+v", accounting, batch)
 	}
 	for _, file := range batch.Files {
@@ -260,6 +266,43 @@ func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	keep("normalized-batch-accounting.json", encoded)
+	if expectCountedNoWait {
+		for _, fault := range []string{"unknown_wait_count0", "numeric_zero", "mismatched_counts", "full_policy", "ack_ms_zero", "ack_ms_seven", "ack_ms_missing", "original_requires_fresh"} {
+			t.Run(fault, func(t *testing.T) {
+				ackCopy := cloneSharedOwnerModel(t, ack)
+				shared := ackCopy["acknowledgement"].(map[string]any)
+				badRefs := refs
+				switch fault {
+				case "unknown_wait_count0":
+					shared["phase_states"].(map[string]any)["reindex_wait"] = "unobserved"
+					shared["counts"].(map[string]any)["reindex_wait"] = map[string]any{"started": json.Number("0"), "completed": json.Number("0"), "not_applicable": json.Number("0")}
+				case "numeric_zero":
+					shared["observed_execution_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+				case "mismatched_counts":
+					shared["counts"].(map[string]any)["reindex_wait"].(map[string]any)["completed"] = json.Number("0")
+				case "full_policy":
+					badRefs.AckMode = "full"
+				case "ack_ms_zero":
+					shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+				case "ack_ms_seven":
+					shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("7")
+				case "ack_ms_missing":
+					delete(shared["phases_ms"].(map[string]any), "reindex_wait")
+				case "original_requires_fresh":badRefs.OriginalNoRequireFresh=false
+				}
+				fresh := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
+				got, batch := fresh.accountingForBatchSetStatuses(ctx, statuses, ackCopy, badRefs)
+				if got.State == "observed_shared_owner_windows_checks_pass" || len(got.Reasons) == 0 || batch.State != "observed_batch_shared_owner_windows_checks_pass" {
+					t.Fatalf("bad A applicability was waived or erased actual E/B: %+v %+v", got, batch)
+				}
+			})
+		}
+		shared := ack["acknowledgement"].(map[string]any)
+		strict := checkEditProbeAcknowledgement(statuses[refs.Files[0].Observation], refs.Files[0].Observation, "publication_generation", shared, true)
+		if !strings.Contains(strings.Join(strict.Reasons, ";"), "reindex_wait") {
+			t.Fatal("default strict A wrapper gained a batch exemption")
+		}
+	}
 	for _, fault := range []string{"missing_member", "foreign_path", "replaced_ticket", "missing_membership", "wrong_hash", "foreign_process", "unknown_version", "ordinary_domain", "wrong_rpc"} {
 		t.Run(fault, func(t *testing.T) {
 			rows := map[string]map[string]any{}
@@ -378,4 +421,110 @@ func TestBatchSetRestoreRefusesBeforeAnyPartialWrite(t *testing.T) {
 			t.Fatalf("refusal changed %s: %v", name, err)
 		}
 	}
+}
+
+// Synthetic scalar guard controls only; actual branch and live-owner authority
+// come from the separate real-router/native fixture. No runtime timings here.
+func TestBatchACKWaitNAGuardRequiresBothNullWireMaps(t *testing.T) {
+	base := editProbeAccountingFixture()
+	ack := base["acknowledgement"].(map[string]any)
+	ack["caller_response_ready_ms"] = json.Number("7")
+	ack["observed_execution_ms"].(map[string]any)["reindex_wait"] = nil
+	ack["phase_states"].(map[string]any)["reindex_wait"] = "not_applicable"
+	ack["phases_ms"] = map[string]any{"reindex_wait": nil}
+	ack["counts"] = map[string]any{"reindex_wait": map[string]any{"started": json.Number("1"), "completed": json.Number("1"), "not_applicable": json.Number("1")}}
+	valid := checkEditProbeAcknowledgementWithWaitDisposition(base, "receipt-a", "reindex_generation", ack, false, true)
+	if valid.A == nil || len(valid.Reasons) != 0 {
+		t.Fatalf("counted/null guard rejected: %+v", valid)
+	}
+	for _, fault := range []string{"ack_zero", "ack_seven", "ack_missing", "observed_zero", "observed_missing", "count0", "count_mismatch", "default_strict"} {
+		t.Run(fault, func(t *testing.T) {
+			value := cloneSharedOwnerModel(t, base)
+			shared := value["acknowledgement"].(map[string]any)
+			enabled := true
+			switch fault {
+			case "ack_zero":
+				shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "ack_seven":
+				shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("7")
+			case "ack_missing":
+				delete(shared["phases_ms"].(map[string]any), "reindex_wait")
+			case "observed_zero":
+				shared["observed_execution_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "observed_missing":
+				delete(shared["observed_execution_ms"].(map[string]any), "reindex_wait")
+			case "count0":
+				shared["counts"].(map[string]any)["reindex_wait"] = map[string]any{"started": json.Number("0"), "completed": json.Number("0"), "not_applicable": json.Number("0")}
+			case "count_mismatch":
+				shared["counts"].(map[string]any)["reindex_wait"].(map[string]any)["completed"] = json.Number("0")
+			case "default_strict":
+				enabled = false
+			}
+			got := checkEditProbeAcknowledgementWithWaitDisposition(value, "receipt-a", "reindex_generation", shared, false, enabled)
+			if len(got.Reasons) == 0 {
+				t.Fatal("contradictory or unauthorized NA passed independent A coverage")
+			}
+		})
+	}
+}
+
+// Synthetic one-file compatibility control. The direct P/B fixtures stay
+// independent; only the original local typed ACK may supply counted wait NA.
+func TestBatchOneFileCountedNoWaitPreservesPhysicalAccounting(t *testing.T) {
+	body:=editProbeBatchACKFixture()
+	body["ack_mode"]="local"
+	refs,err:=decodeEditProbeBatchAcknowledgement(body,"transaction-1",editProbeBatchACKAbsPath(),"repo/file.go",editProbeBatchOfferedBytes())
+	if err!=nil { t.Fatal(err) }
+	refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(request{Tool:"edit",Operation:"batch",Arguments:map[string]any{"options":map[string]any{"transaction_id":"transaction-1"}}})
+	refs.GraphGeneration,refs.ResultGeneration=1,1
+	file:=editProbeAccountingFixture()
+	ack:=file["acknowledgement"].(map[string]any)
+	ack["rpc_id"],ack["clock"],ack["scope"]="rpc-2","monotonic","shared_rpc_mcp_bound_call"
+	ack["caller_response_ready_ms"]=json.Number("7")
+	ack["observed_execution_ms"].(map[string]any)["reindex_wait"]=nil
+	ack["phase_states"].(map[string]any)["reindex_wait"]="not_applicable"
+	ack["phases_ms"]=map[string]any{"reindex_wait":nil}
+	ack["counts"]=map[string]any{"reindex_wait":map[string]any{"started":json.Number("1"),"completed":json.Number("1"),"not_applicable":json.Number("1")}}
+	shared:=map[string]any{"found":true,"receipt":refs.Acknowledgement,"receipt_kind":"batch_acknowledgement","acknowledgement":ack}
+	file["acknowledgement"]=nil
+	file["found"],file["receipt_kind"],file["receipt"]=true,"batch_file_observation",refs.Observation
+	file["transaction_id"],file["path"],file["batch_disk_verdict"]=refs.TransactionID,refs.RelativePath,"committed"
+	file["after_sha256"],file["publication_receipt"],file["publication_generation"]=refs.AfterSHA256,refs.GraphReceipt,json.Number("1")
+	file["writer_return_observed"],file["acknowledgement_state"]=true,"not_applicable_shared_transaction_rpc"
+	got:=refs.accounting(file,shared)
+	if got.State!="observed_single_window_checks_pass" || got.A==nil || got.P==nil || got.B==nil || got.Shared!=nil { t.Fatalf("one-file original windows lost: %+v",got) }
+	for _,fault:=range []string{"full_mode","missing_mode","foreign_server_rpc","missing_ack_ms","numeric_ack_ms","missing_original_blob","original_requires_fresh"} {
+		t.Run(fault,func(t *testing.T) {
+			r:=refs;row:=cloneSharedOwnerModel(t,file);owner:=cloneSharedOwnerModel(t,shared)
+			switch fault {
+			case "full_mode":r.AckMode="full"
+			case "missing_mode":r.AckMode=""
+			case "foreign_server_rpc":owner["acknowledgement"].(map[string]any)["rpc_id"]="rpc-foreign"
+			case "missing_ack_ms":delete(owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any),"reindex_wait")
+			case "numeric_ack_ms":owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any)["reindex_wait"]=json.Number("0")
+			case "missing_original_blob":delete(row,"after_sha256")
+			case "original_requires_fresh":r.OriginalNoRequireFresh=false
+			}
+			if got:=r.accounting(row,owner);got.State=="observed_single_window_checks_pass" { t.Fatal("unproved one-file applicability/source acquired full accounting") }
+		})
+	}
+}
+
+func TestBatchOriginalNoFreshnessProofUsesAllActualRequestContainers(t *testing.T) {
+	for _,tc:=range []struct{name string;args map[string]any;want bool}{
+		{"absent_default_false",map[string]any{"options":map[string]any{"transaction_id":"owned"}},true},
+		{"top_false",map[string]any{"require_fresh":false},true},
+		{"top_true",map[string]any{"require_fresh":true},false},
+		{"options_false",map[string]any{"options":map[string]any{"require_fresh":false}},true},
+		{"options_true",map[string]any{"options":map[string]any{"require_fresh":true}},false},
+		{"arguments_false",map[string]any{"arguments":map[string]any{"require_fresh":false}},true},
+		{"arguments_true",map[string]any{"arguments":map[string]any{"require_fresh":true}},false},
+		{"top_false_does_not_override_nested_true",map[string]any{"require_fresh":false,"options":map[string]any{"require_fresh":true}},false},
+		{"malformed_top",map[string]any{"require_fresh":"false"},false},
+		{"malformed_nested",map[string]any{"options":map[string]any{"require_fresh":"false"}},false},
+		{"malformed_container",map[string]any{"options":"unknown"},false},
+	} {
+		t.Run(tc.name,func(t *testing.T){ if got:=originalBatchNoRequireFresh(request{Tool:"edit",Operation:"batch",Arguments:tc.args});got!=tc.want { t.Fatalf("original request no-freshness witness=%t want%t",got,tc.want) } })
+	}
+	if originalBatchNoRequireFresh(request{}) { t.Fatal("unretained original request granted a no-wait exemption") }
 }

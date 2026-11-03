@@ -892,6 +892,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 				refs, ackErr := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
 				requestErr = ackErr
 				if ackErr == nil {
+					refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(step.Request)
 					batchSet = &refs
 					batchIntents = intents
 				}
@@ -909,6 +910,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 				refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
 				requestErr = ackErr
 				if ackErr == nil {
+					refs.OriginalNoRequireFresh=originalBatchNoRequireFresh(step.Request)
 					batch = &refs
 					batchOffered = offered
 				}
