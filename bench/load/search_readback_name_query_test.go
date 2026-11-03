@@ -78,7 +78,7 @@ func TestSearchReadbackNameClauseKeepsExactPositiveAndCompleteNegative(t *testin
 					t.Fatal("actual request/reply witness was not retained")
 				}
 				var event struct {
-					WireID int64 `json:"wire_id"`
+					WireID  int64           `json:"wire_id"`
 					Payload json.RawMessage `json:"payload"`
 				}
 				if err := json.Unmarshal(sink.data.Bytes(), &event); err != nil || event.WireID != caller.last.ID || len(event.Payload) == 0 {
