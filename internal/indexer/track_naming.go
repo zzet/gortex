@@ -25,7 +25,7 @@ type trackNamingFacts struct {
 }
 
 func trackNamingFailure(ctx context.Context, err error) error {
-	if ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errPrefixStatUnavailable)) {
+	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %w", errPrefixIdentityUnknown, err)
 	}
 	return err
@@ -71,14 +71,10 @@ func (a *prefixStatAllowance) canonical(ctx context.Context, root string) (track
 // The two fixed discovery operations share the existing identity allowance.
 // Canonical membership lookup must not parse workspace configuration or run git.
 func (a *prefixStatAllowance) observeNaming(ctx context.Context, root string, read func(context.Context, string) trackNamingFacts) (trackNamingFacts, error) {
-	if err := ctx.Err(); err != nil {
+	ctx, cancelBudget := context.WithTimeout(ctx, prefixOwnershipTimeout)
+	defer cancelBudget()
+	if err := a.acquire(ctx); err != nil {
 		return trackNamingFacts{}, err
-	}
-	a.once.Do(func() { a.slots = make(chan struct{}, 2) })
-	select {
-	case a.slots <- struct{}{}:
-	default:
-		return trackNamingFacts{}, errPrefixStatUnavailable
 	}
 	slots := a.slots
 	done := make(chan trackNamingFacts, 1)
