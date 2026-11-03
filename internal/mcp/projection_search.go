@@ -108,9 +108,10 @@ type pendingSymbolCaptureKey struct{}
 // context. It certifies only the immutable pending layers selected by that
 // call; canonical, route, cursor and cancellation gates remain independent.
 type pendingSymbolCapture struct {
-	mu      sync.RWMutex
-	facts   *requestProjectionFacts
-	entries map[string]*projectionEntry
+	mu       sync.RWMutex
+	facts    *requestProjectionFacts
+	entries  map[string]*projectionEntry
+	disabled bool
 }
 
 func withPendingSymbolCapture(ctx context.Context, tool string) context.Context {
@@ -131,9 +132,22 @@ func sealPendingSymbolCapture(ctx context.Context) {
 	facts.mu.RUnlock()
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	if capture.entries == nil && len(entries) > 0 {
+	if !capture.disabled && capture.entries == nil && len(entries) > 0 {
 		capture.facts, capture.entries = facts, entries
 	}
+}
+
+// Literal recovery reads a separate mutable text lane, so its answer keeps
+// the existing strict final projection validation even within symbol search.
+func disablePendingSymbolCapture(ctx context.Context) {
+	capture, _ := ctx.Value(pendingSymbolCaptureKey{}).(*pendingSymbolCapture)
+	if capture == nil {
+		return
+	}
+	capture.mu.Lock()
+	capture.disabled = true
+	capture.facts, capture.entries = nil, nil
+	capture.mu.Unlock()
 }
 
 func validateSymbolResponseProjections(ctx context.Context, tool string) error {
