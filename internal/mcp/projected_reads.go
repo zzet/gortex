@@ -276,6 +276,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		rawHash = blake3.Sum256(raw)
 		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
 			pathkey.MutationKey(abs) == key {
+			if err := buildCtx.Err(); err != nil {
+				return nil, err
+			}
 			if observe, ok := buildCtx.Value(checkedProjectionReadObserverKey{}).(checkedProjectionReadObserver); ok {
 				observe(buildCtx, expected)
 				if err := buildCtx.Err(); err != nil {

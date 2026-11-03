@@ -247,12 +247,15 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 		}()
 	}
 	if !afterBorrow {
+		seen := make(map[string]bool)
 		for range gateReads {
 			select {
 			case captured := <-capturedReads:
 				require.Same(t, entry, captured.entry, "every actual request must capture the same old pointer before the actual CAS")
 				require.Equal(t, session, SessionIDFromContext(captured.ctx))
 				require.Contains(t, tools, captured.tool)
+				require.False(t, seen[captured.tool], "one captured expectation per actual tool request")
+				seen[captured.tool] = true
 			case <-time.After(3 * time.Second):
 				t.Fatal("owned registered reads did not reach the common verified pre-CAS boundary")
 			}
