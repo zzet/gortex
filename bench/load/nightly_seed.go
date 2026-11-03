@@ -12,8 +12,14 @@ func validateNightlyWorkloadSeed(o runOptions) error {
 	if o.NightlySeed == "" {
 		return nil
 	}
-	if o.NightlySeed != "search-delay-v1" || o.Scenario != "edit" || o.Agents != 0 || o.Editors != 4 || o.Worktrees != 0 || o.EditGateSeed != "" || o.EditGateModes || o.PRSmokeDrain != 0 || o.SearchReadbackAcceptance {
+	if o.NightlySeed != "search-delay-v1" || o.Scenario != "edit" || o.Agents != 0 || o.Editors != 4 || o.Worktrees != 0 || o.EditGateSeed != "" || o.EditGateModes || o.SearchReadbackAcceptance {
 		return errors.New("--nightly-workload-seed requires search-delay-v1 and the standalone four-editor workload without edit/worktree faults")
+	}
+	if o.PRSmokeDrain != 0 {
+		if prSmokeDrainVersion(o) != 2 {
+			return errors.New("nightly search seed drain requires the explicit version 2 edit protocol")
+		}
+		return validatePRSmokeDrain(o)
 	}
 	return nil
 }
