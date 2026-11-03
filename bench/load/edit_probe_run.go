@@ -36,6 +36,9 @@ type editProbeReadback struct {
 }
 type editProbeRecord struct {
 	SearchACK                map[string]any               `json:"search_ack,omitempty"`
+	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
+	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
+	SearchTurnReleasedNS     *int64                       `json:"search_turn_released_ns,omitempty"`
 	AdmittedTargetLines      *int                         `json:"admitted_target_lines,omitempty"`
 	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
 	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
@@ -138,6 +141,8 @@ type editProbeRuntime struct {
 	phase             *Phase
 	plan              editProbePlan
 	editors           []*socketClient // fixed per ordinal; editors[0] owns run-level controls
+	searchTurnsOnce   sync.Once
+	searchTurns       map[int]*searchReadbackTurn // acceptance-only per-editor ACK/four-search FIFO
 	readers           []*socketClient
 	pendingEdits      atomic.Int64 // sent edits whose receipt is not yet observed terminal and whose loop has not ended
 	reads             []editProbeRead
@@ -829,6 +834,11 @@ func editProbeReceiptClient(phase *Phase, clients []*socketClient) *socketClient
 }
 
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+	release, admitted := r.waitSearchReadbackTurn(ctx, step)
+	if !admitted {
+		return
+	}
+	defer release() // Error/cancellation before the fourth witness still drains.
 	if step.Sender != "" {
 		r.doNativeWrite(ctx, step)
 		return
@@ -1200,6 +1210,9 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
 		if identity.Finished.After(readbackEnd) {
 			readbackEnd = identity.Finished
+		}
+		if r.plan.SearchReadbackAcceptance && index == 3 && kind == "old_text_absent" {
+			r.releaseSearchReadbackTurn(step)
 		}
 	}
 	return readbackEnd, readbacksCorrect

@@ -1920,6 +1920,36 @@
                             "null"
                           ]
                         },
+                        "search_queue_wait_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_queued_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_turn_released_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "stale_claimed_fresh": {
                           "type": "boolean"
                         },

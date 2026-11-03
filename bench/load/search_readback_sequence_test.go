@@ -141,6 +141,62 @@ func TestSearchReadbackSameEditorWaitsForAllFourWitnesses(t *testing.T) {
 			}
 			cancel()
 			tasks.Wait()
+			first, second, other := r.states[0].record, r.states[1].record, r.states[2].record
+			if first.SearchTurnReleasedNS == nil || second.StartedNS == nil || other.StartedNS == nil || second.SearchQueueWaitNS == nil || *second.SearchQueueWaitNS <= 0 {
+				t.Fatal("queue/dispatch/turn evidence is missing")
+			}
+			if *second.StartedNS < *first.SearchTurnReleasedNS || *other.StartedNS >= *first.SearchTurnReleasedNS {
+				t.Fatal("per-editor turn serialized another editor or released after the next edit")
+			}
+			if len(first.Readbacks) < 4 {
+				t.Fatal("a failed search erased a required first response")
+			}
 		})
+	}
+}
+
+func TestSearchReadbackCanceledQueueKeepsEveryOfferedRecord(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	plan := editProbePlan{SearchReadbackAcceptance: true, Steps: []editProbeStep{{Ordinal: 0}, {Ordinal: 1}, {Ordinal: 2}}}
+	r := &editProbeRuntime{plan: plan, origin: time.Now()}
+	for _, step := range plan.Steps {
+		r.states = append(r.states, &editProbeState{step: step, record: editProbeRecord{Ordinal: step.Ordinal}, ackReady: make(chan struct{})})
+	}
+	release, admitted := r.waitSearchReadbackTurn(ctx, plan.Steps[0])
+	if !admitted {
+		t.Fatal("initial turn refused")
+	}
+	defer release()
+	done := make(chan bool, 2)
+	for _, step := range plan.Steps[1:] {
+		go func() {
+			release, admitted := r.waitSearchReadbackTurn(ctx, step)
+			defer release()
+			done <- admitted
+		}()
+	}
+	cancel()
+	for range 2 {
+		select {
+		case admitted := <-done:
+			if admitted {
+				t.Error("canceled queued edit was dispatched")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancellation failed to join the offered queue")
+		}
+	}
+	if len(r.states) != len(plan.Steps) {
+		t.Fatal("queue cancellation erased offered tasks")
+	}
+	for _, state := range r.states[1:] {
+		if state.record.Outcome != "phase_censored" || state.record.StartedNS != nil || state.record.SearchQueueWaitNS == nil || state.record.SearchTurnReleasedNS == nil || len(state.record.Errors) != 1 {
+			t.Fatalf("canceled offer not retained as an explicit failure: %+v", state.record)
+		}
+		select {
+		case <-state.ackReady:
+		default:
+			t.Fatal("canceled task left its owned completion outstanding")
+		}
 	}
 }
