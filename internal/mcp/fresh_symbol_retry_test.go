@@ -72,12 +72,21 @@ func TestFreshSymbolSearchPersistentDriftAndCancellationStayBounded(t *testing.T
 			srv, _ := setupTestServer(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			deadline := time.Now().Add(120 * time.Millisecond)
+			// wait_deadline is an absolute timestamp: serialization/parse strips
+			// Go's monotonic clock. Assert against that same original wall-only
+			// deadline, rather than a different clock after a wall adjustment.
+			deadline := time.Now().Add(120 * time.Millisecond).Round(0)
 			req := makeReq("search_symbols", map[string]any{requireExactArgName: true, requireFreshArgName: true, waitDeadlineArgName: deadline.Format(time.RFC3339Nano)})
 			calls := 0
+			var firstEffective, lastEffective time.Time
 			h := srv.retryFreshSymbolSearch(func(ctx context.Context, request mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 				calls++
-				if got := takeRequestFreshness(&request).effectiveDeadline(time.Now().Add(time.Hour), ctx); !got.Equal(deadline) {
+				got := takeRequestFreshness(&request).effectiveDeadline(time.Now().Add(time.Hour), ctx)
+				if calls == 1 {
+					firstEffective = got
+				}
+				lastEffective = got
+				if !got.Equal(deadline) {
 					return nil, errors.New("retry renewed its deadline")
 				}
 				ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt).withdrawn = true
@@ -86,7 +95,13 @@ func TestFreshSymbolSearchPersistentDriftAndCancellationStayBounded(t *testing.T
 				}
 				return mcplib.NewToolResultError("witnessed base_changed"), nil
 			})
+			started := time.Now()
 			result, err := h(ctx, req)
+			returned := time.Now()
+			t.Logf("original_absolute=%s first_effective=%s last_effective=%s returned_wall=%s call_elapsed=%s before_original=%t calls=%d caller_err=%v handler_err=%v result_nil=%t",
+				deadline.Format(time.RFC3339Nano), firstEffective.Format(time.RFC3339Nano), lastEffective.Format(time.RFC3339Nano), returned.Format(time.RFC3339Nano), returned.Sub(started), returned.Before(deadline), calls, ctx.Err(), err, result == nil)
+			require.True(t, firstEffective.Equal(deadline), "attempt one must use the exact original absolute deadline")
+			require.True(t, lastEffective.Equal(deadline), "the terminal attempt must not renew the original deadline")
 			if cancelCaller {
 				require.ErrorIs(t, err, context.Canceled)
 				require.Equal(t, 1, calls)
@@ -94,7 +109,7 @@ func TestFreshSymbolSearchPersistentDriftAndCancellationStayBounded(t *testing.T
 				require.NoError(t, err)
 				require.True(t, result.IsError)
 				require.Greater(t, calls, 1)
-				require.False(t, time.Now().Before(deadline), "persistent drift ended without exhausting its fixed ceiling")
+				require.False(t, returned.Before(deadline), "persistent drift ended without exhausting its original absolute ceiling")
 			}
 		})
 	}
