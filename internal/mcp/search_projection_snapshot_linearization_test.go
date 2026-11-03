@@ -338,7 +338,13 @@ func TestSymbolCaptureDoesNotExemptLiteralContentFallback(t *testing.T) {
 	require.NoError(t, owned.err)
 	require.False(t, owned.result.IsError, resultText(owned.result))
 	fields := extractTextResult(t, owned.result)
-	require.Empty(t, fields["results"], "the marker is a physical comment, never a symbol node")
+	if rows, ok := fields["results"].([]any); ok {
+		for _, raw := range rows {
+			row, ok := raw.(map[string]any)
+			require.True(t, ok)
+			require.NotEqual(t, "SnapshotLiteralOnly", row["name"], "decomposition may return other symbols, but the physical comment is never a symbol identity")
+		}
+	}
 	content, ok := fields["content_matches"].(map[string]any)
 	require.True(t, ok, "prove actual physical literal-content fallback, not a fabricated result")
 	count, ok := content["count"].(float64)
@@ -361,4 +367,21 @@ func TestSymbolCaptureDoesNotExemptLiteralContentFallback(t *testing.T) {
 	require.NoError(t, final.err)
 	require.True(t, final.result.IsError, "a pending-symbol capture cannot certify later literal-byte work: %s", resultText(final.result))
 	require.Contains(t, resultText(final.result), "superseded")
+}
+
+func TestDeepVerifyBodyReadKeepsStrictProjectionValidation(t *testing.T) {
+	s, _, base, path, entry := snapshotFacadeFixture(t)
+	selected, err := s.bindPendingSearch(withPendingSymbolCapture(base, "search_symbols"))
+	require.NoError(t, err)
+	node := entry.layer.NodeByID("main.go::Target")
+	require.NotNil(t, node)
+	body := extractBodyForVerify(selected, s, node)
+	require.Contains(t, body, "func Target()", "exercise the existing real physical body helper without an LLM campaign")
+	peer := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "NeighborBefore", "Neighbor"))
+	require.False(t, peer.IsError, resultText(peer))
+	require.Equal(t, true, extractTextResult(t, peer)["readback_exact"])
+	require.ErrorIs(t, validateRequestProjections(selected), projectionSuperseded)
+	err = validateSymbolResponseProjections(selected, "search_symbols")
+	t.Logf("real_body=%q later_ack=%s final_validation=%v", body, resultText(peer), err)
+	require.ErrorIs(t, err, projectionSuperseded, "physical deep-assist body work must revoke immutable symbol-only capture credit")
 }
