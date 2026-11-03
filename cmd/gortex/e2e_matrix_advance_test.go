@@ -469,7 +469,7 @@ func e2eAdvanceMintedFor(owners map[string]bool, before, after map[int64]e2eView
 // because a sibling item renames its own helper.
 func e2eAdvanceCounters(t *testing.T, f *issue767Fixture) (map[string]int64, error) {
 	t.Helper()
-	output, err := f.tryCommand(60*time.Second, f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	output, err := f.tryJSONCommand(60*time.Second, f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json: %w: %s", err, e2eViewsTail(output))
 	}

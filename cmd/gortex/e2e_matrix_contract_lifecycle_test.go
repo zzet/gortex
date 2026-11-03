@@ -144,7 +144,7 @@ func e2eContractAwait(f *issue767Fixture, root string, present, absent string) {
 		if err != nil {
 			f.t.Fatal(err)
 		}
-		out, err := f.tryCommand(20*time.Second, root, "call", "contracts", "--index", root, "--json", string(args), "--format", "json")
+		out, err := f.tryJSONCommand(20*time.Second, root, "call", "contracts", "--index", root, "--json", string(args), "--format", "json")
 		if err != nil {
 			return false
 		}

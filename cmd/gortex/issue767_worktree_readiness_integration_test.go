@@ -159,21 +159,7 @@ func (f *issue767Fixture) readinessRead(phase, root, present, absent string) {
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(f.t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, f.binary, "call", "read", "--index", root, "--json", string(payload), "--format", "json")
-	cmd.Dir, cmd.Env = root, f.env
-	f.mu.Lock()
-	f.clientCalls++
-	f.mu.Unlock()
-	output, stderr, err := issue767ReadCommandOutput(cmd)
-	f.write(filepath.Join(f.root, phase+".stderr"), string(stderr))
-	f.mu.Lock()
-	f.lastOutput = string(output) + string(stderr)
-	if len(f.lastOutput) > 4096 {
-		f.lastOutput = f.lastOutput[len(f.lastOutput)-4096:]
-	}
-	f.mu.Unlock()
+	output, err := f.tryJSONCommand(30*time.Second, root, "call", "read", "--index", root, "--json", string(payload), "--format", "json")
 	f.write(filepath.Join(f.root, phase+".json"), string(output))
 	if err != nil {
 		f.t.Fatalf("%s: %v; output: %s", phase, err, output)

@@ -402,7 +402,7 @@ func (e *e2eLifecycleEnv) addWorktree(name, branch, marker string) string {
 func (e *e2eLifecycleEnv) status() daemon.StatusResponse {
 	e.t.Helper()
 	var status daemon.StatusResponse
-	output, err := e.f.tryCommand(60*time.Second, e.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	output, err := e.f.tryJSONCommand(60*time.Second, e.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		e.t.Fatalf("daemon status: %v\n%s", err, sustainedIOTail(output))
 	}
@@ -469,7 +469,7 @@ func (e *e2eLifecycleEnv) families() e2eLifecycleFamilyList {
 // about the catalog.
 func (e *e2eLifecycleEnv) tryFamiliesFrom(root string) (e2eLifecycleFamilyList, error) {
 	var list e2eLifecycleFamilyList
-	output, err := e.f.tryCommand(60*time.Second, root, "repos", "families", "--format", "json", "--index", root, "--no-progress")
+	output, err := e.f.tryJSONCommand(60*time.Second, root, "repos", "families", "--format", "json", "--index", root, "--no-progress")
 	if err != nil {
 		return list, fmt.Errorf("repos families --index %s: %w: %s", root, err, sustainedIOTail(output))
 	}
@@ -815,7 +815,7 @@ func (e *e2eLifecycleEnv) askFrom(dir, root, name, file string, spelling issue76
 	if err != nil {
 		return answer, err
 	}
-	output, err := e.f.tryCommand(60*time.Second, dir, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
+	output, err := e.f.tryJSONCommand(60*time.Second, dir, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
 	if err != nil {
 		answer.Error = fmt.Sprintf("search command: %v: %s", err, sustainedIOTail(output))
 		return answer, fmt.Errorf("search command: %w: %s", err, sustainedIOTail(output))
@@ -838,7 +838,7 @@ func (e *e2eLifecycleEnv) freshnessOf(surface, root, tool string, request map[st
 	if err != nil {
 		return e2eLifecycleFreshness{}, err
 	}
-	output, err := e.f.tryCommand(60*time.Second, root, "call", tool, "--index", root, "--json", string(payload), "--format", "json")
+	output, err := e.f.tryJSONCommand(60*time.Second, root, "call", tool, "--index", root, "--json", string(payload), "--format", "json")
 	if err != nil {
 		return e2eLifecycleFreshness{Surface: surface}, fmt.Errorf("%s: %w: %s", surface, err, sustainedIOTail(output))
 	}
@@ -1169,7 +1169,7 @@ func e2eLifecycleRowPrimaryRemoval(t *testing.T, rec *e2eLifecycleRecorder, bina
 	rec.note("the sibling is an independent instance before the primary is touched")
 
 	// The preview half: no --confirm, so nothing is written.
-	preview, err := e.f.tryCommand(4*time.Minute, e.f.root, "untrack", e.f.primary, "--format", "json", "--no-progress")
+	preview, err := e.f.tryJSONCommand(4*time.Minute, e.f.root, "untrack", e.f.primary, "--format", "json", "--no-progress")
 	if err != nil {
 		t.Fatalf("untrack preview: %v\n%s", err, sustainedIOTail(preview))
 	}
@@ -1188,7 +1188,7 @@ func e2eLifecycleRowPrimaryRemoval(t *testing.T, rec *e2eLifecycleRecorder, bina
 	e.awaitExact(sibling, marker, file, issue767AsOwnCorpus)
 	rec.note("after the preview both corpora still answer")
 
-	output, err = e.f.tryCommand(8*time.Minute, e.f.root, "untrack", e.f.primary, "--confirm", "--format", "json", "--no-progress")
+	output, err = e.f.tryJSONCommand(8*time.Minute, e.f.root, "untrack", e.f.primary, "--confirm", "--format", "json", "--no-progress")
 	if err != nil {
 		t.Fatalf("untrack --confirm: %v\n%s", err, sustainedIOTail(output))
 	}
@@ -1393,7 +1393,7 @@ func e2eLifecycleRowCancellation(t *testing.T, rec *e2eLifecycleRecorder, binary
 		t.Fatal(err)
 	}
 	baseline := time.Now()
-	if _, err := e.f.tryCommand(2*time.Minute, worktree, "call", "search", "--index", worktree, "--json", string(payload), "--format", "json"); err != nil {
+	if _, err := e.f.tryJSONCommand(2*time.Minute, worktree, "call", "search", "--index", worktree, "--json", string(payload), "--format", "json"); err != nil {
 		t.Fatalf("the request the row cancels does not succeed uncancelled: %v", err)
 	}
 	full := time.Since(baseline)
@@ -1409,7 +1409,7 @@ func e2eLifecycleRowCancellation(t *testing.T, rec *e2eLifecycleRecorder, binary
 		if budget < 5*time.Millisecond {
 			budget = 5 * time.Millisecond
 		}
-		if _, err := e.f.tryCommand(budget, worktree, "call", "search", "--index", worktree, "--json", string(payload), "--format", "json"); err != nil {
+		if _, err := e.f.tryJSONCommand(budget, worktree, "call", "search", "--index", worktree, "--json", string(payload), "--format", "json"); err != nil {
 			abandoned++
 			rungs = append(rungs, fmt.Sprintf("%s:abandoned", budget.Round(time.Millisecond)))
 		} else {
@@ -1639,7 +1639,7 @@ func e2eLifecycleRowDiskFull(t *testing.T, rec *e2eLifecycleRecorder, binary str
 	// Whatever the daemon did, it must not have lied about it. Either it is
 	// alive and says so in the census, or it is gone — both are recorded.
 	alive := true
-	statusOutput, err := e.f.tryCommand(60*time.Second, e.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	statusOutput, err := e.f.tryJSONCommand(60*time.Second, e.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		alive = false
 		rec.note("the daemon did not answer status on a full volume: %v", err)

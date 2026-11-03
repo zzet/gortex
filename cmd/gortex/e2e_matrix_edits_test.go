@@ -1214,7 +1214,7 @@ func (h *e2eMatrixEditHarness) waitAbsent(name, rel string) {
 }
 
 func (h *e2eMatrixEditHarness) counters() (map[string]int64, error) {
-	output, err := h.f.tryCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	output, err := h.f.tryJSONCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json unavailable: %w", err)
 	}
@@ -1603,7 +1603,7 @@ func e2eMatrixProject(f *issue767Fixture, probes []e2eMatrixProbe, drop map[stri
 		// The payload is written against <ROOT>; every daemon is asked about
 		// its own checkout.
 		request := strings.ReplaceAll(string(payload), e2eMatrixRootToken, f.primary)
-		output, err := f.tryCommand(e2eMatrixCommandTimeout, f.primary, "call", probe.Facade,
+		output, err := f.tryJSONCommand(e2eMatrixCommandTimeout, f.primary, "call", probe.Facade,
 			"--index", f.primary, "--json", request, "--format", "json")
 		if err != nil {
 			out[probe.Key] = "call error: " + err.Error() + ": " + sustainedIOTail(output)

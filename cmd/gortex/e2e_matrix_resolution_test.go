@@ -2085,7 +2085,7 @@ func e2eResolutionPublicCallers(t *testing.T, f *issue767Fixture, minTier string
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := f.tryCommand(10*time.Second, f.primary, "call", "relations", "--index", f.primary, "--json", string(request), "--format", "json")
+	output, err := f.tryJSONCommand(10*time.Second, f.primary, "call", "relations", "--index", f.primary, "--json", string(request), "--format", "json")
 	if err != nil {
 		t.Fatalf("public callers min_tier=%q: %v: %s", minTier, err, output)
 	}
