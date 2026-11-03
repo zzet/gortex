@@ -46,13 +46,13 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 			return nil, err
 		}
 		r := item.receipt
-		if r.Version != 1 || r.Plan.Lane != "nightly" || r.Plan.PolicySHA256 != policyDigest(p) || r.Started.IsZero() || r.Finished.Before(r.Started) || !revisionPattern.MatchString(r.Workflow.Revision) || r.Workflow.Ref != "refs/heads/main" || r.Workflow.Event != "schedule" || !strings.HasPrefix(r.Workflow.RunURL, "https://github.com/") || !strings.Contains(r.Workflow.RunURL, "/actions/runs/") {
-			return nil, errors.New("nightly history requires dated scheduled-main workflow provenance; preflight and dispatch runs do not start the five-night calendar")
+		if r.Version != 1 || r.Plan.Lane != "nightly" || r.Plan.PolicySHA256 != policyDigest(p) || r.Started.IsZero() || r.Finished.Before(r.Started) || !revisionPattern.MatchString(r.Workflow.Revision) || r.Workflow.Ref != "refs/heads/main" || r.Workflow.Attempt < 1 || !slices.Contains([]string{"schedule", "workflow_dispatch"}, r.Workflow.Event) || !strings.HasPrefix(r.Workflow.RunURL, "https://github.com/") || !strings.Contains(r.Workflow.RunURL, "/actions/runs/") {
+			return nil, errors.New("nightly history requires complete scheduled or manual main workflow provenance; PR and preflight evidence cannot qualify")
 		}
 		item.day = r.Started.UTC().Format(time.DateOnly)
-		key := item.day + "/" + r.Plan.HostClass
+		key := fmt.Sprintf("%s/%d/%s", r.Workflow.RunURL, r.Workflow.Attempt, r.Plan.HostClass)
 		if seen[key] {
-			return nil, errors.New("duplicate nightly host/day; reruns cannot manufacture consecutive nights")
+			return nil, errors.New("duplicate nightly workflow-run attempt/host artifact")
 		}
 		seen[key] = true
 		data, err = os.ReadFile(filepath.Join(path, "budget-results.json"))
@@ -90,7 +90,7 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 		}
 		if allPass {
 			// A table alone cannot prove complete evidence. Re-evaluate the retained
-			// raw reports through the same strict checker before counting a green night.
+			// raw reports through the same strict checker before counting a qualifying main run.
 			dataset, err := loadInputs(filepath.Join(path, "inputs.json"))
 			if err != nil {
 				return nil, err
@@ -125,21 +125,50 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 
 func rowKey(row result) string { return row.HostClass + " / " + row.Scenario + " / " + row.Metric }
 
-func historyVerdict(evidence []nightlyEvidence, through time.Time, hosts []string, out io.Writer) bool {
-	pass := true
+func historyVerdict(evidence []nightlyEvidence, through time.Time, hosts []string, revision string, out io.Writer) bool {
+	// Required hosts must come from one actual workflow run/attempt at the
+	// reviewed main revision, not a calendar assembled from unrelated runs.
+	cohorts := map[string]map[string]nightlyEvidence{}
+	cutoff := through.Format(time.DateOnly)
+	for _, item := range evidence {
+		w := item.receipt.Workflow
+		if item.day > cutoff || w.Revision != revision {
+			continue
+		}
+		key := fmt.Sprintf("%s/%d/%s", w.RunURL, w.Attempt, w.Event)
+		if cohorts[key] == nil {
+			cohorts[key] = map[string]nightlyEvidence{}
+		}
+		cohorts[key][item.receipt.Plan.HostClass] = item
+	}
+	keys := make([]string, 0, len(cohorts))
+	for key := range cohorts {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	pass := false
+	for _, key := range keys {
+		complete := true
+		for _, host := range hosts {
+			item, ok := cohorts[key][host]
+			good := ok && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
+			fmt.Fprintf(out, "%s / %s: complete main nightly-equivalent = %t\n", host, key, good)
+			complete = complete && good
+		}
+		pass = pass || complete
+	}
+	// Keep nightly trend monitoring independent of the one-run release proof.
 	for _, host := range hosts {
 		byDay := map[string]nightlyEvidence{}
 		for _, item := range evidence {
-			if item.receipt.Plan.HostClass == host {
-				byDay[item.day] = item
+			if item.receipt.Plan.HostClass == host && item.day <= cutoff && item.receipt.Workflow.Event == "schedule" {
+				// Preserve every scheduled miss. A manual pass or same-day retry
+				// cannot erase a failed nightly row; this is not metric pooling.
+				day := byDay[item.day]
+				day.day = item.day
+				day.budgets.Rows = append(day.budgets.Rows, item.budgets.Rows...)
+				byDay[item.day] = day
 			}
-		}
-		for n := 0; n < 5; n++ {
-			day := through.AddDate(0, 0, -n).Format(time.DateOnly)
-			item, ok := byDay[day]
-			good := ok && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
-			fmt.Fprintf(out, "%s / %s: complete scheduled main nightly = %t\n", host, day, good)
-			pass = pass && good
 		}
 		// Check adjacent real dates, not just adjacent available artifacts.
 		for day, current := range byDay {
@@ -174,7 +203,8 @@ func historyCommand(args []string, stdout, stderr io.Writer) int {
 	f := flag.NewFlagSet("history", flag.ContinueOnError)
 	f.SetOutput(stderr)
 	index := f.String("inputs", "", "JSON array of downloaded nightly artifact directories")
-	through := f.String("through", "", "last required UTC date (YYYY-MM-DD)")
+	through := f.String("through", "", "review cutoff UTC date (YYYY-MM-DD), not a waiting period")
+	revision := f.String("revision", "", "reviewed main revision required for the complete run")
 	hosts := f.String("hosts", "reference_linux", "comma-separated reviewed required host classes")
 	budgets := f.String("budgets", "bench/budgets.yaml", "pinned budget policy for history coverage/replay")
 	if err := f.Parse(args); err != nil {
@@ -185,8 +215,8 @@ func historyCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	date, err := time.Parse(time.DateOnly, *through)
 	classes := strings.Split(*hosts, ",")
-	if *index == "" || err != nil || f.NArg() != 0 {
-		fmt.Fprintln(stderr, "history requires --inputs and explicit --through date")
+	if *index == "" || err != nil || !revisionPattern.MatchString(*revision) || f.NArg() != 0 {
+		fmt.Fprintln(stderr, "history requires --inputs, reviewed --revision and explicit --through review cutoff")
 		return 2
 	}
 	for _, host := range classes {
@@ -210,8 +240,8 @@ func historyCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if !historyVerdict(evidence, date, classes, stdout) {
-		fmt.Fprintln(stderr, "five consecutive complete main nightlies are not available")
+	if !historyVerdict(evidence, date, classes, *revision, stdout) {
+		fmt.Fprintln(stderr, "one complete qualifying main nightly-equivalent run is not available for every required host")
 		return 1
 	}
 	return 0

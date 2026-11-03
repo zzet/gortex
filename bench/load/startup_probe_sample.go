@@ -65,7 +65,12 @@ func startupOperations(c Corpus) []request {
 		{Tool: "initialize"},
 		{Tool: "search_symbols", Arguments: map[string]any{"query": c.Query, "limit": 1}},
 		{Tool: "resources/read", Operation: "index-health", Arguments: map[string]any{"uri": "gortex://index-health"}},
+		{Tool: "index_health"},
+		{Tool: "capabilities"},
+		{Tool: "tools_search", Arguments: map[string]any{"query": "index"}},
+		{Tool: "graph_stats"},
 		{Tool: "workspace", Operation: "index", Arguments: map[string]any{"operation": "index"}},
+		{Tool: "workspace", Operation: "graph", Arguments: map[string]any{"operation": "graph"}},
 	}
 }
 
@@ -205,12 +210,25 @@ func (s *startupProbe) finish() ([]probeSample, error) {
 // compact surface for workspace(operation:"index"). Each session records the
 // instructions variant its initialize returned.
 func (s *startupProbe) mcpTick(ctx context.Context, cwd probeCWD) {
+	var legacy, facade []request
+	for _, step := range s.plan[1:] {
+		if step.Tool == "workspace" {
+			facade = append(facade, step)
+		} else {
+			legacy = append(legacy, step)
+			// These discovery tools retain their public names on the facade
+			// surface. There is no workspace capability/search operation.
+			if step.Tool == "capabilities" || step.Tool == "tools_search" {
+				facade = append(facade, step)
+			}
+		}
+	}
 	sessions := []struct {
 		tools, mode, initialize string
 		steps                   []request
 	}{
-		{"core", "defer", "initialize", s.plan[1:3]},
-		{"facade-v1", "hide", "initialize_facade", s.plan[3:]},
+		{"core", "defer", "initialize", legacy},
+		{"facade-v1", "hide", "initialize_facade", facade},
 	}
 	for _, session := range sessions {
 		if !s.mcpSession(ctx, cwd, session.tools, session.mode, session.initialize, session.steps) {
@@ -251,6 +269,9 @@ func (s *startupProbe) mcpSession(ctx context.Context, cwd probeCWD, tools, mode
 		}
 	}
 	for i, call := range calls {
+		if tools == "facade-v1" && (call.surface == "capabilities" || call.surface == "tools_search") {
+			call.surface += "_facade"
+		}
 		start := time.Now()
 		callCtx, cancel := context.WithTimeout(ctx, startupCallTimeout)
 		frame, err := c.roundTrip(callCtx, call.method, call.params)
@@ -282,9 +303,10 @@ type probeCall struct {
 }
 
 type probeConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	next   int
+	conn         net.Conn
+	reader       *bufio.Reader
+	next         int
+	notification func([]byte)
 }
 
 // roundTrip sends one request and returns its response frame, skipping
@@ -317,6 +339,9 @@ func (c *probeConn) roundTrip(ctx context.Context, method string, params any) ([
 		}
 		if err := json.Unmarshal(line, &peek); err != nil {
 			return nil, fmt.Errorf("invalid daemon JSON: %w", err)
+		}
+		if peek.Method != "" && c.notification != nil {
+			c.notification(line)
 		}
 		if peek.Method == "" && string(peek.ID) == id {
 			return line, nil

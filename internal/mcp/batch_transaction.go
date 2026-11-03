@@ -1543,6 +1543,12 @@ func (s *Server) refreshBatchGraphReleasing(ctx context.Context, state *batchTra
 		_ = s.awaitSourceAckTier(ctx, policy, paths, s.batchReceiptsPublished(ctx, receipt.Files))
 	} else if !policy.local() {
 		s.waitBatchGraphReceipts(ctx, receipt.Files)
+	} else {
+		// This executed local policy deliberately performs neither wait.
+		// Record applicability, never a synthetic zero-duration wait.
+		lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+		lap.applicable = false
+		lap.finish()
 	}
 	graphStatus := "fresh"
 	for i := range receipt.Files {

@@ -58,10 +58,11 @@ type bootTiming struct {
 	EnrichedAt time.Time            `json:"enriched_at"`
 	// Coordinators is the largest checkout coordinator count the status
 	// census read in the 2 s after the primary registered.
-	Coordinators *int            `json:"coordinators_within_2s"`
-	CensusReads  int             `json:"census_reads"`
-	CensusErrors []string        `json:"census_errors"`
-	Views        json.RawMessage `json:"views"`
+	Coordinators       *int                       `json:"coordinators_within_2s"`
+	CensusReads        int                        `json:"census_reads"`
+	CensusErrors       []string                   `json:"census_errors"`
+	Views              json.RawMessage            `json:"views"`
+	TransitionEvidence *startupTransitionEvidence `json:"transition_evidence,omitempty"`
 }
 
 func runStartupPhase(ctx context.Context, o runOptions, corpora []Corpus, outputRoot string) (phase Phase, _ []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
@@ -189,6 +190,12 @@ func runStartupBoot(ctx context.Context, o runOptions, p *privateRun, probe *sta
 		return timing, err
 	}
 	primary := configured[0].Corpus.Label
+	var transitions *startupTransitionObserver
+	if o.Worktrees >= 24 {
+		transitions = startStartupTransitionObserver(ctx, p, configured[0], timing.Started, o.WarmTimeout)
+		timing.TransitionEvidence = transitions.e
+		defer transitions.close()
+	}
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
 		data, err := control(probeCtx, p.Socket, "probe", nil)
@@ -206,6 +213,9 @@ func runStartupBoot(ctx context.Context, o runOptions, p *privateRun, probe *sta
 			if err := observeReadiness(&timing, state, configured, now); err != nil {
 				return timing, err
 			}
+		}
+		if transitions != nil {
+			transitions.observeCatalog(ctx, p)
 		}
 		ready, registered := timing.ReadyAt[primary]
 		if registered && now.Sub(ready) <= startupCoordinatorWindow {

@@ -735,6 +735,26 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok && snap.MxFrame == 0 && res.bytesBefore <= cfg.thresholdBytes {
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "nothing_to_reclaim", bytesBefore: res.bytesBefore}
 	}
+	// A below-ceiling standalone bulk writer cannot grant reset authority.
+	// Observe it only in an immediately available writer gap; never wait for
+	// this optimization, and retain the existing late authoritative checks.
+	if !res.leaseOverride && !res.hardCap && !res.lastResort &&
+		cfg.ceilingBytes > 0 && res.bytesBefore < cfg.ceilingBytes &&
+		!editGateClosedSeedPolicy(cfg) && s.writeMu.TryLock() {
+		standalone := s.bulkConn != nil && s.generationBulkLoad == 0 && !s.coordinatedBulkLoad
+		// Do not replace an already visible higher-priority refusal. Classify
+		// on a copy so a declined optimization changes no result/accounting.
+		probe := res
+		knownRefusal := standalone && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil
+		s.writeMu.Unlock()
+		// Release callbacks can cancel the attempt or expose new demand.
+		probe = res
+		if knownRefusal && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil {
+			res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+			res.bytesAfter = s.observedWALFileSize(walPath)
+			return res
+		}
+	}
 	// Step 1: the unbounded backfill (see the file comment), without the
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
