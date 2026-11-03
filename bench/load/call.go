@@ -103,7 +103,11 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 	var attempts []Attempt
 	for retry := 0; ; retry++ {
 		start := time.Now()
-		data, err := client.call(callCtx, "tools/call", map[string]any{"name": r.Tool, "arguments": args})
+		seed, delayNS, err := delayNightlySearch(callCtx, r.name(), role)
+		var data json.RawMessage
+		if err == nil {
+			data, err = client.call(callCtx, "tools/call", map[string]any{"name": r.Tool, "arguments": args})
+		}
 		returned := time.Now()
 		if retryTyped {
 			if clock, ok := client.(interface{ responseReturnedAt() time.Time }); ok {
@@ -129,7 +133,7 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 		if err == nil {
 			err = checkToolResult(data)
 		}
-		a := Attempt{Tool: r.name(), Role: role, Request: hash, Agent: agent, Step: step, Slot: slot, Retry: retry, Started: start, DurationMS: float64(returned.Sub(start)) / float64(time.Millisecond), LogicalMS: float64(returned.Sub(logicalStart)) / float64(time.Millisecond), Outcome: "success"}
+		a := Attempt{NightlySeed: seed, NightlyDelayNS: delayNS, Tool: r.name(), Role: role, Request: hash, Agent: agent, Step: step, Slot: slot, Retry: retry, Started: start, DurationMS: float64(returned.Sub(start)) / float64(time.Millisecond), LogicalMS: float64(returned.Sub(logicalStart)) / float64(time.Millisecond), Outcome: "success"}
 		if session, ok := client.(*socketClient); ok {
 			a.CWD = session.cwd
 		}

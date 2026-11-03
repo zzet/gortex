@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,4 +68,38 @@ func TestMonitorReportsWALP95(t *testing.T) {
 		require.Nil(t, phase.Metrics["p95_wal_bytes"].Value)
 		require.NotEmpty(t, phase.Metrics["p95_wal_bytes"].Reason)
 	})
+}
+
+func TestMonitorWALRawCensusRetainsActualFileSizesAndMissingSamples(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "store.db")
+	self, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	m := &phaseMonitor{p: &privateRun{Store: store, process: &exec.Cmd{Process: self}}, sampler: absentSampler{}, pid: os.Getpid(), started: time.Now(), peaks: make(map[string]Metric), cancel: func() {}}
+	require.NoError(t, os.WriteFile(store+"-wal", make([]byte, 1234), 0600))
+	m.observe()
+	require.NoError(t, os.WriteFile(store+"-wal", make([]byte, 5678), 0600))
+	p := &Phase{Metrics: make(map[string]Metric)}
+	m.finish(p)
+	var raw struct {
+		Version int `json:"schema_version"`
+		Count   int `json:"count"`
+		Samples []struct {
+			Bytes *float64 `json:"bytes"`
+			Error string   `json:"error"`
+		} `json:"samples"`
+	}
+	require.NoError(t, json.Unmarshal(p.Gate["wal_samples_v1"], &raw))
+	require.Equal(t, 1, raw.Version)
+	require.Equal(t, 2, raw.Count)
+	require.Len(t, raw.Samples, 2)
+	require.Equal(t, float64(1234), *raw.Samples[0].Bytes)
+	require.Equal(t, float64(5678), *raw.Samples[1].Bytes)
+	require.NoError(t, os.Remove(store+"-wal"))
+	m.observe()
+	p = &Phase{Metrics: make(map[string]Metric)}
+	m.finish(p)
+	require.NoError(t, json.Unmarshal(p.Gate["wal_samples_v1"], &raw))
+	require.Equal(t, 4, raw.Count)
+	require.Nil(t, raw.Samples[2].Bytes)
+	require.NotEmpty(t, raw.Samples[2].Error)
 }

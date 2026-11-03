@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	NightlySeed              string
 	EditACKMode              string
 	Binary                   string
 	Manifest                 string
@@ -29,6 +30,7 @@ type runOptions struct {
 	Seed                     int64
 	Duration                 time.Duration
 	PRSmokeDrain             time.Duration
+	PRSmokeDrainVersion      int
 	Deadline                 time.Duration
 	WarmTimeout              time.Duration
 	StopTimeout              time.Duration
@@ -87,7 +89,8 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
 	f.Int64Var(&o.Seed, "seed", 1, "reproducible per-agent request/think plan seed")
 	f.DurationVar(&o.Duration, "duration", time.Minute, "measured workload phase duration")
-	f.DurationVar(&o.PRSmokeDrain, "pr-smoke-drain", 0, "opt-in standalone PR read drain budget after 20s/30s offered duration; unsupported for edits/probes/paired")
+	f.DurationVar(&o.PRSmokeDrain, "pr-smoke-drain", 0, "opt-in standalone PR drain budget after the offered duration; unsupported for paired runs")
+	f.IntVar(&o.PRSmokeDrainVersion, "pr-smoke-drain-version", 1, "PR drain identity: 1 for reads, explicit 2 for edits and their visibility probes")
 	f.DurationVar(&o.Deadline, "deadline", 120*time.Second, "product call/visibility deadline, independently of phase clipping")
 	f.DurationVar(&o.WarmTimeout, "warm-timeout", 30*time.Minute, "startup/enrichment/public analysis gate budget")
 	f.DurationVar(&o.StopTimeout, "stop-timeout", 30*time.Second, "graceful owned-daemon shutdown budget before force kill")
@@ -102,6 +105,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.BoolVar(&o.SearchReadbackAcceptance, "search-readback-acceptance", false, "explicit search acceptance: 1000 immediate same-session search witnesses at 1, 4 or 8 editors")
 	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
+	f.StringVar(&o.NightlySeed, "nightly-workload-seed", "", "opt-in nightly workload fault: search-delay-v1; actual one-second measured search request delay")
 	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
@@ -116,6 +120,9 @@ func (o runOptions) editACKPolicy() string {
 }
 
 func validateRunOptions(o runOptions) error {
+	if err := validateNightlyWorkloadSeed(o); err != nil {
+		return err
+	}
 	if o.EditACKMode != "" && o.EditACKMode != "local" && o.EditACKMode != "full" {
 		return errors.New("--edit-ack must be local or full when explicitly set")
 	}
@@ -337,12 +344,13 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		}
 		report.Workload.SessionModel = plan.SessionModel
 	}
+	report.NightlySeed = o.NightlySeed
 	report.Workload.EditGateSeed = o.EditGateSeed
 	report.Workload.EditACKMode = o.editACKPolicy()
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {
-		report.Workload.PRSmokeDrain = &PRSmokeDrain{Version: 1, OfferedSeconds: o.Duration.Seconds(), MaxDrainSeconds: o.PRSmokeDrain.Seconds()}
+		report.Workload.PRSmokeDrain = &PRSmokeDrain{Version: prSmokeDrainVersion(o), OfferedSeconds: o.Duration.Seconds(), MaxDrainSeconds: o.PRSmokeDrain.Seconds()}
 	}
 	report.Workload.CPUProfileSec, report.Workload.WarmTimeoutSec, report.Workload.StopTimeoutSec, report.Workload.KeepState = o.CPUProfile.Seconds(), o.WarmTimeout.Seconds(), o.StopTimeout.Seconds(), o.KeepState
 	report.Workload.SessionModel = "per_agent"
@@ -407,12 +415,19 @@ func finishReport(report *Report, expectedPhases int) error {
 
 func captureReceipt(ctx context.Context, p *privateRun, client *socketClient, phase *Phase) {
 	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	statusStarted := time.Now()
 	status, err := control(statusCtx, p.Socket, "status", nil)
+	statusFinished := time.Now()
 	cancel()
 	if err != nil {
 		phase.Errors = append(phase.Errors, "status receipt: "+err.Error())
 	} else {
 		phase.Status = append(phase.Status, status)
+		pid := 0
+		if p.process != nil && p.process.Process != nil {
+			pid = p.process.Process.Pid
+		}
+		recordStatusCapture(phase, pid, statusStarted, statusFinished)
 	}
 	statsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	stats, err := client.call(statsCtx, "resources/read", map[string]any{"uri": "gortex://stats"})

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -88,15 +89,22 @@ func TestMicrobenchRunsSameFixtureAndRetainsMissingSampleFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			calls, statCalls := 0, 0
-			process := func(_ context.Context, binary string, args []string, cwd string, _ []string) ([]byte, []byte, error) {
+			process := func(ctx context.Context, binary string, args []string, cwd string, _ []string) ([]byte, []byte, error) {
 				if data, ok := syntheticMicroFixtureResponse(args); ok {
 					return data, nil, nil
 				}
 				if binary == c.Benchstat {
+					if ctx.Value(queryMicroDiagnosticsKey{}) != nil {
+						t.Fatal("benchstat inherited query timeout policy")
+					}
 					statCalls++
 					return []byte("synthetic comparison table\n"), nil, nil
 				}
 				calls++
+				capture, _ := ctx.Value(queryMicroDiagnosticsKey{}).(bool)
+				if capture != (runtime.GOOS == "linux" && cwd == filepath.Join(c.Fixture, "internal/query")) {
+					t.Fatal("timeout capture escaped the Linux query group")
+				}
 				if !strings.HasPrefix(cwd, c.Fixture+string(filepath.Separator)) || !strings.Contains(strings.Join(args, " "), "-test.benchtime=1x") {
 					t.Fatal("benchmark did not use identical pinned cwd/profile")
 				}
@@ -127,7 +135,22 @@ func TestMicrobenchRunsSameFixtureAndRetainsMissingSampleFailure(t *testing.T) {
 			if len(receipt.Runs) != 18 || receipt.FormalAcceptance || receipt.Complete == missing {
 				t.Fatal("receipt lost failed repetitions or claimed formal acceptance")
 			}
+			for _, run := range receipt.Runs {
+				want := runtime.GOOS == "linux" && run.Package == "internal/query"
+				if (run.TimeoutCapture == queryMicroCapturePolicy && run.CaptureGraceSeconds == 10) != want || !want && (run.TimeoutCapture != "" || run.CaptureGraceSeconds != 0) {
+					t.Fatal("receipt lost scoped query capture policy")
+				}
+			}
 		})
+	}
+}
+
+func TestQueryMicroDiagnosticEnvRetainsOtherSettings(t *testing.T) {
+	env := []string{"GOMAXPROCS=4", "GOGC=77", "GOMEMLIMIT=123MiB", "GODEBUG=ignored_duplicate=1", "GODEBUG=asyncpreemptoff=0,gctrace=0", "GOTRACEBACK=none"}
+	before := slices.Clone(env)
+	want := []string{"GOMAXPROCS=4", "GOGC=77", "GOMEMLIMIT=123MiB", "GODEBUG=asyncpreemptoff=0,gctrace=1", "GOTRACEBACK=all"}
+	if got := queryMicroDiagnosticEnv(env); !slices.Equal(got, want) || !slices.Equal(env, before) {
+		t.Fatalf("query diagnostics changed other settings or caller environment: %v; original %v", got, env)
 	}
 }
 

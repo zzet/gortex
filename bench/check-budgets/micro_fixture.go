@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -15,12 +16,14 @@ const microFixtureTest = "TestBenchmarkFixtureTargets"
 const microFixtureMarker = "GORTEX_BENCHMARK_FIXTURE_V1 "
 
 type microFixtureCheck struct {
-	Role         string           `json:"role"`
-	Started      time.Time        `json:"started"`
-	Finished     time.Time        `json:"finished"`
-	Observations map[string][]int `json:"nodes_edges,omitempty"`
-	Complete     bool             `json:"complete"`
-	Error        string           `json:"error,omitempty"`
+	Role                string           `json:"role"`
+	Started             time.Time        `json:"started"`
+	Finished            time.Time        `json:"finished"`
+	Observations        map[string][]int `json:"nodes_edges,omitempty"`
+	Complete            bool             `json:"complete"`
+	Error               string           `json:"error,omitempty"`
+	TimeoutCapture      string           `json:"timeout_capture,omitempty"`
+	CaptureGraceSeconds int              `json:"timeout_capture_grace_seconds,omitempty"`
 }
 
 func parseMicroFixtureCheck(stdout []byte) (map[string][]int, error) {
@@ -71,6 +74,11 @@ func checkMicroFixtureExecutables(ctx context.Context, c microConfig, out string
 			}
 			duration, _ := time.ParseDuration(c.Timeout)
 			runCtx, cancel := context.WithTimeout(ctx, duration)
+			if runtime.GOOS == "linux" {
+				runCtx = context.WithValue(runCtx, queryMicroDiagnosticsKey{}, true)
+				check.TimeoutCapture = queryMicroCapturePolicy
+				check.CaptureGraceSeconds = int(queryMicroCaptureGrace / time.Second)
+			}
 			env := append(os.Environ(), "GORTEX_BENCHMARK_FIXTURE_CHECK=1", "TMPDIR="+root, "TMP="+root, "TEMP="+root)
 			cwd := filepath.Join(c.Fixture, "internal/query")
 			stdout, stderr, listErr := process(runCtx, binary, []string{"-test.list=^" + microFixtureTest + "$"}, cwd, env)

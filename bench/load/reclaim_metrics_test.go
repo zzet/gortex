@@ -133,3 +133,14 @@ func TestReclaimMetricsFromStatusReceipts(t *testing.T) {
 		requireUnavailable(t, m, "reclaim_writer_wait_p95_ms", "changed shape")
 	})
 }
+
+// The nightly adapter consumes these exact public cumulative bucket fields.
+// Unlike the older legacy fixtures, count here agrees with the raw population.
+func TestReclaimHoldNightlyRawPopulationMatchesProducer(t *testing.T) {
+	before := map[string]any{"count": int64(2), "bucket_le_ms": []int{10, 50, 100}, "bucket_counts": []int{2, 0, 0, 0}, "max_ms": 8}
+	after := map[string]any{"count": int64(22), "bucket_le_ms": []int{10, 50, 100}, "bucket_counts": []int{21, 0, 1, 0}, "max_ms": 80}
+	raw := []json.RawMessage{reclaimReceipt(t, map[string]any{"writer_hold": before}), reclaimReceipt(t, map[string]any{"writer_hold": after})}
+	metrics := reclaimMetrics(raw)
+	requireMetric(t, metrics, "reclaim_writer_hold_p95_ms", 10, "ms")
+	requireMetric(t, metrics, "reclaim_writer_holds", 20, "holds")
+}

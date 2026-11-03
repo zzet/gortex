@@ -244,6 +244,9 @@
               "null"
             ]
           },
+          "nightly_workload_seed": {
+            "type": "string"
+          },
           "phases": {
             "items": {
               "additionalProperties": false,
@@ -279,6 +282,12 @@
                       },
                       "logical_ms": {
                         "type": "number"
+                      },
+                      "nightly_delay_ns": {
+                        "type": "integer"
+                      },
+                      "nightly_workload_seed": {
+                        "type": "string"
                       },
                       "outcome": {
                         "type": "string"

@@ -19,6 +19,7 @@ type phaseMonitor struct {
 	clientBefore map[string]Metric
 	groupBefore  map[string]Metric
 	peaks        map[string]Metric
+	walRaw       []walSampleObservation
 	walSamples   []float64 // every WAL size a sample found, for the p95
 	cancel       context.CancelFunc
 	done         sync.WaitGroup
@@ -48,6 +49,12 @@ func startMonitor(p *privateRun, sampler processSampler, group string) *phaseMon
 	return m
 }
 
+type walSampleObservation struct {
+	At    time.Time `json:"at"`
+	Bytes *float64  `json:"bytes"`
+	Error string    `json:"error,omitempty"`
+}
+
 func (m *phaseMonitor) observe() {
 	values := m.sampler.sample(m.pid)
 	for key, path := range map[string]string{"wal_bytes": m.p.Store + "-wal", "store_bytes": m.p.Store} {
@@ -56,7 +63,9 @@ func (m *phaseMonitor) observe() {
 			values[key] = measured(float64(info.Size()), "bytes")
 		}
 	}
-	if wal := values["wal_bytes"]; wal.Value != nil {
+	wal := values["wal_bytes"]
+	m.walRaw = append(m.walRaw, walSampleObservation{At: time.Now(), Bytes: wal.Value, Error: wal.Reason})
+	if wal.Value != nil {
 		m.walSamples = append(m.walSamples, *wal.Value)
 	}
 	for _, key := range []string{"rss_bytes", "pss_bytes", "rss_anon_bytes", "phys_footprint_bytes", "wal_bytes", "store_bytes"} {
@@ -80,6 +89,14 @@ func (m *phaseMonitor) finish(phase *Phase) {
 		phase.Gate = make(map[string]json.RawMessage)
 	}
 	phase.Gate["process_counter_window"] = window
+	walWire, _ := json.Marshal(struct {
+		Version  int                    `json:"schema_version"`
+		Started  time.Time              `json:"started"`
+		Finished time.Time              `json:"finished"`
+		Count    int                    `json:"count"`
+		Samples  []walSampleObservation `json:"samples"`
+	}{1, m.started, counterEnd, len(m.walRaw), m.walRaw})
+	phase.Gate["wal_samples_v1"] = walWire
 	clientAfter := m.sampler.sample(os.Getpid())
 	for key, value := range m.peaks {
 		phase.Metrics["peak_"+key] = value
