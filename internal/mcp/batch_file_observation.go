@@ -41,6 +41,40 @@ func (s *Server) beginBatchFileObservation(ctx context.Context, receipt batchTra
 	return record
 }
 
+// Retain each original writer only for a complete existing-file edit frontier.
+// Unsupported operations never borrow an edit member's physical clock.
+func (s *Server) beginBatchFileObservations(ctx context.Context, receipt batchTransactionReceipt, buffers map[string]*batchFileBuffer, paths []string) map[string]*mutationCommitRecord {
+	if len(paths) == 0 || len(paths) != len(receipt.Files) || len(receipt.Results) != len(paths) {
+		return nil
+	}
+	for _, result := range receipt.Results {
+		if result.Op != "edit_file" {
+			return nil
+		}
+	}
+	seen := make(map[string]bool, len(paths))
+	for _, file := range receipt.Files {
+		buffer := buffers[file.Path]
+		if seen[file.Path] || buffer == nil || !buffer.existsBefore || !buffer.existsAfter {
+			return nil
+		}
+		seen[file.Path] = true
+	}
+	for _, path := range paths {
+		if !seen[path] {
+			return nil
+		}
+	}
+	records := make(map[string]*mutationCommitRecord, len(paths))
+	for _, file := range receipt.Files {
+		member := receipt
+		member.Files = []batchTransactionFile{file}
+		member.Results = receipt.Results[:1]
+		records[file.Path] = s.beginBatchFileObservation(ctx, member, buffers, []string{file.Path})
+	}
+	return records
+}
+
 // Capture directly around the selected real forward writer. Journal and
 // rollback writers keep their original separate calls. No bytes or writer
 // closure are retained in the ledger, and an unobserved batch keeps its writer.
@@ -102,14 +136,25 @@ func (s *Server) finishBatchFileObservation(record *mutationCommitRecord, receip
 		record.errText = "batch_not_committed"
 		return
 	}
-	if len(receipt.Files) != 1 || receipt.Files[0].Path != record.absPath || receipt.Files[0].AfterAbsent || receipt.Files[0].BeforeAbsent ||
-		receipt.Files[0].AfterSHA256 != hex.EncodeToString(record.batchAfterSHA256[:]) || record.disk != mutationDiskInFlight ||
+	var member *batchTransactionFile
+	for i := range receipt.Files {
+		if receipt.Files[i].Path == record.absPath {
+			if member != nil {
+				record.disk, record.errText = mutationDiskFailed, "ambiguous_file_identity"
+				return
+			}
+			member = &receipt.Files[i]
+		}
+	}
+	if member == nil || member.AfterAbsent || member.BeforeAbsent ||
+		member.AfterSHA256 != hex.EncodeToString(record.batchAfterSHA256[:]) || record.disk != mutationDiskInFlight ||
 		record.diskWriteStartedAt.IsZero() || record.committedAt.IsZero() || record.committedAt.Before(record.diskWriteStartedAt) || record.newSHA == "" {
 		record.disk, record.graph, record.graphRecorded = mutationDiskFailed, mutationGraphFailed, true
 		record.errText = "unavailable_writer_or_final_file_identity"
 		return
 	}
 	record.disk = mutationDiskCommitted
+	record.contentSHA256 = hex.EncodeToString(record.batchAfterSHA256[:])
 	record.commitSeq = mutationDiskCommitSequence.Add(1)
 }
 
@@ -201,6 +246,10 @@ func (s *Server) batchFileObservationPayload(ctx context.Context, id string) (ma
 			}
 		}
 	}
+	if payload["found"] == true {
+		s.refreshBatchFilePublication(record)
+		s.attachSharedOwnerAccounting(payload, record, publication)
+	}
 	attachMutationPhaseTimings(payload, ticket, committed, indexer.PublicationSourceMCPEdit, publication)
 	if repair != nil {
 		payload["read_assisted_publication"] = repair.payload()
@@ -218,16 +267,42 @@ func (s *Server) batchFileObservationReferences(transaction batchTransactionRece
 	ledger := &s.mutationCommits
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	for i := len(ledger.ordered) - 1; i >= 0; i-- {
-		record := ledger.ordered[i]
+	var references []batchFileObservationReference
+	for _, record := range ledger.ordered {
 		record.mu.RLock()
 		match := record.kind == batchFileObservationCommit && record.owner == s && ledger.byID[record.id] == record &&
 			record.key == transaction.TransactionID && record.fingerprint == transaction.Fingerprint
 		reference := batchFileObservationReference{Path: record.relPath, Receipt: record.id}
 		record.mu.RUnlock()
 		if match {
-			return []batchFileObservationReference{reference}
+			references = append(references, reference)
 		}
 	}
-	return nil
+	return references
+}
+
+// Observe only the original ticket; never re-admit or enter physical replay indexes.
+func (s *Server) refreshBatchFilePublication(record *mutationCommitRecord) {
+	if record == nil || record.kind != batchFileObservationCommit {
+		return
+	}
+	record.mu.RLock()
+	ticket, generation := record.reindexReceipt, record.reindexGeneration
+	record.mu.RUnlock()
+	if ticket == "" {
+		return
+	}
+	outcome, ok := s.mutationReceiptState(ticket)
+	if !ok || outcome.Generation != generation {
+		return
+	}
+	s.mutationCommits.mu.Lock()
+	defer s.mutationCommits.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if s.mutationCommits.byID[record.id] != record || record.owner != s || record.reindexReceipt != ticket || record.reindexGeneration != generation {
+		return
+	}
+	record.graph, record.graphRecorded = graphStatusFor(outcome), true
+	record.appliedGeneration = outcome.AppliedGeneration
 }

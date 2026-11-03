@@ -1,25 +1,27 @@
 package mcp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"github.com/zzet/gortex/internal/indexer"
 )
 
 func (s *Server) bindSharedPhysicalOwner(record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
-	if publication == nil || record == nil || !record.isPhysicalCommit() || !s.sharedIdentity.constructorValid(s) {
+	if publication == nil || record == nil || !record.isPublicationOwner() || !s.sharedIdentity.constructorValid(s) {
 		return
 	}
 	s.mutationCommits.mu.Lock()
 	defer s.mutationCommits.mu.Unlock()
 	record.mu.RLock()
 	defer record.mu.RUnlock()
-	if record.owner != s || s.mutationCommits.byID[record.id] != record || record.publication != publication || record.disk != mutationDiskCommitted || record.commitSeq == 0 {
+	if record.owner != s || s.mutationCommits.byID[record.id] != record || record.publication != publication || !record.validSharedPhysicalMemberLocked() {
 		return
 	}
 	publication.BindSharedPhysicalOwner(indexer.SharedPhysicalOwner{Server: s.sharedIdentity.name, PID: s.sharedIdentity.pid, Birth: s.sharedIdentity.birth, Receipt: record.id, Sequence: record.commitSeq, Hash: record.contentSHA256, Path: record.absPath, Checkout: record.checkoutID, Incarnation: record.checkoutIncarnation})
 }
 
 func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mutationCommitRecord, publication *indexer.PublicationPhaseRecord) {
-	if publication == nil || record == nil || !record.isPhysicalCommit() {
+	if publication == nil || record == nil || !record.isPublicationOwner() {
 		return
 	}
 	state, reason := publication.SharedOwnerProofAvailability()
@@ -43,7 +45,11 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
 			peer := s.mutationCommits.byID[member.Receipt]
 			s.mutationCommits.mu.Unlock()
 			if peer != nil && peer.owner == s {
-				s.refreshPendingSourceRecord(peer)
+				if peer.kind == batchFileObservationCommit {
+					s.refreshBatchFilePublication(peer)
+				} else {
+					s.refreshPendingSourceRecord(peer)
+				}
 			}
 		}
 	}
@@ -74,7 +80,7 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
 		}()
 		for i, member := range proof.PhysicalMembers {
 			current := peers[i]
-			if !current.isPhysicalCommit() || current.id != member.Receipt || current.commitSeq != member.Sequence || current.contentSHA256 != member.Hash || current.absPath != member.Path || current.checkoutID != member.Checkout || current.checkoutIncarnation != member.Incarnation || current.disk != mutationDiskCommitted || member.Server != s.sharedIdentity.name || member.PID != s.sharedIdentity.pid || member.Birth != s.sharedIdentity.birth || !current.graphRecorded || current.graph != mutationGraphFresh || !proof.MatchesPublication(member.Receipt, current.publication, current.appliedGeneration) {
+			if !current.validSharedPhysicalMemberLocked() || current.id != member.Receipt || current.commitSeq != member.Sequence || current.contentSHA256 != member.Hash || current.absPath != member.Path || current.checkoutID != member.Checkout || current.checkoutIncarnation != member.Incarnation || current.disk != mutationDiskCommitted || member.Server != s.sharedIdentity.name || member.PID != s.sharedIdentity.pid || member.Birth != s.sharedIdentity.birth || !current.graphRecorded || current.graph != mutationGraphFresh || !proof.MatchesPublication(member.Receipt, current.publication, current.appliedGeneration) {
 				return false
 			}
 		}
@@ -90,4 +96,20 @@ func (s *Server) attachSharedOwnerAccounting(payload map[string]any, record *mut
 	} else if state == "frozen" {
 		payload["shared_owner_accounting_v1_availability"] = map[string]any{"state": "unavailable", "reason": "membership_changed"}
 	}
+}
+
+// Called with the record lock held. Batch membership is only a writer
+// observation qualified by its durable journal verdict, never a physical
+// mutation/recovery authority or an apportioned transaction acknowledgement.
+func (r *mutationCommitRecord) validSharedPhysicalMemberLocked() bool {
+	if r == nil || r.disk != mutationDiskCommitted || r.commitSeq == 0 {
+		return false
+	}
+	if r.isPhysicalCommit() {
+		return true
+	}
+	return r.kind == batchFileObservationCommit && r.key != "" && r.fingerprint != "" &&
+		r.batchOwner == sha256.Sum256([]byte(r.key)) && !r.diskWriteStartedAt.IsZero() &&
+		!r.committedAt.IsZero() && !r.committedAt.Before(r.diskWriteStartedAt) &&
+		r.contentSHA256 == hex.EncodeToString(r.batchAfterSHA256[:]) && r.newSHA != ""
 }
