@@ -93,7 +93,7 @@ func TestSearchReadbackAcceptanceKeepsFirstSameSessionExactLineWitness(t *testin
 					searches++
 					mu.Unlock()
 					query, _ := args["query"].(string)
-					if query == old {
+					if query == old || operation == "symbols" && query == "name:"+old {
 						if operation == "symbols" {
 							return stubContent(map[string]any{"results": []any{}, "total": 0, "truncated": false}), nil
 						}

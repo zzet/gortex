@@ -150,6 +150,9 @@ func searchReadbackRequest(kind string, repo privateRepo, step editProbeStep) re
 		options["path"] = c.File
 	}
 	if operation == "symbols" {
+		// Use the existing name clause so fuzzy/content neighbors do not
+		// replace the selected declaration probe or make absence unprovable.
+		query = "name:" + query
 		options["query_class"], options["expand"], options["max_per_file"] = "symbol", "off", 0
 	}
 	return request{Tool: "search", Operation: operation, Arguments: map[string]any{"operation": operation, "query": query, "options": options}}
