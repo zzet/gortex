@@ -34,13 +34,17 @@ type registeredLateStormWatcher struct {
 }
 
 func (w *registeredLateStormWatcher) OnSourceEvent(cb func(string)) {
-	w.Watcher.OnSourceEvent(func(path string) {
+	w.Watcher.OnSourceEvent(w.sourceEventCallback(cb))
+}
+
+func (w *registeredLateStormWatcher) sourceEventCallback(cb func(string)) func(string) {
+	return func(path string) {
 		if path == w.eventPath && w.hold.CompareAndSwap(true, false) {
 			close(w.entered)
 			<-w.release
 		}
 		cb(path)
-	})
+	}
 }
 
 func (w *registeredLateStormWatcher) TierPaths() map[string]indexer.MutationTierState {
@@ -128,7 +132,7 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 			require.NoError(t, err)
 			stamp, err := os.Stat(watcher.eventPath)
 			require.NoError(t, err)
-			watcher.hold.Store(true)
+			watcher.holdNextSourceEvent()
 			require.NoError(t, os.WriteFile(watcher.eventPath, eventBytes, 0600))
 			require.NoError(t, os.Chtimes(watcher.eventPath, stamp.ModTime(), stamp.ModTime()))
 			select {
@@ -344,7 +348,7 @@ func startRegisteredLateStormFixtureWatcher(t *testing.T, s *Server, path, scena
 	unblock := sync.OnceFunc(func() { close(watcher.release) })
 	stop := sync.OnceFunc(func() { require.NoError(t, watcher.Stop()) })
 	if scenario == "point_queue" {
-		watcher.hold.Store(true)
+		watcher.holdNextSourceEvent()
 	}
 	s.SetWatcher(watcher)
 	require.NoError(t, watcher.Start([]string{filepath.Dir(path)}))
@@ -357,4 +361,35 @@ func startRegisteredLateStormFixtureWatcher(t *testing.T, s *Server, path, scena
 		require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine, "fixture startup must not publish the later external version")
 	}
 	return watcher, unblock, stop
+}
+
+// This same callback is installed by OnSourceEvent; repeated arm requests must
+// not reuse the one-shot entered/release handshake for a later native event.
+func (w *registeredLateStormWatcher) holdNextSourceEvent() { w.hold.Store(true) }
+
+func TestRegisteredLateStormSourceCallbackArmsOnlyOnce(t *testing.T) {
+	w := &registeredLateStormWatcher{eventPath: "victim.go", entered: make(chan struct{}), release: make(chan struct{})}
+	var forwarded atomic.Int32
+	callback := w.sourceEventCallback(func(string) { forwarded.Add(1) })
+	release := sync.OnceFunc(func() { close(w.release) })
+	t.Cleanup(release)
+	w.holdNextSourceEvent()
+	firstDone := make(chan struct{})
+	go func() { defer close(firstDone); callback("victim.go") }()
+	select {
+	case <-w.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first callback never entered")
+	}
+	require.Zero(t, forwarded.Load(), "actual callback remains held before forwarding")
+	w.holdNextSourceEvent() // common fixture setup after the early point arm
+	release()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("held callback did not join")
+	}
+	require.Equal(t, int32(1), forwarded.Load())
+	require.NotPanics(t, func() { callback("victim.go") }, "a second event must not close the consumed entered channel")
+	require.Equal(t, int32(2), forwarded.Load(), "both actual callbacks forward exactly once")
 }
