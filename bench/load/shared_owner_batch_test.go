@@ -1,0 +1,613 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// This opt-in fixture runs one real owned SQLite daemon over two fresh files.
+// It checks the actual transport/domain/membership boundary, not latency or a
+// corpus/campaign acceptance population. No retained wire can satisfy it.
+func TestSharedOwnerNativeBatchUsesActualJournalMembers(t *testing.T) {
+	runSharedOwnerNativeBatchFixture(t, false)
+}
+func TestSharedOwnerNativeOneFileBatchUsesActualWaitDisposition(t *testing.T) {
+	runSharedOwnerNativeBatchFixture(t, true)
+}
+
+func runSharedOwnerNativeBatchFixture(t *testing.T, oneOnly bool) {
+	t.Helper()
+	binary := os.Getenv("GORTEX_SHARED_OWNER_NATIVE_BINARY")
+	expectCountedNoWait := os.Getenv("GORTEX_SHARED_OWNER_EXPECT_LOCAL_WAIT_NA") == "1"
+	wantOutcome, wantAccounting := "diagnostic_failure", "terminal_unavailable_shared_owner"
+	if expectCountedNoWait {
+		wantOutcome, wantAccounting = "complete", "observed_shared_owner_windows_checks_pass"
+	}
+	if binary == "" {
+		t.Skip("requires an explicitly pinned native shared-owner producer")
+	}
+	if !filepath.IsAbs(binary) {
+		t.Fatal("native fixture requires an absolute pinned executable")
+	}
+	evidence := os.Getenv("GORTEX_SHARED_OWNER_BATCH_EVIDENCE")
+	if !filepath.IsAbs(evidence) {
+		t.Fatal("native fixture requires a fresh absolute evidence directory")
+	}
+	if err := os.Mkdir(evidence, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := func(name string, raw []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(evidence, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use the operator's external, short TMPDIR for the actual socket too.
+	socketDir, err := os.MkdirTemp(os.TempDir(), "shared-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &privateRun{Root: root, Binary: binary, SocketDir: socketDir, Socket: filepath.Join(socketDir, "d.sock"), Store: filepath.Join(root, "store.db"), Config: filepath.Join(root, "config.yaml"), editACKMode: "local"}
+	ownedPID := 0
+	t.Cleanup(func() {
+		stop, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		_, forced, stopErr := p.stop(stop)
+		if forced || stopErr != nil {
+			t.Errorf("native fixture normal stop: forced=%t error=%v", forced, stopErr)
+		}
+		closure, err := json.Marshal(map[string]any{"owned_daemon_pid": ownedPID, "forced_daemon_stop": forced, "normal_stop_error": stopErr != nil, "runtime_root": root, "socket": p.Socket})
+		if err != nil {
+			t.Error(err)
+		} else {
+			keep("owned-closure.json", closure)
+		}
+		for _, name := range []string{"daemon-1.stdout.log", "daemon-1.stderr.log"} {
+			if raw, readErr := os.ReadFile(filepath.Join(root, name)); readErr == nil {
+				keep(name, raw)
+			}
+		}
+		if _, err := os.Lstat(p.Socket); !os.IsNotExist(err) {
+			t.Errorf("owned socket remains after normal stop: %v", err)
+		}
+		if err := os.RemoveAll(socketDir); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, dir := range []string{"home", "cache", "config", "data", "runtime", "tmp", "repos", "hooks"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitConfig := filepath.Join(root, "gitconfig")
+	if err := os.WriteFile(p.Config, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gitConfig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.Env = privateEnv(root, p.Socket, gitConfig)
+	repo := filepath.Join(root, "repos", "fixture")
+	if err := os.Mkdir(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{
+		"go.mod": "module sharedfixture\n\ngo 1.27\n",
+		"a.go":   "package sharedfixture\n\nfunc Moved() int { return 1 }\n",
+		"b.go":   "package sharedfixture\n\nfunc Keeper() int { return 2 }\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := p.git(ctx, repo, "init", "--initial-branch=main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.git(ctx, repo, "add", "go.mod", "a.go", "b.go"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.git(ctx, repo, "-c", "user.name=SharedFixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial owned fixture"); err != nil {
+		t.Fatal(err)
+	}
+	p.Repos = []privateRepo{{Path: repo, File: filepath.Join(repo, "a.go"), Corpus: Corpus{Label: "fixture", File: "a.go"}}}
+	configured, err := p.writeBootRepos(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := p.start(); err != nil {
+		t.Fatal(err)
+	}
+	ownedPID = p.process.Process.Pid
+	gate, _, err := p.awaitReady(ctx, started, configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep("readiness.json", gate["readiness"])
+	var ready readiness
+	if err := json.Unmarshal(gate["readiness"], &ready); err != nil {
+		t.Fatal(err)
+	}
+	for _, tracked := range ready.TrackedRepos {
+		if filepath.Clean(tracked.Path) == repo {
+			p.Repos[0].Prefix = tracked.Prefix
+		}
+	}
+	if p.Repos[0].Prefix == "" {
+		t.Fatal("actual ready primary has no public prefix")
+	}
+	client, err := openMCP(ctx, p.Socket, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	prober, err := openMCP(ctx, p.Socket, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = prober.Close() })
+	if oneOnly {
+		// A separate fresh one-file transaction is not gated on whether a
+		// different multi-file invocation happened to remain fresh/coalesced.
+		oneBefore, err := os.ReadFile(filepath.Join(repo, "a.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Repos[0].Corpus.EditKind, p.Repos[0].Corpus.EditTool = "append_leaf", "edit.batch"
+		_, oneProbe, err := prober.callWithIdentity(ctx, "tools/call", map[string]any{"name": "read", "arguments": map[string]any{"operation": "file", "target": map[string]any{"file": "a.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		oneAfter := string(oneBefore) + "func SingleBatchAdded() int { return 5 }\n"
+		oneRequest := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"changes": []any{map[string]any{"op": "edit_file", "path": filepath.Join(repo, "a.go"), "old_string": string(oneBefore), "new_string": oneAfter}}, "options": map[string]any{"transaction_id": "actual-one-file-journal-batch"}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
+		oneRaw, oneIdentity, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "edit", "arguments": map[string]any{"operation": "batch", "changes": oneRequest.Arguments["changes"], "options": oneRequest.Arguments["options"], "output": oneRequest.Arguments["output"]}})
+		keep("one-file-ack.json", oneRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oneSink, err := os.Create(filepath.Join(evidence, "one-file-continuation-raw.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer oneSink.Close()
+		oneStep := editProbeStep{Request: oneRequest, Marker: "SingleBatchAdded"}
+		oneState := &editProbeState{step: oneStep, client: prober, sink: oneSink, record: editProbeRecord{FirstCorrect: map[string]Metric{}}, firstProbeWrite: oneProbe.WriteStarted, editWrite: oneIdentity.WriteStarted}
+		oneState.startRaw()
+		defer oneState.finishRaw()
+		runtime := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "edit.batch", Mode: "json", File: "a.go"}, origin: oneIdentity.Started, options: runOptions{Deadline: 5 * time.Second}, requireAccounting: true}
+		runtime.finishEditAfterACK(ctx, ctx, oneState, oneStep, oneIdentity.Started, oneRaw, oneIdentity, nil)
+		if expectCountedNoWait {
+			if oneState.record.Outcome != "complete" || oneState.record.Accounting.State != "observed_single_window_checks_pass" || oneState.record.Accounting.A == nil || oneState.record.Accounting.P == nil || oneState.record.Accounting.B == nil || oneState.record.Accounting.Shared != nil || oneState.record.Ack.Value == nil {
+				t.Fatalf("actual one-file counted-NA route did not preserve strict independent A/P/B: %+v", oneState.record)
+			}
+		} else if oneState.record.Accounting.State == "observed_single_window_checks_pass" {
+			t.Fatal("old missing wait applicability acquired complete one-file accounting")
+		}
+		oneEncoded, err := json.MarshalIndent(oneState.record, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		keep("normalized-one-file-record.json", oneEncoded)
+		actualOne, err := os.ReadFile(filepath.Join(repo, "a.go"))
+		if err != nil || string(actualOne) != oneAfter {
+			t.Fatalf("actual one-file source bytes: %v", err)
+		}
+		t.Log("actual one-file journal/NA accounting component only; no benchmark credit")
+		return
+	}
+	_, probeIdentity, err := prober.callWithIdentity(ctx, "tools/call", map[string]any{"name": "read", "arguments": map[string]any{"operation": "file", "target": map[string]any{"file": "a.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Repos[0].Corpus.EditKind, p.Repos[0].Corpus.EditTool = "append_leaf", "edit.batch"
+	prefix := p.Repos[0].Prefix
+	before := []string{"package sharedfixture\n\nfunc Moved() int { return 1 }\n", "package sharedfixture\n\nfunc Keeper() int { return 2 }\n"}
+	after := []string{before[0] + "func BatchAddedA() int { return 3 }\n", before[1] + "func BatchAddedB() int { return 4 }\n"}
+	changes := []any{}
+	for i, name := range []string{"a.go", "b.go"} {
+		changes = append(changes, map[string]any{"op": "edit_file", "path": filepath.Join(repo, name), "old_string": before[i], "new_string": after[i]})
+	}
+	transaction := "actual-two-file-journal-batch"
+	raw, identity, err := client.callWithIdentity(ctx, "tools/call", map[string]any{"name": "edit", "arguments": map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": transaction}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+	keep("batch-ack.json", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := decodeEditProbeResult(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offered := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"changes": changes, "options": map[string]any{"transaction_id": transaction}}}
+	intentID, intents, err := editProbeBatchSetIntent(offered, repo, prefix)
+	if err != nil || intentID != transaction {
+		t.Fatalf("actual offered frontier: %v", err)
+	}
+	refs, err := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
+	refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(offered)
+	if err != nil {
+		t.Fatalf("real complete two-file journal batch cannot enter report decoder: %v", err)
+	}
+	sink, err := os.Create(filepath.Join(evidence, "continuation-raw.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	step := editProbeStep{Request: offered, Marker: "BatchAddedA"}
+	state := &editProbeState{step: step, client: prober, sink: sink, record: editProbeRecord{FirstCorrect: map[string]Metric{}}, firstProbeWrite: probeIdentity.WriteStarted, editWrite: identity.WriteStarted}
+	state.startRaw()
+	defer state.finishRaw()
+	runtime := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "edit.batch", Mode: "json", File: "a.go"}, origin: identity.Started, options: runOptions{Deadline: 5 * time.Second}, requireAccounting: true}
+	runtime.finishEditAfterACK(ctx, ctx, state, step, identity.Started, raw, identity, nil)
+	if state.record.Outcome != wantOutcome || state.record.Ack.Value == nil || state.record.BatchSet == nil || state.record.BatchAccounting == nil || state.record.BatchAccounting.State != "observed_batch_shared_owner_windows_checks_pass" || !state.record.GraphTerminal {
+		t.Fatalf("actual post-ACK continuation did not dispatch batch set/report: %+v", state.record)
+	}
+	if state.record.Accounting.State != wantAccounting || !expectCountedNoWait && !strings.Contains(strings.Join(state.record.Accounting.Reasons, ";"), "reindex_wait is unobserved with counts 0/0/0") {
+		t.Fatalf("missing real A applicability was waived: %+v", state.record.Accounting)
+	}
+	if len(state.record.Readbacks) != 2 || !state.record.Readbacks[0].Correct || !state.record.Readbacks[1].Correct {
+		t.Fatal("actual editing session own-ACK immediate readbacks were not retained")
+	}
+	rows, ok := body["file_observations"].([]any)
+	if !ok || len(rows) != 2 {
+		t.Fatal("actual batch lacks two retained member references")
+	}
+	statuses := map[string]map[string]any{}
+	for i, value := range rows {
+		row, ok := value.(map[string]any)
+		if !ok {
+			t.Fatal("malformed actual file reference")
+		}
+		receipt, ok := row["receipt"].(string)
+		if !ok || receipt == "" {
+			t.Fatal("actual file reference has no receipt")
+		}
+		for {
+			raw, err := client.call(ctx, "tools/call", map[string]any{"name": "change", "arguments": map[string]any{"operation": "receipt", "options": map[string]any{"receipt": receipt}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+			keep([]string{"batch-member-a.json", "batch-member-b.json"}[i], raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, err := decodeEditProbeResult(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			availability, _ := status["shared_owner_accounting_v1_availability"].(map[string]any)
+			if availability["state"] == "frozen" {
+				if status["receipt_kind"] != "batch_file_observation" || status["transaction_id"] != transaction || status["acknowledgement_state"] != "not_applicable_shared_transaction_rpc" {
+					t.Fatal("actual batch member lost journal/ACK domain")
+				}
+				statuses[receipt] = status
+				break
+			}
+			if availability["state"] == "unavailable" || ctx.Err() != nil {
+				t.Fatalf("actual batch owner unavailable: %v / %v", availability, ctx.Err())
+			}
+			if err := waitContext(ctx, 25*time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ackRaw, err := client.call(ctx, "tools/call", map[string]any{"name": "change", "arguments": map[string]any{"operation": "receipt", "options": map[string]any{"receipt": refs.Acknowledgement}, "output": map[string]any{"format": "json", "max_bytes": 0}}})
+	keep("batch-shared-ack-status.json", ackRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, err := decodeEditProbeResult(ackRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounting, batch := runtime.accountingForBatchSetStatuses(ctx, statuses, ack, refs)
+	if accounting.State != wantAccounting || accounting.A == nil || accounting.P != nil || accounting.B != nil || accounting.Shared != nil || batch.State != "observed_batch_shared_owner_windows_checks_pass" || len(batch.Files) != 2 {
+		t.Fatalf("actual batch report unavailable or invented per-file windows: %+v %+v", accounting, batch)
+	}
+	for _, file := range batch.Files {
+		if file.Shared == nil || file.AcknowledgementState != "not_applicable_shared_transaction_rpc" {
+			t.Fatal("actual member lost exact owner or ACKNA")
+		}
+	}
+	encoded, err := json.MarshalIndent(editProbeRecord{Accounting: accounting, BatchSet: &refs, BatchAccounting: batch}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep("normalized-batch-accounting.json", encoded)
+	if expectCountedNoWait {
+		for _, fault := range []string{"unknown_wait_count0", "numeric_zero", "mismatched_counts", "full_policy", "ack_ms_zero", "ack_ms_seven", "ack_ms_missing", "original_requires_fresh"} {
+			t.Run(fault, func(t *testing.T) {
+				ackCopy := cloneSharedOwnerModel(t, ack)
+				shared := ackCopy["acknowledgement"].(map[string]any)
+				badRefs := refs
+				switch fault {
+				case "unknown_wait_count0":
+					shared["phase_states"].(map[string]any)["reindex_wait"] = "unobserved"
+					shared["counts"].(map[string]any)["reindex_wait"] = map[string]any{"started": json.Number("0"), "completed": json.Number("0"), "not_applicable": json.Number("0")}
+				case "numeric_zero":
+					shared["observed_execution_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+				case "mismatched_counts":
+					shared["counts"].(map[string]any)["reindex_wait"].(map[string]any)["completed"] = json.Number("0")
+				case "full_policy":
+					badRefs.AckMode = "full"
+				case "ack_ms_zero":
+					shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+				case "ack_ms_seven":
+					shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("7")
+				case "ack_ms_missing":
+					delete(shared["phases_ms"].(map[string]any), "reindex_wait")
+				case "original_requires_fresh":
+					badRefs.OriginalNoRequireFresh = false
+				}
+				fresh := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
+				got, batch := fresh.accountingForBatchSetStatuses(ctx, statuses, ackCopy, badRefs)
+				if got.State == "observed_shared_owner_windows_checks_pass" || len(got.Reasons) == 0 || batch.State != "observed_batch_shared_owner_windows_checks_pass" {
+					t.Fatalf("bad A applicability was waived or erased actual E/B: %+v %+v", got, batch)
+				}
+			})
+		}
+		shared := ack["acknowledgement"].(map[string]any)
+		strict := checkEditProbeAcknowledgement(statuses[refs.Files[0].Observation], refs.Files[0].Observation, "publication_generation", shared, true)
+		if !strings.Contains(strings.Join(strict.Reasons, ";"), "reindex_wait") {
+			t.Fatal("default strict A wrapper gained a batch exemption")
+		}
+	}
+	for _, fault := range []string{"missing_member", "foreign_path", "replaced_ticket", "missing_membership", "wrong_hash", "foreign_process", "unknown_version", "ordinary_domain", "wrong_rpc"} {
+		t.Run(fault, func(t *testing.T) {
+			rows := map[string]map[string]any{}
+			for key, row := range statuses {
+				rows[key] = cloneSharedOwnerModel(t, row)
+			}
+			ackCopy := cloneSharedOwnerModel(t, ack)
+			row := rows[refs.Files[1].Observation]
+			proof := row["shared_owner_accounting_v1"].(map[string]any)
+			switch fault {
+			case "missing_member":
+				delete(rows, refs.Files[1].Observation)
+			case "foreign_path":
+				row["path"] = "foreign/a.go"
+			case "replaced_ticket":
+				row["publication_generation"] = json.Number("99999")
+			case "missing_membership":
+				delete(proof, "membership")
+			case "wrong_hash":
+				row["after_sha256"] = "foreign"
+			case "foreign_process":
+				proof["definition"].(map[string]any)["owner"].(map[string]any)["process"].(map[string]any)["pid"] = json.Number("1")
+			case "unknown_version":
+				row["shared_owner_accounting_v2"] = map[string]any{}
+			case "ordinary_domain":
+				row["disk_status"] = "committed"
+			case "wrong_rpc":
+				ackCopy["acknowledgement"].(map[string]any)["rpc_id"] = "foreign"
+			}
+			fresh := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
+			got, batch := fresh.accountingForBatchSetStatuses(ctx, rows, ackCopy, refs)
+			if got.State == "observed_shared_owner_windows_checks_pass" || batch.State == "observed_batch_shared_owner_windows_checks_pass" || len(got.Reasons) == 0 || got.P != nil || got.B != nil {
+				t.Fatalf("%s acquired false batch evidence: %+v %+v", fault, got, batch)
+			}
+			if fault != "wrong_rpc" && got.A == nil {
+				t.Fatal("missing batch membership erased independently valid transaction A")
+			}
+		})
+	}
+	for _, fault := range []string{"missing_file", "duplicate_observation", "foreign_after", "foreign_result", "missing_fingerprint", "unsupported_operation"} {
+		t.Run(fault, func(t *testing.T) {
+			bad := cloneSharedOwnerModel(t, body)
+			switch fault {
+			case "missing_file":
+				bad["files"] = bad["files"].([]any)[:1]
+			case "duplicate_observation":
+				bad["file_observations"].([]any)[1].(map[string]any)["receipt"] = refs.Files[0].Observation
+			case "foreign_after":
+				bad["files"].([]any)[1].(map[string]any)["after_sha256"] = refs.Files[0].AfterSHA256
+			case "foreign_result":
+				bad["results"].([]any)[1].(map[string]any)["path"] = "foreign/b.go"
+			case "missing_fingerprint":
+				delete(bad, "fingerprint")
+			case "unsupported_operation":
+				bad["results"].([]any)[1].(map[string]any)["op"] = "delete_file"
+			}
+			decoded, err := decodeEditProbeBatchSetAcknowledgement(bad, transaction, intents, refs.WireID)
+			if fault == "duplicate_observation" {
+				if err != nil || decoded.validateReferences() == nil {
+					t.Fatal("missing timing must preserve committed source ACK but remain unavailable")
+				}
+			} else if err == nil {
+				t.Fatal("invalid complete journal frontier was accepted")
+			}
+		})
+	}
+	report := runtime.finishSharedOwners()
+	if report == nil || report.DistinctOwners != 1 || report.CompleteOwnerWindows != 1 || report.Execution.Count != 1 || report.Background.Count != 1 {
+		t.Fatal("real two-file batch did not retain exactly one complete report owner")
+	}
+	normalized, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep("normalized-batch-owner-report.json", normalized)
+	for i, name := range []string{"a.go", "b.go"} {
+		data, err := os.ReadFile(filepath.Join(repo, name))
+		if err != nil || string(data) != after[i] {
+			t.Fatalf("actual batch bytes %s: %v", name, err)
+		}
+	}
+	t.Log("actual two-file journal batch report component only; no benchmark/latency/coverage closure")
+}
+
+// The reporting slice retains all offered after-images, not all original
+// baselines. Until those are owned, refusal must precede EVERY restore write.
+func TestBatchSetRestoreRefusesBeforeAnyPartialWrite(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.go", "b.go"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("mutated-"+name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var writes atomic.Int64
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		if frame.Params["name"] == "edit" {
+			writes.Add(1)
+		}
+		return stubContent(map[string]any{"status": "committed"}), nil
+	})
+	client, err := openMCP(t.Context(), socket, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	run := &editProbeRuntime{p: &privateRun{Repos: []privateRepo{{Path: root, Prefix: "fixture"}}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "edit.batch", File: "a.go"}, original: []byte("before-a"), phase: &Phase{EditProbe: &editProbeReport{Records: []editProbeRecord{{BatchSet: &editProbeBatchSetReferences{Files: []editProbeBatchReferences{{Path: filepath.Join(root, "a.go")}, {Path: filepath.Join(root, "b.go")}}}, GraphTerminal: true}}}}}
+	if err := run.restore(t.Context()); err == nil || !strings.Contains(err.Error(), "complete original baselines") {
+		t.Fatalf("partial restore was not refused: %v", err)
+	}
+	if writes.Load() != 0 {
+		t.Fatal("unsupported multi-file restore issued a mutation")
+	}
+	for _, name := range []string{"a.go", "b.go"} {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil || string(data) != "mutated-"+name {
+			t.Fatalf("refusal changed %s: %v", name, err)
+		}
+	}
+}
+
+// Synthetic scalar guard controls only; actual branch and live-owner authority
+// come from the separate real-router/native fixture. No runtime timings here.
+func TestBatchACKWaitNAGuardRequiresBothNullWireMaps(t *testing.T) {
+	base := editProbeAccountingFixture()
+	ack := base["acknowledgement"].(map[string]any)
+	ack["caller_response_ready_ms"] = json.Number("7")
+	ack["observed_execution_ms"].(map[string]any)["reindex_wait"] = nil
+	ack["phase_states"].(map[string]any)["reindex_wait"] = "not_applicable"
+	ack["phases_ms"] = map[string]any{"reindex_wait": nil}
+	ack["counts"] = map[string]any{"reindex_wait": map[string]any{"started": json.Number("1"), "completed": json.Number("1"), "not_applicable": json.Number("1")}}
+	valid := checkEditProbeAcknowledgementWithWaitDisposition(base, "receipt-a", "reindex_generation", ack, false, true)
+	if valid.A == nil || len(valid.Reasons) != 0 {
+		t.Fatalf("counted/null guard rejected: %+v", valid)
+	}
+	for _, fault := range []string{"ack_zero", "ack_seven", "ack_missing", "observed_zero", "observed_missing", "count0", "count_mismatch", "default_strict"} {
+		t.Run(fault, func(t *testing.T) {
+			value := cloneSharedOwnerModel(t, base)
+			shared := value["acknowledgement"].(map[string]any)
+			enabled := true
+			switch fault {
+			case "ack_zero":
+				shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "ack_seven":
+				shared["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("7")
+			case "ack_missing":
+				delete(shared["phases_ms"].(map[string]any), "reindex_wait")
+			case "observed_zero":
+				shared["observed_execution_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "observed_missing":
+				delete(shared["observed_execution_ms"].(map[string]any), "reindex_wait")
+			case "count0":
+				shared["counts"].(map[string]any)["reindex_wait"] = map[string]any{"started": json.Number("0"), "completed": json.Number("0"), "not_applicable": json.Number("0")}
+			case "count_mismatch":
+				shared["counts"].(map[string]any)["reindex_wait"].(map[string]any)["completed"] = json.Number("0")
+			case "default_strict":
+				enabled = false
+			}
+			got := checkEditProbeAcknowledgementWithWaitDisposition(value, "receipt-a", "reindex_generation", shared, false, enabled)
+			if len(got.Reasons) == 0 {
+				t.Fatal("contradictory or unauthorized NA passed independent A coverage")
+			}
+		})
+	}
+}
+
+// Synthetic one-file compatibility control. The direct P/B fixtures stay
+// independent; only the original local typed ACK may supply counted wait NA.
+func TestBatchOneFileCountedNoWaitPreservesPhysicalAccounting(t *testing.T) {
+	body := editProbeBatchACKFixture()
+	body["ack_mode"] = "local"
+	refs, err := decodeEditProbeBatchAcknowledgement(body, "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"options": map[string]any{"transaction_id": "transaction-1"}}})
+	refs.GraphGeneration, refs.ResultGeneration = 1, 1
+	file := editProbeAccountingFixture()
+	ack := file["acknowledgement"].(map[string]any)
+	ack["rpc_id"], ack["clock"], ack["scope"] = "rpc-2", "monotonic", "shared_rpc_mcp_bound_call"
+	ack["caller_response_ready_ms"] = json.Number("7")
+	ack["observed_execution_ms"].(map[string]any)["reindex_wait"] = nil
+	ack["phase_states"].(map[string]any)["reindex_wait"] = "not_applicable"
+	ack["phases_ms"] = map[string]any{"reindex_wait": nil}
+	ack["counts"] = map[string]any{"reindex_wait": map[string]any{"started": json.Number("1"), "completed": json.Number("1"), "not_applicable": json.Number("1")}}
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": ack}
+	file["acknowledgement"] = nil
+	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
+	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	got := refs.accounting(file, shared)
+	if got.State != "observed_single_window_checks_pass" || got.A == nil || got.P == nil || got.B == nil || got.Shared != nil {
+		t.Fatalf("one-file original windows lost: %+v", got)
+	}
+	for _, fault := range []string{"full_mode", "missing_mode", "foreign_server_rpc", "missing_ack_ms", "numeric_ack_ms", "missing_original_blob", "original_requires_fresh"} {
+		t.Run(fault, func(t *testing.T) {
+			r := refs
+			row := cloneSharedOwnerModel(t, file)
+			owner := cloneSharedOwnerModel(t, shared)
+			switch fault {
+			case "full_mode":
+				r.AckMode = "full"
+			case "missing_mode":
+				r.AckMode = ""
+			case "foreign_server_rpc":
+				owner["acknowledgement"].(map[string]any)["rpc_id"] = "rpc-foreign"
+			case "missing_ack_ms":
+				delete(owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any), "reindex_wait")
+			case "numeric_ack_ms":
+				owner["acknowledgement"].(map[string]any)["phases_ms"].(map[string]any)["reindex_wait"] = json.Number("0")
+			case "missing_original_blob":
+				delete(row, "after_sha256")
+			case "original_requires_fresh":
+				r.OriginalNoRequireFresh = false
+			}
+			if got := r.accounting(row, owner); got.State == "observed_single_window_checks_pass" {
+				t.Fatal("unproved one-file applicability/source acquired full accounting")
+			}
+		})
+	}
+}
+
+func TestBatchOriginalNoFreshnessProofUsesAllActualRequestContainers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want bool
+	}{
+		{"absent_default_false", map[string]any{"options": map[string]any{"transaction_id": "owned"}}, true},
+		{"top_false", map[string]any{"require_fresh": false}, true},
+		{"top_true", map[string]any{"require_fresh": true}, false},
+		{"options_false", map[string]any{"options": map[string]any{"require_fresh": false}}, true},
+		{"options_true", map[string]any{"options": map[string]any{"require_fresh": true}}, false},
+		{"arguments_false", map[string]any{"arguments": map[string]any{"require_fresh": false}}, true},
+		{"arguments_true", map[string]any{"arguments": map[string]any{"require_fresh": true}}, false},
+		{"top_false_does_not_override_nested_true", map[string]any{"require_fresh": false, "options": map[string]any{"require_fresh": true}}, false},
+		{"malformed_top", map[string]any{"require_fresh": "false"}, false},
+		{"malformed_nested", map[string]any{"options": map[string]any{"require_fresh": "false"}}, false},
+		{"malformed_container", map[string]any{"options": "unknown"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := originalBatchNoRequireFresh(request{Tool: "edit", Operation: "batch", Arguments: tc.args}); got != tc.want {
+				t.Fatalf("original request no-freshness witness=%t want%t", got, tc.want)
+			}
+		})
+	}
+	if originalBatchNoRequireFresh(request{}) {
+		t.Fatal("unretained original request granted a no-wait exemption")
+	}
+}

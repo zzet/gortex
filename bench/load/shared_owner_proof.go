@@ -127,6 +127,10 @@ func validateEditProbeSharedOwner(owner map[string]any, binding *editProbeShared
 // same-status witness. A dictionary may deduplicate them only after this full
 // check against the actual live owned child; it cannot revive a later reply.
 func checkEditProbeSharedProof(status map[string]any, receipt string, binding *editProbeSharedBinding, p *privateRun, role string) (editProbeSharedProof, error) {
+	return checkEditProbeSharedProofForBatch(status, receipt, binding, p, role, nil)
+}
+
+func checkEditProbeSharedProofForBatch(status map[string]any, receipt string, binding *editProbeSharedBinding, p *privateRun, role string, batch *editProbeBatchSetReferences) (editProbeSharedProof, error) {
 	var out editProbeSharedProof
 	bad := func(reason string) (editProbeSharedProof, error) {
 		if out.ownerKey != "" {
@@ -202,23 +206,36 @@ func checkEditProbeSharedProof(status map[string]any, receipt string, binding *e
 	for _, member := range members {
 		found = found || member == m
 	}
-	if err != nil || witnessErr != nil || witness != m || !found || m.Receipt != receipt || status["receipt"] != receipt || status["found"] != true || status["disk_status"] != "committed" || status["graph_status"] != "fresh" || status["graph_status_terminal"] != true {
+	if err != nil || witnessErr != nil || witness != m || !found || m.Receipt != receipt || status["receipt"] != receipt || status["found"] != true {
 		return bad("shared current receipt does not identify its exact original member")
 	}
-	relative, relErr := filepath.Rel(binding.root, m.Path)
-	label, labelOK := status["path"].(string)
-	if relErr != nil || !labelOK || label != m.Path && label != filepath.ToSlash(relative) && label != filepath.ToSlash(filepath.Join(binding.prefix, relative)) ||
-		status["checkout_id"] != nil && status["checkout_id"] != "" || status["checkout_incarnation"] != nil && status["checkout_incarnation"] != "" || status["receipt_kind"] != nil {
-		return bad("shared status path/checkout/kind differs from the original physical member")
-	}
-	requested, reqErr := strconvEditProbeUint(status["reindex_generation"])
-	applied, appErr := strconvEditProbeUint(status["applied_generation"])
 	witnessApplied, waErr := strconvEditProbeUint(membership["applied_generation"])
-	sequence, seqErr := strconvEditProbeUint(status["commit_seq"])
-	publication, _ := status["publication_phases"].(map[string]any)
-	pubTicket, pubErr := strconvEditProbeUint(publication["ticket"])
-	if reqErr != nil || appErr != nil || waErr != nil || seqErr != nil || pubErr != nil || requested != m.Ticket || applied != m.Ticket || witnessApplied != m.Ticket || pubTicket != m.Ticket || sequence != m.PhysicalSequence || status["content_sha256"] != m.ContentSHA256 || publication["key"] != m.PublicationKey || publication["source"] != "mcp_edit" || publication["clock"] != "monotonic" || publication["terminal"] != true {
-		return bad("shared receipt/publication/physical attempt identities disagree")
+	if waErr != nil || witnessApplied != m.Ticket {
+		return bad("shared current witness ticket mismatch")
+	}
+	if batch != nil {
+		if err := batch.validateSharedMember(status, m, members); err != nil {
+			return bad(err.Error())
+		}
+	} else {
+		if err != nil || witnessErr != nil || witness != m || !found || m.Receipt != receipt || status["receipt"] != receipt || status["found"] != true || status["disk_status"] != "committed" || status["graph_status"] != "fresh" || status["graph_status_terminal"] != true {
+			return bad("shared current receipt does not identify its exact original member")
+		}
+		relative, relErr := filepath.Rel(binding.root, m.Path)
+		label, labelOK := status["path"].(string)
+		if relErr != nil || !labelOK || label != m.Path && label != filepath.ToSlash(relative) && label != filepath.ToSlash(filepath.Join(binding.prefix, relative)) ||
+			status["checkout_id"] != nil && status["checkout_id"] != "" || status["checkout_incarnation"] != nil && status["checkout_incarnation"] != "" || status["receipt_kind"] != nil {
+			return bad("shared status path/checkout/kind differs from the original physical member")
+		}
+		requested, reqErr := strconvEditProbeUint(status["reindex_generation"])
+		applied, appErr := strconvEditProbeUint(status["applied_generation"])
+		witnessApplied, waErr := strconvEditProbeUint(membership["applied_generation"])
+		sequence, seqErr := strconvEditProbeUint(status["commit_seq"])
+		publication, _ := status["publication_phases"].(map[string]any)
+		pubTicket, pubErr := strconvEditProbeUint(publication["ticket"])
+		if reqErr != nil || appErr != nil || waErr != nil || seqErr != nil || pubErr != nil || requested != m.Ticket || applied != m.Ticket || witnessApplied != m.Ticket || pubTicket != m.Ticket || sequence != m.PhysicalSequence || status["content_sha256"] != m.ContentSHA256 || publication["key"] != m.PublicationKey || publication["source"] != "mcp_edit" || publication["clock"] != "monotonic" || publication["terminal"] != true {
+			return bad("shared receipt/publication/physical attempt identities disagree")
+		}
 	}
 	physical, _ := status["phase_timing"].(map[string]any)
 	if physical["patch_wall_ms"] != nil || physical["patch_accounting"] != nil || status["requested_background"] != nil || status["coalesced_publication"] != nil {
