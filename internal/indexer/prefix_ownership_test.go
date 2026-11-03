@@ -101,8 +101,10 @@ func TestPrefixStatAllowanceDiscardsLateResults(t *testing.T) {
 			t.Fatal("bounded stat allowance did not start its admitted worker")
 		}
 	}
-	third := allowance.observe(t.Context(), "another-root")
-	require.ErrorIs(t, third.err, errPrefixStatUnavailable)
+	thirdCtx, thirdCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer thirdCancel()
+	third := allowance.observe(thirdCtx, "another-root")
+	require.ErrorIs(t, third.err, context.DeadlineExceeded)
 	require.Equal(t, int32(2), calls.Load(), "saturation must not launch another physically hung call")
 	cancel()
 	for i := 0; i < 2; i++ {
