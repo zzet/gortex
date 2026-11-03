@@ -384,7 +384,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	calleeCap := 20
 
 	bundle, bundleErr := fileEditingContextContext(ctx, s.readerFor(ctx), fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
-	storeBusy := errors.Is(bundleErr, context.DeadlineExceeded) && ctx.Err() == nil
+	storeBusy := (errors.Is(bundleErr, context.DeadlineExceeded) && ctx.Err() == nil) || s.checkedFileScopeFallback(ctx, fp, bundleErr)
 	if storeBusy {
 		ctx = markRequestStoreBusy(ctx, fp)
 		bundle = requestLocalEditingContext(ctx, fp)

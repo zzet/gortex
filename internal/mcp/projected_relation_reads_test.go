@@ -38,8 +38,10 @@ func TestPendingRelationBindingRejectsForeignPhysicalRoot(t *testing.T) {
 
 func TestPendingRelationBindingKeepsOriginalAllowanceAndCancellation(t *testing.T) {
 	s, ctx, _ := projectedCarryFixture(t, false)
-	_, err := s.ensureProjected(ctx, []string{"caller.go"})
+	path := filepath.Join(s.indexer.RootPath(), "caller.go")
+	entry, err := s.projectCurrentTrackedFile(t.Context(), ctx, path, "caller.go", "caller.go")
 	require.NoError(t, err)
+	require.NotNil(t, entry, "the expired-budget case starts with a real published pending entry")
 	originalDeadline := time.Now().Add(-time.Millisecond)
 	allowance := &projectedSourceAllowance{tool: "get_call_chain"}
 	allowance.attempts.Store(2)
