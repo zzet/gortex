@@ -40,7 +40,7 @@ func TestSearchAcceptancePreparationBoundsActualInitializedClients(t *testing.T)
 				name, _, found := strings.Cut(strings.TrimPrefix(line, "func "), "(")
 				if found {
 					id := "fixture/" + corpus.File + "::" + name
-					before[id] = map[string]any{"id": id, "file_path": "fixture/" + corpus.File, "source": line, "start_line": i + 1, "end_line": i + 1}
+					before[id] = map[string]any{"id": id, "name": name, "file_path": "fixture/" + corpus.File, "source": line, "start_line": i + 1, "end_line": i + 1}
 				}
 			}
 			socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
