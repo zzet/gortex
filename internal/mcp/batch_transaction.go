@@ -1045,14 +1045,16 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return state.snapshot(), nil
 	}
 	s.bindBatchAcknowledgement(ctx, state)
-	var fileObservation *mutationCommitRecord
+	var fileObservations map[string]*mutationCommitRecord
 
 	// Only the original new transaction owns source effects. Duplicate/status
 	// and recovery replies above must not count another logical edit. This
 	// defer stays on the actual handler, including non-cancellable commits
 	// that finish after its caller has received a deadline response.
 	defer func() {
-		s.finishBatchFileObservation(fileObservation, result)
+		for _, observation := range fileObservations {
+			s.finishBatchFileObservation(observation, result)
+		}
 		committed := result.Status == "committed" && result.DiskStatus == "committed"
 		observeEditSourceTerminal(ctx, committed, committed && (result.Error != "" || retErr != nil), result.DiskStatus == "rolled_back")
 	}()
@@ -1125,7 +1127,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 
 	// Commit is deliberately non-cancellable. Once the first rename succeeds,
 	// every remaining write or rollback must run to a terminal disk state.
-	fileObservation = s.beginBatchFileObservation(ctx, receipt, buffers, orderedPaths)
+	fileObservations = s.beginBatchFileObservations(ctx, receipt, buffers, orderedPaths)
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
 		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		if rollbackErr != nil {
@@ -1155,10 +1157,10 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
 			} else {
-				_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservation})
+				_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservations[path]})
 			}
 		} else {
-			_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservation})
+			_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservations[path]})
 		}
 		if commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
@@ -1198,7 +1200,9 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	}
 	s.publishBatchProjections(context.WithoutCancel(ctx), state, receipt, preparedProjections)
 	state.publish(receipt, false)
-	s.finishBatchFileObservation(fileObservation, receipt)
+	for _, observation := range fileObservations {
+		s.finishBatchFileObservation(observation, receipt)
+	}
 
 	for _, plan := range plans {
 		session := s.sessionFor(ctx)
@@ -1451,8 +1455,20 @@ func (s *Server) refreshBatchGraphReleasing(ctx context.Context, state *batchTra
 			for _, file := range receipt.Files {
 				paths = append(paths, file.Path)
 			}
+			// Only original retained forward writes can enter the set carrier.
+			// Recovery/status has no original acknowledgement and cannot mint clocks.
+			records := make(map[string]*indexer.PublicationPhaseRecord, len(paths))
+			observations := make(map[string]*mutationCommitRecord, len(paths))
+			if editAcknowledgementFrom(ctx, s) != nil {
+				for _, path := range paths {
+					if record := s.batchPublicationObservation(receipt, path); record != nil {
+						observations[path] = record
+						records[path] = s.openOwnedPublicationRecord(ctx, record)
+					}
+				}
+			}
 			lap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
-			tickets, err := scheduler.EnqueueFileMutations(context.Background(), paths)
+			tickets, err := scheduler.EnqueueFileMutations(indexer.WithFilePublicationRecords(context.Background(), records), paths)
 			lap.finish()
 			if err != nil {
 				for _, path := range paths {
@@ -1473,6 +1489,7 @@ func (s *Server) refreshBatchGraphReleasing(ctx context.Context, state *batchTra
 					}
 					tracked := s.trackMutationTicket(tickets[filepath.Clean(path)])
 					outcomes[path] = tracked.outcome(true)
+					s.bindBatchFilePublication(observations[path], outcomes[path])
 				}
 			}
 		}
