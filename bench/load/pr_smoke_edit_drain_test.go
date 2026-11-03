@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -61,6 +62,13 @@ func TestPREditWindowDrainsEditAndVisibilityWithoutOfferingReads(t *testing.T) {
 				t.Fatalf("lost edit/probe census or offered new reads after window: %+v %+v", phase, observed)
 			}
 			if err := validatePREditDrainObservation(phase, observed, o.Deadline.Seconds()); err != nil {
+				for i, attempt := range phase.Attempts {
+					end := attempt.Started.Add(time.Duration(attempt.DurationMS * float64(time.Millisecond)))
+					invalidDuration := attempt.DurationMS < 0 || math.IsNaN(attempt.DurationMS) || math.IsInf(attempt.DurationMS, 0)
+					exceedsWallSpan := attempt.DurationMS > observed.Finished.Sub(observed.Started).Seconds()*1000+1e-3
+					endsAfterFinished := end.After(observed.Finished.Add(time.Microsecond))
+					t.Logf("attempt[%d] role=%s tool=%s started=%v duration_ms=%.9f reconstructed_end=%v observed_started=%v observed_finished=%v observed_elapsed_seconds=%.9f wall_span_seconds=%.9f end_minus_finished=%s invalid_duration=%t exceeds_wall_span=%t ends_after_finished=%t", i, attempt.Role, attempt.Tool, attempt.Started, attempt.DurationMS, end, observed.Started, observed.Finished, observed.ElapsedSeconds, observed.Finished.Sub(observed.Started).Seconds(), end.Sub(observed.Finished), invalidDuration, exceedsWallSpan, endsAfterFinished)
+				}
 				t.Fatal(err)
 			}
 		})
