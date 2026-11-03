@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,9 +13,7 @@ import (
 )
 
 func TestReadbackCompatibilityNegotiatesAllDeferBeforeAnyCellCall(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "rbc-")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := shortPrivateSocketBase(t)
 	socket := filepath.Join(dir, "s")
 	listener, err := net.Listen("unix", socket)
 	require.NoError(t, err)
@@ -243,7 +240,8 @@ func TestReadbackCompatibilityBaselineCannotBorrowFacadeTiming(t *testing.T) {
 }
 
 func TestReadbackCompatibilityPlanPinsOneSurfaceWithoutAddingOffers(t *testing.T) {
-	p := readbackReferencePlan{Version: 1, Binary: "/owned/candidate", BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: "/owned/manifest.json", Scratch: "/owned/scratch", Output: "/owned/result", Seed: 1, EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30, ToolSurface: readbackReferenceCompatibilitySurface}
+	root := shortPrivateSocketBase(t)
+	p := readbackReferencePlan{Version: 1, Binary: filepath.Join(root, "candidate"), BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: filepath.Join(root, "manifest.json"), Scratch: filepath.Join(root, "scratch"), Output: filepath.Join(root, "result"), Seed: 1, EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30, ToolSurface: readbackReferenceCompatibilitySurface}
 	raw, err := json.Marshal(p)
 	require.NoError(t, err)
 	parsed, err := decodeReadbackReferencePlan(raw)

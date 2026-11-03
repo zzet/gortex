@@ -28,11 +28,20 @@ func TestReadbackReferenceScheduleKeepsAcceptedPacingAndExactCells(t *testing.T)
 	}
 }
 func TestReadbackReferencePlanRejectsUnknownFieldsAndChangedPacing(t *testing.T) {
-	p := readbackReferencePlan{Version: 1, Binary: "/tmp/bin", BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: "/tmp/manifest.json", Scratch: "/tmp/scratch", Output: "/tmp/out.json", EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30}
+	root := shortPrivateSocketBase(t)
+	p := readbackReferencePlan{Version: 1, Binary: filepath.Join(root, "bin"), BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: filepath.Join(root, "manifest.json"), Scratch: filepath.Join(root, "scratch"), Output: filepath.Join(root, "out.json"), EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30}
 	raw, err := json.Marshal(p)
 	require.NoError(t, err)
 	_, err = decodeReadbackReferencePlan(raw)
 	require.NoError(t, err)
+	for _, path := range []string{"relative-bin", root + string(filepath.Separator) + "sub" + string(filepath.Separator) + ".." + string(filepath.Separator) + "bin"} {
+		invalid := p
+		invalid.Binary = path
+		raw, err := json.Marshal(invalid)
+		require.NoError(t, err)
+		_, err = decodeReadbackReferencePlan(raw)
+		require.ErrorContains(t, err, "absolute and canonical")
+	}
 	p.EditMeanNS = int64(time.Second)
 	raw, _ = json.Marshal(p)
 	_, err = decodeReadbackReferencePlan(raw)

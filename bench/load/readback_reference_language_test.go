@@ -11,7 +11,8 @@ import (
 )
 
 func TestReadbackReferenceSupportedLanguageSelectionKeepsGoDefaults(t *testing.T) {
-	base := readbackReferencePlan{Version: 1, Binary: "/owned/bin", BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: "/owned/manifest.json", Scratch: "/owned/scratch", Output: "/owned/out", Seed: 1, EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30, ToolSurface: readbackReferenceCompatibilitySurface}
+	root := shortPrivateSocketBase(t)
+	base := readbackReferencePlan{Version: 1, Binary: filepath.Join(root, "bin"), BinarySHA256: "0123456789012345678901234567890123456789012345678901234567890123", BinaryRevision: "0123456789012345678901234567890123456789", Manifest: filepath.Join(root, "manifest.json"), Scratch: filepath.Join(root, "scratch"), Output: filepath.Join(root, "out"), Seed: 1, EditMeanNS: int64(15 * time.Second), ProductDeadlineSeconds: 120, WarmSeconds: 1800, StopSeconds: 30, ToolSurface: readbackReferenceCompatibilitySurface}
 	defaultCells, err := readbackReferenceSchedules(base)
 	require.NoError(t, err)
 	require.Len(t, defaultCells, 90)
