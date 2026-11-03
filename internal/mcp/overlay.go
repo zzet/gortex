@@ -97,6 +97,22 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// capture below all touch the graph and can block on the same locks.
 	return s.boundToolHandler(s.retryFreshSymbolSearch(s.retryProjectedSymbolSource(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
 		s.noteAcknowledgementMiddleware(ctx)
+		callerOwnsProjectionFacts := ctx.Value(requestProjectionFactsKey{}) != nil
+		acceptedBefore := 0
+		attemptState, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt)
+		if attemptState != nil {
+			acceptedBefore = len(attemptState.accepted)
+		}
+		terminalPending := func(selected context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if callerOwnsProjectionFacts {
+				return nil, nil
+			}
+			pending, err := s.checkedReadTransitionPending(selected, request)
+			if pending != nil && err == nil && attemptState != nil {
+				attemptState.accepted = attemptState.accepted[:acceptedBefore]
+			}
+			return pending, err
+		}
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
@@ -428,7 +444,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// invokeFacadeSpec — and facade names are not in the allow-list, so
 		// the two paths cannot double-count.
 		if hErr == nil {
-			s.recordRetrievalSavings(ctx, req.Params.Name, res)
+			if auditedProjectionRead {
+				retrieved := res
+				afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, req.Params.Name, retrieved) })
+			} else {
+				s.recordRetrievalSavings(ctx, req.Params.Name, res)
+			}
 		}
 		// Opt-in usage telemetry: count this tool invocation by name only —
 		// never arguments or results. nil-safe, consent-gated, and fail-silent,
@@ -445,10 +466,27 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
+			if auditedProjectionRead && res != nil && !res.IsError && !requireExactView {
+				if pending, err := terminalPending(ctx, req); pending != nil || err != nil {
+					return pending, err
+				}
+			}
 			if auditedProjectionRead && res != nil && !res.IsError && retryAfterCheckedProjectionChange(ctx) {
 				return nil, errProjectedSourceMoved
 			}
-			res = s.decorateToolFreshness(ctx, req.Params.Name, req, res)
+			var freshnessErr error
+			res, freshnessErr = s.decorateToolFreshnessChecked(ctx, req.Params.Name, req, res)
+			if freshnessErr != nil {
+				if auditedProjectionRead && !requireExactView {
+					if pending, err := terminalPending(ctx, req); pending != nil || err != nil {
+						return pending, err
+					}
+				}
+				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
+					return nil, errProjectedSourceMoved
+				}
+				res = mcp.NewToolResultError(freshnessErr.Error())
+			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
 			// must say so where the caller already looks for provenance.
@@ -460,6 +498,11 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// only after the last ownership check, including decorator-time I/O.
 		if auditedProjectionRead && hErr == nil && res != nil && !res.IsError {
 			if err := validateRequestProjections(ctx); err != nil {
+				if !requireExactView {
+					if pending, pendingErr := terminalPending(ctx, req); pending != nil || pendingErr != nil {
+						return pending, pendingErr
+					}
+				}
 				if retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
