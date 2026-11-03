@@ -708,7 +708,7 @@ func e2eAdversarialReadFile(t *testing.T, e *e2eLifecycleEnv, root, file string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := e.f.tryCommand(60*time.Second, root, "call", "read", "--index", root, "--json", string(payload), "--format", "json")
+	output, err := e.f.tryJSONCommand(60*time.Second, root, "call", "read", "--index", root, "--json", string(payload), "--format", "json")
 	if err != nil {
 		t.Fatalf("read %s: %v\n%s", file, err, sustainedIOTail(output))
 	}
@@ -723,7 +723,7 @@ func e2eAdversarialTextSearchFinds(t *testing.T, e *e2eLifecycleEnv, root, needl
 	}
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		output, err := e.f.tryCommand(60*time.Second, root, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
+		output, err := e.f.tryJSONCommand(60*time.Second, root, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
 		if err == nil && strings.Contains(string(output), needle) {
 			return true
 		}
