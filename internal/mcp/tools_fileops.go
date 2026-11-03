@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/zeebo/blake3"
@@ -1567,7 +1568,7 @@ func readPhysicalEvidenceDescriptor(f *os.File, afterRead func(), maxBytes int64
 		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
 	return content, physicalReadEvidence{
-		contentSHA256: fmt.Sprintf("%x", sum),
+		contentSHA256: hex.EncodeToString(sum[:]),
 		byteCount:     len(content),
 		readAt:        time.Now().UTC(),
 	}, after, nil
