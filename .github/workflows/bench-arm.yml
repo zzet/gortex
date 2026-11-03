@@ -269,6 +269,8 @@ jobs:
           git ls-tree HEAD internal/mcp/registered_cow_barrier_test.go internal/mcp/registered_same_owner_cow_test.go >> "$DIAG_DIR/source.txt"
           cp internal/mcp/registered_cow_barrier_test.go internal/mcp/registered_same_owner_cow_test.go go.mod go.sum "$DIAG_DIR/"
           go version > "$DIAG_DIR/tools.txt"
+          python --version >> "$DIAG_DIR/tools.txt" 2>&1
+          bash --version >> "$DIAG_DIR/tools.txt"
           go version | grep -F 'go1.27.3 windows/'
           test "$(go env GOOS)" = windows
           test "$(go env CGO_ENABLED)" = 1
