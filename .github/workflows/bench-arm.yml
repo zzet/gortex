@@ -318,8 +318,15 @@ jobs:
           code = int((root/'test.original.exit').read_text())
           value = dict(scope='DIAGNOSTIC_ONLY_NO_ACCEPTANCE_OR_FINAL_CI_WAIVER', source='beb01dd9a5ce49ac0e50df448103debfd4bb69f7', original_exit=code, observed_tests=observed, terminal=terminal, execution_count=1, timestamp_scope='start/finish wall only; JSON converted after run', raw_preserved=True)
           (root/'TEST-CENSUS.json').write_text(json.dumps(value, indent=2)+'\n')
-          if observed != [name] or len(terminal) != 1 or terminal[0]['Action'] == 'skip':
-              raise SystemExit('Unavailable: fixed single-test census missing/foreign/skipped; preserve raw diagnostic')
+          allowed = {name, name+'/get_file_summary', name+'/get_editing_context'}
+          by_test = {test: [row for row in rows if row.get('Test') == test and row.get('Action') in ['pass', 'fail', 'skip']] for test in observed}
+          valid = name in observed and set(observed) <= allowed
+          valid = valid and all(sum(row.get('Test') == test and row.get('Action') == 'run' for row in rows) == 1 and len(by_test[test]) == 1 and by_test[test][0]['Action'] != 'skip' for test in observed)
+          passed = valid and code == 0 and set(observed) == allowed and all(by_test[test][0]['Action'] == 'pass' for test in observed)
+          value.update(census_valid=valid, diagnostic_test_pass=passed, allowed_tests=sorted(allowed))
+          (root/'TEST-CENSUS.json').write_text(json.dumps(value, indent=2)+'\n')
+          if not valid or (code == 0 and not passed):
+              raise SystemExit('Unavailable: fixed test and declared subtest census missing/foreign/skipped/contradictory; preserve raw diagnostic')
           PYCODE
           if [ "$original_code" -ne 0 ]; then exit "$original_code"; fi
           if [ "$converter_code" -ne 0 ]; then exit "$converter_code"; fi
