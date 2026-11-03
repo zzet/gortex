@@ -154,6 +154,9 @@ func (s *Server) handlePreviewEdit(ctx context.Context, req mcp.CallToolRequest)
 			touched = append(touched, s.repoRelative(abs))
 		}
 	}
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", seeds, touched, time.Time{}); err != nil {
+		return nil, err
+	}
 	s.labelRelations(ctx, gaps, seeds, touched).apply(result)
 	return mcp.NewToolResultText(jsonOK(result)), nil
 }

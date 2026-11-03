@@ -58,6 +58,23 @@ func TestPendingTextVerificationBufferPreservesPhysicalEvidence(t *testing.T) {
 				}
 				return readPhysicalFileEvidenceObservedBounded(path, after, limit)
 			}
+			t.Run("receipt_keeps_lowercase_sha256", func(t *testing.T) {
+				for _, fixture := range []struct {
+					content string
+					digest  string
+				}{
+					{"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+					{"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+				} {
+					path := filepath.Join(t.TempDir(), "source.txt")
+					require.NoError(t, os.WriteFile(path, []byte(fixture.content), 0o600))
+					raw, evidence, err := read(path, nil, 1<<20)
+					require.NoError(t, err)
+					require.Equal(t, fixture.content, string(raw))
+					require.Equal(t, fixture.digest, evidence.contentSHA256)
+					require.Equal(t, len(fixture.content), evidence.byteCount)
+				}
+			})
 			t.Run("content_does_not_alias_verification_workspace", func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "source.go")
 				first := bytes.Repeat([]byte("first source\n"), 4096)

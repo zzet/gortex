@@ -32,7 +32,7 @@ func (w *checkedPendingTierWatcher) TierPaths() map[string]indexer.MutationTierS
 
 func TestRegisteredCheckedReadRetirementDuringDecorationReturnsNoDataPending(t *testing.T) {
 	for _, tool := range []string{"get_file_summary", "get_editing_context"} {
-		for _, transition := range []string{"checked_retirement", "read_cow_then_retirement", "same_bytes_event", "unchecked_eviction", "new_physical_owner", "caller_owned", "cancelled"} {
+		for _, transition := range []string{"checked_retirement", "checked_retirement_last_attempt", "read_cow_then_retirement", "same_bytes_event", "unchecked_eviction", "new_physical_owner", "caller_owned", "cancelled"} {
 			t.Run(tool+"/"+transition, func(t *testing.T) {
 				selectedProjectionRegistry(t)
 				s, path, _, raw := acknowledgedCanonicalFile(t)
@@ -113,7 +113,7 @@ func TestRegisteredCheckedReadRetirementDuringDecorationReturnsNoDataPending(t *
 							return
 						}
 						fallthrough
-					case "checked_retirement", "caller_owned":
+					case "checked_retirement", "checked_retirement_last_attempt", "caller_owned":
 						if err := s.indexer.IndexFile(path); err != nil {
 							observationErr = err
 							return
@@ -150,6 +150,12 @@ func TestRegisteredCheckedReadRetirementDuringDecorationReturnsNoDataPending(t *
 					require.NoError(t, err)
 				}
 				allowance := &projectedSourceAllowance{tool: tool}
+				if transition == "checked_retirement_last_attempt" {
+					// Enter the real registered call with just its final allowed attempt.
+					// Checked retirement must produce strict no-data pending, even
+					// though no third attempt may be claimed and time may remain.
+					require.True(t, allowance.claim())
+				}
 				deadline := time.Now().Add(projectedReadBudget)
 				ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 				ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
@@ -179,32 +185,48 @@ func TestRegisteredCheckedReadRetirementDuringDecorationReturnsNoDataPending(t *
 				require.NoError(t, err)
 				require.NotNil(t, result)
 				t.Logf("tool=%s transition=%s attempts=%d remaining=%s result=%s", tool, transition, allowance.attempts.Load(), time.Until(deadline), resultText(result))
-				if transition != "checked_retirement" && transition != "read_cow_then_retirement" {
+				if transition != "checked_retirement" && transition != "checked_retirement_last_attempt" && transition != "read_cow_then_retirement" {
 					require.True(t, result.IsError, "unverified transition cannot gain a pending response")
 					require.Zero(t, acceptedLeaf.Load())
 					return
 				}
 				require.True(t, selectedEntry.checkedRetired.Load())
-				if transition == "checked_retirement" && !result.IsError {
+				require.False(t, result.IsError, resultText(result))
+				body := extractTextResult(t, result)
+				definitionField := "nodes"
+				if tool == "get_editing_context" {
+					definitionField = "defines"
+				}
+				_, hasCurrentData := body[definitionField]
+				// Both current data and data-free pending are non-error results.
+				// Only the actual definition payload can enter the exact-row oracle.
+				if transition == "checked_retirement" && hasCurrentData {
 					requireCanonicalDefinitionRows(t, tool, result, external)
 					require.Equal(t, 2, calls)
 					require.Equal(t, int32(1), acceptedLeaf.Load(), "only the accepted current attempt gets credit")
 					return
 				}
-				require.False(t, result.IsError, resultText(result))
-				body := extractTextResult(t, result)
+				require.Equal(t, false, body["complete"])
+				require.Equal(t, "main.go", body["path"])
 				require.NotContains(t, body, "nodes")
 				require.NotContains(t, body, "defines")
 				require.NotContains(t, body, "source")
 				require.NotContains(t, body, "content")
 				freshness, ok := body["freshness"].(map[string]any)
 				require.True(t, ok)
+				require.Equal(t, false, freshness["complete"])
+				require.Equal(t, "file", freshness["freshness_scope"])
+				require.EqualValues(t, 1, freshness["pending_file_count"])
 				require.Equal(t, "pending", freshness["graph_freshness"])
 				require.Equal(t, "external_write", freshness["file_reason"])
 				require.NotEqual(t, true, freshness["readback_exact"])
 				require.Equal(t, []any{"main.go"}, freshness["pending_files"])
 				require.LessOrEqual(t, calls, 2, "pending must not create a third attempt")
 				require.Zero(t, acceptedLeaf.Load(), "neither discarded data-bearing leaf can receive acceptance credit")
+				if transition == "checked_retirement_last_attempt" {
+					require.Equal(t, 1, calls)
+					require.Equal(t, int32(2), allowance.attempts.Load(), "pending must not claim a third attempt")
+				}
 				// Formatting is independent of permission to execute another attempt.
 				proof := context.WithoutCancel(selected)
 				expiredAllowance := &projectedSourceAllowance{tool: tool}
