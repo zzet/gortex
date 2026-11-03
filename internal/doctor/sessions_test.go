@@ -275,3 +275,88 @@ func TestScanClaudeSessionsMissingHome(t *testing.T) {
 		t.Errorf("missing projects dir should yield nothing, got %+v", got)
 	}
 }
+
+func TestScanAntigravitySessionsClassifiesToolCalls(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	dir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", "conv-1", ".system_generated", "logs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "transcript.jsonl")
+	rec := map[string]any{
+		"type":       "PLANNER_RESPONSE",
+		"created_at": "2026-10-21T08:00:00Z",
+		"tool_calls": []map[string]any{
+			{
+				"name": "call_mcp_tool",
+				"args": map[string]any{
+					"ServerName": `"gortex"`,
+					"ToolName":   `"explore"`,
+				},
+			},
+			{
+				"name": "mcp_gortex_search",
+				"args": map[string]any{},
+			},
+			{
+				"name": "call_mcp_tool",
+				"args": map[string]any{
+					"ServerName": `"other"`,
+					"ToolName":   `"lookup"`,
+				},
+			},
+			{
+				"name": "read_file",
+				"args": map[string]any{"Path": `"/repo/main.go"`},
+			},
+			{
+				"name": "run_command",
+				"args": map[string]any{
+					"CommandLine": `"rg TODO ."`,
+					"Cwd":         `"/repo"`,
+				},
+			},
+			{
+				"name": "run_command",
+				"args": map[string]any{
+					"CommandLine": `"go test ./..."`,
+					"Cwd":         `"/repo"`,
+				},
+			},
+		},
+	}
+	blob, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(blob, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	got := ScanAntigravitySessions(home, now.Add(-24*time.Hour), 10)
+	if got.FilesFound != 1 || got.InWindow != 1 {
+		t.Fatalf("files=%d inWindow=%d want 1/1", got.FilesFound, got.InWindow)
+	}
+	if got.GortexCalls != 2 {
+		t.Errorf("gortex=%d want 2", got.GortexCalls)
+	}
+	if got.OtherMCP != 1 {
+		t.Errorf("otherMCP=%d want 1", got.OtherMCP)
+	}
+	if got.ShellCalls != 3 {
+		t.Errorf("shell=%d want 3 (read_file + 2 run_command)", got.ShellCalls)
+	}
+	if got.ShellReads != 2 {
+		t.Errorf("shellReads=%d want 2 (read_file + rg run_command)", got.ShellReads)
+	}
+	if got.Tools["explore"] != 1 || got.Tools["search"] != 1 {
+		t.Errorf("tools=%v", got.Tools)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].CWD != "/repo" {
+		t.Errorf("session row=%+v", got.Sessions)
+	}
+}
