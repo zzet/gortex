@@ -2951,6 +2951,11 @@ func (s *Server) handleGetDependents(ctx context.Context, req mcp.CallToolReques
 }
 
 func (s *Server) handleGetCallChain(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var bindErr error
+	ctx, bindErr = s.bindPendingRelationReads(ctx)
+	if bindErr != nil {
+		return mcp.NewToolResultError(bindErr.Error()), nil
+	}
 	id, err := s.symbolIDArg(ctx, req)
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
@@ -2985,6 +2990,11 @@ func (s *Server) handleGetCallChain(ctx context.Context, req mcp.CallToolRequest
 }
 
 func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var bindErr error
+	ctx, bindErr = s.bindPendingRelationReads(ctx)
+	if bindErr != nil {
+		return mcp.NewToolResultError(bindErr.Error()), nil
+	}
 	target, err := req.RequireString("id")
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil

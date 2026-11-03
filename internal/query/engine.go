@@ -1888,9 +1888,21 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 }
 
 func stripMeta(sg *SubGraph) {
-	for _, n := range sg.Nodes {
-		n.Meta = nil
+	if sg.Nodes == nil {
+		return
 	}
+	// Readers may lend immutable nodes and their slice to multiple requests.
+	// Brief rendering owns only these response copies, never the reader's full
+	// metadata or another concurrent response's selection.
+	nodes := make([]*graph.Node, len(sg.Nodes))
+	for i, n := range sg.Nodes {
+		if n != nil {
+			cp := *n
+			cp.Meta = nil
+			nodes[i] = &cp
+		}
+	}
+	sg.Nodes = nodes
 }
 
 // bfsViaCapability builds the same SubGraph the layer walk would, but
