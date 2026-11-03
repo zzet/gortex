@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -99,6 +101,67 @@ func (s *projectionNameSearch) SearchContext(ctx context.Context, q string, limi
 type pendingSearchKey struct{}
 
 type pendingSearchSnapshot struct{ candidates []query.ViewLayerSource }
+
+type pendingSymbolCaptureKey struct{}
+
+// A capture belongs to one registered tools/call, never to a reusable caller
+// context. It certifies only the immutable pending layers selected by that
+// call; canonical, route, cursor and cancellation gates remain independent.
+type pendingSymbolCapture struct {
+	mu      sync.RWMutex
+	facts   *requestProjectionFacts
+	entries map[string]*projectionEntry
+}
+
+func withPendingSymbolCapture(ctx context.Context, tool string) context.Context {
+	if tool != "search_symbols" {
+		return ctx
+	}
+	return context.WithValue(ctx, pendingSymbolCaptureKey{}, &pendingSymbolCapture{})
+}
+
+func sealPendingSymbolCapture(ctx context.Context) {
+	capture, _ := ctx.Value(pendingSymbolCaptureKey{}).(*pendingSymbolCapture)
+	facts, _ := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if capture == nil || facts == nil {
+		return
+	}
+	facts.mu.RLock()
+	entries := maps.Clone(facts.entries)
+	facts.mu.RUnlock()
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.entries == nil && len(entries) > 0 {
+		capture.facts, capture.entries = facts, entries
+	}
+}
+
+func validateSymbolResponseProjections(ctx context.Context, tool string) error {
+	if tool != "search_symbols" {
+		return validateRequestProjections(ctx)
+	}
+	capture, _ := ctx.Value(pendingSymbolCaptureKey{}).(*pendingSymbolCapture)
+	facts, _ := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if capture == nil || facts == nil {
+		return validateRequestProjections(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	capture.mu.RLock()
+	defer capture.mu.RUnlock()
+	if capture.facts != facts || len(capture.entries) == 0 {
+		return validateRequestProjections(ctx)
+	}
+	facts.mu.RLock()
+	defer facts.mu.RUnlock()
+	if !maps.Equal(capture.entries, facts.entries) {
+		return projectionSuperseded
+	}
+	// Later publications may invalidate shared old facts without changing
+	// this answer's already selected immutable nodes and canonical mask.
+	return ctx.Err()
+}
 
 func requestSearchCandidates(ctx context.Context) []query.ViewLayerSource {
 	if snapshot, _ := ctx.Value(pendingSearchKey{}).(*pendingSearchSnapshot); snapshot != nil {
@@ -201,5 +264,6 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 	if editor := OverlayViewFromContext(ctx); editor != nil {
 		ctx = WithOverlayView(ctx, graph.NewOverlaidViewWithLayer(s.requestBaseReader(ctx), editor.LayerReader()))
 	}
+	sealPendingSymbolCapture(ctx)
 	return ctx, nil
 }
