@@ -819,12 +819,22 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 }
 
 func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
+	checked, err := s.decorateToolFreshnessChecked(ctx, name, req, res)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error())
+	}
+	return checked
+}
+
+// Keep ownership failure typed until the audited wrapper chooses refusal or a
+// no-data pending reply. Other callers preserve the existing wire behavior.
+func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) (*mcp.CallToolResult, error) {
 	// The leaf may have read before a newer physical execution replaced its
 	// borrowed source view. Refuse the entire read before labelling/rendering;
 	// effectful responses retain their actual disk effects and receipts.
 	if res != nil && !res.IsError && lateExactnessRefusalIsSafe(name) {
 		if err := validateRequestProjections(ctx); err != nil {
-			return mcp.NewToolResultError(err.Error())
+			return nil, err
 		}
 	}
 	scope, ids, files := freshnessTargets(name, req)
@@ -866,7 +876,7 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 			res = decorateResultWithFreshness(res, fields)
 		}
 	}
-	return fitToolFreshnessBudget(ctx, req, res)
+	return fitToolFreshnessBudget(ctx, req, res), nil
 }
 
 func (s *Server) explicitFreshness(ctx context.Context, req mcp.CallToolRequest, label relationFreshness) relationFreshness {

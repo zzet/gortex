@@ -91,7 +91,11 @@ func TestRepeatedCheckedRetirementCannotRenewSourceAllowance(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	t.Logf("handler_attempts=%d final=%s remaining_original_budget=%s", calls, resultText(result), time.Until(originalDeadline))
-	require.True(t, result.IsError, "two retirements cannot authorize a third fresh attempt")
+	require.False(t, result.IsError, resultText(result))
+	terminal := extractTextResult(t, result)
+	require.Equal(t, "pending", terminal["source_state"])
+	require.Equal(t, "external_write", terminal["source_reason"])
+	require.NotContains(t, terminal, "source", "two retirements return no data, never a third fresh attempt")
 	require.Equal(t, 2, calls)
 	require.NotSame(t, entries[0], entries[1])
 	for index, observed := range contexts {
