@@ -27,6 +27,7 @@ type registeredLateStormWatcher struct {
 	*indexer.Watcher
 	eventPath string
 	hold      atomic.Bool
+	holdOnce  sync.Once
 	entered   chan struct{}
 	release   chan struct{}
 	armed     atomic.Bool
@@ -365,7 +366,9 @@ func startRegisteredLateStormFixtureWatcher(t *testing.T, s *Server, path, scena
 
 // This same callback is installed by OnSourceEvent; repeated arm requests must
 // not reuse the one-shot entered/release handshake for a later native event.
-func (w *registeredLateStormWatcher) holdNextSourceEvent() { w.hold.Store(true) }
+func (w *registeredLateStormWatcher) holdNextSourceEvent() {
+	w.holdOnce.Do(func() { w.hold.Store(true) })
+}
 
 func TestRegisteredLateStormSourceCallbackArmsOnlyOnce(t *testing.T) {
 	w := &registeredLateStormWatcher{eventPath: "victim.go", entered: make(chan struct{}), release: make(chan struct{})}
