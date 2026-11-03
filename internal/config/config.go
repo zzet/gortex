@@ -529,6 +529,34 @@ type Config struct {
 	// — branches, tags and commits nobody has checked out. Empty takes
 	// the shipped retention bounds.
 	Views ViewsConfig `mapstructure:"views" yaml:"views,omitempty"`
+	// ContractAnalysis schedules the background contract analysis of
+	// linked git worktrees. Empty takes the shipped policy. The daemon
+	// reads it from its own config file (Load), never from a tracked
+	// repository's .gortex.yaml. It is kept out of IndexConfig on
+	// purpose: IndexConfig is part of every published contract cohort's
+	// identity, and a scheduling choice must not invalidate what was
+	// published under another.
+	ContractAnalysis ContractAnalysisConfig `mapstructure:"contract_analysis" yaml:"contract_analysis,omitempty"`
+}
+
+// ContractAnalysisConfig is the `contract_analysis:` block. It decides when
+// the daemon spends CPU on a linked worktree's contract analysis; primary
+// checkouts and requests that wait for fresh results are not affected.
+type ContractAnalysisConfig struct {
+	// LinkedPolicy is idle (the default: a linked worktree's job starts
+	// only after the daemon had no foreground work for LinkedIdleWindow),
+	// throttled (one linked job at a time, each worktree at most once per
+	// LinkedThrottleInterval) or eager (as soon as it is asked for). The
+	// GORTEX_CONTRACT_LINKED_POLICY env var overrides it.
+	LinkedPolicy string `mapstructure:"linked_policy" yaml:"linked_policy,omitempty"`
+	// LinkedIdleWindow is how long the daemon must have been idle before
+	// the idle policy starts a linked job, as a Go duration ("5s"). Empty
+	// takes the shipped window.
+	LinkedIdleWindow string `mapstructure:"linked_idle_window" yaml:"linked_idle_window,omitempty"`
+	// LinkedThrottleInterval is the least time between two job starts of
+	// one linked worktree under the throttled policy, as a Go duration
+	// ("30s"). Empty takes the shipped interval.
+	LinkedThrottleInterval string `mapstructure:"linked_throttle_interval" yaml:"linked_throttle_interval,omitempty"`
 }
 
 // ViewsConfig is the `views:` block. It bounds how much payload the

@@ -112,6 +112,10 @@ func TestContractAnalysisCountsRequestsAndJobs(t *testing.T) {
 	fields := lines[0].ContextMap()
 	require.Equal(t, start["since_trigger_ms"], fields["dispatch_ms"], "the job line carries the dispatch time")
 	require.Equal(t, start["capture_ms"], fields["capture_ms"])
+	require.Equal(t, start["job"], fields["job"], "the end line names the job its start line opened")
+	require.NotEmpty(t, fields["job"])
+	require.Equal(t, "", fields["checkout"], "a primary job's checkout is empty")
+	require.Equal(t, "interest", fields["trigger"])
 	for _, name := range []string{"w_need_sum", "w_iterations", "window_p10", "window_p50", "window_p90", "window_n"} {
 		require.Contains(t, fields, name)
 	}

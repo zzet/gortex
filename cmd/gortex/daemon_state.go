@@ -38,6 +38,9 @@ type daemonState struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// contractAnalysis is the daemon config's contract_analysis block, read
+	// from the same file as its views block.
+	contractAnalysis config.ContractAnalysisConfig
 	// lifecycle is the shared owner of checkout lifecycle side effects —
 	// track, forget, reload, the periodic sweep. The controller, the MCP
 	// tools and the janitor all drive this one instance.
@@ -160,6 +163,7 @@ func buildDaemonStateWithUpgradeCheckpoint(logger *zap.Logger, checkpoint func(s
 		indexer:             ss.Indexer,
 		multiIndexer:        ss.MultiIndexer,
 		configManager:       ss.ConfigMgr,
+		contractAnalysis:    cfg.ContractAnalysis,
 		lifecycle:           ss.CheckoutLifecycle,
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,

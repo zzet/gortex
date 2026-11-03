@@ -239,6 +239,11 @@ const (
 	// ContractRepairTotal counts idle repairs of contract inputs that no
 	// ordinary save would settle, by what was repaired.
 	ContractRepairTotal = "views_contract_repair_total"
+	// ContractLinkedJobsTotal counts what the linked-checkout scheduling
+	// policy did with a linked worktree's jobs: held back for foreground
+	// demand, stopped at a fill checkpoint because demand returned, or
+	// started, a strict request's start counted apart.
+	ContractLinkedJobsTotal = "views_contract_linked_jobs_total"
 )
 
 // Label names.
@@ -262,6 +267,7 @@ const (
 	LabelWhy      = "why"
 	LabelMode     = "mode"
 	LabelResult   = "result"
+	LabelPolicy   = "policy"
 )
 
 // Contract analysis job modes: a whole-cohort rebuild, a cache fill that
@@ -340,6 +346,23 @@ const (
 	ContractRepairPendingHeader = "pending_header"
 	ContractRepairStuckReceipt  = "stuck_receipt"
 	ContractRepairStuckEnvelope = "stuck_envelope"
+)
+
+// Linked-checkout contract scheduling policies: start a linked worktree's job
+// only once the daemon is idle, at most one at a time and spaced, or at once.
+const (
+	ContractLinkedIdle      = "idle"
+	ContractLinkedThrottled = "throttled"
+	ContractLinkedEager     = "eager"
+)
+
+// Linked-checkout contract job events. A deferral is counted once per hold,
+// however long it lasts; a strict start is a job a waiting caller asked for.
+const (
+	ContractLinkedDeferred          = "deferred"
+	ContractLinkedCheckpointStopped = "checkpoint_stopped"
+	ContractLinkedStarted           = "started"
+	ContractLinkedStrictStarted     = "strict_started"
 )
 
 // Committed-base generation shapes: self-contained, or composed over a parent.
@@ -851,5 +874,11 @@ var catalog = map[string]spec{
 	}},
 	ContractRepairTotal: {kind: kindCounter, labels: []labelSpec{
 		{name: LabelKind, values: []string{ContractRepairPendingHeader, ContractRepairStuckReceipt, ContractRepairStuckEnvelope}},
+	}},
+	ContractLinkedJobsTotal: {kind: kindCounter, labels: []labelSpec{
+		{name: LabelPolicy, values: []string{ContractLinkedIdle, ContractLinkedThrottled, ContractLinkedEager}},
+		{name: LabelEvent, values: []string{
+			ContractLinkedDeferred, ContractLinkedCheckpointStopped, ContractLinkedStarted, ContractLinkedStrictStarted,
+		}},
 	}},
 }
