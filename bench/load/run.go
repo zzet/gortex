@@ -14,7 +14,7 @@ import (
 )
 
 type runOptions struct {
-	NightlySeed string
+	NightlySeed              string
 	EditACKMode              string
 	Binary                   string
 	Manifest                 string
