@@ -70,13 +70,17 @@ type AgentHooks struct {
 	// instead, making the block above dead text.
 	InstructionsShadowed string
 	// PostToolUseDenyPosture is set when the installed PostToolUse hook runs
-	// under the deny posture — its matcher names only the Gortex MCP tools,
-	// never the native read-shaped tools the enrichment path keys on. There
-	// the hook exists to watch localization receipts and is never expected
-	// to inject context (PreToolUse already redirects native reads), so
-	// "ran but never emitted" is the designed steady state, not a
-	// degradation. Agents without a posture concept leave it false and keep
-	// the original warning semantics.
+	// under the deny posture — it only observes Gortex MCP results, never
+	// the native read-shaped tools the enrichment path keys on (the matcher
+	// is agent-specific: Claude Code names its navigation tools, Antigravity
+	// matches MCP calls). There the hook exists to watch localization
+	// receipts and is never expected to inject context (PreToolUse already
+	// redirects native reads), so "ran but never emitted" is the designed
+	// steady state, not a degradation, and so is "never ran" when the
+	// window's transcripts show no Gortex tool calls (see
+	// transcriptsExplainSilence). Agents without a
+	// posture concept leave it false and keep the original warning
+	// semantics.
 	PostToolUseDenyPosture bool
 	// HooksDisabled marks a harness whose configuration switches hook
 	// execution off wholesale. It explains an idle install completely, so it
@@ -199,6 +203,19 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 					event, lastSeenSuffix(stats.LastSeen, now))
 				continue
 			}
+			// Under the deny posture PostToolUse only watches Gortex tool
+			// calls, so transcripts showing none of them explain its
+			// silence — on hosts whose transcript scan sees every Gortex
+			// call form. Without transcripts, or once they show Gortex
+			// calls, silence may mean the matcher missed them: the warning
+			// stands.
+			if event == "PostToolUse" && agent.PostToolUseDenyPosture && transcriptsExplainSilence[agent.Agent] &&
+				adoption.InWindow > 0 && adoption.GortexCalls == 0 {
+				add(SeverityInfo, "",
+					"%s is configured but never ran, while other hooks did%s — expected: this window's transcripts show no Gortex tool calls, and under the deny posture this hook only watches those.",
+					event, lastSeenSuffix(stats.LastSeen, now))
+				continue
+			}
 			remedy := "check this event's entry in the agent's hook configuration, or re-run `gortex install`"
 			if agent.RequiresTrust && agent.TrustRemedy != "" {
 				remedy += ", or re-trust that entry (" + agent.TrustRemedy + ")"
@@ -231,6 +248,12 @@ func Diagnose(agent AgentHooks, summary hooks.EffectivenessSummary, adoption Ado
 			if event == "PostToolUse" && agent.PostToolUseDenyPosture {
 				add(SeverityInfo, "",
 					"%s ran %d time(s) and injected context 0 times — expected under the deny posture: PreToolUse already redirects native reads, and this hook only watches Gortex tool calls.",
+					event, stats.Runs)
+				continue
+			}
+			if isCorrectionOnlyEvent(agent.Agent, event) {
+				add(SeverityInfo, "",
+					"%s ran %d time(s) and injected context 0 times — expected: on this host it only speaks to correct an answer that cites symbols outside its localization evidence.",
 					event, stats.Runs)
 				continue
 			}
@@ -350,6 +373,36 @@ var sessionEndEvents = map[string][]string{
 // sessions ends.
 func isSessionEndEvent(agent, event string) bool {
 	for _, e := range sessionEndEvents[agent] {
+		if e == event {
+			return true
+		}
+	}
+	return false
+}
+
+// transcriptsExplainSilence lists the agents whose session scan counts
+// every way a Gortex tool can be called, so zero Gortex calls in the window
+// explains a deny-posture PostToolUse that never ran. Claude Code is not
+// listed: its PostToolUse matcher also names the plugin-installed
+// mcp__plugin_gortex_gortex__* tools, which ScanClaudeSessions does not
+// count, so a zero there would hide a hook that missed real calls.
+var transcriptsExplainSilence = map[string]bool{
+	"antigravity": true,
+}
+
+// correctionOnlyEvents lists, per agent, the hook events whose only output
+// is a rare correction, so a run that injects nothing is the steady state
+// rather than a hook with nothing to say. Antigravity's Stop has no channel
+// for a post-task briefing: it answers only with the one-shot claim-check
+// "continue" when an answer cites symbols outside its localization evidence.
+var correctionOnlyEvents = map[string][]string{
+	"antigravity": {"Stop"},
+}
+
+// isCorrectionOnlyEvent reports whether event only ever emits a correction
+// on agent's host.
+func isCorrectionOnlyEvent(agent, event string) bool {
+	for _, e := range correctionOnlyEvents[agent] {
 		if e == event {
 			return true
 		}

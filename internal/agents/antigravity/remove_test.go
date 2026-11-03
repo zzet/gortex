@@ -72,8 +72,8 @@ func TestAntigravityRemoveGlobalCleanInstall(t *testing.T) {
 
 // Uninstall removes only Gortex's pieces. What it keeps (other servers and
 // hook specs, user prose, customised files, a renamed copy of the gortex
-// spec) is exactly what GlobalArtifacts still reports, and it reads
-// commented (JSONC) files.
+// spec) is exactly what GlobalArtifacts and Inspect still report, and both
+// read commented (JSONC) files.
 func TestAntigravityRemoveGlobalKeepsUserContent(t *testing.T) {
 	env := globalEnv(t)
 	a := New()
@@ -125,6 +125,9 @@ func TestAntigravityRemoveGlobalKeepsUserContent(t *testing.T) {
 
 	if got := GlobalArtifacts(env.Home); !slices.Equal(got, []string{hooksPath}) {
 		t.Errorf("GlobalArtifacts after uninstall = %v, want only the renamed hook spec in %s", got, hooksPath)
+	}
+	if state := Inspect(env.Home); state.Hooks["PreToolUse"] != 1 || state.MCPServer {
+		t.Errorf("Inspect after uninstall = %+v, want only the renamed spec's hooks", state)
 	}
 }
 
