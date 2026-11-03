@@ -182,28 +182,10 @@ func TestDaemonMigrationSocketKeepsMetadataAndScopedLoadingAvailable(t *testing.
 	require.NoError(t, os.WriteFile(filepath.Join(root, "release-migration"), nil, 0o600))
 	// The same socket sessions must survive publication; no reconnect can hide
 	// a temporary catalog or a lost initialized-session state.
-	require.Eventually(t, func() bool {
-		response := migrationSocketFrame(t, clients[0], `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_symbols","arguments":{"query":"MigrationSocketProbe","format":"json"}}}`, 4)
-		result, _ := response["result"].(map[string]any)
-		content, _ := result["content"].([]any)
-		for _, block := range content {
-			text, _ := block.(map[string]any)["text"].(string)
-			var payload struct {
-				Results []struct {
-					Name string `json:"name"`
-					ID   string `json:"id"`
-				} `json:"results"`
-			}
-			if json.Unmarshal([]byte(text), &payload) == nil {
-				for _, node := range payload.Results {
-					if node.Name == "MigrationSocketProbe" && node.ID != "" {
-						return true
-					}
-				}
-			}
-		}
-		return false
-	}, 10*time.Second, 20*time.Millisecond)
+	// One graph visibility budget starts after release. No per-read timeout
+	// may discard a partial response; each complete reply ends its sole request.
+	visibilityDeadline := time.Now().Add(10 * time.Second)
+	require.NoError(t, migrationSocketAwaitProbe(clients[0], visibilityDeadline))
 	control, err := daemon.DialToWithDeadline(filepath.Join(root, "s"), daemon.Handshake{Mode: daemon.ModeControl}, time.Now().Add(time.Second))
 	require.NoError(t, err)
 	_, err = control.ControlWithTimeout(daemon.ControlShutdown, nil, 5*time.Second)

@@ -622,6 +622,19 @@ notifications retain client timestamps and raw payloads, with a 1,000-record
 per-session cap and an explicit dropped count. Notifications supplement the
 public readiness/publication gates rather than replacing them.
 
+Standalone `run` and fixed `smoke` accept `--retain-read-source-failures` for
+private diagnosis. It defaults off. When enabled, selected `read.source` calls
+observe their actual transport frames; only failed attempts retain a
+`failure_rpc` envelope. The first eight failures per report can retain exact
+base64 request/response bytes, including line framing, with a combined 64-KiB
+limit per envelope. Oversize, missing, partial, unsupported and cap-exhausted
+observations have explicit statuses and never claim exact bytes. Offered
+handshake options and response-observed facade metadata are separate fields.
+Raw frames may contain source or private paths: keep these reports private.
+Enabled healthy calls incur transient observation work; failure encoding occurs
+after the measured return timestamp. This option adds no RPC or retry and does
+not change request-plan identity, deadlines, pacing or success criteria.
+
 Completed private stores/clones are removed by default while JSON, logs and
 profiles remain. This prevents earlier scenarios' retained stores from using
 the next scenario's disk budget. `--keep-state` is only available for native
