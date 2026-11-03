@@ -222,7 +222,7 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 			if transition != "caller_cancellation" {
 				require.ErrorIs(t, validateRequestProjections(owned.ctx), projectionSuperseded, "shared old facts remain invalid; snapshot semantics must be search-specific")
 			}
-			require.Nil(t, backend.Store.GetNode("main.go::Target"), "the response must use its selected layer, not newly published canonical rows")
+			require.Nil(t, backend.GetNode("main.go::Target"), "the response must use its selected layer, not newly published canonical rows")
 			release()
 			worker.Wait()
 			<-leafDone
@@ -241,7 +241,18 @@ func TestRegisteredSearchCompletesItsCapturedAuthorizedVersion(t *testing.T) {
 			}
 			require.NoError(t, response.err)
 			require.Equal(t, rows, snapshotTargetRows(t, response.result), "the answer must retain its one authorized immutable selection")
-			require.Equal(t, extractTextResult(t, owned.result), extractTextResult(t, response.result), "capture does not fabricate latest/current freshness or alter the selected answer")
+			fields := extractTextResult(t, response.result)
+			freshness, ok := fields["freshness"].(map[string]any)
+			require.True(t, ok, "retain the existing honest canonical-index drift rider")
+			require.Equal(t, []any{map[string]any{"file": "main.go"}}, freshness["stale_files"])
+			require.NotEmpty(t, freshness["stale_hint"])
+			require.Len(t, freshness, 2)
+			for _, key := range []string{"state", "file_view", "readback_exact", "not_modified", "current", "latest"} {
+				require.NotContains(t, freshness, key, "snapshot completion cannot claim latest-at-response credit")
+				require.NotContains(t, fields, key)
+			}
+			delete(fields, "freshness")
+			require.Equal(t, extractTextResult(t, owned.result), fields, "the semantic answer must stay exactly the selected capture")
 			require.NotNil(t, response.result.Meta)
 			for key, value := range owned.result.Meta.AdditionalFields {
 				require.Equal(t, value, response.result.Meta.AdditionalFields[key], "selected scope metadata must survive: %s", key)
