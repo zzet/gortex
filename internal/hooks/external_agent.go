@@ -44,9 +44,17 @@ func RunExternalAgent() {
 // event gets a concise stale-index hint, emitted only when something is
 // actionable (so the hook stays quiet on the happy path).
 func handleExternalAgent(data []byte) {
+	if out := externalAgentResponse(data); out != "" {
+		fmt.Print(out)
+	}
+}
+
+// externalAgentResponse builds the stdout body handleExternalAgent emits,
+// or "" when there is nothing to say.
+func externalAgentResponse(data []byte) string {
 	var input ExternalAgentInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return ""
 	}
 
 	var ctx string
@@ -56,10 +64,10 @@ func handleExternalAgent(data []byte) {
 	case "aftertool":
 		ctx = buildStaleIndexHint(input.CWD)
 	default:
-		return
+		return ""
 	}
 	if strings.TrimSpace(ctx) == "" {
-		return
+		return ""
 	}
 
 	out, err := json.Marshal(HookOutput{HookSpecificOutput: &HookSpecificOutput{
@@ -67,9 +75,9 @@ func handleExternalAgent(data []byte) {
 		AdditionalContext: ctx,
 	}})
 	if err != nil {
-		return
+		return ""
 	}
-	fmt.Print(string(out))
+	return string(out)
 }
 
 // normalizeExternalEvent maps the agent's event name onto the two
