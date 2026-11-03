@@ -138,9 +138,10 @@ type DoctorFileStatus struct {
 	ByteSize int64             `json:"byte_size,omitempty"`
 	Reason   string            `json:"reason,omitempty"`
 	// StanzaStatus is set for a present mcpServers file carrying a
-	// Gortex-authored entry: "current" when it matches the canonical stanza,
-	// "stale" when Gortex wrote it but the shape has since changed. Empty for
-	// files that are not Gortex MCP configs. StanzaHint carries the fix.
+	// Gortex-authored entry: "current" when its command and args match the
+	// canonical ones, "stale" when Gortex wrote it but its args have since
+	// changed. Empty for files that are not Gortex MCP configs. StanzaHint
+	// carries the fix.
 	StanzaStatus string `json:"stanza_status,omitempty"`
 	StanzaHint   string `json:"stanza_hint,omitempty"`
 }
@@ -242,10 +243,12 @@ func doctorEnvironment() DoctorEnvironment {
 }
 
 // inspectMCPStanza reads a present file, looks for a Gortex-authored entry
-// under mcpServers, and reports whether it matches the canonical stanza
-// ("current") or has drifted ("stale"). ok is false when the file is not a
-// Gortex MCP config (not JSON, no mcpServers, or the entry is user-authored),
-// so non-MCP planned files are left unannotated.
+// under mcpServers, and reports whether it still launches Gortex the current
+// way ("current") or carries drifted args ("stale"). Keys adapters and users
+// add (env, alwaysAllow, type, cwd, ...) never make an entry stale; see
+// agents.GortexMCPEntryCurrent. ok is false when the file is not a Gortex MCP
+// config (not JSON, no mcpServers, or the entry is user-authored), so non-MCP
+// planned files are left unannotated.
 func inspectMCPStanza(path string) (status string, ok bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -273,7 +276,7 @@ func inspectMCPStanza(path string) (status string, ok bool) {
 	if !found || !agents.IsGortexAuthoredMCPEntry(entry) {
 		return "", false
 	}
-	if agents.MCPEntriesEqual(entry, agents.DefaultGortexMCPEntry()) {
+	if agents.GortexMCPEntryCurrent(entry) {
 		return "current", true
 	}
 	return "stale", true
@@ -301,8 +304,8 @@ func inspectAdapter(a agents.Adapter, env agents.Env) DoctorAgentReport {
 			anyPresent = true
 			status.Status = "present"
 			status.ByteSize = info.Size()
-			// For a present mcpServers config, verify the Gortex stanza is
-			// the current canonical shape — Gortex owns the migration logic,
+			// For a present mcpServers config, verify the Gortex stanza's
+			// command and args are current. Gortex owns the migration logic,
 			// so doctor can flag an authored-but-outdated stanza and name the
 			// one-command fix instead of silently leaving a broken wiring.
 			if st, isStanza := inspectMCPStanza(pf.Path); isStanza {

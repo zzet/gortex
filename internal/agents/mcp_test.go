@@ -87,6 +87,40 @@ func TestIsGortexAuthoredMCPEntry(t *testing.T) {
 	}
 }
 
+// TestGortexMCPEntryCurrent pins the doctor's notion of "current": only
+// command and args count, extra keys never do.
+func TestGortexMCPEntryCurrent(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"canonical", `{"command":"gortex","args":["mcp"]}`, true},
+		{"extra keys", `{"command":"gortex","args":["mcp"],"env":{},"type":"local","alwaysAllow":["x"]}`, true},
+		{"exe on windows path", `{"command":"C:\\Gortex\\gortex.exe","args":["mcp"]}`, true},
+		{"legacy proxy flag", `{"command":"gortex","args":["mcp","--proxy"]}`, false},
+		{"no args", `{"command":"gortex"}`, false},
+		{"non-string arg", `{"command":"gortex","args":["mcp",1]}`, false},
+		{"other command", `{"command":"node","args":["mcp"]}`, false},
+		{"not an object", `["gortex","mcp"]`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var v any
+			if err := json.Unmarshal([]byte(tc.raw), &v); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := GortexMCPEntryCurrent(v); got != tc.want {
+				t.Errorf("GortexMCPEntryCurrent(%s) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+	// A freshly built entry carries []string args, not []any.
+	if !GortexMCPEntryCurrent(DefaultGortexMCPEntry()) {
+		t.Error("DefaultGortexMCPEntry() must be current")
+	}
+}
+
 // TestUpsertMCPServerWithMigrationReplacesLegacy exercises the
 // migration path: a user with an old global config containing
 // `--index . --watch` should get rewritten to the proxy entry on next
