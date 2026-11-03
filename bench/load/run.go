@@ -423,9 +423,11 @@ func captureReceipt(ctx context.Context, p *privateRun, client *socketClient, ph
 		phase.Errors = append(phase.Errors, "status receipt: "+err.Error())
 	} else {
 		phase.Status = append(phase.Status, status)
-		pid:=0
-		if p.process!=nil && p.process.Process!=nil {pid=p.process.Process.Pid}
-		recordStatusCapture(phase,pid,statusStarted,statusFinished)
+		pid := 0
+		if p.process != nil && p.process.Process != nil {
+			pid = p.process.Process.Pid
+		}
+		recordStatusCapture(phase, pid, statusStarted, statusFinished)
 	}
 	statsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	stats, err := client.call(statsCtx, "resources/read", map[string]any{"uri": "gortex://stats"})
