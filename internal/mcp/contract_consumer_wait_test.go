@@ -628,6 +628,21 @@ func TestContractConsumerYieldCountsOrdinaryWorkAndBalancesFailure(t *testing.T)
 	require.True(t, f.srv.ContractAnalysisShouldYield())
 }
 
+// TestContractAnalysisDemandSeesCallsBetweenSamples: a tool call that starts
+// and ends between two samples is in flight at neither, but it moves the
+// demand sequence the contract scheduler's idle window watches.
+func TestContractAnalysisDemandSeesCallsBetweenSamples(t *testing.T) {
+	f := newContractConsumerFixture(t)
+	_, before := f.srv.ContractAnalysisDemand()
+	runtimeactivity.Begin("mcp")
+	busy, during := f.srv.ContractAnalysisDemand()
+	runtimeactivity.End("mcp")
+	_, after := f.srv.ContractAnalysisDemand()
+	require.True(t, busy)
+	require.Greater(t, during, before, "a call's start moves the sequence")
+	require.Greater(t, after, during, "so does its end")
+}
+
 func (f *contractConsumerFixture) strictList(ctx context.Context, wait time.Duration) (*mcplib.CallToolResult, error) {
 	return f.request(ctx, "contracts", map[string]any{"action": "list", "format": "json", "wait_deadline": time.Now().Add(wait).Format(time.RFC3339Nano)}, f.srv.handleContracts)
 }
@@ -638,7 +653,13 @@ func (f *contractConsumerFixture) strictList(ctx context.Context, wait time.Dura
 func TestContractConsumerWaitsOnTheActorPromiseNotByRecapture(t *testing.T) {
 	f := newContractConsumerFixture(t)
 	release := make(chan struct{})
-	fake := &contractRuntimeFake{t: t, schedule: scheduledAt(1), waitActor: waitUntilClosed(release)}
+	fake := &contractRuntimeFake{t: t, waitActor: waitUntilClosed(release)}
+	var strict, targeted atomic.Bool
+	fake.schedule = func(ctx context.Context, req indexer.ContractScheduleRequest) (indexer.ContractScheduleResult, error) {
+		strict.Store(req.Strict)
+		targeted.Store(req.PriorityTarget)
+		return scheduledAt(1)(ctx, req)
+	}
 	f.srv.SetContractAnalysisRuntime(fake.runtime())
 	done := make(chan *mcplib.CallToolResult, 1)
 	go func() {
@@ -660,6 +681,8 @@ func TestContractConsumerWaitsOnTheActorPromiseNotByRecapture(t *testing.T) {
 		t.Fatal("the strict call did not complete")
 	}
 	require.EqualValues(t, 1, fake.schedules.Load(), "one schedule for one key")
+	require.True(t, strict.Load(), "a waiting caller marks its request strict")
+	require.False(t, targeted.Load(), "an untargeted strict request carries no priority target, only the strict marker")
 }
 
 // TestContractConsumerStaleInputsWaitForTheInputEpoch: inputs whose capture
