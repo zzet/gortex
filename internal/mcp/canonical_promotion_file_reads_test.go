@@ -110,10 +110,14 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 				s.InitFrecency("", "", ModeAI)
 				retirement := s.canonicalProjectionRetirement(path)
 				require.NotNil(t, retirement)
-				deadline := time.Now().Add(projectedReadBudget)
+				deadline := time.Now().Add(canonicalLifecycleFixtureBudget)
 				caller, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				ctx := context.WithValue(caller, projectedSourceDeadlineKey{}, deadline)
+				originalAllowance := &projectedSourceAllowance{tool: tool}
+				if transition != "compression_not_audited" {
+					ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, originalAllowance)
+				}
 				beforeCount := s.tokenStatsFor(t.Context()).snapshot()["calls_counted"].(int64)
 				beforeFrecency := canonicalReadFrecency(s, "main.go::Target")
 				calls := 0
@@ -133,6 +137,11 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 								defer close(cancelledLeafDone)
 							}
 							require.Equal(t, deadline, ctx.Value(projectedSourceDeadlineKey{}))
+							if transition == "compression_not_audited" {
+								require.Nil(t, ctx.Value(projectedSourceAllowanceKey{}), "compression must not gain replay permission")
+							} else {
+								require.Same(t, originalAllowance, ctx.Value(projectedSourceAllowanceKey{}))
+							}
 							var result *mcplib.CallToolResult
 							var err error
 							if tool == "get_file_summary" {
