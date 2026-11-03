@@ -53,4 +53,9 @@ func TestGraphFileMetadataContextContentionNeverBlocksTheCaller(t *testing.T) {
 	rows, err = reader.FileMetasByPathsContext(caller, "repo", []string{"repo/a.go"})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, rows)
+	expired, stop := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer stop()
+	rows, err = reader.FileMetasByPathsContext(expired, "repo", []string{"repo/a.go"})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, rows)
 }
