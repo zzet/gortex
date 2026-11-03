@@ -200,7 +200,27 @@ func TestBatchWaitApplicabilityDoesNotExemptRejectedOrUnobservedRoutes(t *testin
 			require.NoError(t, err)
 			value, ok := s.batchTransactions.Load("not-blanket-applicability")
 			require.True(t, ok)
-			ack := s.batchAcknowledgement(value.(*batchTransactionState))
+			state := value.(*batchTransactionState)
+			ack := s.batchAcknowledgement(state)
+			if !rejected {
+				// Completed watcher tickets are consumed asynchronously by the server.
+				// The original full call may legitimately measure that passive wait.
+				// Join the actual retained receipts before exercising the no-wait route.
+				for _, file := range state.snapshot().Files {
+					v, found := s.mutationReceipts.Load(file.ReindexReceipt)
+					require.True(t, found)
+					select {
+					case <-v.(*mutationReceipt).done:
+					case <-time.After(time.Second):
+						t.Fatal("server receipt completion did not join")
+					}
+				}
+				ctx, completeAck, _ := s.withEditAcknowledgement(canonicalTimingContext())
+				s.refreshBatchGraph(ctx, state)
+				completeAck.finishActual()
+				snapshot := completeAck.snapshot()
+				ack.Snapshot = &snapshot
+			}
 			require.NotNil(t, ack.Snapshot)
 			require.Equal(t, "unobserved", ack.Snapshot.ReindexWait.State)
 			require.Zero(t, ack.Snapshot.ReindexWait.Started)
