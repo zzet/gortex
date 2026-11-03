@@ -49,7 +49,7 @@ func TestContractConsumerWatchedFreshnessComposition(t *testing.T) {
 			req := mcplib.CallToolRequest{}
 			req.Params.Name = "verify_change"
 			req.Params.Arguments = map[string]any{
-				"changes": fmt.Sprintf(`[{"symbol_id":%q,"new_signature":"func Target()"}]`, targetID(t, s)),
+				"changes":       fmt.Sprintf(`[{"symbol_id":%q,"new_signature":"func Target()"}]`, targetID(t, s)),
 				"require_fresh": true, "wait_deadline": time.Now().Add(250 * time.Millisecond).Format(time.RFC3339Nano), "format": "json",
 			}
 			ctx, cancel := context.WithCancel(t.Context())
