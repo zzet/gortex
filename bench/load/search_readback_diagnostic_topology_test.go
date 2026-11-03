@@ -74,13 +74,14 @@ func TestSearchAcceptanceQueuedOffersDoNotFanOutOrdinaryOracles(t *testing.T) {
 					t.Error("queued activation did not finish without ordinary oracle loops")
 				}
 			} else {
+			ordinaryCalls:
 				for observed < 16 { // Two real offers, eight unchanged oracles each.
 					select {
 					case <-calls:
 						observed++
 					case <-ctx.Done():
 						t.Errorf("ordinary activation lost its oracle population: observed=%d", observed)
-						observed = 16
+						break ordinaryCalls
 					}
 				}
 			}

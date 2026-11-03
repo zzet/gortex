@@ -324,7 +324,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
 	phase.EditProbe.AccountingRequired = r.requireAccounting
 	if plan.SearchReadbackAcceptance {
-		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable")
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable", "one shared setup/diagnostic client; zero per-offer ordinary oracle loops; post-required diagnostics are serial, at most one sample per editor and three calls per sample, within the remaining original phase window and a 1s diagnostic-only cap", "retained owned keep-state clones are NON-PRISTINE, not restored and never reusable as fresh acceptance seeds")
 	}
 	if len(p.Repos) > 1 {
 		r.originals = make(map[string][]byte, len(p.Repos))
@@ -418,11 +418,16 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		}
 		state.sink = sink
 		state.startRaw()
-		state.client, err = openMCP(ctx, p.Socket, repo.Path)
-		if err != nil {
-			return r, clients, err
+		if plan.SearchReadbackAcceptance && len(clients) != 0 {
+			// One owned setup/diagnostic connection, never one per queued offer.
+			state.client = clients[0]
+		} else {
+			state.client, err = openMCP(ctx, p.Socket, repo.Path)
+			if err != nil {
+				return r, clients, err
+			}
+			clients = append(clients, state.client)
 		}
-		clients = append(clients, state.client)
 		// A file created during the run proves its own presence before the
 		// paired delete is sent; it cannot be admitted here.
 		if state.step.BeforeSymbol != "" && state.step.File == "" {
@@ -701,7 +706,10 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 // RPC/result; a blocked prober cannot shift this or any other edit's due time.
 func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 	probeCtx, cancel := context.WithCancel(ctx)
-	r.probe(probeCtx, cancel, r.activateProbeState(step, cancel))
+	state := r.activateProbeState(step, cancel)
+	if !r.plan.SearchReadbackAcceptance {
+		r.probe(probeCtx, cancel, state)
+	}
 }
 
 func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.CancelFunc, s *editProbeState) {
@@ -989,11 +997,11 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.signalAck()
 	readbackKinds := []string{"file", "source"}
 	if r.plan.SearchReadbackAcceptance {
-		readbackKinds = []string{"search_visible", "text", "old_search_absent", "old_text_absent", "file", "source"}
+		readbackKinds = []string{"search_visible", "text", "old_search_absent", "old_text_absent"}
 	} else if r.plan.GateModes {
 		readbackKinds = []string{"source", "file", "summary", "search_visible", "text"}
 	}
-	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
+	if !r.plan.SearchReadbackAcceptance && step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
 	if step.Relocated {
@@ -1005,6 +1013,24 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.record.Readback = unavailable("ms", "immediate readback missing or incorrect")
 	if readbacksCorrect {
 		s.record.Readback = measured(float64(readbackEnd.Sub(started))/float64(time.Millisecond), "ms")
+	}
+	if r.plan.SearchReadbackAcceptance {
+		// This named profile certifies ACK plus its four immediate searches,
+		// never canonical publication, relation readiness or A/P/B accounting.
+		if !searchReadbackObjectACK(s.record.SearchACK) {
+			s.record.Errors = append(s.record.Errors, "exact local search ACK unavailable")
+		}
+		if ctx.Err() != nil {
+			s.record.Outcome = "phase_censored"
+		} else if callCtx.Err() != nil {
+			s.record.Outcome = "product_deadline"
+		} else if readbacksCorrect && len(s.record.Errors) == 0 {
+			s.record.Outcome = "complete"
+		} else {
+			s.record.Outcome = "diagnostic_failure"
+		}
+		s.mu.Unlock()
+		return
 	}
 	s.mu.Unlock()
 	if move != nil {
@@ -1241,6 +1267,9 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	err = runEditProbeArrivals(measuredCtx, r.plan, r.origin, r.activate, r.doEdit, waitContext)
 	stopReads()
 	readers.Wait()
+	if r.plan.SearchReadbackAcceptance {
+		r.collectSearchAcceptanceDiagnostics(measuredCtx)
+	}
 	finished := r.finish()
 	after, statsErr := r.stats(measuredCtx)
 	r.phase.EditProbe.StatsAfter = after
@@ -1355,6 +1384,11 @@ func (r *editProbeRuntime) close() error {
 }
 
 func (r *editProbeRuntime) restore(ctx context.Context) error {
+	if r.plan.SearchReadbackAcceptance && r.options.KeepState {
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "not restored: owned non-pristine search-acceptance clone retained")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"preserved_owned_non_pristine_keep_state","restored":false,"fresh_seed_reuse_allowed":false}`)
+		return nil
+	}
 	if len(r.plan.Steps) > 0 && r.plan.Steps[0].ExpectedRefusal {
 		return r.confirmRefusalUnchanged()
 	}

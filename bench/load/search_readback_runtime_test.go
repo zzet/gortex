@@ -131,6 +131,15 @@ func TestSearchReadbackAcceptanceKeepsFirstSameSessionExactLineWitness(t *testin
 			state.record.ActivatedNS = &zero
 			run.doEdit(ctx, step)
 			state.finishRaw()
+			if (state.record.Outcome == "complete") != (fault == "none") {
+				t.Fatalf("search-specific completion lost its exact four-witness predicate: fault=%s outcome=%s", fault, state.record.Outcome)
+			}
+			if state.record.GraphTerminal || state.record.Accounting.State != "not_observed" {
+				t.Fatal("search completion invented canonical/accounting evidence")
+			}
+			if len(state.record.Readbacks) != 4 {
+				t.Fatalf("acceptance retained other immediate obligations: %d", len(state.record.Readbacks))
+			}
 			if !searchReadbackObjectACK(state.record.SearchACK) {
 				t.Fatalf("actual local/object metadata was not retained from the edit ACK: %v", state.record.SearchACK)
 			}
@@ -138,7 +147,7 @@ func TestSearchReadbackAcceptanceKeepsFirstSameSessionExactLineWitness(t *testin
 			calls := append([]string(nil), editorCalls...)
 			searchCount := searches
 			mu.Unlock()
-			if len(calls) < 3 || calls[0] != "edit.file" || calls[1] != "search.symbols" || calls[2] != "search.text" {
+			if len(calls) != 5 || calls[0] != "edit.file" || calls[1] != "search.symbols" || calls[2] != "search.text" || calls[3] != "search.symbols" || calls[4] != "search.text" {
 				t.Fatalf("searches were not the first same-editor post-ACK calls: %v", calls)
 			}
 			if searchCount < 2 {
