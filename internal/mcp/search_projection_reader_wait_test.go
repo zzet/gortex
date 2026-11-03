@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -104,6 +105,15 @@ func runPendingSearchMetadataCancellation(t *testing.T, cancelCaller bool) {
 	quiet := preselectionRegisteredCall(t, s, ctx, 11, "search_symbols", map[string]any{"query": "Target", "query_class": "symbol", "expand": "off", "limit": 10000, "max_per_file": 0, "max_bytes": 0, "format": "json"})
 	require.False(t, quiet.IsError, resultText(quiet))
 	require.Contains(t, resultText(quiet), "main.go::Target", "the same real registered fixture is exact before contention")
+	// This control must reach actual metadata SQL even when verified same-byte
+	// refresh can reuse an immutable layer without taking a reader connection.
+	// Change a separate physical body while preserving the queried Target.
+	current, err := os.ReadFile(path)
+	require.NoError(t, err)
+	neighborBefore := []byte("func NeighborBefore() int { return 2 }")
+	require.Equal(t, 1, bytes.Count(current, neighborBefore))
+	changed := bytes.Replace(current, neighborBefore, []byte("func NeighborBefore() int { return 3 }"), 1)
+	require.NoError(t, os.WriteFile(path, changed, 0o600))
 	captured, ok := s.facades.legacy("search_symbols")
 	require.True(t, ok)
 	leafDone := make(chan struct{})

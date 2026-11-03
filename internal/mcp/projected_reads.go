@@ -260,6 +260,49 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err != nil || !before.matches(after) {
 		return nil, errors.Join(err, errProjectionExternalWrite)
 	}
+	if err := buildCtx.Err(); err != nil {
+		return nil, err
+	}
+	// This path already read the bounded, confined current bytes. Never call
+	// legacy lookup/onDisk here: its suspect rehash performs another raw read.
+	var rawHash [32]byte
+	if expected != nil {
+		rawHash = blake3.Sum256(raw)
+		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
+			pathkey.MutationKey(abs) == key {
+			// Ownership can move while bounded current bytes are read even
+			// though their content did not change. Refuse this selection without
+			// inventing source invalidation on a checked historical owner.
+			if pendingFileProjections.snap.Load().entries[key] != expected {
+				return nil, projectionSuperseded
+			}
+			if err := buildCtx.Err(); err != nil {
+				return nil, err
+			}
+			if !expected.suspect.Load() {
+				return expected, nil
+			}
+			// Reuse the immutable parse only after bounded current-byte checks.
+			// This unpublished copy has no physical sequence or old invalidation;
+			// the old pointer stays suspect and the revision is checked at publish.
+			entry := expected.committedCopy(0, after)
+			entry.suspect.Store(false)
+			if err := buildCtx.Err(); err != nil {
+				return nil, err
+			}
+			if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
+				return nil, err
+			}
+			s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
+			if err := buildCtx.Err(); err != nil {
+				return nil, err
+			}
+			return entry, nil
+		}
+	}
+	// Exact immutable reuse above needs no canonical SQL admission. Existing
+	// hash-based publication callbacks still retire its current COW owner.
+	// Changed or uncached bytes retain the bounded canonical-match path.
 	if !requestViewFromContext(requestCtx).routed() {
 		matches, err := idx.IndexedContentMatchesContext(buildCtx, rel, raw)
 		if err != nil {
@@ -272,38 +315,15 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	if err := buildCtx.Err(); err != nil {
 		return nil, err
 	}
-	// This path already read the bounded, confined current bytes. Never call
-	// legacy lookup/onDisk here: its suspect rehash performs another raw read.
-	rawHash := blake3.Sum256(raw)
 	if expected != nil {
-		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
-			pathkey.MutationKey(abs) == key {
-			// Ownership can move while metadata is read even though these
-			// bounded bytes did not change. Refuse this selection without
-			// inventing source invalidation on a checked historical owner.
-			if pendingFileProjections.snap.Load().entries[key] != expected {
-				return nil, projectionSuperseded
-			}
-			if !expected.suspect.Load() {
-				return expected, nil
-			}
-			// Reuse the immutable parse only after bounded current-byte checks.
-			// This unpublished copy has no physical sequence or old invalidation;
-			// the old pointer stays suspect and the revision is checked at publish.
-			entry := expected.committedCopy(0, after)
-			entry.suspect.Store(false)
-			if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
-				return nil, err
-			}
-			s.admitReadBuiltProjection(requestCtx, root, idx, tracked, entry)
-			return entry, nil
-		}
 		// Invalidate the old bytes on every exit, including cache refusal.
 		// Do it after admission so this read's own old-version invalidation
 		// cannot be inherited as an event against the newly verified bytes.
 		// Actual concurrent watcher events advance its captured revision;
 		// read publication refuses them rather than clearing their evidence.
 		defer expected.suspect.Store(true)
+	} else {
+		rawHash = blake3.Sum256(raw)
 	}
 	// No fresh extraction during a queued storm. The matching-cache branch
 	// above reused only bounded, identity-checked bytes and immutable nodes.
