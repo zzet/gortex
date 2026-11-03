@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -87,14 +88,47 @@ func TestRepoLoadRecordLookupConcurrentImmutableAndABA(t *testing.T) {
 }
 
 func TestRepoLoadRecordLookupAllocatesNoTemporarySnapshot(t *testing.T) {
-	records := []RepoLoad{{Root: "/owned/a", key: pathkey.IdentityKey("/owned/a"), canonicalKey: pathkey.IdentityKey("/canonical/a")}}
-	var index int
-	var found bool
-	allocated := testing.AllocsPerRun(20, func() { index, found = findRepoLoadRecord(records, "/canonical/a") })
-	if !found || index != 0 {
-		t.Fatal("lookup lost canonical identity")
+	queries := []struct{ name, path string }{
+		{"clean_ascii", "/canonical/a"},
+		{"cleaning", "/canonical//./a"},
+		{"unicode_and_case", "/canonical/Cafe\u0301/A"},
+		{"windows_slashes", "c:/Canonical/A"},
+		{"windows_backslashes", `c:\Canonical\A`},
 	}
-	if allocated != 0 {
-		t.Fatalf("single-root lookup allocated %g objects; no temporary snapshot is needed", allocated)
+	for _, count := range []int{200, 1000} {
+		for _, query := range queries {
+			t.Run(fmt.Sprintf("records=%d/%s", count, query.name), func(t *testing.T) {
+				records := make([]RepoLoad, count)
+				for i := range records {
+					root := fmt.Sprintf("/owned/repo-%04d", i)
+					records[i] = RepoLoad{Root: root, Prefix: fmt.Sprintf("repo-%04d", i), State: RepoLoadReady, key: pathkey.IdentityKey(root)}
+				}
+				records[0].canonicalKey = pathkey.IdentityKey(query.path)
+				// Build the reference index OUTSIDE the measured lookup. Both routes
+				// retain exactly one IdentityKey call, whose unavoidable normalization
+				// allocation varies by host/path (for example Windows slash cleaning).
+				snapshot := newRepoLoadSnapshot(records)
+				var baselineIndex, actualIndex int
+				var baselineFound, actualFound bool
+				baseline := testing.AllocsPerRun(20, func() { baselineIndex, baselineFound = snapshot.find(query.path) })
+				actual := testing.AllocsPerRun(20, func() { actualIndex, actualFound = findRepoLoadRecord(records, query.path) })
+				if !baselineFound || baselineIndex != 0 || actualFound != baselineFound || actualIndex != baselineIndex {
+					t.Fatal("lookup lost canonical identity or differs from the existing index")
+				}
+				var legacyIndex int
+				var legacyFound bool
+				legacy := testing.AllocsPerRun(20, func() { legacyIndex, legacyFound = newRepoLoadSnapshot(records).find(query.path) })
+				if !legacyFound || legacyIndex != baselineIndex {
+					t.Fatal("original temporary snapshot lost the same canonical identity")
+				}
+				if legacy <= baseline {
+					t.Fatal("positive control did not expose the original temporary snapshot allocation")
+				}
+				t.Logf("prebuilt-index normalization allocations=%g direct=%g original-temporary=%g", baseline, actual, legacy)
+				if actual != baseline {
+					t.Fatalf("single-root lookup allocated %g objects, prebuilt-index normalization allocated %g; temporary snapshot allocation is not needed", actual, baseline)
+				}
+			})
+		}
 	}
 }
