@@ -103,11 +103,14 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if attemptState != nil {
 			acceptedBefore = len(attemptState.accepted)
 		}
-		terminalPending := func(selected context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
 			if callerOwnsProjectionFacts {
 				return nil, nil
 			}
-			pending, err := s.checkedReadTransitionPending(selected, request)
+			pending, err := s.lateStormTransitionPending(selected, request, failure)
+			if pending == nil && err == nil {
+				pending, err = s.checkedReadTransitionPending(selected, request)
+			}
 			if pending != nil && err == nil && attemptState != nil {
 				attemptState.accepted = attemptState.accepted[:acceptedBefore]
 			}
@@ -467,7 +470,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
 			if auditedProjectionRead && res != nil && !res.IsError && !requireExactView {
-				if pending, err := terminalPending(ctx, req); pending != nil || err != nil {
+				if pending, err := terminalPending(ctx, req, nil); pending != nil || err != nil {
 					return pending, err
 				}
 			}
@@ -478,7 +481,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			res, freshnessErr = s.decorateToolFreshnessChecked(ctx, req.Params.Name, req, res)
 			if freshnessErr != nil {
 				if auditedProjectionRead && !requireExactView {
-					if pending, err := terminalPending(ctx, req); pending != nil || err != nil {
+					if pending, err := terminalPending(ctx, req, freshnessErr); pending != nil || err != nil {
 						return pending, err
 					}
 				}
@@ -499,7 +502,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if auditedProjectionRead && hErr == nil && res != nil && !res.IsError {
 			if err := validateRequestProjections(ctx); err != nil {
 				if !requireExactView {
-					if pending, pendingErr := terminalPending(ctx, req); pending != nil || pendingErr != nil {
+					if pending, pendingErr := terminalPending(ctx, req, err); pending != nil || pendingErr != nil {
 						return pending, pendingErr
 					}
 				}
