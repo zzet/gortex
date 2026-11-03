@@ -185,10 +185,14 @@ func (s *Server) readerFor(ctx context.Context) graph.Reader {
 // play, and what a buffer overlay composes on top of: the routed checkout
 // view when the request resolved to one, the indexed corpus otherwise.
 func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
+	var reader graph.Reader = s.graph
 	if view := requestViewFromContext(ctx); view.routed() {
-		return view.reader
+		reader = view.reader
 	}
-	return s.graph
+	for _, layer := range requestProjectionLayers(ctx) {
+		reader = graph.NewOverlaidViewWithLayer(reader, layer)
+	}
+	return reader
 }
 
 // nodeGetterFor returns the request-scoped node lookup: the session
@@ -243,6 +247,9 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	// shared engine untouched (zero overhead); its handlers pass their
 	// context through QueryOptions.Context instead.
 	view := requestViewFromContext(ctx)
+	if len(requestProjectionLayers(ctx)) != 0 {
+		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
+	}
 	if v := OverlayViewFromContext(ctx); v != nil {
 		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx).WithLayers(s.requestLayers(ctx))
 	}

@@ -58,14 +58,17 @@ type projectionSnapshot struct {
 	bytes   int64
 }
 
-// projectionEntry is one file's projection. Everything but suspect is
-// immutable once published.
+// projectionEntry is one file's projection. Payload fields are immutable;
+// suspect is atomic and sourceEvents is guarded by the owning registry mutex.
 type projectionEntry struct {
 	key        string
 	absPath    string
 	graphPath  string
 	repoPrefix string
 	commitSeq  uint64
+	// Existing physical source version survives a checked read-only COW copy.
+	// A new physical execution supplies its own sequence; zero stays unavailable.
+	sourceCommitSeq uint64
 	// hash equals the store's FileMetaRow.ContentHash once the store holds
 	// these bytes; rawHash covers the bytes on disk for the suspect re-check.
 	hash          string
@@ -82,7 +85,10 @@ type projectionEntry struct {
 	tombstone     bool
 	// suspect is set by a watcher event for the path; the next lookup
 	// re-reads the file before serving the entry.
-	suspect atomic.Bool
+	suspect      atomic.Bool
+	sourceEvents uint64 // source-event revision, guarded by pendingProjections.mu
+	// Permission for one fresh source attempt, never freshness of this old owner.
+	checkedRetired atomic.Bool
 }
 
 // projectionRefusal is why a publish left the live entries as they were.
@@ -172,20 +178,21 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		layer.AddEdge(e)
 	}
 	return &projectionEntry{
-		key:          pathkey.MutationKey(absPath),
-		absPath:      absPath,
-		graphPath:    projection.GraphPath,
-		repoPrefix:   repoPrefix,
-		commitSeq:    commitSeq,
-		hash:         projection.ContentHash,
-		rawHash:      blake3.Sum256(raw),
-		disk:         disk,
-		language:     projection.Language,
-		layer:        layer,
-		parseErrors:  projection.ParseErrors,
-		parseChecked: projection.ParseChecked,
-		buildTime:    projection.BuildTime,
-		size:         int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes,
+		key:             pathkey.MutationKey(absPath),
+		absPath:         absPath,
+		graphPath:       projection.GraphPath,
+		repoPrefix:      repoPrefix,
+		commitSeq:       commitSeq,
+		sourceCommitSeq: commitSeq,
+		hash:            projection.ContentHash,
+		rawHash:         blake3.Sum256(raw),
+		disk:            disk,
+		language:        projection.Language,
+		layer:           layer,
+		parseErrors:     projection.ParseErrors,
+		parseChecked:    projection.ParseChecked,
+		buildTime:       projection.BuildTime,
+		size:            int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + 24,
 	}
 }
 
@@ -193,9 +200,13 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 // The owned layer is immutable and may be shared; the suspect atomic and disk
 // identity must never be copied or rewritten on an already-published entry.
 func (e *projectionEntry) committedCopy(sequence uint64, disk diskStamp) *projectionEntry {
+	sourceSequence := e.sourceCommitSeq
+	if sequence != 0 {
+		sourceSequence = sequence
+	}
 	copy := &projectionEntry{
 		key: e.key, absPath: e.absPath, graphPath: e.graphPath, repoPrefix: e.repoPrefix,
-		commitSeq: sequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
+		commitSeq: sequence, sourceCommitSeq: sourceSequence, hash: e.hash, rawHash: e.rawHash, contentSHA256: e.contentSHA256, disk: disk, language: e.language,
 		layer: e.layer, fileView: e.fileView, parseErrors: e.parseErrors, parseChecked: e.parseChecked,
 		buildTime: e.buildTime, size: e.size, tombstone: e.tombstone,
 	}
@@ -211,13 +222,15 @@ func newProjectionTombstone(absPath, graphPath, repoPrefix string, commitSeq uin
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile(graphPath, true)
 	return &projectionEntry{
-		key:        pathkey.MutationKey(absPath),
-		absPath:    absPath,
-		graphPath:  graphPath,
-		repoPrefix: repoPrefix,
-		commitSeq:  commitSeq,
-		layer:      layer,
-		tombstone:  true,
+		key:             pathkey.MutationKey(absPath),
+		absPath:         absPath,
+		graphPath:       graphPath,
+		repoPrefix:      repoPrefix,
+		commitSeq:       commitSeq,
+		sourceCommitSeq: commitSeq,
+		layer:           layer,
+		size:            24, // source version, source-event revision and checked-retirement hint
+		tombstone:       true,
 	}
 }
 
@@ -232,6 +245,49 @@ func (p *pendingProjections) publish(e *projectionEntry) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if prev := p.snap.Load().entries[e.key]; prev != nil && prev.commitSeq > e.commitSeq {
+		p.refused[projectionSuperseded]++
+		return projectionSuperseded
+	}
+	return p.publishLocked(e)
+}
+
+// Read-through has no physical sequence to borrow. It may replace exactly the
+// immutable entry it checked, including an old physical entry, after checking
+// the current bytes again. A new/retired pointer cannot authorize that replace.
+func (p *pendingProjections) publishExpected(e, expected *projectionEntry) error {
+	if !p.enabled {
+		return projectionDisabled
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e.commitSeq != 0 || p.snap.Load().entries[e.key] != expected {
+		p.refused[projectionSuperseded]++
+		return projectionSuperseded
+	}
+	return p.publishLocked(e)
+}
+
+// Callers prove ordering by physical sequence or the exact checked pointer.
+// Path-case and global file/byte caps apply equally to both publication paths.
+func (p *pendingProjections) publishLocked(e *projectionEntry) error {
+	next, err := p.projectionReplacementLocked(e)
+	if err != nil {
+		return err
+	}
+	// Physical publication cannot certify a native event that arrived after
+	// its write. Preserve that invalidation on the replacement.
+	if previous := p.snap.Load().entries[e.key]; previous != nil && previous.suspect.Load() {
+		e.suspect.Store(true)
+	}
+	p.snap.Store(next)
+	p.published.Add(1)
+	return nil
+}
+
+// projectionReplacementLocked applies the common immutable-map/cap checks.
+// Callers separately prove physical ordering or one checked read observation.
+func (p *pendingProjections) projectionReplacementLocked(e *projectionEntry) (*projectionSnapshot, error) {
 	cur := p.snap.Load()
 	prev := cur.entries[e.key]
 	bytes := cur.bytes + e.size
@@ -240,10 +296,10 @@ func (p *pendingProjections) publish(e *projectionEntry) error {
 	}
 	var refusal projectionRefusal
 	switch {
+	case e.checkedRetired.Load():
+		refusal = projectionSuperseded // historical owners cannot be republished
 	case prev != nil && prev.graphPath != e.graphPath:
 		refusal = projectionPathCase
-	case prev != nil && prev.commitSeq > e.commitSeq:
-		refusal = projectionSuperseded
 	case prev == nil && len(cur.entries) >= projectionMaxFiles:
 		refusal = projectionOverFiles
 	case bytes > projectionMaxBytes:
@@ -251,15 +307,48 @@ func (p *pendingProjections) publish(e *projectionEntry) error {
 	}
 	if refusal != "" {
 		p.refused[refusal]++
-		return refusal
-	}
-	// A watcher event that landed between the write and this publish
-	// marked the entry being replaced; it applies to these bytes too.
-	if prev != nil && prev.suspect.Load() {
-		e.suspect.Store(true)
+		return nil, refusal
 	}
 	next := &projectionSnapshot{entries: maps.Clone(cur.entries), bytes: bytes}
 	next.entries[e.key] = e
+	return next, nil
+}
+
+// A read observation is captured before its bounded byte/absence checks.
+// This local revision is neither a graph generation nor a physical receipt.
+type projectionReadExpectation struct {
+	entry        *projectionEntry
+	sourceEvents uint64
+}
+
+func (p *pendingProjections) captureReadExpectation(key string) projectionReadExpectation {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry := p.snap.Load().entries[key]
+	result := projectionReadExpectation{entry: entry}
+	if entry != nil {
+		result.sourceEvents = entry.sourceEvents
+	}
+	return result
+}
+
+func (p *pendingProjections) publishReadExpected(e *projectionEntry, observed projectionReadExpectation) error {
+	if !p.enabled {
+		return projectionDisabled
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e.commitSeq != 0 || e == observed.entry || e.suspect.Load() || p.snap.Load().entries[e.key] != observed.entry ||
+		(observed.entry != nil && observed.entry.sourceEvents != observed.sourceEvents) {
+		p.refused[projectionSuperseded]++
+		return projectionSuperseded
+	}
+	next, err := p.projectionReplacementLocked(e)
+	if err != nil {
+		return err
+	}
+	// The fresh bounded bytes observed all events captured before the read;
+	// a later event or changed owner refused above. Keep old pointers suspect.
 	p.snap.Store(next)
 	p.published.Add(1)
 	return nil
@@ -305,7 +394,10 @@ func (p *pendingProjections) markSuspect(path string) {
 	if len(snap.entries) == 0 {
 		return
 	}
-	if e := snap.entries[pathkey.MutationKey(path)]; e != nil {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.snap.Load().entries[pathkey.MutationKey(path)]; e != nil {
+		e.sourceEvents++
 		e.suspect.Store(true)
 	}
 }
@@ -322,6 +414,11 @@ func (p *pendingProjections) dropAll(entries []*projectionEntry) int {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.dropAllLocked(entries)
+}
+
+// dropAllLocked requires p.mu; callers already checked pointer ownership.
+func (p *pendingProjections) dropAllLocked(entries []*projectionEntry) int {
 	cur := p.snap.Load()
 	next := &projectionSnapshot{bytes: cur.bytes}
 	dropped := 0
@@ -340,6 +437,21 @@ func (p *pendingProjections) dropAll(entries []*projectionEntry) int {
 		p.snap.Store(next)
 	}
 	return dropped
+}
+
+// Invalidation and expected-pointer publication share one linearization
+// boundary. An already-published newer owner is never marked or removed.
+func (p *pendingProjections) invalidateCurrent(entry *projectionEntry) {
+	if entry == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.snap.Load().entries[entry.key] != entry {
+		return
+	}
+	entry.suspect.Store(true)
+	p.dropAllLocked([]*projectionEntry{entry})
 }
 
 // projectionStore is what retirement reads: a file's content identity, then
@@ -372,11 +484,14 @@ func (p *pendingProjections) retire(store projectionStore) int {
 // A receipt alone is never retirement evidence. Both entry points preserve
 // durable hash -> node comparison -> durable hash and pointer-fenced COW drop.
 func (p *pendingProjections) retireSelected(store projectionStore, selected map[string]struct{}) int {
+	p.mu.Lock()
 	snap := p.snap.Load()
 	if len(snap.entries) == 0 {
+		p.mu.Unlock()
 		return 0
 	}
 	byRepo := make(map[string][]*projectionEntry)
+	revisions := make(map[*projectionEntry]uint64, len(snap.entries))
 	for key, e := range snap.entries {
 		if selected != nil {
 			if _, ok := selected[key]; !ok {
@@ -384,7 +499,9 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 			}
 		}
 		byRepo[e.repoPrefix] = append(byRepo[e.repoPrefix], e)
+		revisions[e] = e.sourceEvents
 	}
+	p.mu.Unlock() // metadata/node/layer reads stay outside the registry lock
 	var caughtUp []*projectionEntry
 	for prefix, entries := range byRepo {
 		candidates := storeHolds(store, prefix, entries)
@@ -396,13 +513,36 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 		for _, e := range storeHolds(store, prefix, candidates) {
 			if diverged[e] {
 				p.divergence.Add(1)
+				delete(revisions, e) // dropping a divergent payload grants no retry hint
 			}
 			caughtUp = append(caughtUp, e)
 		}
 	}
-	retired := p.dropAll(caughtUp)
+	// Checked selected adapters must finish all I/O before dropAll takes mu.
+	if checked, ok := store.(interface{ validateProjectionRetirement() error }); ok {
+		if checked.validateProjectionRetirement() != nil {
+			return 0
+		}
+	}
+	retired := p.dropCheckedRetired(caughtUp, revisions)
 	p.retired.Add(int64(retired))
 	return retired
+}
+
+func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revisions map[*projectionEntry]uint64) int {
+	if len(entries) == 0 {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.snap.Load()
+	for _, entry := range entries {
+		if revision, observed := revisions[entry]; observed && current.entries[entry.key] == entry &&
+			entry.sourceEvents == revision && !entry.suspect.Load() {
+			entry.checkedRetired.Store(true)
+		}
+	}
+	return p.dropAllLocked(entries)
 }
 
 // storeHolds returns the entries whose content the store holds now.

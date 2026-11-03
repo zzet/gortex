@@ -5,14 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zeebo/blake3"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -36,7 +38,7 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 	if owner == nil || rel == "" {
 		return 0, 0, fmt.Errorf("no indexer owns %s", node.FilePath)
 	}
-	if owner.IndexedContentMatches(rel, content) {
+	if !requestViewFromContext(ctx).routed() && owner.IndexedContentMatches(rel, content) {
 		// A reindex writes a file's nodes before its content identity, so
 		// the node read now belongs to these bytes. node may have been read
 		// before that reindex committed.
@@ -122,19 +124,63 @@ type nodeSource struct {
 // node's range against exactly the bytes it read. An editor overlay is served
 // with the node's own range, since the overlay view parsed that content.
 func (s *Server) readNodeSource(ctx context.Context, node *graph.Node, absPath string) (nodeSource, error) {
+	caller := ctx
+	if deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	if content, ok := s.overlayContentFor(ctx, absPath); ok {
 		return nodeSource{content: content, startLine: node.StartLine, endLine: node.EndLine}, nil
 	}
-	raw, err := func() ([]byte, error) {
-		release := s.beginEditedFileRead(ctx, absPath)
-		defer release()
-		return os.ReadFile(absPath)
-	}()
+	owner, _ := s.indexerForRel(node.FilePath)
+	if owner == nil {
+		return nodeSource{}, fmt.Errorf("no indexer owns %s", node.FilePath)
+	}
+	if reason := requestDeferredProjectionFiles(ctx)[node.FilePath]; reason == "storm" || reason == "external_write" {
+		return nodeSource{}, errProjectedSourceDeferred
+	}
+	root, rel, key, err := selectedProjectionReadPath(ctx, owner.RootPath(), owner.RepoPrefix(), absPath)
 	if err != nil {
 		return nodeSource{}, err
 	}
+	files, err := source.NewFilesystemSource(root)
+	if err != nil {
+		return nodeSource{}, err
+	}
+	defer files.Close()
+	raw, _, err := func() ([]byte, source.FileMeta, error) {
+		release := s.beginEditedFileRead(ctx, absPath)
+		defer release()
+		return files.ReadRegularFile(ctx, filepath.ToSlash(rel), 1<<20)
+	}()
+	if err != nil {
+		if caller.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nodeSource{}, errProjectedSourceDeferred
+		}
+		return nodeSource{}, err
+	}
+	var entry *projectionEntry
+	if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
+		facts.mu.RLock()
+		entry = facts.entries[key]
+		facts.mu.RUnlock()
+	}
+	if entry != nil {
+		if !liveProjectionForAcknowledgement(entry) || entry.rawHash != blake3.Sum256(raw) {
+			return nodeSource{}, invalidateProjectedSource(entry)
+		}
+		current := entry.layer.NodeByID(node.ID)
+		if current == nil {
+			return nodeSource{}, errSymbolRemoved
+		}
+		return nodeSource{content: string(indexer.DecodeUTF16Source(raw)), startLine: current.StartLine, endLine: current.EndLine}, nil
+	}
 	start, end, err := s.nodeLinesIn(ctx, node, raw)
 	if err != nil {
+		if caller.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nodeSource{}, errProjectedSourceDeferred
+		}
 		return nodeSource{}, err
 	}
 	return nodeSource{content: string(indexer.DecodeUTF16Source(raw)), startLine: start, endLine: end}, nil

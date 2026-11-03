@@ -17,30 +17,34 @@ func TestFreshnessResponseContractNormalizesFileReadPaths(t *testing.T) {
 		t.Run(tool, func(t *testing.T) {
 			s, root := newRelationFixture(t)
 			path := filepath.Join(root, "target.go")
-			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{
-				path: {Generation: 1, AckAt: time.Now()},
-			}})
-			handlers := map[string]func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error){
-				"read_file":           s.handleReadFile,
-				"get_file_summary":    s.handleGetFileSummary,
-				"get_editing_context": s.handleGetEditingContext,
-			}
+			s.SetWatcher(&watchedTierFixture{paths: map[string]indexer.MutationTierState{path: {Generation: 1, AckAt: time.Now()}}})
+			handlers := map[string]func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error){"read_file": s.handleReadFile, "get_file_summary": s.handleGetFileSummary, "get_editing_context": s.handleGetEditingContext}
 			for _, target := range []string{"target.go", path} {
-				t.Run(target, func(t *testing.T) {
-					req := mcp.CallToolRequest{}
-					req.Params.Name = tool
-					req.Params.Arguments = map[string]any{"path": target, "format": "json"}
-					res, err := s.wrapToolHandler(handlers[tool])(t.Context(), req)
-					require.NoError(t, err)
-					require.False(t, res.IsError, resultText(res))
-					payload := resultJSON(t, res)
-					freshness, ok := payload["freshness"].(map[string]any)
-					require.True(t, ok, "pending file read lacks freshness: %s", resultText(res))
-					require.Equal(t, "pending", freshness["graph_freshness"])
-					require.Equal(t, "file", freshness["freshness_scope"])
-					require.EqualValues(t, 1, freshness["pending_file_count"])
-					require.Equal(t, []any{"target.go"}, freshness["pending_files"])
-				})
+				for _, scope := range []string{"", "file"} {
+					t.Run(target+"/scope_"+scope, func(t *testing.T) {
+						req := mcp.CallToolRequest{}
+						req.Params.Name = tool
+						arguments := map[string]any{"path": target, "format": "json"}
+						expectedScope := "relations"
+						if tool == "read_file" {
+							expectedScope = "file"
+						}
+						if scope != "" {
+							arguments["freshness_scope"] = scope
+							expectedScope = scope
+						}
+						req.Params.Arguments = arguments
+						res, err := s.wrapToolHandler(handlers[tool])(t.Context(), req)
+						require.NoError(t, err)
+						require.False(t, res.IsError, resultText(res))
+						freshness, ok := resultJSON(t, res)["freshness"].(map[string]any)
+						require.True(t, ok, "pending file read lacks freshness: %s", resultText(res))
+						require.Equal(t, "pending", freshness["graph_freshness"])
+						require.Equal(t, expectedScope, freshness["freshness_scope"])
+						require.EqualValues(t, 1, freshness["pending_file_count"])
+						require.Equal(t, []any{"target.go"}, freshness["pending_files"])
+					})
+				}
 			}
 		})
 	}

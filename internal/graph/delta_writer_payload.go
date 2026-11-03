@@ -84,6 +84,7 @@ func deltaEdgeRender(e *Edge) string {
 	c.Via = ""
 	c.Alias = ""
 	c.NameOnly = false
+	c.Provisional = false
 	return fmt.Sprintf("%+v", c)
 }
 
@@ -145,10 +146,10 @@ func deltaEdgeContentEqual(a, b *Edge) bool {
 }
 
 // deltaEdgeFieldsCompared is the number of Edge fields deltaEdgeContentEqual
-// accounts for (the ten it compares, Meta, and the five that are not
+// accounts for (the ten it compares, Meta, and the six that are not
 // persisted). An Edge with another field falls back to the rendered
 // comparison until the comparison learns it.
-const deltaEdgeFieldsCompared = 16
+const deltaEdgeFieldsCompared = 17
 
 var deltaEdgeFields = reflect.TypeOf(Edge{}).NumField()
 

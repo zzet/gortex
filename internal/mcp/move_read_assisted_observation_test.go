@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -91,13 +89,15 @@ func TestMoveReadAssistedPendingVerdictAndUnknownOwnerRemainUnavailable(t *testi
 	require.Equal(t, "unavailable_move_write_verdict", after["read_assisted_reconcile_state"], "later final verdict cannot manufacture a callback window")
 }
 
-func TestMoveActualCoalescedPublicReaderAndDirectKeepBothCausesOneExecution(t *testing.T) {
+// The reader must not wait for or join the pending direct executor. Legacy
+// observer fixtures above retain their historical identity/competitor fences.
+func TestProjectedReadDoesNotJoinOrWaitForMoveDirectExecution(t *testing.T) {
 	s, move, ctx, _, _, target := moveObservationExecutionFixture(t)
 	root, ok := s.multiIndexer.RepoRoot("fixture")
 	require.True(t, ok)
 	entered, resume := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(resume) }) }
+	var once sync.Once
+	release := func() { once.Do(func() { close(resume) }) }
 	gateDone := make(chan error, 1)
 	go func() {
 		gateDone <- s.multiIndexer.RunRepositoryTopologyBatch(t.Context(), func(context.Context) error { close(entered); <-resume; return nil })
@@ -115,94 +115,63 @@ func TestMoveActualCoalescedPublicReaderAndDirectKeepBothCausesOneExecution(t *t
 			select {
 			case <-gateDone:
 			case <-time.After(5 * time.Second):
-				t.Error("coalescing gate did not join")
+				t.Error("topology gate did not join")
 			}
 		}
 		if readerStarted && !readerJoined {
 			select {
 			case <-readerDone:
 			case <-time.After(5 * time.Second):
-				t.Error("actual public reader did not join")
+				t.Error("public reader did not join")
 			}
 		}
 		if directStarted && !directJoined {
 			select {
 			case <-directDone:
 			case <-time.After(5 * time.Second):
-				t.Error("actual direct caller did not join")
+				t.Error("direct publisher did not join")
 			}
 		}
 	})
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("existing topology gate was not held")
+		t.Fatal("topology gate was not held")
 	}
+	directStarted = true
+	go func() { directDone <- move.reindex(ctx, target) }()
 	readerStarted = true
 	go func() {
 		request := mcpgo.CallToolRequest{}
 		request.Params.Arguments = map[string]any{"id": "fixture/target.go::Moved", "context_lines": 0}
-		result, err := s.handleGetSymbolSource(WithSessionCWD(WithSessionID(ctx, "actual-coalesced-reader"), root), request)
+		result, err := s.handleGetSymbolSource(WithSessionCWD(WithSessionID(ctx, "independent-projected-reader"), root), request)
 		readerDone <- readerResult{result, err}
 	}()
-	directStarted = true
-	go func() { directDone <- move.reindex(ctx, target) }()
-	// The existing gate blocks drain before it takes pending paths. Observe the
-	// two real callers parked after coordinator admission, not just goroutine
-	// launch or observer construction; then release one genuinely coalesced batch.
+	select {
+	case read := <-readerDone:
+		readerJoined = true
+		require.NoError(t, read.err)
+		require.False(t, read.result.IsError, "%v", read.result.Content)
+		require.Contains(t, unmarshalResult(t, read.result)["source"], "func Moved()")
+	case <-time.After(2 * time.Second):
+		t.Fatal("read waited for the held mutation lane")
+	}
+	require.Nil(t, s.engineFor(t.Context()).GetSymbol("fixture/target.go::Moved"), "read did not publish base")
 	require.Eventually(t, func() bool {
 		record := move.records[target]
 		record.mu.RLock()
-		pending := record.moveFile.directState == "pending_observer" && record.moveFile.readState == "pending_observer"
-		record.mu.RUnlock()
-		if !pending {
-			return false
-		}
-		stack := make([]byte, 128<<10)
-		n := runtime.Stack(stack, true)
-		return strings.Count(string(stack[:n]), "(*repositoryMutationCoordinator).reconcileObserved(") >= 2
-	}, 5*time.Second, time.Millisecond)
+		defer record.mu.RUnlock()
+		return record.moveFile.directState == "pending_observer"
+	}, time.Second, time.Millisecond)
 	release()
-	select {
-	case err := <-gateDone:
-		gateJoined = true
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("gate did not finish")
-	}
-	select {
-	case result := <-readerDone:
-		readerJoined = true
-		require.NoError(t, result.err)
-		require.False(t, result.result.IsError)
-	case <-time.After(5 * time.Second):
-		t.Fatal("public read did not finish")
-	}
-	select {
-	case success := <-directDone:
-		directJoined = true
-		require.True(t, success)
-	case <-time.After(5 * time.Second):
-		t.Fatal("direct reconcile did not finish")
-	}
+	require.NoError(t, <-gateDone)
+	gateJoined = true
+	require.True(t, <-directDone)
+	directJoined = true
 	status, _ := s.moveFileObservationPayload(t.Context(), move.records[target].id)
 	require.Equal(t, "observed", status["direct_reconcile_state"])
-	require.Equal(t, "observed", status["read_assisted_reconcile_state"])
+	require.Equal(t, "not_applicable_projected_reads", status["read_assisted_reconcile_state"])
+	require.NotContains(t, status, "read_assisted_reconcile")
 	direct := status["direct_reconcile"].(map[string]any)
-	repair := status["read_assisted_reconcile"].(map[string]any)
-	for _, key := range []string{"owner_generation", "window_ns", "accepted_blob_sha", "writer_return_to_acceptance_ns", "started_from_ack_ns", "finished_from_ack_ns", "accepted_from_start_ns", "reconcile_causes"} {
-		require.Equal(t, direct[key], repair[key], "different executed %s", key)
-	}
-	require.Equal(t, "actual-coalesced-reader", repair["request_cause"].(mutationReadRepairCause).Session)
-	require.NotEqual(t, repair["request_cause"], direct["request_cause"])
-	require.Len(t, repair["reconcile_causes"], 2)
-	directPhases := direct["phase_accounting"].(map[string]any)
-	repairPhases := repair["phase_accounting"].(map[string]any)
-	require.Equal(t, "move_direct_reconcile", directPhases["scope"])
-	require.Equal(t, "move_read_assisted_reconcile", repairPhases["scope"])
-	for key, value := range directPhases {
-		if key != "scope" {
-			require.Equal(t, value, repairPhases[key], "different partition %s", key)
-		}
-	}
+	require.Len(t, direct["reconcile_causes"], 1, "the projection read cannot invent a second physical execution/cause")
 }
