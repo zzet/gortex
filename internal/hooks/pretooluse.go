@@ -809,7 +809,7 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 // scopeNamesFile reports whether a `path` scope names one file rather than a
 // directory to search under. An existing path answers directly; one that is
 // not on disk (a scope the agent typed from memory) is judged by whether it
-// carries an extension.
+// carries an extension (`.` and `..` are always directories).
 func scopeNamesFile(cwd, scope string) bool {
 	abs := scope
 	if !filepath.IsAbs(abs) && cwd != "" {
@@ -817,6 +817,9 @@ func scopeNamesFile(cwd, scope string) bool {
 	}
 	if info, err := os.Stat(abs); err == nil {
 		return !info.IsDir()
+	}
+	if base := filepath.Base(scope); base == "." || base == ".." {
+		return false
 	}
 	return filepath.Ext(scope) != ""
 }
@@ -1536,12 +1539,16 @@ func enrichBashShapes(cmd, cwd string, probe fileScopeProbe, deadline time.Time)
 		// the write pre-pass instead of returning silence.
 		c = classifyBashReadCommand(cmd)
 	}
-	// A grep whose every target lies outside every tracked repo gets the
-	// silence `cat` of the same file and Grep with `path:` already get (#893):
-	// the graph the redirect names has nothing for it. Pass over it rather than
-	// stopping, so a source read chained after it is still answered.
+	// A grep whose every target lies outside every tracked repo, or is docs or
+	// config inside one, gets the silence `cat` of the same file and Grep with
+	// `path:` already get (#893): the graph the redirect names has nothing for
+	// it. Pass over it rather than stopping, so a source read chained after it
+	// is still answered, unless the operands it read off the command cannot
+	// be trusted (searchOperandsUncertain).
+	trusted := !searchOperandsUncertain(cmd)
 	outsideGraph := func(next BashClassification) bool {
-		return next.Action == BashActionGrepLike && bashSearchOutsideTrackedRepos(next.Paths, cwd)
+		return next.Action == BashActionGrepLike && trusted &&
+			(bashSearchOutsideTrackedRepos(next.Paths, cwd) || bashSearchNonSource(next.Paths, cwd))
 	}
 	if outsideGraph(c) {
 		c = classifyBashReadCommandSkipping(cmd, outsideGraph)

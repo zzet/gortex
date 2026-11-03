@@ -238,6 +238,36 @@ func (f *issue767Fixture) command(timeout time.Duration, dir string, args ...str
 	return output
 }
 
+// tryJSONCommand preserves the CLI wire and diagnostics independently. Raw
+// streams and argv are retained before any caller parses or rejects a response.
+// tryCommand remains the combined-output path for general diagnostics.
+func (f *issue767Fixture) tryJSONCommand(timeout time.Duration, dir string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(f.t.Context(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, f.binary, args...)
+	cmd.Dir, cmd.Env = dir, f.env
+	f.mu.Lock()
+	f.clientCalls++
+	call := f.clientCalls
+	f.mu.Unlock()
+	stdout, stderr, err := issue767ReadCommandOutput(cmd)
+	stem := filepath.Join(f.root, fmt.Sprintf("json-command-%06d", call))
+	f.write(stem+".stdout.json", string(stdout))
+	f.write(stem+".stderr", string(stderr))
+	meta, metaErr := json.Marshal(map[string]any{"dir": dir, "argv": args, "error": fmt.Sprint(err)})
+	if metaErr != nil {
+		f.t.Fatal(metaErr)
+	}
+	f.write(stem+".command.json", string(meta))
+	f.mu.Lock()
+	f.lastOutput = string(stdout) + string(stderr)
+	if len(f.lastOutput) > 4096 {
+		f.lastOutput = f.lastOutput[len(f.lastOutput)-4096:]
+	}
+	f.mu.Unlock()
+	return stdout, err
+}
+
 func (f *issue767Fixture) tryCommand(timeout time.Duration, dir string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(f.t.Context(), timeout)
 	defer cancel()
@@ -656,7 +686,7 @@ func (f *issue767Fixture) askSymbol(root, name, file string, spelling issue767Sp
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	output, err := f.tryCommand(10*time.Second, root, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
+	output, err := f.tryJSONCommand(10*time.Second, root, "call", "search", "--index", root, "--json", string(payload), "--format", "json")
 	if err != nil {
 		answer.Error = fmt.Sprintf("search command: %v: %s", err, output)
 		return answer, fmt.Errorf("search command: %w: %s", err, output)

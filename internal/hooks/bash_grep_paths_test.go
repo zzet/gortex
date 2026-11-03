@@ -43,6 +43,20 @@ func TestBashGrepJudgedByPathOperands(t *testing.T) {
 		{"cd chain into untracked", "cd " + elsewhereFixtureRoot + " && cd notes && grep -rn panel .", false},
 		{"cd tracked, absolute untracked operand", "cd " + trackedPkg + " && grep -rn panel " + notes, false},
 
+		// Docs and config inside the tracked repo, as the Grep tool sees them.
+		{"tracked README", "grep -n panel README.md", false},
+		{"tracked config files", "grep -c panel go.mod CHANGELOG.md", false},
+		{"glob (its expansion depends on shell options)", "grep -i panel docs/*.md", true},
+		{"tracked directory", "grep -rn panel docs", true},
+		{"README and a source file", "grep -n panel README.md internal/x.go", true},
+		{"escape the shell turns into .go", `grep -n panel internal/x.g\o`, true},
+		{"rg --ignore takes no value", "rg panel --ignore internal/x.go README.md", true},
+		{"piped grep naming source", "grep -n panel README.md | grep panel internal/x.go", true},
+		{"piped grep over stdin", "grep -n panel README.md | grep -v test", false},
+		{"long switch", "grep --line-number panel README.md", false},
+		{"long option taking the file as its value", "grep -rn panel --group-separator README.md", true},
+		{"-X takes the next word", "grep -rnX grep panel.md", true},
+
 		// Anything tracked, or anything unproven, keeps the policy.
 		{"cwd recursion", "grep -rn panel .", true},
 		{"no path operand", "grep -rn panel", true},

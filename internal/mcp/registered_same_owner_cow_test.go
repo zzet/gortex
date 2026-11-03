@@ -92,6 +92,15 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	releaseBorrowed := make(chan struct{})
 	releaseBorrowedOnce := sync.OnceFunc(func() { close(releaseBorrowed) })
 	t.Cleanup(releaseBorrowedOnce)
+	var originalDeadline time.Time
+	allowances := make(map[string]*projectedSourceAllowance)
+	for _, tool := range tools {
+		if tool != "read_file" {
+			allowances[tool] = &projectedSourceAllowance{tool: tool}
+		}
+	}
+	var selectedBudgetMu sync.Mutex
+	var selectedBudgets []registeredBorrowObservation
 	if afterBorrow {
 		for _, name := range tools {
 			if name == "read_file" {
@@ -103,6 +112,11 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 			leaf := captured.handler
 			tool := name
 			s.addTool(captured.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+				if ctx.Value(registeredReadCOWActorKey{}) != true {
+					selectedBudgetMu.Lock()
+					selectedBudgets = append(selectedBudgets, registeredBorrowObservation{tool: tool, ctx: ctx})
+					selectedBudgetMu.Unlock()
+				}
 				result, err := leaf(ctx, req)
 				if err == nil && result != nil && !result.IsError && ctx.Value(registeredReadCOWActorKey{}) != true {
 					borrowed <- registeredBorrowObservation{tool: tool, ctx: ctx}
@@ -167,7 +181,13 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 		require.Zero(t, borrowedOwner.commitSeq)
 		require.Same(t, entry.layer, borrowedOwner.layer)
 	}
-	originalDeadline := time.Now().Add(projectedReadBudget)
+	budget := projectedReadBudget
+	if afterBorrow {
+		// Deliberately held leaf/peer/refresh orchestration tests lifecycle,
+		// separately from the unchanged production150ms default and expiry.
+		budget = canonicalLifecycleFixtureBudget
+	}
+	originalDeadline = time.Now().Add(budget)
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, originalDeadline)
 	backend.armed.Store(!afterBorrow)
 	release := sync.OnceFunc(func() { close(backend.release) })
@@ -176,13 +196,9 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 		result *mcplib.CallToolResult
 	}
 	answers := make(chan answer, len(tools))
-	allowances := make(map[string]*projectedSourceAllowance)
 	var workers sync.WaitGroup
 	t.Cleanup(func() { release(); releaseBorrowedOnce(); workers.Wait() })
 	for i, tool := range tools {
-		if tool != "read_file" {
-			allowances[tool] = &projectedSourceAllowance{tool: tool}
-		}
 		allowance := allowances[tool]
 		workers.Add(1)
 		go func() {
@@ -260,6 +276,13 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 		}
 	}
 	workers.Wait()
+	if afterBorrow {
+		require.GreaterOrEqual(t, len(selectedBudgets), len(tools)-1, "each held graph leaf must expose its original allowance")
+	}
+	for _, observed := range selectedBudgets {
+		require.Equal(t, originalDeadline, observed.ctx.Value(projectedSourceDeadlineKey{}), "a COW retry cannot reset the original fixture deadline")
+		require.Same(t, allowances[observed.tool], observed.ctx.Value(projectedSourceAllowanceKey{}), "all attempts keep the original two-attempt allowance")
+	}
 	winner := liveEntry(pendingFileProjections, path)
 	require.NotNil(t, winner)
 	require.NotSame(t, entry, winner)

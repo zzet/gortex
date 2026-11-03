@@ -18,6 +18,11 @@ import (
 	"github.com/zzet/gortex/internal/tokens"
 )
 
+// Lifecycle fixtures perform real producer work inside the selected read.
+// Their original allowance is injected before attempt one; it is not the
+// production 150ms read/performance contract, tested independently.
+const canonicalLifecycleFixtureBudget = time.Second
+
 func canonicalPromotionReadFixture(t *testing.T) (*Server, *store_sqlite.Store, string) {
 	t.Helper()
 	// Daemon startup warms token counting before it serves source requests.
@@ -27,7 +32,7 @@ func canonicalPromotionReadFixture(t *testing.T) (*Server, *store_sqlite.Store, 
 	path := filepath.Join(root, "main.go")
 	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc Target() int { return 1 }\n\nfunc Neighbor() int { return 9 }\n"), 0600))
 	// This is a real SQLite publication/reader interleaving, not a persistence
-	// benchmark. Keep temporary-filesystem I/O outside the 150ms read oracle;
+	// benchmark. Keep temporary-filesystem I/O outside the lifecycle oracle;
 	// the actual IndexFile, SQL rows, retirement and deadline checks stay intact.
 	store, err := store_sqlite.Open(":memory:")
 	require.NoError(t, err)
@@ -87,10 +92,12 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 			retirement := s.canonicalProjectionRetirement(path)
 			require.NotNil(t, retirement)
 
-			originalDeadline := time.Now().Add(projectedReadBudget)
+			originalDeadline := time.Now().Add(canonicalLifecycleFixtureBudget)
 			caller, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			ctx := context.WithValue(caller, projectedSourceDeadlineKey{}, originalDeadline)
+			originalAllowance := &projectedSourceAllowance{tool: "get_symbol_source"}
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, originalAllowance)
 			calls := 0
 			var first context.Context
 			var deadlines []time.Time
@@ -104,6 +111,7 @@ func TestSymbolSourceCanonicalPromotionAfterLeafUsesBoundedFreshAttempt(t *testi
 						t.Logf("tool=%s stage=callback_entry remaining_original_budget=%s", "get_symbol_source", time.Until(originalDeadline))
 						leafStarted := time.Now()
 						calls++
+						require.Same(t, originalAllowance, ctx.Value(projectedSourceAllowanceKey{}))
 						deadlines = append(deadlines, ctx.Value(projectedSourceDeadlineKey{}).(time.Time))
 						result, readErr := s.handleGetSymbolSource(ctx, req)
 						t.Logf("tool=%s stage=leaf_return elapsed=%s remaining_original_budget=%s", "get_symbol_source", time.Since(leafStarted), time.Until(originalDeadline))

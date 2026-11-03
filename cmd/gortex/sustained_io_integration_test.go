@@ -1166,7 +1166,7 @@ func (r *sustainedIORun) processIO() (issue767ProcessIO, error) {
 // the counters landed — returns an error, which is recorded by name; it is never substituted with
 // zeros.
 func (r *sustainedIORun) counters() (map[string]int64, error) {
-	output, err := r.f.tryCommand(sustainedIOStatusScrapeTimeout, r.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	output, err := r.f.tryJSONCommand(sustainedIOStatusScrapeTimeout, r.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json unavailable on this arm: %w", err)
 	}
