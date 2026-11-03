@@ -1315,7 +1315,16 @@
                               "error": {
                                 "type": "string"
                               },
+                              "expected_id": {
+                                "type": "string"
+                              },
+                              "expected_line": {
+                                "type": "integer"
+                              },
                               "expected_outcome": {
+                                "type": "string"
+                              },
+                              "expected_path": {
                                 "type": "string"
                               },
                               "kind": {
@@ -1524,6 +1533,13 @@
                         },
                         "route": {
                           "type": "string"
+                        },
+                        "search_ack": {
+                          "additionalProperties": {},
+                          "type": [
+                            "object",
+                            "null"
+                          ]
                         },
                         "stale_claimed_fresh": {
                           "type": "boolean"
@@ -2037,6 +2053,9 @@
                           "null"
                         ]
                       },
+                      "search_readback_acceptance": {
+                        "type": "boolean"
+                      },
                       "seed": {
                         "type": "integer"
                       },
@@ -2086,6 +2105,9 @@
                             },
                             "expected_refusal": {
                               "type": "boolean"
+                            },
+                            "expected_search_line": {
+                              "type": "integer"
                             },
                             "file": {
                               "type": "string"
@@ -2593,6 +2615,110 @@
                   },
                   "role": {
                     "type": "string"
+                  },
+                  "search_readback_acceptance": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "acknowledged": {
+                            "type": "integer"
+                          },
+                          "actual_ack_modes": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "actual_edits_by_editor": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "actual_file_view_states": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "editors": {
+                            "type": "integer"
+                          },
+                          "immediate_witnesses": {
+                            "additionalProperties": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "correct": {
+                                  "type": "integer"
+                                },
+                                "errors": {
+                                  "type": "integer"
+                                },
+                                "missing": {
+                                  "type": "integer"
+                                },
+                                "observed": {
+                                  "type": "integer"
+                                },
+                                "refusals": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "observed",
+                                "correct",
+                                "errors",
+                                "refusals",
+                                "missing"
+                              ],
+                              "type": "object"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "local_object_acks": {
+                            "type": "integer"
+                          },
+                          "offered": {
+                            "type": "integer"
+                          },
+                          "pass": {
+                            "type": "boolean"
+                          },
+                          "records": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "local_object_acks",
+                          "actual_ack_modes",
+                          "actual_file_view_states",
+                          "offered",
+                          "editors",
+                          "acknowledged",
+                          "records",
+                          "pass",
+                          "immediate_witnesses",
+                          "actual_edits_by_editor"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "stats_after": {},
                   "stats_before": {},
@@ -3890,6 +4016,9 @@
                     "null"
                   ]
                 },
+                "search_readback_acceptance": {
+                  "type": "boolean"
+                },
                 "seed": {
                   "type": "integer"
                 },
@@ -3939,6 +4068,9 @@
                       },
                       "expected_refusal": {
                         "type": "boolean"
+                      },
+                      "expected_search_line": {
+                        "type": "integer"
                       },
                       "file": {
                         "type": "string"

@@ -81,7 +81,7 @@ func runStartupPhase(ctx context.Context, o runOptions, corpora []Corpus, output
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
-	p.editACKMode = o.EditACKMode
+	p.editACKMode = o.editACKPolicy()
 	artifacts["private_root"] = p.Root
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), o.StopTimeout)

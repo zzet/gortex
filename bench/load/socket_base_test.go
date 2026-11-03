@@ -112,3 +112,17 @@ func TestPrivateRunSocketOverrideKeepsCleanupInsideOwnedDirectory(t *testing.T) 
 		t.Fatalf("cleanup touched caller-owned sibling: %q %v", value, err)
 	}
 }
+
+func TestSearchAcceptanceOuterUsesActualOutputFlag(t *testing.T) {
+	for _, editors := range []int{1, 4, 8} {
+		args := searchAcceptanceArgs(editors, 1000)
+		args = append(args, "--search-readback-acceptance", "--edit-mean=1s", "--edit-ack=local", "--out=/owned/report.json")
+		parsed, err := parseRun(args)
+		if err != nil || parsed.Output != "/owned/report.json" || parsed.EditCount != 1000 || parsed.Editors != editors || !parsed.SearchReadbackAcceptance {
+			t.Fatalf("actual per-cell argv refused or altered: %+v %v", parsed, err)
+		}
+		if _, err := parseRun(append(args, "--output=/owned/invalid.json")); err == nil {
+			t.Fatal("obsolete unregistered --output flag unexpectedly accepted")
+		}
+	}
+}
