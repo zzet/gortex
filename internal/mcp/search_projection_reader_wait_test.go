@@ -158,7 +158,7 @@ func runPendingSearchMetadataCancellation(t *testing.T, cancelCaller bool) {
 		holders.Add(1)
 		go func() {
 			defer holders.Done()
-			holderErrors <- backend.Store.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
+			holderErrors <- backend.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
 				entered <- struct{}{}
 				<-poolRelease
 				return fixtureRelease // Roll back without another pool acquisition.
@@ -172,13 +172,13 @@ func runPendingSearchMetadataCancellation(t *testing.T, cancelCaller bool) {
 			t.Fatal("real SQLite scope did not reserve its reader connection")
 		}
 	}
-	before := backend.Store.ReaderWaitMark()
+	before := backend.ReaderWaitMark()
 	startQuery()
 	admissionDeadline := time.Now().Add(time.Second)
 	for backend.Store.ReaderWaitMark().PoolWaits == before.PoolWaits && time.Now().Before(admissionDeadline) {
 		runtime.Gosched() // Wait for an actual SQL pool-admission witness only.
 	}
-	blocked := backend.Store.ReaderWaitMark()
+	blocked := backend.ReaderWaitMark()
 	poolWaitProven := blocked.PoolWaits > before.PoolWaits
 	cancelled := time.Now()
 	want := context.DeadlineExceeded
