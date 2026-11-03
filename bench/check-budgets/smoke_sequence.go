@@ -94,7 +94,7 @@ func smokeWarmBudget(ctx context.Context) (time.Duration, error) {
 	if remaining <= 0 {
 		return 0, context.DeadlineExceeded
 	}
-	return min(remaining, 13*time.Minute), nil
+	return min(remaining, smokeMeasurementWindow), nil
 }
 
 func validateSmokeSequence(s smokeSequenceReceipt, plan lanePlan, started, finished time.Time) error {

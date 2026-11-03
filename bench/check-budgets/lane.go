@@ -41,6 +41,7 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
+	NightlySeed       *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
 	EditGateSeed      string               `json:"edit_gate_seed,omitempty"`
 	Version           int                  `json:"schema_version"`
 	Lane              string               `json:"lane"`
@@ -75,13 +76,14 @@ type laneTask struct {
 }
 
 type lanePlan struct {
-	Lane          string     `json:"lane"`
-	Execution     string     `json:"execution,omitempty"`
-	HostClass     string     `json:"host_class"`
-	Tasks         []laneTask `json:"tasks"`
-	Prerequisites []string   `json:"unavailable_prerequisites"`
-	Ready         bool       `json:"ready"`
-	PolicySHA256  string     `json:"policy_sha256"`
+	NightlySeed   *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
+	Lane          string               `json:"lane"`
+	Execution     string               `json:"execution,omitempty"`
+	HostClass     string               `json:"host_class"`
+	Tasks         []laneTask           `json:"tasks"`
+	Prerequisites []string             `json:"unavailable_prerequisites"`
+	Ready         bool                 `json:"ready"`
+	PolicySHA256  string               `json:"policy_sha256"`
 }
 
 type taskReceipt struct {
@@ -118,6 +120,12 @@ func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 	}
 	if d.Decode(new(any)) != io.EOF {
 		return c, errors.New("lane config must contain exactly one JSON document")
+	}
+	if err := validateNightlySeed(c); err != nil {
+		return c, err
+	}
+	if c.NightlySeed != nil && len(editGate) > 0 && editGate[0] {
+		return c, errors.New("nightly workload fault requires the full collector, not edit-collect")
 	}
 	if c.EditGateSeed != "" && (len(editGate) == 0 || !editGate[0] || c.Lane != "smoke" || c.EditGateSeed != "ack-wait" && c.EditGateSeed != "closed-read-gate") {
 		return c, errors.New("edit_gate_seed requires the explicit edit smoke collector and ack-wait or closed-read-gate")
@@ -187,10 +195,14 @@ func readLaneConfig(path string, editGate ...bool) (laneConfig, error) {
 func pathAbsolute(path string) string { absolute, _ := filepath.Abs(path); return absolute }
 
 func makeLanePlan(p policy, c laneConfig) (lanePlan, error) {
-	plan := lanePlan{Lane: c.Lane, HostClass: c.HostClass, Ready: true, Prerequisites: []string{}, PolicySHA256: policyDigest(p)}
+	if err := validateNightlySeed(c); err != nil {
+		return lanePlan{}, err
+	}
+	plan := lanePlan{NightlySeed: c.NightlySeed, Lane: c.Lane, HostClass: c.HostClass, Ready: true, Prerequisites: []string{}, PolicySHA256: policyDigest(p)}
 	scenarios := map[string]int{}
 	needsTag := map[string]bool{}
 	gaps := map[string]bool{}
+
 	for _, b := range p.Budgets {
 		if b.HostClass != c.HostClass || !slices.Contains(b.Lane, c.Lane) {
 			continue
@@ -467,6 +479,9 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 	}
 	build := c.Builds[task.Role]
 	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
+	if c.NightlySeed != nil && task.Role == "candidate" && task.Scenario == "load-8" {
+		args = append(args, "--nightly-workload-seed", c.NightlySeed.Kind)
+	}
 	if task.EditGate {
 		args = append(args, "--edit-gate-modes", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
 	}
@@ -510,7 +525,7 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 		}
 		receipt.Smoke = &proof
 	}
-	index := inputs{Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: shippedRevision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
+	index := inputs{NightlySeed: c.NightlySeed, Version: 1, CandidateRevision: c.Builds["candidate"].Revision, MainRevision: c.Builds["main"].Revision, TagRevision: shippedRevision, Repeats: c.Repeats, ScenarioRepeats: map[string]int{}, Hosts: map[string]string{c.HostClass: c.Machine}, Runs: []runInput{}}
 	var failures []error
 	// Release wall time includes all startup, teardown and budget checking, not
 	// just offered load. Reserve three minutes for the harness's independent
