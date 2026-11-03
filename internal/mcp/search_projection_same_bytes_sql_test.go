@@ -102,6 +102,8 @@ func TestSameByteSuspectRefreshReusesCheckedLayerWithoutSQL(t *testing.T) {
 	for range count {
 		require.ErrorIs(t, <-holderErrors, fixtureRelease)
 	}
+	require.NotNil(t, result.entry)
+	require.Same(t, result.entry, liveEntry(pendingFileProjections, path), "actual new COW owner must precede canonical retirement")
 	// The pre-refresh captured callback must still retire whichever checked
 	// owner is current after real IndexFile publication, including read-COW.
 	require.NoError(t, s.indexer.IndexFile(path))
@@ -109,6 +111,7 @@ func TestSameByteSuspectRefreshReusesCheckedLayerWithoutSQL(t *testing.T) {
 	require.NotNil(t, canonical)
 	require.Equal(t, 3, canonical.StartLine)
 	retirement.run()
+	require.True(t, result.entry.checkedRetired.Load(), "actual canonical callback retires the NEW COW owner")
 	require.Nil(t, liveEntry(pendingFileProjections, path))
 	t.Logf("same_bytes=%v returned_while_SQL_held=%v metadata_called=%v real_pool_wait_delta=%d private_error=%v refresh_error=%v entry_present=%v canonical_retired=true", beforeSHA == sha256.Sum256(after), returnedWhileHeld, metadataCalled, poolAfter.PoolWaits-poolBefore.PoolWaits, privateErr, result.err, result.entry != nil)
 	// Every worker and real SQL scope is joined before the causal assertions.
@@ -131,4 +134,24 @@ func TestSameByteSuspectRefreshReusesCheckedLayerWithoutSQL(t *testing.T) {
 	require.Zero(t, result.entry.commitSeq)
 	require.True(t, result.entry.readVersionChecked)
 	require.True(t, original.suspect.Load())
+}
+
+// Scheduling observers cannot authorize publication after the original build
+// context is canceled, even though the bytes were verified before the callback.
+func TestSameByteReuseObserverCannotBypassOriginalCancellation(t *testing.T) {
+	s, _, caller, path, original := searchReaderWaitFixture(t)
+	pendingFileProjections.markSuspect(path)
+	build, cancel := context.WithCancel(caller)
+	defer cancel()
+	var observed *projectionEntry
+	build = context.WithValue(build, checkedProjectionReadObserverKey{}, checkedProjectionReadObserver(func(ctx context.Context, entry *projectionEntry) {
+		observed = entry
+		cancel()
+	}))
+	entry, err := s.projectCurrentTrackedFile(build, caller, path, "main.go", "main.go")
+	require.Same(t, original, observed)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, entry)
+	require.Same(t, original, liveEntry(pendingFileProjections, path))
+	require.True(t, original.suspect.Load(), "the observer cannot publish or rehabilitate the old owner")
 }

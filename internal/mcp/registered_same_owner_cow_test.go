@@ -5,14 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
@@ -20,27 +18,10 @@ import (
 	"go.uber.org/zap"
 )
 
-type sameOwnerReadCOWStore struct {
-	*store_sqlite.Store
-	armed     atomic.Bool
-	arrivals  atomic.Int32
-	gateReads int32
-	captured  chan *projectionEntry
-	release   chan struct{}
-	path      string
-}
-
-func (s *sameOwnerReadCOWStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
-}
-
-func (s *sameOwnerReadCOWStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
-	if err == nil && s.armed.Load() && s.arrivals.Add(1) <= s.gateReads {
-		s.captured <- liveEntry(pendingFileProjections, s.path)
-		<-s.release
-	}
-	return rows, err
+type checkedReadObservation struct {
+	tool  string
+	ctx   context.Context
+	entry *projectionEntry
 }
 
 // The actual daemon admits independent Fast requests from one connection.
@@ -86,7 +67,9 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "cow.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sql.Close()) })
-	backend := &sameOwnerReadCOWStore{Store: sql, captured: make(chan *projectionEntry, gateReads), release: make(chan struct{}), path: path, gateReads: gateReads}
+	backend := sql
+	capturedReads := make(chan checkedReadObservation, gateReads)
+	releaseReads := make(chan struct{})
 	idx := newProjectionTestIndexer(t, backend)
 	_, err = idx.Index(root)
 	require.NoError(t, err)
@@ -105,6 +88,23 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	}
 	var selectedBudgetMu sync.Mutex
 	var selectedBudgets []registeredBorrowObservation
+	if !afterBorrow {
+		for _, tool := range tools {
+			if tool == "read_file" {
+				continue
+			}
+			var once sync.Once
+			observeRegisteredCheckedRead(s, tool, func(ctx context.Context, entry *projectionEntry) {
+				once.Do(func() {
+					capturedReads <- checkedReadObservation{tool: tool, ctx: ctx, entry: entry}
+					select {
+					case <-releaseReads:
+					case <-ctx.Done():
+					}
+				})
+			})
+		}
+	}
 	if afterBorrow {
 		for _, name := range tools {
 			if name == "read_file" {
@@ -193,8 +193,7 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	}
 	originalDeadline = time.Now().Add(budget)
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, originalDeadline)
-	backend.armed.Store(!afterBorrow)
-	release := sync.OnceFunc(func() { close(backend.release) })
+	release := sync.OnceFunc(func() { close(releaseReads) })
 	type answer struct {
 		tool   string
 		result *mcplib.CallToolResult
@@ -225,10 +224,12 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	if !afterBorrow {
 		for range gateReads {
 			select {
-			case captured := <-backend.captured:
-				require.Same(t, entry, captured, "both metadata reads and source must capture the same old pointer before the actual CAS")
+			case captured := <-capturedReads:
+				require.Same(t, entry, captured.entry, "every actual request must capture the same old pointer before the actual CAS")
+				require.Equal(t, session, SessionIDFromContext(captured.ctx))
+				require.Contains(t, tools, captured.tool)
 			case <-time.After(3 * time.Second):
-				t.Fatal("owned registered reads did not reach the common metadata barrier")
+				t.Fatal("owned registered reads did not reach the common verified pre-CAS boundary")
 			}
 		}
 		release()

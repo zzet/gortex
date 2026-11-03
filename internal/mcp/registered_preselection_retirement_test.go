@@ -20,28 +20,32 @@ import (
 	"github.com/zzet/gortex/internal/tokens"
 )
 
-// Observe one real metadata read without replacing the selected store's other
-// capabilities. The callback is armed only after the registered same-session
-// edit and preliminary reads; its old result is a legitimate pre-publication
-// observation, not a fabricated hash or node row.
+// Install the observer on an actual registered request, retaining the normal
+// selected-store capabilities and the handler's original context/deadline.
+func observeRegisteredCheckedRead(s *Server, name string, observe checkedProjectionReadObserver) {
+	s.facades.mu.RLock()
+	captured := s.facades.captured[name]
+	s.facades.mu.RUnlock()
+	leaf := captured.handler
+	s.addTool(captured.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		return leaf(context.WithValue(ctx, checkedProjectionReadObserverKey{}, observe), req)
+	})
+}
+
 type preselectionRetirementStore struct {
 	*store_sqlite.Store
-	armed   atomic.Bool
-	reads   atomic.Int32
-	publish func()
+	armed    atomic.Bool
+	reads    atomic.Int32
+	observed *projectionEntry
+	publish  func()
 }
 
-func (s *preselectionRetirementStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
-}
-
-func (s *preselectionRetirementStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
-	if err == nil && s.armed.CompareAndSwap(true, false) {
+func (s *preselectionRetirementStore) observe(_ context.Context, expected *projectionEntry) {
+	if s.armed.CompareAndSwap(true, false) {
 		s.reads.Add(1)
+		s.observed = expected
 		s.publish()
 	}
-	return rows, err
 }
 
 // This is the production daemon's promote-on-demand and per-call authorization
@@ -143,9 +147,11 @@ func TestRegisteredPreselectionRetirementKeepsCurrentFileRows(t *testing.T) {
 			}
 			deadline := time.Now().Add(projectedReadBudget)
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
+			observeRegisteredCheckedRead(s, tool, backend.observe)
 			backend.armed.Store(true)
 			result := preselectionRegisteredCall(t, s, ctx, 20, tool, map[string]any{"path": "main.go", "format": "json"})
-			require.Equal(t, int32(1), backend.reads.Load(), "actual preselection metadata seam must be reached")
+			require.Equal(t, int32(1), backend.reads.Load(), "actual verified pre-CAS request boundary must be reached")
+			require.Same(t, entry, backend.observed)
 			t.Logf("registered stage=callback_entry remaining_original_budget=%s publication_elapsed=%s remaining_at_publication=%s", deadline.Sub(callbackEntered), publicationElapsed, deadline.Sub(publicationFinished))
 			require.NotNil(t, beforeNode)
 			require.Equal(t, 5, beforeNode.StartLine)

@@ -5,46 +5,18 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
-
-type remainingReaderCOWStore struct {
-	*store_sqlite.Store
-	armed    atomic.Bool
-	arrivals atomic.Int32
-	captured chan *projectionEntry
-	release  [2]chan struct{}
-	path     string
-}
-
-func (s *remainingReaderCOWStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
-}
-
-func (s *remainingReaderCOWStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
-	ordinal := int32(0)
-	if err == nil && s.armed.Load() {
-		ordinal = s.arrivals.Add(1)
-	}
-	if ordinal > 0 && ordinal <= 2 {
-		s.captured <- liveEntry(pendingFileProjections, s.path)
-		<-s.release[ordinal-1]
-	}
-	return rows, err
-}
 
 // The actual daemon admits independent Fast requests from one connection.
 // Both reads see the same already-observed source event and capture the
@@ -60,7 +32,9 @@ func TestRemainingRegisteredReadersKeepCurrentRangesOnCOWLoss(t *testing.T) {
 			sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "cow.sqlite"))
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, sql.Close()) })
-			backend := &remainingReaderCOWStore{Store: sql, captured: make(chan *projectionEntry, 2), release: [2]chan struct{}{make(chan struct{}), make(chan struct{})}, path: path}
+			backend := sql
+			capturedReads := make(chan checkedReadObservation, 2)
+			releases := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
 			idx := newProjectionTestIndexer(t, backend)
 			_, err = idx.Index(root)
 			require.NoError(t, err)
@@ -107,10 +81,21 @@ func TestRemainingRegisteredReadersKeepCurrentRangesOnCOWLoss(t *testing.T) {
 			require.ErrorIs(t, validateRequestProjections(oldCtx), projectionSuperseded)
 			originalDeadline := time.Now().Add(projectedReadBudget)
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, originalDeadline)
-			backend.armed.Store(true)
+			for ordinal, name := range []string{"get_symbol_source", tool} {
+				var once sync.Once
+				observeRegisteredCheckedRead(s, name, func(ctx context.Context, entry *projectionEntry) {
+					once.Do(func() {
+						capturedReads <- checkedReadObservation{tool: name, ctx: ctx, entry: entry}
+						select {
+						case <-releases[ordinal]:
+						case <-ctx.Done():
+						}
+					})
+				})
+			}
 
-			releaseFirst := sync.OnceFunc(func() { close(backend.release[0]) })
-			releaseSecond := sync.OnceFunc(func() { close(backend.release[1]) })
+			releaseFirst := sync.OnceFunc(func() { close(releases[0]) })
+			releaseSecond := sync.OnceFunc(func() { close(releases[1]) })
 			release := func() { releaseFirst(); releaseSecond() }
 			type answer struct {
 				tool   string
@@ -126,22 +111,24 @@ func TestRemainingRegisteredReadersKeepCurrentRangesOnCOWLoss(t *testing.T) {
 					answers <- answer{name, preselectionRegisteredCall(t, s, ctx, id, name, args)}
 				}()
 			}
-			capture := func() {
+			capture := func(name string) {
 				select {
-				case captured := <-backend.captured:
-					require.Same(t, entry, captured)
+				case captured := <-capturedReads:
+					require.Same(t, entry, captured.entry)
+					require.Equal(t, name, captured.tool)
+					require.Equal(t, session, SessionIDFromContext(captured.ctx))
 				case <-time.After(3 * time.Second):
-					t.Fatal("registered read did not reach actual pre-CAS metadata barrier")
+					t.Fatal("registered read did not reach actual verified pre-CAS boundary")
 				}
 			}
 			start(20, "get_symbol_source", map[string]any{"id": "main.go::Target", "context_lines": 0, "format": "json"})
-			capture()
+			capture("get_symbol_source")
 			args := map[string]any{"id": "main.go::Neighbor", "detail": "full", "format": "json"}
 			if tool == "read_file" {
 				args = map[string]any{"path": "main.go", "compress_bodies": true, "keep": "Target", "format": "json"}
 			}
 			start(21, tool, args)
-			capture()
+			capture(tool)
 			releaseFirst()
 			var first answer
 			select {

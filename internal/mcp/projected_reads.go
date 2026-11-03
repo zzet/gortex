@@ -20,6 +20,12 @@ import (
 
 const projectedReadBudget = 150 * time.Millisecond
 
+// checkedProjectionReadObserver observes an already physically verified reuse
+// before its live-owner check. It supplies no projection or publication authority.
+// Only request-scoped lifecycle tests install this optional scheduling observer.
+type checkedProjectionReadObserverKey struct{}
+type checkedProjectionReadObserver func(context.Context, *projectionEntry)
+
 var errProjectionStorm = errors.New("file projection deferred by queued source storm")
 
 func (s *Server) projectionStormActive(abs string) bool {
@@ -270,6 +276,12 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 		rawHash = blake3.Sum256(raw)
 		if !expected.tombstone && expected.rawHash == rawHash && expected.disk.matches(after) &&
 			pathkey.MutationKey(abs) == key {
+			if observe, ok := buildCtx.Value(checkedProjectionReadObserverKey{}).(checkedProjectionReadObserver); ok {
+				observe(buildCtx, expected)
+				if err := buildCtx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			// Ownership can move while bounded current bytes are read even
 			// though their content did not change. Refuse this selection without
 			// inventing source invalidation on a checked historical owner.

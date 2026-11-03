@@ -17,7 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/tokens"
 )
 
-// A metadata read can overlap checked canonical retirement after capturing its
+// A physically verified read can overlap checked canonical retirement after capturing its
 // expected owner. An unchanged read must not call that historical owner a new
 // source invalidation merely because it no longer occupies the registry slot.
 func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T) {
@@ -73,15 +73,20 @@ func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T
 	require.NoError(t, err)
 	retirement := s.canonicalProjectionRetirement(path)
 	require.NotNil(t, retirement)
+	var beforeLine, afterLine int
+	var publicationErr error
+	var diff []string
+	var retired, suspect bool
+	var current *projectionEntry
 	backend.publish = func() {
-		require.Equal(t, 5, sql.GetNode("main.go::Neighbor").StartLine)
-		require.NoError(t, idx.IndexFile(path))
-		require.Equal(t, 8, sql.GetNode("main.go::Neighbor").StartLine)
-		require.Empty(t, indexer.DiffProjectedNodes(entry.layer.FileNodes("main.go"), sql.GetFileNodes("main.go")))
+		beforeLine = sql.GetNode("main.go::Neighbor").StartLine
+		publicationErr = idx.IndexFile(path)
+		afterLine = sql.GetNode("main.go::Neighbor").StartLine
+		diff = indexer.DiffProjectedNodes(entry.layer.FileNodes("main.go"), sql.GetFileNodes("main.go"))
 		retirement.run()
-		require.True(t, entry.checkedRetired.Load())
-		require.False(t, entry.suspect.Load(), "actual checked retirement starts with unchanged source proof")
-		require.Nil(t, liveEntry(pendingFileProjections, path))
+		retired = entry.checkedRetired.Load()
+		suspect = entry.suspect.Load()
+		current = liveEntry(pendingFileProjections, path)
 	}
 	deadline := time.Now().Add(canonicalLifecycleFixtureBudget)
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
@@ -89,8 +94,17 @@ func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T
 	ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 	proof = context.WithValue(proof, projectedSourceDeadlineKey{}, deadline)
 	proof = context.WithValue(proof, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: "get_symbol_source"})
+	observeRegisteredCheckedRead(s, "get_file_summary", backend.observe)
 	backend.armed.Store(true)
 	result := preselectionRegisteredCall(t, s, ctx, 20, "get_file_summary", map[string]any{"path": "main.go", "format": "json"})
+	require.Equal(t, 5, beforeLine)
+	require.NoError(t, publicationErr)
+	require.Equal(t, 8, afterLine)
+	require.Empty(t, diff)
+	require.True(t, retired)
+	require.False(t, suspect, "actual checked retirement starts with unchanged source proof")
+	require.Nil(t, current)
+	require.Same(t, entry, backend.observed)
 	requireCanonicalDefinitionRows(t, "get_file_summary", result, raw)
 	require.Equal(t, int32(1), backend.reads.Load())
 	require.LessOrEqual(t, allowance.attempts.Load(), int32(2))
