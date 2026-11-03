@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,24 +12,33 @@ import (
 )
 
 func TestPendingTextVerificationBufferRemovesPerFileScratchAllocation(t *testing.T) {
-	var paths []string
+	var files []*os.File
 	root := t.TempDir()
 	for i := range 4 {
 		path := filepath.Join(root, fmt.Sprintf("source-%d.go", i))
 		require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("package fixture\n"), 4096), 0o600))
-		paths = append(paths, path)
+		file, err := openPhysicalEvidenceFile(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = file.Close() })
+		files = append(files, file)
 	}
 	scratch := make([]byte, 32<<10)
+	// Isolate the production descriptor reader's verification-buffer cost.
+	// Re-resolving full paths adds independent filesystem/pool allocations to
+	// each variant; the path/hash/identity oracles are tested separately below.
 	measure := func(buffer []byte) float64 {
 		return testing.AllocsPerRun(3, func() {
-			for _, path := range paths {
-				_, _, err := readPhysicalFileEvidenceObservedBoundedBuffer(path, nil, 1<<20, buffer)
+			for _, file := range files {
+				_, err := file.Seek(0, io.SeekStart)
+				require.NoError(t, err)
+				_, _, _, err = readPhysicalEvidenceDescriptor(file, nil, 1<<20, buffer)
 				require.NoError(t, err)
 			}
 		})
 	}
 	legacy, buffered := measure(nil), measure(scratch)
-	require.GreaterOrEqual(t, legacy-buffered, float64(len(paths)), "one new streaming verification buffer per file returned")
+	t.Logf("actual_descriptor_allocations legacy=%g request_buffer=%g files=%d", legacy, buffered, len(files))
+	require.GreaterOrEqual(t, legacy-buffered, float64(len(files)), "one new streaming verification buffer per file returned")
 }
 
 func TestPendingTextVerificationBufferPreservesPhysicalEvidence(t *testing.T) {
