@@ -17,6 +17,14 @@ import (
 // receipt to initialize the decorator's facts. The registered relation must
 // still refuse a later source event instead of returning its old selection.
 func TestRegisteredRelationLateSourceEventWithoutReceiptRefuses(t *testing.T) {
+	runRegisteredRelationLateFacts(t, true)
+}
+
+func TestRegisteredRelationWithoutReceiptRemainsReadableWithoutEvent(t *testing.T) {
+	runRegisteredRelationLateFacts(t, false)
+}
+
+func runRegisteredRelationLateFacts(t *testing.T, sourceEvent bool) {
 	for _, tool := range []string{"get_callers", "get_call_chain"} {
 		t.Run(tool, func(t *testing.T) {
 			selectedProjectionRegistry(t)
@@ -40,7 +48,9 @@ func TestRegisteredRelationLateSourceEventWithoutReceiptRefuses(t *testing.T) {
 				result, err := captured.handler(ctx, req)
 				if err == nil && result != nil && !result.IsError {
 					fired = true
-					pendingFileProjections.markSuspect(path)
+					if sourceEvent {
+						pendingFileProjections.markSuspect(path)
+					}
 				}
 				return result, err
 			})
@@ -64,9 +74,15 @@ func TestRegisteredRelationLateSourceEventWithoutReceiptRefuses(t *testing.T) {
 			}
 			result := preselectionRegisteredCall(t, s, ctx, 11, tool, map[string]any{"id": target, "depth": 1, "limit": 1000, "format": "json"})
 			require.True(t, fired, "source event must occur after the actual relation leaf read")
-			require.True(t, entry.suspect.Load())
-			require.ErrorIs(t, validateRequestProjections(pinned), projectionSuperseded, "old fact contexts stay invalid")
-			require.True(t, result.IsError, "late source event must refuse the whole public relation response: %s", resultText(result))
+			if sourceEvent {
+				require.True(t, entry.suspect.Load())
+				require.ErrorIs(t, validateRequestProjections(pinned), projectionSuperseded, "old fact contexts stay invalid")
+				require.True(t, result.IsError, "late source event must refuse the whole public relation response: %s", resultText(result))
+			} else {
+				require.False(t, entry.suspect.Load())
+				require.NoError(t, validateRequestProjections(pinned))
+				require.False(t, result.IsError, resultText(result))
+			}
 		})
 	}
 }
