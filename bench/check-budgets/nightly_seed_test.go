@@ -39,7 +39,7 @@ func TestNightlySeedIsCandidateOnlyAndDoesNotShrinkMatrix(t *testing.T) {
 	c := fixtureLaneConfig()
 	c.Lane, c.HostClass = "nightly", "reference_linux"
 	p := testPolicy()
-	p.Budgets = []budget{{Scenario: "load-8", Metric: "read_p95", Mode: "block", HostClass: c.HostClass, Lane: []string{"nightly"}}}
+	p.Budgets = []budget{{Scenario: "loadedit-4", Metric: "search_symbols_p95", Mode: "block", HostClass: c.HostClass, Lane: []string{"nightly"}}}
 	plain, err := makeLanePlan(p, c)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestNightlySeedIsCandidateOnlyAndDoesNotShrinkMatrix(t *testing.T) {
 	for _, task := range seeded.Tasks {
 		args := taskArgs(c, task, "manifest", "state", "report")
 		hasSeed := strings.Contains(strings.Join(args, " "), "--nightly-workload-seed search-delay-v1")
-		if hasSeed != (task.Role == "candidate" && task.Scenario == "load-8") {
+		if hasSeed != (task.Role == "candidate" && task.Scenario == "loadedit-4") {
 			t.Fatalf("foreign seed route: %+v %v", task, args)
 		}
 	}
@@ -83,7 +83,7 @@ func TestNightlySeedConfigStrictDecode(t *testing.T) {
 func TestNightlySeedRequiresActualRawEchoAndRejectsForeignRole(t *testing.T) {
 	seed := &nightlyWorkloadSeed{Version: 1, Kind: "search-delay-v1", CandidateRevision: strings.Repeat("a", 40)}
 	c := inputs{CandidateRevision: seed.CandidateRevision, NightlySeed: seed}
-	input := runInput{Role: "candidate", Scenario: "load-8"}
+	input := runInput{Role: "candidate", Scenario: "loadedit-4"}
 	r := report{NightlySeed: seed.Kind, Phases: []phase{{Attempts: []attempt{{Tool: "search.symbols", Role: "workload", NightlySeed: seed.Kind, NightlyDelayNS: 1000000000}}}}}
 	if err := validateNightlySeedReport(c, input, r); err != nil {
 		t.Fatal(err)
@@ -101,5 +101,18 @@ func TestNightlySeedRequiresActualRawEchoAndRejectsForeignRole(t *testing.T) {
 	input.Role = "candidate"
 	if err := validateNightlySeedReport(c, input, r); err == nil {
 		t.Fatal("undeclared seed accepted")
+	}
+}
+
+func TestNightlySeedRejectsOldScenarioAndProbeEcho(t *testing.T) {
+	seed := &nightlyWorkloadSeed{Version: 1, Kind: "search-delay-v1", CandidateRevision: strings.Repeat("a", 40)}
+	c := inputs{CandidateRevision: seed.CandidateRevision, NightlySeed: seed}
+	r := report{NightlySeed: seed.Kind, Phases: []phase{{Attempts: []attempt{{Tool: "search.symbols", Role: "workload", NightlySeed: seed.Kind, NightlyDelayNS: 1000000000}}}}}
+	if err := validateNightlySeedReport(c, runInput{Role: "candidate", Scenario: "load-8"}, r); err == nil {
+		t.Fatal("old eight-reader target supplied seeded latency evidence")
+	}
+	r.Phases[0].Attempts[0].Role = "probe"
+	if err := validateNightlySeedReport(c, runInput{Role: "candidate", Scenario: "loadedit-4"}, r); err == nil {
+		t.Fatal("visibility probe supplied workload seed evidence")
 	}
 }

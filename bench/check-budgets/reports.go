@@ -63,7 +63,16 @@ type attempt struct {
 	LogicalMS      *float64 `json:"logical_ms"`
 }
 
+type smokeEditACK struct {
+	Acknowledgement struct {
+		StructuredContent struct {
+			AckMode string `json:"ack_mode"`
+		} `json:"structuredContent"`
+	} `json:"acknowledgement"`
+}
+
 type phase struct {
+	Edits        []smokeEditACK             `json:"edits,omitempty"`
 	Status       []json.RawMessage          `json:"daemon_status"`
 	EditProbe    json.RawMessage            `json:"edit_probe,omitempty"`
 	SessionModel string                     `json:"session_model"`

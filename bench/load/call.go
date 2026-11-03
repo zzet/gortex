@@ -104,9 +104,20 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 	for retry := 0; ; retry++ {
 		start := time.Now()
 		seed, delayNS, err := delayNightlySearch(callCtx, r.name(), role)
+		recorder, wire := readSourceFailureCapture(callCtx, r, args)
 		var data json.RawMessage
 		if err == nil {
-			data, err = client.call(callCtx, "tools/call", map[string]any{"name": r.Tool, "arguments": args})
+			params := map[string]any{"name": r.Tool, "arguments": args}
+			if wire == nil {
+				data, err = client.call(callCtx, "tools/call", params)
+			} else if observed, ok := client.(interface {
+				callWithFailureCapture(context.Context, string, any, *failureWireCapture) (json.RawMessage, error)
+			}); ok {
+				data, err = observed.callWithFailureCapture(callCtx, "tools/call", params, wire)
+			} else {
+				wire.unsupported = true
+				data, err = client.call(callCtx, "tools/call", params)
+			}
 		}
 		returned := time.Now()
 		if retryTyped {
@@ -160,6 +171,9 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			}
 			if retryTyped && errors.Is(err, errEditProbeEvidenceIncomplete) {
 				a.Outcome = "harness_incomplete"
+			}
+			if wire != nil {
+				a.FailureRPC = recorder.failure(wire)
 			}
 		}
 		attempts = append(attempts, a)

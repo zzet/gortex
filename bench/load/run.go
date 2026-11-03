@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	RetainReadSourceFailures bool
 	NightlySeed              string
 	EditACKMode              string
 	Binary                   string
@@ -60,6 +61,7 @@ func parseRun(args []string) (runOptions, error) {
 	var o runOptions
 	f := flag.NewFlagSet("load run", flag.ContinueOnError)
 	bindRunFlags(f, &o)
+	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
 	if err := f.Parse(args); err != nil {
 		return o, err
@@ -266,6 +268,7 @@ func runCommand(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	ctx = withReadSourceFailureEvidence(ctx, o.RetainReadSourceFailures)
 	corpora, err := loadManifest(o.Manifest)
 	if err != nil {
 		return err
@@ -322,6 +325,9 @@ func runCommand(ctx context.Context, args []string) error {
 
 func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputRoot string) (Report, error) {
 	report := Report{SchemaVersion: reportVersion, RunID: filepath.Base(outputRoot), GitSHA: sha, Binary: o.Binary, Started: time.Now().UTC(), Profile: o.Profile, Seed: o.Seed, Host: host, Corpus: corpora, Metrics: make(map[string]Metric), Artifacts: map[string]string{"root": outputRoot}, Crashes: make(map[string]int)}
+	if o.RetainReadSourceFailures {
+		report.FailureCapture = &readSourceFailureConfig{MaxRecords: readSourceFailureRecords, MaxBytes: readSourceFailureBytes, Encoding: "base64"}
+	}
 	for _, corpus := range corpora {
 		ops, err := readingPlan(corpus)
 		if o.Scenario == "sweep" {

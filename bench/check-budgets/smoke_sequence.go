@@ -13,6 +13,7 @@ import (
 )
 
 type smokeSequenceReceipt struct {
+	EditACKMode   string         `json:"edit_ack_mode,omitempty"`
 	Version       int            `json:"schema_version"`
 	Started       time.Time      `json:"started"`
 	Finished      time.Time      `json:"finished"`
@@ -42,6 +43,7 @@ func collectSmokeSequence(ctx context.Context, c laneConfig, p policy, plan lane
 		receipt.Finished = time.Now().UTC()
 		return errors.Join(err, writeNewJSON(filepath.Join(out, "lane.json"), receipt))
 	}
+	proof.EditACKMode = "local"
 	receipt.Smoke = &proof
 	root := filepath.Join(out, "runs")
 	log, err := os.OpenFile(filepath.Join(out, "client.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -49,7 +51,7 @@ func collectSmokeSequence(ctx context.Context, c laneConfig, p policy, plan lane
 		return err
 	}
 	started := time.Now().UTC()
-	args := []string{"smoke", "--main-binary", c.Builds["main"].Binary, "--main-revision", c.Builds["main"].Revision, "--candidate-binary", c.Builds["candidate"].Binary, "--candidate-revision", c.Builds["candidate"].Revision, "--manifest", c.Manifest, "--out", root, "--offer", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-duration", c.SweepDuration}
+	args := smokeSequenceArgs(c, root)
 	runErr := errors.Join(process(ctx, c.Load, args, io.MultiWriter(stdout, log)), log.Close())
 	finished := time.Now().UTC()
 	var failures []error
@@ -58,6 +60,9 @@ func collectSmokeSequence(ctx context.Context, c laneConfig, p policy, plan lane
 	}
 	var sequence smokeSequenceReceipt
 	err = readStrictJSON(filepath.Join(root, "sequence.json"), &sequence)
+	if err == nil && sequence.EditACKMode != "local" {
+		err = errors.New("smoke child did not retain its explicitly selected local ACK policy")
+	}
 	if err == nil {
 		err = validateSmokeSequence(sequence, plan, started, finished)
 	}
@@ -157,4 +162,9 @@ func validateSmokeStores(d dataset) error {
 		return errors.New("main and candidate require distinct owned stores")
 	}
 	return nil
+}
+
+// Keep the actual child command testable without launching an owned daemon.
+func smokeSequenceArgs(c laneConfig, root string) []string {
+	return []string{"smoke", "--main-binary", c.Builds["main"].Binary, "--main-revision", c.Builds["main"].Revision, "--candidate-binary", c.Builds["candidate"].Binary, "--candidate-revision", c.Builds["candidate"].Revision, "--manifest", c.Manifest, "--out", root, "--offer", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-duration", c.SweepDuration, "--edit-ack", "local"}
 }
