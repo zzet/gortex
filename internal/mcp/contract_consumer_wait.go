@@ -71,6 +71,14 @@ func (s *Server) ContractAnalysisShouldYield() bool {
 	return runtimeactivity.Current().ByKind["mcp"] > s.contractAnalysisWaiters.Load()
 }
 
+// ContractAnalysisDemand is ContractAnalysisShouldYield with a sequence that
+// moves whenever a tool call starts or ends: a scheduler that samples it now
+// and then still sees the calls that came and went between two samples.
+func (s *Server) ContractAnalysisDemand() (busy bool, seq uint64) {
+	seq = runtimeactivity.KindEpoch("mcp")
+	return s.ContractAnalysisShouldYield(), seq
+}
+
 type contractConsumerContextKey struct{}
 
 type contractConsumerStatus struct {
@@ -311,7 +319,9 @@ func (s *Server) scheduleAndWaitContractAnalysis(ctx context.Context, actor inde
 		if err != nil {
 			return indexer.ContractActorStatus{}, 0, err
 		}
-		scheduled, err := runtime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch, PriorityTarget: pending.targetOnly})
+		// Strict: this caller waits on the promise, so no linked policy may
+		// hold its job back, targeted or not.
+		scheduled, err := runtime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch, PriorityTarget: pending.targetOnly, Strict: true})
 		var full *indexer.ContractQueueFullError
 		if errors.As(err, &full) {
 			if runtime.AcquireLastPublishedCohort != nil {
