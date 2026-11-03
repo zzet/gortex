@@ -62,8 +62,10 @@ func validateReport(data []byte, r Report) error {
 		return errors.New("invalid or incomplete offered workload")
 	}
 	if drain := r.Workload.PRSmokeDrain; drain != nil {
-		if drain.Version != 1 || drain.OfferedSeconds != r.Workload.DurationSec || math.IsNaN(drain.MaxDrainSeconds) || math.IsInf(drain.MaxDrainSeconds, 0) || drain.MaxDrainSeconds < r.Workload.DeadlineSec || drain.MaxDrainSeconds > 120 || (drain.OfferedSeconds != 20 && drain.OfferedSeconds != 30) || r.Profile != "agent" || r.Host.Profile != "native" || r.Workload.Scenario != "read" || r.Workload.EditAgents != 0 || r.Workload.LinkedWorktrees != 0 || r.Workload.CPUProfileSec != 0 || r.Workload.KeepState {
-			return errors.New("invalid or unsupported PR read offered-window/drain identity")
+		read := drain.Version == 1 && r.Workload.Scenario == "read" && r.Workload.EditAgents == 0
+		edit := drain.Version == 2 && r.Workload.Scenario == "edit" && r.Workload.EditAgents > 0 && drain.OfferedSeconds == 20 && r.Workload.DeadlineSec == 120
+		if (!read && !edit) || drain.OfferedSeconds != r.Workload.DurationSec || math.IsNaN(drain.MaxDrainSeconds) || math.IsInf(drain.MaxDrainSeconds, 0) || drain.MaxDrainSeconds < r.Workload.DeadlineSec || drain.MaxDrainSeconds > 120 || (drain.OfferedSeconds != 20 && drain.OfferedSeconds != 30) || r.Profile != "agent" || r.Host.Profile != "native" || r.Workload.LinkedWorktrees != 0 || r.Workload.CPUProfileSec != 0 || r.Workload.KeepState {
+			return errors.New("invalid or unsupported versioned PR offered-window/drain identity")
 		}
 	}
 	if err := validateAgentCounts(r.Workload.Scenario, r.Workload.Agents, r.Workload.EditAgents); err != nil {

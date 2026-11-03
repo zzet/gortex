@@ -14,6 +14,9 @@ import (
 )
 
 func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corpus, group, outputRoot string) (phase Phase, sweep []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
+	if o.NightlySeed != "" {
+		ctx = context.WithValue(ctx, nightlySeedKey{}, o.NightlySeed)
+	}
 	seedEnv, err := editGateSeedEnvironment(o)
 	if err != nil {
 		return phase, nil, nil, nil, "", err
@@ -576,10 +579,7 @@ func dispatchArgs(r request, repo privateRepo) map[string]any {
 
 func runAgents(parent context.Context, o runOptions, p *privateRun, clients []*socketClient, editing bool, phase *Phase) error {
 	if o.PRSmokeDrain > 0 {
-		if editing {
-			return errors.New("offered-window/drain for edit/probe work is unsupported")
-		}
-		return runPRSmokeReads(parent, o, p, clients, phase)
+		return runPRSmokeAgents(parent, o, p, clients, editing, phase)
 	}
 	ctx, cancel := context.WithTimeout(parent, o.Duration)
 	defer cancel()

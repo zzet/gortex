@@ -350,9 +350,28 @@ shorter profile is silently chosen. The query benchmark indexes `../..`, so
 both builds run from package directories under the **same clean pinned fixture
 snapshot**, never arbitrary binary-download CWDs. Fixture cleanliness is checked
 again after runs and before benchstat. Changed input fails. Interrupted/missing
-samples remain failed evidence. Benchmark-only processes get an Interrupt then
-a two-second kill/join bound; abnormal exit/context errors cannot become success.
+samples remain failed evidence. Linux query test executables (fixture preflight
+and benchmark group) enable GC logs and all-goroutine tracebacks. At the original
+context deadline they receive SIGQUIT, with at most ten seconds to capture output
+before forced kill/join. Query processes own a separate process group; surviving
+descendants receive TERM then KILL with at most two seconds to join after each.
+Leftover work is failed evidence even when cleanup succeeds. The receipt records `linux_query_sigquit_v1` and the
+capture grace separately. Crossing the original deadline always fails, including
+a child that handles SIGQUIT and exits zero. The monotonic deadline is checked
+after Wait as well, so a delayed timer callback cannot admit a late zero exit.
+The passing budget is unchanged.
+Other processes retain Interrupt and the two-second kill/join bound;
+abnormal exit/context errors cannot become success.
 The daemon collector instead joins owned cleanup without killing its client.
+
+For a separately reviewed query setup diagnosis, the test executable accepts
+`GORTEX_BENCH_QUERY_SETUP_TRACE` as a new output-file prefix. It writes exclusive
+`.start.json` and `.finish.json` sidecars with shared setup and indexing clocks,
+monotonic elapsed durations, and the indexed file/worker census. A start without
+a finish remains incomplete evidence. An existing sidecar or write failure
+fails the requested diagnosis. The unset default emits no sidecars. This trace
+does not change query bodies, fixture scope, timers, or child safety bounds;
+shared setup runs once per executable and remains outside the benchmark timers.
 
 Outputs include per-run raw text, combined main/candidate samples, benchstat
 text and `microbench.json`. `formal_acceptance` is always false: the workload
@@ -492,14 +511,22 @@ four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
 19 edits/75 reads for edit4; publication speed is unmeasured. Per-tool counts
 will be much smaller, and p99 can effectively be a maximum. Neither sample
 adequacy nor the full-job p95 <=15 minutes is established. The entry cancels
-measurement at 13 minutes, reserves cleanup time and fails after 15 minutes.
-Strict startup/enrichment uses the remaining measurement deadline instead of an
-independent five-minute cold-start cutoff; parent cancellation still interrupts
-the load client for owned cleanup. This harness bound is not a cold-start
-performance allowance or evidence that the full profile fits fifteen minutes;
-the workflow's 18-minute outer bound permits cleanup/upload after failure. It
-cannot certify full-job timing, which includes build/download/preparation and
-requires twenty actual runs.
+measurement at 120 minutes and reserves two minutes for owned cleanup.
+Strict startup/enrichment uses the remaining measurement deadline; parent
+cancellation interrupts the load client for cleanup. The job caps setup steps
+at twenty minutes in total, the measurement step at 122 minutes including
+cleanup, and always-upload at three minutes, within a 145-minute job bound.
+These are measurement safety bounds, not accepted performance targets.
+
+The original full-job p95 <=15-minute target is explicitly deferred while a
+complete run is measured; it has not become a 120-minute target. The receipt
+retains the original 900-second target, reports deferred timing acceptance and
+whether the entry alone exceeded that target, and never grants formal
+acceptance. Full-job timing includes build/download/preparation; an entry below
+fifteen minutes would not establish full-job acceptance either. One naturally
+triggered complete attempt is reviewed before any repeat campaign. Fixture,
+readiness, five phases, three repeats, both fresh stores, thirty-six starts and
+all other strict checker thresholds remain unchanged.
 
 The measurement job is visibly skipped until `PERF_PR_SMOKE_ENABLED` is reviewed
 and enabled. Main publication separately requires its new harness contract on
