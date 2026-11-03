@@ -1463,6 +1463,14 @@ func readPhysicalFileEvidenceBounded(absPath string, maxBytes int64) ([]byte, ph
 }
 
 func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), maxBytes int64) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBoundedBuffer(absPath, afterRead, maxBytes, nil)
+}
+
+// scratch is request-owned verification workspace, never returned content or
+// cached source authority. Reusing it across a pending-file scan preserves both
+// full reads/hashes and every physical identity check while avoiding one 32KiB
+// io.Copy allocation per file. Existing callers retain their nil-buffer path.
+func readPhysicalFileEvidenceObservedBoundedBuffer(absPath string, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, error) {
 	linkInfo, err := os.Lstat(absPath)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
@@ -1480,19 +1488,45 @@ func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), m
 	}
 	defer f.Close()
 
+	content, evidence, after, err := readPhysicalEvidenceDescriptor(f, afterRead, maxBytes, scratch)
+	if err != nil {
+		return nil, physicalReadEvidence{}, err
+	}
+	pathInfo, err := os.Stat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	}
+	resolvedAfter, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
+	}
+	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
+		!samePhysicalFileVersion(after, pathInfo) {
+		return nil, physicalReadEvidence{}, errPhysicalFileMoved
+	}
+
+	evidence.resolvedPath = resolvedAfter
+	evidence.symlinkResolved = linkInfo.Mode()&os.ModeSymlink != 0
+	return content, evidence, nil
+}
+
+// readPhysicalEvidenceDescriptor preserves the same full-buffer read, second
+// streaming hash and descriptor version checks for both physical path readers.
+// Path and parent identity remain the responsibility of their respective caller.
+func readPhysicalEvidenceDescriptor(f *os.File, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, os.FileInfo, error) {
 	before, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not stat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not stat physical file: %w", err)
 	}
 	if !before.Mode().IsRegular() {
-		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
 	if maxBytes > 0 && before.Size() > maxBytes {
-		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	content, err := readAllSizedBounded(f, before.Size(), maxBytes)
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not read physical file: %w", err)
 	}
 	sum := sha256.Sum256(content)
 	if afterRead != nil {
@@ -1504,49 +1538,39 @@ func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), m
 	// full buffer and detecting in-place same-size rewrites whose mtime was
 	// restored. Metadata-only checks cannot prove that invariant.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file for verification: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not rewind physical file for verification: %w", err)
 	}
 	verificationHash := sha256.New()
 	var verificationReader io.Reader = f
 	if maxBytes > 0 {
 		verificationReader = io.LimitReader(f, maxBytes+1)
 	}
-	verifiedBytes, err := io.Copy(verificationHash, verificationReader)
+	if len(scratch) == 0 {
+		scratch = nil
+	}
+	verifiedBytes, err := io.CopyBuffer(verificationHash, verificationReader, scratch)
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file content: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not verify physical file content: %w", err)
 	}
 	if maxBytes > 0 && verifiedBytes > maxBytes {
-		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	if !bytes.Equal(sum[:], verificationHash.Sum(nil)) {
-		return nil, physicalReadEvidence{}, errPhysicalFileMoved
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
 
 	after, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not restat physical file: %w", err)
 	}
-	pathInfo, err := os.Stat(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	if !samePhysicalFileVersion(before, after) {
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
-	resolvedAfter, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
-	}
-	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
-		!samePhysicalFileVersion(before, after) ||
-		!samePhysicalFileVersion(after, pathInfo) {
-		return nil, physicalReadEvidence{}, errPhysicalFileMoved
-	}
-
 	return content, physicalReadEvidence{
-		resolvedPath:    resolvedAfter,
-		contentSHA256:   fmt.Sprintf("%x", sum),
-		byteCount:       len(content),
-		symlinkResolved: linkInfo.Mode()&os.ModeSymlink != 0,
-		readAt:          time.Now().UTC(),
-	}, nil
+		contentSHA256: fmt.Sprintf("%x", sum),
+		byteCount:     len(content),
+		readAt:        time.Now().UTC(),
+	}, after, nil
 }
 
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -406,6 +406,9 @@ func sortEdgesByLine(edges []*Edge) {
 type OverlaidView struct {
 	base  Reader
 	layer OverlayLayerReader
+	// Set only by the request-scoped immutable multi-layer constructor.
+	// All other read surfaces keep the original chain and its capabilities.
+	adjacencyBatch *overlayAdjacencyBatch
 
 	// statsMu guards the first complete statistics result shared by Stats and
 	// StatsContext. Computation stays outside the lock so a canceled caller
@@ -506,6 +509,15 @@ func (v *OverlaidView) baseNodeVisible(n *Node) bool {
 // overlaid file, or one a node tombstone removed without claiming that
 // file. Everything else comes from base.
 func (v *OverlaidView) GetNode(id string) *Node {
+	if v.adjacencyBatch != nil {
+		if layer := v.adjacencyBatch.nodeLayer(id); layer != nil {
+			return layer.NodeByID(id)
+		}
+		if v.adjacencyBatch.base == nil {
+			return nil
+		}
+		return v.adjacencyBatch.base.GetNode(id)
+	}
 	if v.overlayOwnsIdentity(id) {
 		return v.layer.NodeByID(id) // may be nil — the layer hid it
 	}
@@ -847,6 +859,13 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 // alone is the answer. baseEdgeVisible has already dropped everything
 // the layer speaks for, so nothing surfaces twice.
 func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetOutEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -869,6 +888,13 @@ func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
 // originating in overlaid files, since those are replaced by overlay
 // versions) with the overlay's in-edges for the same target.
 func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetInEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -897,6 +923,9 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 // file's symbol can still hold base edges other files recorded out of
 // it — a claim that is per edge and cannot be settled from the id.
 func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, false)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
@@ -959,6 +988,9 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 // files) with overlay-introduced in-edges for each input id, all in a
 // single batched base round-trip.
 func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, true)
+	}
 	if len(ids) == 0 {
 		return nil
 	}

@@ -102,6 +102,9 @@ func (v *OverlaidView) GetNodeKindsByIDsContext(ctx context.Context, ids []strin
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.nodeKinds(ctx, ids)
+	}
 	var ownIDs, baseIDs []string
 	for _, id := range uniqueNonEmpty(ids) {
 		if v.overlayOwnsIdentity(id) {
