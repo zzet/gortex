@@ -27,7 +27,7 @@ func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T
 	path := filepath.Join(root, "main.go")
 	require.NoError(t, os.WriteFile(path, []byte("package probe\n\nfunc Target() int { return 1 }\n\nfunc Neighbor() int { return 9 }\n"), 0600))
 	// Exercise the real SQLite publication/reader boundary without charging
-	// temporary-filesystem persistence to this 150ms interleaving oracle.
+	// temporary-filesystem persistence to this lifecycle interleaving oracle.
 	sql, err := store_sqlite.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sql.Close()) })
@@ -83,7 +83,7 @@ func TestUnchangedReadAfterRetirementCannotPoisonBorrowedRetryProof(t *testing.T
 		require.False(t, entry.suspect.Load(), "actual checked retirement starts with unchanged source proof")
 		require.Nil(t, liveEntry(pendingFileProjections, path))
 	}
-	deadline := time.Now().Add(projectedReadBudget)
+	deadline := time.Now().Add(canonicalLifecycleFixtureBudget)
 	ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
 	allowance := &projectedSourceAllowance{tool: "get_file_summary"}
 	ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)

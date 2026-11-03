@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	mcp "github.com/mark3labs/mcp-go/mcp"
 
@@ -909,6 +910,9 @@ func (s *Server) handleChangeContract(ctx context.Context, req mcp.CallToolReque
 	}
 	if req.GetBool("ack", false) {
 		return s.handleRiskAck(ctx, req, p)
+	}
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", p.changedIDs, p.touchedFiles, time.Time{}); err != nil {
+		return nil, err
 	}
 	violations := s.evaluateChange(ctx, p)
 	env := s.assembleEnvelope(ctx, p, violations)
