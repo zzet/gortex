@@ -166,6 +166,22 @@ func (s *repoLoadSnapshot) find(path string) (int, bool) {
 	return 0, false
 }
 
+// findRepoLoadRecord is the single-root lookup for a private update copy.
+// Reverse order preserves the published index's last-write-wins behavior for
+// conflicting lexical/canonical keys. Batch and reader lookups keep their index.
+func findRepoLoadRecord(records []RepoLoad, path string) (int, bool) {
+	if len(records) == 0 || path == "" {
+		return 0, false
+	}
+	key := pathkey.IdentityKey(path)
+	for i := len(records) - 1; i >= 0; i-- {
+		if records[i].key == key || records[i].canonicalKey != "" && records[i].canonicalKey == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // update applies mutate to a private copy of the records and publishes it.
 // mutate reports whether anything changed; an unchanged table republishes
 // nothing.
@@ -278,7 +294,7 @@ func (mi *MultiIndexer) expectRepos(entries []config.RepoEntry, inspect bool) {
 			// Retain the owner's diagnostic without turning uncertainty into a
 			// terminal absent-alias result. No request performs this operation again.
 			mi.repoLoads.update(func(records []RepoLoad) ([]RepoLoad, bool) {
-				i, ok := newRepoLoadSnapshot(records).find(rec.Root)
+				i, ok := findRepoLoadRecord(records, rec.Root)
 				if !ok || !records[i].identityPending || records[i].identityToken != rec.identityToken {
 					return records, false
 				}
@@ -339,7 +355,7 @@ func resolveRepoLoadIdentityWith(rec RepoLoad, canonicalize func(string) (string
 
 func (mi *MultiIndexer) publishRepoLoadIdentity(before, resolved RepoLoad) {
 	mi.repoLoads.update(func(records []RepoLoad) ([]RepoLoad, bool) {
-		i, ok := newRepoLoadSnapshot(records).find(before.Root)
+		i, ok := findRepoLoadRecord(records, before.Root)
 		if !ok || !records[i].identityPending || records[i].identityToken != before.identityToken {
 			return records, false
 		}
@@ -464,7 +480,7 @@ func (mi *MultiIndexer) setRepoLoad(path string, mutate func(*RepoLoad) bool) {
 	}
 	root := absRepoRoot(path)
 	mi.repoLoads.update(func(records []RepoLoad) ([]RepoLoad, bool) {
-		i, ok := newRepoLoadSnapshot(records).find(root)
+		i, ok := findRepoLoadRecord(records, root)
 		if !ok {
 			return records, false
 		}
@@ -501,7 +517,7 @@ func (mi *MultiIndexer) markRepoRegistered(prefix, root string) {
 	var listeners []func(RepoLoad)
 	mi.repoLoads.update(func(records []RepoLoad) ([]RepoLoad, bool) {
 		listeners = slices.Clone(mi.repoLoads.listeners)
-		if i, ok := newRepoLoadSnapshot(records).find(root); ok {
+		if i, ok := findRepoLoadRecord(records, root); ok {
 			records[i].State, records[i].Reason, records[i].Since = RepoLoadReady, "", now
 			records[i].ErrorCode, records[i].OwnerPath, records[i].OwnerState = "", "", ""
 			if registered.canonicalKey != "" {
@@ -540,7 +556,7 @@ func (mi *MultiIndexer) forgetRepoLoad(root string) {
 		return
 	}
 	mi.repoLoads.update(func(records []RepoLoad) ([]RepoLoad, bool) {
-		i, ok := newRepoLoadSnapshot(records).find(root)
+		i, ok := findRepoLoadRecord(records, root)
 		if !ok {
 			return records, false
 		}
