@@ -64,6 +64,7 @@ type attempt struct {
 }
 
 type phase struct {
+	Status []json.RawMessage `json:"daemon_status"`
 	EditProbe    json.RawMessage            `json:"edit_probe,omitempty"`
 	SessionModel string                     `json:"session_model"`
 	Name         string                     `json:"name"`

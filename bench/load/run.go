@@ -415,12 +415,17 @@ func finishReport(report *Report, expectedPhases int) error {
 
 func captureReceipt(ctx context.Context, p *privateRun, client *socketClient, phase *Phase) {
 	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	statusStarted := time.Now()
 	status, err := control(statusCtx, p.Socket, "status", nil)
+	statusFinished := time.Now()
 	cancel()
 	if err != nil {
 		phase.Errors = append(phase.Errors, "status receipt: "+err.Error())
 	} else {
 		phase.Status = append(phase.Status, status)
+		pid:=0
+		if p.process!=nil && p.process.Process!=nil {pid=p.process.Process.Pid}
+		recordStatusCapture(phase,pid,statusStarted,statusFinished)
 	}
 	statsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	stats, err := client.call(statsCtx, "resources/read", map[string]any{"uri": "gortex://stats"})
