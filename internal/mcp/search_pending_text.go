@@ -73,7 +73,13 @@ func (s *Server) pendingTextFiles(ctx context.Context, resolved ResolvedScope, p
 			continue
 		}
 		relative, inside := relativeWithinRoot(owner.RootPath(), abs)
-		if !inside || pathkey.MutationKey(filepath.Join(owner.RootPath(), relative)) != pathkey.MutationKey(abs) {
+		if !inside {
+			continue
+		}
+		// Identical cleaned inputs cannot have different MutationKeys. Keep the
+		// real alias check for distinct spellings and the entry-key check above.
+		joined := filepath.Join(owner.RootPath(), relative)
+		if filepath.Clean(joined) != filepath.Clean(abs) && pathkey.MutationKey(joined) != pathkey.MutationKey(abs) {
 			continue
 		}
 		prefix := owner.RepoPrefix()
@@ -105,13 +111,37 @@ func (s *Server) pendingTextFiles(ctx context.Context, resolved ResolvedScope, p
 	return files, nil
 }
 
-func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFile, query string, expression *regexp.Regexp, limit int) ([]enrichedTextMatch, map[string]map[string]struct{}, error) {
-	matches := make([]enrichedTextMatch, 0)
-	excluded := make(map[string]map[string]struct{})
+func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFile, query string, expression *regexp.Regexp, limit int) (matches []enrichedTextMatch, excluded map[string]map[string]struct{}, err error) {
+	matches = make([]enrichedTextMatch, 0)
+	excluded = make(map[string]map[string]struct{})
+	var active *pendingTextRoot
+	var activeOwner *indexer.Indexer
+	defer func() {
+		if active != nil {
+			if closeErr := active.close(ctx); closeErr != nil {
+				matches, excluded, err = nil, nil, errors.Join(err, closeErr)
+			}
+		}
+	}()
 	total := 0
+	verificationBuffer := make([]byte, 32<<10)
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
+		}
+		if activeOwner != file.indexer {
+			if active != nil {
+				closeErr := active.close(ctx)
+				active = nil
+				if closeErr != nil {
+					return nil, nil, closeErr
+				}
+			}
+			active, err = openPendingTextRootForScan(file.indexer.RootPath())
+			if err != nil {
+				return nil, nil, err
+			}
+			activeOwner = file.indexer
 		}
 		prefix := file.indexer.RepoPrefix()
 		if excluded[prefix] == nil {
@@ -122,7 +152,7 @@ func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFi
 		if budget <= 0 {
 			return nil, nil, fmt.Errorf("%w: pending byte bound", indexer.ErrSourceSearchBudget)
 		}
-		raw, evidence, err := readPhysicalFileEvidenceBounded(file.abs, budget)
+		raw, evidence, err := active.read(ctx, file.relative, nil, budget, verificationBuffer)
 		if errors.Is(err, os.ErrNotExist) && pendingTextPathAbsent(file.abs, file.indexer.RootPath()) {
 			continue
 		} // actual absence masks old postings too

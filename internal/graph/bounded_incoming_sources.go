@@ -46,6 +46,9 @@ func (v *OverlaidView) GetNodesByIDsContext(ctx context.Context, ids []string) (
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.nodes(ctx, ids)
+	}
 	out := make(map[string]*Node, len(ids))
 	baseIDs := make([]string, 0, len(ids))
 	seen := make(map[string]struct{}, len(ids))
