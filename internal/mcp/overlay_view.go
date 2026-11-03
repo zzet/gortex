@@ -189,7 +189,18 @@ func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
 	if view := requestViewFromContext(ctx); view.routed() {
 		reader = view.reader
 	}
-	for _, layer := range requestProjectionLayers(ctx) {
+	layers := requestProjectionLayers(ctx)
+	if prepared, _ := ctx.Value(preparedSymbolReaderKey{}).(*preparedSymbolReader); prepared != nil && prepared.matches(s, ctx, reader, layers) {
+		return prepared.reader
+	}
+	if len(layers) > 1 {
+		composed := graph.NewOverlaidViewWithLayers(reader, layers)
+		if observe, ok := ctx.Value(requestReaderCompositionObserverKey{}).(func(*graph.OverlaidView)); ok {
+			observe(composed)
+		}
+		return composed
+	}
+	for _, layer := range layers {
 		reader = graph.NewOverlaidViewWithLayer(reader, layer)
 	}
 	return reader

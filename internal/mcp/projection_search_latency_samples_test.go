@@ -26,7 +26,8 @@ type projectionLatencySample struct {
 	Error     string                 `json:"error,omitempty"`
 }
 
-// Each adjacent pair uses the identical request; its order alternates. Fixture
+// Each adjacent pair uses the identical request; population order rotates within
+// each tool and reverses for that probe on the next repetition. Fixture
 // setup, population switching and validation sit outside the timed call. The
 // call includes per-request deadline/request assembly, registered-tool lookup
 // and the public handler equally for both populations. Every refusal, error
@@ -37,11 +38,20 @@ func sampleProjectionHandlers(probes []projectionLatencyProbe, repeats int, sele
 	}
 	var samples []projectionLatencySample
 	var failures []error
+	// Keep tool position separate from the alternating tool list. Using the
+	// global pair parity fixes every symbol at 0-first and every text at
+	// 512-first. Repetition parity also balances each repeated query.
+	withinTool := make(map[string]int)
+	probeOrdinals := make([]int, len(probes))
+	for i, probe := range probes {
+		probeOrdinals[i] = withinTool[probe.Tool]
+		withinTool[probe.Tool]++
+	}
 	pair := 0
-	for range repeats {
-		for _, probe := range probes {
+	for repetition := range repeats {
+		for probeIndex, probe := range probes {
 			order := []int{0, 512}
-			if pair%2 != 0 {
+			if (repetition+probeOrdinals[probeIndex])%2 != 0 {
 				order[0], order[1] = order[1], order[0]
 			}
 			for _, entries := range order {
@@ -101,7 +111,7 @@ func TestProjectionHandlerComparisonKeepsMatchedOrderAndCompleteSamples(t *testi
 		return &mcplib.CallToolResult{}, nil
 	}, func(projectionLatencyProbe, *mcplib.CallToolResult) error { return nil })
 	require.NoError(t, err)
-	require.Equal(t, []int{0, 512, 512, 0, 0, 512, 512, 0}, calls)
+	require.Equal(t, []int{0, 512, 0, 512, 512, 0, 512, 0}, calls)
 	require.Len(t, samples, 8)
 	for pair := range 4 {
 		require.Equal(t, samples[pair*2].Probe, samples[pair*2+1].Probe)
@@ -142,6 +152,75 @@ func TestProjectionHandlerComparisonNeverDropsRefusedWrongOrMissingSamples(t *te
 			require.Len(t, samples, 4, "failure must retain both populations and both repetitions")
 			for _, sample := range samples {
 				require.NotEmpty(t, sample.Error)
+			}
+		})
+	}
+}
+
+func TestProjectionHandlerScheduleBalancesOrderWithinEveryTool(t *testing.T) {
+	var probes []projectionLatencyProbe
+	for i := range 20 {
+		for _, tool := range []string{"search_symbols", "search_text"} {
+			probes = append(probes, projectionLatencyProbe{Tool: tool, Query: fmt.Sprintf("probe-%02d", i), ID: fmt.Sprintf("file%02d.go::Probe", i), File: fmt.Sprintf("file%02d.go", i), Line: i + 1})
+		}
+	}
+	for _, cell := range []struct {
+		name                        string
+		repeats, records, eachOrder int
+	}{{"warmup", 1, 80, 10}, {"measured", 50, 4000, 500}} {
+		t.Run(cell.name, func(t *testing.T) {
+			var emitted []projectionLatencySample
+			samples, err := sampleProjectionHandlers(probes, cell.repeats, func(int) (func() error, error) { return func() error { return nil }, nil }, func(int, projectionLatencyProbe) (*mcplib.CallToolResult, error) {
+				return &mcplib.CallToolResult{}, nil
+			}, func(projectionLatencyProbe, *mcplib.CallToolResult) error { return nil }, func(sample projectionLatencySample) error { emitted = append(emitted, sample); return nil })
+			require.NoError(t, err)
+			require.Len(t, samples, cell.records)
+			require.Equal(t, samples, emitted, "raw emission retains every offered sample")
+			firstCounts := map[string]map[int]int{}
+			perProbeFirstCounts := map[string]map[int]int{}
+			perProbePopulation := map[string]map[int]int{}
+			for pair := range len(samples) / 2 {
+				first, second := samples[2*pair], samples[2*pair+1]
+				require.Equal(t, pair, first.Pair)
+				require.Equal(t, pair, second.Pair)
+				require.Equal(t, probes[pair%len(probes)], first.Probe, "identical probe order and offered denominator")
+				require.Equal(t, first.Probe, second.Probe)
+				require.NotEqual(t, first.Entries, second.Entries)
+				tool := first.Probe.Tool
+				if firstCounts[tool] == nil {
+					firstCounts[tool] = map[int]int{}
+				}
+				firstCounts[tool][first.Entries]++
+				firstKey := tool + "/" + first.Probe.Query
+				if perProbeFirstCounts[firstKey] == nil {
+					perProbeFirstCounts[firstKey] = map[int]int{}
+				}
+				perProbeFirstCounts[firstKey][first.Entries]++
+				for _, sample := range []projectionLatencySample{first, second} {
+					require.Empty(t, sample.Error)
+					require.NotNil(t, sample.ElapsedNS)
+					require.GreaterOrEqual(t, *sample.ElapsedNS, int64(0))
+					key := sample.Probe.Tool + "/" + sample.Probe.Query
+					if perProbePopulation[key] == nil {
+						perProbePopulation[key] = map[int]int{}
+					}
+					perProbePopulation[key][sample.Entries]++
+				}
+			}
+			for _, tool := range []string{"search_symbols", "search_text"} {
+				require.Equal(t, cell.eachOrder, firstCounts[tool][0])
+				require.Equal(t, cell.eachOrder, firstCounts[tool][512])
+			}
+			require.Len(t, perProbePopulation, len(probes))
+			for _, counts := range perProbePopulation {
+				require.Equal(t, cell.repeats, counts[0])
+				require.Equal(t, cell.repeats, counts[512])
+			}
+			if cell.repeats%2 == 0 {
+				for _, counts := range perProbeFirstCounts {
+					require.Equal(t, cell.repeats/2, counts[0], "each repeated query must exercise both orders")
+					require.Equal(t, cell.repeats/2, counts[512])
+				}
 			}
 		})
 	}

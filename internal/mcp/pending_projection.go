@@ -90,6 +90,11 @@ type projectionEntry struct {
 	sourceEvents uint64 // source-event revision, guarded by pendingProjections.mu
 	// Permission for one fresh source attempt, never freshness of this old owner.
 	checkedRetired atomic.Bool
+	// readVersionChecked is set only by a successful checked-read publication.
+	// It is not physical provenance and never makes an old owner live. Copies
+	// start without this witness and must earn it through their own byte checks.
+	// Access is guarded by the owning registry mutex.
+	readVersionChecked bool
 }
 
 // projectionRefusal is why a publish left the live entries as they were.
@@ -232,7 +237,7 @@ func newProjectionTombstone(absPath, graphPath, repoPrefix string, commitSeq uin
 		commitSeq:       commitSeq,
 		sourceCommitSeq: commitSeq,
 		layer:           layer,
-		size:            24, // source version, source-event revision and checked-retirement hint
+		size:            24, // source/event versions plus shared retirement/witness tail word
 		tombstone:       true,
 	}
 }
@@ -299,8 +304,8 @@ func (p *pendingProjections) projectionReplacementLocked(e *projectionEntry) (*p
 	}
 	var refusal projectionRefusal
 	switch {
-	case e.checkedRetired.Load():
-		refusal = projectionSuperseded // historical owners cannot be republished
+	case e.checkedRetired.Load() || e.readVersionChecked:
+		refusal = projectionSuperseded // historical checked owners cannot be republished
 	case prev != nil && prev.graphPath != e.graphPath:
 		refusal = projectionPathCase
 	case prev == nil && len(cur.entries) >= projectionMaxFiles:
@@ -352,6 +357,7 @@ func (p *pendingProjections) publishReadExpected(e *projectionEntry, observed pr
 	}
 	// The fresh bounded bytes observed all events captured before the read;
 	// a later event or changed owner refused above. Keep old pointers suspect.
+	e.readVersionChecked = true
 	p.snap.Store(next)
 	p.published.Add(1)
 	return nil
