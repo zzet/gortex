@@ -104,6 +104,14 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	if !ok || !time.Now().Before(deadline) {
 		return false
 	}
+	return checkedProjectionChange(ctx) && ctx.Err() == nil && time.Now().Before(deadline)
+}
+
+// Structural ownership proof, independent of permission or time for another attempt.
+func checkedProjectionChange(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
 		return false
@@ -112,7 +120,7 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	defer facts.mu.RUnlock()
 	changed := false
 	for _, entry := range facts.entries {
-		if entry == nil || ctx.Err() != nil || !time.Now().Before(deadline) {
+		if entry == nil || ctx.Err() != nil {
 			return false
 		}
 		candidate := pendingFileProjections.snap.Load().entries[entry.key]
