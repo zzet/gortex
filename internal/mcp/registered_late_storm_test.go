@@ -60,7 +60,22 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 		if forceStartupReconcile { scenario = "point_queue" }
 		t.Run(name, func(t *testing.T) {
 			selectedProjectionRegistry(t)
-			s, path, _, raw := acknowledgedCanonicalFile(t)
+			var s *Server
+			var path string
+			var raw []byte
+			var watcher *registeredLateStormWatcher
+			var unblock, stopWatcher func()
+			if scenario == "point_queue" {
+				s, _, path = canonicalPromotionReadFixture(t)
+				watcher, unblock, stopWatcher = startRegisteredLateStormFixtureWatcher(t, s, path, scenario, forceStartupReconcile)
+				s, path, _, raw = acknowledgedCanonicalFileOnFixture(t, s, path)
+				// Latest cleanup runs before the held-ACK receipt join; the early
+				// once-protected registration also covers failures during setup.
+				t.Cleanup(stopWatcher)
+				t.Cleanup(unblock)
+			} else {
+				s, path, _, raw = acknowledgedCanonicalFile(t)
+			}
 			external := []byte(strings.Replace(string(raw), "func Target()", "// external version\n\nfunc Target()", 1))
 			require.NoError(t, os.WriteFile(path+".external", external, 0600))
 			require.NoError(t, os.Rename(path+".external", path))
@@ -86,26 +101,16 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 			for _, file := range []string{auxA, auxB, other} {
 				require.NoError(t, os.WriteFile(file, []byte("package probe\nfunc Auxiliary() int { return 0 }\n"), 0600))
 			}
-			threshold := 1
+			if watcher == nil {
+				watcher, unblock, stopWatcher = startRegisteredLateStormFixtureWatcher(t, s, path, scenario, false)
+			} else {
+				// The held-ACK helper installs its receipt watcher; restore the
+				// already-started native watcher for the actual registered read.
+				s.SetWatcher(watcher)
+			}
 			if scenario == "point_queue" {
-				threshold = 0
-			}
-			native, err := indexer.NewWatcher(s.indexer, config.WatchConfig{Enabled: true, DebounceMs: 60000, StormThreshold: threshold, StormWindowMs: 5000, StormQuietPeriodMs: 60000}, zap.NewNop())
-			require.NoError(t, err)
-			watcher := &registeredLateStormWatcher{Watcher: native, eventPath: path, entered: make(chan struct{}), release: make(chan struct{})}
-			if scenario == "other_path" {
-				watcher.eventPath = other
-			}
-			unblock := sync.OnceFunc(func() { close(watcher.release) })
-			s.SetWatcher(watcher)
-			require.NoError(t, watcher.Start([]string{root}))
-			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
-			t.Cleanup(unblock)
-			if forceStartupReconcile {
-				// Deterministic real publication at the allowed startup stage. This
-				// models startup reconciliation, not the historical CI cause.
-				require.NoError(t, s.indexer.IndexFile(path))
-				require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine, "fixture startup must not publish the later external version")
+				require.Equal(t, 5, s.graph.GetNode("main.go::Neighbor").StartLine, "point fixture requires the old canonical graph")
+				require.False(t, s.indexer.IndexedContentMatches("main.go", external), "point read must borrow its checked owner rather than current canonical bytes")
 			}
 			if scenario != "point_queue" {
 				require.NoError(t, os.WriteFile(auxA, []byte("package probe\nfunc AuxiliaryA() int { return 1 }\n"), 0600))
@@ -317,4 +322,30 @@ func TestRegisteredSummaryLateNativeStormCannotEscapeAsGenericSuperseded(t *test
 			}
 		})
 	}
+}
+
+// Point startup must precede BOTH the held edit and external checked version.
+// Its first real victim event is held before graph admission; no production
+// replay/canonicalization is disabled and all original read caps remain intact.
+func startRegisteredLateStormFixtureWatcher(t *testing.T, s *Server, path, scenario string, forceStartupReconcile bool) (*registeredLateStormWatcher, func(), func()) {
+ t.Helper()
+ threshold:=1
+ if scenario=="point_queue" {threshold=0}
+ native,err:=indexer.NewWatcher(s.indexer,config.WatchConfig{Enabled:true,DebounceMs:60000,StormThreshold:threshold,StormWindowMs:5000,StormQuietPeriodMs:60000},zap.NewNop())
+ require.NoError(t,err)
+ watcher:=&registeredLateStormWatcher{Watcher:native,eventPath:path,entered:make(chan struct{}),release:make(chan struct{})}
+ if scenario=="other_path" {watcher.eventPath=filepath.Join(filepath.Dir(path),"other.go")}
+ unblock:=sync.OnceFunc(func(){close(watcher.release)})
+ stop:=sync.OnceFunc(func(){require.NoError(t,watcher.Stop())})
+ if scenario=="point_queue" {watcher.hold.Store(true)}
+ s.SetWatcher(watcher)
+ require.NoError(t,watcher.Start([]string{filepath.Dir(path)}))
+ t.Cleanup(stop);t.Cleanup(unblock)
+ if forceStartupReconcile {
+  // Controlled real publication at startup, not a claim about the hosted
+  // event that was never captured. Before the edit this must retain old rows.
+  require.NoError(t,s.indexer.IndexFile(path))
+  require.Equal(t,5,s.graph.GetNode("main.go::Neighbor").StartLine,"fixture startup must not publish the later external version")
+ }
+ return watcher,unblock,stop
 }
