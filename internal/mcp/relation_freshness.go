@@ -13,6 +13,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -62,8 +63,14 @@ func relationWaitDeadline(ctx context.Context, freshness requestFreshness) time.
 // or failed. A deadline already passed labels without waiting. Edits outside
 // the scope are neither waited on nor reported.
 func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string, deadline time.Time) relationFreshness {
+	return s.awaitScopedFreshness(ctx, "relations", ids, files, deadline)
+}
+
+// Relation verdicts and derived candidates share the existing scoped producer
+// and wait loop; each caller retains its pre-walk evidence for the answer.
+func (s *Server) awaitScopedFreshness(ctx context.Context, scope string, ids, files []string, deadline time.Time) relationFreshness {
 	started := time.Now()
-	label := s.freshnessFor(ctx, "relations", ids, files)
+	label := s.freshnessFor(ctx, scope, ids, files)
 	if label.state == "" || label.state == "failed" || !deadline.After(started) {
 		label.waited = time.Since(started)
 		return label
@@ -75,17 +82,40 @@ func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string
 	for {
 		select {
 		case <-ticker.C:
-			label = s.freshnessFor(ctx, "relations", ids, files)
+			label = s.freshnessFor(ctx, scope, ids, files)
 			if label.state != "" && label.state != "failed" {
 				continue
 			}
 		case <-timer.C:
-			label = s.freshnessFor(ctx, "relations", ids, files)
+			label = s.freshnessFor(ctx, scope, ids, files)
 		case <-ctx.Done():
 		}
 		label.waited = time.Since(started)
 		return label
 	}
+}
+
+// awaitConsumerFreshness labels freshness-budget expiry while preserving caller
+// cancellation. No default wait or workspace-wide scope is introduced. The
+// optional shared deadline bounds a whole candidate pass.
+func (s *Server) awaitConsumerFreshness(ctx context.Context, req mcp.CallToolRequest, scope string, ids, files []string, deadline time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	freshness := takeRequestFreshness(&req)
+	if !freshness.requireFresh || len(ids)+len(files) == 0 {
+		return nil
+	}
+	// Derived verdicts cannot be certified by a weaker requested tier.
+	if scope != "derived" && freshness.scope != "" {
+		scope = freshness.scope
+	}
+	if deadline.IsZero() {
+		deadline = freshness.effectiveDeadline(time.Now(), ctx)
+	}
+	daemon.ReleaseMCPDispatchSlot(ctx)
+	s.awaitScopedFreshness(ctx, scope, ids, files, deadline)
+	return ctx.Err()
 }
 
 // laggingMutationReceipts returns the request's mutation receipts whose edit
