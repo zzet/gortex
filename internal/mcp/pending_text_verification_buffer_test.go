@@ -78,10 +78,19 @@ func TestPendingTextVerificationBufferPreservesPhysicalEvidence(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "source.go")
 				raw := []byte("package fixture\nfunc Same() {}\n")
 				require.NoError(t, os.WriteFile(path, raw, 0o600))
-				_, _, err := read(path, func() {
-					require.NoError(t, os.Rename(path, path+".old"))
+				var rename pendingTextTestRename
+				current, _, err := read(path, func() {
+					if !rename.try(t, path, path+".old") {
+						return
+					}
 					require.NoError(t, os.WriteFile(path, raw, 0o600))
 				}, 1<<20)
+				if rename.blocked {
+					require.NoError(t, err)
+					require.Equal(t, raw, current)
+					rename.afterClose(t)
+					return
+				}
 				require.ErrorIs(t, err, errPhysicalFileMoved)
 			})
 			t.Run("byte_budget_still_refuses", func(t *testing.T) {

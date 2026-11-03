@@ -29,12 +29,16 @@ func TestPendingTextRootRejectsDirectoryReplacementWithSameLeaf(t *testing.T) {
 			require.NoError(t, os.WriteFile(path, []byte("package fixture\nfunc Current() {}\n"), 0o600))
 			reader, err := openPendingTextRoot(root)
 			require.NoError(t, err)
-			_, _, readErr := reader.read(context.Background(), "pkg/source.go", func() {
+			t.Cleanup(func() { _ = reader.close(context.Background()) })
+			var rename pendingTextTestRename
+			current, _, readErr := reader.read(context.Background(), "pkg/source.go", func() {
 				moved := parent
 				if replaceRoot {
 					moved = root
 				}
-				require.NoError(t, os.Rename(moved, moved+".old"))
+				if !rename.try(t, moved, moved+".old") {
+					return
+				}
 				require.NoError(t, os.MkdirAll(parent, 0o700))
 				old := filepath.Join(parent+".old", "source.go")
 				if replaceRoot {
@@ -43,6 +47,15 @@ func TestPendingTextRootRejectsDirectoryReplacementWithSameLeaf(t *testing.T) {
 				require.NoError(t, os.Link(old, path), "same file inode in a new parent must not preserve path authority")
 			}, 1<<20, make([]byte, 32<<10))
 			closeErr := reader.close(context.Background())
+			if rename.blocked {
+				require.NoError(t, readErr)
+				require.NoError(t, closeErr)
+				require.Equal(t, []byte("package fixture\nfunc Current() {}\n"), current)
+				rename.afterClose(t)
+				_, err = reader.handle.Stat(".")
+				require.Error(t, err)
+				return
+			}
 			require.Error(t, readErr, "unchanged leaf inode does not prove its parent/root identity")
 			if replaceRoot {
 				require.Error(t, closeErr, "final root fence must reject even an otherwise complete result")
@@ -57,7 +70,15 @@ func TestPendingTextRootFinalFenceRejectsRebindingWithoutReads(t *testing.T) {
 	require.NoError(t, os.Mkdir(root, 0o700))
 	reader, err := openPendingTextRoot(root)
 	require.NoError(t, err)
-	require.NoError(t, os.Rename(root, root+".old"))
+	t.Cleanup(func() { _ = reader.close(context.Background()) })
+	var rename pendingTextTestRename
+	if !rename.try(t, root, root+".old") {
+		require.NoError(t, reader.close(context.Background()))
+		rename.afterClose(t)
+		_, err = reader.handle.Stat(".")
+		require.Error(t, err)
+		return
+	}
 	require.NoError(t, os.Mkdir(root, 0o700))
 	require.Error(t, reader.close(context.Background()), "empty selection must not bypass final root identity")
 }
@@ -101,6 +122,7 @@ func TestPendingTextRootRetainsPhysicalVersionAndCancellationProof(t *testing.T)
 			require.NoError(t, err)
 			reader, err := openPendingTextRoot(root)
 			require.NoError(t, err)
+			t.Cleanup(func() { _ = reader.close(context.Background()) })
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			budget := int64(1 << 20)
@@ -110,21 +132,28 @@ func TestPendingTextRootRetainsPhysicalVersionAndCancellationProof(t *testing.T)
 			if mode == "missing" {
 				require.NoError(t, os.Remove(path))
 			}
-			_, _, err = reader.read(ctx, "pkg/source.go", func() {
+			var rename pendingTextTestRename
+			current, _, readErr := reader.read(ctx, "pkg/source.go", func() {
 				switch mode {
 				case "same_size_restored_mtime":
 					require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("b"), len(content)), 0o600))
 					require.NoError(t, os.Chtimes(path, before.ModTime(), before.ModTime()))
 				case "same_bytes_new_inode":
-					require.NoError(t, os.Rename(path, path+".old"))
+					if !rename.try(t, path, path+".old") {
+						return
+					}
 					require.NoError(t, os.WriteFile(path, content, 0o600))
 				case "parent_symlink_inserted":
-					require.NoError(t, os.Rename(parent, parent+".old"))
+					if !rename.try(t, parent, parent+".old") {
+						return
+					}
 					if err := os.Symlink(parent+".old", parent); err != nil {
 						t.Skipf("symlink unavailable: %v", err)
 					}
 				case "leaf_symlink_inserted":
-					require.NoError(t, os.Rename(path, path+".old"))
+					if !rename.try(t, path, path+".old") {
+						return
+					}
 					if err := os.Symlink(path+".old", path); err != nil {
 						t.Skipf("symlink unavailable: %v", err)
 					}
@@ -133,9 +162,18 @@ func TestPendingTextRootRetainsPhysicalVersionAndCancellationProof(t *testing.T)
 				}
 			}, budget, make([]byte, 32<<10))
 			closeErr := reader.close(ctx)
-			require.Error(t, err)
+			if rename.blocked {
+				require.NoError(t, readErr)
+				require.NoError(t, closeErr)
+				require.Equal(t, content, current)
+				rename.afterClose(t)
+				_, err = reader.handle.Stat(".")
+				require.Error(t, err)
+				return
+			}
+			require.Error(t, readErr)
 			if mode == "canceled" {
-				require.ErrorIs(t, err, context.Canceled)
+				require.ErrorIs(t, readErr, context.Canceled)
 				require.ErrorIs(t, closeErr, context.Canceled)
 			} else {
 				require.NoError(t, closeErr)

@@ -71,7 +71,18 @@ func TestPendingTextScanRootCannotServeCachedDirectoryAfterRebind(t *testing.T) 
 			staleDescriptor, err := os.OpenRoot(parent)
 			require.NoError(t, err)
 			defer staleDescriptor.Close()
-			require.NoError(t, os.Rename(parent, parent+".old"))
+			var rename pendingTextTestRename
+			if !rename.try(t, parent, parent+".old") {
+				current, _, readErr := reader.read(t.Context(), "pkg/b.go", nil, 1<<20, nil)
+				require.NoError(t, readErr)
+				require.Equal(t, old, current, "denied rename leaves the current named bytes unchanged")
+				require.NoError(t, reader.close(t.Context()))
+				require.NoError(t, staleDescriptor.Close())
+				rename.afterClose(t)
+				_, _, readErr = reader.read(t.Context(), "pkg/b.go", nil, 1<<20, nil)
+				require.Error(t, readErr, "closed old directory cannot supply a later successful group")
+				return
+			}
 			target := parent
 			if mode == "inserted_alias" {
 				target = filepath.Join(root, "new-target")
@@ -131,34 +142,50 @@ func TestPendingTextScanRootVersionAndClosureControls(t *testing.T) {
 				return child, openErr
 			}
 			maxBytes := int64(1 << 20)
+			var rename pendingTextTestRename
 			if mode == "byte_bound" {
 				maxBytes = 2
 			}
-			_, _, readErr := reader.read(ctx, "pkg/deep/source.go", func() {
+			current, _, readErr := reader.read(ctx, "pkg/deep/source.go", func() {
 				switch mode {
 				case "same_size_restored_mtime":
 					require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("x"), len(raw)), 0o600))
 					require.NoError(t, os.Chtimes(path, before.ModTime(), before.ModTime()))
 				case "same_bytes_new_inode":
-					require.NoError(t, os.Rename(path, path+".old"))
+					if !rename.try(t, path, path+".old") {
+						return
+					}
 					require.NoError(t, os.WriteFile(path, raw, 0o600))
 				case "parent_replaced":
-					require.NoError(t, os.Rename(parent, parent+".old"))
+					if !rename.try(t, parent, parent+".old") {
+						return
+					}
 					require.NoError(t, os.Mkdir(parent, 0o700))
 					require.NoError(t, os.Link(filepath.Join(parent+".old", "source.go"), path))
 				case "root_replaced":
-					require.NoError(t, os.Rename(root, root+".old"))
+					if !rename.try(t, root, root+".old") {
+						return
+					}
 					require.NoError(t, os.MkdirAll(parent, 0o700))
 					require.NoError(t, os.Link(filepath.Join(root+".old", "pkg", "deep", "source.go"), path))
 				case "inserted_leaf_alias":
-					require.NoError(t, os.Rename(path, path+".old"))
+					if !rename.try(t, path, path+".old") {
+						return
+					}
 					requirePendingTextTestSymlink(t, path+".old", path)
 				case "canceled":
 					cancel()
 				}
 			}, maxBytes, make([]byte, 32<<10))
 			closeErr := reader.close(ctx)
-			require.Error(t, errors.Join(readErr, closeErr), "no complete group after physical/version/path/budget/cancellation refusal")
+			if rename.blocked {
+				require.NoError(t, readErr)
+				require.NoError(t, closeErr)
+				require.Equal(t, raw, current, "kernel-refused replacement preserves current bytes")
+				rename.afterClose(t)
+			} else {
+				require.Error(t, errors.Join(readErr, closeErr), "no complete group after physical/version/path/budget/cancellation refusal")
+			}
 			for _, handle := range opened {
 				_, statErr := handle.Stat(".")
 				require.Error(t, statErr, "all actual ancestor handles must close on every failure path")
@@ -207,7 +234,15 @@ func TestPendingTextScanRootFinalFenceRejectsRootRebindingWithoutReads(t *testin
 	require.NoError(t, os.Mkdir(root, 0o700))
 	reader, err := openPendingTextRootForScan(root)
 	require.NoError(t, err)
-	require.NoError(t, os.Rename(root, root+".old"))
+	t.Cleanup(func() { _ = reader.close(context.Background()) })
+	var rename pendingTextTestRename
+	if !rename.try(t, root, root+".old") {
+		require.NoError(t, reader.close(t.Context()))
+		rename.afterClose(t)
+		_, err = reader.handle.Stat(".")
+		require.Error(t, err, "kernel-protected root still closes before it can be renamed")
+		return
+	}
 	require.NoError(t, os.Mkdir(root, 0o700))
 	require.Error(t, reader.close(t.Context()), "empty groups still require the named-root fence")
 	_, err = reader.handle.Stat(".")
