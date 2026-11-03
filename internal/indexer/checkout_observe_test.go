@@ -268,7 +268,8 @@ func TestObserveCheckoutPathUnknownFamilyAndDeniedScopeHaveNoSideEffects(t *test
 // refused, another known family's new worktree still gets its identity, and a
 // path outside every known family never takes a discovery slot.
 func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
-	lc, _, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	lc, _, primary, familyID, _, closeFixture := newCheckoutObservationFixture(t)
+	const requestCount = 40
 	base := filepath.Dir(primary)
 	other := filepath.Join(base, "other")
 	if err := os.Mkdir(other, 0o755); err != nil {
@@ -298,13 +299,35 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 			builderGit(t, dir, "init", "--initial-branch=main")
 		}
 	}
+	type inventoryEntry struct {
+		path string
+		job  *checkoutObservationJob
+	}
+	enteredJobs := make(chan inventoryEntry, requestCount)
+	admitted := make([]*checkoutObservationJob, 0, checkoutObservationFamilyCapacity)
 	release := make(chan struct{})
-	defer close(release)
+	defer func() {
+		close(release)
+		closeFixture() // Join the real lifecycle-owned workers after releasing Git.
+		for _, job := range admitted {
+			if !channelClosed(job.done) {
+				t.Errorf("witnessed discovery was not joined during cleanup")
+			}
+		}
+	}()
 	stuckRoot := pathkey.CanonicalExistingRoot(stuck)
 	var entered atomic.Int32
 	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
 		if pathkey.HasPathPrefix(path, stuckRoot) {
+			lc.observationMu.Lock()
+			job := lc.observationJobs[path]
+			lc.observationMu.Unlock()
 			entered.Add(1)
+			select {
+			case enteredJobs <- inventoryEntry{path: path, job: job}:
+			default:
+				return nil, fmt.Errorf("too many actual inventory-entry witnesses")
+			}
 			<-release // Git or a mount that ignores cancellation.
 			return nil, context.Canceled
 		}
@@ -327,7 +350,7 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	}
 	observeOutside("idle", 0)
 
-	requests := make([]string, 40)
+	requests := make([]string, requestCount)
 	errs := make([]error, len(requests))
 	for i := range requests {
 		requests[i] = filepath.Join(stuck, fmt.Sprintf("request-%d", i))
@@ -335,8 +358,37 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Busy callers alone do not prove occupied slots: their 250ms budget
+	// also includes marker/catalog work before admission. Establish eight
+	// real blocked workers before the remaining burst, without retrying calls.
+	setupDeadline := time.Now().Add(checkoutObservationWorkTimeout)
+	setupCtx, cancelSetup := context.WithDeadline(t.Context(), setupDeadline)
+	defer cancelSetup()
+	for i := range checkoutObservationFamilyCapacity {
+		_, _, errs[i] = lc.ObserveCheckoutPath(setupCtx, requests[i])
+		if !errors.Is(errs[i], ErrCheckoutMutationBusy) {
+			t.Fatalf("setup request %d: %v", i, errs[i])
+		}
+		var witness inventoryEntry
+		select {
+		case witness = <-enteredJobs:
+		case <-setupCtx.Done():
+			t.Fatalf("setup admitted %d of eight blocking workers: %v", len(admitted), setupCtx.Err())
+		}
+		lc.observationMu.Lock()
+		valid := witness.job != nil && lc.observationJobs[witness.path] == witness.job &&
+			witness.job.familyID == familyID && witness.job.holdsSlot() &&
+			!channelClosed(witness.job.proofReady) && !channelClosed(witness.job.done) && witness.job.ctx.Err() == nil
+		lc.observationMu.Unlock()
+		if !valid || !pathkey.EqualPaths(witness.path, requests[i]) || setupCtx.Err() != nil || !time.Now().Before(setupDeadline) {
+			t.Fatalf("setup request %d has no live matching blocking-entry witness: path=%q valid=%v setup=%v", i, witness.path, valid, setupCtx.Err())
+		}
+		admitted = append(admitted, witness.job)
+	}
+	cancelSetup()
+
 	var wg sync.WaitGroup
-	for i := range requests {
+	for i := checkoutObservationFamilyCapacity; i < len(requests); i++ {
 		wg.Go(func() { _, _, errs[i] = lc.ObserveCheckoutPath(t.Context(), requests[i]) })
 	}
 	wg.Wait()
@@ -356,12 +408,8 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	if len(jobs) != checkoutObservationFamilyCapacity {
 		t.Errorf("one family holds %d discovery jobs, want its own bound of %d", len(jobs), checkoutObservationFamilyCapacity)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for int(entered.Load()) < len(jobs) {
-		if time.Now().After(deadline) {
-			t.Fatalf("workers did not reach the stalled inventory: %d of %d", entered.Load(), len(jobs))
-		}
-		time.Sleep(time.Millisecond)
+	if int(entered.Load()) != checkoutObservationFamilyCapacity {
+		t.Errorf("actual blocking entries = %d, want exactly eight", entered.Load())
 	}
 	for _, job := range jobs {
 		job.cancel() // Past the work deadline; the workers keep running.
