@@ -98,6 +98,9 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 			if dataset.config.CandidateRevision != r.Workflow.Revision {
 				return nil, errors.New("nightly workflow and raw evidence revisions differ")
 			}
+			if dataset.config.NightlySeed != nil {
+				return nil, errors.New("seeded raw evidence cannot supply GREEN nightly history")
+			}
 			rows, err := check(p, dataset, "nightly")
 			if err != nil {
 				return nil, err
@@ -151,7 +154,7 @@ func historyVerdict(evidence []nightlyEvidence, through time.Time, hosts []strin
 		complete := true
 		for _, host := range hosts {
 			item, ok := cohorts[key][host]
-			good := ok && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
+			good := ok && item.receipt.Plan.NightlySeed == nil && item.receipt.BudgetPass && item.receipt.Error == "" && item.receipt.Plan.Ready && len(item.receipt.Plan.Prerequisites) == 0
 			fmt.Fprintf(out, "%s / %s: complete main nightly-equivalent = %t\n", host, key, good)
 			complete = complete && good
 		}

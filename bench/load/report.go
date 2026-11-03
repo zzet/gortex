@@ -83,6 +83,8 @@ type Host struct {
 // Every attempt is retained, including busy refusals and phase-censored calls.
 // Workload and readiness/visibility probes have distinct Role denominators.
 type Attempt struct {
+	NightlySeed     string         `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS  int64          `json:"nightly_delay_ns,omitempty"`
 	CWD             string         `json:"cwd,omitempty"`
 	ErrorData       map[string]any `json:"error_data,omitempty"`
 	Tool            string         `json:"tool"`
@@ -155,6 +157,7 @@ type Phase struct {
 }
 
 type Report struct {
+	NightlySeed   string            `json:"nightly_workload_seed,omitempty"`
 	SchemaVersion int               `json:"schema_version"`
 	RunID         string            `json:"run_id"`
 	GitSHA        string            `json:"git_sha"`

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -16,11 +17,15 @@ func TestMicroFixturePreflightRefusesAbsentSkippedEmptyOrChangedTargets(t *testi
 			c := syntheticMicroConfig(t)
 			out := filepath.Join(t.TempDir(), "evidence")
 			timed := 0
-			process := func(_ context.Context, binary string, args []string, cwd string, env []string) ([]byte, []byte, error) {
+			process := func(ctx context.Context, binary string, args []string, cwd string, env []string) ([]byte, []byte, error) {
 				data, preflight := syntheticMicroFixtureResponse(args)
 				if !preflight {
 					timed++
 					return []byte("BenchmarkSynthetic-2 1 100 ns/op\n"), nil, nil
+				}
+				capture, _ := ctx.Value(queryMicroDiagnosticsKey{}).(bool)
+				if capture != (runtime.GOOS == "linux") {
+					t.Fatal("query fixture timeout capture lost Linux scope")
 				}
 				if cwd != filepath.Join(c.Fixture, "internal/query") || !slices.Contains(env, "GORTEX_BENCHMARK_FIXTURE_CHECK=1") {
 					t.Fatal("preflight escaped the pinned query fixture or omitted explicit opt-in")
@@ -59,6 +64,12 @@ func TestMicroFixturePreflightRefusesAbsentSkippedEmptyOrChangedTargets(t *testi
 			}
 			if len(receipt.FixtureChecks) != 2 || receipt.Complete != (mutation == "") {
 				t.Fatal("both binary preflight receipts and failure state must be retained")
+			}
+			for _, check := range receipt.FixtureChecks {
+				want := runtime.GOOS == "linux"
+				if (check.TimeoutCapture == queryMicroCapturePolicy && check.CaptureGraceSeconds == 10) != want || !want && (check.TimeoutCapture != "" || check.CaptureGraceSeconds != 0) {
+					t.Fatal("fixture receipt lost scoped timeout capture policy")
+				}
 			}
 			if mutation == "absent-main-test" && !strings.Contains(receipt.Error, "trusted main must contain the new harness contract") {
 				t.Fatal("old main's absent executable test must fail explicitly")

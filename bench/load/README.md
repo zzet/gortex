@@ -79,6 +79,17 @@ and native paired edit scenarios). This adds no hidden reader population.
 `--agents 4 --edit-agents 4` is the separate four-pure-reader/four-editor tail
 workload. The counts remain explicit in the report and workload hash.
 
+The PR smoke entry uses a versioned offered-window/drain profile. Read drains
+retain version 1. Explicit edit drains (`--pr-smoke-drain-version 2`, with
+`--pr-smoke-drain 2m`) offer work for 20 seconds, then stop new logical edits and
+reads. Already admitted edits retain their original 120-second call/visibility
+budgets, including required visibility probes. The finite drain ends no later
+than 140 seconds after phase start; an earlier parent cancellation still wins.
+Reports retain admission times, distinct edit/read identities, every attempt,
+visibility follow-ups, and the full elapsed drain time. Expired or canceled work
+remains a failure. This opt-in changes the workload hash; ordinary runs and the
+frozen reference profile retain their existing phase-clipping behavior.
+
 An explicit corpus `edit_tool: "edit.write"` selects whole-file write intent for
 the same narrow Go, TypeScript or Python intrafile-call fixture. It additionally
 requires `edit_initial_content` containing the exact pinned initial file bytes.

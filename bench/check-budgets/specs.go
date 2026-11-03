@@ -12,7 +12,7 @@ type metricSpec struct {
 
 var metricSpecs = map[string]metricSpec{
 	"readback_max":          {unit: "s", axis: "timing", everyRepeat: true, missing: "report-v1 does not retain exact edited-file readback latency"},
-	"wal_p95_mib":           {unit: "MiB", axis: "disk", missing: "report-v1 does not retain a WAL observation distribution"},
+	"wal_p95_mib":           {unit: "MiB", axis: "disk"},
 	"edit_ack_p95":          {unit: "s", axis: "timing"},
 	"edit_ack_max":          {unit: "s", axis: "timing", everyRepeat: true},
 	"read_p95":              {unit: "s", axis: "timing"},
@@ -41,8 +41,8 @@ var metricSpecs = map[string]metricSpec{
 	"unflagged_stale":       {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 has no stale-flag correctness census across output modes"},
 	"relations_lag_p95":     {unit: "s", axis: "timing", missing: "indexed-symbol visibility does not measure relations publication"},
 	"derived_lag_p95":       {unit: "s", axis: "timing", missing: "report-v1 has no derived-publication lag observation"},
-	"reclaim_hold_p95":      {unit: "s", axis: "timing", missing: "report-v1 has no WAL-reclaim writer-hold distribution"},
-	"read_gate_closures":    {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 has no read-gate closure census"},
+	"reclaim_hold_p95":      {unit: "s", axis: "timing"},
+	"read_gate_closures":    {unit: "count", axis: "safety", everyRepeat: true},
 	"cancel_release_max":    {unit: "s", axis: "timing", everyRepeat: true, missing: "report-v1 does not measure cancellation-to-slot-release"},
 	"impact_stale_refusals": {unit: "count", axis: "safety", everyRepeat: true, missing: "attempt code/error does not provide a structured stale-refusal reason census"},
 	"detect_stale_refusals": {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 lacks detect_changes primary-checkout refusal probes"},
