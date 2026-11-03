@@ -33,15 +33,21 @@ type searchMetadataPoolStore struct {
 	entered  chan struct{}
 	query    chan struct{}
 	returned chan error
+	observed context.Context
 }
 
 func (s *searchMetadataPoolStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
+}
+
+func (s *searchMetadataPoolStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
 	observed := s.armed.CompareAndSwap(true, false)
 	if observed {
+		s.observed = ctx
 		close(s.entered)
 		<-s.query // Test-only barrier before the real SQL call, never fake rows.
 	}
-	rows, err := s.Store.FileMetasByPaths(prefix, paths)
+	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
 	if observed {
 		s.returned <- err
 	}
@@ -89,6 +95,11 @@ func searchReaderWaitFixture(t *testing.T) (*Server, *searchMetadataPoolStore, c
 }
 
 func TestRegisteredPendingSearchMetadataWaitHonorsCallerCancellation(t *testing.T) {
+	t.Run("caller_cancellation", func(t *testing.T) { runPendingSearchMetadataCancellation(t, true) })
+	t.Run("original_private_deadline", func(t *testing.T) { runPendingSearchMetadataCancellation(t, false) })
+}
+
+func runPendingSearchMetadataCancellation(t *testing.T, cancelCaller bool) {
 	s, backend, ctx, path, original := searchReaderWaitFixture(t)
 	quiet := preselectionRegisteredCall(t, s, ctx, 11, "search_symbols", map[string]any{"query": "Target", "query_class": "symbol", "expand": "off", "limit": 10000, "max_per_file": 0, "max_bytes": 0, "format": "json"})
 	require.False(t, quiet.IsError, resultText(quiet))
@@ -127,6 +138,10 @@ func TestRegisteredPendingSearchMetadataWaitHonorsCallerCancellation(t *testing.
 	case <-time.After(3 * time.Second):
 		t.Fatal("registered source refresh did not enter actual file metadata reader")
 	}
+	deadline, hasDeadline := backend.observed.Deadline()
+	require.True(t, hasDeadline, "the real metadata read must carry its original private build allowance")
+	require.Positive(t, time.Until(deadline))
+	require.LessOrEqual(t, time.Until(deadline), projectedReadBudget)
 
 	// Reserve the actual read-pool connections only after every earlier
 	// registered/view/selection stage has reached the real metadata seam.
@@ -166,13 +181,19 @@ func TestRegisteredPendingSearchMetadataWaitHonorsCallerCancellation(t *testing.
 	blocked := backend.Store.ReaderWaitMark()
 	poolWaitProven := blocked.PoolWaits > before.PoolWaits
 	cancelled := time.Now()
-	cancel()
+	want := context.DeadlineExceeded
+	observationWindow := 2 * projectedReadBudget // Safety join only; the actual context still expires at its original150ms.
+	if cancelCaller {
+		cancel()
+		want = context.Canceled
+		observationWindow = projectedReadBudget
+	}
 	var metadataErr error
 	metadataReturnedBeforeRelease := false
 	select {
 	case metadataErr = <-backend.returned:
 		metadataReturnedBeforeRelease = true
-	case <-time.After(projectedReadBudget):
+	case <-time.After(observationWindow):
 	}
 	elapsed := time.Since(cancelled)
 	releasePool()
@@ -198,7 +219,11 @@ func TestRegisteredPendingSearchMetadataWaitHonorsCallerCancellation(t *testing.
 	// a detached leaf exits; the separate metadata witness catches that escape.
 	t.Logf("pool_wait_proven=%v metadata_returned_before_pool_release=%v after_cancel=%s metadata_error=%v caller_error=%v result=%v protocol_error=%v", poolWaitProven, metadataReturnedBeforeRelease, elapsed, metadataErr, caller.Err(), response.result, response.err)
 	require.True(t, poolWaitProven, "prove the real SQL pool wait, not a sleeping fake reader")
-	require.ErrorIs(t, caller.Err(), context.Canceled)
+	if cancelCaller {
+		require.ErrorIs(t, caller.Err(), context.Canceled)
+	} else {
+		require.NoError(t, caller.Err(), "private150ms expiry is not caller cancellation")
+	}
 	if response.result != nil {
 		require.True(t, response.result.IsError, "cancellation cannot earn current data: %s", resultText(response.result))
 		require.NotContains(t, resultText(response.result), `"readback_exact":true`)
@@ -218,6 +243,6 @@ func TestRegisteredPendingSearchMetadataWaitHonorsCallerCancellation(t *testing.
 	require.Equal(t, 1, targets, "physical target remains independently present")
 	require.True(t, original.suspect.Load(), "an old owner's event cannot be consumed")
 	require.True(t, metadataReturnedBeforeRelease, "actual metadata SQL must honor caller cancellation while the reader pool remains occupied")
-	require.ErrorIs(t, metadataErr, context.Canceled)
+	require.ErrorIs(t, metadataErr, want)
 	require.Same(t, original, liveEntry(pendingFileProjections, path), "a cancelled refresh must not publish a checked replacement")
 }

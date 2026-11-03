@@ -32,7 +32,11 @@ type preselectionRetirementStore struct {
 }
 
 func (s *preselectionRetirementStore) FileMetasByPaths(prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
-	rows, err := s.Store.FileMetasByPaths(prefix, paths)
+	return s.FileMetasByPathsContext(context.Background(), prefix, paths)
+}
+
+func (s *preselectionRetirementStore) FileMetasByPathsContext(ctx context.Context, prefix string, paths []string) (map[string]graph.FileMetaRow, error) {
+	rows, err := s.Store.FileMetasByPathsContext(ctx, prefix, paths)
 	if err == nil && s.armed.CompareAndSwap(true, false) {
 		s.reads.Add(1)
 		s.publish()
