@@ -35,6 +35,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 	manifest := f.String("manifest", "", "one pinned contemporary corpus")
 	out := f.String("out", "", "NEW owned stores/report directory outside source")
 	editACK := f.String("edit-ack", "", "explicit local or full owned edit policy; omission preserves the product default")
+	retainFailures := f.Bool("retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	offer := f.Duration("offer", 20*time.Second, "version 2 PR smoke offered window: 20s")
 	deadline := f.Duration("deadline", 120*time.Second, "original product deadline")
 	warm := f.Duration("warm-timeout", 5*time.Minute, "each ready/enriched/public-analysis gate budget")
@@ -138,7 +139,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 					return errors.Join(result, err)
 				}
 				build := builds[role]
-				o := runOptions{EditACKMode: *editACK, Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
+				o := runOptions{RetainReadSourceFailures: *retainFailures, EditACKMode: *editACK, Binary: build.binary, GitSHA: build.sha, Manifest: *manifest, Scratch: *out, Output: filepath.Join(root, "report.json"), Profile: "agent", Host: "native", Scenario: step.wire, Agents: step.readers, Editors: step.editors, Seed: int64(repeat), Duration: *offer, Deadline: *deadline, WarmTimeout: *warm, StopTimeout: *stop, SweepBudget: *sweep, SweepRepetitions: 1, smokeState: states[role], smokeMarkers: markers[role]}
 				if step.wire == "read" {
 					o.PRSmokeDrain = *deadline
 				}
@@ -153,7 +154,7 @@ func smokeCommand(ctx context.Context, args []string) (result error) {
 				if err != nil {
 					return errors.Join(result, err)
 				}
-				phase, sweepRows, artifacts, crashes, version, runErr := runPhase(ctx, o, step.wire, corpora, group, root)
+				phase, sweepRows, artifacts, crashes, version, runErr := runPhase(withReadSourceFailureEvidence(ctx, *retainFailures), o, step.wire, corpora, group, root)
 				addPhase(&report, phase, sweepRows, artifacts, crashes, version, runErr)
 				runErr = errors.Join(runErr, finishReport(&report, 1))
 				path := filepath.Join(root, "report.json")
