@@ -5284,6 +5284,9 @@ func (idx *Indexer) indexFile(
 	// transformed source and parse tree. Validate and consume that snapshot
 	// before acquiring another lease; acquiring first can self-deadlock when
 	// one oversized prepared file owns the entire shared budget.
+	fallbackObservation := beginFallbackPatchObservation(markerBatch)
+	fallbackComplete := false
+	defer func() { fallbackObservation.finish(fallbackComplete) }()
 	preparedEntry, prepared := idx.takePreparedRefresh(absPath)
 	if prepared && preparedEntry.relPath != relPath {
 		preparedEntry.release()
@@ -5420,6 +5423,9 @@ func (idx *Indexer) indexFile(
 		}
 		return err
 	}
+	if !skipped {
+		fallbackObservation.next(patchApply)
+	}
 	omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
 
 	// Affected-by snapshot: the symbol shapes and reverse-reference
@@ -5530,6 +5536,7 @@ func (idx *Indexer) indexFile(
 	result.ReleaseTree()
 	parseLease.Release()
 
+	fallbackObservation.next(patchSearch)
 	// Add new symbols to search index. shouldIndexForSearch enforces
 	// the same SkipSearch filter used by the bulk and upgrade paths.
 	// When the backing store implements graph.SymbolSearcher we
@@ -5561,6 +5568,7 @@ func (idx *Indexer) indexFile(
 		}
 	}
 	commitDuration = time.Since(commitStarted)
+	fallbackObservation.next(patchBookkeeping)
 
 	if resolve {
 		// Forward pass (this file's outgoing references) plus the
@@ -5709,9 +5717,13 @@ func (idx *Indexer) indexFile(
 	// form), NOT relPath — relPath is the OS-native graph key, whereas
 	// the fileMtimes map and IsStale / TrackedFileState all key on the
 	// slash form.
+	fallbackObservation.next(patchMtimes)
 	if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
 		return idx.fileIndexFailureError(absPath)
 	}
+	fallbackObservation.finish(!skipped)
+	fallbackObservation = nil
+	fallbackComplete = true
 	if elapsed := time.Since(indexFileStarted); elapsed >= 2*time.Second {
 		idx.logger.Warn("indexer: slow incremental stages",
 			zap.String("file", graphPath),

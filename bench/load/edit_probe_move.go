@@ -94,17 +94,18 @@ func decodeEditProbeMoveAcknowledgement(body map[string]any, sourceID, targetID 
 }
 
 type editProbeMoveFileAccounting struct {
-	Path            string           `json:"path"`
-	Role            string           `json:"role"`
-	Receipt         string           `json:"receipt"`
-	Blob            string           `json:"accepted_blob_sha"`
-	OwnerGeneration uint64           `json:"owner_generation"`
-	WriteStartedNS  *int64           `json:"write_started_ns"`
-	WriteReturnedNS *int64           `json:"write_returned_ns"`
-	WriteWindowNS   *int64           `json:"write_window_ns"`
-	D               *editProbeWindow `json:"direct_reconcile,omitempty"`
-	R               *editProbeWindow `json:"read_assisted_reconcile,omitempty"`
-	Route           string           `json:"publication_route,omitempty"`
+	Shared          *editProbeSharedReference `json:"shared_owner,omitempty"`
+	Path            string                    `json:"path"`
+	Role            string                    `json:"role"`
+	Receipt         string                    `json:"receipt"`
+	Blob            string                    `json:"accepted_blob_sha"`
+	OwnerGeneration uint64                    `json:"owner_generation"`
+	WriteStartedNS  *int64                    `json:"write_started_ns"`
+	WriteReturnedNS *int64                    `json:"write_returned_ns"`
+	WriteWindowNS   *int64                    `json:"write_window_ns"`
+	D               *editProbeWindow          `json:"direct_reconcile,omitempty"`
+	R               *editProbeWindow          `json:"read_assisted_reconcile,omitempty"`
+	Route           string                    `json:"publication_route,omitempty"`
 }
 type editProbeMoveAccounting struct {
 	State   string                        `json:"state"`
@@ -164,7 +165,7 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 			fail("move accepted blob unavailable")
 		}
 		ack, _ := row["acknowledgement"].(map[string]any)
-		if ack["rpc_id"] != out.RPCID || ack["clock"] != "monotonic" || ack["scope"] != "shared_rpc_mcp_bound_call" || ack["disjoint_observed_intervals"] != true || ack["parse_scope"] != "explicit_go_parser_calls_formatting_unattributed" {
+		if ack["rpc_id"] != out.RPCID || ack["clock"] != "monotonic" || ack["scope"] != "shared_rpc_mcp_bound_call" || ack["disjoint_observed_intervals"] != true || !moveAcknowledgementParserScope(ack) {
 			fail("shared move acknowledgement identity unavailable")
 		}
 		hash, hashErr := hashJSON(ack)
@@ -354,6 +355,21 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		}
 	}
 	return out
+}
+
+func moveAcknowledgementParserScope(ack map[string]any) bool {
+	if ack["parse_scope"] == "explicit_go_parser_calls_formatting_unattributed" {
+		return true
+	}
+	if ack["parse_scope"] != "mixed_observed_parser_paths" {
+		return false
+	}
+	counts, _ := ack["counts"].(map[string]any)
+	parse, _ := counts["parse"].(map[string]any)
+	started, se := strconvEditProbeUint(parse["started"])
+	completed, ce := strconvEditProbeUint(parse["completed"])
+	na, ne := strconvEditProbeUint(parse["not_applicable"])
+	return se == nil && ce == nil && ne == nil && started > 0 && completed == started && na == 0
 }
 
 // Applicability belongs to each file, while execution/counts describe the one

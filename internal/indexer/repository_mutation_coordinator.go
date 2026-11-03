@@ -411,6 +411,9 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	// can acquire the batch gate while this call owns the lane, then wait for
 	// that lane itself — a gate/lane cycle that prevents either side advancing.
 	var batchAdmission canonicalAdmissionSpan
+	if batchMutationGate == nil && c.batchAdmissionHook == nil {
+		PublicationStampsFrom(ctx).markSharedOptionalDisposition("batch_admission", "no_batch_gate_or_hook")
+	}
 	if batchMutationGate != nil || c.batchAdmissionHook != nil {
 		batchAdmission = PublicationStampsFrom(ctx).beginCanonicalAdmission(canonicalBatchAdmission)
 	}
