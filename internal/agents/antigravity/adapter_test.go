@@ -202,6 +202,9 @@ func readJSONC(t *testing.T, path string) map[string]any {
 // A global install writes one gortex spec covering all five events, each
 // carrying its on-disk event name and the --hook-mode flag.
 func TestAntigravityHooksJSONHonoursHookMode(t *testing.T) {
+	prev := hookShellIsCmd // the cmd /c form is covered by its own test
+	hookShellIsCmd = false
+	t.Cleanup(func() { hookShellIsCmd = prev })
 	for mode, flag := range map[string]string{
 		"": "", "deny": "", "enrich": " --mode=enrich",
 		"consult-unlock": " --mode=consult-unlock", "nudge": " --mode=nudge",
