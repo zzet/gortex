@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,52 +34,54 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
-	SearchACK                map[string]any            `json:"search_ack,omitempty"`
-	AdmittedTargetLines      *int                      `json:"admitted_target_lines,omitempty"`
-	MutationTiers            *editProbeLiveTiers       `json:"mutation_tiers,omitempty"`
-	GateReadback             *Metric                   `json:"t_gate_readback_ms,omitempty"`
-	ACKReadbackExact         *bool                     `json:"ack_readback_exact,omitempty"`
-	ProbeMode                string                    `json:"probe_mode,omitempty"`
-	Ordinal                  int                       `json:"ordinal"`
-	Editor                   int                       `json:"editor,omitempty"`
-	Route                    string                    `json:"route,omitempty"`
-	CheckoutID               string                    `json:"checkout_id,omitempty"`
-	Marker                   string                    `json:"marker"`
-	MutationID               string                    `json:"mutation_id"`
-	PlannedDueNS             int64                     `json:"planned_due_ns"`
-	ActivatedNS              *int64                    `json:"activated_ns"`
-	StartedNS                *int64                    `json:"started_ns"`
-	StartLatenessNS          *int64                    `json:"start_lateness_ns"`
-	Outcome                  string                    `json:"outcome"`
-	Receipt                  string                    `json:"mutation_receipt"`
-	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
-	Move                     *editProbeMoveReferences  `json:"move,omitempty"`
-	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
-	Restart                  *editProbeRestartRecord   `json:"restart,omitempty"`
-	NativeWrite              *editProbeNativeWrite     `json:"native_write,omitempty"`
-	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
-	Ack                      Metric                    `json:"t_ack_ms"`
-	PhasesMS                 map[string]Metric         `json:"phases_ms,omitempty"`
-	Readback                 Metric                    `json:"t_readback_ms,omitempty"`
-	FileGraph                Metric                    `json:"t_file_graph_ms,omitempty"`
-	Relations                Metric                    `json:"t_relations_ms,omitempty"`
-	Search                   Metric                    `json:"t_search_ms,omitempty"`
-	Derived                  Metric                    `json:"t_derived_ms,omitempty"`
-	Readbacks                []editProbeReadback       `json:"readbacks"`
-	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
-	Accounting               editProbeAccounting       `json:"accounting"`
-	PendingReads             int                       `json:"reads_while_receipt_observed_pending"`
-	ExpectedRefusals         int                       `json:"expected_refusals,omitempty"`
-	ProbeErrors              int                       `json:"probe_errors"`
-	StaleClaimedFresh        bool                      `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches int                       `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal            bool                      `json:"graph_terminal"`
-	Evidence                 string                    `json:"raw_evidence"`
-	EvidenceWriteMS          float64                   `json:"evidence_write_ms"`
-	EvidenceEncodeMS         float64                   `json:"evidence_encode_ms"`
-	EvidenceBytes            int                       `json:"evidence_bytes"`
-	EvidenceLimit            int                       `json:"evidence_limit_bytes"`
-	Errors                   []string                  `json:"errors"`
+	SearchACK                map[string]any               `json:"search_ack,omitempty"`
+	AdmittedTargetLines      *int                         `json:"admitted_target_lines,omitempty"`
+	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
+	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact         *bool                        `json:"ack_readback_exact,omitempty"`
+	ProbeMode                string                       `json:"probe_mode,omitempty"`
+	Ordinal                  int                          `json:"ordinal"`
+	Editor                   int                          `json:"editor,omitempty"`
+	Route                    string                       `json:"route,omitempty"`
+	CheckoutID               string                       `json:"checkout_id,omitempty"`
+	Marker                   string                       `json:"marker"`
+	MutationID               string                       `json:"mutation_id"`
+	PlannedDueNS             int64                        `json:"planned_due_ns"`
+	ActivatedNS              *int64                       `json:"activated_ns"`
+	StartedNS                *int64                       `json:"started_ns"`
+	StartLatenessNS          *int64                       `json:"start_lateness_ns"`
+	Outcome                  string                       `json:"outcome"`
+	Receipt                  string                       `json:"mutation_receipt"`
+	Batch                    *editProbeBatchReferences    `json:"batch,omitempty"`
+	BatchSet                 *editProbeBatchSetReferences `json:"batch_set,omitempty"`
+	BatchAccounting          *editProbeBatchSetAccounting `json:"batch_accounting,omitempty"`
+	Move                     *editProbeMoveReferences     `json:"move,omitempty"`
+	MoveAccounting           *editProbeMoveAccounting     `json:"move_accounting,omitempty"`
+	Restart                  *editProbeRestartRecord      `json:"restart,omitempty"`
+	NativeWrite              *editProbeNativeWrite        `json:"native_write,omitempty"`
+	GraphTerminalBasis       string                       `json:"graph_terminal_basis,omitempty"`
+	Ack                      Metric                       `json:"t_ack_ms"`
+	PhasesMS                 map[string]Metric            `json:"phases_ms,omitempty"`
+	Readback                 Metric                       `json:"t_readback_ms,omitempty"`
+	FileGraph                Metric                       `json:"t_file_graph_ms,omitempty"`
+	Relations                Metric                       `json:"t_relations_ms,omitempty"`
+	Search                   Metric                       `json:"t_search_ms,omitempty"`
+	Derived                  Metric                       `json:"t_derived_ms,omitempty"`
+	Readbacks                []editProbeReadback          `json:"readbacks"`
+	FirstCorrect             map[string]Metric            `json:"first_correct_ms"`
+	Accounting               editProbeAccounting          `json:"accounting"`
+	PendingReads             int                          `json:"reads_while_receipt_observed_pending"`
+	ExpectedRefusals         int                          `json:"expected_refusals,omitempty"`
+	ProbeErrors              int                          `json:"probe_errors"`
+	StaleClaimedFresh        bool                         `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches int                          `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal            bool                         `json:"graph_terminal"`
+	Evidence                 string                       `json:"raw_evidence"`
+	EvidenceWriteMS          float64                      `json:"evidence_write_ms"`
+	EvidenceEncodeMS         float64                      `json:"evidence_encode_ms"`
+	EvidenceBytes            int                          `json:"evidence_bytes"`
+	EvidenceLimit            int                          `json:"evidence_limit_bytes"`
+	Errors                   []string                     `json:"errors"`
 }
 type editProbeReport struct {
 	SharedOwners       *editProbeSharedOwnerReport `json:"shared_owners,omitempty"`
@@ -879,24 +882,47 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	var move *editProbeMoveReferences
 	var batch *editProbeBatchReferences
 	var batchOffered []byte
+	var batchSet *editProbeBatchSetReferences
+	var batchIntents []editProbeBatchIntentMember
 	if r.plan.Tool == "edit.batch" {
-		transaction, offered, requestErr := editProbeBatchIntent(step.Request)
-		if requestErr == nil {
-			refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
-			requestErr = ackErr
-			if ackErr == nil {
-				batch = &refs
-				batchOffered = offered
+		changes, _ := step.Request.Arguments["changes"].([]any)
+		if len(changes) > 1 {
+			transaction, intents, requestErr := editProbeBatchSetIntent(step.Request, r.p.Repos[0].Path, r.p.Repos[0].Prefix)
+			if requestErr == nil {
+				refs, ackErr := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
+				requestErr = ackErr
+				if ackErr == nil {
+					batchSet = &refs
+					batchIntents = intents
+				}
+			}
+			if requestErr != nil {
+				s.mu.Lock()
+				s.record.Outcome = "invalid_ack"
+				s.record.Errors = append(s.record.Errors, requestErr.Error())
+				s.mu.Unlock()
+				return
+			}
+		} else {
+			transaction, offered, requestErr := editProbeBatchIntent(step.Request)
+			if requestErr == nil {
+				refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
+				requestErr = ackErr
+				if ackErr == nil {
+					batch = &refs
+					batchOffered = offered
+				}
+			}
+			if requestErr != nil {
+				s.mu.Lock()
+				s.record.Outcome = "invalid_ack"
+				s.record.Errors = append(s.record.Errors, requestErr.Error())
+				s.mu.Unlock()
+				return
 			}
 		}
-		if requestErr != nil {
-			s.mu.Lock()
-			s.record.Outcome = "invalid_ack"
-			s.record.Errors = append(s.record.Errors, requestErr.Error())
-			s.mu.Unlock()
-			return
-		}
 	}
+
 	if step.Relocated {
 		refs, moveErr := decodeEditProbeMoveAcknowledgement(body, r.p.Repos[0].Prefix+"/"+step.BeforeSymbol, r.p.Repos[0].Prefix+"/"+step.TargetSymbol, r.movePaths())
 		if moveErr != nil {
@@ -920,6 +946,11 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 	}
 	s.record.Receipt = receipt
+	if batchSet != nil {
+		s.record.BatchSet = batchSet
+		s.record.Receipt = ""
+		s.record.MutationID = ""
+	}
 	if batch != nil {
 		s.record.Batch = batch
 		if batch.TransactionError != "" {
@@ -935,7 +966,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.PhasesMS = editProbePhases(nil, "relocation reports per-file move accounting, not one receipt's phases_ms")
 		s.record.Derived = unavailable("ms", "relocation reports per-file move accounting, not one receipt's timeline")
 	}
-	if receipt == "" && batch == nil && move == nil {
+	if receipt == "" && batch == nil && batchSet == nil && move == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
 	} else if !identity.Finished.IsZero() {
 		s.record.Ack = measured(float64(identity.Finished.Sub(started))/float64(time.Millisecond), "ms")
@@ -965,6 +996,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 	if move != nil {
 		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
+	} else if batchSet != nil {
+		r.collectBatchSetEvidence(callCtx, s, *batchSet, batchIntents)
 	} else if batch != nil {
 		r.collectBatchEvidence(callCtx, s, *batch, batchOffered)
 	} else {
@@ -1314,10 +1347,13 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
+		if record.BatchSet != nil {
+			return errors.New("multi-file batch restore unsupported: complete original baselines are not retained")
+		}
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
-		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
+		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}
