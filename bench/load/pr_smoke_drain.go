@@ -31,6 +31,7 @@ type prDrainObservation struct {
 	AdmittedEdits             int                `json:"admitted_edits,omitempty"`
 	VisibilityProbeAttempts   int                `json:"visibility_probe_attempts,omitempty"`
 	Admissions                []prDrainAdmission `json:"admissions,omitempty"`
+	EditClock                 *prEditClock       `json:"edit_clock,omitempty"`
 }
 
 type prDrainAdmission struct {
@@ -116,13 +117,22 @@ func validatePRDrainObservation(r Report) error {
 		return err
 	}
 	config := r.Workload.PRSmokeDrain
-	phaseEnd := phase.Started.Add(time.Duration(phase.DurationSec*float64(time.Second)) + time.Microsecond)
-	if observed.Version != config.Version || observed.Started.IsZero() || observed.Started.Before(phase.Started) || observed.Finished.After(phaseEnd) || observed.Finished.Before(observed.OfferDeadline) || observed.Finished.After(observed.DrainDeadline) || observed.AdmittedCalls < 1 || observed.NotOffered < 0 {
-		return errors.New("offered-window drain has invalid phase timing or admission receipts")
-	}
-	// This tolerance concerns JSON timestamp/float round trips, not a budget.
-	if math.Abs(observed.OfferDeadline.Sub(observed.Started).Seconds()-config.OfferedSeconds) > 1e-6 || math.Abs(observed.DrainDeadline.Sub(observed.OfferDeadline).Seconds()-config.MaxDrainSeconds) > 1e-6 || math.Abs(observed.ElapsedSeconds-observed.Finished.Sub(observed.Started).Seconds()) > 1e-6 || math.Abs(observed.AfterOfferDeadlineSeconds-observed.Finished.Sub(observed.OfferDeadline).Seconds()) > 1e-6 || phase.DurationSec+1e-6 < observed.ElapsedSeconds {
-		return errors.New("offered-window drain elapsed/admission receipts do not match the offered and product-drain profile")
+	if config.Version == 2 {
+		if observed.Version != 2 || observed.Started.IsZero() || observed.Finished.IsZero() || observed.AdmittedCalls < 1 || observed.NotOffered < 0 {
+			return errors.New("edit drain invalid phase identity or admission receipts")
+		}
+		if err := validatePREditPhaseClock(phase, observed, config); err != nil {
+			return err
+		}
+	} else {
+		phaseEnd := phase.Started.Add(time.Duration(phase.DurationSec*float64(time.Second)) + time.Microsecond)
+		if observed.Version != config.Version || observed.Started.IsZero() || observed.Started.Before(phase.Started) || observed.Finished.After(phaseEnd) || observed.Finished.Before(observed.OfferDeadline) || observed.Finished.After(observed.DrainDeadline) || observed.AdmittedCalls < 1 || observed.NotOffered < 0 {
+			return errors.New("offered-window drain has invalid phase timing or admission receipts")
+		}
+		// This tolerance concerns JSON timestamp/float round trips, not a budget.
+		if math.Abs(observed.OfferDeadline.Sub(observed.Started).Seconds()-config.OfferedSeconds) > 1e-6 || math.Abs(observed.DrainDeadline.Sub(observed.OfferDeadline).Seconds()-config.MaxDrainSeconds) > 1e-6 || math.Abs(observed.ElapsedSeconds-observed.Finished.Sub(observed.Started).Seconds()) > 1e-6 || math.Abs(observed.AfterOfferDeadlineSeconds-observed.Finished.Sub(observed.OfferDeadline).Seconds()) > 1e-6 || phase.DurationSec+1e-6 < observed.ElapsedSeconds {
+			return errors.New("offered-window drain elapsed/admission receipts do not match the offered and product-drain profile")
+		}
 	}
 	logical := map[prDrainCall]bool{}
 	for _, attempt := range phase.Attempts {
@@ -145,19 +155,22 @@ type prDrainCall struct {
 }
 
 func validatePREditDrainObservation(phase Phase, observed prDrainObservation, deadlineSeconds float64) error {
+	if err := validatePREditClock(phase, observed); err != nil {
+		return err
+	}
 	if observed.AdmittedEdits < 1 || observed.AdmittedEdits != len(phase.Edits) || len(observed.Admissions) != observed.AdmittedCalls {
 		return errors.New("edit drain is missing its edit/admission census")
 	}
-	admissions := map[prDrainCall]time.Time{}
-	edits := map[[2]int]time.Time{}
-	for _, admission := range observed.Admissions {
+	admissions := map[prDrainCall]int64{}
+	edits := map[[2]int]int64{}
+	for i, admission := range observed.Admissions {
 		key := prDrainCall{admission.Agent, admission.Step, admission.Slot, admission.Tool}
-		if _, duplicate := admissions[key]; duplicate || admission.OfferedAt.Before(observed.Started) || !admission.OfferedAt.Before(observed.OfferDeadline) {
+		if _, duplicate := admissions[key]; duplicate || observed.EditClock.Admissions[i].OffsetNS < 0 || observed.EditClock.Admissions[i].OffsetNS >= observed.EditClock.OfferedNS {
 			return errors.New("edit drain has duplicate or late logical admissions")
 		}
-		admissions[key] = admission.OfferedAt
+		admissions[key] = observed.EditClock.Admissions[i].OffsetNS
 		if admission.Tool == "edit.file" {
-			edits[[2]int{admission.Agent, admission.Step}] = admission.OfferedAt
+			edits[[2]int{admission.Agent, admission.Step}] = observed.EditClock.Admissions[i].OffsetNS
 		}
 	}
 	if len(edits) != observed.AdmittedEdits {
@@ -166,15 +179,12 @@ func validatePREditDrainObservation(phase Phase, observed prDrainObservation, de
 	started := map[prDrainCall]bool{}
 	visibleProbes := map[[2]int]bool{}
 	probes := 0
-	for _, attempt := range phase.Attempts {
+	for i, attempt := range phase.Attempts {
 		key := prDrainCall{attempt.Agent, attempt.Step, attempt.Slot, attempt.Tool}
-		if attempt.DurationMS < 0 || math.IsNaN(attempt.DurationMS) || math.IsInf(attempt.DurationMS, 0) || attempt.DurationMS > observed.Finished.Sub(observed.Started).Seconds()*1000+1e-3 || attempt.Started.Add(time.Duration(attempt.DurationMS*float64(time.Millisecond))).After(observed.Finished.Add(time.Microsecond)) {
-			return errors.New("edit drain attempt has invalid elapsed time or ends after phase completion")
-		}
 		switch attempt.Role {
 		case "workload":
 			admitted, ok := admissions[key]
-			if !ok || attempt.Started.Before(admitted) {
+			if !ok || observed.EditClock.Attempts[i].OffsetNS < admitted {
 				return errors.New("edit drain workload attempt lacks a preceding logical admission")
 			}
 			if attempt.Retry == 0 {
@@ -186,7 +196,7 @@ func validatePREditDrainObservation(phase Phase, observed prDrainObservation, de
 		case "probe":
 			editKey := [2]int{attempt.Agent, attempt.Step}
 			admitted, ok := edits[editKey]
-			if !ok || attempt.Tool != "search.symbols" || attempt.Started.Before(admitted) {
+			if !ok || attempt.Tool != "search.symbols" || observed.EditClock.Attempts[i].OffsetNS < admitted {
 				return errors.New("edit drain visibility probe lacks an admitted edit")
 			}
 			if attempt.Outcome == "success" {
@@ -205,8 +215,8 @@ func validatePREditDrainObservation(phase Phase, observed prDrainObservation, de
 			return errors.New("complete edit drain lacks an admitted edit's successful visibility probe")
 		}
 		found := false
-		for _, edit := range phase.Edits {
-			if edit.Marker == fmt.Sprintf("GortexLoadMarkerA%dS%d", key[0], key[1]) && !edit.Started.Before(admitted) && !edit.Started.After(observed.Finished) {
+		for i, edit := range phase.Edits {
+			if edit.Marker == fmt.Sprintf("GortexLoadMarkerA%dS%d", key[0], key[1]) && observed.EditClock.Edits[i].OffsetNS >= admitted && observed.EditClock.Edits[i].OffsetNS <= observed.EditClock.ElapsedNS {
 				if edit.Outcome != "visible" || edit.VisibilityMS.Value == nil || *edit.VisibilityMS.Value > deadlineSeconds*1000 {
 					return errors.New("complete edit drain has an unfinished or expired visibility observation")
 				}
@@ -330,6 +340,9 @@ func runPRSmokeWindow(parent context.Context, o runOptions, p *privateRun, clien
 				observation.VisibilityProbeAttempts++
 			}
 		}
+	}
+	if editing && observation.Version == 2 {
+		observation.EditClock = capturePREditClock(*phase, observation)
 	}
 	data, marshalErr := json.Marshal(observation)
 	if phase.Gate == nil {

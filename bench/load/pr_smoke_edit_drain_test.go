@@ -154,6 +154,9 @@ func TestPREditDrainChecksDistinctAdmissionsAndProbeLineage(t *testing.T) {
 			{Agent: 0, Step: 0, Slot: 0, Tool: "edit.file", OfferedAt: editAt},
 			{Agent: 0, Step: 0, Slot: 0, Tool: "search.symbols", OfferedAt: readAt},
 		}}
+		observed.ElapsedSeconds = 22
+		observed.AfterOfferDeadlineSeconds = 2
+		observed.EditClock = capturePREditClock(phase, observed)
 		return phase, observed
 	}
 	phase, observed := build()
