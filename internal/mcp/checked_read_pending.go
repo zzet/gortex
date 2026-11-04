@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -60,14 +61,95 @@ func (s *Server) checkedReadTransitionPending(ctx context.Context, req mcplib.Ca
 	if target == "" || graphPathKey(rel) != file || pathkey.MutationKey(abs) != key {
 		return nil, nil
 	}
+	return s.projectionTransitionPendingResult(ctx, req, file, "external_write")
+}
+
+// A real source event can reach the exact queued storm after leaf selection.
+// Only that typed failed selection may become a data-free pending reply. It
+// receives no retry permission and cannot make any old fact valid again.
+func (s *Server) lateStormTransitionPending(ctx context.Context, req mcplib.CallToolRequest, failure error) (*mcplib.CallToolResult, error) {
+	if !errors.Is(failure, projectionSuperseded) {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	legacy, known := s.legacyToolName(&req)
+	_, hasDeadline := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+	if !ok || !known || !hasDeadline || legacy != "get_file_summary" || allowance.tool != legacy || allowance.attempts.Load() < 1 || allowance.attempts.Load() > 2 {
+		return nil, nil
+	}
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok {
+		return nil, nil
+	}
+	facts.mu.RLock()
+	var entry *projectionEntry
+	if len(facts.entries) == 1 {
+		for _, selected := range facts.entries {
+			entry = selected
+		}
+	}
+	facts.mu.RUnlock()
+	if entry == nil {
+		return nil, nil
+	}
+	// Existing registry ownership, immutable checked-read provenance and the
+	// actual source-event revision distinguish this from an unchecked eviction,
+	// another physical execution, or an arbitrary projection refusal.
+	eligible := func() bool {
+		facts.mu.RLock()
+		defer facts.mu.RUnlock()
+		pendingFileProjections.mu.Lock()
+		defer pendingFileProjections.mu.Unlock()
+		return len(facts.entries) == 1 && facts.entries[entry.key] == entry &&
+			pendingFileProjections.snap.Load().entries[entry.key] == entry &&
+			entry.commitSeq == 0 && entry.sourceCommitSeq == 0 && entry.readVersionChecked &&
+			!entry.tombstone && entry.layer != nil && !entry.checkedRetired.Load() &&
+			entry.suspect.Load() && entry.sourceEvents > 0
+	}
+	if !eligible() {
+		return nil, nil
+	}
+	// Use the same fail-closed scoped resolver as the checked-retirement funnel,
+	// never graphRelPath's unresolved-string fallback. No source bytes are read.
+	target := req.GetString("path", "")
+	abs, rel, resolveErr := s.resolveFilePath(ctx, target)
+	if resolveErr != nil {
+		return nil, ctx.Err()
+	}
+	if target == "" || graphPathKey(rel) != entry.graphPath || pathkey.MutationKey(abs) != entry.key {
+		return nil, nil
+	}
+	if !s.projectionStormActive(abs) {
+		return nil, ctx.Err()
+	}
+	// Watcher observation may block on its existing locks. A newer physical
+	// publication or caller cancellation while observing it retains refusal.
+	if !eligible() {
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result, err := s.projectionTransitionPendingResult(ctx, req, entry.graphPath, "storm")
+	if cancelled := ctx.Err(); cancelled != nil {
+		return nil, cancelled
+	}
+	return result, err
+}
+
+func (s *Server) projectionTransitionPendingResult(ctx context.Context, req mcplib.CallToolRequest, file, reason string) (*mcplib.CallToolResult, error) {
+	legacy, _ := s.legacyToolName(&req)
 	payload := map[string]any{"path": file, "complete": false}
 	if legacy == "get_symbol_source" {
 		payload["id"] = req.GetString("id", "")
 		payload["source_state"] = "pending"
-		payload["source_reason"] = "external_write"
+		payload["source_reason"] = reason
 	}
 	freshness := map[string]any{}
-	relationFreshness{state: "pending", scope: "file", files: []string{file}, fileReason: "external_write"}.apply(freshness)
+	relationFreshness{state: "pending", scope: "file", files: []string{file}, fileReason: reason}.apply(freshness)
 	payload["freshness"] = freshness
 	result, err := s.respondJSONOrTOON(ctx, req, payload)
 	if err != nil {

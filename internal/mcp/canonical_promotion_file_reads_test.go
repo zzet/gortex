@@ -18,6 +18,12 @@ import (
 func acknowledgedCanonicalFile(t *testing.T) (*Server, string, *projectionEntry, []byte) {
 	t.Helper()
 	s, _, path := canonicalPromotionReadFixture(t)
+	return acknowledgedCanonicalFileOnFixture(t, s, path)
+}
+
+// Reuse the exact held-ACK protocol after a caller prepares its real watcher.
+func acknowledgedCanonicalFileOnFixture(t *testing.T, s *Server, path string) (*Server, string, *projectionEntry, []byte) {
+	t.Helper()
 	pending := make(chan indexer.MutationResult)
 	var receipt *mutationReceipt
 	t.Cleanup(func() {
