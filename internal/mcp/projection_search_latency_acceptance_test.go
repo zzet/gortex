@@ -32,15 +32,15 @@ import (
 )
 
 type projectionLatencyFixture struct {
-	server        *Server
-	registry      *pendingProjections
-	snapshot      *projectionSnapshot
-	root          string
-	covered       map[string]bool
-	files         int
-	nativeSymbols int
+	server              *Server
+	registry            *pendingProjections
+	snapshot            *projectionSnapshot
+	root                string
+	covered             map[string]bool
+	files               int
+	nativeSymbols       int
 	nativeSymbolsSHA256 string
-	indexer       *indexer.Indexer
+	indexer             *indexer.Indexer
 }
 
 func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entries int) *projectionLatencyFixture {

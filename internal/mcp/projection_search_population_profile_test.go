@@ -30,23 +30,23 @@ const projectionLatencySelectionPolicy = "directory-round-robin/path-order/actua
 const projectionLatencyNativeMembershipEncoding = "UTF-8 sorted IDs joined by LF with terminal LF"
 
 type projectionLatencyPopulationManifest struct {
-	Revision       string                       `json:"revision"`
-	Policy         string                       `json:"policy"`
-	Requested      int                          `json:"requested"`
-	Admitted       int                          `json:"admitted"`
-	MaxFiles       int                          `json:"max_files"`
-	MaxBytes       int64                        `json:"max_bytes"`
-	ChargedBytes   int64                        `json:"charged_bytes"`
-	IndexedFiles   int                          `json:"indexed_files"`
-	NativeSymbols  int                          `json:"native_symbols"`
-	NativeSymbolsSHA256 string `json:"native_symbols_sha256"`
-	NativeSymbolsEncoding string `json:"native_symbols_encoding"`
-	EligibleCount  int                          `json:"eligible_count"`
-	SelectedNodes  int                          `json:"selected_nodes"`
-	SelectedEdges  int                          `json:"selected_edges"`
-	SelectedFuncs  int                          `json:"selected_functions"`
-	InputsVerified bool                         `json:"inputs_verified"`
-	Entries        []projectionLatencyCandidate `json:"entries"`
+	Revision              string                       `json:"revision"`
+	Policy                string                       `json:"policy"`
+	Requested             int                          `json:"requested"`
+	Admitted              int                          `json:"admitted"`
+	MaxFiles              int                          `json:"max_files"`
+	MaxBytes              int64                        `json:"max_bytes"`
+	ChargedBytes          int64                        `json:"charged_bytes"`
+	IndexedFiles          int                          `json:"indexed_files"`
+	NativeSymbols         int                          `json:"native_symbols"`
+	NativeSymbolsSHA256   string                       `json:"native_symbols_sha256"`
+	NativeSymbolsEncoding string                       `json:"native_symbols_encoding"`
+	EligibleCount         int                          `json:"eligible_count"`
+	SelectedNodes         int                          `json:"selected_nodes"`
+	SelectedEdges         int                          `json:"selected_edges"`
+	SelectedFuncs         int                          `json:"selected_functions"`
+	InputsVerified        bool                         `json:"inputs_verified"`
+	Entries               []projectionLatencyCandidate `json:"entries"`
 }
 
 func validateProjectionLatencyPopulationManifest(manifest projectionLatencyPopulationManifest, revision string, count int) error {
