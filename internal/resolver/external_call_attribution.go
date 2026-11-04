@@ -75,7 +75,7 @@ func (r *Resolver) attributeGoExternalCalls() {
 		return
 	}
 	seen := map[extKey]struct{}{}
-	for _, target := range r.graph.DistinctExternalTargets(goExternalAttribKinds) {
+	for _, target := range r.graph.DistinctExternalTargets(goExternalAttribKinds, ".go") {
 		collectGoExternalTargetID(target, seen)
 	}
 	r.materializeGoExternalSeen(seen)
@@ -112,7 +112,8 @@ var goExternalAttribKindSet = func() map[graph.EdgeKind]struct{} {
 // would otherwise materialize a module node (unscoped, since the import
 // target carries no repository) that a whole index never has.
 func collectGoExternalTarget(e *graph.Edge, seen map[extKey]struct{}) {
-	if e == nil || e.To == "" {
+	// The target ID prefixes are shared with other language resolvers.
+	if e == nil || e.To == "" || !strings.HasSuffix(e.FilePath, ".go") {
 		return
 	}
 	if _, attributed := goExternalAttribKindSet[e.Kind]; !attributed {
