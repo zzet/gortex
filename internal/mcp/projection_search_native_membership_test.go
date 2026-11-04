@@ -86,3 +86,19 @@ func TestProjectionLatencyNativeMembershipUsesExactGenerationRows(t *testing.T) 
 	_, err = projectionLatencyNativeMembership(t.Context(), store, count)
 	require.Error(t, err, "a failed census cannot become a digest")
 }
+
+func TestProjectionLatencyNativeMembershipRetainsNewlineIDs(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	for _, id := range []string{"a\nb", "c"} {
+		store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: id})
+		require.NoError(t, store.UpsertSymbolFTS(id, "symbol"))
+	}
+	count, err := store.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+	digest, err := projectionLatencyNativeMembership(t.Context(), store, count)
+	require.NoError(t, err, "opaque ownership IDs containing LF must not be rejected or filtered")
+	require.Len(t, digest, 64)
+}
