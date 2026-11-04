@@ -7,7 +7,7 @@ func readFreshnessCode(code string) bool {
 }
 
 func readFreshnessRequest(r request,args map[string]any,role string) bool {
- if role!="workload" || r.Tool!="read" || r.Operation!="summary" && r.Operation!="editing_context" {return false}
+ if role!="workload" || r.Tool!="read" || args["operation"]!=r.Operation || r.Operation!="summary" && r.Operation!="editing_context" {return false}
  if r.Operation=="summary" {return true}
  values:=[]map[string]any{args}
  if value,present:=args["options"];present {options,valid:=value.(map[string]any);if !valid {return false};values=append(values,options)}
