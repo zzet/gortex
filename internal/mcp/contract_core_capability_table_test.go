@@ -138,6 +138,7 @@ func contractCoreCapabilityTable() []contractCoreCapRow {
 		{"ZeroEdgeReader", capOf[graph.ZeroEdgeReader], capWrapper, "satisfied by the filtered Reader methods"},
 		{"NodeLightScanner", capOf[graph.NodeLightScanner], capWrapper, "AllNodesLight forwarder"},
 		{"NodeSearchKeyScanner", capOf[graph.NodeSearchKeyScanner], capWrapper, "ScanNodeSearchKeys forwarder"},
+		{"FoldedNameCandidateReader", capOf[graph.FoldedNameCandidateReader], capWrapper, "coherent node-only selection and hydration on the exact selected reader"},
 		{"NodeKindsByIDsReader", capOf[graph.NodeKindsByIDsReader], capWrapper, "GetNodeKindsByIDsContext forwarder"},
 		{"NodeIDsByKinds", capOf[graph.NodeIDsByKinds], capWrapper, "ID-only kind scan forwarder; falls back to the selected reader's kind iterators"},
 		{"BoundedFileNodeReader", capOf[graph.BoundedFileNodeReader], capWrapper, "conditional variant"},

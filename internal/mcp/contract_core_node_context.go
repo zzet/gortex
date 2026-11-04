@@ -157,6 +157,17 @@ func (r *contractCoreEdges) ScanNodeSearchKeys(ctx context.Context, pageSize int
 	return graph.ScanNodeSearchKeys(ctx, r.Reader, pageSize, yield)
 }
 
+func (r *contractCoreEdges) FindFoldedNameCandidatesContext(ctx context.Context, needle string, limit int, filter graph.NameSearchFilter) ([]*graph.Node, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	coherent, ok := r.Reader.(graph.FoldedNameCandidateReader)
+	if !ok {
+		return nil, false, projectionSuperseded
+	}
+	return coherent.FindFoldedNameCandidatesContext(ctx, needle, limit, filter)
+}
+
 func (r *contractCoreEdges) AllNodesLight() []*graph.Node {
 	return graph.AllNodesLight(r.Reader)
 }

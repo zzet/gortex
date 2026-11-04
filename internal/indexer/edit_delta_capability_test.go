@@ -34,7 +34,8 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
-	"anonymous{DBStats}": "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
+	"graph.FoldedNameCandidateReader": "handler-only coherent candidate/payload snapshot; mutable DeltaWriter owns neither a physical read transaction nor a frozen delta layer, so the name-only handler refuses unsupported composition instead of forwarding base-only complete absence",
+	"anonymous{DBStats}":              "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
 
 	"anonymous{BulkLoadWindow}":        "physical durable-store full-shadow window telemetry; DeltaWriter stages per-file changes and does not own a cold or generation bulk window",
 	"anonymous{RecordFirstIndexDrain}": "physical durable-store full-shadow completion telemetry; a per-file DeltaWriter has no full-shadow drain to record and must not forward writes to its base",
