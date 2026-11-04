@@ -107,7 +107,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.BoolVar(&o.SearchReadbackAcceptance, "search-readback-acceptance", false, "explicit search acceptance: 1000 immediate same-session search witnesses at 1, 4 or 8 editors")
 	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
-	f.StringVar(&o.NightlySeed, "nightly-workload-seed", "", "opt-in nightly workload fault: search-delay-v1; actual one-second measured search request delay")
+	f.StringVar(&o.NightlySeed, "nightly-workload-seed", "", "opt-in measured one-second search delay: search-delay-v1 (edit4), search-delay-read16-v1 (read16)")
 	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
