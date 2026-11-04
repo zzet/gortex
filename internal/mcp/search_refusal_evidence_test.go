@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -134,7 +133,7 @@ func TestSearchRefusalEvidenceKeepsDefaultErrorAndBoundedScalars(t *testing.T) {
 		}
 		for stage := searchRefusalBindInherited; stage <= searchRefusalResponseValidation; stage++ {
 			marked := annotateSearchRefusal(ctx, stage, cause)
-			require.True(t, errors.Is(marked, cause))
+			require.ErrorIs(t, marked, cause)
 			require.Equal(t, cause.Error(), marked.Error())
 			require.Same(t, marked, annotateSearchRefusal(ctx, searchRefusalResponseValidation, marked), "preserve first refusal site")
 			result := searchRefusalToolResult(marked)
