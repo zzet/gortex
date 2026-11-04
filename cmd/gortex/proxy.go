@@ -137,7 +137,7 @@ func runProxy(ctx context.Context, surface *gortexmcp.ToolSurface) (ran bool, er
 		}
 	})
 
-	if err := relayProxySession(ctx, h, client, os.Stdin, os.Stdout, os.Stderr, surface, orphanCh); err != nil {
+	if err := relayProxySessionWithClientCWD(ctx, h, client, os.Stdin, os.Stdout, os.Stderr, surface, orphanCh, parentProcessCWD); err != nil {
 		return true, fmt.Errorf("proxy relay: %w", err)
 	}
 	return true, nil
