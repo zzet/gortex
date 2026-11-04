@@ -139,58 +139,75 @@ func TestReadFreshnessCheckerLeavesLegacyBusyProbePolicyUnchanged(t *testing.T) 
 // A declared refusal is evidence even when a corrupted history resets or drops
 // its retry index. Sequential attempt cost cannot erase previous wire work.
 func TestReadFreshnessCheckerRejectsOrphanCountersAndOmittedAttemptCost(t *testing.T) {
- for _, name := range []string{"original_removed_retry_reset", "original_removed_retry_omitted", "other_tool_orphan_counter", "previous_attempt_cost_omitted"} {
-  t.Run(name, func(t *testing.T) {
-   raw := readFreshnessReportFixture("projection_superseded")
-   p := raw["phases"].([]any)[0].(map[string]any)
-   rows := p["attempts"].([]any)
-   first := rows[0].(map[string]any)
-   last := rows[1].(map[string]any)
-   switch name {
-   case "original_removed_retry_reset":
-    p["attempts"] = rows[1:]
-    last["retry"] = 0
-   case "original_removed_retry_omitted":
-    p["attempts"] = rows[1:]
-    delete(last, "retry")
-   case "other_tool_orphan_counter":
-    other := make(map[string]any)
-    for key, value := range last { other[key] = value }
-    other["tool"], other["slot"], other["retry"], other["logical_ms"] = "read.editing_context", 2, 0, 2
-    p["attempts"] = append(rows, other)
-    p["tools"].(map[string]any)["read.editing_context"] = map[string]any{"successes": 1, "retryable_refusals": 1, "errors": map[string]any{}, "phase_censored": 0, "product_expired": 0, "latency_ms": map[string]any{"count": 1, "p95": map[string]any{"value": 2, "unit": "ms", "reason": ""}}}
-   case "previous_attempt_cost_omitted":
-    first["duration_ms"], first["logical_ms"] = 100, 100
-    last["duration_ms"], last["logical_ms"] = 100, 100
-   }
-   if err := validateFreshnessFixture(t, raw); err == nil { t.Fatal("orphan refusal or omitted sequential attempt cost accepted") }
-  })
- }
+	for _, name := range []string{"original_removed_retry_reset", "original_removed_retry_omitted", "other_tool_orphan_counter", "previous_attempt_cost_omitted"} {
+		t.Run(name, func(t *testing.T) {
+			raw := readFreshnessReportFixture("projection_superseded")
+			p := raw["phases"].([]any)[0].(map[string]any)
+			rows := p["attempts"].([]any)
+			first := rows[0].(map[string]any)
+			last := rows[1].(map[string]any)
+			switch name {
+			case "original_removed_retry_reset":
+				p["attempts"] = rows[1:]
+				last["retry"] = 0
+			case "original_removed_retry_omitted":
+				p["attempts"] = rows[1:]
+				delete(last, "retry")
+			case "other_tool_orphan_counter":
+				other := make(map[string]any)
+				for key, value := range last {
+					other[key] = value
+				}
+				other["tool"], other["slot"], other["retry"], other["logical_ms"] = "read.editing_context", 2, 0, 2
+				p["attempts"] = append(rows, other)
+				p["tools"].(map[string]any)["read.editing_context"] = map[string]any{"successes": 1, "retryable_refusals": 1, "errors": map[string]any{}, "phase_censored": 0, "product_expired": 0, "latency_ms": map[string]any{"count": 1, "p95": map[string]any{"value": 2, "unit": "ms", "reason": ""}}}
+			case "previous_attempt_cost_omitted":
+				first["duration_ms"], first["logical_ms"] = 100, 100
+				last["duration_ms"], last["logical_ms"] = 100, 100
+			}
+			if err := validateFreshnessFixture(t, raw); err == nil {
+				t.Fatal("orphan refusal or omitted sequential attempt cost accepted")
+			}
+		})
+	}
 }
 
 func TestReadFreshnessCheckerKeepsInterleavedGroupsAndBusyBackoff(t *testing.T) {
- for _, name := range []string{"interleaved_groups", "busy_then_explicit_refusal"} {
-  t.Run(name, func(t *testing.T) {
-   raw := readFreshnessReportFixture("projection_superseded")
-   p := raw["phases"].([]any)[0].(map[string]any)
-   rows := p["attempts"].([]any)
-   clone := func(row map[string]any) map[string]any { result:=make(map[string]any); for key,value:=range row {result[key]=value};return result }
-   first, last := rows[0].(map[string]any), rows[1].(map[string]any)
-   switch name {
-   case "interleaved_groups":
-    otherFirst, otherLast := clone(first), clone(last)
-    otherFirst["tool"], otherLast["tool"] = "read.editing_context", "read.editing_context"
-    otherFirst["slot"], otherLast["slot"] = 2, 2
-    p["attempts"] = []any{first,otherFirst,last,otherLast}
-    metrics:=make(map[string]any);for key,value:=range p["tools"].(map[string]any)["read.summary"].(map[string]any){metrics[key]=value}
-    p["tools"].(map[string]any)["read.editing_context"]=metrics
-   case "busy_then_explicit_refusal":
-    busy:=clone(first);busy["outcome"],busy["code"],busy["error"]="busy",-32002,"busy";delete(busy,"error_data")
-    first["retry"],first["logical_ms"] = 1,10
-    last["retry"] = 2
-    p["attempts"] = []any{busy,first,last}
-   }
-   if err:=validateFreshnessFixture(t,raw);err!=nil{t.Fatal(err)}
-  })
- }
+	for _, name := range []string{"interleaved_groups", "busy_then_explicit_refusal"} {
+		t.Run(name, func(t *testing.T) {
+			raw := readFreshnessReportFixture("projection_superseded")
+			p := raw["phases"].([]any)[0].(map[string]any)
+			rows := p["attempts"].([]any)
+			clone := func(row map[string]any) map[string]any {
+				result := make(map[string]any)
+				for key, value := range row {
+					result[key] = value
+				}
+				return result
+			}
+			first, last := rows[0].(map[string]any), rows[1].(map[string]any)
+			switch name {
+			case "interleaved_groups":
+				otherFirst, otherLast := clone(first), clone(last)
+				otherFirst["tool"], otherLast["tool"] = "read.editing_context", "read.editing_context"
+				otherFirst["slot"], otherLast["slot"] = 2, 2
+				p["attempts"] = []any{first, otherFirst, last, otherLast}
+				metrics := make(map[string]any)
+				for key, value := range p["tools"].(map[string]any)["read.summary"].(map[string]any) {
+					metrics[key] = value
+				}
+				p["tools"].(map[string]any)["read.editing_context"] = metrics
+			case "busy_then_explicit_refusal":
+				busy := clone(first)
+				busy["outcome"], busy["code"], busy["error"] = "busy", -32002, "busy"
+				delete(busy, "error_data")
+				first["retry"], first["logical_ms"] = 1, 10
+				last["retry"] = 2
+				p["attempts"] = []any{busy, first, last}
+			}
+			if err := validateFreshnessFixture(t, raw); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
