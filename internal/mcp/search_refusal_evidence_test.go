@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,4 +99,123 @@ func TestRegisteredNativeSearchRefusalEvidenceIsOptIn(t *testing.T) {
 			require.LessOrEqual(t, len(encoded), 128, "fixed scalar evidence cannot retain request or source payloads")
 		})
 	}
+}
+
+func TestSearchRefusalEvidenceKeepsDefaultErrorAndBoundedScalars(t *testing.T) {
+	var cause error = projectionSuperseded
+	for _, flag := range []string{"", "0", "true"} {
+		t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", flag)
+		require.True(t, annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, cause) == cause)
+		require.Zero(t, testing.AllocsPerRun(100, func() {
+			if annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, cause) != cause {
+				panic("default refusal identity changed")
+			}
+		}), "disabled annotation adds no allocation; its environment lookup remains refusal-only")
+		result := searchRefusalToolResult(cause)
+		require.Nil(t, result.Meta)
+	}
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+	require.Nil(t, annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, nil))
+	require.True(t, annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, context.Canceled) == context.Canceled)
+	require.True(t, annotateSearchRefusal(context.Background(), searchRefusalStage(255), cause) == cause)
+	facts := &requestProjectionFacts{}
+	for _, state := range []string{"none", "unsealed", "sealed", "disabled", "foreign"} {
+		ctx := context.WithValue(context.Background(), requestProjectionFactsKey{}, facts)
+		if state != "none" {
+			capture := &pendingSymbolCapture{}
+			if state == "sealed" || state == "foreign" {
+				capture.facts, capture.entries = facts, map[string]*projectionEntry{"fixture": {}}
+			}
+			capture.disabled = state == "disabled"
+			if state == "foreign" {
+				capture.facts = &requestProjectionFacts{}
+			}
+			ctx = context.WithValue(ctx, pendingSymbolCaptureKey{}, capture)
+		}
+		for stage := searchRefusalBindInherited; stage <= searchRefusalResponseValidation; stage++ {
+			marked := annotateSearchRefusal(ctx, stage, cause)
+			require.True(t, errors.Is(marked, cause))
+			require.Equal(t, cause.Error(), marked.Error())
+			require.Same(t, marked, annotateSearchRefusal(ctx, searchRefusalResponseValidation, marked), "preserve first refusal site")
+			result := searchRefusalToolResult(marked)
+			require.True(t, result.IsError)
+			require.Equal(t, cause.Error(), resultText(result))
+			member := result.Meta.AdditionalFields["gortex_search_refusal"]
+			require.Equal(t, map[string]any{"stage": stage.label(), "capture_state": state}, member)
+			encoded, err := json.Marshal(result.Meta)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(encoded), 128, "complete added member has a caller-independent fixed bound")
+		}
+	}
+}
+
+func TestRegisteredNativeLiteralRefusalEvidenceIdentifiesFinalValidation(t *testing.T) {
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+	s, backend, base, path, _ := snapshotFacadeFixture(t)
+	s.engine.SetSearchProvider(s.indexer.Search)
+	count, err := backend.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Positive(t, count)
+	ack := snapshotRegisteredCall(t, s, base, 12, "edit", snapshotEditArgs(path, "return 2", "return 2 /* SnapshotLiteralOnly */"))
+	require.False(t, ack.IsError, resultText(ack))
+	require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
+	leaf, ok := s.facades.legacy("search_symbols")
+	require.True(t, ok)
+	type answer struct {
+		ctx context.Context
+		result *mcplib.CallToolResult
+		err error
+	}
+	held, answered := make(chan answer, 1), make(chan answer, 1)
+	released := make(chan struct{})
+	release := sync.OnceFunc(func() { close(released) })
+	s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		result, err := leaf.handler(ctx, req)
+		held <- answer{ctx, result, err}
+		<-released
+		return result, err
+	})
+	args := snapshotSearchArgs()
+	args["query"] = "SnapshotLiteralOnly"
+	var worker sync.WaitGroup
+	worker.Add(1)
+	t.Cleanup(func() { release(); worker.Wait() })
+	go func() {
+		defer worker.Done()
+		result, err := externalVersionRegisteredCall(s, base, 20, "search", args)
+		answered <- answer{result: result, err: err}
+	}()
+	var selected answer
+	select {
+	case selected = <-held:
+	case early := <-answered:
+		t.Fatalf("no completed leaf: result=%v error=%v", early.result, early.err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("native literal query did not reach completed leaf")
+	}
+	require.NoError(t, selected.err)
+	require.NotNil(t, selected.result)
+	require.False(t, selected.result.IsError, resultText(selected.result))
+	fields := extractTextResult(t, selected.result)
+	content, ok := fields["content_matches"].(map[string]any)
+	require.True(t, ok, "actual physical literal fallback, not a fabricated selected result")
+	require.Positive(t, content["count"])
+	require.NoError(t, validateRequestProjections(selected.ctx))
+	peer := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "NeighborBefore", "Neighbor"))
+	require.False(t, peer.IsError, resultText(peer))
+	require.Equal(t, true, extractTextResult(t, peer)["readback_exact"])
+	require.ErrorIs(t, validateRequestProjections(selected.ctx), projectionSuperseded)
+	snapshotPhysicalTarget(t, path)
+	release()
+	worker.Wait()
+	final := <-answered
+	require.NoError(t, final.err)
+	require.NotNil(t, final.result)
+	require.True(t, final.result.IsError, "stage evidence never authorizes mutable literal fallback")
+	require.Equal(t, "projection not published: superseded", resultText(final.result))
+	require.NotNil(t, final.result.Meta)
+	require.Equal(t, map[string]any{"stage": "response.projection_validation", "capture_state": "disabled"}, final.result.Meta.AdditionalFields["gortex_search_refusal"])
+	encoded, err := json.Marshal(final.result)
+	require.NoError(t, err)
+	t.Logf("native_FTS=%d actual_completed_literal_then_peer_ACK_final=%s", count, encoded)
 }

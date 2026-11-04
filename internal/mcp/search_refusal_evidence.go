@@ -67,6 +67,7 @@ func annotateSearchRefusal(ctx context.Context, stage searchRefusalStage, err er
 	}
 	state := "none"
 	if ctx != nil {
+		facts, _ := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 		if capture, _ := ctx.Value(pendingSymbolCaptureKey{}).(*pendingSymbolCapture); capture != nil {
 			capture.mu.RLock()
 			switch {
@@ -74,7 +75,7 @@ func annotateSearchRefusal(ctx context.Context, stage searchRefusalStage, err er
 				state = "disabled"
 			case capture.facts == nil || len(capture.entries) == 0:
 				state = "unsealed"
-			case capture.facts != ctx.Value(requestProjectionFactsKey{}):
+			case capture.facts != facts:
 				state = "foreign"
 			default:
 				state = "sealed"
