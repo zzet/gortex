@@ -22,6 +22,7 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 	t.Helper()
 	require.NotNil(t, result)
 	require.True(t, result.IsError, "a retry contract must never turn the refused first response into success")
+ require.True(t, metadataTransientRefusal(result), "only exact data-free typed refusals bypass successful freshness decoration")
 	var body struct {
 		Code      string         `json:"error_code"`
 		Retriable bool           `json:"retriable"`
@@ -227,6 +228,14 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 }
 
 func TestMetadataTransientContractLeavesTerminalErrorsUnmarked(t *testing.T) {
+ for _, body := range []string{
+ `{"error_code":"projection_superseded","retriable":false,"data":{"retry_scope":"read_only","delivery_unknown":false}}`,
+ `{"error_code":"file_view_pending","retriable":true,"data":{"retry_scope":"read_only"}}`,
+ `{"error_code":"file_view_pending","retriable":true,"data":{"retry_scope":"write","delivery_unknown":false}}`,
+ `{"error_code":"unknown","retriable":true,"data":{"retry_scope":"read_only","delivery_unknown":false}}`,
+ } { require.False(t, metadataTransientRefusal(mcplib.NewToolResultError(body))) }
+ require.False(t, metadataTransientRefusal(mcplib.NewToolResultText(`{"error_code":"file_view_pending","retriable":true,"data":{"retry_scope":"read_only","delivery_unknown":false}}`)))
+
 	s, _ := setupTestServer(t)
 	for _, tc := range []struct {
 		name, tool string
