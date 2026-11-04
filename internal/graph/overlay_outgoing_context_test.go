@@ -245,7 +245,7 @@ func TestComposedOutgoingContextCallerBoundariesRemainVisibleAfterMasking(t *tes
 type legacyLightOutgoing struct{ graph.Reader }
 
 func (r legacyLightOutgoing) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, _ int) (map[string][]*graph.Edge, bool, error) {
-	return lightOutgoingRows(r.Reader.GetOutEdgesByNodeIDs(ids)), false, ctx.Err()
+	return lightOutgoingRows(r.GetOutEdgesByNodeIDs(ids)), false, ctx.Err()
 }
 func TestComposedOutgoingContextLegacyOriginKeepsWeightedFullOracle(t *testing.T) {
 	g := graph.New()

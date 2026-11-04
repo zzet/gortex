@@ -95,7 +95,8 @@ func (v *OverlaidView) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []st
 	if limit <= 0 {
 		return nil, true, nil
 	}
-	copyView := *v
+	// Only adjacency inputs are needed; never copy the statistics mutex/cache.
+	copyView := OverlaidView{base: v.base, layer: v.layer, adjacencyBatch: v.adjacencyBatch}
 	var wrapped *composedOutgoingContextBase
 	if v.adjacencyBatch != nil {
 		batch := *v.adjacencyBatch
