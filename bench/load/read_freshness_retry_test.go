@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
- "context"
+	"context"
 	"encoding/json"
 	"net"
 	"sync"
@@ -92,41 +92,111 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 	}
 }
 
-type readFreshnessPolicyPeer struct {calls int;data json.RawMessage;deadlines []time.Time;successAfter int}
-func(p *readFreshnessPolicyPeer)call(ctx context.Context,_ string,_ any)(json.RawMessage,error){
- p.calls++;deadline,_:=ctx.Deadline();p.deadlines=append(p.deadlines,deadline)
- if p.successAfter>0 && p.calls>=p.successAfter{return json.RawMessage(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`),nil}
- return p.data,nil
+type readFreshnessPolicyPeer struct {
+	calls        int
+	data         json.RawMessage
+	deadlines    []time.Time
+	successAfter int
 }
-func readFreshnessTestWire(code string,retriable any,data map[string]any)json.RawMessage{
- fields:=map[string]any{"error_code":code,"message":"selected read unavailable","data":data};if retriable!=nil{fields["retriable"]=retriable};body,_:=json.Marshal(fields)
- raw,_:=json.Marshal(map[string]any{"isError":true,"content":[]any{map[string]any{"type":"text","text":string(body)}}});return raw
+
+func (p *readFreshnessPolicyPeer) call(ctx context.Context, _ string, _ any) (json.RawMessage, error) {
+	p.calls++
+	deadline, _ := ctx.Deadline()
+	p.deadlines = append(p.deadlines, deadline)
+	if p.successAfter > 0 && p.calls >= p.successAfter {
+		return json.RawMessage(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`), nil
+	}
+	return p.data, nil
 }
-func TestReadFreshnessRetryRejectsUnknownAndFirstProbeAuthority(t *testing.T){
- for _,name:=range []string{"plain_generic","unknown_code","false_retriable","missing_retriable","missing_scope","missing_delivery","unknown_delivery","wrong_scope","write","compressed","wrong_actual_operation","probe","strict_probe_path"}{t.Run(name,func(t *testing.T){
-  data:=map[string]any{"retry_scope":"read_only","delivery_unknown":false};code:="projection_superseded";var retriable any=true
-  r:=request{Tool:"read",Operation:"editing_context"};args:=map[string]any{"operation":"editing_context"};role:="workload"
-  switch name{case "unknown_code":code="unknown";case "false_retriable":retriable=false;case "missing_retriable":retriable=nil;case "missing_scope":delete(data,"retry_scope");case "missing_delivery":delete(data,"delivery_unknown");case "unknown_delivery":data["delivery_unknown"]=true;case "wrong_scope":data["retry_scope"]="write";case "write":r.Tool="edit";r.Operation="file";args["operation"]="file";case "compressed":args["options"]=map[string]any{"compress_bodies":true};case "wrong_actual_operation":args["operation"]="source";case "probe":role="probe"}
-  wire:=readFreshnessTestWire(code,retriable,data);if name=="plain_generic"{wire=json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"projection not published: superseded"}]}`)}
-  peer:=&readFreshnessPolicyPeer{data:wire,successAfter:2}
-  call:=callTool;if name=="strict_probe_path"{call=callEditProbeTool}
-  _,rows,err:=call(t.Context(),peer,r,args,role,0,0,0,time.Second,waitContext)
-  require.Error(t,err);require.Equal(t,1,peer.calls);require.Len(t,rows,1);require.Equal(t,"error",rows[0].Outcome)
- })}
+func readFreshnessTestWire(code string, retriable any, data map[string]any) json.RawMessage {
+	fields := map[string]any{"error_code": code, "message": "selected read unavailable", "data": data}
+	if retriable != nil {
+		fields["retriable"] = retriable
+	}
+	body, _ := json.Marshal(fields)
+	raw, _ := json.Marshal(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(body)}}})
+	return raw
 }
-func TestReadFreshnessRetryCapCancellationAndOneDeadline(t *testing.T){
- wire:=readFreshnessTestWire("file_view_pending",true,map[string]any{"retry_scope":"read_only","delivery_unknown":false})
- r:=request{Tool:"read",Operation:"summary"};args:=map[string]any{"operation":"summary"}
- immediate:=func(ctx context.Context,_ time.Duration)error{return ctx.Err()}
- capped:=&readFreshnessPolicyPeer{data:wire}
- _,rows,err:=callTool(t.Context(),capped,r,args,"workload",0,0,0,time.Second,immediate)
- require.Error(t,err);require.Equal(t,3,capped.calls);require.Len(t,rows,3);require.Equal(t,"error",rows[2].Outcome)
- metric:=summarize(rows,1,"workload")["read.summary"];require.Equal(t,2,metric.RetryableRefusals);require.NotEmpty(t,metric.Errors)
- for _,deadline:=range capped.deadlines{require.Equal(t,capped.deadlines[0],deadline,"fresh requests cannot reset the logical deadline")}
- caller,cancel:=context.WithCancel(t.Context());cancelled:=&readFreshnessPolicyPeer{data:wire,successAfter:2}
- _,rows,err=callTool(caller,cancelled,r,args,"workload",0,0,0,time.Second,func(ctx context.Context,_ time.Duration)error{cancel();return ctx.Err()})
- require.Error(t,err);require.Equal(t,1,cancelled.calls);require.Len(t,rows,2);require.Equal(t,"retryable",rows[0].Outcome);require.Equal(t,"phase_censored",rows[1].Outcome)
- deadlinePeer:=&readFreshnessPolicyPeer{data:wire,successAfter:2}
- _,rows,err=callTool(t.Context(),deadlinePeer,r,args,"workload",0,0,0,5*time.Millisecond,func(ctx context.Context,_ time.Duration)error{<-ctx.Done();return ctx.Err()})
- require.Error(t,err);require.Equal(t,1,deadlinePeer.calls);require.Equal(t,"product_deadline",rows[len(rows)-1].Outcome)
+func TestReadFreshnessRetryRejectsUnknownAndFirstProbeAuthority(t *testing.T) {
+	for _, name := range []string{"plain_generic", "unknown_code", "false_retriable", "missing_retriable", "missing_scope", "missing_delivery", "unknown_delivery", "wrong_scope", "write", "compressed", "wrong_actual_operation", "probe", "strict_probe_path"} {
+		t.Run(name, func(t *testing.T) {
+			data := map[string]any{"retry_scope": "read_only", "delivery_unknown": false}
+			code := "projection_superseded"
+			var retriable any = true
+			r := request{Tool: "read", Operation: "editing_context"}
+			args := map[string]any{"operation": "editing_context"}
+			role := "workload"
+			switch name {
+			case "unknown_code":
+				code = "unknown"
+			case "false_retriable":
+				retriable = false
+			case "missing_retriable":
+				retriable = nil
+			case "missing_scope":
+				delete(data, "retry_scope")
+			case "missing_delivery":
+				delete(data, "delivery_unknown")
+			case "unknown_delivery":
+				data["delivery_unknown"] = true
+			case "wrong_scope":
+				data["retry_scope"] = "write"
+			case "write":
+				r.Tool = "edit"
+				r.Operation = "file"
+				args["operation"] = "file"
+			case "compressed":
+				args["options"] = map[string]any{"compress_bodies": true}
+			case "wrong_actual_operation":
+				args["operation"] = "source"
+			case "probe":
+				role = "probe"
+			}
+			wire := readFreshnessTestWire(code, retriable, data)
+			if name == "plain_generic" {
+				wire = json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"projection not published: superseded"}]}`)
+			}
+			peer := &readFreshnessPolicyPeer{data: wire, successAfter: 2}
+			call := callTool
+			if name == "strict_probe_path" {
+				call = callEditProbeTool
+			}
+			_, rows, err := call(t.Context(), peer, r, args, role, 0, 0, 0, time.Second, waitContext)
+			require.Error(t, err)
+			require.Equal(t, 1, peer.calls)
+			require.Len(t, rows, 1)
+			require.Equal(t, "error", rows[0].Outcome)
+		})
+	}
+}
+func TestReadFreshnessRetryCapCancellationAndOneDeadline(t *testing.T) {
+	wire := readFreshnessTestWire("file_view_pending", true, map[string]any{"retry_scope": "read_only", "delivery_unknown": false})
+	r := request{Tool: "read", Operation: "summary"}
+	args := map[string]any{"operation": "summary"}
+	immediate := func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	capped := &readFreshnessPolicyPeer{data: wire}
+	_, rows, err := callTool(t.Context(), capped, r, args, "workload", 0, 0, 0, time.Second, immediate)
+	require.Error(t, err)
+	require.Equal(t, 3, capped.calls)
+	require.Len(t, rows, 3)
+	require.Equal(t, "error", rows[2].Outcome)
+	metric := summarize(rows, 1, "workload")["read.summary"]
+	require.Equal(t, 2, metric.RetryableRefusals)
+	require.NotEmpty(t, metric.Errors)
+	for _, deadline := range capped.deadlines {
+		require.Equal(t, capped.deadlines[0], deadline, "fresh requests cannot reset the logical deadline")
+	}
+	caller, cancel := context.WithCancel(t.Context())
+	cancelled := &readFreshnessPolicyPeer{data: wire, successAfter: 2}
+	_, rows, err = callTool(caller, cancelled, r, args, "workload", 0, 0, 0, time.Second, func(ctx context.Context, _ time.Duration) error { cancel(); return ctx.Err() })
+	require.Error(t, err)
+	require.Equal(t, 1, cancelled.calls)
+	require.Len(t, rows, 2)
+	require.Equal(t, "retryable", rows[0].Outcome)
+	require.Equal(t, "phase_censored", rows[1].Outcome)
+	deadlinePeer := &readFreshnessPolicyPeer{data: wire, successAfter: 2}
+	_, rows, err = callTool(t.Context(), deadlinePeer, r, args, "workload", 0, 0, 0, 5*time.Millisecond, func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() })
+	require.Error(t, err)
+	require.Equal(t, 1, deadlinePeer.calls)
+	require.Equal(t, "product_deadline", rows[len(rows)-1].Outcome)
 }

@@ -70,8 +70,9 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			var worker sync.WaitGroup
 			worker.Add(1)
 			t.Cleanup(func() { unblock(); worker.Wait() })
-			logical,cancelLogical:=context.WithTimeout(base,time.Second);defer cancelLogical()
-            deadline := time.Now().Add(projectedReadBudget)
+			logical, cancelLogical := context.WithTimeout(base, time.Second)
+			defer cancelLogical()
+			deadline := time.Now().Add(projectedReadBudget)
 			caller := context.WithValue(logical, projectedSourceDeadlineKey{}, deadline)
 			go func() {
 				defer worker.Done()
@@ -104,10 +105,10 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			require.NoError(t, got.err)
 			t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t", fts, tc.operation, time.Until(deadline), got.result != nil && got.result.IsError)
 			requireReadFreshnessContract(t, got.result, "projection_superseded")
-            fresh:=snapshotRegisteredCall(t,s,logical,40,"read",map[string]any{"operation":tc.operation,"target":map[string]any{"file":path},"output":map[string]any{"format":"json","max_bytes":0}})
-            require.False(t,fresh.IsError,resultText(fresh))
-            require.Contains(t,resultText(fresh),"NeighborAfter")
-            require.ErrorIs(t,validateRequestProjections(old.ctx),projectionSuperseded,"a new successful RPC cannot revive the refused first selection")
+			fresh := snapshotRegisteredCall(t, s, logical, 40, "read", map[string]any{"operation": tc.operation, "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
+			require.False(t, fresh.IsError, resultText(fresh))
+			require.Contains(t, resultText(fresh), "NeighborAfter")
+			require.ErrorIs(t, validateRequestProjections(old.ctx), projectionSuperseded, "a new successful RPC cannot revive the refused first selection")
 		})
 	}
 }
@@ -219,32 +220,49 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 	require.Equal(t, changed, physical)
 	t.Logf("CAUSAL_PENDING_EMPTY_SQL_VERIFIED nativeFTS=%d projection_private_expired=%t caller_live=true pool_wait=true request_pending=true actual_empty_refusal=%t", fts, !time.Now().Before(deadline), got.result != nil && got.result.IsError)
 	requireReadFreshnessContract(t, got.result, "file_view_pending")
-    fresh:=snapshotRegisteredCall(t,s,caller,40,"read",map[string]any{"operation":"editing_context","target":map[string]any{"file":path},"output":map[string]any{"format":"json","max_bytes":0}})
-    require.False(t,fresh.IsError,resultText(fresh))
-    require.Contains(t,resultText(fresh),"main.go::Target")
-    require.NoError(t,caller.Err(),"both distinct RPCs retain one outer logical budget")
+	fresh := snapshotRegisteredCall(t, s, caller, 40, "read", map[string]any{"operation": "editing_context", "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
+	require.False(t, fresh.IsError, resultText(fresh))
+	require.Contains(t, resultText(fresh), "main.go::Target")
+	require.NoError(t, caller.Err(), "both distinct RPCs retain one outer logical budget")
 }
 
 func TestMetadataTransientContractLeavesTerminalErrorsUnmarked(t *testing.T) {
- s,_:=setupTestServer(t)
- for _,tc:=range []struct{name,tool string;err error;args map[string]any;cancel bool}{
-  {"message_only","get_file_summary",errors.New(projectionSuperseded.Error()),nil,false},
-  {"genuine_notfound","get_editing_context",errors.New("no symbols found for file: main.go"),nil,false},
-  {"scope_denial","get_editing_context",errors.New("scope denied"),nil,false},
-  {"write","edit_file",projectionSuperseded,nil,false},
-  {"unaudited_callers","get_callers",projectionSuperseded,nil,false},
-  {"compressed","get_editing_context",projectionSuperseded,map[string]any{"compress_bodies":true},false},
-  {"caller_cancelled","get_file_summary",projectionSuperseded,nil,true},
-  {"file_cap","get_file_summary",projectionOverFiles,nil,false},
- } {t.Run(tc.name,func(t *testing.T){
-  ctx,cancel:=context.WithCancel(t.Context());defer cancel();if tc.cancel{cancel()}
-  req:=makeReq(tc.tool,tc.args)
-  result:=s.metadataReadError(ctx,req,tc.err);require.True(t,result.IsError)
-  var body struct{Code string `json:"error_code"`};_ = json.Unmarshal([]byte(resultText(result)),&body)
-  require.NotEqual(t,"projection_superseded",body.Code);require.NotEqual(t,"file_view_pending",body.Code)
- })}
- ctx:=withRequestProjectionFacts(t.Context());req:=makeReq("get_editing_context",map[string]any{"path":"main.go"})
- require.Nil(t,s.pendingEmptyMetadataRead(ctx,req,"main.go"),"real absence has no pending witness")
- markRequestProjectionDeferred(ctx,"other.go","external_write")
- require.Nil(t,s.pendingEmptyMetadataRead(ctx,req,"main.go"),"another file cannot mark requested absence transient")
+	s, _ := setupTestServer(t)
+	for _, tc := range []struct {
+		name, tool string
+		err        error
+		args       map[string]any
+		cancel     bool
+	}{
+		{"message_only", "get_file_summary", errors.New(projectionSuperseded.Error()), nil, false},
+		{"genuine_notfound", "get_editing_context", errors.New("no symbols found for file: main.go"), nil, false},
+		{"scope_denial", "get_editing_context", errors.New("scope denied"), nil, false},
+		{"write", "edit_file", projectionSuperseded, nil, false},
+		{"unaudited_callers", "get_callers", projectionSuperseded, nil, false},
+		{"compressed", "get_editing_context", projectionSuperseded, map[string]any{"compress_bodies": true}, false},
+		{"caller_cancelled", "get_file_summary", projectionSuperseded, nil, true},
+		{"file_cap", "get_file_summary", projectionOverFiles, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			req := makeReq(tc.tool, tc.args)
+			result := s.metadataReadError(ctx, req, tc.err)
+			require.True(t, result.IsError)
+			var body struct {
+				Code string `json:"error_code"`
+			}
+			_ = json.Unmarshal([]byte(resultText(result)), &body)
+			require.NotEqual(t, "projection_superseded", body.Code)
+			require.NotEqual(t, "file_view_pending", body.Code)
+		})
+	}
+	ctx := withRequestProjectionFacts(t.Context())
+	req := makeReq("get_editing_context", map[string]any{"path": "main.go"})
+	require.Nil(t, s.pendingEmptyMetadataRead(ctx, req, "main.go"), "real absence has no pending witness")
+	markRequestProjectionDeferred(ctx, "other.go", "external_write")
+	require.Nil(t, s.pendingEmptyMetadataRead(ctx, req, "main.go"), "another file cannot mark requested absence transient")
 }
