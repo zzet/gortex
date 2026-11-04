@@ -480,7 +480,7 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 	}
 	build := c.Builds[task.Role]
 	args := []string{"run", "--binary", build.Binary, "--git-sha", build.Revision, "--manifest", manifest, "--scratch", scratch, "--out", report, "--host", host, "--profile", "agent", "--scenario", spec.wire, "--agents", fmt.Sprint(spec.agents), "--edit-agents", fmt.Sprint(spec.editors), "--worktrees", fmt.Sprint(spec.worktrees), "--seed", fmt.Sprint(task.Seed), "--duration", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-repetitions", fmt.Sprint(c.SweepRepetitions), "--sweep-duration", c.SweepDuration}
-	if c.NightlySeed != nil && task.Role == "candidate" && task.Scenario == "loadedit-4" {
+	if c.NightlySeed != nil && task.Role == "candidate" && task.Scenario == c.NightlySeed.scenario() {
 		args = append(args, "--nightly-workload-seed", c.NightlySeed.Kind)
 	}
 	if task.EditGate {

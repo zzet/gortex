@@ -12,12 +12,18 @@ func validateNightlyWorkloadSeed(o runOptions) error {
 	if o.NightlySeed == "" {
 		return nil
 	}
-	if o.NightlySeed != "search-delay-v1" || o.Scenario != "edit" || o.Agents != 0 || o.Editors != 4 || o.Worktrees != 0 || o.EditGateSeed != "" || o.EditGateModes || o.SearchReadbackAcceptance {
-		return errors.New("--nightly-workload-seed requires search-delay-v1 and the standalone four-editor workload without edit/worktree faults")
+	edit := o.NightlySeed == "search-delay-v1" && o.Scenario == "edit" && o.Agents == 0 && o.Editors == 4
+	read := o.NightlySeed == "search-delay-read16-v1" && o.Scenario == "read" && o.Agents == 16 && o.Editors == 0
+	if (!edit && !read) || o.Worktrees != 0 || o.EditGateSeed != "" || o.EditGateModes || o.SearchReadbackAcceptance {
+		return errors.New("nightly search seed requires standalone edit4/search-delay-v1 or read16/search-delay-read16-v1 without edit/worktree faults")
 	}
 	if o.PRSmokeDrain != 0 {
-		if prSmokeDrainVersion(o) != 2 {
-			return errors.New("nightly search seed drain requires the explicit version 2 edit protocol")
+		version := 2
+		if read {
+			version = 1
+		}
+		if prSmokeDrainVersion(o) != version {
+			return errors.New("nightly search seed drain differs from its read/edit protocol")
 		}
 		return validatePRSmokeDrain(o)
 	}
@@ -32,7 +38,7 @@ func delayNightlySearch(ctx context.Context, tool, role string) (string, int64, 
 	if seed == "" || tool != "search.symbols" || role != "workload" {
 		return "", 0, nil
 	}
-	if seed != "search-delay-v1" {
+	if seed != "search-delay-v1" && seed != "search-delay-read16-v1" {
 		return seed, 0, errors.New("unsupported nightly workload seed")
 	}
 	start := time.Now()

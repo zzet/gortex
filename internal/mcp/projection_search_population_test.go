@@ -144,6 +144,7 @@ func TestProjectionLatencyPopulationManifestKeepsExactCountChargeAndSource(t *te
 		Revision: strings.Repeat("a", 40), Policy: projectionLatencySelectionPolicy,
 		Requested: 2, Admitted: 2, MaxFiles: projectionMaxFiles, MaxBytes: projectionMaxBytes,
 		ChargedBytes: 55, IndexedFiles: 12, NativeSymbols: 20, EligibleCount: 8,
+		NativeSymbolsSHA256: strings.Repeat("a", 64), NativeSymbolsEncoding: projectionLatencyNativeMembershipEncoding,
 		SelectedNodes: 2, SelectedFuncs: 2,
 		InputsVerified: true,
 		Entries: []projectionLatencyCandidate{
