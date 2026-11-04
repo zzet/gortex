@@ -220,15 +220,23 @@ func (s *Store) SimilarTo(vec []float32, limit int) ([]graph.VectorHit, error) {
 	// candidate better than the root evicts it. This keeps the heap at
 	// `limit` and yields an exact top-k.
 	h := &hitHeap{}
+	// Only IDs and distances escape into the heap. Reuse one request-local
+	// decoding buffer rather than allocating a float slice for every row.
+	var cand []float32
 	for rows.Next() {
 		var id, parentID string
 		var blob sql.RawBytes
 		if err := rows.Scan(&id, &parentID, &blob); err != nil {
 			return nil, err
 		}
-		cand := decodeVec(blob)
-		if len(cand) != len(vec) {
+		if len(blob)%4 != 0 || len(blob)/4 != len(vec) {
 			continue
+		}
+		if cand == nil {
+			cand = make([]float32, len(vec))
+		}
+		for i := range cand {
+			cand[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4:]))
 		}
 		cNorm := norm(cand)
 		if cNorm == 0 {
