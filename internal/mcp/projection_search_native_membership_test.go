@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,9 +32,10 @@ func TestProjectionLatencyNativeMembershipManifestIsRequired(t *testing.T) {
 	require.NoError(t, json.Unmarshal(encoded, &fields))
 	for _, test := range []struct{ name, digest, encoding string }{
 		{"missing", "", ""},
-		{"invalid_hash", "unknown", "UTF-8 sorted IDs joined by LF with terminal LF"},
+		{"invalid_hash", "unknown", projectionLatencyNativeMembershipEncoding},
 		{"different_domain", strings.Repeat("a", 64), "JSON encoded IDs"},
-		{"valid", strings.Repeat("a", 64), "UTF-8 sorted IDs joined by LF with terminal LF"},
+		{"legacy_ambiguous_domain", strings.Repeat("a", 64), "UTF-8 sorted IDs joined by LF with terminal LF"},
+		{"valid", strings.Repeat("a", 64), projectionLatencyNativeMembershipEncoding},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fields["native_symbols_sha256"] = test.digest
@@ -69,8 +71,8 @@ func TestProjectionLatencyNativeMembershipUsesExactGenerationRows(t *testing.T) 
 	require.Equal(t, 3, count)
 	digest, err := projectionLatencyNativeMembership(t.Context(), store, count)
 	require.NoError(t, err)
-	expected := sha256.Sum256([]byte("A\nz\né\n"))
-	require.Equal(t, hex.EncodeToString(expected[:]), digest, "UTF-8 IDs sorted by bytes with terminal LF, not JSON/token/other-generation rows")
+	expected := sha256.Sum256([]byte("\x00\x00\x00\x00\x00\x00\x00\x01A\x00\x00\x00\x00\x00\x00\x00\x01z\x00\x00\x00\x00\x00\x00\x00\x02é"))
+	require.Equal(t, hex.EncodeToString(expected[:]), digest, "sorted raw IDs with uint64BE byte lengths, not delimiters/JSON/token/other-generation rows")
 	manifest := projectionLatencyPopulationManifest{IndexedFiles: 2, NativeSymbols: count, NativeSymbolsSHA256: digest}
 	require.NoError(t, validateProjectionLatencyNativeCensus(manifest, 2, count, digest))
 	require.Error(t, validateProjectionLatencyNativeCensus(manifest, 3, count, digest))
@@ -101,4 +103,46 @@ func TestProjectionLatencyNativeMembershipRetainsNewlineIDs(t *testing.T) {
 	digest, err := projectionLatencyNativeMembership(t.Context(), store, count)
 	require.NoError(t, err, "opaque ownership IDs containing LF must not be rejected or filtered")
 	require.Len(t, digest, 64)
+}
+
+func TestProjectionLatencyNativeMembershipEncodingIsUnambiguous(t *testing.T) {
+	left, err := projectionLatencyNativeIDsDigest([]string{"a\nb", "c"})
+	require.NoError(t, err)
+	right, err := projectionLatencyNativeIDsDigest([]string{"a", "b\nc"})
+	require.NoError(t, err)
+	require.NotEqual(t, left, right, "LF joining would make these distinct ID sets collide")
+	again, err := projectionLatencyNativeIDsDigest([]string{"c", "a\nb"})
+	require.NoError(t, err)
+	require.Equal(t, left, again, "input ordering does not change sorted membership")
+	_, err = projectionLatencyNativeIDsDigest([]string{"\x00\xff\n"})
+	require.NoError(t, err, "arbitrary opaque bytes remain representable")
+	for _, ids := range [][]string{nil, {""}, {"a", ""}, {"same", "same"}} {
+		_, err = projectionLatencyNativeIDsDigest(ids)
+		require.Error(t, err, "empty or duplicate ownership is not a valid membership")
+	}
+}
+
+func TestProjectionLatencyNativeMembershipRetainedCensus(t *testing.T) {
+	name := os.Getenv("GORTEX_SEARCH_LATENCY_CENSUS_IDS")
+	if name == "" {
+		t.Skip("explicit retained census qualification only; no index rebuild")
+	}
+	require.True(t, filepath.IsAbs(name))
+	raw, err := os.ReadFile(name)
+	require.NoError(t, err)
+	var ids []string
+	require.NoError(t, json.Unmarshal(raw, &ids))
+	require.Len(t, ids, 82380)
+	newlineIDs := 0
+	for _, id := range ids {
+		if strings.ContainsRune(id, '\n') {
+			newlineIDs++
+		}
+	}
+	require.Equal(t, 2, newlineIDs, "both retained opaque IDs must be preserved")
+	digest, err := projectionLatencyNativeIDsDigest(ids)
+	require.NoError(t, err)
+	manifest, err := readProjectionLatencyPopulationManifest("bdbcdf627ee9d6ed372806215e8d3f6b1b058f3f", projectionMaxFiles)
+	require.NoError(t, err)
+	require.NoError(t, validateProjectionLatencyNativeCensus(manifest, 2133, len(ids), digest))
 }

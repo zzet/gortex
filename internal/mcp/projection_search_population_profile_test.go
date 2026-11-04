@@ -5,6 +5,7 @@ package mcp
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -27,7 +27,7 @@ const projectionLatencyPendingComment = "\n// pending search comparison fixture\
 
 const projectionLatencySelectionPolicy = "directory-round-robin/path-order/actual-charge-feasibility-v1"
 
-const projectionLatencyNativeMembershipEncoding = "UTF-8 sorted IDs joined by LF with terminal LF"
+const projectionLatencyNativeMembershipEncoding = "sorted raw NodeID bytes; each ID is uint64be byte length followed by raw bytes; no separators or header"
 
 type projectionLatencyPopulationManifest struct {
 	Revision              string                       `json:"revision"`
@@ -94,7 +94,6 @@ func validateProjectionLatencyPopulationManifest(manifest projectionLatencyPopul
 // warmup or timing; a token count or graph-node approximation cannot replace it.
 func projectionLatencyNativeMembership(ctx context.Context, store *store_sqlite.Store, count int) (string, error) {
 	ids := make([]string, 0, count)
-	seen := make(map[string]bool, count)
 	var cursor int64
 	for {
 		rows, next, err := store.SymbolFTSGenerationRows(ctx, store.ViewGeneration(), "", cursor, 2048)
@@ -102,10 +101,6 @@ func projectionLatencyNativeMembership(ctx context.Context, store *store_sqlite.
 			return "", err
 		}
 		for _, row := range rows {
-			if row.NodeID == "" || !utf8.ValidString(row.NodeID) || strings.ContainsRune(row.NodeID, '\n') || seen[row.NodeID] {
-				return "", fmt.Errorf("invalid or duplicate native symbol ownership ID")
-			}
-			seen[row.NodeID] = true
 			ids = append(ids, row.NodeID)
 		}
 		if next == 0 {
@@ -119,9 +114,28 @@ func projectionLatencyNativeMembership(ctx context.Context, store *store_sqlite.
 	if count <= 0 || len(ids) != count {
 		return "", fmt.Errorf("native symbol membership has %d IDs, expected %d", len(ids), count)
 	}
+	return projectionLatencyNativeIDsDigest(ids)
+}
+
+func projectionLatencyNativeIDsDigest(ids []string) (string, error) {
+	if len(ids) == 0 {
+		return "", fmt.Errorf("native symbol membership is empty")
+	}
+	ids = append([]string(nil), ids...)
 	sort.Strings(ids)
-	digest := sha256.Sum256([]byte(strings.Join(ids, "\n") + "\n"))
-	return hex.EncodeToString(digest[:]), nil
+	digest := sha256.New()
+	var size [8]byte
+	for i, id := range ids {
+		if id == "" || i > 0 && id == ids[i-1] {
+			return "", fmt.Errorf("empty or duplicate native symbol ownership ID")
+		}
+		// IDs are opaque bytes. Length-prefixing is unambiguous even for LF,
+		// NUL or non-UTF-8 bytes; do not normalize or filter their contents.
+		binary.BigEndian.PutUint64(size[:], uint64(len(id)))
+		_, _ = digest.Write(size[:])
+		_, _ = digest.Write([]byte(id))
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func validateProjectionLatencyNativeCensus(manifest projectionLatencyPopulationManifest, files, count int, digest string) error {
