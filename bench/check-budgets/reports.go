@@ -88,18 +88,29 @@ type phase struct {
 	Censored     *int                       `json:"visibility_censored"`
 }
 
+type readSourceFailureConfig struct {
+	MaxRecords int    `json:"max_records"`
+	MaxBytes   int    `json:"max_combined_wire_bytes"`
+	Encoding   string `json:"encoding"`
+}
+
+func validReadSourceFailureConfig(c *readSourceFailureConfig) bool {
+	return c == nil || c.MaxRecords == 8 && c.MaxBytes == 64<<10 && c.Encoding == "base64"
+}
+
 type report struct {
-	NightlySeed string          `json:"nightly_workload_seed,omitempty"`
-	Started     time.Time       `json:"started"`
-	Binary      string          `json:"binary"`
-	Version     int             `json:"schema_version"`
-	RunID       string          `json:"run_id"`
-	Revision    string          `json:"git_sha"`
-	Profile     string          `json:"profile"`
-	Plan        string          `json:"request_plan_sha256"`
-	Seed        int64           `json:"seed"`
-	Workload    json.RawMessage `json:"workload"`
-	Host        struct {
+	FailureCapture *readSourceFailureConfig `json:"read_source_failure_capture,omitempty"`
+	NightlySeed    string                   `json:"nightly_workload_seed,omitempty"`
+	Started        time.Time                `json:"started"`
+	Binary         string                   `json:"binary"`
+	Version        int                      `json:"schema_version"`
+	RunID          string                   `json:"run_id"`
+	Revision       string                   `json:"git_sha"`
+	Profile        string                   `json:"profile"`
+	Plan           string                   `json:"request_plan_sha256"`
+	Seed           int64                    `json:"seed"`
+	Workload       json.RawMessage          `json:"workload"`
+	Host           struct {
 		Machine   string            `json:"machine"`
 		OS        string            `json:"os"`
 		Arch      string            `json:"arch"`
@@ -216,6 +227,9 @@ func (c inputs) repeats(scenario string) int {
 }
 
 func validateReport(c inputs, input runInput, r report) error {
+	if !validReadSourceFailureConfig(r.FailureCapture) {
+		return errors.New("unknown or enlarged read.source failure-capture policy")
+	}
 	if err := validateNightlySeedReport(c, input, r); err != nil {
 		return err
 	}
@@ -320,7 +334,7 @@ func validateHost(class, machine string, r report) error {
 
 func comparable(a, b report) bool {
 	var aw, bw any
-	if decodeNumbers(a.Workload, &aw) != nil || decodeNumbers(b.Workload, &bw) != nil || !reflect.DeepEqual(aw, bw) || a.Plan != b.Plan || !reflect.DeepEqual(a.Host, b.Host) {
+	if decodeNumbers(a.Workload, &aw) != nil || decodeNumbers(b.Workload, &bw) != nil || !reflect.DeepEqual(aw, bw) || a.Plan != b.Plan || !reflect.DeepEqual(a.Host, b.Host) || !reflect.DeepEqual(a.FailureCapture, b.FailureCapture) {
 		return false
 	}
 	logical := func(corpus []map[string]any) []map[string]any {

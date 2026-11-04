@@ -166,5 +166,9 @@ func validateSmokeStores(d dataset) error {
 
 // Keep the actual child command testable without launching an owned daemon.
 func smokeSequenceArgs(c laneConfig, root string) []string {
-	return []string{"smoke", "--main-binary", c.Builds["main"].Binary, "--main-revision", c.Builds["main"].Revision, "--candidate-binary", c.Builds["candidate"].Binary, "--candidate-revision", c.Builds["candidate"].Revision, "--manifest", c.Manifest, "--out", root, "--offer", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-duration", c.SweepDuration, "--edit-ack", "local"}
+	args := []string{"smoke", "--main-binary", c.Builds["main"].Binary, "--main-revision", c.Builds["main"].Revision, "--candidate-binary", c.Builds["candidate"].Binary, "--candidate-revision", c.Builds["candidate"].Revision, "--manifest", c.Manifest, "--out", root, "--offer", c.Duration, "--deadline", c.Deadline, "--warm-timeout", c.WarmTimeout, "--stop-timeout", c.StopTimeout, "--sweep-duration", c.SweepDuration, "--edit-ack", "local"}
+	if c.RetainReadSourceFailures {
+		args = append(args, "--retain-read-source-failures")
+	}
+	return args
 }
