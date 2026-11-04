@@ -155,6 +155,9 @@ func runRegisteredMetadataOwnerTransition(t *testing.T, duringPhysicalCheck bool
 			require.NoError(t, callErr)
 			require.NotNil(t, result)
 			require.False(t, result.IsError, resultText(result))
+			if duringPhysicalCheck {
+				require.Equal(t, 1, callbacks, "select the checked owner before spending a response attempt")
+			}
 			if tool == "get_symbol" {
 				node := extractTextResult(t, result)["node"].(map[string]any)
 				require.Equal(t, "main.go::Target", node["id"])
