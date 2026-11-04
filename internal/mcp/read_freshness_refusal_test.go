@@ -215,3 +215,27 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 	t.Logf("CAUSAL_PENDING_EMPTY_SQL_VERIFIED nativeFTS=%d projection_private_expired=%t caller_live=true pool_wait=true request_pending=true actual_empty_refusal=%t", fts, !time.Now().Before(deadline), got.result != nil && got.result.IsError)
 	requireReadFreshnessContract(t, got.result, "file_view_pending")
 }
+
+func TestMetadataTransientContractLeavesTerminalErrorsUnmarked(t *testing.T) {
+ s,_:=setupTestServer(t)
+ for _,tc:=range []struct{name,tool string;err error;args map[string]any;cancel bool}{
+  {"message_only","get_file_summary",errors.New(projectionSuperseded.Error()),nil,false},
+  {"genuine_notfound","get_editing_context",errors.New("no symbols found for file: main.go"),nil,false},
+  {"scope_denial","get_editing_context",errors.New("scope denied"),nil,false},
+  {"write","edit_file",projectionSuperseded,nil,false},
+  {"unaudited_callers","get_callers",projectionSuperseded,nil,false},
+  {"compressed","get_editing_context",projectionSuperseded,map[string]any{"compress_bodies":true},false},
+  {"caller_cancelled","get_file_summary",projectionSuperseded,nil,true},
+  {"file_cap","get_file_summary",projectionOverFiles,nil,false},
+ } {t.Run(tc.name,func(t *testing.T){
+  ctx,cancel:=context.WithCancel(t.Context());defer cancel();if tc.cancel{cancel()}
+  req:=makeReq(tc.tool,tc.args)
+  result:=s.metadataReadError(ctx,req,tc.err);require.True(t,result.IsError)
+  var body struct{Code string `json:"error_code"`};_ = json.Unmarshal([]byte(resultText(result)),&body)
+  require.NotEqual(t,"projection_superseded",body.Code);require.NotEqual(t,"file_view_pending",body.Code)
+ })}
+ ctx:=withRequestProjectionFacts(t.Context());req:=makeReq("get_editing_context",map[string]any{"path":"main.go"})
+ require.Nil(t,s.pendingEmptyMetadataRead(ctx,req,"main.go"),"real absence has no pending witness")
+ markRequestProjectionDeferred(ctx,"other.go","external_write")
+ require.Nil(t,s.pendingEmptyMetadataRead(ctx,req,"main.go"),"another file cannot mark requested absence transient")
+}

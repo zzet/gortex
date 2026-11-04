@@ -31,7 +31,8 @@ func (s *Server) metadataReadError(ctx context.Context,req mcplib.CallToolReques
 // Only an actual request-local unavailable-file observation qualifies. Empty
 // canonical results and scope-denial results keep their original error shape.
 func (s *Server) pendingEmptyMetadataRead(ctx context.Context,req mcplib.CallToolRequest,file string)*mcplib.CallToolResult {
- if ctx.Err()!=nil || !s.metadataReadRetryScope(req) {return nil}
+ name,known:=s.legacyToolName(&req)
+ if ctx.Err()!=nil || !known || name!="get_editing_context" || !s.metadataReadRetryScope(req) {return nil}
  reason:=""
  if _,pending:=requestDeferredProjectionFiles(ctx)[file];pending {reason="projection_deferred"}
  if reason=="" {for _,busy:=range requestStoreBusyFiles(ctx) {if busy==file {reason="store_busy";break}}}

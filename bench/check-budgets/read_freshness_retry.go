@@ -27,7 +27,7 @@ func validateReadFreshnessGroups(r report)(map[int]bool,error) {
  attempts:=r.Phases[0].Attempts
  keys:=make(map[readFreshnessKey]bool)
  for _,a:=range attempts {
-  if a.Outcome!="retryable" && (!scopedReadTool(a.Tool) || a.Retry==nil || *a.Retry==0) {continue}
+  if a.Outcome!="retryable" && (a.Role!="workload" || !scopedReadTool(a.Tool) || a.Retry==nil || *a.Retry==0) {continue}
   key,valid:=readFreshnessKeyOf(a);if !valid {return nil,errors.New("retry lacks complete workload read identity; probes and writes stay first-response strict")};keys[key]=true
  }
  if len(keys)==0{return allowed,nil}
