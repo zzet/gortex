@@ -10,7 +10,8 @@ import (
 // ScanNodeSearchKeys reads the compact search projection in bounded ID-keyset
 // pages. Each page cursor is fully consumed and closed before yield runs, so a
 // callback may safely re-enter Store and no long-lived read snapshot pins WAL
-// checkpoints while ranking candidates.
+// checkpoints while ranking candidates. Storage failures remain errors even
+// when legacy teardown policy is benign: partial scans cannot prove absence.
 func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func([]graph.NodeSearchKey) bool) error {
 	if s.coreless() || yield == nil {
 		return nil
@@ -39,7 +40,7 @@ func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 			return ctxErr
 		}
 		panicOnFatal(err)
-		return nil
+		return err
 	}
 
 	after := ""
@@ -70,7 +71,7 @@ LIMIT ?`, after, highWater, s.viewGen, pageSize)
 				return ctxErr
 			}
 			panicOnFatal(err)
-			return nil
+			return err
 		}
 
 		page := make([]graph.NodeSearchKey, 0, pageSize)
@@ -82,7 +83,7 @@ LIMIT ?`, after, highWater, s.viewGen, pageSize)
 					return ctxErr
 				}
 				panicOnFatal(scanErr)
-				return nil
+				return scanErr
 			}
 			page = append(page, key)
 		}
@@ -93,14 +94,14 @@ LIMIT ?`, after, highWater, s.viewGen, pageSize)
 				return ctxErr
 			}
 			panicOnFatal(rowsErr)
-			return nil
+			return rowsErr
 		}
 		if closeErr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
 			panicOnFatal(closeErr)
-			return nil
+			return closeErr
 		}
 		if len(page) == 0 {
 			return nil
