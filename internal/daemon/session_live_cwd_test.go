@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -10,19 +11,21 @@ import (
 )
 
 func TestSessionLiveCWD(t *testing.T) {
-	s := &Session{CWD: "/launch"}
-	assert.Equal(t, "/launch", s.EffectiveCWD(), "no report yet: the handshake CWD")
+	launch := t.TempDir()
+	feature := filepath.Join(launch, ".worktrees", "feature")
+	s := &Session{CWD: launch}
+	assert.Equal(t, launch, s.EffectiveCWD(), "no report yet: the handshake CWD")
 
 	s.SetLiveCWD("relative/path")
 	s.SetLiveCWD("")
-	assert.Equal(t, "/launch", s.EffectiveCWD(), "unusable reports are ignored")
+	assert.Equal(t, launch, s.EffectiveCWD(), "unusable reports are ignored")
 
-	s.SetLiveCWD("/launch/.worktrees/feature/")
-	assert.Equal(t, "/launch/.worktrees/feature", s.EffectiveCWD())
-	assert.Equal(t, "/launch", s.CWD, "the handshake CWD is never rewritten")
+	s.SetLiveCWD(feature + string(filepath.Separator))
+	assert.Equal(t, feature, s.EffectiveCWD())
+	assert.Equal(t, launch, s.CWD, "the handshake CWD is never rewritten")
 
 	var nilSession *Session
-	nilSession.SetLiveCWD("/x")
+	nilSession.SetLiveCWD(launch)
 	assert.Empty(t, nilSession.EffectiveCWD())
 }
 
@@ -31,13 +34,15 @@ func TestSessionLiveCWD(t *testing.T) {
 // resumes the logical session when that handshake CWD still matches.
 func TestSessionLiveCWD_ReconnectResumes(t *testing.T) {
 	r := NewSessionRegistry()
-	h := Handshake{Mode: ModeMCP, PID: 4242, LogicalSessionID: "logical-live-cwd", CWD: "/launch"}
+	launch := t.TempDir()
+	feature := filepath.Join(launch, ".worktrees", "feature")
+	h := Handshake{Mode: ModeMCP, PID: 4242, LogicalSessionID: "logical-live-cwd", CWD: launch}
 
 	c1, c1Peer := net.Pipe()
 	defer c1.Close()
 	defer c1Peer.Close()
 	first := r.Register(c1, h)
-	first.SetLiveCWD("/launch/.worktrees/feature")
+	first.SetLiveCWD(feature)
 
 	c2, c2Peer := net.Pipe()
 	defer c2.Close()
@@ -45,7 +50,7 @@ func TestSessionLiveCWD_ReconnectResumes(t *testing.T) {
 	second := r.Register(c2, h)
 
 	require.Same(t, first, second, "reconnect must resume the same session")
-	assert.Equal(t, "/launch/.worktrees/feature", second.EffectiveCWD())
+	assert.Equal(t, feature, second.EffectiveCWD())
 }
 
 // TestReplayIdentityIgnoresMetaCWD: the proxy's cwd stamp is routing, not
@@ -70,13 +75,15 @@ func TestReplayIdentityIgnoresMetaCWD(t *testing.T) {
 }
 
 func TestSessionLiveCWD_ConcurrentAccess(t *testing.T) {
-	s := &Session{CWD: "/launch"}
+	launch := t.TempDir()
+	moved := filepath.Join(launch, "a")
+	s := &Session{CWD: launch}
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(2)
-		go func() { defer wg.Done(); s.SetLiveCWD("/a") }()
+		go func() { defer wg.Done(); s.SetLiveCWD(moved) }()
 		go func() { defer wg.Done(); _ = s.EffectiveCWD() }()
 	}
 	wg.Wait()
-	assert.Equal(t, "/a", s.EffectiveCWD())
+	assert.Equal(t, moved, s.EffectiveCWD())
 }

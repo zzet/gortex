@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -150,14 +151,16 @@ func TestDispatcher_LiveClientCWDReturnsToTrackedRepo(t *testing.T) {
 // when another frame on the session recorded a different live CWD after it
 // arrived — the concurrency case where two stamped calls interleave.
 func TestRequestCWD_FrameStampWins(t *testing.T) {
-	sess := &daemon.Session{CWD: "/launch"}
-	frameA := stampClientCWD([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`), "/launch")
-	sess.SetLiveCWD("/launch/.worktrees/b") // frame B landed in between
+	launch := t.TempDir()
+	worktreeB := filepath.Join(launch, ".worktrees", "b")
+	sess := &daemon.Session{CWD: launch}
+	frameA := stampClientCWD([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}`), launch)
+	sess.SetLiveCWD(worktreeB) // frame B landed in between
 
-	assert.Equal(t, "/launch", requestCWD(sess, frameA))
-	assert.Equal(t, "/launch/.worktrees/b", requestCWD(sess, []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)),
+	assert.Equal(t, launch, requestCWD(sess, frameA))
+	assert.Equal(t, worktreeB, requestCWD(sess, []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)),
 		"an unstamped frame uses the session's live CWD")
-	assert.Equal(t, "/launch/.worktrees/b", requestCWD(sess, []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":{"cwd":"relative"}}}`)),
+	assert.Equal(t, worktreeB, requestCWD(sess, []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":{"cwd":"relative"}}}`)),
 		"an invalid stamp is ignored")
 }
 
