@@ -39,21 +39,39 @@ func TestRegisteredNameOnlySearchPredicatePrecedesNativeHorizon(t *testing.T) {
 	path := filepath.Join(root, rel)
 	var victim strings.Builder
 	victim.WriteString("package probe\n\nfunc QueryFixtureRoot() int { return 0 }\n\n")
+	var victimCorpus strings.Builder
+	victimCorpus.WriteString("package probe\n\n")
 	for ordinal := range 1000 {
-		fmt.Fprintf(&victim, "func QueryMarker%03dBefore() int { return %d }\n\n", ordinal, ordinal)
+		destination := &victimCorpus
+		if ordinal == 1 || ordinal == 2 {
+			destination = &victim
+		}
+		fmt.Fprintf(destination, "func QueryMarker%03dBefore() int { return %d }\n\n", ordinal, ordinal)
 	}
 	require.NoError(t, os.WriteFile(path, []byte(victim.String()), 0o600))
+	// Keep the real native corpus width without making fixture admission
+	// depend on projecting 1000 untouched declarations inside the build cap.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "victim_corpus.go"), []byte(victimCorpus.String()), 0o600))
 	neighborDir := filepath.Join(root, "neighbors")
 	require.NoError(t, os.Mkdir(neighborDir, 0o700))
 	for file := range 21 {
 		var neighbor strings.Builder
 		neighbor.WriteString("package neighbors\n\n")
+		var neighborCorpus strings.Builder
+		neighborCorpus.WriteString("package neighbors\n\n")
 		for ordinal := range 1000 {
 			// Native FTS shares the CamelCase Query token, while the actual
 			// literal name predicate must reject every one of these names.
-			fmt.Fprintf(&neighbor, "func QueryMarkerReplica%02d%03dBefore() int { return %d }\n", file, ordinal, ordinal)
+			destination := &neighbor
+			if file == 0 && ordinal != 0 {
+				destination = &neighborCorpus
+			}
+			fmt.Fprintf(destination, "func QueryMarkerReplica%02d%03dBefore() int { return %d }\n", file, ordinal, ordinal)
 		}
 		require.NoError(t, os.WriteFile(filepath.Join(neighborDir, fmt.Sprintf("names%02d.go", file)), []byte(neighbor.String()), 0o600))
+		if file == 0 {
+			require.NoError(t, os.WriteFile(filepath.Join(neighborDir, "names00_corpus.go"), []byte(neighborCorpus.String()), 0o600))
+		}
 	}
 	positions := token.NewFileSet()
 	parsed, err := parser.ParseFile(positions, path, victim.String(), 0)
@@ -74,6 +92,7 @@ func TestRegisteredNameOnlySearchPredicatePrecedesNativeHorizon(t *testing.T) {
 	require.NoError(t, err)
 	ftsCount, err := store.SymbolFTSCount()
 	require.NoError(t, err)
+	require.Equal(t, 22001, ftsCount, "splitting fixture files must preserve the actual native corpus")
 	require.Greater(t, ftsCount, rawLaneThreshold)
 	t.Logf("actual_native_FTS_count=%d raw_lane_threshold=%d request_limit=%d", ftsCount, rawLaneThreshold, requestLimit)
 	require.NotNil(t, store.GetNode(oldID))
@@ -136,7 +155,9 @@ func TestRegisteredNameOnlySearchPredicatePrecedesNativeHorizon(t *testing.T) {
 	retainedACK := negativeQueryRegisteredCall(s, ctx, 11, "edit", snapshotEditArgs(path, "QueryMarker002Before", "QueryMarker002"), oldID, oldName)
 	retained := negativeQueryRegisteredCall(s, ctx, 12, "search", args(oldName, true), oldID, oldName)
 	logObservation("retained_after_local_ACK", retained)
+	logObservation("retained_LOCAL_ACK", retainedACK)
 	renamedACK := negativeQueryRegisteredCall(s, ctx, 13, "edit", snapshotEditArgs(path, oldName, newName), oldID, oldName)
+	logObservation("rename_LOCAL_ACK", renamedACK)
 	oldOwner := liveEntry(pendingFileProjections, path)
 	require.NotNil(t, oldOwner)
 	oldFacts, err := s.bindPendingSearch(ctx)
@@ -163,8 +184,6 @@ func TestRegisteredNameOnlySearchPredicatePrecedesNativeHorizon(t *testing.T) {
 	absent := negativeQueryRegisteredCall(s, ctx, 16, "search", args(oldName, true), oldID, oldName)
 	logObservation("new_positive_after_rename_ACK", positive)
 	logObservation("old_negative_after_rename_ACK", absent)
-	logObservation("retained_LOCAL_ACK", retainedACK)
-	logObservation("rename_LOCAL_ACK", renamedACK)
 	logObservation("unrelated_layer_LOCAL_ACK", layeredACK)
 	// Physical observations follow the immediate burst and cannot give the
 	// watcher time to manufacture a successful immediate response.
