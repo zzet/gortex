@@ -263,10 +263,11 @@ type Store interface {
 	GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet
 
 	// DistinctExternalTargets returns the unique external-shaped destination
-	// IDs used by the supplied edge kinds. Backends must push both the kind and
-	// target predicates down and project only the destination ID; no per-kind
+	// IDs used by the supplied edge kinds. A non-empty fileSuffix restricts
+	// the recording file. Backends must push the predicates down and
+	// project only the destination ID; no per-kind
 	// queries or full Edge materialisation are permitted.
-	DistinctExternalTargets(kinds []EdgeKind) []string
+	DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string
 
 	// GetRepoEdges returns every edge whose source node has the given
 	// RepoPrefix. Equivalent to GetRepoNodes(r) followed by

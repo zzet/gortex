@@ -84,9 +84,9 @@ func (g *derivedReadGuard) FileNodeIdentitiesSeq(repos []string) iter.Seq[graph.
 	g.noteWhole("FileNodeIdentitiesSeq")
 	return g.DeltaWriter.FileNodeIdentitiesSeq(repos)
 }
-func (g *derivedReadGuard) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
+func (g *derivedReadGuard) DistinctExternalTargets(kinds []graph.EdgeKind, fileSuffix string) []string {
 	g.noteWhole("DistinctExternalTargets")
-	return g.DeltaWriter.DistinctExternalTargets(kinds)
+	return g.DeltaWriter.DistinctExternalTargets(kinds, fileSuffix)
 }
 func (g *derivedReadGuard) NodesInScopeSeq(repos, files []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
 	g.noteScope("NodesInScopeSeq", files, kinds)

@@ -1218,7 +1218,7 @@ func (dw *DeltaWriter) getEdgeCandidatesByAdjacency(endpoints []EdgeEndpoint, si
 }
 
 // DistinctExternalTargets implements Store by a kind-bounded scan.
-func (dw *DeltaWriter) DistinctExternalTargets(kinds []EdgeKind) []string {
+func (dw *DeltaWriter) DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string {
 	dw.noteSlowRead("DistinctExternalTargets")
 	targets := make(map[string]struct{})
 	for _, kind := range kinds {
@@ -1226,7 +1226,7 @@ func (dw *DeltaWriter) DistinctExternalTargets(kinds []EdgeKind) []string {
 			continue
 		}
 		for e := range dw.view.EdgesByKind(kind) {
-			if e != nil && isExternalTargetID(e.To) {
+			if e != nil && isExternalTargetID(e.To) && strings.HasSuffix(e.FilePath, fileSuffix) {
 				targets[e.To] = struct{}{}
 			}
 		}

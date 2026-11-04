@@ -602,16 +602,20 @@ func (s *Store) externalCallCandidatePage(kind graph.EdgeKind, after, highWater 
 // DistinctExternalTargets performs the Go external-attribution discovery as
 // one SQLite aggregate. Only distinct destination IDs cross the driver; full
 // edge payloads (especially Meta) stay disk-resident.
-func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
+func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind, fileSuffix string) []string {
 	_, args := aggDedupeEdgeKinds(kinds)
 	if len(args) == 0 {
 		return nil
 	}
 	q := `SELECT DISTINCT to_id FROM edges
 		WHERE kind IN (` + inPlaceholders(len(args)) + `) AND ` + externalCallTargetPredicate + `
-		  AND view_gen = ?
-		ORDER BY to_id`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
+		  AND view_gen = ?`
+	args = append(args, s.viewGen)
+	if fileSuffix != "" {
+		q += ` AND substr(file_path, -length(?)) = ?`
+		args = append(args, fileSuffix, fileSuffix)
+	}
+	rows, err := s.db.Query(q+` ORDER BY to_id`, args...)
 	panicOnFatal(err)
 	if rows == nil {
 		return nil

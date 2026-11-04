@@ -1176,7 +1176,7 @@ func generationReadProbes() []genProbe {
 			return edgeTokens(s.ExternalCallCandidateEdges())
 		}},
 		{name: "DistinctExternalTargets", run: func(t *testing.T, s *Store) []string {
-			return prefixed("external ", s.DistinctExternalTargets([]graph.EdgeKind{graph.EdgeCalls}))
+			return prefixed("external ", s.DistinctExternalTargets([]graph.EdgeKind{graph.EdgeCalls}, ""))
 		}},
 
 		{name: "NodeCount", run: func(t *testing.T, s *Store) []string {
