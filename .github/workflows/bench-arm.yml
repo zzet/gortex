@@ -15,6 +15,12 @@ on:
           - acceptance-native
           - acceptance-native-windows
 
+# A-selected qualified public main; tooling checkout remains separate.
+# BOTH roles refuse malformed candidate pins before checkout or build.
+env:
+  RELEASE_SIZE_CANDIDATE_SHA: 427c0cd837f80b1f83920c9195ab3ec92beb6fbc
+  RELEASE_SIZE_CANDIDATE_TREE: c014599b9cc20fc9b41d4e36ea3534172cc1788f
+
 permissions:
   contents: read
 
@@ -233,18 +239,38 @@ jobs:
       matrix:
         include:
           - label: candidate
-            source: bed4c788445710f79f1c6d8218e41b5d5fa8637c
-            tree: 719e2a13213522c02c5fd33b7455017fd183c7b2
           - label: control
-            source: a6573abafc416ab008120e3820b4eda182e347bf
-            tree: d0f619d85e3c6286ae8784b90b958bfe6b8597c5
     env:
-      SOURCE_SHA: ${{ matrix.source }}
       # Common fixed, equal-length metadata for attribution. This is a
       # prospective release-shape build, never an official release artifact.
       SOURCE_VERSION: 0.64.12
       SOURCE_DATE: '2026-11-01T00:00:00Z'
     steps:
+      - name: Refuse unbound candidate and bind exact source role
+        env:
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          for field in RELEASE_SIZE_CANDIDATE_SHA RELEASE_SIZE_CANDIDATE_TREE; do
+            if ! [[ "${!field}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "FATAL: $field must identify the exact public final product before either build" >&2
+              exit 2
+            fi
+          done
+          case "$LABEL" in
+            candidate)
+              source_sha=$RELEASE_SIZE_CANDIDATE_SHA
+              source_tree=$RELEASE_SIZE_CANDIDATE_TREE
+              ;;
+            control)
+              # v0.64.10 SOURCE rebuilt with the SAME producer/metadata.
+              # This does not replace the checksum-verified published baseline.
+              source_sha=defa9f8e7a670792b5b693744d88488f741a8160
+              source_tree=655071eb061f2647bd819ef30e0f42116f1dfcbf
+              ;;
+            *) exit 2 ;;
+          esac
+          printf 'SOURCE_SHA=%s\nEXPECTED_TREE=%s\n' "$source_sha" "$source_tree" >> "$GITHUB_ENV"
       - name: Check out dispatch tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -253,19 +279,16 @@ jobs:
       - name: Check out exact measurement source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ matrix.source }}
+          ref: ${{ env.SOURCE_SHA }}
           path: source
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source identity
-        env:
-          EXPECTED_TREE: ${{ matrix.tree }}
         run: |
           set -euo pipefail
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git -C source rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
           test -z "$(git -C source status --porcelain)"
-          git -C source merge-base --is-ancestor a6573abafc416ab008120e3820b4eda182e347bf "$SOURCE_SHA"
       - name: Build both Linux architectures in exact release image
         env:
           LABEL: ${{ matrix.label }}
@@ -296,7 +319,7 @@ jobs:
         with:
           name: release-size-candidate
           path: ${{ runner.temp }}/proof/candidate
-      - name: Fetch matched parent measurement artifact
+      - name: Fetch same-image tag-source measurement artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-size-control
