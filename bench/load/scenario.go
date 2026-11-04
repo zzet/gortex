@@ -245,7 +245,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}()
 	}
 	coldStart := time.Now()
-	if err := p.start(); err != nil {
+	if err := p.startWithSearchRefusalEvidence(scenario == editProbeScenario && o.SearchReadbackAcceptance); err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
 	startupMonitor := startMonitor(p, newProcessSampler(), group)

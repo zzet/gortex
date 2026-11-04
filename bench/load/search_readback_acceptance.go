@@ -7,8 +7,25 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"os"
 	"strings"
 )
+
+// The generic private environment deliberately strips inherited GORTEX_*
+// settings. Only this explicitly selected acceptance profile may forward the
+// one bounded diagnostic opt-in, through the existing daemon-only override.
+func (p *privateRun) startWithSearchRefusalEvidence(searchAcceptance bool) error {
+	if searchAcceptance && os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") == "1" {
+		prior := p.daemonEnv
+		env := p.Env
+		if p.daemonEnv != nil {
+			env = p.daemonEnv
+		}
+		p.daemonEnv = append(append([]string(nil), env...), "GORTEX_SEARCH_REFUSAL_EVIDENCE=1")
+		defer func() { p.daemonEnv = prior }()
+	}
+	return p.start()
+}
 
 type searchReadbackCounts struct {
 	Observed int `json:"observed"`

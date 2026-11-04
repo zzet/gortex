@@ -17,6 +17,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("LOAD_SEARCH_REFUSAL_ENV_PROBE") == "selected-env-observation" {
+		os.Exit(runSearchRefusalEnvProbe())
+	}
 	if mode := os.Getenv("LOAD_DAEMON_FIXTURE"); mode != "" {
 		os.Exit(fixtureDaemon(mode))
 	}
