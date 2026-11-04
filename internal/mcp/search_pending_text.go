@@ -40,14 +40,14 @@ func (s *Server) pendingTextFiles(ctx context.Context, resolved ResolvedScope, p
 	if len(entries) == 0 && len(records) == 0 {
 		return nil, nil
 	}
+	if err := s.validatePendingTextKeys(ctx, entries); err != nil {
+		return nil, err
+	}
 	paths := make(map[string]struct{}, len(entries)+len(records))
 	for _, entry := range entries {
 		owner := s.pickIndexerForPath(entry.absPath)
 		if owner == nil || owner.RepoPrefix() != entry.repoPrefix {
 			continue
-		}
-		if pathkey.MutationKey(entry.absPath) != entry.key {
-			return nil, fmt.Errorf("pending text physical identity changed")
 		}
 		paths[entry.absPath] = struct{}{}
 	}
@@ -109,6 +109,74 @@ func (s *Server) pendingTextFiles(ctx context.Context, resolved ResolvedScope, p
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	return files, nil
+}
+
+// Validate the same immutable entry keys before selection, amortizing only
+// the absolute repository prefix. At most one grouped root/ancestor stack is
+// open, and no key is accepted until its complete directory/root fence closes.
+// The later physical-byte reader and its mutation token remain independent.
+func (s *Server) validatePendingTextKeys(ctx context.Context, entries map[string]*projectionEntry) (err error) {
+	type selected struct {
+		entry *projectionEntry
+		owner *indexer.Indexer
+	}
+	ordered := make([]selected, 0, len(entries))
+	for _, entry := range entries {
+		owner := s.pickIndexerForPath(entry.absPath)
+		if owner != nil && owner.RepoPrefix() == entry.repoPrefix {
+			ordered = append(ordered, selected{entry, owner})
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		a, b := ordered[i], ordered[j]
+		if a.owner.RootPath() != b.owner.RootPath() {
+			return a.owner.RootPath() < b.owner.RootPath()
+		}
+		return a.entry.absPath < b.entry.absPath
+	})
+	var active *pendingTextRoot
+	var activeOwner *indexer.Indexer
+	defer func() {
+		if active != nil {
+			err = errors.Join(err, active.close(ctx))
+		}
+	}()
+	for _, item := range ordered {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entry, owner := item.entry, item.owner
+		relative, inside := relativeWithinRoot(owner.RootPath(), entry.absPath)
+		var key string
+		if !inside {
+			// Keep the old physical spelling check for non-lexical aliases; path
+			// selection below still applies its existing owning-root admission.
+			key = pathkey.MutationKey(entry.absPath)
+		} else {
+			if owner != activeOwner {
+				if active != nil {
+					closed := active.close(ctx)
+					active = nil
+					if closed != nil {
+						return closed
+					}
+				}
+				active, err = openPendingTextRootForScan(owner.RootPath())
+				if err != nil {
+					return err
+				}
+				activeOwner = owner
+			}
+			key, err = active.mutationKey(ctx, relative)
+			if err != nil {
+				return err
+			}
+		}
+		if key != entry.key {
+			return fmt.Errorf("pending text physical identity changed")
+		}
+	}
+	return ctx.Err()
 }
 
 func (s *Server) scanPendingTextFiles(ctx context.Context, files []pendingTextFile, query string, expression *regexp.Regexp, limit int) (matches []enrichedTextMatch, excluded map[string]map[string]struct{}, err error) {
