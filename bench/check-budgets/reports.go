@@ -89,9 +89,9 @@ type phase struct {
 }
 
 type readSourceFailureConfig struct {
-	MaxRecords int `json:"max_records"`
-	MaxBytes int `json:"max_combined_wire_bytes"`
-	Encoding string `json:"encoding"`
+	MaxRecords int    `json:"max_records"`
+	MaxBytes   int    `json:"max_combined_wire_bytes"`
+	Encoding   string `json:"encoding"`
 }
 
 func validReadSourceFailureConfig(c *readSourceFailureConfig) bool {
@@ -100,17 +100,17 @@ func validReadSourceFailureConfig(c *readSourceFailureConfig) bool {
 
 type report struct {
 	FailureCapture *readSourceFailureConfig `json:"read_source_failure_capture,omitempty"`
-	NightlySeed string          `json:"nightly_workload_seed,omitempty"`
-	Started     time.Time       `json:"started"`
-	Binary      string          `json:"binary"`
-	Version     int             `json:"schema_version"`
-	RunID       string          `json:"run_id"`
-	Revision    string          `json:"git_sha"`
-	Profile     string          `json:"profile"`
-	Plan        string          `json:"request_plan_sha256"`
-	Seed        int64           `json:"seed"`
-	Workload    json.RawMessage `json:"workload"`
-	Host        struct {
+	NightlySeed    string                   `json:"nightly_workload_seed,omitempty"`
+	Started        time.Time                `json:"started"`
+	Binary         string                   `json:"binary"`
+	Version        int                      `json:"schema_version"`
+	RunID          string                   `json:"run_id"`
+	Revision       string                   `json:"git_sha"`
+	Profile        string                   `json:"profile"`
+	Plan           string                   `json:"request_plan_sha256"`
+	Seed           int64                    `json:"seed"`
+	Workload       json.RawMessage          `json:"workload"`
+	Host           struct {
 		Machine   string            `json:"machine"`
 		OS        string            `json:"os"`
 		Arch      string            `json:"arch"`

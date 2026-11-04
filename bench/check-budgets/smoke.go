@@ -16,14 +16,14 @@ import (
 )
 
 type smokeProvenance struct {
-	RetainReadSourceFailures bool `json:"retain_read_source_failures,omitempty"`
-	EditACKMode       string            `json:"edit_ack_mode,omitempty"`
-	Main              artifactSelection `json:"main_selection"`
-	MainBinary        mainArtifact      `json:"main_binary"`
-	CandidateBinary   mainArtifact      `json:"candidate_binary"`
-	RunnerEnvironment string            `json:"runner_environment"`
-	RunnerOS          string            `json:"runner_os"`
-	RunnerArch        string            `json:"runner_arch"`
+	RetainReadSourceFailures bool              `json:"retain_read_source_failures,omitempty"`
+	EditACKMode              string            `json:"edit_ack_mode,omitempty"`
+	Main                     artifactSelection `json:"main_selection"`
+	MainBinary               mainArtifact      `json:"main_binary"`
+	CandidateBinary          mainArtifact      `json:"candidate_binary"`
+	RunnerEnvironment        string            `json:"runner_environment"`
+	RunnerOS                 string            `json:"runner_os"`
+	RunnerArch               string            `json:"runner_arch"`
 }
 
 func readStrictJSON(path string, value any) error {
