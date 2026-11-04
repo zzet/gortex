@@ -1,6 +1,7 @@
 package serverstack
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,10 @@ import (
 // minor point 3: the snapshot is renamed over the file the sqlite backend
 // uses, so a -wal/-shm left by a crashed sqlite session would be replayed
 // against the brand-new database. The publish path removes both before the
-// rename.
+// rename. The rename carries this snapshot's own WAL pair along (a clean
+// close does not guarantee a full checkpoint), so after the publish the
+// sidecars at the destination — if any — are the matched pair of THIS
+// database, never the crashed session's bytes.
 func TestMemorySnapshotClearsStaleSqliteSidecars(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 	store, closeFn, err := openMemoryBackend(path, nil)
@@ -35,7 +39,8 @@ func TestMemorySnapshotClearsStaleSqliteSidecars(t *testing.T) {
 	closeFn()
 
 	for _, stale := range []string{path + "-wal", path + "-shm"} {
-		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		data, err := os.ReadFile(stale)
+		if err == nil && bytes.Contains(data, []byte("stale-sqlite-sidecar")) {
 			t.Errorf("stale sidecar %s survived the snapshot publish (err=%v)", stale, err)
 		}
 	}

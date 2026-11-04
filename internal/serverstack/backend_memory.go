@@ -328,7 +328,23 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	if err := os.Rename(tmp, snapshotPath); err != nil {
 		return fmt.Errorf("memory backend: publish snapshot: %w", err)
 	}
+	// The db rename must carry its own WAL pair: a clean close does not
+	// guarantee a full checkpoint (pooled reader connections can pin the
+	// WAL), so un-checkpointed frames — every ordinary write after the
+	// bulk flush, the mtime sidecar included — may still live in tmp-wal.
+	// Orphaning them silently drops committed rows (bulk-sealed nodes
+	// survive; ordinary writes do not). The pair is matched to THIS
+	// database, so moving it along is a plain file rename, and the next
+	// open replays it into the published snapshot.
 	published = true
+	for _, pair := range [][2]string{
+		{tmp + "-wal", snapshotPath + "-wal"},
+		{tmp + "-shm", snapshotPath + "-shm"},
+	} {
+		if err := os.Rename(pair[0], pair[1]); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("memory backend: publish snapshot sidecar %q: %w", pair[0], err)
+		}
+	}
 	return nil
 }
 
