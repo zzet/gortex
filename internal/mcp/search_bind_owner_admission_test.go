@@ -49,7 +49,7 @@ func TestRegisteredNativeSearchSelectsCheckedOwnerAfterReadAdmission(t *testing.
 					ack := snapshotRegisteredCall(t, s, base, 12, "edit", map[string]any{
 						"operation": "write", "target": map[string]any{"file": targetPath},
 						"content": "package probe\n\nfunc Sibling() int { return 3 }\n",
-						"output": map[string]any{"format": "json"},
+						"output":  map[string]any{"format": "json"},
 					})
 					require.False(t, ack.IsError, resultText(ack))
 					require.Equal(t, true, extractTextResult(t, ack)["readback_exact"])
