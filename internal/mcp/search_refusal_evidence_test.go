@@ -161,9 +161,9 @@ func TestRegisteredNativeLiteralRefusalEvidenceIdentifiesFinalValidation(t *test
 	leaf, ok := s.facades.legacy("search_symbols")
 	require.True(t, ok)
 	type answer struct {
-		ctx context.Context
+		ctx    context.Context
 		result *mcplib.CallToolResult
-		err error
+		err    error
 	}
 	held, answered := make(chan answer, 1), make(chan answer, 1)
 	released := make(chan struct{})
