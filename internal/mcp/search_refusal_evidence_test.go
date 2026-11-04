@@ -93,7 +93,7 @@ func TestRegisteredNativeSearchRefusalEvidenceIsOptIn(t *testing.T) {
 				return
 			}
 			require.True(t, present, "an opted-in real refusal must identify its existing failure site")
-			require.Equal(t, map[string]any{"stage": "bind.refresh", "capture_state": "unsealed"}, evidence)
+			require.Equal(t, map[string]any{"stage": "bind.refresh/live/superseded_nil", "capture_state": "unsealed"}, evidence)
 			encoded, err := json.Marshal(evidence)
 			require.NoError(t, err)
 			require.LessOrEqual(t, len(encoded), 128, "fixed scalar evidence cannot retain request or source payloads")
@@ -140,7 +140,7 @@ func TestSearchRefusalEvidenceKeepsDefaultErrorAndBoundedScalars(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, pendingSymbolCaptureKey{}, capture)
 		}
-		for stage := searchRefusalBindInherited; stage <= searchRefusalResponseValidation; stage++ {
+		for stage := searchRefusalBindInherited; stage <= searchRefusalRefreshCancelledView; stage++ {
 			marked := annotateSearchRefusal(ctx, stage, cause)
 			require.ErrorIs(t, marked, cause)
 			require.Equal(t, cause.Error(), marked.Error())

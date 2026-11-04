@@ -19,6 +19,12 @@ const (
 	searchRefusalBindFinal
 	searchRefusalNameCandidates
 	searchRefusalResponseValidation
+	searchRefusalRefreshLiveNil
+	searchRefusalRefreshLiveView
+	searchRefusalRefreshDeadlineNil
+	searchRefusalRefreshDeadlineView
+	searchRefusalRefreshCancelledNil
+	searchRefusalRefreshCancelledView
 )
 
 func (stage searchRefusalStage) label() string {
@@ -39,6 +45,18 @@ func (stage searchRefusalStage) label() string {
 		return "leaf.name_candidates"
 	case searchRefusalResponseValidation:
 		return "response.projection_validation"
+	case searchRefusalRefreshLiveNil:
+		return "bind.refresh/live/superseded_nil"
+	case searchRefusalRefreshLiveView:
+		return "bind.refresh/live/superseded_view"
+	case searchRefusalRefreshDeadlineNil:
+		return "bind.refresh/deadline/superseded_nil"
+	case searchRefusalRefreshDeadlineView:
+		return "bind.refresh/deadline/superseded_view"
+	case searchRefusalRefreshCancelledNil:
+		return "bind.refresh/cancelled/superseded_nil"
+	case searchRefusalRefreshCancelledView:
+		return "bind.refresh/cancelled/superseded_view"
 	default:
 		return ""
 	}
@@ -85,6 +103,31 @@ func annotateSearchRefusal(ctx context.Context, stage searchRefusalStage, err er
 		}
 	}
 	return &searchRefusalDiagnostic{cause: err, stage: stage, captureState: state}
+}
+
+// Refusal-only observations, not an inference about the underlying race:
+// superseded means a nonnil typed refresh error; nil/view is its returned
+// projection, and live/deadline/cancelled is the child context at this site.
+// A nil view without an error is canonical handoff, never a refusal.
+func annotateSearchRefreshRefusal(ctx, child context.Context, view *projectionEntry, err error) error {
+	if !errors.Is(err, projectionSuperseded) || os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") != "1" {
+		return err
+	}
+	stage := searchRefusalBindRefresh
+	if child != nil {
+		switch child.Err() {
+		case nil:
+			stage = searchRefusalRefreshLiveNil
+		case context.DeadlineExceeded:
+			stage = searchRefusalRefreshDeadlineNil
+		case context.Canceled:
+			stage = searchRefusalRefreshCancelledNil
+		}
+		if view != nil && stage != searchRefusalBindRefresh {
+			stage++ // Each closed context category has adjacent nil/view labels.
+		}
+	}
+	return annotateSearchRefusal(ctx, stage, err)
 }
 
 func searchRefusalToolResult(err error) *mcplib.CallToolResult {

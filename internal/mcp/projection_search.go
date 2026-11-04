@@ -305,7 +305,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 				}
 			}
 			if err != nil {
-				return ctx, annotateSearchRefusal(ctx, searchRefusalBindRefresh, err)
+				return ctx, annotateSearchRefreshRefusal(ctx, refreshCtx, current, err)
 			}
 			if current == nil {
 				continue // the existing helper checked actual canonical content

@@ -105,3 +105,50 @@ func TestRegisteredSearchRefreshRefusalIdentifiesExpiredChildContext(t *testing.
 	t.Log("REFRESH_CONTEXT_PREMISES_VERIFIED: actual registered COW, original child deadline expired, typed refusal unchanged")
 	require.Equal(t, map[string]any{"stage": "bind.refresh/deadline/superseded_nil", "capture_state": "unsealed"}, result.Meta.AdditionalFields["gortex_search_refusal"])
 }
+
+type searchRefreshUnobservedContext struct{ context.Context }
+
+func (searchRefreshUnobservedContext) Err() error {
+	panic("disabled or non-refusal annotation must not inspect child context")
+}
+
+func TestSearchRefreshRefusalEvidenceKeepsDefaultAndClosedOutcomes(t *testing.T) {
+	unobserved := searchRefreshUnobservedContext{context.Background()}
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "")
+	require.True(t, annotateSearchRefreshRefusal(t.Context(), unobserved, nil, projectionSuperseded) == projectionSuperseded)
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+	require.Nil(t, annotateSearchRefreshRefusal(t.Context(), unobserved, nil, nil), "canonical nil view without error stays successful")
+	require.Nil(t, annotateSearchRefreshRefusal(t.Context(), unobserved, &projectionEntry{}, nil))
+	require.ErrorIs(t, annotateSearchRefreshRefusal(t.Context(), unobserved, nil, context.Canceled), context.Canceled)
+	unknown := searchRefusalToolResult(annotateSearchRefreshRefusal(t.Context(), nil, nil, projectionSuperseded))
+	require.Equal(t, map[string]any{"stage": "bind.refresh", "capture_state": "none"}, unknown.Meta.AdditionalFields["gortex_search_refusal"])
+	expired, finishExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer finishExpired()
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	for _, tc := range []struct {
+		name  string
+		child context.Context
+	}{
+		{name: "live", child: t.Context()},
+		{name: "deadline", child: expired},
+		{name: "cancelled", child: cancelled},
+	} {
+		for _, hasView := range []bool{false, true} {
+			var view *projectionEntry
+			outcome := "nil"
+			if hasView {
+				view = &projectionEntry{}
+				outcome = "view"
+			}
+			marked := annotateSearchRefreshRefusal(t.Context(), tc.child, view, projectionSuperseded)
+			require.ErrorIs(t, marked, projectionSuperseded)
+			require.Equal(t, projectionSuperseded.Error(), marked.Error())
+			result := searchRefusalToolResult(marked)
+			require.Equal(t, map[string]any{"stage": "bind.refresh/" + tc.name + "/superseded_" + outcome, "capture_state": "none"}, result.Meta.AdditionalFields["gortex_search_refusal"])
+			encoded, err := json.Marshal(result.Meta)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(encoded), 128)
+		}
+	}
+}
