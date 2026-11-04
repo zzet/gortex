@@ -612,6 +612,23 @@ func (p editProbePlan) budget(deadline time.Duration, builds int) (time.Duration
 		return 0, errors.New("edit-probe deadline overflow")
 	}
 	drain := int64(deadline) * int64(builds)
+	if p.SearchReadbackAcceptance {
+		// Actual dispatch is FIFO per editor through its four searches.
+		// A turn receives its own transaction deadline only after that wait,
+		// so last offered due plus one deadline cannot bound the queued work.
+		// Keep the existing drain after the last bounded turn. This is only
+		// a ceiling: the scheduler joins and returns as soon as all turns end.
+		finished := make(map[int]int64)
+		tail = 0
+		for _, step := range p.Steps {
+			start := max(step.DueNS, finished[step.Editor])
+			if step.DueNS < 0 || start > math.MaxInt64-drain {
+				return 0, errors.New("edit-probe search completion budget overflow or invalid due")
+			}
+			finished[step.Editor] = start + drain
+			tail = max(tail, finished[step.Editor])
+		}
+	}
 	if p.NoEditWindow < 0 || tail > math.MaxInt64-drain || tail+drain > math.MaxInt64-p.NoEditWindow {
 		return 0, errors.New("edit-probe run budget overflow")
 	}
