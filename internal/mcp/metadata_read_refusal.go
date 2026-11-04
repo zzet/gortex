@@ -2,8 +2,8 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
- "encoding/json"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 )
@@ -62,13 +62,21 @@ func (s *Server) pendingEmptyMetadataRead(ctx context.Context, req mcplib.CallTo
 // Do not let error decoration wait on the same unavailable reader that caused
 // it. Generic errors retain their existing decoration and wire behavior.
 func metadataTransientRefusal(result *mcplib.CallToolResult) bool {
- if result == nil || !result.IsError { return false }
- text, ok := singleTextContent(result)
- if !ok { return false }
- var body StructuredError
- if json.Unmarshal([]byte(text), &body) != nil { return false }
- if body.ErrorCode != ErrCodeProjectionSuperseded && body.ErrorCode != ErrCodeFileViewPending { return false }
- scope, scoped := body.Data["retry_scope"].(string)
- unknown, deliveryKnown := body.Data["delivery_unknown"].(bool)
- return body.Retriable && scoped && scope == "read_only" && deliveryKnown && !unknown
+	if result == nil || !result.IsError {
+		return false
+	}
+	text, ok := singleTextContent(result)
+	if !ok {
+		return false
+	}
+	var body StructuredError
+	if json.Unmarshal([]byte(text), &body) != nil {
+		return false
+	}
+	if body.ErrorCode != ErrCodeProjectionSuperseded && body.ErrorCode != ErrCodeFileViewPending {
+		return false
+	}
+	scope, scoped := body.Data["retry_scope"].(string)
+	unknown, deliveryKnown := body.Data["delivery_unknown"].(bool)
+	return body.Retriable && scoped && scope == "read_only" && deliveryKnown && !unknown
 }
