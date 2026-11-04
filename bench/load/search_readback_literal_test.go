@@ -41,7 +41,7 @@ func TestSearchReadbackLiteralExistsOnlyAfterOfferedRename(t *testing.T) {
 		if old == "" || !strings.Contains(corpus.EditInitialContent, old) || strings.Contains(replacement, old) {
 			t.Fatalf("edit%d negative probe lost the exact removed name: %q", index, old)
 		}
-		if got := searchReadbackRequest("search_visible", repo, step).Arguments["query"]; got != step.Marker {
+		if got := searchReadbackRequest("search_visible", repo, step).Arguments["query"]; got != "name:"+step.Marker {
 			t.Fatalf("symbol name query changed: %v", got)
 		}
 	}

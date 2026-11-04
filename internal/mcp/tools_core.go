@@ -1826,6 +1826,13 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// explicit kind / repo / project arguments.
 	fq := parseFieldQuery(q)
 	q = fq.Text
+	// A field-only name query still needs a retrieval needle on native
+	// backends, which reject empty text. Keep the residual query unchanged
+	// for field filtering, relaxation, literal fallback and response metadata.
+	candidateQuery := q
+	if candidateQuery == "" && fq.Name != "" {
+		candidateQuery = fq.Name
+	}
 	scopeReq := requestWithInlineScopeClauses(req, fq)
 
 	// Apply server-default scope merged with caller args. `workspace`
@@ -2095,10 +2102,10 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	var nodes []*graph.Node
 	var primaryCount int
 	if len(expandedTerms) > 0 {
-		nodes, primaryCount = fetchAndMergeBM25TimedContext(ctx, requestEngine, q, expandedTerms, fetchLimit, scope, timings)
+		nodes, primaryCount = fetchAndMergeBM25TimedContext(ctx, requestEngine, candidateQuery, expandedTerms, fetchLimit, scope, timings)
 	} else {
 		bm25Start := time.Now()
-		nodes = searchSymbolsScopedContext(ctx, requestEngine, q, fetchLimit, scope)
+		nodes = searchSymbolsScopedContext(ctx, requestEngine, candidateQuery, fetchLimit, scope)
 		timings.BM25PrimaryMS += time.Since(bm25Start).Milliseconds()
 		primaryCount = len(nodes)
 	}
@@ -2116,14 +2123,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// merge dedupes by node ID; ranking among the merged set is settled
 	// by the rerank pass downstream.
 	if corpus.includesDocs() {
-		nodes = s.mergeDocChannel(ctx, q, nodes, fetchLimit, scope, timings)
+		nodes = s.mergeDocChannel(ctx, candidateQuery, nodes, fetchLimit, scope, timings)
 	}
 	// Content retrieval channel: content (data_class=content) sections live
 	// in the dedicated content index, not the symbol search, so the fetches
 	// above can't surface them — pull them from the ContentSearcher and
 	// merge before the corpus filter runs.
 	if corpus.includesContent() {
-		nodes = s.mergeContentChannel(ctx, q, nodes, fetchLimit)
+		nodes = s.mergeContentChannel(ctx, candidateQuery, nodes, fetchLimit)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

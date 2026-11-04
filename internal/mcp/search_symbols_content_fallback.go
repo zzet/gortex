@@ -83,6 +83,8 @@ func (s *Server) searchSymbolsContentFallback(
 		return nil
 	}
 
+	disablePendingSymbolCapture(ctx)
+
 	boundedCtx, cancel := context.WithTimeout(ctx, s.sourceLiteralRecallBudget())
 	defer cancel()
 	search := s.searchExploreSourceLiteral(

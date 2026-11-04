@@ -31,6 +31,12 @@ func countContractJob(mode, outcome string, elapsed time.Duration) {
 	viewmetrics.Observe(viewmetrics.ContractAnalysisJobSeconds, elapsed, mode)
 }
 
+// countContractLinkedJob records one scheduling event of a linked-checkout
+// actor's job under policy.
+func countContractLinkedJob(policy ContractLinkedPolicy, event string) {
+	viewmetrics.Count(viewmetrics.ContractLinkedJobsTotal, string(policy), event)
+}
+
 // countContractBaseline records a baseline admission answer or job outcome.
 func countContractBaseline(outcome string) {
 	viewmetrics.Count(viewmetrics.ContractBaselineTotal, outcome)

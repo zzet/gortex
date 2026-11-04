@@ -13,12 +13,12 @@ func TestNightlyUnionPreservesStrictSearchACKAndSmokeOptions(t *testing.T) {
 	if _, err := parseRun(append(args, "--edit-ack=full")); err == nil {
 		t.Fatal("source union weakened B's full-ACK refusal")
 	}
-	read := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", "read", "--agents", "8", "--edit-agents", "0", "--worktrees", "0", "--duration", "20s", "--deadline", "120s", "--nightly-workload-seed", "search-delay-v1"}
-	options, err = parseRun(read)
+	edit := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", "edit", "--agents", "0", "--edit-agents", "4", "--worktrees", "0", "--duration", "20s", "--deadline", "120s", "--nightly-workload-seed", "search-delay-v1"}
+	options, err = parseRun(edit)
 	if err != nil || options.NightlySeed != "search-delay-v1" || options.PRSmokeDrain != 0 {
 		t.Fatalf("nightly union lost: %+v %v", options, err)
 	}
-	if _, err := parseRun(append(read, "--pr-smoke-drain=2m", "--pr-smoke-drain-version=1")); err == nil {
+	if _, err := parseRun(append(edit, "--pr-smoke-drain=2m", "--pr-smoke-drain-version=1")); err == nil {
 		t.Fatal("nightly fault accepted smoke-only offered/drain envelope")
 	}
 }

@@ -96,3 +96,29 @@ func TestTrackerConcurrentKindsBalance(t *testing.T) {
 		t.Fatalf("epoch = %d, want %d", snapshot.Epoch, workers*2)
 	}
 }
+
+func TestTrackerKindEpochCountsTransitionsOfItsKind(t *testing.T) {
+	tracker := NewTracker()
+	tracker.Begin("mcp")
+	tracker.End("mcp")
+	tracker.Begin("watcher")
+	if got := tracker.KindEpoch("mcp"); got != 2 {
+		t.Fatalf("mcp epoch after a call that came and went = %d, want 2", got)
+	}
+	if got := tracker.KindEpoch("watcher"); got != 1 {
+		t.Fatalf("watcher epoch = %d, want 1", got)
+	}
+	tracker.End("watcher")
+	tracker.Begin("")
+	if got := tracker.KindEpoch(""); got != 1 || tracker.KindEpoch("unspecified") != 1 {
+		t.Fatalf("unnamed kind epoch = %d, want 1 under its normalized name", got)
+	}
+	var zero Tracker
+	if got := zero.KindEpoch("mcp"); got != 0 {
+		t.Fatalf("zero-value tracker epoch = %d, want 0", got)
+	}
+	zero.Begin("mcp")
+	if got := zero.KindEpoch("mcp"); got != 1 {
+		t.Fatalf("zero-value tracker epoch after Begin = %d, want 1", got)
+	}
+}

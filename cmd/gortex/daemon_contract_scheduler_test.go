@@ -83,6 +83,9 @@ func daemonContractPublicationAndRepair(t *testing.T, observeRepair func(time.Du
 	var panicked atomic.Bool
 	runtime, err := installDaemonContractAnalysisWith(state, zap.New(core), func(options *indexer.ContractAnalysisCoordinatorOptions) {
 		require.NotNil(t, options.RetireReservation, "the daemon uses its existing lifecycle retirement owner")
+		require.Equal(t, indexer.ContractLinkedIdle, options.LinkedPolicy, "linked worktrees' fills wait for idle time by default")
+		require.NotNil(t, options.Demand, "the idle policy waits on the daemon's own foreground demand")
+		require.NotNil(t, options.LinkedInputs)
 		capture := options.Capture
 		options.Capture = func(ctx context.Context, source *indexer.ContractCaptureSource, inputs *graphview.SelectedContractInputs, repo, checkout string) (indexer.ContractFollowupSnapshot, []indexer.ContractFollowupTarget, error) {
 			if panicked.CompareAndSwap(false, true) {

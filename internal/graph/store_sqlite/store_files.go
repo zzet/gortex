@@ -169,6 +169,15 @@ func (s *Store) FileMetasForRepo(repoPrefix string) ([]graph.FileMetaRow, error)
 // (repo_prefix,file_path) primary key. Chunks stay below SQLite's conservative
 // host-parameter limit and avoid both a repository scan and one query per file.
 func (s *Store) FileMetasByPaths(repoPrefix string, filePaths []string) (map[string]graph.FileMetaRow, error) {
+	return s.FileMetasByPathsContext(context.Background(), repoPrefix, filePaths)
+}
+
+// FileMetasByPathsContext carries the caller's existing allowance through pool
+// admission and SQLite reads. Legacy callers retain their unbounded API above.
+func (s *Store) FileMetasByPathsContext(ctx context.Context, repoPrefix string, filePaths []string) (map[string]graph.FileMetaRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := make(map[string]graph.FileMetaRow, len(filePaths))
 	for start := 0; start < len(filePaths); start += fileMetaChunk {
 		end := start + fileMetaChunk
@@ -189,7 +198,7 @@ func (s *Store) FileMetasByPaths(repoPrefix string, filePaths []string) (map[str
 		}
 		stmt = append(stmt, ')')
 
-		rows, err := s.db.Query(string(stmt), args...)
+		rows, err := s.db.QueryContext(ctx, string(stmt), args...)
 		if err != nil {
 			return nil, err
 		}
@@ -208,6 +217,9 @@ func (s *Store) FileMetasByPaths(repoPrefix string, filePaths []string) (map[str
 		if err := rows.Close(); err != nil {
 			return nil, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

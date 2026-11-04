@@ -232,6 +232,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// A facade call is lowered to its legacy name once here; both of the
 		// gates below read that name rather than resolving it twice.
 		legacyName, _ := s.legacyToolName(&req)
+		ctx = withPendingSymbolCapture(ctx, legacyName)
 		auditedProjectionRead := auditedProjectionReadRetry(legacyName, req)
 		controlOperation := checkoutControlOperationName(legacyName)
 		batchContinuation := s.isBatchContinuation(legacyName, &req)

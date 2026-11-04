@@ -66,9 +66,14 @@ func TestDispatcher_PendingDiscoveryStaysInItsWorktree(t *testing.T) {
 	// cancellation, like Git on a hung mount.
 	stuck, nested := filepath.Join(base, "stuck"), filepath.Join(primary, "nested")
 	release := make(chan struct{})
+	selectedEntered := make(chan struct{})
+	var selectedOnce sync.Once
 	t.Cleanup(func() { close(release) })
 	reconcile.WithHEADSampler(func(ctx context.Context, root string) (gitstate.HEADState, error) {
 		if root = pathkey.CanonicalExistingRoot(root); pathkey.HasPathPrefix(root, stuck) || pathkey.HasPathPrefix(root, nested) {
+			if pathkey.EqualPaths(root, stuck) {
+				selectedOnce.Do(func() { close(selectedEntered) })
+			}
 			<-release
 			return gitstate.HEADState{}, errors.New("released hung HEAD sample")
 		}
@@ -108,6 +113,23 @@ func TestDispatcher_PendingDiscoveryStaysInItsWorktree(t *testing.T) {
 		require.NoError(t, os.Mkdir(cwd, 0o700))
 		stuckSessions[i] = &daemon.Session{ID: fmt.Sprintf("stuck-%d", i), CWD: cwd}
 	}
+	// Admit one dedicated session before the burst and observe its actual
+	// hung HEAD sampler. A historical in_progress response alone can outlive
+	// its worker or precede admission, and is not this ownership witness.
+	selectedPath := filepath.Join(stuck, "selected-worker")
+	require.NoError(t, os.Mkdir(selectedPath, 0o700))
+	selectedSession := &daemon.Session{ID: "selected-stuck-worker", CWD: selectedPath}
+	for {
+		data := errorData(t, dispatchJSON(t, d, selectedSession, searchFrame))
+		select {
+		case <-selectedEntered:
+			goto selectedWorkerObserved
+		default:
+		}
+		require.Equal(t, "in_progress", data["reason"], "selected fixture worker did not reach its actual HEAD sampler: %v", data)
+		require.NoError(t, ctx.Err())
+	}
+selectedWorkerObserved:
 	stuckReplies := make([][]byte, len(stuckSessions))
 	stuckErrs := make([]error, len(stuckSessions))
 	for range 2 {
@@ -120,20 +142,9 @@ func TestDispatcher_PendingDiscoveryStaysInItsWorktree(t *testing.T) {
 
 	// The checks below run once the hung discovery is past its work deadline
 	// and still running: a session waiting on it is then refused as draining.
-	waiting := -1
-	for i, raw := range stuckReplies {
-		require.NoError(t, stuckErrs[i])
-		var parsed map[string]any
-		require.NoError(t, json.Unmarshal(raw, &parsed))
-		if errorData(t, parsed)["reason"] == "in_progress" {
-			waiting = i
-			break
-		}
-	}
-	require.NotEqual(t, -1, waiting, "no session waits on a hung discovery")
 	drainBy := time.Now().Add(6 * time.Second)
 	for {
-		data := errorData(t, dispatchJSON(t, d, stuckSessions[waiting], searchFrame))
+		data := errorData(t, dispatchJSON(t, d, selectedSession, searchFrame))
 		if data["reason"] == "draining" {
 			break
 		}

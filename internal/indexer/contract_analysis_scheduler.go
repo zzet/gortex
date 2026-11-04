@@ -149,6 +149,10 @@ type ContractScheduleRequest struct {
 	// PriorityTarget is an explicit response-target hint. Accepted edits are
 	// prioritized independently, including actors reached through repo: *.
 	PriorityTarget bool
+	// Strict marks a request whose caller waits on this request's promise.
+	// For the rest of the caller's budget, at most the interest TTL, the
+	// actor's jobs start and run outside its linked policy.
+	Strict bool
 }
 
 // ContractScheduleOutcome is what Schedule did with a request.
@@ -332,6 +336,16 @@ type contractActor struct {
 	interestUntil time.Time
 	// interestExpired remembers work suspended when its interest ran out.
 	interestExpired bool
+	// held is set once a queued linked actor's policy held it back
+	// (contract_linked_schedule.go), so the hold is counted once and its
+	// ring woken; leaving the queue clears it. Whether the policy holds
+	// the actor now is linkedHeldLocked. linkedStartedAt is when a linked
+	// actor was last picked.
+	held            bool
+	linkedStartedAt time.Time
+	// strictUntil is when the last strict request's budget ends: until then
+	// no linked policy holds or stops the actor's jobs.
+	strictUntil time.Time
 	// A lost/rejected partial checkpoint must not restart the same prefix forever.
 	fillNeedsCheckpoint bool
 	fillCheckpoint      ContractFillCheckpointStatus
@@ -532,7 +546,11 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 		return result, nil
 	}
 	if a == nil {
-		if c.activeLocked() >= c.options.QueueCapacity {
+		// A linked actor the idle policy holds pins no source, slot or
+		// lease and may wait out a long busy spell: it takes no queue
+		// capacity, so a worktree opened under load still records its
+		// interest. Held actors count against the registry instead.
+		if active, held := c.activeLocked(now); active-held >= c.options.QueueCapacity || active >= contractSchedulerMaxActors {
 			// A known actor is never refused; a new one is, and asks again
 			// once a job's time has passed.
 			label = viewmetrics.ContractRequestQueueFull
@@ -541,6 +559,9 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 		a = c.registerLocked(req.Actor, now)
 	}
 	a.interestUntil, a.lastUsed = now.Add(contractInterestTTL), now
+	if req.Strict {
+		c.markStrictLocked(ctx, a, now)
+	}
 	defer func() {
 		if label == viewmetrics.ContractRequestAdmitted || label == viewmetrics.ContractRequestCoalesced {
 			switch {
@@ -643,15 +664,19 @@ func (c *ContractAnalysisCoordinator) registerLocked(id ContractActor, now time.
 	return a
 }
 
-// activeLocked counts actors with pending or running work.
-func (c *ContractAnalysisCoordinator) activeLocked() int {
-	active := 0
+// activeLocked counts actors with pending or running work and, of those, the
+// queued ones the idle policy holds at now.
+func (c *ContractAnalysisCoordinator) activeLocked(now time.Time) (active, held int) {
 	for _, a := range c.actors {
-		if a.hasWork() {
-			active++
+		if !a.hasWork() {
+			continue
+		}
+		active++
+		if a.state == contractActorQueued && c.idleHeldLocked(a, now) {
+			held++
 		}
 	}
-	return active
+	return active, held
 }
 
 // retryAfterLocked is when a refused request should ask again: the mean job
@@ -667,7 +692,7 @@ func (c *ContractAnalysisCoordinator) retryAfterLocked() time.Duration {
 // setStateLocked moves an actor to state, stepping the capacity epoch when it
 // leaves pending or running work.
 func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state contractActorState) {
-	had := a.hasWork()
+	had, was := a.hasWork(), a.state
 	a.state = state
 	if state != contractActorDeferred {
 		a.deferred = ""
@@ -678,16 +703,27 @@ func (c *ContractAnalysisCoordinator) setStateLocked(a *contractActor, state con
 	if state != contractActorIdle {
 		a.repairWait = contractRepairWaitNone
 	}
+	if state != contractActorQueued {
+		a.held = false
+	}
 	if had && !a.hasWork() {
-		c.capacityEpoch++
-		close(c.capacityChanged)
-		c.capacityChanged = make(chan struct{})
+		c.capacityFreedLocked()
 	}
 	if a.dirty && state != contractActorRunning && state != contractActorCapturing {
 		// A Published that arrived during the job is captured now.
 		a.ring.signal()
 	}
+	if !a.primary() && c.options.LinkedPolicy == ContractLinkedThrottled && (was == contractActorCapturing || was == contractActorRunning) && state != contractActorCapturing && state != contractActorRunning {
+		c.wakeHeldLocked()
+	}
 	a.notifyLocked()
+}
+
+// capacityFreedLocked steps the capacity epoch and wakes its waiters.
+func (c *ContractAnalysisCoordinator) capacityFreedLocked() {
+	c.capacityEpoch++
+	close(c.capacityChanged)
+	c.capacityChanged = make(chan struct{})
 }
 
 // enqueueLocked queues an actor at the back of its home ring.
@@ -709,14 +745,17 @@ func (c *ContractAnalysisCoordinator) expireLocked(now time.Time) {
 		if now.Before(a.interestUntil) {
 			continue
 		}
-		switch a.state {
-		case contractActorDeferred, contractActorBackoff:
+		switch {
+		case a.state == contractActorDeferred, a.state == contractActorBackoff, a.state == contractActorQueued && c.idleHeldLocked(a, now):
+			// A linked actor the idle policy still holds, and no request
+			// asked for again, is dropped like any other waiting work. One
+			// waiting only for its turn is not.
 			a.interestExpired = true
 			a.want.source.Release()
 			a.want.source = nil
 			a.retryOnInputs, a.dirty = false, false
 			c.setStateLocked(a, contractActorIdle)
-		case contractActorIdle:
+		case a.state == contractActorIdle:
 			// A stale primary capture can wait here with an unresolved
 			// promise. Preserve its suspended intent before dropping the
 			// Published retry; a fresh RPC may renew it after the TTL.
@@ -949,12 +988,14 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			open = c.ctx.Err() == nil
 		}
 	}()
+	demand := c.idleDemand()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return false
 	}
 	now := c.now()
+	c.noteDemandLocked(now, demand)
 	c.expireLocked(now)
 	wait := time.Duration(-1)
 	for _, a := range ring.actors {
@@ -978,16 +1019,31 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			return true
 		}
 	}
+	// Pick the first queued actor its linked policy lets start. A held one
+	// keeps its place, so a primary actor behind it is not held up.
 	var next *contractActor
-	for len(ring.queue) > 0 && next == nil {
-		if candidate := ring.queue[0]; candidate.state == contractActorQueued {
-			next = candidate
+	var unpinned []*ContractCaptureSource
+	for i := 0; i < len(ring.queue) && next == nil; {
+		candidate := ring.queue[i]
+		if candidate.state != contractActorQueued {
+			ring.queue = slices.Delete(ring.queue, i, i+1)
+			continue
 		}
-		ring.queue = ring.queue[1:]
+		if held, recheck := c.linkedHoldLocked(candidate, now); held {
+			unpinned = append(unpinned, c.holdLocked(candidate))
+			if recheck > 0 && (wait < 0 || recheck < wait) {
+				wait = recheck
+			}
+			i++
+			continue
+		}
+		next = candidate
+		ring.queue = slices.Delete(ring.queue, i, i+1)
 	}
 	if next == nil {
 		wake := ring.wake
 		c.mu.Unlock()
+		releaseContractSources(unpinned)
 		var timeout <-chan time.Time
 		if wait >= 0 {
 			timer := time.NewTimer(wait)
@@ -1005,9 +1061,13 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 	want := next.want
 	next.want.source = nil
 	next.running.contractActorKeySeq = contractActorKeySeq{want.key, want.seq}
+	if !next.primary() {
+		next.linkedStartedAt = now
+	}
 	trigger, triggeredAt := next.trigger, next.triggeredAt
 	c.setStateLocked(next, contractActorCapturing)
 	c.mu.Unlock()
+	releaseContractSources(unpinned)
 	c.startActor(next, want, trigger, triggeredAt)
 	return true
 }
@@ -1335,9 +1395,17 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}()
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
+	demand := c.linkedDemand(a)
 	c.mu.Lock()
 	a.running.cancel = cancel
+	// Demand that returned while the job waited for the slot sends it back
+	// to wait before it captures anything.
+	again := c.linkedHeldAgainLocked(a, demand)
 	c.mu.Unlock()
+	if again {
+		c.endLinkedDeferred(a, want, trigger, triggeredAt)
+		return
+	}
 	captureStart := time.Now()
 	if !a.primary() && source == nil {
 		c.mu.Lock()
@@ -1588,6 +1656,7 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	if (a.primary() || c.options.LinkedInputs != nil) && canContinueFill {
 		job.otherActorWaiting = func() bool { return c.otherActorWaiting(a) }
 	}
+	c.linkJob(a, job)
 	// Registered after capture succeeds and before the body starts. Returning
 	// cache custody precedes panic recovery; a panic discards its unproven state.
 	returnedCache := false
@@ -1627,8 +1696,22 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 
 	c.options.Logger.Info("contract cache borrow", zap.String("actor", a.id.String()), zap.Bool("cache_present", cached != nil), zap.Bool("complete", cacheComplete), zap.Int64("checkpoint_bytes", cacheBytes), zap.Int64("retained_bytes", retainedBytes), zap.Uint64("registry_evictions", registryEvictions), zap.Bool("interest_expired", interestExpired))
 
+	demand = c.linkedDemand(a)
 	c.mu.Lock()
+	if c.linkedHeldAgainLocked(a, demand) {
+		// Demand returned during the capture: no job body starts while a
+		// call is in flight. The borrowed cache goes back unchanged.
+		c.mu.Unlock()
+		returnCache(session.cache)
+		release()
+		source.Release()
+		c.endLinkedDeferred(a, want, trigger, triggeredAt)
+		return
+	}
 	c.setStateLocked(a, contractActorRunning)
+	c.countLinkedStartLocked(a, job)
+	// The job's yield looks for demand past what its start already saw.
+	job.demandSeq.Store(c.demandSeq)
 	c.mu.Unlock()
 	run := c.execute
 	if c.run != nil {
@@ -1636,6 +1719,9 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	}
 	body := time.Now()
 	outcome := run(job)
+	if job.stoppedForDemand(outcome) {
+		countContractLinkedJob(job.linkedPolicy, viewmetrics.ContractLinkedCheckpointStopped)
+	}
 	returnCache(session.cache)
 	release()
 	source.Release()
@@ -1646,8 +1732,17 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 func (c *ContractAnalysisCoordinator) otherActorWaiting(current *contractActor) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.otherActorWaitingLocked(current, c.now())
+}
+
+func (c *ContractAnalysisCoordinator) otherActorWaitingLocked(current *contractActor, now time.Time) bool {
 	for _, actor := range c.actors {
-		if actor != current && (actor.state == contractActorQueued || actor.state == contractActorCapturing) {
+		if actor == current {
+			continue
+		}
+		// A queued actor its linked policy holds cannot take the slot, so
+		// no running fill stops at a checkpoint for it.
+		if actor.state == contractActorCapturing || actor.state == contractActorQueued && !c.linkedHeldLocked(actor, now) {
 			return true
 		}
 	}

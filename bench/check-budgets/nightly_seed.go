@@ -23,14 +23,15 @@ func validateNightlySeed(c laneConfig) error {
 }
 
 // Raw fault identity is separate from the normalized offered workload. It must
-// agree with the selected candidate cell; MAIN/tag and other cells stay clean.
+// agree with candidate/loadedit-4, whose search latency has an absolute budget;
+// MAIN/tag and other cells stay clean.
 func validateNightlySeedReport(c inputs, input runInput, r report) error {
 	expected := ""
 	if c.NightlySeed != nil {
 		if err := validateNightlySeed(laneConfig{Lane: "nightly", NightlySeed: c.NightlySeed, Builds: map[string]laneBuild{"candidate": {Revision: c.CandidateRevision}}}); err != nil {
 			return err
 		}
-		if input.Role == "candidate" && input.Scenario == "load-8" {
+		if input.Role == "candidate" && input.Scenario == "loadedit-4" {
 			expected = c.NightlySeed.Kind
 		}
 	}

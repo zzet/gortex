@@ -988,7 +988,9 @@ func e2eMatrixNoopCases() []e2eMatrixNoopCase {
 			Name: "repeated_samples", Gate: "gate2",
 			Apply: func(h *e2eMatrixNoopHarness) {
 				for i := 0; i < 8; i++ {
-					h.f.command(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+					if _, err := h.f.tryJSONCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress"); err != nil {
+						h.f.t.Fatalf("isolated JSON status: %v", err)
+					}
 					h.mustAnswer(h.probeName, h.probePath)
 				}
 			},
@@ -1181,7 +1183,7 @@ func (h *e2eMatrixNoopHarness) payloadOf(rel string) e2eMatrixPayload {
 }
 
 func (h *e2eMatrixNoopHarness) counters() (map[string]int64, error) {
-	output, err := h.f.tryCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
+	output, err := h.f.tryJSONCommand(e2eMatrixCommandTimeout, h.f.primary, "daemon", "status", "--format", "json", "--no-progress")
 	if err != nil {
 		return nil, fmt.Errorf("daemon status --format json unavailable: %w", err)
 	}

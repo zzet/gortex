@@ -267,6 +267,100 @@
                 "expected_outcome": {
                   "type": "string"
                 },
+                "failure_rpc": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "daemon_version": {
+                          "type": "string"
+                        },
+                        "is_error": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "is_error_presence_known": {
+                          "type": "boolean"
+                        },
+                        "is_error_present": {
+                          "type": "boolean"
+                        },
+                        "observed_facade": {},
+                        "observed_facade_presence_known": {
+                          "type": "boolean"
+                        },
+                        "observed_facade_present": {
+                          "type": "boolean"
+                        },
+                        "offered_profile_known": {
+                          "type": "boolean"
+                        },
+                        "offered_tools": {
+                          "type": "string"
+                        },
+                        "offered_tools_mode": {
+                          "type": "string"
+                        },
+                        "request_bytes": {
+                          "type": "integer"
+                        },
+                        "request_status": {
+                          "type": "string"
+                        },
+                        "request_wire_base64": {
+                          "type": "string"
+                        },
+                        "response_bytes": {
+                          "type": "integer"
+                        },
+                        "response_status": {
+                          "type": "string"
+                        },
+                        "response_wire_base64": {
+                          "type": "string"
+                        },
+                        "schema_version": {
+                          "type": "integer"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "wire_id": {
+                          "type": "integer"
+                        },
+                        "write_completed": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "schema_version",
+                        "status",
+                        "wire_id",
+                        "request_status",
+                        "response_status",
+                        "request_bytes",
+                        "response_bytes",
+                        "write_completed",
+                        "is_error_presence_known",
+                        "is_error_present",
+                        "is_error",
+                        "observed_facade_present",
+                        "observed_facade_presence_known",
+                        "offered_profile_known"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "logical_ms": {
                   "type": "number"
                 },
@@ -1918,6 +2012,36 @@
                           "type": [
                             "object",
                             "null"
+                          ]
+                        },
+                        "search_queue_wait_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_queued_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_turn_released_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "stale_claimed_fresh": {
@@ -4591,6 +4715,33 @@
     },
     "profile": {
       "type": "string"
+    },
+    "read_source_failure_capture": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "encoding": {
+              "type": "string"
+            },
+            "max_combined_wire_bytes": {
+              "type": "integer"
+            },
+            "max_records": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "max_records",
+            "max_combined_wire_bytes",
+            "encoding"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "request_plan_sha256": {
       "type": "string"
