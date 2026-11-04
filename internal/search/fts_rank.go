@@ -147,29 +147,40 @@ func ftsFoldTerm(t string) (string, bool) {
 // tokensOf splits text the way unicode61 does for ASCII: runs of letters and
 // digits, lower-cased. ok is false when text holds a non-ASCII byte.
 func ftsTokensOf(text string) ([]string, bool) {
-	var out []string
+	// Kept generation rows already retain text. Share their lowercase token
+	// bytes instead of allocating a string per token, and size the headers
+	// once instead of retaining a geometrically grown slice per document.
+	count := 0
+	inToken := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c >= 0x80 {
+			return nil, false
+		}
+		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if alnum && !inToken {
+			count++
+		}
+		inToken = alnum
+	}
+	if count == 0 {
+		return nil, true
+	}
+	out := make([]string, 0, count)
 	start := -1
-	b := []byte(text)
-	for i := 0; i <= len(b); i++ {
+	for i := 0; i <= len(text); i++ {
 		alnum := false
-		if i < len(b) {
-			c := b[i]
-			if c >= 0x80 {
-				return nil, false
-			}
-			switch {
-			case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-				alnum = true
-			case c >= 'A' && c <= 'Z':
-				b[i] = c + 'a' - 'A'
-				alnum = true
-			}
+		if i < len(text) {
+			c := text[i]
+			alnum = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 		}
 		if alnum && start < 0 {
 			start = i
 		}
 		if !alnum && start >= 0 {
-			out = append(out, string(b[start:i]))
+			// Lower only the token: a mixed-case row with large separators
+			// must not retain a second copy of all its punctuation.
+			out = append(out, strings.ToLower(text[start:i]))
 			start = -1
 		}
 	}
@@ -530,6 +541,8 @@ func FTSKeptDocs() (docs, bytes int64) { return ftsKeptDocs.Load(), ftsKeptBytes
 func ftsDocsBytes(rows []FTSRankRow, tokens [][]string) int64 {
 	// Allocation sizes, not lengths: a string's bytes are allocated in
 	// 8-byte (and larger) size classes, and a slice holds its capacity.
+	// Token bytes are conservatively counted even when ASCII tokens share
+	// their row's text; non-ASCII tokenizer results can own separate strings.
 	alloc := func(n int) int64 {
 		if n == 0 {
 			return 0
