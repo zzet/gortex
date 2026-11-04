@@ -144,3 +144,58 @@ func BenchmarkScanNodeSearchKeysVsAllNodes(b *testing.B) {
 		}
 	})
 }
+
+func TestScanNodeSearchKeysClosedStoreCannotProveExhaustion(t *testing.T) {
+	for _, betweenPages := range []bool{false, true} {
+		t.Run(fmt.Sprintf("between_pages_%t", betweenPages), func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "closed-search-keys.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed := false
+			closeStore := func() error {
+				err := store.Close()
+				closed = true
+				return err
+			}
+			t.Cleanup(func() {
+				if !closed {
+					if err := closeStore(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			store.AddNode(&graph.Node{ID: "a.go::A", Name: "A", Kind: graph.KindFunction, FilePath: "a.go"})
+			store.AddNode(&graph.Node{ID: "b.go::Target", Name: "Target", Kind: graph.KindFunction, FilePath: "b.go"})
+			if !betweenPages {
+				if err := closeStore(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := t.Context()
+			calls := 0
+			var closeErr error
+			err = store.ScanNodeSearchKeys(ctx, 1, func([]graph.NodeSearchKey) bool {
+				calls++
+				closeErr = closeStore()
+				return true
+			})
+			if err == nil {
+				t.Fatal("closed database returned successful empty/partial scan; this cannot prove search exhaustion")
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			wantCalls := 0
+			if betweenPages {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("pages = %d, want %d", calls, wantCalls)
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("fixture caller must remain live: %v", ctx.Err())
+			}
+		})
+	}
+}

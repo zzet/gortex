@@ -458,6 +458,13 @@ func generationReadProbes() []genProbe {
 			}
 			return nodeTokens(nodes)
 		}},
+		{name: "FindFoldedNameCandidatesContext", run: func(t *testing.T, s *Store) []string {
+			nodes, more, err := s.FindFoldedNameCandidatesContext(t.Context(), "Gen", 1000, graph.NameSearchFilter{RepoAllow: map[string]bool{genReadRepo: true}})
+			if err != nil || more {
+				t.Fatalf("folded generation head: more=%v err=%v", more, err)
+			}
+			return nodeTokens(nodes)
+		}},
 		{name: "FindNodesByNames", run: func(t *testing.T, s *Store) []string {
 			return nodeSliceMapTokens(s.FindNodesByNames(genReadProbeNames()))
 		}},
@@ -2283,6 +2290,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.NodePlacementBatchReader)(nil), probe: "NodePlacementsByIDs"},
 		{iface: (*graph.NodeSearchKeyScanner)(nil), probe: "ScanNodeSearchKeys"},
 		{iface: (*graph.FilteredContainingNameReader)(nil), probe: "FindNodesByNameContainingFilteredContext"},
+		{iface: (*graph.FoldedNameCandidateReader)(nil), probe: "FindFoldedNameCandidatesContext"},
 		{iface: (*graph.NodesByKindsScanner)(nil), probe: "NodesByKinds"},
 		{iface: (*graph.NodesByKindsSequencer)(nil), probe: "NodesByKindsSeq"},
 		{iface: (*graph.NodesInFilesByKindFinder)(nil), probe: "NodesInFilesByKind"},
