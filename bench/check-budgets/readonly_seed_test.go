@@ -13,13 +13,13 @@ import (
 // Synthetic arithmetic/contract inputs, never claimed runtime evidence.
 func TestReadOnlySeedCheckerRequiresMeasuredDoubling(t *testing.T) {
  for _, tc := range []struct{name string; on float64; want int; doubled bool}{
-  {"flag_without_slowdown",100,0,false},
-  {"below_double",199,0,false},
-  {"exact_double",200,1,true},
-  {"actual_second",1100,1,true},
+  {"flag_without_slowdown",1100,0,false},
+  {"below_double",2199,0,false},
+  {"exact_double",2200,1,true},
+  {"measured_double",3300,1,true},
  } {
   t.Run(tc.name,func(t *testing.T){
-   off,on := readonlySeedInputFiles(t,100,100,tc.on)
+   off,on := readonlySeedInputFiles(t,1100,1100,tc.on)
    var out, diagnostics bytes.Buffer
    code := run([]string{"seed-search","--off-inputs",off,"--on-inputs",on,"--host-class","reference_linux"}, &out,&diagnostics)
    if code != tc.want || !strings.Contains(out.String(),"search_symbols_p95") || !strings.Contains(out.String(),fmt.Sprintf("measured_doubling=%t",tc.doubled)) { t.Fatalf("unmeasured/incorrect gate: exit%d out=%s err=%s",code,&out,&diagnostics) }
