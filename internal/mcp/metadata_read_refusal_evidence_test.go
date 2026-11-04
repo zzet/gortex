@@ -42,6 +42,7 @@ func TestMetadataReadRefusalEvidenceCapturesActualPredicate(t *testing.T) {
 					entry.suspect.Store(false)
 					require.True(t, liveProjectionForAcknowledgement(entry))
 				}
+				t.Logf("METADATA_GUARD_CAUSAL flag=%q original_guard=%s refused=true suspect_restored=%v", flag, guard, guard == "suspect_before")
 				result := searchRefusalToolResult(refusal)
 				require.True(t, result.IsError)
 				require.Equal(t, projectionSuperseded.Error(), resultText(result))
@@ -122,6 +123,7 @@ func TestRegisteredMetadataReadRefusalEvidenceIsOptIn(t *testing.T) {
 				require.NoError(t, err)
 				require.NotEqual(t, before, after)
 				require.True(t, result.IsError)
+				t.Logf("REAL_METADATA_REFUSAL native_FTS=%d leaf_calls=%d remaining_original150=%s tool=%s physical_changed=true selected_facts_invalid=true flag=%q", fts, calls, remaining, tool, flag)
 				if flag != "1" {
 					if result.Meta != nil {
 						require.NotContains(t, result.Meta.AdditionalFields, "gortex_projection_refusal")
