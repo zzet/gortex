@@ -56,7 +56,7 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
   require.ErrorIs(t,validateRequestProjections(old.ctx),projectionSuperseded)
   require.True(t,time.Now().Before(deadline),"original150ms must be live at the actual physical peer transition")
   unblock();got:=<-answered;worker.Wait();require.NoError(t,got.err)
-  t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true",fts,tc.operation,time.Until(deadline))
+  t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t",fts,tc.operation,time.Until(deadline),got.result!=nil&&got.result.IsError)
   requireReadFreshnessContract(t,got.result,"projection_superseded")
  })}
 }

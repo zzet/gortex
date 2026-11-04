@@ -30,6 +30,7 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
   r:=request{Tool:"read",Operation:"editing_context",Arguments:args}
   started:=time.Now();result,attempts,err:=callTool(t.Context(),client,r,args,"workload",3,0,1,time.Second,waitContext)
   closeAndJoin()
+  require.NotEmpty(t,responses);require.Contains(t,string(responses[0]),code);require.Contains(t,string(responses[0]),"isError")
   t.Logf("ACTUAL_FRAMED_TRANSIENT_WITNESS code=%s requests=%d responses=%d original_errors_retained=%+v",code,len(requests),len(responses),attempts)
   require.NoError(t,err,"explicit read-only contract must allow a bounded fresh RPC within the original logical deadline")
   require.Len(t,requests,2);require.Len(t,responses,2);require.Len(t,attempts,2)
