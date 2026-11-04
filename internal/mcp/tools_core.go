@@ -1848,7 +1848,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	ctx, err = s.bindPendingSearch(ctx)
 	if err != nil {
 		if errors.Is(err, projectionSuperseded) {
-			return mcp.NewToolResultError(err.Error()), nil
+			return searchRefusalToolResult(err), nil
 		}
 		return nil, err
 	}
@@ -2113,7 +2113,7 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 		nodes, nameMore, err = nameOnlySymbolCandidates(ctx, s.readerFor(ctx), fq.Name, fetchLimit, candidateScope)
 		if err != nil {
 			if errors.Is(err, projectionSuperseded) {
-				return mcp.NewToolResultError(err.Error()), nil
+				return searchRefusalToolResult(annotateSearchRefusal(ctx, searchRefusalNameCandidates, err)), nil
 			}
 			return nil, err
 		}

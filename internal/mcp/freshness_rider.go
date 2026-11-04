@@ -821,7 +821,7 @@ func freshnessTargets(name string, req mcp.CallToolRequest) (scope string, ids, 
 func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) *mcp.CallToolResult {
 	checked, err := s.decorateToolFreshnessChecked(ctx, name, req, res)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error())
+		return searchRefusalToolResult(err)
 	}
 	return checked
 }
@@ -838,6 +838,9 @@ func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, 
 			validationTool, _ = s.legacyToolName(&req)
 		}
 		if err := validateSymbolResponseProjections(ctx, validationTool); err != nil {
+			if validationTool == "search_symbols" {
+				return nil, annotateSearchRefusal(ctx, searchRefusalResponseValidation, err)
+			}
 			return nil, err
 		}
 	}

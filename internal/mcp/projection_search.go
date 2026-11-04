@@ -222,10 +222,13 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 		return ctx, nil
 	}
 	if ctx.Value(pendingSearchKey{}) != nil {
-		return ctx, validateRequestProjections(ctx)
+		if err := validateRequestProjections(ctx); err != nil {
+			return ctx, annotateSearchRefusal(ctx, searchRefusalBindReentry, err)
+		}
+		return ctx, nil
 	}
 	if err := validateRequestProjections(ctx); err != nil {
-		return ctx, err
+		return ctx, annotateSearchRefusal(ctx, searchRefusalBindInherited, err)
 	}
 	snapshot := pendingFileProjections.snap.Load()
 	if len(snapshot.entries) == 0 {
@@ -261,7 +264,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 			continue
 		}
 		if pendingFileProjections.snap.Load().entries[key] != entry {
-			return ctx, projectionSuperseded
+			return ctx, annotateSearchRefusal(ctx, searchRefusalBindSnapshot, projectionSuperseded)
 		}
 		if entry.suspect.Load() {
 			// Legacy lookup consumes an old pointer's invalidation on equal
@@ -280,7 +283,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 				}
 			}
 			if err != nil {
-				return ctx, err
+				return ctx, annotateSearchRefusal(ctx, searchRefusalBindRefresh, err)
 			}
 			if current == nil {
 				continue // the existing helper checked actual canonical content
@@ -289,7 +292,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 		}
 		borrowed, err := retainRequestProjection(ctx, entry)
 		if err != nil {
-			return ctx, err
+			return ctx, annotateSearchRefusal(ctx, searchRefusalBindRetain, err)
 		}
 		ctx = borrowed
 		layers = append(layers, entry.layer)
@@ -300,7 +303,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 		sources = append(sources, query.ViewLayerSource{Search: backend, Layer: entry.layer})
 	}
 	if err := validateRequestProjections(ctx); err != nil {
-		return ctx, err
+		return ctx, annotateSearchRefusal(ctx, searchRefusalBindFinal, err)
 	}
 	if len(layers) == 0 {
 		return ctx, nil
