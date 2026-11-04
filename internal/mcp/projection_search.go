@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"path/filepath"
 	"sort"
@@ -184,6 +185,35 @@ func requestSearchCandidates(ctx context.Context) []query.ViewLayerSource {
 	return requestViewFromContext(ctx).candidateLayers()
 }
 
+// A concurrent checked reader may win the same-byte refresh before this
+// search retains any owner. Borrow only that exact immutable successor, never
+// a newer physical execution or a historical owner's facts. This is selection
+// under the existing refresh deadline, not another parse or response attempt.
+func checkedPendingSearchCOWSuccessor(ctx context.Context, expected *projectionEntry) *projectionEntry {
+	if expected == nil || ctx.Err() != nil {
+		return nil
+	}
+	current := pendingFileProjections.snap.Load().entries[expected.key]
+	if current == nil || current == expected || !liveProjectionForAcknowledgement(current) {
+		return nil
+	}
+	// Stat above stays outside the registry mutex. Bind that observation to
+	// the exact live pointer and event revision before accepting its witness.
+	pendingFileProjections.mu.Lock()
+	defer pendingFileProjections.mu.Unlock()
+	versionChecked := expected.sourceCommitSeq != 0 || expected.commitSeq == 0 && expected.readVersionChecked
+	if ctx.Err() != nil || pendingFileProjections.snap.Load().entries[expected.key] != current ||
+		current.commitSeq != 0 || !current.readVersionChecked || !versionChecked ||
+		current.sourceCommitSeq != expected.sourceCommitSeq || current.sourceEvents != 0 ||
+		current.suspect.Load() || current.checkedRetired.Load() || current.tombstone || expected.tombstone ||
+		current.key != expected.key || current.absPath != expected.absPath || current.graphPath != expected.graphPath || current.repoPrefix != expected.repoPrefix ||
+		current.layer == nil || current.layer != expected.layer || current.names != expected.names || current.fileView != expected.fileView ||
+		current.hash != expected.hash || current.rawHash != expected.rawHash || current.contentSHA256 != expected.contentSHA256 || !current.disk.matches(expected.disk) {
+		return nil
+	}
+	return current
+}
+
 // Bind one registry snapshot only after the request has selected its view.
 // Prefix equality alone is insufficient: another daemon or linked checkout
 // can publish the same graph path from a different physical source root.
@@ -244,6 +274,11 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 				defer cancel() // initialized at most once for the entire selection
 			}
 			current, err := s.projectCurrentTrackedFile(refreshCtx, ctx, entry.absPath, entry.graphPath, rel)
+			if errors.Is(err, projectionSuperseded) {
+				if successor := checkedPendingSearchCOWSuccessor(refreshCtx, entry); successor != nil {
+					current, err = successor, nil
+				}
+			}
 			if err != nil {
 				return ctx, err
 			}
