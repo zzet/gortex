@@ -135,3 +135,31 @@ func TestReadFreshnessCheckerLeavesLegacyBusyProbePolicyUnchanged(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+// A declared refusal is evidence even when a corrupted history resets or drops
+// its retry index. Sequential attempt cost cannot erase previous wire work.
+func TestReadFreshnessCheckerRejectsOrphanCountersAndOmittedAttemptCost(t *testing.T) {
+ for _, name := range []string{"original_removed_retry_reset", "original_removed_retry_omitted", "other_tool_orphan_counter", "previous_attempt_cost_omitted"} {
+  t.Run(name, func(t *testing.T) {
+   raw := readFreshnessReportFixture("projection_superseded")
+   p := raw["phases"].([]any)[0].(map[string]any)
+   rows := p["attempts"].([]any)
+   first := rows[0].(map[string]any)
+   last := rows[1].(map[string]any)
+   switch name {
+   case "original_removed_retry_reset":
+    p["attempts"] = rows[1:]
+    last["retry"] = 0
+   case "original_removed_retry_omitted":
+    p["attempts"] = rows[1:]
+    delete(last, "retry")
+   case "other_tool_orphan_counter":
+    p["tools"].(map[string]any)["read.editing_context"] = map[string]any{"retryable_refusals": 1, "successes": 0}
+   case "previous_attempt_cost_omitted":
+    first["duration_ms"], first["logical_ms"] = 100, 100
+    last["duration_ms"], last["logical_ms"] = 100, 100
+   }
+   if err := validateFreshnessFixture(t, raw); err == nil { t.Fatal("orphan refusal or omitted sequential attempt cost accepted") }
+  })
+ }
+}
