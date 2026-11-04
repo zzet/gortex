@@ -143,8 +143,9 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 			return editProbePlan{}, err
 		}
 		p.SearchReadbackAcceptance = true
-		p.SessionModel = "fixed_editors_immediate_search_then_independent_uncredited_probes"
+		p.SessionModel = "fixed_editors_fifo_ack_four_searches_then_independent_uncredited_probes"
 		p.NotSelected = append(p.NotSelected, "search acceptance uses pinned line-preserving renames; only first same-editor post-ACK search responses count, never later polling")
+		p.NotSelected = append(p.NotSelected, "planned arrivals remain absolute; actual edits queue per editor through four immediate searches, with queue wait and dispatch lateness retained")
 	}
 	if err != nil {
 		return p, err

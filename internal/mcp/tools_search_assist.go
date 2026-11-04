@@ -541,6 +541,7 @@ func extractBodyForVerify(ctx context.Context, s *Server, n *graph.Node) string 
 	if err != nil {
 		return ""
 	}
+	disablePendingSymbolCapture(ctx)
 	source, _, _, err := readLines(abs, n.StartLine, n.EndLine, 0)
 	if err != nil {
 		return ""
