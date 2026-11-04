@@ -289,6 +289,14 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 			// though their content did not change. Refuse this selection without
 			// inventing source invalidation on a checked historical owner.
 			if pendingFileProjections.snap.Load().entries[key] != expected {
+				// No file layer or facts have been retained at this boundary.
+				// A competing checked read may already own these exact immutable
+				// bytes. Use search binding's same-version authority proof instead
+				// of spending a whole-response attempt on pointer contention.
+				// Physical executions, events and expired contexts still refuse.
+				if current := checkedPendingSearchCOWSuccessor(buildCtx, expected); current != nil {
+					return current, nil
+				}
 				return nil, projectionSuperseded
 			}
 			if err := buildCtx.Err(); err != nil {
