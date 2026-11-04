@@ -56,6 +56,7 @@ type toolResult struct {
 }
 
 type attempt struct {
+ Started time.Time `json:"started"`
 	CWD            string         `json:"cwd"`
 	Request        string         `json:"request_sha256"`
 	Agent          *int           `json:"agent"`
