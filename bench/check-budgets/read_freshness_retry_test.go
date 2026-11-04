@@ -167,3 +167,30 @@ func TestReadFreshnessCheckerRejectsOrphanCountersAndOmittedAttemptCost(t *testi
   })
  }
 }
+
+func TestReadFreshnessCheckerKeepsInterleavedGroupsAndBusyBackoff(t *testing.T) {
+ for _, name := range []string{"interleaved_groups", "busy_then_explicit_refusal"} {
+  t.Run(name, func(t *testing.T) {
+   raw := readFreshnessReportFixture("projection_superseded")
+   p := raw["phases"].([]any)[0].(map[string]any)
+   rows := p["attempts"].([]any)
+   clone := func(row map[string]any) map[string]any { result:=make(map[string]any); for key,value:=range row {result[key]=value};return result }
+   first, last := rows[0].(map[string]any), rows[1].(map[string]any)
+   switch name {
+   case "interleaved_groups":
+    otherFirst, otherLast := clone(first), clone(last)
+    otherFirst["tool"], otherLast["tool"] = "read.editing_context", "read.editing_context"
+    otherFirst["slot"], otherLast["slot"] = 2, 2
+    p["attempts"] = []any{first,otherFirst,last,otherLast}
+    metrics:=make(map[string]any);for key,value:=range p["tools"].(map[string]any)["read.summary"].(map[string]any){metrics[key]=value}
+    p["tools"].(map[string]any)["read.editing_context"]=metrics
+   case "busy_then_explicit_refusal":
+    busy:=clone(first);busy["outcome"],busy["code"],busy["error"]="busy",-32002,"busy";delete(busy,"error_data")
+    first["retry"],first["logical_ms"] = 1,10
+    last["retry"] = 2
+    p["attempts"] = []any{busy,first,last}
+   }
+   if err:=validateFreshnessFixture(t,raw);err!=nil{t.Fatal(err)}
+  })
+ }
+}
