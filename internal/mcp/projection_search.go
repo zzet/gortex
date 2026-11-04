@@ -239,6 +239,24 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 		refreshDeadline = original
 	}
 	var refreshCtx context.Context
+	// Initial binding has not borrowed this key yet. A checked reader can
+	// replace its pointer at either ownership check below without changing
+	// the immutable search view. Select only that independently checked COW
+	// successor, under this same absolute allowance; never restart selection
+	// or replace facts the request has already retained.
+	checkedSuccessor := func(expected *projectionEntry) *projectionEntry {
+		if refreshCtx != nil {
+			return checkedPendingSearchCOWSuccessor(refreshCtx, expected)
+		}
+		ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, refreshDeadline)
+		checkedCtx, cancel := context.WithDeadline(ctx, refreshDeadline)
+		defer cancel()
+		current := checkedPendingSearchCOWSuccessor(checkedCtx, expected)
+		if checkedCtx.Err() != nil {
+			return nil
+		}
+		return current
+	}
 	keys := make([]string, 0, len(snapshot.entries))
 	for key := range snapshot.entries {
 		keys = append(keys, key)
@@ -264,7 +282,11 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 			continue
 		}
 		if pendingFileProjections.snap.Load().entries[key] != entry {
-			return ctx, annotateSearchRefusal(ctx, searchRefusalBindSnapshot, projectionSuperseded)
+			if current := checkedSuccessor(entry); current != nil {
+				entry = current
+			} else {
+				return ctx, annotateSearchRefusal(ctx, searchRefusalBindSnapshot, projectionSuperseded)
+			}
 		}
 		if entry.suspect.Load() {
 			// Legacy lookup consumes an old pointer's invalidation on equal
@@ -283,7 +305,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 				}
 			}
 			if err != nil {
-				return ctx, annotateSearchRefusal(ctx, searchRefusalBindRefresh, err)
+				return ctx, annotateSearchRefreshRefusal(ctx, refreshCtx, current, err)
 			}
 			if current == nil {
 				continue // the existing helper checked actual canonical content
@@ -291,6 +313,14 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 			entry = current
 		}
 		borrowed, err := retainRequestProjection(ctx, entry)
+		if errors.Is(err, projectionSuperseded) {
+			if current := checkedSuccessor(entry); current != nil {
+				borrowed, err = retainRequestProjection(ctx, current)
+				if err == nil {
+					entry = current
+				}
+			}
+		}
 		if err != nil {
 			return ctx, annotateSearchRefusal(ctx, searchRefusalBindRetain, err)
 		}
