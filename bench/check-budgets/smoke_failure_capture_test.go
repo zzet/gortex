@@ -61,6 +61,7 @@ func TestSmokeCaptureAttestationMatchesAllActualReports(t *testing.T) {
 			for i := range d.runs {
 				data, err = json.Marshal(d.runs[i].data)
 				if err != nil { t.Fatal(err) }
+				raw = map[string]any{}
 				if err := json.Unmarshal(data, &raw); err != nil { t.Fatal(err) }
 				delete(raw, "read_source_failure_capture")
 				if mutation != "off" && !(mutation == "missing" && i == 0) {
@@ -80,11 +81,11 @@ func TestSmokeCaptureAttestationMatchesAllActualReports(t *testing.T) {
 }
 
 func TestReportComparabilityIncludesCaptureOverhead(t *testing.T) {
-	before, err := decodeReport(marshalTestJSON(t, syntheticReport()))
+	before, err := decodeReport(marshalSmokeCaptureControlJSON(t, syntheticReport()))
 	if err != nil { t.Fatal(err) }
 	raw := syntheticReport()
 	raw["read_source_failure_capture"] = map[string]any{"max_records": 8, "max_combined_wire_bytes": 65536, "encoding": "base64"}
-	after, err := decodeReport(marshalTestJSON(t, raw))
+	after, err := decodeReport(marshalSmokeCaptureControlJSON(t, raw))
 	if err != nil { t.Fatal(err) }
 	if !comparable(before, before) || !comparable(after, after) || comparable(before, after) { t.Fatal("capture observation overhead was silently ignored in measurement identity") }
 }
@@ -97,7 +98,7 @@ func TestSmokeWorkflowExposesExplicitDefaultOffCaptureOptIn(t *testing.T) {
 	}
 }
 
-func marshalTestJSON(t *testing.T, value any) []byte {
+func marshalSmokeCaptureControlJSON(t *testing.T, value any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil { t.Fatal(err) }
