@@ -16,9 +16,9 @@ import (
 func runSearchRefusalEnvProbe() int {
 	err := json.NewEncoder(os.Stdout).Encode(map[string]string{
 		"evidence": os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE"),
-		"foreign": os.Getenv("GORTEX_REFUSAL_TEST_LEAK"),
-		"owned": os.Getenv("GORTEX_REFUSAL_TEST_OWNED"),
-		"tools": os.Getenv("GORTEX_TOOLS"),
+		"foreign":  os.Getenv("GORTEX_REFUSAL_TEST_LEAK"),
+		"owned":    os.Getenv("GORTEX_REFUSAL_TEST_OWNED"),
+		"tools":    os.Getenv("GORTEX_TOOLS"),
 	})
 	if err != nil {
 		return 1
@@ -28,11 +28,11 @@ func runSearchRefusalEnvProbe() int {
 
 func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		flag string
-		search bool
+		name          string
+		flag          string
+		search        bool
 		ownedOverride bool
-		want string
+		want          string
 	}{
 		{name: "default_off", search: true},
 		{name: "explicit_search", flag: "1", search: true, want: "1"},
