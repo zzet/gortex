@@ -154,7 +154,11 @@ func TestReadFreshnessCheckerRejectsOrphanCountersAndOmittedAttemptCost(t *testi
     p["attempts"] = rows[1:]
     delete(last, "retry")
    case "other_tool_orphan_counter":
-    p["tools"].(map[string]any)["read.editing_context"] = map[string]any{"retryable_refusals": 1, "successes": 0}
+    other := make(map[string]any)
+    for key, value := range last { other[key] = value }
+    other["tool"], other["slot"], other["retry"], other["logical_ms"] = "read.editing_context", 2, 0, 2
+    p["attempts"] = append(rows, other)
+    p["tools"].(map[string]any)["read.editing_context"] = map[string]any{"successes": 1, "retryable_refusals": 1, "errors": map[string]any{}, "phase_censored": 0, "product_expired": 0, "latency_ms": map[string]any{"count": 1, "p95": map[string]any{"value": 2, "unit": "ms", "reason": ""}}}
    case "previous_attempt_cost_omitted":
     first["duration_ms"], first["logical_ms"] = 100, 100
     last["duration_ms"], last["logical_ms"] = 100, 100
