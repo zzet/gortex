@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // pendingTextRoot owns one anchor and, for the serial scanner, a bounded
@@ -182,6 +184,17 @@ func (r *pendingTextRoot) read(ctx context.Context, relative string, afterRead f
 	relative = filepath.Clean(filepath.FromSlash(relative))
 	if !filepath.IsLocal(relative) || relative == "." {
 		return nil, physicalReadEvidence{}, fmt.Errorf("pending text path is not a local file")
+	}
+	// Capture one coherent file version before a later tool write. Keep all
+	// physical hashes and path/root checks: writers outside the tool protocol
+	// still have to be detected, rather than lending authority to mixed bytes.
+	key := pathkey.MutationKey(filepath.Join(r.root, relative))
+	if !mutationPathAdmitted(ctx, key) {
+		release, err := acquireMutationPathKey(ctx, key)
+		if err != nil {
+			return nil, physicalReadEvidence{}, err
+		}
+		defer release()
 	}
 	stamps, parent, legacy, err := r.walk(ctx, relative, nil)
 	if err != nil {

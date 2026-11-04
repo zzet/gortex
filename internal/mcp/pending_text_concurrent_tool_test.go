@@ -144,3 +144,78 @@ func TestPendingTextReadCapturesBeforeConcurrentToolWrite(t *testing.T) {
 	require.Empty(t, oldRows, "complete old-text absence is proven by the same captured bytes")
 	require.Zero(t, mutationRefs(path))
 }
+
+func TestPendingTextReadQueuePreservesCancellationAndAdmission(t *testing.T) {
+	for _, mode := range []string{"canceled_wait", "released_admission", "already_expired", "current_admission"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "main.go")
+			content := []byte("package fixture\nfunc Current() {}\n")
+			require.NoError(t, os.WriteFile(path, content, 0o600))
+			base := t.Context()
+			if mode == "released_admission" {
+				admitted, release, err := acquireMutationPath(base, path)
+				require.NoError(t, err)
+				release()
+				base = admitted
+			}
+			owned, release, err := acquireMutationPath(t.Context(), path)
+			require.NoError(t, err)
+			defer release()
+			if mode == "current_admission" {
+				base = owned
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			if mode == "already_expired" {
+				deadline = time.Now().Add(-time.Second)
+			}
+			ctx, cancel := context.WithDeadline(base, deadline)
+			defer cancel()
+			reader, err := openPendingTextRootForScan(root)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = reader.close(context.Background()) })
+			if mode == "current_admission" || mode == "already_expired" {
+				raw, _, err := reader.read(ctx, "main.go", nil, 1<<20, nil)
+				if mode == "current_admission" {
+					require.NoError(t, err, "a live owned context must not deadlock reacquiring itself")
+					require.Equal(t, content, raw)
+				} else {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+					require.Nil(t, raw)
+				}
+				require.Equal(t, 1, mutationRefs(path))
+				return
+			}
+			type answer struct {
+				raw []byte
+				err error
+			}
+			done := make(chan answer, 1)
+			var worker sync.WaitGroup
+			worker.Add(1)
+			t.Cleanup(func() { cancel(); worker.Wait() })
+			go func() {
+				defer worker.Done()
+				raw, _, err := reader.read(ctx, "main.go", nil, 1<<20, nil)
+				done <- answer{raw, err}
+			}()
+			waitForMutationRefs(t, path, 2)
+			cancel()
+			var result answer
+			select {
+			case result = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("canceled read did not leave the real mutation queue")
+			}
+			worker.Wait()
+			require.ErrorIs(t, result.err, context.Canceled)
+			require.Nil(t, result.raw)
+			currentDeadline, _ := ctx.Deadline()
+			require.Equal(t, deadline, currentDeadline)
+			require.Equal(t, 1, mutationRefs(path), "canceling a waiter cannot release the writer's ownership")
+			require.ErrorIs(t, reader.close(ctx), context.Canceled)
+			release()
+			require.Zero(t, mutationRefs(path))
+		})
+	}
+}
