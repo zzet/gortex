@@ -26,7 +26,7 @@ func readOnlySeedCommand(args []string, stdout, stderr io.Writer) int {
  valid:=rows[0].Pass && doubled
  fmt.Fprintf(stdout,"measured_doubling=%t demonstration_valid=%t (no full-smoke or nightly-history credit)\n",doubled,valid)
  if *output!="" {
-  evidence:=struct{Rows []result `json:"rows"`; MeasuredDoubling bool `json:"measured_doubling"`; DemonstrationValid bool `json:"demonstration_valid"`}{rows,doubled,valid}
+  evidence:=struct{Pass bool `json:"pass"`; Rows []result `json:"rows"`; MeasuredDoubling bool `json:"measured_doubling"`; DemonstrationValid bool `json:"demonstration_valid"`}{pass,rows,doubled,valid}
   if err:=writeNewJSON(*output,evidence);err!=nil {fmt.Fprintln(stderr,err);return 2}
  }
  if !pass {return 1};return 0
