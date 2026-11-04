@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+ "time"
 )
 
 func readFreshnessReportFixture(code string) map[string]any {
@@ -11,7 +12,7 @@ func readFreshnessReportFixture(code string) map[string]any {
 	raw["workload"].(map[string]any)["agents"] = 16
 	p := raw["phases"].([]any)[0].(map[string]any)
 	identity := func(retry int, outcome string, status int, logical float64) map[string]any {
-		return map[string]any{"cwd": "/owned/private", "request_sha256": strings.Repeat("c", 64), "agent": 3, "step": 0, "slot": 1, "retry": retry, "duration_ms": 2, "logical_ms": logical, "tool": "read.summary", "role": "workload", "outcome": outcome, "code": status, "error": ""}
+		return map[string]any{"cwd": "/owned/private", "request_sha256": strings.Repeat("c", 64), "agent": 3, "step": 0, "slot": 1, "retry": retry, "duration_ms": 2, "logical_ms": logical, "started": time.Date(2026,11,4,12,0,0,0,time.UTC).Add(time.Duration(logical-2)*time.Millisecond), "tool": "read.summary", "role": "workload", "outcome": outcome, "code": status, "error": ""}
 	}
 	first := identity(0, "retryable", -32000, 2)
 	first["error"] = code + ": selected read unavailable"
@@ -91,7 +92,8 @@ func TestReadFreshnessCheckerRejectsMissingOrWeakenedEvidence(t *testing.T) {
 						clone[k] = v
 					}
 					clone["retry"] = retry
-					clone["logical_ms"] = float64(retry + 2)
+					clone["logical_ms"] = float64(2 * (retry + 1))
+ clone["started"] = time.Date(2026,11,4,12,0,0,0,time.UTC).Add(time.Duration(2*retry)*time.Millisecond)
 					return clone
 				}
 				last["retry"] = 3
@@ -202,6 +204,7 @@ func TestReadFreshnessCheckerKeepsInterleavedGroupsAndBusyBackoff(t *testing.T) 
 				busy["outcome"], busy["code"], busy["error"] = "busy", -32002, "busy"
 				delete(busy, "error_data")
 				first["retry"], first["logical_ms"] = 1, 10
+ first["started"] = time.Date(2026,11,4,12,0,0,8*int(time.Millisecond),time.UTC)
 				last["retry"] = 2
 				p["attempts"] = []any{busy, first, last}
 			}
@@ -210,4 +213,21 @@ func TestReadFreshnessCheckerKeepsInterleavedGroupsAndBusyBackoff(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestReadFreshnessCheckerRejectsDroppedBackoffAndMissingTimestamps(t *testing.T) {
+ for _, name := range []string{"backoff_omitted", "first_started_missing", "last_started_missing", "started_moves_backwards"} {
+  t.Run(name,func(t *testing.T){
+   raw:=readFreshnessReportFixture("projection_superseded")
+   rows:=raw["phases"].([]any)[0].(map[string]any)["attempts"].([]any)
+   first,last:=rows[0].(map[string]any),rows[1].(map[string]any)
+   switch name {
+   case "backoff_omitted": last["logical_ms"]=4 // two2ms attempts but actual retained start gap48ms
+   case "first_started_missing": delete(first,"started")
+   case "last_started_missing": delete(last,"started")
+   case "started_moves_backwards": last["started"]=first["started"].(time.Time).Add(-time.Millisecond)
+   }
+   if err:=validateFreshnessFixture(t,raw);err==nil{t.Fatal("missing original timestamps or omitted backoff cost accepted")}
+  })
+ }
 }
