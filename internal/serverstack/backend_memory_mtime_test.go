@@ -37,7 +37,7 @@ func TestMemoryBackendMtimesSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer close2()
+	defer func() { _ = close2() }()
 	mem, ok := s2.(*graph.MemoryStore)
 	if !ok {
 		t.Fatalf("backend is %T, want *graph.MemoryStore", s2)
@@ -65,7 +65,7 @@ func TestMemoryBackendMtimesSnapshotRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second reopen: %v", err)
 	}
-	defer close3()
+	defer func() { _ = close3() }()
 	mem3 := s3.(*graph.MemoryStore)
 	wantA2 := map[string]int64{"a.go": 444}
 	if got := mem3.LoadFileMtimes("repoA"); !equalMtimes(got, wantA2) {
@@ -106,7 +106,7 @@ func TestFailedDumpKeepsJournal(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	s1.AddNode(&graph.Node{ID: "repoA/a.go::f", Kind: graph.KindFunction, Name: "f", FilePath: "a.go"})
-	close1()
+	_ = close1()
 
 	// Session 2: journal a mutation the snapshot does not contain, then
 	// force the dump to fail — the tmp target is a non-empty directory, so
@@ -120,14 +120,14 @@ func TestFailedDumpKeepsJournal(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(tmpDir, "blocker"), 0o755); err != nil {
 		t.Fatalf("block tmp: %v", err)
 	}
-	close2() // dump fails; the journal must survive untouched
+	_ = close2() // dump fails; the journal must survive untouched
 
 	// Session 3: the journaled mutation must still replay.
 	s3, close3, err := openMemoryBackend(snapPath, nil)
 	if err != nil {
 		t.Fatalf("third open: %v", err)
 	}
-	defer close3()
+	defer func() { _ = close3() }()
 	if got := s3.GetNode("repoB/b.go::g"); got == nil || got.Name != "g" {
 		t.Fatalf("failed dump lost journaled mutations: %+v", got)
 	}
@@ -148,7 +148,7 @@ func TestEpochSidecarRoundTrip(t *testing.T) {
 	if mem1.JournalEpoch() != 0 {
 		t.Fatalf("initial epoch: want 0, got %d", mem1.JournalEpoch())
 	}
-	close1()
+	_ = close1()
 	if got := readJournalEpoch(epochPath); got != 1 {
 		t.Fatalf("sidecar after first close: want 1, got %d", got)
 	}
@@ -166,7 +166,7 @@ func TestEpochSidecarRoundTrip(t *testing.T) {
 	if _, _, _, skipped, lagged := mem2.ReplayAnomalies(); skipped || lagged {
 		t.Fatalf("unexpected replay anomaly: skipped=%v lagged=%v", skipped, lagged)
 	}
-	close2()
+	_ = close2()
 	if got := readJournalEpoch(epochPath); got != 2 {
 		t.Fatalf("sidecar after second close: want 2, got %d", got)
 	}
@@ -209,5 +209,5 @@ func TestPeriodicSnapshotJournalSizeTrigger(t *testing.T) {
 	if _, err := os.Stat(snapPath); err != nil {
 		t.Fatalf("snapshot missing: %v", err)
 	}
-	closeFn()
+	_ = closeFn()
 }

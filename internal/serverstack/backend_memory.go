@@ -91,7 +91,12 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 		// still runs under the store's write lock (issue #25 A8).
 		mstore.ColdLoadBatch(snap.AllNodes(), snap.AllEdges())
 		restoreFileMtimes(mstore, snap)
-		closeSnap()
+		// The snapshot is fully read — reads already saw the WAL — so a
+		// failed close cannot corrupt the loaded state. Surface it, never
+		// fail the boot for it: Store.Close logs its own checkpoint detail.
+		if cerr := closeSnap(); cerr != nil && logger != nil {
+			logger.Warn("memory backend: snapshot close after cold load", zap.Error(cerr))
+		}
 	}
 
 	// 2. Replay the journal on top of the snapshot (or onto the empty graph).
@@ -289,7 +294,9 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	snap.AddBatch(store.AllNodes(), store.AllEdges())
 	if hasBulk {
 		if err := bl.FlushBulk(); err != nil {
-			closeSnap()
+			// The dump already failed and the tmp store is abandoned; keep
+			// the primary cause instead of the close error.
+			_ = closeSnap()
 			return fmt.Errorf("memory backend: snapshot bulk flush: %w", err)
 		}
 	}
@@ -304,12 +311,19 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	if hasReplace {
 		for _, prefix := range store.FileMtimePrefixes() {
 			if err := replacer.ReplaceFileMtimes(prefix, store.LoadFileMtimes(prefix)); err != nil {
-				closeSnap()
+				// Same as the bulk-flush failure: the dump failed, the tmp
+				// store is abandoned, and the close error is secondary.
+				_ = closeSnap()
 				return fmt.Errorf("memory backend: snapshot mtimes for %q: %w", prefix, err)
 			}
 		}
 	}
-	closeSnap()
+	// Best-effort close, by design: a clean close does not guarantee a full
+	// checkpoint (pooled reader connections can pin the WAL), so the publish
+	// below carries tmp's own -wal/-shm along with the db file —
+	// un-checkpointed frames ride in the published pair, not in the close
+	// result.
+	_ = closeSnap()
 	// The snapshot path is shared with the sqlite backend, so a stale
 	// -wal/-shm beside the OLD snapshot would be replayed against this
 	// brand-new file on the next open: SQLite validates a WAL against its own

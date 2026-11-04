@@ -41,13 +41,13 @@ func TestMemoryBackendRoundTrips(t *testing.T) {
 	if store.GetNode(node.ID) == nil {
 		t.Fatal("node missing before close")
 	}
-	closeFn()
+	_ = closeFn()
 
 	reopened, closeReopened, err := openMemoryBackend(path, zap.NewNop())
 	if err != nil {
 		t.Fatalf("openMemoryBackend reopen: %v", err)
 	}
-	defer closeReopened()
+	defer func() { _ = closeReopened() }()
 	got := reopened.GetNode(node.ID)
 	if got == nil {
 		t.Fatal("node missing after reopen (snapshot+journal replay failed)")

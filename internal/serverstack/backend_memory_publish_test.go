@@ -36,7 +36,7 @@ func TestMemorySnapshotClearsStaleSqliteSidecars(t *testing.T) {
 			t.Fatalf("seed stale sidecar %s: %v", stale, err)
 		}
 	}
-	closeFn()
+	_ = closeFn()
 
 	for _, stale := range []string{path + "-wal", path + "-shm"} {
 		data, err := os.ReadFile(stale)
@@ -62,14 +62,14 @@ func TestOpenBackendWarnsOnMemoryPublishedStore(t *testing.T) {
 	}
 	mstore.AddNode(&graph.Node{ID: "r/x.go::Foo", Kind: graph.KindFunction, Name: "Foo",
 		FilePath: "x.go", Language: "go", RepoPrefix: "r"})
-	closeFn()
+	_ = closeFn()
 
 	core, observed := observer.New(zap.WarnLevel)
 	store, cleanup, err := OpenBackend("sqlite", path, zap.New(core), false)
 	if err != nil {
 		t.Fatalf("OpenBackend(sqlite) on a memory-published store: %v", err)
 	}
-	defer cleanup()
+	defer func() { _ = cleanup() }()
 
 	if store.GetNode("r/x.go::Foo") == nil {
 		t.Fatal("node from the memory snapshot must be readable in sqlite mode")
@@ -92,7 +92,7 @@ func TestOpenBackendNoProvenanceWarningOnFreshStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenBackend(sqlite) on a fresh store: %v", err)
 	}
-	defer cleanup()
+	defer func() { _ = cleanup() }()
 	if store == nil {
 		t.Fatal("nil store")
 	}
