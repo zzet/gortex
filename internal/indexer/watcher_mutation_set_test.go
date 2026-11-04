@@ -46,9 +46,17 @@ func TestWatcherMutationSetParsesWholeFrontierBeforeResolution(t *testing.T) {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 	mi := &MultiIndexer{graph: g, repos: map[string]*RepoMetadata{"repo": {RepoPrefix: "repo", RootPath: dir, FileMtimes: idx.FileMtimes()}}, indexers: map[string]*Indexer{"repo": idx}, logger: zap.NewNop()}
+	// This hand-built Indexer bypasses the production MultiIndexer factory.
+	// Retain its controlled hooks while installing the factory's owner binding.
+	idx.repositoryMutationOwner = mi
 	mw, err := NewMultiWatcher(mi, map[string]config.WatchConfig{"repo": {DebounceMs: 60000}}, zap.NewNop())
 	require.NoError(t, err)
 	w := mw.watchers["repo"]
+	require.NotNil(t, w)
+	current := w.currentMutationIndexer()
+	require.NotNil(t, current)
+	require.NotNil(t, current.repositoryMutationOwner)
+	require.Same(t, mi, current.repositoryMutationOwner)
 	w.degradedNoFsnotify = true
 	t.Cleanup(func() { require.NoError(t, w.Stop()) })
 	writeTestFile(t, caller, "package pair\nfunc Caller(){Renamed()}\n")

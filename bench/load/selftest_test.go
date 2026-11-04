@@ -17,6 +17,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("LOAD_SEARCH_REFUSAL_ENV_PROBE") == "selected-env-observation" {
+		os.Exit(runSearchRefusalEnvProbe())
+	}
 	if mode := os.Getenv("LOAD_DAEMON_FIXTURE"); mode != "" {
 		os.Exit(fixtureDaemon(mode))
 	}
@@ -143,12 +146,14 @@ func fixtureDaemon(mode string) int {
 					case "status":
 						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{"coordinators": coordinators()}, "storage": map[string]any{"wal_pending_frames": 0}, "pprof_addr": pprof.Addr().String()}
 					case "search_symbols":
+						checkoutID := ""
 						if path, _ := frame.Params["path"].(string); path != "" {
 							viewsMu.Lock()
 							views[filepath.Clean(path)] = true
 							viewsMu.Unlock()
+							checkoutID = "fixture-checkout-" + filepath.Base(path)
 						}
-						result = map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": config.Repos[0].Name}}
+						result = map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": config.Repos[0].Name, "checkout_id": checkoutID}}
 					case "shutdown":
 						result = map[string]any{"stopping": true}
 					default:

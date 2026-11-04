@@ -107,6 +107,9 @@ func (s *Server) handlePreviewEdit(ctx context.Context, req mcp.CallToolRequest)
 	wantDiag := req.GetBool("diagnostics", true)
 	diagTimeout := time.Duration(req.GetInt("diagnostics_timeout_ms", 1500)) * time.Millisecond
 
+	// Snapshot the unpublished edits before the simulation reads relations;
+	// the symbols that scope the label are known only once it has run.
+	gaps := s.laggingMutationReceipts(ctx)
 	sim, simErr := s.buildSimulation(ctx, []lsp.WorkspaceEdit{edit}, inherit)
 	if simErr != nil {
 		if ctxErr := requestContextError(ctx, simErr); ctxErr != nil {
@@ -138,6 +141,23 @@ func (s *Server) handlePreviewEdit(ctx context.Context, req mcp.CallToolRequest)
 		result["diagnostics_summary"] = summariseDiagnostics(diags)
 	}
 
+	// broken_callers walks the callers of the removed and renamed symbols.
+	seeds := append([]string{}, step.symbolsRemoved...)
+	for _, renamed := range step.symbolsRenamed {
+		seeds = append(seeds, renamed["from"])
+	}
+	// touched_files keeps each path as the client spelled it; the scope
+	// takes graph keys.
+	var touched []string
+	for _, path := range step.touchedFiles {
+		if abs, err := s.resolveOverlayAbsPath(path); err == nil && abs != "" {
+			touched = append(touched, s.repoRelative(abs))
+		}
+	}
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", seeds, touched, time.Time{}); err != nil {
+		return nil, err
+	}
+	s.labelRelations(ctx, gaps, seeds, touched).apply(result)
 	return mcp.NewToolResultText(jsonOK(result)), nil
 }
 

@@ -1,0 +1,2 @@
+method Server.HandleRequest server/server.go:14 (in Server)
+method Server.HandleHealth server/server.go:22 (in Server)

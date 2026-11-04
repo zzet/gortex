@@ -116,6 +116,11 @@ const (
 	// retriable. This is distinct from LocalizationComplete, which also covers
 	// non-terminal refinement and in-flight states.
 	ErrCodeLocalizationTerminal ErrorCode = "localization_terminal"
+
+	// These two read-only refusals explicitly permit a fresh client request.
+	// Neither makes the refused selection or its first response correct.
+	ErrCodeProjectionSuperseded ErrorCode = "projection_superseded"
+	ErrCodeFileViewPending      ErrorCode = "file_view_pending"
 )
 
 // StructuredError is the JSON shape encoded into the TextContent

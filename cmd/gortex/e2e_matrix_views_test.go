@@ -327,7 +327,7 @@ func e2eViewsCLI(t *testing.T, f *issue767Fixture, dir, tool string, args map[st
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := f.tryCommand(timeout, dir, "call", tool, "--index", dir, "--json", string(body), "--format", "json")
+	raw, err := f.tryJSONCommand(timeout, dir, "call", tool, "--index", dir, "--json", string(body), "--format", "json")
 	if err != nil {
 		return nil, raw, fmt.Errorf("cli %s: %w: %s", tool, err, e2eViewsTail(raw))
 	}

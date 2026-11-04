@@ -56,7 +56,7 @@ func TestObserveCheckoutPathTrackedNonGitUnknownAncestorSkipsInventory(t *testin
 		return gitstate.Inventory(ctx, path)
 	}
 	for range 3 {
-		job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(root))
+		job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(root), checkoutObservationTarget{}, true)
 		require.NoError(t, err)
 		select {
 		case <-job.done:
@@ -90,7 +90,7 @@ func TestObserveCheckoutPathTrackedNonGitUnknownAncestorSkipsInventory(t *testin
 	// worktree of the known family. No remembered negative may hide its identity.
 	require.NoError(t, os.Rename(root, root+"-before-worktree"))
 	builderGit(t, primary, "worktree", "add", "-b", "competitor-worktree", root)
-	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(root))
+	job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(root), checkoutObservationTarget{}, true)
 	require.NoError(t, err)
 	select {
 	case <-job.proofReady:

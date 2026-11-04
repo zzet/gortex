@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/zeebo/blake3"
 	"io"
 	"math"
 	"os"
@@ -21,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
@@ -771,8 +774,11 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 	// This charges the whole file as the counterfactual, so claim it for the
 	// session: a later retrieval page that merely cites the file must not
 	// bill it a second time (savings_retrieval.go).
-	stats.creditFile(abs)
-	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
+	node := s.fileAttributionNode(relPath, language)
+	afterFreshSymbolAcceptance(ctx, func() {
+		stats.creditFile(abs)
+		stats.record(node, tool, returned, fullFile)
+	})
 }
 
 // pendingSavings is one source-read observation assembled before an
@@ -925,7 +931,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -935,7 +941,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// old_string, so an un-replayed retry would fail the match check with a
 	// confusing "not found" instead of returning the original result.
 	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1016,8 +1022,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = s.checkAcknowledgedParseGate(ctx, relPath, content, newContentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, content, newContentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1051,7 +1058,8 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
@@ -1065,7 +1073,9 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
@@ -1085,6 +1095,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
@@ -1119,7 +1130,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -1129,7 +1140,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	// call waits for it and then sees a terminal record, rather than both
 	// deciding independently that they are the first.
 	fingerprint := mutationFingerprint("write_file", absPath, content)
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1191,8 +1202,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = s.checkAcknowledgedParseGate(ctx, relPath, priorContent, contentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1224,7 +1236,8 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil
@@ -1238,7 +1251,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
@@ -1254,6 +1269,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, priorContent, fileExists)
 	}
@@ -1448,6 +1464,14 @@ func readPhysicalFileEvidenceBounded(absPath string, maxBytes int64) ([]byte, ph
 }
 
 func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), maxBytes int64) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBoundedBuffer(absPath, afterRead, maxBytes, nil)
+}
+
+// scratch is request-owned verification workspace, never returned content or
+// cached source authority. Reusing it across a pending-file scan preserves both
+// full reads/hashes and every physical identity check while avoiding one 32KiB
+// io.Copy allocation per file. Existing callers retain their nil-buffer path.
+func readPhysicalFileEvidenceObservedBoundedBuffer(absPath string, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, error) {
 	linkInfo, err := os.Lstat(absPath)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
@@ -1465,19 +1489,45 @@ func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), m
 	}
 	defer f.Close()
 
+	content, evidence, after, err := readPhysicalEvidenceDescriptor(f, afterRead, maxBytes, scratch)
+	if err != nil {
+		return nil, physicalReadEvidence{}, err
+	}
+	pathInfo, err := os.Stat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	}
+	resolvedAfter, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
+	}
+	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
+		!samePhysicalFileVersion(after, pathInfo) {
+		return nil, physicalReadEvidence{}, errPhysicalFileMoved
+	}
+
+	evidence.resolvedPath = resolvedAfter
+	evidence.symlinkResolved = linkInfo.Mode()&os.ModeSymlink != 0
+	return content, evidence, nil
+}
+
+// readPhysicalEvidenceDescriptor preserves the same full-buffer read, second
+// streaming hash and descriptor version checks for both physical path readers.
+// Path and parent identity remain the responsibility of their respective caller.
+func readPhysicalEvidenceDescriptor(f *os.File, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, os.FileInfo, error) {
 	before, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not stat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not stat physical file: %w", err)
 	}
 	if !before.Mode().IsRegular() {
-		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
 	if maxBytes > 0 && before.Size() > maxBytes {
-		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	content, err := readAllSizedBounded(f, before.Size(), maxBytes)
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not read physical file: %w", err)
 	}
 	sum := sha256.Sum256(content)
 	if afterRead != nil {
@@ -1489,49 +1539,39 @@ func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), m
 	// full buffer and detecting in-place same-size rewrites whose mtime was
 	// restored. Metadata-only checks cannot prove that invariant.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file for verification: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not rewind physical file for verification: %w", err)
 	}
 	verificationHash := sha256.New()
 	var verificationReader io.Reader = f
 	if maxBytes > 0 {
 		verificationReader = io.LimitReader(f, maxBytes+1)
 	}
-	verifiedBytes, err := io.Copy(verificationHash, verificationReader)
+	if len(scratch) == 0 {
+		scratch = nil
+	}
+	verifiedBytes, err := io.CopyBuffer(verificationHash, verificationReader, scratch)
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file content: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not verify physical file content: %w", err)
 	}
 	if maxBytes > 0 && verifiedBytes > maxBytes {
-		return nil, physicalReadEvidence{}, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	if !bytes.Equal(sum[:], verificationHash.Sum(nil)) {
-		return nil, physicalReadEvidence{}, errPhysicalFileMoved
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
 
 	after, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not restat physical file: %w", err)
 	}
-	pathInfo, err := os.Stat(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	if !samePhysicalFileVersion(before, after) {
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
-	resolvedAfter, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
-	}
-	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
-		!samePhysicalFileVersion(before, after) ||
-		!samePhysicalFileVersion(after, pathInfo) {
-		return nil, physicalReadEvidence{}, errPhysicalFileMoved
-	}
-
 	return content, physicalReadEvidence{
-		resolvedPath:    resolvedAfter,
-		contentSHA256:   fmt.Sprintf("%x", sum),
-		byteCount:       len(content),
-		symlinkResolved: linkInfo.Mode()&os.ModeSymlink != 0,
-		readAt:          time.Now().UTC(),
-	}, nil
+		contentSHA256: hex.EncodeToString(sum[:]),
+		byteCount:     len(content),
+		readAt:        time.Now().UTC(),
+	}, after, nil
 }
 
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1555,6 +1595,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
+	releaseInteractiveRead := func() {}
+	defer func() { releaseInteractiveRead() }()
 	var (
 		absPath, relPath  string
 		viewURI           string
@@ -1614,6 +1656,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 				return mcp.NewToolResultError("file is deleted in the current editor buffer"), nil
 			}
 		}
+		if !overlayPresent {
+			releaseInteractiveRead = s.beginEditedFileRead(ctx, absPath)
+		}
 		info, statErr := os.Stat(absPath)
 		if statErr != nil && (sourceView == nil || !overlayPresent || physicalEvidenceRequested) {
 			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
@@ -1671,11 +1716,14 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			// indexer extracted (#846); the indexer holds symbols from the
 			// decoded file, so serving raw NUL-interleaved bytes makes
 			// discovery and reads disagree.
+			diskContent = b
 			b, utf16Decoded = decodedSourceForRead(b)
 			content = b
 		}
 	}
 
+	releaseInteractiveRead() // before graph/projection queries; this marker covered physical read-back only
+	releaseInteractiveRead = func() {}
 	originalBytes := len(content)
 	sourceHead := content[:min(512, len(content))]
 
@@ -1691,6 +1739,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	isBinary := looksBinary(content)
 	bodiesElided := false
+	compressionPending := false
+	compressionBound := false
+	var compressionSymbols []*graph.Node
 	var keptSymbols []string
 	var language string
 	if sourceRequestView(ctx) != nil {
@@ -1698,17 +1749,46 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	} else {
 		language = s.detectLanguageForPath(ctx, absPath, relPath)
 	}
+	// Graph-dependent compression must use the same current file as its
+	// source bytes. Ordinary raw reads and unsupported eliders stay untouched.
+	if req.GetBool("compress_bodies", false) && req.GetString("keep", "") != "" && elide.IsSupported(language) && sourceRequestView(ctx) == nil && refViewFilesFor(ctx) == nil && !installedSkillPath(rawPath) {
+		ctx, err = s.ensureProjected(ctx, []string{relPath})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !servedFromOverlay {
+			var entry *projectionEntry
+			if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
+				facts.mu.RLock()
+				entry = facts.entries[pathkey.MutationKey(absPath)]
+				facts.mu.RUnlock()
+				if entry != nil && (!liveProjectionForAcknowledgement(entry) || entry.rawHash != blake3.Sum256(diskContent)) {
+					return mcp.NewToolResultError(errProjectedSourceMoved.Error()), nil
+				}
+			}
+			if entry != nil {
+				compressionSymbols = entry.layer.FileNodes(relPath)
+				compressionBound = true
+			} else {
+				compressionSymbols, compressionBound = s.readFileCompressionSymbols(ctx, absPath, relPath, content)
+			}
+			compressionPending = !compressionBound
+		}
+	}
 	// Tool-call observer: credit the recent search for the symbols in
 	// the file the agent is reading.
 	var sg *query.SubGraph
-	if sourceRequestView(ctx) == nil {
+	if sourceRequestView(ctx) == nil && !compressionPending {
 		afterFreshSymbolAcceptance(ctx, func() { s.creditFileConsumption(ctx, relPath) })
 		sg = s.engineFor(ctx).GetFileSymbols(relPath)
 	}
-	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
+	if !compressionPending && req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
 		var symbols []*graph.Node
 		if sg != nil {
 			symbols = sg.Nodes
+		}
+		if compressionBound {
+			symbols = compressionSymbols // Never re-query ranges after their proof.
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
 		decide := fidelityDecideForPath(fidelityRules, relPath)
@@ -1792,6 +1872,10 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if compressionPending {
+		result["compression_state"] = "pending"
+		result["compression_reason"] = "source_projection_unavailable"
 	}
 	if sourceRequestView(ctx) != nil {
 		source := "disk"

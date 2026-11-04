@@ -315,15 +315,16 @@ func checkEditProbeWindowNS(ns int64, phases map[string]any) (editProbeWindow, e
 }
 
 type editProbeAccounting struct {
-	State     string           `json:"state"`
-	RPCID     string           `json:"bound_rpc_id"`
-	Requested uint64           `json:"requested_generation"`
-	Applied   uint64           `json:"applied_generation"`
-	A         *editProbeWindow `json:"acknowledgement"`
-	P         *editProbeWindow `json:"physical"`
-	B         *editProbeWindow `json:"requested_background"`
-	R         *editProbeWindow `json:"read_assisted_publisher,omitempty"`
-	Reasons   []string         `json:"reasons"`
+	Shared    *editProbeSharedReference `json:"shared_owner,omitempty"`
+	State     string                    `json:"state"`
+	RPCID     string                    `json:"bound_rpc_id"`
+	Requested uint64                    `json:"requested_generation"`
+	Applied   uint64                    `json:"applied_generation"`
+	A         *editProbeWindow          `json:"acknowledgement"`
+	P         *editProbeWindow          `json:"physical"`
+	B         *editProbeWindow          `json:"requested_background"`
+	R         *editProbeWindow          `json:"read_assisted_publisher,omitempty"`
+	Reasons   []string                  `json:"reasons"`
 }
 
 func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAccounting {
@@ -342,10 +343,15 @@ func checkEditProbeAccountingForTool(status map[string]any, receipt, tool string
 	return checkEditProbeAccounting(status, receipt)
 }
 
-// A batch's shared RPC owner is supplied separately from its per-file P/B/R
-// owner. The windows remain independent; no map is merged into a synthetic
-// physical mutation_status reply and A is never added to background work.
-func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+// checkEditProbeAcknowledgement validates A and receipt/generation identities only.
+// Callers retain every reason before validating their distinct execution owner.
+func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+	return checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
+}
+
+// Existing callers stay strict. The batch-bound route may select an executed
+// local no-wait disposition only after original journal/ACK identity checks.
+func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
 	if status["receipt"] != receipt {
@@ -372,6 +378,19 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 	aPhases, _ := ack["observed_execution_ms"].(map[string]any)
 	aStates, _ := ack["phase_states"].(map[string]any)
 	for _, name := range []string{"caller_result", "disk_write", "edit_control", "middleware", "parse", "publish", "reindex_wait", "reply_prepare"} {
+		if name == "reindex_wait" && countedNoWait {
+			counts, _ := ack["counts"].(map[string]any)
+			count, _ := counts[name].(map[string]any)
+			started, se := strconvEditProbeUint(count["started"])
+			completed, ce := strconvEditProbeUint(count["completed"])
+			na, ne := strconvEditProbeUint(count["not_applicable"])
+			_, present := aPhases[name]
+			ackPhases, _ := ack["phases_ms"].(map[string]any)
+			_, ackPresent := ackPhases[name]
+			if present && ackPresent && ackPhases[name] == nil && aPhases[name] == nil && aStates[name] == "not_applicable" && se == nil && ce == nil && ne == nil && started > 0 && completed == started && na == started {
+				continue
+			}
+		}
 		// The actual batch text-splice handler explicitly records that it
 		// performs no parser gate. Preserve that null applicability state;
 		// missing/unknown work and an applicable parse never get this escape.
@@ -388,6 +407,29 @@ func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt,
 		fail("A: " + e.Error())
 	} else {
 		out.A = &a
+	}
+	return out
+}
+
+// A batch's shared RPC owner is supplied separately from its per-file P/B/R
+// owner. The windows remain independent; no map is merged into a synthetic
+// physical mutation_status reply and A is never added to background work.
+func checkEditProbeAccountingWithAcknowledgement(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable bool) editProbeAccounting {
+	return checkEditProbeAccountingWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
+}
+
+func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
+	out := checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, countedNoWait)
+	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
+	requested, applied := out.Requested, out.Applied
+	// Shared execution has a distinct owner/domain proof. Even malformed or
+	// unknown versions cannot fall through to valid-looking per-file numbers.
+	// Preserve the independently validated A window without borrowing P/B.
+	for name := range status {
+		if strings.HasPrefix(name, "shared_owner_accounting_v") {
+			fail("shared-owner claim requires explicit bound owner validation: " + name)
+			return out
+		}
 	}
 	original, _ := status["phase_timing"].(map[string]any)
 	publication, _ := status["publication_phases"].(map[string]any)
@@ -541,7 +583,11 @@ func editProbeObservedDuplicatePhysical(physical, publication map[string]any, ap
 }
 
 func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accounting editProbeAccounting) bool {
-	return graphTerminal && allCorrect && (!requireAccounting || accounting.State == "observed_single_window_checks_pass" || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background")
+	return graphTerminal && allCorrect && (!requireAccounting || editProbeAccountingComplete(accounting) || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background" || accounting.State == "terminal_unavailable_shared_owner")
+}
+
+func editProbeAccountingComplete(accounting editProbeAccounting) bool {
+	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {

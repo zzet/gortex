@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -113,10 +115,10 @@ func TestCanonicalPatchRealChunksAggregateWithoutChargingInterleavedWork(t *test
 	require.NotNil(t, timings.Window.PublicationUnattributedWallMS)
 }
 
-// This controlled source changes only the prepared refresh read. It forces the
-// real legacy combined fallback through an existing source seam, without a
-// production knob or timing-dependent filesystem race. All later reads serve
-// the actual owned file bytes again.
+// This controlled source changes both prepared refresh reads. It exhausts the
+// one bounded fresh preparation, forcing the real legacy combined fallback
+// without a production knob or timing-dependent filesystem race. All later
+// reads serve the actual owned file bytes again.
 type refreshMismatchSource struct {
 	source.ContentSource
 	reads atomic.Int32
@@ -124,8 +126,12 @@ type refreshMismatchSource struct {
 
 func (s *refreshMismatchSource) Open(path string) (io.ReadCloser, source.FileMeta, error) {
 	rc, meta, err := s.ContentSource.Open(path)
-	if err != nil || path != "edit.go" || s.reads.Add(1) != 2 {
+	if err != nil || path != "edit.go" {
 		return rc, meta, err
+	}
+	read := s.reads.Add(1)
+	if read != 2 {
+		return rc, meta, nil
 	}
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
@@ -137,12 +143,14 @@ func (s *refreshMismatchSource) Open(path string) (io.ReadCloser, source.FileMet
 	return io.NopCloser(bytes.NewReader(data)), meta, nil
 }
 
-func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *testing.T) {
+func TestCanonicalPatchRealCombinedFallbackObservesSuccessfulLapTotals(t *testing.T) {
 	path, idx, _ := pointPublicationFixture(t)
 	fs, err := source.NewFilesystemSource(filepath.Dir(path))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, fs.Close()) })
 	changing := &refreshMismatchSource{ContentSource: fs}
+	core, logs := observer.New(zap.InfoLevel)
+	idx.logger = zap.New(core)
 	idx.SetContentSource(changing)
 	t.Cleanup(func() { idx.SetContentSource(nil) })
 	r, s := beginRealPatchObservation(t)
@@ -151,14 +159,32 @@ func TestCanonicalPatchRealCombinedFallbackCannotPublishPartialLapTotals(t *test
 	}, false)
 	require.Empty(t, failed)
 	require.Contains(t, reparsed, path)
-	require.GreaterOrEqual(t, changing.reads.Load(), int32(3), "speculative read, changed refresh and actual fallback must all run")
+	require.GreaterOrEqual(t, changing.reads.Load(), int32(3), "probe, refresh rejection and actual legacy fallback must all run")
+	// Observe the real combined path, not just a fixture read count. The
+	// canonical measured assertions below must describe its actual work.
+	parsePhases, fallbackPhases := 0, 0
+	for _, entry := range logs.FilterMessage("indexer: reconcile phase complete").All() {
+		fields := entry.ContextMap()
+		switch fields["phase"] {
+		case "chunk_parse":
+			parsePhases++
+			require.EqualValues(t, 0, fields["staged_files"])
+			require.EqualValues(t, 1, fields["fallback_files"])
+		case "chunk_fallback_parse_apply":
+			fallbackPhases++
+			require.EqualValues(t, 1, fields["files"])
+			require.EqualValues(t, 0, fields["failed_files"])
+		}
+	}
+	require.Equal(t, 1, parsePhases)
+	require.Equal(t, 1, fallbackPhases, "a successful legacy parse/apply must actually complete")
 	require.NotNil(t, nodeByName(t, idx, "edit.go", "After"), "the fallback must actually parse and apply")
 	snapshot := finishRealPatchObservation(r, s)
 	for _, lap := range []canonicalPatchLap{patchParse, patchApply, patchSearch} {
-		require.True(t, snapshot.patchLaps.laps[lap].incomplete)
+		require.False(t, snapshot.patchLaps.laps[lap].incomplete)
 		name := canonicalPatchLapNames[lap]
-		require.Nil(t, snapshot.EditTimings().Milliseconds[name])
-		require.Equal(t, "not_observed", snapshot.EditTimings().States[name])
+		require.NotNil(t, snapshot.EditTimings().Milliseconds[name])
+		require.Equal(t, "measured", snapshot.EditTimings().States[name])
 	}
 	require.FileExists(t, path)
 	data, err := os.ReadFile(path)

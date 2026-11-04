@@ -237,6 +237,7 @@ func bridgeToolCall(ev BridgeEvent, port int, mode Mode) (decision BridgeDecisio
 	if ev.IsGortexTool {
 		if mode == ModeConsultUnlock {
 			markGraphConsulted(ev.SessionID)
+			return BridgeDecision{}
 		}
 		// Still let adaptive-nudge reset its streak on a symbolic call —
 		// but only while the daemon is up. During an outage every adapter
@@ -247,13 +248,20 @@ func bridgeToolCall(ev BridgeEvent, port int, mode Mode) (decision BridgeDecisio
 		if mode == ModeAdaptiveNudge && daemonUp {
 			_ = applyMode(input, true, mode, enrichResult{})
 		}
-		return BridgeDecision{}
+		if daemonUp {
+			return BridgeDecision{}
+		}
 	}
 
 	// Daemon outage: stand down (#486) — a block or advisory here would
 	// point at graph tools the daemon cannot serve. The consult-unlock
-	// marker above is local state and deliberately stays live.
+	// marker above is local state and deliberately stays live. Like
+	// Claude's PreToolUse, a tracked-repo call carries one notice per
+	// session so a mid-session outage is explained.
 	if !daemonUp {
+		if hookCallTargetsTrackedRepo(ev.ToolName, ev.ToolInput, ev.CWD) {
+			return BridgeDecision{AdditionalContext: daemonDownNoticeOnce(ev.SessionID)}
+		}
 		return BridgeDecision{}
 	}
 

@@ -16,6 +16,8 @@ import (
 
 const maxWireBytes = 64 << 20
 
+const loadWireTools, loadWireToolsMode = "facade-v1", "hide"
+
 type rpcError struct {
 	Code      int            `json:"code"`
 	Message   string         `json:"message"`
@@ -39,12 +41,14 @@ func (e *rpcError) retryEditProbe() bool {
 }
 
 type wireReply struct {
-	ID     json.Number     `json:"id"`
-	Result json.RawMessage `json:"result"`
-	Error  *rpcError       `json:"error"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	err    error
+	ID       json.Number     `json:"id"`
+	Result   json.RawMessage `json:"result"`
+	Error    *rpcError       `json:"error"`
+	Method   string          `json:"method"`
+	Params   json.RawMessage `json:"params"`
+	err      error
+	rawFrame []byte
+	rawBytes int
 }
 
 type notificationObservation struct {
@@ -53,17 +57,20 @@ type notificationObservation struct {
 }
 
 type socketClient struct {
-	conn          net.Conn
-	reader        *bufio.Reader
-	writeGate     chan struct{}
-	mu            sync.Mutex
-	next          int64
-	pending       map[int64]chan wireReply
-	closed        error
-	done          chan struct{}
-	notifies      []notificationObservation
-	notifyDropped int
-	version       string
+	conn                      net.Conn
+	reader                    *bufio.Reader
+	writeGate                 chan struct{}
+	mu                        sync.Mutex
+	next                      int64
+	pending                   map[int64]chan wireReply
+	capturePending            map[int64]bool // allocated only for opt-in observed calls
+	closed                    error
+	done                      chan struct{}
+	notifies                  []notificationObservation
+	notifyDropped             int
+	version                   string
+	cwd                       string // immutable checkout supplied by the successful handshake
+	offeredTools, offeredMode string
 }
 
 // Per-call values returned to its caller, never a shared last-ID cache. Times
@@ -71,6 +78,7 @@ type socketClient struct {
 type wireCallIdentity struct {
 	ID                                                             int64
 	onWriteStart                                                   func(time.Time)
+	failure                                                        *failureWireCapture
 	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
 }
 
@@ -89,7 +97,7 @@ func readWireLine(reader *bufio.Reader) ([]byte, error) {
 }
 
 func dialSocket(ctx context.Context, socket, cwd, mode string) (net.Conn, *bufio.Reader, string, error) {
-	return dialSocketSurface(ctx, socket, cwd, mode, "facade-v1", "hide")
+	return dialSocketSurface(ctx, socket, cwd, mode, loadWireTools, loadWireToolsMode)
 }
 
 // dialSocketSurface negotiates the session's tool surface in the handshake,
@@ -142,7 +150,8 @@ func openMCP(ctx context.Context, socket, cwd string) (*socketClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, writeGate: make(chan struct{}, 1)}
+	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, cwd: cwd, writeGate: make(chan struct{}, 1)}
+	c.offeredTools, c.offeredMode = loadWireTools, loadWireToolsMode
 	go c.readLoop()
 	if _, err := c.call(ctx, "initialize", map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "gortex-load", "version": "1"}}); err != nil {
 		_ = c.Close()
@@ -191,8 +200,16 @@ func (c *socketClient) readLoop() {
 		}
 		c.mu.Lock()
 		ch := c.pending[id]
+		capture := c.capturePending[id]
 		delete(c.pending, id)
+		delete(c.capturePending, id)
 		c.mu.Unlock()
+		if capture {
+			reply.rawBytes = len(line)
+			if len(line) <= readSourceFailureBytes {
+				reply.rawFrame = append([]byte(nil), line...)
+			}
+		}
 		if ch != nil {
 			ch <- reply
 		}
@@ -209,6 +226,7 @@ func (c *socketClient) fail(err error) {
 	for id, ch := range c.pending {
 		ch <- wireReply{err: err}
 		delete(c.pending, id)
+		delete(c.capturePending, id)
 	}
 }
 
@@ -266,7 +284,24 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 			observation.onWriteStart(observation.WriteStarted)
 		}
 	}
-	_, err = io.Copy(c.conn, bytes.NewReader(append(data, '\n')))
+	frame := append(data, '\n')
+	written, writeErr := io.Copy(c.conn, bytes.NewReader(frame))
+	err = writeErr
+	if observation != nil && observation.failure != nil {
+		capture := observation.failure
+		capture.requestBytes = int(written)
+		capture.writeCompleted = writeErr == nil && written == int64(len(frame))
+		switch {
+		case written > readSourceFailureBytes:
+			capture.requestStatus = "oversize"
+		case written > 0:
+			capture.request = append([]byte(nil), frame[:int(written)]...)
+			capture.requestStatus = "partial"
+			if capture.writeCompleted {
+				capture.requestStatus = "complete"
+			}
+		}
+	}
 	if observation != nil {
 		observation.WriteFinished = time.Now()
 	}
@@ -285,6 +320,14 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 
 func (c *socketClient) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	return c.callObserved(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithFailureCapture(ctx context.Context, method string, params any, capture *failureWireCapture) (json.RawMessage, error) {
+	observation := wireCallIdentity{failure: capture}
+	capture.offeredTools, capture.offeredMode, capture.daemonVersion = c.offeredTools, c.offeredMode, c.version
+	data, err := c.callObserved(ctx, method, params, &observation)
+	capture.id = observation.ID
+	return data, err
 }
 
 func (c *socketClient) callWithIdentity(ctx context.Context, method string, params any) (json.RawMessage, wireCallIdentity, error) {
@@ -320,10 +363,17 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 	}
 	ch := make(chan wireReply, 1)
 	c.pending[id] = ch
+	if observation != nil && observation.failure != nil {
+		if c.capturePending == nil {
+			c.capturePending = make(map[int64]bool)
+		}
+		c.capturePending[id] = true
+	}
 	c.mu.Unlock()
 	defer func() {
 		c.mu.Lock()
 		delete(c.pending, id)
+		delete(c.capturePending, id)
 		c.mu.Unlock()
 	}()
 	if err := c.sendObserved(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false, observation); err != nil {
@@ -340,6 +390,14 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 	case reply := <-ch:
 		if observation != nil {
 			observation.ReplyDelivered = time.Now()
+			if capture := observation.failure; capture != nil && reply.rawBytes > 0 {
+				capture.responseBytes = reply.rawBytes
+				capture.response = reply.rawFrame
+				capture.responseStatus = "complete"
+				if len(reply.rawFrame) == 0 {
+					capture.responseStatus = "oversize"
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return reply.Result, ctx.Err()

@@ -2479,10 +2479,11 @@ func testDistinctExternalTargets(t *testing.T, factory Factory) {
 	add("external-call::dep::example.com/old", graph.EdgeCalls, 6)
 	add("local.go::resolved", graph.EdgeCalls, 7)
 	add("dep::wrong-kind::Call", graph.EdgeTests, 8)
+	s.AddEdge(&graph.Edge{From: "other", To: "dep::collections.Counter::Counter", Kind: graph.EdgeCalls, FilePath: "worker.py"})
 
 	got := s.DistinctExternalTargets([]graph.EdgeKind{
 		graph.EdgeCalls, graph.EdgeReferences, graph.EdgeReads, graph.EdgeCalls,
-	})
+	}, ".go")
 	want := []string{
 		"dep::example.com/pkg::Call",
 		"external-call::dep::example.com/old",
@@ -2493,7 +2494,7 @@ func testDistinctExternalTargets(t *testing.T, factory Factory) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("DistinctExternalTargets = %v, want %v", got, want)
 	}
-	if got := s.DistinctExternalTargets(nil); len(got) != 0 {
+	if got := s.DistinctExternalTargets(nil, ""); len(got) != 0 {
 		t.Fatalf("DistinctExternalTargets(nil) yielded %d targets, want 0", len(got))
 	}
 }

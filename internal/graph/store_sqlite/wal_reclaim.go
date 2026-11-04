@@ -100,9 +100,9 @@ const (
 	// mutation (AnnounceWrite) ends a hold at once.
 	walReclaimMaxWriterHold = 2 * time.Second
 	// walReclaimUrgentFactor: from this multiple of the threshold the log is
-	// urgent. An urgent attempt does not yield to waiting writes (it still
-	// never holds the writer past walReclaimMaxWriterHold), so a store whose
-	// writes never pause still gets its WAL reset instead of growing forever.
+	// urgent. Urgency selects spacing and convergence, never overrides edit
+	// demand. Only over-ceiling bulk completion and the hard cap/last resort
+	// retain completion credit during a burst; interactive reads always win.
 	walReclaimUrgentFactor = 2
 	// walReclaimClosedGateMaxResidue is the most unbackfilled frames the
 	// closed-gate fallback accepts: its TRUNCATE has walReclaimTruncateBudget
@@ -254,6 +254,18 @@ func resolveWALReclaimConfig() walReclaimConfig {
 // read gate was closed per attempt that closed it; ReaderWait is what readers
 // actually spent held at the gate (per held read), measured on their side.
 type WALReclaimStats struct {
+	EditBurstWriterHold                        DurationHistogram
+	EditBurstGateClosures                      int64
+	DeferredEditBurst, DeferredInteractiveRead int64
+	BulkExceptionHolds, HardCapExceptionHolds  int64
+
+	// WriterHold covers each reclaim acquisition, including credit reacquisition.
+	// WriterWait measures the first queued foreground waiter per reclaim hold.
+	// Snapshots never wait on the current writer holder.
+	WriterHold, WriterWait DurationHistogram
+	// Closed admission before final reset, and from final-reset start until reopening.
+	PauseDrain, PauseTruncate DurationHistogram
+
 	// One first observed cause per final non-reset reclaim attempt, including
 	// writer-demand refusal. Parked writer precedes intent if both are seen.
 	CancelledWriterParked, CancelledWriteIntent, CancelledOther int64
@@ -263,6 +275,7 @@ type WALReclaimStats struct {
 	WALPeakObserved      bool
 	ThresholdBytes       int64
 	Attempts             int64 // attempts that passed the size check and the lease
+	UrgentAttempts       int64 // admitted attempts whose final urgency was set
 	Resets               int64 // TRUNCATE checkpoints that reset the log
 	OpenGateResets       int64 // resets reached without closing the read gate
 	// LastResortRuns counts attempts at walReclaimLastResortBytes (each may
@@ -325,10 +338,14 @@ type WALReclaimStats struct {
 }
 
 type walReclaimState struct {
-	observedPeak atomic.Int64
-	peakObserved atomic.Bool
-	mu           sync.Mutex
-	stats        WALReclaimStats
+	interactive walInteractiveReads
+
+	pauseDrain    durationHistogram
+	pauseTruncate durationHistogram
+	observedPeak  atomic.Int64
+	peakObserved  atomic.Bool
+	mu            sync.Mutex
+	stats         WALReclaimStats
 	// cycle is the build-lane yield shared by the reclaim and the PASSIVE
 	// loop (checkpoint_cycle_yield.go).
 	cycle checkpointCycleYield
@@ -342,6 +359,13 @@ func (s *Store) WALReclaimStats() WALReclaimStats {
 	s.walReclaim.mu.Lock()
 	out := s.walReclaim.stats
 	s.walReclaim.mu.Unlock()
+	out.PauseDrain = s.walReclaim.pauseDrain.snapshot()
+	out.PauseTruncate = s.walReclaim.pauseTruncate.snapshot()
+	out.WriterHold = s.writeMu.reclaimHold.snapshot()
+	out.EditBurstWriterHold = s.writeMu.reclaimBurstHold.snapshot()
+	out.BulkExceptionHolds = s.writeMu.reclaimBulkExceptions.Load()
+	out.HardCapExceptionHolds = s.writeMu.reclaimHardExceptions.Load()
+	out.WriterWait = s.writeMu.reclaimWait.snapshot()
 	out.WALPeakObserved = s.walReclaim.peakObserved.Load()
 	out.ObservedPeakWALBytes = s.walReclaim.observedPeak.Load()
 	cycle := &s.walReclaim.cycle
@@ -409,13 +433,21 @@ type walReclaimResetReaders struct {
 }
 
 type walReclaimResult struct {
-	attempt     *backgroundCheckpointAttempt // bounded cause witness, never a global registry
-	outcome     walReclaimOutcome
-	reason      string
-	frames      int
-	pause       time.Duration
-	pauseClosed bool
-	openGate    bool
+	// Compile-tagged closed-gate fault only, never a bulk/hard-cap exception.
+	closedGateSeed bool
+	// Only shrink slices/journal-limit restoration may pass a build lane whose
+	// producer is currently blocked in AwaitWarmupWAL. Rechecked at admission.
+	warmupShrink                               bool
+	deferredEditBurst, deferredInteractiveRead bool
+	attempt                                    *backgroundCheckpointAttempt // bounded cause witness, never a global registry
+	outcome                                    walReclaimOutcome
+	reason                                     string
+	frames                                     int
+	pause                                      time.Duration
+	pauseClosed                                bool
+	pauseDrain, pauseTruncate                  time.Duration
+	pauseResetStarted                          time.Time
+	openGate                                   bool
 	// writerHold is the longest single hold of the writer; writerHolds
 	// counts the holds (the in-lane stage may take several short ones).
 	writerHold     time.Duration
@@ -556,6 +588,12 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 	s.walReclaim.update(func(st *WALReclaimStats) {
 		st.ThresholdBytes = cfg.thresholdBytes
 		st.noteInterruption(res)
+		if res.deferredEditBurst {
+			st.DeferredEditBurst++
+		}
+		if res.deferredInteractiveRead {
+			st.DeferredInteractiveRead++
+		}
 		st.LastOutcome = res.outcome.String()
 		st.LastReason = res.reason
 		if res.adaptiveUsed {
@@ -569,6 +607,8 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 		}
 		if res.pauseClosed {
 			st.notePause(res.pause)
+			s.walReclaim.pauseDrain.observe(res.pauseDrain)
+			s.walReclaim.pauseTruncate.observe(res.pauseTruncate)
 		}
 		switch res.outcome {
 		case walReclaimSkipped:
@@ -589,6 +629,9 @@ func (s *Store) reclaimWALOnce(cfg walReclaimConfig, ckptDB *sql.DB, walPath str
 			st.Failures++
 		}
 		st.Attempts++
+		if res.urgent {
+			st.UrgentAttempts++
+		}
 	})
 	return res
 }
@@ -692,6 +735,26 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 	if snap, ok := readWALIndexSnapshot(s.dbPath); ok && snap.MxFrame == 0 && res.bytesBefore <= cfg.thresholdBytes {
 		return walReclaimResult{outcome: walReclaimSkipped, reason: "nothing_to_reclaim", bytesBefore: res.bytesBefore}
 	}
+	// A below-ceiling standalone bulk writer cannot grant reset authority.
+	// Observe it only in an immediately available writer gap; never wait for
+	// this optimization, and retain the existing late authoritative checks.
+	if !res.leaseOverride && !res.hardCap && !res.lastResort &&
+		cfg.ceilingBytes > 0 && res.bytesBefore < cfg.ceilingBytes &&
+		!editGateClosedSeedPolicy(cfg) && s.writeMu.TryLock() {
+		standalone := s.bulkConn != nil && s.generationBulkLoad == 0 && !s.coordinatedBulkLoad
+		// Do not replace an already visible higher-priority refusal. Classify
+		// on a copy so a declined optimization changes no result/accounting.
+		probe := res
+		knownRefusal := standalone && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil
+		s.writeMu.Unlock()
+		// Release callbacks can cancel the attempt or expose new demand.
+		probe = res
+		if knownRefusal && context.Cause(attempt.ctx) == nil && s.reclaimCompletionCause(context.Background(), &probe) == nil {
+			res.outcome, res.reason = walReclaimSkipped, "bulk_writer"
+			res.bytesAfter = s.observedWALFileSize(walPath)
+			return res
+		}
+	}
 	// Step 1: the unbounded backfill (see the file comment), without the
 	// writer. Its error is not fatal — the lane copies whatever remains —
 	// unless the attempt was cancelled.
@@ -772,7 +835,7 @@ func (s *Store) reclaimWALAttempt(cfg walReclaimConfig, ckptDB *sql.DB, walPath 
 			// Never inside an edit: only an attempt that runs through a busy
 			// lane (pressure, hard cap) may hold the writer during one.
 			yieldsToLane := !res.pressure && !res.hardCap
-			if s.walRemainderFits(&res) && (res.urgent || !s.writeWanted()) && (!yieldsToLane || !s.buildLaneBusy()) {
+			if s.walRemainderFits(&res) && (!s.writeWanted() || res.burstException()) && (!yieldsToLane || !s.buildLaneBusy()) {
 				outcome, reason := res.outcome, res.reason
 				var done bool
 				var herr error
@@ -967,16 +1030,20 @@ func (s *Store) walLaneHoldCap() time.Duration {
 }
 
 func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult) error {
-	urgent := res.urgent
-	// A mutation already waiting for the writer wins outright (unless the log
-	// is urgent; the hold stays capped).
-	if demand := s.writeDemandCause(); !urgent && demand != nil {
+	res.closedGateSeed = editGateClosedSeedPolicy(cfg)
+	// A mutation already waiting for the writer wins outright, including
+	// urgent attempts, except the explicit bulk/hard-cap completion classes.
+	if demand := s.writeDemandCause(); !res.closedGateSeed && !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
+		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return demand
 	}
 	if !res.lastResort && !res.bulkCompletion && !walReclaimSkipQuiescence && s.readGate != nil && !walReclaimSkipOpenGate && cfg.readerWait > 0 {
 		return s.reclaimWALInLaneOpenGate(ctx, cfg, ckptDB, res)
+	}
+	if err := s.reclaimCompletionCause(ctx, res); err != nil {
+		return err
 	}
 	if res.bulkCompletion && !res.lastResort {
 		defer func() {
@@ -1011,15 +1078,18 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	// open-gate stages disabled).
 	// 3. Writer quiescence, capped at walReclaimMaxWriterHold from here on.
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err := s.writeMu.LockContext(wctx)
+	err := s.lockWALReclaimCompletion(wctx, res)
 	wcancel()
 	if err != nil {
-		res.reason = "writer_gate"
+		if !errors.Is(err, errWALReclaimInteractiveRead) && !errors.Is(err, errWALReclaimEditBurst) && !errors.Is(err, errWALReclaimWriterWaiting) {
+			res.reason = "writer_gate"
+		}
 		return fmt.Errorf("%w: %w", ErrMaintenanceBusy, err)
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
-	writer.yieldToWriters = !res.urgent
+	writer.yieldToWriters = !res.closedGateSeed && !res.burstException()
+	writer.result = res
 	defer func() {
 		writer.release()
 		res.writerHold = max(res.writerHold, writer.longest)
@@ -1042,10 +1112,7 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	}
 	hctx, hcancel := context.WithDeadline(ctx, held.Add(allowance))
 	defer hcancel()
-	yctx, stopYield := hctx, func() {}
-	if !urgent {
-		yctx, stopYield = s.yieldToWriters(hctx)
-	}
+	yctx, stopYield := s.yieldWALReclaim(hctx, res)
 	defer stopYield()
 	yielded := func() bool {
 		cause := context.Cause(yctx)
@@ -1171,17 +1238,22 @@ func (s *Store) reclaimWALInLane(ctx context.Context, cfg walReclaimConfig, ckpt
 	reopen := func() {}
 	if quiesce {
 		var inFlight int
-		reopen, inFlight, err = s.readGate.quiesce(yctx, start.Add(cfg.drainDeadline))
+		reopen, inFlight, err = s.readGate.quiesceReclaim(yctx, start.Add(cfg.drainDeadline), s, res)
 		if err != nil {
-			res.pause, res.pauseClosed = time.Since(start), true
+			if !errors.Is(err, errReadGateBusy) {
+				res.notePauseInterval(start, time.Now(), time.Time{})
+			}
 			return giveUp(fmt.Sprintf("readers_in_flight=%d", inFlight), nil)
 		}
 	}
 	tctx, tcancel := context.WithTimeout(yctx, cfg.truncateBudget)
+	resetStarted := time.Now()
 	result, err := s.resetWALForReclaim(tctx)
 	tcancel()
 	reopen()
-	res.pause, res.pauseClosed = time.Since(start), quiesce
+	if quiesce {
+		res.notePauseInterval(start, time.Now(), resetStarted)
+	}
 	if err != nil {
 		return giveUp(fmt.Sprintf("truncate busy=%d wal_frames=%d checkpointed=%d error=%v", result.Busy, result.WALFrames, result.CheckpointedFrames, err), err)
 	}
@@ -1215,6 +1287,14 @@ func (s *Store) resetWALAfterOlderReaderProgress(ctx context.Context, deadline t
 // before it waits on anything else — so every checkpoint running under it is
 // interrupted and the writer handed back within walReclaimYieldPoll.
 func (s *Store) yieldToWriters(parent context.Context) (context.Context, func()) {
+	return s.yieldWALReclaim(parent, nil)
+}
+
+func (s *Store) yieldWALReclaim(parent context.Context, res *walReclaimResult) (context.Context, func()) {
+	exception := res != nil && res.burstException()
+	seed := res != nil && res.closedGateSeed
+	limit, bounded := parent.Deadline()
+	longHold := bounded && time.Until(limit) > walReclaimResetHold
 	ctx, cancel := context.WithCancelCause(parent)
 	done := make(chan struct{})
 	go func() {
@@ -1227,15 +1307,35 @@ func (s *Store) yieldToWriters(parent context.Context) (context.Context, func())
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if demand := s.writeDemandCause(); demand != nil {
+				if demand := s.writeDemandCause(); !seed && !exception && demand != nil {
 					cancel(demand)
 					return
+				}
+				if res != nil && !seed {
+					if s.walReclaim.interactive.active.Load() > 0 {
+						cancel(errWALReclaimInteractiveRead)
+						return
+					}
+					if !exception && longHold && s.editBurstActive() {
+						cancel(errWALReclaimEditBurst)
+						return
+					}
 				}
 			}
 		}
 	}()
 	return ctx, func() {
 		close(done)
+		if res != nil {
+			cause := context.Cause(ctx)
+			noteWALReclaimDemand(parent, cause)
+			if errors.Is(cause, errWALReclaimInteractiveRead) {
+				res.deferredInteractiveRead = true
+			}
+			if errors.Is(cause, errWALReclaimEditBurst) || errors.Is(cause, errWALReclaimWriterWaiting) {
+				res.deferredEditBurst = true
+			}
+		}
 		cancel(context.Canceled)
 	}
 }
@@ -1254,7 +1354,9 @@ func (s *Store) writeWanted() bool {
 // mutation queued behind them upstream of the write gate is not held by them
 // either. The release is idempotent.
 func (s *Store) AnnounceWrite() (release func()) {
-	return s.announceWrite(true)
+	release = s.announceWrite(true)
+	editGateClosedReclaimSeed(s)
+	return release
 }
 
 // AnnounceCheckoutRefresh retains global mutation demand while a checkout
@@ -1755,6 +1857,9 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 		return done, err
 	}
 	if budget := res.takeAdaptiveWriterBudget(); budget > 0 {
+		if err := s.reclaimCompletionCause(ctx, res); err != nil {
+			return done, err
+		}
 		return s.reclaimWALResetHoldOnce(ctx, cfg, ckptDB, res, first, yieldsToLane, budget)
 	}
 	return done, err
@@ -1762,21 +1867,29 @@ func (s *Store) reclaimWALResetHold(ctx context.Context, cfg walReclaimConfig, c
 
 func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfig, ckptDB *sql.DB, res *walReclaimResult, first, yieldsToLane bool, budget time.Duration) (done bool, err error) {
 	res.resetReaders = nil
-	if demand := s.writeDemandCause(); !res.urgent && demand != nil {
+	if demand := s.writeDemandCause(); !res.closedGateSeed && !res.burstException() && demand != nil {
 		noteWALReclaimDemand(ctx, demand)
+		res.deferredEditBurst = true
 		res.outcome, res.reason = walReclaimSkipped, "writer_waiting"
 		return false, demand
 	}
 	wctx, wcancel := context.WithTimeout(ctx, walReclaimWriterWait)
-	err = s.writeMu.LockContext(wctx)
+	if budget > walReclaimResetHold {
+		err = s.lockWALReclaimCompletion(wctx, res)
+	} else {
+		err = s.lockWALReclaimWriter(wctx, res)
+	}
 	wcancel()
 	if err != nil {
-		res.reason = "writer_gate"
+		if !errors.Is(err, errWALReclaimInteractiveRead) && !errors.Is(err, errWALReclaimEditBurst) && !errors.Is(err, errWALReclaimWriterWaiting) {
+			res.reason = "writer_gate"
+		}
 		return false, fmt.Errorf("%w: %w", ErrMaintenanceBusy, err)
 	}
 	held := time.Now()
 	writer := newWALReclaimWriterCredit(s, held)
-	writer.yieldToWriters = !res.urgent
+	writer.yieldToWriters = !res.closedGateSeed && !res.burstException()
+	writer.result = res
 	adaptiveCopy := false
 	defer func() {
 		writer.release()
@@ -1797,10 +1910,7 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 	}
 	hctx, hcancel := context.WithDeadline(ctx, held.Add(budget))
 	defer hcancel()
-	yctx, stopYield := hctx, func() {}
-	if !res.urgent {
-		yctx, stopYield = s.yieldToWriters(hctx)
-	}
+	yctx, stopYield := s.yieldWALReclaim(hctx, res)
 	defer stopYield()
 	yielded := func() bool {
 		cause := context.Cause(yctx)
@@ -1873,6 +1983,9 @@ func (s *Store) reclaimWALResetHoldOnce(ctx context.Context, cfg walReclaimConfi
 		}
 		observer("short_reset_before", epoch, older, nil)
 	}
+	if err := s.reclaimYieldCause(ctx, res); err != nil {
+		return false, err
+	}
 	_, terr := s.resetWALForReclaim(writer.resetContext(yctx))
 	if observer := walReclaimRoundObserver; observer != nil {
 		observer("short_reset_after", 0, 0, terr)
@@ -1926,4 +2039,23 @@ func (s *Store) watchWALMark(parent context.Context, walPath string, markBytes i
 		}
 	}()
 	return ctx, cancel
+}
+
+// notePauseInterval partitions actual closed admission. A timer may reopen the
+// gate while SQLite finishes: work after reopening never inflates either stage.
+func (r *walReclaimResult) notePauseInterval(start, end, reset time.Time) {
+	if end.Before(start) {
+		end = start
+	}
+	split := end
+	if !reset.IsZero() && reset.Before(end) {
+		split = reset
+	}
+	if split.Before(start) {
+		split = start
+	}
+	r.pauseDrain += split.Sub(start)
+	r.pauseTruncate += end.Sub(split)
+	r.pause += end.Sub(start)
+	r.pauseClosed = true
 }

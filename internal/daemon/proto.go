@@ -5,6 +5,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/zzet/gortex/internal/graph"
 	"io"
 	"time"
 )
@@ -128,9 +129,11 @@ type ControlResponse struct {
 
 // Control operation kinds. One constant per kind so callers can't typo.
 const (
-	ControlTrack   = "track"
-	ControlUntrack = "untrack"
-	ControlReload  = "reload"
+	ControlTrack = "track"
+	// ControlTrackPreflight observes ownership without registering or saving.
+	ControlTrackPreflight = "track_preflight"
+	ControlUntrack        = "untrack"
+	ControlReload         = "reload"
 	// ControlProxy reloads servers.toml and rebuilds + atomically swaps
 	// the daemon's multi-server Router, then invalidates the roster
 	// cache — so `gortex proxy on/off/add/remove` apply to a running
@@ -525,8 +528,10 @@ type PublicationPhaseOffset struct {
 
 // StorageStatus is the store's write-ahead-log state for daemon status.
 type StorageStatus struct {
-	DBBytes  int64 `json:"db_bytes"`
-	WALBytes int64 `json:"wal_bytes"`
+	DenseIndexesMissing []string                         `json:"dense_indexes_missing,omitempty"`
+	LastFirstIndexDrain map[string]graph.FirstIndexDrain `json:"last_first_index_drain,omitempty"`
+	DBBytes             int64                            `json:"db_bytes"`
+	WALBytes            int64                            `json:"wal_bytes"`
 	// WALPendingFrames is the backlog not yet copied into the database
 	// (mxFrame - nBackfill), -1 when the wal-index could not be read.
 	WALPendingFrames int64 `json:"wal_pending_frames"`
@@ -537,8 +542,9 @@ type StorageStatus struct {
 	// CloseCheckpointPolicy is skip/full for stores reporting their effective
 	// policy. Empty means an older or unknown backend; callers must not infer
 	// the daemon's choice from their own environment.
-	CloseCheckpointPolicy string            `json:"close_checkpoint_policy,omitempty"`
-	WALReclaim            *WALReclaimStatus `json:"wal_reclaim,omitempty"`
+	CloseCheckpointPolicy string               `json:"close_checkpoint_policy,omitempty"`
+	WALReclaim            *WALReclaimStatus    `json:"wal_reclaim,omitempty"`
+	WALCheckpoint         *WALCheckpointStatus `json:"wal_checkpoint,omitempty"`
 	// RowCounters is the writer-maintained per-generation node/edge counts:
 	// whether NodeCount/EdgeCount read them, and — on an exact status only —
 	// the drift check against a recount.
@@ -559,10 +565,54 @@ type RowCounterStatus struct {
 	FirstDrift string `json:"first_drift,omitempty"`
 }
 
+// WALCheckpointStatus reports the periodic producer separately from reclaim.
+// Missing capability omits this block; unobserved frame work remains explicit.
+type WALCheckpointStatus struct {
+	Attempts                   int64   `json:"attempts"`
+	Complete                   int64   `json:"complete"`
+	Incomplete                 int64   `json:"incomplete"`
+	ZeroProgress               int64   `json:"zero_progress"`
+	DeferredBuildLane          int64   `json:"deferred_build_lane"`
+	LongestBuildLaneDeferralMS float64 `json:"longest_build_lane_deferral_ms"`
+	RefusedLease               int64   `json:"refused_lease"`
+	RefusedInflight            int64   `json:"refused_inflight"`
+	StoodAsideReclaim          int64   `json:"stood_aside_reclaim"`
+	YieldCancelled             int64   `json:"yield_cancelled"`
+	Failed                     int64   `json:"failed"`
+	FramesBackfilledTotal      int64   `json:"frames_backfilled_total"`
+	FramesUnobserved           int64   `json:"frames_unobserved"`
+	LastOKAt                   string  `json:"last_ok_at,omitempty"`
+	LastOutcome                string  `json:"last_outcome"`
+}
+
 // WALReclaimStatus mirrors the store's bounded WAL-reclaim counters. Pause is
 // the time the read gate was closed for a reset; ReaderWait is the time new
 // reads spent waiting at it.
+// WALDurationHistogramStatus is a since-store-open distribution. Bucket counts
+// are disjoint so callers can subtract snapshots for a measured window.
+type WALDurationHistogramStatus struct {
+	Count        int64     `json:"count"`
+	TotalMS      float64   `json:"total_ms"`
+	MaxMS        float64   `json:"max_ms"`
+	P50MS        float64   `json:"p50_ms"`
+	P95MS        float64   `json:"p95_ms"`
+	BucketLeMS   []float64 `json:"bucket_le_ms"`
+	BucketCounts []int64   `json:"bucket_counts"`
+}
+
 type WALReclaimStatus struct {
+	EditBurstWriterHold     *WALDurationHistogramStatus `json:"edit_burst_writer_hold"`
+	EditBurstGateClosures   int64                       `json:"edit_burst_gate_closures"`
+	DeferredEditBurst       int64                       `json:"deferred_edit_burst"`
+	DeferredInteractiveRead int64                       `json:"deferred_interactive_read"`
+	BulkExceptionHolds      int64                       `json:"bulk_exception_holds"`
+	HardCapExceptionHolds   int64                       `json:"hard_cap_exception_holds"`
+
+	WriterHold    WALDurationHistogramStatus `json:"writer_hold"`
+	WriterWait    WALDurationHistogramStatus `json:"writer_wait"`
+	PauseDrain    WALDurationHistogramStatus `json:"pause_drain"`
+	PauseTruncate WALDurationHistogramStatus `json:"pause_truncate"`
+
 	// Same since-store-open observations exposed by graph_stats. The peak is
 	// a sampled lower bound and remains null until actually observed; reads
 	// and WAL resets never clear it or the cancellation counters.
@@ -574,6 +624,7 @@ type WALReclaimStatus struct {
 
 	ThresholdBytes int64 `json:"threshold_bytes"`
 	Attempts       int64 `json:"attempts"`
+	UrgentAttempts int64 `json:"urgent_attempts"`
 	Resets         int64 `json:"resets"`
 	// OpenGateResets counts resets reached without closing the read gate;
 	// WriterHold* is how long the reclaim held the application writer.

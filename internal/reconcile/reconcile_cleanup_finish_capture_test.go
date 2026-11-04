@@ -16,12 +16,12 @@ type capturedCleanupTestHooks struct {
 func (*capturedCleanupTestHooks) PurgeCheckoutLayers(context.Context, string, string) error {
 	return nil
 }
-func (*capturedCleanupTestHooks) ReleaseGraph(context.Context, string) error { return nil }
+func (*capturedCleanupTestHooks) ReleaseGraph(context.Context, string, string) error { return nil }
 func (h *capturedCleanupTestHooks) BeginGraphCleanup(context.Context, string) error {
 	return h.beginErr
 }
 func (h *capturedCleanupTestHooks) RepositoryCleanupAttemptFinished([]string) { h.legacyCalls++ }
-func (h *capturedCleanupTestHooks) BeginGraphCleanupAttempt(_ context.Context, graphID string) (func(), error) {
+func (h *capturedCleanupTestHooks) BeginGraphCleanupAttempt(_ context.Context, graphID string, _ ...string) (func(), error) {
 	return func() { h.finished[graphID]++ }, h.beginErr
 }
 

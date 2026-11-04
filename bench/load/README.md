@@ -79,6 +79,17 @@ and native paired edit scenarios). This adds no hidden reader population.
 `--agents 4 --edit-agents 4` is the separate four-pure-reader/four-editor tail
 workload. The counts remain explicit in the report and workload hash.
 
+The PR smoke entry uses a versioned offered-window/drain profile. Read drains
+retain version 1. Explicit edit drains (`--pr-smoke-drain-version 2`, with
+`--pr-smoke-drain 2m`) offer work for 20 seconds, then stop new logical edits and
+reads. Already admitted edits retain their original 120-second call/visibility
+budgets, including required visibility probes. The finite drain ends no later
+than 140 seconds after phase start; an earlier parent cancellation still wins.
+Reports retain admission times, distinct edit/read identities, every attempt,
+visibility follow-ups, and the full elapsed drain time. Expired or canceled work
+remains a failure. This opt-in changes the workload hash; ordinary runs and the
+frozen reference profile retain their existing phase-clipping behavior.
+
 An explicit corpus `edit_tool: "edit.write"` selects whole-file write intent for
 the same narrow Go, TypeScript or Python intrafile-call fixture. It additionally
 requires `edit_initial_content` containing the exact pinned initial file bytes.
@@ -242,7 +253,14 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
-`--edit-agents N` (1 to 32) runs N fixed editors against the same single
+`--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
+for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
+preserves the original 15-second plan and seeding. For example, `250ms` offers
+four edits per second on average from each fixed editor. The plan records its
+actual mean and due times; a changed offered rate is a separate measurement,
+not evidence for an earlier frozen plan or an accepted performance gate.
+
+`--edit-agents N` (1 to 32) defaults to N fixed editors against one
 repository. Each editor offers its own open-loop Poisson stream with the same
 15 second mean; editor 0 keeps the one-editor seeding, so `--edit-agents 1`
 offers exactly the original plan. The streams merge by due time (ties by editor
@@ -250,16 +268,38 @@ index) and the merge order is the global ordinal, so markers and mutation IDs
 stay keyed by ordinal and each ordinal is owned by one editor for the whole run.
 Plan steps and edit records name that editor. An edit and its immediate
 file/source readbacks go through its own editor's session; probes and receipt
-status stay on the edit's separate prober session, and run-level status, stats
-and the restore batch use editor 0. A blocked editor ACK does not delay another
-editor's arrival. Editors share one file. `edit.write` carries whole-file
+status stay on the edit's separate prober session, and run-level status and
+stats use editor 0. The singleton restore batch also uses editor 0. A blocked editor ACK does not delay another
+editor's arrival. In a singleton cell, editors share one file. `edit.write` carries whole-file
 content precomputed in ordinal order, so an out-of-order write would silently
 drop another editor's marker until the next write restored it; it is refused
 with more than one editor. An out-of-order `edit.batch` fails its `old_string`
 precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
-the paired no-regression cell stay one editor. Routing across several
-repositories or linked worktrees is not implemented.
+the paired no-regression cell stay one editor.
+
+`--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
+six distinct pinned repositories. Source checkouts that share one Git common
+directory count as one repository. For linked views of one pinned primary,
+use `--edit-repos 1 --worktrees 3 --edit-agents 4 --agents 0`; linked counts
+3, 7 and 15 give 4, 8 and 16 total checkouts. These routed cells require 100
+global offered edits, at least one fixed editor per checkout, and ordinary Go
+`add_intrafile_call` / `edit.file` / JSON fixtures. Pure readers, native and
+lifecycle senders, moves and other output/tool/language cells are explicitly
+unsupported for routed runs; their existing singleton cells remain separate.
+
+The plan pins every route's logical repository, checkout identity, commit,
+file and callee. A fixed editor, its immediate readbacks, and each edit's
+independent prober and receipt query stay on that checkout's cwd. Linked
+checkouts require their own exact public view admission even though their
+repository prefix is shared. Linked edit records retain that admitted checkout
+ID; a missing or different receipt checkout ID cannot supply terminal graph
+or accounting evidence. Each route restores its admitted original bytes
+through its own editor and transaction after mutation outcomes settle. The
+source repositories stay read-only. Route steps preserve the original merged
+editor arrival stream and global marker/mutation IDs; a route with no offered
+ordinal is not silently given an extra edit. Implementation and fixture tests
+do not establish a completed live or reference campaign.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -582,6 +622,19 @@ notifications retain client timestamps and raw payloads, with a 1,000-record
 per-session cap and an explicit dropped count. Notifications supplement the
 public readiness/publication gates rather than replacing them.
 
+Standalone `run` and fixed `smoke` accept `--retain-read-source-failures` for
+private diagnosis. It defaults off. When enabled, selected `read.source` calls
+observe their actual transport frames; only failed attempts retain a
+`failure_rpc` envelope. The first eight failures per report can retain exact
+base64 request/response bytes, including line framing, with a combined 64-KiB
+limit per envelope. Oversize, missing, partial, unsupported and cap-exhausted
+observations have explicit statuses and never claim exact bytes. Offered
+handshake options and response-observed facade metadata are separate fields.
+Raw frames may contain source or private paths: keep these reports private.
+Enabled healthy calls incur transient observation work; failure encoding occurs
+after the measured return timestamp. This option adds no RPC or retry and does
+not change request-plan identity, deadlines, pacing or success criteria.
+
 Completed private stores/clones are removed by default while JSON, logs and
 profiles remain. This prevents earlier scenarios' retained stores from using
 the next scenario's disk budget. `--keep-state` is only available for native
@@ -749,3 +802,59 @@ Inspect a profile with
 `go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
 and what one more worktree retains with
 `go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.
+
+### Live checkout discovery containment
+
+`--scenario worktree-discovery` starts with the first two pinned repositories
+in the manifest. It keeps their reading/editing sessions open while adding
+`--worktrees` detached checkouts alternating the two repositories during the offered
+window. Each added checkout gets separate root and subdirectory query sessions.
+Use `--agents 0 --edit-agents 8` for eight combined edit/readback agents, or
+`--agents 8 --edit-agents 0` for a read-only control. Editing requires the same
+validated edit fixtures as the ordinary edit scenarios.
+
+`phase.gate.checkout_discovery` records every added root, first request, first
+observed exact worktree view, and the resulting visibility lag. That lag is an
+upper bound on catalog identity allocation; it does not claim an unobserved
+earlier allocation time. Each cwd has its class, call/error/refusal counts,
+complete-call read latency distribution and separately counted censored reads.
+Attempts retain the actual session cwd and structured RPC `error_data`, including
+the refused root, family, reason and retryability when supplied by the daemon.
+A refusal or completed error outside a currently pending checkout fails the run.
+
+Run an otherwise identical `--worktrees 0` control to compare primary read p95.
+Keep both reports and all refused/censored attempts. Zero refusals without any
+`pending_refusals` is not evidence of fault containment under a stuck discovery.
+A hung-discovery fixture, upgraded-store fixture and the reference-host runs
+remain separate acceptance cells; this scenario does not manufacture them.
+All measurements require an isolated host window and fresh owned clones/stores.
+
+
+Discovery additions alternate the primary and unrelated control families. Each
+new root keeps its own family query and prefix for the exact-view witness;
+foreign-family capacity refusals fail the containment gate even while that
+new root is pending. `--discovery-stall-first` installs a daemon-only Git shim
+for the first new primary-family checkout. Its child ignores TERM and retains
+stdout until explicit release or a 60-second bound. The harness releases it
+before daemon shutdown and retains child/root/operation events. A missing
+stall or pending-refusal observation fails this cell.
+
+For upgraded fixtures, `--discovery-prepare <descriptor.json>` prepares owned
+roots without opening a store or launching a daemon. Add
+`--discovery-existing-worktrees 20 --discovery-existing-nested 5` to create five
+in-repository and fifteen sibling checkouts of the first family. The unrelated
+control is retained, so descriptor counts are two primaries plus twenty linked
+checkouts; selected-family counts are one plus twenty. The descriptor records
+actual paths, Git common directories, commits, source and configuration hashes,
+and a random owner token. Preparation requires a separate exclusive fixture
+producer to populate and upgrade the store at those exact paths.
+
+`--discovery-resume <lineage.json>` consumes that prepared root once. Lineage
+must bind the descriptor, old and upgrade binary/source pins, schema-44 main
+and WAL hashes, and structured normal-stop/catalog-identity receipts. Unknown,
+live, changed or relocated identities are refused. The stopped immutable
+snapshot remains inside the owned root; the destination store must be absent.
+The existing seed copier copies only main/WAL files, then both source and
+copied hashes are checked again. There is no SQL or catalog path rewriting.
+These discovery-only flags preserve the startup scenario's `--seed-store`
+contract. A copied fixture or synthetic parser control is not upgrade acceptance.

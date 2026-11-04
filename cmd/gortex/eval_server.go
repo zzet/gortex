@@ -68,7 +68,7 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	eng := query.NewEngine(g)
 	eng.SetSearch(idx.Search())
 	gortexmcp.Version = version
-	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules)
+	srv := gortexmcp.NewServer(eng, g, idx, nil, logger, cfg.Guards.Rules, gortexmcp.MultiRepoOptions{EditAckMode: cfg.Edit.Ack})
 	defer srv.DrainBackground()
 	srv.SetArchitecture(cfg.Architecture)
 	srv.SetEventRules(cfg.Events.Rules)

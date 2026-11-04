@@ -128,6 +128,13 @@ func TestMutationReindexStateReturnsTheDispatchSlotOnceItOnlyWaits(t *testing.T)
 				require.NotEmpty(t, outcomes[1].Receipt)
 				outcomes[0].Receipt, outcomes[1].Receipt = "", ""
 			}
+			// These are independent admissions on separate servers. Their private
+			// publication identities must survive even when full ACK omits the
+			// public pending receipt; compare the answer after checking identity.
+			require.NotEmpty(t, outcomes[0].publicationReceipt)
+			require.NotEmpty(t, outcomes[1].publicationReceipt)
+			require.NotEqual(t, outcomes[0].publicationReceipt, outcomes[1].publicationReceipt)
+			outcomes[0].publicationReceipt, outcomes[1].publicationReceipt = "", ""
 			require.Equal(t, outcomes[1], outcomes[0], "giving the slot back leaves the edit's answer unchanged")
 		})
 	}
@@ -319,7 +326,14 @@ func TestRenameReturnsTheDispatchSlotOnlyAtItsLastFile(t *testing.T) {
 		return true
 	}
 
-	results := s.commitRenameWrites(context.Background(), writes)
+	paths := make([]string, len(writes))
+	for i, w := range writes {
+		paths[i] = w.AbsPath
+	}
+	heldCtx, releasePaths, err := acquireMutationPaths(context.Background(), paths)
+	require.NoError(t, err)
+	defer releasePaths()
+	results := s.commitRenameWrites(heldCtx, writes, releasePaths)
 	require.Len(t, results, len(writes))
 	for _, result := range results {
 		require.Equal(t, "applied", result["status"])

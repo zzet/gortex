@@ -217,6 +217,18 @@ func cleanStaleTempFiles(dir string) {
 // Keys is collected from the top-level map keys after mutation —
 // useful for the --json report but not semantically load-bearing.
 func MergeJSON(w io.Writer, path string, mutate func(root map[string]any, existed bool) (changed bool, err error), opts ApplyOpts) (FileAction, error) {
+	return mergeJSON(w, path, mutate, opts, isJSONCPath(path))
+}
+
+// MergeJSONC is MergeJSON for a `.json` file whose host parses it as JSONC
+// (comments and trailing commas allowed), as Antigravity does for
+// hooks.json and mcp_config.json. Without it a commented file reads as
+// malformed and every entry that is not ours drops out of the live file.
+func MergeJSONC(w io.Writer, path string, mutate func(root map[string]any, existed bool) (changed bool, err error), opts ApplyOpts) (FileAction, error) {
+	return mergeJSON(w, path, mutate, opts, true)
+}
+
+func mergeJSON(w io.Writer, path string, mutate func(root map[string]any, existed bool) (changed bool, err error), opts ApplyOpts, jsonc bool) (FileAction, error) {
 	existed := false
 	root := make(map[string]any)
 	var backupPath string
@@ -237,7 +249,7 @@ func MergeJSON(w io.Writer, path string, mutate func(root map[string]any, existe
 			// round-tripped through the re-marshal — same policy as
 			// MergeTOML.
 			parse := data
-			if isJSONCPath(path) {
+			if jsonc {
 				parse = stripJSONComments(data)
 			}
 			if err := json.Unmarshal(parse, &root); err != nil {

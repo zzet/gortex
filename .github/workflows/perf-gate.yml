@@ -37,7 +37,7 @@ jobs:
       - name: Declare smoke prerequisites (not a measured smoke lane)
         continue-on-error: true
         run: go run ./bench/check-budgets plan --lane smoke --host-class hosted_arm_smoke --out smoke-readiness.json
-      - name: Declare nightly prerequisites (does not start the five-night calendar)
+      - name: Declare nightly prerequisites (not measured nightly-equivalent evidence)
         continue-on-error: true
         run: go run ./bench/check-budgets plan --lane nightly --out nightly-readiness.json
       - name: Declare release prerequisites
@@ -57,24 +57,28 @@ jobs:
     # Job scope also covers preparation, retrieval and artifact-upload failures.
     continue-on-error: true
     runs-on: ubuntu-24.04-arm
-    # The driver cancels measurement after 13m and reserves <=2m for cleanup.
-    # This outer bound also permits artifact upload after a failed attempt.
-    # Actual full-job p95 <=15m remains a measured 20-run acceptance criterion.
-    timeout-minutes: 18
+    # Complete-run measurement bound: <=120m, plus <=2m owned cleanup.
+    # Setup steps total <=20m and always-upload has <=3m. The 15m full-job
+    # p95 target is deferred; this operational bound is NOT a new target.
+    timeout-minutes: 145
     permissions:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - timeout-minutes: 2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - timeout-minutes: 5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Build clean candidate and owned measurement commands
+        timeout-minutes: 5
         run: |
           go build -buildvcs=true -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
           go build -buildvcs=true -o "${{ runner.temp }}/perf-load" ./bench/load
           go build -buildvcs=true -o "${{ runner.temp }}/perf-check-budgets" ./bench/check-budgets
       - name: Retrieve the exact main pinned at PR planning time
+        timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
           PERF_MAIN_REVISION: ${{ github.event.pull_request.base.sha }}
@@ -83,16 +87,19 @@ jobs:
           --main-revision "$PERF_MAIN_REVISION"
           --out "${{ runner.temp }}/perf-main"
       - name: Prepare the reviewed contemporary fixture
+        timeout-minutes: 2
         run: >-
           "${{ runner.temp }}/perf-check-budgets" prepare-fixture
           --revision c6c6de19da02fc698db7a89f9922a8ec49cc61b5
           --out "${{ runner.temp }}/perf-fixture"
       - name: Compile all three clean candidate benchmark executables
+        timeout-minutes: 4
         run: >-
           "${{ runner.temp }}/perf-check-budgets" prepare-tests
           --source . --revision "${{ github.sha }}"
           --out "${{ runner.temp }}/perf-candidate-tests"
       - name: Run five standalone steps and same-job microbenchmark comparison
+        timeout-minutes: 122
         # Resolve the tool caches prepared by this job before private daemons
         # isolate HOME. Graph stores remain fresh and owned by their build.
         run: |
@@ -103,9 +110,11 @@ jobs:
             --main-bundle "${{ runner.temp }}/perf-main" \
             --candidate-builds "${{ runner.temp }}/perf-candidate-tests" \
             --fixture "${{ runner.temp }}/perf-fixture" \
+            --retain-read-source-failures="${{ vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true' }}" \
             --offer 20s \
             --out "${{ runner.temp }}/perf-smoke-evidence"
       - name: Preserve attempted smoke reports and failures
+        timeout-minutes: 3
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

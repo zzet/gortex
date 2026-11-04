@@ -24,11 +24,11 @@ Common calls:
 
 ## Worktree and branch routing
 
-- The session/CWD selects the view. A session-discovered checkout (a linked worktree included) is an automatic overlay; do not `track` it. Only an explicit user request to track creates a dedicated logical graph.
-- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Freshness `exact:false` = the requested view was not served. Every fallback is read-only. `require_exact:true` refuses substitution; `require_fresh:true` awaits filesystem state under RFC3339 `wait_deadline`, routed automatic checkouts only; else `fresh:false`.
-- Select explicitly when CWD is not the target: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
-- Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 
 Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
@@ -62,38 +62,29 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
     }
   }
 }
-=== project/home/.gemini/settings.json ===
-{
-  "hooks": {
-    "AfterTool": [
-      {
-        "hooks": [
-          {
-            "command": "gortex hook --agent antigravity",
-            "description": "Gortex graph context + stale-index hint",
-            "name": "gortex",
-            "timeout": 10000,
-            "type": "command"
-          }
-        ],
-        "matcher": "run_shell_command|search_file_content|glob"
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "gortex hook --agent antigravity",
-            "description": "Gortex session orientation",
-            "name": "gortex",
-            "timeout": 10000,
-            "type": "command"
-          }
-        ]
-      }
-    ]
-  }
-}
+=== project/root/.agents/skills/gortex-example-one/SKILL.md ===
+---
+name: gortex-example-one
+description: Example generated community skill used by the render drift fence.
+---
+
+# example-one
+
+Routing stub for the example-one community.
+=== project/root/.agents/skills/gortex-example-two/SKILL.md ===
+---
+name: gortex-example-two
+description: Example generated community skill used by the render drift fence.
+---
+
+# example-two
+
+Routing stub for the example-two community.
+=== project/root/AGENTS.md ===
+<!-- gortex:communities:start -->
+- [example-community](.claude/skills/example/SKILL.md) — example routing block
+
+<!-- gortex:communities:end -->
 === global/home/.gemini/antigravity/knowledge/gortex-workflow/artifacts/gortex-instructions.md ===
 ---
 type: "Knowledge Item"
@@ -120,11 +111,11 @@ Common calls:
 
 ## Worktree and branch routing
 
-- The session/CWD selects the view. A session-discovered checkout (a linked worktree included) is an automatic overlay; do not `track` it. Only an explicit user request to track creates a dedicated logical graph.
-- **Overall** means the selected overlay plus exactly one designated primary in its Git family, never a union of incompatible branches. Unique overlay/base matches keep normal relevance order; for a duplicate identity the overlay wins, and deletion/tombstone masks hide the base copy.
-- Freshness `exact:false` = the requested view was not served. Every fallback is read-only. `require_exact:true` refuses substitution; `require_fresh:true` awaits filesystem state under RFC3339 `wait_deadline`, routed automatic checkouts only; else `fresh:false`.
-- Select explicitly when CWD is not the target: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable committed structural/source snapshots: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback and ref/commit views are not.
-- Untracking a non-primary dedicated worktree demotes it to automatic only if another ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
 
 Never restart the daemon, delete its store, or re-track merely to expose a worktree.
 
@@ -147,6 +138,56 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
     }
   }
 }
+=== global/home/.gemini/config/hooks.json ===
+{
+  "gortex": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "gortex hook --agent=antigravity --event=PostToolUse",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*mcp.*|.*gortex.*"
+      }
+    ],
+    "PreInvocation": [
+      {
+        "command": "gortex hook --agent=antigravity --event=PreInvocation",
+        "timeout": 10,
+        "type": "command"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "gortex hook --agent=antigravity --event=PreToolUse",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "SessionStart": [
+      {
+        "command": "gortex hook --agent=antigravity --event=SessionStart",
+        "timeout": 10,
+        "type": "command"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "gortex hook --agent=antigravity --event=Stop",
+        "timeout": 10,
+        "type": "command"
+      }
+    ]
+  }
+}
 === global/home/.gemini/config/mcp_config.json ===
 {
   "mcpServers": {
@@ -158,35 +199,653 @@ Use `recall` before revisiting prior work and `remember` immediately for durable
     }
   }
 }
-=== global/home/.gemini/settings.json ===
+=== global/home/.gemini/config/plugins/gortex/plugin.json ===
 {
-  "hooks": {
-    "AfterTool": [
-      {
-        "hooks": [
-          {
-            "command": "gortex hook --agent antigravity",
-            "description": "Gortex graph context + stale-index hint",
-            "name": "gortex",
-            "timeout": 10000,
-            "type": "command"
-          }
-        ],
-        "matcher": "run_shell_command|search_file_content|glob"
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "command": "gortex hook --agent antigravity",
-            "description": "Gortex session orientation",
-            "name": "gortex",
-            "timeout": 10000,
-            "type": "command"
-          }
-        ]
-      }
-    ]
-  }
+  "name": "gortex"
 }
+=== global/home/.gemini/config/plugins/gortex/rules/AGENTS.md ===
+<!-- gortex:rules:start -->
+## MANDATORY: Use Gortex MCP tools instead of Read/Grep/Glob
+
+The machine-wide `gortex` MCP server indexes tracked code. You MUST prefer graph queries over file reads. Hook posture is configurable; follow every Gortex hook instruction even when native tools remain callable.
+
+Follow advertised tools and server/session instructions. Compact examples require those tools; otherwise follow legacy session guidance. Missing `change` alone is not missing editing when legacy editors are advertised. Read-only policies and explicit denials still apply.
+
+When Gortex can serve the step:
+
+1. Named-file read/review/summarize: first new-task call `read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true})`; do not localize. Unknown file/symbol/evidence: `explore(operation:"localize")`; obey `completion.required_action`; at `answer_ready` answer from `completion.final_response` and stop. Diagnosis/change: `explore(operation:"task")`.
+2. Diagnosis/change: at most one follow-up on one unresolved symbol with `search`, `read`, `relations`, or `trace`; then step 3. Never reopen indexed source with Read/Grep/Glob or shell equivalents.
+3. Before mutation, call `change(operation:"impact")`; for a signature change, also `change(operation:"verify")` with the proposed signature. Mutate only with `edit` or `refactor`. After mutation, call `change(operation:"detect")`, then its symbol IDs with `change(operation:"tests")`, `change(operation:"guards")`, and `change(operation:"contract")`.
+4. `capabilities`: exact operation fields only.
+
+Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+
+Use `recall` before revisiting prior work; `remember` immediately for a durable decision, invariant, constraint, or gotcha.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+Never restart the daemon, delete its store, or re-track merely to expose a worktree.
+
+## Reference and discovery
+
+- **`gortex://guide` resource** (or the `gortex guide [topic]` CLI) is the full reference: LLM providers, capabilities, analyze / search_ast catalogs, token economy, MCP resources, session-start checklist. Read it on demand.
+- **`capabilities`** — exact operation schema on demand; ordinary coding needs no discovery.
+- MCP startup manages daemon availability; do not start a daemon manually. "cwd is not covered by any tracked repo" means graph tools are unavailable there: use native tools.
+- **Instruction profiles** — this block is the active `core` profile. `gortex instructions list` shows the others (`core` balanced · `localization` lean · `full` maximum); switch with `gortex instructions switch <name>` — applies to NEW sessions only (instructions, tools/list and skills all load at session start).
+
+<!-- gortex:rules:end -->
+=== global/home/.gemini/config/skills/gortex-add-test/SKILL.md ===
+---
+name: gortex-add-test
+description: "Add tests for under-tested code and coverage gaps."
+---
+# Add Tests with Gortex
+
+1. Localize the behavior with `explore`.
+2. Confirm the specific gap with `change({operation: "tests", source: {symbols: ["<id>"]}})`. Use repository-wide `analyze({kind: "untested"})` or path-scoped `analyze({kind: "coverage_gaps", options: {path_prefix: "<path>"}})` only for broader coverage discovery.
+3. Inspect callers with `relations({operation: "callers", target: {symbol: "<id>"}})` and request targets with `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+4. Add the narrowest test with `edit({operation: "file", target: {file: "<existing test path>"}, ...})`; use operation `write` for a new test file.
+5. Run the test, then require `change` operations `detect` and `guards`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-architecture-review/SKILL.md ===
+---
+name: gortex-architecture-review
+description: "Graph-grounded architectural read of a repo."
+---
+# Review Architecture with Gortex
+
+1. Build the map with `explore({operation: "outline"})` and `analyze` kinds `architecture` and `communities`.
+2. Measure boundaries with `analyze({kind: "coupling"})` and cycles with `analyze({kind: "cycles"})`.
+3. Trace representative paths with `trace` and inspect public boundaries with `analyze({kind: "contracts", options: {action: "list"}})`.
+4. Deliver observed structure, intended structure, violations, consequences, and prioritized changes. Cite graph evidence for every finding.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-cli/SKILL.md ===
+---
+name: gortex-cli
+description: "Bash-only mirror of Gortex MCP tools for harnesses without MCP support."
+---
+# Gortex from a Bash-Only Harness
+
+Use this skill only in a harness that has no MCP transport by design. If a Gortex MCP server is configured but its callable tools are missing, report an integration failure; do not use this skill as a fallback.
+
+Every public MCP tool has the same name through `gortex call`:
+
+```bash
+gortex call explore --arg task='locate the authentication flow'
+gortex call search --arg operation=symbols --arg query=UserStore
+gortex call read --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call relations --arg operation=usages --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call change --arg operation=impact --arg target='{"symbol":"internal/store.go::UserStore"}'
+gortex call edit --arg target='{"file":"internal/store.go"}' --arg match='old text' --arg replacement='new text'
+gortex call change --arg operation=detect --arg source='{"scope":"all"}'
+```
+
+For an exact operation schema:
+
+```bash
+gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema
+```
+
+The required order is `explore` → targeted `search/read/relations/trace` → pre-change `change` → `edit/refactor` → post-change `change`. Do not use shell file reads or search as a substitute.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-co-change/SKILL.md ===
+---
+name: gortex-co-change
+description: "Find what changes together and hidden coupling."
+---
+# Analyze Co-Change with Gortex
+
+1. Resolve the anchor with `search({operation: "symbols", query: "<name>"})`.
+2. Call symbol-scoped `analyze({kind: "co_change", target: {symbol: "<id>"}})` and repository-wide `analyze({kind: "churn"})`.
+3. Compare structural coupling through `relations` operations `cluster` and `dependents`.
+4. Report strong historical pairs, graph-confirmed dependencies, likely hidden coupling, and an actionable boundary or guard.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-cross-repo-usage/SKILL.md ===
+---
+name: gortex-cross-repo-usage
+description: "Find who uses a symbol across all consumer repos."
+---
+# Find Cross-Repository Usage with Gortex
+
+1. Confirm tracked repositories with `workspace({operation: "repos"})`.
+2. Resolve the provider symbol with `search({operation: "symbols", query: "<name>", options: {repo: "<provider>"}})`.
+3. Call `relations({operation: "usages", target: {symbol: "<id>"}})` and group results by repository.
+4. Add `analyze({kind: "cross_repo", options: {repo: "<provider>"}})` for repository boundaries and `analyze({kind: "contracts", options: {action: "bridge", mode: "impact", symbol: "<id>"}})` for wire-level consumers.
+5. Report indexed coverage and name any untracked repositories as an explicit gap.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-dataflow-trace/SKILL.md ===
+---
+name: gortex-dataflow-trace
+description: "Trace where a value flows through the code."
+---
+# Trace Data Flow with Gortex
+
+1. Call `explore({operation: "task", task: "trace <value> from <source> to <sink>"})`.
+2. Resolve endpoints with `search({operation: "symbols", query: "<source or sink>"})`.
+3. Use `trace({operation: "flow", target: {symbol: "<source-id>"}, to: {symbol: "<sink-id>"}})`. Use operation `taint` when source/sink security semantics matter.
+4. Cross-check control flow with operation `call_chain` when the data-flow graph has a gap.
+5. Report each hop with its symbol ID and confidence; distinguish no path from incomplete indexing.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-debug/SKILL.md ===
+---
+name: gortex-debug
+description: "Debug a bug, trace an error, or find why something fails."
+---
+# Debug with Gortex
+
+1. Localize the exact symptom with `explore({operation: "task", task: "<error and observed behavior>"})`.
+2. For a literal error, call `search({operation: "text", query: "<exact text>"})`. For a name, use operation `symbols`.
+3. Walk toward the cause with `relations({operation: "callers", target: {symbol: "<id>"}})` and `trace({operation: "call_chain", target: {symbol: "<id>"}})`. Use `flow` or `taint` only after resolving both `target` and `to` endpoints.
+4. Confirm repository-wide error propagation with `analyze({kind: "error_surface"})`; use `options.repo` to narrow a multi-repository workspace.
+5. Before fixing, run `change({operation: "impact", source: {symbols: ["<id>"]}})`. After fixing, run `change` operations `detect`, `tests`, and `guards`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-episode-replay/SKILL.md ===
+---
+name: gortex-episode-replay
+description: "Reconstruct what changed in a window (postmortem, release, PR)."
+---
+# Replay a Change Episode with Gortex
+
+1. Run `analyze({kind: "replay", options: {from: "<start>", to: "<end>"}})` for the requested window.
+2. Project the relevant diff with `change({operation: "detect", source: {scope: "<scope>"}})`.
+3. Surface decisions with `recall({operation: "surface", arguments: {task: "<episode>"}})`.
+4. Trace important before/after paths using `trace` and identify which change altered behavior.
+5. Produce a timestamped narrative with evidence links, impact, missed signals, and remaining uncertainty.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-explore/SKILL.md ===
+---
+name: gortex-explore
+description: "Understand how code works or trace an execution flow."
+---
+# Explore a Codebase with Gortex
+
+1. Call `explore({operation: "task", task: "<question>"})`.
+2. Read only a returned anchor with `read({target: {symbol: "<id>"}})`.
+3. Choose the needed relationship (`callers`, `usages`, or `dependencies`), for example `relations({operation: "callers", target: {symbol: "<id>"}})`; use `trace({operation: "call_chain", target: {symbol: "<id>"}})` for execution order.
+4. Answer with the execution path, file locations, symbol IDs, and any graph uncertainty.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-extract-function/SKILL.md ===
+---
+name: gortex-extract-function
+description: "Extract code into a function or method via LSP refactor."
+---
+# Extract a Function with Gortex
+
+1. Inspect the file with `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Resolve the selected range with `change({operation: "ranges", source: {file: "<path>", range: {...}}})`.
+3. Request extraction actions with `change({operation: "code_actions", source: {file: "<path>", range: {...}}})`.
+4. Apply the selected action through `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`.
+5. Run `change` operations `detect`, `tests`, `guards`, and `contract`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-fix-all/SKILL.md ===
+---
+name: gortex-fix-all
+description: "Clear LSP diagnostics — one error, a file, or source.fixAll."
+---
+# Fix Diagnostics with Gortex
+
+1. Read diagnostics using `change({operation: "diagnostics", source: {file: "<path>"}})`.
+2. Fetch applicable fixes with `change({operation: "code_actions", source: {file: "<path>"}})`.
+3. Apply one reviewed action with `refactor({operation: "apply_code_action", target: {file: "<path>"}, options: {...}})`, or use operation `fix_all` only when the user asked for all safe fixes.
+4. Re-run diagnostics, then run `change` operations `detect` and `tests`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-guide/SKILL.md ===
+---
+name: gortex-guide
+description: "Gortex reference: available tools, graph schema, and workflow."
+---
+# Gortex Guide
+
+Use this sequence for codebase work:
+
+1. `explore({operation: "task", task: "<goal or bug>"})` — localize the task and obtain the working set.
+2. `search({operation: "symbols", query: "<name>"})` or `search({operation: "text", query: "<literal>"})` — resolve a precise anchor.
+3. `read({operation: "source", target: {symbol: "<id>"}})` — read only the source needed.
+4. `relations({operation: "usages", target: {symbol: "<id>"}})` or `trace({operation: "call_chain", target: {symbol: "<id>"}})` — follow verified graph edges.
+5. `change({operation: "impact", source: {symbols: ["<id>"]}})` — assess a planned change.
+6. Apply with `edit` or `refactor`, then run `change` operations `detect`, `guards`, and `tests`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-impact/SKILL.md ===
+---
+name: gortex-impact
+description: "Assess what breaks if you change X before editing it."
+---
+# Assess Change Impact with Gortex
+
+1. Resolve the target with `search({operation: "symbols", query: "<name>"})`.
+2. Query `relations` operations `usages`, `dependents`, and `implementations` for the resolved symbol.
+3. Call `change({operation: "impact", source: {symbols: ["<id>"]}})`; add operation `api_impact` for a public API.
+4. For a signature change, require `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+5. Report direct callers, transitive risk, interfaces, contracts, and the tests returned by `change({operation: "tests", source: {symbols: ["<id>"]}})`.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-incident-investigation/SKILL.md ===
+---
+name: gortex-incident-investigation
+description: "Walk a production symptom back to its root cause."
+---
+# Investigate an Incident with Gortex
+
+1. Paste the exact symptom into `explore({operation: "task", task: "<alert, error, and time window>"})`.
+2. Search exact error text with `search({operation: "text", query: "<literal>"})`.
+3. Walk `relations` operation `callers` and `trace` operations `call_chain`, `flow`, or `taint` from symptom toward cause.
+4. Correlate repository-wide `analyze({kind: "recent_changes"})` with symbol-scoped `recall({operation: "surface", arguments: {symbol_ids: "<id>", task: "<symptom>"}})`.
+5. Separate evidence, hypothesis, and unknowns. Gate any fix through `change` before and after the mutation.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-onboarding/SKILL.md ===
+---
+name: gortex-onboarding
+description: "Structured tour of an unfamiliar repo."
+---
+# Onboard to a Repository with Gortex
+
+1. Call `explore({operation: "outline"})`, then `explore({operation: "task", task: "explain the repository's main responsibilities and entry points"})`.
+2. Run `analyze` with kinds `architecture`, `communities`, and `processes`.
+3. Trace one representative request or job with `trace({operation: "call_chain", target: {symbol: "<entry-id>"}})`.
+4. Read only the key returned symbols. Deliver a concise map of entry points, boundaries, data flow, tests, and operational risks.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-pr-review-agent/SKILL.md ===
+---
+name: gortex-pr-review-agent
+description: "Coding-agent review verdict via the gortex review verb."
+---
+# Review a Change as a Sub-Agent
+
+## MCP-capable harness
+
+Native Gortex MCP is mandatory. Call `review({operation: "run", source: {scope: "<scope>"}})`, then use `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation. If the configured callable tools are missing, report a Gortex MCP integration failure and stop; do not start a daemon or use the Bash path below.
+
+## Bash-only harness
+
+Use this path only when the harness has no MCP transport by design:
+
+```bash
+gortex review --audience agent --format json
+```
+
+In either mode, return `VERDICT: clean` or `VERDICT: findings` followed by actionable findings with severity and `file:line`. Do not replace graph-backed review with ad-hoc `git diff` inspection.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-pr-review/SKILL.md ===
+---
+name: gortex-pr-review
+description: "Graph-grounded review of a pending change or PR."
+---
+# Review a Change with Gortex
+
+1. Project the working tree with `change({operation: "detect", source: {scope: "unstaged"}})`; use `staged` or `compare` only when that is the requested review scope.
+2. Build review context with `review({operation: "run", source: {scope: "<scope>"}})` and operation `diff_context` when per-file context is needed.
+3. Require `change` operations `guards`, `tests`, and `contract`. When the proposed signature is known, run operation `verify` before mutation.
+4. Check wire boundaries with `analyze({kind: "contracts", options: {action: "check"}})` when APIs or events changed.
+5. Report only actionable findings with severity, `file:line`, evidence, consequence, and correction. State an explicit clean verdict when none remain.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-quality-audit/SKILL.md ===
+---
+name: gortex-quality-audit
+description: "Repo-scale quality scan — dead code, hotspots, clones."
+---
+# Audit Repository Quality with Gortex
+
+1. Establish scope with `workspace({operation: "info"})` and `explore({operation: "outline"})`.
+2. Run `analyze` for `health`, `dead_code`, `hotspots`, `cycles`, and `clones`.
+3. Validate high-risk findings with `read` and `relations`; do not report an unverified heuristic as a fact.
+4. Rank findings by evidence, impact, and remediation cost. Include exact paths, symbol IDs, and a smallest-first action plan.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-refactor/SKILL.md ===
+---
+name: gortex-refactor
+description: "Rename, extract, split, or restructure code safely."
+---
+# Refactor with Gortex
+
+1. Call `explore({operation: "task", task: "<refactor goal>"})` and resolve every target with `search`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. Before altering a signature, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature>"}]}})`.
+3. Choose exactly one `refactor` operation: `rename`, `move`, `inline`, `delete`, or `apply_code_action`. For example: `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<name>"})`.
+4. Require `change` operations `detect`, `tests`, `guards`, and `contract` after the mutation. Resolve every violation before finishing.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-rename/SKILL.md ===
+---
+name: gortex-rename
+description: "Rename a symbol and update every reference atomically."
+---
+# Rename a Symbol with Gortex
+
+1. Resolve exactly one symbol with `search({operation: "symbols", query: "<old name>"})`.
+2. Enumerate references and implementations with `relations` operations `usages` and `implementations`.
+3. Run `change({operation: "impact", source: {symbols: ["<id>"]}})`. For a public signature rename, also run `change({operation: "verify", source: {changes: [{symbol_id: "<id>", new_signature: "<signature with new name>"}]}})`.
+4. Preview with `refactor({operation: "rename", target: {symbol: "<id>"}, new_name: "<new>", dry_run: true})`, then repeat it with `dry_run: false` to apply.
+5. Require `change` operations `detect`, `guards`, and `tests`; confirm no old usages remain.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.
+=== global/home/.gemini/config/skills/gortex-safe-edit/SKILL.md ===
+---
+name: gortex-safe-edit
+description: "Preview an edit's blast radius on the shadow graph before writing."
+---
+# Make a Safe Edit with Gortex
+
+1. Localize with `explore` and inspect `read({operation: "editing_context", target: {file: "<path>"}})`.
+2. Run `change({operation: "impact", source: {symbols: ["<id>"]}})` before editing.
+3. Choose `edit` operation `file`, `symbol`, or `batch`. Preview with `dry_run: true`; after review, repeat the same guarded request with `dry_run: false`. Use `change({operation: "simulate", source: {steps: "<WorkspaceEdit JSON array>"}})` for a multi-step semantic edit.
+4. Run `change` operations `detect`, `tests`, `guards`, and `contract`. Signature verification belongs before mutation with the proposed signature.
+
+## Required behavior
+
+- Never use `gortex call` in place of MCP; git, build, and test commands are fine. If a Gortex call fails or tools seem absent (empty tool search is not absence), retry later, verify a write before resending it, do other work natively, report only the step needing the graph. Never start a daemon, track, or reconfigure.
+- When Gortex can serve the step, do not substitute shell reads, file search, or Git plumbing.
+- Start task-shaped work with `explore`. For one already-known symbol, start with `search`.
+- When Gortex can serve the step, use `change` before a mutation and again after it. Write only through `edit` or `refactor`.
+- Call `capabilities({domain: "<tool>", operation: "<operation>", detail: "schema"})` only when an operation's exact arguments are unclear.
+- Report graph-backed paths and symbol IDs. Never invent a result when an operation returns no match.
+
+## Worktree and branch routing
+
+- CWD/session selects the view. Discovered checkouts (including linked worktrees) use an automatic overlay; don't `track` them. An explicit user request to track creates a dedicated graph.
+- **Overall**: selected overlay plus exactly one designated primary in its Git family; never incompatible branches. Unique overlay/base matches keep normal relevance order; duplicate identity: overlay wins; deletion/tombstone masks hide the base copy.
+- Every fallback is read-only (`exact:false`); `require_exact:true` refuses it. `readback_exact:true`: continue, no polling. Check `graph_freshness`; pending files are not dead. Rename/delete/signature edits: `require_fresh:true`, `freshness_scope:"relations"`, RFC3339 `wait_deadline`. Waits cover watched primaries and routed automatic checkouts; ref/commit: `fresh:false`.
+- Target another CWD: `view:{kind:"worktree",checkout_id:"…"}` or `view:{kind:"git_ref",value:"refs/heads/release",graph_id:"…"}`. Inactive ref/commit views are immutable source/structure: no working-copy LSP, `search.text`, or edits. Approved coordinator-backed exact worktree edits are supported; fallback/ref edits are not.
+- Untracking a non-primary dedicated worktree demotes it to automatic only if a ready primary survives. Before primary closure, family forget, or `set-primary`, preview the effects and obtain user confirmation.

@@ -269,27 +269,3 @@ func (w mutationReadRepairWitness) bind(accepted mutationReadRepairObservation) 
 	accepted.acceptedBlobSHA = w.blobSHA
 	record.readRepair = &accepted
 }
-
-// Only the already-needed multi-repository read repair is observed. Embedded
-// and unobserved callers preserve their existing fallback and nil behavior.
-func (s *Server) reindexFileForRead(ctx context.Context, absPath string, idx *indexer.Indexer) bool {
-	if s.multiIndexer != nil {
-		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			result, err := s.multiIndexer.IncrementalReindexRepoObserved(prefix, []string{absPath}, s.readRepairObserver(ctx, absPath, idx))
-			if incrementalReindexSucceeded(result, err) {
-				return true
-			}
-		}
-	}
-	// Match reindexFile's existing standalone fallback without submitting the
-	// multi-repository reconcile twice after a failure.
-	if s.indexer != nil {
-		if root := s.indexer.RootPath(); root != "" {
-			if _, ok := relativeWithinRoot(root, absPath); ok {
-				result, err := s.indexer.IncrementalReindexPaths(root, []string{absPath})
-				return incrementalReindexSucceeded(result, err)
-			}
-		}
-	}
-	return false
-}

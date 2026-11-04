@@ -18,34 +18,44 @@ import (
 // actually declares, so it never emits a candidate that cannot bind. Call it
 // once at the end of an extractor's Extract with the parse-tree root.
 func captureValueRefCandidates(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte) {
+	captureValueRefCandidatesWithGoWork(result, root, filePath, src, nil)
+}
+
+func captureValueRefCandidatesWithGoWork(result *parser.ExtractionResult, root *sitter.Node, filePath string, src []byte, goWork *goTailWork) {
 	if root == nil || result == nil {
 		return
 	}
-	consts := map[string]bool{}
-	for _, n := range result.Nodes {
-		if n == nil || n.FilePath != filePath {
-			continue
+	var consts map[string]bool
+	var funcRanges []funcRange
+	if goWork != nil {
+		consts = goWork.referenceScope.values
+		funcRanges = goWork.referenceScope.ranges
+	} else {
+		consts = map[string]bool{}
+		for _, n := range result.Nodes {
+			if n == nil || n.FilePath != filePath {
+				continue
+			}
+			if n.Kind != graph.KindConstant && n.Kind != graph.KindVariable {
+				continue
+			}
+			if isDistinctiveConstName(n.Name) {
+				consts[n.Name] = true
+			}
 		}
-		if n.Kind != graph.KindConstant && n.Kind != graph.KindVariable {
-			continue
+		if len(consts) == 0 {
+			return
 		}
-		if isDistinctiveConstName(n.Name) {
-			consts[n.Name] = true
-		}
+		funcRanges = buildFuncRanges(result)
 	}
 	if len(consts) == 0 {
 		return
 	}
-	funcRanges := buildFuncRanges(result)
 	if len(funcRanges) == 0 {
 		return
 	}
 	seen := map[string]bool{}
-	walkNodes(root, func(n *sitter.Node) {
-		if !isValueRefIdentNode(n.Type()) {
-			return
-		}
-		name := n.Content(src)
+	visit := func(n *sitter.Node, name string) {
 		if !consts[name] {
 			return
 		}
@@ -64,7 +74,20 @@ func captureValueRefCandidates(result *parser.ExtractionResult, root *sitter.Nod
 			FilePath: filePath, Line: line, Origin: graph.OriginSpeculative,
 			Meta: map[string]any{"via": "value_ref_candidate", "name": name},
 		})
-	})
+	}
+	if goWork == nil {
+		walkNodes(root, func(n *sitter.Node) {
+			if isValueRefIdentNode(n.Type()) {
+				visit(n, n.Content(src))
+			}
+		})
+	} else {
+		for _, fact := range goWork.references {
+			if fact.kind == "identifier" {
+				visit(fact.node, fact.name)
+			}
+		}
+	}
 }
 
 // isValueRefIdentNode reports whether a node type is a value-position

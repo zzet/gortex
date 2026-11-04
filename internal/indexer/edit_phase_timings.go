@@ -17,13 +17,15 @@ type EditPhaseTimings struct {
 // identify the acknowledgement's default reindex wait. It is not a phase
 // measurement or a claim of complete phase accounting.
 type EditTimingWindow struct {
-	Clock                         string               `json:"clock"`
-	Coverage                      string               `json:"coverage"`
-	AcknowledgementWallMS         *float64             `json:"ack_wall_ms"`
-	PatchWallMS                   *float64             `json:"patch_wall_ms"`
-	PatchAccounting               *EditPatchAccounting `json:"patch_accounting,omitempty"`
-	PublicationWallMS             *float64             `json:"publication_wall_ms"`
-	PublicationUnattributedWallMS *float64             `json:"publication_unattributed_ms"`
+	ResolveMutexWait              *EditResolveMutexWait `json:"resolve_mutex_wait,omitempty"`
+	Clock                         string                `json:"clock"`
+	Coverage                      string                `json:"coverage"`
+	AcknowledgementWallMS         *float64              `json:"ack_wall_ms"`
+	PatchWallMS                   *float64              `json:"patch_wall_ms"`
+	PatchAccounting               *EditPatchAccounting  `json:"patch_accounting,omitempty"`
+	SharedSetExecution            *SharedSetExecution   `json:"shared_set_execution,omitempty"`
+	PublicationWallMS             *float64              `json:"publication_wall_ms"`
+	PublicationUnattributedWallMS *float64              `json:"publication_unattributed_ms"`
 }
 
 var editAckPhaseNames = [...]string{
@@ -60,6 +62,7 @@ func (s PublicationPhaseSnapshot) EditTimings() EditPhaseTimings {
 		return out
 	}
 	out.Window.Clock = s.Clock
+	out.Window.SharedSetExecution = s.SharedSetExecution()
 	if s.attemptWindow != nil {
 		// P is independent of receipt/ACK lifetime and may finish later.
 		ms := float64(s.attemptWindow.endNS-s.attemptWindow.startNS) / 1e6

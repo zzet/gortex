@@ -100,7 +100,16 @@ func TestCanonicalPublicationObservesMultiWatcherExecutor(t *testing.T) {
 		})
 	}
 	w := mw.watchers["repo-a"]
-	require.NotNil(t, w.pointReindexRaw, "production MultiWatcher must install the daemon's MultiIndexer executor")
+	idx := w.currentMutationIndexer()
+	require.NotNil(t, idx, "production MultiWatcher must select its registered Indexer")
+	require.NotNil(t, idx.repositoryMutationOwner, "production Indexer must bind the daemon executor")
+	require.Same(t, mi, idx.repositoryMutationOwner)
+	var crossCalls atomic.Int32
+	idx.incrementalCatchupHook = func(kind string, _ []string) {
+		if kind == "cross_repo" {
+			crossCalls.Add(1)
+		}
+	}
 	path := filepath.Join(root, "main.go")
 	bumpMtime(t, path, "package main\n\nfunc ChangedByDaemonPath() {}\n")
 	record := newPointPublication(t, "multi")
@@ -108,6 +117,7 @@ func TestCanonicalPublicationObservesMultiWatcherExecutor(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, awaitMutationRetryResult(t, ticket).Err)
 	require.NotNil(t, nodeByName(t, mi.GetIndexer("repo-a"), "repo-a/main.go", "ChangedByDaemonPath"))
+	require.EqualValues(t, 1, crossCalls.Load(), "the real daemon resolver tail must run, not the standalone fallback")
 	requirePointExecution(t, record, true)
 }
 
@@ -138,8 +148,8 @@ func TestCanonicalPublicationCommitsOnlyGuardedWinningAttempt(t *testing.T) {
 			var second *MutationTicket
 			if nativeSuccessor {
 				// The normal fsnotify path has no request context. A native
-				// successor must resolve the older ticket without borrowing its
-				// record for the newer physical work.
+				// successor must not borrow the older record for its newer
+				// physical work. The already-landed body covers the old ticket.
 				second = w.scheduleFileMutation(path, ChangeModified)
 				require.NotNil(t, second)
 			} else {
@@ -153,24 +163,15 @@ func TestCanonicalPublicationCommitsOnlyGuardedWinningAttempt(t *testing.T) {
 				result := awaitMutationRetryResult(t, ticket)
 				require.NoError(t, result.Err)
 				require.Equal(t, ticket.Generation, result.RequestedGeneration)
-				require.Equal(t, second.Generation, result.AppliedGeneration)
+				require.Equal(t, ticket.Generation, result.AppliedGeneration)
 			}
 			require.Greater(t, second.Generation, first.Generation)
 			requirePointExecution(t, older, false)
 			requirePointExecution(t, newer, !nativeSuccessor)
 			require.Equal(t, first.Generation, older.Snapshot().Ticket)
-			if nativeSuccessor {
-				require.Eventually(t, func() bool {
-					winner := older.CoalescedPublication()
-					return winner != nil && winner.Timings.Window.PatchWallMS != nil
-				}, 5*time.Second, time.Millisecond)
-				winner := older.CoalescedPublication()
-				require.Equal(t, first.Generation, winner.RequestedGeneration)
-				require.Equal(t, second.Generation, winner.AppliedGeneration)
-				require.NotEqual(t, older.Key(), winner.Publication.Key)
-				require.Nil(t, winner.Timings.Milliseconds["debounce"])
-				require.Equal(t, "not_established", winner.BackgroundCoverage)
-			}
+			// Covered completion does not promote an overtaken attempt into a
+			// publication winner or attach unrelated successor timing to it.
+			require.Nil(t, older.CoalescedPublication())
 		})
 	}
 }

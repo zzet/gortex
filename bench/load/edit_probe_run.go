@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +23,9 @@ const editProbeRawLimit = 8 << 20
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
 type editProbeReadback struct {
+	ExpectedLine    int    `json:"expected_line,omitempty"`
+	ExpectedPath    string `json:"expected_path,omitempty"`
+	ExpectedID      string `json:"expected_id,omitempty"`
 	Kind            string `json:"kind"`
 	Latency         Metric `json:"latency_ms"`
 	Correct         bool   `json:"correct"`
@@ -29,59 +35,74 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
-	Ordinal                  int                       `json:"ordinal"`
-	Editor                   int                       `json:"editor,omitempty"`
-	Marker                   string                    `json:"marker"`
-	MutationID               string                    `json:"mutation_id"`
-	PlannedDueNS             int64                     `json:"planned_due_ns"`
-	ActivatedNS              *int64                    `json:"activated_ns"`
-	StartedNS                *int64                    `json:"started_ns"`
-	StartLatenessNS          *int64                    `json:"start_lateness_ns"`
-	Outcome                  string                    `json:"outcome"`
-	Receipt                  string                    `json:"mutation_receipt"`
-	Batch                    *editProbeBatchReferences `json:"batch,omitempty"`
-	Move                     *editProbeMoveReferences  `json:"move,omitempty"`
-	MoveAccounting           *editProbeMoveAccounting  `json:"move_accounting,omitempty"`
-	Restart                  *editProbeRestartRecord   `json:"restart,omitempty"`
-	NativeWrite              *editProbeNativeWrite     `json:"native_write,omitempty"`
-	GraphTerminalBasis       string                    `json:"graph_terminal_basis,omitempty"`
-	Ack                      Metric                    `json:"t_ack_ms"`
-	PhasesMS                 map[string]Metric         `json:"phases_ms,omitempty"`
-	Readback                 Metric                    `json:"t_readback_ms,omitempty"`
-	FileGraph                Metric                    `json:"t_file_graph_ms,omitempty"`
-	Relations                Metric                    `json:"t_relations_ms,omitempty"`
-	Search                   Metric                    `json:"t_search_ms,omitempty"`
-	Derived                  Metric                    `json:"t_derived_ms,omitempty"`
-	Readbacks                []editProbeReadback       `json:"readbacks"`
-	FirstCorrect             map[string]Metric         `json:"first_correct_ms"`
-	Accounting               editProbeAccounting       `json:"accounting"`
-	PendingReads             int                       `json:"reads_while_receipt_observed_pending"`
-	ExpectedRefusals         int                       `json:"expected_refusals,omitempty"`
-	ProbeErrors              int                       `json:"probe_errors"`
-	StaleClaimedFresh        bool                      `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches int                       `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal            bool                      `json:"graph_terminal"`
-	Evidence                 string                    `json:"raw_evidence"`
-	EvidenceWriteMS          float64                   `json:"evidence_write_ms"`
-	EvidenceEncodeMS         float64                   `json:"evidence_encode_ms"`
-	EvidenceBytes            int                       `json:"evidence_bytes"`
-	EvidenceLimit            int                       `json:"evidence_limit_bytes"`
-	Errors                   []string                  `json:"errors"`
+	SearchACK                map[string]any               `json:"search_ack,omitempty"`
+	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
+	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
+	SearchTurnReleasedNS     *int64                       `json:"search_turn_released_ns,omitempty"`
+	AdmittedTargetLines      *int                         `json:"admitted_target_lines,omitempty"`
+	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
+	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact         *bool                        `json:"ack_readback_exact,omitempty"`
+	ProbeMode                string                       `json:"probe_mode,omitempty"`
+	Ordinal                  int                          `json:"ordinal"`
+	Editor                   int                          `json:"editor,omitempty"`
+	Route                    string                       `json:"route,omitempty"`
+	CheckoutID               string                       `json:"checkout_id,omitempty"`
+	Marker                   string                       `json:"marker"`
+	MutationID               string                       `json:"mutation_id"`
+	PlannedDueNS             int64                        `json:"planned_due_ns"`
+	ActivatedNS              *int64                       `json:"activated_ns"`
+	StartedNS                *int64                       `json:"started_ns"`
+	StartLatenessNS          *int64                       `json:"start_lateness_ns"`
+	Outcome                  string                       `json:"outcome"`
+	Receipt                  string                       `json:"mutation_receipt"`
+	Batch                    *editProbeBatchReferences    `json:"batch,omitempty"`
+	BatchSet                 *editProbeBatchSetReferences `json:"batch_set,omitempty"`
+	BatchAccounting          *editProbeBatchSetAccounting `json:"batch_accounting,omitempty"`
+	Move                     *editProbeMoveReferences     `json:"move,omitempty"`
+	MoveAccounting           *editProbeMoveAccounting     `json:"move_accounting,omitempty"`
+	Restart                  *editProbeRestartRecord      `json:"restart,omitempty"`
+	NativeWrite              *editProbeNativeWrite        `json:"native_write,omitempty"`
+	GraphTerminalBasis       string                       `json:"graph_terminal_basis,omitempty"`
+	Ack                      Metric                       `json:"t_ack_ms"`
+	PhasesMS                 map[string]Metric            `json:"phases_ms,omitempty"`
+	Readback                 Metric                       `json:"t_readback_ms,omitempty"`
+	FileGraph                Metric                       `json:"t_file_graph_ms,omitempty"`
+	Relations                Metric                       `json:"t_relations_ms,omitempty"`
+	Search                   Metric                       `json:"t_search_ms,omitempty"`
+	Derived                  Metric                       `json:"t_derived_ms,omitempty"`
+	Readbacks                []editProbeReadback          `json:"readbacks"`
+	FirstCorrect             map[string]Metric            `json:"first_correct_ms"`
+	Accounting               editProbeAccounting          `json:"accounting"`
+	PendingReads             int                          `json:"reads_while_receipt_observed_pending"`
+	ExpectedRefusals         int                          `json:"expected_refusals,omitempty"`
+	ProbeErrors              int                          `json:"probe_errors"`
+	StaleClaimedFresh        bool                         `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches int                          `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal            bool                         `json:"graph_terminal"`
+	Evidence                 string                       `json:"raw_evidence"`
+	EvidenceWriteMS          float64                      `json:"evidence_write_ms"`
+	EvidenceEncodeMS         float64                      `json:"evidence_encode_ms"`
+	EvidenceBytes            int                          `json:"evidence_bytes"`
+	EvidenceLimit            int                          `json:"evidence_limit_bytes"`
+	Errors                   []string                     `json:"errors"`
 }
 type editProbeReport struct {
-	Role               string            `json:"role,omitempty"`
-	Plan               editProbePlan     `json:"plan"`
-	PlanHash           string            `json:"plan_sha256"`
-	AccountingRequired bool              `json:"accounting_required"`
-	Records            []editProbeRecord `json:"edits"`
-	Summary            *editProbeSummary `json:"summary,omitempty"`
-	OutputModes        editProbeModes    `json:"output_modes,omitempty"`
-	Reads              editProbeReads    `json:"reads,omitempty"`
-	RestoreMS          Metric            `json:"restore_batch_ms"`
-	Restore            json.RawMessage   `json:"restore_batch"`
-	StatsBefore        json.RawMessage   `json:"stats_before"`
-	StatsAfter         json.RawMessage   `json:"stats_after"`
-	Limitations        []string          `json:"limitations"`
+	SharedOwners       *editProbeSharedOwnerReport `json:"shared_owners,omitempty"`
+	SearchReadbacks    *searchReadbackAcceptance   `json:"search_readback_acceptance,omitempty"`
+	Role               string                      `json:"role,omitempty"`
+	Plan               editProbePlan               `json:"plan"`
+	PlanHash           string                      `json:"plan_sha256"`
+	AccountingRequired bool                        `json:"accounting_required"`
+	Records            []editProbeRecord           `json:"edits"`
+	Summary            *editProbeSummary           `json:"summary,omitempty"`
+	OutputModes        editProbeModes              `json:"output_modes,omitempty"`
+	Reads              editProbeReads              `json:"reads,omitempty"`
+	RestoreMS          Metric                      `json:"restore_batch_ms"`
+	Restore            json.RawMessage             `json:"restore_batch"`
+	StatsBefore        json.RawMessage             `json:"stats_before"`
+	StatsAfter         json.RawMessage             `json:"stats_after"`
+	Limitations        []string                    `json:"limitations"`
 }
 
 type editProbeState struct {
@@ -112,17 +133,24 @@ type editProbeState struct {
 }
 
 type editProbeRuntime struct {
+	sharedMu          sync.Mutex // optional shared report evidence only; never serializes ordinary requests
+	sharedBinding     *editProbeSharedBinding
+	sharedReport      editProbeSharedOwnerReport
 	options           runOptions
 	p                 *privateRun
 	phase             *Phase
 	plan              editProbePlan
 	editors           []*socketClient // fixed per ordinal; editors[0] owns run-level controls
+	searchTurnsOnce   sync.Once
+	searchTurns       map[int]*searchReadbackTurn // acceptance-only per-editor ACK/four-search FIFO
 	readers           []*socketClient
 	pendingEdits      atomic.Int64 // sent edits whose receipt is not yet observed terminal and whose loop has not ended
 	reads             []editProbeRead
 	modeCounts        map[string]editProbeModeCounts
 	states            []*editProbeState
 	original          []byte
+	originals         map[string][]byte // routed checkout path -> independently admitted original bytes
+	checkoutIDs       map[string]string // linked checkout path -> exact admitted public view identity
 	moveOriginal      []byte
 	origin            time.Time
 	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
@@ -133,7 +161,7 @@ type editProbeRuntime struct {
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
-	record := editProbeRecord{Ordinal: step.Ordinal, Editor: step.Editor, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
+	record := editProbeRecord{ProbeMode: step.ProbeMode, Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
@@ -185,14 +213,84 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	return out
 }
 
+// The editor's successful handshake owns its checkout. Prefixes are shared by
+// linked worktrees and cannot identify a view. A singleton has one unambiguous
+// route; with several checkouts an unknown session never inherits the primary.
+func (r *editProbeRuntime) repoFor(step editProbeStep) (privateRepo, error) {
+	if len(r.p.Repos) == 1 {
+		return r.p.Repos[0], nil // standalone receipt collectors need no editor session
+	}
+	if step.Editor < 0 || step.Editor >= len(r.editors) {
+		return privateRepo{}, fmt.Errorf("edit %d has unknown editor %d", step.Ordinal, step.Editor)
+	}
+	editor := r.editors[step.Editor]
+	if editor == nil {
+		return privateRepo{}, fmt.Errorf("edit %d has no editor session", step.Ordinal)
+	}
+	var offered *editProbeRoute
+	for i := range r.plan.Routes {
+		if r.plan.Routes[i].ID == step.Route {
+			offered = &r.plan.Routes[i]
+			break
+		}
+	}
+	if len(r.plan.Routes) > 0 && (offered == nil || step.Route == "" || r.plan.Routes[step.Editor%len(r.plan.Routes)].ID != step.Route) || len(r.plan.Routes) == 0 && step.Route != "" {
+		return privateRepo{}, errors.New("edit has an unknown or foreign offered route")
+	}
+	for _, repo := range r.p.Repos {
+		if editor.cwd != "" && filepath.Clean(editor.cwd) == filepath.Clean(repo.Path) {
+			logicalRepo := repo.Corpus.Label
+			if r.plan.LinkedWorktrees > 0 {
+				logicalRepo = r.plan.Repo
+			}
+			if offered != nil && (offered.ID != repo.Corpus.Label || offered.Repo != logicalRepo || offered.Commit != repo.Corpus.Commit || offered.File != repo.Corpus.File) {
+				return privateRepo{}, errors.New("editor checkout differs from its offered route pin")
+			}
+			return repo, nil
+		}
+	}
+	return privateRepo{}, fmt.Errorf("edit %d editor checkout is not a registered route", step.Ordinal)
+}
+
+func (r *editProbeRuntime) calleeFor(repo privateRepo) string {
+	if len(r.p.Repos) == 1 {
+		return r.plan.Callee
+	}
+	selected := repo.Corpus.Symbol
+	if repo.Corpus.EditKind == "add_crossfile_call" {
+		selected = repo.Corpus.EditCallee
+	}
+	separator := strings.LastIndex(selected, "::")
+	if separator < 0 {
+		return ""
+	}
+	return selected[separator+2:]
+}
+
 func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
-	plan, err := planEditProbe(p.Repos[0].Corpus, o)
+	corpora := make([]Corpus, len(p.Repos))
+	for i, repo := range p.Repos {
+		corpora[i] = repo.Corpus
+	}
+	plan, err := planEditProbeRoutes(corpora, o)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(plan.Routes) > 0 && len(plan.Routes) != len(p.Repos) {
+		return nil, nil, errors.New("offered edit routes differ from registered private checkout count")
+	}
+	if len(p.Repos) > 1 {
+		for _, repo := range p.Repos {
+			c := repo.Corpus
+			if plan.Kind != "add_intrafile_call" || plan.Tool != "edit.file" || plan.Mode != "json" || plan.Sender != "" || filepath.Ext(c.File) != ".go" || c.EditSender != "" || c.EditKind != "" && c.EditKind != "add_intrafile_call" || c.EditTool != "" && c.EditTool != "edit.file" || c.EditOutput != "" && c.EditOutput != "json" {
+				return nil, nil, errors.New("routed edit-probe runtime currently supports ordinary Go add_intrafile_call/edit.file JSON fixtures only")
+			}
+		}
 	}
 	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -220,7 +318,58 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return nil, nil, errors.New("planned marker already exists before edit")
 		}
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, original: original, requireAccounting: !o.editProbeBaseline}
+	r.original = original
+	// The search-only profile requires actual immediate search witnesses, not
+	// the separate edit gate's full phase accounting. Binary role is unchanged.
+	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
+	phase.EditProbe.AccountingRequired = r.requireAccounting
+	if plan.SearchReadbackAcceptance {
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable", "one shared setup/diagnostic client; zero per-offer ordinary oracle loops; post-required diagnostics are serial, at most one sample per editor and three calls per sample, within the remaining original phase window and a 1s diagnostic-only cap", "retained owned keep-state clones are NON-PRISTINE, not restored and never reusable as fresh acceptance seeds")
+	}
+	if len(p.Repos) > 1 {
+		r.originals = make(map[string][]byte, len(p.Repos))
+		for _, repo := range p.Repos {
+			data, readErr := os.ReadFile(filepath.Join(repo.Path, filepath.FromSlash(repo.Corpus.File)))
+			if readErr != nil {
+				return r, nil, readErr
+			}
+			if err := editProbeWriteAdmission(repo.Corpus, data); err != nil {
+				return r, nil, err
+			}
+			if strings.Count(string(data), repo.Corpus.EditAnchor) != 1 {
+				return r, nil, errors.New("each routed edit-probe anchor must occur exactly once")
+			}
+			for _, step := range plan.Steps {
+				if strings.Contains(string(data), step.Marker) {
+					return r, nil, errors.New("planned marker already exists in a routed fixture")
+				}
+			}
+			r.originals[repo.Path] = data
+		}
+	}
+	if plan.LinkedWorktrees > 0 {
+		r.checkoutIDs = make(map[string]string, plan.LinkedWorktrees)
+		seen := map[string]bool{}
+		for _, repo := range p.Repos[1:] {
+			var admitted struct {
+				View *struct {
+					Kind   string `json:"kind"`
+					Exact  bool   `json:"exact"`
+					Prefix string `json:"repo_prefix"`
+					ID     string `json:"checkout_id"`
+				} `json:"view"`
+			}
+			if err := json.Unmarshal(phase.Gate[repo.Corpus.Label+".view"], &admitted); err != nil || admitted.View == nil || !admitted.View.Exact || admitted.View.Kind != "worktree" || admitted.View.Prefix != repo.Prefix || strings.TrimSpace(admitted.View.ID) == "" {
+				return r, nil, errors.New("linked checkout has no exact admitted public checkout identity")
+			}
+			id := admitted.View.ID
+			if seen[id] {
+				return r, nil, errors.New("linked checkouts share an admitted checkout identity")
+			}
+			seen[id] = true
+			r.checkoutIDs[repo.Path] = id
+		}
+	}
 	if plan.Tool == "refactor.move" {
 		r.moveOriginal, err = os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(p.Repos[0].Corpus.EditDestination)))
 		if err != nil {
@@ -230,7 +379,6 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			return r, nil, errors.New("move destination bytes differ from offered fixture")
 		}
 	}
-	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, r.requireAccounting)
 	if plan.Sender == editProbeRestart {
 		r.restarter = editProbeDaemonRestarter{p: p}
 	}
@@ -247,7 +395,12 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	var clients []*socketClient
 	setup := time.Now()
 	for _, step := range plan.Steps {
-		record := newEditProbeRecord(p.Repos[0].Corpus, step)
+		repo, err := r.repoFor(step)
+		if err != nil {
+			return r, nil, err
+		}
+		record := newEditProbeRecord(repo.Corpus, step)
+		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
 		state := &editProbeState{step: step, record: record}
@@ -255,26 +408,35 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
 	for _, state := range r.states {
+		repo, err := r.repoFor(state.step)
+		if err != nil {
+			return r, clients, err
+		}
 		sink, err := os.OpenFile(state.record.Evidence, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return r, clients, err
 		}
 		state.sink = sink
 		state.startRaw()
-		state.client, err = openMCP(ctx, p.Socket, p.Repos[0].Path)
-		if err != nil {
-			return r, clients, err
+		if plan.SearchReadbackAcceptance && len(clients) != 0 {
+			// One owned setup/diagnostic connection, never one per queued offer.
+			state.client = clients[0]
+		} else {
+			state.client, err = openMCP(ctx, p.Socket, repo.Path)
+			if err != nil {
+				return r, clients, err
+			}
+			clients = append(clients, state.client)
 		}
-		clients = append(clients, state.client)
 		// A file created during the run proves its own presence before the
 		// paired delete is sent; it cannot be admitted here.
 		if state.step.BeforeSymbol != "" && state.step.File == "" {
 			req := request{Tool: "read", Operation: "source", Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": state.step.BeforeSymbol}, "options": map[string]any{"context_lines": 0}}}
-			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, p.Repos[0])})
+			raw, identity, readErr := state.client.callWithIdentity(ctx, "tools/call", map[string]any{"name": req.Tool, "arguments": dispatchArgs(req, repo)})
 			if readErr == nil {
 				readErr = checkToolResult(raw)
 			}
-			proven := readErr == nil && editProbePresenceProof(raw, p.Repos[0].Corpus, state.step.BeforeSymbol)
+			proven := readErr == nil && editProbePresenceProof(raw, repo.Corpus, state.step.BeforeSymbol)
 			if err := state.emit(map[string]any{"event": "before_presence_admission", "symbol": state.step.BeforeSymbol, "wire_id": identity.ID, "write_started": identity.WriteStarted, "finished": identity.Finished, "payload": raw, "proven": proven}); err != nil {
 				return r, clients, err
 			}
@@ -309,7 +471,19 @@ func (s *editProbeState) emit(value any) error {
 		return fmt.Errorf("%w: raw writer already closing", errEditProbeEvidenceIncomplete)
 	}
 	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
-		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded", errEditProbeEvidenceIncomplete)
+		// Preserve only first-refusal scalar facts in the existing error path.
+		// The rejected payload is never queued and the original cap is unchanged.
+		row, _ := value.(map[string]any)
+		event, _ := row["event"].(string)
+		purpose, _ := row["purpose"].(string)
+		wireID, payloadBytes := "unavailable", -1
+		if id, known := row["wire_id"].(int64); known {
+			wireID = strconv.FormatInt(id, 10)
+		}
+		if payload, known := row["payload"].(json.RawMessage); known {
+			payloadBytes = len(payload)
+		}
+		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
 		return s.sinkErr
 	}
 	// Pending and in-flight payloads share the unchanged total byte cap. A
@@ -447,6 +621,13 @@ func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, clien
 }
 
 func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, []Attempt, error) {
+	repo, routeErr := r.repoFor(s.step)
+	if routeErr != nil {
+		return nil, wireCallIdentity{}, nil, routeErr
+	}
+	if len(r.p.Repos) > 1 && (client == nil || filepath.Clean(client.cwd) != filepath.Clean(repo.Path)) {
+		return nil, wireCallIdentity{}, nil, errors.New("edit-probe request session belongs to another checkout")
+	}
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
 		budget = min(budget, 20*time.Second)
@@ -455,7 +636,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 		budget = min(budget, time.Until(end))
 	}
 	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
-	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, r.p.Repos[0]), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
+	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, repo), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
@@ -486,17 +667,22 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	repo, routeErr := r.repoFor(s.step)
+	if routeErr != nil {
+		return routeErr
+	}
 	ended := identity.Finished
 	if !identity.WriteStarted.IsZero() {
 		sent = identity.WriteStarted
 	}
-	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle), oracle.call.name())
+	body, decodeErr := decodeEditProbeOutput(data, r.probeOutput(oracle, s.step), oracle.call.name())
 	absence, exactRefusal := err.(*editProbeExpectedAbsence)
-	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+oracle.call.ExpectedAbsentSymbol
-	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, r.p.Repos[0].Corpus, s.step, r.plan.Callee)
+	expectedAbsence := oracle.call.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+oracle.call.ExpectedAbsentSymbol
+	correct := expectedAbsence || err == nil && decodeErr == nil && editProbeCorrect(oracle.name, body, repo.Corpus, s.step, r.calleeFor(repo))
 	fresh := decodeErr == nil && editProbeClaimsFresh(body)
 	stale, precommit := false, false
 	s.mu.Lock()
+	postACK := !s.acknowledged.IsZero() && !sent.Before(s.acknowledged)
 	if expectedAbsence {
 		s.record.ExpectedRefusals++
 	} else if err != nil {
@@ -523,19 +709,37 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 		}
 	}
 	s.mu.Unlock()
-	r.countMode(r.probeOutput(oracle), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
-	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
+	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
+	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
+	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
 }
 
 // Activation only starts owned loops and returns. It never waits for a probe
 // RPC/result; a blocked prober cannot shift this or any other edit's due time.
 func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 	probeCtx, cancel := context.WithCancel(ctx)
-	r.probe(probeCtx, cancel, r.activateProbeState(step, cancel))
+	state := r.activateProbeState(step, cancel)
+	if !r.plan.SearchReadbackAcceptance {
+		r.probe(probeCtx, cancel, state)
+	}
 }
 
 func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.CancelFunc, s *editProbeState) {
-	for index, oracle := range editProbeOracles(r.p.Repos[0].Corpus, s.step) {
+	repo, err := r.repoFor(s.step)
+	if err != nil {
+		s.mu.Lock()
+		s.record.Errors = append(s.record.Errors, err.Error())
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	corpus := repo.Corpus
+	corpus.EditOutput = r.stepProbeMode(s.step)
+	for index, oracle := range editProbeOracles(corpus, s.step) {
+		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" {
+			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
+			oracle.call.Arguments["require_fresh"] = true
+		}
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
@@ -545,7 +749,7 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 				var data json.RawMessage
 				var identity wireCallIdentity
 				var err error
-				if r.plan.Mode == "cli" {
+				if r.stepProbeMode(s.step) == "cli" {
 					data, identity, err = r.performCLI(probeCtx, s, oracle.call, "oracle:"+oracle.name, 10+index)
 				} else {
 					data, identity, err = r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
@@ -584,6 +788,22 @@ func (r *editProbeRuntime) beginEdit(ctx context.Context, step editProbeStep) (*
 	s.record.StartedNS = &ns
 	s.record.StartLatenessNS = &late
 	s.record.Outcome = "in_flight"
+	if r.plan.GateModes {
+		initial := r.original
+		if len(r.p.Repos) > 1 {
+			initial = nil
+			if repo, err := r.repoFor(step); err == nil {
+				initial = r.originals[repo.Path]
+			}
+		}
+		if initial != nil {
+			lines := bytes.Count(initial, []byte{'\n'})
+			if len(initial) > 0 && initial[len(initial)-1] != '\n' {
+				lines++
+			}
+			s.record.AdmittedTargetLines = &lines
+		}
+	}
 	if s.record.ActivatedNS == nil {
 		s.record.Errors = append(s.record.Errors, "missing pre-edit activation")
 	}
@@ -634,6 +854,11 @@ func editProbeReceiptClient(phase *Phase, clients []*socketClient) *socketClient
 }
 
 func (r *editProbeRuntime) doEdit(ctx context.Context, step editProbeStep) {
+	release, admitted := r.waitSearchReadbackTurn(ctx, step)
+	if !admitted {
+		return
+	}
+	defer release() // Error/cancellation before the fourth witness still drains.
 	if step.Sender != "" {
 		r.doNativeWrite(ctx, step)
 		return
@@ -677,28 +902,60 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 		return
 	}
+	if r.plan.GateModes {
+		s.mu.Lock()
+		if exact, ok := body["readback_exact"].(bool); ok {
+			s.record.ACKReadbackExact = &exact
+		}
+		s.mu.Unlock()
+	}
 	receipt, _ := body["mutation_receipt"].(string)
 	var move *editProbeMoveReferences
 	var batch *editProbeBatchReferences
 	var batchOffered []byte
+	var batchSet *editProbeBatchSetReferences
+	var batchIntents []editProbeBatchIntentMember
 	if r.plan.Tool == "edit.batch" {
-		transaction, offered, requestErr := editProbeBatchIntent(step.Request)
-		if requestErr == nil {
-			refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
-			requestErr = ackErr
-			if ackErr == nil {
-				batch = &refs
-				batchOffered = offered
+		changes, _ := step.Request.Arguments["changes"].([]any)
+		if len(changes) > 1 {
+			transaction, intents, requestErr := editProbeBatchSetIntent(step.Request, r.p.Repos[0].Path, r.p.Repos[0].Prefix)
+			if requestErr == nil {
+				refs, ackErr := decodeEditProbeBatchSetAcknowledgement(body, transaction, intents, strconv.FormatInt(identity.ID, 10))
+				requestErr = ackErr
+				if ackErr == nil {
+					refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(step.Request)
+					batchSet = &refs
+					batchIntents = intents
+				}
+			}
+			if requestErr != nil {
+				s.mu.Lock()
+				s.record.Outcome = "invalid_ack"
+				s.record.Errors = append(s.record.Errors, requestErr.Error())
+				s.mu.Unlock()
+				return
+			}
+		} else {
+			transaction, offered, requestErr := editProbeBatchIntent(step.Request)
+			if requestErr == nil {
+				refs, ackErr := decodeEditProbeBatchAcknowledgement(body, transaction, r.p.Repos[0].File, filepath.ToSlash(filepath.Join(r.p.Repos[0].Prefix, r.plan.File)), offered)
+				requestErr = ackErr
+				if ackErr == nil {
+					refs.OriginalNoRequireFresh = originalBatchNoRequireFresh(step.Request)
+					batch = &refs
+					batchOffered = offered
+				}
+			}
+			if requestErr != nil {
+				s.mu.Lock()
+				s.record.Outcome = "invalid_ack"
+				s.record.Errors = append(s.record.Errors, requestErr.Error())
+				s.mu.Unlock()
+				return
 			}
 		}
-		if requestErr != nil {
-			s.mu.Lock()
-			s.record.Outcome = "invalid_ack"
-			s.record.Errors = append(s.record.Errors, requestErr.Error())
-			s.mu.Unlock()
-			return
-		}
 	}
+
 	if step.Relocated {
 		refs, moveErr := decodeEditProbeMoveAcknowledgement(body, r.p.Repos[0].Prefix+"/"+step.BeforeSymbol, r.p.Repos[0].Prefix+"/"+step.TargetSymbol, r.movePaths())
 		if moveErr != nil {
@@ -711,7 +968,22 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		move = &refs
 	}
 	s.mu.Lock()
+	if r.plan.SearchReadbackAcceptance {
+		// Retain only this response's owned metadata; do not encode, hash or
+		// perform another read before the first semantic search witness.
+		s.record.SearchACK = make(map[string]any, 5)
+		for _, key := range []string{"ack_mode", "content_sha256", "readback_exact", "file_view", "graph_status_hint"} {
+			if value, present := body[key]; present {
+				s.record.SearchACK[key] = value
+			}
+		}
+	}
 	s.record.Receipt = receipt
+	if batchSet != nil {
+		s.record.BatchSet = batchSet
+		s.record.Receipt = ""
+		s.record.MutationID = ""
+	}
 	if batch != nil {
 		s.record.Batch = batch
 		if batch.TransactionError != "" {
@@ -727,7 +999,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.PhasesMS = editProbePhases(nil, "relocation reports per-file move accounting, not one receipt's phases_ms")
 		s.record.Derived = unavailable("ms", "relocation reports per-file move accounting, not one receipt's timeline")
 	}
-	if receipt == "" && batch == nil && move == nil {
+	if receipt == "" && batch == nil && batchSet == nil && move == nil {
 		s.record.Errors = append(s.record.Errors, "ACK mutation receipt unavailable")
 	} else if !identity.Finished.IsZero() {
 		s.record.Ack = measured(float64(identity.Finished.Sub(started))/float64(time.Millisecond), "ms")
@@ -736,7 +1008,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 	s.signalAck()
 	readbackKinds := []string{"file", "source"}
-	if step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
+	if r.plan.SearchReadbackAcceptance {
+		readbackKinds = []string{"search_visible", "text", "old_search_absent", "old_text_absent"}
+	} else if r.plan.GateModes {
+		readbackKinds = []string{"source", "file", "summary", "search_visible", "text"}
+	}
+	if !r.plan.SearchReadbackAcceptance && step.BeforeSymbol != "" && !step.Deleted && step.TargetSymbol == "" {
 		readbackKinds = append(readbackKinds, "old_source_absent")
 	}
 	if step.Relocated {
@@ -749,9 +1026,29 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if readbacksCorrect {
 		s.record.Readback = measured(float64(readbackEnd.Sub(started))/float64(time.Millisecond), "ms")
 	}
+	if r.plan.SearchReadbackAcceptance {
+		// This named profile certifies ACK plus its four immediate searches,
+		// never canonical publication, relation readiness or A/P/B accounting.
+		if !searchReadbackObjectACK(s.record.SearchACK) {
+			s.record.Errors = append(s.record.Errors, "exact local search ACK unavailable")
+		}
+		if ctx.Err() != nil {
+			s.record.Outcome = "phase_censored"
+		} else if callCtx.Err() != nil {
+			s.record.Outcome = "product_deadline"
+		} else if readbacksCorrect && len(s.record.Errors) == 0 {
+			s.record.Outcome = "complete"
+		} else {
+			s.record.Outcome = "diagnostic_failure"
+		}
+		s.mu.Unlock()
+		return
+	}
 	s.mu.Unlock()
 	if move != nil {
 		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
+	} else if batchSet != nil {
+		r.collectBatchSetEvidence(callCtx, s, *batchSet, batchIntents)
 	} else if batch != nil {
 		r.collectBatchEvidence(callCtx, s, *batch, batchOffered)
 	} else {
@@ -767,11 +1064,21 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 			if statusErr == nil {
 				if status, decodeErr := decodeEditProbeResult(raw); decodeErr == nil {
-					accounting := checkEditProbeAccountingForTool(status, receipt, r.plan.Tool)
+					if expected := s.record.CheckoutID; expected != "" && status["checkout_id"] != expected {
+						s.mu.Lock()
+						s.record.Errors = append(s.record.Errors, "status checkout identity does not match the admitted linked view")
+						s.mu.Unlock()
+						break // Foreign terminal/accounting fields cannot settle this edit.
+					}
+					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
+					s.record.MutationTiers = editProbeStatusTiers(status)
+					if s.record.MutationTiers != nil && s.record.MutationTiers.State == "invalid" {
+						s.record.Errors = append(s.record.Errors, "invalid live tier observation: "+s.record.MutationTiers.Reason)
+					}
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					if s.record.GraphTerminal {
 						r.settlePendingLocked(s)
@@ -818,10 +1125,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if !s.record.GraphTerminal && (move == nil || r.requireAccounting || !movePublicFactsComplete(s.record)) {
 		s.record.Errors = append(s.record.Errors, "graph receipt terminal unavailable")
 	}
-	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || s.record.MoveAccounting.State != "observed_move_windows_checks_pass") {
+	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || !editProbeMoveAccountingComplete(*s.record.MoveAccounting)) {
 		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
 	}
-	if r.requireAccounting && move == nil && s.record.Accounting.State != "observed_single_window_checks_pass" {
+	if r.requireAccounting && move == nil && !editProbeAccountingComplete(s.record.Accounting) {
 		s.record.Errors = append(s.record.Errors, "A/P/B accounting unavailable: "+strings.Join(s.record.Accounting.Reasons, "; "))
 	}
 	if s.record.StaleClaimedFresh {
@@ -843,8 +1150,15 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 // Observation-only kinds are recorded but neither gate the readback time nor
 // fail the record.
 func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool) (time.Time, bool) {
+	repo, err := r.repoFor(step)
+	if err != nil {
+		s.mu.Lock()
+		s.record.Errors = append(s.record.Errors, err.Error())
+		s.mu.Unlock()
+		return time.Time{}, false
+	}
 	readbackEnd, readbacksCorrect := time.Time{}, true
-	file := r.plan.File
+	file := repo.Corpus.File
 	if step.File != "" {
 		file = step.File
 	}
@@ -860,6 +1174,13 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			}
 		}
 		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		if kind == "search_visible" || kind == "text" {
+			operation := "symbols"
+			if kind == "text" {
+				operation = "text"
+			}
+			req = request{Tool: "search", Operation: operation, Arguments: map[string]any{"operation": operation, "query": step.Marker}}
+		}
 		if kind == "source" && step.TargetSymbol != "" {
 			req.Arguments["options"] = map[string]any{"context_lines": 0}
 		}
@@ -872,16 +1193,30 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			req.Operation = "file"
 			req.Arguments["operation"] = "file"
 		}
+		searchWitness := r.plan.SearchReadbackAcceptance && (kind == "search_visible" || kind == "text" || kind == "old_search_absent" || kind == "old_text_absent")
+		if searchWitness {
+			req = searchReadbackRequest(kind, repo, step)
+		}
 		req = editProbeWithOutput(req, r.plan.Mode)
 		begin := time.Now()
 		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
 		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
-		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, r.p.Repos[0].Corpus, step, r.plan.Callee)}
+		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, repo.Corpus, step, r.calleeFor(repo))}
+		if searchWitness {
+			back.ExpectedLine = step.ExpectedSearchLine
+			back.ExpectedPath = repo.Prefix + "/" + repo.Corpus.File
+			back.ExpectedID = back.ExpectedPath + "::" + step.Marker
+			back.Correct = readErr == nil && decodeErr == nil && exactSearchReadback(kind, payload, repo, step, r.calleeFor(repo))
+			var refused *rpcError
+			if errors.As(readErr, &refused) {
+				back.Refusal = refused.Message
+			}
+		}
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 		}
 		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
-		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == r.p.Repos[0].Prefix+"/"+req.ExpectedAbsentSymbol {
+		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
 			back.Correct = true
 			back.ExpectedOutcome = "symbol_absent"
 			back.Refusal = absence.message
@@ -895,6 +1230,13 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		}
 		back.ObservationOnly = observeOnly[kind]
 		s.mu.Lock()
+		if r.plan.GateModes && index == 0 {
+			metric := unavailable("ms", "first same-editor symbol-source readback endpoint missing or incorrect")
+			if back.Correct && !identity.Finished.IsZero() && !s.started.IsZero() && !identity.Finished.Before(s.started) {
+				metric = measured(float64(identity.Finished.Sub(s.started))/float64(time.Millisecond), "ms")
+			}
+			s.record.GateReadback = &metric
+		}
 		s.record.Readbacks = append(s.record.Readbacks, back)
 		if !back.Correct && !back.ObservationOnly {
 			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
@@ -906,6 +1248,9 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
 		if identity.Finished.After(readbackEnd) {
 			readbackEnd = identity.Finished
+		}
+		if r.plan.SearchReadbackAcceptance && index == 3 && kind == "old_text_absent" {
+			r.releaseSearchReadbackTurn(step)
 		}
 	}
 	return readbackEnd, readbacksCorrect
@@ -934,6 +1279,9 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	err = runEditProbeArrivals(measuredCtx, r.plan, r.origin, r.activate, r.doEdit, waitContext)
 	stopReads()
 	readers.Wait()
+	if r.plan.SearchReadbackAcceptance {
+		r.collectSearchAcceptanceDiagnostics(measuredCtx)
+	}
 	finished := r.finish()
 	after, statsErr := r.stats(measuredCtx)
 	r.phase.EditProbe.StatsAfter = after
@@ -946,6 +1294,11 @@ func (r *editProbeRuntime) finish() error {
 		return nil
 	}
 	r.finalized = true
+	for _, s := range r.states {
+		s.stopProbes()
+		s.finishRaw()
+	}
+	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
 	r.phase.EditProbe.Records = nil
 	for _, s := range r.states {
 		s.stopProbes()
@@ -963,6 +1316,7 @@ func (r *editProbeRuntime) finish() error {
 		}
 		record := s.record
 		s.mu.Unlock()
+		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners, r.requireAccounting)
 		record.groupTimes()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
@@ -986,9 +1340,17 @@ func (r *editProbeRuntime) finish() error {
 	}
 	finishEditProbeMetrics(r.phase)
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
+	r.phase.EditProbe.SearchReadbacks = summarizeSearchReadbacks(r.plan, r.phase.EditProbe.Records)
+	if r.phase.EditProbe.SearchReadbacks != nil && !r.phase.EditProbe.SearchReadbacks.Pass {
+		failures = append(failures, errors.New("immediate search readback acceptance incomplete or incorrect"))
+	}
 	r.mu.Lock()
 	r.phase.EditProbe.Reads = summarizeEditProbeReads(r.reads, r.plan.Seed)
-	r.phase.EditProbe.OutputModes = editProbeOutputCoverage(r.plan.Mode, r.modeCounts)
+	selected := r.plan.Mode
+	if r.plan.GateModes {
+		selected = "gate"
+	}
+	r.phase.EditProbe.OutputModes = editProbeOutputCoverage(selected, r.modeCounts)
 	r.mu.Unlock()
 	return errors.Join(failures...)
 }
@@ -1034,6 +1396,11 @@ func (r *editProbeRuntime) close() error {
 }
 
 func (r *editProbeRuntime) restore(ctx context.Context) error {
+	if r.plan.SearchReadbackAcceptance && r.options.KeepState {
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "not restored: owned non-pristine search-acceptance clone retained")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"preserved_owned_non_pristine_keep_state","restored":false,"fresh_seed_reuse_allowed":false}`)
+		return nil
+	}
 	if len(r.plan.Steps) > 0 && r.plan.Steps[0].ExpectedRefusal {
 		return r.confirmRefusalUnchanged()
 	}
@@ -1042,16 +1409,38 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
 	for _, record := range r.phase.EditProbe.Records {
+		if record.BatchSet != nil {
+			return errors.New("multi-file batch restore unsupported: complete original baselines are not retained")
+		}
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
-		if (record.Receipt == "" && record.Batch == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
+		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
+	}
+	if len(r.p.Repos) > 1 {
+		return r.restoreRoutes(ctx)
 	}
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	// A terminal batch authorizes restoring only its retained owned after-image.
+	// The public conditional transaction still checks these bytes again at write time.
+	if r.plan.Tool == "edit.batch" {
+		var last *editProbeBatchReferences
+		for _, record := range r.phase.EditProbe.Records {
+			if record.Batch != nil {
+				last = record.Batch
+			}
+		}
+		if last == nil || last.TransactionID == "" || last.Observation == "" || last.Acknowledgement == "" ||
+			last.Path != filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)) ||
+			last.RelativePath != r.p.Repos[0].Prefix+"/"+r.plan.File ||
+			last.AfterSHA256 != fmt.Sprintf("%x", sha256.Sum256(current)) {
+			return errors.New("batch restore refused: retained source identity or owned after-image differs")
+		}
 	}
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {

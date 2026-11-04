@@ -823,7 +823,9 @@ func TestContractHeaderRepairRetriesFailedBaselinesWithoutAnActor(t *testing.T) 
 			t.Cleanup(r.Close)
 			require.Eventually(t, func() bool {
 				state, found, err := job.store.ContractInputStateContext(t.Context(), "fixture", "")
-				return err == nil && found && state.Accepted
+				// Acceptance is durable before the asynchronous baseline releases its
+				// live-owner marker. Observe completed repair, not only its commit.
+				return err == nil && found && state.Accepted && !job.mi.contractBaselineActive("fixture")
 			}, 20*time.Second, 10*time.Millisecond)
 			want := int64(2)
 			if beforeStart {

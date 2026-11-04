@@ -9,7 +9,6 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
-	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
@@ -259,13 +258,45 @@ func (s *Server) handleOverlayMerge(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	var writer daemon.DiskWriteFn
+	var writes []committedSourceMutation
+	release := func() {}
 	if toDisk {
-		// Capture the resolver closure once; each per-file write
-		// re-resolves, re-checks drift, and atomically writes.
-		writer = s.diskWriteForMerge(ctx)
+		// Resolve and own the complete bounded file set before taking the
+		// branch mutex. The manager then verifies that exact source cohort
+		// before the first callback, without waiting for publication inside it.
+		files, err := s.overlays.FilesForBranchBounded(id, from, overlayRequestSnapshotMaxFiles, overlayRequestSnapshotMaxBytes)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		opts.ExpectedFiles = append(make([]daemon.OverlayFile, 0, len(files)), files...)
+		paths := make([]string, 0, len(files))
+		for _, file := range files {
+			path, _, err := s.resolveFilePath(ctx, file.Path)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			paths = append(paths, path)
+		}
+		ctx, release, err = acquireMutationPaths(ctx, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
+		writer = func(file daemon.OverlayFile) error {
+			write, err := s.writeOverlayMergeFileHeld(ctx, file)
+			if write.record != nil {
+				writes = append(writes, write)
+			}
+			return err
+		}
 	}
 
 	res, mergeErr := s.overlays.MergeBranches(id, opts, writer)
+	if toDisk {
+		// The branch mutex is now released, including on a later-file error.
+		// Every successfully committed file still receives its one admission.
+		s.completeCommittedSourceMutations(ctx, writes, release)
+	}
 	if mergeErr != nil {
 		switch {
 		case errors.Is(mergeErr, daemon.ErrSessionNotFound):
@@ -321,60 +352,56 @@ func (s *Server) handleOverlayMerge(ctx context.Context, req mcp.CallToolRequest
 // reuse, drift detection would be duplicated and could silently
 // diverge across surfaces.
 func (s *Server) diskWriteForMerge(ctx context.Context) daemon.DiskWriteFn {
-	return func(f daemon.OverlayFile) error {
-		absPath, _, resolveErr := s.resolveFilePath(ctx, f.Path)
-		if resolveErr != nil {
-			return fmt.Errorf("merge to_disk: %s: %w", f.Path, resolveErr)
+	return func(file daemon.OverlayFile) error {
+		path, _, err := s.resolveFilePath(ctx, file.Path)
+		if err != nil {
+			return fmt.Errorf("merge to_disk: %s: %w", file.Path, err)
 		}
-		if f.Deleted {
-			// Tombstone-on-disk: remove the file. Honour the
-			// drift guard before removal so a concurrent edit
-			// can't be silently overwritten by an unlink.
-			if f.BaseSHA != "" {
-				current, readErr := os.ReadFile(absPath)
-				if readErr != nil {
-					// File already gone is not drift; surface
-					// the error only when something other than
-					// "not found" is at play.
-					if errors.Is(readErr, os.ErrNotExist) {
-						return nil
-					}
-					return readErr
-				}
-				if gitBlobSHA(current) != normalizeExpectedSHA(f.BaseSHA) {
-					return fmt.Errorf("%s: %w", f.Path, daemon.ErrOverlayDrift)
-				}
-			}
-			if rmErr := os.Remove(absPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				return fmt.Errorf("merge to_disk: remove %s: %w", absPath, rmErr)
-			}
-			s.reindexFile(absPath)
-			return nil
+		held, release, err := acquireMutationPath(ctx, path)
+		if err != nil {
+			return err
 		}
-		if f.BaseSHA != "" {
-			current, readErr := os.ReadFile(absPath)
-			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-				return readErr
-			}
-			if readErr == nil && gitBlobSHA(current) != normalizeExpectedSHA(f.BaseSHA) {
-				return fmt.Errorf("%s: %w", f.Path, daemon.ErrOverlayDrift)
-			}
-			if readErr != nil && f.BaseSHA != "" {
-				// File expected on disk but missing — treat as
-				// drift so the caller re-reads + resubmits.
-				return fmt.Errorf("%s: %w", f.Path, daemon.ErrOverlayDrift)
-			}
+		defer release()
+		write, err := s.writeOverlayMergeFileHeld(held, file)
+		if write.record != nil {
+			s.completeCommittedSourceMutations(held, []committedSourceMutation{write}, release)
 		}
-		perm := os.FileMode(0o644)
-		if info, statErr := os.Stat(absPath); statErr == nil {
-			perm = info.Mode().Perm()
-		}
-		if err := agents.AtomicWriteFile(absPath, []byte(f.Content), perm); err != nil {
-			return fmt.Errorf("merge to_disk: write %s: %w", absPath, err)
-		}
-		s.reindexFile(absPath)
-		return nil
+		return err
 	}
+}
+
+// Only physical I/O belongs in the manager callback; admission and graph waits
+// belong to the operation's final frontier after the manager releases its mutex.
+func (s *Server) writeOverlayMergeFileHeld(ctx context.Context, file daemon.OverlayFile) (committedSourceMutation, error) {
+	path, _, err := s.resolveFilePath(ctx, file.Path)
+	if err != nil {
+		return committedSourceMutation{}, fmt.Errorf("merge to_disk: %s: %w", file.Path, err)
+	}
+	if file.BaseSHA != "" {
+		current, readErr := os.ReadFile(path)
+		if file.Deleted && errors.Is(readErr, os.ErrNotExist) {
+			return committedSourceMutation{}, nil
+		}
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return committedSourceMutation{}, readErr
+		}
+		if readErr != nil || gitBlobSHA(current) != normalizeExpectedSHA(file.BaseSHA) {
+			return committedSourceMutation{}, fmt.Errorf("%s: %w", file.Path, daemon.ErrOverlayDrift)
+		}
+	}
+	perm := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+	operation := sourceMutationOperation{kind: sourceWrite}
+	if file.Deleted {
+		operation.kind = sourceRemove
+	}
+	commit, err := s.commitFileMutation(ctx, "overlay_merge", "", "", file.Path, path, []byte(file.Content), perm, operation)
+	if err != nil {
+		return committedSourceMutation{}, fmt.Errorf("merge to_disk: %s: %w", file.Path, err)
+	}
+	return captureCommittedSourceMutation(ctx, path, commit), nil
 }
 
 // handleCompareBranches runs the supplied query kind against two

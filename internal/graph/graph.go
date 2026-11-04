@@ -1610,7 +1610,7 @@ func (g *Graph) EdgesByKinds(kinds []EdgeKind) iter.Seq[*Edge] {
 // DistinctExternalTargets returns the unique external-shaped destinations for
 // kinds in one shard walk. It keeps only target strings in memory and never
 // materialises the graph's full edge set.
-func (g *Graph) DistinctExternalTargets(kinds []EdgeKind) []string {
+func (g *Graph) DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string {
 	if len(kinds) == 0 {
 		return nil
 	}
@@ -1629,7 +1629,7 @@ func (g *Graph) DistinctExternalTargets(kinds []EdgeKind) []string {
 		s.mu.RLock()
 		for _, edges := range s.outEdges {
 			for _, e := range edges {
-				if e == nil || !isExternalTargetID(e.To) {
+				if e == nil || !isExternalTargetID(e.To) || !strings.HasSuffix(e.FilePath, fileSuffix) {
 					continue
 				}
 				if _, ok := kindSet[e.Kind]; ok {

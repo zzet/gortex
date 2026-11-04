@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/config"
@@ -62,6 +63,23 @@ type ContractAnalysisCoordinatorOptions struct {
 	JobSlots int
 	// Now replaces time.Now for interest and backoff.
 	Now func() time.Time
+	// LinkedPolicy decides when a linked-checkout actor's job may start:
+	// idle (the zero value), throttled or eager. It applies only where the
+	// scheduler can reacquire a linked actor's inputs (LinkedInputs); idle
+	// also needs Demand, without which the daemon always counts as idle.
+	LinkedPolicy ContractLinkedPolicy
+	// LinkedIdleWindow is how long Demand must have reported nothing before
+	// the idle policy starts a linked job; zero means 5 s.
+	LinkedIdleWindow time.Duration
+	// LinkedThrottleInterval is the least time between two job starts of
+	// one linked actor under the throttled policy; zero means 30 s.
+	LinkedThrottleInterval time.Duration
+	// Demand reports foreground work: busy while a tool call is in flight
+	// or the edit lane is busy, and seq, a count that moves whenever a tool
+	// call starts or ends, so a call that came and went between two
+	// samples still counts. It is sampled outside the scheduler's lock and
+	// must not wait.
+	Demand func() (busy bool, seq uint64)
 }
 
 type contractAnalysisJob struct {
@@ -79,6 +97,20 @@ type contractAnalysisJob struct {
 	priorityRepos     []string
 	targetPublished   func(ContractFollowupTargetResult)
 	backgroundCurrent func(context.Context) error
+	// yield replaces the coordinator's Yield for this job: a linked job the
+	// idle policy governs parks without a progress slice.
+	yield func(context.Context) error
+	// linkedPolicy names the policy a linked actor's job ran under, empty
+	// for a primary actor; strict is set when a strict request started it,
+	// and gatedAt is when, on the wall clock, its policy let it start.
+	// demandSeen is set once the job's yield met foreground demand;
+	// demandStop when its last checkpoint question was answered yes for
+	// demand alone. demandSeq is the highest demand sequence the job saw.
+	linkedPolicy           ContractLinkedPolicy
+	strict                 bool
+	gatedAt                time.Time
+	demandSeen, demandStop atomic.Bool
+	demandSeq              atomic.Uint64
 }
 
 // contractJobTriggerInterest queues a job for a request's interest in its key.
@@ -123,6 +155,11 @@ type ContractAnalysisCoordinator struct {
 	// unsettled, when set, asks the repair to scan a cohort a job could not
 	// settle its reads in.
 	unsettled func(repos []string)
+	// lastDemand is when a Demand sample last showed foreground work, on
+	// the coordinator's clock: the idle window runs from it. demandSeq is
+	// the highest demand sequence a sample returned.
+	lastDemand time.Time
+	demandSeq  uint64
 }
 
 func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) (*ContractAnalysisCoordinator, error) {
@@ -138,10 +175,28 @@ func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) 
 	if options.Logger == nil {
 		options.Logger = zap.NewNop()
 	}
+	switch options.LinkedPolicy {
+	case "":
+		options.LinkedPolicy = ContractLinkedIdle
+	case ContractLinkedIdle, ContractLinkedThrottled, ContractLinkedEager:
+	default:
+		return nil, fmt.Errorf("contract analysis coordinator: unknown linked policy %q", options.LinkedPolicy)
+	}
+	if options.LinkedIdleWindow < 0 || options.LinkedThrottleInterval < 0 {
+		return nil, fmt.Errorf("contract analysis coordinator: invalid linked schedule")
+	}
+	if options.LinkedIdleWindow == 0 {
+		options.LinkedIdleWindow = contractLinkedIdleWindow
+	}
+	if options.LinkedThrottleInterval == 0 {
+		options.LinkedThrottleInterval = contractLinkedThrottleInterval
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &ContractAnalysisCoordinator{deltaCaches: contractDeltaLRU{budget: contractDeltaMemoryBudget(options.MemoryLimitBytes)}, options: options, ctx: ctx, cancel: cancel, changed: make(chan struct{}),
 		acceptedEpoch: make(map[string]uint64), acceptedAt: make(map[string]time.Time), actors: make(map[ContractActor]*contractActor), rings: make(map[string]*contractRing),
 		slots: &contractJobSlots{free: contractJobSlotCount(options.JobSlots)}, capacityChanged: make(chan struct{})}
+	// A daemon that just started has not been idle for a window yet.
+	c.lastDemand = c.now()
 	return c, nil
 }
 
@@ -326,11 +381,15 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 			}
 		}
 	}
-	c.options.Logger.Info("contract analysis job started", zap.String("mode", startMode), zap.String("job", job.id),
+	c.options.Logger.Info("contract analysis job started", append([]zap.Field{zap.String("mode", startMode), zap.String("job", job.id),
 		zap.String("repo", targets[0].Key.RepoPrefix), zap.String("checkout", targets[0].Key.CheckoutID), zap.Int("targets", len(targets)),
 		zap.String("trigger", job.trigger), zap.Float64("since_trigger_ms", contractMillis(dispatch)),
-		zap.Float64("since_accept_ms", sinceAccept), zap.Float64("capture_ms", contractMillis(job.capture)))
-	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: c.options.Yield,
+		zap.Float64("since_accept_ms", sinceAccept), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedStartFields()...)...)
+	yield := c.options.Yield
+	if job.yield != nil {
+		yield = job.yield
+	}
+	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: yield,
 		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, delta: job.delta,
 		PriorityRepos: job.priorityRepos, BackgroundCurrent: job.backgroundCurrent,
 		TargetPublished: func(result ContractFollowupTargetResult) {
@@ -376,8 +435,11 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		mode = viewmetrics.ContractModeCold
 	}
 	countContractJob(mode, outcome, elapsed)
-	logContractJob(c.options.Logger, mode, outcome, elapsed, report,
-		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture)))
+	// The job, checkout and trigger name the start line this end belongs to,
+	// so a linked checkout's fill time can be attributed from the log alone.
+	logContractJob(c.options.Logger, mode, outcome, elapsed, report, append([]zap.Field{
+		zap.String("job", job.id), zap.String("checkout", targets[0].Key.CheckoutID), zap.String("trigger", job.trigger),
+		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedEndFields(outcome)...)...)
 	return outcome
 }
 

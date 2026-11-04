@@ -621,6 +621,13 @@ type Edge struct {
 	// only on the in-memory projection under min_tier:"text_matched";
 	// never persisted, never part of the edge identity / dedup key.
 	NameOnly bool `json:"name_only,omitempty"`
+	// Provisional marks a stored relation carried onto an overlay that
+	// re-parsed its file before relations were rebuilt: the new content
+	// still references the same target from the same source, so the edge
+	// is served at the reference's new line until the reindex confirms
+	// it. Set only on the in-memory overlay; never persisted, never part
+	// of the edge identity / dedup key.
+	Provisional bool `json:"provisional,omitempty"`
 	// Meta is intentionally excluded from JSON. It holds internal
 	// instrumentation (semantic_source, provider hints, etc.) that agents
 	// don't consume but that adds measurable bytes to every edge in

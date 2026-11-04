@@ -389,12 +389,12 @@ func (s *Server) stackedEdgeBatches(ctx context.Context) *memoEdgeLevelReader {
 // levels, or returns nil when the view is not a stack the memo can stand for:
 // no materialized routed checkout, a stack that composes the mutable base
 // corpus, a reader that is not the materialized stack itself (an
-// editor-buffer overlay, a narrowed base), or a stack whose shape does not
+// editor-buffer overlay, a borrowed disk projection, a narrowed base), or a stack whose shape does not
 // match its sources. wrap builds one level's memoized reader over the level's
 // uncached composition; top marks the level the caller reads, bare a stack
 // that is the root handle alone.
 func (s *Server) stackedLevels(ctx context.Context, wrap func(underlying graph.Reader, memo *stackAdjacencyMemo, level *stackAdjacencyLevel, top, bare bool) graph.Reader) graph.Reader {
-	if stackedAdjacencyDisabledForTest || OverlayViewFromContext(ctx) != nil {
+	if stackedAdjacencyDisabledForTest || OverlayViewFromContext(ctx) != nil || len(requestProjectionLayers(ctx)) != 0 {
 		return nil
 	}
 	view := requestViewFromContext(ctx)

@@ -71,6 +71,15 @@ whether a host is reference or large. Linux PSS and Mac physical footprint are
 distinct fixed memory observations, compared only within the same host class
 and measurement identity. Neither silently substitutes RSS when unavailable.
 
+`smoke --retain-read-source-failures` forwards the load client's existing
+bounded failure-wire option to both builds. It defaults off. The existing PR
+workflow selects it only when `PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES=true`;
+the checker requires the selected mode and the unchanged eight-record/64-KiB
+base64 limits in every report. Capture observation work is part of measurement
+identity, so enabled and disabled reports cannot be compared. This adds no
+RPC, retry, workload step, deadline or budget allowance. Keep raw evidence out
+of PR prose; reports from private corpora must remain private.
+
 Each repeat contributes its own p95/p99/p50 or counter observation. The checker
 uses the median of at least three repeats, not a pooled percentile. A ratio row
 uses the ratio of repeated medians. Hard edit/stop maxima, zero-safety counters
@@ -157,10 +166,11 @@ go run ./bench/check-budgets collect --config reviewed-lane.json --out NEW-evide
 go build -o /benchmark/bin/release-gate ./bench/release-gate
 /benchmark/bin/release-gate --config reviewed-release.json --out /benchmark/NEW-release-dir
 
-# Inspect downloaded scheduled-main artifacts, replay all passing raw reports,
-# require five actual adjacent UTC dates, and flag two-night row misses.
+# Inspect downloaded scheduled/manual-main artifacts and replay all passing
+# raw reports. Require one complete run at the reviewed main revision across
+# every required host; keep two-night row-miss monitoring separately.
 go run ./bench/check-budgets history --inputs downloaded-nightlies.json \
-  --through 2026-10-30 --hosts reference_linux
+  --revision "$REVIEWED_MAIN_SHA" --through 2026-10-30 --hosts reference_linux
 ```
 
 Build the release entry before invoking it so a supervisor can address its PID
@@ -176,14 +186,21 @@ toward the same release start time, cleanup reserve and wall-time receipt.
 `downloaded-nightlies.json` is an array of retained artifact-directory paths,
 relative to that index or absolute. Review their run provenance before use:
 this command checks local content and replays raw evidence, not the authenticity
-of arbitrary local files. Only `schedule` events on `refs/heads/main` count.
-Dispatch, readiness, duplicate host/date, omitted dates, shortened tables and
-changed policies cannot manufacture five accepted nights. Use `--through` for
-the last required night before the candidate; stale history is not a current
-release verdict. Consecutive block misses are labeled `BLOCKER`; consecutive
-disk/memory guard misses are labeled `GUARD REVIEW`. Missing history fails.
-The workflow preserves each artifact; downloading/curating the history index
-and calling this check before the first RC remain release-owner actions.
+of arbitrary local files. One complete qualifying main nightly-equivalent run
+is required: either a scheduled event or an explicit workflow_dispatch on
+refs/heads/main, at the reviewed --revision with the same pinned policy,
+complete matrix, independent repetitions, host coverage, raw schema and budget
+table. Required host artifacts must belong to the SAME workflow run/attempt;
+unrelated hosts, revisions or reruns cannot be assembled into a qualifying run.
+The --through date is a review cutoff, not a calendar waiting period. PR,
+readiness, synthetic, shortened or incomplete artifacts do not qualify. Same-day
+separate real runs remain inspectable; duplicate run/attempt/host artifacts fail.
+Nightly monitoring continues: consecutive block misses are labeled BLOCKER and
+consecutive disk/memory guard misses GUARD REVIEW. Manual passes and same-day
+retries do not erase scheduled misses. A seeded RED nightly gate
+proof remains separately required; neither this green-run check nor synthetic
+unit fixtures supplies it. The workflow preserves each artifact; reviewing the
+provenance/index and the separate seeded RED proof remains release-owner work.
 
 A lane configuration is strict schema1 JSON. Example below is **configuration
 shape only**, with synthetic paths/revisions and no measured baseline:
@@ -267,8 +284,10 @@ separate owner-approved infrastructure actions. No existing VM is adopted.
 
 After that review, the owner places the external config, sets only its matching
 config-path variable, and sets `PERF_REFERENCE_NIGHTLY_ENABLED` or
-`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch can verify plumbing
-but cannot count as one of the five scheduled nights. Leave both enabled
+`PERF_MAC_NIGHTLY_ENABLED` to `true`. A manual main dispatch qualifies only when
+its dedicated nightly jobs collect the same complete policy, matrix, required
+hosts, independent repeats, raw JSON and budget table as a scheduled run.
+A smoke or plumbing-only dispatch does not qualify. Leave both enabled
 variables unset while prerequisites remain; GitHub displays measurement jobs
 as skipped. Removing the variable stops future scheduling without cancelling
 an in-flight owned daemon. A host being busy is reason to leave its lane
@@ -340,9 +359,28 @@ shorter profile is silently chosen. The query benchmark indexes `../..`, so
 both builds run from package directories under the **same clean pinned fixture
 snapshot**, never arbitrary binary-download CWDs. Fixture cleanliness is checked
 again after runs and before benchstat. Changed input fails. Interrupted/missing
-samples remain failed evidence. Benchmark-only processes get an Interrupt then
-a two-second kill/join bound; abnormal exit/context errors cannot become success.
+samples remain failed evidence. Linux query test executables (fixture preflight
+and benchmark group) enable GC logs and all-goroutine tracebacks. At the original
+context deadline they receive SIGQUIT, with at most ten seconds to capture output
+before forced kill/join. Query processes own a separate process group; surviving
+descendants receive TERM then KILL with at most two seconds to join after each.
+Leftover work is failed evidence even when cleanup succeeds. The receipt records `linux_query_sigquit_v1` and the
+capture grace separately. Crossing the original deadline always fails, including
+a child that handles SIGQUIT and exits zero. The monotonic deadline is checked
+after Wait as well, so a delayed timer callback cannot admit a late zero exit.
+The passing budget is unchanged.
+Other processes retain Interrupt and the two-second kill/join bound;
+abnormal exit/context errors cannot become success.
 The daemon collector instead joins owned cleanup without killing its client.
+
+For a separately reviewed query setup diagnosis, the test executable accepts
+`GORTEX_BENCH_QUERY_SETUP_TRACE` as a new output-file prefix. It writes exclusive
+`.start.json` and `.finish.json` sidecars with shared setup and indexing clocks,
+monotonic elapsed durations, and the indexed file/worker census. A start without
+a finish remains incomplete evidence. An existing sidecar or write failure
+fails the requested diagnosis. The unset default emits no sidecars. This trace
+does not change query bodies, fixture scope, timers, or child safety bounds;
+shared setup runs once per executable and remains outside the benchmark timers.
 
 Outputs include per-run raw text, combined main/candidate samples, benchstat
 text and `microbench.json`. `formal_acceptance` is always false: the workload
@@ -482,14 +520,22 @@ four-call bursts, optimistic 20-second estimates are about 328 load16 calls and
 19 edits/75 reads for edit4; publication speed is unmeasured. Per-tool counts
 will be much smaller, and p99 can effectively be a maximum. Neither sample
 adequacy nor the full-job p95 <=15 minutes is established. The entry cancels
-measurement at 13 minutes, reserves cleanup time and fails after 15 minutes.
-Strict startup/enrichment uses the remaining measurement deadline instead of an
-independent five-minute cold-start cutoff; parent cancellation still interrupts
-the load client for owned cleanup. This harness bound is not a cold-start
-performance allowance or evidence that the full profile fits fifteen minutes;
-the workflow's 18-minute outer bound permits cleanup/upload after failure. It
-cannot certify full-job timing, which includes build/download/preparation and
-requires twenty actual runs.
+measurement at 120 minutes and reserves two minutes for owned cleanup.
+Strict startup/enrichment uses the remaining measurement deadline; parent
+cancellation interrupts the load client for cleanup. The job caps setup steps
+at twenty minutes in total, the measurement step at 122 minutes including
+cleanup, and always-upload at three minutes, within a 145-minute job bound.
+These are measurement safety bounds, not accepted performance targets.
+
+The original full-job p95 <=15-minute target is explicitly deferred while a
+complete run is measured; it has not become a 120-minute target. The receipt
+retains the original 900-second target, reports deferred timing acceptance and
+whether the entry alone exceeded that target, and never grants formal
+acceptance. Full-job timing includes build/download/preparation; an entry below
+fifteen minutes would not establish full-job acceptance either. One naturally
+triggered complete attempt is reviewed before any repeat campaign. Fixture,
+readiness, five phases, three repeats, both fresh stores, thirty-six starts and
+all other strict checker thresholds remain unchanged.
 
 The measurement job is visibly skipped until `PERF_PR_SMOKE_ENABLED` is reviewed
 and enabled. Main publication separately requires its new harness contract on
@@ -520,9 +566,28 @@ The floor class and extra lifecycle adapters require explicit reviewed support;
 do not relabel floor runs as reference Linux.
 
 Actual acceptance is still required: 20 real smoke runs for wall-time/flake
-rates, linked seeded latency/edit-wait regressions, five actual nights on main,
-a seeded nightly failure, a measured release subset under eight hours per host,
+rates, linked seeded latency/edit-wait regressions, one complete qualifying main
+nightly-equivalent run (scheduled or manual) with raw JSON and budget table,
+a separate seeded nightly failure, a measured release subset under eight hours per host,
 no forced daemons, and 20-PR CI wall-time comparison. None is simulated by unit
 tests. #996 and #998 implementations are merged; baseline acceptance remains separate. #1000's deferred 400-task
 harness is not recreated here. A small release scripted-agent fixture remains
 separate future work, requiring its own reviewed plan.
+
+The opt-in `nightly_workload_seed` schema1 `search-delay-v1` targets only the
+candidate `loadedit-4` cell. It delays actual workload `search.symbols` calls
+inside their existing measured interval by one cancellable second, so the
+unchanged 0.4-second absolute search p95 budget can observe the regression.
+MAIN/tag, visibility probes, other cells and ordinary seed-off runs stay clean.
+Raw seed/delay provenance is required; a missing observation or unrelated
+collector failure is not an observed latency regression. Seeded reports never
+supply GREEN history. Actual targeted seed-off/seed-on evidence remains separate
+from source tests and from full nightly automation.
+
+The fixed PR smoke entry explicitly selects `edit.ack=local` for both builds.
+The child sequence, smoke provenance, and each workload retain that selection;
+every actual edit ACK must report the same effective mode. Missing/mismatched
+mode evidence fails rather than being labeled local. Existing implicit/full
+runs retain their original identity and failures. This is an explicit future
+measurement configuration, not a waiver or relabeling of full-mode latency.
+The 0.20-second p95 and one-second hard maximum remain unchanged.

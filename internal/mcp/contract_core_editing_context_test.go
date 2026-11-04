@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -100,6 +101,23 @@ func (s *contractCoreEditingSpy) GetInEdges(id string) []*graph.Edge {
 func (s *contractCoreEditingSpy) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
 	s.inEdgeBatches++
 	return s.Store.GetInEdgesByNodeIDs(ids)
+}
+
+// The scope spy observes the same batched assembly inside its borrowed reader.
+func (s *contractCoreEditingSpy) WithFileEditingContextReader(ctx context.Context, fn func(context.Context, graph.FileEditingContextRows) error) error {
+	return s.Store.WithFileEditingContextReader(ctx, func(ctx context.Context, rows graph.FileEditingContextRows) error {
+		return fn(ctx, &contractCoreEditingRowsSpy{FileEditingContextRows: rows, spy: s})
+	})
+}
+
+type contractCoreEditingRowsSpy struct {
+	graph.FileEditingContextRows
+	spy *contractCoreEditingSpy
+}
+
+func (r *contractCoreEditingRowsSpy) GetInEdgesByNodeIDs(ids []string) map[string][]*graph.Edge {
+	r.spy.inEdgeBatches++
+	return r.FileEditingContextRows.GetInEdgesByNodeIDs(ids)
 }
 
 // get_editing_context on a primary session takes the fast path under the

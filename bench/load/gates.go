@@ -127,7 +127,11 @@ func (p *privateRun) writeBootRepos(worktrees bool) ([]privateRepo, error) {
 	for _, repo := range configured {
 		entries = append(entries, map[string]string{"path": repo.Path, "name": repo.Corpus.Label})
 	}
-	data, err := json.Marshal(map[string]any{"repos": entries})
+	payload := map[string]any{"repos": entries}
+	if p.editACKMode != "" {
+		payload["edit"] = map[string]string{"ack": p.editACKMode}
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}

@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 )
 
@@ -24,7 +26,7 @@ type publicationIntentWatcher struct {
 	reject    bool
 }
 
-func (w *publicationIntentWatcher) EnqueueFileMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
+func (w *publicationIntentWatcher) EnqueueToolMutation(_ context.Context, path string) (*indexer.MutationTicket, error) {
 	w.protected.Store(w.store.WriteWanted())
 	if w.reject {
 		return nil, nil
@@ -210,4 +212,36 @@ func TestPrimaryMutationFallbackKeepsOrdinaryWriteIntent(t *testing.T) {
 			require.True(t, w.store.WriteWanted())
 		})
 	}
+}
+
+// TestPrimaryEditAnnouncesNoWriteIntent spies on the store across a primary
+// checkout edit_file in watcher mode. The edit writes only the source file
+// and the watcher's patch announces its own store writes, so nothing on the
+// ack path may announce a writer that holds off WAL reclaim for the request.
+func TestPrimaryEditAnnouncesNoWriteIntent(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_LAZY_INDEXES", "off")
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "intent.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	srv, dir := setupTestServer(t)
+	srv.materializer = &graphview.Materializer{Store: store}
+	require.True(t, srv.facades.mutatesSource("edit_file"))
+	mainGo := filepath.Join(dir, "main.go")
+	done := make(chan indexer.MutationResult, 1)
+	done <- indexer.MutationResult{RequestedGeneration: 1, AppliedGeneration: 1, Reindexed: true}
+	close(done)
+	w := &publicationIntentWatcher{watcherHistory: mutationTestWatcher{}, store: store,
+		tickets: map[string]*indexer.MutationTicket{mainGo: {Path: mainGo, Generation: 1, Done: done}}}
+	srv.SetWatcher(w)
+
+	ctx, release := srv.withSourceMutationWriteIntent(t.Context(), "edit_file")
+	defer release()
+	require.False(t, store.WriteWanted(), "the edit request announced a store writer")
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": mainGo, "old_string": "func helper() {}", "new_string": "func helper() { _ = 1 }"}
+	res, err := srv.handleEditFile(ctx, req)
+	require.NoError(t, err)
+	require.False(t, res.IsError, "edit refused: %v", res.Content)
+	require.False(t, w.protected.Load(), "watcher admission ran under an announced store writer")
 }

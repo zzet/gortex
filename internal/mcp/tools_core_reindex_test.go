@@ -74,6 +74,10 @@ func TestHandleReindexRepository_ResolvesFailedReceiptForTheReparsedPath(t *test
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 	srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+	watcher := &reindexTierFixture{watchedTierFixture: watchedTierFixture{
+		paths: map[string]indexer.MutationTierState{target: {Generation: 4, Failed: true}},
+	}}
+	srv.SetWatcher(watcher)
 
 	// A failed ingest for that exact path, plus one for a file the pass will
 	// not touch: only the re-parsed path may be resolved.
@@ -104,6 +108,18 @@ func TestHandleReindexRepository_ResolvesFailedReceiptForTheReparsedPath(t *test
 	if outcome := untouched.outcome(false); outcome.Err == nil {
 		t.Fatal("reindex resolved a receipt for a path it never re-parsed")
 	}
+	require.Equal(t, target, watcher.captured, "the recovery frontier must be captured before the pass")
+	require.Empty(t, watcher.TierPaths(), "watcher failure evidence must be repaired alongside the MCP receipt")
+}
+
+type reindexTierFixture struct {
+	watchedTierFixture
+	captured string
+}
+
+func (w *reindexTierFixture) CaptureTierRepair(path string) func() {
+	w.captured = path
+	return func() { delete(w.paths, path) }
 }
 
 func TestHandleReindexRepository_WholeRepoSingleMode(t *testing.T) {

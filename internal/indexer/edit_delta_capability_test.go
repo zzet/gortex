@@ -34,6 +34,12 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.FoldedNameCandidateReader": "handler-only coherent candidate/payload snapshot; mutable DeltaWriter owns neither a physical read transaction nor a frozen delta layer, so the name-only handler refuses unsupported composition instead of forwarding base-only complete absence",
+	"anonymous{DBStats}":              "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
+
+	"anonymous{BulkLoadWindow}":        "physical durable-store full-shadow window telemetry; DeltaWriter stages per-file changes and does not own a cold or generation bulk window",
+	"anonymous{RecordFirstIndexDrain}": "physical durable-store full-shadow completion telemetry; a per-file DeltaWriter has no full-shadow drain to record and must not forward writes to its base",
+
 	"graph.BFSAdmissionReader":            "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
 	"graph.FilteredBFSAdmissionReader":    "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
 	"graph.KindAdjacencyReader":           "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",
@@ -61,6 +67,9 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.OverlayLayerSemanticBindingTypeReader":          "checked physical-layer compiler bindings; the selected OverlaidView composes accepted file ownership, while DeltaWriter is not a persisted ancestry layer",
 	"graph.OverlayLayerContractProjectionReader":           "checked physical-layer contract projection; DeltaWriter is the composed reader that applies visibility and sibling groups, not a physical ancestry layer",
 	"graph.OverlayLayerContractFileNodesReader":            "checked physical-layer file-node projection; ContractFileNodesContext dispatches DeltaWriter explicitly through its composed view, preserving delta ownership instead of forwarding a physical layer",
+	"graph.FileEditingContextReadScope":                    "handler-only cancellable full-context read transaction; the per-save engine does not request an editing context from its mutable DeltaWriter, and WithFileEditingContextReader explicitly returns unsupported rather than borrowing a base-only transaction",
+	"graph.FileEditingContextLayerScope":                   "asserted on the immutable selected overlay layer inside a handler's full-context transaction, never on the composed mutable DeltaWriter; its delta layer cannot be forwarded as a published generation",
+	"graph.editingContextLayerIncoming":                    "private incoming-adjacency adapter asserted only on the borrowed immutable layer of an editing-context scope; DeltaWriter is not that layer and its ordinary composed incoming reads preserve delta ownership",
 	"graph.OverlayLayerScopedNameReader":                   "a capability of the layers a delta composes over, not of a store: the engine asks it of each layer below the delta, and a DeltaWriter is never a layer below another delta",
 	"graph.ReadContextBinder":                              "request-handler cancellation of long whole-store reads; the per-save engine never binds its store, and absent the binder returns the reader unchanged",
 	"anonymous{Catalog}":                                   "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
@@ -119,6 +128,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.FileIndexFailureReader":                         "per-repository ledger read (index state, file metadata, mtimes, failures, receipts): absent, the engine treats nothing as recorded and takes its conservative path; a delta forces its explicit paths",
 	"graph.FileLanguageNodeSequencer":                      "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.FileMetaPathReader":                             "per-repository ledger read (index state, file metadata, mtimes, failures, receipts): absent, the engine treats nothing as recorded and takes its conservative path; a delta forces its explicit paths",
+	"indexer.fileMetaPathContextReader":                    "deliberately absent like FileMetaPathReader: primary or generation-sidecar metadata is not the delta's composed canonical-content ledger; context-aware content matching must remain unknown, never skip explicit delta paths or infer base-span validity",
 	"graph.FileMetaReader":                                 "per-repository ledger read (index state, file metadata, mtimes, failures, receipts): absent, the engine treats nothing as recorded and takes its conservative path; a delta forces its explicit paths",
 	"graph.FileMetaRepoReplacer":                           "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
 	"graph.FileMtimeReader":                                "per-repository ledger read (index state, file metadata, mtimes, failures, receipts): absent, the engine treats nothing as recorded and takes its conservative path; a delta forces its explicit paths",
@@ -215,6 +225,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"indexer.repoSemanticStateReleaser":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repoSemanticStateRetainer":                    "semantic (go/types) state: the enrichment stage runs over the generation handle after the delta (runEnrichment), not over the DeltaWriter",
 	"indexer.repositoryCleanupPayload":                     "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
+	"indexer.drainCheckedWriter":                           "checked write of the whole-repository shadow drain into the durable store (full index, shadow replacement); not on a file delta's per-save path, and a store without it takes the void AddBatch",
 	"resolver.backendResolveWorkIndicator":                 "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"resolver.batchClaimingResolver":                       "framework synthesizer contract, asserted on synthesizers",
 	"resolver.claimEdgeVocabulary":                         "framework synthesizer contract, asserted on synthesizers",

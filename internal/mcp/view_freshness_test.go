@@ -131,6 +131,9 @@ func TestViewsGuideStatesTheRequestLevelFreshnessContract(t *testing.T) {
 
 // knobValue is a well-formed value for one request-level knob.
 func knobValue(knob string) any {
+	if knob == freshnessScopeArgName {
+		return "file"
+	}
 	if knob == waitDeadlineArgName {
 		return time.Now().Add(time.Minute).Format(time.RFC3339)
 	}

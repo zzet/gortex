@@ -185,10 +185,25 @@ func (s *Server) readerFor(ctx context.Context) graph.Reader {
 // play, and what a buffer overlay composes on top of: the routed checkout
 // view when the request resolved to one, the indexed corpus otherwise.
 func (s *Server) requestBaseReader(ctx context.Context) graph.Reader {
+	var reader graph.Reader = s.graph
 	if view := requestViewFromContext(ctx); view.routed() {
-		return view.reader
+		reader = view.reader
 	}
-	return s.graph
+	layers := requestProjectionLayers(ctx)
+	if prepared, _ := ctx.Value(preparedSymbolReaderKey{}).(*preparedSymbolReader); prepared != nil && prepared.matches(s, ctx, reader, layers) {
+		return prepared.reader
+	}
+	if len(layers) > 1 {
+		composed := graph.NewOverlaidViewWithLayers(reader, layers)
+		if observe, ok := ctx.Value(requestReaderCompositionObserverKey{}).(func(*graph.OverlaidView)); ok {
+			observe(composed)
+		}
+		return composed
+	}
+	for _, layer := range layers {
+		reader = graph.NewOverlaidViewWithLayer(reader, layer)
+	}
+	return reader
 }
 
 // nodeGetterFor returns the request-scoped node lookup: the session
@@ -223,15 +238,19 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 		binding := contractAnalysisFromContext(ctx)
 		reader := s.readerFor(ctx)
 		view := requestViewFromContext(ctx)
-		layers := append([]query.ViewLayerSource(nil), view.candidateLayers()...)
+		layers := append([]query.ViewLayerSource(nil), requestSearchCandidates(ctx)...)
 		for _, analysis := range binding.views {
 			layers = append(layers, query.ViewLayerSource{Search: analysis.SearchBackend(), Layer: binding.composedLayer})
 		}
-		return s.engine.WithComposedView(reader, layers, ctx, view.excludesBaseCorpus())
+		ownership := s.requestLayers(ctx)
+		if binding.composedLayer != nil {
+			ownership = append(ownership, binding.composedLayer)
+		}
+		return s.engine.WithComposedView(reader, layers, ctx, view.excludesBaseCorpus()).WithLayers(ownership)
 	}
 	if s.contractAnalysisRuntime != nil {
 		view := requestViewFromContext(ctx)
-		return s.engine.WithComposedView(s.readerFor(ctx), view.candidateLayers(), ctx, view.excludesBaseCorpus())
+		return s.engine.WithComposedView(s.readerFor(ctx), requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	// A routed or overlaid request engine is already a per-request clone, and
 	// it carries the request's lifetime so its long graph walks stop when the
@@ -239,11 +258,14 @@ func (s *Server) engineFor(ctx context.Context) *query.Engine {
 	// shared engine untouched (zero overhead); its handlers pass their
 	// context through QueryOptions.Context instead.
 	view := requestViewFromContext(ctx)
+	if len(requestProjectionLayers(ctx)) != 0 {
+		return s.engine.WithComposedView(s.readerFor(ctx), requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
+	}
 	if v := OverlayViewFromContext(ctx); v != nil {
-		return s.engine.WithViewLayersContext(v, view.candidateLayers(), ctx)
+		return s.engine.WithViewLayersContext(v, requestSearchCandidates(ctx), ctx).WithLayers(s.requestLayers(ctx))
 	}
 	if view.routed() {
-		return s.engine.WithComposedView(view.reader, view.candidateLayers(), ctx, view.excludesBaseCorpus())
+		return s.engine.WithComposedView(view.reader, requestSearchCandidates(ctx), ctx, view.excludesBaseCorpus()).WithLayers(s.requestLayers(ctx))
 	}
 	return s.engine
 }
@@ -1526,4 +1548,23 @@ func (s *Server) validateOverlaySnapshotDrift(ctx context.Context, snapshot *ove
 	}
 
 	return nil
+}
+
+// requestLayers carries the same ownership claims as readerFor, independently
+// of runtime wrappers. Candidate corpora and row ownership are separate inputs.
+func (s *Server) requestLayers(ctx context.Context) []graph.OverlayLayerReader {
+	var layers []graph.OverlayLayerReader
+	for _, source := range requestViewFromContext(ctx).candidateLayers() {
+		if source.Layer != nil {
+			layers = append(layers, source.Layer)
+		}
+	}
+	// Disk projections are immutable request snapshots. Borrow the existing
+	// ownership layers below the session buffer; do not rebuild or enumerate
+	// the base corpus for unrelated cached hits.
+	layers = append(layers, requestProjectionLayers(ctx)...)
+	if overlay := OverlayViewFromContext(ctx); overlay != nil && overlay.LayerReader() != nil {
+		layers = append(layers, overlay.LayerReader())
+	}
+	return layers
 }

@@ -16,12 +16,14 @@ import (
 )
 
 type smokeProvenance struct {
-	Main              artifactSelection `json:"main_selection"`
-	MainBinary        mainArtifact      `json:"main_binary"`
-	CandidateBinary   mainArtifact      `json:"candidate_binary"`
-	RunnerEnvironment string            `json:"runner_environment"`
-	RunnerOS          string            `json:"runner_os"`
-	RunnerArch        string            `json:"runner_arch"`
+	RetainReadSourceFailures bool              `json:"retain_read_source_failures,omitempty"`
+	EditACKMode              string            `json:"edit_ack_mode,omitempty"`
+	Main                     artifactSelection `json:"main_selection"`
+	MainBinary               mainArtifact      `json:"main_binary"`
+	CandidateBinary          mainArtifact      `json:"candidate_binary"`
+	RunnerEnvironment        string            `json:"runner_environment"`
+	RunnerOS                 string            `json:"runner_os"`
+	RunnerArch               string            `json:"runner_arch"`
 }
 
 func readStrictJSON(path string, value any) error {
@@ -117,7 +119,7 @@ func prepareSmokeProvenance(c laneConfig, workflow workflowProvenance) (smokePro
 	if candidate.Revision != c.Builds["candidate"].Revision || !sameBuildSettings(metadata, candidate) {
 		return proof, errors.New("candidate/main binary platform, pinned toolchain or build settings differ")
 	}
-	proof = smokeProvenance{Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
+	proof = smokeProvenance{RetainReadSourceFailures: c.RetainReadSourceFailures, Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
 	return proof, validateSmokeWorkflow(workflow)
 }
 
@@ -139,6 +141,16 @@ func validateSmokeJob(receipt laneReceipt, d dataset) error {
 		return err
 	}
 	proof := receipt.Smoke
+	for _, run := range d.runs {
+		if (run.data.FailureCapture != nil) != proof.RetainReadSourceFailures || !validReadSourceFailureConfig(run.data.FailureCapture) {
+			return errors.New("smoke failure-capture configuration differs from its selected bounded policy")
+		}
+	}
+	if proof.EditACKMode != "" {
+		if err := validateSmokeACKPolicy(d, proof.EditACKMode); err != nil {
+			return err
+		}
+	}
 	if receipt.Plan.HostClass != hostedSmokeClass || d.config.Hosts[hostedSmokeClass] == "" || proof.RunnerEnvironment != "github-hosted" || proof.RunnerOS != "Linux" || proof.RunnerArch != "ARM64" {
 		return errors.New("smoke needs the scoped public hosted Linux ARM job profile, not reference capacity")
 	}
@@ -246,4 +258,32 @@ func verifySmokeCommand(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// Configured workload identity and actual wire ACKs are separate observations.
+// Historical receipts without an explicit policy keep their original identity.
+func validateSmokeACKPolicy(d dataset, expected string) error {
+	if expected != "local" && expected != "full" {
+		return errors.New("unknown explicit smoke ACK policy")
+	}
+	for _, run := range d.runs {
+		var workload struct {
+			EditACKMode string `json:"edit_ack_mode"`
+		}
+		if json.Unmarshal(run.data.Workload, &workload) != nil || workload.EditACKMode != expected {
+			return errors.New("smoke workload differs from its explicitly configured ACK policy")
+		}
+		if run.input.Scenario != "loadedit-4" {
+			continue
+		}
+		if len(run.data.Phases) != 1 || len(run.data.Phases[0].Edits) == 0 {
+			return errors.New("smoke lacks actual edit ACK policy observations")
+		}
+		for _, edit := range run.data.Phases[0].Edits {
+			if edit.Acknowledgement.StructuredContent.AckMode != expected {
+				return errors.New("missing or mismatched effective smoke edit ACK policy")
+			}
+		}
+	}
+	return nil
 }

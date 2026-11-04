@@ -853,6 +853,10 @@ type MergeOptions struct {
 	Into   string
 	ToDisk bool
 	Force  bool
+	// ExpectedFiles is a bounded source snapshot checked under the branch
+	// mutex before the first disk callback. Nil retains legacy callers;
+	// a non-nil empty slice requires an empty source branch.
+	ExpectedFiles []OverlayFile
 }
 
 // DiskWriteFn is the callback MergeBranches invokes for each From
@@ -926,6 +930,17 @@ func (m *OverlayManager) MergeBranches(sessionID string, opts MergeOptions, writ
 	}
 
 	if opts.ToDisk {
+		if opts.ExpectedFiles != nil {
+			if len(opts.ExpectedFiles) != len(src.files) {
+				return MergeResult{}, errors.New("merge: source branch changed while waiting for disk paths")
+			}
+			for _, expected := range opts.ExpectedFiles {
+				actual, ok := src.files[expected.Path]
+				if !ok || !overlayFilesEqual(actual, expected) {
+					return MergeResult{}, errors.New("merge: source branch changed while waiting for disk paths")
+				}
+			}
+		}
 		if write == nil {
 			return MergeResult{}, errors.New("merge: disk write callback is required for to_disk merges")
 		}

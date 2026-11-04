@@ -231,6 +231,9 @@
         "null"
       ]
     },
+    "nightly_workload_seed": {
+      "type": "string"
+    },
     "phases": {
       "items": {
         "additionalProperties": false,
@@ -245,17 +248,127 @@
                 "code": {
                   "type": "integer"
                 },
+                "cwd": {
+                  "type": "string"
+                },
                 "duration_ms": {
                   "type": "number"
                 },
                 "error": {
                   "type": "string"
                 },
+                "error_data": {
+                  "additionalProperties": {},
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
                 "expected_outcome": {
                   "type": "string"
                 },
+                "failure_rpc": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "daemon_version": {
+                          "type": "string"
+                        },
+                        "is_error": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "is_error_presence_known": {
+                          "type": "boolean"
+                        },
+                        "is_error_present": {
+                          "type": "boolean"
+                        },
+                        "observed_facade": {},
+                        "observed_facade_presence_known": {
+                          "type": "boolean"
+                        },
+                        "observed_facade_present": {
+                          "type": "boolean"
+                        },
+                        "offered_profile_known": {
+                          "type": "boolean"
+                        },
+                        "offered_tools": {
+                          "type": "string"
+                        },
+                        "offered_tools_mode": {
+                          "type": "string"
+                        },
+                        "request_bytes": {
+                          "type": "integer"
+                        },
+                        "request_status": {
+                          "type": "string"
+                        },
+                        "request_wire_base64": {
+                          "type": "string"
+                        },
+                        "response_bytes": {
+                          "type": "integer"
+                        },
+                        "response_status": {
+                          "type": "string"
+                        },
+                        "response_wire_base64": {
+                          "type": "string"
+                        },
+                        "schema_version": {
+                          "type": "integer"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "wire_id": {
+                          "type": "integer"
+                        },
+                        "write_completed": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "schema_version",
+                        "status",
+                        "wire_id",
+                        "request_status",
+                        "response_status",
+                        "request_bytes",
+                        "response_bytes",
+                        "write_completed",
+                        "is_error_presence_known",
+                        "is_error_present",
+                        "is_error",
+                        "observed_facade_present",
+                        "observed_facade_presence_known",
+                        "offered_profile_known"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "logical_ms": {
                   "type": "number"
+                },
+                "nightly_delay_ns": {
+                  "type": "integer"
+                },
+                "nightly_workload_seed": {
+                  "type": "string"
                 },
                 "outcome": {
                   "type": "string"
@@ -596,6 +709,68 @@
                             "requested_generation": {
                               "type": "integer"
                             },
+                            "shared_owner": {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "definition_key": {
+                                      "type": "string"
+                                    },
+                                    "member": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "checkout_id": {
+                                          "type": "string"
+                                        },
+                                        "checkout_incarnation": {
+                                          "type": "string"
+                                        },
+                                        "content_sha256": {
+                                          "type": "string"
+                                        },
+                                        "path": {
+                                          "type": "string"
+                                        },
+                                        "physical_commit_sequence": {
+                                          "type": "integer"
+                                        },
+                                        "publication_key": {
+                                          "type": "string"
+                                        },
+                                        "receipt": {
+                                          "type": "string"
+                                        },
+                                        "ticket": {
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "receipt",
+                                        "publication_key",
+                                        "path",
+                                        "ticket",
+                                        "physical_commit_sequence",
+                                        "content_sha256",
+                                        "checkout_id",
+                                        "checkout_incarnation"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "same_status_membership": {}
+                                  },
+                                  "required": [
+                                    "definition_key",
+                                    "member",
+                                    "same_status_membership"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "state": {
                               "type": "string"
                             }
@@ -612,7 +787,27 @@
                           ],
                           "type": "object"
                         },
+                        "ack_readback_exact": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "activated_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "admitted_target_lines": {
                           "anyOf": [
                             {
                               "type": "integer"
@@ -627,6 +822,9 @@
                             {
                               "additionalProperties": false,
                               "properties": {
+                                "ack_mode": {
+                                  "type": "string"
+                                },
                                 "acknowledgement_receipt": {
                                   "type": "string"
                                 },
@@ -638,6 +836,9 @@
                                 },
                                 "file_observation_receipt": {
                                   "type": "string"
+                                },
+                                "original_request_no_require_fresh": {
+                                  "type": "boolean"
                                 },
                                 "path": {
                                   "type": "string"
@@ -683,6 +884,249 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "batch_accounting": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "files": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "acknowledgement_state": {
+                                        "type": "string"
+                                      },
+                                      "path": {
+                                        "type": "string"
+                                      },
+                                      "reasons": {
+                                        "items": {
+                                          "type": "string"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "receipt": {
+                                        "type": "string"
+                                      },
+                                      "shared_owner": {
+                                        "anyOf": [
+                                          {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "definition_key": {
+                                                "type": "string"
+                                              },
+                                              "member": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "checkout_id": {
+                                                    "type": "string"
+                                                  },
+                                                  "checkout_incarnation": {
+                                                    "type": "string"
+                                                  },
+                                                  "content_sha256": {
+                                                    "type": "string"
+                                                  },
+                                                  "path": {
+                                                    "type": "string"
+                                                  },
+                                                  "physical_commit_sequence": {
+                                                    "type": "integer"
+                                                  },
+                                                  "publication_key": {
+                                                    "type": "string"
+                                                  },
+                                                  "receipt": {
+                                                    "type": "string"
+                                                  },
+                                                  "ticket": {
+                                                    "type": "integer"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "receipt",
+                                                  "publication_key",
+                                                  "path",
+                                                  "ticket",
+                                                  "physical_commit_sequence",
+                                                  "content_sha256",
+                                                  "checkout_id",
+                                                  "checkout_incarnation"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "same_status_membership": {}
+                                            },
+                                            "required": [
+                                              "definition_key",
+                                              "member",
+                                              "same_status_membership"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "receipt",
+                                      "path",
+                                      "acknowledgement_state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "reasons": {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "state": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "state",
+                                "files"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "batch_set": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "ack_mode": {
+                                  "type": "string"
+                                },
+                                "acknowledgement_receipt": {
+                                  "type": "string"
+                                },
+                                "actual_wire_id": {
+                                  "type": "string"
+                                },
+                                "bound_server_rpc_id": {
+                                  "type": "string"
+                                },
+                                "files": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "ack_mode": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement_receipt": {
+                                        "type": "string"
+                                      },
+                                      "acknowledgement_state": {
+                                        "type": "string"
+                                      },
+                                      "after_sha256": {
+                                        "type": "string"
+                                      },
+                                      "file_observation_receipt": {
+                                        "type": "string"
+                                      },
+                                      "original_request_no_require_fresh": {
+                                        "type": "boolean"
+                                      },
+                                      "path": {
+                                        "type": "string"
+                                      },
+                                      "reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "relative_path": {
+                                        "type": "string"
+                                      },
+                                      "result_reindex_generation": {
+                                        "type": "integer"
+                                      },
+                                      "result_reindex_receipt": {
+                                        "type": "string"
+                                      },
+                                      "transaction_error": {
+                                        "type": "string"
+                                      },
+                                      "transaction_id": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "transaction_id",
+                                      "file_observation_receipt",
+                                      "acknowledgement_receipt",
+                                      "path",
+                                      "relative_path",
+                                      "after_sha256",
+                                      "reindex_receipt",
+                                      "reindex_generation",
+                                      "result_reindex_receipt",
+                                      "result_reindex_generation",
+                                      "acknowledgement_state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": [
+                                    "array",
+                                    "null"
+                                  ]
+                                },
+                                "fingerprint": {
+                                  "type": "string"
+                                },
+                                "original_request_no_require_fresh": {
+                                  "type": "boolean"
+                                },
+                                "reference_error": {
+                                  "type": "string"
+                                },
+                                "transaction_id": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "transaction_id",
+                                "fingerprint",
+                                "ack_mode",
+                                "original_request_no_require_fresh",
+                                "acknowledgement_receipt",
+                                "bound_server_rpc_id",
+                                "actual_wire_id",
+                                "files"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "checkout_id": {
+                          "type": "string"
                         },
                         "editor": {
                           "type": "integer"
@@ -933,6 +1377,68 @@
                                       "role": {
                                         "type": "string"
                                       },
+                                      "shared_owner": {
+                                        "anyOf": [
+                                          {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "definition_key": {
+                                                "type": "string"
+                                              },
+                                              "member": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "checkout_id": {
+                                                    "type": "string"
+                                                  },
+                                                  "checkout_incarnation": {
+                                                    "type": "string"
+                                                  },
+                                                  "content_sha256": {
+                                                    "type": "string"
+                                                  },
+                                                  "path": {
+                                                    "type": "string"
+                                                  },
+                                                  "physical_commit_sequence": {
+                                                    "type": "integer"
+                                                  },
+                                                  "publication_key": {
+                                                    "type": "string"
+                                                  },
+                                                  "receipt": {
+                                                    "type": "string"
+                                                  },
+                                                  "ticket": {
+                                                    "type": "integer"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "receipt",
+                                                  "publication_key",
+                                                  "path",
+                                                  "ticket",
+                                                  "physical_commit_sequence",
+                                                  "content_sha256",
+                                                  "checkout_id",
+                                                  "checkout_incarnation"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "same_status_membership": {}
+                                            },
+                                            "required": [
+                                              "definition_key",
+                                              "member",
+                                              "same_status_membership"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
                                       "write_returned_ns": {
                                         "anyOf": [
                                           {
@@ -1011,6 +1517,49 @@
                         },
                         "mutation_receipt": {
                           "type": "string"
+                        },
+                        "mutation_tiers": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "ack_at": {
+                                  "type": "string"
+                                },
+                                "derived_at": {
+                                  "type": "string"
+                                },
+                                "file_graph_at": {
+                                  "type": "string"
+                                },
+                                "observation_state": {
+                                  "type": "string"
+                                },
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "relations_at": {
+                                  "type": "string"
+                                },
+                                "tier_state": {
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "observation_state"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "native_write": {
                           "anyOf": [
@@ -1223,6 +1772,9 @@
                         "probe_errors": {
                           "type": "integer"
                         },
+                        "probe_mode": {
+                          "type": "string"
+                        },
                         "raw_evidence": {
                           "type": "string"
                         },
@@ -1236,7 +1788,16 @@
                               "error": {
                                 "type": "string"
                               },
+                              "expected_id": {
+                                "type": "string"
+                              },
+                              "expected_line": {
+                                "type": "integer"
+                              },
                               "expected_outcome": {
+                                "type": "string"
+                              },
+                              "expected_path": {
                                 "type": "string"
                               },
                               "kind": {
@@ -1443,6 +2004,46 @@
                             }
                           ]
                         },
+                        "route": {
+                          "type": "string"
+                        },
+                        "search_ack": {
+                          "additionalProperties": {},
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "search_queue_wait_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_queued_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "search_turn_released_ns": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "stale_claimed_fresh": {
                           "type": "boolean"
                         },
@@ -1546,6 +2147,40 @@
                             "reason"
                           ],
                           "type": "object"
+                        },
+                        "t_gate_readback_ms": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
                         },
                         "t_readback_ms": {
                           "additionalProperties": false,
@@ -1684,6 +2319,16 @@
                         "decode_failures": {
                           "type": "integer"
                         },
+                        "observed_edits": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "precommit_fresh_mismatches_unassessed": {
                           "type": "integer"
                         },
@@ -1722,6 +2367,67 @@
                         },
                         "state": {
                           "type": "string"
+                        },
+                        "tools": {
+                          "additionalProperties": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "claims_fresh": {
+                                "type": "integer"
+                              },
+                              "correct_edits": {
+                                "type": "integer"
+                              },
+                              "decode_failures": {
+                                "type": "integer"
+                              },
+                              "fallback_answers": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "observed_edits": {
+                                "type": "integer"
+                              },
+                              "probe_answers": {
+                                "type": "integer"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "refused_edits": {
+                                "anyOf": [
+                                  {
+                                    "type": "integer"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "state": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "state",
+                              "correct_edits",
+                              "probe_answers",
+                              "observed_edits",
+                              "decode_failures",
+                              "claims_fresh"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
                         }
                       },
                       "required": [
@@ -1761,11 +2467,17 @@
                       "file": {
                         "type": "string"
                       },
+                      "gate_modes": {
+                        "type": "boolean"
+                      },
                       "kind": {
                         "type": "string"
                       },
                       "language": {
                         "type": "string"
+                      },
+                      "linked_worktrees": {
+                        "type": "integer"
                       },
                       "mean_interarrival_ns": {
                         "type": "integer"
@@ -1793,6 +2505,59 @@
                       },
                       "repo": {
                         "type": "string"
+                      },
+                      "routes": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "callee": {
+                              "type": "string"
+                            },
+                            "commit": {
+                              "type": "string"
+                            },
+                            "file": {
+                              "type": "string"
+                            },
+                            "id": {
+                              "type": "string"
+                            },
+                            "kind": {
+                              "type": "string"
+                            },
+                            "language": {
+                              "type": "string"
+                            },
+                            "mode": {
+                              "type": "string"
+                            },
+                            "repo": {
+                              "type": "string"
+                            },
+                            "tool": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "repo",
+                            "commit",
+                            "file",
+                            "callee",
+                            "kind",
+                            "tool",
+                            "language",
+                            "mode"
+                          ],
+                          "type": "object"
+                        },
+                        "type": [
+                          "array",
+                          "null"
+                        ]
+                      },
+                      "search_readback_acceptance": {
+                        "type": "boolean"
                       },
                       "seed": {
                         "type": "integer"
@@ -1844,6 +2609,9 @@
                             "expected_refusal": {
                               "type": "boolean"
                             },
+                            "expected_search_line": {
+                              "type": "integer"
+                            },
                             "file": {
                               "type": "string"
                             },
@@ -1858,6 +2626,9 @@
                             },
                             "ordinal": {
                               "type": "integer"
+                            },
+                            "probe_mode": {
+                              "type": "string"
                             },
                             "relocated": {
                               "type": "boolean"
@@ -1890,6 +2661,9 @@
                               "type": "object"
                             },
                             "request_sha256": {
+                              "type": "string"
+                            },
+                            "route": {
                               "type": "string"
                             },
                             "sender": {
@@ -2344,6 +3118,486 @@
                   },
                   "role": {
                     "type": "string"
+                  },
+                  "search_readback_acceptance": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "acknowledged": {
+                            "type": "integer"
+                          },
+                          "actual_ack_modes": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "actual_edits_by_editor": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "actual_file_view_states": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "editors": {
+                            "type": "integer"
+                          },
+                          "immediate_witnesses": {
+                            "additionalProperties": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "correct": {
+                                  "type": "integer"
+                                },
+                                "errors": {
+                                  "type": "integer"
+                                },
+                                "missing": {
+                                  "type": "integer"
+                                },
+                                "observed": {
+                                  "type": "integer"
+                                },
+                                "refusals": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "observed",
+                                "correct",
+                                "errors",
+                                "refusals",
+                                "missing"
+                              ],
+                              "type": "object"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "local_object_acks": {
+                            "type": "integer"
+                          },
+                          "offered": {
+                            "type": "integer"
+                          },
+                          "pass": {
+                            "type": "boolean"
+                          },
+                          "records": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "local_object_acks",
+                          "actual_ack_modes",
+                          "actual_file_view_states",
+                          "offered",
+                          "editors",
+                          "acknowledged",
+                          "records",
+                          "pass",
+                          "immediate_witnesses",
+                          "actual_edits_by_editor"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "shared_owners": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "background_wall_ms": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "count": {
+                                "type": "integer"
+                              },
+                              "max": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p50": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p95": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p99": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "count",
+                              "p50",
+                              "p95",
+                              "p99",
+                              "max"
+                            ],
+                            "type": "object"
+                          },
+                          "complete_owner_windows": {
+                            "type": "integer"
+                          },
+                          "definitions": {
+                            "additionalProperties": {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "background": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "residual_ns": {
+                                              "type": "integer"
+                                            },
+                                            "sum_ns": {
+                                              "type": "integer"
+                                            },
+                                            "wall_ns": {
+                                              "type": "integer"
+                                            },
+                                            "within_five_percent": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "wall_ns",
+                                            "sum_ns",
+                                            "residual_ns",
+                                            "within_five_percent"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "definition": {},
+                                    "execution": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "residual_ns": {
+                                              "type": "integer"
+                                            },
+                                            "sum_ns": {
+                                              "type": "integer"
+                                            },
+                                            "wall_ns": {
+                                              "type": "integer"
+                                            },
+                                            "within_five_percent": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "wall_ns",
+                                            "sum_ns",
+                                            "residual_ns",
+                                            "within_five_percent"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "first_conflicting_definition": {},
+                                    "reasons": {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "type": [
+                                        "array",
+                                        "null"
+                                      ]
+                                    },
+                                    "state": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "state",
+                                    "definition",
+                                    "execution",
+                                    "background",
+                                    "reasons"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "distinct_observed_owners": {
+                            "type": "integer"
+                          },
+                          "execution_wall_ms": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "count": {
+                                "type": "integer"
+                              },
+                              "max": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p50": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p95": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "p99": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "count",
+                              "p50",
+                              "p95",
+                              "p99",
+                              "max"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "definitions",
+                          "distinct_observed_owners",
+                          "complete_owner_windows",
+                          "execution_wall_ms",
+                          "background_wall_ms"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "stats_after": {},
                   "stats_before": {},
@@ -3462,6 +4716,33 @@
     "profile": {
       "type": "string"
     },
+    "read_source_failure_capture": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "encoding": {
+              "type": "string"
+            },
+            "max_combined_wire_bytes": {
+              "type": "integer"
+            },
+            "max_records": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "max_records",
+            "max_combined_wire_bytes",
+            "encoding"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "request_plan_sha256": {
       "type": "string"
     },
@@ -3520,8 +4801,14 @@
         "duration_seconds": {
           "type": "number"
         },
+        "edit_ack_mode": {
+          "type": "string"
+        },
         "edit_agents": {
           "type": "integer"
+        },
+        "edit_gate_seed": {
+          "type": "string"
         },
         "edit_probe": {
           "anyOf": [
@@ -3546,11 +4833,17 @@
                 "file": {
                   "type": "string"
                 },
+                "gate_modes": {
+                  "type": "boolean"
+                },
                 "kind": {
                   "type": "string"
                 },
                 "language": {
                   "type": "string"
+                },
+                "linked_worktrees": {
+                  "type": "integer"
                 },
                 "mean_interarrival_ns": {
                   "type": "integer"
@@ -3578,6 +4871,59 @@
                 },
                 "repo": {
                   "type": "string"
+                },
+                "routes": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "callee": {
+                        "type": "string"
+                      },
+                      "commit": {
+                        "type": "string"
+                      },
+                      "file": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "language": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "repo": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "repo",
+                      "commit",
+                      "file",
+                      "callee",
+                      "kind",
+                      "tool",
+                      "language",
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "type": [
+                    "array",
+                    "null"
+                  ]
+                },
+                "search_readback_acceptance": {
+                  "type": "boolean"
                 },
                 "seed": {
                   "type": "integer"
@@ -3629,6 +4975,9 @@
                       "expected_refusal": {
                         "type": "boolean"
                       },
+                      "expected_search_line": {
+                        "type": "integer"
+                      },
                       "file": {
                         "type": "string"
                       },
@@ -3643,6 +4992,9 @@
                       },
                       "ordinal": {
                         "type": "integer"
+                      },
+                      "probe_mode": {
+                        "type": "string"
                       },
                       "relocated": {
                         "type": "boolean"
@@ -3675,6 +5027,9 @@
                         "type": "object"
                       },
                       "request_sha256": {
+                        "type": "string"
+                      },
+                      "route": {
                         "type": "string"
                       },
                       "sender": {

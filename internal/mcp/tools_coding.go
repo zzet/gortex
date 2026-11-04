@@ -365,182 +365,117 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// mode — the cause of spurious "no symbols found for file" misses.
 	fp = s.graphRelPath(ctx, fp)
 
-	// Auto re-index stale file before querying.
-	s.ensureFreshContext(ctx, []string{fp})
+	ctx, err = s.ensureProjected(ctx, []string{fp})
+	if err != nil {
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
+		return s.metadataReadError(ctx, req, err), nil
+	}
 
-	s.sessionFor(ctx).recordFile(fp)
-	// Tool-call observer: credit the recent search for the symbols in
-	// the file the agent is about to edit.
-	s.creditFileConsumption(ctx, fp)
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.sessionFor(ctx).recordFile(fp)
+		// Credit the file consume only if this response is accepted.
+		s.creditFileConsumption(ctx, fp)
+	})
 	out := editingContext{}
 	var fileNodeForScope *graph.Node
 	callerCap := 20
 	calleeCap := 20
 
-	// Fast path: when the backend implements FileEditingContext we
-	// take all five projections in a small fixed number of
-	// round-trips instead of the per-symbol GetCallers / GetCallChain
-	// loop. The fallback retains the previous engine-based shape so
-	// the in-memory backend is unaffected.
-	if fc, ok := fileEditingContextFor(s.readerFor(ctx)); ok {
-		bundle := fc.FileEditingContext(fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
-		if bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0) {
-			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
+	bundle, bundleErr := fileEditingContextContext(ctx, s.readerFor(ctx), fp, []graph.NodeKind{graph.KindFunction, graph.KindMethod})
+	storeBusy := (errors.Is(bundleErr, context.DeadlineExceeded) && ctx.Err() == nil) || s.checkedFileScopeFallback(ctx, fp, bundleErr)
+	if storeBusy {
+		ctx = markRequestStoreBusy(ctx, fp)
+		bundle = requestLocalEditingContext(ctx, fp)
+	} else if bundleErr != nil {
+		return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
+	}
+
+	if !storeBusy && (bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0)) {
+		if pending := s.pendingEmptyMetadataRead(ctx, req, fp); pending != nil {
+			return pending, nil
 		}
-		fileNodeForScope = bundle.FileNode
-		if fileNodeForScope == nil && len(bundle.Defines) > 0 {
-			fileNodeForScope = bundle.Defines[0]
+		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
+	}
+	if storeBusy && (bundle == nil || bundle.FileNode == nil && len(bundle.Defines) == 0) {
+		if pending := s.pendingEmptyMetadataRead(ctx, req, fp); pending != nil {
+			return pending, nil
 		}
-		if !s.nodeInSessionScope(ctx, fileNodeForScope) {
-			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
+	}
+	fileNodeForScope = bundle.FileNode
+	if fileNodeForScope == nil && len(bundle.Defines) > 0 {
+		fileNodeForScope = bundle.Defines[0]
+	}
+	if fileNodeForScope != nil && !s.nodeInSessionScope(ctx, fileNodeForScope) {
+		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
+	}
+	consumedIDs := make([]string, len(bundle.Defines))
+	for i, n := range bundle.Defines {
+		consumedIDs[i] = n.ID
+	}
+	afterFreshSymbolAcceptance(ctx, func() {
+		for _, id := range consumedIDs {
+			s.frecency.Record(id)
 		}
-		for _, n := range bundle.Defines {
-			s.frecency.Record(n.ID)
+	})
+	if bundle.FileNode != nil {
+		out.File = map[string]any{"id": bundle.FileNode.ID, "language": bundle.FileNode.Language}
+	}
+	for _, n := range bundle.Defines {
+		entry := map[string]any{
+			"id":         n.ID,
+			"kind":       n.Kind,
+			"name":       n.Name,
+			"start_line": n.StartLine,
 		}
-		if bundle.FileNode != nil {
-			out.File = map[string]any{"id": bundle.FileNode.ID, "language": bundle.FileNode.Language}
-		}
-		for _, n := range bundle.Defines {
-			entry := map[string]any{
-				"id":         n.ID,
-				"kind":       n.Kind,
-				"name":       n.Name,
-				"start_line": n.StartLine,
-			}
-			if n.Meta != nil {
-				if sig, ok := n.Meta["signature"]; ok {
-					entry["signature"] = sig
-				}
-			}
-			out.Defines = append(out.Defines, entry)
-		}
-		for _, e := range bundle.Imports {
-			out.Imports = append(out.Imports, map[string]any{
-				"id":       e.To,
-				"external": strings.HasPrefix(e.To, "external::"),
-			})
-		}
-		// Workspace-scope post-filter mirrors the legacy GetCallers /
-		// GetCallChain WorkspaceID gate.
-		sessWS, _, bound := s.sessionScope(ctx)
-		var opts query.QueryOptions
-		if bound {
-			opts.WorkspaceID = sessWS
-		}
-		for _, n := range bundle.CalledBy {
-			if bound && !opts.ScopeAllows(n) {
-				continue
-			}
-			if len(out.CalledBy) >= callerCap {
-				break
-			}
-			out.CalledBy = append(out.CalledBy, map[string]any{
-				"id":         n.ID,
-				"name":       n.Name,
-				"file_path":  n.FilePath,
-				"start_line": n.StartLine,
-			})
-		}
-		for _, n := range bundle.Calls {
-			if bound && !opts.ScopeAllows(n) {
-				continue
-			}
-			if len(out.Calls) >= calleeCap {
-				break
-			}
-			out.Calls = append(out.Calls, map[string]any{
-				"id":         n.ID,
-				"name":       n.Name,
-				"file_path":  n.FilePath,
-				"start_line": n.StartLine,
-			})
-		}
-	} else {
-		sg := s.engineFor(ctx).GetFileSymbols(fp)
-		if len(sg.Nodes) == 0 {
-			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
-		}
-		if !s.nodeInSessionScope(ctx, sg.Nodes[0]) {
-			return mcp.NewToolResultError("no symbols found for file: " + fp), nil
-		}
-		sessWS, _, _ := s.sessionScope(ctx)
-		for _, n := range sg.Nodes {
-			if n.Kind == graph.KindFile {
-				continue
-			}
-			s.frecency.Record(n.ID)
-		}
-		for _, n := range sg.Nodes {
-			if n.Kind == graph.KindFile {
-				out.File = map[string]any{"id": n.ID, "language": n.Language}
-				// The same anchor the fast path keeps: without it the
-				// whole-file compressed view below has no node to resolve a
-				// path from, so every backend without a FileEditingContext
-				// bundle answered compress_bodies with nothing at all.
-				fileNodeForScope = n
-				break
-			}
-		}
-		if fileNodeForScope == nil {
-			fileNodeForScope = sg.Nodes[0]
-		}
-		for _, n := range sg.Nodes {
-			if n.Kind == graph.KindFile {
-				continue
-			}
-			entry := map[string]any{
-				"id":         n.ID,
-				"kind":       n.Kind,
-				"name":       n.Name,
-				"start_line": n.StartLine,
-			}
+		if n.Meta != nil {
 			if sig, ok := n.Meta["signature"]; ok {
 				entry["signature"] = sig
 			}
-			out.Defines = append(out.Defines, entry)
 		}
-		for _, e := range sg.Edges {
-			if e.Kind == graph.EdgeImports {
-				out.Imports = append(out.Imports, map[string]any{
-					"id":       e.To,
-					"external": strings.HasPrefix(e.To, "external::"),
-				})
-			}
+		out.Defines = append(out.Defines, entry)
+	}
+	for _, e := range bundle.Imports {
+		out.Imports = append(out.Imports, map[string]any{
+			"id":       e.To,
+			"external": strings.HasPrefix(e.To, "external::"),
+		})
+	}
+	// Workspace-scope post-filter mirrors the legacy GetCallers /
+	// GetCallChain WorkspaceID gate.
+	sessWS, _, bound := s.sessionScope(ctx)
+	var opts query.QueryOptions
+	if bound {
+		opts.WorkspaceID = sessWS
+	}
+	for _, n := range bundle.CalledBy {
+		if bound && !opts.ScopeAllows(n) {
+			continue
 		}
-		callerSeen := make(map[string]bool)
-		for _, n := range sg.Nodes {
-			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-				callers := s.engineFor(ctx).GetCallers(n.ID, query.QueryOptions{Depth: 1, Limit: callerCap, Detail: "brief", WorkspaceID: sessWS})
-				for _, cn := range callers.Nodes {
-					if cn.FilePath != fp && !callerSeen[cn.ID] {
-						callerSeen[cn.ID] = true
-						out.CalledBy = append(out.CalledBy, map[string]any{
-							"id":         cn.ID,
-							"name":       cn.Name,
-							"file_path":  cn.FilePath,
-							"start_line": cn.StartLine,
-						})
-					}
-				}
-			}
+		if len(out.CalledBy) >= callerCap {
+			break
 		}
-		callSeen := make(map[string]bool)
-		for _, n := range sg.Nodes {
-			if n.Kind == graph.KindFunction || n.Kind == graph.KindMethod {
-				chain := s.engineFor(ctx).GetCallChain(n.ID, query.QueryOptions{Depth: 1, Limit: calleeCap, Detail: "brief", WorkspaceID: sessWS})
-				for _, cn := range chain.Nodes {
-					if cn.FilePath != fp && !callSeen[cn.ID] {
-						callSeen[cn.ID] = true
-						out.Calls = append(out.Calls, map[string]any{
-							"id":         cn.ID,
-							"name":       cn.Name,
-							"file_path":  cn.FilePath,
-							"start_line": cn.StartLine,
-						})
-					}
-				}
-			}
+		out.CalledBy = append(out.CalledBy, map[string]any{
+			"id":         n.ID,
+			"name":       n.Name,
+			"file_path":  n.FilePath,
+			"start_line": n.StartLine,
+		})
+	}
+	for _, n := range bundle.Calls {
+		if bound && !opts.ScopeAllows(n) {
+			continue
 		}
+		if len(out.Calls) >= calleeCap {
+			break
+		}
+		out.Calls = append(out.Calls, map[string]any{
+			"id":         n.ID,
+			"name":       n.Name,
+			"file_path":  n.FilePath,
+			"start_line": n.StartLine,
+		})
 	}
 
 	// Optional: full-file compressed view. When compress_bodies=true,
@@ -620,7 +555,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		// invalidates the cached entry on the caller side.
 		etag = computeETag([2]any{out, sourceCompressed})
 	}
-	if ifNoneMatch := req.GetString("if_none_match", ""); ifNoneMatch != "" && ifNoneMatch == etag {
+	if ifNoneMatch := req.GetString("if_none_match", ""); !storeBusy && ifNoneMatch != "" && ifNoneMatch == etag {
 		return notModifiedResult(etag), nil
 	}
 
@@ -947,13 +882,28 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFreshContext(ctx, []string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
+		removed, err := s.removedByPendingProjection(ctx, req, id)
+		if errors.Is(err, errProjectedSourceMoved) {
+			return nil, err
+		}
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if removed {
+			return removedProjectedSymbolGuidance(id, true), nil
+		}
 		return mcp.NewToolResultError("symbol not found: " + id + s.suggestSymbolIDs(ctx, id)), nil
 	}
 	// A by-id fetch must not cross the session's workspace boundary —
@@ -1022,11 +972,20 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
-		var err error
-		source, startLine, totalFileChars, err = s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines)
+		ns, err := s.readNodeSource(ctx, node, absPath)
 		if err != nil {
+			if errors.Is(err, errProjectedSourceMoved) {
+				return nil, err
+			}
+			if errors.Is(err, errProjectedSourceDeferred) {
+				return s.respondJSONOrTOON(ctx, req, map[string]any{"id": node.ID, "source_state": "pending", "source_reason": "external_write", "complete": false})
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("could not read source: %v", err)), nil
 		}
+		resolved := *node
+		resolved.StartLine, resolved.EndLine = ns.startLine, ns.endLine
+		node = &resolved
+		source, startLine, totalFileChars, _ = extractLinesFromContent(ns.content, ns.startLine, ns.endLine, contextLines)
 	}
 
 	compressBodies := req.GetBool("compress_bodies", false)
@@ -1353,7 +1312,9 @@ func (s *Server) handleBatchSymbols(ctx context.Context, req mcp.CallToolRequest
 		// Source code (optional).
 		if includeSource && node.StartLine > 0 && node.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, node); err == nil {
-				if source, fromLine, totalFileChars, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, contextLines); err == nil {
+				if ns, err := s.readNodeSource(ctx, node, absPath); err == nil {
+					source, fromLine, totalFileChars, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, contextLines)
+					entry["start_line"], entry["end_line"] = ns.startLine, ns.endLine
 					entry["source"] = source
 					entry["from_line"] = fromLine
 					pending = append(pending, pendingSavings{
@@ -1719,7 +1680,8 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 	// 1. Get the example source.
 	if node.StartLine > 0 && node.EndLine > 0 {
 		if absPath, err := s.resolveNodePath(ctx, node); err == nil {
-			if source, _, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0); err == nil {
+			if ns, err := s.readNodeSource(ctx, node, absPath); err == nil {
+				source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
 				result["example_source"] = elideSourceForPattern(source, maxSourceLines)
 			}
 		}
@@ -1767,7 +1729,9 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 		// Get the registration source (the caller function that wires this symbol).
 		if cn.StartLine > 0 && cn.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, cn); err == nil {
-				if source, _, _, err := s.readLinesForCtx(ctx, absPath, cn.StartLine, cn.EndLine, 0); err == nil {
+				if ns, err := s.readNodeSource(ctx, cn, absPath); err == nil {
+					source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+					entry["start_line"] = ns.startLine
 					entry["source"] = elideSourceForPattern(source, maxSourceLines)
 				}
 			}
@@ -1797,7 +1761,9 @@ func (s *Server) handleSuggestPattern(ctx context.Context, req mcp.CallToolReque
 			// Get test source.
 			if tn.StartLine > 0 && tn.EndLine > 0 {
 				if absPath, err := s.resolveNodePath(ctx, tn); err == nil {
-					if source, _, _, err := s.readLinesForCtx(ctx, absPath, tn.StartLine, tn.EndLine, 0); err == nil {
+					if ns, err := s.readNodeSource(ctx, tn, absPath); err == nil {
+						source, _, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+						entry["start_line"] = ns.startLine
 						entry["source"] = elideSourceForPattern(source, maxSourceLines)
 					}
 				}
@@ -1847,6 +1813,10 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 		ids[i] = strings.TrimSpace(ids[i])
 	}
 
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", ids, nil, time.Time{}); err != nil {
+		return nil, err
+	}
+	gaps := s.laggingMutationReceipts(ctx)
 	depth := req.GetInt("depth", 3)
 
 	type editStep struct {
@@ -1987,12 +1957,16 @@ func (s *Server) handleGetEditPlan(ctx context.Context, req mcp.CallToolRequest)
 		}
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	response := map[string]any{
 		"edit_order":  editSteps,
 		"test_after":  testSteps,
 		"total_files": len(steps),
 		"summary":     fmt.Sprintf("%d files to edit, %d test files to verify", len(editSteps), len(testSteps)),
-	})
+	}
+	label := s.labelRelations(ctx, gaps, ids, nil)
+	label.apply(response)
+	res, err := s.respondJSONOrTOON(ctx, req, response)
+	return label.decorate(res), err
 }
 
 // extractPrefix returns the common prefix of a camelCase/PascalCase name.
@@ -2301,7 +2275,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 			(sym.Kind == graph.KindFunction || sym.Kind == graph.KindMethod) &&
 			sym.StartLine > 0 && sym.EndLine > 0 {
 			if absPath, err := s.resolveNodePath(ctx, sym); err == nil {
-				if source, _, totalFileChars, err := s.readLinesForCtx(ctx, absPath, sym.StartLine, sym.EndLine, 0); err == nil {
+				if ns, err := s.readNodeSource(ctx, sym, absPath); err == nil {
+					source, _, totalFileChars, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
+					entry["start_line"] = ns.startLine
 					if red, did := s.maybeRedactConfigLeaf(sym.Language, sym.FilePath, false, source); did {
 						source = red
 					}
@@ -2741,6 +2717,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	dryRun := req.GetBool("dry_run", false)
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 
+	gaps := s.laggingMutationReceipts(ctx)
 	node := s.engineFor(ctx).GetSymbol(id)
 	if node == nil {
 		if recovery := s.unindexedRenameRecovery(ctx, id, newName, dryRun); recovery != nil {
@@ -2903,27 +2880,80 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 
+	// Graph-backed edits in a pending file are provisional too: its current
+	// line can have a different binding even when the spelling still matches.
+	pendingFiles := make(map[string]bool, len(gaps))
+	for _, gap := range gaps {
+		pendingFiles[s.repoRelative(gap.path)] = true
+	}
+	var verified, provisional []renameEdit
+	for _, edit := range edits {
+		if pendingFiles[edit.File] {
+			edit.Confidence = "provisional"
+			edit.Reason = "relations pending; verify this site manually"
+			provisional = append(provisional, edit)
+		} else {
+			verified = append(verified, edit)
+		}
+	}
+	for _, site := range s.provisionalSites(s.readerFor(ctx), gaps, node) {
+		key := fmt.Sprintf("%s:%d", site.File, site.Line)
+		if editSeen[key] {
+			continue
+		}
+		editSeen[key] = true
+		replacement, _ := rewrite(site.Text)
+		provisional = append(provisional, renameEdit{File: site.File, Line: site.Line,
+			OldText: site.Text, NewText: replacement, Confidence: "provisional",
+			Reason: "relations pending; verify this site manually"})
+	}
+	// Only verified edits ever reach planRenameWrites and the commit loop.
+	edits = verified
+	reported := append(append([]renameEdit(nil), verified...), provisional...)
+	label := s.labelRelations(ctx, gaps, []string{id}, nil)
+	respond := func(payload map[string]any) (*mcp.CallToolResult, error) {
+		label.apply(payload)
+		res, err := s.respondJSONOrTOON(ctx, req, payload)
+		return label.decorate(res), err
+	}
+
 	// Collect affected files.
 	fileSet := make(map[string]bool)
 	for _, e := range edits {
 		fileSet[e.File] = true
 	}
 
+	reportedFiles := make(map[string]bool, len(fileSet))
+	for _, edit := range reported {
+		reportedFiles[edit.File] = true
+	}
 	resp := map[string]any{
 		"old_name":       oldName,
 		"new_name":       newName,
-		"edits":          edits,
-		"total_edits":    len(edits),
-		"files_affected": len(fileSet),
+		"edits":          reported,
+		"total_edits":    len(reported),
+		"files_affected": len(reportedFiles),
 		"dry_run":        dryRun,
 	}
 
+	if len(provisional) > 0 {
+		resp["provisional_site_count"] = len(provisional)
+		resp["manual_required"] = true
+	}
+	if !dryRun && pendingFiles[node.FilePath] {
+		resp["status"] = "pending_definition"
+		resp["written"] = false
+		return respond(resp)
+	}
 	if len(edits) == 0 {
 		// Nothing to write either way. Say so rather than reporting an
 		// applied rename that touched no bytes.
 		resp["status"] = "no_edits"
+		if len(provisional) > 0 {
+			resp["status"] = "provisional_only"
+		}
 		resp["written"] = false
-		return s.respondJSONOrTOON(ctx, req, resp)
+		return respond(resp)
 	}
 
 	// Lock every affected path before verifying, so the check that each line
@@ -2936,7 +2966,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		}
 		absPaths = append(absPaths, abs)
 	}
-	releaseMutation, lockErr := acquireMutationPaths(ctx, absPaths)
+	ctx, releaseMutation, lockErr := acquireMutationPaths(ctx, absPaths)
 	if lockErr != nil {
 		return mcp.NewToolResultError("rename cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -2951,10 +2981,10 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		resp["status"] = "would_apply"
 		resp["written"] = false
 		resp["files"] = previewRenameWrites(writes)
-		return s.respondJSONOrTOON(ctx, req, resp)
+		return respond(resp)
 	}
 
-	results := s.commitRenameWrites(ctx, writes)
+	results := s.commitRenameWrites(ctx, writes, releaseMutation)
 	written := 0
 	failed := 0
 	for _, r := range results {
@@ -2965,6 +2995,9 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 		failed++
 	}
 	resp["status"] = "applied"
+	if len(provisional) > 0 {
+		resp["status"] = "applied_with_provisional"
+	}
 	resp["written"] = written > 0
 	resp["files"] = results
 	resp["files_written"] = written
@@ -2978,7 +3011,7 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 			resp["status"] = "failed"
 		}
 	}
-	return s.respondJSONOrTOON(ctx, req, resp)
+	return respond(resp)
 }
 
 func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -3024,7 +3057,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -3034,7 +3067,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	// landed old_source no longer matches, so an un-replayed retry would be
 	// refused rather than answered with the original result.
 	fingerprint := mutationFingerprint("edit_symbol", id, absPath, oldSource, newSource)
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -3067,91 +3100,27 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		}
 	}
 
+	start, end, locateErr := s.symbolLinesUnderLock(ctx, node, absPath, content)
+	if locateErr != nil {
+		return mcp.NewToolResultError(locateErr.Error()), nil
+	}
+	resolved := *node
+	resolved.StartLine, resolved.EndLine = start, end
+	node = &resolved
 	fileStr := string(content)
-
-	// Extract the symbol's source lines to verify old_source is within them.
-	lines := strings.Split(fileStr, "\n")
-	if node.StartLine > len(lines) || node.EndLine > len(lines) {
-		return mcp.NewToolResultError("symbol line range exceeds file length"), nil
-	}
-
-	symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
-
-	if findEOLMatches(symbolSource, oldSource).count == 0 {
-		// Expand search to include preceding doc comments (agents often include
-		// them because get_symbol_source returns context_lines above the symbol).
-		expandedStart := node.StartLine - 1
-		for expandedStart > 0 {
-			trimmed := strings.TrimSpace(lines[expandedStart-1])
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-				strings.HasPrefix(trimmed, "*") || trimmed == "" {
-				expandedStart--
-			} else {
-				break
-			}
+	edit, locateErr := locateSymbolEdit(fileStr, start, end, oldSource)
+	if locateErr != nil {
+		if errors.Is(locateErr, errEditFragmentRepeated) {
+			return mcp.NewToolResultError("old_source appears multiple times within the symbol. Provide a larger fragment to make it unique."), nil
 		}
-		if expandedStart < node.StartLine-1 {
-			symbolSource = strings.Join(lines[expandedStart:node.EndLine], "\n")
+		if errors.Is(locateErr, errEditFragmentNotFound) {
+			return mcp.NewToolResultError(fmt.Sprintf("old_source not found within symbol %s (lines %d-%d). Use get_symbol_source to see the current code.", id, start, end)), nil
 		}
+		return mcp.NewToolResultError(locateErr.Error()), nil
 	}
-
-	srcMatches := findEOLMatches(symbolSource, oldSource)
-	if srcMatches.count == 0 {
-		return mcp.NewToolResultError(fmt.Sprintf(
-			"old_source not found within symbol %s (lines %d-%d). Use get_symbol_source to see the current code.",
-			id, node.StartLine, node.EndLine)), nil
-	}
-
-	// Verify old_source is unique within the symbol.
-	if srcMatches.count > 1 {
-		return mcp.NewToolResultError(
-			"old_source appears multiple times within the symbol. Provide a larger fragment to make it unique."), nil
-	}
-
-	// Apply the edit to the full file content.
-	// Find old_source within the symbol's line range only (not the whole file).
-	// Use the expanded start if doc comments were included.
-	effectiveStart := node.StartLine
-	if findEOLMatches(strings.Join(lines[node.StartLine-1:node.EndLine], "\n"), oldSource).count == 0 {
-		// Recalculate expanded start for offset computation.
-		expandedStart := node.StartLine - 1
-		for expandedStart > 0 {
-			trimmed := strings.TrimSpace(lines[expandedStart-1])
-			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-				strings.HasPrefix(trimmed, "*") || trimmed == "" {
-				expandedStart--
-			} else {
-				break
-			}
-		}
-		effectiveStart = expandedStart + 1
-	}
-
-	symbolStart := 0
-	for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
-		symbolStart += len(lines[i]) + 1 // +1 for newline
-	}
-
-	symbolEnd := symbolStart + len(symbolSource)
-	if symbolEnd > len(fileStr) {
-		symbolEnd = len(fileStr)
-	}
-
-	// Find old_source within the symbol region (EOL-tolerant: an
-	// LF-authored fragment still matches a CRLF region). Spans are byte
-	// offsets into the raw region, so the splice below always lands on the
-	// real on-disk bytes.
-	regionMatches := findEOLMatches(fileStr[symbolStart:symbolEnd], oldSource)
-	if len(regionMatches.spans) == 0 {
-		return mcp.NewToolResultError("old_source not found in symbol region"), nil
-	}
-	span := regionMatches.spans[0]
-
-	// Build the new file content.
-	editStart := symbolStart + span.start
-	editEnd := symbolStart + span.end
+	editStart, editEnd := edit.start, edit.end
 	effectiveNew := newSource
-	if regionMatches.normalized {
+	if edit.normalized {
 		// Rewrite new_source's terminators to the matched region's own
 		// style so the splice never introduces mixed line endings.
 		effectiveNew = adaptToDominantEOL(newSource, fileStr[editStart:editEnd])
@@ -3177,7 +3146,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 			"diff":         unifiedDiff(node.FilePath, fileStr, newContent),
 			"new_sha":      gitBlobSHA(newContentBytes),
 		}
-		if regionMatches.normalized {
+		if edit.normalized {
 			preview["eol_normalized"] = true
 		}
 		return s.respondJSONOrTOON(ctx, req, preview)
@@ -3189,6 +3158,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		perm = info.Mode().Perm()
 	}
 	commit, writeErr := s.commitFileMutation(ctx, "edit_symbol", mutationID, fingerprint, node.FilePath, absPath, newContentBytes, perm)
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
@@ -3202,7 +3172,9 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	sess.recordModified(node.FilePath)
 	sess.recordSymbol(id)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	// Count lines changed.
@@ -3218,13 +3190,14 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		"status":       "applied",
 		"new_sha":      gitBlobSHA(newContentBytes),
 	}
-	if regionMatches.normalized {
+	if edit.normalized {
 		resp["eol_normalized"] = true
 	}
 	if reindexOutcome.Err != nil {
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, node.FilePath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}

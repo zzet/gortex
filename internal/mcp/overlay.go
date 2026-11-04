@@ -95,8 +95,27 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 	// of this function) so it bounds the whole middleware chain, not just the
 	// leaf handler — the overlay build, the freshness sweep, and the response
 	// capture below all touch the graph and can block on the same locks.
-	return s.boundToolHandler(s.retryFreshSymbolSearch(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
+	return s.boundToolHandler(s.retryFreshSymbolSearch(s.retryProjectedSymbolSource(func(ctx context.Context, req mcp.CallToolRequest) (res *mcp.CallToolResult, retErr error) {
 		s.noteAcknowledgementMiddleware(ctx)
+		callerOwnsProjectionFacts := ctx.Value(requestProjectionFactsKey{}) != nil
+		acceptedBefore := 0
+		attemptState, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt)
+		if attemptState != nil {
+			acceptedBefore = len(attemptState.accepted)
+		}
+		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
+			if callerOwnsProjectionFacts {
+				return nil, nil
+			}
+			pending, err := s.lateStormTransitionPending(selected, request, failure)
+			if pending == nil && err == nil {
+				pending, err = s.checkedReadTransitionPending(selected, request)
+			}
+			if pending != nil && err == nil && attemptState != nil {
+				attemptState.accepted = attemptState.accepted[:acceptedBefore]
+			}
+			return pending, err
+		}
 		// The instant the call entered the middleware: the origin a mutation's
 		// or a fresh request's publication phases are measured from.
 		ctx = withToolReceivedAt(ctx, time.Now())
@@ -213,6 +232,8 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// A facade call is lowered to its legacy name once here; both of the
 		// gates below read that name rather than resolving it twice.
 		legacyName, _ := s.legacyToolName(&req)
+		ctx = withPendingSymbolCapture(ctx, legacyName)
+		auditedProjectionRead := auditedProjectionReadRetry(legacyName, req)
 		controlOperation := checkoutControlOperationName(legacyName)
 		batchContinuation := s.isBatchContinuation(legacyName, &req)
 		if batchContinuation {
@@ -229,11 +250,6 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
 		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
-		// A source mutation preempts background writers while it selects and
-		// enters its mutation lane. Publication waits temporarily release that
-		// intent so the previous edit can finish the route this one needs.
-		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, req.Params.Name)
-		defer releaseWriteIntent()
 		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		byteCtx, byteView, releaseByte, byteRefusal := s.prepareByteEditAuthority(ctx, &req, selector, freshness, capabilities)
 		if byteRefusal != nil {
@@ -265,6 +281,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withRequestView(ctx, view)
 			defer view.close()
 		}
+		// The selected route identifies whether this handler writes the view
+		// store. File-only canonical edits never announce a store writer.
+		ctx, releaseWriteIntent := s.withSourceMutationWriteIntent(ctx, legacyName)
+		defer releaseWriteIntent()
 		indexer.StampPublicationPhase(ctx, indexer.PublicationViewResolved)
 		// Tell the deadline firewall what this call is reading and what
 		// repositories it is admitted to. If it stops waiting for this handler
@@ -276,6 +296,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Publishing is a no-op when no firewall frame is above us (an
 		// unbounded call).
 		noteRetainedRequest(ctx, view, scope)
+		if refusal := s.awaitWatchedFreshness(ctx, legacyName, req, freshness); refusal != nil {
+			return refusal, nil
+		}
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
 			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
 				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil
@@ -354,6 +377,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
+		ctx = withProjectedReadToolFacts(ctx, req.Params.Name)
+		ctx, releaseExplicitFreshness := s.captureExplicitFreshness(ctx, req)
+		if releaseExplicitFreshness != nil {
+			defer releaseExplicitFreshness()
+		}
+		ctx = s.captureToolFreshness(ctx)
+		ctx, req = s.reserveToolFreshnessBudget(ctx, req.Params.Name, req)
 		res, hErr := s.invokeAcknowledgedLeaf(ctx, req, h)
 		if hErr == nil && res != nil && !res.IsError && lateExactnessRefusalIsSafe(req.Params.Name) {
 			if err := contractCoreReadError(ctx); err != nil {
@@ -402,7 +432,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				return refused, nil
 			}
 		}
-		if hErr == nil && res != nil && !res.IsError {
+		if hErr == nil && res != nil && !res.IsError && !auditedProjectionRead {
 			res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
 			if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil && state.withdrawn {
 				s.recorder.Record("mcp_tool_call", req.Params.Name)
@@ -418,7 +448,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// invokeFacadeSpec — and facade names are not in the allow-list, so
 		// the two paths cannot double-count.
 		if hErr == nil {
-			s.recordRetrievalSavings(ctx, req.Params.Name, res)
+			if auditedProjectionRead {
+				retrieved := res
+				afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, req.Params.Name, retrieved) })
+			} else {
+				s.recordRetrievalSavings(ctx, req.Params.Name, res)
+			}
 		}
 		// Opt-in usage telemetry: count this tool invocation by name only —
 		// never arguments or results. nil-safe, consent-gated, and fail-silent,
@@ -435,12 +470,26 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// small `freshness` block so the agent knows the graph view may lag
 		// the working tree. Omitted (zero cost) for the common fresh case.
 		if hErr == nil {
-			if rider := s.freshnessRiderFor(req.Params.Name, req); rider != nil {
-				res = decorateResultWithFreshness(res, rider)
-			} else if isFreshnessListTool(req.Params.Name) {
-				// List tools get a per-file sweep: any hit whose file drifted
-				// or vanished on disk is flagged with per-repo provenance.
-				res = s.decorateListResultWithFreshness(res)
+			if auditedProjectionRead && res != nil && !res.IsError && !requireExactView {
+				if pending, err := terminalPending(ctx, req, nil); pending != nil || err != nil {
+					return pending, err
+				}
+			}
+			if auditedProjectionRead && res != nil && !res.IsError && retryAfterCheckedProjectionChange(ctx) {
+				return nil, errProjectedSourceMoved
+			}
+			var freshnessErr error
+			res, freshnessErr = s.decorateToolFreshnessChecked(ctx, req.Params.Name, req, res)
+			if freshnessErr != nil {
+				if auditedProjectionRead && !requireExactView {
+					if pending, err := terminalPending(ctx, req, freshnessErr); pending != nil || err != nil {
+						return pending, err
+					}
+				}
+				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
+					return nil, errProjectedSourceMoved
+				}
+				res = s.metadataReadError(ctx, req, freshnessErr)
 			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
@@ -448,6 +497,23 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			res = s.attachViewRider(ctx, res)
 			res = s.attachCheckoutControlScope(ctx, res)
 			res = decorateContractConsumerResult(ctx, res)
+		}
+		// These nonpaginated reads commit their existing bookkeeping buffer
+		// only after the last ownership check, including decorator-time I/O.
+		if auditedProjectionRead && hErr == nil && res != nil && !res.IsError {
+			if err := validateRequestProjections(ctx); err != nil {
+				if !requireExactView {
+					if pending, pendingErr := terminalPending(ctx, req, err); pending != nil || pendingErr != nil {
+						return pending, pendingErr
+					}
+				}
+				if retryAfterCheckedProjectionChange(ctx) {
+					return nil, errProjectedSourceMoved
+				}
+				res = s.metadataReadError(ctx, req, err)
+			} else {
+				res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
+			}
 		}
 		// The arg guard's warn rider lands here — after the warming and
 		// freshness decorators, both of which rebuild the text result from
@@ -467,9 +533,12 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// (momentum.go). No-op for non-read tools and error results.
 		if hErr == nil {
 			res = s.maybeAttachMomentumNote(ctx, req.Params.Name, res)
+			if _, reserved := ctx.Value(toolFreshnessBudgetKey{}).(int); reserved {
+				res = fitToolFreshnessBudget(ctx, req, res)
+			}
 		}
 		return res, hErr
-	}))
+	})))
 }
 
 // refuseWithdrawnExactness is require_exact's post-handler half: it refuses an

@@ -304,6 +304,95 @@ func (l *OverlayLayer) RebuildInEdges() {
 	}
 }
 
+// CarryBaseEdges returns provisional copies of the call edges base recorded in
+// file that layerEdges, the file's re-parse, still make. A layer that covers a
+// file hides every base edge recorded there, while the re-parse holds its calls
+// as unresolved references until relations are rebuilt, so an edited function
+// would otherwise lose its callees and drop out of its callees' callers. A base
+// call is carried when the re-parse has an unresolved call from the same
+// source to the target's name; the copy takes that call's line. Repeated calls
+// pair up in line order, and a call the re-parse no longer makes is dropped.
+func CarryBaseEdges(base Reader, file string, layerEdges []*Edge) []*Edge {
+	type site struct{ from, name string }
+	refs := make(map[site][]*Edge)
+	for _, e := range layerEdges {
+		if e == nil || e.Kind != EdgeCalls || !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
+			continue
+		}
+		key := site{e.From, unresolvedCallName(e.To)}
+		refs[key] = append(refs[key], e)
+	}
+	if base == nil || len(refs) == 0 {
+		return nil
+	}
+	for _, at := range refs {
+		sortEdgesByLine(at)
+	}
+	var ids []string
+	for _, n := range base.GetFileNodes(file) {
+		ids = append(ids, n.ID)
+	}
+	var recorded []*Edge
+	var targets []string
+	for _, edges := range base.GetOutEdgesByNodeIDs(ids) {
+		for _, e := range edges {
+			if e != nil && e.Kind == EdgeCalls && e.FilePath == file && !IsUnresolvedTarget(e.To) {
+				recorded = append(recorded, e)
+				targets = append(targets, e.To)
+			}
+		}
+	}
+	sortEdgesByLine(recorded)
+	names := base.GetNodesByIDs(targets)
+	used := make(map[site]int, len(refs))
+	var carried []*Edge
+	for _, e := range recorded {
+		target := names[e.To]
+		if target == nil {
+			continue
+		}
+		key := site{e.From, target.Name}
+		at := refs[key]
+		if used[key] >= len(at) {
+			continue
+		}
+		c := *e
+		c.Line = at[used[key]].Line
+		c.Provisional = true
+		used[key]++
+		carried = append(carried, &c)
+	}
+	return carried
+}
+
+// unresolvedCallName is the bare callee name of an unresolved call target:
+// `unresolved::Name`, `unresolved::*.name` and qualified forms all name their
+// last segment.
+func unresolvedCallName(id string) string {
+	name := UnresolvedName(id)
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+// sortEdgesByLine orders edges by source, line and target.
+func sortEdgesByLine(edges []*Edge) {
+	sort.Slice(edges, func(i, j int) bool {
+		a, b := edges[i], edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.To < b.To
+	})
+}
+
 // OverlaidView composes an immutable base Reader with a per-session
 // overlay layer. Every read path consults the layer first for paths
 // the overlay covers; falls through to base otherwise. The base is
@@ -317,6 +406,9 @@ func (l *OverlayLayer) RebuildInEdges() {
 type OverlaidView struct {
 	base  Reader
 	layer OverlayLayerReader
+	// Set only by the request-scoped immutable multi-layer constructor.
+	// All other read surfaces keep the original chain and its capabilities.
+	adjacencyBatch *overlayAdjacencyBatch
 
 	// statsMu guards the first complete statistics result shared by Stats and
 	// StatsContext. Computation stays outside the lock so a canceled caller
@@ -417,6 +509,15 @@ func (v *OverlaidView) baseNodeVisible(n *Node) bool {
 // overlaid file, or one a node tombstone removed without claiming that
 // file. Everything else comes from base.
 func (v *OverlaidView) GetNode(id string) *Node {
+	if v.adjacencyBatch != nil {
+		if layer := v.adjacencyBatch.nodeLayer(id); layer != nil {
+			return layer.NodeByID(id)
+		}
+		if v.adjacencyBatch.base == nil {
+			return nil
+		}
+		return v.adjacencyBatch.base.GetNode(id)
+	}
 	if v.overlayOwnsIdentity(id) {
 		return v.layer.NodeByID(id) // may be nil — the layer hid it
 	}
@@ -758,6 +859,13 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 // alone is the answer. baseEdgeVisible has already dropped everything
 // the layer speaks for, so nothing surfaces twice.
 func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetOutEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -780,6 +888,13 @@ func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
 // originating in overlaid files, since those are replaced by overlay
 // versions) with the overlay's in-edges for the same target.
 func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetInEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -808,6 +923,9 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 // file's symbol can still hold base edges other files recorded out of
 // it — a claim that is per edge and cannot be settled from the id.
 func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, false)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
@@ -870,6 +988,9 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 // files) with overlay-introduced in-edges for each input id, all in a
 // single batched base round-trip.
 func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, true)
+	}
 	if len(ids) == 0 {
 		return nil
 	}

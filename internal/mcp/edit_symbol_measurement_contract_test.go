@@ -98,11 +98,19 @@ func TestEditSymbolMeasurementFixtureUsesActualSpliceAndExplicitAbsence(t *testi
 				status := s.mutationStatusPayload(record)
 				require.Equal(t, "edit_symbol", status["tool"])
 				ack := status["acknowledgement"].(acknowledgementPayload)
-				require.Equal(t, "not_applicable_text_splice", ack.ParserScope)
-				require.Equal(t, "not_applicable", ack.PhaseStates["parse"])
+				// Text splicing itself has no parser. The same source operation
+				// now builds its committed file projection, whose actual parse
+				// belongs to this ACK rather than a fabricated absent phase.
+				require.Equal(t, "mixed_observed_parser_paths", ack.ParserScope)
+				require.Equal(t, "measured", ack.PhaseStates["parse"])
 				parse, present := ack.ObservedExecutionMS["parse"]
 				require.True(t, present)
-				require.Nil(t, parse)
+				require.NotNil(t, parse)
+				require.GreaterOrEqual(t, *parse, 0.0, "actual completed work may have equal monotonic endpoints")
+				require.Positive(t, ack.Counts["parse"].Started)
+				require.Equal(t, ack.Counts["parse"].Started, ack.Counts["parse"].Completed)
+				require.Zero(t, ack.Counts["parse"].NotApplicable)
+				require.True(t, ack.Disjoint)
 				actual, err := os.ReadFile(path)
 				require.NoError(t, err)
 				require.Equal(t, strings.Replace(source, declaration, replacement, 1), string(actual))

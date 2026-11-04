@@ -15,7 +15,6 @@ import (
 const prefixOwnershipTimeout = 2 * time.Second
 
 var (
-	errPrefixStatUnavailable = errors.New("repository identity stat allowance is occupied")
 	errPrefixOwnerChanged    = errors.New("repository prefix owner changed during identity observation; retry the operation")
 	errPrefixConfigChanged   = errors.New("repository configuration changed during prefix preparation; retry the operation")
 	errPrefixIdentityUnknown = errors.New("repository root identity could not be established")
@@ -27,7 +26,8 @@ var ErrRepoIdentityPending = errPrefixIdentityUnknown
 
 // prefixStatAllowance is deliberately not a filesystem worker service. Native
 // filesystem calls have no portable cancellation API. At most two observations per indexer
-// may remain physically stuck; further callers abstain without starting work.
+// may remain physically stuck; other callers wait only within their existing
+// identity deadline, without starting another physical call.
 // Each worker captures only immutable path/function/channel inputs, never an
 // indexer, store or publication callback. Late results fit in a private buffer
 // and are discarded. Close therefore does NOT join a hung OS Stat, and makes no
@@ -43,15 +43,34 @@ type prefixStatResult struct {
 	err  error
 }
 
-func (a *prefixStatAllowance) observe(ctx context.Context, path string) prefixStatResult {
+// acquire bounds physical calls, not healthy concurrent callers. Waiting for
+// a permit consumes the same original identity budget as the observation; it
+// starts no worker and holds no registry lock. A deadline/permit race cannot
+// authorize a new OS call after cancellation.
+func (a *prefixStatAllowance) acquire(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return prefixStatResult{err: err}
+		return err
 	}
 	a.once.Do(func() { a.slots = make(chan struct{}, 2) })
 	select {
 	case a.slots <- struct{}{}:
-	default:
-		return prefixStatResult{err: errPrefixStatUnavailable}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-a.slots
+		return err
+	}
+	return nil
+}
+
+func (a *prefixStatAllowance) observe(ctx context.Context, path string) prefixStatResult {
+	// A caller without a deadline still cannot wait indefinitely. Existing
+	// candidate/owner preparation deadlines are earlier and remain unchanged.
+	ctx, cancel := context.WithTimeout(ctx, prefixOwnershipTimeout)
+	defer cancel()
+	if err := a.acquire(ctx); err != nil {
+		return prefixStatResult{err: err}
 	}
 	stat := a.stat
 	if stat == nil {

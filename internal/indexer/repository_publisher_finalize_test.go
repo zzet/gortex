@@ -20,7 +20,9 @@ type publisherFinalizationBoundaryHooks struct{}
 func (*publisherFinalizationBoundaryHooks) PurgeCheckoutLayers(context.Context, string, string) error {
 	return nil
 }
-func (*publisherFinalizationBoundaryHooks) ReleaseGraph(context.Context, string) error { return nil }
+func (*publisherFinalizationBoundaryHooks) ReleaseGraph(context.Context, string, string) error {
+	return nil
+}
 
 func publisherFinalizationFixture(t *testing.T) (*CheckoutLifecycle, *dedicatedBaseRuntime, store_sqlite.RepositoryCleanupIdentity, store_sqlite.DedicatedGraph) {
 	t.Helper()

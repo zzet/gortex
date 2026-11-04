@@ -94,17 +94,18 @@ func decodeEditProbeMoveAcknowledgement(body map[string]any, sourceID, targetID 
 }
 
 type editProbeMoveFileAccounting struct {
-	Path            string           `json:"path"`
-	Role            string           `json:"role"`
-	Receipt         string           `json:"receipt"`
-	Blob            string           `json:"accepted_blob_sha"`
-	OwnerGeneration uint64           `json:"owner_generation"`
-	WriteStartedNS  *int64           `json:"write_started_ns"`
-	WriteReturnedNS *int64           `json:"write_returned_ns"`
-	WriteWindowNS   *int64           `json:"write_window_ns"`
-	D               *editProbeWindow `json:"direct_reconcile,omitempty"`
-	R               *editProbeWindow `json:"read_assisted_reconcile,omitempty"`
-	Route           string           `json:"publication_route,omitempty"`
+	Shared          *editProbeSharedReference `json:"shared_owner,omitempty"`
+	Path            string                    `json:"path"`
+	Role            string                    `json:"role"`
+	Receipt         string                    `json:"receipt"`
+	Blob            string                    `json:"accepted_blob_sha"`
+	OwnerGeneration uint64                    `json:"owner_generation"`
+	WriteStartedNS  *int64                    `json:"write_started_ns"`
+	WriteReturnedNS *int64                    `json:"write_returned_ns"`
+	WriteWindowNS   *int64                    `json:"write_window_ns"`
+	D               *editProbeWindow          `json:"direct_reconcile,omitempty"`
+	R               *editProbeWindow          `json:"read_assisted_reconcile,omitempty"`
+	Route           string                    `json:"publication_route,omitempty"`
 }
 type editProbeMoveAccounting struct {
 	State   string                        `json:"state"`
@@ -134,6 +135,8 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 	}
 	out.RPCID = "rpc-" + strings.TrimPrefix(refs.OperationID, "move-")
 	ackHash, session := "", ""
+	queuedRows := 0
+	queuedWaitRequired, queuedWaitMeasured := false, false
 	for _, ref := range refs.Files {
 		row := statuses[ref.Role]
 		file := editProbeMoveFileAccounting{Path: ref.Path, Role: ref.Role, Receipt: ref.Receipt}
@@ -146,7 +149,13 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		if row["move_write_verdict"] != "all_writes_completed" || row["file_write_status"] != "committed" || row["writer_return_observed"] != true {
 			fail("move source writes not confirmed")
 		}
-		if row["requested_background_state"] != "not_applicable_direct_reconcile" || row["requested_background"] != nil {
+		queued := row["direct_reconcile_state"] == "unavailable_queued_publication" || row["read_assisted_reconcile_state"] == "unavailable_queued_publication"
+		if queued {
+			queuedRows++
+			if row["direct_reconcile_state"] != "unavailable_queued_publication" || row["read_assisted_reconcile_state"] != "unavailable_queued_publication" || row["direct_reconcile"] != nil || row["read_assisted_reconcile"] != nil || row["requested_background"] != nil {
+				fail("queued move contradicts unavailable publication windows")
+			}
+		} else if row["requested_background_state"] != "not_applicable_direct_reconcile" || row["requested_background"] != nil {
 			fail("move direct route/background applicability mismatch")
 		}
 		blob, _ := row["new_sha"].(string)
@@ -156,7 +165,7 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 			fail("move accepted blob unavailable")
 		}
 		ack, _ := row["acknowledgement"].(map[string]any)
-		if ack["rpc_id"] != out.RPCID || ack["clock"] != "monotonic" || ack["scope"] != "shared_rpc_mcp_bound_call" || ack["disjoint_observed_intervals"] != true || ack["parse_scope"] != "explicit_go_parser_calls_formatting_unattributed" {
+		if ack["rpc_id"] != out.RPCID || ack["clock"] != "monotonic" || ack["scope"] != "shared_rpc_mcp_bound_call" || ack["disjoint_observed_intervals"] != true || !moveAcknowledgementParserScope(ack) {
 			fail("shared move acknowledgement identity unavailable")
 		}
 		hash, hashErr := hashJSON(ack)
@@ -173,6 +182,16 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		for _, name := range []string{"caller_result", "disk_write", "edit_control", "middleware", "parse", "publish", "reindex_wait", "reply_prepare"} {
 			value, present := phases[name]
 			if name == "publish" || name == "reindex_wait" {
+				if queued {
+					if !moveQueuedAcknowledgementPhase(row, name, value, present, states[name], applicability[name], counts[name]) {
+						fail("queued move scheduler A phase unavailable: " + name)
+					}
+					if name == "reindex_wait" {
+						queuedWaitRequired = queuedWaitRequired || applicability[name] == "applicable"
+						queuedWaitMeasured = queuedWaitMeasured || value != nil
+					}
+					continue
+				}
 				count, _ := counts[name].(map[string]any)
 				started, se := strconvEditProbeUint(count["started"])
 				completed, ce := strconvEditProbeUint(count["completed"])
@@ -200,6 +219,25 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		if timing["scope"] == "move_file_write" && timing["clock"] == "monotonic" && timing["state"] == "measured" && timing["outcome"] == "committed" && se == nil && re == nil && we == nil && returned >= start && wall == returned-start {
 			file.WriteStartedNS, file.WriteReturnedNS, file.WriteWindowNS = &start, &returned, &wall
 		}
+		if out.A != nil && returned > out.A.WallNS {
+			fail("move write exceeds actual acknowledgement bounds")
+		}
+		original, _ := row["move_request_cause"].(map[string]any)
+		originalSession, _ := original["session"].(string)
+		originalKey, _ := original["request_id_key"].(string)
+		if originalSession == "" || originalKey != "n:"+strconv.FormatInt(wireID, 10) {
+			fail("original move wire cause unavailable")
+		}
+		if session == "" {
+			session = originalSession
+		} else if session != originalSession {
+			fail("move per-file original causes came from different sessions")
+		}
+		if queued {
+			file.Route = "queued_publication_ack_write_only"
+			out.Files = append(out.Files, file)
+			continue
+		}
 		route, scope := "direct_reconcile", "move_direct_reconcile"
 		coalesced := row["direct_reconcile_state"] == "observed" && row["read_assisted_reconcile_state"] == "observed"
 		var directView map[string]any
@@ -225,9 +263,7 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		if row[route+"_state"] != "observed" || direct["scope"] != scope || direct["clock"] != "monotonic" || direct["accepted_blob_sha"] != blob || direct["additive_with_acknowledgement"] != false || oe != nil || owner == 0 || de != nil || dwall <= 0 || ae != nil {
 			fail("move actual accepted owner/window unavailable")
 		}
-		if out.A != nil && returned > out.A.WallNS {
-			fail("move write exceeds actual acknowledgement bounds")
-		}
+
 		if !movePublicationEndpoints(direct, route, dwall, returned, toAcceptance, out.A) {
 			fail("move actual acceptance/write/window endpoints disagree")
 		}
@@ -235,17 +271,6 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 			fail("coalesced direct work exceeds acknowledgement bounds")
 		}
 		file.OwnerGeneration = owner
-		original, _ := row["move_request_cause"].(map[string]any)
-		originalSession, _ := original["session"].(string)
-		originalKey, _ := original["request_id_key"].(string)
-		if originalSession == "" || originalKey != "n:"+strconv.FormatInt(wireID, 10) {
-			fail("original move wire cause unavailable")
-		}
-		if session == "" {
-			session = originalSession
-		} else if session != originalSession {
-			fail("move per-file original causes came from different sessions")
-		}
 		request, _ := direct["request_cause"].(map[string]any)
 		requestSession, _ := request["session"].(string)
 		requestKey, _ := request["request_id_key"].(string)
@@ -318,10 +343,65 @@ func checkEditProbeMoveAccounting(statuses map[string]map[string]any, refs editP
 		}
 		out.Files = append(out.Files, file)
 	}
+	if queuedRows > 0 && (queuedRows != len(refs.Files) || !queuedWaitRequired && queuedWaitMeasured) {
+		fail("queued move route does not explain shared acknowledgement execution")
+	}
 	if len(out.Reasons) == 0 {
-		out.State = "observed_move_windows_checks_pass"
+		if queuedRows == len(refs.Files) {
+			out.State = "qualified_queued_ack_write_only"
+			fail("queued publication: physical P/B and direct/R windows are unavailable; shared ACK and file writes only")
+		} else {
+			out.State = "observed_move_windows_checks_pass"
+		}
 	}
 	return out
+}
+
+func moveAcknowledgementParserScope(ack map[string]any) bool {
+	if ack["parse_scope"] == "explicit_go_parser_calls_formatting_unattributed" {
+		return true
+	}
+	if ack["parse_scope"] != "mixed_observed_parser_paths" {
+		return false
+	}
+	counts, _ := ack["counts"].(map[string]any)
+	parse, _ := counts["parse"].(map[string]any)
+	started, se := strconvEditProbeUint(parse["started"])
+	completed, ce := strconvEditProbeUint(parse["completed"])
+	na, ne := strconvEditProbeUint(parse["not_applicable"])
+	return se == nil && ce == nil && ne == nil && started > 0 && completed == started && na == 0
+}
+
+// Applicability belongs to each file, while execution/counts describe the one
+// shared RPC. A failed or fast file can share a real wait for its sibling;
+// that wait never becomes a per-file publication or background observation.
+func moveQueuedAcknowledgementPhase(row map[string]any, name string, value any, present bool, state, applicability, rawCounts any) bool {
+	background := row["requested_background_state"]
+	if background != "admitted" && background != "admission_failed" {
+		return false
+	}
+	if name == "publish" {
+		if applicability != "applicable" || state != "measured" || value == nil {
+			return false
+		}
+	} else if background == "admission_failed" {
+		if applicability != "not_observed" {
+			return false
+		}
+	} else if applicability != "applicable" && applicability != "not_applicable_fast_ack" {
+		return false
+	}
+	count, _ := rawCounts.(map[string]any)
+	started, se := strconvEditProbeUint(count["started"])
+	completed, ce := strconvEditProbeUint(count["completed"])
+	na, ne := strconvEditProbeUint(count["not_applicable"])
+	if !present || se != nil || ce != nil || ne != nil || na != 0 {
+		return false
+	}
+	if value == nil {
+		return applicability != "applicable" && state == "unobserved" && started == 0 && completed == 0
+	}
+	return state == "measured" && started > 0 && completed == started
 }
 
 func (r editProbeMoveReferences) validateReferences() error {

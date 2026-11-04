@@ -83,20 +83,25 @@ type Host struct {
 // Every attempt is retained, including busy refusals and phase-censored calls.
 // Workload and readiness/visibility probes have distinct Role denominators.
 type Attempt struct {
-	Tool            string    `json:"tool"`
-	Role            string    `json:"role"`
-	Request         string    `json:"request_sha256"`
-	Agent           int       `json:"agent"`
-	Step            int       `json:"step"`
-	Slot            int       `json:"slot"`
-	Retry           int       `json:"retry"`
-	Started         time.Time `json:"started"`
-	DurationMS      float64   `json:"duration_ms"`
-	LogicalMS       float64   `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
-	Code            int       `json:"code"`
-	Error           string    `json:"error"`
-	ExpectedOutcome string    `json:"expected_outcome,omitempty"`
-	Outcome         string    `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	FailureRPC      *readSourceFailureEvidence `json:"failure_rpc,omitempty"`
+	NightlySeed     string                     `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS  int64                      `json:"nightly_delay_ns,omitempty"`
+	CWD             string                     `json:"cwd,omitempty"`
+	ErrorData       map[string]any             `json:"error_data,omitempty"`
+	Tool            string                     `json:"tool"`
+	Role            string                     `json:"role"`
+	Request         string                     `json:"request_sha256"`
+	Agent           int                        `json:"agent"`
+	Step            int                        `json:"step"`
+	Slot            int                        `json:"slot"`
+	Retry           int                        `json:"retry"`
+	Started         time.Time                  `json:"started"`
+	DurationMS      float64                    `json:"duration_ms"`
+	LogicalMS       float64                    `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
+	Code            int                        `json:"code"`
+	Error           string                     `json:"error"`
+	ExpectedOutcome string                     `json:"expected_outcome,omitempty"`
+	Outcome         string                     `json:"outcome"` // success, error, busy, product_deadline, phase_censored
 }
 
 type ToolMetrics struct {
@@ -153,25 +158,27 @@ type Phase struct {
 }
 
 type Report struct {
-	SchemaVersion int               `json:"schema_version"`
-	RunID         string            `json:"run_id"`
-	GitSHA        string            `json:"git_sha"`
-	Binary        string            `json:"binary"`
-	DaemonVersion string            `json:"daemon_version"`
-	Started       time.Time         `json:"started"`
-	Profile       string            `json:"profile"`
-	Seed          int64             `json:"seed"`
-	Workload      Workload          `json:"workload"`
-	Host          Host              `json:"host"`
-	Corpus        []Corpus          `json:"corpus"`
-	RequestPlan   string            `json:"request_plan_sha256"`
-	Phases        []Phase           `json:"phases"`
-	Sweep         []SweepEntry      `json:"tool_sweep"`
-	Metrics       map[string]Metric `json:"metrics"`
-	Artifacts     map[string]string `json:"artifacts"`
-	Crashes       map[string]int    `json:"crashes"`
-	Errors        []string          `json:"errors"`
-	Complete      bool              `json:"complete"`
+	FailureCapture *readSourceFailureConfig `json:"read_source_failure_capture,omitempty"`
+	NightlySeed    string                   `json:"nightly_workload_seed,omitempty"`
+	SchemaVersion  int                      `json:"schema_version"`
+	RunID          string                   `json:"run_id"`
+	GitSHA         string                   `json:"git_sha"`
+	Binary         string                   `json:"binary"`
+	DaemonVersion  string                   `json:"daemon_version"`
+	Started        time.Time                `json:"started"`
+	Profile        string                   `json:"profile"`
+	Seed           int64                    `json:"seed"`
+	Workload       Workload                 `json:"workload"`
+	Host           Host                     `json:"host"`
+	Corpus         []Corpus                 `json:"corpus"`
+	RequestPlan    string                   `json:"request_plan_sha256"`
+	Phases         []Phase                  `json:"phases"`
+	Sweep          []SweepEntry             `json:"tool_sweep"`
+	Metrics        map[string]Metric        `json:"metrics"`
+	Artifacts      map[string]string        `json:"artifacts"`
+	Crashes        map[string]int           `json:"crashes"`
+	Errors         []string                 `json:"errors"`
+	Complete       bool                     `json:"complete"`
 }
 
 func writeReport(path string, report Report) error {

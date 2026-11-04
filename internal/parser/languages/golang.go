@@ -375,9 +375,9 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// don't defer Close — closing happens in the indexer after the
 	// contract pass releases its ref.
 	pt := parser.NewParseTree(tree, src, "go")
-	result := &parser.ExtractionResult{Tree: pt}
-
 	root := tree.RootNode()
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{Tree: pt, ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID:        filePath,
@@ -447,10 +447,14 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 			// No-op (the package name is not currently surfaced as a node).
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitFunction(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["method.def"] != nil:
-			e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			root.WithScratch(func() {
+				e.emitMethod(m, filePath, fileID, src, result, paramsByFunc, paramNamesByFunc, imports, seenIDs)
+			})
 
 		case m.Captures["typedef.def"] != nil:
 			e.emitTypeDecl(m, filePath, fileID, src, result, seenTypeName)
@@ -1278,26 +1282,27 @@ func (e *GoExtractor) ExtractWithOptions(filePath string, src []byte, opts parse
 	// override method emits as a separate KindMethod node, so this
 	// post-pass runs after every node in the file has been emitted and
 	// rewires any convention-derived EdgeModelsTable to the literal.
-	rewireORMTableNameOverrides(root, src, result)
+	root.WithScratch(func() { rewireORMTableNameOverrides(root, src, result) })
 
 	// WebSocket upgrade handlers → real-time endpoint edges.
 	emitGoWebSocketEdges(src, filePath, result)
 
-	// Same-file constant/variable value references → impact-radius reads.
-	captureValueRefCandidates(result, root, filePath, src)
-	captureFnValueCandidates(result, root, filePath, src)
+	// Collect once before the original tail emission phases. Function values
+	// still precede Gin metadata, type references and GoFrame routes.
+	root.WithScratch(func() {
+		work := collectGoTailWork(root, src, result, filePath, funcRanges)
+		captureValueRefCandidatesWithGoWork(result, root, filePath, src, &work)
+		captureFnValueCandidatesWithGoWork(result, root, filePath, src, &work)
 
-	// Gin middleware-chain dispatcher + route registrations → resolver hints.
-	mineGinMiddleware(src, result)
+		// Gin middleware-chain dispatcher + route registrations → resolver hints.
+		mineGinMiddleware(src, result)
 
-	// Composite/generic element type references — generic arguments,
-	// map key/value, channel element. These positions are dropped by the
-	// bare-name type passes, so without this find_usages of a type misses
-	// every place it appears only as an argument/element type.
-	emitGoTypeArgReferences(root, src, filePath, fileID, funcRanges, result)
+		// Composite/generic element type references preserve later parameters.
+		emitGoTypeArgReferences(work, src, filePath, fileID, funcRanges, result)
 
-	// GoFrame reflective routes: g.Meta-tagged request structs → controllers.
-	captureGoFrameRoutes(result, root, filePath, src)
+		// GoFrame reflective routes retain their original tail emission order.
+		captureGoFrameRoutes(result, root, work, filePath, src)
+	})
 
 	return result, nil
 }
@@ -1340,15 +1345,16 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 	if tp := goTypeParams(def.Node, src); len(tp) > 0 {
 		node.Meta["type_params"] = tp
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	declStartByte := int(def.Node.StartByte())
+	if doc := ExtractDocAboveByte(src, declStartByte, DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	var bodyPlan *goBodyCapturePlan
 	if body := goFuncBody(def.Node); body != nil {
-		StampFunctionMetrics(node, body, "go")
-		StampLoopSignals(node, body, src, "go")
+		bodyPlan = collectGoBodyCapturePlan(node, body, src)
 	}
-	scanGoPragmas(src, def.StartLine, node)
+	scanGoPragmasAboveByte(src, declStartByte, node)
 	result.Nodes = append(result.Nodes, node)
 	// Record func-returning-literal into ConstValues sidecar for const-deref dispatch.
 	if v, ok := goFuncSingleReturnLiteral(def.Node, src); ok {
@@ -1360,8 +1366,8 @@ func (e *GoExtractor) emitFunction(m parser.QueryResult, filePath, fileID string
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitGoThrowsEdges(node, m.Captures["func.result"], filePath, result)
-	emitGoFunctionShape(id, def.Node, m.Captures["func.params"], m.Captures["func.result"],
-		src, filePath, def.StartLine+1, imports, result)
+	emitGoFunctionShapeWithCapturePlan(id, def.Node, m.Captures["func.params"], m.Captures["func.result"],
+		src, filePath, def.StartLine+1, imports, result, bodyPlan)
 }
 
 // goFuncBody returns the `block` body child of a function/method
@@ -1457,15 +1463,16 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 	if tp := goTypeParams(def.Node, src); len(tp) > 0 {
 		node.Meta["type_params"] = tp
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	declStartByte := int(def.Node.StartByte())
+	if doc := ExtractDocAboveByte(src, declStartByte, DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
+	var bodyPlan *goBodyCapturePlan
 	if body := goFuncBody(def.Node); body != nil {
-		StampFunctionMetrics(node, body, "go")
-		StampLoopSignals(node, body, src, "go")
+		bodyPlan = collectGoBodyCapturePlan(node, body, src)
 	}
-	scanGoPragmas(src, def.StartLine, node)
+	scanGoPragmasAboveByte(src, declStartByte, node)
 	result.Nodes = append(result.Nodes, node)
 	// Record method-returning-literal into ConstValues sidecar for const-deref dispatch.
 	if v, ok := goFuncSingleReturnLiteral(def.Node, src); ok {
@@ -1482,8 +1489,8 @@ func (e *GoExtractor) emitMethod(m parser.QueryResult, filePath, fileID string, 
 		From: id, To: typeID, Kind: graph.EdgeMemberOf, FilePath: filePath, Line: def.StartLine + 1,
 	})
 	emitGoThrowsEdges(node, m.Captures["method.result"], filePath, result)
-	emitGoFunctionShape(id, def.Node, m.Captures["method.params"], m.Captures["method.result"],
-		src, filePath, def.StartLine+1, imports, result)
+	emitGoFunctionShapeWithCapturePlan(id, def.Node, m.Captures["method.params"], m.Captures["method.result"],
+		src, filePath, def.StartLine+1, imports, result, bodyPlan)
 }
 
 // goTypeParams reads the `type_parameters` child of a Go declaration
@@ -1657,7 +1664,7 @@ func (e *GoExtractor) emitTypeDecl(m parser.QueryResult, filePath, fileID string
 			isStruct = true
 		}
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
@@ -1828,7 +1835,7 @@ func emitGoFieldNode(decl, anchor *sitter.Node, fieldName, fieldType, ownerID, o
 	if fieldType != "" {
 		meta["field_type"] = fieldType
 	}
-	if doc := ExtractDocAbove(src, int(anchor.StartPoint().Row), DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(anchor.StartByte()), DocLangSlashSlash); doc != "" {
 		meta["doc"] = doc
 	}
 	result.Nodes = append(result.Nodes, &graph.Node{
@@ -1899,7 +1906,7 @@ func (e *GoExtractor) emitTypeAlias(m parser.QueryResult, filePath, fileID strin
 			"alias": true,
 		},
 	}
-	if doc := ExtractDocAbove(src, def.StartLine, DocLangSlashSlash); doc != "" {
+	if doc := ExtractDocAboveByte(src, int(def.Node.StartByte()), DocLangSlashSlash); doc != "" {
 		node.Meta["doc"] = doc
 	}
 	node.Meta["visibility"] = VisibilityByCase(name)
@@ -2943,7 +2950,7 @@ func compositeLiteralType(lit *sitter.Node, src []byte) string {
 // stripCallArgs, findMethodReturnType, findFactoryReturnType) is shared across
 // every AST extractor and lives in helpers_chaintype.go.
 
-// scanGoPragmas inspects up to 5 source lines immediately before a
+// scanGoPragmasAboveByte inspects up to 5 source lines immediately before a
 // function or method declaration looking for `//go:*` or `//export`
 // comments and stamps them onto the node's Meta. Lets callers flag
 // special Go entry points (cgo exports, linkname) so dead-code
@@ -2956,31 +2963,14 @@ func compositeLiteralType(lit *sitter.Node, src []byte) string {
 // call, which on a Go monorepo like k8s (12 k+ .go files, hundreds
 // of symbols each) was the single biggest allocation in the
 // indexer (4.57 GB / 14 % of total).
-func scanGoPragmas(src []byte, startLine int, node *graph.Node) {
-	// startLine is 0-based (matches tree-sitter's row numbering at the
-	// call site). One forward scan locates the '\n' that ends row
-	// startLine − 1, and the backward walk from there is bounded at 5
-	// iterations regardless of file size.
-	if startLine <= 0 || len(src) == 0 {
+func scanGoPragmasAboveByte(src []byte, startByte int, node *graph.Node) {
+	if startByte <= 0 || len(src) == 0 {
 		return
 	}
-	end := -1
-	{
-		row := 0
-		for i := 0; i < len(src); i++ {
-			if src[i] != '\n' {
-				continue
-			}
-			row++
-			end = i
-			if row == startLine {
-				break
-			}
-		}
+	if startByte > len(src) {
+		startByte = len(src)
 	}
-	if end < 0 {
-		return
-	}
+	end := bytes.LastIndexByte(src[:startByte], '\n')
 	for scanned := 0; scanned < 5 && end >= 0; scanned++ {
 		prev := bytes.LastIndexByte(src[:end], '\n')
 		line := bytes.TrimSpace(src[prev+1 : end])

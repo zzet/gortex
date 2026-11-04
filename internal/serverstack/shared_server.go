@@ -83,10 +83,12 @@ type SharedServerConfig struct {
 	Logger            *zap.Logger
 	Version           string
 	MigrationObserver store_sqlite.MigrationObserver
-	Embedder          EmbedderRequest
-	SideStores        SideStores
-	ScopeWorkspace    string
-	ScopeProject      string
+	// Set only by the acceptance-tagged per-invocation configurator.
+	sqliteUpgradeOption store_sqlite.Option
+	Embedder            EmbedderRequest
+	SideStores          SideStores
+	ScopeWorkspace      string
+	ScopeProject        string
 	// ActiveProject names the project the MCP server should start scoped
 	// to (multi-repo mode hint). Empty leaves it unset.
 	ActiveProject string
@@ -422,11 +424,16 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 		s.addCleanup("store_lock", lock.Unlock)
 		storeLockHeld = true
+		// Expired pre-upgrade backups go before the store opens, so the space
+		// they free counts toward an upgrade's free-space check. Only under
+		// the lock: a partial copy can be in progress only while some process
+		// holds it.
+		pruneStoreUpgradeBackups(storePath, logger, time.Now())
 	}
 
 	// allowRebuild is gated on actually holding the store lock: only then may
 	// the sqlite backend rebuild a supported older schema when necessary.
-	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld, cfg.MigrationObserver)
+	g, backendCleanup, err := openBackendWithUpgradeOption(cfg.Backend, storePath, logger, storeLockHeld, cfg.sqliteUpgradeOption, cfg.MigrationObserver)
 	if err != nil {
 		// Backend initialization can fail after the store lock was acquired.
 		return nil, errors.Join(err, s.Close())
@@ -855,6 +862,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 	scopeIntentDefaults := conf.Scope.IntentDefaults
 	multiOpts := []gortexmcp.MultiRepoOptions{{
+		EditAckMode:         conf.Edit.Ack,
 		MultiIndexer:        mi,
 		ConfigManager:       cm,
 		CheckoutLifecycle:   s.CheckoutLifecycle,

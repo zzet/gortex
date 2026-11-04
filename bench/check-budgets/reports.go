@@ -13,14 +13,15 @@ import (
 )
 
 type inputs struct {
-	Version           int               `json:"schema_version"`
-	CandidateRevision string            `json:"candidate_revision"`
-	MainRevision      string            `json:"main_revision"`
-	TagRevision       string            `json:"tag_revision"`
-	Repeats           int               `json:"repeats"`
-	ScenarioRepeats   map[string]int    `json:"scenario_repeats"`
-	Hosts             map[string]string `json:"hosts"` // reviewed host class -> exact observed machine
-	Runs              []runInput        `json:"runs"`
+	NightlySeed       *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
+	Version           int                  `json:"schema_version"`
+	CandidateRevision string               `json:"candidate_revision"`
+	MainRevision      string               `json:"main_revision"`
+	TagRevision       string               `json:"tag_revision"`
+	Repeats           int                  `json:"repeats"`
+	ScenarioRepeats   map[string]int       `json:"scenario_repeats"`
+	Hosts             map[string]string    `json:"hosts"` // reviewed host class -> exact observed machine
+	Runs              []runInput           `json:"runs"`
 }
 
 type runInput struct {
@@ -46,21 +47,46 @@ type distribution struct {
 }
 
 type toolResult struct {
-	Latency       distribution    `json:"latency_ms"`
-	Errors        map[string]*int `json:"errors"`
-	PhaseCensored *int            `json:"phase_censored"`
-	Expired       *int            `json:"product_expired"`
+	Successes         *int            `json:"successes"`
+	RetryableRefusals *int            `json:"retryable_refusals"`
+	Latency           distribution    `json:"latency_ms"`
+	Errors            map[string]*int `json:"errors"`
+	PhaseCensored     *int            `json:"phase_censored"`
+	Expired           *int            `json:"product_expired"`
 }
 
 type attempt struct {
-	Tool      string   `json:"tool"`
-	Role      string   `json:"role"`
-	Outcome   string   `json:"outcome"`
-	Code      *int     `json:"code"`
-	LogicalMS *float64 `json:"logical_ms"`
+	Started        time.Time      `json:"started"`
+	CWD            string         `json:"cwd"`
+	Request        string         `json:"request_sha256"`
+	Agent          *int           `json:"agent"`
+	Step           *int           `json:"step"`
+	Slot           *int           `json:"slot"`
+	Retry          *int           `json:"retry"`
+	DurationMS     *float64       `json:"duration_ms"`
+	Error          string         `json:"error"`
+	ErrorData      map[string]any `json:"error_data"`
+	NightlySeed    string         `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS int64          `json:"nightly_delay_ns,omitempty"`
+	Tool           string         `json:"tool"`
+	Role           string         `json:"role"`
+	Outcome        string         `json:"outcome"`
+	Code           *int           `json:"code"`
+	LogicalMS      *float64       `json:"logical_ms"`
+}
+
+type smokeEditACK struct {
+	Acknowledgement struct {
+		StructuredContent struct {
+			AckMode string `json:"ack_mode"`
+		} `json:"structuredContent"`
+	} `json:"acknowledgement"`
 }
 
 type phase struct {
+	Edits        []smokeEditACK             `json:"edits,omitempty"`
+	Status       []json.RawMessage          `json:"daemon_status"`
+	EditProbe    json.RawMessage            `json:"edit_probe,omitempty"`
 	SessionModel string                     `json:"session_model"`
 	Name         string                     `json:"name"`
 	Duration     float64                    `json:"duration_seconds"`
@@ -74,17 +100,29 @@ type phase struct {
 	Censored     *int                       `json:"visibility_censored"`
 }
 
+type readSourceFailureConfig struct {
+	MaxRecords int    `json:"max_records"`
+	MaxBytes   int    `json:"max_combined_wire_bytes"`
+	Encoding   string `json:"encoding"`
+}
+
+func validReadSourceFailureConfig(c *readSourceFailureConfig) bool {
+	return c == nil || c.MaxRecords == 8 && c.MaxBytes == 64<<10 && c.Encoding == "base64"
+}
+
 type report struct {
-	Started  time.Time       `json:"started"`
-	Binary   string          `json:"binary"`
-	Version  int             `json:"schema_version"`
-	RunID    string          `json:"run_id"`
-	Revision string          `json:"git_sha"`
-	Profile  string          `json:"profile"`
-	Plan     string          `json:"request_plan_sha256"`
-	Seed     int64           `json:"seed"`
-	Workload json.RawMessage `json:"workload"`
-	Host     struct {
+	FailureCapture *readSourceFailureConfig `json:"read_source_failure_capture,omitempty"`
+	NightlySeed    string                   `json:"nightly_workload_seed,omitempty"`
+	Started        time.Time                `json:"started"`
+	Binary         string                   `json:"binary"`
+	Version        int                      `json:"schema_version"`
+	RunID          string                   `json:"run_id"`
+	Revision       string                   `json:"git_sha"`
+	Profile        string                   `json:"profile"`
+	Plan           string                   `json:"request_plan_sha256"`
+	Seed           int64                    `json:"seed"`
+	Workload       json.RawMessage          `json:"workload"`
+	Host           struct {
 		Machine   string            `json:"machine"`
 		OS        string            `json:"os"`
 		Arch      string            `json:"arch"`
@@ -110,7 +148,9 @@ type dataset struct {
 	runs   []observation
 }
 
-func loadInputs(path string) (dataset, error) {
+func loadInputs(path string) (dataset, error) { return loadInputsChecked(path, validateReport) }
+
+func loadInputsChecked(path string, validate func(inputs, runInput, report) error) (dataset, error) {
 	var out dataset
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -166,7 +206,7 @@ func loadInputs(path string) (dataset, error) {
 		if err != nil {
 			return out, fmt.Errorf("%s: %w", cell, err)
 		}
-		if err := validateReport(c, input, r); err != nil {
+		if err := validate(c, input, r); err != nil {
 			return out, fmt.Errorf("%s: %w", cell, err)
 		}
 		if ids[r.RunID] {
@@ -199,6 +239,12 @@ func (c inputs) repeats(scenario string) int {
 }
 
 func validateReport(c inputs, input runInput, r report) error {
+	if !validReadSourceFailureConfig(r.FailureCapture) {
+		return errors.New("unknown or enlarged read.source failure-capture policy")
+	}
+	if err := validateNightlySeedReport(c, input, r); err != nil {
+		return err
+	}
 	want := map[string]string{"candidate": c.CandidateRevision, "main": c.MainRevision, "tag": c.TagRevision}[input.Role]
 	if r.Version != 1 || !r.Complete || r.RunID == "" || r.Revision != want || r.Profile != "agent" || !planPattern.MatchString(r.Plan) || len(r.Errors) != 0 || len(r.Phases) != 1 {
 		return errors.New("need complete standalone report-v1 with pinned identity and agent profile; paired/saturation evidence is not capacity evidence")
@@ -222,8 +268,12 @@ func validateReport(c inputs, input runInput, r report) error {
 	if len(p.Attempts) == 0 {
 		return errors.New("missing attempts")
 	}
-	for _, a := range p.Attempts {
-		validOutcome := a.Code != nil && (a.Outcome == "success" && *a.Code == 0 || a.Outcome == "busy" && *a.Code == -32002)
+	retainedRefusals, groupErr := validateReadFreshnessGroups(r)
+	if groupErr != nil {
+		return groupErr
+	}
+	for index, a := range p.Attempts {
+		validOutcome := retainedRefusals[index] || a.Code != nil && (a.Outcome == "success" && *a.Code == 0 || a.Outcome == "busy" && *a.Code == -32002)
 		if a.LogicalMS == nil || !finiteNonnegative(*a.LogicalMS) || !validOutcome {
 			return errors.New("failed, censored or unrecognized attempt retained: run cannot pass")
 		}
@@ -300,7 +350,7 @@ func validateHost(class, machine string, r report) error {
 
 func comparable(a, b report) bool {
 	var aw, bw any
-	if decodeNumbers(a.Workload, &aw) != nil || decodeNumbers(b.Workload, &bw) != nil || !reflect.DeepEqual(aw, bw) || a.Plan != b.Plan || !reflect.DeepEqual(a.Host, b.Host) {
+	if decodeNumbers(a.Workload, &aw) != nil || decodeNumbers(b.Workload, &bw) != nil || !reflect.DeepEqual(aw, bw) || a.Plan != b.Plan || !reflect.DeepEqual(a.Host, b.Host) || !reflect.DeepEqual(a.FailureCapture, b.FailureCapture) {
 		return false
 	}
 	logical := func(corpus []map[string]any) []map[string]any {

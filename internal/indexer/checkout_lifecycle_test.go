@@ -130,9 +130,10 @@ type lifecycleFixture struct {
 	watcher *fakeWatcher
 	notify  *countingNotifier
 	clock   *manualClock
+	logger  *zap.Logger
 }
 
-func newLifecycleFixture(t *testing.T) *lifecycleFixture {
+func newLifecycleFixture(t *testing.T, loggers ...*zap.Logger) *lifecycleFixture {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available in PATH")
@@ -152,6 +153,9 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	gc.SetConfigPath(f.cfgPath)
 	require.NoError(t, gc.Save())
 
+	if len(loggers) > 0 {
+		f.logger = loggers[0]
+	}
 	f.open()
 	return f
 }
@@ -161,6 +165,10 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 // dropping the whole stack and building a fresh one over the same files.
 func (f *lifecycleFixture) open() {
 	f.t.Helper()
+	logger := f.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	store, err := store_sqlite.Open(f.dbPath)
 	require.NoError(f.t, err)
 	f.store = store
@@ -170,12 +178,12 @@ func (f *lifecycleFixture) open() {
 	require.NoError(f.t, err)
 	f.cm = cm
 
-	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, logger)
 	lc, err := NewCheckoutLifecycle(CheckoutLifecycleConfig{
 		MultiIndexer:  f.mi,
 		ConfigManager: cm,
 		Graph:         store,
-		Logger:        zap.NewNop(),
+		Logger:        logger,
 		Reconcile:     lifecycleGrace,
 		Clock:         f.clock.Now,
 	})
@@ -869,9 +877,15 @@ func TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo(t *testing.T) 
 
 	held := f.checkoutOf("unindexed-repo")
 	assert.Equal(t, tracked.CheckoutID, held.CheckoutID, "the identity survives")
-	assert.Equal(t, store_sqlite.CheckoutStateAvailabilityGrace, held.State,
-		"an unreachable root enters availability handling, indexed or not")
-	assert.Zero(t, held.RemovalDetectedAt, "an outage never starts the removal clock")
+	evidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, held.CheckoutID)
+	require.NoError(t, err)
+	if evidence.CommonDirVolumeToken != "" {
+		assert.Equal(t, store_sqlite.CheckoutStateRemovalGrace, held.State, "mounted-volume common-dir deletion enters removal grace")
+		assert.NotZero(t, held.RemovalDetectedAt)
+	} else {
+		assert.Equal(t, store_sqlite.CheckoutStateReady, held.State, "unknown inventory freezes state without mounted-volume deletion proof")
+		assert.Zero(t, held.RemovalDetectedAt)
+	}
 }
 
 // TestCheckoutLifecycleSeedIsIdempotent runs the startup path twice and
@@ -995,67 +1009,54 @@ func TestCheckoutLifecycleBindDedicatedGraphRejectsOwnerFamilyMismatch(t *testin
 	assert.Len(t, graphs, 1)
 }
 
-// TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace covers a checkout
-// whose root and Git directory disappear together. It receives one
-// availability grace and is then removed completely, including its persisted
-// configuration, rather than surviving as an unavailable shadow graph.
-func TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace(t *testing.T) {
+// A deleted intended root keeps its identity/config across grace and restart.
+// An unavailable volume cannot be proved deleted and stays Unknown instead.
+func TestCheckoutLifecycleDeletedPrimaryRemainsTrackedAfterGrace(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
-
 	root := f.gitRepo("offline-repo")
 	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: root, Name: "offline-repo"}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
+	evidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	proven := evidence.CommonDirVolumeToken != ""
 	require.NoError(t, os.RemoveAll(root))
-
 	graced, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 0, graced.Removed)
+	require.Zero(t, graced.Removed)
 	require.Len(t, graced.Reports, 1)
-	assert.False(t, graced.Reports[0].InventoryUsable)
-
-	held := f.checkoutOf("offline-repo")
-	assert.Equal(t, tracked.CheckoutID, held.CheckoutID)
-	assert.Equal(t, store_sqlite.CheckoutStateAvailabilityGrace, held.State)
-	assert.Zero(t, held.RemovalDetectedAt, "inaccessibility uses only one grace clock")
-
-	// A reader still holding the corpus defers its purge, so the retirement
-	// takes the path a busy daemon does: the sweep reports it done and the
-	// cleanup runtime finishes the purge once the reader lets go.
+	require.False(t, graced.Reports[0].InventoryUsable)
 	pin := f.lc.ViewLeases().AcquireBaseCorpus("offline-repo")
-	defer pin.Release() // An early failure must not leave Close waiting on the reader.
-	require.True(t, pin.OwnerPinned(), "the serving pin carries no repository owner")
+	defer pin.Release()
+	require.True(t, pin.OwnerPinned())
 	f.clock.advance(lifecycleGrace.AvailabilityGrace + time.Second)
 	expired, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, expired.Removed)
-	require.NotNil(t, f.mi.GetMetadata("offline-repo"),
-		"the purge did not wait for the pinned reader, so this step proves nothing about a deferred cleanup")
-	during, err := f.lc.Sweep(ctx)
-	require.NoError(t, err, "a sweep during a deferred purge failed on it")
-	assert.Zero(t, during.Removed, "a sweep during a deferred purge retired the checkout a second time")
-
-	pin.Release()
-	require.Eventually(t, func() bool {
-		return f.mi.GetMetadata("offline-repo") == nil && !f.lc.RepositoryAdmissionClosed("offline-repo")
-	}, 30*time.Second, 10*time.Millisecond, "its corpus is never evicted")
-	_, checkoutExists, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.Zero(t, expired.Removed)
+	row, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
 	require.NoError(t, err)
-	assert.False(t, checkoutExists, "the checkout catalog row is removed")
-	assert.False(t, f.watcher.isAttached("offline-repo"), "its watcher is detached")
-	assert.NotContains(t, f.configPaths(), root, "the removal is persisted")
-
+	require.True(t, found)
+	if proven {
+		require.Equal(t, store_sqlite.CheckoutStateUnavailable, row.State)
+		require.False(t, f.watcher.isAttached("offline-repo"))
+	} else {
+		require.Zero(t, row.UnavailableSince)
+		require.Zero(t, row.RemovalDetectedAt)
+	}
+	require.NotNil(t, f.mi.GetMetadata("offline-repo"))
+	require.False(t, f.lc.RepositoryAdmissionClosed("offline-repo"), "an automatic pass closed intended repository admission")
+	require.Contains(t, f.configPaths(), root)
+	pin.Release()
 	f.restart()
 	require.NoError(t, f.lc.Seed(ctx))
-	assert.Nil(t, f.mi.GetMetadata("offline-repo"), "a restart does not resurrect it")
+	_, found, err = f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "restart lost intended checkout identity")
+	require.Contains(t, f.configPaths(), root)
 }
 
-// TestCheckoutLifecycleImplicitRegistrationWritesNoIntent covers the
-// auto-index path: the checkout is recorded and served like any other, but
-// nobody asked for it, so no tracking intent claims otherwise — and nothing
-// is written to the configuration that a later boot could read back as one.
 func TestCheckoutLifecycleImplicitRegistrationWritesNoIntent(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()

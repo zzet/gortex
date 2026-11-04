@@ -71,56 +71,67 @@ var purgeSidecarTables = []string{
 // Refuses prefix=="" (shared global externals / solo-mode live data — see the
 // file-level INVARIANT).
 func (s *Store) PurgeRepo(prefix string) error {
+	return s.PurgeRepoContext(context.Background(), prefix)
+}
+
+// PurgeRepoContext preserves the maintenance producer lifetime through writer
+// admission, SQL work and commit. Rollback joins before the writer is released.
+func (s *Store) PurgeRepoContext(ctx context.Context, prefix string) (err error) {
 	if prefix == "" {
 		return fmt.Errorf("store_sqlite: PurgeRepo refuses empty repo prefix (would delete shared global externals / solo-repo data)")
 	}
 	// The sweep is generation-unscoped; invalidate the base so every view's
 	// analysis and process-local mutation witness observes the removal.
 	if s.viewGen != baseViewGeneration {
-		return s.atBase().PurgeRepo(prefix)
+		return s.atBase().PurgeRepoContext(ctx, prefix)
 	}
 
-	s.writeMu.Lock()
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.writeMu.Unlock()
 
 	// PurgeRepo bypasses the ordinary Add/Evict entry points, so invalidate a
 	// persisted whole-graph analysis before the transaction can delete live graph
 	// rows. The preflight is safe under writeMu and avoids touching analysis state
 	// for sidecar-only purges.
-	conn, release, err := s.activeWriteConnLocked(context.Background())
+	conn, release, err := s.activeWriteConnLocked(ctx)
 	if err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo writer preflight connection: %w", err)
 	}
 	var hasGraphRows int
-	err = conn.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? LIMIT 1)`, prefix).Scan(&hasGraphRows)
+	err = conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? LIMIT 1)`, prefix).Scan(&hasGraphRows)
 	release()
 	if err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo graph preflight: %w", err)
 	}
-	if hasGraphRows != 0 && !s.invalidateAnalysisBeforeMutationLocked() {
-		return fmt.Errorf("store_sqlite: PurgeRepo could not invalidate active analysis")
+	if hasGraphRows != 0 {
+		if err := s.invalidateAnalysisGenerationLockedContext(ctx); err != nil {
+			return fmt.Errorf("store_sqlite: PurgeRepo invalidate active analysis: %w", err)
+		}
 	}
 
-	tx, err := s.beginWrite()
+	owner, err := s.beginOwnedWrite(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
+	defer owner.finish(&err)
+	tx := owner.tx
 
 	// Collect this repo's node IDs first for edge deletion. Vectors are removed
 	// below by repo_prefix so synthetic chunk rows are covered too. Edge deletion
 	// semantics mirror scope eviction's (store.go): delete every edge touching
 	// one of these nodes, then the nodes themselves.
-	ids, err := repoNodeIDsTx(tx, prefix)
+	ids, err := repoNodeIDsTxContext(ctx, tx, prefix)
 	if err != nil {
 		return err
 	}
-	if err := deleteByIDColumnsTx(tx, "edges", []string{"from_id", "to_id"}, ids); err != nil {
+	if err := deleteByIDColumnsTxContext(ctx, tx, "edges", []string{"from_id", "to_id"}, ids); err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo edges: %w", err)
 	}
 	changed := len(ids) > 0
 	for _, table := range purgeSidecarTables {
-		res, err := tx.Exec(`DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
+		res, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE repo_prefix = ?`, prefix)
 		noteTableRows(table, res, err)
 		if err != nil {
 			return fmt.Errorf("store_sqlite: PurgeRepo %s: %w", table, err)
@@ -130,7 +141,7 @@ func (s *Store) PurgeRepo(prefix string) error {
 		}
 	}
 
-	res, err := countNodeWrite(tx.Exec(`DELETE FROM nodes WHERE repo_prefix = ?`, prefix))
+	res, err := countNodeWrite(tx.ExecContext(ctx, `DELETE FROM nodes WHERE repo_prefix = ?`, prefix))
 	if err != nil {
 		return fmt.Errorf("store_sqlite: PurgeRepo nodes: %w", err)
 	}
@@ -138,9 +149,12 @@ func (s *Store) PurgeRepo(prefix string) error {
 		changed = true
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := owner.commit(ctx); err != nil {
 		return err
 	}
+	s.firstIndexDrainsMu.Lock()
+	delete(s.firstIndexDrains, prefix)
+	s.firstIndexDrainsMu.Unlock()
 	s.finishAnalysisMutationLocked(len(ids) > 0)
 	if changed {
 		s.payloadInputAdminRevision.Add(1)
@@ -351,6 +365,14 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.firstIndexDrainsMu.Lock()
+	if observation, ok := s.firstIndexDrains[oldPrefix]; ok {
+		if current, exists := s.firstIndexDrains[newPrefix]; !exists || current.CompletedAt.Before(observation.CompletedAt) {
+			s.firstIndexDrains[newPrefix] = observation
+		}
+		delete(s.firstIndexDrains, oldPrefix)
+	}
+	s.firstIndexDrainsMu.Unlock()
 	if changed {
 		s.payloadInputAdminRevision.Add(1)
 		s.markMutationReceiptsIncompleteLocked()
@@ -362,8 +384,8 @@ func (s *Store) RekeyRepoPrefix(oldPrefix, newPrefix string) error {
 // caller holds writeMu. Rows are fully drained + closed before the caller
 // issues writes on the same tx — SQLite forbids an open read cursor while
 // writing on the same connection.
-func repoNodeIDsTx(tx *sql.Tx, repoPrefix string) ([]string, error) {
-	rows, err := tx.Query(`SELECT id FROM nodes WHERE repo_prefix = ?`, repoPrefix)
+func repoNodeIDsTxContext(ctx context.Context, tx *sql.Tx, repoPrefix string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM nodes WHERE repo_prefix = ?`, repoPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +410,7 @@ func repoNodeIDsTx(tx *sql.Tx, repoPrefix string) ([]string, error) {
 // of ids, chunked so each statement stays under SQLite's 999 bound-variable
 // limit. Mirrors scope eviction's separate from_id/to_id edge deletes
 // (store.go) — the semantics source for edge eviction. Empty ids is a no-op.
-func deleteByIDColumnsTx(tx *sql.Tx, table string, cols, ids []string) error {
+func deleteByIDColumnsTxContext(ctx context.Context, tx *sql.Tx, table string, cols, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -402,7 +424,7 @@ func deleteByIDColumnsTx(tx *sql.Tx, table string, cols, ids []string) error {
 			for i, id := range batch {
 				args[i] = id
 			}
-			result, err := tx.Exec(`DELETE FROM `+table+` WHERE `+col+` IN (`+placeholders+`)`, args...)
+			result, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE `+col+` IN (`+placeholders+`)`, args...)
 			noteTableRows(table, result, err)
 			if err != nil {
 				return err

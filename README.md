@@ -26,6 +26,9 @@
   <a href="https://trendshift.io/repositories/36832" target="_blank"><img src="https://trendshift.io/api/badge/repositories/36832" alt="zzet%2Fgortex | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
 
+> [!IMPORTANT]
+> **Gortex has no cryptocurrency token or coin.** We have not issued, authorized, or endorsed any cryptocurrency token, coin, token sale, or airdrop. Any claims of an official Gortex token or an affiliation with such projects are false. Verify announcements through the [official Gortex repository](https://github.com/zzet/gortex).
+
 High-quality parsing 257 languages/grammars through tree-sitter AST analysis, in-process resolvers, enhanced with [compiler-grade resolution](https://github.com/zzet/gortex/blob/main/docs/lsp.md) for Python, TypeScript / JavaScript, PHP, C#, Go, C, C++, Java, Kotlin, Swift, Zig, Rust, Ruby, Elixir, Ocaml, Haskell, and [others](https://github.com/zzet/gortex/blob/main/docs/languages.md#at-a-glance) - producing a persistent provenance-tiered knowledge graph of functions, classes, call chains, HTTP routes, and cross-service contracts and calls with a strong confidence model. 175 (configurable) MCP tools - use only what you need. Zero dependencies. Plug and play across 19 coding agents. **Up to 50× fewer tokens per response**. Reproducible [benchmarks](BENCHMARK.md).
 
 

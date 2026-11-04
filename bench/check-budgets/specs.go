@@ -11,6 +11,8 @@ type metricSpec struct {
 }
 
 var metricSpecs = map[string]metricSpec{
+	"readback_max":          {unit: "s", axis: "timing", everyRepeat: true, missing: "report-v1 does not retain exact edited-file readback latency"},
+	"wal_p95_mib":           {unit: "MiB", axis: "disk"},
 	"edit_ack_p95":          {unit: "s", axis: "timing"},
 	"edit_ack_max":          {unit: "s", axis: "timing", everyRepeat: true},
 	"read_p95":              {unit: "s", axis: "timing"},
@@ -39,8 +41,8 @@ var metricSpecs = map[string]metricSpec{
 	"unflagged_stale":       {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 has no stale-flag correctness census across output modes"},
 	"relations_lag_p95":     {unit: "s", axis: "timing", missing: "indexed-symbol visibility does not measure relations publication"},
 	"derived_lag_p95":       {unit: "s", axis: "timing", missing: "report-v1 has no derived-publication lag observation"},
-	"reclaim_hold_p95":      {unit: "s", axis: "timing", missing: "report-v1 has no WAL-reclaim writer-hold distribution"},
-	"read_gate_closures":    {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 has no read-gate closure census"},
+	"reclaim_hold_p95":      {unit: "s", axis: "timing"},
+	"read_gate_closures":    {unit: "count", axis: "safety", everyRepeat: true},
 	"cancel_release_max":    {unit: "s", axis: "timing", everyRepeat: true, missing: "report-v1 does not measure cancellation-to-slot-release"},
 	"impact_stale_refusals": {unit: "count", axis: "safety", everyRepeat: true, missing: "attempt code/error does not provide a structured stale-refusal reason census"},
 	"detect_stale_refusals": {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 lacks detect_changes primary-checkout refusal probes"},
@@ -49,6 +51,11 @@ var metricSpecs = map[string]metricSpec{
 	"idle_written_mib_min":  {unit: "MiB/min", axis: "disk", missing: "report-v1 lacks an idle-write observation interval"},
 	"idle_memory_60s_mib":   {unit: "MiB", axis: "memory", missing: "idle_after_2s is not a 60-second post-enrichment footprint observation"},
 	"cold_go_sys_peak_mib":  {unit: "MiB", axis: "memory", missing: "daemon status Go Sys snapshots do not establish cold-window peak Go Sys"},
+	"silent_stale_json":     {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_toon":     {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_compact":  {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_facade":   {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
+	"silent_stale_cli":      {unit: "count", axis: "safety", everyRepeat: true, missing: "report-v1 does not retain mode-specific edit oracle observations"},
 }
 
 type scenarioSpec struct {
@@ -71,6 +78,7 @@ func buildScenarioSpecs() map[string]scenarioSpec {
 		out["load-"+cell.name] = scenarioSpec{wire: "read", agents: cell.n, repos: 1}
 		out["loadedit-"+cell.name] = scenarioSpec{wire: "edit", editors: cell.n, repos: 1}
 	}
+	out["loadedit-4-largefile"] = scenarioSpec{missing: "frozen report-v1 has no identified large-file edit-probe fixture"}
 	out["multirepoedit-6"] = scenarioSpec{wire: "many-edit", editors: 6, repos: 6}
 	for _, cell := range []struct {
 		name string

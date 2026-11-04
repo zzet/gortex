@@ -143,3 +143,15 @@ func (idx *Indexer) sourceSearchMatcher(patterns []string) *excludes.Matcher {
 	}
 	return idx.sourceSearchCompiled
 }
+
+// PendingSourceSearchPathFilter applies the source-search exclusion rules to
+// already committed pending paths. Parser/language/extraction limits do not
+// hide their current text when a graph projection was refused. The returned
+// request-local predicate shares one ignore hierarchy, never a new cache.
+func (idx *Indexer) PendingSourceSearchPathFilter(root string, patterns []string) func(string) bool {
+	matcher := idx.sourceSearchMatcher(patterns)
+	ignores := excludes.NewHierarchicalWithDiagnostics(root, dirIgnoreFiles, func(dir string, rules *excludes.Matcher) {
+		idx.warnExcludedNegationsAt(rules, dir)
+	})
+	return func(path string) bool { return !sourceSearchExcluded(matcher, ignores, root, path, false) }
+}

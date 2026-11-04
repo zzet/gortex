@@ -24,6 +24,28 @@ Such a session has no single workspace slug, so `_meta.scope_applied` reports `r
 
 A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. The error preserves the attempted path and points to `gortex repos` to list tracked repositories. Reconnect MCP with its working directory inside the intended repository, or track the current directory if it is a new repository. Tool-level `path` or `repo` arguments do not change this session admission check. A configured repo that warmup has not registered yet after a daemon start is not "untracked": its sessions get `repo_loading` (retryable) until it is ready, then work in place without reconnecting — see [Startup states](mcp.md#startup-states). Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
 
+## Tracking and temporary outages
+
+The daemon never untracks a repository on its own. A failed Git family inventory
+freezes availability and removal clocks. A checkout whose root and `.git` marker
+remain reachable stays ready even if a linked worktree has damaged Git metadata.
+
+An explicitly tracked checkout that is genuinely unavailable after its grace
+period keeps its catalog identity, graph and configuration entry. Its serving
+layers become unavailable. When the root returns, the daemon reconciles edits
+made during the outage and reattaches its watcher before marking it ready.
+Automatic linked worktrees can still expire when removal is confirmed.
+
+Unknown family inventories retry after 30 seconds, 2 minutes, 8 minutes, then
+every 30 minutes. A successful inventory resets this process-local backoff;
+restarting begins with the 30-second interval. Tracking intent, lifecycle clocks,
+filesystem evidence and cleanup authorization remain durable.
+
+Configuration removal requires an explicit untrack or forget, a requested
+demotion, or removal from the configuration file. Ordinary logs record each
+removal with its cause. See the [upgrade notes](upgrade-v0.64.12.md) before
+running an older build against an unfinished cleanup journal.
+
 ## Repository prefixes
 
 Each indexed root needs a unique repository prefix. The default is its directory
@@ -200,6 +222,7 @@ Environment variables:
 - `GORTEX_TRIGRAM_MAX_LIVE` — how many repos may hold a built trigram index at once (default `3`). `0` means never build one: every text search then streams over the repo's known file list, holding no index state at the cost of scan latency. Binary files are excluded from the index and from literal search regardless of these settings.
 - `GORTEX_TRIGRAM_IDLE_TTL` — how long an unused trigram index is kept before it is dropped (default `10m`, any Go duration string). A repo being actively grepped re-touches its entry on every query, so the TTL only reclaims repos that have gone quiet.
 - `GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT` — how long a macOS watcher waits at startup for FSEvents to hand back its own handshake marker, proving the stream is live and its replay has been ordered. Default `5s`; any Go duration string. Raise it if `daemon: some repositories are not being watched` appears on a very large tree or a busy machine. Exceeding it no longer stops the repo from being watched — the watcher continues in a degraded state, backed by the adaptive poller, and reports the reason.
+- `GORTEX_CONTRACT_LINKED_POLICY` — when the daemon spends CPU on contract analysis for linked git worktrees: `idle` (default), `throttled` or `eager`. Overrides `contract_analysis.linked_policy`; see [Contract analysis in linked worktrees](#contract-analysis-in-linked-worktrees).
 - `GORTEX_DAEMON_MEMRELEASE=0` — disable the post-burst heap-to-OS release. By default the daemon calls `debug.FreeOSMemory()` at allocation-burst boundaries (warmup completion, a reconcile-janitor tick that reindexed something, the close of a cold-index window, and a whole-graph analysis pass) so a burst's high-water footprint is returned to the OS promptly instead of pinning resident memory at the peak. It only ever fires at those boundaries, never on a timer.
 
 ### When a repository stops being watched
@@ -361,6 +384,67 @@ registers, not at the janitor's next pass. Held work is not dropped either — a
 reschedules onto the gate's own wake, and a ref view's build keeps its claim, so
 the selection that made it still gets a token to poll and later selections
 coalesce onto the same one.
+
+### Contract analysis in linked worktrees
+
+Contract analysis (the HTTP route, env-var and other contract layers) runs in
+the background per checkout. Each linked worktree is analyzed apart from the
+primary checkout, and those fills compete for CPU with the reads agents make in
+the same worktrees. The linked policy decides when a linked worktree's analysis
+may run:
+
+- `idle` (default): a linked worktree's job starts only once the daemon has had
+  no foreground work for the idle window (5 s): no tool call has started or
+  ended, none is in flight, and no edit is being applied. Requests still record
+  what each worktree needs, and a waiting worktree does not take a place in the
+  analysis queue; only the start waits. A fill that is running when work comes
+  back pauses, stops at its next checkpoint, and resumes from there in the next
+  idle window.
+- `throttled`: at most one linked worktree's job runs at a time, and one
+  worktree's jobs start at least the throttle interval (30 s) apart. Foreground
+  work does not matter.
+- `eager`: linked worktrees are analyzed as soon as they ask, as the primary
+  checkout is. This was the behavior before the policy existed.
+
+The policy never applies to the primary checkout, nor to a request that waits
+for fresh contract results (`contracts`, `api_impact`, `analyze kind=routes`,
+or any call that requires the contracts capability): such a request starts its
+worktree's analysis at once under every policy. The exemption lasts until the
+request's deadline, capped at 60 s; completion or cancellation does not shorten
+it. Other jobs for that worktree can start during that remaining budget. A
+strict request joining a held job reacquires the worktree's inputs before the
+job starts. An ordinary read in a worktree
+whose analysis is waiting does not block: it answers from the worktree's last
+published contract analysis, with `contract_analysis.state` `building` and
+reason `contract_analysis_pending`, or reports that there is no attachment yet.
+
+```yaml
+# the daemon's own config file
+contract_analysis:
+  linked_policy: idle            # idle | throttled | eager
+  linked_idle_window: 5s         # idle: quiet time before a linked job starts
+  linked_throttle_interval: 30s  # throttled: least time between one worktree's starts
+```
+
+The block is read once, at daemon start, from the daemon's own config file: the
+one `--config` names, else `.gortex.yaml` in the directory the daemon was
+started from, else `.gortex.yaml` in the Gortex config directory (`~/.gortex`
+by default). A `contract_analysis:` block in a tracked repository's
+`.gortex.yaml` is not read.
+
+`GORTEX_CONTRACT_LINKED_POLICY` overrides `linked_policy`. A value that does not
+parse is logged and its default is used; the daemon still starts. The daemon
+logs the policy in effect at startup (`contract analysis linked policy`).
+
+`gortex daemon status` counts what the policy did in
+`views_contract_linked_jobs_total{policy,event}`: `deferred` (a linked job held
+back, once per hold), `checkpoint_stopped` (a running fill stopped for returning
+work), `started`, and `strict_started` (a job started during a strict request's
+remaining budget). The
+`contract analysis job started` and `contract analysis job` log lines carry the
+job id, `checkout` and `trigger`; linked jobs add `policy` and `strict`. The
+start line also carries `since_gate_ms`, how long before it the policy let the
+job start, and the completion line `demand_stop`.
 
 ## CLI
 
