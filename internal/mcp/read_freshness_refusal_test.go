@@ -70,8 +70,9 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			var worker sync.WaitGroup
 			worker.Add(1)
 			t.Cleanup(func() { unblock(); worker.Wait() })
-			deadline := time.Now().Add(projectedReadBudget)
-			caller := context.WithValue(base, projectedSourceDeadlineKey{}, deadline)
+			logical,cancelLogical:=context.WithTimeout(base,time.Second);defer cancelLogical()
+            deadline := time.Now().Add(projectedReadBudget)
+			caller := context.WithValue(logical, projectedSourceDeadlineKey{}, deadline)
 			go func() {
 				defer worker.Done()
 				r, e := externalVersionRegisteredCall(s, caller, 20, "read", map[string]any{"operation": tc.operation, "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
@@ -103,6 +104,10 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			require.NoError(t, got.err)
 			t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t", fts, tc.operation, time.Until(deadline), got.result != nil && got.result.IsError)
 			requireReadFreshnessContract(t, got.result, "projection_superseded")
+            fresh:=snapshotRegisteredCall(t,s,logical,40,"read",map[string]any{"operation":tc.operation,"target":map[string]any{"file":path},"output":map[string]any{"format":"json","max_bytes":0}})
+            require.False(t,fresh.IsError,resultText(fresh))
+            require.Contains(t,resultText(fresh),"NeighborAfter")
+            require.ErrorIs(t,validateRequestProjections(old.ctx),projectionSuperseded,"a new successful RPC cannot revive the refused first selection")
 		})
 	}
 }
@@ -214,6 +219,10 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 	require.Equal(t, changed, physical)
 	t.Logf("CAUSAL_PENDING_EMPTY_SQL_VERIFIED nativeFTS=%d projection_private_expired=%t caller_live=true pool_wait=true request_pending=true actual_empty_refusal=%t", fts, !time.Now().Before(deadline), got.result != nil && got.result.IsError)
 	requireReadFreshnessContract(t, got.result, "file_view_pending")
+    fresh:=snapshotRegisteredCall(t,s,caller,40,"read",map[string]any{"operation":"editing_context","target":map[string]any{"file":path},"output":map[string]any{"format":"json","max_bytes":0}})
+    require.False(t,fresh.IsError,resultText(fresh))
+    require.Contains(t,resultText(fresh),"main.go::Target")
+    require.NoError(t,caller.Err(),"both distinct RPCs retain one outer logical budget")
 }
 
 func TestMetadataTransientContractLeavesTerminalErrorsUnmarked(t *testing.T) {
