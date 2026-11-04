@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
- "time"
+	"time"
 )
 
 type readFreshnessKey struct {
@@ -75,24 +75,24 @@ func validateReadFreshnessGroups(r report) (map[int]bool, error) {
 		}
 		fresh := 0
 		previous := float64(0)
-        firstStarted := attempts[group[0]].Started
-        var previousStarted time.Time
-        var previousDuration float64
+		firstStarted := attempts[group[0]].Started
+		var previousStarted time.Time
+		var previousDuration float64
 		for retry, index := range group {
 			a := attempts[index]
 			if *a.Retry != retry || a.DurationMS == nil || !finiteNonnegative(*a.DurationMS) || a.LogicalMS == nil || !finiteNonnegative(*a.LogicalMS) || *a.LogicalMS < previous+*a.DurationMS || *a.LogicalMS > workload.Deadline*1000 {
 				return nil, errors.New("retry sequence/cumulative cost exceeds or resets original logical budget")
 			}
-            // Serialized Started retains nanosecond wall-clock precision. A
-            // missing/backwards/overlapping clock cannot certify sequential
-            // retry work, so refuse it rather than estimate or reset cost.
-            // LogicalMS remains the producer's original monotonic elapsed time.
-            if firstStarted.IsZero() || a.Started.IsZero() || a.Started.Before(firstStarted) ||
-                retry > 0 && float64(a.Started.Sub(previousStarted))/float64(time.Millisecond) < previousDuration ||
-                *a.LogicalMS < float64(a.Started.Sub(firstStarted))/float64(time.Millisecond)+*a.DurationMS {
-                return nil, errors.New("retry timestamps omit original attempt/backoff cost or are not comparable")
-            }
-            previousStarted, previousDuration = a.Started, *a.DurationMS
+			// Serialized Started retains nanosecond wall-clock precision. A
+			// missing/backwards/overlapping clock cannot certify sequential
+			// retry work, so refuse it rather than estimate or reset cost.
+			// LogicalMS remains the producer's original monotonic elapsed time.
+			if firstStarted.IsZero() || a.Started.IsZero() || a.Started.Before(firstStarted) ||
+				retry > 0 && float64(a.Started.Sub(previousStarted))/float64(time.Millisecond) < previousDuration ||
+				*a.LogicalMS < float64(a.Started.Sub(firstStarted))/float64(time.Millisecond)+*a.DurationMS {
+				return nil, errors.New("retry timestamps omit original attempt/backoff cost or are not comparable")
+			}
+			previousStarted, previousDuration = a.Started, *a.DurationMS
 			previous = *a.LogicalMS
 			if retry == len(group)-1 {
 				if a.Outcome != "success" || a.Code == nil || *a.Code != 0 || a.Error != "" {
