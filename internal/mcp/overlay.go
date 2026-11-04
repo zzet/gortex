@@ -489,7 +489,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = mcp.NewToolResultError(freshnessErr.Error())
+				res = searchRefusalToolResult(freshnessErr)
 			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —

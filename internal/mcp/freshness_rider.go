@@ -838,6 +838,9 @@ func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, 
 			validationTool, _ = s.legacyToolName(&req)
 		}
 		if err := validateSymbolResponseProjections(ctx, validationTool); err != nil {
+			if validationTool == "search_symbols" {
+				return nil, annotateSearchRefusal(ctx, searchRefusalResponseValidation, err)
+			}
 			return nil, err
 		}
 	}
