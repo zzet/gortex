@@ -168,13 +168,56 @@ func TestRemainingRegisteredReadersKeepCurrentRangesOnCOWLoss(t *testing.T) {
 				require.EqualValues(t, 8, node["start_line"], "full symbol metadata must not return canonical old5 after losing the actual CAS")
 				require.EqualValues(t, 8, node["end_line"])
 			case "get_cfg":
-				require.True(t, candidate.result.IsError, "deferred source must refuse instead of building CFG from old ranges")
-				require.Contains(t, resultText(candidate.result), "source is pending")
+				// This checked same-version owner is current, not deferred. Its
+				// exact range must win over the independently held canonical old5.
+				require.False(t, candidate.result.IsError, resultText(candidate.result))
+				decoded := extractTextResult(t, candidate.result)
+				require.Equal(t, "main.go::Neighbor", decoded["id"])
+				require.Equal(t, "Neighbor", decoded["name"])
+				require.Equal(t, "main.go", decoded["file_path"])
+				require.EqualValues(t, 8, decoded["start_line"])
+				require.EqualValues(t, 8, decoded["end_line"])
+				blocks, ok := decoded["blocks"].([]any)
+				require.True(t, ok)
+				var statements []map[string]any
+				for _, rawBlock := range blocks {
+					block, ok := rawBlock.(map[string]any)
+					require.True(t, ok)
+					rows, ok := block["statements"].([]any)
+					require.True(t, ok)
+					for _, rawStatement := range rows {
+						statement, ok := rawStatement.(map[string]any)
+						require.True(t, ok)
+						statements = append(statements, statement)
+					}
+				}
+				require.Len(t, statements, 1)
+				require.Equal(t, "return", statements[0]["kind"])
+				require.Equal(t, "return 9", statements[0]["text"])
+				require.EqualValues(t, 8, statements[0]["start_line"])
+				require.EqualValues(t, 8, statements[0]["end_line"])
+				freshness, ok := decoded["freshness"].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, "projected", freshness["file_view"])
+				require.Equal(t, "file", freshness["freshness_scope"])
+				require.Equal(t, true, freshness["readback_exact"])
 			case "read_file":
 				require.False(t, candidate.result.IsError, resultText(candidate.result))
 				decoded := extractTextResult(t, candidate.result)
-				require.Equal(t, "pending", decoded["compression_state"])
-				require.Equal(t, string(raw), decoded["content"], "pending keep-range proof must retain actual current raw bytes")
+				// A valid current keep-range proof may compress Neighbor, but
+				// must preserve Target's actual newly acknowledged complete body.
+				require.Equal(t, "package probe\n\n"+body+"\n\nfunc Neighbor() int { return 9 }\n", string(raw))
+				expected := "package probe\n\n" + body + "\n\nfunc Neighbor() int { /* 1 lines elided */ }\n"
+				require.Equal(t, expected, decoded["content"])
+				require.EqualValues(t, len(raw), decoded["original_bytes"])
+				require.EqualValues(t, len(expected), decoded["bytes"])
+				require.Equal(t, true, decoded["bodies_elided"])
+				require.NotContains(t, decoded, "compression_state")
+				freshness, ok := decoded["freshness"].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, "projected", freshness["file_view"])
+				require.Equal(t, "file", freshness["freshness_scope"])
+				require.Equal(t, true, freshness["readback_exact"])
 			}
 		})
 	}
