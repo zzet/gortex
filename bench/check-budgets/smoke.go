@@ -16,6 +16,7 @@ import (
 )
 
 type smokeProvenance struct {
+	RetainReadSourceFailures bool `json:"retain_read_source_failures,omitempty"`
 	EditACKMode       string            `json:"edit_ack_mode,omitempty"`
 	Main              artifactSelection `json:"main_selection"`
 	MainBinary        mainArtifact      `json:"main_binary"`
@@ -118,7 +119,7 @@ func prepareSmokeProvenance(c laneConfig, workflow workflowProvenance) (smokePro
 	if candidate.Revision != c.Builds["candidate"].Revision || !sameBuildSettings(metadata, candidate) {
 		return proof, errors.New("candidate/main binary platform, pinned toolchain or build settings differ")
 	}
-	proof = smokeProvenance{Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
+	proof = smokeProvenance{RetainReadSourceFailures: c.RetainReadSourceFailures, Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
 	return proof, validateSmokeWorkflow(workflow)
 }
 
@@ -140,6 +141,11 @@ func validateSmokeJob(receipt laneReceipt, d dataset) error {
 		return err
 	}
 	proof := receipt.Smoke
+	for _, run := range d.runs {
+		if (run.data.FailureCapture != nil) != proof.RetainReadSourceFailures || !validReadSourceFailureConfig(run.data.FailureCapture) {
+			return errors.New("smoke failure-capture configuration differs from its selected bounded policy")
+		}
+	}
 	if proof.EditACKMode != "" {
 		if err := validateSmokeACKPolicy(d, proof.EditACKMode); err != nil {
 			return err

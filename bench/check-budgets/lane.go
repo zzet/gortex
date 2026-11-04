@@ -41,6 +41,7 @@ type laneBuild struct {
 }
 
 type laneConfig struct {
+	RetainReadSourceFailures bool `json:"retain_read_source_failures,omitempty"`
 	NightlySeed       *nightlyWorkloadSeed `json:"nightly_workload_seed,omitempty"`
 	EditGateSeed      string               `json:"edit_gate_seed,omitempty"`
 	Version           int                  `json:"schema_version"`
@@ -490,6 +491,9 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 	}
 	if c.Lane == "smoke" && spec.wire == "read" && c.PRSmokeDrain != "" {
 		args = append(args, "--pr-smoke-drain", c.PRSmokeDrain)
+	}
+	if c.RetainReadSourceFailures {
+		args = append(args, "--retain-read-source-failures")
 	}
 	return args
 }

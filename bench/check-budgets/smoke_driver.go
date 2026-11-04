@@ -41,6 +41,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 	out := f.String("out", "", "NEW evidence directory outside the fixture")
 	budgets := f.String("budgets", "bench/budgets.yaml", "full strict policy")
 	offer := f.Duration("offer", 20*time.Second, "version 2 PR-only offered window: 20s")
+	retainFailures := f.Bool("retain-read-source-failures", false, "opt in to bounded read.source wire failure evidence in every smoke report")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -81,6 +82,7 @@ func smokeDriverCommand(args []string, stdout, stderr io.Writer) int {
 		builds, err = admitMicroBundle(micro, workflow)
 	}
 	c := laneConfig{Version: 1, Lane: "smoke", HostClass: hostedSmokeClass, Load: pathAbsolute(*load), Manifest: filepath.Join(output, "manifest.json"), MainArtifact: mainBundle, Builds: map[string]laneBuild{"main": {Binary: filepath.Join(mainBundle, mainArtifactBinary), Revision: metadata.Revision}, "candidate": {Binary: pathAbsolute(*candidate), Revision: workflow.Revision}}, Repeats: 3, Duration: offer.String(), Deadline: "120s", PRSmokeDrain: "120s", WarmTimeout: "120m", StopTimeout: "30s", SweepDuration: "2m", SweepRepetitions: 1, started: started}
+	c.RetainReadSourceFailures = *retainFailures
 	if err == nil {
 		c.Machine, err = os.Hostname()
 	}

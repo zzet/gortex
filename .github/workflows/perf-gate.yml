@@ -110,6 +110,7 @@ jobs:
             --main-bundle "${{ runner.temp }}/perf-main" \
             --candidate-builds "${{ runner.temp }}/perf-candidate-tests" \
             --fixture "${{ runner.temp }}/perf-fixture" \
+            --retain-read-source-failures="${{ vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true' }}" \
             --offer 20s \
             --out "${{ runner.temp }}/perf-smoke-evidence"
       - name: Preserve attempted smoke reports and failures

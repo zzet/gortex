@@ -71,6 +71,15 @@ whether a host is reference or large. Linux PSS and Mac physical footprint are
 distinct fixed memory observations, compared only within the same host class
 and measurement identity. Neither silently substitutes RSS when unavailable.
 
+`smoke --retain-read-source-failures` forwards the load client's existing
+bounded failure-wire option to both builds. It defaults off. The existing PR
+workflow selects it only when `PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES=true`;
+the checker requires the selected mode and the unchanged eight-record/64-KiB
+base64 limits in every report. Capture observation work is part of measurement
+identity, so enabled and disabled reports cannot be compared. This adds no
+RPC, retry, workload step, deadline or budget allowance. Keep raw evidence out
+of PR prose; reports from private corpora must remain private.
+
 Each repeat contributes its own p95/p99/p50 or counter observation. The checker
 uses the median of at least three repeats, not a pooled percentile. A ratio row
 uses the ratio of repeated medians. Hard edit/stop maxima, zero-safety counters
