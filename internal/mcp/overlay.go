@@ -489,7 +489,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = searchRefusalToolResult(freshnessErr)
+				res = s.metadataReadError(ctx, req, freshnessErr)
 			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
@@ -510,7 +510,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = mcp.NewToolResultError(err.Error())
+				res = s.metadataReadError(ctx, req, err)
 			} else {
 				res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
 			}

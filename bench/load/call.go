@@ -66,6 +66,14 @@ func checkToolResult(data json.RawMessage) error {
 	if body.Code == "invalid_argument" {
 		code = -32602
 	}
+	if readFreshnessCode(body.Code) {
+		body.Data = copyRPCErrorData(body.Data)
+		if body.Data == nil {
+			body.Data = make(map[string]any)
+		}
+		body.Data["error_code"] = body.Code
+		body.Data["retriable"] = body.Retriable
+	}
 	return &rpcError{Code: code, Message: body.Code + ": " + body.Message, Data: body.Data, Retriable: body.Code == "repo_loading" && body.Retriable}
 }
 
@@ -101,6 +109,7 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 		return nil, nil, err
 	}
 	var attempts []Attempt
+	freshnessRetries := 0
 	for retry := 0; ; retry++ {
 		start := time.Now()
 		seed, delayNS, err := delayNightlySearch(callCtx, r.name(), role)
@@ -159,6 +168,12 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 				a.Outcome = "busy"
 			} else if retryTyped && remote != nil && remote.retryEditProbe() {
 				a.Outcome = "retryable"
+			}
+			// A fresh RPC, never internal replay or a new logical deadline. The
+			// explicit scoped contract cannot authorize writes or first-ACK probes.
+			if !retryTyped && !expired && remote.retryReadFreshness(r, args, role) && freshnessRetries < readFreshnessRetryLimit {
+				a.Outcome = "retryable"
+				freshnessRetries++
 			}
 			if _, expected := err.(*editProbeExpectedAbsence); expected {
 				a.Outcome = "expected_refusal"

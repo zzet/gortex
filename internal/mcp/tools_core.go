@@ -2809,7 +2809,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		if errors.Is(err, errProjectedSourceMoved) {
 			return nil, err
 		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return s.metadataReadError(ctx, req, err), nil
 	}
 
 	// GCX emits an adjacent-edge count; other formats retain the full rows.
