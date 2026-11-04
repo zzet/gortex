@@ -27,7 +27,7 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 		Retriable bool           `json:"retriable"`
 		Data      map[string]any `json:"data"`
 	}
-	require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body), "typed transient refusal must survive actual MCP result encoding")
+	require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body), "typed transient refusal must survive actual MCP result encoding: %s", resultText(result))
 	require.Equal(t, code, body.Code)
 	require.True(t, body.Retriable)
 	require.Equal(t, "read_only", body.Data["retry_scope"])
@@ -108,7 +108,7 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			fresh := snapshotRegisteredCall(t, s, logical, 40, "read", map[string]any{"operation": tc.operation, "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
 			require.False(t, fresh.IsError, resultText(fresh))
 			require.Contains(t, resultText(fresh), "NeighborAfter")
-			require.ErrorIs(t, validateRequestProjections(old.ctx), projectionSuperseded, "a new successful RPC cannot revive the refused first selection")
+			require.ErrorIs(t, validateRequestProjections(context.WithoutCancel(old.ctx)), projectionSuperseded, "old ownership stays invalid independently of completed RPC cancellation")
 		})
 	}
 }
