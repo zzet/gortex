@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -57,8 +58,83 @@ func (s *Store) FindFoldedNameCandidatesContext(ctx context.Context, needle stri
 	return out, more, nil
 }
 
+// foldedNameLiteralGlob uses case classes instead of SQL lower/LIKE. GLOB is
+// independent of case_sensitive_like; user metacharacters are always literal.
+// Unsafe needles and expanded patterns beyond SQLite's existing pattern limit
+// fall back to the original unfiltered scan, never a new refusal or SQL cap.
+func foldedNameLiteralGlob(needle string) (string, bool) {
+	folded := strings.ToLower(needle)
+	if len(folded) > sqliteLikePatternLimit-2 {
+		return "", false
+	}
+	var pattern strings.Builder
+	pattern.Grow(min(4*len(folded)+2, sqliteLikePatternLimit))
+	_ = pattern.WriteByte('*')
+	for i := range len(folded) {
+		c := folded[i]
+		if c < 0x20 || c > 0x7e {
+			return "", false
+		}
+		width := 1
+		if c >= 'a' && c <= 'z' {
+			width = 4
+		} else if c == '*' || c == '?' || c == '[' || c == ']' {
+			width = 3
+		}
+		if pattern.Len()+width+1 > sqliteLikePatternLimit {
+			return "", false
+		}
+		switch {
+		case c >= 'a' && c <= 'z':
+			_ = pattern.WriteByte('[')
+			_ = pattern.WriteByte(c)
+			_ = pattern.WriteByte(c - ('a' - 'A'))
+			_ = pattern.WriteByte(']')
+		case c == '*':
+			_, _ = pattern.WriteString("[*]")
+		case c == '?':
+			_, _ = pattern.WriteString("[?]")
+		case c == '[':
+			_, _ = pattern.WriteString("[[]")
+		case c == ']':
+			_, _ = pattern.WriteString("[]]")
+		default:
+			_ = pattern.WriteByte(c)
+		}
+	}
+	_ = pattern.WriteByte('*')
+	return pattern.String(), true
+}
+
+// foldedNameCandidatesSQL deliberately has no visit order: the bounded Go
+// set supplies the authoritative total head order and overflow bit. Let the
+// planner use an existing covering index, or fall back if it is absent.
+func foldedNameCandidatesSQL(generation int64, needle string) (string, []any) {
+	query := `SELECT ` + nameCandidateCols + ` FROM nodes WHERE view_gen = ?`
+	args := []any{generation}
+	// A nonempty Go-lower needle cannot match an empty TEXT name. This
+	// explicit predicate makes the existing partial covering index eligible.
+	// Empty internal needles retain the old full population.
+	if needle != "" {
+		query += ` AND name <> ''`
+	}
+	if pattern, usable := foldedNameLiteralGlob(needle); usable {
+		// Only printable ASCII TEXT can be excluded here. Unicode, NUL,
+		// malformed bytes and legacy storage types still reach Go matching.
+		query += ` AND (
+			typeof(name) <> 'text'
+			OR name GLOB ?
+			OR length(CAST(name AS BLOB)) <> length(name)
+			OR name GLOB '*[^ -~]*'
+		)`
+		args = append(args, pattern)
+	}
+	return query, args
+}
+
 func selectFoldedNameCandidates(ctx context.Context, tx *sql.Tx, generation int64, needle string, limit int, filter graph.NameSearchFilter) ([]graph.NodeSearchKey, bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT `+nameCandidateCols+` FROM nodes WHERE view_gen = ? ORDER BY id`, generation)
+	query, args := foldedNameCandidatesSQL(generation, needle)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}
