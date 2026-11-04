@@ -328,6 +328,7 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"FileMtimeWriter", capOf[graph.FileMtimeWriter]},
 		{"FileNodeIdentitySequencer", capOf[graph.FileNodeIdentitySequencer]},
 		{"FileReceiptPager", capOf[graph.FileReceiptPager]},
+		{"FTSEngine", capOf[graph.FTSEngine]},
 		{"FnValuePlaceholderScanner", capOf[graph.FnValuePlaceholderScanner]},
 		{"FrameworkCensusEdgeSequencer", capOf[graph.FrameworkCensusEdgeSequencer]},
 		{"GoMethodReceiverBatchRebinder", capOf[graph.GoMethodReceiverBatchRebinder]},
