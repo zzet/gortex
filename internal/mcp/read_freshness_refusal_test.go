@@ -5,6 +5,7 @@ import (
  "context"
  "crypto/sha256"
  "encoding/json"
+ "encoding/hex"
  "errors"
  "os"
  "runtime"
@@ -34,7 +35,7 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
  for _,tc:=range []struct{legacy,operation string}{{"get_file_summary","summary"},{"get_editing_context","editing_context"}} {t.Run(tc.operation,func(t *testing.T){
   s,backend,base,path,_:=snapshotFacadeFixture(t)
-  idx,_:=s.indexerForRel("main.go");s.engine.SetSearchProvider(idx.Search)
+  idx,_:=s.indexerForRel("main.go");require.NotNil(t,idx.Search);s.engine.SetSearchProvider(idx.Search)
   fts,err:=backend.SymbolFTSCount();require.NoError(t,err);require.Positive(t,fts)
   leaf,ok:=s.facades.legacy(tc.legacy);require.True(t,ok)
   type selected struct {ctx context.Context; result *mcplib.CallToolResult; err error}
@@ -60,14 +61,14 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
  })}
 }
 
-func fmtReadSHA(raw []byte) string {sum:=sha256.Sum256(raw);const digits="0123456789abcdef";encoded:=make([]byte,len(sum)*2);for i,b:=range sum{encoded[i*2]=digits[b>>4];encoded[i*2+1]=digits[b&15]};return string(encoded)}
+func fmtReadSHA(raw []byte) string {sum:=sha256.Sum256(raw);return hex.EncodeToString(sum[:])}
 
 // Real SQL admission exhausts the original150ms projection allowance and the
 // separate existing30ms file section. The caller remains live, bytes stay exact,
 // and no current projection rows exist to authorize a successful metadata answer.
 func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
  s,backend,base,path,original:=snapshotFacadeFixture(t)
- idx,_:=s.indexerForRel("main.go");s.engine.SetSearchProvider(idx.Search)
+ idx,_:=s.indexerForRel("main.go");require.NotNil(t,idx.Search);s.engine.SetSearchProvider(idx.Search)
  fts,err:=backend.SymbolFTSCount();require.NoError(t,err);require.Positive(t,fts)
  raw,err:=os.ReadFile(path);require.NoError(t,err)
  changed:=bytes.Replace(raw,[]byte("return 2"),[]byte("return 3"),1);require.NotEqual(t,raw,changed);require.NoError(t,os.WriteFile(path,changed,0600))
