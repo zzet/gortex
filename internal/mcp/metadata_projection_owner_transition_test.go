@@ -92,9 +92,12 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 				peer = preselectionRegisteredCall(t, s, ctx, 30, "get_symbol_source", map[string]any{"id": "main.go::Target", "context_lines": 0, "compress_bodies": false, "format": "json"})
 				successor = liveEntry(pendingFileProjections, path)
 				originalErr = build.Err()
-				deadline, ok := build.Deadline()
+				deadline, ok := build.Value(projectedSourceDeadlineKey{}).(time.Time)
 				require.True(t, ok)
 				remaining = time.Until(deadline)
+				// A second independently checked reader may win again before
+				// the next initial selection. Never arm during the peer call.
+				watcher.armed.Store(callbacks < 2)
 			}
 			s.SetWatcher(watcher)
 			watcher.armed.Store(true)
@@ -106,7 +109,8 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 			require.True(t, s.IsToolEnabledForSession(ctx, tool))
 			s.EnsureToolPromotedForSession(ctx, tool)
 			result, callErr := externalVersionRegisteredCall(s, WithAuthorizedToolCall(ctx, tool), 20, tool, args)
-			require.Equal(t, 1, callbacks)
+			require.GreaterOrEqual(t, callbacks, 1)
+			require.LessOrEqual(t, callbacks, 2)
 			require.NotNil(t, admitted)
 			require.NotSame(t, original, admitted)
 			require.NotSame(t, admitted, successor)
@@ -124,7 +128,7 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 			require.Equal(t, physicalHash, sha256.Sum256(after))
 			require.Equal(t, 5, backend.GetNode("main.go::Neighbor").StartLine)
 			require.ErrorIs(t, validateRequestProjections(oldFacts), projectionSuperseded)
-			t.Logf("CAUSAL_PREMISES_VERIFIED tool=%s FTS=%d original_remaining=%s call_error=%v result=%v", tool, fts, remaining, callErr, result)
+			t.Logf("CAUSAL_PREMISES_VERIFIED tool=%s FTS=%d checked_replacements=%d original_remaining=%s call_error=%v result=%v", tool, fts, callbacks, remaining, callErr, result)
 			require.NoError(t, callErr)
 			require.NotNil(t, result)
 			require.False(t, result.IsError, resultText(result))
