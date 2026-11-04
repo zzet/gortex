@@ -172,36 +172,6 @@ func (r *pendingTextRoot) walk(ctx context.Context, relative string, expected []
 	return nil, nil, false, errPhysicalFileMoved
 }
 
-// mutationKey shares only the already bound absolute prefix. The grouped
-// descriptor walk proves every parent is a real directory; the leaf is never
-// followed, matching MutationKey's writer policy. Alias/missing-parent cases
-// retain the original resolver. All keys remain provisional until close.
-func (r *pendingTextRoot) mutationKey(ctx context.Context, relative string) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	relative = filepath.Clean(filepath.FromSlash(relative))
-	if !filepath.IsLocal(relative) || relative == "." {
-		return "", fmt.Errorf("pending text path is not a local file")
-	}
-	absolute := filepath.Join(r.root, relative)
-	if !r.grouped {
-		return pathkey.MutationKey(absolute), ctx.Err()
-	}
-	_, _, _, err := r.walk(ctx, relative, nil)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	// walkGrouped retains every non-symlink parent before visiting the leaf,
-	// including a missing or symlink leaf. A short stack means a parent alias
-	// or absent suffix still needs the established canonicalization behavior.
-	parents := strings.Count(relative, string(filepath.Separator))
-	if len(r.directories) == parents {
-		return pathkey.IdentityKey(filepath.Join(r.canonical, relative)), ctx.Err()
-	}
-	return pathkey.MutationKey(absolute), ctx.Err()
-}
-
 func (r *pendingTextRoot) read(ctx context.Context, relative string, afterRead func(), maxBytes int64, scratch []byte) (raw []byte, evidence physicalReadEvidence, err error) {
 	defer func() {
 		if r.grouped && err != nil && !errors.Is(err, os.ErrNotExist) {
