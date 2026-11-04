@@ -28,3 +28,18 @@ func TestReadOnlySearchSeedUsesExistingMeasuredCallAndDrain(t *testing.T) {
  var raw map[string]any; if err := json.Unmarshal(data, &raw); err != nil { t.Fatal(err) }
  if _, ok := raw["nightly_workload_seed"]; ok { t.Fatal("ordinary wire/report shape changed") }
 }
+
+func TestReadOnlySearchSeedRejectsForeignTopologyAndDeadline(t *testing.T) {
+ base:=runOptions{NightlySeed:"search-delay-read16-v1",Scenario:"read",Agents:16,Host:"native",Profile:"agent",Duration:20*time.Second,Deadline:120*time.Second,PRSmokeDrain:120*time.Second,PRSmokeDrainVersion:1}
+ for name,change:=range map[string]func(*runOptions){
+  "editor":func(o *runOptions){o.Editors=1},
+  "other_readers":func(o *runOptions){o.Agents=8},
+  "edit_protocol":func(o *runOptions){o.PRSmokeDrainVersion=2},
+  "worktree":func(o *runOptions){o.Worktrees=1},
+  "wrong_kind":func(o *runOptions){o.NightlySeed="search-delay-v1"},
+ } {t.Run(name,func(t *testing.T){o:=base;change(&o);if validateNightlyWorkloadSeed(o)==nil{t.Fatal("foreign read-only seed admitted")}})}
+ caller:=&nightlySeedCaller{}
+ ctx,cancel:=context.WithTimeout(context.WithValue(t.Context(),nightlySeedKey{},"search-delay-read16-v1"),5*time.Millisecond);defer cancel()
+ _,rows,err:=callTool(ctx,caller,request{Tool:"search",Operation:"symbols"},nil,"workload",0,0,0,time.Second,waitContext)
+ if err==nil || caller.calls!=0 || len(rows)!=1 || rows[0].Outcome!="phase_censored" {t.Fatalf("cancelled delay dispatched or lost censoring: %+v %v",rows,err)}
+}

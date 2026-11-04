@@ -51,3 +51,38 @@ func readonlySeedInputFiles(t *testing.T, mainMS, offMS, onMS float64) (string,s
  }
  return makeInputs(false),makeInputs(true)
 }
+
+func TestReadOnlySeedRoutesWithoutShrinkingExistingMatrix(t *testing.T) {
+ data,err:=os.ReadFile("../budgets.yaml");if err!=nil{t.Fatal(err)}
+ p,err:=loadPolicy(data);if err!=nil{t.Fatal(err)}
+ c:=fixtureLaneConfig();c.Lane="nightly";c.HostClass="reference_linux"
+ plain,err:=makeLanePlan(p,c);if err!=nil{t.Fatal(err)}
+ c.NightlySeed=&nightlyWorkloadSeed{Version:1,Kind:"search-delay-read16-v1",CandidateRevision:c.Builds["candidate"].Revision}
+ seeded,err:=makeLanePlan(p,c);if err!=nil{t.Fatal(err)}
+ if len(plain.Tasks)!=len(seeded.Tasks) || plain.PolicySHA256!=seeded.PolicySHA256 {t.Fatal("read-only seed changed full matrix or release policy")}
+ for i,task:=range seeded.Tasks {
+  a,_:=json.Marshal(plain.Tasks[i]);b,_:=json.Marshal(task);if !bytes.Equal(a,b) {t.Fatal("seed changed workload/task identity")}
+  args:=strings.Join(taskArgs(c,task,"manifest","scratch","report")," ")
+  if strings.Contains(args,"--nightly-workload-seed")!=(task.Role=="candidate" && task.Scenario=="load-16") {t.Fatalf("seed escaped read16: %+v",task)}
+ }
+}
+
+func TestReadOnlySeedCheckerRejectsMissingOrIncomparableEvidence(t *testing.T) {
+ for _,kind:=range []string{"missing_repeat","wrong_scenario","no_seed_echo","changed_deadline","reused_identity"} {t.Run(kind,func(t *testing.T){
+  off,on:=readonlySeedInputFiles(t,1100,1100,2200)
+  data,err:=os.ReadFile(on);if err!=nil{t.Fatal(err)}
+  var c inputs;if err:=json.Unmarshal(data,&c);err!=nil{t.Fatal(err)}
+  switch kind {
+  case "missing_repeat":c.Runs=c.Runs[:2]
+  case "wrong_scenario":c.Runs[0].Scenario="load-8"
+  default:
+   path:=c.Runs[0].Report;data,err:=os.ReadFile(path);if err!=nil{t.Fatal(err)}
+   var r map[string]any;if err:=json.Unmarshal(data,&r);err!=nil{t.Fatal(err)}
+   switch kind {case "no_seed_echo":delete(r,"nightly_workload_seed");case "changed_deadline":r["workload"].(map[string]any)["product_deadline_seconds"]=121;case "reused_identity":r["run_id"]="off-candidate-1"}
+   data,err=json.Marshal(r);if err!=nil{t.Fatal(err)};if err:=os.WriteFile(path,data,0600);err!=nil{t.Fatal(err)}
+  }
+  data,err=json.Marshal(c);if err!=nil{t.Fatal(err)};if err:=os.WriteFile(on,data,0600);err!=nil{t.Fatal(err)}
+  var out,diagnostics bytes.Buffer
+  if code:=run([]string{"seed-search","--off-inputs",off,"--on-inputs",on,"--host-class","reference_linux"},&out,&diagnostics);code!=2 {t.Fatalf("unproved evidence became numerical breach/pass: %d %s %s",code,&out,&diagnostics)}
+ })}
+}
