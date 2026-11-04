@@ -86,7 +86,7 @@ func TestSmokeCaptureAttestationMatchesAllActualReports(t *testing.T) {
 					t.Fatal(err)
 				}
 				delete(raw, "read_source_failure_capture")
-				if mutation != "off" && !(mutation == "missing" && i == 0) {
+				if mutation != "off" && (mutation != "missing" || i != 0) {
 					cap := map[string]any{"max_records": 8, "max_combined_wire_bytes": 65536, "encoding": "base64"}
 					if i == 0 {
 						switch mutation {
