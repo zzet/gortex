@@ -3,6 +3,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,15 +15,19 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 const projectionLatencyPendingComment = "\n// pending search comparison fixture\n"
 
 const projectionLatencySelectionPolicy = "directory-round-robin/path-order/actual-charge-feasibility-v1"
+
+const projectionLatencyNativeMembershipEncoding = "UTF-8 sorted IDs joined by LF with terminal LF"
 
 type projectionLatencyPopulationManifest struct {
 	Revision       string                       `json:"revision"`
@@ -34,6 +39,8 @@ type projectionLatencyPopulationManifest struct {
 	ChargedBytes   int64                        `json:"charged_bytes"`
 	IndexedFiles   int                          `json:"indexed_files"`
 	NativeSymbols  int                          `json:"native_symbols"`
+	NativeSymbolsSHA256 string `json:"native_symbols_sha256"`
+	NativeSymbolsEncoding string `json:"native_symbols_encoding"`
 	EligibleCount  int                          `json:"eligible_count"`
 	SelectedNodes  int                          `json:"selected_nodes"`
 	SelectedEdges  int                          `json:"selected_edges"`
@@ -51,6 +58,10 @@ func validateProjectionLatencyPopulationManifest(manifest projectionLatencyPopul
 	}
 	if manifest.IndexedFiles <= 0 || manifest.NativeSymbols <= 0 || manifest.EligibleCount < count {
 		return fmt.Errorf("actual native corpus/eligible population unavailable")
+	}
+	digest, err := hex.DecodeString(manifest.NativeSymbolsSHA256)
+	if err != nil || len(digest) != sha256.Size || manifest.NativeSymbolsEncoding != projectionLatencyNativeMembershipEncoding {
+		return fmt.Errorf("exact native symbol membership digest/domain unavailable")
 	}
 	if !manifest.InputsVerified {
 		return fmt.Errorf("source literal and covered/uncovered query witnesses are unverified")
@@ -74,6 +85,48 @@ func validateProjectionLatencyPopulationManifest(manifest projectionLatencyPopul
 	}
 	if charged != manifest.ChargedBytes || nodes != manifest.SelectedNodes || edges != manifest.SelectedEdges || functions != manifest.SelectedFuncs {
 		return fmt.Errorf("population charge/definition census differs")
+	}
+	return nil
+}
+
+// This setup-only census uses the same generation ownership rows as
+// SymbolFTSCount. It runs after Index returns and before pending publication,
+// warmup or timing; a token count or graph-node approximation cannot replace it.
+func projectionLatencyNativeMembership(ctx context.Context, store *store_sqlite.Store, count int) (string, error) {
+	ids := make([]string, 0, count)
+	seen := make(map[string]bool, count)
+	var cursor int64
+	for {
+		rows, next, err := store.SymbolFTSGenerationRows(ctx, store.ViewGeneration(), "", cursor, 2048)
+		if err != nil {
+			return "", err
+		}
+		for _, row := range rows {
+			if row.NodeID == "" || !utf8.ValidString(row.NodeID) || strings.ContainsRune(row.NodeID, '\n') || seen[row.NodeID] {
+				return "", fmt.Errorf("invalid or duplicate native symbol ownership ID")
+			}
+			seen[row.NodeID] = true
+			ids = append(ids, row.NodeID)
+		}
+		if next == 0 {
+			break
+		}
+		if next <= cursor {
+			return "", fmt.Errorf("native symbol membership cursor did not advance")
+		}
+		cursor = next
+	}
+	if count <= 0 || len(ids) != count {
+		return "", fmt.Errorf("native symbol membership has %d IDs, expected %d", len(ids), count)
+	}
+	sort.Strings(ids)
+	digest := sha256.Sum256([]byte(strings.Join(ids, "\n") + "\n"))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func validateProjectionLatencyNativeCensus(manifest projectionLatencyPopulationManifest, files, count int, digest string) error {
+	if files != manifest.IndexedFiles || count != manifest.NativeSymbols || digest != manifest.NativeSymbolsSHA256 {
+		return fmt.Errorf("native population differs: files=%d symbols=%d sha256=%s", files, count, digest)
 	}
 	return nil
 }
@@ -104,7 +157,7 @@ func writeProjectionLatencySetup(t *testing.T, fixture *projectionLatencyFixture
 	record := map[string]any{
 		"requested": requested, "admitted": len(snapshot.entries), "charged_bytes": snapshot.bytes,
 		"max_files": projectionMaxFiles, "max_bytes": projectionMaxBytes,
-		"indexed_files": fixture.files, "native_symbols": fixture.nativeSymbols, "failure": *failure,
+		"indexed_files": fixture.files, "native_symbols": fixture.nativeSymbols, "native_symbols_sha256": fixture.nativeSymbolsSHA256, "native_symbols_encoding": projectionLatencyNativeMembershipEncoding, "failure": *failure,
 	}
 	raw, err := json.MarshalIndent(record, "", "  ")
 	if err == nil {
@@ -214,7 +267,7 @@ func TestProjectionLatencyActualCorpusCapacityPreflight(t *testing.T) {
 	complete = true
 	selected, err := selectProjectionLatencyPopulation(candidates, projectionMaxFiles, projectionMaxBytes)
 	require.NoError(t, err)
-	manifest := projectionLatencyPopulationManifest{Revision: revision, Policy: projectionLatencySelectionPolicy, Requested: projectionMaxFiles, MaxFiles: projectionMaxFiles, MaxBytes: projectionMaxBytes, IndexedFiles: fixture.files, NativeSymbols: fixture.nativeSymbols, EligibleCount: len(candidates), Entries: selected}
+	manifest := projectionLatencyPopulationManifest{Revision: revision, Policy: projectionLatencySelectionPolicy, Requested: projectionMaxFiles, MaxFiles: projectionMaxFiles, MaxBytes: projectionMaxBytes, IndexedFiles: fixture.files, NativeSymbols: fixture.nativeSymbols, NativeSymbolsSHA256: fixture.nativeSymbolsSHA256, NativeSymbolsEncoding: projectionLatencyNativeMembershipEncoding, EligibleCount: len(candidates), Entries: selected}
 	failure := ""
 	defer writeProjectionLatencySetup(t, fixture, projectionMaxFiles, &failure)
 	for _, candidate := range selected {

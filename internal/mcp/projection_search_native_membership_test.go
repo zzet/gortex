@@ -3,11 +3,18 @@
 package mcp
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestProjectionLatencyNativeMembershipManifestIsRequired(t *testing.T) {
@@ -43,4 +50,39 @@ func TestProjectionLatencyNativeMembershipManifestIsRequired(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProjectionLatencyNativeMembershipUsesExactGenerationRows(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	ids := []string{"z", "é", "A"}
+	for _, id := range ids {
+		store.AddNode(&graph.Node{ID: id, Kind: graph.KindFunction, Name: id})
+		require.NoError(t, store.UpsertSymbolFTS(id, id))
+	}
+	other := store.AtGeneration(7)
+	other.AddNode(&graph.Node{ID: "foreign", Kind: graph.KindFunction, Name: "foreign"})
+	require.NoError(t, other.UpsertSymbolFTS("foreign", "foreign"))
+	count, err := store.SymbolFTSCount()
+	require.NoError(t, err)
+	require.Equal(t, 3, count)
+	digest, err := projectionLatencyNativeMembership(t.Context(), store, count)
+	require.NoError(t, err)
+	expected := sha256.Sum256([]byte("A\nz\né\n"))
+	require.Equal(t, hex.EncodeToString(expected[:]), digest, "UTF-8 IDs sorted by bytes with terminal LF, not JSON/token/other-generation rows")
+	manifest := projectionLatencyPopulationManifest{IndexedFiles: 2, NativeSymbols: count, NativeSymbolsSHA256: digest}
+	require.NoError(t, validateProjectionLatencyNativeCensus(manifest, 2, count, digest))
+	require.Error(t, validateProjectionLatencyNativeCensus(manifest, 3, count, digest))
+	require.Error(t, validateProjectionLatencyNativeCensus(manifest, 2, count+1, digest))
+	require.Error(t, validateProjectionLatencyNativeCensus(manifest, 2, count, strings.Repeat("a", 64)), "same count does not credit changed membership")
+	_, err = projectionLatencyNativeMembership(t.Context(), store, count+1)
+	require.Error(t, err, "enumerated ownership count must match scalar")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = projectionLatencyNativeMembership(ctx, store, count)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, store.Close())
+	_, err = projectionLatencyNativeMembership(t.Context(), store, count)
+	require.Error(t, err, "a failed census cannot become a digest")
 }
