@@ -23,6 +23,15 @@ import (
 // before the metadata handler retains its first selection. No response has
 // been assembled, and this must not authorize reuse of any caller's old facts.
 func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
+	runRegisteredMetadataOwnerTransition(t, false)
+}
+
+func TestRegisteredMetadataSelectsCheckedOwnerDuringPhysicalCheck(t *testing.T) {
+	runRegisteredMetadataOwnerTransition(t, true)
+}
+
+func runRegisteredMetadataOwnerTransition(t *testing.T, duringPhysicalCheck bool) {
+	t.Helper()
 	for _, tool := range []string{"get_symbol", "get_editing_context"} {
 		t.Run(tool, func(t *testing.T) {
 			selectedProjectionRegistry(t)
@@ -84,7 +93,7 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 			var remaining time.Duration
 			callbacks := 0
 			watcher := &searchBindAdmissionWatcher{mutationTestWatcher: mutationTestWatcher{done: pending}}
-			watcher.observe = func(build context.Context, admittedPath string) {
+			observe := func(build context.Context, admittedPath string) {
 				callbacks++
 				require.Equal(t, path, admittedPath)
 				admitted = liveEntry(pendingFileProjections, path)
@@ -97,10 +106,22 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 				remaining = time.Until(deadline)
 				// A second independently checked reader may win again before
 				// the next initial selection. Never arm during the peer call.
-				watcher.armed.Store(callbacks < 2)
+				if !duringPhysicalCheck {
+					watcher.armed.Store(callbacks < 2)
+				}
 			}
-			s.SetWatcher(watcher)
-			watcher.armed.Store(true)
+			if duringPhysicalCheck {
+				observeRegisteredCheckedRead(s, tool, func(build context.Context, expected *projectionEntry) {
+					if callbacks < 2 {
+						require.Same(t, liveEntry(pendingFileProjections, path), expected)
+						observe(build, path)
+					}
+				})
+			} else {
+				watcher.observe = observe
+				s.SetWatcher(watcher)
+				watcher.armed.Store(true)
+			}
 			pendingFileProjections.markSuspect(path)
 			args := map[string]any{"path": "main.go", "format": "json"}
 			if tool == "get_symbol" {
@@ -112,7 +133,9 @@ func TestRegisteredMetadataSelectsCheckedOwnerBeforeRetain(t *testing.T) {
 			require.GreaterOrEqual(t, callbacks, 1)
 			require.LessOrEqual(t, callbacks, 2)
 			require.NotNil(t, admitted)
-			require.NotSame(t, original, admitted)
+			if !duringPhysicalCheck {
+				require.NotSame(t, original, admitted)
+			}
 			require.NotSame(t, admitted, successor)
 			require.Same(t, original.layer, successor.layer)
 			require.Equal(t, original.sourceCommitSeq, successor.sourceCommitSeq)
