@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -105,11 +106,19 @@ func TestSearchRefusalEvidenceKeepsDefaultErrorAndBoundedScalars(t *testing.T) {
 	for _, flag := range []string{"", "0", "true"} {
 		t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", flag)
 		require.True(t, annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, cause) == cause)
-		require.Zero(t, testing.AllocsPerRun(100, func() {
+		// Windows Getenv allocates for its UTF-16 conversion. Annotation
+		// must add no allocation beyond the same platform environment lookup.
+		lookupAllocs := testing.AllocsPerRun(100, func() {
+			if os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") != flag {
+				panic("refusal evidence environment changed")
+			}
+		})
+		annotationAllocs := testing.AllocsPerRun(100, func() {
 			if annotateSearchRefusal(context.Background(), searchRefusalBindRefresh, cause) != cause {
 				panic("default refusal identity changed")
 			}
-		}), "disabled annotation adds no allocation; its environment lookup remains refusal-only")
+		})
+		require.Equal(t, lookupAllocs, annotationAllocs, "disabled annotation adds no allocation beyond its refusal-only environment lookup (flag=%q)", flag)
 		result := searchRefusalToolResult(cause)
 		require.Nil(t, result.Meta)
 	}

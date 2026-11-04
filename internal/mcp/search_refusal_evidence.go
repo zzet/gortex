@@ -56,8 +56,9 @@ func (e *searchRefusalDiagnostic) Unwrap() error { return e.cause }
 // GORTEX_SEARCH_REFUSAL_EVIDENCE=1 opts into two fixed scalar fields on an
 // existing typed search refusal. The existing RPC/raw spool retains them;
 // no query, path, payload, extra RPC or retained recorder state is added.
-// Disabled annotation returns the original error without allocation. The
-// environment lookup is on this refusal path only, never successful search.
+// Disabled annotation returns the original error without allocating diagnostic
+// state. The platform's environment lookup is on this refusal path only, never
+// successful search.
 func annotateSearchRefusal(ctx context.Context, stage searchRefusalStage, err error) error {
 	if !errors.Is(err, projectionSuperseded) || stage.label() == "" || os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") != "1" {
 		return err
