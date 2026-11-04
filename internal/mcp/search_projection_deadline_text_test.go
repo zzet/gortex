@@ -26,7 +26,7 @@ func TestPendingTextSearchReadsExactDiskAfterProjectionBuildDeadline(t *testing.
 	t.Setenv("GORTEX_PROJECTION", "1")
 	selectedProjectionRegistry(t)
 	extractor := &pendingBudgetExtractor{
-		base: languages.NewGoExtractor(),
+		base:    languages.NewGoExtractor(),
 		entered: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{}),
 	}
 	registry := parser.NewRegistry()
@@ -89,7 +89,7 @@ func TestPendingTextSearchReadsExactDiskAfterProjectionBuildDeadline(t *testing.
 	})
 	extractor.hold.Store(true)
 	request := mcpgo.CallToolRequest{Params: mcpgo.CallToolParams{
-		Name: "edit_file",
+		Name:      "edit_file",
 		Arguments: map[string]any{"path": path, "old_string": oldName, "new_string": newName, "format": "json"},
 	}}
 	go func() {
