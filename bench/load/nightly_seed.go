@@ -19,7 +19,9 @@ func validateNightlyWorkloadSeed(o runOptions) error {
 	}
 	if o.PRSmokeDrain != 0 {
 		version := 2
-		if read { version = 1 }
+		if read {
+			version = 1
+		}
 		if prSmokeDrainVersion(o) != version {
 			return errors.New("nightly search seed drain differs from its read/edit protocol")
 		}

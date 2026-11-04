@@ -64,6 +64,8 @@ func validateNightlySeedReport(c inputs, input runInput, r report) error {
 }
 
 func (s *nightlyWorkloadSeed) scenario() string {
- if s.Kind == "search-delay-read16-v1" { return "load-16" }
- return "loadedit-4"
+	if s.Kind == "search-delay-read16-v1" {
+		return "load-16"
+	}
+	return "loadedit-4"
 }
