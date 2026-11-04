@@ -27,8 +27,9 @@ func (s *Store) ScanNodeSearchKeys(ctx context.Context, pageSize int, yield func
 	}
 
 	// Freeze the upper boundary so inserts with larger IDs cannot extend an
-	// in-progress scan indefinitely. The query layer compares MutationRevision
-	// around scan + hydration and retries once when any committed mutation races.
+	// in-progress scan indefinitely. This paged stream is not a cross-page
+	// snapshot; cache revision equality cannot certify its completeness.
+	// FindFoldedNameCandidatesContext keeps selection and hydration in one view.
 	var highWater string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id FROM nodes WHERE view_gen = ? ORDER BY id DESC LIMIT 1`, s.viewGen).Scan(&highWater)
