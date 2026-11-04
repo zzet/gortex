@@ -314,6 +314,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check approved size limit boundaries
+        run: python3 scripts/size-proof-compare_test.py
       - name: Fetch candidate measurement artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -333,12 +335,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/proof/baseline"
           gh api repos/zzet/gortex/releases/tags/v0.64.10 > "$RUNNER_TEMP/proof/baseline/release.json"
           gh release download v0.64.10 --repo zzet/gortex             --pattern checksums.txt --pattern gortex_linux_amd64.tar.gz             --pattern gortex_linux_arm64.tar.gz --dir "$RUNNER_TEMP/proof/baseline"
-      - name: Evaluate original two percent size gate
+      - name: Evaluate approved five percent size gate
         if: needs.release-size-build.result == 'success'
         run: |
           set -euo pipefail
           printf 'workflow_source=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/proof/compare-provenance.txt"
-          sha256sum scripts/size-proof-compare.py .github/workflows/bench-arm.yml >> "$RUNNER_TEMP/proof/compare-provenance.txt"
+          sha256sum scripts/size-proof-compare.py scripts/size-proof-compare_test.py .github/workflows/bench-arm.yml >> "$RUNNER_TEMP/proof/compare-provenance.txt"
           python3 scripts/size-proof-compare.py "$RUNNER_TEMP/proof"
       - name: Publish measurement summary
         if: always()

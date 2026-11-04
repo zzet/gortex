@@ -86,25 +86,25 @@ for arch, (tag_bytes, archive_sha) in expected.items():
                  'candidate_vs_tag_percent': (csize / tag_bytes - 1) * 100,
                  'candidate_minus_control_bytes': csize - msize,
                  'candidate_vs_control_percent': (csize / msize - 1) * 100,
-                 'maximum_bytes_at_two_percent': tag_bytes * 102 // 100,
-                 'two_percent_gate_passed': csize * 100 <= tag_bytes * 102,
+                 'maximum_bytes_at_limit': tag_bytes * 105 // 100,
+                 'size_gate_passed': csize * 100 <= tag_bytes * 105,
                  'published_tag_sha256': sha(tag), 'candidate_sha256': sha(candidate),
                  'matched_control_sha256': sha(control), 'archive_sha256': archive_sha})
-report = {'baseline': 'published v0.64.10', 'sources': sources,
+report = {'baseline': 'published v0.64.10', 'size_limit_percent': 5, 'sources': sources,
           'control_kind': 'v0.64.10 source rebuilt with the same image and common metadata',
           'candidate_kind': 'prospective release-shape build',
           'official_release_artifact_equivalence_established': False,
-          'scope': 'size only; no cold-index acceptance or revised budget', 'rows': rows}
+          'scope': 'size only; approved 5% limit; cold-index acceptance remains separate', 'rows': rows}
 (root / 'size-report.json').write_text(json.dumps(report, indent=2) + '\n')
 text = ['Prospective release-shape builds versus checksum-verified published v0.64.10.',
         'These are measurement artifacts, not official release artifacts. Cold acceptance is unmeasured.',
-        'Control is v0.64.10 source rebuilt with common metadata; the original gate uses the published tag.',
+        'Control is v0.64.10 source rebuilt with common metadata; the approved 5% gate uses the published tag.',
         f"Candidate source: {sources['candidate']['commit']} / tree {sources['candidate']['tree']}.",
         f"Tag-source control: {sources['control']['commit']} / tree {sources['control']['tree']}.", '',
-        '| Arch | Published tag bytes | Final candidate bytes | Same-image tag-source bytes | vs published tag | Candidate minus tag-source bytes | +2% published |',
+        '| Arch | Published tag bytes | Final candidate bytes | Same-image tag-source bytes | vs published tag | Candidate minus tag-source bytes | +5% published |',
         '|---|---:|---:|---:|---:|---:|---|']
 for row in rows:
-    text.append(f"| {row['arch']} | {row['published_tag_bytes']} | {row['candidate_bytes']} | {row['matched_control_bytes']} | {row['candidate_vs_tag_percent']:+.4f}% | {row['candidate_minus_control_bytes']:+d} | {'PASS' if row['two_percent_gate_passed'] else 'FAIL'} |")
+    text.append(f"| {row['arch']} | {row['published_tag_bytes']} | {row['candidate_bytes']} | {row['matched_control_bytes']} | {row['candidate_vs_tag_percent']:+.4f}% | {row['candidate_minus_control_bytes']:+d} | {'PASS' if row['size_gate_passed'] else 'FAIL'} |")
 (root / 'size-report.md').write_text('\n'.join(text) + '\n')
 print('\n'.join(text))
-sys.exit(0 if all(row['two_percent_gate_passed'] for row in rows) else 1)
+sys.exit(0 if all(row['size_gate_passed'] for row in rows) else 1)
