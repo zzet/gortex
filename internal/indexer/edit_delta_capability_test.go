@@ -34,6 +34,7 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"graph.contextOutgoingEdgesReader": "optional cancellable base-batch accelerator for OverlaidView composition; DeltaWriter deliberately retains its composed full-metadata GetOutEdgesByNodeIDs fallback, so delta ownership and masks are not bypassed by forwarding base-only rows",
 	"graph.FoldedNameCandidateReader": "handler-only coherent candidate/payload snapshot; mutable DeltaWriter owns neither a physical read transaction nor a frozen delta layer, so the name-only handler refuses unsupported composition instead of forwarding base-only complete absence",
 	"anonymous{DBStats}":              "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
 
