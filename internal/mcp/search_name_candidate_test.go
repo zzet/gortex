@@ -21,7 +21,7 @@ func TestNameOnlySearchKeepsLiteralSubstringAndPathScope(t *testing.T) {
 		t.Run(label, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			root := t.TempDir()
-			require.NoError(t, os.WriteFile(filepath.Join(root, "selected.go"), []byte("package probe\n\nfunc AlphaNeed_leHandler() {}\nfunc AlphaNeedXleHandler() {}\nfunc HiddenBody() { _ = `AbsentLiteral` }\n"), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(root, "selected.go"), []byte("package probe\n\nfunc AlphaNeed_leHandler() {}\nfunc AlphaNeedXleHandler() {}\nfunc HiddenBody() { _ = `AbsentLiteral` }\nfunc KeyHandler() {}\n"), 0o600))
 			require.NoError(t, os.WriteFile(filepath.Join(root, "other.go"), []byte("package probe\n\nfunc OtherNeed_leHandler() {}\n"), 0o600))
 			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "names.sqlite"))
 			require.NoError(t, err)
@@ -43,6 +43,7 @@ func TestNameOnlySearchKeepsLiteralSubstringAndPathScope(t *testing.T) {
 				want              []string
 			}{
 				{"substring_case", "name:nEeD_lE", "selected.go", []string{"AlphaNeed_leHandler"}},
+				{"unicode_fold", "name:kEy", "selected.go", []string{"KeyHandler"}},
 				{"underscore_literal", "name:Need_le", "", []string{"AlphaNeed_leHandler", "OtherNeed_leHandler"}},
 				{"percent_literal", "name:Need%le", "", nil},
 				{"asterisk_literal", "name:Need*le", "", nil},

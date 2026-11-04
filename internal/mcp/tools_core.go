@@ -2101,7 +2101,24 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	requestEngine := s.engineFor(ctx)
 	var nodes []*graph.Node
 	var primaryCount int
-	if len(expandedTerms) > 0 {
+	nameOnly := q == "" && fq.Name != ""
+	nameMore := false
+	if nameOnly {
+		candidateScope := scope
+		if contractScopeBinding != nil {
+			// Required contract evidence may consult the selected reader;
+			// its full predicate stays in the existing post-filter below.
+			candidateScope.SearchNodeFilter = nil
+		}
+		nodes, nameMore, err = nameOnlySymbolCandidates(ctx, s.readerFor(ctx), fq.Name, fetchLimit, candidateScope)
+		if err != nil {
+			if errors.Is(err, projectionSuperseded) {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return nil, err
+		}
+		primaryCount = len(nodes)
+	} else if len(expandedTerms) > 0 {
 		nodes, primaryCount = fetchAndMergeBM25TimedContext(ctx, requestEngine, candidateQuery, expandedTerms, fetchLimit, scope, timings)
 	} else {
 		bm25Start := time.Now()
@@ -2122,14 +2139,14 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	// corpus filter runs, so prose competes on its own terms. The
 	// merge dedupes by node ID; ranking among the merged set is settled
 	// by the rerank pass downstream.
-	if corpus.includesDocs() {
+	if !nameOnly && corpus.includesDocs() {
 		nodes = s.mergeDocChannel(ctx, candidateQuery, nodes, fetchLimit, scope, timings)
 	}
 	// Content retrieval channel: content (data_class=content) sections live
 	// in the dedicated content index, not the symbol search, so the fetches
 	// above can't surface them — pull them from the ContentSearcher and
 	// merge before the corpus filter runs.
-	if corpus.includesContent() {
+	if !nameOnly && corpus.includesContent() {
 		nodes = s.mergeContentChannel(ctx, candidateQuery, nodes, fetchLimit)
 	}
 	if err := ctx.Err(); err != nil {
@@ -2139,6 +2156,11 @@ func (s *Server) handleSearchSymbols(ctx context.Context, req mcp.CallToolReques
 	candsAfterGather := len(nodes)
 	pageHorizon := fetchLimit
 	pageMore := len(nodes) >= fetchLimit || scope.SymbolSearchStats != nil && scope.SymbolSearchStats.TextSaturated
+	if nameOnly {
+		// Exhaustion is measured over actual literal-name candidates, not
+		// unrelated FTS token neighbors. Later filters retain this bound.
+		pageMore = nameMore
+	}
 	mergedCount := len(nodes) // pre-filter; comparable to primaryCount
 
 	allowed := resolved.RepoAllow

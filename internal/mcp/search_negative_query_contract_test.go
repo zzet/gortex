@@ -295,9 +295,18 @@ func runRegisteredNameQueryPresenceControls(t *testing.T, native bool) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	var source strings.Builder
 	source.WriteString("package probe\n\nfunc QueryFixtureRoot() int { return 0 }\n\n")
+	var corpus strings.Builder
+	corpus.WriteString("package probe\n\n")
 	for ordinal := range 1000 {
-		fmt.Fprintf(&source, "func QueryMarker%03dBefore() int { return %d }\n\n", ordinal, ordinal)
+		destination := &corpus
+		if ordinal == 14 || ordinal == 15 {
+			destination = &source
+		}
+		fmt.Fprintf(destination, "func QueryMarker%03dBefore() int { return %d }\n\n", ordinal, ordinal)
 	}
+	// The endpoint still searches all 1001 real declarations; only the file
+	// that must gain a LOCAL projection contains the two controlled edits.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "corpus.go"), []byte(corpus.String()), 0o600))
 	initialPositions := token.NewFileSet()
 	initialAST, err := parser.ParseFile(initialPositions, path, source.String(), 0)
 	require.NoError(t, err)
@@ -319,7 +328,7 @@ func runRegisteredNameQueryPresenceControls(t *testing.T, native bool) {
 	require.NotNil(t, store.GetNode(oldID), "real indexed old identity must exist before any query")
 	nativeSymbols, err := store.SymbolFTSCount()
 	require.NoError(t, err)
-	require.Positive(t, nativeSymbols, "the registered control must use the populated native SQLite symbol corpus")
+	require.Equal(t, 1001, nativeSymbols, "the registered control must keep the full real native SQLite symbol corpus")
 	engine := query.NewEngine(store)
 	if native {
 		engine.SetSearchProvider(idx.Search) // Same provider wiring as the normal daemon.
