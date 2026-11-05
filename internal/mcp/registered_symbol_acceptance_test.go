@@ -194,3 +194,39 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 		})
 	}
 }
+
+func TestFullSymbolReplayPolicyKeepsOriginalAllowanceAndUnsafeShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		safe bool
+	}{
+		{"full_json", map[string]any{"id": "main.go::Target", "detail": "full", "format": "json"}, true},
+		{"full_default_json", map[string]any{"id": "main.go::Target", "detail": "full"}, true},
+		{"brief", map[string]any{"id": "main.go::Target", "detail": "brief", "format": "json"}, false},
+		{"default_brief", map[string]any{"id": "main.go::Target", "format": "json"}, false},
+		{"toon", map[string]any{"id": "main.go::Target", "detail": "full", "format": "toon"}, false},
+		{"malformed_detail", map[string]any{"id": "main.go::Target", "detail": true, "format": "json"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Server{}
+			req := makeReq("get_symbol", tc.args)
+			require.Equal(t, tc.safe, auditedProjectionReadRetry("get_symbol", req))
+			deadline := time.Now().Add(projectedReadBudget / 2)
+			ctx := context.WithValue(t.Context(), projectedSourceDeadlineKey{}, deadline)
+			calls := 0
+			_, err := s.withProjectedSourceReadBudget(func(selected context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+				calls++
+				require.Equal(t, deadline, selected.Value(projectedSourceDeadlineKey{}), "binding never resets the caller's earlier private deadline")
+				allowance, ok := selected.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+				require.True(t, ok, "every symbol shape retains the original early-selection allowance")
+				require.True(t, allowance.claim())
+				require.True(t, allowance.claim())
+				require.False(t, allowance.claim(), "full-symbol replay cannot create a third attempt")
+				return mcplib.NewToolResultText("policy control"), nil
+			})(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, 1, calls)
+		})
+	}
+}
