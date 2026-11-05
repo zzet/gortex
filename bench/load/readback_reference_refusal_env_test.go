@@ -14,12 +14,20 @@ import (
 )
 
 func TestReadbackProtocolRefusalEnvReachesOnlyDiagnosticDaemon(t *testing.T) {
-	for _, tc := range []struct{ role, flag, want string }{
+	for _, tc := range []struct {
+		role, flag, want string
+		selected         bool
+	}{
 		{role: "protocol_preflight", flag: "1", want: "1"},
 		{role: "protocol_preflight"},
 		{role: "protocol_preflight", flag: "true"},
 		{role: "under_edit", flag: "1"},
 		{role: "no_edit", flag: "1"},
+		{role: "under_edit", flag: "1", selected: true, want: "1"},
+		{role: "no_edit", flag: "1", selected: true, want: "1"},
+		{role: "under_edit", flag: "true", selected: true},
+		{role: "under_edit", selected: true},
+		{role: "unknown", flag: "1", selected: true},
 	} {
 		t.Run(tc.role+"/"+tc.flag, func(t *testing.T) {
 			t.Setenv("LOAD_DAEMON_FIXTURE", "")
@@ -34,7 +42,7 @@ func TestReadbackProtocolRefusalEnvReachesOnlyDiagnosticDaemon(t *testing.T) {
 			originalEnv := append([]string(nil), p.Env...)
 			p.daemonEnv = append(append([]string(nil), p.Env...), "GORTEX_REFUSAL_TEST_OWNED=preserved")
 			originalOverride := append([]string(nil), p.daemonEnv...)
-			require.NoError(t, p.startReadbackReferenceDaemon(tc.role))
+			require.NoError(t, p.startReadbackReferenceDaemon(tc.role, tc.selected))
 			wait, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			select {
@@ -55,7 +63,7 @@ func TestReadbackProtocolRefusalEnvReachesOnlyDiagnosticDaemon(t *testing.T) {
 			require.NoError(t, err)
 			var observed map[string]string
 			require.NoError(t, json.Unmarshal(data, &observed))
-			t.Logf("role=%s offered_flag=%q actual_child_flag=%q reaped=true forced=false", tc.role, tc.flag, observed["evidence"])
+			t.Logf("role=%s selected=%v offered_flag=%q actual_child_flag=%q reaped=true forced=false", tc.role, tc.selected, tc.flag, observed["evidence"])
 			require.Equal(t, tc.want, observed["evidence"])
 			require.Empty(t, observed["foreign"])
 			require.Equal(t, "preserved", observed["owned"])

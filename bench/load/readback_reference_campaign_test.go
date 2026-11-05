@@ -23,6 +23,7 @@ import (
 var readbackReferencePlanPath = flag.String("readback-reference-plan", "", "explicit frozen readback plan; omission never launches a daemon")
 var readbackReferencePhase = flag.String("readback-reference-phase", "preflight", "preflight, protocol_preflight, no_edit, under_edit, compare or main_compare")
 var readbackReferenceCellIndex = flag.Int("readback-reference-cell", -1, "exact frozen cell index; no implicit next cell")
+var readbackReferenceRefusalEvidence = flag.Bool("readback-reference-refusal-evidence", false, "explicit diagnostic-only forwarding of GORTEX_SEARCH_REFUSAL_EVIDENCE=1; schedules and strict first responses unchanged")
 var readbackReferenceExecute = flag.Bool("readback-reference-execute", false, "execute one explicitly granted reference cell")
 var readbackReferenceBaselineReport = flag.String("readback-reference-baseline-report", "", "exact no-edit artifact for offline paired comparison")
 var readbackReferenceMainReport = flag.String("readback-reference-main-report", "", "existing load read-only main report")
@@ -561,6 +562,6 @@ func checkReadbackReferenceSQLite(ctx context.Context, store, prefix string, tri
 
 // This narrow diagnostic start seam initially delegates unchanged to the
 // existing lifecycle. Its opt-in forwarding is qualified separately.
-func (p *privateRun) startReadbackReferenceDaemon(_ string) error {
+func (p *privateRun) startReadbackReferenceDaemon(_ string, _ bool) error {
 	return p.start()
 }
