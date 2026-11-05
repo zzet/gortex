@@ -178,14 +178,16 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	}
 
 	runtime := collectRuntime(home, doctorDays)
+	generated := doctorGeneratedFiles()
 
 	if doctorJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(map[string]any{
-			"environment": doctorEnv,
-			"agents":      reports,
-			"runtime":     runtime,
+			"environment":     doctorEnv,
+			"agents":          reports,
+			"generated_files": generated,
+			"runtime":         runtime,
 		}); err != nil {
 			return err
 		}
@@ -193,6 +195,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	}
 	printDoctorEnvironment(cmd.OutOrStdout(), doctorEnv)
 	printDoctorHuman(cmd.OutOrStdout(), reports)
+	printDoctorGeneratedFiles(cmd.OutOrStdout(), generated)
 	printDoctorRuntime(cmd.OutOrStdout(), runtime)
 	return doctorExit(runtime)
 }

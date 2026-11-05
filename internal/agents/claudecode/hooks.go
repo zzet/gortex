@@ -363,6 +363,44 @@ func commandInvokesGortexHook(cmd string) bool {
 	return slices.Contains(fields[1:], "hook")
 }
 
+// InstalledHookMode reads back the posture `gortex install --hook-mode`
+// left in the user-level settings: the `--mode=` of the Gortex hook
+// entries, or deny when they carry none. ok is false when no Gortex hook
+// is installed there, so a caller can tell "deny" from "nothing to keep".
+// It is the only record of the posture outside the generated files.
+func InstalledHookMode(home string) (mode string, ok bool) {
+	raw, err := os.ReadFile(userSettingsPath(home))
+	if err != nil {
+		return "", false
+	}
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil {
+		return "", false
+	}
+	hooks, _ := root["hooks"].(map[string]any)
+	for _, event := range []string{"PreToolUse", "PostToolUse", "Stop", "SessionStart", "UserPromptSubmit"} {
+		groups, _ := hooks[event].([]any)
+		for _, g := range groups {
+			gm, _ := g.(map[string]any)
+			inner, _ := gm["hooks"].([]any)
+			for _, e := range inner {
+				em, _ := e.(map[string]any)
+				cmd, _ := em["command"].(string)
+				if !commandInvokesGortexHook(cmd) {
+					continue
+				}
+				for _, f := range strings.Fields(cmd) {
+					if v, found := strings.CutPrefix(f, "--mode="); found {
+						return normalizeHookMode(v), true
+					}
+				}
+				return HookModeDeny, true
+			}
+		}
+	}
+	return "", false
+}
+
 // rewriteGortexHookMode rewrites every Gortex hook entry's command
 // across all events so it matches newCommand. Used when the install
 // posture changes (deny ↔ enrich) — the existing entries already

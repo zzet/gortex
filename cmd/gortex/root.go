@@ -48,6 +48,7 @@ var rootCmd = &cobra.Command{
 		platform.MigrateToUnifiedHome(func(format string, a ...any) {
 			fmt.Fprintf(os.Stderr, format+"\n", a...)
 		})
+		refreshAgentFilesFromCLI(cmd)
 	},
 	// Runs after every subcommand (no subcommand defines its own
 	// PersistentPostRun, so cobra falls through to the root's). Records the

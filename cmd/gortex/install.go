@@ -223,6 +223,13 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 	}
 
 	opts = agents.ApplyOpts{DryRun: installDryRun, Force: installForce}
+	if !installDryRun {
+		// Hold the generated-files lock across the writes and their record,
+		// so a refresh pass that read an older copy cannot overwrite them.
+		if unlock, ok := lockAgentFiles(agentRefreshManifestPath(), true); ok {
+			defer unlock()
+		}
+	}
 	results = make([]*agents.Result, 0, len(selected))
 	prog.Stage(stageAdapters, fmt.Sprintf("%d adapter(s)", len(selected)))
 	for _, a := range selected {
@@ -247,6 +254,9 @@ func runInstall(cmd *cobra.Command, _ []string) (err error) {
 	if !installDryRun {
 		if err := ensureGlobalConfigExists(); err != nil {
 			return err
+		}
+		if err := recordAgentFiles(env); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "[gortex install] warning: could not record generated agent files: %v\n", err)
 		}
 		if err := runInstallFollowUps(cmd); err != nil {
 			return err

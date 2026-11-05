@@ -38,6 +38,7 @@ package opencode
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -131,6 +132,109 @@ func planPlugin(env agents.Env) []agents.FileAction {
 		return nil
 	}
 	return []agents.FileAction{{Path: PluginPath(env.Home), Action: agents.ActionWouldCreate}}
+}
+
+// OwnedFiles makes the bridge part of the post-upgrade refresh. The refresh
+// renders it with the running binary and the posture the installed copy
+// carries (`--mode=` in its argv, its enforce flag), so a machine set to
+// enrich stays on enrich.
+func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
+	if env.Home == "" {
+		return nil
+	}
+	return []agents.OwnedFile{{
+		Path: PluginPath(env.Home),
+		Render: func(existing []byte) (string, bool) {
+			installed, ok := parseInstalledPlugin(existing)
+			if !ok {
+				return string(existing), false
+			}
+			env.HookMode, env.InstallHooks = installed.mode, installed.enforce
+			return renderPlugin(env), shippedPluginTemplates[installed.template]
+		},
+	}}
+}
+
+// shippedPluginTemplates are the sha256 digests of every plugin/gortex.js a
+// release embedded: the OpenCode 1.x-only bridge (v0.63.4 to v0.64.5) and the
+// current one. A copy whose template is one of these is a Gortex render.
+var shippedPluginTemplates = map[string]bool{
+	"cf40086e0a15aa19c2e8b101448fec7a8af6c14b3c0ab8af17f3f64e92d19275": true,
+	agents.GeneratedHash([]byte(pluginSource)):                         true,
+}
+
+type installedPlugin struct {
+	mode     string
+	enforce  bool
+	template string // digest of the copy with its values put back as sentinels
+}
+
+// pluginValueLine matches the three templated constants, which every shipped
+// template spells on a line of their own.
+var pluginValueLine = regexp.MustCompile(`(?m)^const (GORTEX_BIN|HOOK_ARGV|ENFORCE) = (.*);$`)
+
+// parseInstalledPlugin reads the posture back out of an installed bridge and
+// reverses its substitution, so the copy can be matched to the template it
+// was rendered from whatever binary path it bakes in. The values must have
+// the exact shape renderPlugin produces: a wrapper binary with extra argv,
+// or an enforce flag that is not a JSON bool, is the user's, not ours.
+func parseInstalledPlugin(b []byte) (installedPlugin, bool) {
+	var p installedPlugin
+	var bin string
+	var argv []string
+	seen := map[string]int{}
+	bad := false
+	template := pluginValueLine.ReplaceAllStringFunc(string(b), func(line string) string {
+		m := pluginValueLine.FindStringSubmatch(line)
+		seen[m[1]]++
+		var sentinel string
+		var target any
+		switch m[1] {
+		case "GORTEX_BIN":
+			sentinel, target = sentinelBin, &bin
+		case "HOOK_ARGV":
+			sentinel, target = sentinelArgv, &argv
+		case "ENFORCE":
+			sentinel, target = sentinelEnforce, &p.enforce
+		}
+		if json.Unmarshal([]byte(m[2]), target) != nil {
+			bad = true
+		}
+		return "const " + m[1] + " = " + sentinel + ";"
+	})
+	if bad || len(seen) != 3 || seen["GORTEX_BIN"] != 1 || seen["HOOK_ARGV"] != 1 || seen["ENFORCE"] != 1 {
+		return p, false
+	}
+	p.mode = "deny"
+	switch {
+	case len(argv) == 3:
+	case len(argv) == 4 && strings.HasPrefix(argv[3], "--mode="):
+		p.mode = strings.TrimPrefix(argv[3], "--mode=")
+		if normalizeHookMode(p.mode) != p.mode || p.mode == "deny" {
+			return p, false
+		}
+	default:
+		return p, false
+	}
+	if bin == "" || argv[0] != bin || argv[1] != "hook" || argv[2] != "--agent="+Name {
+		return p, false
+	}
+	p.template = agents.GeneratedHash([]byte(template))
+	return p, true
+}
+
+// InstalledHookMode reads the posture of the installed bridge, if a Gortex
+// one is there. ok is false when there is none or it is not recognisable.
+func InstalledHookMode(home string) (mode string, ok bool) {
+	b, err := os.ReadFile(PluginPath(home))
+	if err != nil {
+		return "", false
+	}
+	p, ok := parseInstalledPlugin(b)
+	if !ok || !shippedPluginTemplates[p.template] {
+		return "", false
+	}
+	return p.mode, true
 }
 
 // resolveGortexBin prefers the binary the caller already resolved into
