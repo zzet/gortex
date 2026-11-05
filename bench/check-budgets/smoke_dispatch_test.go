@@ -244,3 +244,48 @@ func TestUnrelatedManualWorkflowKeepsOriginalProvenance(t *testing.T) {
 		})
 	}
 }
+
+func TestEditLoopSmokeDispatchDoesNotGainPerformanceSmokePins(t *testing.T) {
+	// The existing separate edit-loop workflow really has a manual job named
+	// smoke; job-name equality alone cannot identify the performance workflow.
+	data, err := os.ReadFile("../../.github/workflows/edit-loop-gate.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			If string `yaml:"if"`
+		} `yaml:"jobs"`
+	}
+	if err = yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	condition := workflow.Jobs["smoke"].If
+	if !strings.Contains(condition, "github.event_name == 'workflow_dispatch'") || !strings.Contains(condition, "inputs.lane == 'smoke'") {
+		t.Fatal("existing edit-loop same-name manual route was not established")
+	}
+	for key, value := range map[string]string{
+		"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_JOB": "smoke",
+		"GITHUB_WORKFLOW_REF": "zzet/gortex/.github/workflows/edit-loop-gate.yml@refs/heads/main", "GITHUB_WORKFLOW_SHA": strings.Repeat("c", 40),
+		"PERF_SMOKE_BASELINE_REVISION": strings.Repeat("a", 40), "PERF_SMOKE_BASELINE_ARTIFACT_ID": "456", "PERF_SMOKE_BASELINE_ARTIFACT_DIGEST": "sha256:" + strings.Repeat("b", 64), "PERF_SMOKE_CANDIDATE_REVISION": strings.Repeat("c", 40),
+	} {
+		t.Setenv(key, value)
+	}
+	observed := currentBuildWorkflow(strings.Repeat("c", 40))
+	data, err = json.Marshal(observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("ACTUAL_EDIT_LOOP_SAME_JOB_ROUTE_VERIFIED event=workflow_dispatch job=smoke workflow=edit-loop-gate.yml")
+	if strings.Contains(string(data), "smoke_dispatch") {
+		t.Fatal("the existing unrelated edit-loop smoke job gained performance-specific pins")
+	}
+	if err := validateSmokeWorkflow(observed); err == nil {
+		t.Fatal("edit-loop dispatch was admitted as performance smoke")
+	}
+	// Missing or invalid actual selected-workflow identity is not a fallback.
+	t.Setenv("GITHUB_WORKFLOW_REF", "")
+	if err := validateSmokeWorkflow(currentBuildWorkflow(strings.Repeat("c", 40))); err == nil {
+		t.Fatal("missing performance workflow identity was accepted")
+	}
+}
