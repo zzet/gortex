@@ -41,6 +41,10 @@ func dispatchSmokeFixture(t *testing.T, mutation string) (laneReceipt, dataset) 
 		pins["workflow_revision"] = strings.Repeat("d", 40)
 	case "wrong_workflow_ref":
 		pins["workflow_ref"] = "zzet/gortex/.github/workflows/other.yml@refs/heads/main"
+	case "missing_job":
+		workflow["job"] = "other"
+	case "bare_run_id":
+		workflow["run_url"] = "789"
 	case "branch_ref":
 		workflow["ref"] = "refs/heads/feature"
 	case "pr_with_dispatch_pins":
@@ -63,7 +67,7 @@ func TestManualSmokeRequiresExactTrustedRolePins(t *testing.T) {
 	if err := validateSmokeJob(receipt, d); err != nil {
 		t.Fatal(err)
 	}
-	for _, mutation := range []string{"missing_pins", "wrong_baseline", "wrong_artifact_id", "missing_artifact_digest", "wrong_artifact_digest", "wrong_candidate", "wrong_workflow_revision", "wrong_workflow_ref", "branch_ref", "pr_with_dispatch_pins", "missing_candidate_hash"} {
+	for _, mutation := range []string{"missing_pins", "wrong_baseline", "wrong_artifact_id", "missing_artifact_digest", "wrong_artifact_digest", "wrong_candidate", "wrong_workflow_revision", "wrong_workflow_ref", "branch_ref", "missing_job", "bare_run_id", "pr_with_dispatch_pins", "missing_candidate_hash"} {
 		t.Run(mutation, func(t *testing.T) {
 			receipt, d := dispatchSmokeFixture(t, mutation)
 			if err := validateSmokeJob(receipt, d); err == nil {
@@ -180,5 +184,37 @@ func TestManualSmokeWorkflowPinsKeepExistingValueComparisons(t *testing.T) {
 	}
 	if strings.Contains(string(data), "smoke_dispatch") {
 		t.Fatal("default PR provenance gained empty manual pins")
+	}
+}
+
+func TestManualSmokeCurrentWorkflowRetainsExplicitDispatchInputs(t *testing.T) {
+	receipt, _ := dispatchSmokeFixture(t, "")
+	for key, value := range map[string]string{
+		"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": receipt.Workflow.Revision,
+		"GITHUB_WORKFLOW_REF": "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main", "GITHUB_WORKFLOW_SHA": receipt.Workflow.Revision,
+		"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "zzet/gortex", "GITHUB_RUN_ID": "789", "GITHUB_JOB": "smoke", "GITHUB_RUN_ATTEMPT": "1",
+		"PERF_SMOKE_BASELINE_REVISION": receipt.Smoke.Main.Revision, "PERF_SMOKE_BASELINE_ARTIFACT_ID": "456", "PERF_SMOKE_BASELINE_ARTIFACT_DIGEST": receipt.Smoke.Main.Artifact.Digest, "PERF_SMOKE_CANDIDATE_REVISION": receipt.Workflow.Revision,
+	} {
+		t.Setenv(key, value)
+	}
+	got := currentBuildWorkflow(receipt.Workflow.Revision)
+	if got != receipt.Workflow {
+		t.Fatal("actual job environment lost explicit manual source/artifact pins")
+	}
+	if err := validateSmokeWorkflow(got); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PERF_SMOKE_BASELINE_ARTIFACT_ID", "invalid")
+	if err := validateSmokeWorkflow(currentBuildWorkflow(receipt.Workflow.Revision)); err == nil {
+		t.Fatal("invalid artifact ID became an implicit artifact selection")
+	}
+	t.Setenv("GITHUB_EVENT_NAME", "pull_request")
+	got = currentBuildWorkflow(receipt.Workflow.Revision)
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "smoke_dispatch") {
+		t.Fatal("manual environment leaked into unchanged PR provenance")
 	}
 }

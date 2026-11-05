@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Manual measurements retain their real dispatch identity. They never borrow a
@@ -27,7 +28,7 @@ func currentSmokeDispatchPins(event string) smokeDispatchPins {
 
 func validSmokeDispatchWorkflow(workflow workflowProvenance) bool {
 	pins := workflow.SmokeDispatch
-	return workflow.Ref == "refs/heads/main" && pins != (smokeDispatchPins{}) && pins.WorkflowRef == "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main" && pins.WorkflowRevision == workflow.Revision && pins.CandidateRevision == workflow.Revision && revisionPattern.MatchString(pins.BaselineRevision) && pins.BaselineArtifactID > 0 && validDigest(pins.BaselineArtifactDigest)
+	return workflow.Job == "smoke" && strings.HasPrefix(workflow.RunURL, "https://github.com/zzet/gortex/actions/runs/") && workflow.Ref == "refs/heads/main" && pins != (smokeDispatchPins{}) && pins.WorkflowRef == "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main" && pins.WorkflowRevision == workflow.Revision && pins.CandidateRevision == workflow.Revision && revisionPattern.MatchString(pins.BaselineRevision) && pins.BaselineArtifactID > 0 && validDigest(pins.BaselineArtifactDigest)
 }
 
 func validateSmokeDispatchBinding(workflow workflowProvenance, proof smokeProvenance) error {

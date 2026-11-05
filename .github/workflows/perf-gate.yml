@@ -20,7 +20,7 @@ on:
         type: string
         default: ''
       smoke_baseline_artifact_digest:
-        description: Exact baseline archive digest (sha256 plus colon and64hex)
+        description: Exact baseline archive digest (sha256 colon followed by64hex digits)
         type: string
         default: ''
       smoke_candidate_revision:
