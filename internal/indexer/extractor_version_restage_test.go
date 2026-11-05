@@ -53,6 +53,14 @@ func TestExtractorRestageParseFailureRecoveryReplacesOldExtraction(t *testing.T)
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	require.NotNil(t, store.GetNode("fixture/failed.go::OldExtraction"))
+	baselineStats := store.RepoStats()
+	baselineNodes, baselineEdges := len(store.AllNodes()), len(store.AllEdges())
+	assertCounts := func() {
+		t.Helper()
+		require.Len(t, store.AllNodes(), baselineNodes, "reconciliation must not inflate or discard nodes")
+		require.Len(t, store.AllEdges(), baselineEdges, "reconciliation must not inflate or discard edges")
+		require.Equal(t, baselineStats, store.RepoStats(), "authoritative repository aggregates must remain stable")
+	}
 	state, found, err := store.GetRepoIndexState("fixture")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -65,6 +73,7 @@ func TestExtractorRestageParseFailureRecoveryReplacesOldExtraction(t *testing.T)
 		require.Equal(t, want, result.StaleFileCount, "pass %d", pass)
 		require.Len(t, result.FailedFiles, 1)
 		require.NotNil(t, store.GetNode("fixture/failed.go::OldExtraction"))
+		assertCounts()
 	}
 	extractor.fail = false
 	result, err := idx.IncrementalReindexPaths(root, nil)
@@ -74,6 +83,7 @@ func TestExtractorRestageParseFailureRecoveryReplacesOldExtraction(t *testing.T)
 	require.Empty(t, LoadFileIndexFailures(store, "fixture"))
 	require.Nil(t, store.GetNode("fixture/failed.go::OldExtraction"))
 	require.NotNil(t, store.GetNode("fixture/failed.go::NewExtraction"))
+	assertCounts()
 }
 
 type restageFailureLedgerStore struct {
