@@ -19,7 +19,7 @@ type smokeDispatchPins struct {
 }
 
 func currentSmokeDispatchPins(event string) smokeDispatchPins {
-	if event != "workflow_dispatch" || os.Getenv("GITHUB_JOB") != "smoke" {
+	if event != "workflow_dispatch" || os.Getenv("GITHUB_JOB") != "smoke" || os.Getenv("GITHUB_WORKFLOW_REF") != "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main" {
 		return smokeDispatchPins{}
 	}
 	id, _ := strconv.ParseInt(os.Getenv("PERF_SMOKE_BASELINE_ARTIFACT_ID"), 10, 64)
