@@ -899,6 +899,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		if removed {
 			return removedProjectedSymbolGuidance(id, true), nil
 		}
+		if pending := s.pendingSourceMiss(ctx, req, id); pending != nil {
+			return pending, nil
+		}
 		return mcp.NewToolResultError("symbol not found: " + id + s.suggestSymbolIDs(ctx, id)), nil
 	}
 	// A by-id fetch must not cross the session's workspace boundary —
