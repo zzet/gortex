@@ -83,31 +83,35 @@ type Host struct {
 // Every attempt is retained, including busy refusals and phase-censored calls.
 // Workload and readiness/visibility probes have distinct Role denominators.
 type Attempt struct {
-	FailureRPC      *readSourceFailureEvidence `json:"failure_rpc,omitempty"`
-	NightlySeed     string                     `json:"nightly_workload_seed,omitempty"`
-	NightlyDelayNS  int64                      `json:"nightly_delay_ns,omitempty"`
-	CWD             string                     `json:"cwd,omitempty"`
-	ErrorData       map[string]any             `json:"error_data,omitempty"`
-	Tool            string                     `json:"tool"`
-	Role            string                     `json:"role"`
-	Request         string                     `json:"request_sha256"`
-	Agent           int                        `json:"agent"`
-	Step            int                        `json:"step"`
-	Slot            int                        `json:"slot"`
-	Retry           int                        `json:"retry"`
-	Started         time.Time                  `json:"started"`
-	DurationMS      float64                    `json:"duration_ms"`
-	LogicalMS       float64                    `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
-	Code            int                        `json:"code"`
-	Error           string                     `json:"error"`
-	ExpectedOutcome string                     `json:"expected_outcome,omitempty"`
-	Outcome         string                     `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	ReadMetadataState string                     `json:"read_metadata_state,omitempty"` // partial_pending only; absent is UNOBSERVED
+	FailureRPC        *readSourceFailureEvidence `json:"failure_rpc,omitempty"`
+	NightlySeed       string                     `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS    int64                      `json:"nightly_delay_ns,omitempty"`
+	CWD               string                     `json:"cwd,omitempty"`
+	ErrorData         map[string]any             `json:"error_data,omitempty"`
+	Tool              string                     `json:"tool"`
+	Role              string                     `json:"role"`
+	Request           string                     `json:"request_sha256"`
+	Agent             int                        `json:"agent"`
+	Step              int                        `json:"step"`
+	Slot              int                        `json:"slot"`
+	Retry             int                        `json:"retry"`
+	Started           time.Time                  `json:"started"`
+	DurationMS        float64                    `json:"duration_ms"`
+	LogicalMS         float64                    `json:"logical_ms"` // includes earlier refusals and backoff, excludes think time
+	Code              int                        `json:"code"`
+	Error             string                     `json:"error"`
+	ExpectedOutcome   string                     `json:"expected_outcome,omitempty"`
+	Outcome           string                     `json:"outcome"` // success, error, busy, product_deadline, phase_censored
 }
 
 type ToolMetrics struct {
+	// This is a count of explicit observations, not missing/complete metadata.
+	// nil is historical UNOBSERVED; nonnil0 means zero explicit partials.
+	PartialPending    *int           `json:"partial_pending,omitempty"`
 	Latency           Distribution   `json:"latency_ms"`
 	SuccessPerSec     Metric         `json:"successful_calls_per_second"`
-	Successes         int            `json:"successes"`
+	Successes         int            `json:"successes"` // RPC success, not proof of complete metadata
 	ExpectedRefusals  int            `json:"expected_refusals,omitempty"`
 	BusyRefusals      int            `json:"busy_refusals"`
 	RetryableRefusals int            `json:"retryable_refusals,omitempty"`
@@ -178,7 +182,7 @@ type Report struct {
 	Artifacts      map[string]string        `json:"artifacts"`
 	Crashes        map[string]int           `json:"crashes"`
 	Errors         []string                 `json:"errors"`
-	Complete       bool                     `json:"complete"`
+	Complete       bool                     `json:"complete"` // execution completion; response freshness is independent
 }
 
 func writeReport(path string, report Report) error {
@@ -199,6 +203,14 @@ func summarize(attempts []Attempt, seconds float64, role string) map[string]Tool
 		m := result[a.Tool]
 		if m.Errors == nil {
 			m.Errors = make(map[string]int)
+		}
+		if role == "workload" && metadataObservationTool(a.Tool) {
+			if m.PartialPending == nil {
+				m.PartialPending = new(int)
+			}
+			if a.Outcome == "success" && a.ReadMetadataState == partialPendingMetadata {
+				*m.PartialPending++
+			}
 		}
 		switch a.Outcome {
 		case "success":
