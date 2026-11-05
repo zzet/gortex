@@ -17,17 +17,17 @@ type smokeDispatchPins struct {
 	CandidateRevision      string `json:"candidate_revision"`
 }
 
-func currentSmokeDispatchPins(event string) *smokeDispatchPins {
+func currentSmokeDispatchPins(event string) smokeDispatchPins {
 	if event != "workflow_dispatch" {
-		return nil
+		return smokeDispatchPins{}
 	}
 	id, _ := strconv.ParseInt(os.Getenv("PERF_SMOKE_BASELINE_ARTIFACT_ID"), 10, 64)
-	return &smokeDispatchPins{WorkflowRef: os.Getenv("GITHUB_WORKFLOW_REF"), WorkflowRevision: os.Getenv("GITHUB_WORKFLOW_SHA"), BaselineRevision: os.Getenv("PERF_SMOKE_BASELINE_REVISION"), BaselineArtifactID: id, BaselineArtifactDigest: os.Getenv("PERF_SMOKE_BASELINE_ARTIFACT_DIGEST"), CandidateRevision: os.Getenv("PERF_SMOKE_CANDIDATE_REVISION")}
+	return smokeDispatchPins{WorkflowRef: os.Getenv("GITHUB_WORKFLOW_REF"), WorkflowRevision: os.Getenv("GITHUB_WORKFLOW_SHA"), BaselineRevision: os.Getenv("PERF_SMOKE_BASELINE_REVISION"), BaselineArtifactID: id, BaselineArtifactDigest: os.Getenv("PERF_SMOKE_BASELINE_ARTIFACT_DIGEST"), CandidateRevision: os.Getenv("PERF_SMOKE_CANDIDATE_REVISION")}
 }
 
 func validSmokeDispatchWorkflow(workflow workflowProvenance) bool {
 	pins := workflow.SmokeDispatch
-	return workflow.Ref == "refs/heads/main" && pins != nil && pins.WorkflowRef == "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main" && pins.WorkflowRevision == workflow.Revision && pins.CandidateRevision == workflow.Revision && revisionPattern.MatchString(pins.BaselineRevision) && pins.BaselineArtifactID > 0 && validDigest(pins.BaselineArtifactDigest)
+	return workflow.Ref == "refs/heads/main" && pins != (smokeDispatchPins{}) && pins.WorkflowRef == "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main" && pins.WorkflowRevision == workflow.Revision && pins.CandidateRevision == workflow.Revision && revisionPattern.MatchString(pins.BaselineRevision) && pins.BaselineArtifactID > 0 && validDigest(pins.BaselineArtifactDigest)
 }
 
 func validateSmokeDispatchBinding(workflow workflowProvenance, proof smokeProvenance) error {

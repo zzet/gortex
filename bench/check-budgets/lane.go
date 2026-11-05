@@ -21,13 +21,13 @@ import (
 )
 
 type workflowProvenance struct {
-	SmokeDispatch *smokeDispatchPins `json:"smoke_dispatch,omitempty"`
-	Event         string             `json:"event"`
-	Ref           string             `json:"ref"`
-	Revision      string             `json:"revision"`
-	RunURL        string             `json:"run_url"`
-	Job           string             `json:"job"`
-	Attempt       int                `json:"run_attempt"`
+	SmokeDispatch smokeDispatchPins `json:"smoke_dispatch,omitzero"`
+	Event         string            `json:"event"`
+	Ref           string            `json:"ref"`
+	Revision      string            `json:"revision"`
+	RunURL        string            `json:"run_url"`
+	Job           string            `json:"job"`
+	Attempt       int               `json:"run_attempt"`
 }
 
 type budgetEvidence struct {

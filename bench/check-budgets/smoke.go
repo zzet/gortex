@@ -131,7 +131,7 @@ var pullRefPattern = regexp.MustCompile(`^refs/pull/[0-9]+/(head|merge)$`)
 func validateSmokeWorkflow(workflow workflowProvenance) error {
 	runID, err := strconv.ParseInt(strings.TrimPrefix(workflow.RunURL, "https://github.com/zzet/gortex/actions/runs/"), 10, 64)
 	identity := workflow.Job != "" && workflow.Attempt >= 1 && revisionPattern.MatchString(workflow.Revision) && err == nil && runID > 0
-	pr := workflow.Event == "pull_request" && pullRefPattern.MatchString(workflow.Ref) && workflow.SmokeDispatch == nil
+	pr := workflow.Event == "pull_request" && pullRefPattern.MatchString(workflow.Ref) && workflow.SmokeDispatch == (smokeDispatchPins{})
 	manual := workflow.Event == "workflow_dispatch" && validSmokeDispatchWorkflow(workflow)
 	if !identity || !pr && !manual {
 		return errors.New("smoke comparisons require one explicit PR workflow run/attempt/job identity or an explicitly pinned trusted-main manual smoke")

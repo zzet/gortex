@@ -190,7 +190,7 @@ jobs:
   # exact formal observations exist. Do not execute PR code on these hosts.
   nightly-reference:
     name: Reference nightly measurement
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PERF_REFERENCE_NIGHTLY_ENABLED == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.run_smoke) && vars.PERF_REFERENCE_NIGHTLY_ENABLED == 'true'
     runs-on: [self-hosted, perf-reference-linux]
     timeout-minutes: 1440
     steps:
@@ -224,7 +224,7 @@ jobs:
 
   nightly-mac:
     name: Apple Silicon nightly measurement (when owned host is available)
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PERF_MAC_NIGHTLY_ENABLED == 'true'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.run_smoke) && vars.PERF_MAC_NIGHTLY_ENABLED == 'true'
     runs-on: [self-hosted, perf-apple-silicon]
     timeout-minutes: 1440
     steps:

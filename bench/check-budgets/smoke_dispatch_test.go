@@ -111,6 +111,11 @@ func TestManualSmokeWorkflowSelectsExistingBoundedLane(t *testing.T) {
 			t.Errorf("manual smoke %s must default off", key)
 		}
 	}
+	for _, job := range []string{"nightly-reference", "nightly-mac"} {
+		if !strings.Contains(workflow.Jobs[job].If, "!(github.event_name == 'workflow_dispatch' && inputs.run_smoke)") {
+			t.Errorf("explicit manual smoke must not also select %s", job)
+		}
+	}
 	job := workflow.Jobs["smoke"]
 	if job.If != "(github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_smoke)" {
 		t.Fatal("manual route must be explicit trusted-main-only and preserve PR opt-in")
@@ -150,5 +155,30 @@ func TestManualSmokeWorkflowSelectsExistingBoundedLane(t *testing.T) {
 		if !strings.Contains(upload, required) {
 			t.Errorf("explicit role or measurement evidence lost %s", required)
 		}
+	}
+}
+
+// Existing microbundle admission compares workflow structs by value. The
+// explicit pins must survive JSON and independently reconstructed observations.
+func TestManualSmokeWorkflowPinsKeepExistingValueComparisons(t *testing.T) {
+	receipt, _ := dispatchSmokeFixture(t, "")
+	data, err := json.Marshal(receipt.Workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundtrip workflowProvenance
+	if err = json.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundtrip != receipt.Workflow {
+		t.Fatal("same-job manual provenance cannot survive existing microbundle equality guards")
+	}
+	pr := workflowProvenance{Event: "pull_request"}
+	data, err = json.Marshal(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "smoke_dispatch") {
+		t.Fatal("default PR provenance gained empty manual pins")
 	}
 }
