@@ -8,7 +8,7 @@ import (
 )
 
 // Manual measurements retain their real dispatch identity. They never borrow a
-// synthetic PR ref, and cannot select an older-green or arbitrary artifact.
+// synthetic PR ref or silently fall back to another revision or artifact.
 type smokeDispatchPins struct {
 	WorkflowRef            string `json:"workflow_ref"`
 	WorkflowRevision       string `json:"workflow_revision"`
@@ -19,7 +19,7 @@ type smokeDispatchPins struct {
 }
 
 func currentSmokeDispatchPins(event string) smokeDispatchPins {
-	if event != "workflow_dispatch" {
+	if event != "workflow_dispatch" || os.Getenv("GITHUB_JOB") != "smoke" {
 		return smokeDispatchPins{}
 	}
 	id, _ := strconv.ParseInt(os.Getenv("PERF_SMOKE_BASELINE_ARTIFACT_ID"), 10, 64)
