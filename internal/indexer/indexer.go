@@ -7646,10 +7646,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	} else if mode.surfaceFirstVersionChange && len(failedFiles) > 0 {
 		result.mutationErr = idx.fileIndexFailureError(failedFiles[0])
 	}
-	// A clean version-driven restage re-stamps the stored extractor
-	// versions; a failed file keeps the old row so the next full pass
-	// retries the language.
-	if len(extractorStaleLangs) > 0 && len(failedFiles) == 0 {
+	// Persisted file failures are their own retry inventory, so they need not
+	// restage successful files of the same language forever. Discovery failures
+	// can hide an entire subtree, and torn passes cannot attest a completed
+	// restage. Keep the language-wide fence for either, or for an unsafe ledger.
+	if len(extractorStaleLangs) > 0 && len(discoveryFailed) == 0 && result.mutationErr == nil &&
+		idx.failedFilesSafelyRetryable(failedFiles) {
 		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
