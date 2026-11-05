@@ -7683,12 +7683,17 @@ func relPathInScope(relPath string, scope map[string]bool) bool {
 	if scope[relPath] {
 		return true
 	}
-	for s := range scope {
-		if s == "." {
-			return true
-		}
-		if strings.HasPrefix(relPath, s+"/") {
-			return true
+	if _, exists := scope["."]; exists {
+		return true
+	}
+	// Directory membership historically depends on key presence, including
+	// false-valued and empty keys. Probe each slash boundary without normalizing
+	// the path: trailing/leading/repeated slashes are significant to callers.
+	for i := 0; i < len(relPath); i++ {
+		if relPath[i] == '/' {
+			if _, exists := scope[relPath[:i]]; exists {
+				return true
+			}
 		}
 	}
 	return false
