@@ -64,6 +64,9 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 			}
 			t.Cleanup(closeAndJoin)
 			args := map[string]any{"operation": tc.operation, "target": map[string]any{"file": "main.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}
+			if tc.operation == "source" {
+				args["target"] = map[string]any{"symbol": "main.go::Target"}
+			}
 			r := request{Tool: "read", Operation: tc.operation, Arguments: args}
 			started := time.Now()
 			result, attempts, err := callTool(t.Context(), client, r, args, "workload", 3, 0, 1, time.Second, waitContext)

@@ -25,6 +25,13 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	reg.Register(e)
 	s, root := setupTestServerWithRegistry(t, reg)
 	s.SetWatcher(mutationTestWatcher{})
+	const session = "source-pending-facade"
+	require.NoError(t, s.ConnectSession(session, func([]byte) error { return nil }))
+	t.Cleanup(func() { s.DisconnectSession(session) })
+	base := s.WithClientSession(WithSessionID(t.Context(), session), session)
+	s.NoteSessionToolPolicy(session, FacadeSurfaceVersion, "hide")
+	require.NotNil(t, s.MCPServer().HandleMessage(base, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"gortex-load","version":"1"}}}`)))
+	s.MCPServer().HandleMessage(base, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
 	path := filepath.Join(root, "main.go")
 	before, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -33,7 +40,7 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	require.Nil(t, s.engine.GetSymbol("main.go::SourceBeyondDeadline"))
 	e.hold.Store(true)
 	release := sync.OnceFunc(func() { close(e.release) })
-	caller, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	caller, cancel := context.WithTimeout(base, 3*time.Second)
 	type answer struct {
 		result *mcplib.CallToolResult
 		err    error
@@ -102,4 +109,87 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	require.Equal(t, "projection_deferred", body.Data["reason"])
 	require.NotContains(t, resultText(got.result), "func SourceBeyondDeadline", "refusal carries no source payload")
 	t.Log("REAL_SOURCE_DEFERRAL_VERIFIED caller_live=true original_private_allowance_expired=true physical_target_present=true canonical_target_absent=true")
+}
+
+// Negative marker controls exercise classification only. The positive contract
+// above requires an actual unavailable projection and an actual registered wire.
+func TestSourcePendingRefusalRejectsUnprovenOrUnauthorizedMisses(t *testing.T) {
+	s, root := setupTestServer(t)
+	for _, name := range []string{"canonical_miss", "wrong_file", "unknown_reason", "store_busy_only", "cancelled", "expired_caller", "wrong_tool", "compressed", "malformed_options", "outside_root", "non_normalized", "out_of_scope", "complete_selected_layer"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := withRequestProjectionFacts(t.Context())
+			id := "main.go::Absent"
+			req := mcplib.CallToolRequest{Params: mcplib.CallToolParams{Name: "get_symbol_source", Arguments: map[string]any{"id": id}}}
+			switch name {
+			case "canonical_miss":
+			case "wrong_file":
+				markRequestProjectionDeferred(ctx, "other.go", "external_write")
+			case "unknown_reason":
+				markRequestProjectionDeferred(ctx, "main.go", "unknown")
+			case "store_busy_only":
+				ctx = markRequestStoreBusy(ctx, "main.go")
+			default:
+				markRequestProjectionDeferred(ctx, "main.go", "external_write")
+			}
+			switch name {
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "expired_caller":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			case "wrong_tool":
+				req.Params.Name = "get_file_summary"
+			case "compressed":
+				req.Params.Arguments.(map[string]any)["compress_bodies"] = true
+			case "malformed_options":
+				req.Params.Arguments.(map[string]any)["options"] = "invalid"
+			case "outside_root":
+				id = filepath.Join(filepath.Dir(root), "outside.go") + "::Absent"
+				markRequestProjectionDeferred(ctx, filepath.Join(filepath.Dir(root), "outside.go"), "external_write")
+			case "non_normalized":
+				id = "nested/../main.go::Absent"
+				markRequestProjectionDeferred(ctx, "nested/../main.go", "external_write")
+			case "out_of_scope":
+				session := s.sessionFor(ctx)
+				session.mu.Lock()
+				session.scopeResolved = true
+				session.scopeBound = true
+				session.scopeWorkspaceID = "other-workspace"
+				session.mu.Unlock()
+				defer func() { session.mu.Lock(); session.resetScopeLocked(); session.mu.Unlock() }()
+			case "complete_selected_layer":
+				projected, err := s.ensureProjected(ctx, []string{"main.go"})
+				require.NoError(t, err)
+				require.NotEmpty(t, requestProjectionLayers(projected))
+				ctx = projected
+			}
+			require.Nil(t, s.pendingSourceMiss(ctx, req, id), "only an exact authorized unavailable-file observation may become a typed source refusal")
+		})
+	}
+	// Real canonical absence remains the ordinary not-found response.
+	result, err := s.handleGetSymbolSource(t.Context(), mcplib.CallToolRequest{Params: mcplib.CallToolParams{Name: "get_symbol_source", Arguments: map[string]any{"id": "main.go::Absent"}}})
+	require.NoError(t, err)
+	require.True(t, result.IsError)
+	require.False(t, metadataTransientRefusal(result))
+	require.Contains(t, resultText(result), "symbol not found")
+}
+
+func TestSourcePendingRefusalPreservesCheckedRemovalAndSuccess(t *testing.T) {
+	s, _, ctx, _, _ := snapshotFacadeFixture(t)
+	for _, tc := range []struct {
+		id      string
+		refused bool
+	}{{"main.go::TargetBefore", true}, {"main.go::Target", false}} {
+		result := snapshotRegisteredCall(t, s, ctx, 95, "read", map[string]any{"operation": "source", "target": map[string]any{"symbol": tc.id}, "output": map[string]any{"format": "json", "max_bytes": 0}})
+		require.Equal(t, tc.refused, result.IsError, resultText(result))
+		require.False(t, metadataTransientRefusal(result))
+		if tc.refused {
+			require.Contains(t, resultText(result), "removed by pending edit")
+		} else {
+			require.Contains(t, resultText(result), "func Target()")
+		}
+	}
 }

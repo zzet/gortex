@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func sourcePendingReportFixture() map[string]any {
 	raw := readFreshnessReportFixture("file_view_pending")
@@ -51,12 +54,20 @@ func TestSourcePendingCheckerRequiresCompleteScopedHistory(t *testing.T) {
 			case "unknown_delivery":
 				data["delivery_unknown"] = true
 			case "cap":
-				third := make(map[string]any)
-				for k, v := range first {
-					third[k] = v
+				group := []any{first}
+				for retry := 1; retry <= 2; retry++ {
+					next := make(map[string]any)
+					for key, value := range first {
+						next[key] = value
+					}
+					next["retry"] = retry
+					next["logical_ms"] = float64(2 + retry*3)
+					next["started"] = first["started"].(time.Time).Add(time.Duration(retry*3) * time.Millisecond)
+					group = append(group, next)
 				}
-				third["retry"] = 2
-				p["attempts"] = []any{first, last, third}
+				last["retry"] = 3
+				metric["retryable_refusals"] = 3
+				p["attempts"] = append(group, last)
 			case "wrong_source_marker":
 				last["read_metadata_state"] = "partial_pending"
 				metric["partial_pending"] = 1
