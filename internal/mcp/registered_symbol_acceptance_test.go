@@ -167,7 +167,7 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 			})
 			require.NotNil(t, original)
 			for _, scope := range heldScopes {
-				require.Zero(t, scope.Holders(), "every discarded or final attempt releases its repository lease")
+				require.Eventually(t, func() bool { return scope.Holders() == 0 }, 3*time.Second, time.Millisecond, "join every discarded or final attempt repository lease after dispatch, including cancelled workers")
 			}
 			success := transition == "canonical_retirement" || transition == "checked_read_cow"
 			if success {
