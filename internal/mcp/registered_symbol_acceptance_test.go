@@ -13,13 +13,14 @@ import (
 
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // This registered boundary control does not identify the native suspect setter.
 // It admits a fresh answer only after an existing checked owner transition;
 // a source event alone, another physical version, and cancellation stay strict.
 func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
-	for _, transition := range []string{"canonical_retirement", "checked_read_cow", "unverified_event", "changed_physical", "caller_cancel"} {
+	for _, transition := range []string{"canonical_retirement", "checked_read_cow", "unverified_event", "changed_physical", "caller_cancel", "enrichment_active"} {
 		t.Run(transition, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			s, store, path := canonicalPromotionReadFixture(t)
@@ -28,7 +29,10 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 			fts, err := store.SymbolFTSCount()
 			require.NoError(t, err)
 			require.Positive(t, fts)
-			require.Nil(t, s.semanticMgr, "this replay contract excludes active enrichment")
+			require.Nil(t, s.semanticMgr, "the native fixture starts without enrichment")
+			if transition == "enrichment_active" {
+				s.semanticMgr = &semantic.Manager{} // Existing no-provider enrichment admission fixture.
+			}
 			pending := make(chan indexer.MutationResult)
 			s.SetWatcher(mutationTestWatcher{done: pending})
 			var receipt *mutationReceipt
@@ -118,7 +122,7 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 					require.True(t, s.hasRequestProjectionFact(attempt, "main.go"))
 					require.NoError(t, validateRequestProjections(attempt))
 					switch transition {
-					case "canonical_retirement", "caller_cancel":
+					case "canonical_retirement", "caller_cancel", "enrichment_active":
 						require.NoError(t, s.indexer.IndexFile(path))
 						require.Equal(t, 8, store.GetNode("main.go::Neighbor").StartLine)
 						retirement.run()
