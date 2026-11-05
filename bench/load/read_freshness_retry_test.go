@@ -40,6 +40,9 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 						return
 					}
 					result := map[string]any{"content": []any{map[string]any{"type": "text", "text": "{\"file\":{\"id\":\"main.go\"},\"defines\":[]}"}}}
+					if tc.operation == "source" {
+						result = map[string]any{"content": []any{map[string]any{"type": "text", "text": "{\"symbol_id\":\"main.go::Target\",\"source\":\"func Target() {}\",\"start_line\":3}"}}}
+					}
 					if i == 0 {
 						body, _ := json.Marshal(map[string]any{"error_code": code, "message": "transient selected read unavailable", "retriable": true, "data": map[string]any{"retry_scope": "read_only", "delivery_unknown": false, "reason": "projection_deferred"}})
 						result = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(body)}}}
