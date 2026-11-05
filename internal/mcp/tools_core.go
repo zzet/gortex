@@ -1754,7 +1754,17 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 		return symbolNotFoundGuidance(id), nil
 	}
 
-	s.sessionFor(ctx).recordSymbol(id)
+	sess := s.sessionFor(ctx)
+	afterFreshSymbolAcceptance(ctx, func() { sess.recordSymbol(id) })
+
+	// Enrichment can spawn a language server and persist a generation before
+	// serialization. Keep that shape out of after-leaf replay; staging the
+	// session credit does not make those producer effects replay-safe.
+	if s.semanticMgr != nil && s.graph != nil && !nodeHasSemanticType(node) {
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.replayUnsafe = true
+		}
+	}
 
 	// On-demand LSP: when the synchronous LSP sweep is off (the default), fault
 	// in this symbol's precise type now — one hover on the lazy-spawned server,

@@ -104,7 +104,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			acceptedBefore = len(attemptState.accepted)
 		}
 		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
-			if callerOwnsProjectionFacts {
+			legacy, _ := s.legacyToolName(&request)
+			// Auditing full-symbol replay does not add a data-free pending
+			// response to that tool's existing wire contract.
+			if callerOwnsProjectionFacts || legacy == "get_symbol" {
 				return nil, nil
 			}
 			pending, err := s.lateStormTransitionPending(selected, request, failure)
