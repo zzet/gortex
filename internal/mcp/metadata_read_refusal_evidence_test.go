@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,4 +139,77 @@ func TestRegisteredMetadataReadRefusalEvidenceIsOptIn(t *testing.T) {
 			})
 		}
 	}
+}
+
+// Validation must describe the phase that actually rejected the borrowed
+// fact, even when the guard is healthy again before wire conversion.
+func TestMetadataReadValidationEvidenceKeepsFirstPredicate(t *testing.T) {
+	for _, inherited := range []bool{false, true} {
+		t.Run(fmt.Sprint(inherited), func(t *testing.T) {
+			t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+			selectedProjectionRegistry(t)
+			path := filepath.Join(t.TempDir(), "proof.go")
+			raw := []byte("package proof\n")
+			require.NoError(t, os.WriteFile(path, raw, 0600))
+			stamp, err := statDiskStamp(path)
+			require.NoError(t, err)
+			entry := syntheticProjectionEntry(path, "proof.go", "proof", 1, stamp, raw)
+			require.NoError(t, pendingFileProjections.publish(entry))
+			ctx, err := retainRequestProjection(t.Context(), entry)
+			require.NoError(t, err)
+			entry.suspect.Store(true)
+			var refusal error
+			stage := "projection.validation"
+			if inherited {
+				_, refusal = (&Server{}).ensureProjected(ctx, nil)
+				stage = "bind.inherited_facts"
+			} else {
+				refusal = validateRequestProjections(ctx)
+			}
+			require.ErrorIs(t, refusal, projectionSuperseded)
+			entry.suspect.Store(false)
+			require.NoError(t, validateRequestProjections(ctx))
+			t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "0")
+			result := searchRefusalToolResult(refusal)
+			require.True(t, result.IsError)
+			require.Equal(t, projectionSuperseded.Error(), resultText(result))
+			require.NotNil(t, result.Meta)
+			require.Equal(t, map[string]any{"stage": stage, "guard": "suspect_before"}, result.Meta.AdditionalFields["gortex_projection_refusal"])
+		})
+	}
+}
+
+func TestMetadataReadEvidenceDoesNotAnnotateCancellationOrSuccess(t *testing.T) {
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+	selectedProjectionRegistry(t)
+	path := filepath.Join(t.TempDir(), "proof.go")
+	raw := []byte("package proof\n")
+	require.NoError(t, os.WriteFile(path, raw, 0600))
+	stamp, err := statDiskStamp(path)
+	require.NoError(t, err)
+	entry := syntheticProjectionEntry(path, "proof.go", "proof", 1, stamp, raw)
+	require.NoError(t, pendingFileProjections.publish(entry))
+	ctx, err := retainRequestProjection(t.Context(), entry)
+	require.NoError(t, err)
+	require.NoError(t, validateRequestProjections(ctx))
+	for _, deadline := range []bool{false, true} {
+		var stopped context.Context
+		var cancel context.CancelFunc
+		want := context.Canceled
+		if deadline {
+			stopped, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+			want = context.DeadlineExceeded
+		} else {
+			stopped, cancel = context.WithCancel(ctx)
+			cancel()
+		}
+		refusal := validateRequestProjections(stopped)
+		cancel()
+		require.ErrorIs(t, refusal, want)
+		result := searchRefusalToolResult(refusal)
+		require.Nil(t, result.Meta)
+		require.Equal(t, want.Error(), resultText(result))
+	}
+	generic := errors.New(projectionSuperseded.Error())
+	require.Nil(t, searchRefusalToolResult(generic).Meta, "matching English text carries no typed guard authority")
 }
