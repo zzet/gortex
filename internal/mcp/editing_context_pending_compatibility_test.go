@@ -61,9 +61,9 @@ func (s *canonicalContextDeadlineStore) WithFileEditingContextReader(ctx context
 		s.join()
 		return err
 	}
-	before := s.Store.ReaderWaitMark()
+	before := s.ReaderWaitMark()
 	s.observedErr = s.Store.WithFileEditingContextReader(ctx, fn)
-	after := s.Store.ReaderWaitMark()
+	after := s.ReaderWaitMark()
 	s.waits = after.PoolWaits - before.PoolWaits
 	s.release()
 	s.join()
@@ -94,7 +94,7 @@ func TestRegisteredCanonicalContextDeadlineKeepsPartialPendingWire(t *testing.T)
 			holders.Add(1)
 			go func() {
 				defer holders.Done()
-				err := backend.Store.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
+				err := backend.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
 					entered <- struct{}{}
 					<-release
 					return errors.New("owned reader released")
@@ -200,7 +200,7 @@ func TestRegisteredDeferredEmptyRefusalKeepsTypedReason(t *testing.T) {
 		holders.Add(1)
 		go func() {
 			defer holders.Done()
-			holderErrors <- backend.Store.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
+			holderErrors <- backend.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
 				entered <- struct{}{}
 				<-release
 				return nil
