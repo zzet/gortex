@@ -11,8 +11,8 @@ import (
 )
 
 // scopedProjectionPage is deliberately small: framework partial passes may
-// inspect a very large changed repository, but neither the SQLite cursor nor a
-// Go slice is allowed to turn that repository into the memory unit.
+// inspect a very large changed repository, but decoded edge/node rows remain
+// page-bounded. File-frontier edge scans retain only integer IDs across pages.
 const scopedProjectionPage = 256
 
 // Scoped projections bind the kind as a literal predicate — one streaming
@@ -217,7 +217,9 @@ func (s *Store) streamScopedNodes(query string, args []any, summary bool, yield 
 	}
 }
 
-// EdgesInScopeSeq keyset-pages source-owned edges. Source nodes are hydrated
+// EdgesInScopeSeq pages source-owned edges. Repository scopes use an ID keyset;
+// file frontiers freeze an ordered ID inventory before reading row pages.
+// Source nodes are hydrated
 // once per page, after the edge cursor is closed; callers therefore get an
 // edge+source pair without an N+1 GetNode loop or a second open SQLite cursor.
 // maxID freezes the scan boundary once for all kinds so edges synthesized
@@ -256,11 +258,104 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			if !ok {
 				return
 			}
-			if !s.streamScopedEdges(query, args, maxID, yield) {
+			if len(filePaths) > 0 {
+				if !s.streamScopedFileEdges(query, args, maxID, yield) {
+					return
+				}
+			} else if !s.streamScopedEdges(query, args, maxID, yield) {
 				return
 			}
 		}
 	}
+}
+
+// File-frontier joins are selective but not ID ordered. Freeze their ordered
+// IDs once rather than sorting the remaining frontier again for every page.
+// Only integer IDs survive the census; decoded edges and endpoints remain
+// page-bounded, and every cursor closes before callbacks can mutate the store.
+func (s *Store) streamScopedFileEdges(query string, args []any, maxID int64, yield func(graph.ScopedEdgeRow) bool) bool {
+	idQuery := strings.Replace(query, "SELECT e.id, "+lookupQualifiedEdgeCols, "SELECT e.id", 1)
+	idQuery = strings.TrimSuffix(idQuery, " LIMIT ?")
+	rows, err := s.db.Query(idQuery, append(append([]any(nil), args...), int64(0), maxID)...)
+	if err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			panicOnFatal(err)
+			return false
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		panicOnFatal(err)
+		return false
+	}
+	for start := 0; start < len(ids); start += scopedProjectionPage {
+		end := min(start+scopedProjectionPage, len(ids))
+		pageArgs := make([]any, 0, end-start+1)
+		for _, id := range ids[start:end] {
+			pageArgs = append(pageArgs, id)
+		}
+		pageArgs = append(pageArgs, s.viewGen)
+		rows, err := s.db.Query(scopedEdgeIDPageQuery(end-start), pageArgs...)
+		if err != nil {
+			panicOnFatal(err)
+			return false
+		}
+		page := make([]*graph.Edge, 0, end-start)
+		for rows.Next() {
+			edge, err := s.scanEdgeCursor(rows)
+			if err != nil {
+				_ = rows.Close()
+				panicOnFatal(err)
+				return false
+			}
+			if edge != nil {
+				page = append(page, edge)
+			}
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			panicOnFatal(err)
+			return false
+		}
+		// A deleted page is not EOF: later inventory IDs may still exist.
+		endpointIDs := make([]string, 0, len(page)*2)
+		for _, edge := range page {
+			endpointIDs = append(endpointIDs, edge.From)
+			if edge.To != "" && !graph.IsUnresolvedTarget(edge.To) {
+				endpointIDs = append(endpointIDs, edge.To)
+			}
+		}
+		endpoints := s.GetNodesByIDs(endpointIDs)
+		for _, edge := range page {
+			// The census may outlive a source node. The batch hydration already
+			// checks this generation, avoiding a second node lookup per edge in
+			// SQL while preserving the source-owned projection after deletions.
+			if endpoints[edge.From] == nil {
+				continue
+			}
+			if !yield(graph.ScopedEdgeRow{Edge: edge, Source: endpoints[edge.From], Target: endpoints[edge.To]}) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func scopedEdgeIDPageQuery(count int) string {
+	// The generation index can make SQLite sort even a short IN list. Keep
+	// generation equality exact, but drive these already-selected IDs by rowid.
+	return `SELECT ` + lookupQualifiedEdgeCols + ` FROM edges AS e WHERE e.id IN (?` +
+		strings.Repeat(",?", count-1) + `) AND +e.view_gen = ? ORDER BY e.id`
 }
 
 // streamScopedEdges drains one edge-kind cursor page by page, hydrating both
