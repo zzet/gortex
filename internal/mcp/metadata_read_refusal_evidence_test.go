@@ -169,6 +169,7 @@ func TestMetadataReadValidationEvidenceKeepsFirstPredicate(t *testing.T) {
 			require.ErrorIs(t, refusal, projectionSuperseded)
 			entry.suspect.Store(false)
 			require.NoError(t, validateRequestProjections(ctx))
+			t.Logf("METADATA_VALIDATION_CAUSAL inherited=%v original_guard=suspect_before restored_validation_pass=true", inherited)
 			t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "0")
 			result := searchRefusalToolResult(refusal)
 			require.True(t, result.IsError)

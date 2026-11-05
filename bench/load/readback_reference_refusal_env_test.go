@@ -55,11 +55,11 @@ func TestReadbackProtocolRefusalEnvReachesOnlyDiagnosticDaemon(t *testing.T) {
 			require.NoError(t, err)
 			var observed map[string]string
 			require.NoError(t, json.Unmarshal(data, &observed))
+			t.Logf("role=%s offered_flag=%q actual_child_flag=%q reaped=true forced=false", tc.role, tc.flag, observed["evidence"])
 			require.Equal(t, tc.want, observed["evidence"])
 			require.Empty(t, observed["foreign"])
 			require.Equal(t, "preserved", observed["owned"])
 			require.Equal(t, "facade-v1", observed["tools"])
-			t.Logf("role=%s offered_flag=%q actual_child_flag=%q reaped=true forced=false", tc.role, tc.flag, observed["evidence"])
 		})
 	}
 }
