@@ -71,6 +71,15 @@ func contractSeries() []struct {
 		rows = append(rows, row{viewmetrics.ContractRepairTotal, []string{kind},
 			"views_contract_repair_total{kind=" + kind + "}"})
 	}
+	for _, policy := range []string{viewmetrics.ContractLinkedIdle, viewmetrics.ContractLinkedThrottled, viewmetrics.ContractLinkedEager} {
+		for _, event := range []string{
+			viewmetrics.ContractLinkedDeferred, viewmetrics.ContractLinkedCheckpointStopped,
+			viewmetrics.ContractLinkedStarted, viewmetrics.ContractLinkedStrictStarted,
+		} {
+			rows = append(rows, row{viewmetrics.ContractLinkedJobsTotal, []string{policy, event},
+				fmt.Sprintf("views_contract_linked_jobs_total{policy=%s,event=%s}", policy, event)})
+		}
+	}
 	for name, key := range map[string]string{
 		viewmetrics.ContractAnalysisRoundsTotal:             "views_contract_analysis_rounds_total",
 		viewmetrics.ContractAnalysisIterationsTotal:         "views_contract_analysis_iterations_total",
