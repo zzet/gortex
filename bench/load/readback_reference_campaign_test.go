@@ -64,6 +64,7 @@ type readbackReferenceCaseReport struct {
 	Cleanup                 map[string]any                      `json:"cleanup"`
 	Errors                  []string                            `json:"errors"`
 	AcceptanceState         string                              `json:"acceptance_state"`
+	RefusalEvidenceOptIn    bool                                `json:"refusal_evidence_requested,omitempty"`
 	ProtocolOnly            bool                                `json:"protocol_only"`
 	ProtocolPass            bool                                `json:"protocol_pass"`
 	ToolSurface             string                              `json:"tool_surface"`
@@ -201,6 +202,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		return report, err
 	}
 	report.ToolSurface = surface
+	report.RefusalEvidenceOptIn = *readbackReferenceRefusalEvidence
 	operationRole := role
 	hostProfile := "reference"
 	if role == "protocol_preflight" {
@@ -328,7 +330,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		return report, err
 	}
 	started := time.Now()
-	if err := p.start(); err != nil {
+	if err := p.startReadbackReferenceDaemon(role, *readbackReferenceRefusalEvidence); err != nil {
 		return report, err
 	}
 	report.DaemonPID = p.process.Process.Pid
@@ -560,8 +562,10 @@ func checkReadbackReferenceSQLite(ctx context.Context, store, prefix string, tri
 	return checked, nil
 }
 
-// This narrow diagnostic start seam initially delegates unchanged to the
-// existing lifecycle. Its opt-in forwarding is qualified separately.
-func (p *privateRun) startReadbackReferenceDaemon(_ string, _ bool) error {
-	return p.start()
+// The existing one-offer protocol diagnostic is intrinsically selected. Other
+// existing runtime roles forward the flag only with the separate explicit SDK
+// diagnostic switch; ordinary acceptance remains isolated by default.
+func (p *privateRun) startReadbackReferenceDaemon(role string, explicit bool) error {
+	selected := role == "protocol_preflight" || explicit && (role == "under_edit" || role == "no_edit")
+	return p.startWithSearchRefusalEvidence(selected)
 }

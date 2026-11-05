@@ -844,7 +844,7 @@ func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, 
 			if validationTool == "search_symbols" {
 				return nil, annotateSearchRefusal(ctx, searchRefusalResponseValidation, err)
 			}
-			return nil, err
+			return nil, annotateProjectionReadRefusal(projectionReadDecoration, projectionOwnerLive, err)
 		}
 	}
 	scope, ids, files := freshnessTargets(name, req)

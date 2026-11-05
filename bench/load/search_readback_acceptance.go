@@ -12,8 +12,8 @@ import (
 )
 
 // The generic private environment deliberately strips inherited GORTEX_*
-// settings. Only this explicitly selected acceptance profile may forward the
-// one bounded diagnostic opt-in, through the existing daemon-only override.
+// settings. Only an explicitly selected search acceptance or one-offer
+// readback diagnostic may forward this opt-in via the daemon-only override.
 func (p *privateRun) startWithSearchRefusalEvidence(searchAcceptance bool) error {
 	if searchAcceptance && os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") == "1" {
 		prior := p.daemonEnv
