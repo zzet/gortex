@@ -218,3 +218,29 @@ func TestManualSmokeCurrentWorkflowRetainsExplicitDispatchInputs(t *testing.T) {
 		t.Fatal("manual environment leaked into unchanged PR provenance")
 	}
 }
+
+func TestUnrelatedManualWorkflowKeepsOriginalProvenance(t *testing.T) {
+	for _, job := range []string{"nightly-reference", "nightly-mac", "main-linux-arm64"} {
+		t.Run(job, func(t *testing.T) {
+			for key, value := range map[string]string{
+				"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_JOB": job,
+				"GITHUB_WORKFLOW_REF": "zzet/gortex/.github/workflows/perf-gate.yml@refs/heads/main", "GITHUB_WORKFLOW_SHA": strings.Repeat("c", 40),
+				"PERF_SMOKE_BASELINE_REVISION": strings.Repeat("a", 40), "PERF_SMOKE_BASELINE_ARTIFACT_ID": "456", "PERF_SMOKE_BASELINE_ARTIFACT_DIGEST": "sha256:" + strings.Repeat("b", 64), "PERF_SMOKE_CANDIDATE_REVISION": strings.Repeat("c", 40),
+			} {
+				t.Setenv(key, value)
+			}
+			observed := currentBuildWorkflow(strings.Repeat("c", 40))
+			data, err := json.Marshal(observed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("UNRELATED_MANUAL_PROVENANCE_OBSERVED job=%s event=%s", job, observed.Event)
+			if strings.Contains(string(data), "smoke_dispatch") {
+				t.Fatal("unrelated manual workflow gained smoke-specific source/artifact pins")
+			}
+			if err := validateSmokeWorkflow(observed); err == nil {
+				t.Fatal("an unrelated job cannot become an admitted smoke measurement")
+			}
+		})
+	}
+}
