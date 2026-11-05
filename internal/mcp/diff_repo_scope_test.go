@@ -10,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
@@ -81,4 +82,23 @@ func TestDiffRepoScope(t *testing.T) {
 	root, prefix = srv.diffRepoScope(WithSessionCWD(ctx, repoB), "")
 	require.Equal(t, repoB, root)
 	require.Equal(t, "repo-b", prefix)
+
+	// A request routed to a worktree view of repo-b diffs the view's working
+	// copy under repo-b's prefix; a selector naming another repo keeps that
+	// repo's root.
+	worktree := t.TempDir()
+	viewCtx := withRequestView(ctx, &requestView{
+		kind:         requestViewKindWorktree,
+		viewRoot:     worktree,
+		materialized: &graphview.RepoView{ID: graphview.RepoViewID{RepoPrefix: "repo-b"}},
+	})
+	root, prefix = srv.diffRepoScope(WithSessionCWD(viewCtx, repoB), "")
+	require.Equal(t, worktree, root)
+	require.Equal(t, "repo-b", prefix)
+	root, prefix = srv.diffRepoScope(viewCtx, "repo-b")
+	require.Equal(t, worktree, root)
+	require.Equal(t, "repo-b", prefix)
+	root, prefix = srv.diffRepoScope(viewCtx, "repo-a")
+	require.Equal(t, repoA, root)
+	require.Equal(t, "repo-a", prefix)
 }

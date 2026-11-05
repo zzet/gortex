@@ -420,7 +420,20 @@ func (s *Server) diffJoinPrefix(repoRoot string) string {
 // repo. With no selector the lone tracked repo wins, then the session's
 // cwd-bound repo (clients dial the daemon with their working directory).
 // Both empty means no resolvable working tree.
+//
+// A request routed to a worktree view reads that view's working copy, so the
+// diff runs there too; the prefix stays the tracked repository's, which is how
+// the graph keys the view's files. A view of another repository, or of a
+// committed tree (no working copy), keeps the tracked root.
 func (s *Server) diffRepoScope(ctx context.Context, repo string) (repoRoot, repoPrefix string) {
+	repoRoot, repoPrefix = s.trackedDiffRepoScope(ctx, repo)
+	if view := requestViewPathRoot(ctx); repoRoot != "" && view.serves(repoPrefix) {
+		repoRoot = view.root
+	}
+	return repoRoot, repoPrefix
+}
+
+func (s *Server) trackedDiffRepoScope(ctx context.Context, repo string) (repoRoot, repoPrefix string) {
 	if repo != "" {
 		if p := s.resolveRepoPrefix(repo); p != "" {
 			repo = p
