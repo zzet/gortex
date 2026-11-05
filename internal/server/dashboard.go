@@ -677,7 +677,8 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 		Confidence float64        `json:"confidence"`
 	}
 	type wrap struct {
-		ByRepo map[string]struct {
+		ContractAnalysis json.RawMessage `json:"contract_analysis"`
+		ByRepo           map[string]struct {
 			Contracts map[string][]rawContract `json:"contracts"`
 			Total     int                      `json:"total"`
 		} `json:"by_repo"`
@@ -755,7 +756,11 @@ func (h *Handler) handleContracts(w http.ResponseWriter, r *http.Request) {
 		}
 		return out[i].Name < out[j].Name
 	})
-	WriteJSON(w, http.StatusOK, map[string]any{"contracts": out})
+	payload := map[string]any{"contracts": out}
+	if len(w0.ContractAnalysis) > 0 {
+		payload["contract_analysis"] = w0.ContractAnalysis
+	}
+	WriteJSON(w, http.StatusOK, payload)
 }
 
 // --- /v1/contracts/validate ---
