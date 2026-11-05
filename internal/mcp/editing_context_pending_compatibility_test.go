@@ -161,7 +161,7 @@ func TestRegisteredDeferredEmptyRefusalKeepsTypedReason(t *testing.T) {
 	require.Empty(t, backend.GetFileNodes("untracked.go"))
 	backend.entered = make(chan struct{})
 	backend.query = make(chan struct{})
-	backend.returned = make(chan error)
+	backend.returned = make(chan error, 1)
 	backend.armed.Store(true)
 	startSQL := sync.OnceFunc(func() { close(backend.query) })
 	release := make(chan struct{})
@@ -195,11 +195,12 @@ func TestRegisteredDeferredEmptyRefusalKeepsTypedReason(t *testing.T) {
 		t.Fatal("new-file projection did not reach the real metadata query")
 	}
 	entered := make(chan struct{}, min(runtime.NumCPU(), 4))
+	holderErrors := make(chan error, cap(entered))
 	for range cap(entered) {
 		holders.Add(1)
 		go func() {
 			defer holders.Done()
-			_ = backend.Store.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
+			holderErrors <- backend.Store.WithFileEditingContextReader(t.Context(), func(context.Context, graph.FileEditingContextRows) error {
 				entered <- struct{}{}
 				<-release
 				return nil
@@ -222,6 +223,9 @@ func TestRegisteredDeferredEmptyRefusalKeepsTypedReason(t *testing.T) {
 	require.ErrorIs(t, queryErr, context.DeadlineExceeded)
 	releasePool()
 	holders.Wait()
+	for range cap(entered) {
+		require.NoError(t, <-holderErrors)
+	}
 	got := <-answered
 	request.Wait()
 	require.NoError(t, got.err)
