@@ -101,6 +101,11 @@ func TestDiffRepoScope(t *testing.T) {
 	root, prefix = srv.diffRepoScope(viewCtx, "repo-a")
 	require.Equal(t, repoA, root)
 	require.Equal(t, "repo-a", prefix)
+	// With no selector and no session binding the repo stays ambiguous; the
+	// view does not supply a root on its own.
+	root, prefix = srv.diffRepoScope(viewCtx, "")
+	require.Empty(t, root)
+	require.Empty(t, prefix)
 
 	// A routed checkout whose working-tree layer was withdrawn reads a
 	// committed tree (a composed stack with no layer), so the diff keeps the
