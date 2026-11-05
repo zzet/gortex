@@ -68,7 +68,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		return ctx, nil
 	}
 	ctx = withRequestProjectionFacts(ctx)
-	if err := validateRequestProjections(ctx); err != nil {
+	if err := validateRequestProjectionStage(ctx, projectionReadInherited); err != nil {
 		return ctx, err
 	}
 	deadline := time.Now().Add(projectedReadBudget)
@@ -100,7 +100,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		}
 		if borrowed {
 			if !s.hasRequestProjectionFact(ctx, graphPath) {
-				return ctx, projectionSuperseded
+				return ctx, annotateProjectionReadRefusal(projectionReadBorrowed, projectionOwnerFactUnavailable, projectionSuperseded)
 			}
 			// Candidate enumeration and hydration must keep one immutable
 			// selection. Supersession was refused above; never append a newer
@@ -168,7 +168,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			layers = append(layers, layer)
 		}
 	}
-	if err := validateRequestProjections(ctx); err != nil {
+	if err := validateRequestProjectionStage(ctx, projectionReadSelection); err != nil {
 		return ctx, err
 	}
 	if len(layers) == 0 {
@@ -459,14 +459,14 @@ func requestStoreBusyFiles(ctx context.Context) []string {
 // with candidate and row selection. It adds no registry or publication owner.
 func retainRequestProjection(ctx context.Context, entry *projectionEntry) (context.Context, error) {
 	ctx = withRequestProjectionFacts(ctx)
-	if entry == nil || !liveProjectionForAcknowledgement(entry) {
-		return ctx, projectionSuperseded
+	if guard := projectionLivenessFailure(entry); guard != projectionOwnerLive {
+		return ctx, annotateProjectionReadRefusal(projectionReadRetain, guard, projectionSuperseded)
 	}
 	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	facts.mu.Lock()
 	defer facts.mu.Unlock()
 	if prior := facts.entries[entry.key]; prior != nil && prior != entry {
-		return ctx, projectionSuperseded
+		return ctx, annotateProjectionReadRefusal(projectionReadRetain, projectionOwnerFactsConflict, projectionSuperseded)
 	}
 	facts.entries[entry.key] = entry
 	return ctx, nil
@@ -476,6 +476,10 @@ func retainRequestProjection(ctx context.Context, entry *projectionEntry) (conte
 // owned by a newer physical execution. Only borrowed entries are examined;
 // there is no global rebuild, candidate scan, raw read or parser invocation.
 func validateRequestProjections(ctx context.Context) error {
+	return validateRequestProjectionStage(ctx, projectionReadValidation)
+}
+
+func validateRequestProjectionStage(ctx context.Context, stage projectionReadStage) error {
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
 		return nil
@@ -489,8 +493,8 @@ func validateRequestProjections(ctx context.Context) error {
 		return err
 	}
 	for _, entry := range facts.entries {
-		if !liveProjectionForAcknowledgement(entry) {
-			return projectionSuperseded
+		if guard := projectionLivenessFailure(entry); guard != projectionOwnerLive {
+			return annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
 		}
 	}
 	return nil

@@ -510,7 +510,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = s.metadataReadError(ctx, req, err)
+				res = s.metadataReadError(ctx, req, annotateProjectionReadRefusal(projectionReadFinal, projectionOwnerLive, err))
 			} else {
 				res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
 			}
