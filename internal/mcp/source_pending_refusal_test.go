@@ -103,12 +103,12 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, after, raw)
 	require.Nil(t, s.engine.GetSymbol("main.go::SourceBeyondDeadline"), "read must not publish canonical state")
+	t.Logf("REAL_SOURCE_DEFERRAL_VERIFIED caller_live=true original_private_allowance_expired=true physical_target_present=true canonical_target_absent=true result=%s", resultText(got.result))
 	requireReadFreshnessContract(t, got.result, "file_view_pending")
 	var body StructuredError
 	require.NoError(t, json.Unmarshal([]byte(resultText(got.result)), &body))
 	require.Equal(t, "projection_deferred", body.Data["reason"])
 	require.NotContains(t, resultText(got.result), "func SourceBeyondDeadline", "refusal carries no source payload")
-	t.Log("REAL_SOURCE_DEFERRAL_VERIFIED caller_live=true original_private_allowance_expired=true physical_target_present=true canonical_target_absent=true")
 }
 
 // Negative marker controls exercise classification only. The positive contract
