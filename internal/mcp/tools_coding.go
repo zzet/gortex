@@ -398,11 +398,6 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		}
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
-	if storeBusy && (bundle == nil || bundle.FileNode == nil && len(bundle.Defines) == 0) {
-		if pending := s.pendingEmptyMetadataRead(ctx, req, fp); pending != nil {
-			return pending, nil
-		}
-	}
 	fileNodeForScope = bundle.FileNode
 	if fileNodeForScope == nil && len(bundle.Defines) > 0 {
 		fileNodeForScope = bundle.Defines[0]
