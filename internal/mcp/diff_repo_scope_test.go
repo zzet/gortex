@@ -101,4 +101,16 @@ func TestDiffRepoScope(t *testing.T) {
 	root, prefix = srv.diffRepoScope(viewCtx, "repo-a")
 	require.Equal(t, repoA, root)
 	require.Equal(t, "repo-a", prefix)
+
+	// A routed checkout whose working-tree layer was withdrawn reads a
+	// committed tree (a composed stack with no layer), so the diff keeps the
+	// tracked root.
+	withdrawnCtx := withRequestView(ctx, &requestView{
+		kind:         requestViewKindWorktree,
+		viewRoot:     worktree,
+		materialized: &graphview.RepoView{ID: graphview.RepoViewID{RepoPrefix: "repo-b"}, Reader: g},
+	})
+	root, prefix = srv.diffRepoScope(withdrawnCtx, "repo-b")
+	require.Equal(t, repoB, root)
+	require.Equal(t, "repo-b", prefix)
 }

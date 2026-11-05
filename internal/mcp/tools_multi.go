@@ -423,11 +423,12 @@ func (s *Server) diffJoinPrefix(repoRoot string) string {
 //
 // A request routed to a worktree view reads that view's working copy, so the
 // diff runs there too; the prefix stays the tracked repository's, which is how
-// the graph keys the view's files. A view of another repository, or of a
-// committed tree (no working copy), keeps the tracked root.
+// the graph keys the view's files. A view of another repository, or one that
+// reads a committed tree (a ref view, or a routed checkout whose working-tree
+// layer was withdrawn), keeps the tracked root.
 func (s *Server) diffRepoScope(ctx context.Context, repo string) (repoRoot, repoPrefix string) {
 	repoRoot, repoPrefix = s.trackedDiffRepoScope(ctx, repo)
-	if view := requestViewPathRoot(ctx); repoRoot != "" && view.serves(repoPrefix) {
+	if view := requestViewPathRoot(ctx); repoRoot != "" && view.serves(repoPrefix) && !requestReadsCommittedTree(ctx) {
 		repoRoot = view.root
 	}
 	return repoRoot, repoPrefix
