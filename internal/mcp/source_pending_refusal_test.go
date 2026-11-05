@@ -161,6 +161,10 @@ func TestSourcePendingRefusalRejectsUnprovenOrUnauthorizedMisses(t *testing.T) {
 				session.mu.Unlock()
 				defer func() { session.mu.Lock(); session.resetScopeLocked(); session.mu.Unlock() }()
 			case "complete_selected_layer":
+				file := filepath.Join(root, "main.go")
+				raw, err := os.ReadFile(file)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(file, append(raw, []byte("\nfunc CompleteSelectedLayer() {}\n")...), 0o600))
 				projected, err := s.ensureProjected(ctx, []string{"main.go"})
 				require.NoError(t, err)
 				require.NotEmpty(t, requestProjectionLayers(projected))
