@@ -138,7 +138,7 @@ func TestSmokeWorkflowExposesExplicitDefaultOffCaptureOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), `--retain-read-source-failures="${{ vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true' }}"`) {
+	if !strings.Contains(string(data), `--retain-read-source-failures="${{ (github.event_name == 'workflow_dispatch' && inputs.retain_read_source_failures) || (github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true') }}"`) {
 		t.Fatal("existing smoke workflow cannot select bounded failure evidence without changing source again")
 	}
 }

@@ -120,15 +120,21 @@ func prepareSmokeProvenance(c laneConfig, workflow workflowProvenance) (smokePro
 		return proof, errors.New("candidate/main binary platform, pinned toolchain or build settings differ")
 	}
 	proof = smokeProvenance{RetainReadSourceFailures: c.RetainReadSourceFailures, Main: selection, MainBinary: metadata, CandidateBinary: candidate, RunnerEnvironment: os.Getenv("RUNNER_ENVIRONMENT"), RunnerOS: os.Getenv("RUNNER_OS"), RunnerArch: os.Getenv("RUNNER_ARCH")}
-	return proof, validateSmokeWorkflow(workflow)
+	if err := validateSmokeWorkflow(workflow); err != nil {
+		return proof, err
+	}
+	return proof, validateSmokeDispatchBinding(workflow, proof)
 }
 
 var pullRefPattern = regexp.MustCompile(`^refs/pull/[0-9]+/(head|merge)$`)
 
 func validateSmokeWorkflow(workflow workflowProvenance) error {
 	runID, err := strconv.ParseInt(strings.TrimPrefix(workflow.RunURL, "https://github.com/zzet/gortex/actions/runs/"), 10, 64)
-	if workflow.Event != "pull_request" || !pullRefPattern.MatchString(workflow.Ref) || workflow.Job == "" || workflow.Attempt < 1 || !revisionPattern.MatchString(workflow.Revision) || err != nil || runID < 1 {
-		return errors.New("smoke comparisons require one explicit PR workflow run/attempt/job identity")
+	identity := workflow.Job != "" && workflow.Attempt >= 1 && revisionPattern.MatchString(workflow.Revision) && err == nil && runID > 0
+	pr := workflow.Event == "pull_request" && pullRefPattern.MatchString(workflow.Ref) && workflow.SmokeDispatch == nil
+	manual := workflow.Event == "workflow_dispatch" && validSmokeDispatchWorkflow(workflow)
+	if !identity || !pr && !manual {
+		return errors.New("smoke comparisons require one explicit PR workflow run/attempt/job identity or an explicitly pinned trusted-main manual smoke")
 	}
 	return nil
 }
@@ -141,6 +147,9 @@ func validateSmokeJob(receipt laneReceipt, d dataset) error {
 		return err
 	}
 	proof := receipt.Smoke
+	if err := validateSmokeDispatchBinding(receipt.Workflow, *proof); err != nil {
+		return err
+	}
 	for _, run := range d.runs {
 		if (run.data.FailureCapture != nil) != proof.RetainReadSourceFailures || !validReadSourceFailureConfig(run.data.FailureCapture) {
 			return errors.New("smoke failure-capture configuration differs from its selected bounded policy")

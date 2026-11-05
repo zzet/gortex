@@ -6,6 +6,31 @@ on:
   schedule:
     - cron: '19 1 * * *'
   workflow_dispatch:
+    inputs:
+      run_smoke:
+        description: Run the complete existing hosted smoke lane from trusted main
+        type: boolean
+        default: false
+      smoke_baseline_revision:
+        description: Exact baseline main SHA with a trusted push-produced full bundle
+        type: string
+        default: ''
+      smoke_baseline_artifact_id:
+        description: Exact trusted baseline bundle artifact ID
+        type: string
+        default: ''
+      smoke_baseline_artifact_digest:
+        description: Exact baseline archive digest (sha256 plus colon and64hex)
+        type: string
+        default: ''
+      smoke_candidate_revision:
+        description: Exact candidate SHA (must equal this main dispatch github.sha)
+        type: string
+        default: ''
+      retain_read_source_failures:
+        description: Retain bounded read.source failure wires in every smoke report
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,8 +76,8 @@ jobs:
           if-no-files-found: error
 
   smoke:
-    name: PR performance measurement (report-only)
-    if: github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true'
+    name: Hosted performance measurement (report-only)
+    if: (github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_smoke)
     # Keep the checker strict and retain failed evidence without failing a PR.
     # Job scope also covers preparation, retrieval and artifact-upload failures.
     continue-on-error: true
@@ -64,6 +89,11 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      PERF_SMOKE_BASELINE_REVISION: ${{ inputs.smoke_baseline_revision }}
+      PERF_SMOKE_BASELINE_ARTIFACT_ID: ${{ inputs.smoke_baseline_artifact_id }}
+      PERF_SMOKE_BASELINE_ARTIFACT_DIGEST: ${{ inputs.smoke_baseline_artifact_digest }}
+      PERF_SMOKE_CANDIDATE_REVISION: ${{ inputs.smoke_candidate_revision }}
     steps:
       - timeout-minutes: 2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,14 +104,29 @@ jobs:
       - name: Build clean candidate and owned measurement commands
         timeout-minutes: 5
         run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$GITHUB_REF" = refs/heads/main
+            test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+            test "$PERF_SMOKE_CANDIDATE_REVISION" = "$GITHUB_SHA"
+            [[ "$PERF_SMOKE_BASELINE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$PERF_SMOKE_BASELINE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$PERF_SMOKE_BASELINE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          fi
           go build -buildvcs=true -o "${{ runner.temp }}/perf-candidate" ./cmd/gortex
           go build -buildvcs=true -o "${{ runner.temp }}/perf-load" ./bench/load
           go build -buildvcs=true -o "${{ runner.temp }}/perf-check-budgets" ./bench/check-budgets
+          candidate_sha="$(sha256sum "${{ runner.temp }}/perf-candidate" | cut -d' ' -f1)"
+          load_sha="$(sha256sum "${{ runner.temp }}/perf-load" | cut -d' ' -f1)"
+          checker_sha="$(sha256sum "${{ runner.temp }}/perf-check-budgets" | cut -d' ' -f1)"
+          printf '{"source_revision":"%s","candidate_sha256":"%s","load_sha256":"%s","checker_sha256":"%s"}\n' \
+            "$GITHUB_SHA" "$candidate_sha" "$load_sha" "$checker_sha" > "${{ runner.temp }}/perf-role-builds.json"
       - name: Retrieve the exact main pinned at PR planning time
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
-          PERF_MAIN_REVISION: ${{ github.event.pull_request.base.sha }}
+          PERF_MAIN_REVISION: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_baseline_revision || github.event.pull_request.base.sha }}
         run: >-
           "${{ runner.temp }}/perf-check-budgets" fetch-main
           --main-revision "$PERF_MAIN_REVISION"
@@ -110,7 +155,7 @@ jobs:
             --main-bundle "${{ runner.temp }}/perf-main" \
             --candidate-builds "${{ runner.temp }}/perf-candidate-tests" \
             --fixture "${{ runner.temp }}/perf-fixture" \
-            --retain-read-source-failures="${{ vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true' }}" \
+            --retain-read-source-failures="${{ (github.event_name == 'workflow_dispatch' && inputs.retain_read_source_failures) || (github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_RETAIN_SOURCE_FAILURES == 'true') }}" \
             --offer 20s \
             --out "${{ runner.temp }}/perf-smoke-evidence"
       - name: Preserve attempted smoke reports and failures
@@ -120,6 +165,9 @@ jobs:
         with:
           name: pr-performance-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            ${{ runner.temp }}/perf-role-builds.json
+            ${{ runner.temp }}/perf-main/selection.json
+            ${{ runner.temp }}/perf-main/main-artifact.json
             ${{ runner.temp }}/perf-smoke-evidence/*.json
             ${{ runner.temp }}/perf-smoke-evidence/workload/*.json
             ${{ runner.temp }}/perf-smoke-evidence/workload/*.txt
