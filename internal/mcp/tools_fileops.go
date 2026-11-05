@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
@@ -457,16 +458,17 @@ func pathContainedIn(abs, root string) bool {
 // location is outside every tracked repository root. resolveFilePath /
 // resolveNodePath already block lexical `../` traversal, but a symlink INSIDE
 // the repo can still point at an arbitrary file on disk (repo/link ->
-// /etc/passwd) that os.ReadFile would happily follow. This closes that hole by
-// resolving the real path and requiring it to stay within an indexed root.
+// /etc/passwd) that os.ReadFile would happily follow. A Windows directory
+// junction redirects everything beneath it the same way. This closes that hole
+// by resolving the real path and requiring it to stay within an indexed root.
 // Roots are symlink-resolved too, so a repo under a symlinked prefix (macOS
 // /tmp -> /private/tmp, a temp-dir test root) still matches. A broken / missing
 // target, or a control client with no known roots, is left to the normal read
 // path — there is nothing to leak.
 func (s *Server) guardSymlinkWithinRepo(ctx context.Context, absPath string) error {
-	real, err := filepath.EvalSymlinks(absPath)
+	real, err := pathguard.EvalLinks(absPath)
 	if err != nil {
-		// Not-yet-created file (or broken symlink): EvalSymlinks can't resolve
+		// Not-yet-created file (or broken symlink): EvalLinks can't resolve
 		// the leaf, so resolve the nearest existing ancestor and re-append the
 		// trailing components. This keeps a brand-new file under a symlinked
 		// root (e.g. macOS /var -> /private/var, or a symlinked checkout) inside
@@ -505,7 +507,7 @@ func resolveNearestExistingAncestor(absPath string) string {
 	cur := filepath.Clean(absPath)
 	var suffix string
 	for {
-		if real, err := filepath.EvalSymlinks(cur); err == nil {
+		if real, err := pathguard.EvalLinks(cur); err == nil {
 			if suffix == "" {
 				return real
 			}
@@ -533,7 +535,7 @@ func (s *Server) guardRepoRoots(ctx context.Context) []string {
 		if root == "" {
 			return
 		}
-		if real, err := filepath.EvalSymlinks(root); err == nil {
+		if real, err := pathguard.EvalLinks(root); err == nil {
 			root = real
 		}
 		roots = append(roots, filepath.Clean(root))

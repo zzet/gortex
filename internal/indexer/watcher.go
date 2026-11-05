@@ -3718,10 +3718,10 @@ func pickKind(types []fswatcher.EventType) ChangeKind {
 // mutations) funnels through here, so one check covers them all.
 func (w *Watcher) isExcluded(path string) bool {
 	root := w.indexer.rootPath
-	// One Lstat serves both the symlink check and the folder check; only a
-	// symlink pays for resolving its target.
+	// One Lstat serves both the link check and the folder check; only a
+	// link pays for resolving its target.
 	info, err := os.Lstat(path)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 && pathguard.SymlinkEscapes(path, root) {
+	if err == nil && pathguard.IsLink(path, info) && pathguard.SymlinkEscapes(path, root) {
 		return true
 	}
 	m := w.currentExcludeMatcher()
