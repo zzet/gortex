@@ -154,6 +154,11 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			err = checkToolResult(data)
 		}
 		a := Attempt{NightlySeed: seed, NightlyDelayNS: delayNS, Tool: r.name(), Role: role, Request: hash, Agent: agent, Step: step, Slot: slot, Retry: retry, Started: start, DurationMS: float64(returned.Sub(start)) / float64(time.Millisecond), LogicalMS: float64(returned.Sub(logicalStart)) / float64(time.Millisecond), Outcome: "success"}
+		if err == nil && !retryTyped {
+			// Retain explicit incompleteness without changing the RPC outcome,
+			// original response-arrival latency, deadline, or retry authority.
+			a.ReadMetadataState = observePartialMetadata(r, args, role, data)
+		}
 		if session, ok := client.(*socketClient); ok {
 			a.CWD = session.cwd
 		}

@@ -119,7 +119,7 @@ func fmtReadSHA(raw []byte) string { sum := sha256.Sum256(raw); return hex.Encod
 // Real SQL admission exhausts the original150ms projection allowance and the
 // separate existing30ms file section. The caller remains live, bytes stay exact,
 // and no current projection rows exist to authorize a successful metadata answer.
-func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
+func TestRegisteredBusyEmptyReadKeepsPartialPending(t *testing.T) {
 	s, backend, base, path, original := snapshotFacadeFixture(t)
 	idx, _ := s.indexerForRel("main.go")
 	require.NotNil(t, idx.Search)
@@ -154,6 +154,9 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 	s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		r, e := leaf.handler(ctx, req)
 		selectedLeaf <- selected{ctx, r, e}
+		// Observe the original partial leaf contract independently of later
+		// decoration on the unavailable reader pool. No response is replayed.
+		releasePool()
 		return r, e
 	})
 	type answer struct {
@@ -219,8 +222,8 @@ func TestRegisteredPendingEmptyReadCarriesTypedReason(t *testing.T) {
 	physical, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, changed, physical)
-	t.Logf("CAUSAL_PENDING_EMPTY_SQL_VERIFIED nativeFTS=%d projection_private_expired=%t caller_live=true pool_wait=true request_pending=true actual_empty_refusal=%t", fts, !time.Now().Before(deadline), got.result != nil && got.result.IsError)
-	requireReadFreshnessContract(t, got.result, "file_view_pending")
+	t.Logf("CAUSAL_PENDING_EMPTY_SQL_VERIFIED nativeFTS=%d projection_private_expired=%t caller_live=true pool_wait=true request_pending=true actual_partial_is_error=%t", fts, !time.Now().Before(deadline), got.result != nil && got.result.IsError)
+	requirePartialPendingContext(t, got.result)
 	fresh := snapshotRegisteredCall(t, s, caller, 40, "read", map[string]any{"operation": "editing_context", "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
 	require.False(t, fresh.IsError, resultText(fresh))
 	require.Contains(t, resultText(fresh), "main.go::Target")

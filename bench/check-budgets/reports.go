@@ -47,6 +47,7 @@ type distribution struct {
 }
 
 type toolResult struct {
+	PartialPending    *int            `json:"partial_pending,omitempty"` // nil means historical UNOBSERVED, not zero
 	Successes         *int            `json:"successes"`
 	RetryableRefusals *int            `json:"retryable_refusals"`
 	Latency           distribution    `json:"latency_ms"`
@@ -56,23 +57,24 @@ type toolResult struct {
 }
 
 type attempt struct {
-	Started        time.Time      `json:"started"`
-	CWD            string         `json:"cwd"`
-	Request        string         `json:"request_sha256"`
-	Agent          *int           `json:"agent"`
-	Step           *int           `json:"step"`
-	Slot           *int           `json:"slot"`
-	Retry          *int           `json:"retry"`
-	DurationMS     *float64       `json:"duration_ms"`
-	Error          string         `json:"error"`
-	ErrorData      map[string]any `json:"error_data"`
-	NightlySeed    string         `json:"nightly_workload_seed,omitempty"`
-	NightlyDelayNS int64          `json:"nightly_delay_ns,omitempty"`
-	Tool           string         `json:"tool"`
-	Role           string         `json:"role"`
-	Outcome        string         `json:"outcome"`
-	Code           *int           `json:"code"`
-	LogicalMS      *float64       `json:"logical_ms"`
+	ReadMetadataState string         `json:"read_metadata_state,omitempty"`
+	Started           time.Time      `json:"started"`
+	CWD               string         `json:"cwd"`
+	Request           string         `json:"request_sha256"`
+	Agent             *int           `json:"agent"`
+	Step              *int           `json:"step"`
+	Slot              *int           `json:"slot"`
+	Retry             *int           `json:"retry"`
+	DurationMS        *float64       `json:"duration_ms"`
+	Error             string         `json:"error"`
+	ErrorData         map[string]any `json:"error_data"`
+	NightlySeed       string         `json:"nightly_workload_seed,omitempty"`
+	NightlyDelayNS    int64          `json:"nightly_delay_ns,omitempty"`
+	Tool              string         `json:"tool"`
+	Role              string         `json:"role"`
+	Outcome           string         `json:"outcome"`
+	Code              *int           `json:"code"`
+	LogicalMS         *float64       `json:"logical_ms"`
 }
 
 type smokeEditACK struct {
@@ -267,6 +269,11 @@ func validateReport(c inputs, input runInput, r report) error {
 	}
 	if len(p.Attempts) == 0 {
 		return errors.New("missing attempts")
+	}
+	// Report.Complete and success/code0 certify execution/RPC status only.
+	// A retained partial response must never become complete metadata proof.
+	if err := validateReadMetadataObservations(p); err != nil {
+		return err
 	}
 	retainedRefusals, groupErr := validateReadFreshnessGroups(r)
 	if groupErr != nil {

@@ -42,6 +42,13 @@ func fileEditingContextFor(reader graph.Reader) (graph.FileEditingContext, bool)
 func fileEditingContextContext(ctx context.Context, reader graph.Reader, path string, kinds []graph.NodeKind) (*graph.FileEditingContextResult, error) {
 	var result *graph.FileEditingContextResult
 	err := withFileStoreRows(ctx, reader, func(rows graph.FileEditingContextRows) error {
+		if filtered, ok := rows.(*editingContextCoreRows); ok {
+			// This consumer uses imports from the file and calls from its
+			// definitions. Do not classify endpoints it will never consume.
+			editing := *filtered
+			editing.editingContextOnly = true
+			rows = &editing
+		}
 		result = graph.FileEditingContextOf(rows, path, kinds)
 		return nil
 	})
@@ -80,12 +87,16 @@ func withFileStoreRows(ctx context.Context, reader graph.Reader, consume func(gr
 
 type editingContextCoreRows struct {
 	graph.FileEditingContextRows
-	core *contractCoreEdges
+	core               *contractCoreEdges
+	editingContextOnly bool
 }
 
-func (r *editingContextCoreRows) filter(rows []*graph.Edge) []*graph.Edge {
+func (r *editingContextCoreRows) filter(rows []*graph.Edge, kind graph.EdgeKind) []*graph.Edge {
 	var ids []string
 	for _, edge := range rows {
+		if kind != "" && (edge == nil || edge.Kind != kind) {
+			continue
+		}
 		if r.core.visible(edge) {
 			ids = append(ids, edge.From, edge.To)
 		}
@@ -100,6 +111,9 @@ func (r *editingContextCoreRows) filter(rows []*graph.Edge) []*graph.Edge {
 	}
 	var out []*graph.Edge
 	for _, edge := range rows {
+		if kind != "" && (edge == nil || edge.Kind != kind) {
+			continue
+		}
 		if r.core.visible(edge) && !owned(edge.From) && !owned(edge.To) {
 			out = append(out, edge)
 		}
@@ -107,15 +121,23 @@ func (r *editingContextCoreRows) filter(rows []*graph.Edge) []*graph.Edge {
 	return out
 }
 func (r *editingContextCoreRows) GetOutEdges(id string) []*graph.Edge {
-	return r.filter(r.FileEditingContextRows.GetOutEdges(id))
+	var kind graph.EdgeKind
+	if r.editingContextOnly {
+		kind = graph.EdgeImports
+	}
+	return r.filter(r.FileEditingContextRows.GetOutEdges(id), kind)
 }
 func (r *editingContextCoreRows) filterBatch(rows map[string][]*graph.Edge) map[string][]*graph.Edge {
 	var all []*graph.Edge
 	for _, edges := range rows {
 		all = append(all, edges...)
 	}
+	var kind graph.EdgeKind
+	if r.editingContextOnly {
+		kind = graph.EdgeCalls
+	}
 	visible := make(map[*graph.Edge]bool)
-	for _, edge := range r.filter(all) {
+	for _, edge := range r.filter(all, kind) {
 		visible[edge] = true
 	}
 	out := make(map[string][]*graph.Edge, len(rows))

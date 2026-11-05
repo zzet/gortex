@@ -15,8 +15,14 @@ func scopedReadTool(tool string) bool {
 	return tool == "read.summary" || tool == "read.editing_context"
 }
 
+// Source refusal accounting does not broaden partial-metadata observation:
+// that independent contract still uses scopedReadTool's two metadata tools.
+func freshnessRetryTool(tool string) bool {
+	return scopedReadTool(tool) || tool == "read.source"
+}
+
 func readFreshnessKeyOf(a attempt) (readFreshnessKey, bool) {
-	if a.Role != "workload" || !scopedReadTool(a.Tool) || a.CWD == "" || !planPattern.MatchString(a.Request) || a.Agent == nil || a.Step == nil || a.Slot == nil || a.Retry == nil {
+	if a.Role != "workload" || !freshnessRetryTool(a.Tool) || a.CWD == "" || !planPattern.MatchString(a.Request) || a.Agent == nil || a.Step == nil || a.Slot == nil || a.Retry == nil {
 		return readFreshnessKey{}, false
 	}
 	return readFreshnessKey{a.CWD, a.Request, a.Tool, *a.Agent, *a.Step, *a.Slot}, true
@@ -24,8 +30,11 @@ func readFreshnessKeyOf(a attempt) (readFreshnessKey, bool) {
 
 func explicitReadFreshness(a attempt) bool {
 	code, _ := a.ErrorData["error_code"].(string)
+	if a.Tool == "read.source" && (code != "file_view_pending" || a.ErrorData["reason"] != "projection_deferred") {
+		return false
+	}
 	unknown, known := a.ErrorData["delivery_unknown"].(bool)
-	return a.Role == "workload" && scopedReadTool(a.Tool) && a.Outcome == "retryable" && a.Code != nil && *a.Code == -32000 && a.Error != "" && (code == "projection_superseded" || code == "file_view_pending") && a.ErrorData["retriable"] == true && a.ErrorData["retry_scope"] == "read_only" && known && !unknown
+	return a.Role == "workload" && freshnessRetryTool(a.Tool) && a.Outcome == "retryable" && a.Code != nil && *a.Code == -32000 && a.Error != "" && (code == "projection_superseded" || code == "file_view_pending") && a.ErrorData["retriable"] == true && a.ErrorData["retry_scope"] == "read_only" && known && !unknown
 }
 
 // A refused first response remains refused. Only the separately retained final
@@ -35,7 +44,7 @@ func validateReadFreshnessGroups(r report) (map[int]bool, error) {
 	attempts := r.Phases[0].Attempts
 	keys := make(map[readFreshnessKey]bool)
 	for _, a := range attempts {
-		if a.Outcome != "retryable" && (a.Role != "workload" || !scopedReadTool(a.Tool) || a.Retry == nil || *a.Retry == 0) {
+		if a.Outcome != "retryable" && (a.Role != "workload" || !freshnessRetryTool(a.Tool) || a.Retry == nil || *a.Retry == 0) {
 			continue
 		}
 		key, valid := readFreshnessKeyOf(a)
@@ -46,7 +55,7 @@ func validateReadFreshnessGroups(r report) (map[int]bool, error) {
 	}
 	refusals := make(map[string]int)
 	for tool, metrics := range r.Phases[0].Tools {
-		if scopedReadTool(tool) && metrics.RetryableRefusals != nil && *metrics.RetryableRefusals != 0 {
+		if freshnessRetryTool(tool) && metrics.RetryableRefusals != nil && *metrics.RetryableRefusals != 0 {
 			refusals[tool] = 0
 		}
 	}

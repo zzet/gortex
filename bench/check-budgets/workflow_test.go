@@ -35,7 +35,7 @@ func TestPRSmokeWorkflowIsReportOnly(t *testing.T) {
 	if !strings.Contains(smoke.Name, "report-only") {
 		t.Fatal("PR smoke must identify its report-only status")
 	}
-	if smoke.If != "github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true'" || smoke.RunsOn != "ubuntu-24.04-arm" {
+	if smoke.If != "(github.event_name == 'pull_request' && vars.PERF_PR_SMOKE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_smoke)" || smoke.RunsOn != "ubuntu-24.04-arm" {
 		t.Fatal("PR smoke must remain opt-in on the hosted ARM runner")
 	}
 	if len(smoke.Permissions) != 2 || smoke.Permissions["contents"] != "read" || smoke.Permissions["actions"] != "read" {

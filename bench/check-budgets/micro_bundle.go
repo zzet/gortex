@@ -52,6 +52,7 @@ type testBuildReceipt struct {
 func currentBuildWorkflow(revision string) workflowProvenance {
 	workflow := workflowProvenance{Event: os.Getenv("GITHUB_EVENT_NAME"), Ref: os.Getenv("GITHUB_REF"), Revision: revision, Job: os.Getenv("GITHUB_JOB")}
 	workflow.Attempt, _ = strconv.Atoi(os.Getenv("GITHUB_RUN_ATTEMPT"))
+	workflow.SmokeDispatch = currentSmokeDispatchPins(workflow.Event)
 	if server, repo, id := os.Getenv("GITHUB_SERVER_URL"), os.Getenv("GITHUB_REPOSITORY"), os.Getenv("GITHUB_RUN_ID"); server != "" && repo != "" && id != "" {
 		workflow.RunURL = server + "/" + repo + "/actions/runs/" + id
 	}

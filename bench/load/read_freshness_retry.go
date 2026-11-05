@@ -7,7 +7,7 @@ func readFreshnessCode(code string) bool {
 }
 
 func readFreshnessRequest(r request, args map[string]any, role string) bool {
-	if role != "workload" || r.Tool != "read" || args["operation"] != r.Operation || r.Operation != "summary" && r.Operation != "editing_context" {
+	if role != "workload" || r.Tool != "read" || args["operation"] != r.Operation || r.Operation != "summary" && r.Operation != "editing_context" && r.Operation != "source" {
 		return false
 	}
 	if r.Operation == "summary" {
@@ -37,6 +37,9 @@ func (e *rpcError) retryReadFreshness(r request, args map[string]any, role strin
 		return false
 	}
 	code, _ := e.Data["error_code"].(string)
+	if r.Operation == "source" && (code != "file_view_pending" || e.Data["reason"] != "projection_deferred") {
+		return false
+	}
 	retriable, _ := e.Data["retriable"].(bool)
 	unknown, known := e.Data["delivery_unknown"].(bool)
 	return readFreshnessCode(code) && retriable && known && !unknown && e.Data["retry_scope"] == "read_only"

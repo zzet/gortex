@@ -15,8 +15,9 @@ import (
 // Actual framed transport, not a fabricated last-response cache. This test
 // retains the first refused frame separately from the final successful frame.
 func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
-	for _, code := range []string{"projection_superseded", "file_view_pending"} {
-		t.Run(code, func(t *testing.T) {
+	for _, tc := range []struct{ operation, code string }{{"editing_context", "projection_superseded"}, {"editing_context", "file_view_pending"}, {"source", "file_view_pending"}} {
+		code := tc.code
+		t.Run(tc.operation+"/"+code, func(t *testing.T) {
 			left, right := net.Pipe()
 			client := &socketClient{conn: left, reader: bufio.NewReader(left), writeGate: make(chan struct{}, 1), pending: make(map[int64]chan wireReply), done: make(chan struct{}), cwd: "/owned/private"}
 			go client.readLoop()
@@ -39,8 +40,11 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 						return
 					}
 					result := map[string]any{"content": []any{map[string]any{"type": "text", "text": "{\"file\":{\"id\":\"main.go\"},\"defines\":[]}"}}}
+					if tc.operation == "source" {
+						result = map[string]any{"content": []any{map[string]any{"type": "text", "text": "{\"id\":\"main.go::Target\",\"kind\":\"function\",\"name\":\"Target\",\"file_path\":\"main.go\",\"source\":\"func Target() {}\",\"start_line\":3,\"end_line\":3,\"from_line\":3}"}}}
+					}
 					if i == 0 {
-						body, _ := json.Marshal(map[string]any{"error_code": code, "message": "transient selected read unavailable", "retriable": true, "data": map[string]any{"retry_scope": "read_only", "delivery_unknown": false}})
+						body, _ := json.Marshal(map[string]any{"error_code": code, "message": "transient selected read unavailable", "retriable": true, "data": map[string]any{"retry_scope": "read_only", "delivery_unknown": false, "reason": "projection_deferred"}})
 						result = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(body)}}}
 					}
 					frame, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
@@ -62,8 +66,11 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 				}
 			}
 			t.Cleanup(closeAndJoin)
-			args := map[string]any{"operation": "editing_context", "target": map[string]any{"file": "main.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}
-			r := request{Tool: "read", Operation: "editing_context", Arguments: args}
+			args := map[string]any{"operation": tc.operation, "target": map[string]any{"file": "main.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}
+			if tc.operation == "source" {
+				args["target"] = map[string]any{"symbol": "main.go::Target"}
+			}
+			r := request{Tool: "read", Operation: tc.operation, Arguments: args}
 			started := time.Now()
 			result, attempts, err := callTool(t.Context(), client, r, args, "workload", 3, 0, 1, time.Second, waitContext)
 			closeAndJoin()
@@ -85,7 +92,7 @@ func TestReadOnlyFreshnessRetryKeepsFirstWireAndLogicalCost(t *testing.T) {
 			require.Less(t, time.Since(started), time.Second)
 			require.Contains(t, string(responses[0]), "isError")
 			require.NotEmpty(t, result)
-			metric := summarize(attempts, 1, "workload")["read.editing_context"]
+			metric := summarize(attempts, 1, "workload")["read."+tc.operation]
 			require.Equal(t, 1, metric.RetryableRefusals)
 			require.Equal(t, 1, metric.Successes)
 		})
