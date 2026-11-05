@@ -558,3 +558,9 @@ func checkReadbackReferenceSQLite(ctx context.Context, store, prefix string, tri
 	}
 	return checked, nil
 }
+
+// This narrow diagnostic start seam initially delegates unchanged to the
+// existing lifecycle. Its opt-in forwarding is qualified separately.
+func (p *privateRun) startReadbackReferenceDaemon(_ string) error {
+	return p.start()
+}
