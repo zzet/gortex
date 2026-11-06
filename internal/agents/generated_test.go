@@ -25,7 +25,12 @@ func owned(path string) OwnedFile {
 func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 	dir := t.TempDir()
 	path := func(name string) string { return filepath.Join(dir, name) }
-	write := func(name, body string) { t.Helper(); os.WriteFile(path(name), []byte(body), 0o644) }
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(path(name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	write("recorded", "v1 render")   // in the manifest, untouched since
 	write("edited", "user changes")  // in the manifest, hash no longer matches
@@ -47,7 +52,7 @@ func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 	listers := []NamedLister{{Name: "fake", Lister: files}}
 	env := Env{BinaryVersion: "v2"}
 
-	entries, next, err := RefreshOwnedFiles(listers, env, prev, false)
+	entries, _, err := RefreshOwnedFiles(listers, env, prev, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +66,7 @@ func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 		t.Fatalf("apply=false rewrote a file: %q", got)
 	}
 
-	entries, next, err = RefreshOwnedFiles(listers, env, prev, true)
+	entries, next, err := RefreshOwnedFiles(listers, env, prev, true)
 	if err != nil {
 		t.Fatal(err)
 	}
