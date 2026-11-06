@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/opencode"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestUpgradeInstallMethodDetection proves the path-math that maps a binary's
@@ -327,7 +328,7 @@ func TestPostUpgradeStepsDecision(t *testing.T) {
 // --hook-mode=enrich must still be on enrich afterwards.
 func TestUpgradeKeepsHookPosture(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	settings := filepath.Join(home, ".claude", "settings.json")
 	if _, err := claudecode.InstallHookWithMode(io.Discard, settings, claudecode.HookModeEnrich, agents.ApplyOpts{}); err != nil {

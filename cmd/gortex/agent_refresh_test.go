@@ -9,16 +9,15 @@ import (
 
 	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/agents/opencode"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // A brew-style binary swap: the OpenCode bridge an older release installed
 // with --hook-mode=enrich is rewritten once by the new binary, posture kept,
 // and a second start with the same binary touches nothing.
 func TestAgentRefreshOnVersionChange(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "cfg"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	dirs := testenv.Sandbox(t) // HOME alone is a no-op on Windows
+	home := dirs.Home
 	plugin := opencode.PluginPath(home)
 	manifest := agentRefreshManifestPath()
 
@@ -91,7 +90,7 @@ func TestAgentRefreshOnVersionChange(t *testing.T) {
 
 	// Opt-out: the file stays as the old binary wrote it.
 	oldInstall(true)
-	cfg := filepath.Join(home, "cfg", "gortex", "config.yaml")
+	cfg := filepath.Join(dirs.Config, "gortex", "config.yaml")
 	if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err != nil {
 		t.Fatal(err)
 	}
