@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/testenv"
 )
@@ -112,6 +114,40 @@ func TestAgentRefreshOnVersionChange(t *testing.T) {
 	run()
 	if _, err := os.Stat(plugin); !os.IsNotExist(err) {
 		t.Fatalf("refresh created a bridge the user opted out of: %v", err)
+	}
+}
+
+// Codex hooks from an older binary are reported by the refresh and by
+// doctor, with the re-approval notice, and the config is left as it was.
+func TestAgentRefreshReportsStaleCodexHooks(t *testing.T) {
+	home := testenv.Sandbox(t).Home
+	_, cfg := codex.UserHookFiles(home)
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := agents.Env{Home: home, Mode: agents.ModeGlobal, InstallHooks: true, HookCommand: "/old/bin/gortex hook"}
+	if _, err := codex.InstallHooksOnly(io.Discard, cfg, env, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(cfg)
+
+	var reported []agents.RefreshEntry
+	refreshAgentFilesIfVersionChanged(agentRefreshReport{
+		entry: func(e agents.RefreshEntry) { reported = append(reported, e) },
+		fail:  func(err error) { t.Fatal(err) },
+	})
+	if len(reported) != 1 || reported[0].Agent != "codex" || reported[0].Status != agents.RefreshStale || reported[0].Note == "" {
+		t.Fatalf("refresh reported %+v, want stale Codex hooks with the trust notice", reported)
+	}
+	if after, _ := os.ReadFile(cfg); string(after) != string(before) {
+		t.Fatal("the refresh rewrote Codex's config.toml")
+	}
+	found := false
+	for _, f := range doctorGeneratedFiles() {
+		found = found || (f.Agent == "codex" && f.Note != "" && f.Refresh == "gortex install --agents=codex")
+	}
+	if !found {
+		t.Fatalf("doctor does not report the stale Codex hooks: %+v", doctorGeneratedFiles())
 	}
 }
 

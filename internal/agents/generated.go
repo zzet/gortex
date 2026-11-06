@@ -122,6 +122,24 @@ type RefreshEntry struct {
 	Status      RefreshStatus `json:"status"`
 	FromVersion string        `json:"from_version,omitempty"`
 	ToVersion   string        `json:"to_version,omitempty"`
+	// Note is what the user must do beyond the refresh command, for a
+	// merged config that is reported instead of rewritten.
+	Note string `json:"note,omitempty"`
+}
+
+// StaleConfig is a merged config an adapter manages that no longer matches
+// what this binary's install writes.
+type StaleConfig struct {
+	Path string
+	Note string
+}
+
+// StaleConfigReporter is implemented by adapters whose merged config must be
+// reported, never rewritten, when it goes stale. Codex is the case: it
+// records trust against each hook's hash and skips a changed hook until the
+// user approves it again, so a silent rewrite would switch every hook off.
+type StaleConfigReporter interface {
+	StaleConfigs(env Env) []StaleConfig
 }
 
 // NamedLister pairs an adapter name with its owned files, for reporting and

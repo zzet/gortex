@@ -2770,6 +2770,13 @@ func refreshAgentFilesOnStart(logger *zap.Logger) {
 					zap.String("path", e.Path), zap.String("status", string(e.Status)),
 					zap.String("refresh", agentRefreshRefreshCommand(e.Agent)))
 			case agents.RefreshStale:
+				if e.Note != "" { // a merged config, reported and never rewritten
+					logger.Warn("daemon: agent config is outdated and was not rewritten",
+						zap.String("path", e.Path), zap.String("from_version", displayVersion(e.FromVersion)),
+						zap.String("to_version", e.ToVersion), zap.String("refresh", agentRefreshRefreshCommand(e.Agent)),
+						zap.String("note", e.Note))
+					return
+				}
 				logger.Info("daemon: generated agent file is outdated; agents.auto_refresh is off",
 					zap.String("path", e.Path), zap.String("refresh", agentRefreshRefreshCommand(e.Agent)))
 			}

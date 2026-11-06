@@ -30,6 +30,11 @@ var agentRefreshManifestPath = agents.GeneratedManifestPath
 type agentRefreshReport struct {
 	entry func(agents.RefreshEntry)
 	fail  func(error)
+	// quietWhenOff drops the stale-config reports while auto_refresh is
+	// off. That pass never stamps the version, so it runs on every CLI
+	// command, and repeating the same notice there helps no one; doctor
+	// and the daemon log still carry it.
+	quietWhenOff bool
 }
 
 // ownedFileListers returns every registered adapter that owns whole files.
@@ -38,6 +43,24 @@ func ownedFileListers() []agents.NamedLister {
 	for _, a := range buildRegistry().All() {
 		if l, ok := a.(agents.OwnedFileLister); ok {
 			out = append(out, agents.NamedLister{Name: a.Name(), Lister: l})
+		}
+	}
+	return out
+}
+
+// staleConfigEntries reports the merged configs an adapter manages that are
+// out of date. They are never rewritten, so they are reported as stale on
+// every pass, with whatever the user has to do beyond reinstalling.
+func staleConfigEntries(env agents.Env, from string) []agents.RefreshEntry {
+	var out []agents.RefreshEntry
+	for _, a := range buildRegistry().All() {
+		r, ok := a.(agents.StaleConfigReporter)
+		if !ok {
+			continue
+		}
+		for _, c := range r.StaleConfigs(env) {
+			out = append(out, agents.RefreshEntry{Agent: a.Name(), Path: c.Path, Status: agents.RefreshStale,
+				FromVersion: from, ToVersion: env.BinaryVersion, Note: c.Note})
 		}
 	}
 	return out
@@ -79,7 +102,12 @@ func refreshAgentFilesIfVersionChanged(r agentRefreshReport) {
 		r.fail(err)
 		return
 	}
-	if prev == nil && !ownedFilesPresent(env) {
+	from := ""
+	if prev != nil {
+		from = prev.Version
+	}
+	stale := staleConfigEntries(env, from)
+	if prev == nil && len(stale) == 0 && !ownedFilesPresent(env) {
 		return // nothing generated on this machine: leave no trace either
 	}
 	unlock, ok := lockAgentFiles(path, false)
@@ -98,7 +126,10 @@ func refreshAgentFilesIfVersionChanged(r agentRefreshReport) {
 		apply = gc.Agents.AutoRefreshEnabled()
 	}
 	entries, next, err := agents.RefreshOwnedFiles(ownedFileListers(), env, prev, apply)
-	for _, e := range entries {
+	if !apply && r.quietWhenOff {
+		stale = nil
+	}
+	for _, e := range append(entries, stale...) {
 		r.entry(e)
 	}
 	if err != nil {
@@ -216,11 +247,16 @@ func refreshAgentFilesFromCLI(cmd *cobra.Command) {
 				fmt.Fprintf(stderr, "[gortex] refreshed %s (%s -> %s)\n", e.Path, displayVersion(e.FromVersion), e.ToVersion)
 			case agents.RefreshModified, agents.RefreshUnrecognized:
 				fmt.Fprintf(stderr, "[gortex] kept %s: it is not what Gortex generated; run `%s` to replace it\n", e.Path, agentRefreshRefreshCommand(e.Agent))
+			case agents.RefreshStale:
+				if e.Note != "" { // a merged config, never rewritten
+					fmt.Fprintf(stderr, "[gortex] %s is outdated and was not rewritten; run `%s`. %s\n", e.Path, agentRefreshRefreshCommand(e.Agent), e.Note)
+				}
 			}
 		},
 		fail: func(err error) {
 			fmt.Fprintf(stderr, "[gortex] could not refresh agent files: %v\n", err)
 		},
+		quietWhenOff: true,
 	})
 }
 
@@ -247,8 +283,12 @@ func doctorGeneratedFiles() []doctorGeneratedFile {
 	}
 	prev, _ := loadAgentManifest(agentRefreshManifestPath())
 	entries, _, _ := agents.RefreshOwnedFiles(ownedFileListers(), env, prev, false)
+	from := ""
+	if prev != nil {
+		from = prev.Version
+	}
 	var out []doctorGeneratedFile
-	for _, e := range entries {
+	for _, e := range append(entries, staleConfigEntries(env, from)...) {
 		if e.Status == agents.RefreshCurrent {
 			continue
 		}
@@ -269,7 +309,13 @@ func printDoctorGeneratedFiles(w io.Writer, files []doctorGeneratedFile) {
 			agents.RefreshModified:     "edited since Gortex wrote it",
 			agents.RefreshUnrecognized: "not a file Gortex generated",
 		}[f.Status]
+		if f.Note != "" {
+			why = "outdated, not rewritten automatically"
+		}
 		fmt.Fprintf(w, "  %s %s: %s — run `%s` to replace it\n", glyphWarn, f.Path, why, f.Refresh)
+		if f.Note != "" {
+			fmt.Fprintf(w, "      %s\n", f.Note)
+		}
 	}
 }
 
