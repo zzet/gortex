@@ -23,6 +23,7 @@ import (
 var readbackReferencePlanPath = flag.String("readback-reference-plan", "", "explicit frozen readback plan; omission never launches a daemon")
 var readbackReferencePhase = flag.String("readback-reference-phase", "preflight", "preflight, protocol_preflight, no_edit, under_edit, compare or main_compare")
 var readbackReferenceCellIndex = flag.Int("readback-reference-cell", -1, "exact frozen cell index; no implicit next cell")
+var readbackReferenceRefusalEvidence = flag.Bool("readback-reference-refusal-evidence", false, "explicit diagnostic-only forwarding of GORTEX_SEARCH_REFUSAL_EVIDENCE=1; schedules and strict first responses unchanged")
 var readbackReferenceExecute = flag.Bool("readback-reference-execute", false, "execute one explicitly granted reference cell")
 var readbackReferenceBaselineReport = flag.String("readback-reference-baseline-report", "", "exact no-edit artifact for offline paired comparison")
 var readbackReferenceMainReport = flag.String("readback-reference-main-report", "", "existing load read-only main report")
@@ -63,6 +64,7 @@ type readbackReferenceCaseReport struct {
 	Cleanup                 map[string]any                      `json:"cleanup"`
 	Errors                  []string                            `json:"errors"`
 	AcceptanceState         string                              `json:"acceptance_state"`
+	RefusalEvidenceOptIn    bool                                `json:"refusal_evidence_requested,omitempty"`
 	ProtocolOnly            bool                                `json:"protocol_only"`
 	ProtocolPass            bool                                `json:"protocol_pass"`
 	ToolSurface             string                              `json:"tool_surface"`
@@ -200,6 +202,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		return report, err
 	}
 	report.ToolSurface = surface
+	report.RefusalEvidenceOptIn = *readbackReferenceRefusalEvidence
 	operationRole := role
 	hostProfile := "reference"
 	if role == "protocol_preflight" {
@@ -327,7 +330,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		return report, err
 	}
 	started := time.Now()
-	if err := p.start(); err != nil {
+	if err := p.startReadbackReferenceDaemon(role, *readbackReferenceRefusalEvidence); err != nil {
 		return report, err
 	}
 	report.DaemonPID = p.process.Process.Pid
@@ -557,4 +560,12 @@ func checkReadbackReferenceSQLite(ctx context.Context, store, prefix string, tri
 		}
 	}
 	return checked, nil
+}
+
+// The existing one-offer protocol diagnostic is intrinsically selected. Other
+// existing runtime roles forward the flag only with the separate explicit SDK
+// diagnostic switch; ordinary acceptance remains isolated by default.
+func (p *privateRun) startReadbackReferenceDaemon(role string, explicit bool) error {
+	selected := role == "protocol_preflight" || explicit && (role == "under_edit" || role == "no_edit")
+	return p.startWithSearchRefusalEvidence(selected)
 }

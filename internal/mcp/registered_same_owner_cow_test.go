@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
@@ -358,11 +359,14 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 	}
 }
 
-// The newly enabled full-metadata allowance stops at early selection errors.
-// A later withdrawal must not replay recordSymbol or on-demand enrichment.
+// An early CAS allowance alone never authorizes replay of active enrichment.
+// Inert full-JSON metadata has a separately audited accepted-only contract;
+// this guard retains the unsafe on-demand producer shape and strict refusal.
 func TestFullSymbolCASAllowanceDoesNotGrantAfterLeafReplay(t *testing.T) {
 	selectedProjectionRegistry(t)
 	s, path, entry, _ := acknowledgedCanonicalFile(t)
+	// The existing no-provider fixture exercises output admission without LSP subprocesses.
+	s.semanticMgr = &semantic.Manager{}
 	retirement := s.canonicalProjectionRetirement(path)
 	require.NotNil(t, retirement)
 	calls := 0
@@ -374,6 +378,7 @@ func TestFullSymbolCASAllowanceDoesNotGrantAfterLeafReplay(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, result.IsError, resultText(result))
 		require.EqualValues(t, 8, extractTextResult(t, result)["node"].(map[string]any)["start_line"])
+		require.True(t, ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt).replayUnsafe, "actual enrichment work must mark the attempt ineligible")
 		require.NoError(t, s.indexer.IndexFile(path))
 		retirement.run()
 		require.True(t, entry.checkedRetired.Load())

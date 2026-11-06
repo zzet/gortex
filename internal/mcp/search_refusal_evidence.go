@@ -139,5 +139,13 @@ func searchRefusalToolResult(err error) *mcplib.CallToolResult {
 			"gortex_search_refusal": map[string]any{"stage": evidence.stage.label(), "capture_state": evidence.captureState},
 		}}
 	}
+	if projection, present := err.(*projectionReadDiagnostic); present {
+		if result.Meta == nil {
+			result.Meta = &mcplib.Meta{AdditionalFields: map[string]any{}}
+		}
+		result.Meta.AdditionalFields["gortex_projection_refusal"] = map[string]any{
+			"stage": projection.stage.label(), "guard": projection.guard.label(),
+		}
+	}
 	return result
 }

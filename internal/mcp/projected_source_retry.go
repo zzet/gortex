@@ -21,8 +21,9 @@ func invalidateProjectedSource(entry *projectionEntry) error {
 type projectedSourceDeadlineKey struct{}
 type projectedSourceAllowanceKey struct{}
 type projectedSourceAllowance struct {
-	attempts atomic.Int32
-	tool     string
+	attempts       atomic.Int32
+	tool           string
+	symbolMetadata bool // Bound once to the actual audited full-JSON request.
 }
 
 // Only these nonpaginated file reads have audited replay-safe response work.
@@ -32,6 +33,10 @@ func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
 	switch tool {
 	case "get_symbol_source", "get_file_summary":
 		return true
+	case "get_symbol":
+		// Full JSON assembly has no cursor/compression state. The handler
+		// separately marks any active enrichment attempt replay-unsafe.
+		return req.GetString("detail", "brief") == "full" && req.GetString("format", "json") == "json"
 	case "get_editing_context":
 		args := req.GetArguments()
 		var options map[string]any
@@ -59,9 +64,9 @@ func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
 func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		legacy, known := s.legacyToolName(&req)
-		// Full symbol metadata may restart only its early projection selection,
-		// before recordSymbol/enrichNodeOnDemand. Keep it out of the audited
-		// after-leaf replay set, which would include those response side effects.
+		// Every symbol shape keeps its early projection-selection allowance.
+		// Only full JSON with inert enrichment also qualifies after the leaf;
+		// session bookkeeping is staged until the final acceptance check.
 		if !known || !auditedProjectionReadRetry(legacy, req) && legacy != "get_symbol" {
 			return next(ctx, req)
 		}
@@ -71,7 +76,7 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 				deadline = prior
 			}
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
-			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy})
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, symbolMetadata: legacy == "get_symbol" && auditedProjectionReadRetry(legacy, req)})
 		}
 		return next(ctx, req)
 	}
@@ -97,7 +102,10 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 		return false
 	}
 	allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
-	if !ok || allowance.tool == "get_symbol" {
+	if !ok || allowance.tool == "get_symbol" && !allowance.symbolMetadata {
+		return false
+	}
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil && state.replayUnsafe {
 		return false
 	}
 	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)

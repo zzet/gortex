@@ -373,6 +373,9 @@
                 "outcome": {
                   "type": "string"
                 },
+                "read_metadata_state": {
+                  "type": "string"
+                },
                 "request_sha256": {
                   "type": "string"
                 },
@@ -4293,6 +4296,16 @@
                   ],
                   "type": "object"
                 },
+                "partial_pending": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "phase_censored": {
                   "type": "integer"
                 },
@@ -4501,6 +4514,16 @@
                     "max"
                   ],
                   "type": "object"
+                },
+                "partial_pending": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "phase_censored": {
                   "type": "integer"

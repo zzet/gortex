@@ -32,14 +32,15 @@ import (
 )
 
 type projectionLatencyFixture struct {
-	server        *Server
-	registry      *pendingProjections
-	snapshot      *projectionSnapshot
-	root          string
-	covered       map[string]bool
-	files         int
-	nativeSymbols int
-	indexer       *indexer.Indexer
+	server              *Server
+	registry            *pendingProjections
+	snapshot            *projectionSnapshot
+	root                string
+	covered             map[string]bool
+	files               int
+	nativeSymbols       int
+	nativeSymbolsSHA256 string
+	indexer             *indexer.Indexer
 }
 
 func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entries int) *projectionLatencyFixture {
@@ -70,6 +71,8 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 	nativeSymbols, err := store.SymbolFTSCount()
 	require.NoError(t, err, "native symbol FTS is mandatory; substring fallback cannot satisfy this comparison")
 	require.Greater(t, nativeSymbols, 0, "native symbol FTS corpus must be populated")
+	nativeSymbolsSHA256, err := projectionLatencyNativeMembership(t.Context(), store, nativeSymbols)
+	require.NoError(t, err, "exact native generation ownership census required before timing")
 	engine := query.NewEngine(store)
 	engine.SetSearch(search.NewSymbolSearcherBackend(store))
 	server := NewServer(engine, store, idx, nil, zap.NewNop(), nil)
@@ -77,7 +80,7 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 	// or read gate. This inert watcher also prevents legacy read repair from
 	// changing the population being compared.
 	server.SetWatcher(mutationTestWatcher{done: make(chan indexer.MutationResult)})
-	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount, nativeSymbols: nativeSymbols, indexer: idx}
+	fixture := &projectionLatencyFixture{server: server, registry: newPendingProjections(), root: root, covered: map[string]bool{}, files: indexed.FileCount, nativeSymbols: nativeSymbols, nativeSymbolsSHA256: nativeSymbolsSHA256, indexer: idx}
 	failure := ""
 	defer writeProjectionLatencySetup(t, fixture, entries, &failure)
 	if entries != 0 {
@@ -87,8 +90,7 @@ func prepareProjectionLatencyFixture(t *testing.T, source, revision string, entr
 		}
 		require.NoError(t, manifestErr)
 		failure = "validating pinned native corpus census"
-		require.Equal(t, fixture.files, manifest.IndexedFiles, "same full corpus index scope")
-		require.Equal(t, fixture.nativeSymbols, manifest.NativeSymbols, "same native FTS population")
+		require.NoError(t, validateProjectionLatencyNativeCensus(manifest, fixture.files, fixture.nativeSymbols, fixture.nativeSymbolsSHA256), "same exact native corpus membership")
 		for _, candidate := range manifest.Entries {
 			failure = "validating pinned member " + candidate.Path
 			path := filepath.Join(root, filepath.FromSlash(candidate.Path))
@@ -249,6 +251,7 @@ func TestProjectionSearchHandlerLatencyAcceptance(t *testing.T) {
 	fixtures := map[int]*projectionLatencyFixture{0: prepareProjectionLatencyFixture(t, source, revision, 0), 512: prepareProjectionLatencyFixture(t, source, revision, 512)}
 	require.Equal(t, fixtures[0].files, fixtures[512].files, "matched fixture indexing populations")
 	require.Equal(t, fixtures[0].nativeSymbols, fixtures[512].nativeSymbols, "matched native FTS populations before comment-only projections")
+	require.Equal(t, fixtures[0].nativeSymbolsSHA256, fixtures[512].nativeSymbolsSHA256, "matched exact native FTS membership before comment-only projections")
 	probes := projectionLatencyProbes(t, fixtures[512])
 	selectPopulation := func(entries int) (func() error, error) {
 		fixture := fixtures[entries]

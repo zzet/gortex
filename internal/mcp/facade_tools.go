@@ -1490,7 +1490,11 @@ func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
 // relations, target.file, ...), so applying the policy there would miss the
 // legacy path/id fields the rider is deliberately keyed to.
 func (s *Server) decorateFacadeFreshness(ctx context.Context, legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
-	return s.decorateToolFreshness(ctx, legacy, req, result)
+	checked, err := s.decorateToolFreshnessChecked(ctx, legacy, req, result)
+	if err != nil {
+		return s.metadataReadError(ctx, req, err)
+	}
+	return checked
 }
 
 func facadeLegacyManagesOwnOverlay(name string) bool {

@@ -104,7 +104,10 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			acceptedBefore = len(attemptState.accepted)
 		}
 		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
-			if callerOwnsProjectionFacts {
+			legacy, _ := s.legacyToolName(&request)
+			// Auditing full-symbol replay does not add a data-free pending
+			// response to that tool's existing wire contract.
+			if callerOwnsProjectionFacts || legacy == "get_symbol" {
 				return nil, nil
 			}
 			pending, err := s.lateStormTransitionPending(selected, request, failure)
@@ -489,7 +492,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = searchRefusalToolResult(freshnessErr)
+				res = s.metadataReadError(ctx, req, freshnessErr)
 			}
 			// Which view answered rides in that same block: a response that
 			// came from somewhere other than the base — or fell back to it —
@@ -510,7 +513,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 				if retryAfterCheckedProjectionChange(ctx) {
 					return nil, errProjectedSourceMoved
 				}
-				res = mcp.NewToolResultError(err.Error())
+				res = s.metadataReadError(ctx, req, annotateProjectionReadRefusal(projectionReadFinal, projectionOwnerLive, err))
 			} else {
 				res, hErr = s.commitFreshSymbolPage(ctx, res, req.Params.Name, view)
 			}

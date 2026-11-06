@@ -92,21 +92,42 @@ func (record *mutationCommitRecord) attachFileProjection(response map[string]any
 // Check the immutable pointer on both sides of metadata I/O so an old receipt
 // cannot claim a concurrently replaced entry, even with identical bytes.
 func liveProjectionForAcknowledgement(entry *projectionEntry) bool {
-	if entry == nil || entry.suspect.Load() || pendingFileProjections.snap.Load().entries[entry.key] != entry {
-		return false
+	return projectionLivenessFailure(entry) == projectionOwnerLive
+}
+
+// Preserve the original check order and single stat. The returned enum records
+// the actual first failed predicate; it is not a later ownership resample.
+func projectionLivenessFailure(entry *projectionEntry) projectionLivenessGuard {
+	if entry == nil {
+		return projectionOwnerMissing
+	}
+	if entry.suspect.Load() {
+		return projectionOwnerSuspectBefore
+	}
+	if pendingFileProjections.snap.Load().entries[entry.key] != entry {
+		return projectionOwnerChangedBefore
 	}
 	stamp, err := statDiskStamp(entry.absPath)
-	if err != nil || !entry.disk.matches(stamp) {
-		return false
+	if err != nil {
+		return projectionOwnerStatError
+	}
+	if !entry.disk.matches(stamp) {
+		return projectionOwnerStampChanged
 	}
 	if entry.tombstone {
 		if stamp.info != nil {
-			return false
+			return projectionOwnerTombstonePresent
 		}
 	} else if stamp.info == nil || !stamp.info.Mode().IsRegular() {
-		return false
+		return projectionOwnerNotRegular
 	}
-	return !entry.suspect.Load() && pendingFileProjections.snap.Load().entries[entry.key] == entry
+	if entry.suspect.Load() {
+		return projectionOwnerSuspectAfter
+	}
+	if pendingFileProjections.snap.Load().entries[entry.key] != entry {
+		return projectionOwnerChangedAfter
+	}
+	return projectionOwnerLive
 }
 
 // Bind accepted file facts to exactly this physical execution. Tombstones

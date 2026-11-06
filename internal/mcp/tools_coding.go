@@ -370,7 +370,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		if errors.Is(err, errProjectedSourceMoved) {
 			return nil, err
 		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return s.metadataReadError(ctx, req, err), nil
 	}
 
 	afterFreshSymbolAcceptance(ctx, func() {
@@ -393,6 +393,9 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	}
 
 	if !storeBusy && (bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0)) {
+		if pending := s.pendingEmptyMetadataRead(ctx, req, fp); pending != nil {
+			return pending, nil
+		}
 		return mcp.NewToolResultError("no symbols found for file: " + fp), nil
 	}
 	fileNodeForScope = bundle.FileNode
@@ -895,6 +898,9 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		}
 		if removed {
 			return removedProjectedSymbolGuidance(id, true), nil
+		}
+		if pending := s.pendingSourceMiss(ctx, req, id); pending != nil {
+			return pending, nil
 		}
 		return mcp.NewToolResultError("symbol not found: " + id + s.suggestSymbolIDs(ctx, id)), nil
 	}

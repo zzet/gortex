@@ -1730,7 +1730,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 			if errors.Is(err, errProjectedSourceMoved) {
 				return nil, err
 			}
-			return mcp.NewToolResultError(err.Error()), nil
+			return searchRefusalToolResult(err), nil
 		}
 	}
 
@@ -1738,7 +1738,7 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	if node == nil {
 		removed, err := s.removedByPendingProjection(ctx, req, id)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return searchRefusalToolResult(err), nil
 		}
 		if removed {
 			return removedProjectedSymbolGuidance(id, false), nil
@@ -1754,7 +1754,17 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 		return symbolNotFoundGuidance(id), nil
 	}
 
-	s.sessionFor(ctx).recordSymbol(id)
+	sess := s.sessionFor(ctx)
+	afterFreshSymbolAcceptance(ctx, func() { sess.recordSymbol(id) })
+
+	// Enrichment can spawn a language server and persist a generation before
+	// serialization. Keep that shape out of after-leaf replay; staging the
+	// session credit does not make those producer effects replay-safe.
+	if s.semanticMgr != nil && s.graph != nil && !nodeHasSemanticType(node) {
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.replayUnsafe = true
+		}
+	}
 
 	// On-demand LSP: when the synchronous LSP sweep is off (the default), fault
 	// in this symbol's precise type now — one hover on the lazy-spawned server,
@@ -2809,7 +2819,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		if errors.Is(err, errProjectedSourceMoved) {
 			return nil, err
 		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return s.metadataReadError(ctx, req, err), nil
 	}
 
 	// GCX emits an adjacent-edge count; other formats retain the full rows.

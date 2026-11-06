@@ -19,6 +19,8 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "seed-search":
+			return readOnlySeedCommand(args[1:], stdout, stderr)
 		case "edit-loop":
 			return editLoopCommand(args[1:], stdout, stderr)
 		case "plan", "collect", "edit-plan", "edit-collect":

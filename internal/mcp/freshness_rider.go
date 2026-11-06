@@ -829,6 +829,9 @@ func (s *Server) decorateToolFreshness(ctx context.Context, name string, req mcp
 // Keep ownership failure typed until the audited wrapper chooses refusal or a
 // no-data pending reply. Other callers preserve the existing wire behavior.
 func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, req mcp.CallToolRequest, res *mcp.CallToolResult) (*mcp.CallToolResult, error) {
+	if metadataTransientRefusal(res) {
+		return res, nil
+	}
 	// File reads refuse replaced owners before labelling/rendering. Symbol
 	// search may finish the one immutable pending view checked by this call;
 	// effectful responses retain their actual disk effects and receipts.
@@ -841,7 +844,7 @@ func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, 
 			if validationTool == "search_symbols" {
 				return nil, annotateSearchRefusal(ctx, searchRefusalResponseValidation, err)
 			}
-			return nil, err
+			return nil, annotateProjectionReadRefusal(projectionReadDecoration, projectionOwnerLive, err)
 		}
 	}
 	scope, ids, files := freshnessTargets(name, req)
