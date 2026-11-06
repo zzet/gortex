@@ -273,19 +273,18 @@ func (s *Server) handleGetDiagnostics(ctx context.Context, req mcp.CallToolReque
 		return mcp.NewToolResultError(fmt.Sprintf("open document: %v", err)), nil
 	}
 
-	var diags []lsp.Diagnostic
 	if wait {
-		diags = provider.WaitForDiagnostics(absPath, time.Duration(timeoutMs)*time.Millisecond)
-	} else {
-		d, _ := provider.LastDiagnostics(absPath)
-		diags = d
+		provider.WaitForSettledDiagnostics(absPath, time.Duration(timeoutMs)*time.Millisecond, diagnosticsQuietWindow)
 	}
+	diags, published := provider.LastDiagnostics(absPath)
 
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
 		"path":        path,
 		"diagnostics": diagsToWire(diags),
 		"total":       len(diags),
 		"provider":    provider.Name(),
+		// false: the server has said nothing yet, an empty list is not "clean".
+		"published": published,
 	})
 }
 
@@ -486,6 +485,11 @@ func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) 
 			if err != nil {
 				return nil, abs, err
 			}
+			if spec.WorkspaceGate != nil {
+				if err := spec.WorkspaceGate(root); err != nil {
+					return nil, abs, err
+				}
+			}
 			lp, err := r.ForSpecWorkspace(spec, root)
 			if err != nil {
 				return nil, abs, fmt.Errorf("router spawn %s: %w", spec.Name, err)
@@ -518,7 +522,7 @@ func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) 
 		}
 		return lp, abs, nil
 	}
-	return nil, abs, fmt.Errorf("no LSP provider registered for languages %v", spec.Languages)
+	return nil, abs, fmt.Errorf("no LSP provider for %s: %s is disabled or not on the daemon's PATH", spec.Name, spec.Command)
 }
 
 // lspRouter returns the semantic manager's LSP router as a concrete
@@ -636,6 +640,10 @@ func (s *Server) workspaceRootFor(absPath string) (string, error) {
 	}
 	return "", fmt.Errorf("no tracked repo contains %s: refusing to derive an LSP workspace from the daemon's working directory", absPath)
 }
+
+// diagnosticsQuietWindow is how long a server has to stay silent before a
+// waiting get_diagnostics trusts the last publish.
+const diagnosticsQuietWindow = 1500 * time.Millisecond
 
 // lspNoProviderResult returns a structured error for the "no LSP
 // available" common case so callers can branch on a stable

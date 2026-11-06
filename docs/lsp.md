@@ -25,6 +25,7 @@ The core registry (`internal/semantic/lsp/registry.go`):
 | `gopls`                      | `gopls`                          | go                          | 3                |
 | `tsgo`                       | `tsgo --lsp`                     | typescript, javascript      | 5                |
 | `typescript-language-server` | `typescript-language-server`     | typescript, javascript      | 6                |
+| `vue-typescript`             | `typescript-language-server`     | none, `.vue` on demand      | 5                |
 | `pyright`                    | `pyright-langserver`             | python                      | 5                |
 | `rust-analyzer`              | `rust-analyzer`                  | rust                        | 5                |
 | `clangd`                     | `clangd --background-index`      | c, c++, objc, objc++        | 5                |
@@ -110,6 +111,9 @@ pip install python-lsp-server     # alt (pylsp)
 # TypeScript / JavaScript (pick one)
 npm install -g @typescript/native-preview          # ships tsgo (preferred)
 npm install -g typescript typescript-language-server  # node-based fallback
+
+# Vue diagnostics (typescript-language-server plus the plugin below)
+npm install -g @vue/language-server  # or add @vue/typescript-plugin to the project
 
 # C / C++ / Objective-C
 brew install llvm                 # ships clangd
@@ -487,6 +491,19 @@ Two surfaces:
 the LSP server produced for a file. Use it for one-shot reads, batch
 checks, or contexts where the agent doesn't maintain a long-lived
 session.
+
+`published` says whether the server reported on the file at all. With
+`published: false` an empty list means "no answer yet", not "no errors".
+`wait: true` waits past the first publish until the server stays quiet, since
+tsserver can send an empty report just before the real one.
+
+`.vue` files go through the `vue-typescript` spec: `typescript-language-server`
+with `@vue/typescript-plugin` loaded into the project's own `tsserver`. The
+plugin is taken from the repo's `node_modules`, or from next to a
+`vue-language-server` on the daemon's PATH. Without the plugin or the project's
+`node_modules/typescript` the tool answers `no_lsp_for` and says which one is
+missing. The spec has no languages, so indexing never sweeps `.vue` files
+through it: a server starts only when a tool asks about one.
 
 ### Push (opt-in)
 

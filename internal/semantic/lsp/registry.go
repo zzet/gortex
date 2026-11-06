@@ -148,6 +148,15 @@ type ServerSpec struct {
 	// of NeedsCompileDB for servers whose failure is a missing dependency
 	// tree rather than a missing compilation database.
 	ProjectReady func(root string) (ready bool, remediation string)
+	// WorkspaceGate, when non-nil, refuses a workspace before anything is
+	// spawned for an on-demand LSP request; the error is the reason shown to
+	// the caller. Keep this out of the spawn path: a spawn failure downgrades
+	// the spec for every workspace, this only concerns the one asked about.
+	WorkspaceGate func(root string) error
+	// InitOptionsFunc computes the initialize options per workspace, for a
+	// server whose options depend on what the repo has installed. A non-empty
+	// result wins over InitializationOptions.
+	InitOptionsFunc func(root string) json.RawMessage
 }
 
 // ConnectSpec carries the transport coordinates for passive LSP attach
@@ -713,6 +722,26 @@ var Servers = []ServerSpec{
 		Priority:    7,
 		Daemon:      true,
 		MaxParallel: 4,
+	},
+	{
+		// SFC diagnostics: tsserver with the Vue plugin inside, the setup the
+		// Vue language tools document for typescript-language-server. A spec
+		// of its own, not a .vue entry on the one above: tsgo takes .ts on most
+		// machines and has no plugin API, and the plugin stays out of plain
+		// TS sessions. No Languages on purpose, so the eager enrichment sweep
+		// skips it and it runs only when a tool asks about a .vue file.
+		Name:       "vue-typescript",
+		Command:    "typescript-language-server",
+		Args:       []string{"--stdio"},
+		Extensions: []string{".vue"},
+		LanguageIDs: map[string]string{
+			".vue": "vue",
+		},
+		Priority:        5,
+		Daemon:          true,
+		MaxParallel:     4,
+		WorkspaceGate:   vueWorkspaceGate,
+		InitOptionsFunc: vueInitOptions,
 	},
 	{
 		Name:       "mql-lsp-server",

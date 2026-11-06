@@ -338,6 +338,11 @@ func (p *Provider) effectiveInitOptions(workspaceRoot string) json.RawMessage {
 	if len(p.altInitOptions) > 0 {
 		return p.altInitOptions
 	}
+	if p.spec != nil && p.spec.InitOptionsFunc != nil {
+		if opts := p.spec.InitOptionsFunc(workspaceRoot); len(opts) > 0 {
+			return opts
+		}
+	}
 	return effectiveInitializationOptions(p.spec)
 }
 
@@ -2947,6 +2952,27 @@ func (p *Provider) LastDiagnostics(absPath string) ([]Diagnostic, bool) {
 	out := make([]Diagnostic, len(d))
 	copy(out, d)
 	return out, true
+}
+
+// WaitForSettledDiagnostics waits for a publish, then until the server stays
+// quiet for the given window, all within timeout. tsserver reports a file in
+// stages, so the first publish can be an empty one that the real errors follow
+// moments later: stopping there reads as "clean". Read the outcome with
+// LastDiagnostics.
+func (p *Provider) WaitForSettledDiagnostics(absPath string, timeout, quiet time.Duration) {
+	deadline := time.Now().Add(timeout)
+	p.WaitForDiagnostics(absPath, timeout)
+	for {
+		window := min(quiet, time.Until(deadline))
+		if window <= 0 {
+			return
+		}
+		start := time.Now()
+		p.WaitForDiagnostics(absPath, window)
+		if time.Since(start) >= window {
+			return
+		}
+	}
 }
 
 // WaitForDiagnostics blocks until the server publishes the next

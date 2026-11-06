@@ -228,7 +228,7 @@ Wired across every running language server (gopls, tsserver, pyright, rust-analy
 |------|-------------|
 | `subscribe_diagnostics` | Opt the session into push `notifications/diagnostics`; initial state replays immediately, deltas thereafter. Filter by `min_severity` / `path_prefix` |
 | `unsubscribe_diagnostics` | Opt back out — idempotent, fires automatically on session disconnect |
-| `get_diagnostics` | Latest stored diagnostics for a file; `wait: true` blocks on the first publish |
+| `get_diagnostics` | Latest stored diagnostics for a file; `wait: true` blocks until the server goes quiet after a publish; `published: false` means nothing has arrived yet, so an empty list is not a clean file |
 | `get_code_actions` | LSP code actions (quickfix / organizeImports / refactor / source) at a file location |
 | `apply_code_action` | Apply a single code action to disk — atomic temp+rename |
 | `fix_all_in_file` | Loop codeAction → apply → re-collect until convergence over the whole file |
