@@ -17,7 +17,10 @@ import (
 //
 //   - the cross-repository candidate query of a changed-file frontier drove
 //     from edges_by_to on view_gen alone and probed the frontier CTE per edge
-//     (13-21 s per save) until the CTE was pinned as the outer loop;
+//     (13-21 s per save) until the CTE was pinned as the outer loop, and its
+//     incoming incident arm drove from edges_by_kind and probed the frontier
+//     files per edge (1m50s for 5 files on a 6M-edge store) until the
+//     frontier nodes were pinned as that arm's outer loop;
 //   - the contract-eviction frontier's de-duplicating UNION was planned as a
 //     sorted MERGE whose arms read every node and every edge of the generation
 //     in id order (4.8 s per save) until it became UNION ALL.
@@ -86,6 +89,14 @@ func TestPerSaveFrontierPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 				assertNoGenerationWalk(t, "cross_repo_frontier", cross, "e")
 				if joined := strings.Join(cross, "\n"); !strings.Contains(joined, "SCAN ce") {
 					t.Errorf("cross_repo_frontier: the frontier CTE does not drive:\n%s", joined)
+				}
+				// Every edge of a base kind is most of the table: the incident
+				// arms must reach edges through the frontier files' nodes,
+				// never through the kind index.
+				for _, line := range cross {
+					if strings.Contains(line, "edges_by_kind") {
+						t.Errorf("cross_repo_frontier: an arm walks edges by kind (%s):\n%s", trimPlanLine(line), strings.Join(cross, "\n"))
+					}
 				}
 				contract := explainOnConn(t, ctx, conn, contractFileEvictionFrontierSQL(scoped), contractArgs...)
 				assertNoGenerationWalk(t, "contract_eviction_frontier", contract, "nodes", "edges")

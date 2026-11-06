@@ -579,16 +579,23 @@ JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 			if !ok {
 				return "", nil, false
 			}
+			// CROSS JOIN pins the frontier files' nodes as the driving loop of
+			// both incident arms. With a plain JOIN the planner drove the
+			// incoming arm from edges_by_kind and probed nodes_by_file for
+			// every edge of the four base kinds. It planned it that way with
+			// no statistics, and also on a 6M-edge store whose sqlite_stat1
+			// estimated 667 rows per kind: 1m50s for a 5-file frontier there,
+			// 11ms pinned.
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
+  CROSS JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
 			args = appendKinds(args)
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
+  CROSS JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
