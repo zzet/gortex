@@ -193,6 +193,13 @@ func RefreshOwnedFiles(listers []NamedLister, env Env, prev *GeneratedManifest, 
 			want, inManifest := recorded[f.Path]
 			content, recognized := f.Render(existing)
 			switch {
+			case recognized && string(existing) == content:
+				// Checked first: a copy that is exactly what this binary
+				// writes is Gortex's whatever an older record says. An
+				// upgrade's install, or the user deleting an edited copy
+				// and reinstalling, leaves the record behind otherwise.
+				entry.Status = RefreshCurrent
+				next.Files[f.Path] = hash
 			case inManifest && want != hash:
 				entry.Status = RefreshModified
 				next.Files[f.Path] = want // keep flagging it until the user decides
