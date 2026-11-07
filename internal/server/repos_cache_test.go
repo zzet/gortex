@@ -74,7 +74,7 @@ func TestReposConcurrentRefreshAndAbandonedCancellation(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 16 {
 		wg.Go(func() {
-			if _, _, err := cache.get(context.Background(), s); err != nil {
+			if _, _, err := cache.get(context.Background(), s, nil); err != nil {
 				t.Error(err)
 			}
 		})
@@ -91,7 +91,7 @@ func TestReposConcurrentRefreshAndAbandonedCancellation(t *testing.T) {
 	s.release = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, _, err := cache.get(ctx, s); done <- err }()
+	go func() { _, _, err := cache.get(ctx, s, nil); done <- err }()
 	<-s.started
 	cancel()
 	if err := <-done; err != context.Canceled {

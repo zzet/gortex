@@ -206,7 +206,7 @@ func repoEntries(stats map[string]graph.GraphStats) []repoEntry {
 func (h *Handler) handleRepos(w http.ResponseWriter, r *http.Request) {
 	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
 	defer read.release()
-	repos, age, err := h.repoSnapshot.get(r.Context(), h.graph)
+	repos, age, err := h.repoSnapshot.get(r.Context(), h.graph, read.pin)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return

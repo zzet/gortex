@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 const repoSnapshotTTL = 5 * time.Second
@@ -30,7 +32,7 @@ type repoSnapshotCache struct {
 	flight    *repoSnapshotFlight
 }
 
-func (c *repoSnapshotCache) get(ctx context.Context, g graph.Store) ([]repoEntry, time.Duration, error) {
+func (c *repoSnapshotCache) get(ctx context.Context, g graph.Store, pin *graphview.BasePin) ([]repoEntry, time.Duration, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -42,6 +44,13 @@ func (c *repoSnapshotCache) get(ctx context.Context, g graph.Store) ([]repoEntry
 	}
 	f := c.flight
 	if f == nil {
+		// Cancellation ends a wait, not necessarily the store read. Join the
+		// request's hold before launching work that can outlive every waiter.
+		hold := pin.Handoff()
+		if pin != nil && hold == nil {
+			c.mu.Unlock()
+			return nil, 0, errors.New("repo snapshot: base pin already released")
+		}
 		queryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		f = &repoSnapshotFlight{done: make(chan struct{}), cancel: cancel}
 		c.flight = f
@@ -53,6 +62,7 @@ func (c *repoSnapshotCache) get(ctx context.Context, g graph.Store) ([]repoEntry
 			// Preserve request-level panic recovery and lease release even though
 			// the shared query runs off the HTTP handler's goroutine.
 			func() {
+				defer hold.Release()
 				defer func() { f.panicValue = recover() }()
 				if reader, ok := g.(repoStatsContextReader); ok {
 					stats, err = reader.RepoStatsContext(queryCtx)
