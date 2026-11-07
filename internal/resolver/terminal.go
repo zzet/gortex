@@ -244,9 +244,38 @@ func (r *Resolver) reconcileTerminalStamps() (stamped, unstamped int) {
 // To-less — so a record whose edge was heuristically bound and then
 // guard-reverted still matches its live, again-unresolved edge here.
 func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPWorkKey]struct{}) (stamped, unstamped int) {
+	// The unresolved iterator closes its page cursor before yielding. Persist
+	// each bounded batch before requesting more rows: terminal updates do not
+	// alter the unresolved predicate or its ID watermark. A partially completed
+	// run is safe to repeat, since already-correct stamps are left untouched.
+	const batchSize = 256
+	pending := make([]*graph.Edge, 0, batchSize)
+	flush := func() {
+		s, u := r.reconcileTerminalStampPage(pending, excluded)
+		stamped += s
+		unstamped += u
+		clear(pending)
+		pending = pending[:0]
+	}
+	for edge := range r.graph.EdgesWithUnresolvedTarget() {
+		if edge == nil {
+			continue
+		}
+		pending = append(pending, edge)
+		if len(pending) == batchSize {
+			flush()
+		}
+	}
+	if len(pending) > 0 {
+		flush()
+	}
+	return stamped, unstamped
+}
+
+func (r *Resolver) reconcileTerminalStampPage(pending []*graph.Edge, excluded map[deferredLSPWorkKey]struct{}) (stamped, unstamped int) {
 	var stillPending []*graph.Edge
 	var changed []*graph.Edge
-	for e := range r.graph.EdgesWithUnresolvedTarget() {
+	for _, e := range pending {
 		if e == nil {
 			continue
 		}
