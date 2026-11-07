@@ -78,20 +78,26 @@ import (
 
 // pickImportEvidenceCallee returns the single candidate whose defining
 // file the caller file imports (directly or through re-export hops), or
-// nil when the evidence is absent or ambiguous. Only consulted for JS/TS
-// callers with ≥2 candidates — the single-candidate paths keep today's
-// behaviour, and the cross-package guard still polices them.
+// nil when the evidence is absent or ambiguous. JS/TS callers only. A
+// single candidate goes through the same check: a cross-directory call
+// whose caller imports the candidate's file is structural evidence, and
+// without this pick it fell into the name-only fallback, got tagged
+// text_matched and find_usages hid it behind the import line.
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
-	if callerFile == "" || len(candidates) < 2 || !isJSTSPath(callerFile) {
+	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil
 	}
 	// A candidate defined in the caller's own file is (or may be) module-
 	// local — the import pick must stand down and let the locality/scope
 	// cascade bind it. Any kind blocks: a local class, const, or nested
 	// helper of the same name all shadow an import at some scope, and
-	// falling through only preserves today's behaviour.
+	// falling through only preserves today's behaviour. The one exception
+	// is the caller's own import-statement node: its display name is the
+	// imported module's basename, so `import { useX } from './useX'` puts a
+	// same-named KindImport node in the caller file. That node is the
+	// import evidence itself, not a shadow.
 	for _, c := range candidates {
-		if c.FilePath == callerFile {
+		if c.FilePath == callerFile && c.Kind != graph.KindImport {
 			return nil
 		}
 	}

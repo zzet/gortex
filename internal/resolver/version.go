@@ -40,7 +40,8 @@ import (
 // Convergence winner payloads and surviving outgoing order change stored edges
 // for an unchanged corpus.
 // Go module binding changes candidate order, cross-repo provenance and import identity.
-const ResolutionSemanticsVersion = 5
+// Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
+const ResolutionSemanticsVersion = 6
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be
