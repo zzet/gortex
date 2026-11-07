@@ -241,7 +241,7 @@ require (
 	github.com/jedib0t/go-pretty/v6 v6.8.3
 	github.com/knights-analytics/hugot v0.8.4
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v1.4.0
+	github.com/mark3labs/mcp-go v1.5.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -366,3 +366,11 @@ replace github.com/mattn/go-pointer => ./internal/thirdparty/go-pointer
 // blocked the Windows build because github.com/coder/hnsw imports it
 // unconditionally. See internal/thirdparty/renameio.
 replace github.com/google/renameio => ./internal/thirdparty/renameio
+
+// In-tree patched copy of github.com/mark3labs/mcp-go. Upstream has no fixed
+// release for GO-2026-6911 (SSRF/credential leak via unvalidated Location
+// header in client/transport); the fix only exists in unmerged PR #1192. The
+// vulnerable client transport is not imported by gortex (used as an MCP
+// server), but the module is flagged at the module level, so ship the patched
+// drop-in here alongside go-pointer and renameio.
+replace github.com/mark3labs/mcp-go => ./internal/thirdparty/mcp-go
