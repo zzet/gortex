@@ -131,10 +131,10 @@ func (d *migrationMetadataDispatcher) Dispatch(ctx context.Context, session *dae
 	// Metadata never performs cwd, Git, catalog or graph admission. Until the
 	// store has opened, uncertainty is loading for every graph request.
 	if !loadingMetadataMethod(method) {
-		return jsonRPCErrorFrame(frame, "store schema is opening or migrating", map[string]any{"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": session.CWD, "phase": d.phase(), "percent": 0}), nil
+		return jsonRPCErrorFrame(frame, "store schema is opening or migrating", map[string]any{"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": session.EffectiveCWD(), "phase": d.phase(), "percent": 0}), nil
 	}
 	srv := d.catalog.srv
-	ctx = gortexmcp.WithClientConnection(gortexmcp.WithSessionCWD(gortexmcp.WithSessionID(ctx, session.ID), session.CWD))
+	ctx = gortexmcp.WithClientConnection(gortexmcp.WithSessionCWD(gortexmcp.WithSessionID(ctx, session.ID), session.EffectiveCWD()))
 	ctx = srv.WithClientSession(ctx, session.ID)
 	srv.NoteSessionToolPolicy(session.ID, session.ToolSpec, session.ToolMode)
 	d.catalog.maybeSnoopInitialize(session, frame)

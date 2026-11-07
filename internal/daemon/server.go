@@ -910,7 +910,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 				name, version := sess.SnapshotClientInfo()
 				row := MCPSessionStatus{
 					ID:            sess.ID,
-					Cwd:           sess.CWD,
+					Cwd:           sess.EffectiveCWD(),
 					ClientName:    name,
 					ClientVersion: version,
 				}

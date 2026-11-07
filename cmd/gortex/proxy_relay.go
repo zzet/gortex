@@ -41,6 +41,9 @@ type proxyRelayState struct {
 	stdout    io.Writer
 	stderr    io.Writer
 	surface   *gortexmcp.ToolSurface
+	// clientCWD reports the host's current directory for stamping onto each
+	// tools/call (see stampClientCWD). Nil disables stamping.
+	clientCWD clientCWDProbe
 
 	client         *daemon.Client
 	responses      <-chan proxyFrameEvent
@@ -59,6 +62,22 @@ func relayProxySession(
 	surface *gortexmcp.ToolSurface,
 	orphan <-chan struct{},
 ) error {
+	return relayProxySessionWithClientCWD(ctx, h, initial, stdin, stdout, stderr, surface, orphan, nil)
+}
+
+// relayProxySessionWithClientCWD is relayProxySession with a probe for the
+// host's current directory, stamped onto every tools/call so the daemon
+// follows a host that changes directory mid-session.
+func relayProxySessionWithClientCWD(
+	ctx context.Context,
+	h daemon.Handshake,
+	initial *daemon.Client,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	surface *gortexmcp.ToolSurface,
+	orphan <-chan struct{},
+	clientCWD clientCWDProbe,
+) error {
 	relayCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -68,6 +87,7 @@ func relayProxySession(
 		stdout:    stdout,
 		stderr:    stderr,
 		surface:   surface,
+		clientCWD: clientCWD,
 		pending:   make(map[string]*proxyPendingRequest),
 	}
 	state.attach(initial)
@@ -117,6 +137,7 @@ func relayProxySession(
 				}
 			}
 
+			event.frame = stampClientCWD(event.frame, liveClientCWD(state.clientCWD))
 			state.noteProtocolFrame(event.frame)
 			pending, hasID := pendingRequest(event.frame)
 			if hasID {

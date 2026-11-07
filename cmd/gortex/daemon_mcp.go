@@ -117,13 +117,20 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// untracked: see pendingRepoRefusal.
 	// Discovery needs the calling CWD for its scope authorization, but binding
 	// a client session must wait until admission has succeeded.
+	// A client that moved directory mid-session (a host entering a linked
+	// worktree without restarting its MCP server) reports where it is now in
+	// `params._meta.cwd`; record it before anything resolves against the CWD.
+	// The frame's own stamp wins over the session's recorded value, so a
+	// concurrent frame stamped elsewhere cannot move this one mid-dispatch.
+	sess.SetLiveCWD(peekFrameClientCWD(frame))
+	cwd := requestCWD(sess, frame)
 	ctx = gortexmcp.WithSessionID(ctx, sess.ID)
-	ctx = gortexmcp.WithSessionCWD(ctx, sess.CWD)
+	ctx = gortexmcp.WithSessionCWD(ctx, cwd)
 	// Every frame here comes from an MCP client (socket or Streamable HTTP),
 	// so the default tool surface must not hinge on whether its initialize
 	// carried a clientInfo.name.
 	ctx = gortexmcp.WithClientConnection(ctx)
-	reachable, admissionErr := d.cwdReachableChecked(ctx, sess.CWD)
+	reachable, admissionErr := d.cwdReachableChecked(ctx, cwd)
 	// A configured repository the registry does not hold yet is neither
 	// tracked nor untracked: it is loading, or its load ended without
 	// registering it. It gets its own answers below, never the untracked
@@ -133,16 +140,16 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		admissionErr = nil
 	}
 	var terminalFamilyLoad []indexer.RepoLoad
-	if pending != nil && pending.load.State.Unavailable() && agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
+	if pending != nil && pending.load.State.Unavailable() && agents.PendingAutomaticCheckout(cwd, d.familyRoots()) {
 		terminalFamilyLoad = []indexer.RepoLoad{pending.load}
 		pending = nil // still unadmitted; only the guidance/refusal classification changes
 	}
-	untracked := sess.CWD != "" && !reachable && admissionErr == nil && pending == nil
+	untracked := cwd != "" && !reachable && admissionErr == nil && pending == nil
 	if admissionErr != nil && !checkoutAdmissionMetadataMethod(peekFrameMethod(frame)) {
-		return checkoutAdmissionError(sess.CWD, frame, admissionErr), nil
+		return checkoutAdmissionError(cwd, frame, admissionErr), nil
 	}
-	if sess.CWD != "" && !reachable && admissionErr == nil && d.bootstrapTracksOwnFamilyRoot(sess.CWD, frame) {
-		return d.familyDiscoveryRefusal(sess.CWD, frame, "family_member"), nil
+	if cwd != "" && !reachable && admissionErr == nil && d.bootstrapTracksOwnFamilyRoot(cwd, frame) {
+		return d.familyDiscoveryRefusal(cwd, frame, "family_member"), nil
 	}
 	if pending != nil {
 		if refused := d.pendingRepoRefusal(sess, frame, pending); refused != nil {
@@ -212,7 +219,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 			newly := d.srv.EnsureToolPromotedForSession(ctx, name)
 			// Record only permitted calls to deferred/learned tools so a rejected
 			// hidden call cannot refresh learned-surface state.
-			d.srv.NoteToolUse(name, sess.CWD, newly)
+			d.srv.NoteToolUse(name, cwd, newly)
 			// Promotion alone is not enough: mcp-go re-applies the tools/list
 			// filter to the requested tool at call time and reports a filtered
 			// tool as "not found". Mark the call as authorized so the surface
@@ -240,10 +247,10 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// its inactive variant: the agent gets the actionable "run gortex track"
 	// instructions. tools/list is left whole.
 	if untracked {
-		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD, d.familyRoots(), terminalFamilyLoad...)
+		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, cwd, d.familyRoots(), terminalFamilyLoad...)
 	}
 	if admissionErr != nil {
-		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, sess.CWD, admissionErr)
+		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, cwd, admissionErr)
 	}
 	if pending != nil && pending.familyInstructions != "" {
 		out = rewriteMCPAdmissionInstructions(peekFrameMethod(frame), out, pending.familyInstructions)
@@ -252,6 +259,35 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		d.notePendingRepoSession(sess, peekFrameMethod(frame), pending.load)
 	}
 	return out, nil
+}
+
+// peekFrameClientCWD returns the client's current working directory from a
+// frame's `params._meta.cwd`, or "" when the frame carries none. The stdio
+// proxy stamps it on every tools/call so a host that changes directory
+// mid-session keeps its session routed to the checkout it is working in.
+func peekFrameClientCWD(frame []byte) string {
+	var peek struct {
+		Params struct {
+			Meta struct {
+				CWD string `json:"cwd"`
+			} `json:"_meta"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(frame, &peek) != nil {
+		return ""
+	}
+	return strings.TrimSpace(peek.Params.Meta.CWD)
+}
+
+// requestCWD is the directory one frame resolves against: its own
+// `_meta.cwd` stamp when valid, else the session's effective CWD. Every
+// helper serving that frame reads it here, so admission, routing and
+// refusal text agree even while other frames on the session move it.
+func requestCWD(sess *daemon.Session, frame []byte) string {
+	if cwd := daemon.NormalizeClientCWD(peekFrameClientCWD(frame)); cwd != "" {
+		return cwd
+	}
+	return sess.EffectiveCWD()
 }
 
 // peekFrameMethod extracts the JSON-RPC method from a raw frame, or "" when it
@@ -611,7 +647,7 @@ func (d *mcpDispatcher) logUncoveredCWDOnce(sess *daemon.Session) {
 	}
 	d.logger.Info("mcp session cwd is not covered by any tracked repo",
 		zap.String("session_id", sess.ID),
-		zap.String("cwd", sess.CWD),
+		zap.String("cwd", sess.EffectiveCWD()),
 		zap.Strings("tracked_roots", d.trackedRoots()))
 }
 
@@ -722,7 +758,7 @@ func (d *mcpDispatcher) tryProxyToolCall(ctx context.Context, sess *daemon.Sessi
 	outcome := d.decision.Decide(ctx, daemon.RouteInputs{
 		ToolName: peek.Params.Name,
 		Body:     body,
-		Cwd:      sess.CWD,
+		Cwd:      requestCWD(sess, frame),
 		Scope:    scope,
 	}, sess)
 	if !outcome.Proxied {
@@ -838,8 +874,9 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 // (error_code, path, suggestion) so a tool UI can offer a one-click
 // "track this repo" button without regex-parsing the message string.
 func (d *mcpDispatcher) notTrackedError(sess *daemon.Session, inbound []byte) []byte {
-	if agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
-		return d.familyDiscoveryRefusal(sess.CWD, inbound, "family_pending")
+	cwd := requestCWD(sess, inbound)
+	if agents.PendingAutomaticCheckout(cwd, d.familyRoots()) {
+		return d.familyDiscoveryRefusal(cwd, inbound, "family_pending")
 	}
 	// Pull the request id out of the inbound frame so the response
 	// pairs correctly. If parsing fails (malformed frame), send a
@@ -859,11 +896,11 @@ func (d *mcpDispatcher) notTrackedError(sess *daemon.Session, inbound []byte) []
 		"id":      peek.ID,
 		"error": map[string]any{
 			"code":    -32000,
-			"message": fmt.Sprintf("repository not tracked: %s. %s", sess.CWD, recovery),
+			"message": fmt.Sprintf("repository not tracked: %s. %s", cwd, recovery),
 			"data": map[string]any{
 				"error_code": "repo_not_tracked",
-				"path":       sess.CWD,
-				"suggestion": fmt.Sprintf("%s Alternatively, run `gortex track %s` to include this repo in the shared graph.", recovery, sess.CWD),
+				"path":       cwd,
+				"suggestion": fmt.Sprintf("%s Alternatively, run `gortex track %s` to include this repo in the shared graph.", recovery, cwd),
 			},
 		},
 	}

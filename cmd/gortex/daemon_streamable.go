@@ -160,10 +160,10 @@ func (d *daemonStreamableDispatcher) acquire(sid, cwd string) *daemon.Session {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if sess, ok := d.bridged[sid]; ok {
-		// Refresh the cwd if the client moved between requests.
-		if cwd != "" && sess.CWD != cwd {
-			sess.CWD = cwd
-		}
+		// Refresh the cwd if the client moved between requests. Recorded as
+		// the live CWD under the session lock: dispatch reads EffectiveCWD
+		// concurrently, and a `_meta.cwd` report shares the same slot.
+		sess.SetLiveCWD(cwd)
 		return sess
 	}
 	// Use the streamable session id verbatim — that way the daemon

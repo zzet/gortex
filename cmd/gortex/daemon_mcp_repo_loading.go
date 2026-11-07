@@ -40,7 +40,7 @@ func (d *mcpDispatcher) pendingRepoRefusal(sess *daemon.Session, frame []byte, p
 	method := peekFrameMethod(frame)
 	if pending.familyInstructions != "" {
 		if method == "tools/call" && !untrackedBootstrapCall(frame) {
-			return familyDiscoveryError(sess.CWD, frame, "family_pending")
+			return familyDiscoveryError(requestCWD(sess, frame), frame, "family_pending")
 		}
 		return nil
 	}
@@ -121,7 +121,7 @@ func (d *mcpDispatcher) repoLoadingError(sess *daemon.Session, inbound []byte, r
 			reason, phase, suggestion = rec.Reason, "scope_binding", gortexmcp.ServerInstructionsScopeBindingPending()
 		}
 		return jsonRPCErrorFrame(inbound, "graph admission is pending", map[string]any{
-			"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": sess.CWD,
+			"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": requestCWD(sess, inbound),
 			"state": reason, "reason": reason, "phase": phase, "percent": 0,
 			"suggestion": suggestion,
 		})
@@ -134,7 +134,7 @@ func (d *mcpDispatcher) repoLoadingError(sess *daemon.Session, inbound []byte, r
 	return jsonRPCErrorFrame(inbound, fmt.Sprintf("repository loading: %s (%s, %d%%)", label, phase, percent), map[string]any{
 		"error_code": string(gortexmcp.ErrCodeRepoLoading),
 		"retryable":  true,
-		"path":       sess.CWD,
+		"path":       requestCWD(sess, inbound),
 		"repo":       rec.Prefix,
 		"repo_path":  rec.Root,
 		"state":      string(rec.State),
@@ -150,7 +150,7 @@ func repoUnavailableError(sess *daemon.Session, inbound []byte, rec indexer.Repo
 	if rec.ErrorCode == daemon.ErrPrefixCollision {
 		return jsonRPCErrorFrame(inbound, "repository prefix collision: "+rec.Reason, map[string]any{
 			"error_code": daemon.ErrPrefixCollision, "retryable": false,
-			"path": sess.CWD, "repo_path": rec.Root, "prefix": rec.Prefix,
+			"path": requestCWD(sess, inbound), "repo_path": rec.Root, "prefix": rec.Prefix,
 			"owner_path": rec.OwnerPath, "owner_state": rec.OwnerState,
 			"suggestion": gortexmcp.PrefixCollisionSuggestion(rec),
 		})
@@ -158,7 +158,7 @@ func repoUnavailableError(sess *daemon.Session, inbound []byte, rec indexer.Repo
 	return jsonRPCErrorFrame(inbound, fmt.Sprintf("repository unavailable: %s (%s)", rec.Label(), rec.Reason), map[string]any{
 		"error_code": string(gortexmcp.ErrCodeRepoUnavailable),
 		"retryable":  false,
-		"path":       sess.CWD,
+		"path":       requestCWD(sess, inbound),
 		"repo":       rec.Prefix,
 		"repo_path":  rec.Root,
 		"state":      string(rec.State),

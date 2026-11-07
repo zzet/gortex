@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -85,9 +86,18 @@ type Session struct {
 	// is needed. Guarded by mu.
 	remoteOverrides map[string]bool
 
-	// mu protects ClientName / ClientVersion / ClientNameSource and
-	// remoteOverrides, which can be updated by the dispatcher and the
-	// proxy-toggle tools mid-session.
+	// liveCWD is the client's working directory as last reported on a
+	// request (the stdio proxy stamps `params._meta.cwd` on each tools/call).
+	// A host such as Claude Code can move into a linked worktree mid-session
+	// without restarting its MCP server, so the handshake CWD goes stale.
+	// CWD itself is never rewritten: Register matches a reconnecting logical
+	// session on the handshake CWD, and frames dispatch concurrently. Read it
+	// through EffectiveCWD. Guarded by mu.
+	liveCWD string
+
+	// mu protects ClientName / ClientVersion / ClientNameSource,
+	// remoteOverrides and liveCWD, which can be updated by the dispatcher
+	// and the proxy-toggle tools mid-session.
 	mu sync.RWMutex
 }
 
@@ -256,6 +266,14 @@ func parseMCPReplayIdentity(request []byte) (mcpReplayIdentity, bool) {
 		return mcpReplayIdentity{}, false
 	}
 	envelope["id"] = normalizedID
+	// The stdio proxy stamps the host's current directory into
+	// params._meta.cwd when it forwards a request, so a host retry of the
+	// same request after the host changed directory carries different bytes.
+	// The stamp is transport routing, not part of what the client asked for:
+	// leave it out of the digest so that retry still replays.
+	if params, ok := withoutMetaCWD(envelope["params"]); ok {
+		envelope["params"] = params
+	}
 	normalizedRequest, err := json.Marshal(envelope)
 	if err != nil {
 		return mcpReplayIdentity{}, false
@@ -264,6 +282,38 @@ func parseMCPReplayIdentity(request []byte) (mcpReplayIdentity, bool) {
 		key:    canonicalID,
 		digest: sha256.Sum256(normalizedRequest),
 	}, true
+}
+
+// withoutMetaCWD returns an object params re-encoded with sorted top-level
+// keys and `_meta.cwd` removed (`_meta` itself dropped when that empties it).
+// Re-encoding even when there is nothing to remove keeps a stamped and an
+// unstamped copy of one request byte-identical. ok is false when params is
+// absent or not an object, in which case the caller keeps the original bytes.
+func withoutMetaCWD(params json.RawMessage) (json.RawMessage, bool) {
+	var fields map[string]json.RawMessage
+	if len(params) == 0 || json.Unmarshal(params, &fields) != nil || fields == nil {
+		return nil, false
+	}
+	var meta map[string]json.RawMessage
+	if raw, present := fields["_meta"]; present && json.Unmarshal(raw, &meta) == nil && meta != nil {
+		if _, stamped := meta["cwd"]; stamped {
+			delete(meta, "cwd")
+			if len(meta) == 0 {
+				delete(fields, "_meta")
+			} else {
+				rawMeta, err := json.Marshal(meta)
+				if err != nil {
+					return nil, false
+				}
+				fields["_meta"] = rawMeta
+			}
+		}
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 func mcpResponseCacheIdentity(request []byte) (string, [sha256.Size]byte, bool) {
@@ -288,6 +338,42 @@ func (s *Session) SetClientInfo(name, version string) {
 		s.ClientVersion = version
 	}
 	s.mu.Unlock()
+}
+
+// NormalizeClientCWD returns cwd cleaned when it is an absolute path, else "".
+// It is the one acceptance rule for a client-reported working directory.
+func NormalizeClientCWD(cwd string) string {
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return ""
+	}
+	return filepath.Clean(cwd)
+}
+
+// SetLiveCWD records the working directory the client reported on its latest
+// request. Only a clean absolute path is accepted; anything else is ignored so
+// a malformed report can never replace a usable CWD.
+func (s *Session) SetLiveCWD(cwd string) {
+	cwd = NormalizeClientCWD(cwd)
+	if s == nil || cwd == "" {
+		return
+	}
+	s.mu.Lock()
+	s.liveCWD = cwd
+	s.mu.Unlock()
+}
+
+// EffectiveCWD is the directory this session's requests resolve against: the
+// live CWD the client last reported, else the handshake CWD.
+func (s *Session) EffectiveCWD() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.liveCWD != "" {
+		return s.liveCWD
+	}
+	return s.CWD
 }
 
 // HasInitializeClientInfo reports whether client metadata has already been
