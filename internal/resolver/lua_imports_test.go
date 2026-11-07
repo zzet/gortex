@@ -114,9 +114,6 @@ func TestResolveLuaRequires_UnindexedStaysExternal(t *testing.T) {
 	assert.Equal(t, "unresolved::import::nonexistent.module", e.To)
 }
 
-// luauTree seeds a Rojo-style Luau tree that exercises every require-by-string
-// base: a plain module, an init module, a module with children and a
-// name that exists only in another folder.
 func luauTree(g graph.Store) {
 	for _, f := range []string{
 		"top.luau",
@@ -133,10 +130,7 @@ func luauTree(g graph.Store) {
 	}
 }
 
-// TestResolveLuaRequires_LuauPaths pins Luau's require-by-string rules: `./`
-// and `../` start at the requiring file's directory, an init file stands in
-// for its directory, `@self` is the module itself, and a path that names no
-// single file stays unresolved rather than binding elsewhere.
+// TestResolveLuaRequires_LuauPaths pins Luau's require-by-string resolution.
 func TestResolveLuaRequires_LuauPaths(t *testing.T) {
 	cases := []struct {
 		name, from, spec, want string
@@ -171,8 +165,7 @@ func TestResolveLuaRequires_LuauPaths(t *testing.T) {
 }
 
 // TestResolveAll_LuauRequiresReachLuaPass catches the generic import resolver
-// claiming Lua requires first: it stubbed `./Economy` to `external::` and bound
-// `./Pkg` to whichever file sat in a `Pkg/` folder, so the Lua pass never ran.
+// claiming Lua requires before the Lua pass runs.
 func TestResolveAll_LuauRequiresReachLuaPass(t *testing.T) {
 	g := graph.New()
 	luauTree(g)
