@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
@@ -260,6 +261,7 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 		logger.Warn("daemon: could not read log policy — using defaults", zap.Error(configErr))
 	}
 	refreshInstructionProfilesOnStart(profiles.DefaultDir(), canonicalVersion(), logger)
+	refreshAgentFilesOnStart(logger)
 	startupReporter := newDaemonStartupReporter(logger)
 	defer startupReporter.Stop()
 
@@ -2752,6 +2754,38 @@ func formatBytes(n uint64) string {
 
 // stubController is a placeholder Controller so `gortex daemon start`
 // works end-to-end before the real MultiIndexer integration lands. It
+
+// refreshAgentFilesOnStart brings generated agent files up to date after a
+// binary swap. Like the profile refresh, a failure is logged and the daemon
+// serves anyway.
+func refreshAgentFilesOnStart(logger *zap.Logger) {
+	refreshAgentFilesIfVersionChanged(agentRefreshReport{
+		entry: func(e agents.RefreshEntry) {
+			switch e.Status {
+			case agents.RefreshRewritten:
+				logger.Info("daemon: refreshed generated agent file", zap.String("path", e.Path),
+					zap.String("from_version", displayVersion(e.FromVersion)), zap.String("to_version", e.ToVersion))
+			case agents.RefreshModified, agents.RefreshUnrecognized:
+				logger.Warn("daemon: kept a generated agent file that differs from what Gortex wrote",
+					zap.String("path", e.Path), zap.String("status", string(e.Status)),
+					zap.String("refresh", agentRefreshRefreshCommand(e.Agent)))
+			case agents.RefreshStale:
+				if e.Note != "" { // a merged config, reported and never rewritten
+					logger.Warn("daemon: agent config is outdated and was not rewritten",
+						zap.String("path", e.Path), zap.String("from_version", displayVersion(e.FromVersion)),
+						zap.String("to_version", e.ToVersion), zap.String("refresh", agentRefreshRefreshCommand(e.Agent)),
+						zap.String("note", e.Note))
+					return
+				}
+				logger.Info("daemon: generated agent file is outdated; agents.auto_refresh is off",
+					zap.String("path", e.Path), zap.String("refresh", agentRefreshRefreshCommand(e.Agent)))
+			}
+		},
+		fail: func(err error) {
+			logger.Warn("daemon: could not refresh generated agent files", zap.Error(err))
+		},
+	})
+}
 
 // A profile conflict must not prevent the daemon serving the user's task.
 func refreshInstructionProfilesOnStart(dir, binaryVersion string, logger *zap.Logger) {

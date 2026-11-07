@@ -262,3 +262,56 @@ func TestPluginHasNoPackageDependencies(t *testing.T) {
 		t.Fatalf("plugin has a non-builtin dependency: %s", trimmed)
 	}
 }
+
+// TestOwnedPluginRefreshKeepsPosture: a bridge an older release rendered
+// (here the v0.64.5 template, OpenCode 1.x only) is recognised as Gortex's
+// and re-rendered with the running binary and current template, keeping the
+// installed posture instead of the install default.
+func TestOwnedPluginRefreshKeepsPosture(t *testing.T) {
+	legacy, err := os.ReadFile(filepath.Join("testdata", "gortex-v0.64.5.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldArgv := []string{"/old/bin/gortex", "hook", "--agent=" + Name, "--mode=enrich"}
+	installed := substituteSentinel(string(legacy), sentinelBin, jsonValue(oldArgv[0]))
+	installed = substituteSentinel(installed, sentinelArgv, jsonValue(oldArgv))
+	installed = substituteSentinel(installed, sentinelEnforce, jsonValue(true))
+
+	env, _ := globalEnv(t)
+	env.HookCommand = "/new/bin/gortex hook"
+	files := New().OwnedFiles(env)
+	if len(files) != 1 {
+		t.Fatalf("owned files = %d, want the bridge", len(files))
+	}
+	content, recognized := files[0].Render([]byte(installed))
+	if !recognized {
+		t.Fatal("a bridge rendered from a shipped template was not recognised")
+	}
+	env.HookMode, env.InstallHooks = "enrich", true
+	if content != renderPlugin(env) || !strings.Contains(content, `"--mode=enrich"`) {
+		t.Fatalf("refreshed bridge lost its posture or binary:\n%s", content)
+	}
+
+	if _, recognized := files[0].Render([]byte(installed + "// my tweak\n")); recognized {
+		t.Fatal("an edited bridge was recognised as a shipped render")
+	}
+}
+
+// TestOwnedPluginRejectsForeignShapes: values renderPlugin never produces
+// make the bridge the user's, even on the shipped template.
+func TestOwnedPluginRejectsForeignShapes(t *testing.T) {
+	env, _ := globalEnv(t)
+	files := New().OwnedFiles(env)
+	for name, values := range map[string][3]string{
+		"wrapper argv": {`"/w"`, `["/w","--profile","work","hook","--agent=opencode"]`, `true`},
+		"enforce 1":    {`"/g"`, `["/g","hook","--agent=opencode"]`, `1`},
+		"bad json":     {`"/g"`, `[ ,"/g"]`, `true`},
+	} {
+		body := substituteSentinel(pluginSource, sentinelBin, values[0])
+		body = substituteSentinel(body, sentinelArgv, values[1])
+		body = substituteSentinel(body, sentinelEnforce, values[2])
+		if _, recognized := files[0].Render([]byte(body)); recognized {
+			t.Errorf("%s: recognised as a shipped render", name)
+		}
+	}
+}

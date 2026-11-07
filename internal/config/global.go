@@ -100,10 +100,26 @@ type GlobalConfig struct {
 	// must not be able to authorize extra in-process servers on the machine.
 	MCP GlobalMCPConfig `mapstructure:"mcp" yaml:"mcp,omitempty"`
 
+	// Agents carries policy for the agent files Gortex generates.
+	Agents AgentsConfig `mapstructure:"agents" yaml:"agents,omitempty"`
+
 	// configPath stores the file path used for Save(). Set by LoadGlobal or SetConfigPath.
 	configPath string `yaml:"-"`
 	// repoRevision invalidates ConfigManager's root lookup after list edits.
 	repoRevision uint64
+}
+
+// AgentsConfig is the `agents:` block in ~/.gortex/config.yaml.
+type AgentsConfig struct {
+	// AutoRefresh, when false, stops a new binary from rewriting the agent
+	// files an older one generated. Stale files are still detected and
+	// reported by `gortex doctor`. Unset means on.
+	AutoRefresh *bool `mapstructure:"auto_refresh" yaml:"auto_refresh,omitempty"`
+}
+
+// AutoRefreshEnabled reports the effective agents.auto_refresh value.
+func (a AgentsConfig) AutoRefreshEnabled() bool {
+	return a.AutoRefresh == nil || *a.AutoRefresh
 }
 
 // DaemonConfig is the `daemon:` block in ~/.gortex/config.yaml.

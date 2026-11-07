@@ -7,6 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/opencode"
 )
 
 // upgrade_migrate.go re-applies agent configuration after a successful binary
@@ -40,7 +43,33 @@ var upgradeNoMigrate bool
 var upgradeMigrateCommand = func(ctx context.Context, bin string) *exec.Cmd {
 	// --yes keeps it non-interactive: the user already consented by upgrading,
 	// and a wizard prompt inside an upgrade would be a surprise.
-	return exec.CommandContext(ctx, bin, "install", "--yes")
+	args := []string{"install", "--yes"}
+	// install defaults to --hook-mode=deny, so without this a machine set
+	// to enrich would be reset by every upgrade. The installed hooks are the
+	// only record of the posture; read it back here, before the re-exec.
+	if home, err := os.UserHomeDir(); err == nil {
+		if mode, ok := installedHookMode(home); ok {
+			args = append(args, "--hook-mode="+mode)
+		}
+	}
+	return exec.CommandContext(ctx, bin, args...)
+}
+
+// installedHookMode is the one posture the installed hooks agree on. Claude
+// Code's settings and the OpenCode bridge each carry one; when both exist
+// and differ, no single --hook-mode would keep both, so none is passed and
+// install's default applies, as it always did.
+func installedHookMode(home string) (string, bool) {
+	claude, haveClaude := claudecode.InstalledHookMode(home)
+	bridge, haveBridge := opencode.InstalledHookMode(home)
+	switch {
+	case haveClaude && haveBridge && claude != bridge:
+		return "", false
+	case haveClaude:
+		return claude, true
+	default:
+		return bridge, haveBridge
+	}
 }
 
 // resolveUpgradedBinary finds the gortex that the upgrade just installed.

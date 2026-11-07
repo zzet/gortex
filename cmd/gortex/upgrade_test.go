@@ -7,11 +7,17 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/claudecode"
+	"github.com/zzet/gortex/internal/agents/opencode"
+	"github.com/zzet/gortex/internal/testenv"
 )
 
 // TestUpgradeInstallMethodDetection proves the path-math that maps a binary's
@@ -315,4 +321,33 @@ func TestPostUpgradeStepsDecision(t *testing.T) {
 			t.Errorf("skipping must be stated, not silent:\n%s", out.String())
 		}
 	})
+}
+
+// TestUpgradeKeepsHookPosture: `gortex upgrade --run` re-runs install from
+// the new binary, whose default posture is deny. A machine installed with
+// --hook-mode=enrich must still be on enrich afterwards.
+func TestUpgradeKeepsHookPosture(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if _, err := claudecode.InstallHookWithMode(io.Discard, settings, claudecode.HookModeEnrich, agents.ApplyOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	args := upgradeMigrateCommand(context.Background(), "/new/gortex").Args
+	if !slices.Contains(args, "--hook-mode=enrich") {
+		t.Fatalf("upgrade re-exec %v drops the installed enrich posture", args)
+	}
+
+	// OpenCode deliberately on deny: one --hook-mode cannot keep both, so
+	// none is passed rather than moving OpenCode to enrich.
+	env := agents.Env{Home: home, Mode: agents.ModeGlobal, InstallHooks: true, HookCommand: "/g/gortex hook"}
+	if _, err := opencode.New().Apply(env, agents.ApplyOpts{ForceDetect: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range upgradeMigrateCommand(context.Background(), "/new/gortex").Args {
+		if strings.HasPrefix(a, "--hook-mode") {
+			t.Fatalf("upgrade passed %s although Claude Code and OpenCode disagree", a)
+		}
+	}
 }
