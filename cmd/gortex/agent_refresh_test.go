@@ -8,7 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/opencode"
 	"github.com/zzet/gortex/internal/testenv"
@@ -114,6 +117,59 @@ func TestAgentRefreshOnVersionChange(t *testing.T) {
 	run()
 	if _, err := os.Stat(plugin); !os.IsNotExist(err) {
 		t.Fatalf("refresh created a bridge the user opted out of: %v", err)
+	}
+}
+
+// Skills an older release recorded are refreshed with the bridge, and the
+// first CLI command prints one line per agent rather than one per file.
+func TestAgentRefreshGroupsSkillsPerAgent(t *testing.T) {
+	home := testenv.Sandbox(t).Home
+	var skills []string
+	for _, f := range claudecode.New().OwnedFiles(agents.Env{Home: home}) {
+		if filepath.Base(f.Path) == "SKILL.md" {
+			skills = append(skills, f.Path)
+		}
+	}
+	if len(skills) < 3 {
+		t.Fatalf("claude-code lists %d skills", len(skills))
+	}
+	recorded := map[string]string{}
+	for i, path := range skills[:3] {
+		body := "an older release's skill\n"
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recorded[path] = agents.GeneratedHash([]byte(body))
+		if i == 2 { // edited since that release wrote it
+			recorded[path] = agents.GeneratedHash([]byte("what Gortex wrote\n"))
+		}
+	}
+	writeJSON(t, agentRefreshManifestPath(), agents.GeneratedManifest{Version: "v0.0.1", Files: recorded})
+
+	root := &cobra.Command{Use: "gortex"}
+	cmd := &cobra.Command{Use: "status"}
+	root.AddCommand(cmd)
+	var out strings.Builder
+	cmd.SetErr(&out)
+	refreshAgentFilesFromCLI(cmd)
+
+	want := []string{
+		"[gortex] refreshed 2 " + claudecode.Name + " files (v0.0.1 -> " + canonicalVersion() + ")",
+		"[gortex] kept " + skills[2] + ": it is not what Gortex generated; delete it, then run `gortex install --agents=" + claudecode.Name + "`",
+	}
+	for _, w := range want {
+		if !strings.Contains(out.String(), w) {
+			t.Fatalf("output lacks %q:\n%s", w, out.String())
+		}
+	}
+	if n := strings.Count(out.String(), "\n"); n != 2 {
+		t.Fatalf("%d lines, want one per agent and outcome:\n%s", n, out.String())
+	}
+	if body, _ := os.ReadFile(skills[0]); string(body) != claudecode.GlobalSkills[filepath.Base(filepath.Dir(skills[0]))] {
+		t.Fatalf("recorded skill was not refreshed:\n%s", body)
 	}
 }
 

@@ -280,8 +280,8 @@ func TestOwnedPluginRefreshKeepsPosture(t *testing.T) {
 	env, _ := globalEnv(t)
 	env.HookCommand = "/new/bin/gortex hook"
 	files := New().OwnedFiles(env)
-	if len(files) != 1 {
-		t.Fatalf("owned files = %d, want the bridge", len(files))
+	if len(files) == 0 || files[0].Path != PluginPath(env.Home) {
+		t.Fatalf("owned files = %d, want the bridge first", len(files))
 	}
 	content, recognized := files[0].Render([]byte(installed))
 	if !recognized {

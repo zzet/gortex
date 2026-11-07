@@ -55,6 +55,10 @@ type OwnedFile struct {
 	// of. A copy whose settings cannot be read back returns itself, not
 	// recognized, and is left alone.
 	Render func(existing []byte) (content string, recognized bool)
+	// Note, when set, is shown with a copy the refresh keeps (edited or
+	// unrecognised): what the user must do to get the shipped file back
+	// when the refresh command alone would not replace it.
+	Note string
 }
 
 // OwnedFileLister is implemented by adapters that own whole files in global
@@ -122,8 +126,9 @@ type RefreshEntry struct {
 	Status      RefreshStatus `json:"status"`
 	FromVersion string        `json:"from_version,omitempty"`
 	ToVersion   string        `json:"to_version,omitempty"`
-	// Note is what the user must do beyond the refresh command, for a
-	// merged config that is reported instead of rewritten.
+	// Note is what the user must do beyond the refresh command: for a
+	// merged config reported instead of rewritten, or for a kept file the
+	// refresh command would not replace (OwnedFile.Note).
 	Note string `json:"note,omitempty"`
 }
 
@@ -201,12 +206,12 @@ func RefreshOwnedFiles(listers []NamedLister, env Env, prev *GeneratedManifest, 
 				entry.Status = RefreshCurrent
 				next.Files[f.Path] = hash
 			case inManifest && want != hash:
-				entry.Status = RefreshModified
+				entry.Status, entry.Note = RefreshModified, f.Note
 				next.Files[f.Path] = want // keep flagging it until the user decides
 			case !inManifest && !recognized:
 				// Checked before "current": a copy the adapter cannot read
 				// back renders as itself, and must not be recorded as ours.
-				entry.Status = RefreshUnrecognized
+				entry.Status, entry.Note = RefreshUnrecognized, f.Note
 			case string(existing) == content:
 				entry.Status = RefreshCurrent
 				next.Files[f.Path] = hash

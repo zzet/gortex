@@ -240,13 +240,27 @@ func refreshAgentFilesFromCLI(cmd *cobra.Command) {
 		}
 	}
 	stderr := cmd.ErrOrStderr()
+	// Rewritten and kept files are printed one line per agent once the pass
+	// is done: with skills, one upgrade can touch dozens of files.
+	type group struct {
+		agent string
+		kept  bool
+	}
+	var order []group
+	groups := map[group][]agents.RefreshEntry{}
+	add := func(g group, e agents.RefreshEntry) {
+		if _, ok := groups[g]; !ok {
+			order = append(order, g)
+		}
+		groups[g] = append(groups[g], e)
+	}
 	refreshAgentFilesIfVersionChanged(agentRefreshReport{
 		entry: func(e agents.RefreshEntry) {
 			switch e.Status {
 			case agents.RefreshRewritten:
-				fmt.Fprintf(stderr, "[gortex] refreshed %s (%s -> %s)\n", e.Path, displayVersion(e.FromVersion), e.ToVersion)
+				add(group{e.Agent, false}, e)
 			case agents.RefreshModified, agents.RefreshUnrecognized:
-				fmt.Fprintf(stderr, "[gortex] kept %s: it is not what Gortex generated; run `%s` to replace it\n", e.Path, agentRefreshRefreshCommand(e.Agent))
+				add(group{e.Agent, true}, e)
 			case agents.RefreshStale:
 				if e.Note != "" { // a merged config, never rewritten
 					fmt.Fprintf(stderr, "[gortex] %s is outdated and was not rewritten; run `%s`. %s\n", e.Path, agentRefreshRefreshCommand(e.Agent), e.Note)
@@ -258,6 +272,31 @@ func refreshAgentFilesFromCLI(cmd *cobra.Command) {
 		},
 		quietWhenOff: true,
 	})
+	for _, g := range order {
+		es := groups[g]
+		e := es[0]
+		switch {
+		case !g.kept && len(es) == 1:
+			fmt.Fprintf(stderr, "[gortex] refreshed %s (%s -> %s)\n", e.Path, displayVersion(e.FromVersion), e.ToVersion)
+		case !g.kept:
+			fmt.Fprintf(stderr, "[gortex] refreshed %d %s files (%s -> %s)\n", len(es), g.agent, displayVersion(e.FromVersion), e.ToVersion)
+		case len(es) == 1:
+			fmt.Fprintf(stderr, "[gortex] kept %s: it is not what Gortex generated; %s\n", e.Path, agentRefreshReplaceHint(e))
+		default:
+			fmt.Fprintf(stderr, "[gortex] kept %d %s files that are not what Gortex generated; `gortex doctor` lists them\n", len(es), g.agent)
+		}
+	}
+}
+
+// agentRefreshReplaceHint tells the user how to get the shipped file back.
+// A kept file with a note is one install would keep as well, so it has to go
+// first; the note itself says why (daemon log, doctor JSON).
+func agentRefreshReplaceHint(e agents.RefreshEntry) string {
+	cmd := agentRefreshRefreshCommand(e.Agent)
+	if e.Note != "" && e.Status != agents.RefreshStale {
+		return "delete it, then run `" + cmd + "`, to get the shipped one"
+	}
+	return "run `" + cmd + "` to replace it"
 }
 
 func displayVersion(v string) string {
@@ -309,11 +348,11 @@ func printDoctorGeneratedFiles(w io.Writer, files []doctorGeneratedFile) {
 			agents.RefreshModified:     "edited since Gortex wrote it",
 			agents.RefreshUnrecognized: "not a file Gortex generated",
 		}[f.Status]
-		if f.Note != "" {
+		if f.Note != "" && f.Status == agents.RefreshStale {
 			why = "outdated, not rewritten automatically"
 		}
-		fmt.Fprintf(w, "  %s %s: %s — run `%s` to replace it\n", glyphWarn, f.Path, why, f.Refresh)
-		if f.Note != "" {
+		fmt.Fprintf(w, "  %s %s: %s — %s\n", glyphWarn, f.Path, why, agentRefreshReplaceHint(f.RefreshEntry))
+		if f.Note != "" && f.Status == agents.RefreshStale {
 			fmt.Fprintf(w, "      %s\n", f.Note)
 		}
 	}
