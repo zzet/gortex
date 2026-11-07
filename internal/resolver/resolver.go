@@ -4323,6 +4323,11 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		stats.Unresolved++
 		return
 	}
+	if isLuaRequireEdge(e) {
+		// resolveLuaRequires owns this one; see the note on the helper.
+		stats.Unresolved++
+		return
+	}
 	callerRepo := r.callerRepoPrefix(e)
 	callerWorkspace := r.callerWorkspaceID(e)
 	goOwnership := r.goImportGateForEdge(e, importPath)

@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"path"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -18,10 +19,13 @@ import (
 // directory module), the direct repo-relative path winning, then a unique
 // path-suffix match (the package-root net). Roblox instance-path requires bind
 // to the unique `<leaf>.lua` / `<leaf>.luau` file in the repo, refusing on
-// ambiguity. Edges whose target is not indexed stay external.
+// ambiguity. Luau require-by-string paths (`./X`, `../X`, `@self/X`) bind to
+// the one file they name relative to the requiring file. Edges whose target
+// is not indexed stay unresolved.
 //
 // Runs serially in ResolveAll's relative-import settle window, after
-// resolveRelativeImports (which never touches Lua).
+// resolveRelativeImports (which never touches Lua). Reaching it at all takes
+// isLuaRequireEdge holding the generic import resolver off.
 func (r *Resolver) resolveLuaRequires() {
 	if !r.graphHasLanguage("lua") && !r.graphHasLanguage("luau") {
 		return
@@ -60,12 +64,7 @@ func (r *Resolver) resolveLuaRequires() {
 		if name == "" {
 			continue
 		}
-		var resolved string
-		if _, isRoblox := e.Meta["roblox_path"]; isRoblox {
-			resolved = resolveLuaRobloxRequire(filesByBase, name)
-		} else {
-			resolved = resolveLuaModuleRequire(fileIDs, filesByBase, name)
-		}
+		resolved := resolveLuaRequire(fileIDs, filesByBase, e, name)
 		if resolved == "" {
 			continue
 		}
@@ -80,11 +79,41 @@ func (r *Resolver) resolveLuaRequires() {
 	}
 }
 
+// isLuaRequireEdge reports whether an import edge is a Lua / Luau require,
+// which resolveLuaRequires owns.
+//
+// The generic import resolver must leave it alone. It runs first, and it
+// either stubs a require it cannot place to `external::<spec>` — which the
+// Lua pass never looks at, so no require bound through the real pipeline —
+// or matches the spec's last segment against a directory index and binds
+// `require("./Pkg")` to an arbitrary file under any `Pkg/` folder. Holding it
+// off costs nothing: the pass that owns these runs in the same resolve, and
+// mirrors how isGodotResPlaceholder treats `res://` paths.
+func isLuaRequireEdge(e *graph.Edge) bool {
+	return strings.HasSuffix(e.FilePath, ".lua") || strings.HasSuffix(e.FilePath, ".luau")
+}
+
+// resolveLuaRequire dispatches one require on its form: a Roblox instance
+// path, a Luau require-by-string path, or a classic dotted module path.
+func resolveLuaRequire(fileIDs map[string]struct{}, filesByBase map[string][]string, e *graph.Edge, spec string) string {
+	if _, isRoblox := e.Meta["roblox_path"]; isRoblox {
+		return resolveLuaRobloxRequire(filesByBase, spec)
+	}
+	if isLuauPathRequire(spec) {
+		return resolveLuauPathRequire(fileIDs, e.From, spec)
+	}
+	return resolveLuaModuleRequire(fileIDs, filesByBase, spec)
+}
+
 // luaModuleCandidates converts a dotted/slashed Lua module path to its ordered
-// candidate file paths: the `.lua` / `.luau` file, then the `init` directory
-// module.
+// candidate file paths.
 func luaModuleCandidates(modPath string) []string {
-	p := strings.Trim(strings.ReplaceAll(modPath, ".", "/"), "/")
+	return luaFileCandidates(strings.Trim(strings.ReplaceAll(modPath, ".", "/"), "/"))
+}
+
+// luaFileCandidates lists the files a slash-separated module path can name:
+// the `.lua` / `.luau` file, then the `init` directory module.
+func luaFileCandidates(p string) []string {
 	if p == "" {
 		return nil
 	}
@@ -122,6 +151,76 @@ func resolveLuaRobloxRequire(filesByBase map[string][]string, leaf string) strin
 			}
 			match = cand
 		}
+	}
+	return match
+}
+
+// isLuauPathRequire reports whether a string require uses Luau's
+// require-by-string syntax rather than a classic dotted module path. Luau
+// rejects an unprefixed path, so the prefix alone decides it.
+func isLuauPathRequire(spec string) bool {
+	return strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") || strings.HasPrefix(spec, "@")
+}
+
+// resolveLuauPathRequire binds a Luau require-by-string path to the one file
+// it names relative to the requiring file. A relative path names exactly one
+// place, so a miss stays unresolved instead of falling back to the suffix net,
+// which would bind `./Util` to some other folder's `Util.luau`.
+func resolveLuauPathRequire(fileIDs map[string]struct{}, fromFile, spec string) string {
+	modPath, ok := luauRequireModulePath(fromFile, spec)
+	if !ok {
+		return ""
+	}
+	return luauModuleFile(fileIDs, modPath)
+}
+
+// luauRequireModulePath joins a require-by-string path onto the requiring
+// file, per Luau's amended require resolution: `./` and `../` start at the
+// file's directory, and an `init` file stands in for its directory, so its
+// `./` starts one level up; `@self` is the requiring module itself. Other
+// aliases (`.luaurc` aliases, Rojo's `@game`) need config this pass does not
+// read, and a path that climbs out of the repo root names nothing indexed.
+func luauRequireModulePath(fromFile, spec string) (string, bool) {
+	dir, file := path.Split(fromFile)
+	dir = strings.TrimSuffix(dir, "/")
+	stem := strings.TrimSuffix(file, path.Ext(file))
+	isInit := stem == "init"
+
+	var base, rest string
+	switch {
+	case spec == "@self" || strings.HasPrefix(spec, "@self/"):
+		base, rest = path.Join(dir, stem), strings.TrimPrefix(spec, "@self")
+		if isInit {
+			base = dir
+		}
+	case strings.HasPrefix(spec, "@"):
+		return "", false
+	default:
+		base, rest = dir, spec
+		if isInit {
+			base = path.Join(dir, "..")
+		}
+	}
+	joined := path.Join(base, rest)
+	if joined == "." || joined == ".." || strings.HasPrefix(joined, "../") {
+		return "", false
+	}
+	return joined, true
+}
+
+// luauModuleFile returns the one indexed file a resolved module path names.
+// Luau errors when a path matches more than one candidate (`X.luau` beside
+// `X.lua`, or beside `X/init.luau`), so that refuses here too.
+func luauModuleFile(fileIDs map[string]struct{}, modPath string) string {
+	match := ""
+	for _, c := range luaFileCandidates(modPath) {
+		if _, ok := fileIDs[c]; !ok {
+			continue
+		}
+		if match != "" {
+			return ""
+		}
+		match = c
 	}
 	return match
 }
