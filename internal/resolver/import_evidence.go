@@ -172,7 +172,7 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 		pendingBarrels = append(pendingBarrels, f)
 	}
 
-	for _, e := range r.graph.GetOutEdges(callerFile) {
+	for _, e := range r.callerOutEdges(callerFile) {
 		if e.Kind != graph.EdgeImports {
 			continue
 		}
@@ -253,4 +253,64 @@ func (r *Resolver) nodeFilePath(id string) string {
 		return n.ID
 	}
 	return ""
+}
+
+// callerOutEdges returns a caller file's outgoing edges from the pass
+// prefetch when prefetchImportEdges loaded them, else from the store.
+func (r *Resolver) callerOutEdges(callerFile string) []*graph.Edge {
+	r.importFilesMu.RLock()
+	edges, ok := r.importOutByFile[callerFile]
+	r.importFilesMu.RUnlock()
+	if ok {
+		return edges
+	}
+	return r.graph.GetOutEdges(callerFile)
+}
+
+// prefetchImportEdges loads, in one batched read, the outgoing edges of
+// every JS/TS caller file behind edges — the import statements
+// importedFilesFor walks for every bare call. known is an optional
+// already-loaded out-edge map (the incremental page frontier) consumed
+// before asking the store. Without this every JS/TS call edge cost one
+// point GetOutEdges on the caller file, which on a disk backend is one
+// round-trip per call.
+func (r *Resolver) prefetchImportEdges(edges []*graph.Edge, known map[string][]*graph.Edge) {
+	if len(edges) == 0 {
+		return
+	}
+	r.importFilesMu.Lock()
+	defer r.importFilesMu.Unlock()
+	if r.importOutByFile == nil {
+		r.importOutByFile = make(map[string][]*graph.Edge)
+	}
+	var missing []string
+	seen := make(map[string]struct{})
+	for _, e := range edges {
+		if e == nil {
+			continue
+		}
+		caller := e.FilePath
+		if caller == "" || !isJSTSPath(caller) {
+			continue
+		}
+		if _, dup := seen[caller]; dup {
+			continue
+		}
+		seen[caller] = struct{}{}
+		if _, ok := r.importOutByFile[caller]; ok {
+			continue
+		}
+		if out, ok := known[caller]; ok {
+			r.importOutByFile[caller] = out
+			continue
+		}
+		missing = append(missing, caller)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	byFile := r.graph.GetOutEdgesByNodeIDs(missing)
+	for _, caller := range missing {
+		r.importOutByFile[caller] = byFile[caller]
+	}
 }
