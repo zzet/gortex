@@ -10,6 +10,12 @@ import (
 )
 
 func TestHasLanguageUsesCoveringLanguageProbe(t *testing.T) {
+	// A small store can choose this index even without the pin. Require the
+	// explicit choice as well: large-store statistics can favor a competing
+	// index, which is the regression this query must remain insulated from.
+	if !strings.Contains(hasLanguageSQL, "INDEXED BY nodes_by_repo_language_name") {
+		t.Fatal("language gate must seek the covering language index: explicit index pin missing")
+	}
 	s := openScopedProjectionTestStore(t)
 	// Exercise the production query against the complete schema, including the
 	// competing nodes_name_candidates index. Avoid wall-clock assertions.
