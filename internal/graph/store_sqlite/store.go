@@ -3443,19 +3443,25 @@ func (s *Store) Stats() graph.GraphStats {
 }
 
 func (s *Store) RepoStats() map[string]graph.GraphStats {
+	out, err := s.RepoStatsContext(context.Background())
+	panicOnFatal(err)
+	return out
+}
+
+// RepoStatsContext aggregates authoritative rows under the request's lifetime.
+// Partial results are never published as a successful snapshot.
+func (s *Store) RepoStatsContext(ctx context.Context) (map[string]graph.GraphStats, error) {
 	out := map[string]graph.GraphStats{}
-	rows, err := s.stmtRepoStatsNodes.Query(s.viewGen)
+	rows, err := s.stmtRepoStatsNodes.QueryContext(ctx, s.viewGen)
 	if err != nil {
-		panicOnFatal(err)
-		return out
+		return nil, err
 	}
 	for rows.Next() {
 		var repo, kind, lang string
 		var n int
 		if err := rows.Scan(&repo, &kind, &lang, &n); err != nil {
 			_ = rows.Close()
-			panicOnFatal(err)
-			return out
+			return nil, err
 		}
 		st, ok := out[repo]
 		if !ok {
@@ -3468,23 +3474,20 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		panicOnFatal(err)
-		return out
+		return nil, err
 	}
 	_ = rows.Close()
 
-	rows, err = s.stmtRepoStatsEdges.Query(s.viewGen)
+	rows, err = s.stmtRepoStatsEdges.QueryContext(ctx, s.viewGen)
 	if err != nil {
-		panicOnFatal(err)
-		return out
+		return nil, err
 	}
 	for rows.Next() {
 		var repo string
 		var n int
 		if err := rows.Scan(&repo, &n); err != nil {
 			_ = rows.Close()
-			panicOnFatal(err)
-			return out
+			return nil, err
 		}
 		st, ok := out[repo]
 		if !ok {
@@ -3495,11 +3498,10 @@ func (s *Store) RepoStats() map[string]graph.GraphStats {
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		panicOnFatal(err)
-		return out
+		return nil, err
 	}
 	_ = rows.Close()
-	return out
+	return out, nil
 }
 
 func (s *Store) RepoPrefixes() []string {

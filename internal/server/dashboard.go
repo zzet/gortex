@@ -177,7 +177,10 @@ func splitOwner(prefix string) (owner, name string) {
 }
 
 func reposFromGraph(g graph.Store) []repoEntry {
-	stats := g.RepoStats()
+	return repoEntries(g.RepoStats())
+}
+
+func repoEntries(stats map[string]graph.GraphStats) []repoEntry {
 	out := make([]repoEntry, 0, len(stats))
 	for prefix, s := range stats {
 		owner, name := splitOwner(prefix)
@@ -203,8 +206,12 @@ func reposFromGraph(g graph.Store) []repoEntry {
 func (h *Handler) handleRepos(w http.ResponseWriter, r *http.Request) {
 	read := h.beginBaseRead(r, "", graphview.CapSyntaxGraph)
 	defer read.release()
-	repos := reposFromGraph(h.graph)
-	payload := map[string]any{"repos": repos}
+	repos, age, err := h.repoSnapshot.get(r.Context(), h.graph, read.pin)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	payload := map[string]any{"repos": repos, "snapshot_age_ms": age.Milliseconds()}
 	if rider := read.close(); rider != nil {
 		payload["view"] = rider
 	}

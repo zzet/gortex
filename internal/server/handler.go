@@ -52,6 +52,7 @@ import (
 type Handler struct {
 	mcpServer     *mcpserver.MCPServer
 	graph         graph.Store
+	repoSnapshot  repoSnapshotCache
 	version       string
 	logger        *zap.Logger
 	mux           *http.ServeMux
