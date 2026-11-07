@@ -727,6 +727,16 @@ func freshnessExactRefusal(reason string, waited time.Duration) error {
 	if reason == "" {
 		reason = freshReasonRouteWithdrawn
 	}
+	if reason == freshReasonCommittedBaseAdvance {
+		return graphview.NewViewError(graphview.CodeCapabilityUnavailable, fmt.Sprintf(
+			"the selected graph cannot advance its committed base (fresh_reason %q); "+
+				"increasing wait_deadline cannot make it working-copy fresh. "+
+				"Remove require_fresh and wait_deadline to read the indexed graph, "+
+				"select a dedicated graph with view.kind:base and its graph_id, "+
+				"or use an automatic checkout for a fresh working-copy graph; "+
+				"require_exact refused the stale graph, so no fallback was served",
+			reason))
+	}
 	return graphview.NewViewError(graphview.CodeViewBuilding, fmt.Sprintf(
 		"the selected checkout view is not current (fresh_reason %q after %dms); "+
 			"require_fresh asked for the working copy and require_exact refused the stale route, "+

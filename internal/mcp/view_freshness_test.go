@@ -1090,10 +1090,9 @@ func TestFreshnessCarrierNeverInventsARouteClaim(t *testing.T) {
 //
 // An explicitly selected dedicated/primary checkout DOES reach it.
 // viewForWorktreeSelector gates on checkout state, never on mode, so
-// view:{kind:"worktree",checkout_id:<dedicated>} is routed like any other, and
-// both the materialized and the not-yet-routed shapes name that checkout as
-// the wait target. Without the gate each of them issues a RequestCheckoutRefresh
-// admission against a checkout the coordinator has no automatic route for.
+// view:{kind:"worktree",checkout_id:<dedicated>} can still materialize a ready
+// route. The freshness gate must not admit a refresh for that route; an absent
+// route is instead refused during selection as an unsupported capability.
 func TestRequireFreshOnADedicatedCheckoutNeverAdmitsARefresh(t *testing.T) {
 	// The fixture's primary is Ready and Dedicated: exactly the population the
 	// gate exists for, and the one graphview.ServesAutomaticView excludes.
@@ -1135,10 +1134,8 @@ func TestRequireFreshOnADedicatedCheckoutNeverAdmitsARefresh(t *testing.T) {
 	})
 
 	t.Run("named but not routed yet", func(t *testing.T) {
-		// No route row for the primary: selection refuses with view_building
-		// and freshnessWaitTarget takes its selector arm, which resolves the
-		// same dedicated checkout. The gate is the only thing between that and
-		// an admission.
+		// No route row for the primary: this is unsupported, not a build
+		// that a freshness admission can complete.
 		stack := newViewStack(t)
 		waiter := &fakeFreshnessWaiter{}
 		stack.srv.freshnessWaiter = waiter
@@ -1148,7 +1145,7 @@ func TestRequireFreshOnADedicatedCheckoutNeverAdmitsARefresh(t *testing.T) {
 		}, time.Minute)
 		res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", args, captureReader(stack.srv, new(graph.Reader)))
 		require.NoError(t, err)
-		assertToolError(t, res, graphview.CodeViewBuilding)
+		assertToolError(t, res, graphview.CodeCapabilityUnavailable)
 		require.Empty(t, waiter.observed(),
 			"require_fresh admitted a checkout refresh for an unrouted dedicated checkout")
 	})
@@ -1229,6 +1226,77 @@ func TestAnUnresolvableWaitTargetIsNotReportedAsACommittedBase(t *testing.T) {
 }
 
 // ------------------------------------------ require_exact, everywhere ---
+
+func TestDedicatedCWDExactnessOnlyRequiresFreshnessWhenRequested(t *testing.T) {
+	stack := newViewStack(t)
+	waiter := &fakeFreshnessWaiter{}
+	stack.srv.freshnessWaiter = waiter
+	for _, fresh := range []bool{false, true} {
+		args := map[string]any{requireExactArgName: true}
+		if fresh {
+			args = freshArgs(args, time.Minute)
+		}
+		var served graph.Reader
+		res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", args, captureReader(stack.srv, &served))
+		require.NoError(t, err)
+		if fresh {
+			assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+			require.Nil(t, served)
+			text := viewResultText(t, res)
+			for _, guidance := range []string{freshReasonCommittedBaseAdvance, "wait_deadline", "require_fresh", "base", "graph_id", "automatic checkout", "no fallback"} {
+				require.Contains(t, text, guidance)
+			}
+		} else {
+			require.False(t, res.IsError, viewResultText(t, res))
+			require.True(t, hasNode(served, "repo/edit.go::Old"))
+		}
+		require.Empty(t, waiter.observed(), "a dedicated base cannot admit a working-copy refresh")
+	}
+}
+
+func TestDedicatedReadFacadeSeparatesSourceAndGraphFreshness(t *testing.T) {
+	t.Setenv("GORTEX_TOOLS", "facade-v1")
+	stack := newViewStack(t)
+	waiter := &fakeFreshnessWaiter{}
+	stack.srv.freshnessWaiter = waiter
+	registered := stack.srv.MCPServer().GetTool("read")
+	require.NotNil(t, registered)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.repoRoot)
+	for _, nested := range []bool{false, true} {
+		for _, keep := range []string{"", "Keeper"} {
+			args := map[string]any{
+				"operation": "file",
+				"target":    map[string]any{"file": "keep.go"},
+				"view":      map[string]any{"kind": "worktree", "checkout_id": viewTestPrimary},
+				"output":    map[string]any{"format": "json"},
+			}
+			knobs := freshArgs(map[string]any{requireExactArgName: true}, time.Minute)
+			if nested {
+				args["options"] = knobs
+			} else {
+				for key, value := range knobs {
+					args[key] = value
+				}
+			}
+			if keep != "" {
+				args["context"] = map[string]any{"keep": keep}
+			}
+			res, err := registered.Handler(ctx, makeReq("read", args))
+			require.NoError(t, err)
+			if keep != "" {
+				assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+			} else {
+				require.False(t, res.IsError, viewResultText(t, res))
+				require.Contains(t, viewResultText(t, res), "Keeper")
+				rider := resultFreshness(t, res)
+				require.Equal(t, true, rider["fresh"])
+				require.Equal(t, "file", rider["freshness_scope"])
+				require.Equal(t, "pending", rider["graph_freshness"])
+			}
+			require.Empty(t, waiter.observed())
+		}
+	}
+}
 
 // require_exact means "do not hand me something I did not ask for". Paired with
 // require_fresh it used to enforce that for exactly one of the six ways a wait
@@ -1349,7 +1417,11 @@ func TestRequireExactRefusesEveryUnfreshOutcome(t *testing.T) {
 			var served graph.Reader
 			res, err = strict.callWithView(t, strict.worktreeRoot, "get_symbol", args, captureReader(strict.srv, &served))
 			require.NoError(t, err)
-			assertToolError(t, res, graphview.CodeViewBuilding)
+			code := graphview.CodeViewBuilding
+			if tc.reason == freshReasonCommittedBaseAdvance {
+				code = graphview.CodeCapabilityUnavailable
+			}
+			assertToolError(t, res, code)
 			require.Nil(t, served, "require_exact must refuse before the handler reads a fallback")
 			require.Len(t, strict.srv.freshnessWaiter.(*fakeFreshnessWaiter).observed(), controlWaits,
 				"the strict request must wait exactly as the control did, not short-cut on state the control left")

@@ -387,20 +387,20 @@ func viewSelectorSchema() map[string]any {
 	}
 	return map[string]any{
 		"type":        "object",
-		"description": "Select the graph view for this request; omit it (or use auto) to resolve from the session workspace.",
+		"description": "Select the graph view for this request; omit it (or use auto) to resolve from the session workspace. Dedicated checkout CWDs read the indexed corpus; require_exact alone does not require working-copy freshness.",
 		"oneOf": []any{
 			object(map[string]any{"kind": kind(string(graphview.SelectorAuto))}),
 			object(map[string]any{
 				"kind":     kind(string(graphview.SelectorBase)),
-				"graph_id": text("Dedicated graph identifier."),
+				"graph_id": text("Dedicated graph identifier. Reads its indexed graph; omit require_fresh and wait_deadline to accept that graph. Strict working-copy freshness is unavailable for committed bases."),
 			}, "kind", "graph_id"),
 			object(map[string]any{
 				"kind":        kind(string(graphview.SelectorWorktree)),
-				"checkout_id": text("Registered checkout identifier, available from workspace.checkouts. For a filesystem path use view.path instead."),
+				"checkout_id": text("Registered checkout identifier, available from workspace.checkouts. Graph reads require a ready automatic route; a dedicated checkout without one returns capability_unavailable: select base with its graph_id instead. Source-only file reads prove bytes independently of relationships. For a filesystem path use view.path instead."),
 			}, "kind", "checkout_id"),
 			object(map[string]any{
 				"kind": kind(string(graphview.SelectorWorktree)),
-				"path": text("Absolute root path of an automatically discovered worktree. No explicit tracking is needed."),
+				"path": text("Absolute root path of a registered checkout. Automatic worktrees need no explicit tracking and can refresh their graph. A dedicated checkout without a ready automatic route cannot serve worktree graph reads: select base with its graph_id instead. Source-only file reads do not certify fresh relationships."),
 			}, "kind", "path"),
 			object(map[string]any{
 				"kind":     kind(string(graphview.SelectorGitRef)),
@@ -2249,6 +2249,12 @@ func (s *Server) materializeRequestView(
 		return viewFallback(strict, rider, graphview.WrapViewError(graphview.CodeCheckoutInaccessible,
 			fmt.Sprintf("read the route of checkout %q", checkout.CheckoutID), err))
 	case !found || !graphview.RouteReady(route):
+		if checkout.EffectiveMode == store_sqlite.CheckoutModeDedicated {
+			return viewFallback(strict, rider, graphview.NewViewError(graphview.CodeCapabilityUnavailable,
+				fmt.Sprintf("dedicated checkout %q has no ready automatic route; waiting cannot build one. "+
+					"Select its indexed graph with view.kind:base and its graph_id, without require_fresh or wait_deadline, "+
+					"or use an automatic checkout for a fresh working-copy graph", checkout.CheckoutID)))
+		}
 		// The selected worktree has no ready route — it may be dormant, never
 		// built since startup. Kick its coordinator so the awaited or retried
 		// build actually runs, then return the labelled base fallback now. The

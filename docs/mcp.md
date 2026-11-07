@@ -670,11 +670,11 @@ Graph and checkout ids are opaque; `list_checkouts` (CLI: `gortex repos families
 |---|---|---|
 | `auto` (default when `view` is omitted) | — | the session's own view: its cwd's checkout when that checkout is served automatically, else the base corpus |
 | `base` | `graph_id` | one persisted base graph by id |
-| `worktree` | `checkout_id` | one registered checkout by id, including its working-tree edits |
+| `worktree` | `checkout_id` or absolute root `path` | one registered checkout's automatic route, including its working-tree edits |
 | `git_ref` | `value` | the commit a **full** ref points at — under `refs/heads/`, `refs/tags/`, or `refs/remotes/` |
 | `commit` | `value` | one commit by object id — a full lowercase hex oid, 40 (SHA-1) or 64 (SHA-256) characters |
 
-`git_ref` and `commit` also take an optional `graph_id`. `kind`, `graph_id`, `checkout_id` and `value` are the only accepted fields, and each must be a string.
+`git_ref` and `commit` also take an optional `graph_id`. `kind`, `graph_id`, `checkout_id`, `path` and `value` are the only accepted fields, and each must be a string. A `worktree` selector accepts exactly one of `checkout_id` and `path`.
 
 Rules worth knowing before a client builds selectors:
 
@@ -715,6 +715,21 @@ A view is rarely complete all at once: source bytes are readable long before the
 | `optional_capabilities` | same shapes | annotates only — never fails a request |
 
 The schemas also publish three consistency controls on every view-aware tool: `require_exact` rejects substitution, `require_fresh` waits until the selected worktree reflects current filesystem state, and `wait_deadline` is the absolute RFC3339 deadline bounding that wait. A deadline without a wait requirement is rejected rather than ignored.
+
+Selector and freshness behavior depends on whether the request needs source bytes or graph relationships:
+
+| Selection / read | Freshness controls | Result |
+|---|---|---|
+| Dedicated checkout CWD (`auto`), or `base` with its `graph_id`; indexed graph read | No `require_fresh`, with or without `require_exact` | Reads the indexed corpus. Exact selection alone does not require a current working-copy graph. |
+| Same dedicated/base graph read | `require_fresh:true`, without `require_exact` | Answers with `fresh:false` and `fresh_reason:committed_base_advance_unimplemented`. |
+| Same dedicated/base graph read | Both `require_fresh:true` and `require_exact:true` | Refuses with `capability_unavailable`, preserving `committed_base_advance_unimplemented`; no fallback is served. A later `wait_deadline` cannot advance this committed base. |
+| Dedicated checkout selected as `worktree`, by checkout ID or absolute root path, without a ready automatic route; graph read | With or without strict freshness | Refuses with `capability_unavailable`. Use `view:{kind:"base",graph_id:"<dedicated-graph-id>"}` to read its indexed graph without `require_fresh`, or select an automatic checkout for a fresh working-copy graph. No build token or retry hint is advertised. |
+| Automatic checkout selected as `worktree`; graph read | Strict selection while the route is pending | Activates its coordinator and returns `view_building`. A missing route or `coordinator_live:false` alone does not establish an unsupported capability. |
+| Automatic checkout; graph read | `require_fresh:true` | Waits for publication up to `wait_deadline`; a successful exact answer reads the published route. Without `require_exact`, an unfresh answer remains labelled; with it, transient failures retain their specific refusal codes and reasons. |
+| Supported source-only file read, including `read` operation `file` through an explicit dedicated worktree selector | With or without strict freshness | Proves the bytes it serves independently of graph publication. `freshness_scope:file` and `fresh:true` certify only those bytes; inspect `graph_freshness` before relying on relationships. |
+| File read with a nonempty `context.keep`, or explicit graph capability requirements | With strict freshness | Uses graph selection and freshness rules above; a dedicated checkout's unsupported graph request remains `capability_unavailable`. |
+
+For dedicated/base graph reads, remove `require_fresh` (and its `wait_deadline`) to read the indexed graph. Selecting `base` alone does not make that graph working-copy fresh. The same consistency controls are accepted inside a facade request's `options` object. Scope, checkout accessibility, catalog failures, and primary readiness are checked before disclosing an unsupported worktree capability.
 
 Defaults that were not required are still evaluated and reported under `degraded_capabilities`. A request the base corpus serves is exempt: the base is a plain whole index with no producer rows to read.
 

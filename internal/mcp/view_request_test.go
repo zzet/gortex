@@ -582,6 +582,46 @@ func TestPrimaryCWDReadsTheBaseCorpus(t *testing.T) {
 	}
 }
 
+func TestDedicatedWorktreeSelectorWithoutRouteIsUnsupported(t *testing.T) {
+	stack := newViewStack(t)
+	for _, field := range []string{"checkout_id", "path"} {
+		for _, strictFresh := range []bool{false, true} {
+			selector := map[string]any{"kind": "worktree", field: viewTestPrimary}
+			if field == "path" {
+				selector[field] = stack.repoRoot
+			}
+			args := map[string]any{"view": selector}
+			if strictFresh {
+				args = freshArgs(args, time.Minute)
+				args[requireExactArgName] = true
+			}
+			var reader graph.Reader
+			res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", args, captureReader(stack.srv, &reader))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+			text := viewResultText(t, res)
+			if reader != nil || !strings.Contains(text, "base") || !strings.Contains(text, "graph_id") ||
+				strings.Contains(text, "build_token") || strings.Contains(text, "retry_after") {
+				t.Fatalf("unsupported dedicated selector served a fallback or lacks permanent selector guidance: %s", text)
+			}
+			// The middleware consumes request metadata; restore it for the
+			// out-of-scope control.
+			args["view"] = selector
+			if strictFresh {
+				args = freshArgs(args, time.Minute)
+				args[requireExactArgName] = true
+			}
+			res, err = stack.callWithView(t, stack.otherRoot, "get_symbol", args, captureReader(stack.srv, &reader))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertToolError(t, res, graphview.CodeSelectorOutOfScope)
+		}
+	}
+}
+
 func TestBuildingRouteFallsBackToTheBase(t *testing.T) {
 	stack := newViewStack(t)
 	routeViewCheckout(t, stack.store, stack.graphID, stack.commit, 0, store_sqlite.RouteActive)
