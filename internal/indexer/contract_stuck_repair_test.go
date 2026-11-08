@@ -371,6 +371,124 @@ func TestContractStuckRepairBusyPassSchedulesAnotherPass(t *testing.T) {
 	})
 }
 
+// TestContractStuckRepairBusyLaneBacksOff: a lane that stays busy across
+// passes is asked for again after a doubling delay, capped, so a lane held
+// for hours costs a bounded number of passes and log lines; a watcher wake
+// during the delay does not cut it short.
+func TestContractStuckRepairBusyLaneBacksOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mi := &MultiIndexer{}
+		release, ok := mi.TryRepositoryMutationLanes([]string{"fixture"})
+		require.True(t, ok)
+		defer release()
+		core, logs := observer.New(zapcore.InfoLevel)
+		r := &ContractStuckRepair{
+			options: ContractStuckRepairOptions{MultiIndexer: mi, Logger: zap.New(core)},
+			period:  contractRepairTestPeriod,
+			ctx:     t.Context(),
+		}
+		state := &contractRepoRepair{repo: "fixture", wake: make(chan struct{}, 1)}
+		p := contractRepairTestPeriod
+		want := []time.Duration{p, 2 * p, 4 * p, 8 * p, 16 * p, 16 * p, 16 * p}
+		var gaps []time.Duration
+		last := time.Now()
+		for range want {
+			// A watcher wake lands at once; the delay still holds.
+			signalContractRepair(state.wake)
+			require.True(t, r.awaitBusyBackoff(state))
+			r.pass(state)
+			now := time.Now()
+			gaps = append(gaps, now.Sub(last)-p)
+			last = now
+		}
+		// Each gap is the delay before the pass, after the pass's own
+		// period: none before the first pass, then the previous delay.
+		require.Equal(t, append([]time.Duration{0}, want[:len(want)-1]...), gaps)
+		busy := logs.FilterMessage("contract stuck repair").FilterField(zap.String("outcome", "busy")).All()
+		require.Len(t, busy, len(want))
+		for i, entry := range busy {
+			require.Equal(t, want[i], entry.ContextMap()["retry_in"], "busy pass %d", i+1)
+		}
+
+		// A pass that takes the lane ends the streak and its delay.
+		require.NotZero(t, state.busyStreak)
+		r.noteLaneTaken(state)
+		require.Zero(t, state.busyStreak)
+		start := time.Now()
+		require.True(t, r.awaitBusyBackoff(state))
+		require.Zero(t, time.Since(start), "no delay once the lane was taken")
+	})
+}
+
+func TestContractStuckRepairBusyBackoffEndsWithTheRepair(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		r := &ContractStuckRepair{period: contractRepairTestPeriod, ctx: ctx}
+		state := &contractRepoRepair{repo: "fixture", busyUntil: time.Now().Add(time.Hour)}
+		done := make(chan bool)
+		go func() { done <- r.awaitBusyBackoff(state) }()
+		synctest.Wait()
+		cancel()
+		require.False(t, <-done, "a closed repair stops waiting out its delay")
+	})
+}
+
+// TestContractStuckRepairBusyBackoffEndsWhenAWakeFindsTheLaneFree: a lane
+// released during a delay is taken at the next wake, not when the delay ends.
+func TestContractStuckRepairBusyBackoffEndsWhenAWakeFindsTheLaneFree(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mi := &MultiIndexer{}
+		release, ok := mi.TryRepositoryMutationLanes([]string{"fixture"})
+		require.True(t, ok)
+		r := &ContractStuckRepair{options: ContractStuckRepairOptions{MultiIndexer: mi}, period: contractRepairTestPeriod, ctx: t.Context()}
+		state := &contractRepoRepair{repo: "fixture", wake: make(chan struct{}, 1), busyStreak: 5, busyUntil: time.Now().Add(16 * contractRepairTestPeriod)}
+		start := time.Now()
+		done := make(chan bool)
+		go func() { done <- r.awaitBusyBackoff(state) }()
+		time.Sleep(contractRepairTestPeriod)
+		signalContractRepair(state.wake)
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("a wake that finds the lane held must not end the delay")
+		default:
+		}
+		release()
+		time.Sleep(contractRepairTestPeriod)
+		signalContractRepair(state.wake)
+		require.True(t, <-done)
+		require.Equal(t, 2*contractRepairTestPeriod, time.Since(start), "the delay ends at the first wake after the release")
+		_, ok = mi.TryRepositoryMutationLanes([]string{"fixture"})
+		require.True(t, ok, "the probe returns the lane it took")
+	})
+}
+
+// TestContractStuckRepairRunBacksOffABusyLane drives the repository's repair
+// goroutine against a lane held for many periods: its passes, and their busy
+// lines, thin out instead of recurring every period.
+func TestContractStuckRepairRunBacksOffABusyLane(t *testing.T) {
+	f := newContractRepairFixture(t, nil)
+	f.strict(t, time.Minute)
+	f.failBody(t, "consts.go", jobConsts+"// a failed apply\n")
+	unlock, ok := f.mi.TryRepositoryMutationLanes([]string{"fixture"})
+	require.True(t, ok)
+	busy := func() int {
+		return len(f.logs.FilterMessage("contract stuck repair").FilterField(zap.String("outcome", "busy")).All())
+	}
+	before := busy()
+	held := 12 * contractRepairTestPeriod
+	time.Sleep(held)
+	passes := busy() - before
+	repaired := repairCount("stuck_receipt")
+	unlock()
+	// Without the back-off a pass ends every period: ~12 busy lines. With
+	// it they end near 1, 3, 7 periods (then 15): at most 4 even with
+	// scheduling slack, and at least one.
+	require.GreaterOrEqual(t, passes, 1)
+	require.LessOrEqual(t, passes, 4, "busy passes over %v of a held lane", held)
+	require.Eventually(t, func() bool { return repairCount("stuck_receipt") > repaired }, testTimingSlack(20*time.Second), time.Millisecond, "the repair runs once the lane is free")
+}
+
 func TestContractRepairAdmissionHonorsTheBatchGate(t *testing.T) {
 	mi := &MultiIndexer{}
 	func() {
