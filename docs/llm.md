@@ -177,6 +177,7 @@ A gateway preset is a built-in, ready-made custom provider for a well-known Open
 | `opper` | `https://api.opper.ai/v3/compat` | `gpt-6.1-terra` | `OPPER_API_KEY` | `frontier` |
 | `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
 | `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
+| `standardcompute` | `https://api.stdcmpt.com/v1` (US: `https://us.stdcmpt.com/v1`) | `deepseek/deepseek-v4-flash` | `STANDARDCOMPUTE_API_KEY` | `frontier` |
 
 The `cheapaimodel` preset also sends `reasoning_effort: none`: its default model reasons by default, and the reasoning can use up the small output budget of the `assist` passes before any JSON is written. Kimi models accept `none` too. GLM models always reason: with `none` they returned HTTP 400 or an empty answer, and with the default effort they used up the 192-token expand budget, so they are not a good fit for `assist`.
 
