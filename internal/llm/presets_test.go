@@ -99,6 +99,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("cheapaimodel preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(cam))
 	}
 
+	sc := Config{Provider: "standardcompute"}
+	cp, ok = sc.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.stdcmpt.com/v1" || cp.Model != "deepseek/deepseek-v4-flash" || cp.APIKeyEnv != "STANDARDCOMPUTE_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(sc) != ProfileFrontier {
+		t.Errorf("standardcompute preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(sc))
+	}
+
 	// A user custom provider of the same name always wins, wholesale —
 	// no preset field leaks into it.
 	c.Custom = map[string]CustomProvider{"testgw": {BaseURL: "https://mine/v1", Model: "my-model"}}
