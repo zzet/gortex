@@ -38,15 +38,17 @@ func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 	write("foreign", "someone else") // no record, not a shipped render
 	write("current", "new")          // already what this binary writes
 	write("garbage", "garbage")      // a copy the adapter cannot read back
+	write("reinstalled", "new")      // recorded by an older release, rewritten by install since
 	if err := os.Symlink(path("recorded"), path("linked")); err != nil {
 		t.Fatal(err)
 	}
 	prev := &GeneratedManifest{Version: "v1", Files: map[string]string{
-		path("recorded"): GeneratedHash([]byte("v1 render")),
-		path("edited"):   GeneratedHash([]byte("v1 render")),
+		path("recorded"):    GeneratedHash([]byte("v1 render")),
+		path("edited"):      GeneratedHash([]byte("v1 render")),
+		path("reinstalled"): GeneratedHash([]byte("v1 render")),
 	}}
 	var files fakeLister
-	for _, n := range []string{"recorded", "edited", "legacy", "foreign", "current", "garbage", "linked", "absent"} {
+	for _, n := range []string{"recorded", "edited", "legacy", "foreign", "current", "garbage", "reinstalled", "linked", "absent"} {
 		files = append(files, owned(path(n)))
 	}
 	listers := []NamedLister{{Name: "fake", Lister: files}}
@@ -59,7 +61,7 @@ func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 	want := map[string]RefreshStatus{
 		"recorded": RefreshStale, "edited": RefreshModified, "legacy": RefreshStale,
 		"foreign": RefreshUnrecognized, "current": RefreshCurrent,
-		"garbage": RefreshUnrecognized, "linked": RefreshUnrecognized,
+		"garbage": RefreshUnrecognized, "linked": RefreshUnrecognized, "reinstalled": RefreshCurrent,
 	}
 	assertStatuses(t, entries, want, path)
 	if got, _ := os.ReadFile(path("recorded")); string(got) != "v1 render" {
@@ -90,7 +92,8 @@ func TestRefreshOwnedFilesRewritesOnlyWhatGortexProvablyWrote(t *testing.T) {
 		t.Fatal("a copy the adapter cannot read back was recorded as generated")
 	}
 	if next.Version != "v2" || next.Files[path("recorded")] != GeneratedHash([]byte("new")) ||
-		next.Files[path("edited")] != prev.Files[path("edited")] {
+		next.Files[path("edited")] != prev.Files[path("edited")] ||
+		next.Files[path("reinstalled")] != GeneratedHash([]byte("new")) {
 		t.Fatalf("manifest after refresh = %+v", next)
 	}
 }

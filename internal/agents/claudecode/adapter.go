@@ -752,7 +752,12 @@ func installPermissions(w io.Writer, settingsPath string, opts agents.ApplyOpts)
 // Also used by `gortex instructions switch` to re-shape the installed
 // skill surface when the active profile changes.
 func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
-	skillsDir := filepath.Join(userClaudeConfigDir(home), "skills")
+	return skillpack.Sync(w, globalSkillSpec(home), allowed, opts)
+}
+
+// globalSkillSpec is the user-level skill pack, shared by the install, the
+// profile switch and the post-upgrade refresh.
+func globalSkillSpec(home string) skillpack.SyncSpec {
 	known := make(map[string][]string, len(GlobalSkills))
 	preWorktree := skillpack.PreWorktreeClaudeSkillHashes()
 	preWorktree = skillpack.AddWorktreeV1Hashes(GlobalSkills, profiles.WorktreeBranchRoutingPolicy, preWorktree)
@@ -760,7 +765,51 @@ func SyncGlobalSkills(w io.Writer, home string, allowed []string, opts agents.Ap
 		known[name] = append(known[name], v060GlobalSkillHashes[name])
 		known[name] = append(known[name], preWorktree[name]...)
 	}
-	return skillpack.Sync(w, skillpack.SyncSpec{Dir: skillsDir, Rendered: GlobalSkills, KnownHashes: known}, allowed, opts)
+	return skillpack.SyncSpec{Dir: filepath.Join(userClaudeConfigDir(home), "skills"), Rendered: GlobalSkills, KnownHashes: known}
+}
+
+// OwnedFiles makes the user-level skills, slash commands and sub-agents part
+// of the post-upgrade refresh, on the same ownership terms install uses.
+func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
+	if env.Home == "" {
+		return nil
+	}
+	out := skillpack.OwnedFiles(globalSkillSpec(env.Home))
+	base := userClaudeConfigDir(env.Home)
+	for _, set := range []struct {
+		dir                 string
+		bodies, v060, preWT map[string]string
+	}{
+		{"commands", SlashCommands, v060SlashCommandHashes, preWorktreeSlashCommandHashes},
+		{"agents", SubAgents, v060SubAgentHashes, preWorktreeSubAgentHashes},
+	} {
+		names := make([]string, 0, len(set.bodies))
+		for name := range set.bodies {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			content, known := set.bodies[name], artifactMigrationHashes(set.bodies[name], set.v060[name], set.preWT[name])
+			out = append(out, agents.OwnedFile{
+				Path: filepath.Join(base, set.dir, name),
+				Render: func(existing []byte) (string, bool) {
+					return content, isShippedAgentArtifact(existing, content, known...)
+				},
+				Note: keptArtifactNote,
+			})
+		}
+	}
+	return out
+}
+
+// keptArtifactNote is the slash-command and sub-agent twin of
+// skillpack.KeptSkillNote: install keeps a customised copy too.
+const keptArtifactNote = "`gortex install` keeps an edited file, so delete it before reinstalling."
+
+// artifactMigrationHashes are the bodies earlier releases shipped for one
+// slash command or sub-agent whose current body is content.
+func artifactMigrationHashes(content, v060, preWorktree string) []string {
+	return []string{v060, preWorktree, skillpack.WorktreeV1BodyHash(content, profiles.WorktreeBranchRoutingPolicy)}
 }
 
 // installGlobalSlashCommands writes ~/.claude/commands/gortex-*.md
@@ -773,7 +822,7 @@ func installGlobalSlashCommands(w io.Writer, home string, opts agents.ApplyOpts)
 	dir := filepath.Join(userClaudeConfigDir(home), "commands")
 	for name, content := range SlashCommands {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, []string{v060SlashCommandHashes[name], preWorktreeSlashCommandHashes[name], skillpack.WorktreeV1BodyHash(content, profiles.WorktreeBranchRoutingPolicy)}, opts)
+		action, err := writeAgentArtifact(w, path, content, artifactMigrationHashes(content, v060SlashCommandHashes[name], preWorktreeSlashCommandHashes[name]), opts)
 		if err != nil {
 			return out, err
 		}
@@ -791,7 +840,7 @@ func installGlobalSubAgents(w io.Writer, home string, opts agents.ApplyOpts) ([]
 	dir := filepath.Join(userClaudeConfigDir(home), "agents")
 	for name, content := range SubAgents {
 		path := filepath.Join(dir, name)
-		action, err := writeAgentArtifact(w, path, content, []string{v060SubAgentHashes[name], preWorktreeSubAgentHashes[name], skillpack.WorktreeV1BodyHash(content, profiles.WorktreeBranchRoutingPolicy)}, opts)
+		action, err := writeAgentArtifact(w, path, content, artifactMigrationHashes(content, v060SubAgentHashes[name], preWorktreeSubAgentHashes[name]), opts)
 		if err != nil {
 			return out, err
 		}

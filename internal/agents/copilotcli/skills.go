@@ -175,15 +175,31 @@ func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpt
 // deletion rule (never remove a customised file) lives in skillpack, not
 // here, so all four skill-aware hosts enforce it identically.
 func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
+	return skillpack.Sync(w, curatedSkillSpec(root), allowed, opts)
+}
+
+// curatedSkillSpec is the curated pack under root, shared by the install,
+// the profile switch and the post-upgrade refresh. An empty root yields a
+// spec that does nothing.
+func curatedSkillSpec(root string) skillpack.SyncSpec {
 	if root == "" {
-		return nil, nil
+		return skillpack.SyncSpec{}
 	}
-	return skillpack.Sync(w, skillpack.SyncSpec{
+	rendered := CuratedSkills()
+	return skillpack.SyncSpec{
 		Dir:         root,
 		FileName:    skillFileName,
-		Rendered:    CuratedSkills(),
-		KnownHashes: skillpack.AddWorktreeV1Hashes(CuratedSkills(), profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeClaudeSkillHashes()),
-	}, allowed, opts)
+		Rendered:    rendered,
+		KnownHashes: skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeClaudeSkillHashes()),
+	}
+}
+
+// OwnedFiles makes the curated skills part of the post-upgrade refresh.
+func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
+	if env.Home == "" {
+		return nil
+	}
+	return skillpack.OwnedFiles(curatedSkillSpec(curatedSkillsRoot(env)))
 }
 
 // installGeneratedSkills writes the per-community skills the caller

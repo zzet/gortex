@@ -2766,9 +2766,12 @@ func refreshAgentFilesOnStart(logger *zap.Logger) {
 				logger.Info("daemon: refreshed generated agent file", zap.String("path", e.Path),
 					zap.String("from_version", displayVersion(e.FromVersion)), zap.String("to_version", e.ToVersion))
 			case agents.RefreshModified, agents.RefreshUnrecognized:
-				logger.Warn("daemon: kept a generated agent file that differs from what Gortex wrote",
-					zap.String("path", e.Path), zap.String("status", string(e.Status)),
-					zap.String("refresh", agentRefreshRefreshCommand(e.Agent)))
+				fields := []zap.Field{zap.String("path", e.Path), zap.String("status", string(e.Status)),
+					zap.String("refresh", agentRefreshRefreshCommand(e.Agent))}
+				if e.Note != "" {
+					fields = append(fields, zap.String("note", e.Note))
+				}
+				logger.Warn("daemon: kept a generated agent file that differs from what Gortex wrote", fields...)
 			case agents.RefreshStale:
 				if e.Note != "" { // a merged config, reported and never rewritten
 					logger.Warn("daemon: agent config is outdated and was not rewritten",
