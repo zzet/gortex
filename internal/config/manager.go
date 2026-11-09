@@ -376,6 +376,30 @@ func repoLocalExtractorPluginsEnabled() bool {
 	return strings.TrimSpace(os.Getenv(ExtractorPluginsLocalOptInEnv)) == "1"
 }
 
+// TransformsLocalOptInEnv gates transforms declared in a repo-local
+// .gortex.yaml. A transform rule runs an arbitrary command (its argv) over
+// every matching file's bytes on the indexer's behalf — a cloned repo
+// carrying a malicious index.transforms entry would execute attacker-chosen
+// code when the victim indexes it. Same command-exec capability as
+// index.extractor_plugins, gated the same way. The flag makes it explicit:
+// operator opt-in.
+const TransformsLocalOptInEnv = "GORTEX_ALLOW_LOCAL_TRANSFORMS"
+
+func repoLocalTransformsEnabled() bool {
+	return strings.TrimSpace(os.Getenv(TransformsLocalOptInEnv)) == "1"
+}
+
+// GrammarsLocalOptInEnv gates grammar declarations in a repo-local
+// .gortex.yaml. Each grammar's Library is a compiled shared object loaded
+// with dlopen (unix) or LoadDLL (windows) at index startup, so a cloned
+// repo carrying a malicious index.grammars entry injects attacker-chosen
+// native code into the victim's indexer. Gated like the command fields.
+const GrammarsLocalOptInEnv = "GORTEX_ALLOW_LOCAL_GRAMMARS"
+
+func repoLocalGrammarsEnabled() bool {
+	return strings.TrimSpace(os.Getenv(GrammarsLocalOptInEnv)) == "1"
+}
+
 // LocalProvidersOptInEnv gates providers declared in a repo-local
 // .gortex.yaml. Loading an endpoint definition from a cloned repo is a
 // supply-chain risk: an attacker-controlled `llm.custom` base_url makes
@@ -386,6 +410,19 @@ const LocalProvidersOptInEnv = "GORTEX_ALLOW_LOCAL_PROVIDERS"
 
 func repoLocalProvidersEnabled() bool {
 	return strings.TrimSpace(os.Getenv(LocalProvidersOptInEnv)) == "1"
+}
+
+// SemanticProvidersLocalOptInEnv gates providers declared in a repo-local
+// .gortex.yaml under `semantic.providers`. Each provider with a Command
+// spawns a subprocess (an scip index or an LSP server) on the daemon's
+// behalf, so a cloned repo carrying a malicious semantic.providers entry
+// would run attacker-chosen code. Gated like the other repo-local
+// exec-capable fields: operator opt-in via GORTEX_ALLOW_LOCAL_SEMANTIC_
+// PROVIDERS.
+const SemanticProvidersLocalOptInEnv = "GORTEX_ALLOW_LOCAL_SEMANTIC_PROVIDERS"
+
+func repoLocalSemanticProvidersEnabled() bool {
+	return strings.TrimSpace(os.Getenv(SemanticProvidersLocalOptInEnv)) == "1"
 }
 
 // LastGoodWorkspace returns the workspace config last published for
@@ -463,6 +500,35 @@ func (cm *ConfigManager) repoConfig(repoPrefix string, ws *Config, repoPath stri
 	// leaves compiled defaults untouched.
 	if ws != nil && !repoLocalExtractorPluginsEnabled() {
 		out.Index.ExtractorPlugins = nil
+	}
+	// Repo-local transforms run arbitrary, operator-configured commands over
+	// repo file content on the indexer's behalf, so a cloned repo carrying a
+	// malicious index.transforms entry would execute attacker-chosen code when
+	// the victim indexes it. Drop them unless the operator has explicitly opted
+	// in via GORTEX_ALLOW_LOCAL_TRANSFORMS. `out` copies the workspace config
+	// only when ws != nil, so this targets repo-local config and leaves compiled
+	// defaults untouched.
+	if ws != nil && !repoLocalTransformsEnabled() {
+		out.Index.Transforms = nil
+	}
+	// Repo-local grammar libraries are native shared objects loaded with
+	// dlopen/LoadDLL at index startup, so a cloned repo carrying a malicious
+	// index.grammars entry injects attacker-chosen native code into the
+	// victim's indexer. Drop them unless the operator has explicitly opted in
+	// via GORTEX_ALLOW_LOCAL_GRAMMARS. See repoLocalGrammarsEnabled.
+	if ws != nil && !repoLocalGrammarsEnabled() {
+		out.Index.Grammars = nil
+	}
+	// Repo-local semantic providers with a Command spawn subprocesses (an
+	// scip indexer or an LSP server) on the daemon's behalf. The daemon
+	// seeds its semantic manager from the operator's global config, so a
+	// cloned repo's semantic.providers is not currently wired to a spawn;
+	// drop repo-local providers anyway to close the deny-list gap and stay
+	// consistent with the transforms/grammars/extractor-gates. `out`
+	// copies the workspace config only when ws != nil, so this targets
+	// repo-local config and leaves compiled defaults untouched.
+	if ws != nil && !repoLocalSemanticProvidersEnabled() {
+		out.Semantic.Providers = nil
 	}
 	// Repo-local llm.custom base_urls are uncontrolled egress points (a
 	// cloned repo can point LLM calls and API keys at an arbitrary host).
