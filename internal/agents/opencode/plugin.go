@@ -46,6 +46,7 @@ import (
 	_ "embed"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/skillpack"
 )
 
 //go:embed plugin/gortex.js
@@ -142,7 +143,20 @@ func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
 	if env.Home == "" {
 		return nil
 	}
-	return []agents.OwnedFile{{
+	return append([]agents.OwnedFile{a.pluginOwnedFile(env)}, curatedOwnedSkills(env.Home)...)
+}
+
+// curatedOwnedSkills lists the curated skills for the refresh.
+func curatedOwnedSkills(home string) []agents.OwnedFile {
+	spec, err := curatedSkillSpec(globalSkillsDir(home))
+	if err != nil {
+		return nil
+	}
+	return skillpack.OwnedFiles(spec)
+}
+
+func (a *Adapter) pluginOwnedFile(env agents.Env) agents.OwnedFile {
+	return agents.OwnedFile{
 		Path: PluginPath(env.Home),
 		Render: func(existing []byte) (string, bool) {
 			installed, ok := parseInstalledPlugin(existing)
@@ -152,7 +166,7 @@ func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
 			env.HookMode, env.InstallHooks = installed.mode, installed.enforce
 			return renderPlugin(env), shippedPluginTemplates[installed.template]
 		},
-	}}
+	}
 }
 
 // shippedPluginTemplates are the sha256 digests of every plugin/gortex.js a

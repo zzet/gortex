@@ -50,6 +50,12 @@ const contractRepairOrphanGrace = time.Second
 // contractRepairLanePoll is how often a repair asks again for a busy lane.
 const contractRepairLanePoll = 100 * time.Millisecond
 
+// contractRepairBusyBackoffMax caps, in periods, the delay before a repair
+// asks again for a lane its last passes found busy. The delay doubles with
+// each busy pass from one period, so a lane held for hours costs a bounded
+// rate of passes and log lines instead of one of each per period.
+const contractRepairBusyBackoffMax = 16
+
 // contractRepairEnvelopeAfter is how many forced reindexes a path gets
 // before the repair excludes it with a failure envelope.
 const contractRepairEnvelopeAfter = 3
@@ -110,6 +116,11 @@ type contractRepoRepair struct {
 	// protected by the repair's mutex; attempts and pendingKey stay private
 	// to the repository's repair goroutine.
 	retry bool
+	// busyStreak counts the consecutive passes that found the lane busy;
+	// busyUntil is when the next pass may ask for it again. Both stay
+	// private to the repository's repair goroutine.
+	busyStreak int
+	busyUntil  time.Time
 }
 
 // NewContractStuckRepair starts the repair. Each repository it sees gets a
@@ -327,6 +338,9 @@ func (r *ContractStuckRepair) run(state *contractRepoRepair) {
 			return
 		case <-state.wake:
 		}
+		if !r.awaitBusyBackoff(state) {
+			return
+		}
 		if _, _, err := r.repoIndexer(state.repo); err != nil {
 			r.mu.Lock()
 			if r.repos[state.repo] == state {
@@ -339,9 +353,61 @@ func (r *ContractStuckRepair) run(state *contractRepoRepair) {
 	}
 }
 
+// awaitBusyBackoff waits until the repository's busy delay, if any, has
+// passed, or until a wake finds the lane free. The watcher re-signals a
+// repository every period while its suspects or stuck windows remain; each
+// such wake makes one unlogged try for the lane and ends the delay only if
+// the lane is free, so a lane released mid-delay is repaired within a period
+// while a lane that stays held costs no pass and no log line. It reports
+// false once the repair is closing.
+func (r *ContractStuckRepair) awaitBusyBackoff(state *contractRepoRepair) bool {
+	wait := time.Until(state.busyUntil)
+	if wait <= 0 {
+		return true
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case <-state.wake:
+			if release, ok := r.options.MultiIndexer.TryRepositoryMutationLanes([]string{state.repo}); ok {
+				release()
+				return true
+			}
+		}
+	}
+}
+
+// noteLaneBusy records a pass that found the lane busy for its period and
+// returns the delay before the next pass: one period after the first busy
+// pass, doubling after each further one, capped at
+// contractRepairBusyBackoffMax periods.
+func (r *ContractStuckRepair) noteLaneBusy(state *contractRepoRepair) time.Duration {
+	state.busyStreak++
+	limit := contractRepairBusyBackoffMax * r.period
+	delay := r.period
+	for i := 1; i < state.busyStreak && delay < limit; i++ {
+		delay *= 2
+	}
+	delay = min(delay, limit)
+	state.busyUntil = time.Now().Add(delay)
+	return delay
+}
+
+// noteLaneTaken ends a busy streak: the next pass asks at once.
+func (r *ContractStuckRepair) noteLaneTaken(state *contractRepoRepair) {
+	state.busyStreak = 0
+	state.busyUntil = time.Time{}
+}
+
 // pass takes the repository's lane when it is free, retrying every poll, and
-// repairs under it. A lane busy for a whole period is logged, and the next
-// pass goes on asking for it.
+// repairs under it. A lane busy for a whole period is logged and backs the
+// next pass off (noteLaneBusy); that pass is scheduled at once and waits out
+// the delay in run.
 func (r *ContractStuckRepair) pass(state *contractRepoRepair) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -360,10 +426,12 @@ func (r *ContractStuckRepair) pass(state *contractRepoRepair) {
 		release, ok := r.options.MultiIndexer.TryRepositoryMutationLanes([]string{state.repo})
 		if ok {
 			defer release()
+			r.noteLaneTaken(state)
 			break
 		}
 		if !time.Now().Before(deadline) {
-			r.options.Logger.Info("contract stuck repair", zap.String("repo", state.repo), zap.String("outcome", "busy"))
+			delay := r.noteLaneBusy(state)
+			r.options.Logger.Info("contract stuck repair", zap.String("repo", state.repo), zap.String("outcome", "busy"), zap.Int("busy_passes", state.busyStreak), zap.Duration("retry_in", delay))
 			signalContractRepair(state.wake)
 			return
 		}

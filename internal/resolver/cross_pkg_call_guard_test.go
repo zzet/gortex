@@ -19,7 +19,21 @@ func buildGraphFromSources(t *testing.T, files map[string]string) graph.Store {
 	g := graph.New()
 	ts := languages.NewTypeScriptExtractor()
 	js := languages.NewJavaScriptExtractor()
+	vue := languages.NewVueExtractor()
 	for path, src := range files {
+		if strings.HasSuffix(path, ".vue") {
+			r, err := vue.Extract(path, []byte(src))
+			if err != nil {
+				t.Fatalf("vue extract %s: %v", path, err)
+			}
+			for _, n := range r.Nodes {
+				g.AddNode(n)
+			}
+			for _, e := range r.Edges {
+				g.AddEdge(e)
+			}
+			continue
+		}
 		if strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".tsx") {
 			r, err := ts.Extract(path, []byte(src))
 			if err != nil {

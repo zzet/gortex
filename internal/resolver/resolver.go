@@ -500,7 +500,13 @@ type Resolver struct {
 	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
 	// import_evidence.go for the precedence design.
 	importFilesByCaller map[string]map[string]struct{}
-	importFilesMu       sync.RWMutex
+	// importOutByFile is the batched out-edge prefetch importedFilesFor
+	// reads before falling back to a point GetOutEdges: one
+	// GetOutEdgesByNodeIDs over every JS/TS caller file of a pass
+	// (prefetchImportEdges) instead of one point read per call edge.
+	// Guarded by importFilesMu, cleared with the per-pass caches.
+	importOutByFile map[string][]*graph.Edge
+	importFilesMu   sync.RWMutex
 
 	// csharpNSByFile memoises each C# file's visible namespaces (usings
 	// + own namespace chain). Built lazily inside the parallel resolve
@@ -1127,6 +1133,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 			}
 
+			r.prefetchImportEdges(scPending, nil)
 			workersStart := time.Now()
 			workers := runtime.NumCPU()
 			if workers < 1 {
@@ -2460,6 +2467,7 @@ func (r *Resolver) clearLookupCache() {
 	r.namesMissMu.Unlock()
 	r.importFilesMu.Lock()
 	r.importFilesByCaller = nil
+	r.importOutByFile = nil
 	r.importFilesMu.Unlock()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
@@ -3438,6 +3446,15 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 			origin:     edge.Origin,
 		})
 	}
+	pageEdges := append([]*graph.Edge(nil), detached...)
+	for _, filePath := range filePaths {
+		for _, node := range nodesByFile[filePath] {
+			if node != nil {
+				pageEdges = append(pageEdges, outByNode[node.ID]...)
+			}
+		}
+	}
+	r.prefetchImportEdges(pageEdges, outByNode)
 	for _, filePath := range filePaths {
 		for _, node := range nodesByFile[filePath] {
 			if node == nil {
@@ -3794,6 +3811,11 @@ func (r *Resolver) resolveIncomingStubEdgesLocked(stubKeys []string, inByStub ma
 	}
 	var reindexBatch []graph.EdgeReindex
 	var jobs []reindexJob
+	var incoming []*graph.Edge
+	for _, key := range stubKeys {
+		incoming = append(incoming, inByStub[key]...)
+	}
+	r.prefetchImportEdges(incoming, nil)
 	for _, key := range stubKeys {
 		for _, edge := range inByStub[key] {
 			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
