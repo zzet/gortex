@@ -41,7 +41,9 @@ import (
 // for an unchanged corpus.
 // Go module binding changes candidate order, cross-repo provenance and import identity.
 // Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
-const ResolutionSemanticsVersion = 6
+// Lua/Luau requires bind by path in the Lua pass instead of the generic import
+// cascade, changing import edges for an unchanged corpus.
+const ResolutionSemanticsVersion = 7
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

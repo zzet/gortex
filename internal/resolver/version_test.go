@@ -22,7 +22,7 @@ import (
 // and say which in the commit message. A diff that changes this line and
 // nothing else in internal/resolver is the signal that something re-keyed
 // every cached generation by accident.
-const resolverVersionGolden = "resolver-6:1d041ee489712f11544c6b6f7ce62982"
+const resolverVersionGolden = "resolver-7:bdeaa492250b429d78a230beea33a00f"
 
 func TestResolverVersionIsPinned(t *testing.T) {
 	if got := Version(); got != resolverVersionGolden {
@@ -38,7 +38,7 @@ func TestResolverVersionIsStable(t *testing.T) {
 	if first != second {
 		t.Fatalf("two reads of the resolution contract disagree: %q then %q", first, second)
 	}
-	if !strings.HasPrefix(first, "resolver-6:") {
+	if !strings.HasPrefix(first, "resolver-7:") {
 		t.Fatalf("the version %q does not name the semantics version it was produced under", first)
 	}
 }
