@@ -176,6 +176,13 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.logger.Debug("incremental reindex: failed to index file",
 			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
+	if idx.contractRestatementErr != nil {
+		// The reconcile already fails with this error (its caller returns it
+		// before using the result). A retry pass would only meet the same
+		// refusal: for the warmup WAL boundary, a second full wait. The first
+		// pass's file-failure notes are kept rather than cleared by a retry.
+		return invalidation, reparsed, failed, versionChanged
+	}
 	if len(failed) == 0 {
 		if len(reparsed) > 0 {
 			idx.reparsedThisRun.Store(true)

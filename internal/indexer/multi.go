@@ -3114,6 +3114,11 @@ func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
 	return result, nil
 }
 
+// awaitWarmupWAL is a restored indexer's warmup write boundary. A package
+// variable only so the in-package cases can inject a refusal; production never
+// assigns it.
+var awaitWarmupWAL = (*store_sqlite.Store).AwaitWarmupWAL
+
 // ReconcileRepoCtx registers a repo that already has nodes in the graph
 // (typically restored from a daemon snapshot) and brings it back into
 // agreement with the filesystem without a full re-index. priorMtimes
@@ -3211,7 +3216,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 	idx.SetRootPath(absPath)
 	idx.SetFileMtimes(priorMtimes)
 	if store, ok := mi.graph.(*store_sqlite.Store); ok {
-		idx.warmupWriteBoundary = func() error { return store.AwaitWarmupWAL(ctx) }
+		idx.warmupWriteBoundary = func() error { return awaitWarmupWAL(store, ctx) }
 		defer func() {
 			if idx.warmupWriteBoundary != nil {
 				idx.warmupWriteBoundary = nil
