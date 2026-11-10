@@ -239,6 +239,9 @@ type binder struct {
 	// the spec names no members. Every call fact recorded under it carries
 	// it as its authored owner.
 	member string
+	// moduleLoads collects LangSpec.ModuleLoad specifiers during the field
+	// prepass, in source order; run appends them to the file's imports.
+	moduleLoads []Import
 }
 
 func newBinder(spec *LangSpec, src []byte, facts *fileFacts) *binder {
@@ -254,14 +257,21 @@ func (b *binder) run(root *sitter.Node) {
 	if b.spec.Imports != nil {
 		b.facts.imports = b.spec.Imports(root, b.src)
 	}
+	b.facts.imports = append(b.facts.imports, b.moduleLoads...)
 	b.walk(root, fileScope)
 }
 
 // prepassFields collects field types for every type declaration in the
-// file before the main walk.
+// file before the main walk, and the run-time module loads the spec
+// recognises, since it visits every node.
 func (b *binder) prepassFields(n *sitter.Node) {
 	if n == nil {
 		return
+	}
+	if b.spec.ModuleLoad != nil {
+		if path := b.spec.ModuleLoad(n, b.src); path != "" {
+			b.moduleLoads = append(b.moduleLoads, Import{Path: path})
+		}
 	}
 	if b.spec.TypeDeclTypes[n.Type()] && b.spec.TypeDeclName != nil {
 		if name := b.spec.TypeDeclName(n, b.src); name != "" && b.spec.Fields != nil {

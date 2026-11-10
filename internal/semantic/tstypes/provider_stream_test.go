@@ -216,12 +216,13 @@ func semanticSnapshot(g graph.Store) []string {
 		if edge == nil {
 			continue
 		}
-		source := ""
+		source, strategy := "", ""
 		if edge.Meta != nil {
 			source, _ = edge.Meta["semantic_source"].(string)
+			strategy = fmt.Sprint(edge.Meta["resolution_strategy"])
 		}
-		snapshot = append(snapshot, fmt.Sprintf("e|%s|%s|%s|%d|%s|%.4f|%s",
-			edge.From, edge.To, edge.Kind, edge.Line, edge.Origin, edge.Confidence, source))
+		snapshot = append(snapshot, fmt.Sprintf("e|%s|%s|%s|%d|%s|%.4f|%s|%s|%s",
+			edge.From, edge.To, edge.Kind, edge.Line, edge.Origin, edge.Confidence, edge.ConfidenceLabel, source, strategy))
 	}
 	for _, node := range g.AllNodes() { // test-only exact parity oracle
 		if node == nil || node.Meta == nil {

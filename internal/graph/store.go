@@ -1442,6 +1442,41 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// EnrichmentResumePoint is how far a cut whole-repo enrichment apply pass got
+// for one (repo, provider): every page of Phase up to and including the file
+// path After was committed against the graph at IndexedSHA by an engine
+// identified by Version. Covered carries the symbols-covered count the pass
+// measured before applying anything, so a pass that resumes past that walk
+// can still report the coverage of a full pass. A provider that applies in
+// deterministic pages records it after each committed page so the next pass
+// starts where the last one was cut instead of replaying from page one.
+type EnrichmentResumePoint struct {
+	RepoPrefix string
+	Provider   string
+	IndexedSHA string
+	Version    string
+	Phase      int
+	After      string
+	Covered    int
+	// LedgerDigest names the re-parse-pending files (and their on-disk
+	// versions) whose enrichment the recorded pages already cover; "" when
+	// none were pending.
+	LedgerDigest string
+	UpdatedAt    int64 // unix seconds
+}
+
+// EnrichmentResumeStore is an optional capability for backends that persist
+// enrichment resume points. A backend without durable state does not
+// implement it, and a provider then never resumes — every pass starts from
+// the first page, which is always correct.
+//
+// GetEnrichmentResume's bool is false when no point is recorded.
+type EnrichmentResumeStore interface {
+	GetEnrichmentResume(repoPrefix, provider string) (EnrichmentResumePoint, bool, error)
+	SetEnrichmentResume(point EnrichmentResumePoint) error
+	ClearEnrichmentResume(repoPrefix, provider string) error
+}
+
 // ContractState is the per-repo completion marker for the contract tier: the
 // git revision the whole-repo contract pass last committed at, when it
 // finished, and how many contracts it wrote.

@@ -325,6 +325,32 @@ type LangSpec struct {
 	// Imports lists the file's name-binding imports.
 	Imports func(root *sitter.Node, src []byte) []Import
 
+	// ModuleLoad returns the literal module specifier when n is an
+	// expression that loads a module at run time (CommonJS require("m"),
+	// dynamic import("m")), "" otherwise. The binder's field prepass calls
+	// it on every node, so finding these costs no extra walk; each
+	// specifier joins the file's imports as a path entry with no Local,
+	// which the engine resolves no name through. nil records none.
+	ModuleLoad func(n *sitter.Node, src []byte) string
+
+	// ImportHintsAuthoritative reports that in this language a file
+	// reaches a name declared in another file through an import Imports or
+	// ModuleLoad records, so the files importing a re-parsed file are the
+	// direct dependents a resumed apply must re-apply after the per-file
+	// ledger changed; without it (the default) a changed ledger sends the
+	// pass back to the first page. It does not make the importers every
+	// file bound into the re-parsed one. The engine's repo-unique name
+	// fallback also binds through routes no recorded import reveals:
+	// ambient, global and script-mode names; specifiers that are not
+	// literals; type queries such as import("m").T; and binding through an
+	// intermediate module, as a factory's return type or a member
+	// inherited through a middle class, with no import of the re-parsed
+	// file. Leave it false wherever even a direct cross-file reference can
+	// carry no recorded import: package- or namespace-scoped names (Java,
+	// Kotlin, Go, C#, PHP), wildcard or module-qualified access (Java,
+	// Python, Rust), or no import binding at all (Ruby).
+	ImportHintsAuthoritative bool
+
 	// SupertypeKinds widens the node kinds a declared supertype name
 	// may resolve to. nil keeps the receiver default (type /
 	// interface). Ruby adds packages: tree-sitter modules index as

@@ -3,9 +3,12 @@ package tstypes
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
 )
 
 const tsSvc = `export class Svc {
@@ -213,4 +216,46 @@ export function main(): void {
 	}
 	caller := nodeByNameKind(t, g, "main", graph.KindFunction)
 	assertUntouched(t, g, caller.ID, "run", "typescript-types")
+}
+
+// Import forms that bind no single local name still name the module a file
+// depends on; they are recorded with the path and no local, which the type
+// engine never resolves a name through. The file's facts are read through
+// the binder, which also collects the modules loaded at run time.
+func TestTSImportsRecordPathOnlyForms(t *testing.T) {
+	spec := TypeScriptSpec()
+	for _, tc := range []struct {
+		name, file, src string
+		want            []Import
+	}{
+		{name: "named import keeps its local", file: "a.ts", src: `import { Svc as S } from "./svc";`,
+			want: []Import{{Local: "S", Path: "./svc"}}},
+		{name: "namespace import", file: "a.ts", src: `import * as svc from "./svc";`,
+			want: []Import{{Path: "./svc"}}},
+		{name: "default and namespace import", file: "a.ts", src: `import def, * as svc from "./svc";`,
+			want: []Import{{Local: "def", Path: "./svc"}, {Path: "./svc"}}},
+		{name: "import require", file: "a.ts", src: `import svc = require("./svc");`,
+			want: []Import{{Path: "./svc"}}},
+		{name: "CommonJS require", file: "a.js", src: `const svc = require("./svc");
+const { Svc } = require('./other');
+function lazy() { return require("./late"); }`,
+			want: []Import{{Path: "./svc"}, {Path: "./other"}, {Path: "./late"}}},
+		{name: "await dynamic import", file: "a.ts", src: `async function f() { const m = await import("./dyn"); }`,
+			want: []Import{{Path: "./dyn"}}},
+		{name: "dynamic import then", file: "a.ts", src: `import("./then").then((m) => m);`,
+			want: []Import{{Path: "./then"}}},
+		{name: "static and run-time imports together", file: "a.ts", src: `import { A } from "./a";
+const b = require("./b");`,
+			want: []Import{{Local: "A", Path: "./a"}, {Path: "./b"}}},
+		{name: "not a module load", file: "a.js", src: `obj.require("./svc"); require(name); require(); import(name);`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree, err := parser.ParseFile([]byte(tc.src), spec.GrammarFor(tc.file))
+			require.NoError(t, err)
+			defer tree.Close()
+			facts := &fileFacts{file: tc.file}
+			newBinder(spec, []byte(tc.src), facts).run(tree.RootNode())
+			assert.Equal(t, tc.want, facts.imports)
+		})
+	}
 }

@@ -236,14 +236,34 @@ func (idx *Indexer) setReparsePendingEnrichment(graphPath string, pending bool) 
 	idx.setReparsePendingEnrichments(map[string]bool{graphPath: pending})
 }
 
+// setReparsePendingEnrichments applies setReparsePendingEnrichment to many
+// files in one batch.
+//
+// Writing the marker false for any file also raises resumeUntrusted, whether
+// or not the marker was set. The write that matters follows enrichment that
+// ran for the file in place (a watch save, a batched or point semantic
+// catch-up, a forced re-resolve, a file-scoped deferred pass). That
+// enrichment re-applies only the file's own facts, but the re-parse also
+// evicted the edges importers' type facts point into the file, and only a
+// pass that re-applies the importers restores them. The ledger no longer
+// names the file, so a resumed pass could not re-apply it and would seal the
+// gap with a completion marker; the next whole-repo pass must start from the
+// first page. The other false writes are harmless to distrust: a whole-repo
+// discharge follows a non-partial pass that already cleared its points, and
+// a file with no type tier to wait for (no providers, or an omitted file)
+// costs at most one pass that does not resume.
 func (idx *Indexer) setReparsePendingEnrichments(pendingByFile map[string]bool) {
 	if len(pendingByFile) == 0 {
 		return
 	}
 	paths := make([]string, 0, len(pendingByFile))
-	for graphPath := range pendingByFile {
-		if graphPath != "" {
-			paths = append(paths, graphPath)
+	for graphPath, pending := range pendingByFile {
+		if graphPath == "" {
+			continue
+		}
+		paths = append(paths, graphPath)
+		if !pending {
+			idx.resumeUntrusted.Store(true)
 		}
 	}
 	sort.Strings(paths)

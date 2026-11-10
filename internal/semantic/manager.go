@@ -249,6 +249,16 @@ type RepoEnrichState struct {
 	// non-partial completion still refreshes the marker afterwards.
 	Force bool
 
+	// ReparsedFilesMarked qualifies Force: every re-parse since a whole-repo
+	// pass last saw the graph was a scoped one that left its file on the
+	// durable per-file ledger (graph.MetaReparsePendingEnrichment). A scoped
+	// re-parse that re-enriched its file in place cleared that marker without
+	// restoring the edges its importers point into it, so it leaves this
+	// false, as a whole-repo re-parse does. A provider that resumes a cut pass
+	// may then keep its recorded progress and re-apply the marked files,
+	// instead of starting over. The marker gate ignores it.
+	ReparsedFilesMarked bool
+
 	// CheckoutID scopes the pass to one routed automatic checkout's working
 	// copy. Empty — every caller but EnrichCheckout — means the repository's
 	// base corpus, and keeps the legacy marker key exactly as it was.
@@ -1204,6 +1214,9 @@ func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang str
 	}
 	if checkoutScope != nil {
 		ctx = WithCheckoutCompilerScope(ctx, *checkoutScope)
+	}
+	if scope, ok := enrichResumeScope(rs); ok {
+		ctx = WithEnrichResume(ctx, scope)
 	}
 	defer cancel()
 

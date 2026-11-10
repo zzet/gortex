@@ -79,7 +79,15 @@ func TypeScriptSpec() *LangSpec {
 			}
 			return fieldText(n, "property", src), true
 		},
-		Imports: tsImports,
+		Imports:    tsImports,
+		ModuleLoad: tsModuleLoad,
+		// A file reaches another module's names through an import, and
+		// every form with a literal specifier is recorded, including those
+		// that bind a module rather than a name (namespace imports, import
+		// x = require, CommonJS require, dynamic import). That bounds the
+		// direct dependents only; the routes no recorded import reveals
+		// are listed on LangSpec.ImportHintsAuthoritative.
+		ImportHintsAuthoritative: true,
 	}
 }
 
@@ -235,6 +243,13 @@ func tsImports(root *sitter.Node, src []byte) []Import {
 		if stmt.Type() != "import_statement" {
 			continue
 		}
+		if req := firstChildOfType(stmt, "import_require_clause"); req != nil {
+			// import x = require("m"): x is a module, not a name.
+			if source := tsModuleSpecifier(firstChildOfType(req, "string"), src); source != "" {
+				out = append(out, Import{Path: source})
+			}
+			continue
+		}
 		source := fieldText(stmt, "source", src)
 		source = strings.Trim(source, "\"'`")
 		if source == "" {
@@ -248,6 +263,9 @@ func tsImports(root *sitter.Node, src []byte) []Import {
 			switch c.Type() {
 			case "identifier": // default import
 				out = append(out, Import{Local: c.Content(src), Path: source})
+			case "namespace_import":
+				// import * as ns: ns is the module; ns.Name binds by name.
+				out = append(out, Import{Path: source})
 			case "named_imports":
 				for spec := range c.NamedChildren() {
 					if spec.Type() != "import_specifier" {
@@ -265,6 +283,46 @@ func tsImports(root *sitter.Node, src []byte) []Import {
 		}
 	}
 	return out
+}
+
+// tsModuleLoad returns the literal specifier of a run-time module load:
+// CommonJS require("m") and dynamic import("m"), whose callee is the import
+// keyword rather than an identifier. Like namespace imports and import x =
+// require, these bind a module rather than a name, so they are recorded with
+// a path and no local: the engine resolves no name through them, and the
+// names they reach bind by repo-unique name, but the path still tells a
+// resumed apply that the file depends on that module.
+func tsModuleLoad(n *sitter.Node, src []byte) string {
+	if n.Type() != "call_expression" {
+		return ""
+	}
+	fn := n.ChildByFieldName("function")
+	if fn == nil {
+		return ""
+	}
+	switch fn.Type() {
+	case "import":
+	case "identifier":
+		if fn.Content(src) != "require" {
+			return ""
+		}
+	default:
+		return ""
+	}
+	args := n.ChildByFieldName("arguments")
+	if args == nil || args.NamedChildCount() == 0 {
+		return ""
+	}
+	return tsModuleSpecifier(args.NamedChild(0), src)
+}
+
+// tsModuleSpecifier is the text of a string literal module specifier, ""
+// for anything else.
+func tsModuleSpecifier(n *sitter.Node, src []byte) string {
+	if n == nil || n.Type() != "string" {
+		return ""
+	}
+	return strings.Trim(n.Content(src), "\"'`")
 }
 
 // typeAnnotationText unwraps a `: T` type_annotation node to T's text.
