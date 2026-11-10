@@ -2915,7 +2915,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		s.recordFileBaselineSavings(ctx, "get_file_summary", fp, summaryLang, string(payload))
 	}
 	if s.isTOON(ctx, req) {
-		return returnTOON(result)
+		return returnTOON(applyFieldsFilter(result, parseFields(req.GetString("fields", ""))))
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }
