@@ -19,23 +19,53 @@ import (
 )
 
 type discoverySeedRepo struct {
-	Repo       privateRepo `json:"repo"`
-	Role       string      `json:"role"`
-	FileSHA256 string      `json:"file_sha256"`
-	CommonDir  string      `json:"git_common_dir"`
+	Repo                 privateRepo `json:"repo"`
+	Role                 string      `json:"role"`
+	FileSHA256           string      `json:"file_sha256"`
+	CommonDir            string      `json:"git_common_dir"`
+	ID                   string      `json:"id,omitempty"`
+	Kind                 string      `json:"corpus_kind,omitempty"`
+	Family               string      `json:"declared_family,omitempty"`
+	ViewKind             string      `json:"view_kind,omitempty"`
+	CheckoutKind         string      `json:"git_checkout_kind,omitempty"`
+	Configured           bool        `json:"configured,omitempty"`
+	Live                 bool        `json:"live,omitempty"`
+	GraphOwnerCheckoutID *string     `json:"observed_graph_owner_checkout_id,omitempty"`
 }
+
+// Literal rows carry explicit false/null observations for the external owner.
+// Keep the legacy wire shape readable by existing strict descriptor consumers.
+func (r discoverySeedRepo) MarshalJSON() ([]byte, error) {
+	type encodedRepo discoverySeedRepo
+	if r.ID == "" {
+		return json.Marshal(encodedRepo(r))
+	}
+	return json.Marshal(struct {
+		encodedRepo
+		Configured           bool    `json:"configured"`
+		Live                 bool    `json:"live"`
+		GraphOwnerCheckoutID *string `json:"observed_graph_owner_checkout_id"`
+	}{encodedRepo: encodedRepo(r), Configured: r.Configured, Live: r.Live, GraphOwnerCheckoutID: r.GraphOwnerCheckoutID})
+}
+
 type discoverySeedDescriptor struct {
-	State            string              `json:"state"`
-	Root             string              `json:"owned_root"`
-	Nonce            string              `json:"owner_nonce"`
-	ConfigSHA256     string              `json:"config_sha256"`
-	BootConfigSHA256 string              `json:"boot_config_sha256"`
-	GitConfigSHA256  string              `json:"git_config_sha256"`
-	Repos            []discoverySeedRepo `json:"repositories"`
-	PrimaryCount     int                 `json:"primary_checkout_count"`
-	LinkedCount      int                 `json:"linked_checkout_count"`
-	NestedCount      int                 `json:"nested_linked_checkout_count"`
-	TotalCount       int                 `json:"total_checkout_count"`
+	State            string                 `json:"state"`
+	Root             string                 `json:"owned_root"`
+	Nonce            string                 `json:"owner_nonce"`
+	ConfigSHA256     string                 `json:"config_sha256"`
+	BootConfigSHA256 string                 `json:"boot_config_sha256"`
+	GitConfigSHA256  string                 `json:"git_config_sha256"`
+	Repos            []discoverySeedRepo    `json:"repositories"`
+	PrimaryCount     int                    `json:"primary_checkout_count"`
+	LinkedCount      int                    `json:"linked_checkout_count"`
+	NestedCount      int                    `json:"nested_linked_checkout_count"`
+	TotalCount       int                    `json:"total_checkout_count"`
+	Topology         string                 `json:"topology_mode,omitempty"`
+	TopologySHA256   string                 `json:"topology_sha256,omitempty"`
+	LiveCount        int                    `json:"live_checkout_count,omitempty"`
+	StaleCount       int                    `json:"stale_checkout_count,omitempty"`
+	DedicatedCount   int                    `json:"dedicated_checkout_count,omitempty"`
+	SupportRoots     []discoverySupportRoot `json:"support_roots,omitempty"`
 }
 type discoverySeedLineage struct {
 	State                 string                     `json:"state"`
@@ -113,8 +143,11 @@ func discoveryWriteJSON(path string, value any) error {
 // Preparation only makes owned clones/topology and metadata. The exclusive
 // producer must populate and upgrade this exact root before resume can pass.
 func prepareDiscoveryState(ctx context.Context, o runOptions, corpora []Corpus) error {
-	if len(corpora) < 2 {
-		return errors.New("discovery preparation requires two unrelated pinned corpora")
+	if o.Discovery.Topology != "" {
+		return prepareLapsedDiscoveryState(ctx, o, corpora)
+	}
+	if len(corpora) != 2 {
+		return errors.New("discovery preparation requires exactly two unrelated pinned corpora or an explicit topology declaration")
 	}
 	if err := validateOutputRoots(corpora, o.Discovery.Prepare); err != nil {
 		return err
