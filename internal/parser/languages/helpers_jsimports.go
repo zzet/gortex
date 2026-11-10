@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"strings"
+
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
@@ -67,6 +69,24 @@ func jsNamedImportsNode(importNode *sitter.Node) *sitter.Node {
 // "who imports mod". Over jsImportBindingCap bindings the per-binding edges are
 // skipped (the module edge still records the dependency).
 func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePath string, src []byte, result *parser.ExtractionResult) {
+	// Vue template tags refer to the local default binding, which need not
+	// match the component filename. Retain it on the module edge through resolve.
+	if strings.Contains(filePath, ".vue#script:") {
+		if clause := findChildByType(importNode, "import_clause"); clause != nil {
+			for _, id := range jsCollectChildren(clause, "identifier") {
+				for i := len(result.Edges) - 1; i >= 0; i-- {
+					edge := result.Edges[i]
+					if edge.Kind == graph.EdgeImports && edge.From == fileID && edge.To == "unresolved::import::"+importPath {
+						if edge.Meta == nil {
+							edge.Meta = map[string]any{}
+						}
+						edge.Meta["vue_default_import"] = id.Content(src)
+						break
+					}
+				}
+			}
+		}
+	}
 	named := jsNamedImportsNode(importNode)
 	if named == nil {
 		return

@@ -4103,6 +4103,10 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// function/method passes would miss because they only accept
 		// method/function candidates.
 		r.resolveTokenRef(e, target, stats)
+	case e.Kind == graph.EdgeReferences && strings.HasSuffix(e.FilePath, ".vue") && e.Meta["template"] == true:
+		if !r.resolveVueTemplateImport(e, target, stats) {
+			r.resolveTypeOrFunc(e, target, stats)
+		}
 	case e.Kind == graph.EdgeRendersChild:
 		// A rendered child component (`<Button/>`) binds FIRST against the
 		// caller file's import bindings — ground truth that pins the exact
