@@ -22,7 +22,7 @@ func TestEditGateDecodesExplicitFreshScopeWithoutInventingMissingClaims(t *testi
 			t.Fatalf("actual scoped claim discarded: %+v", body)
 		}
 	}
-	for _, text := range []string{"relations: fresh (2 files)\n" + string(encoded), "relations: fresh (0 files)\nfile: fresh (0 files)\n" + string(encoded)} {
+	for _, text := range []string{"relations: fresh (2 files)\n" + string(encoded), "file: fresh (0 files)\nfile: fresh (0 files)\n" + string(encoded)} {
 		if _, err := decodeEditProbeOutput(outputWire(text, nil), "toon", "read.summary"); err == nil {
 			t.Fatal("contradictory/repeated fresh prefix accepted")
 		}
