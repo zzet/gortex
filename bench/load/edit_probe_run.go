@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -700,7 +701,18 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 			s.record.FirstCorrect[oracle.name] = measured(float64(ended.Sub(s.started))/float64(time.Millisecond), "ms")
 		}
 	}
-	if !correct && fresh {
+	// Failed calls cannot attest stale content. A summary can also explicitly
+	// omit the requested subject from its budgeted collection.
+	mismatch := err == nil && !correct && fresh
+	omitted := mismatch && oracle.name == "summary" && r.plan.Kind == "add_intrafile_call" &&
+		s.step.File == "" && editProbeSummaryOmittedByBudget(body, repo.Corpus.File, s.step.Marker)
+	if omitted && postACK && s.record.FirstCorrect[oracle.name].Value == nil {
+		const reason = "summary proof unavailable: requested subject omitted by output budget"
+		if !slices.Contains(s.record.Errors, reason) {
+			s.record.Errors = append(s.record.Errors, reason)
+		}
+	}
+	if mismatch && !omitted {
 		if !s.acknowledged.IsZero() && !sent.Before(s.acknowledged) {
 			s.record.StaleClaimedFresh, stale = true, true
 		} else {
@@ -712,6 +724,49 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
 	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
 	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
+}
+
+func editProbeSummaryOmittedByBudget(body map[string]any, file, marker string) bool {
+	if body["_truncated_by_budget"] != true || file == "" || marker == "" {
+		return false
+	}
+	for _, key := range []string{"file_path", "path"} {
+		if value, present := body[key]; present {
+			path, ok := value.(string)
+			if !ok || !editProbeFixturePath(path, file) {
+				return false
+			}
+		}
+	}
+	nodes, ok := body["nodes"].([]any)
+	original, originalErr := strconvEditProbeUint(body["_original_count_nodes"])
+	returned, returnedErr := strconvEditProbeUint(body["_max_returned_nodes"])
+	if !ok || originalErr != nil || returnedErr != nil || returned != uint64(len(nodes)) || original <= returned {
+		return false
+	}
+	for _, value := range nodes {
+		row, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		for _, key := range []string{"file_path", "path"} {
+			if value, present := row[key]; present {
+				path, ok := value.(string)
+				if !ok || !editProbeFixturePath(path, file) {
+					return false
+				}
+			}
+		}
+		id, _ := row["id"].(string)
+		if path, _, scoped := strings.Cut(id, "::"); scoped && !editProbeFixturePath(path, file) {
+			return false
+		}
+		name, _ := row["name"].(string)
+		if name == marker || strings.HasSuffix(id, "::"+marker) {
+			return false // A visible wrong identity remains an observable error.
+		}
+	}
+	return true
 }
 
 // Activation only starts owned loops and returns. It never waits for a probe
