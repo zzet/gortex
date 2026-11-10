@@ -5118,6 +5118,18 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 }
 
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
+	if phpEdgeMetaString(e, "php_property_path") != "" && phpTypedReceiverCaller(r.cachedGetNode(e.From)) {
+		target, known := r.phpPropertyCallTarget(e, methodName)
+		if target != nil {
+			e.To, e.Origin, e.Confidence = target.ID, graph.OriginASTResolved, 0.95
+			stats.Resolved++
+			return
+		}
+		if known {
+			stats.Unresolved++
+			return
+		}
+	}
 	if phpEdgeMetaString(e, "receiver_fqn") != "" && phpTypedReceiverCaller(r.cachedGetNode(e.From)) {
 		if target := r.phpReceiverMethod(e, methodName); target != nil {
 			e.To = target.ID

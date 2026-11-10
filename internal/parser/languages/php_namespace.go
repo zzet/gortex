@@ -274,6 +274,9 @@ func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.Ext
 				}
 			}
 		}
+		if root, _ := e.Meta["php_property_root"].(string); root != "" {
+			e.Meta["php_property_root"] = nr.resolve(root, e.Line)
+		}
 		if aliases != "" && e.Kind == graph.EdgeCalls {
 			if e.Meta == nil {
 				e.Meta = map[string]any{}
