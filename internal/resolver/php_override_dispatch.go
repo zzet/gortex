@@ -39,9 +39,6 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 		return 0
 	}
 	direct, closure := r.phpTypeHierarchy()
-	if len(direct) == 0 {
-		return 0
-	}
 
 	type job struct {
 		edge   *graph.Edge
@@ -80,6 +77,10 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 
 		// Scope path: parent:: / self:: / static:: bind precisely up the
 		// enclosing class's ancestor chain.
+		// Equal short names can hide a valid, fully-qualified parent chain.
+		if len(direct) == 0 && phpEdgeMetaString(e, "scope_kind") != "parent" {
+			continue
+		}
 		if sk := phpEdgeMetaString(e, "scope_kind"); sk == "parent" || sk == "self" {
 			if caller == nil {
 				caller = r.cachedGetNode(e.From)
@@ -91,18 +92,38 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 			if encloser == "" {
 				continue
 			}
-			var start []string
+			var target *graph.Node
 			if sk == "parent" {
-				for p := range direct[encloser] {
-					start = append(start, p)
+				classID := strings.TrimSuffix(caller.ID, "."+caller.Name)
+				parent, ok := r.phpParentID(classID)
+				if !ok {
+					continue
+				}
+				chain, _ := r.phpAncestorChain(parent)
+			parentChain:
+				for _, level := range chain {
+					if level.kind == "interface" {
+						continue // parent:: requires an implementation, not an interface declaration.
+					}
+					for _, id := range level.ids {
+						m := r.cachedGetNode(id + "." + name)
+						if m == nil || m.Language != "php" || m.Kind != graph.KindMethod {
+							continue
+						}
+						if target != nil && target.ID != m.ID {
+							target = nil // Conflicting traits cannot be picked by iteration order.
+							break parentChain
+						}
+						target = m
+					}
+					if target != nil {
+						break
+					}
 				}
 			} else {
-				start = []string{encloser}
+				target = r.nearestPHPMethod(name, []string{encloser}, direct, repo)
 			}
-			if len(start) == 0 {
-				continue
-			}
-			if target := r.nearestPHPMethod(name, start, direct, repo); target != nil && target.ID != e.From {
+			if target != nil && target.ID != e.From {
 				jobs = append(jobs, job{edge: e, single: target})
 			}
 			continue
