@@ -849,6 +849,29 @@ actual paths, Git common directories, commits, source and configuration hashes,
 and a random owner token. Preparation requires a separate exclusive fixture
 producer to populate and upgrade the store at those exact paths.
 
+For a lapsed topology, combine `--discovery-prepare` with
+`--discovery-topology <declaration.json>`. This preparation-only opt-in accepts
+`{"mode":"literal_lapsed_v1","roots":[...]}`. Each root declares an `id`,
+`role`, `corpus_kind`, and `family`; primary and dedicated roots also select a
+manifest entry with `corpus_label`. IDs are unique path components. Linked
+roots may set `nested: true`. Entry order does not determine ownership.
+
+The declaration must contain three primaries (one code repository, one PDF
+repository, and one SQL dump repository), twenty code-family linked roots,
+four additional dedicated worktrees (two Go, one PDF, and one SQL), and two
+stale code-family checkouts. Use `corpus_kind: "gortex"` for the code primary
+and its linked/stale roots. Each dedicated worktree has an isolated Git family
+with an explicitly recorded, unconfigured support clone without a checkout.
+The descriptor records 27 live roots, two stale registrations to capture, and
+four nonlive support roots. Pinned HEADs may repeat across independent families.
+Git checkout kind is separate from served graph view: configured dedicated
+worktrees serve their indexed base graph, while automatic linked roots serve
+worktree views.
+Graph owner IDs remain null until observed by the separate fixture producer.
+Preparation opens no store, does not remove stale roots, and does not extend
+the existing two-family discovery resume workload. Broader manifests without
+the explicit opt-in are refused.
+
 `--discovery-resume <lineage.json>` consumes that prepared root once. Lineage
 must bind the descriptor, old and upgrade binary/source pins, schema-44 main
 and WAL hashes, and structured normal-stop/catalog-identity receipts. Unknown,
