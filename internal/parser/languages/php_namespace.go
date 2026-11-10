@@ -6,6 +6,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+	"github.com/zzet/gortex/internal/parser/tsitter/php"
 )
 
 // PHP namespace identity.
@@ -48,6 +49,17 @@ type phpNameResolver struct {
 	// funcAliases holds only the `use function X as y` entries, which the
 	// resolver's scope_use_aliases contract keeps separate from class imports.
 	funcAliases map[string]string
+}
+
+// PHPClassNameResolver resolves class references through a file's namespaces and
+// use imports. The returned resolver owns only strings; no tree is retained.
+func PHPClassNameResolver(src []byte) func(string, int) string {
+	tree, err := parser.ParseFile(src, php.GetLanguage())
+	if err != nil || tree == nil {
+		return nil
+	}
+	defer tree.Close()
+	return newPHPNameResolver(tree.RootNode(), src).resolve
 }
 
 // newPHPNameResolver reads a file's namespace declarations and `use` imports.
