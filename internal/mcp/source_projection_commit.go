@@ -29,7 +29,7 @@ func (s *Server) publishCommittedFileProjection(ctx context.Context, record *mut
 				// that any background generation has published the deletion.
 				if err == nil && before.info == nil && pathkey.MutationKey(entry.absPath) == prepared.key {
 					exact = true
-					reason = publishPhysicalProjection(record, entry, before)
+					reason = publishPhysicalProjection(record, entry, before, projectionAcknowledgementFrom(ctx, s))
 				}
 			} else if err == nil && before.info != nil && before.info.Mode().IsRegular() {
 				files, err := source.NewFilesystemSource(filepath.Dir(entry.absPath))
@@ -39,7 +39,7 @@ func (s *Server) publishCommittedFileProjection(ctx context.Context, record *mut
 					after, statErr := statDiskStamp(entry.absPath)
 					if readErr == nil && statErr == nil && before.matches(after) && blake3.Sum256(raw) == prepared.rawHash && pathkey.MutationKey(entry.absPath) == prepared.key {
 						exact = true
-						reason = publishPhysicalProjection(record, entry, after)
+						reason = publishPhysicalProjection(record, entry, after, projectionAcknowledgementFrom(ctx, s))
 					} else if readErr == nil {
 						reason = "readback_changed"
 					}
@@ -132,11 +132,12 @@ func projectionLivenessFailure(entry *projectionEntry) projectionLivenessGuard {
 
 // Bind accepted file facts to exactly this physical execution. Tombstones
 // carry no syntax verdict because no candidate source bytes were parsed.
-func publishPhysicalProjection(record *mutationCommitRecord, entry *projectionEntry, stamp diskStamp) string {
+func publishPhysicalProjection(record *mutationCommitRecord, entry *projectionEntry, stamp diskStamp, ack *projectionAcknowledgement) string {
 	record.mu.RLock()
 	sequence := record.commitSeq
 	record.mu.RUnlock()
 	entry = entry.committedCopy(sequence, stamp)
+	holdProjectionForAcknowledgement(ack, pendingFileProjections, entry)
 	if err := pendingFileProjections.publish(entry); err != nil {
 		if refusal, ok := err.(projectionRefusal); ok {
 			return string(refusal)

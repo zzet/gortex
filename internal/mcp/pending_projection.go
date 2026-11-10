@@ -86,8 +86,9 @@ type projectionEntry struct {
 	tombstone     bool
 	// suspect is set by a watcher event for the path; the next lookup
 	// re-reads the file before serving the entry.
-	suspect      atomic.Bool
-	sourceEvents uint64 // source-event revision, guarded by pendingProjections.mu
+	suspect                 atomic.Bool
+	sourceEvents            uint64 // source-event revision, guarded by pendingProjections.mu
+	acknowledgementRevision uint64 // deferred retirement source-event revision, guarded by mu
 	// Permission for one fresh source attempt, never freshness of this old owner.
 	checkedRetired atomic.Bool
 	// readVersionChecked is set only by a successful checked-read publication.
@@ -95,6 +96,10 @@ type projectionEntry struct {
 	// start without this witness and must earn it through their own byte checks.
 	// Access is guarded by the owning registry mutex.
 	readVersionChecked bool
+	// Only verified retirement is deferred while the original handler builds
+	// its ACK. Both flags are guarded by the owning registry mutex after publish.
+	acknowledgementPending    bool
+	acknowledgementRetirement bool
 }
 
 // projectionRefusal is why a publish left the live entries as they were.
@@ -200,7 +205,7 @@ func newProjectionEntry(absPath, repoPrefix string, projection *indexer.Projecti
 		parseErrors:     projection.ParseErrors,
 		parseChecked:    projection.ParseChecked,
 		buildTime:       projection.BuildTime,
-		size:            int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + names.chargedBytes + 24,
+		size:            int64(len(projection.Nodes))*projectionNodeBytes + int64(len(projection.Edges))*projectionEdgeBytes + names.chargedBytes + 32,
 	}
 }
 
@@ -237,7 +242,7 @@ func newProjectionTombstone(absPath, graphPath, repoPrefix string, commitSeq uin
 		commitSeq:       commitSeq,
 		sourceCommitSeq: commitSeq,
 		layer:           layer,
-		size:            24, // source/event versions plus shared retirement/witness tail word
+		size:            32, // source/event versions, deferred revision and shared tail flags
 		tombstone:       true,
 	}
 }
@@ -545,13 +550,20 @@ func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revi
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	current := p.snap.Load()
+	drop := make([]*projectionEntry, 0, len(entries))
 	for _, entry := range entries {
 		if revision, observed := revisions[entry]; observed && current.entries[entry.key] == entry &&
 			entry.sourceEvents == revision && !entry.suspect.Load() {
+			if entry.acknowledgementPending {
+				entry.acknowledgementRetirement = true
+				entry.acknowledgementRevision = revision
+				continue
+			}
 			entry.checkedRetired.Store(true)
 		}
+		drop = append(drop, entry)
 	}
-	return p.dropAllLocked(entries)
+	return p.dropAllLocked(drop)
 }
 
 // storeHolds returns the entries whose content the store holds now.

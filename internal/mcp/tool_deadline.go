@@ -530,9 +530,10 @@ func (s *Server) boundToolHandler(h mcpserver.ToolHandlerFunc) mcpserver.ToolHan
 		if s != nil && measuredSourceEdit(req) {
 			return s.runAcknowledgedEdit(ctx, req, h)
 		}
-		// The ordinary path has no mutation-only named returns, defer or
-		// closure captures. Reads do not create an observer or sample a clock.
-		return s.runBoundToolHandler(ctx, req, h)
+		ctx, actual := s.withProjectionAcknowledgement(ctx, req, h)
+		// Reads keep the original handler: no projection owner, observer or
+		// clock. Source-only tools share the actual lifetime independently.
+		return s.runBoundToolHandler(ctx, req, actual)
 	}
 }
 
@@ -549,6 +550,7 @@ func (s *Server) runAcknowledgedEdit(ctx context.Context, req mcp.CallToolReques
 		ctx = context.WithValue(ctx, sourceAckPolicyKey{}, policy)
 	}
 	ctx, ack, owner := s.withEditAcknowledgement(ctx)
+	ctx, projected := s.withProjectionAcknowledgement(ctx, req, h)
 	if owner {
 		defer func() { ack.finishReply(result, err) }()
 	}
@@ -557,7 +559,7 @@ func (s *Server) runAcknowledgedEdit(ctx context.Context, req mcp.CallToolReques
 			defer ack.finishActual()
 		}
 		// Actual completion and its counters stay INSIDE the firewall.
-		return s.runMeasuredEditOperation(ctx, req, h)
+		return s.runMeasuredEditOperation(ctx, req, projected)
 	}
 	return s.runBoundToolHandler(ctx, req, actual)
 }
