@@ -16,7 +16,6 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
-	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/tokens"
 	"go.uber.org/zap"
 )
@@ -365,8 +364,8 @@ func runConcurrentRegisteredReadPopulation(t *testing.T, nativePopulation, after
 func TestFullSymbolCASAllowanceDoesNotGrantAfterLeafReplay(t *testing.T) {
 	selectedProjectionRegistry(t)
 	s, path, entry, _ := acknowledgedCanonicalFile(t)
-	// The existing no-provider fixture exercises output admission without LSP subprocesses.
-	s.semanticMgr = &semantic.Manager{}
+	// Admit a real candidate whose passive endpoint fails without a subprocess.
+	registerFailingLSPCandidate(t, s)
 	retirement := s.canonicalProjectionRetirement(path)
 	require.NotNil(t, retirement)
 	calls := 0
