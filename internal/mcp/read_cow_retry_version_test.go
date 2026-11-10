@@ -109,7 +109,7 @@ func TestReadCOWSourceVersionCopyAndByteAccounting(t *testing.T) {
 	require.Zero(t, nextRead.sourceEvents)
 	require.False(t, nextRead.checkedRetired.Load())
 	deleted := newProjectionTombstone(path, "main.go", "", 77)
-	require.Equal(t, int64(24), deleted.size, "charge source version, source-event revision, and checked-retirement state")
+	require.Equal(t, int64(32), deleted.size, "charge source version, source-event revision, deferred ACK retirement revision, and shared state flags")
 	require.Equal(t, uint64(77), deleted.sourceCommitSeq)
 	require.Equal(t, uint64(77), deleted.committedCopy(0, deleted.disk).sourceCommitSeq)
 	require.Equal(t, uint64(78), deleted.committedCopy(78, deleted.disk).sourceCommitSeq)

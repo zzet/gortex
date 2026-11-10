@@ -38,6 +38,7 @@ func (s *Server) publishCommittedProjectionCohort(ctx context.Context, writes []
 		if prepared != nil && prepared.entry != nil {
 			entry, err := s.verifyPreparedProjection(checked, prepared, sequence, sha)
 			if err == nil {
+				holdProjectionForAcknowledgement(projectionAcknowledgementFrom(ctx, s), pendingFileProjections, entry)
 				members = append(members, projectionCohortMember{Entry: entry, Expected: prepared.expected})
 				owners = append(owners, record)
 				continue
