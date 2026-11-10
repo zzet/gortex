@@ -380,7 +380,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
-		ctx = withProjectedReadToolFacts(ctx, req.Params.Name)
+		projectionTool := req.Params.Name
+		if legacyName == "get_file_summary" {
+			// The normalized facade leaf and outer final validation must own
+			// the same attempt-local facts, not two unrelated context values.
+			projectionTool = legacyName
+		}
+		ctx = withProjectedReadToolFacts(ctx, projectionTool)
 		ctx, releaseExplicitFreshness := s.captureExplicitFreshness(ctx, req)
 		if releaseExplicitFreshness != nil {
 			defer releaseExplicitFreshness()
@@ -489,7 +495,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, err
 					}
 				}
-				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
+				if auditedProjectionRead && (retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, freshnessErr)) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, freshnessErr)
@@ -510,7 +516,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, pendingErr
 					}
 				}
-				if retryAfterCheckedProjectionChange(ctx) {
+				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, err) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, annotateProjectionReadRefusal(projectionReadFinal, projectionOwnerLive, err))
