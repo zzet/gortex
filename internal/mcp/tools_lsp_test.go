@@ -3,12 +3,17 @@ package mcp
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/semantic"
+	"github.com/zzet/gortex/internal/semantic/lsp"
 )
 
 // The LSP half of the enrichment-output rule.
@@ -22,12 +27,11 @@ import (
 // the authority like every other enrichment, and a request that reads a
 // checkout of its own is refused before a server is spawned or a byte hovered.
 //
-// These tests do not need a live language server, and deliberately run without
-// one: the thing under test is the ADMISSION — whether a receipt naming the
-// corpus output was taken, and whether the workspace was touched at all —
-// which is resolved before lspProviderForPath is ever called. A standing
-// receipt for the same owner is the observable: the helper's own admission
-// supersedes it, and only its admission can.
+// These tests need no live language server. A registered passive candidate
+// with a missing endpoint exercises admission before startup fails; a manager
+// without providers exercises the inert selection path. A standing receipt
+// for the same owner makes admission observable: the helper's own admission
+// supersedes it, including when that admission is abandoned.
 
 // lspEnrichmentStack is a viewStack with a semantic manager attached (no
 // providers, so nothing spawns) and a real graph node to enrich.
@@ -41,9 +45,8 @@ type lspEnrichmentStack struct {
 func newLSPEnrichmentStack(t *testing.T) *lspEnrichmentStack {
 	t.Helper()
 	stack := newViewStack(t)
-	// A zero Manager registers no providers and no router, so
-	// lspProviderForPath refuses after the output has been resolved. That is
-	// the point: it isolates the admission from the subprocess.
+	// A zero Manager registers no providers and no router. Tests that need
+	// effectful admission add an available candidate explicitly.
 	stack.srv.semanticMgr = &semantic.Manager{}
 
 	var node *graph.Node
@@ -87,6 +90,78 @@ func (s *lspEnrichmentStack) standingReceipt(t *testing.T, producer string) *Enr
 	return out
 }
 
+// The command is available, so this candidate is admitted, but its passive
+// endpoint does not exist. Startup fails without spawning a subprocess. Even
+// this failed attempt must name its output and remain ineligible for replay.
+func registerFailingLSPCandidate(t *testing.T, srv *Server) {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := lsp.NewProviderFromSpec(&lsp.ServerSpec{
+		Name: "failing-enrichment-fixture", Command: executable, Languages: []string{"go"},
+		Connect: &lsp.ConnectSpec{Network: "unix", Address: filepath.Join(t.TempDir(), "absent.sock")},
+	}, zap.NewNop())
+	srv.semanticMgr = semantic.NewManager(semantic.Config{}, zap.NewNop())
+	srv.semanticMgr.RegisterProvider(provider)
+	t.Cleanup(func() {
+		if err := provider.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func TestOnDemandLSPWithoutProviderLeavesOutputCurrent(t *testing.T) {
+	for _, producer := range []string{EnrichProducerSemanticType, EnrichProducerSymbolRefs} {
+		t.Run(producer, func(t *testing.T) {
+			s := newLSPEnrichmentStack(t)
+			standing := s.standingReceipt(t, producer)
+			attempt := &freshSymbolAttempt{}
+			ctx := context.WithValue(t.Context(), freshSymbolAttemptKey{}, attempt)
+			if producer == EnrichProducerSemanticType {
+				s.srv.enrichNodeOnDemand(ctx, s.node)
+			} else {
+				s.srv.confirmSymbolRefsOnDemand(ctx, s.node)
+			}
+			if err := standing.Complete(); err != nil {
+				t.Fatalf("no provider superseded a standing output: %v", err)
+			}
+			if attempt.replayUnsafe {
+				t.Fatal("no-provider selection made a read ineligible for replay")
+			}
+		})
+	}
+}
+
+func TestLSPProviderSelectionDoesNotStartAndCapturesItsCandidate(t *testing.T) {
+	stack, node, _, connections := newReferenceRetryStack(t, "zero", nil)
+	standing, err := BeginBaseEnrichment(t.Context(), stack.srv.outputGenerationAuthority(), stack.srv.graph,
+		EnrichProducerSemanticType, node.RepoPrefix, stack.repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, _, err := stack.srv.lspProviderStartForPath(node.FilePath)
+	if err != nil || start == nil {
+		t.Fatalf("select candidate: %v", err)
+	}
+	if got := connections.Load(); got != 0 {
+		t.Fatalf("selection opened %d connections before output admission", got)
+	}
+	if err := standing.Complete(); err != nil {
+		t.Fatalf("candidate selection superseded a standing output: %v", err)
+	}
+	// A later manager change cannot make the captured start select another
+	// provider or silently classify a selected candidate as an inert absence.
+	stack.srv.semanticMgr = &semantic.Manager{}
+	if provider, err := start(); err != nil || provider == nil {
+		t.Fatalf("start captured candidate: %v", err)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("captured candidate opened %d connections, want one", got)
+	}
+}
+
 // TestOnDemandSemanticTypeNamesItsOutputGeneration is the production-entrypoint
 // trace for the get_symbol fault-in: enrichNodeOnDemand is the function
 // tools_core.go calls, and it must name the corpus output through the
@@ -97,13 +172,18 @@ func (s *lspEnrichmentStack) standingReceipt(t *testing.T, producer string) *Enr
 // Complete returns nil.
 func TestOnDemandSemanticTypeNamesItsOutputGeneration(t *testing.T) {
 	s := newLSPEnrichmentStack(t)
+	registerFailingLSPCandidate(t, s.srv)
 	standing := s.standingReceipt(t, EnrichProducerSemanticType)
+	attempt := &freshSymbolAttempt{}
 
-	s.srv.enrichNodeOnDemand(context.Background(), s.node)
+	s.srv.enrichNodeOnDemand(context.WithValue(t.Context(), freshSymbolAttemptKey{}, attempt), s.node)
 
 	err := standing.Complete()
 	if !errors.Is(err, indexer.ErrOutputMutationReceiptSuperseded) {
 		t.Fatalf("the on-demand semantic_type write named no output generation (standing receipt settled with %v)", err)
+	}
+	if !attempt.replayUnsafe {
+		t.Fatal("an admitted provider startup failure remained replayable")
 	}
 }
 
@@ -111,13 +191,18 @@ func TestOnDemandSemanticTypeNamesItsOutputGeneration(t *testing.T) {
 // find_usages / get_callers fault-in.
 func TestOnDemandSymbolRefsNameTheirOutputGeneration(t *testing.T) {
 	s := newLSPEnrichmentStack(t)
+	registerFailingLSPCandidate(t, s.srv)
 	standing := s.standingReceipt(t, EnrichProducerSymbolRefs)
+	attempt := &freshSymbolAttempt{}
 
-	s.srv.confirmSymbolRefsOnDemand(context.Background(), s.node)
+	s.srv.confirmSymbolRefsOnDemand(context.WithValue(t.Context(), freshSymbolAttemptKey{}, attempt), s.node)
 
 	err := standing.Complete()
 	if !errors.Is(err, indexer.ErrOutputMutationReceiptSuperseded) {
 		t.Fatalf("the on-demand symbol-refs write named no output generation (standing receipt settled with %v)", err)
+	}
+	if !attempt.replayUnsafe {
+		t.Fatal("an admitted provider startup failure remained replayable")
 	}
 }
 
@@ -144,6 +229,7 @@ func TestOnDemandLSPEnrichmentUnderARoutedViewTouchesNothing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newLSPEnrichmentStack(t)
+			registerFailingLSPCandidate(t, s.srv)
 			ctx := routedEnrichmentCtx(t, s.viewStack)
 			standing := s.standingReceipt(t, tc.producer)
 
