@@ -5118,6 +5118,17 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 }
 
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
+	if phpEdgeMetaString(e, "receiver_fqn") != "" && phpTypedReceiverCaller(r.cachedGetNode(e.From)) {
+		if target := r.phpReceiverMethod(e, methodName); target != nil {
+			e.To = target.ID
+			e.Origin = graph.OriginASTResolved
+			e.Confidence = 0.95
+			stats.Resolved++
+		} else {
+			stats.Unresolved++
+		}
+		return
+	}
 	// Same-repo gate first: the per-repo Resolver never resolves a
 	// method call across a repo boundary by name. A cross-repo method
 	// call is left unresolved for CrossRepoResolver, which carries the

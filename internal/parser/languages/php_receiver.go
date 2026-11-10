@@ -38,9 +38,9 @@ type phpReceiverEnv struct {
 	// class is the simple name of the enclosing class, or "" inside a free
 	// function or a `static` closure (which does not bind $this).
 	class string
-	// vars maps a bare variable name (no leading `$`) to its simple type name.
+	// vars maps a bare variable name (no leading `$`) to its written type name.
 	vars typeEnv
-	// props maps a bare property name to its declared simple type name.
+	// props maps a bare property name to its declared type spelling.
 	props map[string]string
 }
 
@@ -49,7 +49,13 @@ func (env phpReceiverEnv) lookupVar(name string) string {
 	if env.vars == nil {
 		return ""
 	}
-	return env.vars[name]
+	typ := env.vars[name]
+	// A local assigned new self/static names the enclosing declaration,
+	// not a class literally named "self" or "static" in its namespace.
+	if strings.EqualFold(typ, "self") || strings.EqualFold(typ, "static") {
+		return env.class
+	}
+	return typ
 }
 
 // lookupProp returns the recorded type of $this->name, or "".
@@ -223,7 +229,7 @@ func phpNewExpressionClass(expr *sitter.Node, src []byte) string {
 		c := expr.NamedChild(i)
 		switch c.Type() {
 		case "name", "qualified_name":
-			return canonicalizePHPTypeRef(c.Content(src))
+			return strings.TrimSpace(c.Content(src))
 		case "arguments", "attribute_list":
 			continue
 		default:
@@ -259,13 +265,14 @@ func phpSoleTypeAtom(decl string) string {
 		if t == "" || phpBuiltinType(t) {
 			continue
 		}
-		return t
+		// Keep the written qualifier until the namespace pass resolves imports.
+		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(branch), "?"))
 	}
 	return ""
 }
 
 // phpClassPropertyTypes maps each declared property of a class / trait / enum
-// body to its simple type name — both classic typed properties and PHP 8
+// body to its written type name — both classic typed properties and PHP 8
 // constructor-promoted ones, which are declared in the constructor's parameter
 // list and have no property_declaration of their own.
 func phpClassPropertyTypes(body *sitter.Node, src []byte) map[string]string {
@@ -388,7 +395,6 @@ func (env phpReceiverEnv) phpScopeReceiverType(scope *sitter.Node, src []byte) s
 	}
 	return ""
 }
-
 
 // collectPHPAssignedPropertyTypes types a property that carries no type
 // DECLARATION from `$this->prop = new Foo()` in the class body. PHP only got
