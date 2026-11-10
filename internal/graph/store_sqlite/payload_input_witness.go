@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 )
 
 // ErrPayloadInputChanged refuses publication when a selected input changed.
@@ -24,10 +25,28 @@ type payloadInputRevision struct {
 	state                         string
 }
 
+var nextPayloadRevisionCoreID atomic.Uint64
+
+// Revision identities carry no database owner or lifetime after capture.
+// A monotonically allocated ID also avoids address reuse after a core closes.
+func (s *Store) payloadRevisionCoreIdentity() uint64 {
+	if id := s.payloadInputIdentity.Load(); id != 0 {
+		return id
+	}
+	id := nextPayloadRevisionCoreID.Add(1)
+	if id == 0 {
+		panic("store_sqlite: payload revision identity exhausted")
+	}
+	if s.payloadInputIdentity.CompareAndSwap(0, id) {
+		return id
+	}
+	return s.payloadInputIdentity.Load()
+}
+
 // PayloadInputRevision is an opaque comparable revision of one selected handle.
 // It describes cached input ownership, not catalog lifetime or publication authority.
 type PayloadInputRevision struct {
-	core                   *storeCore
+	identity               uint64
 	generation             int64
 	analysis, input, admin uint64
 }
@@ -50,7 +69,7 @@ func (s *Store) PayloadInputRevisionContext(ctx context.Context) (PayloadInputRe
 	if err := ctx.Err(); err != nil {
 		return PayloadInputRevision{}, err
 	}
-	return PayloadInputRevision{core: s.storeCore, generation: s.viewGen, analysis: s.analysisViewCounter(s.viewGen).Load(), input: s.constantInputCounter(s.viewGen).Load(), admin: s.payloadInputAdminRevision.Load()}, nil
+	return PayloadInputRevision{identity: s.payloadRevisionCoreIdentity(), generation: s.viewGen, analysis: s.analysisViewCounter(s.viewGen).Load(), input: s.constantInputCounter(s.viewGen).Load(), admin: s.payloadInputAdminRevision.Load()}, nil
 }
 
 // CapturePayloadInputWitness must precede the checked projection. It includes
