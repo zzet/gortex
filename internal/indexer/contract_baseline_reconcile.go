@@ -135,7 +135,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			if err != nil {
 				return err
 			}
-			if found && current.Accepted && baseline != nil && baseline.Version == contractBoundaryReceiptVersion {
+			if found && current.Accepted && baseline != nil && baseline.Version == contractBoundaryReceiptVersion && !options.rebuildBaseline {
 				return nil
 			}
 			var previous *graph.ContractInputState

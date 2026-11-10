@@ -110,6 +110,13 @@ type contractRepoRepair struct {
 	// repair first found with no open window, and when.
 	pendingKey   string
 	pendingSince time.Time
+	// Failed baseline reconstruction can advance the pending key itself, so
+	// its capped retry delay is independent of that key and the lane backoff.
+	headerBackoff time.Duration
+	headerRetryAt time.Time
+	// A refused accepted receipt requires baseline reconstruction even when
+	// the namespace header was already accepted before the policy changed.
+	rebuildBaseline bool
 	// scan asks for a pass over the namespace's unaccepted rows.
 	scan bool
 	// retry keeps incomplete startup repairs on the periodic watch. It is
@@ -452,7 +459,7 @@ func (r *ContractStuckRepair) pass(state *contractRepoRepair) {
 func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRepoRepair) {
 	defer func() {
 		r.mu.Lock()
-		state.retry = !r.closed && (len(state.attempts) > 0 || state.pendingKey != "")
+		state.retry = !r.closed && (len(state.attempts) > 0 || state.pendingKey != "" || state.rebuildBaseline)
 		r.mu.Unlock()
 	}()
 	repo := state.repo
@@ -497,6 +504,37 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 	for path := range suspects {
 		if !stuck[path] && !detected[path] {
 			healed = append(healed, path)
+			row, _, err := store.ContractBoundaryReceiptContext(ctx, repo, "", path)
+			idx, _, indexErr := r.repoIndexer(repo)
+			if err == nil && indexErr == nil && row != nil && row.Accepted {
+				policy, _ := contractReceiptOverflowPolicy(row)
+				language, _ := idx.registry.DetectLanguage(path)
+				if filepath.Base(path) == "go.mod" {
+					language = "go"
+				}
+				if prior, known, _ := contractCorePriorReceipt(row, true); known && prior != nil {
+					policy, language = prior.Policy, prior.Language
+				}
+				if policy != "" {
+					// Use capture's configuration authority, not the core indexer's
+					// earlier settings: a config reload need not mutate any source.
+					cfg := r.options.Baseline.Config
+					mi := r.options.MultiIndexer
+					mi.mu.RLock()
+					if mi.configMgr != nil {
+						cfg = mi.configMgr.GetRepoConfig(repo).Index
+					}
+					mi.mu.RUnlock()
+					current := &Indexer{config: cfg, registry: idx.registry, logger: r.options.Logger, repoPrefix: repo}
+					opts := idx.extractionOptionsValue()
+					current.extractionOptions.Store(&opts)
+					_, policyErr := current.contractFollowupPolicyMode(language, policy)
+					current.Close()
+					if policyErr != nil {
+						state.rebuildBaseline = true
+					}
+				}
+			}
 		}
 	}
 	if len(healed) > 0 {
@@ -697,8 +735,13 @@ func (r *ContractStuckRepair) repairHeader(ctx context.Context, state *contractR
 	repo := state.repo
 	store := r.options.Store.AtGeneration(0)
 	current, found, err := store.ContractInputStateContext(ctx, repo, "")
-	if err != nil || !found || current.Accepted {
+	if err != nil {
+		return
+	}
+	if !found || (current.Accepted && !state.rebuildBaseline) {
 		state.pendingKey = ""
+		state.rebuildBaseline = false
+		state.headerBackoff, state.headerRetryAt = 0, time.Time{}
 		return
 	}
 	work, err := store.PendingContractWorkForScopeContext(ctx, repo, "")
@@ -721,18 +764,23 @@ func (r *ContractStuckRepair) repairHeader(ctx context.Context, state *contractR
 			waited = true
 		}
 	}
-	if !waited {
+	if !waited || now.Before(state.headerRetryAt) {
 		return
 	}
 	countContractRepair(viewmetrics.ContractRepairPendingHeader)
 	options := r.options.Baseline
 	options.Context = ctx
+	options.rebuildBaseline = state.rebuildBaseline
 	err = reconcilePrimaryContractBaseline(ctx, options, repo)
 	r.logRepair(repo, viewmetrics.ContractRepairPendingHeader, nil, err)
 	if err != nil {
+		state.headerBackoff = min(max(r.period, 2*state.headerBackoff), contractRepairBusyBackoffMax*r.period)
+		state.headerRetryAt = time.Now().Add(state.headerBackoff)
 		return
 	}
 	state.pendingKey = ""
+	state.rebuildBaseline = false
+	state.headerBackoff, state.headerRetryAt = 0, time.Time{}
 	if hooks := r.options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
 		hooks.Published(ctx, repo, "")
 	}

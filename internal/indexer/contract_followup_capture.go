@@ -35,9 +35,12 @@ type ContractFollowupCaptureOptions struct {
 	// SuspectStuck, when set, receives the census paths a capture refused
 	// because their receipt row cannot be in flight in this process: a
 	// deleted row, or an unaccepted row no mutation of this process wrote.
-	// Nothing of a live mutation will make such a row admissible.
-	SuspectStuck   func(repo string, paths []string)
-	selectedInputs *graphview.SelectedContractInputs
+	// Policy-stale primary rows also need repair: no source mutation may
+	// arrive to replace their already accepted receipts.
+	SuspectStuck func(repo string, paths []string)
+	// rebuildBaseline bypasses an old accepted baseline during policy repair.
+	rebuildBaseline bool
+	selectedInputs  *graphview.SelectedContractInputs
 }
 
 // ContractCaptureSource is what a capture takes from a request's selected
@@ -559,6 +562,9 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						if policy != file.Policy {
 							projected, policyErr := idx.contractFollowupPolicyMode(language, policy)
 							if policyErr != nil || !projected || !contractGeneratedFileHint(readers[repo].GetNode(path), path) {
+								if options.SuspectStuck != nil && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+									options.SuspectStuck(repo, []string{path})
+								}
 								return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 							}
 							// This is an admission hint from the exact accepted receipt
