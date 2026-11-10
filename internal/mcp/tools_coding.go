@@ -606,7 +606,7 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		result["omissions"] = omissions
 	}
 	if s.isTOON(ctx, req) {
-		return returnTOON(result)
+		return returnTOON(applyFieldsFilter(result, parseFields(req.GetString("fields", ""))))
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }
