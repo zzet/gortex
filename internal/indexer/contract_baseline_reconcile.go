@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -22,15 +23,197 @@ import (
 // accepted primary sources. Legacy sealed positive payloads require the existing
 // core rebuild path; this constructor never edits their immutable rows.
 func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(context.Context, *graphview.RepoView, string, string) (bool, error) {
+	return NewContractBaselineReconcilers(options).Reconcile
+}
+
+// ContractBaselineReconcilers are the two admissions of one baseline job
+// owner: they share its per-repository jobs and its slots.
+type ContractBaselineReconcilers struct {
+	// Reconcile is NewContractBaselineReconciler's admission of a namespace
+	// whose baseline is missing or of an earlier version.
+	Reconcile func(context.Context, *graphview.RepoView, string, string) (bool, error)
+	// PolicyChanged admits the rebuild of an accepted primary namespace a
+	// capture found holding receipts of an earlier extraction policy
+	// (ContractFollowupCaptureOptions.OutdatedPolicy). The job rebuilds only
+	// if its own census still finds such a receipt, and announces Published
+	// only when it did. A request is dropped while the namespace header is
+	// pending (its own baseline owns it), coalesced while a job of the
+	// repository runs or waits, and queued while the slots are full. Within
+	// the repository's retry window (contractBaselinePolicyRun) it is held
+	// and admitted again once the window has passed, so a consumer waiting
+	// on the refused capture is not left without a later wake.
+	PolicyChanged func(repo string)
+}
+
+// contractBaselinePolicyRetry is the shortest gap between two policy rebuilds
+// of one repository, measured from the end of the last one, and
+// contractBaselinePolicyRetryMax the longest. A rebuild cannot settle a
+// receipt whose file is dirty on disk (that file's save owns it), nor one a
+// save keeps rewriting under the configuration the running indexer was built
+// with when only the configuration manager's copy changed; either way the
+// next capture refuses again. The gap doubles for each request that follows
+// the last rebuild within twice its window. Tests shorten the base.
+var contractBaselinePolicyRetry = time.Minute
+
+const contractBaselinePolicyRetryMax = 30 * time.Minute
+
+// contractBaselinePolicyRun is a repository's last policy rebuild: when it
+// ended (when it started, while it runs), and how many such rebuilds
+// followed each other closely.
+type contractBaselinePolicyRun struct {
+	at     time.Time
+	streak int
+}
+
+func (r contractBaselinePolicyRun) window() time.Duration {
+	window := contractBaselinePolicyRetry
+	for i := 0; i < r.streak && window < contractBaselinePolicyRetryMax; i++ {
+		window *= 2
+	}
+	return min(window, contractBaselinePolicyRetryMax)
+}
+
+// NewContractBaselineReconcilers returns the admissions of one baseline job
+// owner.
+func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) ContractBaselineReconcilers {
 	var jobsMu sync.Mutex
 	jobs := make(map[string]bool)
 	slots := make(chan struct{}, 2)
-	return func(ctx context.Context, view *graphview.RepoView, repo, checkout string) (bool, error) {
+	// All guarded by jobsMu: queued are policy rebuilds waiting for a slot, in
+	// arrival order; runs are each repository's last policy rebuild; held are
+	// the requests a window holds until it passes; policyJobs marks running
+	// policy jobs, reported a policy request coalesced onto one, and waiting
+	// a Reconcile request coalesced onto any job.
+	var queued []string
+	queuedSet := make(map[string]bool)
+	runs := make(map[string]contractBaselinePolicyRun)
+	held := make(map[string]*time.Timer)
+	policyJobs, reported, waiting := make(map[string]bool), make(map[string]bool), make(map[string]bool)
+	if options.Context != nil {
+		context.AfterFunc(options.Context, func() {
+			jobsMu.Lock()
+			defer jobsMu.Unlock()
+			for repo, timer := range held {
+				timer.Stop()
+				delete(held, repo)
+			}
+		})
+	}
+	runtimeReady := func() error {
+		if options.Context == nil || options.BaselineAdmissionMu == nil || options.BaselineJobs == nil || options.Store == nil || options.Materializer == nil || options.Materializer.Leases == nil || options.MultiIndexer == nil || options.Yield == nil {
+			return fmt.Errorf("contract baseline: incomplete runtime owner")
+		}
+		return nil
+	}
+	// admitPolicy reports whether the request now owns or awaits a slot:
+	// started, queued, or coalesced with a job that will drain the queue
+	// when it ends. A request dropped or held by its window owns none.
+	var admitPolicy func(repo string) bool
+	// start runs an admitted job; the caller holds jobsMu and a slot.
+	start := func(repo string, policy bool) {
+		jobs[repo] = true
+		if policy {
+			policyJobs[repo] = true
+			if timer := held[repo]; timer != nil {
+				timer.Stop()
+				delete(held, repo)
+			}
+		}
+		countContractBaseline(viewmetrics.ContractBaselineAdmitted)
+		lease := options.Materializer.Leases.Acquire(0)
+		options.BaselineJobs.Add(1)
+		go func() {
+			defer options.BaselineJobs.Done()
+			announce := true
+			// Admission capacity must be available before waking a consumer
+			// that may need to repair another namespace in the same cohort.
+			defer func() {
+				if !announce {
+					return
+				}
+				if hooks := options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
+					hooks.Published(options.Context, repo, "")
+				}
+			}()
+			defer lease.Release()
+			defer func() {
+				<-slots
+				jobsMu.Lock()
+				delete(jobs, repo)
+				delete(policyJobs, repo)
+				if waiting[repo] {
+					// A Reconcile request coalesced onto this job waits for
+					// its announcement, whatever the job found.
+					announce = true
+					delete(waiting, repo)
+				}
+				// A capture that reported while a job which then found
+				// nothing ran saw a drift the job's census did not: ask
+				// again, after the window.
+				again := policy && !announce && reported[repo]
+				delete(reported, repo)
+				if policy {
+					run := runs[repo]
+					run.at = time.Now()
+					runs[repo] = run
+				}
+				jobsMu.Unlock()
+				if again {
+					admitPolicy(repo)
+				}
+				// Hand the freed slot down the queue until a request owns it:
+				// one dropped on admission (its header went pending, or its
+				// window has not passed) must not strand the rest.
+				for {
+					jobsMu.Lock()
+					if len(queued) == 0 {
+						jobsMu.Unlock()
+						return
+					}
+					next := queued[0]
+					queued = queued[1:]
+					delete(queuedSet, next)
+					jobsMu.Unlock()
+					if admitPolicy(next) {
+						return
+					}
+				}
+			}()
+			// A panicking job still releases its slot, lease and waiters above.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					countContractBaseline(viewmetrics.ContractBaselinePanic)
+					if options.Logger != nil {
+						options.Logger.Error("contract baseline reconstruction panicked", zap.String("repo", repo), zap.Any("panic", recovered))
+					}
+				}
+			}()
+			rebuilt, err := rebuildPrimaryContractBaseline(options.Context, options, repo, policy)
+			switch {
+			case err != nil:
+				countContractBaseline(viewmetrics.ContractBaselineFailed)
+			case policy && !rebuilt:
+				// Nothing was rewritten: waking the consumers would only repeat
+				// the capture that asked.
+				announce = false
+				countContractBaseline(viewmetrics.ContractBaselineCurrent)
+				if options.Logger != nil {
+					options.Logger.Debug("contract baseline policy rebuild found every receipt current", zap.String("repo", repo))
+				}
+			default:
+				countContractBaseline(viewmetrics.ContractBaselinePublished)
+			}
+			if err != nil && options.Context.Err() == nil && options.Logger != nil {
+				options.Logger.Warn("contract baseline reconstruction refused", zap.String("repo", repo), zap.Error(err))
+			}
+		}()
+	}
+	reconcile := func(ctx context.Context, view *graphview.RepoView, repo, checkout string) (bool, error) {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		if options.Context == nil || options.BaselineAdmissionMu == nil || options.BaselineJobs == nil || options.Store == nil || options.Materializer == nil || options.Materializer.Leases == nil || options.MultiIndexer == nil || options.Yield == nil {
-			return false, fmt.Errorf("contract baseline: incomplete runtime owner")
+		if err := runtimeReady(); err != nil {
+			return false, err
 		}
 		if view != nil || checkout != "" {
 			return false, nil
@@ -54,60 +237,113 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 			return false, err
 		}
 		jobsMu.Lock()
+		defer jobsMu.Unlock()
 		if jobs[repo] {
-			jobsMu.Unlock()
+			waiting[repo] = true
 			countContractBaseline(viewmetrics.ContractBaselineCoalesced)
 			return true, nil
 		}
 		select {
 		case slots <- struct{}{}:
 		default:
-			jobsMu.Unlock()
 			// The occupied slots have independently owned jobs that publish a
 			// global change after releasing admission capacity.
 			countContractBaseline(viewmetrics.ContractBaselineSaturated)
 			return true, nil
 		}
-		jobs[repo] = true
-		jobsMu.Unlock()
-		countContractBaseline(viewmetrics.ContractBaselineAdmitted)
-		lease := options.Materializer.Leases.Acquire(0)
-		options.BaselineJobs.Add(1)
-		go func() {
-			defer options.BaselineJobs.Done()
-			// Admission capacity must be available before waking a consumer
-			// that may need to repair another namespace in the same cohort.
-			defer func() {
-				if hooks := options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
-					hooks.Published(options.Context, repo, "")
-				}
-			}()
-			defer lease.Release()
-			defer func() { <-slots; jobsMu.Lock(); delete(jobs, repo); jobsMu.Unlock() }()
-			// A panicking job still releases its slot, lease and waiters above.
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					countContractBaseline(viewmetrics.ContractBaselinePanic)
-					if options.Logger != nil {
-						options.Logger.Error("contract baseline reconstruction panicked", zap.String("repo", repo), zap.Any("panic", recovered))
-					}
-				}
-			}()
-			err := reconcilePrimaryContractBaseline(options.Context, options, repo)
-			if err != nil {
-				countContractBaseline(viewmetrics.ContractBaselineFailed)
-			} else {
-				countContractBaseline(viewmetrics.ContractBaselinePublished)
-			}
-			if err != nil && options.Context.Err() == nil && options.Logger != nil {
-				options.Logger.Warn("contract baseline reconstruction refused", zap.String("repo", repo), zap.Error(err))
-			}
-		}()
+		start(repo, false)
 		return true, nil
 	}
+	admitPolicy = func(repo string) bool {
+		ctx := options.Context
+		if runtimeReady() != nil || ctx.Err() != nil || repo == "" {
+			return false
+		}
+		current, found, err := options.Store.AtGeneration(0).ContractInputStateContext(ctx, repo, "")
+		if err != nil || !found || !current.Accepted {
+			// A pending header is its own baseline's, admitted on the
+			// consumer's deferral or by the header repair.
+			return false
+		}
+		options.BaselineAdmissionMu.Lock()
+		defer options.BaselineAdmissionMu.Unlock()
+		if ctx.Err() != nil {
+			return false
+		}
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+		if jobs[repo] || queuedSet[repo] {
+			if policyJobs[repo] {
+				reported[repo] = true
+			}
+			countContractBaseline(viewmetrics.ContractBaselineCoalesced)
+			return true
+		}
+		now := time.Now()
+		run := contractBaselinePolicyRun{at: now}
+		if last, ok := runs[repo]; ok {
+			since := now.Sub(last.at)
+			if since < last.window() {
+				countContractBaseline(viewmetrics.ContractBaselineCurrent)
+				if held[repo] == nil {
+					var timer *time.Timer
+					timer = time.AfterFunc(last.window()-since, func() {
+						jobsMu.Lock()
+						// A job that started meanwhile, or a newer hold, owns
+						// the repository: this firing is spent.
+						current := held[repo] == timer
+						if current {
+							delete(held, repo)
+						}
+						jobsMu.Unlock()
+						if current {
+							admitPolicy(repo)
+						}
+					})
+					held[repo] = timer
+				}
+				return false
+			}
+			if since < 2*last.window() {
+				run.streak = last.streak + 1
+			}
+		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			countContractBaseline(viewmetrics.ContractBaselineSaturated)
+			queued = append(queued, repo)
+			queuedSet[repo] = true
+			return true
+		}
+		runs[repo] = run
+		if options.Logger != nil {
+			fields := []zap.Field{zap.String("repo", repo), zap.Int("repeats", run.streak), zap.Duration("next_after", run.window())}
+			if run.streak >= 3 {
+				options.Logger.Warn("contract receipts keep returning to an earlier extraction policy; the running indexer may not have taken a configuration change", fields...)
+			} else {
+				options.Logger.Info("contract receipts carry an earlier extraction policy; rebuilding the namespace baseline", fields...)
+			}
+		}
+		start(repo, true)
+		return true
+	}
+	return ContractBaselineReconcilers{Reconcile: reconcile, PolicyChanged: func(repo string) { admitPolicy(repo) }}
 }
 
 func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollowupCaptureOptions, repo string) error {
+	_, err := rebuildPrimaryContractBaseline(ctx, options, repo, false)
+	return err
+}
+
+// rebuildPrimaryContractBaseline reconstructs repo's primary namespace
+// baseline and reports whether it rebuilt one. An accepted header over a
+// current baseline is left alone unless policy is set and an accepted
+// receipt of the census carries an extraction policy other than its file's
+// current one (contractBaselinePolicyDrifted): then the namespace is rebuilt
+// as a pending one would be. Every file of the census is read again; a
+// receipt still current is reused rather than extracted again.
+func rebuildPrimaryContractBaseline(ctx context.Context, options ContractFollowupCaptureOptions, repo string, policy bool) (bool, error) {
 	end := options.MultiIndexer.beginContractBaseline(repo)
 	defer end()
 	store := options.Store.AtGeneration(0)
@@ -136,7 +372,13 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 				return err
 			}
 			if found && current.Accepted && baseline != nil && baseline.Version == contractBoundaryReceiptVersion {
-				return nil
+				if !policy {
+					return nil
+				}
+				drifted, err := contractBaselinePolicyDrifted(ctx, options, store, repo, snapshot)
+				if err != nil || !drifted {
+					return err
+				}
 			}
 			var previous *graph.ContractInputState
 			if found {
@@ -155,10 +397,10 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 		})
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if pending.InputFingerprint == "" {
-		return nil
+		return false, nil
 	}
 	digest := sha256.New()
 	yield := options.Yield
@@ -171,13 +413,13 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 		}
 		prior, err := store.ContractBoundaryReceiptsForPathsContext(ctx, repo, "", paths)
 		if err != nil {
-			return err
+			return false, err
 		}
 		rows := make([]graph.ContractBoundaryReceipt, 0, len(files))
 		reconstructed := make(map[string][]byte, len(files))
 		for _, file := range files {
 			if err := yield(ctx); err != nil {
-				return err
+				return false, err
 			}
 			if row := prior[file.Path]; row != nil && row.Accepted && contractReceiptIsFailureEnvelope(row) {
 				// An accepted failure envelope stays: the file is excluded, and
@@ -191,15 +433,15 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 				continue
 			}
 			if err != nil {
-				return err
+				return false, err
 			}
 			cfg, ok := snapshot.RepoConfigs[repo]
 			if !ok {
-				return fmt.Errorf("contract baseline: accepted configuration unavailable")
+				return false, fmt.Errorf("contract baseline: accepted configuration unavailable")
 			}
 			opts, ok := snapshot.RepoExtractionOptions[repo]
 			if !ok {
-				return fmt.Errorf("contract baseline: accepted parser options unavailable")
+				return false, fmt.Errorf("contract baseline: accepted parser options unavailable")
 			}
 			idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, workspaceID: file.WorkspaceID, projectID: file.ProjectID, logger: options.Logger}
 			idx.extractionOptions.Store(&opts)
@@ -214,15 +456,15 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			}
 			idx.Close()
 			if collectErr != nil {
-				return collectErr
+				return false, collectErr
 			}
 			row, err := contractCoreStoredReceipt(repo, "", contractCoreInputChange{FilePath: file.Path, Current: &receipt, SourceFingerprint: accepted.SourceFingerprint})
 			if err != nil {
-				return err
+				return false, err
 			}
 			if row.Scope.Unknown {
 				if _, overflow := contractReceiptOverflowPolicy(&row); !overflow {
-					return fmt.Errorf("contract baseline: incomplete receipt %q", file.Path)
+					return false, fmt.Errorf("contract baseline: incomplete receipt %q", file.Path)
 				}
 				rows = append(rows, row)
 				reconstructed[file.Path] = row.Payload
@@ -232,7 +474,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			receipt.Source = "" // Source bytes certify eligibility, not contract identity.
 			encoded, err := json.Marshal(receipt)
 			if err != nil {
-				return err
+				return false, err
 			}
 			reconstructed[file.Path] = encoded
 		}
@@ -281,10 +523,10 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			})
 		})
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
-	return options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
+	err = options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
 		return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
 			current, found, err := store.ContractInputStateContext(ctx, repo, "")
 			if err != nil {
@@ -306,6 +548,55 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			return store.AcceptContractInputMutationWithBaselineContext(ctx, next, graph.ContractBoundaryReceiptBaseline{RepoPrefix: repo, Version: contractBoundaryReceiptVersion, Fingerprint: hex.EncodeToString(digest.Sum(nil))})
 		})
 	})
+	return err == nil, err
+}
+
+// contractBaselinePolicyDrifted reports whether an accepted primary receipt
+// of the census carries an extraction policy that is neither its file's
+// current ordinary policy nor, for a generated parser, its current projected
+// one: the receipts a strict capture refuses until they are rebuilt. A
+// failure envelope, an unaccepted row and a missing row are left to their
+// own repairs.
+func contractBaselinePolicyDrifted(ctx context.Context, options ContractFollowupCaptureOptions, store *store_sqlite.Store, repo string, snapshot ContractFollowupSnapshot) (bool, error) {
+	cfg, ok := snapshot.RepoConfigs[repo]
+	if !ok {
+		return false, fmt.Errorf("contract baseline: accepted configuration unavailable")
+	}
+	opts := snapshot.RepoExtractionOptions[repo]
+	idx := &Indexer{config: cfg, registry: options.Registry, repoPrefix: repo, logger: options.Logger}
+	idx.extractionOptions.Store(&opts)
+	defer idx.Close()
+	for start := 0; start < len(snapshot.Files); start += 64 {
+		files := snapshot.Files[start:min(start+64, len(snapshot.Files))]
+		paths := make([]string, 0, len(files))
+		for _, file := range files {
+			paths = append(paths, file.Path)
+		}
+		rows, err := store.ContractBoundaryReceiptsForPathsContext(ctx, repo, "", paths)
+		if err != nil {
+			return false, err
+		}
+		for _, file := range files {
+			row := rows[file.Path]
+			if row == nil || !row.Accepted || row.Deleted || contractReceiptIsFailureEnvelope(row) {
+				continue
+			}
+			policy := ""
+			if prior, known, err := contractCorePriorReceipt(row, true); err == nil && known && prior != nil {
+				policy = prior.Policy
+			} else if marker, overflow := contractReceiptOverflowPolicy(row); overflow {
+				policy = marker
+			}
+			if policy == "" || policy == file.Policy {
+				continue
+			}
+			if projected, err := idx.contractFollowupPolicyMode(file.Language, policy); err == nil && projected {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, ctx.Err()
 }
 
 // beginContractBaseline records a live reconstruction before it asks for a

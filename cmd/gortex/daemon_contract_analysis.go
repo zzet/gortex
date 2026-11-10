@@ -69,7 +69,12 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	// exists; a report before then is dropped.
 	var repair atomic.Pointer[indexer.ContractStuckRepair]
 	captureOptions.SuspectStuck = func(repo string, paths []string) { repair.Load().Suspect(repo, paths) }
-	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
+	// Receipts written under an earlier exclude, .gitignore or other
+	// configuration edit are rebuilt by the same baseline job owner that
+	// admits missing baselines, sharing its slots.
+	baselines := indexer.NewContractBaselineReconcilers(captureOptions)
+	captureOptions.OutdatedPolicy = baselines.PolicyChanged
+	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: baselines.Reconcile, Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
 	options.RetireReservation = state.lifecycle.DeferContractReservationRetirement
 	// Linked worktrees' fills follow the configured policy; the demand
 	// signal is the same foreground work the shared yield gives way to,

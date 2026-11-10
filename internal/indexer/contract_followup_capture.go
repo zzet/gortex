@@ -3,6 +3,7 @@ package indexer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -36,7 +37,17 @@ type ContractFollowupCaptureOptions struct {
 	// because their receipt row cannot be in flight in this process: a
 	// deleted row, or an unaccepted row no mutation of this process wrote.
 	// Nothing of a live mutation will make such a row admissible.
-	SuspectStuck   func(repo string, paths []string)
+	SuspectStuck func(repo string, paths []string)
+	// OutdatedPolicy, when set, receives each repository a capture refused
+	// because an accepted receipt of its primary namespace carries an
+	// extraction policy other than the one its current configuration gives:
+	// one written before an exclude, .gitignore or other configuration edit.
+	// No save of an unchanged file rewrites such a receipt, so the capture
+	// skips the rest of that repository, goes on to find the others, reports
+	// each once and refuses. Unset, the first such receipt refuses at once.
+	// A linked checkout's own rows are not reported: their layer is built
+	// from its checkout coordinator's configuration, not rebuilt here.
+	OutdatedPolicy func(repo string)
 	selectedInputs *graphview.SelectedContractInputs
 }
 
@@ -450,6 +461,21 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	// outdated holds the repositories whose primary receipts carry an earlier
+	// extraction policy; each is reported once, however the capture ends.
+	outdated := make(map[string]bool)
+	if options.OutdatedPolicy != nil {
+		defer func() {
+			names := make([]string, 0, len(outdated))
+			for repo := range outdated {
+				names = append(names, repo)
+			}
+			sort.Strings(names)
+			for _, repo := range names {
+				options.OutdatedPolicy(repo)
+			}
+		}()
+	}
 	// Keep receipt payloads streaming and admission facts bounded to one
 	// existing frontier chunk. Sparse upper layers are resolved by indexed keys,
 	// rather than thousands of independently prepared point misses per layer.
@@ -457,6 +483,9 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		chunk := paths[start:min(start+contractFrontierReadBatchSize, len(paths))]
 		files := make(map[string]ContractFollowupFile, len(chunk))
 		for _, path := range chunk {
+			if outdated[pathRepos[path]] {
+				continue
+			}
 			file, ok, e := classify(path, pathRepos[path])
 			if e != nil {
 				return ContractFollowupSnapshot{}, e
@@ -475,6 +504,9 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 				continue
 			}
 			repo := file.RepoPrefix
+			if outdated[repo] {
+				continue
+			}
 			if fact, found := facts[path]; found {
 				if fact.excluded {
 					snapshot.Excluded = append(snapshot.Excluded, path)
@@ -492,7 +524,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			// Admission reads durable receipt identities, never every source file.
 			// Missing legacy proof is usable only by background baseline rebuilding.
 			repoHandles := handlesByRepo[repo]
-			excluded := false
+			excluded, policyOutdated := false, false
 			if options.selectedInputs == nil {
 				// Baseline repair derives its source proof from accepted core metadata,
 				// even when old optional analysis receipts are incomplete or obsolete.
@@ -559,6 +591,15 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						if policy != file.Policy {
 							projected, policyErr := idx.contractFollowupPolicyMode(language, policy)
 							if policyErr != nil || !projected || !contractGeneratedFileHint(readers[repo].GetNode(path), path) {
+								// A primary receipt that is neither the current
+								// ordinary nor the current projected policy was written
+								// under an earlier configuration. Its repository needs a
+								// baseline rebuild; the others are still checked.
+								if options.OutdatedPolicy != nil && !projected && (policyErr == nil || errors.Is(policyErr, graph.ErrContractProjectionStale)) &&
+									row.Accepted && actor == "" && repoHandles[i].ViewGeneration() == 0 {
+									policyOutdated = true
+									break
+								}
 								return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 							}
 							// This is an admission hint from the exact accepted receipt
@@ -571,9 +612,13 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						break
 					}
 				}
-				if file.SourceFingerprint != "" || excluded {
+				if file.SourceFingerprint != "" || excluded || policyOutdated {
 					break
 				}
+			}
+			if policyOutdated {
+				outdated[repo] = true
+				continue
 			}
 			if excluded {
 				snapshot.Excluded = append(snapshot.Excluded, path)
@@ -581,6 +626,9 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			}
 			snapshot.Files = append(snapshot.Files, file)
 		}
+	}
+	if len(outdated) > 0 {
+		return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 	}
 
 	if options.selectedInputs != nil {
