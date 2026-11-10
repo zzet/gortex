@@ -168,7 +168,7 @@ func functionDirectlyRendersJSX(body *sitter.Node) bool {
 		case "jsx_element", "jsx_self_closing_element", "jsx_fragment":
 			return true
 		case "function_declaration", "generator_function_declaration",
-			"method_definition", "class_declaration", "class":
+			"method_definition", "class_declaration", "abstract_class_declaration", "class":
 			// A nested named-function / class scope is its own component.
 			return false
 		case "arrow_function", "function_expression":

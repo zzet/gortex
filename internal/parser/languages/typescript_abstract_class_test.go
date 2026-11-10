@@ -89,3 +89,46 @@ class Circle extends Shape {}
 	require.Equal(t, nodeKeys(ordinary.Nodes), nodeKeys(abstract.Nodes))
 	require.Equal(t, edgeKeys(ordinary.Edges), edgeKeys(abstract.Edges))
 }
+
+func TestTypeScriptExtractor_AbstractClassThrowsScope(t *testing.T) {
+	const src = `function outer() {
+  abstract class Shape {
+    static { throw new RangeError() }
+    m() { throw new TypeError() }
+  }
+  throw new Error()
+}`
+	result, err := NewTypeScriptExtractor().Extract("shape.ts", []byte(src))
+	require.NoError(t, err)
+	var outerThrows []string
+	for _, edge := range result.Edges {
+		if edge.Kind != graph.EdgeThrows {
+			continue
+		}
+		if edge.From == "shape.ts::outer" {
+			outerThrows = append(outerThrows, edge.To)
+		}
+	}
+	require.Equal(t, []string{"unresolved::Error"}, outerThrows)
+}
+
+func TestTypeScriptExtractor_AbstractClassJSXScope(t *testing.T) {
+	const src = `function Outer() {
+  abstract class Shape {
+    view = <span />
+    render() { return <div /> }
+  }
+  return null
+}
+function Page() { return <div /> }
+`
+	result, err := NewTypeScriptExtractor().Extract("shape.tsx", []byte(src))
+	require.NoError(t, err)
+	fix := foldFixture(result)
+	outer := fix.nodesByID["shape.tsx::Outer"]
+	require.NotNil(t, outer)
+	require.NotContains(t, outer.Meta, "ui_component")
+	page := fix.nodesByID["shape.tsx::Page"]
+	require.NotNil(t, page)
+	require.Contains(t, page.Meta, "ui_component")
+}
