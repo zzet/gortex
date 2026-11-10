@@ -369,7 +369,11 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		}
 
 	}
-	snapshot.inventoryValues = inventoryProjection.detachedValues()
+	// Only linked captures can seed a successor through a prepared source.
+	// Primary captures have no consumer for detached inventory.
+	if prepared != nil {
+		snapshot.inventoryValues = inventoryProjection.detachedValues()
+	}
 	snapshot.RepoConfigs = configs
 	snapshot.RepoExtractionOptions = extractionOptions
 	snapshot.TrackedRepoModules = make(map[string]string)

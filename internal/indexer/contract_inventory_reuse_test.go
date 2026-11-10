@@ -205,3 +205,42 @@ func TestContractInventoryDetachedValuesRetainNoResources(t *testing.T) {
 	}
 	check(reflect.TypeFor[contractInventoryValues]())
 }
+
+func TestContractInventoryPrimaryCaptureKeepsFreshCensusWithoutRetention(t *testing.T) {
+	initial := "package fixture\nfunc Initial() {}\n"
+	changed := "package fixture\nfunc Changed() {}\n"
+	added := "package fixture\nfunc Added() {}\n"
+	f := newContractJobFixture(t, map[string]string{"f.go": initial})
+	capture := func(expected map[string]string) ContractFollowupSnapshot {
+		t.Helper()
+		inputs, err := f.options.Materializer.CaptureContractInputs(t.Context(), nil, "fixture", "")
+		require.NoError(t, err)
+		snapshot, targets, err := NewContractFollowupSourceCapture(f.options)(t.Context(), nil, inputs, "fixture", "")
+		require.NoError(t, err)
+		t.Cleanup(snapshot.Release)
+		require.Len(t, targets, 1)
+		require.Len(t, snapshot.Files, len(expected))
+		for _, file := range snapshot.Files {
+			text, found := expected[file.Path]
+			require.True(t, found, "primary capture must preserve the current census")
+			accepted, err := snapshot.ReadAccepted(t.Context(), file)
+			require.NoError(t, err)
+			require.Equal(t, text, string(accepted.Bytes))
+			require.Equal(t, file.SourceFingerprint, accepted.SourceFingerprint)
+			require.Equal(t, file.Policy, accepted.Policy)
+		}
+		if snapshot.inventoryValues != nil {
+			t.Error("a nil-source primary capture has no successor inventory consumer")
+		}
+		return snapshot
+	}
+	first := capture(map[string]string{"fixture/f.go": initial})
+	writeFile(t, filepath.Join(f.root, "f.go"), changed)
+	_, err := first.ReadAccepted(t.Context(), first.Files[0])
+	require.ErrorIs(t, err, graph.ErrContractProjectionStale, "no retained inventory must not weaken dirty-source refusal")
+	first.Release()
+	f.save("f.go", changed)
+	f.save("added.go", added)
+	current := capture(map[string]string{"fixture/f.go": changed, "fixture/added.go": added})
+	current.Release()
+}
