@@ -319,6 +319,7 @@ func TestReferenceConfirmationHonorsProviderOptOut(t *testing.T) {
 
 func TestReferenceConfirmationProviderFailureBacksOff(t *testing.T) {
 	stack := newLSPEnrichmentStack(t)
+	registerFailingLSPCandidate(t, stack.srv)
 	now := time.Now()
 	stack.srv.confirmSymbolRefsAt(context.Background(), stack.node, now)
 	standing := stack.standingReceipt(t, EnrichProducerSymbolRefs)

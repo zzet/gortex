@@ -20,7 +20,7 @@ import (
 // It admits a fresh answer only after an existing checked owner transition;
 // a source event alone, another physical version, and cancellation stay strict.
 func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
-	for _, transition := range []string{"canonical_retirement", "checked_read_cow", "unverified_event", "changed_physical", "caller_cancel", "enrichment_active"} {
+	for _, transition := range []string{"canonical_retirement", "checked_read_cow", "unverified_event", "changed_physical", "caller_cancel", "no_provider", "enrichment_active"} {
 		t.Run(transition, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			s, store, path := canonicalPromotionReadFixture(t)
@@ -30,8 +30,11 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 			require.NoError(t, err)
 			require.Positive(t, fts)
 			require.Nil(t, s.semanticMgr, "the native fixture starts without enrichment")
-			if transition == "enrichment_active" {
-				s.semanticMgr = &semantic.Manager{} // Existing no-provider enrichment admission fixture.
+			switch transition {
+			case "no_provider":
+				s.semanticMgr = &semantic.Manager{}
+			case "enrichment_active":
+				registerFailingLSPCandidate(t, s)
 			}
 			pending := make(chan indexer.MutationResult)
 			s.SetWatcher(mutationTestWatcher{done: pending})
@@ -122,7 +125,7 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 					require.True(t, s.hasRequestProjectionFact(attempt, "main.go"))
 					require.NoError(t, validateRequestProjections(attempt))
 					switch transition {
-					case "canonical_retirement", "caller_cancel", "enrichment_active":
+					case "canonical_retirement", "caller_cancel", "no_provider", "enrichment_active":
 						require.NoError(t, s.indexer.IndexFile(path))
 						require.Equal(t, 8, store.GetNode("main.go::Neighbor").StartLine)
 						retirement.run()
@@ -173,7 +176,7 @@ func TestRegisteredFullSymbolCommitsOnlyAcceptedAttempt(t *testing.T) {
 			for _, scope := range heldScopes {
 				require.Eventually(t, func() bool { return scope.Holders() == 0 }, 3*time.Second, time.Millisecond, "join every discarded or final attempt repository lease after dispatch, including cancelled workers")
 			}
-			success := transition == "canonical_retirement" || transition == "checked_read_cow"
+			success := transition == "canonical_retirement" || transition == "checked_read_cow" || transition == "no_provider"
 			if success {
 				require.NoError(t, callErr)
 				require.NotNil(t, result)
