@@ -105,6 +105,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("standardcompute preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(sc))
 	}
 
+	ul := Config{Provider: "uberllm"}
+	cp, ok = ul.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.uberllm.dev/v1" || cp.Model != "deepseek/deepseek-v4-flash" || cp.APIKeyEnv != "UBERLLM_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(ul) != ProfileFrontier {
+		t.Errorf("uberllm preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(ul))
+	}
+
 	// A user custom provider of the same name always wins, wholesale —
 	// no preset field leaks into it.
 	c.Custom = map[string]CustomProvider{"testgw": {BaseURL: "https://mine/v1", Model: "my-model"}}
