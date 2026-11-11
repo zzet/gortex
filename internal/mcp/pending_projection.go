@@ -552,13 +552,21 @@ func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revi
 	current := p.snap.Load()
 	drop := make([]*projectionEntry, 0, len(entries))
 	for _, entry := range entries {
-		if revision, observed := revisions[entry]; observed && current.entries[entry.key] == entry &&
-			entry.sourceEvents == revision && !entry.suspect.Load() {
-			if entry.acknowledgementPending {
+		if current.entries[entry.key] != entry {
+			continue
+		}
+		revision, observed := revisions[entry]
+		checked := observed && entry.sourceEvents == revision && !entry.suspect.Load()
+		// Invalidated proof cannot bypass the active handler's hold or
+		// authorize a deferred checked retirement.
+		if entry.acknowledgementPending {
+			if checked {
 				entry.acknowledgementRetirement = true
 				entry.acknowledgementRevision = revision
-				continue
 			}
+			continue
+		}
+		if checked {
 			entry.checkedRetired.Store(true)
 		}
 		drop = append(drop, entry)
