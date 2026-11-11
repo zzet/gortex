@@ -73,7 +73,7 @@ func tsWalkThrows(node *sitter.Node, src []byte, fromID, filePath string, seen m
 		switch c.Type() {
 		case "function_declaration", "function_expression", "arrow_function",
 			"method_definition", "generator_function_declaration",
-			"class_declaration", "class_expression":
+			"class_declaration", "abstract_class_declaration", "class_expression":
 			continue
 		}
 		tsWalkThrows(c, src, fromID, filePath, seen, result)

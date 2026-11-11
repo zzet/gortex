@@ -82,7 +82,7 @@ func emitTSReferenceForms(root *sitter.Node, src []byte, filePath, fileID string
 			emitTSTypeOnlyImportRefs(n, src, fileID, graph.EdgeReferences, "import_type", emit)
 		case "export_statement":
 			emitTSTypeOnlyExportRefs(n, src, fileID, graph.EdgeReferences, "export_type", emit)
-		case "class_declaration", "class":
+		case "class_declaration", "abstract_class_declaration", "class":
 			emitTSClassHeritageRefs(n, src, filePath, emit)
 		case "interface_declaration":
 			emitTSInterfaceHeritageRefs(n, src, filePath, emit)
