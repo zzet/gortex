@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type contractInventoryProjectionEntry struct {
 	composition   []store_sqlite.PayloadInputRevision
 	rows          map[string]graph.FileMetaRow
 	bytes         int64
+	retainedRows  int64
 }
 
 // contractInventoryValues carries immutable owned rows and scalar revisions.
@@ -47,6 +49,9 @@ type contractInventoryValueEntry struct {
 	composition []store_sqlite.PayloadInputRevision
 	rows        map[string]graph.FileMetaRow
 	bytes       int64
+	// Exact generic conservative charge of privately admitted immutable rows.
+	// Zero means unsealed values, which must keep the full reflective fallback.
+	retainedRows int64
 	// The current capture's physical projection reads, independent of the
 	// predecessor's count. This value grants no visibility or reuse authority.
 	physicalReads int
@@ -69,10 +74,34 @@ func (p *contractInventoryProjection) detachedValues() *contractInventoryValues 
 	out := &contractInventoryValues{entries: make(map[string]contractInventoryValueEntry), bytes: charge}
 	for repo, entry := range p.entries {
 		if entry.trusted && entry.rows != nil {
-			out.entries[strings.Clone(repo)] = contractInventoryValueEntry{revisions: slices.Clone(entry.revisions), composition: slices.Clone(entry.composition), rows: entry.rows, bytes: entry.bytes, physicalReads: entry.physicalReads}
+			out.entries[strings.Clone(repo)] = contractInventoryValueEntry{revisions: slices.Clone(entry.revisions), composition: slices.Clone(entry.composition), rows: entry.rows, bytes: entry.bytes, retainedRows: entry.retainedRows, physicalReads: entry.physicalReads}
 		}
 	}
 	return out
+}
+
+// retainedSize keeps the generic conservative formula for every checkpoint's
+// fresh map, keys, revision vectors and scalar metadata. Only the unchanged
+// owned row maps skip a second traversal. Their nil placeholders still carry
+// the generic map-header charge, so add back just the recorded backing delta.
+func (v *contractInventoryValues) retainedSize() int64 {
+	if v == nil {
+		return contractRetainedSize(reflect.ValueOf(v))
+	}
+	metadata := *v
+	if v.entries != nil {
+		metadata.entries = make(map[string]contractInventoryValueEntry, len(v.entries))
+	}
+	rowBytes := int64(0)
+	for repo, entry := range v.entries {
+		if entry.retainedRows <= 0 || entry.rows == nil {
+			return contractRetainedSize(reflect.ValueOf(v))
+		}
+		rowBytes += entry.retainedRows - contractRetainedSize(reflect.ValueOf((map[string]graph.FileMetaRow)(nil)))
+		entry.rows = nil
+		metadata.entries[repo] = entry
+	}
+	return contractRetainedSize(reflect.ValueOf(&metadata)) + rowBytes
 }
 
 // seed imports only detached values; readSnapshot checks the newly bound
@@ -92,6 +121,7 @@ func (p *contractInventoryProjection) seed(values *contractInventoryValues) {
 		entry.revisions = slices.Clone(value.revisions)
 		entry.composition = slices.Clone(value.composition)
 		entry.bytes = value.bytes
+		entry.retainedRows = value.retainedRows
 		p.bytes += value.bytes
 	}
 }
@@ -146,7 +176,7 @@ func (p *contractInventoryProjection) readSnapshot(ctx context.Context, repo str
 		return cloneContractInventoryRows(entry.rows), ctx.Err()
 	}
 	p.bytes -= entry.bytes
-	entry.rows, entry.revisions, entry.composition, entry.bytes = nil, nil, nil, 0
+	entry.rows, entry.revisions, entry.composition, entry.bytes, entry.retainedRows = nil, nil, nil, 0, 0
 	entry.physicalReads++
 	rows, err := captureAcceptedContractInventory(ctx, entry.core, entry.handles, repo)
 	if err != nil {
@@ -163,6 +193,7 @@ func (p *contractInventoryProjection) readSnapshot(ctx context.Context, repo str
 		charge := contractInventoryRowsCharge(rows) + contractDeltaAllocation(int64(cap(after)+cap(composition))*int64(unsafe.Sizeof(store_sqlite.PayloadInputRevision{})))
 		if charge <= int64(contractFollowupCompactLimit)-p.bytes {
 			entry.rows = cloneContractInventoryRows(rows)
+			entry.retainedRows = contractRetainedSize(reflect.ValueOf(entry.rows))
 			entry.revisions = after
 			entry.composition = composition
 			entry.bytes = charge
