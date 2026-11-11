@@ -123,7 +123,7 @@ func mineTemplateComponentUsages(src []byte, filePath, componentID, lang string,
 			From: componentID, To: "unresolved::" + name,
 			Kind: graph.EdgeReferences, FilePath: filePath,
 			Line: line, Origin: graph.OriginASTResolved,
-			Meta: map[string]any{"template": true},
+			Meta: map[string]any{"template": true, "template_name": componentRefName(raw)},
 		})
 	}
 }
