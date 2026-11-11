@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
 )
@@ -176,11 +177,14 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.logger.Debug("incremental reindex: failed to index file",
 			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
-	if idx.contractRestatementErr != nil {
+	if errors.Is(idx.contractRestatementErr, store_sqlite.ErrWarmupWALPressure) {
 		// The reconcile already fails with this error (its caller returns it
 		// before using the result). A retry pass would only meet the same
-		// refusal: for the warmup WAL boundary, a second full wait. The first
-		// pass's file-failure notes are kept rather than cleared by a retry.
+		// refusal after a second full wait. The first pass's file-failure
+		// notes are kept rather than cleared by a retry. Only a warm
+		// reconcile's own indexer has the boundary, and a failed reconcile
+		// never installs it, so leaving its reparsedThisRun unraised loses
+		// nothing. Other restatement errors keep the retry pass and the flag.
 		return invalidation, reparsed, failed, versionChanged
 	}
 	if len(failed) == 0 {
