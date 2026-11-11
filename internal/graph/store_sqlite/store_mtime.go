@@ -233,6 +233,34 @@ func (s *Store) LoadFileMtimes(repoPrefix string) map[string]int64 {
 	return out
 }
 
+// FileMtimePrefixes lists the repo prefixes that currently hold mtime rows
+// for the active view generation, sorted. The memory backend's snapshot
+// restore iterates it to copy the sidecar back (issue davalillo/gortex#26);
+// unlike RepoPrefixes (node-derived), this answers from the sidecar itself,
+// so it works even for prefixes whose node projection is empty.
+func (s *Store) FileMtimePrefixes() []string {
+	rows, err := s.db.Query(
+		`SELECT DISTINCT repo_prefix FROM file_mtimes WHERE view_gen = ? ORDER BY repo_prefix`,
+		s.viewGen,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return out
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return out
+	}
+	return out
+}
+
 // FileMtimes is a fallible read form of LoadFileMtimes. It always
 // returns a non-nil (possibly empty) map for a known/unknown prefix and
 // surfaces any query error. The interface method LoadFileMtimes is the
