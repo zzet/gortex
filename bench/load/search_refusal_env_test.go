@@ -31,6 +31,8 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 		name          string
 		flag          string
 		search        bool
+		editGateModes bool
+		scenario      string
 		ownedOverride bool
 		want          string
 	}{
@@ -39,6 +41,10 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 		{name: "invalid_flag", flag: "true", search: true},
 		{name: "generic_profile", flag: "1"},
 		{name: "preserved_owned_override", flag: "1", search: true, ownedOverride: true, want: "1"},
+		{name: "explicit_edit_gate", flag: "1", editGateModes: true, want: "1"},
+		{name: "edit_gate_off", editGateModes: true},
+		{name: "edit_gate_invalid_flag", flag: "true", editGateModes: true},
+		{name: "other_scenario", flag: "1", search: true, editGateModes: true, scenario: "read"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("LOAD_DAEMON_FIXTURE", "")
@@ -55,7 +61,11 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 				p.daemonEnv = append(append([]string(nil), p.Env...), "GORTEX_REFUSAL_TEST_OWNED=preserved")
 			}
 			priorOverride := p.daemonEnv
-			require.NoError(t, p.startWithSearchRefusalEvidence(tc.search))
+			scenario := tc.scenario
+			if scenario == "" {
+				scenario = editProbeScenario
+			}
+			require.NoError(t, p.startWithScenarioRefusalEvidence(scenario, runOptions{SearchReadbackAcceptance: tc.search, EditGateModes: tc.editGateModes}))
 			wait, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			select {
@@ -84,7 +94,7 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 			} else {
 				require.Empty(t, observed["owned"])
 			}
-			t.Logf("selected_search=%v explicit_flag=%q real_child_observed=%v reaped=true forced=false", tc.search, tc.flag, observed)
+			t.Logf("scenario=%s selected_search=%v edit_gate=%v explicit_flag=%q real_child_observed=%v reaped=true forced=false", scenario, tc.search, tc.editGateModes, tc.flag, observed)
 		})
 	}
 }
