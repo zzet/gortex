@@ -118,6 +118,9 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 		// declares the method itself; this pass exists for the inherited case,
 		// which a same-receiver name match cannot see.
 		if rt := edgeReceiverType(e); rt != "" {
+			if phpEdgeMetaString(e, "receiver_fqn") != "" {
+				continue // The FQN path already resolved or conservatively rejected it.
+			}
 			if base := phpBaseTypeName(rt); base != "" {
 				if target := r.nearestPHPMethod(name, []string{base}, direct, repo); target != nil && target.ID != e.From {
 					jobs = append(jobs, job{edge: e, single: target})
@@ -464,6 +467,150 @@ func (r *Resolver) phpFindByFQN(fqn, repo string) []*graph.Node {
 		}
 	}
 	return out
+}
+
+type ancestorTier struct {
+	kind string // class, trait, parent, or interface
+	ids  []string
+}
+
+func (r *Resolver) phpAncestorID(e *graph.Edge, repo string) string {
+	targets := r.phpFindByFQN(phpEdgeMetaString(e, "target_fqn"), repo)
+	if len(targets) != 1 || (targets[0].Kind != graph.KindType && targets[0].Kind != graph.KindInterface) {
+		return ""
+	}
+	return targets[0].ID
+}
+
+// phpParentID returns the unique direct class parent, skipping traits and interfaces.
+func (r *Resolver) phpParentID(classID string) (string, bool) {
+	class := r.cachedGetNode(classID)
+	if class == nil || class.Language != "php" || class.Kind != graph.KindType {
+		return "", false
+	}
+	var parents []string
+	for _, e := range r.graph.GetOutEdges(classID) {
+		if e.Kind == graph.EdgeExtends && phpEdgeMetaString(e, "via") != "trait" {
+			parents = append(parents, r.phpAncestorID(e, class.RepoPrefix))
+		}
+	}
+	if len(parents) != 1 || parents[0] == "" {
+		return "", false
+	}
+	return parents[0], true
+}
+
+// phpAncestorChain returns typed precedence tiers; unknown ancestors leave a valid prefix and complete=false.
+func (r *Resolver) phpAncestorChain(classID string) (chain []ancestorTier, complete bool) {
+	return r.phpReceiverAncestorChain(classID, false)
+}
+
+func (r *Resolver) phpReceiverAncestorChain(classID string, partialTraits bool) (chain []ancestorTier, complete bool) {
+	start := r.cachedGetNode(classID)
+	if start == nil || start.Language != "php" {
+		return nil, false
+	}
+	complete = true
+	seen := map[string]bool{classID: true}
+	pending := []ancestorTier{{"class", []string{classID}}}
+	if start.Kind == graph.KindInterface {
+		pending[0].kind = "interface"
+	}
+	var interfaces []string
+	for len(pending) > 0 {
+		level := pending[0]
+		pending = pending[1:]
+		chain = append(chain, level)
+		next := []ancestorTier{{kind: "trait"}, {kind: "parent"}}
+		traitsComplete := true
+		for _, owner := range level.ids {
+			for _, e := range r.graph.GetOutEdges(owner) {
+				if e.Kind != graph.EdgeExtends && e.Kind != graph.EdgeImplements {
+					continue
+				}
+				isTrait := phpEdgeMetaString(e, "via") == "trait"
+				isInterface := e.Kind == graph.EdgeImplements || level.kind == "interface"
+				id := r.phpAncestorID(e, start.RepoPrefix)
+				if id == "" {
+					complete = false
+					traitsComplete = traitsComplete && !isTrait
+					continue
+				}
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				switch {
+				case isTrait:
+					next[0].ids = append(next[0].ids, id)
+				case isInterface:
+					interfaces = append(interfaces, id)
+				default:
+					next[1].ids = append(next[1].ids, id)
+				}
+			}
+		}
+		// An unknown trait can conflict with its siblings or override a parent.
+		if !traitsComplete {
+			if !partialTraits {
+				return chain, false
+			}
+			// Preserve the legacy lookup through known traits in partial graphs.
+			// Unknown traits still block lower-priority parents and interfaces;
+			// every retained declaration must match its source FQN.
+			pending = nil
+			interfaces = nil
+			next[1].ids = nil
+		}
+		for i := len(next) - 1; i >= 0; i-- {
+			if len(next[i].ids) > 0 {
+				pending = append([]ancestorTier{next[i]}, pending...)
+			}
+		}
+		if len(pending) == 0 && len(interfaces) > 0 {
+			if !complete {
+				return chain, false
+			}
+			pending = []ancestorTier{{"interface", interfaces}}
+			interfaces = nil
+		}
+	}
+	return chain, complete
+}
+
+// phpReceiverMethod walks declaration identities rather than short receiver
+// names, which may refer to unrelated classes in different namespaces.
+func (r *Resolver) phpReceiverMethod(e *graph.Edge, name string) *graph.Node {
+	repo := r.callerRepoPrefix(e)
+	start := r.phpFindByFQN(phpEdgeMetaString(e, "receiver_fqn"), repo)
+	if len(start) != 1 || (start[0].Kind != graph.KindType && start[0].Kind != graph.KindInterface) {
+		return nil
+	}
+	methods := r.cachedFindNodesByNameInRepo(name, repo)
+	chain, complete := r.phpAncestorChain(start[0].ID)
+	if !complete {
+		chain, _ = r.phpReceiverAncestorChain(start[0].ID, true)
+	}
+	for _, level := range chain {
+		var pick *graph.Node
+		for _, id := range level.ids {
+			typ := r.cachedGetNode(id)
+			for _, m := range methods {
+				if m.Language == "php" && m.Kind == graph.KindMethod &&
+					m.FilePath == typ.FilePath && nodeReceiverType(m) == typ.Name &&
+					phpNodeNamespace(m) == phpNodeNamespace(typ) {
+					if pick != nil && pick.ID != m.ID {
+						return nil
+					}
+					pick = m
+				}
+			}
+		}
+		if pick != nil {
+			return pick
+		}
+	}
+	return nil
 }
 
 // phpNodeNamespace reads the namespace a PHP declaration lives in.
