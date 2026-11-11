@@ -4935,7 +4935,10 @@ func pickTopLevelValueCallee(candidates []*graph.Node, funcName, callerDir strin
 // genuine cross-repo case with import-reachability evidence.
 func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	candidates, aliased := r.phpAliasTypeCandidates(e, name, callerRepo)
+	if !aliased {
+		candidates = r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	}
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -5003,7 +5006,10 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 	// the `*.` and resolve on the bare type name.
 	name = strings.TrimPrefix(name, "*.")
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	candidates, aliased := r.phpAliasTypeCandidates(e, name, callerRepo)
+	if !aliased {
+		candidates = r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	}
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return

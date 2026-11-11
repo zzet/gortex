@@ -466,6 +466,31 @@ func phpNarrowByTargetFQN(e *graph.Edge, candidates []*graph.Node) []*graph.Node
 	return out
 }
 
+// phpAliasTypeCandidates handles a PHP type written under a use alias. Unlike
+// ordinary namespace narrowing, an alias must never fall back to its written
+// name: that name can belong to an unrelated class. The bool keeps a missing
+// external target distinct from a reference that is not aliased.
+func (r *Resolver) phpAliasTypeCandidates(e *graph.Edge, name, repo string) ([]*graph.Node, bool) {
+	fqn := phpEdgeMetaString(e, "target_fqn")
+	if fqn == "" || (strings.Contains(fqn, ".") && !strings.Contains(fqn, `\`)) {
+		return nil, false
+	}
+	short := fqn
+	if i := strings.LastIndex(fqn, `\`); i >= 0 {
+		short = fqn[i+1:]
+	}
+	if short == name {
+		return nil, false
+	}
+	var out []*graph.Node
+	for _, c := range r.phpFindByFQN(fqn, repo) {
+		if c.Kind == graph.KindType || c.Kind == graph.KindInterface {
+			out = append(out, c)
+		}
+	}
+	return out, true
+}
+
 // phpFindByFQN returns the PHP declarations whose namespace and name match a
 // fully-qualified name. Used where a lookup by Node.QualName would be natural
 // but is not available: qual_name backs a UNIQUE index that a duplicate FQN
