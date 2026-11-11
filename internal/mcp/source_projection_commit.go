@@ -70,7 +70,8 @@ func (record *mutationCommitRecord) attachFileProjection(response map[string]any
 	}
 	// The original write receipt is historical; a newer registry entry must
 	// never be revived or advertised as this receipt's live file projection.
-	if liveProjectionForAcknowledgement(entry) {
+	guard, diagnostic := acknowledgementProjectionLiveness(entry)
+	if guard == projectionOwnerLive {
 		response["file_view"] = fileViewForEntry(entry)
 		response["readback_exact"] = exact
 	} else {
@@ -79,6 +80,11 @@ func (record *mutationCommitRecord) attachFileProjection(response map[string]any
 		}
 		response["file_view"] = mutationFileView{State: "unavailable", Reason: reason, Historical: exact, DeltaState: "unavailable", DeltaReason: "projection_not_live", SyntaxHealth: fileViewSyntaxHealth{State: "unknown"}}
 		response["readback_exact"] = false
+	}
+	if diagnostic != nil {
+		if _, observed := response["file_liveness_failure"]; !observed {
+			response["file_liveness_failure"] = *diagnostic
+		}
 	}
 	attachMutationFileTier(response, response["readback_exact"] == true)
 	response["graph_status_hint"] = mutationFileGraphHint(response, response["readback_exact"] == true)
@@ -98,13 +104,21 @@ func liveProjectionForAcknowledgement(entry *projectionEntry) bool {
 // Preserve the original check order and single stat. The returned enum records
 // the actual first failed predicate; it is not a later ownership resample.
 func projectionLivenessFailure(entry *projectionEntry) projectionLivenessGuard {
+	return observeProjectionLiveness(entry, nil)
+}
+
+func observeProjectionLiveness(entry *projectionEntry, diagnostic *acknowledgementProjectionFailure) projectionLivenessGuard {
 	if entry == nil {
 		return projectionOwnerMissing
 	}
-	if entry.suspect.Load() {
+	suspect := entry.suspect.Load()
+	diagnostic.observeSuspect("before", suspect)
+	if suspect {
 		return projectionOwnerSuspectBefore
 	}
-	if pendingFileProjections.snap.Load().entries[entry.key] != entry {
+	owner := pendingFileProjections.snap.Load().entries[entry.key]
+	diagnostic.observeOwner("before", entry, owner)
+	if owner != entry {
 		return projectionOwnerChangedBefore
 	}
 	stamp, err := statDiskStamp(entry.absPath)
@@ -121,10 +135,14 @@ func projectionLivenessFailure(entry *projectionEntry) projectionLivenessGuard {
 	} else if stamp.info == nil || !stamp.info.Mode().IsRegular() {
 		return projectionOwnerNotRegular
 	}
-	if entry.suspect.Load() {
+	suspect = entry.suspect.Load()
+	diagnostic.observeSuspect("after", suspect)
+	if suspect {
 		return projectionOwnerSuspectAfter
 	}
-	if pendingFileProjections.snap.Load().entries[entry.key] != entry {
+	owner = pendingFileProjections.snap.Load().entries[entry.key]
+	diagnostic.observeOwner("after", entry, owner)
+	if owner != entry {
 		return projectionOwnerChangedAfter
 	}
 	return projectionOwnerLive
