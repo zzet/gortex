@@ -35,6 +35,7 @@ import (
 	"github.com/zzet/gortex/internal/modules"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
+	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/parser/tsalias"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -8205,6 +8206,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		registrationLine   int
 		trail              string
 		fallback           string
+		handlerClass       string
 		repoHint           string
 		// srcDir is the directory of the contract's registration site
 		// (the file with the HandleFunc call). Used by lookupHandler
@@ -8216,12 +8218,15 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		srcDir string
 	}
 	var todo []pending
+	classResolvers := make(map[string]func(string, int) string)
+	qualifiedClasses := false
 	for _, c := range reg.All() {
 		if c.Role != contracts.RoleProvider || c.Type != contracts.ContractHTTP {
 			continue
 		}
 		trail, _ := c.Meta["handler_trail"].(string)
 		fallback, _ := c.Meta["handler_ident"].(string)
+		handlerClass, _ := c.Meta["handler_class"].(string)
 		if trail == "" && fallback == "" {
 			continue
 		}
@@ -8229,6 +8234,22 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		// initial file-scoped pass worked.
 		if src, _ := c.Meta["schema_source"].(string); src == "extracted" || src == "partial" {
 			continue
+		}
+		if !strings.HasSuffix(c.FilePath, ".php") {
+			// Class-scoped selection relies on PHP namespace identity; other
+			// frameworks keep the name-based lookup.
+			handlerClass = ""
+		}
+		if handlerClass != "" {
+			resolve, seen := classResolvers[c.FilePath]
+			if !seen {
+				resolve = languages.PHPClassNameResolver(idx.contractFileSrc(c.FilePath))
+				classResolvers[c.FilePath] = resolve
+			}
+			if resolve != nil {
+				handlerClass = resolve(handlerClass, c.Line)
+			}
+			qualifiedClasses = qualifiedClasses || strings.Contains(handlerClass, `\`)
 		}
 		// srcDir goes through path.Dir, not filepath.Dir: c.FilePath is a
 		// graph path, slash-separated on every platform, and filepath.Dir
@@ -8241,6 +8262,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			registrationLine:   c.Line,
 			trail:              trail,
 			fallback:           fallback,
+			handlerClass:       handlerClass,
 			repoHint:           c.RepoPrefix,
 			srcDir:             path.Dir(c.FilePath),
 		})
@@ -8290,6 +8312,9 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		if len(candidates) == 0 && p.fallback != "" {
 			candidates = []string{p.fallback}
 		}
+		if p.handlerClass != "" {
+			candidates = append(candidates, p.handlerClass[strings.LastIndex(p.handlerClass, `\`)+1:])
+		}
 		for _, ident := range candidates {
 			name := handlerLookupName(ident)
 			if name == "" {
@@ -8314,6 +8339,27 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		// generic point-lookup door.
 		handlerCandidates = make(map[string][]*graph.Node)
 	}
+	if projectedHandlers && qualifiedClasses {
+		// Namespace identity is absent from declaration projections. Use the
+		// single hydration batch before selection, including potential handlers,
+		// so FQN selection and later enrichment see the same scratch-first rows.
+		var ids []string
+		for _, nodes := range handlerCandidates {
+			for _, n := range nodes {
+				ids = append(ids, n.ID)
+			}
+		}
+		full := idx.graph.GetNodesByIDs(ids)
+		for _, nodes := range handlerCandidates {
+			for i, n := range nodes {
+				if nodes[i] = contractHydrateHandler(n, full[n.ID]); nodes[i] == nil {
+					idx.rememberContractInputError(graph.ErrContractProjectionStale)
+					return
+				}
+			}
+		}
+		projectedHandlers = false
+	}
 
 	type resolvedPending struct {
 		pending pending
@@ -8324,7 +8370,7 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 	seenHandlerPaths := make(map[string]struct{})
 	for _, p := range todo {
 		handler := idx.resolveInnermostHandlerFromCandidates(
-			p.trail, p.fallback, p.repoHint, p.srcDir, handlerCandidates,
+			p.trail, p.fallback, p.repoHint, p.srcDir, p.handlerClass, handlerCandidates,
 		)
 		if handler == nil {
 			continue
@@ -8465,21 +8511,68 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 }
 
 func (idx *Indexer) resolveInnermostHandlerFromCandidates(
-	trail, fallback, repoHint, srcDir string,
+	trail, fallback, repoHint, srcDir, handlerClass string,
 	byName map[string][]*graph.Node,
 ) *graph.Node {
+	var owner *graph.Node
+	if handlerClass != "" {
+		short := handlerClass[strings.LastIndex(handlerClass, `\`)+1:]
+		classes := byName[short]
+		if byName == nil {
+			classes = idx.graph.FindNodesByName(short)
+		}
+		count := 0
+		for _, n := range classes {
+			if n != nil && n.Kind == graph.KindType {
+				if short != handlerClass {
+					ns, _ := n.Meta["scope_ns"].(string)
+					if strings.Trim(ns+`\`+n.Name, `\`) != strings.TrimPrefix(handlerClass, `\`) {
+						continue
+					}
+				}
+				owner = n
+				count++
+				if count > 1 {
+					// A namesake may inherit the action, so matching only
+					// the declaring method's short class name is unsafe.
+					return nil
+				}
+			}
+		}
+		if count == 0 {
+			// An unknown controller gives no evidence for a name-only
+			// fallback; an unrelated method may share the action name.
+			return nil
+		}
+	}
 	candidates := contracts.HandlerCandidatesInTrail(trail)
 	if len(candidates) == 0 && fallback != "" {
 		candidates = []string{fallback}
 	}
 	var best *graph.Node
 	for _, ident := range candidates {
-		var n *graph.Node
-		if byName == nil {
-			n = idx.lookupHandler(ident, repoHint, srcDir)
-		} else {
-			n = lookupHandlerFromCandidates(ident, repoHint, srcDir, byName)
+		name := handlerLookupName(ident)
+		if name == "" {
+			continue
 		}
+		nodes := byName[name]
+		if byName == nil {
+			nodes = idx.graph.FindNodesByName(name)
+		}
+		if owner != nil {
+			var owned []*graph.Node
+			for _, n := range nodes {
+				if n != nil && n.Kind == graph.KindMethod && n.ID == owner.ID+"."+name {
+					owned = append(owned, n)
+				}
+			}
+			// A controller may inherit the action from a base class. Keep
+			// the original name-only fallback when its own method is absent.
+			if len(owned) > 0 {
+				nodes = owned
+			}
+		}
+		n := pickHandlerCandidate(nodes, repoHint, srcDir)
 		if n != nil {
 			best = n
 		}
