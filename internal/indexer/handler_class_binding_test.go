@@ -110,3 +110,47 @@ func TestResolveProviderHandlersHandlerClass(t *testing.T) {
 		})
 	}
 }
+
+func TestLaravelResourceOptionsHandlerBinding(t *testing.T) {
+	for _, tc := range []struct{ name, importLine, controller, duplicate, want string }{
+		{"imported", `use Acme\ShopController;`, "ShopController", "", "app/ShopController.php::ShopController.index"},
+		{"ambiguous", `use Acme\ShopController;`, "ShopController", "other/ShopController.php", ""},
+		{"missing", `use Acme\MissingController;`, "MissingController", "", ""},
+		{"no_import", "", "ShopController", "", "app/ShopController.php::ShopController.index"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			core := graph.New()
+			files := map[string]string{
+				"app/ShopController.php":      "<?php namespace Acme; class ShopController { public function index() {} }",
+				"other/CatalogController.php": "<?php namespace Acme\\Other; class CatalogController { public function index() {} }",
+			}
+			if tc.duplicate != "" {
+				files[tc.duplicate] = "<?php namespace Acme\\Other; class ShopController { public function index() {} }"
+			}
+			for file, source := range files {
+				require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(root, file)), 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(root, file), []byte(source), 0o600))
+				parsed, err := languages.NewPHPExtractor().Extract("a/"+file, []byte(source))
+				require.NoError(t, err)
+				for _, node := range parsed.Nodes {
+					node.RepoPrefix = "a"
+				}
+				core.AddBatch(parsed.Nodes, parsed.Edges)
+			}
+			source := "<?php\n" + tc.importLine + "\nRoute::resource('orders', " + tc.controller + "::class, ['names' => 'orders'])->only(['index']);\n"
+			cs := (&contracts.HTTPExtractor{}).Extract("a/routes/api.php", []byte(source), nil, nil)
+			require.Len(t, cs, 1, "resource options must retain the index route")
+			reg := contracts.NewRegistry()
+			cs[0].RepoPrefix = "a"
+			reg.Add(cs[0])
+			idx := &Indexer{graph: core, rootPath: root, repoPrefix: "a", logger: zap.NewNop()}
+			idx.resolveProviderHandlers(reg)
+			want := tc.want
+			if want != "" {
+				want = "a/" + want
+			}
+			require.Equal(t, want, reg.All()[0].SymbolID)
+		})
+	}
+}
