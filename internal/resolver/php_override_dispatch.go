@@ -63,6 +63,11 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 		if name == "" || strings.HasSuffix(name, ".<init>") {
 			continue
 		}
+		if phpEdgeMetaString(e, "php_property_path") != "" {
+			if _, known := r.phpPropertyCallTarget(e, name); known {
+				continue
+			}
+		}
 		// SQLite joined caller language in the compact census. Only scope-chain
 		// binding needs the full caller node; adapters without exact lookup retain
 		// the historical language gate here.
