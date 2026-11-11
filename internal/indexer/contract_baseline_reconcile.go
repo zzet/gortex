@@ -30,18 +30,22 @@ func NewContractBaselineReconciler(options ContractFollowupCaptureOptions) func(
 // owner: they share its per-repository jobs and its slots.
 type ContractBaselineReconcilers struct {
 	// Reconcile is NewContractBaselineReconciler's admission of a namespace
-	// whose baseline is missing or of an earlier version.
+	// whose baseline is missing or of an earlier version. A request it
+	// reports admitted is followed by a Published for its repository: it
+	// starts a job, coalesces onto one of the repository, or, with both slots
+	// taken, waits for a slot ahead of the policy rebuilds.
 	Reconcile func(context.Context, *graphview.RepoView, string, string) (bool, error)
 	// PolicyChanged admits the rebuild of an accepted primary namespace a
 	// capture found holding receipts of an earlier extraction policy
 	// (ContractFollowupCaptureOptions.OutdatedPolicy). The job rebuilds only
 	// if its own census still finds such a receipt, and announces Published
-	// only when it did. A request is dropped while the namespace header is
-	// pending (its own baseline owns it), coalesced while a job of the
-	// repository runs or waits, and queued while the slots are full. Within
-	// the repository's retry window (contractBaselinePolicyRun) it is held
-	// and admitted again once the window has passed, so a consumer waiting
-	// on the refused capture is not left without a later wake.
+	// only when it did or a Reconcile request coalesced onto it. A request is
+	// dropped while the namespace header is pending (its own baseline owns
+	// it), coalesced while a job of the repository runs or waits, and queued
+	// while the slots are full. Within the repository's retry window
+	// (contractBaselinePolicyRun) it is held and admitted again once the
+	// window has passed, so a consumer waiting on the refused capture is not
+	// left without a later wake.
 	PolicyChanged func(repo string)
 }
 
@@ -80,12 +84,14 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 	jobs := make(map[string]bool)
 	slots := make(chan struct{}, 2)
 	// All guarded by jobsMu: queued are policy rebuilds waiting for a slot, in
-	// arrival order; runs are each repository's last policy rebuild; held are
-	// the requests a window holds until it passes; policyJobs marks running
-	// policy jobs, reported a policy request coalesced onto one, and waiting
-	// a Reconcile request coalesced onto any job.
-	var queued []string
-	queuedSet := make(map[string]bool)
+	// arrival order, and turnedAway the Reconcile requests that found both
+	// slots taken, likewise; runs are each repository's last policy rebuild;
+	// held are the requests a window holds until it passes; policyJobs marks
+	// running policy jobs, reported a policy request coalesced onto one, and
+	// waiting a Reconcile request coalesced onto any job. A repository is in
+	// each queue at most once.
+	var queued, turnedAway []string
+	queuedSet, turnedAwaySet := make(map[string]bool), make(map[string]bool)
 	runs := make(map[string]contractBaselinePolicyRun)
 	held := make(map[string]*time.Timer)
 	policyJobs, reported, waiting := make(map[string]bool), make(map[string]bool), make(map[string]bool)
@@ -109,6 +115,10 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 	// started, queued, or coalesced with a job that will drain the queue
 	// when it ends. A request dropped or held by its window owns none.
 	var admitPolicy func(repo string) bool
+	// admitTurnedAway admits a Reconcile request recorded in turnedAway, as
+	// reconcile would have with a slot free: its consumer waits on the job's
+	// Published for the repository.
+	var admitTurnedAway func(repo string) bool
 	// start runs an admitted job; the caller holds jobsMu and a slot.
 	start := func(repo string, policy bool) {
 		jobs[repo] = true
@@ -124,7 +134,9 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 		options.BaselineJobs.Add(1)
 		go func() {
 			defer options.BaselineJobs.Done()
-			announce := true
+			// current marks a policy job that found every receipt current;
+			// announce, whether the job announces Published for repo.
+			announce, current := true, false
 			// Admission capacity must be available before waking a consumer
 			// that may need to repair another namespace in the same cohort.
 			defer func() {
@@ -149,8 +161,8 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 				}
 				// A capture that reported while a job which then found
 				// nothing ran saw a drift the job's census did not: ask
-				// again, after the window.
-				again := policy && !announce && reported[repo]
+				// again, after the window, whether or not the job announces.
+				again := current && reported[repo]
 				delete(reported, repo)
 				if policy {
 					run := runs[repo]
@@ -161,20 +173,29 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 				if again {
 					admitPolicy(repo)
 				}
-				// Hand the freed slot down the queue until a request owns it:
-				// one dropped on admission (its header went pending, or its
-				// window has not passed) must not strand the rest.
+				// Hand the freed slot down the queues until a request owns it:
+				// first to a Reconcile request turned away while the slots
+				// were full, whose consumer is parked on its namespace, then
+				// to a policy rebuild. One dropped on admission (its owner's
+				// context ended, its header went pending, or its window has
+				// not passed) must not strand the rest.
 				for {
 					jobsMu.Lock()
-					if len(queued) == 0 {
+					var next string
+					admit := admitPolicy
+					switch {
+					case len(turnedAway) > 0:
+						next, turnedAway, admit = turnedAway[0], turnedAway[1:], admitTurnedAway
+						delete(turnedAwaySet, next)
+					case len(queued) > 0:
+						next, queued = queued[0], queued[1:]
+						delete(queuedSet, next)
+					default:
 						jobsMu.Unlock()
 						return
 					}
-					next := queued[0]
-					queued = queued[1:]
-					delete(queuedSet, next)
 					jobsMu.Unlock()
-					if admitPolicy(next) {
+					if admit(next) {
 						return
 					}
 				}
@@ -195,7 +216,7 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 			case policy && !rebuilt:
 				// Nothing was rewritten: waking the consumers would only repeat
 				// the capture that asked.
-				announce = false
+				announce, current = false, true
 				countContractBaseline(viewmetrics.ContractBaselineCurrent)
 				if options.Logger != nil {
 					options.Logger.Debug("contract baseline policy rebuild found every receipt current", zap.String("repo", repo))
@@ -207,6 +228,34 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 				options.Logger.Warn("contract baseline reconstruction refused", zap.String("repo", repo), zap.Error(err))
 			}
 		}()
+	}
+	// admitReconcileLocked admits a Reconcile job of repo; the caller holds
+	// BaselineAdmissionMu and jobsMu. Each outcome ends in a Published for
+	// repo, which wakes the consumers parked on its baseline: the job it
+	// starts announces one, as does a job it coalesces onto. With both slots
+	// taken the request is recorded in turnedAway, and a slot holder's job
+	// admits it when it ends: it was recorded while that job held its slot,
+	// and the job looks for it only after releasing the slot. A request
+	// already recorded stays where it is.
+	admitReconcileLocked := func(repo string) {
+		if jobs[repo] {
+			waiting[repo] = true
+			countContractBaseline(viewmetrics.ContractBaselineCoalesced)
+			return
+		}
+		if turnedAwaySet[repo] {
+			countContractBaseline(viewmetrics.ContractBaselineCoalesced)
+			return
+		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			turnedAway = append(turnedAway, repo)
+			turnedAwaySet[repo] = true
+			countContractBaseline(viewmetrics.ContractBaselineSaturated)
+			return
+		}
+		start(repo, false)
 	}
 	reconcile := func(ctx context.Context, view *graphview.RepoView, repo, checkout string) (bool, error) {
 		if err := ctx.Err(); err != nil {
@@ -238,21 +287,22 @@ func NewContractBaselineReconcilers(options ContractFollowupCaptureOptions) Cont
 		}
 		jobsMu.Lock()
 		defer jobsMu.Unlock()
-		if jobs[repo] {
-			waiting[repo] = true
-			countContractBaseline(viewmetrics.ContractBaselineCoalesced)
-			return true, nil
-		}
-		select {
-		case slots <- struct{}{}:
-		default:
-			// The occupied slots have independently owned jobs that publish a
-			// global change after releasing admission capacity.
-			countContractBaseline(viewmetrics.ContractBaselineSaturated)
-			return true, nil
-		}
-		start(repo, false)
+		admitReconcileLocked(repo)
 		return true, nil
+	}
+	admitTurnedAway = func(repo string) bool {
+		if runtimeReady() != nil || options.Context.Err() != nil {
+			return false
+		}
+		options.BaselineAdmissionMu.Lock()
+		defer options.BaselineAdmissionMu.Unlock()
+		if options.Context.Err() != nil {
+			return false
+		}
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+		admitReconcileLocked(repo)
+		return true
 	}
 	admitPolicy = func(repo string) bool {
 		ctx := options.Context

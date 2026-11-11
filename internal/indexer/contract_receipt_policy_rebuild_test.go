@@ -28,6 +28,10 @@ type policyFixture struct {
 	options   ContractFollowupCaptureOptions
 	jobs      *sync.WaitGroup
 	published atomic.Int64
+	// announcedMu guards announced, the repository of each Published in
+	// order.
+	announcedMu sync.Mutex
+	announced   []string
 }
 
 func newPolicyFixture(t *testing.T, repos ...string) *policyFixture {
@@ -51,7 +55,12 @@ func newPolicyFixture(t *testing.T, repos ...string) *policyFixture {
 	registry := newTestRegistry()
 	mi := NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
 	t.Cleanup(func() { _ = mi.Close(context.Background()) })
-	mi.SetContractCoreRuntime(ContractCoreRuntimeHooks{Published: func(context.Context, string, string) { f.published.Add(1) }})
+	mi.SetContractCoreRuntime(ContractCoreRuntimeHooks{Published: func(_ context.Context, repo, _ string) {
+		f.announcedMu.Lock()
+		f.announced = append(f.announced, repo)
+		f.announcedMu.Unlock()
+		f.published.Add(1)
+	}})
 	_, err = mi.IndexAll()
 	require.NoError(t, err)
 	materializer := &graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: graphview.NewLeaseManager()}
@@ -63,7 +72,17 @@ func newPolicyFixture(t *testing.T, repos ...string) *policyFixture {
 		require.True(t, f.header(t, repo).Accepted)
 	}
 	f.published.Store(0)
+	f.announcedMu.Lock()
+	f.announced = nil
+	f.announcedMu.Unlock()
 	return f
+}
+
+// announcedFor returns the repository of each Published so far, in order.
+func (f *policyFixture) announcedFor() []string {
+	f.announcedMu.Lock()
+	defer f.announcedMu.Unlock()
+	return append([]string(nil), f.announced...)
 }
 
 // excludeIn adds an exclude pattern that matches no file to each repository
@@ -331,4 +350,228 @@ func TestContractPolicyWindowIsMeasuredFromTheRebuildsEnd(t *testing.T) {
 	require.EqualValues(t, 1, second["repeats"], "the report followed the rebuild's end within twice its window")
 	require.Eventually(t, func() bool { return f.capture(t, f.options) == nil }, 10*time.Second, 20*time.Millisecond)
 	f.jobs.Wait()
+}
+
+// holdLanes holds the repository lanes of repos until the returned release
+// runs, so a policy job of one of them waits at its census.
+func (f *policyFixture) holdLanes(t *testing.T, repos ...string) func() {
+	t.Helper()
+	locked, gate := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- f.options.MultiIndexer.withRepositoryMutationLanes(t.Context(), repos, func() error {
+			close(locked)
+			<-gate
+			return nil
+		})
+	}()
+	<-locked
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			close(gate)
+			require.NoError(t, <-done)
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// admissionsDone waits out an admission that has logged its rebuild: it
+// holds BaselineAdmissionMu until its job is added to BaselineJobs, so a
+// Wait that follows covers that job.
+func (f *policyFixture) admissionsDone() {
+	f.options.BaselineAdmissionMu.Lock()
+	defer f.options.BaselineAdmissionMu.Unlock()
+}
+
+// outdateBaseline gives repo's namespace a baseline of an earlier version,
+// which Reconcile admits, and returns its current one.
+func (f *policyFixture) outdateBaseline(t *testing.T, repo string) graph.ContractBoundaryReceiptBaseline {
+	t.Helper()
+	baseline, err := f.options.Store.ContractBoundaryReceiptBaselineContext(t.Context(), repo, "")
+	require.NoError(t, err)
+	require.NotNil(t, baseline)
+	require.NoError(t, f.options.Store.SetContractBoundaryReceiptBaselineContext(t.Context(), graph.ContractBoundaryReceiptBaseline{RepoPrefix: repo, Version: "outdated", Fingerprint: "outdated"}))
+	return *baseline
+}
+
+// baselineCurrent reports whether repo's namespace baseline is of the
+// current version.
+func (f *policyFixture) baselineCurrent(t *testing.T, repo string) bool {
+	t.Helper()
+	baseline, err := f.options.Store.ContractBoundaryReceiptBaselineContext(t.Context(), repo, "")
+	require.NoError(t, err)
+	return baseline != nil && baseline.Version == contractBoundaryReceiptVersion
+}
+
+// TestContractPolicyJobsWakeAReconcileTheyTurnedAway: a Reconcile request
+// that finds both slots taken reports a baseline admitted, so its actor parks
+// until a Published of a repository in its cohort. Policy jobs that rebuild
+// nothing announce none, and a Published of their own repositories need not
+// reach that actor: the request waits for a slot instead, and its own job
+// rebuilds the baseline and announces for its repository.
+func TestContractPolicyJobsWakeAReconcileTheyTurnedAway(t *testing.T) {
+	f := newPolicyFixture(t, "repo-a", "repo-b", "repo-c")
+	f.outdateBaseline(t, "repo-c")
+	release := f.holdLanes(t, "repo-a", "repo-b")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-b")
+	admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-c", "")
+	require.NoError(t, err)
+	require.True(t, admitted, "the consumer is told to wait on a baseline")
+	require.False(t, f.baselineCurrent(t, "repo-c"))
+	release()
+	f.jobs.Wait()
+	require.Equal(t, 2, f.rebuilds())
+	require.Equal(t, []string{"repo-c"}, f.announcedFor(), "the request turned away is woken once, by its own repository")
+	require.True(t, f.baselineCurrent(t, "repo-c"), "the request's own job rebuilt its baseline")
+
+	// Woken, its retry finds the baseline current.
+	admitted, err = reconcilers.Reconcile(t.Context(), nil, "repo-c", "")
+	require.NoError(t, err)
+	require.False(t, admitted)
+	f.jobs.Wait()
+	require.Equal(t, []string{"repo-c"}, f.announcedFor())
+}
+
+// TestContractPolicyTurnedAwayReconcileIsCoalesced: a Reconcile request
+// turned away again before a slot frees waits as the one already turned
+// away, so the namespace is rebuilt and announced once.
+func TestContractPolicyTurnedAwayReconcileIsCoalesced(t *testing.T) {
+	f := newPolicyFixture(t, "repo-a", "repo-b", "repo-c")
+	f.outdateBaseline(t, "repo-c")
+	releaseA := f.holdLanes(t, "repo-a")
+	releaseB := f.holdLanes(t, "repo-b")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-b")
+	for range 2 {
+		admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-c", "")
+		require.NoError(t, err)
+		require.True(t, admitted)
+	}
+	releaseA()
+	// repo-c's job announces last, once it no longer runs: a second request
+	// left waiting would now start another job.
+	require.Eventually(t, func() bool { return f.published.Load() >= 1 }, 10*time.Second, 10*time.Millisecond, "repo-a's slot goes to repo-c")
+	releaseB()
+	f.jobs.Wait()
+	require.Equal(t, []string{"repo-c"}, f.announcedFor(), "repo-b's slot finds no second request")
+}
+
+// TestContractPolicyTurnedAwayReconcileEndsWithItsOwner: once the owner's
+// context has ended, a freed slot starts no job for a request turned away.
+func TestContractPolicyTurnedAwayReconcileEndsWithItsOwner(t *testing.T) {
+	f := newPolicyFixture(t, "repo-a", "repo-b", "repo-c")
+	f.outdateBaseline(t, "repo-c")
+	release := f.holdLanes(t, "repo-a", "repo-b")
+	ctx, cancel := context.WithCancel(t.Context())
+	options := f.options
+	options.Context = ctx
+	reconcilers := NewContractBaselineReconcilers(options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-b")
+	admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-c", "")
+	require.NoError(t, err)
+	require.True(t, admitted)
+	cancel()
+	release()
+	f.jobs.Wait()
+	require.NotContains(t, f.announcedFor(), "repo-c")
+	require.False(t, f.baselineCurrent(t, "repo-c"))
+}
+
+// TestContractPolicyJobAnnouncesToACoalescedReconcile: a Reconcile request
+// that coalesced onto a policy job waits on its Published, even when the job
+// then finds every receipt current.
+func TestContractPolicyJobAnnouncesToACoalescedReconcile(t *testing.T) {
+	f := newPolicyFixture(t, "repo-a")
+	release := f.holdLanes(t, "repo-a")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	// The request reads a baseline a moment before it turns current again.
+	current := f.outdateBaseline(t, "repo-a")
+	admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-a", "")
+	require.NoError(t, err)
+	require.True(t, admitted)
+	require.NoError(t, f.options.Store.SetContractBoundaryReceiptBaselineContext(t.Context(), current))
+	release()
+	f.jobs.Wait()
+	require.Equal(t, 1, f.rebuilds())
+	require.EqualValues(t, 1, f.published.Load())
+}
+
+// TestContractPolicyReportCoalescedOntoACurrentRebuildIsAskedAgain: a report
+// that arrived while a policy job ran saw a drift that job's census may have
+// missed; when the job finds nothing, the report is admitted again once the
+// window has passed.
+func TestContractPolicyReportCoalescedOntoACurrentRebuildIsAskedAgain(t *testing.T) {
+	shortPolicyRetry(t, 500*time.Millisecond)
+	f := newPolicyFixture(t, "repo-a")
+	release := f.holdLanes(t, "repo-a")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-a")
+	require.Equal(t, 1, f.rebuilds(), "the second report coalesced")
+	release()
+	require.Eventually(t, func() bool { return f.rebuilds() == 2 }, 10*time.Second, 10*time.Millisecond, "admitted again after the window")
+	f.admissionsDone()
+	f.jobs.Wait()
+	require.Zero(t, f.published.Load())
+}
+
+// TestContractPolicyReportIsAskedAgainWhenTheJobAnnouncesForAReconcile: a
+// policy job that finds nothing announces for a Reconcile request coalesced
+// onto it, but that announcement is not an answer to a policy report
+// coalesced onto it as well: the report is still admitted again once the
+// window has passed, with no capture asking.
+func TestContractPolicyReportIsAskedAgainWhenTheJobAnnouncesForAReconcile(t *testing.T) {
+	shortPolicyRetry(t, 500*time.Millisecond)
+	f := newPolicyFixture(t, "repo-a")
+	release := f.holdLanes(t, "repo-a")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-a")
+	require.Equal(t, 1, f.rebuilds(), "the second report coalesced")
+	current := f.outdateBaseline(t, "repo-a")
+	admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-a", "")
+	require.NoError(t, err)
+	require.True(t, admitted)
+	require.NoError(t, f.options.Store.SetContractBoundaryReceiptBaselineContext(t.Context(), current))
+	release()
+	require.Eventually(t, func() bool { return f.published.Load() == 1 }, 10*time.Second, 10*time.Millisecond, "the job announces for the coalesced Reconcile")
+	require.Eventually(t, func() bool { return f.rebuilds() == 2 }, 10*time.Second, 10*time.Millisecond, "the coalesced report is admitted again after the window")
+	f.admissionsDone()
+	f.jobs.Wait()
+	require.Equal(t, []string{"repo-a"}, f.announcedFor())
+}
+
+// TestContractPolicyReportIsAskedAgainWhenTheSlotGoesToAReconcile: the job
+// that frees a slot hands it to a Reconcile request it turned away, whose job
+// announces for its own repository. A report coalesced onto the freeing job,
+// which found nothing, is still admitted again once the window has passed,
+// with no capture asking.
+func TestContractPolicyReportIsAskedAgainWhenTheSlotGoesToAReconcile(t *testing.T) {
+	shortPolicyRetry(t, 500*time.Millisecond)
+	f := newPolicyFixture(t, "repo-a", "repo-b", "repo-c")
+	f.outdateBaseline(t, "repo-c")
+	releaseA := f.holdLanes(t, "repo-a")
+	releaseB := f.holdLanes(t, "repo-b")
+	reconcilers := NewContractBaselineReconcilers(f.options)
+	reconcilers.PolicyChanged("repo-a")
+	reconcilers.PolicyChanged("repo-b")
+	reconcilers.PolicyChanged("repo-a")
+	require.Equal(t, 2, f.rebuilds(), "the third report coalesced")
+	admitted, err := reconcilers.Reconcile(t.Context(), nil, "repo-c", "")
+	require.NoError(t, err)
+	require.True(t, admitted, "the consumer is told to wait on a baseline")
+	releaseA()
+	require.Eventually(t, func() bool { return f.published.Load() == 1 }, 10*time.Second, 10*time.Millisecond, "repo-a's slot goes to the request it turned away")
+	require.Eventually(t, func() bool { return f.rebuilds() == 3 }, 10*time.Second, 10*time.Millisecond, "the coalesced report is admitted again after the window")
+	f.admissionsDone()
+	releaseB()
+	f.jobs.Wait()
+	require.Equal(t, []string{"repo-c"}, f.announcedFor())
 }
