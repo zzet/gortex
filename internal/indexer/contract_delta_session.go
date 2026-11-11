@@ -244,7 +244,7 @@ func (s *contractDeltaSession) finish(c *contractConvergence, complete bool) {
 	p.retainedBytes = contractRetainedSizeMode(reflect.ValueOf(&withoutUnits), false) + contractRetainedSizeMode(reflect.ValueOf(proofUnits), false) + pooledBacking + optionalBytes
 	p.retainedBytes += p.continuation.metadataSize()
 	// Inventory strings are owned separately from the pooled proof strings.
-	p.retainedBytes += contractRetainedSize(reflect.ValueOf(p.inventoryValues))
+	p.retainedBytes += p.inventoryValues.retainedSize()
 	rawBytes := int64(0)
 	for _, unit := range p.units {
 		p.retainedBytes += unit.retainedRawBytes
