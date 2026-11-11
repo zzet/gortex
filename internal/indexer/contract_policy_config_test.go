@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -53,4 +55,37 @@ func TestContractPolicyConstructionSettingsPreserveAcceptedRows(t *testing.T) {
 	require.NotEqual(t, receipt.Policy, semanticReceipt.Policy)
 	require.NotEqual(t, receipt.Records.Semantic, semanticReceipt.Records.Semantic)
 	require.NotEqual(t, policy, semanticPolicy)
+}
+
+func TestContractPolicyWorkerCountPreservesAcceptedRows(t *testing.T) {
+	settings := config.Default().Index
+	settings.Workers = 1
+	rows, receipt, policy := contractPolicyAcceptedRows(t, settings)
+	settings.Workers = 4
+	otherRows, otherReceipt, otherPolicy := contractPolicyAcceptedRows(t, settings)
+	require.Equal(t, rows, otherRows)
+	require.Equal(t, receipt, otherReceipt, "worker count changes scheduling, not accepted contract facts")
+	require.Equal(t, policy, otherPolicy)
+}
+
+func TestExecutionSettingsPreserveBothIdentities(t *testing.T) {
+	settings := config.Default().Index
+	_, receipt, policy := contractPolicyAcceptedRows(t, settings)
+	_, generation, err := snapshotDedicatedBaseConfig(settings, "fixture", "", "")
+	require.NoError(t, err)
+	for _, workers := range []int{1, settings.Workers + 1} {
+		t.Setenv("GORTEX_INDEX_WORKERS", strconv.Itoa(workers))
+		manager, err := config.NewConfigManager(filepath.Join(t.TempDir(), "config.yaml"))
+		require.NoError(t, err)
+		configured := settings
+		configured.Workers = manager.GetRepoConfig("fixture").Index.Workers
+		require.Equal(t, workers, configured.Workers)
+		_, otherReceipt, otherPolicy := contractPolicyAcceptedRows(t, configured)
+		owned, otherGeneration, err := snapshotDedicatedBaseConfig(configured, "fixture", "", "")
+		require.NoError(t, err)
+		require.Equal(t, workers, owned.Workers, "snapshots must retain scheduling configuration")
+		require.Equal(t, receipt, otherReceipt)
+		require.Equal(t, policy, otherPolicy)
+		require.Equal(t, generation, otherGeneration, "CPU defaults and environment overrides must not rekey generations")
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,174 @@ func TestContractBaselineReusesCurrentAcceptedReceiptThroughAttachment(t *testin
 			require.Zero(t, spy.reads.Load(), "worker must use accepted core evidence and the frozen helper policy")
 		})
 	}
+}
+
+func TestContractCaptureWorkerCountChangePublishesAcceptedReceipts(t *testing.T) {
+	options, spy, _, original := currentReceiptBaselineFixture(t, nil)
+	spy.forbid.Store(true)
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	// A restart can see a different CPU quota without changing source bytes.
+	options.Config.Workers++
+	inputs, err := options.Materializer.CaptureContractInputs(t.Context(), nil, "fixture", "")
+	require.NoError(t, err)
+	snapshot, targets, err := NewContractFollowupCapture(options)(t.Context(), nil, inputs, "fixture", "")
+	require.NoError(t, err, "worker-count changes must not strand accepted inputs as stale")
+	defer snapshot.Release()
+	require.Len(t, targets, 1)
+	snapshot.Release()
+	coordinator, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{
+		Store: options.Store, Leases: options.Materializer.Leases, Registry: options.Registry,
+		Config: options.Config, Capture: NewContractFollowupSourceCapture(options),
+		Inputs: NewContractPrimaryInputCapture(options.Materializer), Yield: options.Yield,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	attached := scheduleUntilAttached(t, ctx, coordinator, options.Materializer, []string{"fixture"}, "fixture")
+	require.Equal(t, inputs.State, attached.State)
+	analysis, err := options.Materializer.OpenContractAnalysisForInputs(ctx, nil, attached)
+	require.NoError(t, err)
+	defer analysis.Close()
+	nodes, err := analysis.NodesByKindsContext(ctx, []graph.NodeKind{graph.KindContract})
+	require.NoError(t, err)
+	var ids []string
+	for _, node := range nodes {
+		ids = append(ids, node.ID)
+	}
+	require.Contains(t, ids, "http::GET::/reused-current")
+	require.NoError(t, analysis.Validate(ctx))
+	current, _, err := options.Store.ContractBoundaryReceiptContext(ctx, "fixture", "", original.FilePath)
+	require.NoError(t, err)
+	require.JSONEq(t, string(original.Payload), string(current.Payload))
+	require.Zero(t, spy.reads.Load(), "accepted receipts must remain reusable without reparsing")
+}
+
+func TestContractPolicyUpgradeRepairsAcceptedBaseline(t *testing.T) {
+	for _, pendingHeader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pending_%t", pendingHeader), func(t *testing.T) {
+			options, spy, _, original := currentReceiptBaselineFixture(t, nil)
+			require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+			baseline, err := options.Store.ContractBoundaryReceiptBaselineContext(t.Context(), "fixture", "")
+			require.NoError(t, err)
+			require.NotNil(t, baseline)
+			if pendingHeader {
+				current, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+				require.NoError(t, err)
+				pending := current
+				pending.InputFingerprint += "-policy"
+				pending.Accepted = false
+				require.NoError(t, options.Store.BeginContractInputMutationContext(t.Context(), &current, pending, nil))
+			}
+			// Keep the accepted receipts and baseline, then start the new runtime
+			// with a different extraction policy and unchanged source bytes.
+			options.Config.HTTPClientAliases = []string{"apiGet"}
+			// The existing core indexer can still carry the previous configuration.
+			var repair atomic.Pointer[ContractStuckRepair]
+			options.SuspectStuck = func(repo string, paths []string) { repair.Load().Suspect(repo, paths) }
+			coordinator, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{
+				Store: options.Store, Leases: options.Materializer.Leases, Registry: options.Registry,
+				Config: options.Config, Capture: NewContractFollowupSourceCapture(options),
+				Inputs: NewContractPrimaryInputCapture(options.Materializer), Yield: options.Yield,
+			})
+			require.NoError(t, err)
+			options.MultiIndexer.SetContractCoreRuntime(ContractCoreRuntimeHooks{Published: coordinator.Published})
+			runner, err := NewContractStuckRepair(ContractStuckRepairOptions{
+				Store: options.Store, MultiIndexer: options.MultiIndexer, Baseline: options,
+				Coordinator: coordinator, Period: 50 * time.Millisecond,
+			})
+			require.NoError(t, err)
+			repair.Store(runner)
+			t.Cleanup(func() { runner.Close(); require.NoError(t, coordinator.Close()) })
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			attached := scheduleUntilAttached(t, ctx, coordinator, options.Materializer, []string{"fixture"}, "fixture")
+			require.True(t, attached.State.Accepted)
+			analysis, err := options.Materializer.OpenContractAnalysisForInputs(ctx, nil, attached)
+			require.NoError(t, err)
+			defer analysis.Close()
+			nodes, err := analysis.NodesByKindsContext(ctx, []graph.NodeKind{graph.KindContract})
+			require.NoError(t, err)
+			require.NotEmpty(t, nodes)
+			current, _, err := options.Store.ContractBoundaryReceiptContext(ctx, "fixture", "", original.FilePath)
+			require.NoError(t, err)
+			require.True(t, current.Accepted)
+			require.NotEqual(t, original.Payload, current.Payload)
+			require.Equal(t, original.SourceFingerprint, current.SourceFingerprint)
+			require.Positive(t, spy.reads.Load(), "policy upgrades reconstruct only contract receipts from accepted source")
+		})
+	}
+}
+
+func TestContractBaselineRepairStopsWithoutHeader(t *testing.T) {
+	idx, store := newSQLiteIndexer(t)
+	t.Cleanup(idx.Close)
+	r := &ContractStuckRepair{options: ContractStuckRepairOptions{Store: store, Logger: zap.NewNop()}}
+	state := &contractRepoRepair{repo: "fixture", rebuildBaseline: true, pendingKey: "obsolete", headerBackoff: time.Hour, headerRetryAt: time.Now().Add(time.Hour)}
+	r.repairHeld(t.Context(), state)
+	require.False(t, state.rebuildBaseline, "a removed namespace has no baseline to rebuild")
+	require.Empty(t, state.pendingKey)
+	require.False(t, state.retry, "a removed namespace must leave the periodic watch")
+	require.Zero(t, state.headerBackoff)
+	require.Zero(t, state.headerRetryAt)
+}
+
+func TestContractBaselineRepairBacksOffAfterFailure(t *testing.T) {
+	options, _, _, _ := currentReceiptBaselineFixture(t, nil)
+	attempts := 0
+	failing := true
+	options.Yield = func(context.Context) error {
+		if !failing {
+			return nil
+		}
+		attempts++
+		return errors.New("injected persistent baseline failure")
+	}
+	r := &ContractStuckRepair{options: ContractStuckRepairOptions{Store: options.Store, MultiIndexer: options.MultiIndexer, Baseline: options, Logger: zap.NewNop()}, period: time.Hour}
+	current, found, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	state := &contractRepoRepair{repo: "fixture", rebuildBaseline: true, pendingKey: current.InputVersion + "\x00" + current.InputFingerprint}
+	pass := func() {
+		t.Helper()
+		current, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+		require.NoError(t, err)
+		require.NoError(t, options.MultiIndexer.withRepositoryMutationLanes(t.Context(), []string{"fixture"}, func() error {
+			ctx := withHeldRepositoryLanes(t.Context(), []string{"fixture"})
+			if state.pendingKey != current.InputVersion+"\x00"+current.InputFingerprint {
+				r.repairHeld(ctx, state) // Observe the failed reconcile's new key.
+			}
+			state.pendingSince = time.Now().Add(-2 * r.period)
+			r.repairHeld(ctx, state)
+			return nil
+		}))
+	}
+	pass()
+	require.Equal(t, 1, attempts)
+	require.True(t, state.retry, "a failed baseline must remain repairable")
+	pass()
+	require.Equal(t, 1, attempts, "repeated repair passes must respect the failure backoff")
+	for i, periods := range []int{1, 2, 4, 8, 16, 16} {
+		if i > 0 {
+			state.headerRetryAt = time.Now().Add(-time.Second)
+			pass()
+		}
+		require.Equal(t, i+1, attempts)
+		require.Equal(t, time.Duration(periods)*r.period, state.headerBackoff)
+		require.InDelta(t, float64(state.headerBackoff), float64(time.Until(state.headerRetryAt)), float64(time.Minute))
+		pass()
+		require.Equal(t, i+1, attempts, "even a newly pending header must respect the delay")
+	}
+	failing = false
+	state.headerRetryAt = time.Now().Add(-time.Second)
+	pass()
+	current, found, err = options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, found && current.Accepted, "a later successful retry must accept the baseline")
+	require.False(t, state.retry)
+	require.False(t, state.rebuildBaseline)
+	require.Zero(t, state.headerBackoff)
+	require.Zero(t, state.headerRetryAt)
 }
 
 func TestContractBaselineCurrentReceiptRefusesUnprovedEnvelope(t *testing.T) {
