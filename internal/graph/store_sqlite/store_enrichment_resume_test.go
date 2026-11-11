@@ -51,6 +51,30 @@ func TestEnrichmentResumeRoundTripsAcrossReopen(t *testing.T) {
 	require.Equal(t, 2, other.Phase)
 }
 
+func TestClearRepoEnrichmentResumeDropsEveryProvider(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	defer s.Close()
+	providers := []string{"typescript-types", "csharp-types"}
+	for _, repo := range []string{"gone", "kept"} {
+		for _, provider := range providers {
+			require.NoError(t, s.SetEnrichmentResume(graph.EnrichmentResumePoint{
+				RepoPrefix: repo, Provider: provider, IndexedSHA: "sha", Phase: 1,
+			}))
+		}
+	}
+	require.NoError(t, s.ClearRepoEnrichmentResume("gone"))
+	require.NoError(t, s.ClearRepoEnrichmentResume("gone"), "clearing missing points is not an error")
+	for _, provider := range providers {
+		_, found, err := s.GetEnrichmentResume("gone", provider)
+		require.NoError(t, err)
+		require.False(t, found, provider)
+		_, found, err = s.GetEnrichmentResume("kept", provider)
+		require.NoError(t, err)
+		require.True(t, found, "another repository's %s point is untouched", provider)
+	}
+}
+
 func TestPurgeRepoDropsEnrichmentResume(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "store.sqlite"))
 	require.NoError(t, err)

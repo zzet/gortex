@@ -178,3 +178,70 @@ func TestRunDeferredEnrich_InPlaceReenrichDistrustsResume(t *testing.T) {
 		})
 	}
 }
+
+// The latch the in-place re-enrich raises lives only in this process, but
+// the resume point is persisted. After a restart at the same revision a
+// fresh Indexer starts with the latch down and nothing on the ledger names
+// the file, so a point recorded before the save would be honoured over the
+// importers' lost edges. The save therefore deletes the repository's points
+// for every provider; a save left on the ledger keeps them, since a resumed
+// pass re-applies the files the ledger names.
+func TestRunDeferredEnrich_InPlaceReenrichDropsPersistedResume(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		onWatch  bool
+		wantKept bool
+	}{
+		{name: "save re-enriched in place", onWatch: true, wantKept: false},
+		{name: "save left on the ledger", onWatch: false, wantKept: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, spy, repo := newScopeSpyIndexer(t)
+			_, err := idx.Index(repo)
+			require.NoError(t, err)
+			attachScopeSpyWith(idx, spy, semantic.Config{Enabled: true, EnrichOnWatch: tc.onWatch})
+			sha, dirty := repoHeadAndDirty(repo)
+			require.False(t, dirty)
+			store := idx.graph.(graph.EnrichmentResumeStore)
+			providers := []string{spy.Name(), "other"}
+			for _, provider := range providers {
+				require.NoError(t, store.SetEnrichmentResume(graph.EnrichmentResumePoint{
+					RepoPrefix: "r", Provider: provider, IndexedSHA: sha, Version: "v1", Phase: 1, After: "r/main.go",
+				}))
+			}
+
+			main := filepath.Join(repo, "main.go")
+			require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() { helper() }\n\nfunc helper() {}\n"), 0o644))
+			require.NoError(t, idx.IndexFile(main))
+			// Restore HEAD's content, so the restart below sees the same
+			// clean revision the point was recorded at.
+			runGit(t, repo, "checkout", "--", "main.go")
+			require.NoError(t, idx.IndexFile(main))
+			resha, redirty := repoHeadAndDirty(repo)
+			require.Equal(t, sha, resha)
+			require.False(t, redirty)
+			spy.spyEnrichProvider.mu.Lock()
+			enrichedInPlace := len(spy.files) > 0
+			spy.spyEnrichProvider.mu.Unlock()
+			require.Equal(t, tc.onWatch, enrichedInPlace)
+
+			// Restart: a fresh Indexer on the same store starts with the
+			// latch down, so only the store can carry the invalidation.
+			restarted := New(idx.graph, newTestRegistry(), config.Default().Index, zap.NewNop())
+			restarted.SetRepoPrefix("r")
+			restarted.SetRootPath(repo)
+			for _, provider := range providers {
+				_, found, err := store.GetEnrichmentResume("r", provider)
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantKept, found, "provider %s", provider)
+			}
+			restartedSpy := &scopeSpyProvider{}
+			attachScopeSpy(restarted, restartedSpy)
+			restarted.markPendingEnrichFull()
+			restarted.runDeferredEnrich()
+			scopes := restartedSpy.recorded()
+			require.Len(t, scopes, 1)
+			assert.True(t, scopes[0].Resume, "nothing in the restarted process distrusts a stored point")
+		})
+	}
+}

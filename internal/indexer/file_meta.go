@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/zeebo/blake3"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -252,18 +253,36 @@ func (idx *Indexer) setReparsePendingEnrichment(graphPath string, pending bool) 
 // discharge follows a non-partial pass that already cleared its points, and
 // a file with no type tier to wait for (no providers, or an omitted file)
 // costs at most one pass that does not resume.
+//
+// The latch covers only this process, and a restart at the same clean
+// revision would honour the persisted points, so the same write also
+// deletes the repository's points for every provider. It goes before the
+// marker write: a crash in between leaves the file on the ledger with no
+// point to resume, never the reverse.
 func (idx *Indexer) setReparsePendingEnrichments(pendingByFile map[string]bool) {
 	if len(pendingByFile) == 0 {
 		return
 	}
 	paths := make([]string, 0, len(pendingByFile))
+	distrust := false
 	for graphPath, pending := range pendingByFile {
 		if graphPath == "" {
 			continue
 		}
 		paths = append(paths, graphPath)
 		if !pending {
-			idx.resumeUntrusted.Store(true)
+			distrust = true
+		}
+	}
+	if distrust {
+		idx.resumeUntrusted.Store(true)
+		if rs, ok := idx.graph.(graph.EnrichmentResumeStore); ok {
+			if err := rs.ClearRepoEnrichmentResume(idx.repoPrefix); err != nil {
+				// The latch still protects this run; only a restart before
+				// the next whole-repo pass could honour the stale point.
+				idx.logger.Warn("indexer: discard enrichment resume points failed",
+					zap.String("repo", idx.repoPrefix), zap.Error(err))
+			}
 		}
 	}
 	sort.Strings(paths)

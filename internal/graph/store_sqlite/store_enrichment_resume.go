@@ -50,3 +50,13 @@ DELETE FROM enrichment_resume WHERE view_gen = ? AND repo_prefix = ? AND provide
 		s.viewGen, repoPrefix, provider)
 	return err
 }
+
+// ClearRepoEnrichmentResume deletes every provider's resume point for a repo.
+func (s *Store) ClearRepoEnrichmentResume(repoPrefix string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.execActiveWriteLocked(context.Background(), `
+DELETE FROM enrichment_resume WHERE view_gen = ? AND repo_prefix = ?`,
+		s.viewGen, repoPrefix)
+	return err
+}

@@ -1471,10 +1471,13 @@ type EnrichmentResumePoint struct {
 // the first page, which is always correct.
 //
 // GetEnrichmentResume's bool is false when no point is recorded.
+// ClearRepoEnrichmentResume deletes the repository's points for every
+// provider.
 type EnrichmentResumeStore interface {
 	GetEnrichmentResume(repoPrefix, provider string) (EnrichmentResumePoint, bool, error)
 	SetEnrichmentResume(point EnrichmentResumePoint) error
 	ClearEnrichmentResume(repoPrefix, provider string) error
+	ClearRepoEnrichmentResume(repoPrefix string) error
 }
 
 // ContractState is the per-repo completion marker for the contract tier: the
