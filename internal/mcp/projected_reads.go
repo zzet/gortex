@@ -207,6 +207,12 @@ func selectedProjectionReadPath(ctx context.Context, root, prefix, abs string) (
 }
 
 func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context, abs, graphPath, rel string) (*projectionEntry, error) {
+	return s.projectCurrentTrackedFileVersion(buildCtx, requestCtx, abs, graphPath, rel, nil)
+}
+
+// sameVersion confines a late proof to the already selected immutable bytes.
+// Ordinary selection retains the existing changed-source projection path.
+func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.Context, abs, graphPath, rel string, sameVersion *projectionEntry) (*projectionEntry, error) {
 	idx, _ := s.indexerForRel(graphPath)
 	tracked := idx.IsTracked(rel)
 	root, readPath, key, err := selectedProjectionReadPath(requestCtx, idx.RootPath(), idx.RepoPrefix(), abs)
@@ -215,6 +221,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	}
 	observed := pendingFileProjections.captureReadExpectation(key)
 	expected := observed.entry
+	if sameVersion != nil && expected != sameVersion {
+		return nil, projectionSuperseded
+	}
 	// A current cached payload is reusable during queued work. Without an
 	// existing owner, a storm must not start disk projection work at all.
 	if expected == nil && s.projectionStormActive(abs) {
@@ -223,6 +232,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 	before, err := statDiskStamp(abs)
 	if err != nil {
 		return nil, err
+	}
+	if sameVersion != nil && (before.info == nil || !sameVersion.disk.matches(before)) {
+		return nil, projectionSuperseded
 	}
 	if before.info == nil {
 		if expected != nil && expected.tombstone && liveProjectionForAcknowledgement(expected) {
@@ -322,6 +334,9 @@ func (s *Server) projectCurrentTrackedFile(buildCtx, requestCtx context.Context,
 			}
 			return entry, nil
 		}
+	}
+	if sameVersion != nil {
+		return nil, projectionSuperseded // no new bytes, SQL admission or parse may prove this old selection
 	}
 	// Exact immutable reuse above needs no canonical SQL admission. Existing
 	// hash-based publication callbacks still retire its current COW owner.
