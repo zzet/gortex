@@ -60,17 +60,27 @@ runs one linked job at a time instead. See
 ## The store schema upgrade
 
 The first daemon start after upgrading from v0.64.10 (store schema v21) or
-v0.64.11 (v40) upgrades the graph store in place before the daemon opens its
-socket. While it runs, `gortex daemon start` shows `migrating schema vN
-(name)` and the daemon answers nothing — `tools/list` included — until the
-upgrade has finished. Nothing is reindexed.
+v0.64.11 (v40) upgrades the graph store in place. The startup progress display
+reports `migrating schema vN (name)` during the upgrade. Once the socket is
+accepting connections, `tools/list` can answer while SQL migration is still
+underway. Graph requests that need the store return retryable `repo_loading`
+with `phase: migrating` during that phase.
 
-How long it takes grows with the store. Measured locally on the 1.5 GB store
-v0.64.10 writes for this repository (190k nodes, 1.16M edges), the upgrade
-from v21 took about 13 seconds, grew a 0.6 GB write-ahead log and added 66 MB
-to the store; from v0.64.11's v40 it took under 3 seconds. Taking the backup
-(below) adds the time to copy the store once. Numbers for large
-multi-repository stores have not been measured yet.
+After migration, the daemon can still need incremental catch-up before the
+repository is queryable. The v21 startup trace recorded retryable `repo_loading`
+with `phase: snapshot_loaded` and then `phase: parallel_parse` during startup.
+Use `gortex daemon status` to check repository readiness.
+
+Earlier local schema-upgrade measurements on this repository's 1.5 GB store
+(190k nodes, 1.16M edges) recorded about 13 seconds from v21, a 0.6 GB write-ahead
+log and 66 MB of store growth. The earlier upgrade from v40 took under 3 seconds.
+Taking the backup (below) adds the time to copy the store once.
+
+In a separate single-repository v21-to-v44 test, the uninterrupted baseline
+reached its first successful graph probe at 518.192 seconds elapsed across
+startup, migration and catch-up. The incremental reconcile logged 1,952 files
+reindexed and 478.69 seconds in its apply phase. The 29-repository reference
+startup time remains unmeasured.
 
 ### Free disk space
 
