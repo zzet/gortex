@@ -4027,6 +4027,8 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	}
 
 	switch {
+	case e.Kind == graph.EdgeCalls && phpEdgeMetaString(e, "eloquent_model") != "" && r.resolvePHPDeclaredStatic(e, stats):
+		// A PHP class's declared method wins over the Eloquent shortcut.
 	case strings.HasPrefix(target, "grpc::"):
 		// gRPC client-stub call placeholder
 		// (`unresolved::grpc::<Service>::<Method>`). Landed on the
