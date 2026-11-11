@@ -8130,6 +8130,11 @@ func (idx *Indexer) routerPrefixScanFiles(reg *contracts.Registry) []string {
 // bytes they see come from the same place the parse pipeline read: the
 // installed content source when there is one, and the working tree otherwise.
 func (idx *Indexer) contractFileSrc(filePath string) []byte {
+	// A node with no file has no source in either mode. Answer that here so
+	// an analysis-only read never asks the census about an empty path.
+	if filePath == "" {
+		return nil
+	}
 	if idx.contractAnalysisOnly {
 		data, _ := idx.readAcceptedContractSource(filePath)
 		return data
@@ -8352,6 +8357,11 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		full := idx.graph.GetNodesByIDs(ids)
 		for _, nodes := range handlerCandidates {
 			for i, n := range nodes {
+				// A stub with no file keeps its declaration: selection still
+				// sees it, and the handler loop below skips it unenriched.
+				if n.FilePath == "" {
+					continue
+				}
 				if nodes[i] = contractHydrateHandler(n, full[n.ID]); nodes[i] == nil {
 					idx.rememberContractInputError(graph.ErrContractProjectionStale)
 					return
@@ -8372,13 +8382,12 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 		handler := idx.resolveInnermostHandlerFromCandidates(
 			p.trail, p.fallback, p.repoHint, p.srcDir, p.handlerClass, handlerCandidates,
 		)
-		if handler == nil {
+		// A handler with no file, such as a stdlib or dependency stub, has no
+		// body to enrich from: the contract keeps its registration.
+		if handler == nil || handler.FilePath == "" {
 			continue
 		}
 		resolvedTodo = append(resolvedTodo, resolvedPending{pending: p, handler: handler})
-		if handler.FilePath == "" {
-			continue
-		}
 		if _, seen := seenHandlerPaths[handler.FilePath]; seen {
 			continue
 		}
