@@ -297,7 +297,7 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 	// receipt on any of them must fail here even if some sibling arm in the
 	// same function still names an entry.
 	required := []mutationDoor{
-		{file: "contract_baseline_reconcile.go", fn: "reconcilePrimaryContractBaseline", door: "withRepositoryMutationLanes", entries: []string{"OutputEntryContractBaseline"}},
+		{file: "contract_baseline_reconcile.go", fn: "rebuildPrimaryContractBaseline", door: "withRepositoryMutationLanes", entries: []string{"OutputEntryContractBaseline"}},
 		{file: "multi.go", fn: "IndexRepo", door: "runExclusive", entries: []string{"OutputEntryIndexRepo"}},
 		{file: "multi.go", fn: "incrementalDiscoverRepo", door: "runExclusive", entries: []string{"OutputEntryIncrementalDiscoverRepo"}},
 		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "runExclusiveLaneOnly", entries: []string{"OutputEntryRepositoryTopology"}},
