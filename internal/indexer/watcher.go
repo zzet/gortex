@@ -2182,7 +2182,7 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 	if w.mutationTimerArmed != nil {
 		w.mutationTimerArmed(delay)
 	}
-	timer = time.AfterFunc(delay, func() {
+	callback := func() {
 		if observation != nil {
 			observation.entered = time.Now() // callback entry precedes claim/admission
 			if observation.background != nil {
@@ -2215,12 +2215,19 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 			observation.background.invalidate("serving_attempt_unavailable")
 			observation.background.publishUnavailable()
 		}
-	})
-	w.pending[path] = timer
-	if observation != nil && observation.background != nil {
-		observation.background.armFinished(w, path, generation, observation.successor, time.Now())
+	}
+	if observation != nil {
+		armObservedMutationTimer(delay, callback, func(armed *time.Timer) {
+			timer = armed
+			w.pending[path] = armed
+			if observation.background != nil {
+				observation.background.armFinished(w, path, generation, observation.successor, time.Now())
+			}
+		})
 		return observation.background
 	}
+	timer = time.AfterFunc(delay, callback)
+	w.pending[path] = timer
 	return nil
 }
 
@@ -2654,7 +2661,7 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 		}
 	}
 	w.stormTimerObservation = observation
-	w.stormTimer = time.AfterFunc(delay, func() {
+	callback := func() {
 		defer w.stormWork.Done()
 		attempt := w.drainStormObserved(observation)
 		returned := time.Now()
@@ -2662,10 +2669,15 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 			w.sharedOwnerBeforeProjection(returned)
 		}
 		w.finishSharedOwnerProof(attempt, observation, returned)
-	})
-	if observation != nil {
-		observation.armFinished = time.Now()
 	}
+	if observation != nil {
+		armObservedMutationTimer(delay, callback, func(armed *time.Timer) {
+			w.stormTimer = armed
+			observation.armFinished = time.Now()
+		})
+		return
+	}
+	w.stormTimer = time.AfterFunc(delay, callback)
 }
 
 // stopStormTimerLocked cancels the currently published quiet timer. A timer

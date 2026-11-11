@@ -113,3 +113,70 @@ func TestResolveLuaRequires_UnindexedStaysExternal(t *testing.T) {
 
 	assert.Equal(t, "unresolved::import::nonexistent.module", e.To)
 }
+
+func luauTree(g graph.Store) {
+	for _, f := range []string{
+		"top.luau",
+		"src/shared/MatchState.luau",
+		"src/shared/MatchState/Child.luau",
+		"src/shared/Economy.luau",
+		"src/shared/Pkg/init.luau",
+		"src/shared/Pkg/Inner.luau",
+		"src/shared/Both.luau",
+		"src/shared/Both/init.luau",
+		"src/other/Util.luau",
+	} {
+		seedFile(g, f, "luau")
+	}
+}
+
+// TestResolveLuaRequires_LuauPaths pins Luau's require-by-string resolution.
+func TestResolveLuaRequires_LuauPaths(t *testing.T) {
+	cases := []struct {
+		name, from, spec, want string
+	}{
+		{"sibling", "src/shared/MatchState.luau", "./Economy", "src/shared/Economy.luau"},
+		{"parent", "src/shared/MatchState.luau", "../other/Util", "src/other/Util.luau"},
+		{"directory module", "src/shared/MatchState.luau", "./Pkg", "src/shared/Pkg/init.luau"},
+		{"self child", "src/shared/MatchState.luau", "@self/Child", "src/shared/MatchState/Child.luau"},
+		{"init self", "src/shared/Pkg/init.luau", "@self/Inner", "src/shared/Pkg/Inner.luau"},
+		{"init sibling is its folder's sibling", "src/shared/Pkg/init.luau", "./Economy", "src/shared/Economy.luau"},
+		{"missing stays unresolved", "src/shared/MatchState.luau", "./Missing", ""},
+		{"no suffix fallback", "src/other/Util.luau", "./Economy", ""},
+		{"file and init module collide", "src/shared/MatchState.luau", "./Both", ""},
+		{"climbs out of the root", "top.luau", "../Economy", ""},
+		{"config alias not modelled", "src/shared/MatchState.luau", "@game/ReplicatedStorage/Shared/Economy", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			luauTree(g)
+			e := luaRequire(g, tc.from, tc.spec, "")
+
+			New(g).resolveLuaRequires()
+
+			want := tc.want
+			if want == "" {
+				want = "unresolved::import::" + tc.spec
+			}
+			assert.Equal(t, want, e.To)
+		})
+	}
+}
+
+// TestResolveAll_LuauRequiresReachLuaPass catches the generic import resolver
+// claiming Lua requires before the Lua pass runs.
+func TestResolveAll_LuauRequiresReachLuaPass(t *testing.T) {
+	g := graph.New()
+	luauTree(g)
+	from := "src/shared/MatchState.luau"
+	sibling := &graph.Edge{From: from, To: "unresolved::import::./Economy", Kind: graph.EdgeImports, FilePath: from, Line: 2}
+	dirModule := &graph.Edge{From: from, To: "unresolved::import::./Pkg", Kind: graph.EdgeImports, FilePath: from, Line: 3}
+	g.AddEdge(sibling)
+	g.AddEdge(dirModule)
+
+	New(g).ResolveAll()
+
+	assert.Equal(t, "src/shared/Economy.luau", sibling.To)
+	assert.Equal(t, "src/shared/Pkg/init.luau", dirModule.To)
+}

@@ -15,29 +15,51 @@ import (
 
 var editProbeTierLine = regexp.MustCompile(`^(file|relations|derived): (pending|pending_unknown|unknown|failed|fresh) \(([0-9]+) files\)$`)
 
+type editProbeTierLabel struct {
+	Scope string      `json:"scope"`
+	State string      `json:"state"`
+	Count json.Number `json:"count"`
+}
+
+// A typed, harness-local proof preserves every scope without allowing a JSON
+// sibling to manufacture an extra freshness claim.
+type editProbeTierLabels []editProbeTierLabel
+
+const editProbeTierLabelsKey = "\x00load.tier.labels"
+
 // The label is producer evidence, not disposable prose. Keep its exact scope,
 // state and count while decoding the underlying compact/TOON payload normally.
 func editProbeTierPrefix(text []byte) ([]byte, map[string]any, error) {
-	first, rest, found := bytes.Cut(text, []byte("\n"))
-	match := editProbeTierLine.FindSubmatch(first)
-	if match == nil {
+	var labels editProbeTierLabels
+	seen := make(map[string]bool)
+	for {
+		first, rest, found := bytes.Cut(text, []byte("\n"))
+		match := editProbeTierLine.FindSubmatch(first)
+		if match == nil {
+			break
+		}
+		if !found {
+			return nil, nil, errors.New("freshness label has no payload boundary")
+		}
+		scope, state := string(match[1]), string(match[2])
+		if seen[scope] {
+			return nil, nil, errors.New("repeated freshness label for " + scope)
+		}
+		count, err := strconv.ParseUint(string(match[3]), 10, 63)
+		if err != nil {
+			return nil, nil, err
+		}
+		if state == "fresh" && count != 0 {
+			return nil, nil, errors.New("freshness label claims fresh with pending files")
+		}
+		labels = append(labels, editProbeTierLabel{Scope: scope, State: state, Count: json.Number(strconv.FormatUint(count, 10))})
+		seen[scope], text = true, rest
+	}
+	if len(labels) == 0 {
 		return text, nil, nil
 	}
-	if !found {
-		return nil, nil, errors.New("freshness label has no payload boundary")
-	}
-	count, err := strconv.ParseUint(string(match[3]), 10, 63)
-	if err != nil {
-		return nil, nil, err
-	}
-	if string(match[2]) == "fresh" && count != 0 {
-		return nil, nil, errors.New("freshness label claims fresh with pending files")
-	}
-	next, _, _ := bytes.Cut(rest, []byte("\n"))
-	if editProbeTierLine.Match(next) {
-		return nil, nil, errors.New("repeated freshness label")
-	}
-	return rest, map[string]any{"graph_freshness": string(match[2]), "freshness_scope": string(match[1]), "pending_file_count": json.Number(strconv.FormatUint(count, 10))}, nil
+	first := labels[0]
+	return text, map[string]any{"graph_freshness": first.State, "freshness_scope": first.Scope, "pending_file_count": first.Count, editProbeTierLabelsKey: labels}, nil
 }
 
 func editProbeKeepTierFields(body, fields map[string]any) error {

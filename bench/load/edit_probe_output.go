@@ -263,13 +263,19 @@ func editProbeRequestOutput(req request) string {
 // The dispatched output keeps each request's selected wire explicit with no
 // byte budget; any request that selected nothing else stays JSON.
 func editProbeDispatchOutput(req request) map[string]any {
+	output := map[string]any{"format": "json", "max_bytes": 0}
 	switch editProbeRequestOutput(req) {
 	case "toon":
-		return map[string]any{"format": "toon", "max_bytes": 0}
+		output["format"] = "toon"
 	case "compact":
-		return map[string]any{"format": "json", "compact": true, "max_bytes": 0}
+		output["compact"] = true
 	}
-	return map[string]any{"format": "json", "max_bytes": 0}
+	if requested, ok := req.Arguments["output"].(map[string]any); ok {
+		if fields, present := requested["fields"]; present {
+			output["fields"] = fields
+		}
+	}
+	return output
 }
 
 // Compact is requested only from the operations with a compact producer;
@@ -282,6 +288,11 @@ func editProbeWithOutput(req request, format string) request {
 	case format != "toon":
 		return req
 	}
+	if requested, ok := req.Arguments["output"].(map[string]any); ok {
+		if fields, present := requested["fields"]; present {
+			output["fields"] = fields
+		}
+	}
 	req.Arguments = copyJSON(req.Arguments)
 	if req.Arguments == nil {
 		req.Arguments = make(map[string]any)
@@ -290,10 +301,17 @@ func editProbeWithOutput(req request, format string) request {
 	return req
 }
 func editProbeOutputOracles(c Corpus, oracles []editProbeOracle) []editProbeOracle {
-	if c.EditOutput != "toon" && c.EditOutput != "compact" {
-		return oracles
-	}
 	for i := range oracles {
+		if c.EditKind == "add_intrafile_call" && (oracles[i].name == "summary" || oracles[i].name == "editing_context") {
+			// Keep every definition identity under the existing response budget;
+			// per-node search metadata is not part of these presence witnesses.
+			req := oracles[i].call
+			req.Arguments = copyJSON(req.Arguments)
+			output := editProbeDispatchOutput(req)
+			output["fields"] = "id,name,file_path,start_line,end_line"
+			req.Arguments["output"] = output
+			oracles[i].call = req
+		}
 		oracles[i].call = editProbeWithOutput(oracles[i].call, c.EditOutput)
 	}
 	return oracles

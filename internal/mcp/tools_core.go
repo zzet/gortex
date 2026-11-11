@@ -1757,15 +1757,6 @@ func (s *Server) handleGetSymbol(ctx context.Context, req mcp.CallToolRequest) (
 	sess := s.sessionFor(ctx)
 	afterFreshSymbolAcceptance(ctx, func() { sess.recordSymbol(id) })
 
-	// Enrichment can spawn a language server and persist a generation before
-	// serialization. Keep that shape out of after-leaf replay; staging the
-	// session credit does not make those producer effects replay-safe.
-	if s.semanticMgr != nil && s.graph != nil && !nodeHasSemanticType(node) {
-		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
-			state.replayUnsafe = true
-		}
-	}
-
 	// On-demand LSP: when the synchronous LSP sweep is off (the default), fault
 	// in this symbol's precise type now — one hover on the lazy-spawned server,
 	// cached in the graph. No-op when it already has a type or no server serves
@@ -2924,7 +2915,7 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		s.recordFileBaselineSavings(ctx, "get_file_summary", fp, summaryLang, string(payload))
 	}
 	if s.isTOON(ctx, req) {
-		return returnTOON(result)
+		return returnTOON(applyFieldsFilter(result, parseFields(req.GetString("fields", ""))))
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }

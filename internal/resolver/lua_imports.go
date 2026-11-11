@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"path"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -18,7 +19,9 @@ import (
 // directory module), the direct repo-relative path winning, then a unique
 // path-suffix match (the package-root net). Roblox instance-path requires bind
 // to the unique `<leaf>.lua` / `<leaf>.luau` file in the repo, refusing on
-// ambiguity. Edges whose target is not indexed stay external.
+// ambiguity. Luau require-by-string paths (`./X`, `../X`, `@self/X`) bind
+// relative to the requiring file. Edges whose target is not indexed stay
+// unresolved.
 //
 // Runs serially in ResolveAll's relative-import settle window, after
 // resolveRelativeImports (which never touches Lua).
@@ -60,12 +63,7 @@ func (r *Resolver) resolveLuaRequires() {
 		if name == "" {
 			continue
 		}
-		var resolved string
-		if _, isRoblox := e.Meta["roblox_path"]; isRoblox {
-			resolved = resolveLuaRobloxRequire(filesByBase, name)
-		} else {
-			resolved = resolveLuaModuleRequire(fileIDs, filesByBase, name)
-		}
+		resolved := resolveLuaRequire(fileIDs, filesByBase, e, name)
 		if resolved == "" {
 			continue
 		}
@@ -80,11 +78,31 @@ func (r *Resolver) resolveLuaRequires() {
 	}
 }
 
+// isLuaRequireEdge marks the requires resolveLuaRequires owns. The generic
+// import resolver runs first and would stub them `external::` (which the Lua
+// pass skips) or bind `./Pkg` to any file under a `Pkg/` folder.
+func isLuaRequireEdge(e *graph.Edge) bool {
+	return strings.HasSuffix(e.FilePath, ".lua") || strings.HasSuffix(e.FilePath, ".luau")
+}
+
+func resolveLuaRequire(fileIDs map[string]struct{}, filesByBase map[string][]string, e *graph.Edge, spec string) string {
+	if _, isRoblox := e.Meta["roblox_path"]; isRoblox {
+		return resolveLuaRobloxRequire(filesByBase, spec)
+	}
+	if isLuauPathRequire(spec) {
+		return resolveLuauPathRequire(fileIDs, e.From, spec)
+	}
+	return resolveLuaModuleRequire(fileIDs, filesByBase, spec)
+}
+
 // luaModuleCandidates converts a dotted/slashed Lua module path to its ordered
 // candidate file paths: the `.lua` / `.luau` file, then the `init` directory
 // module.
 func luaModuleCandidates(modPath string) []string {
-	p := strings.Trim(strings.ReplaceAll(modPath, ".", "/"), "/")
+	return luaFileCandidates(strings.Trim(strings.ReplaceAll(modPath, ".", "/"), "/"))
+}
+
+func luaFileCandidates(p string) []string {
 	if p == "" {
 		return nil
 	}
@@ -122,6 +140,66 @@ func resolveLuaRobloxRequire(filesByBase map[string][]string, leaf string) strin
 			}
 			match = cand
 		}
+	}
+	return match
+}
+
+// Luau rejects an unprefixed require path, so the prefix alone decides it.
+func isLuauPathRequire(spec string) bool {
+	return strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") || strings.HasPrefix(spec, "@")
+}
+
+// A relative path names one place, so a miss stays unresolved rather than
+// falling back to the suffix net.
+func resolveLuauPathRequire(fileIDs map[string]struct{}, fromFile, spec string) string {
+	modPath, ok := luauRequireModulePath(fromFile, spec)
+	if !ok {
+		return ""
+	}
+	return luauModuleFile(fileIDs, modPath)
+}
+
+// Per Luau's amended require resolution, an `init` file stands in for its
+// directory. Aliases other than `@self` need `.luaurc` or Rojo config.
+func luauRequireModulePath(fromFile, spec string) (string, bool) {
+	dir, file := path.Split(fromFile)
+	dir = strings.TrimSuffix(dir, "/")
+	stem := strings.TrimSuffix(file, path.Ext(file))
+	isInit := stem == "init"
+
+	var base, rest string
+	switch {
+	case spec == "@self" || strings.HasPrefix(spec, "@self/"):
+		base, rest = path.Join(dir, stem), strings.TrimPrefix(spec, "@self")
+		if isInit {
+			base = dir
+		}
+	case strings.HasPrefix(spec, "@"):
+		return "", false
+	default:
+		base, rest = dir, spec
+		if isInit {
+			base = path.Join(dir, "..")
+		}
+	}
+	joined := path.Join(base, rest)
+	if joined == "." || joined == ".." || strings.HasPrefix(joined, "../") {
+		return "", false
+	}
+	return joined, true
+}
+
+// Luau errors when a path matches more than one candidate, so this refuses too.
+func luauModuleFile(fileIDs map[string]struct{}, modPath string) string {
+	match := ""
+	for _, c := range luaFileCandidates(modPath) {
+		if _, ok := fileIDs[c]; !ok {
+			continue
+		}
+		if match != "" {
+			return ""
+		}
+		match = c
 	}
 	return match
 }

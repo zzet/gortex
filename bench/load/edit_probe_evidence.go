@@ -227,6 +227,13 @@ func editProbeCompactCorrect(oracle string, answer editProbeCompactAnswer, c Cor
 }
 
 func editProbeClaimsFresh(body map[string]any) bool {
+	if labels, ok := body[editProbeTierLabelsKey].(editProbeTierLabels); ok {
+		for _, label := range labels {
+			if label.State == "fresh" {
+				return true
+			}
+		}
+	}
 	claims := func(row map[string]any) bool {
 		if row["graph_freshness"] == "fresh" || row["freshness_state"] == "fresh" {
 			return true

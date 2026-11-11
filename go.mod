@@ -225,7 +225,7 @@ require (
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/gofrs/flock v0.13.1
-	github.com/gomlx/go-huggingface v0.4.17
+	github.com/gomlx/go-huggingface v0.4.26
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/renameio v1.0.1
 	github.com/google/uuid v1.6.0
@@ -237,11 +237,11 @@ require (
 	github.com/gortexhq/tree-sitter-protobuf v0.1.0
 	github.com/gortexhq/tree-sitter-sql v0.1.0
 	github.com/gortexhq/tree-sitter-swift v0.1.1-0.20260424235305-8dde3a3327dd
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/jedib0t/go-pretty/v6 v6.8.3
-	github.com/knights-analytics/hugot v0.8.4
+	github.com/knights-analytics/hugot v0.8.5
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v1.4.0
+	github.com/mark3labs/mcp-go v1.5.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -249,7 +249,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/sabhiram/go-gitignore v0.0.0-20210923224102-525f6e181f06
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.10
+	github.com/spf13/pflag v1.1.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.12.1
 	github.com/toon-format/toon-go v1.0.1
@@ -273,7 +273,7 @@ require (
 	github.com/tree-sitter/tree-sitter-python v0.25.0
 	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
-	github.com/tree-sitter/tree-sitter-scala v0.26.3
+	github.com/tree-sitter/tree-sitter-scala v0.26.4
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/yalue/onnxruntime_go v1.38.0
 	github.com/zeebo/blake3 v0.2.4
@@ -287,8 +287,8 @@ require (
 	golang.org/x/tools v0.52.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/libc v1.79.1
-	modernc.org/sqlite v1.61.0
+	modernc.org/libc v1.80.1
+	modernc.org/sqlite v1.61.1
 	pgregory.net/rapid v1.3.0
 )
 
@@ -307,12 +307,12 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
-	github.com/gomlx/compute v0.1.16 // indirect
-	github.com/gomlx/compute-onnx v0.1.15 // indirect
+	github.com/gomlx/compute v0.1.24 // indirect
+	github.com/gomlx/compute-onnx v0.1.23 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
-	github.com/gomlx/go-xla v0.4.16 // indirect
-	github.com/gomlx/gomlx v0.28.19 // indirect
-	github.com/gomlx/onnx-gomlx v0.5.16 // indirect
+	github.com/gomlx/go-xla v0.4.24 // indirect
+	github.com/gomlx/gomlx v0.28.28 // indirect
+	github.com/gomlx/onnx-gomlx v0.5.21 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -325,7 +325,7 @@ require (
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.27 // indirect
-	github.com/microsoft/onnxruntime/go v0.0.0-20261029142256-a371cbde5d83 // indirect
+	github.com/microsoft/onnxruntime/go v0.0.0-20261030073735-b5fe413d0b05 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect

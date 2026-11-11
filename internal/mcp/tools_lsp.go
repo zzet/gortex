@@ -34,7 +34,7 @@ func nodeHasSemanticType(n *graph.Node) bool {
 // stamps the type into the graph so a second read is free — the per-symbol
 // counterpart to the whole-repo enrichment that no longer runs at cold-index
 // time. Best-effort and idempotent: a no-op when the node already has a type,
-// no LSP server serves its language, or the semantic manager is off. Mutates
+// no LSP server serves its language, or no semantic manager is configured. Mutates
 // the passed node in place (and persists) so the caller's response reflects the
 // fresh type.
 func (s *Server) enrichNodeOnDemand(ctx context.Context, node *graph.Node) {
@@ -60,12 +60,11 @@ func (s *Server) enrichNodeOnDemand(ctx context.Context, node *graph.Node) {
 // needs: the output generation it writes, the workspace root it hovers, and a
 // language server rooted there.
 //
-// The output is resolved BEFORE the server is spawned, and that order is the
-// point: a request reading a checkout of its own has no writable output, so it
-// must not spawn a server or hover any bytes at all. Returns a nil output for
-// that case, for a path that cannot be placed on disk, and when no server
-// serves the language. A nonempty path with nil output means admission succeeded
-// but provider resolution failed; callers can back off that failure separately.
+// A request reading its own checkout is refused before selecting a provider.
+// Otherwise selection is inert, and only a selected candidate admits an output
+// before startup. No provider means no output-authority effects. A nonempty
+// path with nil output means provider selection or startup failed, so callers
+// can back off separately from an output refusal.
 func (s *Server) lspEnrichmentTarget(
 	ctx context.Context, producer string, node *graph.Node,
 ) (string, *EnrichmentOutput, *lsp.Provider) {
@@ -77,23 +76,35 @@ func (s *Server) lspEnrichmentTarget(
 	if err != nil {
 		return "", nil, nil
 	}
-	out, err := s.beginEnrichmentOutput(ctx, producer, node.RepoPrefix, root)
-	if err != nil {
-		// The caller's answer is genuinely thinner for this — no hover-grade
-		// semantic_type, no compiler-confirmed callers — so the request says
-		// so instead of returning a quietly degraded answer that still reads
-		// as complete. This is the only place the on-demand fault-in can be
-		// refused, so it is the only place that has to annotate.
+	noteRefusal := func() {
 		requestViewFromContext(ctx).noteDegraded([]graphview.CapabilityStatus{
 			{Capability: lspEnrichmentCapability(producer), State: graphview.StateUnavailable},
 		})
+	}
+	if requestViewFromContext(ctx).readsOwnCheckout() {
+		noteRefusal()
+		return "", nil, nil
+	}
+	start, _, err := s.lspProviderStartForPath(absPath)
+	if err != nil {
+		return absPath, nil, nil
+	}
+	// Selection above is inert. From here, even a failed or abandoned output
+	// admission can supersede a standing receipt, and startup can own a client.
+	// Mark before either effect, using the same captured candidate exactly once.
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+		state.replayUnsafe = true
+	}
+	out, err := s.beginEnrichmentOutput(ctx, producer, node.RepoPrefix, root)
+	if err != nil {
+		noteRefusal()
 		return "", nil, nil
 	}
 	if out.Root == "" {
 		out.Abandon()
 		return "", nil, nil
 	}
-	provider, _, err := s.lspProviderForPath(absPath)
+	provider, err := start()
 	if err != nil || provider == nil {
 		out.Abandon()
 		return absPath, nil, nil
@@ -456,6 +467,19 @@ func (s *Server) handleFixAllInFile(ctx context.Context, req mcp.CallToolRequest
 // Providers via Manager.AllProviders() — the legacy path that still
 // covers user-defined daemons (`pc.Daemon` without a registry spec).
 func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) {
+	start, abs, err := s.lspProviderStartForPath(path)
+	if err != nil {
+		return nil, abs, err
+	}
+	provider, err := start()
+	return provider, abs, err
+}
+
+// lspProviderStartForPath selects a candidate without spawning or opening a
+// client. The returned closure captures that selection: availability changes
+// after this point can fail startup, but never select a new effectful path.
+// Callers that write must admit their output before invoking it.
+func (s *Server) lspProviderStartForPath(path string) (func() (*lsp.Provider, error), string, error) {
 	if s.semanticMgr == nil {
 		return nil, "", errors.New("semantic manager not configured")
 	}
@@ -467,56 +491,37 @@ func (s *Server) lspProviderForPath(path string) (*lsp.Provider, string, error) 
 	if spec == nil {
 		return nil, abs, fmt.Errorf("no LSP server registered for %s", filepath.Ext(abs))
 	}
-
-	// Router-managed lifecycle wins when configured. The router
-	// returns a *lsp.Provider directly; the LSP-action surface needs
-	// the concrete type for LastDiagnostics / GetCodeActions / etc.
-	if r := s.lspRouter(); r != nil {
-		// Router only knows about specs the user enabled via config
-		// — SpecAvailable filters to "enabled AND on PATH" without
-		// spawning. Probe before ForSpec so an opt-out spec or a
-		// missing binary returns a clean no_lsp_for error.
-		if r.SpecAvailable(spec.Name) {
-			// Pass the per-file workspace root so the cache key
-			// is (spec, workspace) — separate subprocess per repo
-			// in a multi-repo daemon, each rooted correctly. A
-			// shared (spec, defaultWorkspace) reuse would corrupt
-			// rootURI for files outside the first-spawned repo.
-			root, err := s.workspaceRootFor(abs)
-			if err != nil {
-				return nil, abs, err
-			}
-			lp, err := r.ForSpecWorkspace(spec, root)
-			if err != nil {
-				return nil, abs, fmt.Errorf("router spawn %s: %w", spec.Name, err)
-			}
-			return lp, abs, nil
-		}
-		// Fall through to legacy scan — Router is in charge but the
-		// user may have an out-of-registry custom daemon registered
-		// the old way.
-	}
-
-	for _, p := range s.semanticMgr.AllProviders() {
-		lp, ok := p.(*lsp.Provider)
-		if !ok {
-			continue
-		}
-		if !providerCovers(lp, spec) {
-			continue
-		}
-		if !lp.Available() {
-			continue
-		}
-		// Lazy spawn — Provider.EnsureClient is idempotent.
+	if r := s.lspRouter(); r != nil && r.SpecAvailable(spec.Name) {
+		// Keep the per-file workspace in the captured router cache key. A
+		// default-workspace provider would hover a different repository's tree.
 		root, err := s.workspaceRootFor(abs)
 		if err != nil {
 			return nil, abs, err
 		}
-		if err := lp.EnsureClient(root); err != nil {
-			return nil, abs, fmt.Errorf("ensure client %s: %w", spec.Name, err)
+		return func() (*lsp.Provider, error) {
+			provider, err := r.ForSpecWorkspace(spec, root)
+			if err != nil {
+				return nil, fmt.Errorf("router spawn %s: %w", spec.Name, err)
+			}
+			return provider, nil
+		}, abs, nil
+	}
+	// A router-unavailable spec can still have a legacy custom daemon.
+	for _, p := range s.semanticMgr.AllProviders() {
+		provider, ok := p.(*lsp.Provider)
+		if !ok || !providerCovers(provider, spec) || !provider.Available() {
+			continue
 		}
-		return lp, abs, nil
+		root, err := s.workspaceRootFor(abs)
+		if err != nil {
+			return nil, abs, err
+		}
+		return func() (*lsp.Provider, error) {
+			if err := provider.EnsureClient(root); err != nil {
+				return nil, fmt.Errorf("ensure client %s: %w", spec.Name, err)
+			}
+			return provider, nil
+		}, abs, nil
 	}
 	return nil, abs, fmt.Errorf("no LSP provider registered for languages %v", spec.Languages)
 }

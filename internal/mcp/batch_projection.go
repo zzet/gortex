@@ -111,6 +111,9 @@ func (s *Server) publishBatchProjections(ctx context.Context, state *batchTransa
 	state.projectionCommitSeq = sequence
 	state.mu.Unlock()
 	members := verifyBatchProjectionCohort(ctx, receipt, prepared, sequence, s.verifyPreparedProjection)
+	for _, member := range members {
+		holdProjectionForAcknowledgement(projectionAcknowledgementFrom(ctx, s), pendingFileProjections, member.Entry)
+	}
 	_ = pendingFileProjections.publishCohort(members) // cache refusal never changes disk authority
 }
 
