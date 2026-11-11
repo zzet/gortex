@@ -49,6 +49,7 @@ type ContractFollowupCoreFile struct {
 // extractor bytes with their exact source/policy proof; it never falls back to current
 // filesystem bytes. The runner owns Release on every exit.
 type ContractFollowupSnapshot struct {
+	inventoryValues *contractInventoryValues
 	// cohortWork is the complete admitted selected work universe, independent
 	// of which exact attachments still need payloads. Nil preserves legacy
 	// target-union capture; a non-nil empty slice certifies an empty capture.

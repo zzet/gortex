@@ -61,6 +61,7 @@ func newContractDeltaReceipt(boundary string, produced map[string]string) contra
 // reader, store, context, source closure or postpass result survives a job.
 // Clock and unit rounds are one coordinate system and must travel together.
 type contractDeltaCache struct {
+	inventoryValues          *contractInventoryValues
 	continuation             *contractFillContinuation
 	names                    *contractPositiveNameProjection
 	identity                 contractDeltaIdentity

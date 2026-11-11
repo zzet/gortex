@@ -194,7 +194,7 @@ func (s *contractDeltaSession) finish(c *contractConvergence, complete bool) {
 		receipts = make(map[string]contractDeltaReceipt)
 	}
 	pool := &contractProofStrings{}
-	p := &contractDeltaCache{identity: pool.identity(s.identity), units: cloneContractUnitsMode(c.units, false, pool), live: cloneContractDeltaMap(c.live, pool), excluded: cloneContractDeltaMap(c.excluded, pool), suspect: cloneContractDeltaMap(c.suspect, pool), retryOwners: cloneContractIndex(c.retryOwners, pool), declarers: c.declarers.clone(pool), clock: cloneContractClock(c.clock, pool), contentAt: cloneContractDeltaMap(c.contentAt, pool), maxContent: c.maxContent, contents: cloneContractDeltaMap(c.contents, pool), receipts: cloneContractDeltaReceipts(receipts, pool), complete: complete}
+	p := &contractDeltaCache{inventoryValues: c.snap.inventoryValues, identity: pool.identity(s.identity), units: cloneContractUnitsMode(c.units, false, pool), live: cloneContractDeltaMap(c.live, pool), excluded: cloneContractDeltaMap(c.excluded, pool), suspect: cloneContractDeltaMap(c.suspect, pool), retryOwners: cloneContractIndex(c.retryOwners, pool), declarers: c.declarers.clone(pool), clock: cloneContractClock(c.clock, pool), contentAt: cloneContractDeltaMap(c.contentAt, pool), maxContent: c.maxContent, contents: cloneContractDeltaMap(c.contents, pool), receipts: cloneContractDeltaReceipts(receipts, pool), complete: complete}
 	// An interrupted warm delta retains its baseline lineage and completed-job
 	// count without certifying this checkpoint. A cold rebuild starts a new
 	// lineage, even when it is itself interrupted before publication.
@@ -238,10 +238,13 @@ func (s *contractDeltaSession) finish(c *contractConvergence, complete bool) {
 	withoutUnits.units = nil
 	withoutUnits.continuation = nil
 	withoutUnits.names = nil
+	withoutUnits.inventoryValues = nil
 	p.proofStringCount, p.proofStringBytes = pool.seal()
 	pooledBacking := p.proofStringBytes
 	p.retainedBytes = contractRetainedSizeMode(reflect.ValueOf(&withoutUnits), false) + contractRetainedSizeMode(reflect.ValueOf(proofUnits), false) + pooledBacking + optionalBytes
 	p.retainedBytes += p.continuation.metadataSize()
+	// Inventory strings are owned separately from the pooled proof strings.
+	p.retainedBytes += contractRetainedSize(reflect.ValueOf(p.inventoryValues))
 	rawBytes := int64(0)
 	for _, unit := range p.units {
 		p.retainedBytes += unit.retainedRawBytes
