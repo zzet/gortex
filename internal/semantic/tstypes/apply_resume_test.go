@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -59,7 +60,8 @@ type resumeCut struct {
 	spec         *LangSpec
 	fault        func(factPageStats) error
 	unidentified bool
-	reapplied    *int // counts pages applied again behind the cursor
+	logger       *zap.Logger // defaults to a no-op logger
+	reapplied    *int        // counts pages applied again behind the cursor
 	// gateCancelled parks the apply phase behind a gate that never opens
 	// and cancels the pass while it waits there, after parsing finished.
 	gateCancelled bool
@@ -139,7 +141,11 @@ func resumeRunOn(t *testing.T, ctx context.Context, cancel context.CancelFunc, g
 	if spec == nil {
 		spec = TypeScriptSpec()
 	}
-	p := NewProvider(spec, zap.NewNop())
+	logger := cut.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	p := NewProvider(spec, logger)
 	// A test binary carries no VCS stamp, so it is unidentified by default.
 	p.resumeVersion = resumeTestVersion
 	if cut.unidentified {
@@ -373,6 +379,10 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 	require.Greater(t, totalPages, 2*cutAfter)
 
 	provider := TypeScriptSpec().ProviderName
+	const (
+		mayNotResume = "this pass may not resume (dirty tree, forced re-enrich, or a re-parse this run the ledger does not cover)"
+		noIdentity   = "this build has no identity"
+	)
 	cases := []struct {
 		name         string
 		rs           semantic.RepoEnrichState
@@ -380,18 +390,19 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 		unidentified bool
 		prepare      func(*testing.T, *store_sqlite.Store)
 		resumes      bool
-		reapplied    int // pages applied again behind the cursor
+		reapplied    int    // pages applied again behind the cursor
+		refusal      string // the logged reason a stored point was discarded
 	}{
 		{name: "same revision on a clean tree", rs: clean, resumes: true},
-		{name: "revision moved", rs: semantic.RepoEnrichState{SHA: "fedcba9876543210fedcba9876543210fedcba98"}},
-		{name: "dirty tree", rs: semantic.RepoEnrichState{SHA: resumeSHA, Dirty: true}},
-		{name: "whole repo re-parsed this run", rs: semantic.RepoEnrichState{SHA: resumeSHA, Force: true}},
+		{name: "revision moved", rs: semantic.RepoEnrichState{SHA: "fedcba9876543210fedcba9876543210fedcba98"}, refusal: "recorded at another revision"},
+		{name: "dirty tree", rs: semantic.RepoEnrichState{SHA: resumeSHA, Dirty: true}, refusal: mayNotResume},
+		{name: "whole repo re-parsed this run", rs: semantic.RepoEnrichState{SHA: resumeSHA, Force: true}, refusal: mayNotResume},
 		{name: "files re-parsed this run are on the ledger", rs: semantic.RepoEnrichState{SHA: resumeSHA, Force: true, ReparsedFilesMarked: true}, resumes: true},
-		{name: "unidentified build", rs: clean, unidentified: true},
-		{name: "forced re-enrich", rs: clean, env: "1"},
+		{name: "unidentified build", rs: clean, unidentified: true, refusal: noIdentity},
+		{name: "forced re-enrich", rs: clean, env: "1", refusal: mayNotResume},
 		{name: "no revision", rs: semantic.RepoEnrichState{}},
 		{name: "checkout-scoped pass", rs: semantic.RepoEnrichState{SHA: resumeSHA, CheckoutID: "checkout-1"}},
-		{name: "engine version changed", rs: clean, prepare: func(t *testing.T, s *store_sqlite.Store) {
+		{name: "engine version changed", rs: clean, refusal: "recorded by another build", prepare: func(t *testing.T, s *store_sqlite.Store) {
 			point, found, err := s.GetEnrichmentResume("", provider)
 			require.NoError(t, err)
 			require.True(t, found)
@@ -408,7 +419,7 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 		{name: "re-parse ahead of the cursor", rs: clean, resumes: true, prepare: func(t *testing.T, s *store_sqlite.Store) {
 			markReparsePending(t, s, "src/d099.ts")
 		}},
-		{name: "point recorded without a build identity", rs: clean, unidentified: true, prepare: func(t *testing.T, s *store_sqlite.Store) {
+		{name: "point recorded without a build identity", rs: clean, unidentified: true, refusal: noIdentity, prepare: func(t *testing.T, s *store_sqlite.Store) {
 			point, found, err := s.GetEnrichmentResume("", provider)
 			require.NoError(t, err)
 			require.True(t, found)
@@ -427,8 +438,18 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 			if tc.env != "" {
 				t.Setenv("GORTEX_WARMUP_FORCE_ENRICH", tc.env)
 			}
-			got, pages := resumeRunCut(t, dbPath, root, tc.rs, resumeCut{unidentified: tc.unidentified})
+			core, logs := observer.New(zap.InfoLevel)
+			got, pages := resumeRunCut(t, dbPath, root, tc.rs, resumeCut{unidentified: tc.unidentified, logger: zap.New(core)})
 			require.False(t, got.Partial)
+			var reasons []any
+			for _, e := range logs.FilterMessage(resumeRefusedMsg).All() {
+				reasons = append(reasons, e.ContextMap()["reason"])
+			}
+			if tc.refusal == "" {
+				assert.Empty(t, reasons, "nothing was refused")
+			} else {
+				assert.Equal(t, []any{tc.refusal}, reasons, "a refused point is logged once with its cause")
+			}
 			if tc.resumes {
 				assert.Equal(t, totalPages-cutAfter+tc.reapplied, pages, "the committed pages must be skipped")
 			} else {

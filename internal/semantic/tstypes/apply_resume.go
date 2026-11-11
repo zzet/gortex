@@ -154,8 +154,18 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 	if !found {
 		return r
 	}
-	if err == nil && scope.Resume && r.point.Version != "" &&
-		prior.IndexedSHA == scope.SHA && prior.Version == r.point.Version && resumablePhase(prior.Phase) {
+	if why := resumeRefusal(err, scope, prior, r.point.Version); why != "" {
+		if err == nil {
+			// Say why: a point recorded by another build or revision is
+			// discarded by design, but silently it reads as a resume that
+			// never happened.
+			r.logger.Info(resumeRefusedMsg,
+				zap.String("provider", p.Name()), zap.String("repo_prefix", repoPrefix),
+				zap.String("reason", why), zap.Int("phase", prior.Phase),
+				zap.String("recorded_sha", prior.IndexedSHA), zap.String("sha", scope.SHA),
+				zap.String("recorded_version", prior.Version), zap.String("version", r.point.Version))
+		}
+	} else {
 		reapply := len(reparsed) > 0 && prior.LedgerDigest != digest
 		if !reapply || p.spec.ImportHintsAuthoritative {
 			r.point.Phase, r.point.After, r.point.Covered = prior.Phase, prior.After, prior.Covered
@@ -182,6 +192,30 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 			zap.String("provider", p.Name()), zap.String("repo_prefix", repoPrefix), zap.Error(err))
 	}
 	return r
+}
+
+// resumeRefusedMsg is logged once, with its reason, when a stored point is
+// discarded rather than resumed.
+const resumeRefusedMsg = "tstypes: resume point not honoured; applying from the first page"
+
+// resumeRefusal names why a stored point cannot be resumed, or returns ""
+// when it can. Every refusal discards the point.
+func resumeRefusal(err error, scope semantic.EnrichResumeScope, prior graph.EnrichmentResumePoint, version string) string {
+	switch {
+	case err != nil:
+		return "read failed"
+	case !scope.Resume:
+		return "this pass may not resume (dirty tree, forced re-enrich, or a re-parse this run the ledger does not cover)"
+	case version == "":
+		return "this build has no identity"
+	case prior.IndexedSHA != scope.SHA:
+		return "recorded at another revision"
+	case prior.Version != version:
+		return "recorded by another build"
+	case !resumablePhase(prior.Phase):
+		return "recorded in a phase that is not resumable"
+	}
+	return ""
 }
 
 // Aliases resolve into the pass's temp spool only, so no point is recorded
