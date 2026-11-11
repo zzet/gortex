@@ -1535,10 +1535,13 @@ func (c *contractConvergence) extract(idx *Indexer, evidence *contractFollowupEv
 	// its evict and add is in the round's point scan.
 	ledger.owner(file.Path)
 	ledger.key("path:", file.Path)
+	_, byLanguage := idx.buildPerFileContractExtractors()
 	var nodes []*graph.Node
 	var edges []*graph.Edge
 	if projected {
 		nodes, edges, err = evidence.loadFile(file.Path)
+	} else if len(byLanguage[file.Language]) == 0 && file.Language != "gomod" && file.Path != "go.mod" && !strings.HasSuffix(file.Path, "/go.mod") && !contractRouterCensus(file) {
+		nodes, edges, err = evidence.loadExtractorFreeFile(file.Path)
 	} else {
 		nodes, edges, err = evidence.loadExtractionFile(file.Path)
 	}
@@ -1549,7 +1552,6 @@ func (c *contractConvergence) extract(idx *Indexer, evidence *contractFollowupEv
 	if err != nil {
 		return nil, err
 	}
-	_, byLanguage := idx.buildPerFileContractExtractors()
 	var tree *parser.ParseTree
 	if projected {
 		if !idx.contractGeneratedCoreProof(c.ctx, file, src, nodes, edges, c.snap.Core) {

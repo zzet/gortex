@@ -1411,6 +1411,12 @@ func (e *contractFollowupEvidence) loadFileRowsContext(path string, ctx context.
 	if err != nil {
 		return nil, nil, err
 	}
+	return e.importSelectedFileRows(path, nodes, edges, extraction)
+}
+
+// Both extraction paths import the same already checked answer. In particular,
+// discovering a tracker must not ask a custom selected reader a second time.
+func (e *contractFollowupEvidence) importSelectedFileRows(path string, nodes []*graph.Node, edges []*graph.Edge, extraction bool) ([]*graph.Node, []*graph.Edge, error) {
 	if e.loadedFileNodes[path] {
 		// Node-only consumers may already have enriched these private rows.
 		// Extend their edge evidence without replacing scratch mutations or
