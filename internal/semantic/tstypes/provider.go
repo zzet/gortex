@@ -23,7 +23,10 @@ type Provider struct {
 	observeSpool func(string)        // synchronous cleanup test hook
 }
 
-var _ semantic.ContextEnricher = (*Provider)(nil)
+var (
+	_ semantic.ContextEnricher            = (*Provider)(nil)
+	_ semantic.QueueWaitExcludingEnricher = (*Provider)(nil)
+)
 
 // NewProvider wraps a LangSpec as a semantic provider.
 func NewProvider(spec *LangSpec, logger *zap.Logger) *Provider {
@@ -60,6 +63,10 @@ func (p *Provider) Close() error        { return nil }
 // semantic.SupplementalProvider): the manager runs it for its
 // languages in addition to the arbitration winner.
 func (p *Provider) Supplemental() bool { return true }
+
+// ExcludesQueueWaitFromCeiling implements semantic.QueueWaitExcludingEnricher:
+// a full pass brackets its resolve-mutex wait with semantic.ExcludeQueueWait.
+func (p *Provider) ExcludesQueueWaitFromCeiling() {}
 
 // A suppressed fallback does no parsing or graph work, so it needs no
 // shared admission. Active AST passes keep ordinary build-lane admission.
@@ -123,7 +130,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		return context.WithDeadline(ctx, deadlineAt)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		markContextPartial(res, err)
 		res.DurationMs = time.Since(start).Milliseconds()
 		return res, nil
@@ -139,7 +146,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		parseCtx, cancelParse := phaseCtx()
 		if err := p.stageRepoFacts(parseCtx, files, spool); err != nil {
-			parseErr := parseCtx.Err()
+			parseErr := context.Cause(parseCtx)
 			cancelParse()
 			if parseErr != nil {
 				markContextPartial(res, parseErr)
@@ -160,11 +167,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		// resolve phase), then the mutex. Both waits are other passes' work,
 		// so both are excluded from this pass's budget below.
 		if err := semantic.ApplyGateWait(ctx); err != nil {
-			markContextPartial(res, err)
+			markContextPartial(res, context.Cause(ctx))
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
+		// The mutex wait cannot be cancelled, so the Manager's outer ceiling
+		// could only expire during it and cut the apply that follows; stop
+		// that clock while queued, as the budget above already does.
+		resumeCeiling := semantic.ExcludeQueueWait(ctx)
 		mu.Lock()
+		resumeCeiling()
 		lockWait := time.Since(lockStart)
 		res.LockWaitMs = lockWait.Milliseconds()
 		if lockWait > 5*time.Second {
@@ -180,7 +192,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			deadlineAt = deadlineAt.Add(lockWait)
 		}
 		applyCtx, cancelApply := phaseCtx()
-		if err := applyCtx.Err(); err != nil {
+		if err := context.Cause(applyCtx); err != nil {
 			mu.Unlock()
 			cancelApply()
 			markContextPartial(res, err)
@@ -189,7 +201,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res)
 		mu.Unlock()
-		applyCtxErr := applyCtx.Err()
+		applyCtxErr := context.Cause(applyCtx)
 		cancelApply()
 		if applyErr != nil {
 			if applyCtxErr != nil {
@@ -200,7 +212,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			return nil, applyErr
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		markContextPartial(res, err)
 	}
 
@@ -208,6 +220,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	return res, nil
 }
 
+// markContextPartial records a pass cut by its context. Callers pass
+// context.Cause, read before the phase context is released, so the reason
+// names the bound that ended the pass: the pass's own budget (a deadline), the
+// Manager's outer ceiling, or a shutdown (canceled).
 func markContextPartial(res *semantic.EnrichResult, err error) {
 	res.Partial = true
 	res.AbortReason = err.Error()
