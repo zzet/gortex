@@ -1193,7 +1193,26 @@ func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang str
 	ctx := baseCtx
 	cancel := func() {}
 	if d > 0 {
-		ctx, cancel = context.WithTimeout(baseCtx, d)
+		if _, pausable := provider.(QueueWaitExcludingEnricher); pausable {
+			// The provider stops this clock while it queues behind another
+			// pass's apply (see ExcludeQueueWait).
+			var ceiling *enrichCeiling
+			// The alarm can still be running after the pass returns, when d
+			// is reassigned below; log the ceiling it was armed for.
+			armed := d
+			ctx, ceiling = newEnrichCeiling(baseCtx, d, func(queued time.Duration) {
+				m.logger.Warn("semantic enrichment: pass queued on the resolve mutex past its outer ceiling; ceiling paused until it gets the mutex",
+					zap.String("provider", provider.Name()),
+					zap.String("language", lang),
+					zap.String("repo", repoName),
+					zap.Duration("queued", queued),
+					zap.Duration("ceiling", armed),
+				)
+			})
+			cancel = ceiling.stop
+		} else {
+			ctx, cancel = context.WithTimeout(baseCtx, d)
+		}
 	}
 	// Compiler-backed providers use the repository census only to choose an
 	// admission class. Keeping the hint on this pass-owned context avoids
