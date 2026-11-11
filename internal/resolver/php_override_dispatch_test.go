@@ -82,6 +82,14 @@ func TestResolvePHPOverrideDispatch_ParentConstructChain(t *testing.T) {
 	phpType(s, mid+"::Mid", "Mid", map[string]any{"scope_parent": "Base"})
 	phpType(s, leaf+"::Leaf", "Leaf", map[string]any{"scope_parent": "Mid"})
 	phpMethod(s, leaf+"::Leaf.__construct", "__construct", "Leaf")
+	s.AddEdge(&graph.Edge{
+		From: mid + "::Mid", To: base + "::Base", Kind: graph.EdgeExtends,
+		FilePath: mid, Meta: map[string]any{"target_fqn": "Base"},
+	})
+	s.AddEdge(&graph.Edge{
+		From: leaf + "::Leaf", To: mid + "::Mid", Kind: graph.EdgeExtends,
+		FilePath: leaf, Meta: map[string]any{"target_fqn": "Mid"},
+	})
 
 	caller := leaf + "::Leaf.__construct"
 	s.AddEdge(&graph.Edge{

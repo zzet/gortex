@@ -5174,6 +5174,17 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		return
 	}
 
+	// PHP parent:: calls must bind through the ancestor chain, never through
+	// the caller's receiver or a same-directory guess. If the scope rule could
+	// not bind (including when reachability hid the parent), leave the call for
+	// resolvePHPOverrideDispatch; an external parent must stay unresolved.
+	if scopeMetaString(e.Meta, MetaScopeKind) == ScopeKindParent {
+		if caller := r.cachedGetNode(e.From); phpTypedReceiverCaller(caller) {
+			stats.Unresolved++
+			return
+		}
+	}
+
 	callerDir := r.dirFor(e.FilePath)
 	receiverType := edgeReceiverType(e)
 

@@ -229,6 +229,11 @@ func TestScope_PhpParentCall(t *testing.T) {
 		Meta: map[string]any{"receiver": "Other", MetaScopeClass: "Other"},
 	})
 	// Child.handle() calls parent::handle() — must bind to Base.handle.
+	g.AddEdge(&graph.Edge{
+		From: "src/Child.php::Child", To: "src/Base.php::Base",
+		Kind: graph.EdgeExtends, FilePath: "src/Child.php",
+		Meta: map[string]any{"target_fqn": "Base"},
+	})
 	e := &graph.Edge{
 		From: "src/Child.php::Child.handle", To: "unresolved::*.handle",
 		Kind: graph.EdgeCalls, FilePath: "src/Child.php", Line: 7,

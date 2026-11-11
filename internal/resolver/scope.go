@@ -336,20 +336,12 @@ func (r *Resolver) preferJavaScopeCandidate(e *graph.Edge, caller *graph.Node, n
 func (r *Resolver) preferPhpScopeCandidate(e *graph.Edge, caller *graph.Node, name string, candidates []*graph.Node) *graph.Node {
 	switch scopeMetaString(e.Meta, MetaScopeKind) {
 	case ScopeKindParent:
-		enclosing := callerEnclosingClass(caller)
-		if enclosing == "" {
-			return nil
-		}
-		parent := r.phpParentClass(caller, enclosing)
-		if parent == "" {
+		parent, ok := r.phpParentID(strings.TrimSuffix(caller.ID, "."+caller.Name))
+		if !ok {
 			return nil
 		}
 		for _, c := range candidates {
-			if c.Kind != graph.KindMethod {
-				continue
-			}
-			if scopeMetaString(c.Meta, MetaScopeClass) == parent ||
-				receiverEquals(c, parent) {
+			if c.Kind == graph.KindMethod && strings.TrimSuffix(c.ID, "."+c.Name) == parent {
 				return c
 			}
 		}
@@ -433,23 +425,6 @@ func (r *Resolver) javaParentClass(caller *graph.Node, child string) string {
 			continue
 		}
 		if n.Language != "java" {
-			continue
-		}
-		if parent := scopeMetaString(n.Meta, MetaScopeParentClass); parent != "" {
-			return parent
-		}
-	}
-	return ""
-}
-
-// phpParentClass is the PHP analogue of javaParentClass. Same
-// strategy, scoped to PHP-language nodes.
-func (r *Resolver) phpParentClass(caller *graph.Node, child string) string {
-	for _, n := range r.graph.FindNodesByName(child) {
-		if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
-			continue
-		}
-		if n.Language != "php" {
 			continue
 		}
 		if parent := scopeMetaString(n.Meta, MetaScopeParentClass); parent != "" {
