@@ -36,7 +36,9 @@ type ContractFollowupCaptureOptions struct {
 	// because their receipt row cannot be in flight in this process: a
 	// deleted row, or an unaccepted row no mutation of this process wrote.
 	// Policy-stale primary rows also need repair: no source mutation may
-	// arrive to replace their already accepted receipts.
+	// arrive to replace their already accepted receipts. So does a primary
+	// census file on disk with no row at all in a current baseline: its file
+	// did not move, so no mutation will write one.
 	SuspectStuck func(repo string, paths []string)
 	// rebuildBaseline bypasses an old accepted baseline during policy repair.
 	rebuildBaseline bool
@@ -317,11 +319,13 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 	extractionOptions := make(map[string]parser.ExtractionOptions)
 	pathRepos := make(map[string]string)
 	scopes := make(map[string][2]string)
+	primaryRoots := make(map[string]string)
 	for _, repo := range repos {
 		root, ok := options.MultiIndexer.RepoRoot(repo)
 		if !ok {
 			return ContractFollowupSnapshot{}, fmt.Errorf("contract capture: source root unavailable for %q", repo)
 		}
+		primaryRoots[repo] = root
 		options.MultiIndexer.mu.RLock()
 		cfg := options.Config
 		if options.MultiIndexer.configMgr != nil {
@@ -465,6 +469,22 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	// absent holds, by repository, the census files a selected capture found
+	// on the primary disk with no primary receipt row in a current baseline.
+	// It is bounded by what a baseline skipped: a receipt version change
+	// leaves every row's namespace without a current baseline, and the
+	// baseline rebuild replaces those, not one forced reindex. A row of
+	// another version, an old failure envelope included, is not absent and
+	// keeps its earlier refusal.
+	absent := make(map[string][]string)
+	// A linked actor's selection carries a witness of its own checkout. It
+	// reports an absent primary row too, but fails once instead of waiting.
+	linked := false
+	if options.selectedInputs != nil {
+		for _, w := range options.selectedInputs.Witnesses {
+			linked = linked || w.State.CheckoutID != ""
+		}
+	}
 	// Keep receipt payloads streaming and admission facts bounded to one
 	// existing frontier chunk. Sparse upper layers are resolved by indexed keys,
 	// rather than thousands of independently prepared point misses per layer.
@@ -507,7 +527,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			// Admission reads durable receipt identities, never every source file.
 			// Missing legacy proof is usable only by background baseline rebuilding.
 			repoHandles := handlesByRepo[repo]
-			excluded := false
+			excluded, primaryAbsent := false, false
 			if options.selectedInputs == nil {
 				// Baseline repair derives its source proof from accepted core metadata,
 				// even when old optional analysis receipts are incomplete or obsolete.
@@ -524,9 +544,15 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 					}
 				}
 				for _, actor := range actors {
-					row, _, e := repoHandles[i].ContractBoundaryReceiptForVersionContext(ctx, repo, actor, path, contractBoundaryReceiptVersion)
+					row, known, e := repoHandles[i].ContractBoundaryReceiptForVersionContext(ctx, repo, actor, path, contractBoundaryReceiptVersion)
 					if e != nil {
 						return ContractFollowupSnapshot{}, e
+					}
+					// known is true for a missing row only when the namespace
+					// baseline is at the current receipt version; a row of
+					// another version reads as missing and not known.
+					if row == nil && known && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+						primaryAbsent = true
 					}
 					if row != nil {
 						if row.Accepted && contractReceiptIsFailureEnvelope(row) {
@@ -597,8 +623,40 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 				snapshot.Excluded = append(snapshot.Excluded, path)
 				continue
 			}
+			// Only a file on the primary disk is the primary repair's: a
+			// linked actor's census may hold a file only its worktree has.
+			if file.SourceFingerprint == "" && primaryAbsent && repo != "" && contractCensusFileOnDisk(primaryRoots[repo], repo, path) {
+				absent[repo] = append(absent[repo], path)
+				continue
+			}
 			snapshot.Files = append(snapshot.Files, file)
 		}
+	}
+	if len(absent) > 0 {
+		// A census file with no primary receipt row has nothing to admit,
+		// and no live mutation will write one: its file did not move, which
+		// a baseline that skipped it as moved (contract_baseline_reconcile.go)
+		// cannot tell. The repair reparses it under the repository's lane and
+		// announces the result; the request waits for that announcement. The
+		// report waits for the whole census, so one capture names every such
+		// file and the repair takes them in one forced reindex.
+		names := make([]string, 0, len(absent))
+		for repo := range absent {
+			names = append(names, repo)
+		}
+		sort.Strings(names)
+		for _, repo := range names {
+			if options.SuspectStuck != nil {
+				options.SuspectStuck(repo, absent[repo])
+			}
+		}
+		// A linked actor keeps its earlier refusal: it fails once, and the
+		// repair's accept of the primary row moves the primary witness its
+		// inputs select, which reruns it.
+		if linked {
+			return ContractFollowupSnapshot{}, graph.ErrContractProjectionIncomplete
+		}
+		return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 	}
 
 	if options.selectedInputs != nil {
