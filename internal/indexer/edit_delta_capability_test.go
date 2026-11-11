@@ -117,6 +117,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.CoverageEnrichmentWriter":                       "node-keyed enrichment side tables (blame, churn, coverage, releases): their rows for an evicted node are the layer below's, hidden with the node; a delta writes none",
 	"graph.CrossRepoFlagMarker":                            "cross-repository edge flagging; single-repository delta",
 	"graph.CurrentGenerationRepoEvicter":                   "whole-repository or administrative operation (full index, repository reset, untrack or cleanup, warm start, vector corpus, bulk load windows, WAL maintenance); not on a file delta's per-save path",
+	"graph.EnrichmentResumeStore":                          "durable type-enrichment resume points, recorded by whole-repository type passes and discarded when the re-parse ledger is written; a delta never writes the ledger and records no point",
 	"graph.EdgeEndpointReader":                             "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.EdgeIdentityBatchFinder":                        "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"graph.EdgeKindEvicter":                                "whole-graph eviction of an edge kind; not a file delta (DeltaWriter's EvictRepo-class refusal would apply)",
