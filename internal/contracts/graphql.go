@@ -1,7 +1,10 @@
 package contracts
 
 import (
+	"bytes"
 	"fmt"
+	"go/scanner"
+	"go/token"
 	"regexp"
 	"sort"
 	"strings"
@@ -174,11 +177,25 @@ func (e *GraphQLExtractor) extractConsumers(filePath string, src []byte, fileNod
 	text := string(src)
 	lines := strings.Split(text, "\n")
 
-	// Direct query/mutation/subscription operations.
-	for _, m := range gqlQueryOpRe.FindAllStringSubmatchIndex(text, -1) {
+	// Ordinary Go syntax, such as type query struct, can look like an
+	// operation to the regex. In Go a query document lives in a string.
+	isGo := strings.HasSuffix(filePath, ".go")
+	var operations [][]int
+	if isGo {
+		if gqlQueryOpRe.Match(src) {
+			operations = goGraphQLStringOperations(filePath, src)
+		}
+	} else {
+		operations = gqlQueryOpRe.FindAllStringSubmatchIndex(text, -1)
+	}
+	for _, m := range operations {
 		opType := text[m[2]:m[3]]
 		body := text[m[4]:m[5]]
 		contracts = append(contracts, e.fieldsFromBody(filePath, opType, body, lines, m[0], fileNodes)...)
+	}
+
+	if isGo {
+		return contracts
 	}
 
 	// gql`` tagged template literals.
@@ -191,6 +208,36 @@ func (e *GraphQLExtractor) extractConsumers(filePath string, src []byte, fileNod
 	}
 
 	return contracts
+}
+
+// goGraphQLStringOperations keeps capture offsets relative to the file so
+// the caller can still attribute each operation to its line and symbol.
+func goGraphQLStringOperations(filePath string, src []byte) [][]int {
+	var matches [][]int
+	file := token.NewFileSet().AddFile(filePath, -1, len(src))
+	var s scanner.Scanner
+	s.Init(file, src, nil, 0)
+	for pos, tok, lit := s.Scan(); tok != token.EOF; pos, tok, lit = s.Scan() {
+		if tok != token.STRING {
+			continue
+		}
+		start := file.Offset(pos)
+		end := start + len(lit)
+		if src[start] == '`' {
+			// The Go scanner strips carriage returns from raw literals.
+			// Look for the closing quote in the source to retain offsets.
+			if close := bytes.IndexByte(src[start+1:], '`'); close >= 0 {
+				end = start + close + 2
+			}
+		}
+		for _, m := range gqlQueryOpRe.FindAllSubmatchIndex(src[start:end], -1) {
+			for i := range m {
+				m[i] += start
+			}
+			matches = append(matches, m)
+		}
+	}
+	return matches
 }
 
 func (e *GraphQLExtractor) fieldsFromBody(filePath, opType, body string, lines []string, baseOffset int, fileNodes []*graph.Node) []Contract {

@@ -316,6 +316,46 @@ func wire(s *grpc.Server, impl interface{}) {
 	}
 }
 
+func TestGRPCExtractor_TSClientsRequireGRPCEvidence(t *testing.T) {
+	extractor := &GRPCExtractor{}
+	for _, tc := range []struct {
+		name, imports string
+		want          bool
+	}{
+		{"LSP", `import { LanguageClient } from "vscode-languageclient";`, false},
+		{"WebSocket", `import { PreviewClient } from "./preview";`, false},
+		{"comment", `// import { credentials } from "@grpc/grpc-js";`, false},
+		{"line comment", `// example; import "@grpc/grpc-js";`, false},
+		{"block comment", "/*\nimport \"@grpc/grpc-js\";\n*/", false},
+		{"template literal", "const sample = `\nimport \"@grpc/grpc-js\";\n`;", false},
+		{"dynamic", `const { PreviewClient } = await import("./preview_pb.js");`, true},
+		{"dynamic comment", `const { PreviewClient } = await import(/* chunk */ "./preview_pb.js");`, true},
+		{"require comment", `const { PreviewClient } = require(/* note */ "./preview_pb.cjs");`, true},
+		{"require later argument", `const other = require(resolvePath, "./preview_pb.cjs");`, false},
+		{"import equals", `import grpc = require("@grpc/grpc-js");`, true},
+		{"package prefix", `import "grpc-websocket";`, false},
+		{"grpc-js", `import { credentials } from "@grpc/grpc-js";`, true},
+		{"proto loader", `import * as protoLoader from "@grpc/proto-loader";`, true},
+		{"Connect", `import { createClient } from "@connectrpc/connect";`, true},
+		{"grpc-web", `import "grpc-web";`, true},
+		{"generated", `import { PreviewClient } from "./preview_grpc_pb.js";`, true},
+		{"require", `const { PreviewClient } = require("./preview_pb.cjs");`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte(tc.imports + "\nconst preview = new PreviewClient(open);\npreview.start();\nnew HubClient();\n")
+			got := extractor.Extract("editor.ts", src, nil, nil)
+			if !tc.want {
+				if len(got) != 0 {
+					t.Fatalf("expected no gRPC contracts, got %+v", got)
+				}
+				return
+			}
+			findContract(t, got, "grpc::Preview::start", RoleConsumer)
+			findContract(t, got, "grpc::Hub", RoleConsumer)
+		})
+	}
+}
+
 func assertContract(t *testing.T, c Contract, id string, ctype ContractType, role Role) {
 	t.Helper()
 	if c.ID != id {

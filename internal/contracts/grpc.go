@@ -3,11 +3,16 @@ package contracts
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+	"github.com/zzet/gortex/internal/parser/tsitter/tsx"
+	"github.com/zzet/gortex/internal/parser/tsitter/typescript"
 )
 
 // GRPCExtractor detects gRPC service definitions (providers) and client usage (consumers).
@@ -524,70 +529,9 @@ func (e *GRPCExtractor) extractConsumers(filePath string, src []byte, fileNodes 
 		})
 	}
 
-	// TS: new ServiceNameClient() — service-level only in v1.
-	// Also walk the rest of the file for per-method calls and emit
-	// method-level contracts when we find them, carrying the
-	// request type from the inline message literal.
-	tsVarToService := make(map[string]string)
-	for _, m := range tsGRPCNewClientAssignRe.FindAllStringSubmatch(text, -1) {
-		tsVarToService[m[1]] = m[2]
-	}
-	tsSeen := make(map[string]struct{})
-	for _, m := range tsGRPCCallRe.FindAllStringSubmatchIndex(text, -1) {
-		recv := text[m[2]:m[3]]
-		method := text[m[4]:m[5]]
-		svc, ok := tsVarToService[recv]
-		if !ok {
-			continue
-		}
-		ln := lineNumber(lines, m[0])
-		key := fmt.Sprintf("%s::%s::%d", svc, method, ln)
-		if _, dup := tsSeen[key]; dup {
-			continue
-		}
-		tsSeen[key] = struct{}{}
-		meta := map[string]any{"service": svc, "method": method, "lang": "typescript"}
-		if rt := detectTSGRPCRequestType(text, m[1]); rt != "" {
-			meta["request_type"] = rt
-			meta["schema_source"] = "extracted"
-		} else {
-			meta["schema_source"] = "partial"
-		}
-		contracts = append(contracts, Contract{
-			ID:         fmt.Sprintf("grpc::%s::%s", svc, method),
-			Type:       ContractGRPC,
-			Role:       RoleConsumer,
-			SymbolID:   findEnclosingSymbol(fileNodes, ln),
-			FilePath:   filePath,
-			Line:       ln,
-			Meta:       meta,
-			Confidence: 0.9,
-		})
-	}
-	// Fallback service-level contracts for TS clients that don't
-	// have resolvable method calls.
-	tsEmitted := make(map[string]struct{})
-	for _, c := range contracts {
-		if s, _ := c.Meta["service"].(string); s != "" && c.Meta["lang"] == "typescript" {
-			tsEmitted[s] = struct{}{}
-		}
-	}
-	for _, m := range tsGRPCNewClientRe.FindAllStringSubmatchIndex(text, -1) {
-		svc := text[m[2]:m[3]]
-		if _, already := tsEmitted[svc]; already {
-			continue
-		}
-		ln := lineNumber(lines, m[0])
-		contracts = append(contracts, Contract{
-			ID:         fmt.Sprintf("grpc::%s", svc),
-			Type:       ContractGRPC,
-			Role:       RoleConsumer,
-			SymbolID:   findEnclosingSymbol(fileNodes, ln),
-			FilePath:   filePath,
-			Line:       ln,
-			Meta:       map[string]any{"service": svc, "lang": "typescript"},
-			Confidence: 0.85,
-		})
+	// Only interpret Client constructors when the file imports a gRPC package or stub.
+	if tsGRPCNewClientRe.MatchString(text) && tsFileImportsGRPC(filePath, src) {
+		contracts = append(contracts, extractTSGRPCConsumers(text, lines, filePath, fileNodes)...)
 	}
 
 	// Python: ServiceNameStub(channel) — service-level + method-level
@@ -653,6 +597,134 @@ func (e *GRPCExtractor) extractConsumers(filePath string, src []byte, fileNodes 
 	}
 
 	return contracts
+}
+
+func extractTSGRPCConsumers(text string, lines []string, filePath string, fileNodes []*graph.Node) []Contract {
+	var contracts []Contract
+	tsVarToService := make(map[string]string)
+	for _, m := range tsGRPCNewClientAssignRe.FindAllStringSubmatch(text, -1) {
+		tsVarToService[m[1]] = m[2]
+	}
+	tsSeen := make(map[string]struct{})
+	for _, m := range tsGRPCCallRe.FindAllStringSubmatchIndex(text, -1) {
+		recv := text[m[2]:m[3]]
+		method := text[m[4]:m[5]]
+		svc, ok := tsVarToService[recv]
+		if !ok {
+			continue
+		}
+		ln := lineNumber(lines, m[0])
+		key := fmt.Sprintf("%s::%s::%d", svc, method, ln)
+		if _, dup := tsSeen[key]; dup {
+			continue
+		}
+		tsSeen[key] = struct{}{}
+		meta := map[string]any{"service": svc, "method": method, "lang": "typescript"}
+		if rt := detectTSGRPCRequestType(text, m[1]); rt != "" {
+			meta["request_type"] = rt
+			meta["schema_source"] = "extracted"
+		} else {
+			meta["schema_source"] = "partial"
+		}
+		contracts = append(contracts, Contract{
+			ID:         fmt.Sprintf("grpc::%s::%s", svc, method),
+			Type:       ContractGRPC,
+			Role:       RoleConsumer,
+			SymbolID:   findEnclosingSymbol(fileNodes, ln),
+			FilePath:   filePath,
+			Line:       ln,
+			Meta:       meta,
+			Confidence: 0.9,
+		})
+	}
+	// Fallback service-level contracts for TS clients that don't
+	// have resolvable method calls.
+	tsEmitted := make(map[string]struct{})
+	for _, c := range contracts {
+		if s, _ := c.Meta["service"].(string); s != "" && c.Meta["lang"] == "typescript" {
+			tsEmitted[s] = struct{}{}
+		}
+	}
+	for _, m := range tsGRPCNewClientRe.FindAllStringSubmatchIndex(text, -1) {
+		svc := text[m[2]:m[3]]
+		if _, already := tsEmitted[svc]; already {
+			continue
+		}
+		ln := lineNumber(lines, m[0])
+		contracts = append(contracts, Contract{
+			ID:         fmt.Sprintf("grpc::%s", svc),
+			Type:       ContractGRPC,
+			Role:       RoleConsumer,
+			SymbolID:   findEnclosingSymbol(fileNodes, ln),
+			FilePath:   filePath,
+			Line:       ln,
+			Meta:       map[string]any{"service": svc, "lang": "typescript"},
+			Confidence: 0.85,
+		})
+	}
+	return contracts
+}
+
+func tsFileImportsGRPC(filePath string, src []byte) bool {
+	if !bytes.Contains(src, []byte("grpc")) && !bytes.Contains(src, []byte("@connectrpc/")) &&
+		!bytes.Contains(src, []byte("_pb")) {
+		return false
+	}
+
+	grammar := typescript.GetLanguage()
+	if strings.HasSuffix(filePath, ".tsx") || strings.HasSuffix(filePath, ".jsx") {
+		grammar = tsx.GetLanguage()
+	}
+	tree, err := parser.ParseFile(src, grammar)
+	if err != nil || tree == nil {
+		return false
+	}
+	defer tree.Close()
+
+	found := false
+	walkNodes(tree.RootNode(), func(n *sitter.Node) {
+		if found {
+			return
+		}
+		var module *sitter.Node
+		switch n.Type() {
+		case "import_statement", "import_require_clause":
+			module = n.ChildByFieldName("source")
+		case "call_expression":
+			fn, args := n.ChildByFieldName("function"), n.ChildByFieldName("arguments")
+			if fn != nil && args != nil && (fn.Type() == "import" ||
+				(fn.Type() == "identifier" && fn.Content(src) == "require")) {
+				for i := 0; i < int(args.NamedChildCount()); i++ {
+					arg := args.NamedChild(i)
+					if arg != nil && arg.Type() != "comment" {
+						module = arg
+						break
+					}
+				}
+			}
+		}
+		if module != nil && module.Type() == "string" {
+			found = isTSGRPCModule(strings.Trim(module.Content(src), "\"'"))
+		}
+	})
+	return found
+}
+
+func isTSGRPCModule(module string) bool {
+	for _, pkg := range []string{"@grpc/grpc-js", "@grpc/proto-loader", "grpc-web"} {
+		if module == pkg || strings.HasPrefix(module, pkg+"/") {
+			return true
+		}
+	}
+	if strings.HasPrefix(module, "@connectrpc/") {
+		return true
+	}
+	base := path.Base(module)
+	switch ext := path.Ext(base); ext {
+	case ".js", ".ts", ".cjs", ".mjs", ".cts", ".mts":
+		base = strings.TrimSuffix(base, ext)
+	}
+	return strings.HasSuffix(base, "_pb")
 }
 
 // detectTSGRPCRequestType picks out the request message type from
