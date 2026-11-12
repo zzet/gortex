@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -491,7 +492,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		}
 	}
 	for path := range candidates {
-		if !stuck[path] && r.restartLeft(ctx, store, repo, path) {
+		if !stuck[path] && (r.restartLeft(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path)) {
 			stuck[path] = true
 		}
 	}
@@ -562,7 +563,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		err := r.reindexPaths(ctx, repo, reindex)
 		r.logRepair(repo, viewmetrics.ContractRepairStuckReceipt, reindex, err)
 		for _, path := range reindex {
-			if !r.inFlight(ctx, store, repo, path) {
+			if !r.unrepaired(ctx, store, repo, path) {
 				delete(state.attempts, path)
 				continue
 			}
@@ -579,7 +580,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		countContractRepair(viewmetrics.ContractRepairStuckEnvelope)
 		err := r.envelopePaths(ctx, repo, []string{path})
 		r.logRepair(repo, viewmetrics.ContractRepairStuckEnvelope, []string{path}, err)
-		if !r.inFlight(ctx, store, repo, path) {
+		if !r.unrepaired(ctx, store, repo, path) {
 			delete(state.attempts, path)
 		}
 	}
@@ -639,6 +640,39 @@ func (r *ContractStuckRepair) restartLeft(ctx context.Context, store *store_sqli
 		return false
 	}
 	return store.ContractReceiptWriteStates(repo, "", []string{path})[path].Seq == 0
+}
+
+// absentRow reports whether path, a census file a capture reported or an
+// earlier repair attempted, is still on disk with no primary row in a
+// namespace whose baseline is at the current receipt version: nothing admits
+// it, and no live mutation will write the row while the file does not move. A
+// baseline that skipped the file as moved, while its save never came, leaves
+// this behind. A row of another version, or a namespace without a current
+// baseline, is the baseline rebuild's to replace, not a forced reindex's. A
+// file gone from disk needs no row: its deletion, once indexed, takes it out
+// of the census.
+func (r *ContractStuckRepair) absentRow(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	row, known, err := store.ContractBoundaryReceiptForVersionContext(ctx, repo, "", path, contractBoundaryReceiptVersion)
+	if err != nil || row != nil || !known {
+		return false
+	}
+	_, root, err := r.repoIndexer(repo)
+	return err == nil && contractCensusFileOnDisk(root, repo, path)
+}
+
+// contractCensusFileOnDisk reports whether a repository's census path names
+// a regular file under root. A capture asks it before reporting an absent row
+// and the repair asks it before taking one, so a request never waits on a
+// repair that would decline the file.
+func contractCensusFileOnDisk(root, repo, path string) bool {
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(path, repo+"/"))))
+	return err == nil && info.Mode().IsRegular()
+}
+
+// unrepaired reports whether a repair left path in flight or still without a
+// row, so its attempts keep counting toward the envelope.
+func (r *ContractStuckRepair) unrepaired(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	return r.inFlight(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path)
 }
 
 // repoIndexer is the repository's live indexer and root.
