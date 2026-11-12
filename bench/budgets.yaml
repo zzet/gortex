@@ -1,6 +1,7 @@
 # Declarative targets, not measured baselines. See check-budgets/README.md.
 # guard target is a future absolute target; only its noise+allowance limit applies now.
-# unassigned is explicit unresolved ownership and is legal only for guards.
+# unassigned is unresolved ownership for guards or the explicit #1420 deferred search target.
+# User decision 2026-11-12: four-agent search p95 <=400ms deferred to #1420; measurements and other gates remain.
 # idle2s is NOT idle60s; unknown/unsupported observations fail rather than become zero.
 # cold-written uses concrete #1073 v0.64.15; #997 older v0.64.14 cross-reference is documented.
 schema_version: 1
@@ -87,7 +88,7 @@ budgets:
   - {"metric": "busy_fraction", "scenario": "load-32", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.01, "unit": "fraction", "allowance": [], "lane": ["nightly", "release"], "compare": "lt"}
   - {"metric": "read_p95_vs_load8", "scenario": "load-32", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "cancel_release_max", "scenario": "cancel", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.1, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
-  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
+  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "unassigned", "mode": "deferred", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "read_source_p99", "scenario": "loadedit-4", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.2, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "dead_code_vs_single", "scenario": "tools-six-gortex", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 1.2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "outline_p50", "scenario": "tools-six-gortex", "host_class": "reference_linux", "owning_release": "v0.64.12", "mode": "block", "target": 0.3, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
@@ -252,7 +253,7 @@ budgets:
   - {"metric": "busy_fraction", "scenario": "load-32", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.01, "unit": "fraction", "allowance": [], "lane": ["nightly", "release"], "compare": "lt"}
   - {"metric": "read_p95_vs_load8", "scenario": "load-32", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "cancel_release_max", "scenario": "cancel", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.1, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
-  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
+  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "reference_mac", "owning_release": "unassigned", "mode": "deferred", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "read_source_p99", "scenario": "loadedit-4", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.2, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "dead_code_vs_single", "scenario": "tools-six-gortex", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 1.2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "outline_p50", "scenario": "tools-six-gortex", "host_class": "reference_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.3, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
@@ -416,7 +417,7 @@ budgets:
   - {"metric": "busy_fraction", "scenario": "load-32", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.01, "unit": "fraction", "allowance": [], "lane": ["nightly", "release"], "compare": "lt"}
   - {"metric": "read_p95_vs_load8", "scenario": "load-32", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "cancel_release_max", "scenario": "cancel", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.1, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
-  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
+  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "large_mac", "owning_release": "unassigned", "mode": "deferred", "target": 0.4, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "read_source_p99", "scenario": "loadedit-4", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.2, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "dead_code_vs_single", "scenario": "tools-six-gortex", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 1.2, "unit": "ratio", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
   - {"metric": "outline_p50", "scenario": "tools-six-gortex", "host_class": "large_mac", "owning_release": "v0.64.12", "mode": "block", "target": 0.3, "unit": "s", "allowance": [], "lane": ["nightly", "release"], "compare": "le"}
@@ -865,7 +866,7 @@ budgets:
   - {"metric": "read_gate_closures", "scenario": "loadedit-4", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}
   - {"metric": "busy_fraction", "scenario": "load-16", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0.01, "unit": "fraction", "allowance": [], "lane": ["smoke"], "compare": "lt"}
   - {"metric": "read_p95_vs_main", "scenario": "load-16", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 1.2, "unit": "ratio", "allowance": [], "lane": ["smoke"], "compare": "le"}
-  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0.4, "unit": "s", "allowance": [], "lane": ["smoke"], "compare": "le"}
+  - {"metric": "search_symbols_p95", "scenario": "loadedit-4", "host_class": "hosted_arm_smoke", "owning_release": "unassigned", "mode": "deferred", "target": 0.4, "unit": "s", "allowance": [], "lane": ["smoke"], "compare": "le"}
   - {"metric": "read_source_p99", "scenario": "loadedit-4", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0.2, "unit": "s", "allowance": [], "lane": ["smoke"], "compare": "le"}
   - {"metric": "impact_stale_refusals", "scenario": "load-16", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}
   - {"metric": "detect_stale_refusals", "scenario": "load-16", "host_class": "hosted_arm_smoke", "owning_release": "v0.64.12", "mode": "block", "target": 0, "unit": "count", "allowance": [], "lane": ["smoke"], "compare": "eq"}

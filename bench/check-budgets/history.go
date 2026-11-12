@@ -83,7 +83,7 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 				return nil, errors.New("invalid or duplicate nightly budget row")
 			}
 			keys[key] = true
-			allPass = allPass && row.Pass
+			allPass = allPass && row.passesGate()
 		}
 		if item.budgets.Pass != allPass || r.BudgetPass != allPass {
 			return nil, errors.New("nightly pass flags disagree with budget table")
@@ -113,7 +113,7 @@ func loadNightlyHistory(index string, p policy) ([]nightlyEvidence, error) {
 				stored[rowKey(row)] = row
 			}
 			for _, row := range rows {
-				if !row.Pass || !reflect.DeepEqual(row, stored[rowKey(row)]) {
+				if !row.passesGate() || !reflect.DeepEqual(row, stored[rowKey(row)]) {
 					return nil, errors.New("nightly raw evidence does not reproduce the exact stored values, limits and verdicts")
 				}
 			}
@@ -191,8 +191,13 @@ func historyVerdict(evidence []nightlyEvidence, through time.Time, hosts []strin
 				if row.Pass || !exists || prior.Mode != row.Mode {
 					continue
 				}
+				if row.passesGate() != prior.passesGate() {
+					continue // A deferred target miss is not a prior blocking evidence failure.
+				}
 				kind := "BLOCKER"
-				if row.Mode == "guard" && slices.Contains([]string{"disk", "memory"}, metricSpecs[row.Metric].axis) {
+				if row.Mode == "deferred" && row.Deferred && prior.Deferred {
+					kind = "DEFERRED TARGET"
+				} else if row.Mode == "guard" && slices.Contains([]string{"disk", "memory"}, metricSpecs[row.Metric].axis) {
 					kind = "GUARD REVIEW"
 				}
 				fmt.Fprintf(out, "%s: %s missed %s and %s\n", kind, rowKey(row), previous.day, current.day)

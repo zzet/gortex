@@ -36,7 +36,7 @@ func TestDeclaredBudgetTargetsAndNamedAllowances(t *testing.T) {
 			{"loadedit-1", "relations_lag_p95", 1.5}, {"loadedit-4", "relations_lag_p95", 3}, {"loadedit-8", "relations_lag_p95", 5}, {"loadedit-8", "derived_lag_p95", 5},
 			{"loadedit-4", "reclaim_hold_p95", .05}, {"loadedit-4", "read_gate_closures", 0},
 			{"load-16", "busy_fraction", .01}, {"load-32", "busy_fraction", .01}, {"load-32", "read_p95_vs_load8", 2}, {"cancel", "cancel_release_max", .1},
-			{"loadedit-4", "search_symbols_p95", .4}, {"loadedit-4", "read_source_p99", .2},
+			{"loadedit-4", "read_source_p99", .2},
 			{"tools-six-gortex", "dead_code_vs_single", 1.2}, {"tools-six-corpus-5", "outline_p50", .3},
 			{"loadedit-4", "impact_stale_refusals", 0}, {"loadedit-4", "detect_stale_refusals", 0}, {"worktrees-4", "daemon_cpu_cores", 4.5},
 			{"warm-restart", "repo_not_tracked", 0}, {"schema21-upgrade", "repo_not_tracked", 0}, {"cold-start", "repo_not_tracked", 0}, {"warm-restart", "first_ok_after_ready", 1.5},
@@ -49,6 +49,9 @@ func TestDeclaredBudgetTargetsAndNamedAllowances(t *testing.T) {
 		}
 		if b := find(host, "idle-stop-20", "force_kills"); b.MinRepeats != 20 {
 			t.Fatal("three repetitions cannot prove 20 clean stops")
+		}
+		if b := find(host, "loadedit-4", "search_symbols_p95"); b.Mode != "deferred" || b.OwningRelease != "unassigned" || b.Target == nil || *b.Target != .4 {
+			t.Fatal("#1420 must retain the unassigned 400ms search target without blocking v0.64.12")
 		}
 		if b := find(host, "loadedit-4", "wal_peak_mib"); b.Mode != "guard" || b.OwningRelease != "v0.64.17" || b.Target == nil || *b.Target != 2048 {
 			t.Fatal("WAL remains a future guard, not an early hard cap")
@@ -85,7 +88,8 @@ func TestHostedSmokeOwnsUnchangedTargetsWithoutReferenceCapacity(t *testing.T) {
 			continue
 		}
 		count++
-		if row.Mode != "block" || len(row.Lane) != 1 || row.Lane[0] != "smoke" || len(row.Allowance) != 0 {
+		modeOK := row.Mode == "block" || row.Mode == "deferred" && row.Metric == "search_symbols_p95"
+		if !modeOK || len(row.Lane) != 1 || row.Lane[0] != "smoke" || len(row.Allowance) != 0 {
 			t.Fatal("hosted smoke relaxed or escaped PR block scope")
 		}
 		if row.Metric == "read_p95_vs_main" {
