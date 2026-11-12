@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,7 +26,16 @@ type editLoopRow struct {
 }
 
 type editLoopWire struct {
+	PhysicalWriteScope *struct {
+		Kind    string `json:"kind"`
+		File    string `json:"file"`
+		Editors int    `json:"editors"`
+	} `json:"physical_write_scope"`
 	Plan struct {
+		Kind   string `json:"kind"`
+		Tool   string `json:"tool"`
+		File   string `json:"file"`
+		Sender string `json:"sender"`
 		Routes []struct {
 			ID       string `json:"id"`
 			Repo     string `json:"repo"`
@@ -52,16 +62,23 @@ type editLoopWire struct {
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
-		Editor      int    `json:"editor"`
-		Route       string `json:"route"`
-		TargetLines *int   `json:"admitted_target_lines"`
-		Ordinal     int    `json:"ordinal"`
-		Mode        string `json:"probe_mode"`
-		Outcome     string `json:"outcome"`
-		ACK         metric `json:"t_ack_ms"`
-		OneRead     metric `json:"t_gate_readback_ms"`
-		ACKExact    *bool  `json:"ack_readback_exact"`
-		Readbacks   []struct {
+		CheckoutID       string `json:"checkout_id"`
+		MutationID       string `json:"mutation_id"`
+		ACKStatus        string `json:"ack_status"`
+		ACKDiskStatus    string `json:"ack_disk_status"`
+		ACKMutationID    string `json:"ack_mutation_id"`
+		ACKCommitSeq     uint64 `json:"ack_commit_seq"`
+		ACKContentSHA256 string `json:"ack_content_sha256"`
+		Editor           int    `json:"editor"`
+		Route            string `json:"route"`
+		TargetLines      *int   `json:"admitted_target_lines"`
+		Ordinal          int    `json:"ordinal"`
+		Mode             string `json:"probe_mode"`
+		Outcome          string `json:"outcome"`
+		ACK              metric `json:"t_ack_ms"`
+		OneRead          metric `json:"t_gate_readback_ms"`
+		ACKExact         *bool  `json:"ack_readback_exact"`
+		Readbacks        []struct {
 			Kind            string `json:"kind"`
 			Correct         *bool  `json:"correct"`
 			Error           string `json:"error"`
@@ -231,6 +248,9 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	if err != nil {
 		return err
 	}
+	if wire.PhysicalWriteScope != nil && (len(r.Corpus) != 1 || !sharedPhysicalEditLoop(wire)) {
+		return errors.New("shared ACK scope lacks the admitted single-worktree/file topology")
+	}
 	editors := wire.Plan.Editors
 	if editors == 0 && wire.Plan.Session == "one_editor_plus_one_separate_prober_per_edit" {
 		editors = 1
@@ -298,6 +318,23 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 		}
 	}
 	return wire, nil
+}
+
+// Only the runtime's physical binding observation qualifies this exception.
+// Editor count or a common branch name alone never relaxes isolated checkouts.
+func sharedPhysicalEditLoop(wire editLoopWire) bool {
+	scope := wire.PhysicalWriteScope
+	if scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.File != wire.Plan.File || scope.Editors < 2 || scope.Editors != wire.Plan.Editors || wire.Plan.LinkedWorktrees != 0 || len(wire.Plan.Routes) != 0 || wire.Plan.Kind != "add_intrafile_call" || wire.Plan.Tool != "edit.file" || wire.Plan.Sender != "" {
+		return false
+	}
+	used := make(map[int]bool)
+	for i, record := range wire.Edits {
+		if record.Editor < 0 || record.Editor >= scope.Editors || record.Editor != wire.Plan.Steps[i].Editor || record.Route != "" || wire.Plan.Steps[i].Route != "" || record.CheckoutID != "" {
+			return false
+		}
+		used[record.Editor] = true
+	}
+	return len(used) > 1
 }
 
 func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
@@ -511,9 +548,18 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 	}
 	var values []float64
 	correct, total := 0, 0
+	sharedPhysical := sharedPhysicalEditLoop(wire)
 	for _, record := range wire.Edits {
 		if name == "edit_ack_p95" || name == "edit_ack_max" {
-			if record.ACKExact == nil || !*record.ACKExact {
+			if record.ACKExact == nil {
+				return 0, errors.New("ACK lacks exact readback proof")
+			}
+			if sharedPhysical {
+				digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
+				if record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
+					return 0, errors.New("ACK lacks confirmed shared-write commit evidence")
+				}
+			} else if !*record.ACKExact {
 				return 0, errors.New("ACK lacks exact readback proof")
 			}
 			value, err := number(record.ACK, "ms")

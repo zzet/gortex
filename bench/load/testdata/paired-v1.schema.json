@@ -803,6 +803,18 @@
                                 ],
                                 "type": "object"
                               },
+                              "ack_commit_seq": {
+                                "type": "integer"
+                              },
+                              "ack_content_sha256": {
+                                "type": "string"
+                              },
+                              "ack_disk_status": {
+                                "type": "string"
+                              },
+                              "ack_mutation_id": {
+                                "type": "string"
+                              },
                               "ack_readback_exact": {
                                 "anyOf": [
                                   {
@@ -812,6 +824,9 @@
                                     "type": "null"
                                   }
                                 ]
+                              },
+                              "ack_status": {
+                                "type": "string"
                               },
                               "activated_ns": {
                                 "anyOf": [
@@ -2460,6 +2475,33 @@
                           "type": [
                             "object",
                             "null"
+                          ]
+                        },
+                        "physical_write_scope": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "editors": {
+                                  "type": "integer"
+                                },
+                                "file": {
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "file",
+                                "editors"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "plan": {
