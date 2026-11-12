@@ -1710,6 +1710,18 @@ func (c *contractConvergence) round(paths []string, point bool) (proven []*contr
 		return nil, nil, err
 	}
 	defer closeContractEvidence(scratch, dir)
+	// Prefetch only inside this round's opening stamp scan. Every later
+	// extraction still enters the installed callback and proves its own rows
+	// and source against the same R0 and its closing scan.
+	batch := &contractReplayCoreBatch{}
+	for _, path := range paths {
+		stamp, stamped := r0.Stamps[path]
+		if file, ok := c.files[path]; ok && c.live[path] && stamped && stamp.quiescent() {
+			batch.add(file)
+		}
+	}
+	defer batch.close()
+	evidence.ctx = context.WithValue(evidence.ctx, contractReplayCoreBatchKey{}, batch)
 	var current *contractUnitLedger
 	reader := &contractPinnedReader{c: c, stamps: r0.Stamps, ledger: func() *contractUnitLedger { return current }, moved: make(map[string]bool)}
 	indexers := c.indexers(evidence, reader.read)
