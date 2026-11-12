@@ -241,9 +241,12 @@ func TestMutationResolveMutexDiagnosticCannotChangePhysicalAccounting(t *testing
 			case "invalid_changed":
 				stamps.patchLaps.invalid = true
 			}
-			window, ok := record.completePhysicalAttempt(stamps, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
+			window, ok, reason := record.completePhysicalAttempt(stamps, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
 			if !ok {
 				t.Fatal("physical owner was rejected")
+			}
+			if reason != "" {
+				t.Fatalf("accepted accounting gained a refusal: %s", reason)
 			}
 			if window.accounting.invalid != (change != "diagnostic_only") {
 				t.Fatalf("diagnostic isolation weakened canonical identity: %s invalid=%t", change, window.accounting.invalid)

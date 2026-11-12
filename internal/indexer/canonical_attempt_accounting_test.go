@@ -115,8 +115,9 @@ func TestCanonicalAttemptAccountingLateCopyRequiresAgreementWithEarlyCarriers(t 
 				s.laneWait.acquired = origin.Add(9 * time.Millisecond)
 			}
 			s.mu.Unlock()
-			_, ok := record.completePhysicalAttempt(s, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
+			_, ok, reason := record.completePhysicalAttempt(s, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
 			require.True(t, ok, "actual wall can remain known even when classification carriers disagree")
+			require.Empty(t, reason)
 			late := record.Snapshot().EditTimings()
 			require.Equal(t, earlyTiming, early.EditTimings(), "no previously exposed snapshot changes")
 			if name == "unchanged" {
@@ -136,8 +137,9 @@ func TestCanonicalAttemptAccountingRefusesDifferentCapturedCallbackOrigin(t *tes
 	record := recorder.Begin("", "origin-fence", PublicationSourceMCPEdit, origin)
 	require.True(t, record.bindCanonicalTicket(1, origin))
 	record.Absorb(s)
-	_, ok := record.completePhysicalAttempt(s, origin.Add(500*time.Microsecond), origin.Add(31*time.Millisecond), 0)
+	_, ok, reason := record.completePhysicalAttempt(s, origin.Add(500*time.Microsecond), origin.Add(31*time.Millisecond), 0)
 	require.False(t, ok, "an endpoint request cannot replace the independently captured callback origin")
+	require.Equal(t, "captured_callback_window_mismatch", reason)
 	require.Nil(t, record.Snapshot().attemptWindow)
 }
 
