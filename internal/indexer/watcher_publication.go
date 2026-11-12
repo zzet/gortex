@@ -5,11 +5,23 @@ import (
 	"time"
 )
 
+// pointCompletionDiagnostic is callback-local evidence, never publication authority.
+// The method returning it still delivers Done before the callback records it.
+type pointCompletionDiagnostic struct {
+	observed          bool
+	kind              string
+	appliedGeneration uint64
+	pendingGeneration uint64
+	completed         int
+	fallback          bool
+}
+
 // pointPublicationAttempt is local to one runnable point attempt. Failed,
 // retried, stopped and superseded attempts never publish this collector into
 // a receipt. The guarded existing waiter completion accepts only its exact
 // winning record, outside the watcher lock and before Done delivery.
 type pointPublicationAttempt struct {
+	completion  pointCompletionDiagnostic
 	record      *PublicationPhaseRecord
 	stamps      *PublicationStamps
 	independent bool

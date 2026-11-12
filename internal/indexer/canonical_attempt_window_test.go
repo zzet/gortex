@@ -105,11 +105,11 @@ func TestCanonicalAttemptWindowRequiresMembershipExactWinnerAndOneShot(t *testin
 			case "before_origin":
 				start = origin.Add(-time.Millisecond)
 			case "one_shot":
-				_, ok, reason := record.completePhysicalAttempt(stamps, start, end, 0)
+				_, ok, reason, _ := record.completePhysicalAttempt(stamps, start, end, 0)
 				require.True(t, ok)
 				require.Empty(t, reason)
 			}
-			_, ok, reason := record.completePhysicalAttempt(stamps, start, end, 0)
+			_, ok, reason, _ := record.completePhysicalAttempt(stamps, start, end, 0)
 			require.Equal(t, want, ok)
 			if ok {
 				require.Empty(t, reason)
@@ -186,7 +186,7 @@ func TestCanonicalAttemptWindowRejectionReasons(t *testing.T) {
 			if record != nil {
 				previous = record.attemptWindow
 			}
-			window, accepted, got := record.completePhysicalAttempt(stamps, start, end, retry)
+			window, accepted, got, _ := record.completePhysicalAttempt(stamps, start, end, retry)
 			require.False(t, accepted)
 			require.Equal(t, canonicalAttemptWindow{}, window)
 			require.Equal(t, reason, got)
@@ -216,7 +216,7 @@ func TestCanonicalAttemptWindowKeepsFirstFailureAndFinishesControl(t *testing.T)
 			case "stamp_after_callback_return":
 				stamps.marks = []publicationMark{late, early}
 			}
-			_, accepted, reason := record.completePhysicalAttempt(stamps, start, end, 0)
+			_, accepted, reason, _ := record.completePhysicalAttempt(stamps, start, end, 0)
 			require.False(t, accepted)
 			require.Equal(t, first, reason)
 			require.Nil(t, record.attemptWindow)
@@ -228,7 +228,7 @@ func TestCanonicalAttemptWindowKeepsFirstFailureAndFinishesControl(t *testing.T)
 	}
 	_, record, stamps, origin := attemptWindowFixture(t)
 	stamps.marks = []publicationMark{{phase: PublicationPatchExecutionFinished, at: origin.Add(9 * time.Millisecond)}}
-	_, accepted, reason := record.completePhysicalAttempt(stamps, origin.Add(2*time.Millisecond), origin.Add(8*time.Millisecond), 0)
+	_, accepted, reason, _ := record.completePhysicalAttempt(stamps, origin.Add(2*time.Millisecond), origin.Add(8*time.Millisecond), 0)
 	require.False(t, accepted)
 	require.Equal(t, "stamp_after_callback_return", reason, "a missing cycle cannot replace an earlier failed predicate")
 }
@@ -268,7 +268,22 @@ func TestCanonicalAttemptWindowLogsRejectedTimingOutsideLocks(t *testing.T) {
 	for _, entry := range logs.All() {
 		require.Equal(t, "graph patch attempt timing unavailable", entry.Message)
 		fields := entry.ContextMap()
-		require.Len(t, fields, 4)
+		require.Len(t, fields, 19)
+		require.Equal(t, true, fields["attempt_guard_observed"])
+		require.Equal(t, recorder.sharedInstance, fields["attempt_guard_recorder"])
+		require.Equal(t, "observed-current-key", fields["attempt_guard_publication_key"])
+		require.EqualValues(t, 7, fields["attempt_guard_ticket"])
+		require.EqualValues(t, 7, fields["attempt_guard_collector_ticket"])
+		require.Equal(t, "absent", fields["attempt_guard_accepted_stamps"])
+		require.Equal(t, false, fields["attempt_guard_window_present"])
+		require.Equal(t, false, fields["attempt_guard_terminal"])
+		require.Equal(t, true, fields["attempt_guard_patch_present"])
+		require.Equal(t, false, fields["attempt_completion_observed"], "direct helper calls have no fabricated completion disposition")
+		require.Empty(t, fields["attempt_completion_disposition"])
+		require.Equal(t, false, fields["attempt_completion_fallback"])
+		require.Zero(t, fields["attempt_completion_applied"])
+		require.Zero(t, fields["attempt_completion_pending_at_check"])
+		require.Zero(t, fields["attempt_completion_count"])
 		require.Equal(t, "physical_attempt_timing_unavailable", fields["patch_lap_scope"])
 		require.Equal(t, "observed-current-key", fields["publication_key"])
 		require.EqualValues(t, 3, fields["attempt_retry"])
