@@ -36,7 +36,7 @@ func TestEditGateRuntimeReadsEveryRequiredKindAndRetainsLiveTiers(t *testing.T) 
 		}
 		args, _ := frame.Params["arguments"].(map[string]any)
 		if frame.Params["name"] == "edit" && args["operation"] == "file" {
-			return stubContent(map[string]any{"mutation_receipt": "receipt-a", "readback_exact": true}), nil
+			return stubContent(map[string]any{"mutation_receipt": "receipt-a", "readback_exact": false, "status": "applied", "disk_status": "committed", "mutation_id": step.MutationID, "commit_seq": 7, "content_sha256": strings.Repeat("a", 64)}), nil
 		}
 		if frame.Params["name"] == "change" && args["operation"] == "receipt" {
 			return stubContent(map[string]any{"receipt": "receipt-a", "mutation_id": step.MutationID, "graph_status_terminal": true, "graph_status": "fresh", "ack_at": "2026-01-01T00:00:00Z", "file_graph_at": "2026-01-01T00:00:00Z", "relations_at": "2026-01-01T00:00:00.001Z", "derived_at": "2026-01-01T00:00:00.002Z", "tier_state": map[string]any{"file_graph": "fresh", "relations": "fresh", "derived": "fresh"}}), nil
@@ -48,6 +48,9 @@ func TestEditGateRuntimeReadsEveryRequiredKindAndRetainsLiveTiers(t *testing.T) 
 	run.doEdit(ctx, step)
 	state := run.states[0]
 	state.finishRaw()
+	if state.record.ACKReadbackExact == nil || *state.record.ACKReadbackExact || state.record.ACKStatus != "applied" || state.record.ACKDiskStatus != "committed" || state.record.ACKMutationID != step.MutationID || state.record.ACKCommitSeq != 7 || state.record.ACKContentSHA256 != strings.Repeat("a", 64) {
+		t.Fatal("ACK evidence was not retained from the original decoded response")
+	}
 	if len(state.record.Readbacks) == 0 || state.record.Readbacks[0].Kind != "source" {
 		t.Error("edit + one read must end at the first symbol-source/summary response, not read_file")
 	}
