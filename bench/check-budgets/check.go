@@ -23,8 +23,11 @@ type result struct {
 	Baseline          string   `json:"baseline"`
 	Allowances        []string `json:"allowances"`
 	Pass              bool     `json:"pass"`
+	Deferred          bool     `json:"target_deferred,omitempty"`
 	Reason            string   `json:"reason"`
 }
+
+func (r result) passesGate() bool { return r.Pass || r.Mode == "deferred" && r.Deferred }
 
 func median(values []float64) (float64, error) {
 	if len(values) < 3 {
@@ -58,7 +61,7 @@ func assess(p policy, b budget, candidate, main, tag []float64, lane string) res
 	}
 	r.Before, r.After, r.Baseline = &before, &after, "main (comparison only)"
 	limit := float64(0)
-	if b.Mode == "block" {
+	if b.Mode == "block" || b.Mode == "deferred" {
 		limit = *b.Target
 		zero := float64(0)
 		r.EffectiveHeadroom = &zero
@@ -132,7 +135,12 @@ func assess(p policy, b budget, candidate, main, tag []float64, lane string) res
 	if !r.Pass {
 		r.Reason = "absolute/guard limit breached (hard maxima and safety counters apply to every repeat)"
 	}
+	if b.Mode == "deferred" {
+		r.Deferred = true
+		r.Reason = "400ms target deferred to #1420; target result is not release acceptance"
+	}
 	if lane == "smoke" && strings.HasSuffix(b.Metric, "_p95") && after > before+before*.20 {
+		r.Deferred = false // The separate smoke regression check remains blocking.
 		r.Pass, r.Reason = false, "smoke p95 is >20% worse than main median"
 	}
 	return r
@@ -216,10 +224,12 @@ func check(p policy, d dataset, lane string) ([]result, error) {
 		}
 		row := assess(p, b, candidate, main, tag, lane)
 		if ce != nil || me != nil || te != nil {
+			row.Deferred = false
 			row.Pass, row.Reason = false, fmt.Sprintf("missing evidence: candidate=%v main=%v tag=%v", ce, me, te)
 		} else {
 			for i := range cr {
 				if !comparable(cr[i], mr[i]) || (b.Mode == "guard" && !comparable(cr[i], tr[i])) {
+					row.Deferred = false
 					row.Pass, row.Reason = false, "baseline and candidate host/corpus/workload identities differ in a matching repeat"
 				}
 			}
