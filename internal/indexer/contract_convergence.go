@@ -861,6 +861,9 @@ type contractConvergence struct {
 	// progress counts the job's proofs: units proven, changed units dropped
 	// for extraction, enrichment rounds run or re-checked current.
 	progress int
+	// fillTurnProven amortizes capture across productive cooperative chunks.
+	// It is job-local scheduling state, never a reusable proof or work clock.
+	fillTurnProven int
 	// idle counts the unblocked rounds without progress since the last
 	// progress that saw an input move or waited out contractRoundWait (a run
 	// of waited-out rounds only while no unblocked event-woken round came
@@ -2965,9 +2968,18 @@ func (c *contractConvergence) continueFill(proven int, more bool) error {
 	if err := c.ctx.Err(); err != nil {
 		return err
 	}
+	c.fillTurnProven = min(contractRoundFiles, c.fillTurnProven+proven)
 	if proven > 0 && more && c.fillContended() {
-		c.req.delta.continued = true
-		return &ContractFillContinued{}
+		// OtherActorWaiting also includes linked-idle demand. Its original
+		// accounting runs before this separate prompt-checkpoint question.
+		demand := c.req.checkpointDemand != nil && c.req.checkpointDemand()
+		// Keep each existing 16-file scan/yield boundary. Only productive
+		// competitor turns coalesce to one normal-round equivalent; partial
+		// progress and foreground demand still hand off immediately.
+		if demand || proven < 16 || c.fillTurnProven >= contractRoundFiles {
+			c.req.delta.continued = true
+			return &ContractFillContinued{}
+		}
 	}
 	return nil
 }

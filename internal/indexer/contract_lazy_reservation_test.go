@@ -16,7 +16,7 @@ import (
 // generation merely to retire it when yielding the slot.
 func TestContractCoordinatorFillContinuationDoesNotReservePayload(t *testing.T) {
 	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-	for i := 0; i < 33; i++ {
+	for i := 0; i < 65; i++ {
 		files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 	}
 	f := newContractJobFixture(t, files)
@@ -43,7 +43,7 @@ func TestContractCoordinatorFillContinuationDoesNotReservePayload(t *testing.T) 
 	require.NotNil(t, job.delta.cache)
 	require.NotNil(t, job.delta.cache.continuation, "yield must retain a resumable frontier")
 	require.NotEmpty(t, job.delta.cache.units, "yield must advance the extraction frontier")
-	require.LessOrEqual(t, len(job.delta.cache.units), 16, "a contended fill keeps its fair quantum")
+	require.LessOrEqual(t, len(job.delta.cache.units), contractRoundFiles, "a productive contended turn keeps its certified-work bound")
 	attachment, err := f.store.GetContractAttachmentContext(t.Context(), job.targets[0].Key)
 	require.NoError(t, err)
 	require.Nil(t, attachment, "incomplete coverage cannot publish")

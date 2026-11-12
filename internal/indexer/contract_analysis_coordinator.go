@@ -94,6 +94,7 @@ type contractAnalysisJob struct {
 	queuedAt          time.Time
 	capture           time.Duration
 	otherActorWaiting func() bool
+	checkpointDemand  func() bool
 	priorityRepos     []string
 	targetPublished   func(ContractFollowupTargetResult)
 	backgroundCurrent func(context.Context) error
@@ -391,7 +392,7 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		yield = job.yield
 	}
 	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: yield,
-		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, delta: job.delta, reservePayload: reservePayload,
+		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, checkpointDemand: job.checkpointDemand, delta: job.delta, reservePayload: reservePayload,
 		PriorityRepos: job.priorityRepos, BackgroundCurrent: job.backgroundCurrent,
 		TargetPublished: func(result ContractFollowupTargetResult) {
 			// Record custody before an external wake-up can panic. A later

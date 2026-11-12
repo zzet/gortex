@@ -170,6 +170,9 @@ type ContractFollowupRequest struct {
 	WaitPublished  func(context.Context, uint64, time.Time) bool
 	// OtherActorWaiting permits a fill to return a resumable checkpoint.
 	OtherActorWaiting func() bool
+	// checkpointDemand preserves prompt linked-demand release independently
+	// of the cooperative turn used for ordinary actor competition.
+	checkpointDemand func() bool
 	// convergenceHooks are test seams at the job's interleaving points.
 	convergenceHooks *contractConvergenceHooks
 	delta            *contractDeltaSession
@@ -250,6 +253,7 @@ type ContractFollowupBatchRequest struct {
 	PublishedEpoch         func() uint64
 	WaitPublished          func(context.Context, uint64, time.Time) bool
 	OtherActorWaiting      func() bool
+	checkpointDemand       func() bool
 	// PriorityRepos opts into independently committing these targets before
 	// companion assembly. Nil preserves the original all-target atomic batch.
 	PriorityRepos []string
@@ -398,7 +402,7 @@ func RunContractFollowupBatch(ctx context.Context, req ContractFollowupBatchRequ
 			}
 		}
 		single := ContractFollowupRequest{Snapshot: snap, RebuildReason: req.RebuildReason, Payload: target.Payload, Catalog: target.Catalog, Registry: req.Registry, Config: req.Config, Logger: req.Logger, Leases: req.Leases, WorkspaceID: req.WorkspaceID, ProjectID: req.ProjectID, RepoConfigs: req.RepoConfigs, ScratchParent: req.ScratchParent, Yield: yield,
-			PublishedEpoch: req.PublishedEpoch, WaitPublished: req.WaitPublished, OtherActorWaiting: req.OtherActorWaiting, convergenceHooks: req.convergenceHooks, delta: req.delta}
+			PublishedEpoch: req.PublishedEpoch, WaitPublished: req.WaitPublished, OtherActorWaiting: req.OtherActorWaiting, checkpointDemand: req.checkpointDemand, convergenceHooks: req.convergenceHooks, delta: req.delta}
 		if req.reservePayload != nil {
 			single.reservePayload = func(ctx context.Context) (*store_sqlite.Store, error) {
 				payload, err := req.reservePayload(ctx, target)
