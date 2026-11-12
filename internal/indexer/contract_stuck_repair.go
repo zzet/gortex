@@ -492,7 +492,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		}
 	}
 	for path := range candidates {
-		if !stuck[path] && (r.restartLeft(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path)) {
+		if !stuck[path] && (r.restartLeft(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path) || r.driftedRow(ctx, store, repo, path)) {
 			stuck[path] = true
 		}
 	}
@@ -672,7 +672,38 @@ func contractCensusFileOnDisk(root, repo, path string) bool {
 // unrepaired reports whether a repair left path in flight or still without a
 // row, so its attempts keep counting toward the envelope.
 func (r *ContractStuckRepair) unrepaired(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
-	return r.inFlight(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path)
+	return r.inFlight(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path) || r.driftedRow(ctx, store, repo, path)
+}
+
+// driftedRow reports whether path, a census file a capture reported or an
+// earlier repair attempted, has bytes on disk that, after the repository's
+// source transforms, no longer match its metadata row. Under the held lane no
+// save is in flight, so nothing will rewrite the row: a baseline rebuild
+// skips the file as moved and leaves its receipt as it stands, so a receipt
+// of an outdated policy is never replaced and the capture refuses it again.
+// The bytes are compared after the indexer's own source transforms, the
+// pipeline the forced reindex writes the row with, so a reindex always
+// clears what this reports. A file whose save is writing is left to it.
+func (r *ContractStuckRepair) driftedRow(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	if repo == "" || store.ContractReceiptWriteStates(repo, "", []string{path})[path].Writing {
+		return false
+	}
+	idx, root, err := r.repoIndexer(repo)
+	if err != nil || !contractCensusFileOnDisk(root, repo, path) {
+		return false
+	}
+	rows, err := store.FileMetasByPathsContext(ctx, repo, []string{path})
+	row, ok := rows[path]
+	if err != nil || !ok || row.ContentHash == "" {
+		return false
+	}
+	rel := strings.TrimPrefix(path, repo+"/")
+	raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		return false
+	}
+	src := idx.transforms.run(rel, raw)
+	return contentHashForSource(src) != row.ContentHash || len(src) != row.Size
 }
 
 // repoIndexer is the repository's live indexer and root.
