@@ -179,6 +179,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 
 	runtime := collectRuntime(home, doctorDays)
 	generated := doctorGeneratedFiles()
+	legacy := collectLegacyState(home, root)
 
 	if doctorJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -188,6 +189,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 			"agents":          reports,
 			"generated_files": generated,
 			"runtime":         runtime,
+			"legacy_state":    legacy,
 		}); err != nil {
 			return err
 		}
@@ -197,6 +199,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	printDoctorHuman(cmd.OutOrStdout(), reports)
 	printDoctorGeneratedFiles(cmd.OutOrStdout(), generated)
 	printDoctorRuntime(cmd.OutOrStdout(), runtime)
+	printDoctorLegacy(cmd.OutOrStdout(), legacy)
 	return doctorExit(runtime)
 }
 
