@@ -1,4 +1,19 @@
 # Release-candidate checks
+# Releasing
+
+## Release candidates
+
+Every release candidate (RC) tag must pass the native Windows worktree smoke
+test before the release notes claim Windows support.
+
+1. Trigger the `acceptance-native-windows` job in
+   `.github/workflows/bench-arm.yml` for the RC tag (manual
+   `workflow_dispatch`, `suite: acceptance-native-windows`).
+2. Post the run link on issue #777.
+3. If the job reproduces #777 (a `view_read_only` or "lane is busy" refusal,
+   or a forced-kill daemon stop), the release notes for that milestone must
+   state that native Windows edits are unsupported, and Windows path-identity
+   hardening moves into the next patch milestone.
 
 ## Offline-untrack escape hatch
 
