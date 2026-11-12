@@ -3,6 +3,7 @@ package indexer
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -125,7 +126,7 @@ func TestLegacyPrimaryClosureReplayPreservesOrRemovesPersistedConfig(t *testing.
 				require.False(t, checkoutPresent)
 				require.False(t, graphPresent)
 				require.Len(t, removals, 1, "real YAML finalization removes the legacy revoked entry once")
-				require.Equal(t, root, removals[0].ContextMap()["root"])
+				require.Equal(t, filepath.ToSlash(root), removals[0].ContextMap()["root"])
 				require.Equal(t, reconcile.CauseUntrack, removals[0].ContextMap()["cause"])
 				require.Equal(t, "repository_cleanup", removals[0].ContextMap()["caller"])
 			} else {
