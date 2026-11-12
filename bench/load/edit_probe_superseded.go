@@ -53,6 +53,9 @@ func supersededStatus(status map[string]any, raw json.RawMessage, wireID int64) 
 }
 
 func classifySupersededRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope, proof *receiptproof.Superseded) bool {
+	// As for normal completion, earlier probe errors and pre-ACK mismatches
+	// remain observations; final readback/oracle failures and false-fresh
+	// content after ACK remain fatal below.
 	if record == nil || proof == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 ||
 		record.Outcome != "diagnostic_failure" || len(record.Errors) != 1 ||
 		record.Errors[0] != "A/P/B accounting unavailable: "+strings.Join(record.Accounting.Reasons, "; ") ||
@@ -62,7 +65,7 @@ func classifySupersededRecord(record *editProbeRecord, scope *editProbePhysicalW
 		record.Accounting.P != nil || record.Accounting.B != nil || record.Accounting.R != nil || record.Accounting.Shared != nil ||
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID ||
 		record.ACKReadbackExact == nil || record.ACKCommitSeq == 0 || record.Ack.Value == nil || !record.GraphTerminal ||
-		record.StaleClaimedFresh || record.PrecommitFreshMismatches != 0 || record.ProbeErrors != 0 ||
+		record.StaleClaimedFresh ||
 		record.EvidenceBytes <= 0 || record.EvidenceLimit != editProbeRawLimit || record.EvidenceBytes > record.EvidenceLimit {
 		return false
 	}

@@ -105,7 +105,7 @@ func TestEditProbeProvenSupersededPreservesUnavailableTimingsAndRefusal(t *testi
 }
 
 func TestEditProbeSupersededNeverMasksOtherFailures(t *testing.T) {
-	for _, mode := range []string{"unknown_scope", "single_writer", "wrong_ACK", "stale", "incorrect_read", "missing_first_correct", "missing_immediate_file", "missing_call_chain", "probe_error", "capped", "deadline", "accepted_timing", "foreign_guard"} {
+	for _, mode := range []string{"unknown_scope", "single_writer", "wrong_ACK", "stale", "incorrect_read", "missing_first_correct", "missing_immediate_file", "missing_call_chain", "read_error", "capped", "deadline", "accepted_timing", "foreign_guard"} {
 		t.Run(mode, func(t *testing.T) {
 			record, proof := supersededRecordFixture(t)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
@@ -126,8 +126,8 @@ func TestEditProbeSupersededNeverMasksOtherFailures(t *testing.T) {
 				record.Readbacks = append(record.Readbacks[:1], record.Readbacks[2:]...)
 			case "missing_call_chain":
 				delete(record.FirstCorrect, "call_chain")
-			case "probe_error":
-				record.ProbeErrors = 1
+			case "read_error":
+				record.Readbacks[0].Error = "readback failed"
 			case "capped":
 				record.Outcome = "harness_evidence_incomplete"
 			case "deadline":
@@ -217,7 +217,7 @@ func TestEditProbeSupersededLatestStatusDiscardsEarlierProof(t *testing.T) {
 }
 
 func TestEditProbeSupersededFinishJoinsRealLogsAfterEvidenceSettles(t *testing.T) {
-	for _, mode := range []string{"proven", "missing_guard", "ambiguous_guard", "sink_error", "cap", "incorrect_read", "missing_file", "missing_call_chain", "probe_error", "stale", "ack_error", "late_invalid_status", "accepted"} {
+	for _, mode := range []string{"proven", "missing_guard", "ambiguous_guard", "sink_error", "cap", "incorrect_read", "missing_file", "missing_call_chain", "read_error", "stale", "ack_error", "late_invalid_status", "accepted"} {
 		t.Run(mode, func(t *testing.T) {
 			record, proof := supersededRecordFixture(t)
 			root := t.TempDir()
@@ -260,8 +260,8 @@ func TestEditProbeSupersededFinishJoinsRealLogsAfterEvidenceSettles(t *testing.T
 				state.record.Readbacks = append(state.record.Readbacks[:1], state.record.Readbacks[2:]...)
 			case "missing_call_chain":
 				delete(state.record.FirstCorrect, "call_chain")
-			case "probe_error":
-				state.record.ProbeErrors = 1
+			case "read_error":
+				state.record.Readbacks[0].Error = "readback failed"
 			case "stale":
 				state.record.StaleClaimedFresh = true
 			case "ack_error":
