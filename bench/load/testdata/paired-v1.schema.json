@@ -2098,6 +2098,258 @@
                                   }
                                 ]
                               },
+                              "superseded_receipt": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "guard": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "attempt_completion_applied": {
+                                            "type": "integer"
+                                          },
+                                          "attempt_completion_count": {
+                                            "type": "integer"
+                                          },
+                                          "attempt_completion_disposition": {
+                                            "type": "string"
+                                          },
+                                          "attempt_completion_fallback": {
+                                            "type": "boolean"
+                                          },
+                                          "attempt_completion_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "attempt_completion_pending_at_check": {
+                                            "type": "integer"
+                                          },
+                                          "attempt_guard_accepted_stamps": {
+                                            "type": "string"
+                                          },
+                                          "attempt_guard_collector_ticket": {
+                                            "type": "integer"
+                                          },
+                                          "attempt_guard_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "attempt_guard_patch_present": {
+                                            "anyOf": [
+                                              {
+                                                "type": "boolean"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "attempt_guard_publication_key": {
+                                            "type": "string"
+                                          },
+                                          "attempt_guard_recorder": {
+                                            "type": "string"
+                                          },
+                                          "attempt_guard_terminal": {
+                                            "anyOf": [
+                                              {
+                                                "type": "boolean"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "attempt_guard_ticket": {
+                                            "type": "integer"
+                                          },
+                                          "attempt_guard_window_present": {
+                                            "anyOf": [
+                                              {
+                                                "type": "boolean"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "attempt_rejection_reason": {
+                                            "type": "string"
+                                          },
+                                          "attempt_retry": {
+                                            "anyOf": [
+                                              {
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "line_number": {
+                                            "type": "integer"
+                                          },
+                                          "line_sha256": {
+                                            "type": "string"
+                                          },
+                                          "msg": {
+                                            "type": "string"
+                                          },
+                                          "patch_lap_scope": {
+                                            "type": "string"
+                                          },
+                                          "repo": {
+                                            "type": "string"
+                                          },
+                                          "source_log": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "required": [
+                                          "msg",
+                                          "patch_lap_scope",
+                                          "attempt_rejection_reason",
+                                          "repo",
+                                          "attempt_guard_observed",
+                                          "attempt_guard_recorder",
+                                          "attempt_guard_publication_key",
+                                          "attempt_guard_ticket",
+                                          "attempt_guard_collector_ticket",
+                                          "attempt_guard_accepted_stamps",
+                                          "attempt_guard_window_present",
+                                          "attempt_guard_terminal",
+                                          "attempt_guard_patch_present",
+                                          "attempt_retry",
+                                          "attempt_completion_observed",
+                                          "attempt_completion_disposition",
+                                          "attempt_completion_fallback",
+                                          "attempt_completion_applied",
+                                          "attempt_completion_pending_at_check",
+                                          "attempt_completion_count",
+                                          "source_log",
+                                          "line_number",
+                                          "line_sha256"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "original_accounting_error": {
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "accepted_attempt_stage": {
+                                            "type": "string"
+                                          },
+                                          "acknowledgement_rpc_id": {
+                                            "type": "string"
+                                          },
+                                          "applied_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_last_observed_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_refusal": {
+                                            "type": "string"
+                                          },
+                                          "background_requested_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_stage": {
+                                            "type": "string"
+                                          },
+                                          "background_unavailable_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "binding_predicate": {
+                                            "type": "string"
+                                          },
+                                          "coalesced_absent_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "mutation_id": {
+                                            "type": "string"
+                                          },
+                                          "observed_native_handoffs": {
+                                            "anyOf": [
+                                              {
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "physical_unavailable_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "publication_clock": {
+                                            "type": "string"
+                                          },
+                                          "publication_key": {
+                                            "type": "string"
+                                          },
+                                          "publication_source": {
+                                            "type": "string"
+                                          },
+                                          "publication_terminal": {
+                                            "type": "boolean"
+                                          },
+                                          "publication_ticket": {
+                                            "type": "integer"
+                                          },
+                                          "receipt": {
+                                            "type": "string"
+                                          },
+                                          "requested_generation": {
+                                            "type": "integer"
+                                          },
+                                          "status_sha256": {
+                                            "type": "string"
+                                          },
+                                          "status_wire_id": {
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "receipt",
+                                          "mutation_id",
+                                          "acknowledgement_rpc_id",
+                                          "requested_generation",
+                                          "applied_generation",
+                                          "publication_key",
+                                          "publication_ticket",
+                                          "publication_source",
+                                          "publication_clock",
+                                          "publication_terminal",
+                                          "physical_unavailable_observed",
+                                          "background_unavailable_observed",
+                                          "coalesced_absent_observed",
+                                          "background_refusal",
+                                          "binding_predicate",
+                                          "background_stage",
+                                          "accepted_attempt_stage",
+                                          "background_requested_generation",
+                                          "background_last_observed_generation",
+                                          "observed_native_handoffs",
+                                          "status_wire_id",
+                                          "status_sha256"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "guard",
+                                      "original_accounting_error"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "t_ack_ms": {
                                 "additionalProperties": false,
                                 "properties": {
