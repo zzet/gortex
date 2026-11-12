@@ -278,6 +278,18 @@ precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
 the paired no-regression cell stay one editor.
 
+A full gate record may use outcome `proven_superseded` only in an admitted
+shared physical worktree. Its optional `superseded_receipt` joins the latest
+terminal receipt status (receipt, mutation, RPC, generation and publication
+identity) to one exact owned daemon-log observation of a covered completion
+without acceptance. Both raw evidence references and hashes remain in the
+proof. The original accounting error, refusal and unavailable P/B windows stay
+visible; no zero timing is substituted, and the outcome has its own count.
+ACK and edit/read correctness, output modes, resources and the full offered
+denominator remain required. Accepted attempts, separate checkouts and missing,
+ambiguous or capped evidence keep their strict requirements. This additive
+report/checker classification does not rewrite historical failed reports.
+
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
 six distinct pinned repositories. Source checkouts that share one Git common
 directory count as one repository. For linked views of one pinned primary,

@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+
+	"github.com/zzet/gortex/bench/receiptproof"
 )
 
 type editLoopRow struct {
@@ -62,6 +64,24 @@ type editLoopWire struct {
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
+		Superseded *receiptproof.Superseded `json:"superseded_receipt"`
+		Receipt    string                   `json:"mutation_receipt"`
+		Accounting struct {
+			State     string `json:"state"`
+			RPCID     string `json:"bound_rpc_id"`
+			Requested uint64 `json:"requested_generation"`
+			Applied   uint64 `json:"applied_generation"`
+			A         *struct {
+				WallNS            int64 `json:"wall_ns"`
+				SumNS             int64 `json:"sum_ns"`
+				ResidualNS        int64 `json:"residual_ns"`
+				WithinFivePercent bool  `json:"within_five_percent"`
+			} `json:"acknowledgement"`
+			P      json.RawMessage `json:"physical"`
+			B      json.RawMessage `json:"requested_background"`
+			R      json.RawMessage `json:"read_assisted_publisher"`
+			Shared json.RawMessage `json:"shared_owner"`
+		} `json:"accounting"`
 		CheckoutID       string `json:"checkout_id"`
 		MutationID       string `json:"mutation_id"`
 		ACKStatus        string `json:"ack_status"`
@@ -313,11 +333,28 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 	}
 	modes := []string{"json", "toon", "compact", "facade", "cli"}
 	for i, record := range wire.Edits {
-		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" || len(record.Errors) != 0 {
+		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome || len(record.Errors) != 0 {
 			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
+		}
+
+		if record.Outcome == receiptproof.SupersededOutcome {
+			a := record.Accounting.A
+			digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
+			if !sharedPhysicalEditLoop(wire) || !record.Superseded.Matches(record.Receipt, record.MutationID, record.Accounting.RPCID, record.Accounting.Requested, record.Accounting.Applied) ||
+				record.Accounting.State != "terminal_unavailable_background" || a == nil || !a.WithinFivePercent || a.WallNS < 0 || a.SumNS < 0 || a.SumNS > a.WallNS ||
+				a.ResidualNS != a.WallNS-a.SumNS || a.ResidualNS > a.WallNS/20 ||
+				string(record.Accounting.P) != "null" || string(record.Accounting.B) != "null" || !absentEditLoopTiming(record.Accounting.R) || !absentEditLoopTiming(record.Accounting.Shared) ||
+				record.ACKExact == nil || record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.ACKMutationID != record.MutationID ||
+				record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
+				return wire, errors.New("superseded receipt lacks exact shared-worktree status/guard/ACK proof")
+			}
 		}
 	}
 	return wire, nil
+}
+
+func absentEditLoopTiming(value json.RawMessage) bool {
+	return len(value) == 0 || string(value) == "null"
 }
 
 // Only the runtime's physical binding observation qualifies this exception.
