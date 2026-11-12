@@ -292,6 +292,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}()
 	fallbacks := make([]incrementalFallback, 0)
 	receipts := make([]fileReadReceipt, 0, len(files))
+	// inertMeta holds, by path, the metadata row of an inert file's saved
+	// bytes: its graph rows stand, but the row must describe the new bytes.
+	inertMeta := make(map[string]graph.FileMetaRow)
 	nodeCount, edgeCount := 0, 0
 	var retainedBytes int64
 	var readFailed []string
@@ -365,6 +368,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 				if inputErr == nil {
 					inputErr = idx.contractCoreInputs.begin([]string{graphPath})
 				}
+				if row, ok := idx.prepareFileMeta(prepared.relPath, prepared.src, prepared.result); ok && inputErr == nil {
+					inertMeta[filePath] = row
+				}
 				prepared.release()
 				if inputErr != nil {
 					idx.noteFileIndexFailure(filePath, inputErr)
@@ -374,6 +380,16 @@ func (idx *Indexer) reindexIncrementalChunk(
 			}
 		}
 		if !forced && inert {
+			if _, kept := inertMeta[filePath]; !kept {
+				if prepared, ok := idx.takePreparedSnapshot(filePath); ok {
+					if row, ok := idx.prepareFileMeta(prepared.relPath, prepared.src, prepared.result); ok {
+						inertMeta[filePath] = row
+					}
+					prepared.release()
+				}
+			}
+			// Both branches took the prepared extraction; this only guards a
+			// path that did not.
 			idx.discardPreparedExtraction(filePath)
 			receipts = append(receipts, fileReadReceipt{
 				absPath: filePath, mtimeKey: idx.relKey(filePath), readVersion: probe.readVersion,
@@ -477,6 +493,12 @@ func (idx *Indexer) reindexIncrementalChunk(
 		zap.Int("receipts", len(receipts)))
 	defer receiptTiming.abort()
 	mtimes := markerBatch.publicationStamps().beginPatchLap(patchMtimes)
+	// As a staged file's row is written before its read is recorded, so is
+	// an inert one's: a read the file has since moved past is not recorded.
+	// Its row then describes bytes no longer on disk, which every reader
+	// that gates on the mtime rejects first, and the next read writes the
+	// row again.
+	idx.persistInertFileMeta(inertMeta)
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
 	mtimes.end()
 	receiptTiming.complete(nil, zap.Int("fresh_files", len(freshPaths)), zap.Int("stale_files", len(stalePaths)))
@@ -1804,6 +1826,34 @@ func (idx *Indexer) persistIncrementalSidecars(stages []*incrementalBatchStage) 
 			_ = writer.BulkSetConstantValues(idx.repoPrefix, constRows)
 		}
 	}
+}
+
+// persistInertFileMeta writes the metadata rows of inert files whose stored
+// row no longer describes their bytes. An inert save restates no graph rows,
+// but the row's content hash and size are what every reader compares with
+// the file to prove its indexed bytes; left behind, the file looks moved to
+// them for good, while its equal mtime keeps the census from reading it.
+func (idx *Indexer) persistInertFileMeta(inertMeta map[string]graph.FileMetaRow) {
+	if len(inertMeta) == 0 {
+		return
+	}
+	paths := make([]string, 0, len(inertMeta))
+	for _, row := range inertMeta {
+		paths = append(paths, row.FilePath)
+	}
+	// A failed read leaves stored empty and writes every row, the safe side.
+	var stored map[string]graph.FileMetaRow
+	if reader, ok := idx.graph.(graph.FileMetaPathReader); ok {
+		stored, _ = reader.FileMetasByPaths(idx.repoPrefix, paths)
+	}
+	rows := make([]graph.FileMetaRow, 0, len(inertMeta))
+	for _, row := range inertMeta {
+		if prior, found := stored[row.FilePath]; found && prior.ContentHash == row.ContentHash && prior.Size == row.Size {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	persistFileMetaRows(idx.graph, idx.repoPrefix, rows)
 }
 
 // recordFileReadVersionsBatched advances only receipts whose exact parsed
