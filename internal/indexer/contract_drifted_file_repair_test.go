@@ -91,11 +91,16 @@ func TestContractDriftedFileIsReindexedWithoutABaselineRebuild(t *testing.T) {
 	driftContractFile(t, f.contractJobFixture, "helper.go", drifted)
 	f.r.Suspect("fixture", []string{helper})
 	store := f.store.AtGeneration(0)
+	// The repair is counted as its reindex starts, and a path whose save is
+	// writing is not drifted: wait for the rewritten row itself.
 	require.Eventually(t, func() bool {
-		return repairCount("stuck_receipt") == repaired+1 && !f.r.driftedRow(t.Context(), store, "fixture", helper)
+		rows, err := store.FileMetasByPaths("fixture", []string{helper})
+		return err == nil && rows[helper].ContentHash == contentHashForSource([]byte(drifted))
 	}, 20*time.Second, 10*time.Millisecond, "one forced reindex rewrote the drifted row")
-	rows, err := store.FileMetasByPaths("fixture", []string{helper})
-	require.NoError(t, err)
-	require.Equal(t, contentHashForSource([]byte(drifted)), rows[helper].ContentHash)
+	require.Eventually(t, func() bool {
+		return len(f.store.OpenContractCoreWindows("fixture")) == 0
+	}, 20*time.Second, 10*time.Millisecond, "the reindex closed its window")
+	require.False(t, f.r.driftedRow(t.Context(), store, "fixture", helper))
+	require.Equal(t, repaired+1, repairCount("stuck_receipt"), "one forced reindex")
 	require.Equal(t, headers, repairCount("pending_header"), "drift alone needs no baseline rebuild")
 }
