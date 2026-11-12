@@ -73,7 +73,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 	repo := strings.TrimSpace(req.GetString("repo", ""))
 	repoRoot, repoPrefix := s.diffRepoScope(ctx, repo)
 
-	changedFiles, fileDomain, _, err := s.resolveReviewerChangeset(ctx, req, repoRoot)
+	changedFiles, fileDomain, _, err := s.resolveReviewerChangeset(ctx, req, repoRoot, repoPrefix)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -159,7 +159,7 @@ func (s *Server) handleSuggestReviewers(ctx context.Context, req mcp.CallToolReq
 // FilePaths, while base (git) and number (forge) yield repo-relative paths.
 // Forcing one domain on all three double-prefixes the ids branch on a prefixed
 // graph and silently drops the ownership and co-change signals.
-func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolRequest, repoRoot string) (files []string, domain analysis.PathDomain, symbolIDs []string, err error) {
+func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolRequest, repoRoot, repoPrefix string) (files []string, domain analysis.PathDomain, symbolIDs []string, err error) {
 	idsStr := strings.TrimSpace(req.GetString("ids", ""))
 	base := strings.TrimSpace(req.GetString("base", ""))
 	number := req.GetInt("number", 0)
@@ -185,7 +185,7 @@ func (s *Server) resolveReviewerChangeset(ctx context.Context, req mcp.CallToolR
 		if repoRoot == "" {
 			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("could not resolve a repository root for the base diff")
 		}
-		diff, derr := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), "compare", base)
+		diff, derr := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, "compare", base)
 		if derr != nil {
 			return nil, analysis.RepoRelativePath, nil, fmt.Errorf("git diff against %q failed: %v", base, derr)
 		}

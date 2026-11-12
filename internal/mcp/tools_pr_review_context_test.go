@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,8 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
 )
 
 // callPRReviewContext invokes the registered pr_review_context tool through
@@ -121,6 +127,77 @@ func TestPRReviewContext_EmptyDiff(t *testing.T) {
 	}))
 	require.Equal(t, 0, out.ChangedSymbols)
 	require.Equal(t, prReviewPass, out.Verdict)
+}
+
+// TestPRReviewContext_DiffsTheWorktreeView: a request routed to a linked
+// worktree's view diffs that worktree's working copy, not the tracked root.
+func TestPRReviewContext_DiffsTheWorktreeView(t *testing.T) {
+	// Given a tracked repo with a clean working tree, and a linked worktree
+	// outside it whose working copy edits fileB only.
+	dir, _, fileB, _ := siblingDiffGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+	worktree := filepath.Join(t.TempDir(), "wt")
+	runGitT(t, dir, "worktree", "add", "--detach", worktree, "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, filepath.FromSlash(fileB)),
+		[]byte("package alpha\n\nfunc Beta() int {\n\treturn 4\n}\n"), 0o644))
+
+	// When pr_review_context runs the default unstaged diff through that view.
+	ctx := withRequestView(t.Context(), &requestView{kind: requestViewKindWorktree, viewRoot: worktree, reader: srv.graph})
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "pr_review_context"
+	req.Params.Arguments = map[string]any{"sections": "diff_context"}
+	res, err := srv.handlePRReviewContext(ctx, req)
+	require.NoError(t, err)
+
+	// Then the changeset is the worktree's edit; the tracked root has none.
+	require.Equal(t, []string{fileB}, decodePRReview(t, res).ChangedFiles)
+}
+
+// TestPRReviewContext_WorktreeViewKeepsTheRepoPrefix: in a multi-repo store
+// the worktree's diff joins graph nodes under the tracked repo's prefix, even
+// though the worktree sits outside every tracked root.
+func TestPRReviewContext_WorktreeViewKeepsTheRepoPrefix(t *testing.T) {
+	// Given a repo tracked under the prefix "repo" and a linked worktree
+	// outside it whose working copy edits Beta's body.
+	dir, _, fileB, _ := siblingDiffGitRepo(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: dir, Name: "repo"}}}
+	gc.SetConfigPath(cfgPath)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(cfgPath)
+	require.NoError(t, err)
+	g := graph.New()
+	mi := indexer.NewMultiIndexer(g, testRegistry(), search.NewNull(), cm, zap.NewNop())
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(t.Context(), entry)
+		require.NoError(t, err)
+	}
+	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{ConfigManager: cm, MultiIndexer: mi})
+	worktree := filepath.Join(t.TempDir(), "wt")
+	runGitT(t, dir, "worktree", "add", "--detach", worktree, "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, filepath.FromSlash(fileB)),
+		[]byte("package alpha\n\nfunc Beta() int {\n\treturn 4\n}\n"), 0o644))
+
+	// When pr_review_context diffs through a view of that worktree.
+	ctx := withRequestView(t.Context(), &requestView{
+		kind:         requestViewKindWorktree,
+		viewRoot:     worktree,
+		reader:       g,
+		materialized: &graphview.RepoView{ID: graphview.RepoViewID{RepoPrefix: "repo"}},
+	})
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "pr_review_context"
+	req.Params.Arguments = map[string]any{"repo": "repo", "sections": "diff_context"}
+	res, err := srv.handlePRReviewContext(ctx, req)
+	require.NoError(t, err)
+
+	// Then Beta's change maps to its graph node under "repo/".
+	out := decodePRReview(t, res)
+	ids := make([]string, 0, len(out.DiffContext))
+	for _, sym := range out.DiffContext {
+		ids = append(ids, sym.ID)
+	}
+	require.Contains(t, ids, "repo/"+fileB+"::Beta")
 }
 
 // TestPRReviewContext_SectionsFilter: a `sections` filter drops the

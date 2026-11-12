@@ -161,12 +161,12 @@ func TestClassifyChangedSymbolsReadsThroughRequestReader(t *testing.T) {
 		ChangedSymbols: []analysis.ChangedSymbol{{ID: rfKeptID, Name: "Kept", FilePath: rfKeptKey}},
 	}
 
-	onBase := srv.classifyChangedSymbols(context.Background(), diff, nil)
+	onBase := srv.classifyChangedSymbols(context.Background(), diff, nil, nil)
 	require.Len(t, onBase, 1)
 	assert.NotEqual(t, "config", onBase[0].Class,
 		"a plain request classifies against the indexed function node")
 
-	onView := srv.classifyChangedSymbols(overlayCtx(t, srv, layer), diff, nil)
+	onView := srv.classifyChangedSymbols(overlayCtx(t, srv, layer), diff, nil, nil)
 	require.Len(t, onView, 1)
 	assert.Equal(t, "config", onView[0].Class,
 		"the buffer's node kind must decide the change class")
