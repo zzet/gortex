@@ -320,6 +320,31 @@ func TestUpgradeKillPointsRecoverEveryFixture(t *testing.T) {
 			require.Equal(t, currentSchemaVersion, want.version)
 			require.Equal(t, "ok", want.integrity)
 
+			if source.name == "fixture_v40" {
+				// Reuse the latest release's upgraded fixture to cover a current
+				// store at the same scale without capturing another schema.
+				t.Run("current_schema_reopen", func(t *testing.T) {
+					store := copyUpgradeStore(t, baselineStore, t.TempDir())
+					var events migrationEvents
+					var points []upgradePoint
+					s, err := Open(store, upgradeDaemonOptions(
+						WithMigrationObserver(events.observe),
+						withUpgradeHook(func(point upgradePoint, _ int) {
+							points = append(points, point)
+						}))...)
+					require.NoError(t, err)
+					require.False(t, s.NeedsRebuild())
+					require.NoError(t, s.Close())
+					require.Empty(t, events.phases())
+					require.Empty(t, points)
+					require.Equal(t, want, readUpgradeOutcome(t, store))
+					backups, err := ListUpgradeBackups(store)
+					require.NoError(t, err)
+					require.Empty(t, backups)
+					requireNoPartialBackup(t, store)
+				})
+			}
+
 			for _, kp := range points {
 				t.Run(kp.label, func(t *testing.T) {
 					store := copyUpgradeStore(t, source.path, t.TempDir())
