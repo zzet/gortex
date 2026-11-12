@@ -303,6 +303,7 @@ func (f *contractJobFixture) job(hooks *contractConvergenceHooks, yield func(con
 // layer's creation order, a snapshot adjustment, the Published source and the
 // job's logger.
 type contractFixtureJob struct {
+	capture           ContractFollowupCapture
 	otherActorWaiting func() bool
 	scratchParent     string
 	cache             **contractDeltaCache
@@ -323,7 +324,11 @@ func runFixtureContractJob(t *testing.T, options ContractFollowupCaptureOptions,
 	inputs, err := options.Materializer.CaptureContractInputs(ctx, nil, "fixture", "")
 	require.NoError(t, err)
 	require.True(t, inputs.State.Accepted)
-	snapshot, targets, err := NewContractFollowupCapture(options)(ctx, nil, inputs, "fixture", "")
+	capture := job.capture
+	if capture == nil {
+		capture = NewContractFollowupCapture(options)
+	}
+	snapshot, targets, err := capture(ctx, nil, inputs, "fixture", "")
 	require.NoError(t, err)
 	require.Len(t, targets, 1)
 	snapshot.Work = targets[0].Work
