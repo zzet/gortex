@@ -2301,14 +2301,23 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 			if w.mutationBeforeComplete != nil {
 				w.mutationBeforeComplete(path, generation)
 			}
-			if !w.completeMutationWaitersObserved(path, generation, patchErr, fanout, true, publication) && patchErr == nil {
+			current, completion := w.completeMutationWaitersObserved(path, generation, patchErr, fanout, true, publication)
+			if publication != nil {
+				publication.completion = completion
+			}
+			if !current && patchErr == nil {
 				if !supersededRecorded {
 					w.noteMutationSuperseded()
 				}
 				// The graph body landed, but a successor won admission before
 				// this completion. Cover only older receipts without accepting
 				// this attempt as the current timing/publication winner.
-				w.completeMutationWaitersGuarded(path, generation, nil, fanout, false)
+				_, covered := w.completeMutationWaitersObserved(path, generation, nil, fanout, false, nil)
+				if publication != nil {
+					covered.fallback = true
+					covered.pendingGeneration = completion.pendingGeneration
+					publication.completion = covered
+				}
 			}
 		}
 	}()
@@ -2405,7 +2414,8 @@ func (w *Watcher) completeMutationWaitersGuarded(
 	fanout DerivedFanoutCompleteness,
 	requireCurrent bool,
 ) bool {
-	return w.completeMutationWaitersObserved(path, appliedGeneration, err, fanout, requireCurrent, nil)
+	completed, _ := w.completeMutationWaitersObserved(path, appliedGeneration, err, fanout, requireCurrent, nil)
+	return completed
 }
 
 func (w *Watcher) completeMutationWaitersObserved(
@@ -2415,7 +2425,7 @@ func (w *Watcher) completeMutationWaitersObserved(
 	fanout DerivedFanoutCompleteness,
 	requireCurrent bool,
 	publication *pointPublicationAttempt,
-) bool {
+) (bool, pointCompletionDiagnostic) {
 	type completion struct {
 		requested   uint64
 		done        chan MutationResult
@@ -2430,9 +2440,14 @@ func (w *Watcher) completeMutationWaitersObserved(
 		fanout = DerivedFanoutCompleteness{}
 	}
 	w.mu.Lock()
+	diagnostic := pointCompletionDiagnostic{
+		observed: true, appliedGeneration: appliedGeneration,
+		pendingGeneration: w.pendingGeneration[path],
+	}
 	if requireCurrent && w.pendingGeneration[path] > appliedGeneration {
 		w.mu.Unlock()
-		return false
+		diagnostic.kind = "superseded_before_completion"
+		return false, diagnostic
 	}
 	_, hasAppliedWaiter := w.mutationWaiters[path][appliedGeneration]
 	// The successful executor's finishGeneration may already have removed the
@@ -2466,6 +2481,17 @@ func (w *Watcher) completeMutationWaitersObserved(
 	if w.observedMutationGeneration[path] <= appliedGeneration {
 		delete(w.observedMutationGeneration, path)
 	}
+	diagnostic.completed = len(completions)
+	switch {
+	case err != nil:
+		diagnostic.kind = "failed_completion"
+	case accepted != nil:
+		diagnostic.kind = "selected_for_absorb"
+	case len(completions) > 0:
+		diagnostic.kind = "covered_without_acceptance"
+	default:
+		diagnostic.kind = "no_completions"
+	}
 	w.mu.Unlock()
 	if accepted != nil {
 		accepted.Absorb(publication.stamps)
@@ -2488,7 +2514,7 @@ func (w *Watcher) completeMutationWaitersObserved(
 		close(completion.done)
 	}
 	w.drainHeldNative(path)
-	return true
+	return true, diagnostic
 }
 
 func (w *Watcher) failMutationWaiters(err error) {

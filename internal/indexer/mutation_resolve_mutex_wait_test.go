@@ -241,7 +241,7 @@ func TestMutationResolveMutexDiagnosticCannotChangePhysicalAccounting(t *testing
 			case "invalid_changed":
 				stamps.patchLaps.invalid = true
 			}
-			window, ok, reason := record.completePhysicalAttempt(stamps, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
+			window, ok, reason, _ := record.completePhysicalAttempt(stamps, origin.Add(time.Millisecond), origin.Add(31*time.Millisecond), 0)
 			if !ok {
 				t.Fatal("physical owner was rejected")
 			}
