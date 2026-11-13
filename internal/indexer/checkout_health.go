@@ -25,8 +25,9 @@ import (
 //
 // Every map is keyed by a lifecycle state, so the key vocabulary is the
 // catalog's own and cannot grow with the workload. Counters carries the
-// view-lifecycle metric registry's non-zero series, which is where the rates
-// behind these levels live.
+// view-lifecycle metric registry's non-zero series and the installed idle
+// producer's explicit deferred zero, which is where the rates behind these
+// levels live.
 type ViewsHealth struct {
 	// Families is how many checkout families the catalog holds.
 	Families int `json:"families"`
@@ -88,7 +89,8 @@ type ViewsHealth struct {
 	// parked or retiring.
 	RetirementBacklog *RetirementBacklog `json:"retirement_backlog,omitempty"`
 	// Counters is the view-lifecycle metric registry, flattened: series key to
-	// value, zero-valued series omitted.
+	// value. Zero-valued series are omitted except the registered idle
+	// producer's deferred count, whose presence reports availability.
 	Counters map[string]int64 `json:"counters,omitempty"`
 }
 
@@ -102,7 +104,15 @@ type ViewsHealth struct {
 // where the truth is "the ref views could not be counted". The caller drops
 // the whole block on an error, which reads as "not available" instead.
 func (l *CheckoutLifecycle) ViewsHealth(ctx context.Context) (ViewsHealth, error) {
-	out := ViewsHealth{Counters: viewmetrics.Read().Flat()}
+	metrics := viewmetrics.Read()
+	out := ViewsHealth{Counters: metrics.Flat()}
+	// The daemon registers this exact series when its idle producer installs.
+	// Preserve an explicit zero from that same snapshot; an absent producer
+	// stays absent, and the generic flat registry keeps its sparse contract.
+	const idleDeferred = viewmetrics.ContractLinkedJobsTotal + "{policy=" + viewmetrics.ContractLinkedIdle + ",event=" + viewmetrics.ContractLinkedDeferred + "}"
+	if count, registered := metrics.Counters[idleDeferred]; registered {
+		out.Counters[idleDeferred] = count
+	}
 	if l == nil || l.catalog == nil {
 		return out, errNoCatalog
 	}
