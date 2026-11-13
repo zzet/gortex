@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,7 +77,7 @@ func TestCanonicalAttemptDuplicateRejectsContradictoryExecution(t *testing.T) {
 }
 
 func TestWatcherNativeDuplicateDispositionRequiresActualEarlyReturn(t *testing.T) {
-	for _, name := range []string{"native_duplicate", "receipt_checked", "changed_bytes"} {
+	for _, name := range []string{"native_duplicate", "receipt_checked", "changed_bytes", "same_mtime_changed_bytes"} {
 		t.Run(name, func(t *testing.T) {
 			root, idx, w := inertTestWatcher(t, "main.go", "package p\nfunc Stable() {}\n")
 			w.degradedNoFsnotify = true // this direct-call fixture never starts the native loop
@@ -84,6 +85,20 @@ func TestWatcherNativeDuplicateDispositionRequiresActualEarlyReturn(t *testing.T
 			path := filepath.Join(root, "main.go")
 			if name == "changed_bytes" {
 				bumpMtime(t, path, "package p\nfunc Changed() {}\n")
+			}
+			if name == "same_mtime_changed_bytes" {
+				before, err := os.Stat(path)
+				require.NoError(t, err)
+				// Keep both length and mtime: persisted content identity must
+				// still reject this plausible native replay before early return.
+				require.NoError(t, os.WriteFile(path, []byte("package p\nfunc Edited() {}\n"), 0o600))
+				require.NoError(t, os.Chtimes(path, before.ModTime(), before.ModTime()))
+				after, err := os.Stat(path)
+				require.NoError(t, err)
+				require.True(t, os.SameFile(before, after))
+				require.Equal(t, before.Size(), after.Size())
+				require.Equal(t, before.ModTime().UnixNano(), after.ModTime().UnixNano())
+				require.False(t, idx.indexedFileReceiptMatches(path))
 			}
 			called := false
 			stop := errors.New("observed executor entry")
@@ -105,6 +120,49 @@ func TestWatcherNativeDuplicateDispositionRequiresActualEarlyReturn(t *testing.T
 				require.False(t, s.patchLaps.nativeMtimeDuplicate)
 			}
 		})
+	}
+}
+
+func TestWatcherNativeDuplicatePublishesOnlyActualControlWindow(t *testing.T) {
+	root, idx, w := inertTestWatcher(t, "main.go", "package p\nfunc Stable() {}\n")
+	w.degradedNoFsnotify = true
+	t.Cleanup(func() { require.NoError(t, w.Stop()) })
+	path := filepath.Join(root, "main.go")
+	require.True(t, idx.indexedFileReceiptMatches(path), "the real persisted content and file version must match")
+	var executorCalls int
+	w.pointReindexRaw = func(string, *PublicationStamps) (*IndexResult, error) {
+		executorCalls++
+		return nil, errors.New("duplicate entered the indexing executor")
+	}
+	record := newPointPublication(t, "native-duplicate-control-window")
+	ticket, err := w.EnqueueFileMutation(WithPublicationRecord(t.Context(), record), path)
+	require.NoError(t, err)
+	result := awaitMutationRetryResult(t, ticket)
+	require.NoError(t, result.Err)
+	require.True(t, result.Reindexed)
+	require.Equal(t, ticket.Generation, result.AppliedGeneration)
+	require.Eventually(t, func() bool { return record.Snapshot().attemptWindow != nil }, 2*time.Second, time.Millisecond)
+	require.Zero(t, executorCalls, "the real receipt gate returns before parse/apply/resolver execution")
+	snapshot := record.Snapshot()
+	p := snapshot.EditTimings().Window.PatchAccounting
+	require.NotNil(t, p)
+	require.Equal(t, ticket.Generation, p.AttemptTicket)
+	require.Zero(t, p.AttemptRetry)
+	require.True(t, p.PartitionComplete)
+	require.Equal(t, "native_mtime_duplicate", p.ExecutionDisposition)
+	require.Equal(t, "not_established", p.BackgroundCoverage)
+	require.Zero(t, *p.UnattributedMS)
+	require.Equal(t, float64(snapshot.attemptWindow.endNS-snapshot.attemptWindow.startNS)/1e6, *p.SubtotalMS)
+	for _, name := range append(canonicalPatchLapNames[:], "patch_analysis", "executor_control") {
+		require.Equal(t, "not_applicable", p.PhaseStates[name], name)
+		require.Nil(t, p.PhasesMS[name], "unexecuted work must not become measured zero: %s", name)
+	}
+	for _, name := range []string{"attempt_setup", "patch_inspection", "attempt_finalize", "cohort_admission", "lane_wait"} {
+		require.Equal(t, "measured", p.PhaseStates[name], name)
+		require.NotNil(t, p.PhasesMS[name], name)
+	}
+	for _, phase := range []PublicationPhase{PublicationPatchExecutionStarted, PublicationPatchExecutionFinished, PublicationPatchDerivedStarted, PublicationPatchDerivedFinished} {
+		require.NotContains(t, phaseOffsets(snapshot), phase, "the no-op cannot inherit another publisher's phases")
 	}
 }
 

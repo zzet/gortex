@@ -478,7 +478,10 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 		}
 	}
 	if duplicate && out.R == nil {
-		fail("actual read-assisted publisher deep coverage unavailable")
+		// A matching native receipt identifies an unexecuted P, not the
+		// earlier publisher. Canonical work can publish before a newer
+		// generation reaches this gate; a reader is only one possible cause.
+		fail("actual publisher deep coverage unavailable")
 	}
 	for _, name := range []string{"gate_wait", "patch_parse", "apply", "search_lap", "resolve", "mtimes", "derived", "attempt_setup", "patch_inspection", "executor_control", "attempt_finalize", "cohort_admission", "lane_wait"} {
 		if duplicate && out.R != nil && (name == "executor_control" || isEditProbeRepairDeepPhase(name)) {

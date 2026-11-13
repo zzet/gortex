@@ -12,7 +12,10 @@ import (
 // A CLI probe is one owned `gortex call` process per oracle request. Its
 // cadence is bounded by process start, daemon dial and exit, not the 25 ms
 // probe period, and the process start stands in for the probe's wire start.
-const editProbeCLIStderrLimit = 64 << 10
+const (
+	editProbeCLIStdoutLimit = 8 << 20
+	editProbeCLIStderrLimit = 64 << 10
+)
 
 type editProbeCappedBuffer struct {
 	data     []byte
@@ -49,7 +52,7 @@ func (r *editProbeRuntime) performCLI(ctx context.Context, s *editProbeState, re
 	configureOwnedProcess(cmd)
 	cmd.Cancel = func() error { return killOwnedProcess(cmd) }
 	cmd.WaitDelay = time.Second
-	stdout := &editProbeCappedBuffer{limit: editProbeRawLimit}
+	stdout := &editProbeCappedBuffer{limit: editProbeCLIStdoutLimit}
 	stderr := &editProbeCappedBuffer{limit: editProbeCLIStderrLimit}
 	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = r.p.Root, r.p.Env, stdout, stderr
 	identity := wireCallIdentity{Started: time.Now()}
@@ -72,7 +75,7 @@ func (r *editProbeRuntime) performCLI(ctx context.Context, s *editProbeState, re
 	case callCtx.Err() != nil:
 		outcome, err = "product_deadline", errors.Join(callCtx.Err(), err)
 	case stdout.overflow:
-		outcome, err = "error", errors.Join(fmt.Errorf("%w: CLI stdout exceeded the per-edit evidence limit", errEditProbeEvidenceIncomplete), err)
+		outcome, err = "error", errors.Join(fmt.Errorf("%w: CLI stdout exceeded the per-call stdout limit", errEditProbeEvidenceIncomplete), err)
 	case err != nil:
 		outcome, err = "error", fmt.Errorf("gortex call: %w: %s", err, stderr.data)
 	}
