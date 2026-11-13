@@ -2823,6 +2823,9 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		ctx = markRequestStoreBusy(ctx, fp)
 		sg = requestLocalFileSummary(ctx, fp, gcxOnly)
 	} else if storeErr != nil {
+		if errors.Is(storeErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+			return nil, errProjectedSourceMoved
+		}
 		return mcp.NewToolResultError("get_file_summary: " + storeErr.Error()), nil
 	}
 	if len(sg.Nodes) == 0 && !storeBusy {
