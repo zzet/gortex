@@ -167,6 +167,9 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		// static, runtime, and the paths quoted inside findings — agrees on
 		// what a given repo is called.
 		doctorPath = newDoctorPathRedactor(home, root)
+		// Family remotes and repo prefixes are identity too, and they are not
+		// paths, so the path rewriter never touched them.
+		doctorLabel = newDoctorLabelRedactor()
 	}
 
 	doctorEnv := doctorEnvironment()
@@ -179,7 +182,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 
 	runtime := collectRuntime(home, doctorDays)
 	generated := doctorGeneratedFiles()
-	legacy := collectLegacyState(home, root)
+	legacy := collectLegacyState(home)
 
 	if doctorJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())

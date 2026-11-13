@@ -57,9 +57,9 @@ func TestLegacyStateClassification(t *testing.T) {
 			CommonDir: "/nonexistent/repos/.git",
 			Checkouts: []indexer.CheckoutOverview{
 				{CheckoutID: v7At(t, base), RootPath: cliOut, Intents: []string{"cli_track"},
-					IntentDetails: []indexer.IntentOverview{{IntentID: v7At(t, base.Add(2 * time.Second)), SourceKind: "cli_track"}}},
+					IntentDetails: []indexer.IntentOverview{{IntentID: v7At(t, base.Add(2*time.Second)), SourceKind: "cli_track"}}},
 				{CheckoutID: v7At(t, base), RootPath: mcpOut, Intents: []string{"mcp_track"},
-					IntentDetails: []indexer.IntentOverview{{IntentID: v7At(t, base.Add(3 * time.Second)), SourceKind: "mcp_track"}}},
+					IntentDetails: []indexer.IntentOverview{{IntentID: v7At(t, base.Add(3*time.Second)), SourceKind: "mcp_track"}}},
 				{CheckoutID: v7At(t, base), RootPath: offlineOut, Intents: []string{"manual_config"},
 					IntentDetails: []indexer.IntentOverview{{IntentID: v7At(t, base), SourceKind: "manual_config"}}},
 				{CheckoutID: v7At(t, base), RootPath: leakOut, Intents: []string{"manual_config"},
@@ -233,5 +233,207 @@ func TestLegacyStateJSONShape(t *testing.T) {
 	}
 	if state["skipped"] == "" {
 		t.Error("a skipped check must say why")
+	}
+}
+
+// stubCensus replaces the census seam for one test and returns the arguments
+// the collector actually sent, so a test can assert on the REQUEST and not
+// only on how the response was interpreted.
+func stubCensus(t *testing.T, raw string, err error) func() map[string]any {
+	t.Helper()
+	orig := doctorCensusTool
+	origEnv := doctorLegacyEnv
+	origPaths := doctorConfiguredPaths
+	var got map[string]any
+	t.Cleanup(func() { doctorCensusTool = orig; doctorLegacyEnv = origEnv; doctorConfiguredPaths = origPaths })
+	// doctorEnvironment() does a live control handshake. Without this stub the
+	// collector would take its "daemon not running" arm on a host with no
+	// daemon and every assertion below would be vacuous.
+	doctorLegacyEnv = func() DoctorEnvironment { return DoctorEnvironment{DaemonRunning: true} }
+	doctorCensusTool = func(tool string, args map[string]any) (json.RawMessage, error) {
+		if tool != "list_checkouts" {
+			t.Errorf("census asked for tool %q, want list_checkouts", tool)
+		}
+		got = args
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(raw), nil
+	}
+	return func() map[string]any { return got }
+}
+
+// TestLegacyStateCensusDisablesTruncation proves the census opts out of the
+// response budget. An empty argument map let list_checkouts apply its 40,000
+// byte default, whose budgeter drops nested checkout/graph rows and whole
+// families -- and FamiliesOverview unmarshals silently past the missing rows.
+func TestLegacyStateCensusDisablesTruncation(t *testing.T) {
+	args := stubCensus(t, `{"families":[]}`, nil)
+	_ = collectLegacyState(t.TempDir())
+
+	got := args()
+	if got == nil {
+		t.Fatal("census was never called")
+	}
+	v, ok := got["max_bytes"]
+	if !ok {
+		t.Fatal("census omitted max_bytes, so the daemon applies its truncating default")
+	}
+	if n, _ := v.(int); n != 0 {
+		t.Errorf("max_bytes = %v, want 0 (explicit opt-out of the byte cap)", v)
+	}
+}
+
+// TestLegacyStateTruncatedCensusFailsClosed proves a trimmed listing is never
+// read as a complete one. A partial inventory makes a tracked repository in
+// another workspace look absent, which classification reports as intentless.
+func TestLegacyStateTruncatedCensusFailsClosed(t *testing.T) {
+	stubCensus(t, `{"families":[],"_truncated_by_budget":true}`, nil)
+	home := t.TempDir()
+	state := collectLegacyState(home)
+
+	if state.Checked {
+		t.Error("a truncated census must not be reported as checked")
+	}
+	if !strings.Contains(state.Skipped, "truncated") {
+		t.Errorf("skip reason must name truncation, got %q", state.Skipped)
+	}
+	if len(state.Intentless) != 0 {
+		t.Errorf("a truncated census must not produce intentless findings, got %+v", state.Intentless)
+	}
+}
+
+// TestLegacyStateCensusErrorIsNotAFinding proves a daemon that refuses the
+// listing is "not checked", never "nothing found".
+func TestLegacyStateCensusErrorIsNotAFinding(t *testing.T) {
+	stubCensus(t, "", errFakeCensus{})
+	state := collectLegacyState(t.TempDir())
+	if state.Checked {
+		t.Error("a failed census must not be reported as checked")
+	}
+	if len(state.DedicatedCorpora)+len(state.Unattributed)+len(state.Intentless) != 0 {
+		t.Error("a failed census must not produce findings")
+	}
+}
+
+type errFakeCensus struct{}
+
+func (errFakeCensus) Error() string { return "daemon refused list_checkouts" }
+
+// TestLegacyStateSeparateWorkspaces proves the census is trusted as
+// daemon-wide: a repository tracked in another workspace is present in the
+// inventory and must be classified from that row, not reported as intentless.
+func TestLegacyStateSeparateWorkspaces(t *testing.T) {
+	now := time.Now()
+	otherRoot := "/elsewhere/other-repo"
+	overview := map[string]any{
+		"families": []any{
+			map[string]any{
+				"family_id":      "fam-main",
+				"display_remote": "github.com/acme/main",
+				"state":          "ready",
+				"checkouts": []any{
+					map[string]any{
+						"checkout_id": uuid.NewString(), "root_path": "/r/repo",
+						"effective_mode": "dedicated", "graph_id": "g-main",
+						"intents": []string{"cli_track"},
+					},
+				},
+				"graphs": []any{map[string]any{"graph_id": "g-main", "state": "ready"}},
+			},
+			map[string]any{
+				"family_id":      "fam-other",
+				"display_remote": "github.com/acme/other",
+				"state":          "ready",
+				"checkouts": []any{
+					map[string]any{
+						"checkout_id": v7At(t, now), "root_path": otherRoot,
+						"effective_mode": "dedicated", "graph_id": "g-other",
+						"intents": []string{"cli_track"},
+					},
+				},
+				"graphs": []any{map[string]any{"graph_id": "g-other", "state": "ready"}},
+			},
+		},
+	}
+	raw, _ := json.Marshal(overview)
+	stubCensus(t, string(raw), nil)
+
+	// A daemon-wide config lists both repos, including the one in the other
+	// workspace. Stub the reader: the real one resolves the platform config
+	// path and would answer from the developer's own config.
+	doctorConfiguredPaths = func(string) []string { return []string{"/r/repo", otherRoot} }
+
+	state := collectLegacyState(t.TempDir())
+	if !state.Checked {
+		t.Fatalf("complete census must be checked, skipped=%q", state.Skipped)
+	}
+	for _, e := range state.Intentless {
+		if e.Path == doctorPath(otherRoot) {
+			t.Errorf("%s is tracked in another workspace and must not be intentless", otherRoot)
+		}
+	}
+}
+
+// TestDedicatedCorporaRedactIdentity proves --redact covers the family remote
+// and the repo prefix, not just the root path. The issue requires prefix/path
+// redaction; a redacted report that still prints `github.com/acme/private`
+// has disclosed the repository it was supposed to hide.
+func TestDedicatedCorporaRedactIdentity(t *testing.T) {
+	origPath, origLabel := doctorPath, doctorLabel
+	t.Cleanup(func() { doctorPath, doctorLabel = origPath, origLabel })
+	doctorLabel = newDoctorLabelRedactor()
+
+	overview := indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID:      "fam",
+		DisplayRemote: "github.com/acme/private-remote",
+		State:         "ready",
+		Graphs: []indexer.GraphOverview{
+			{GraphID: "g1", RepoPrefix: "acme/private-prefix", State: "ready"},
+		},
+		Checkouts: []indexer.CheckoutOverview{
+			{CheckoutID: "c1", RootPath: "/home/u/code/private-remote-wt", AdminName: "wt1",
+				EffectiveMode: "dedicated", GraphID: "g1"},
+		},
+	}}}
+
+	got := dedicatedWorktreeCorpora(overview)
+	if len(got) != 1 {
+		t.Fatalf("corpora = %d, want 1", len(got))
+	}
+	c := got[0]
+	if strings.Contains(c.Family, "acme") || strings.Contains(c.Family, "private") {
+		t.Errorf("family remote leaked: %q", c.Family)
+	}
+	if strings.Contains(c.RepoPrefix, "acme") || strings.Contains(c.RepoPrefix, "private") {
+		t.Errorf("repo prefix leaked: %q", c.RepoPrefix)
+	}
+	if c.Family == "" || c.RepoPrefix == "" {
+		t.Error("redaction must still leave a stable pseudonym, not emptiness")
+	}
+
+	// The human rendering must not reintroduce the raw prefix either.
+	var buf bytes.Buffer
+	printDoctorLegacy(&buf, DoctorLegacyState{Checked: true, DedicatedCorpora: got})
+	if strings.Contains(buf.String(), "acme/private-prefix") {
+		t.Errorf("human rendering printed the raw prefix:\n%s", buf.String())
+	}
+}
+
+// TestLabelRedactorIsStable proves two findings about the same family render as
+// the same pseudonym, so a redacted report still reads as a diagnosis.
+func TestLabelRedactorIsStable(t *testing.T) {
+	red := newDoctorLabelRedactor()
+	a := red("github.com/acme/one")
+	b := red("github.com/acme/one")
+	c := red("github.com/acme/two")
+	if a != b {
+		t.Errorf("same identifier got %q then %q; redaction must be stable", a, b)
+	}
+	if a == c {
+		t.Error("distinct identifiers must not collide")
+	}
+	if red("") != "" {
+		t.Error("an empty identifier stays empty")
 	}
 }

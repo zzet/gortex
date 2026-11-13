@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +13,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/respbudget"
 )
 
 // Legacy state: what older versions quietly left on disk.
@@ -96,20 +101,51 @@ type DoctorLegacyEntry struct {
 // collectLegacyState builds the section. It asks the daemon for the checkout
 // catalog exactly the way `gortex repos families` does, then reads config.yaml
 // directly for the configured repo list. It never opens the store.
-func collectLegacyState(home, root string) DoctorLegacyState {
+func collectLegacyState(home string) DoctorLegacyState {
 	state := DoctorLegacyState{Checked: false}
-	if !doctorEnvironment().DaemonRunning {
+	if !doctorLegacyEnv().DaemonRunning {
 		state.Skipped = "daemon not running; legacy state not checked"
 		return state
 	}
 
-	raw, err := requireCheckoutTool(root, "list_checkouts", map[string]any{})
+	// The census must be daemon-wide, and it must not be structurally trimmed.
+	//
+	// Two defects made this request lie about the inventory it had read:
+	//
+	//  1. It relayed through the current repository, so `list_checkouts`
+	//     answered "families visible to THIS session's workspace". A doctor run
+	//     inside one tracked repository never saw the healthy repositories
+	//     tracked in other workspaces, and classifyConfiguredRepos then read
+	//     their absence as "no active intent". An untracked cwd fails the
+	//     relay's preflight outright. The census below is the administrative,
+	//     unbound read the tool documents as "the daemon-wide inventory" -- the
+	//     only read whose absence means what it appears to mean.
+	//  2. It passed an empty argument map, so `list_checkouts` applied its
+	//     default 40,000-byte response budget. The budgeter drops nested
+	//     checkout/graph rows and whole families when a large worktree
+	//     inventory overflows, and unmarshalling into FamiliesOverview ignores
+	//     the truncation metadata. A trimmed census is partial evidence read as
+	//     complete evidence.
+	//
+	// `max_bytes: 0` opts out of the byte cap. The response is then validated
+	// for completeness before anything is classified.
+	raw, err := collectDaemonWideCensus("list_checkouts", map[string]any{"max_bytes": 0})
 	if err != nil {
 		// A daemon that answered the handshake but refuses the listing is not
 		// a legacy-state finding; say the check did not happen and move on.
 		state.Skipped = "daemon did not answer list_checkouts; legacy state not checked"
 		return state
 	}
+
+	// Fail closed on a trimmed census. Declaring the check complete while
+	// holding a partial listing is how a missing row becomes a false
+	// "intentless" warning.
+	if bytes.Contains(raw, []byte(respbudget.TruncatedKey)) {
+		state.Skipped = "daemon returned a truncated checkout listing; legacy state not checked " +
+			"(a partial inventory would report tracked repositories as intentless)"
+		return state
+	}
+
 	var overview indexer.FamiliesOverview
 	if err := json.Unmarshal(raw, &overview); err != nil {
 		state.Skipped = "daemon returned an unreadable checkout listing; legacy state not checked"
@@ -118,9 +154,65 @@ func collectLegacyState(home, root string) DoctorLegacyState {
 	state.Checked = true
 
 	state.DedicatedCorpora = dedicatedWorktreeCorpora(overview)
-	state.Unattributed, state.Intentless = classifyConfiguredRepos(overview, configuredRepoPaths(home))
+	state.Unattributed, state.Intentless = classifyConfiguredRepos(overview, doctorConfiguredPaths(home))
 	return state
 }
+
+// doctorLegacyEnv is the environment probe the collector reads. Stubbed in
+// tests: doctorEnvironment() performs a live control handshake, so a collector
+// test on a host with no daemon would take the "not checked" arm and assert
+// nothing at all.
+var doctorLegacyEnv = doctorEnvironment
+
+// collectDaemonWideCensus reads a tool result from an administrative session
+// that is NOT bound to a working directory.
+//
+// Every other CLI path goes through resolveExecutorWithToolSurface, which
+// preflights the cwd and refuses to dial when no tracked repo covers it. That
+// refusal is right for a graph query -- the answer would come from the wrong
+// corpus -- but it is exactly wrong for an inventory: doctor is most useful
+// when it runs from a directory gortex does not track, and a workspace-bound
+// session answers only about its own workspace. An empty CWD yields an unbound
+// session, which the daemon serves from the whole catalog (see
+// sessionWorkspaceRepoSet: an unbound session is never clamped).
+//
+// When no daemon is running we say so rather than inventing an empty inventory.
+func collectDaemonWideCensus(tool string, args map[string]any) (json.RawMessage, error) {
+	return doctorCensusTool(tool, args)
+}
+
+// doctorCensusTool is the seam the collector tests stub. A census that needs a
+// live daemon cannot be tested for the properties that matter here -- an
+// unbound read, an explicit no-truncation cap, and a fail-closed arm when the
+// daemon trims anyway.
+var doctorCensusTool = func(tool string, args map[string]any) (json.RawMessage, error) {
+	return dialUnboundCensus(tool, args)
+}
+
+func dialUnboundCensus(tool string, args map[string]any) (json.RawMessage, error) {
+	if !daemon.IsRunning() {
+		return nil, ErrNoExecutor
+	}
+	c, err := daemon.Dial(daemon.Handshake{
+		Mode:       daemon.ModeMCP,
+		ClientName: "doctor-legacy-census",
+		Tools:      cliLegacyToolSurface,
+		ToolsMode:  cliLegacyToolMode,
+		// CWD deliberately empty: an unbound administrative session.
+	})
+	if err != nil {
+		return nil, ErrNoExecutor
+	}
+	defer func() { _ = c.Close() }()
+	exec := &daemonExecutor{client: c, pinJSONDefault: cliLegacyToolSurface != gortexmcp.FacadeSurfaceVersion}
+	return exec.CallTool(context.Background(), tool, args)
+}
+
+// doctorConfiguredPaths is the seam the collector tests stub. The real reader
+// resolves the platform config path, which a t.TempDir() home does not control,
+// so a fixture that wrote config.yaml into its own temp dir was reading the
+// developer's actual config instead.
+var doctorConfiguredPaths = configuredRepoPaths
 
 // configuredRepoPaths reads the repo list out of config.yaml. Reading the file
 // is not writing it, and it is the only place a `manual_config` entry can be
@@ -166,9 +258,10 @@ func dedicatedWorktreeCorpora(overview indexer.FamiliesOverview) []DoctorLegacyC
 			}
 			graph := graphByID[co.GraphID]
 			out = append(out, DoctorLegacyCorpus{
-				Family:          family.DisplayRemote,
-				Root:            doctorPath(co.RootPath),
-				RepoPrefix:      graph.RepoPrefix,
+				Family: doctorLabel(family.DisplayRemote),
+				Root:   doctorPath(co.RootPath),
+				// A prefix names the repository as surely as the remote does.
+				RepoPrefix:      doctorLabel(graph.RepoPrefix),
 				GraphID:         co.GraphID,
 				GraphState:      graph.State,
 				CoordinatorLive: co.CoordinatorLive,
@@ -309,6 +402,8 @@ func printDoctorLegacy(w io.Writer, state DoctorLegacyState) {
 		fmt.Fprintf(w, "  %s %d dedicated worktree corpora (each a full index with its own watcher)\n",
 			glyphWarn, len(state.DedicatedCorpora))
 		for _, c := range state.DedicatedCorpora {
+			// RepoPrefix is already redactor-applied by the collector, so the
+			// human rendering no longer prints a raw identifier here.
 			name := c.RepoPrefix
 			if name == "" {
 				name = c.GraphID
