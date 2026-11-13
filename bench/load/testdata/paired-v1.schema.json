@@ -1509,6 +1509,137 @@
                                   "null"
                                 ]
                               },
+                              "functional_unavailable_receipt": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "original_accounting_error": {
+                                        "type": "string"
+                                      },
+                                      "physical_evidence_absent_observed": {
+                                        "type": "boolean"
+                                      },
+                                      "read_assisted_absent_observed": {
+                                        "type": "boolean"
+                                      },
+                                      "status": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "accepted_attempt_stage": {
+                                            "type": "string"
+                                          },
+                                          "acknowledgement_rpc_id": {
+                                            "type": "string"
+                                          },
+                                          "applied_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_last_observed_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_refusal": {
+                                            "type": "string"
+                                          },
+                                          "background_requested_generation": {
+                                            "type": "integer"
+                                          },
+                                          "background_stage": {
+                                            "type": "string"
+                                          },
+                                          "background_unavailable_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "binding_predicate": {
+                                            "type": "string"
+                                          },
+                                          "coalesced_absent_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "mutation_id": {
+                                            "type": "string"
+                                          },
+                                          "observed_native_handoffs": {
+                                            "anyOf": [
+                                              {
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "physical_unavailable_observed": {
+                                            "type": "boolean"
+                                          },
+                                          "publication_clock": {
+                                            "type": "string"
+                                          },
+                                          "publication_key": {
+                                            "type": "string"
+                                          },
+                                          "publication_source": {
+                                            "type": "string"
+                                          },
+                                          "publication_terminal": {
+                                            "type": "boolean"
+                                          },
+                                          "publication_ticket": {
+                                            "type": "integer"
+                                          },
+                                          "receipt": {
+                                            "type": "string"
+                                          },
+                                          "requested_generation": {
+                                            "type": "integer"
+                                          },
+                                          "status_sha256": {
+                                            "type": "string"
+                                          },
+                                          "status_wire_id": {
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "receipt",
+                                          "mutation_id",
+                                          "acknowledgement_rpc_id",
+                                          "requested_generation",
+                                          "applied_generation",
+                                          "publication_key",
+                                          "publication_ticket",
+                                          "publication_source",
+                                          "publication_clock",
+                                          "publication_terminal",
+                                          "physical_unavailable_observed",
+                                          "background_unavailable_observed",
+                                          "coalesced_absent_observed",
+                                          "background_refusal",
+                                          "binding_predicate",
+                                          "background_stage",
+                                          "accepted_attempt_stage",
+                                          "background_requested_generation",
+                                          "background_last_observed_generation",
+                                          "observed_native_handoffs",
+                                          "status_wire_id",
+                                          "status_sha256"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "physical_evidence_absent_observed",
+                                      "read_assisted_absent_observed",
+                                      "original_accounting_error"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "graph_terminal": {
                                 "type": "boolean"
                               },

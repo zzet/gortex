@@ -64,9 +64,11 @@ type editLoopWire struct {
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
-		Superseded          *receiptproof.Superseded `json:"superseded_receipt"`
-		CoalescedFunctional *receiptproof.Coalesced  `json:"coalesced_functional_receipt"`
-		MutationTiers       *struct {
+		Superseded            *receiptproof.Superseded            `json:"superseded_receipt"`
+		FunctionalUnavailable *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt"`
+		PhasesMS              map[string]metric                   `json:"phases_ms"`
+		CoalescedFunctional   *receiptproof.Coalesced             `json:"coalesced_functional_receipt"`
+		MutationTiers         *struct {
 			State     string            `json:"observation_state"`
 			Reason    string            `json:"reason"`
 			ACK       string            `json:"ack_at"`
@@ -351,10 +353,13 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 	}
 	modes := []string{"json", "toon", "compact", "facade", "cli"}
 	for i, record := range wire.Edits {
-		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome && record.Outcome != receiptproof.CoalescedFunctionalOutcome || len(record.Errors) != 0 {
+		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome && record.Outcome != receiptproof.CoalescedFunctionalOutcome && record.Outcome != receiptproof.FunctionalUnavailableOutcome || len(record.Errors) != 0 {
 			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
 		}
 
+		if record.Outcome == receiptproof.FunctionalUnavailableOutcome && !functionalUnavailableEditLoopRecord(wire, i) {
+			return wire, errors.New("qualified functional receipt lacks owned unavailable-timing and functional proof")
+		}
 		if record.Outcome == receiptproof.CoalescedFunctionalOutcome && !coalescedFunctionalEditLoopRecord(wire, i) {
 			return wire, errors.New("qualified coalesced receipt lacks independent functional/status proof")
 		}

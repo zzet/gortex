@@ -13,10 +13,14 @@ import (
 func coalescedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 	r := wire.Edits[index]
 	p := r.CoalescedFunctional
-	if !sharedPhysicalEditLoop(wire) || r.Superseded != nil || !p.Matches(r.Receipt, r.MutationID, r.Accounting.RPCID, r.Accounting.Requested, r.Accounting.Applied) ||
-		r.Accounting.State != "terminal_unavailable_background" && (p.NativeNoOp == nil || r.Accounting.State != "unavailable") || r.Accounting.A == nil ||
+	return sharedFunctionalEditLoopRecord(wire, index) && r.FunctionalUnavailable == nil && p.Matches(r.Receipt, r.MutationID, r.Accounting.RPCID, r.Accounting.Requested, r.Accounting.Applied) &&
+		(r.Accounting.State == "terminal_unavailable_background" || p.NativeNoOp != nil && r.Accounting.State == "unavailable") && p.AccountingError == "A/P/B accounting unavailable: "+strings.Join(r.Accounting.Reasons, "; ")
+}
+
+func sharedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
+	r := wire.Edits[index]
+	if !sharedPhysicalEditLoop(wire) || r.Superseded != nil || r.Accounting.A == nil ||
 		!absentEditLoopTiming(r.Accounting.P) || !absentEditLoopTiming(r.Accounting.B) || !absentEditLoopTiming(r.Accounting.R) || !absentEditLoopTiming(r.Accounting.Shared) ||
-		p.AccountingError != "A/P/B accounting unavailable: "+strings.Join(r.Accounting.Reasons, "; ") ||
 		r.ACKExact == nil || r.ACKStatus != "applied" || r.ACKDiskStatus != "committed" || r.MutationID == "" || r.ACKMutationID != r.MutationID || r.ACKCommitSeq == 0 ||
 		r.GraphTerminal == nil || !*r.GraphTerminal || r.StaleClaimedFresh == nil || *r.StaleClaimedFresh ||
 		r.EvidenceBytes <= 0 || r.EvidenceBytes > r.EvidenceLimit || r.EvidenceLimit != 8<<20 && r.EvidenceLimit != 16<<20 {

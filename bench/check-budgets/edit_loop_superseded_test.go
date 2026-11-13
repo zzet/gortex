@@ -88,7 +88,7 @@ func TestEditLoopProvenSupersededRequiresExactProofAndSharedScope(t *testing.T) 
 }
 
 func TestEditLoopSupersededWholeGateKeepsAllFourteenRowsStrict(t *testing.T) {
-	for _, qualifiedKind := range []string{"superseded", "coalesced", "native_noop", "native_noop_same"} {
+	for _, qualifiedKind := range []string{"superseded", "coalesced", "native_noop", "native_noop_same", "functional_unavailable", "functional_preexisting"} {
 		for _, mode := range []string{"proven", "incorrect_read", "slow_ack", "read_gate_closed", "WAL_breach", "missing_output_mode", "unknown_proof"} {
 			t.Run(qualifiedKind+"/"+mode, func(t *testing.T) {
 				dir := t.TempDir()
@@ -110,6 +110,9 @@ func TestEditLoopSupersededWholeGateKeepsAllFourteenRowsStrict(t *testing.T) {
 					}
 					if qualifiedKind == "native_noop" || qualifiedKind == "native_noop_same" {
 						r, raw, first = nativeNoOpEditLoopFixture(t, qualifiedKind == "native_noop_same")
+					}
+					if qualifiedKind == "functional_unavailable" || qualifiedKind == "functional_preexisting" {
+						r, raw, first = functionalUnavailableEditLoopFixture(t, qualifiedKind == "functional_preexisting")
 					}
 					r.RunID = fmt.Sprintf("superseded-gate-%d", repeat)
 					// Retain the existing compact unobservable/refusal contract from the
@@ -142,6 +145,7 @@ func TestEditLoopSupersededWholeGateKeepsAllFourteenRowsStrict(t *testing.T) {
 					case "unknown_proof":
 						delete(first, "superseded_receipt")
 						delete(first, "coalesced_functional_receipt")
+						delete(first, "functional_unavailable_receipt")
 					}
 					data, err := json.Marshal(raw)
 					if err != nil {

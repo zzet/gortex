@@ -128,11 +128,11 @@ func TestEditProbeSameRequestNoOpWaitsForActualFreshTierObservation(t *testing.T
 	}
 	tiers := editProbeStatusTiers(decoded)
 	tiers.Tiers["derived"] = "pending"
-	if editProbeFinishedWithQualification(true, true, true, accounting, candidate, tiers) {
+	if editProbeFinishedWithQualification(true, true, true, accounting, candidate != nil, tiers) {
 		t.Fatal("pending derived tier ended observation")
 	}
 	tiers.Tiers["derived"] = "fresh"
-	if !editProbeFinishedWithQualification(true, true, true, accounting, candidate, tiers) {
+	if !editProbeFinishedWithQualification(true, true, true, accounting, candidate != nil, tiers) {
 		t.Fatal("later observed fresh tier did not complete")
 	}
 }

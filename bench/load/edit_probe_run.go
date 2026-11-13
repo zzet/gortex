@@ -40,66 +40,68 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
-	Superseded               *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
-	supersededStatus         *receiptproof.Status
-	coalescedStatus          *receiptproof.Coalesced
-	CoalescedFunctional      *receiptproof.Coalesced      `json:"coalesced_functional_receipt,omitempty"`
-	SearchACK                map[string]any               `json:"search_ack,omitempty"`
-	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
-	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
-	SearchTurnReleasedNS     *int64                       `json:"search_turn_released_ns,omitempty"`
-	AdmittedTargetLines      *int                         `json:"admitted_target_lines,omitempty"`
-	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
-	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
-	ACKReadbackExact         *bool                        `json:"ack_readback_exact,omitempty"`
-	ACKStatus                string                       `json:"ack_status,omitempty"`
-	ACKDiskStatus            string                       `json:"ack_disk_status,omitempty"`
-	ACKMutationID            string                       `json:"ack_mutation_id,omitempty"`
-	ACKCommitSeq             uint64                       `json:"ack_commit_seq,omitempty"`
-	ACKContentSHA256         string                       `json:"ack_content_sha256,omitempty"`
-	ProbeMode                string                       `json:"probe_mode,omitempty"`
-	Ordinal                  int                          `json:"ordinal"`
-	Editor                   int                          `json:"editor,omitempty"`
-	Route                    string                       `json:"route,omitempty"`
-	CheckoutID               string                       `json:"checkout_id,omitempty"`
-	Marker                   string                       `json:"marker"`
-	MutationID               string                       `json:"mutation_id"`
-	PlannedDueNS             int64                        `json:"planned_due_ns"`
-	ActivatedNS              *int64                       `json:"activated_ns"`
-	StartedNS                *int64                       `json:"started_ns"`
-	StartLatenessNS          *int64                       `json:"start_lateness_ns"`
-	Outcome                  string                       `json:"outcome"`
-	Receipt                  string                       `json:"mutation_receipt"`
-	Batch                    *editProbeBatchReferences    `json:"batch,omitempty"`
-	BatchSet                 *editProbeBatchSetReferences `json:"batch_set,omitempty"`
-	BatchAccounting          *editProbeBatchSetAccounting `json:"batch_accounting,omitempty"`
-	Move                     *editProbeMoveReferences     `json:"move,omitempty"`
-	MoveAccounting           *editProbeMoveAccounting     `json:"move_accounting,omitempty"`
-	Restart                  *editProbeRestartRecord      `json:"restart,omitempty"`
-	NativeWrite              *editProbeNativeWrite        `json:"native_write,omitempty"`
-	GraphTerminalBasis       string                       `json:"graph_terminal_basis,omitempty"`
-	Ack                      Metric                       `json:"t_ack_ms"`
-	PhasesMS                 map[string]Metric            `json:"phases_ms,omitempty"`
-	Readback                 Metric                       `json:"t_readback_ms,omitempty"`
-	FileGraph                Metric                       `json:"t_file_graph_ms,omitempty"`
-	Relations                Metric                       `json:"t_relations_ms,omitempty"`
-	Search                   Metric                       `json:"t_search_ms,omitempty"`
-	Derived                  Metric                       `json:"t_derived_ms,omitempty"`
-	Readbacks                []editProbeReadback          `json:"readbacks"`
-	FirstCorrect             map[string]Metric            `json:"first_correct_ms"`
-	Accounting               editProbeAccounting          `json:"accounting"`
-	PendingReads             int                          `json:"reads_while_receipt_observed_pending"`
-	ExpectedRefusals         int                          `json:"expected_refusals,omitempty"`
-	ProbeErrors              int                          `json:"probe_errors"`
-	StaleClaimedFresh        bool                         `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches int                          `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal            bool                         `json:"graph_terminal"`
-	Evidence                 string                       `json:"raw_evidence"`
-	EvidenceWriteMS          float64                      `json:"evidence_write_ms"`
-	EvidenceEncodeMS         float64                      `json:"evidence_encode_ms"`
-	EvidenceBytes            int                          `json:"evidence_bytes"`
-	EvidenceLimit            int                          `json:"evidence_limit_bytes"`
-	Errors                   []string                     `json:"errors"`
+	Superseded                  *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
+	supersededStatus            *receiptproof.Status
+	coalescedStatus             *receiptproof.Coalesced
+	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
+	FunctionalUnavailable       *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt,omitempty"`
+	CoalescedFunctional         *receiptproof.Coalesced             `json:"coalesced_functional_receipt,omitempty"`
+	SearchACK                   map[string]any                      `json:"search_ack,omitempty"`
+	SearchQueuedNS              *int64                              `json:"search_queued_ns,omitempty"`
+	SearchQueueWaitNS           *int64                              `json:"search_queue_wait_ns,omitempty"`
+	SearchTurnReleasedNS        *int64                              `json:"search_turn_released_ns,omitempty"`
+	AdmittedTargetLines         *int                                `json:"admitted_target_lines,omitempty"`
+	MutationTiers               *editProbeLiveTiers                 `json:"mutation_tiers,omitempty"`
+	GateReadback                *Metric                             `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact            *bool                               `json:"ack_readback_exact,omitempty"`
+	ACKStatus                   string                              `json:"ack_status,omitempty"`
+	ACKDiskStatus               string                              `json:"ack_disk_status,omitempty"`
+	ACKMutationID               string                              `json:"ack_mutation_id,omitempty"`
+	ACKCommitSeq                uint64                              `json:"ack_commit_seq,omitempty"`
+	ACKContentSHA256            string                              `json:"ack_content_sha256,omitempty"`
+	ProbeMode                   string                              `json:"probe_mode,omitempty"`
+	Ordinal                     int                                 `json:"ordinal"`
+	Editor                      int                                 `json:"editor,omitempty"`
+	Route                       string                              `json:"route,omitempty"`
+	CheckoutID                  string                              `json:"checkout_id,omitempty"`
+	Marker                      string                              `json:"marker"`
+	MutationID                  string                              `json:"mutation_id"`
+	PlannedDueNS                int64                               `json:"planned_due_ns"`
+	ActivatedNS                 *int64                              `json:"activated_ns"`
+	StartedNS                   *int64                              `json:"started_ns"`
+	StartLatenessNS             *int64                              `json:"start_lateness_ns"`
+	Outcome                     string                              `json:"outcome"`
+	Receipt                     string                              `json:"mutation_receipt"`
+	Batch                       *editProbeBatchReferences           `json:"batch,omitempty"`
+	BatchSet                    *editProbeBatchSetReferences        `json:"batch_set,omitempty"`
+	BatchAccounting             *editProbeBatchSetAccounting        `json:"batch_accounting,omitempty"`
+	Move                        *editProbeMoveReferences            `json:"move,omitempty"`
+	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
+	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
+	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
+	Ack                         Metric                              `json:"t_ack_ms"`
+	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
+	Readback                    Metric                              `json:"t_readback_ms,omitempty"`
+	FileGraph                   Metric                              `json:"t_file_graph_ms,omitempty"`
+	Relations                   Metric                              `json:"t_relations_ms,omitempty"`
+	Search                      Metric                              `json:"t_search_ms,omitempty"`
+	Derived                     Metric                              `json:"t_derived_ms,omitempty"`
+	Readbacks                   []editProbeReadback                 `json:"readbacks"`
+	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
+	Accounting                  editProbeAccounting                 `json:"accounting"`
+	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
+	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
+	ProbeErrors                 int                                 `json:"probe_errors"`
+	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal               bool                                `json:"graph_terminal"`
+	Evidence                    string                              `json:"raw_evidence"`
+	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
+	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
+	EvidenceBytes               int                                 `json:"evidence_bytes"`
+	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
+	Errors                      []string                            `json:"errors"`
 }
 type editProbeReport struct {
 	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
@@ -1181,6 +1183,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.mu.Lock()
 			s.record.supersededStatus = nil // Only the latest status call may supply evidence.
 			s.record.coalescedStatus = nil
+			s.record.functionalUnavailableStatus = nil
 			s.mu.Unlock()
 			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
 				break
@@ -1198,6 +1201,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.record.Accounting = accounting
 					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
 					s.record.coalescedStatus = coalescedFunctionalStatus(status, raw, statusIdentity.ID, accounting)
+					s.record.functionalUnavailableStatus = functionalUnavailableStatus(status, raw, statusIdentity.ID, accounting)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
@@ -1215,7 +1219,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						}
 					}
 					terminal := s.record.GraphTerminal
-					qualifiedCandidate := s.record.coalescedStatus
+					qualifiedCandidate := s.record.coalescedStatus != nil || s.record.functionalUnavailableStatus != nil
 					qualifiedTiers := s.record.MutationTiers
 					if terminal && status["graph_status"] != "fresh" {
 						s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
@@ -1463,6 +1467,9 @@ func (r *editProbeRuntime) finish() error {
 		}
 		if !classified {
 			classified = classifyCoalescedFunctionalRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
+		}
+		if !classified {
+			classified = classifyFunctionalUnavailableRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
 		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
 		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {

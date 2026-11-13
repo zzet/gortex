@@ -132,8 +132,8 @@ func qualifiedFunctionalAccounting(a editProbeAccounting, p *receiptproof.Coales
 // A positive functional candidate is ready only with its required tier evidence.
 // In particular, a no-op's terminal control window cannot end a pending->fresh
 // observation sequence before the functional predicates actually hold.
-func editProbeFinishedWithQualification(terminal, all, required bool, a editProbeAccounting, p *receiptproof.Coalesced, tiers *editProbeLiveTiers) bool {
-	if p != nil {
+func editProbeFinishedWithQualification(terminal, all, required bool, a editProbeAccounting, qualified bool, tiers *editProbeLiveTiers) bool {
+	if qualified {
 		return terminal && all && coalescedFreshTiers(tiers)
 	}
 	return editProbeFinished(terminal, all, required, a)

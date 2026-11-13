@@ -54,9 +54,23 @@ func coalescedFunctionalStatus(status map[string]any, raw json.RawMessage, wireI
 }
 
 func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {
-	if record == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 || record.CheckoutID != "" || record.Route != "" ||
-		record.Outcome != "diagnostic_failure" || record.coalescedStatus == nil || record.Superseded != nil || len(record.Errors) != 1 || record.Errors[0] != record.coalescedStatus.AccountingError ||
-		!qualifiedFunctionalAccounting(record.Accounting, record.coalescedStatus) ||
+	if !sharedFunctionalRecord(record, scope) || record.coalescedStatus == nil || record.Superseded != nil || record.FunctionalUnavailable != nil || len(record.Errors) != 1 || record.Errors[0] != record.coalescedStatus.AccountingError ||
+		!qualifiedFunctionalAccounting(record.Accounting, record.coalescedStatus) {
+		return false
+	}
+	p := record.coalescedStatus
+	if !p.Matches(record.Receipt, record.MutationID, record.Accounting.RPCID, record.Accounting.Requested, record.Accounting.Applied) {
+		return false
+	}
+	copy := *p
+	record.CoalescedFunctional, record.Outcome, record.Errors = &copy, receiptproof.CoalescedFunctionalOutcome, nil
+	// P was measured for the independent winner, not the original requested edit.
+	record.Accounting.P, record.Accounting.B = nil, nil
+	return true
+}
+
+func sharedFunctionalRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {
+	if record == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 || record.CheckoutID != "" || record.Route != "" || record.Outcome != "diagnostic_failure" ||
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || record.ACKReadbackExact == nil ||
 		!record.GraphTerminal || record.StaleClaimedFresh || !coalescedFreshTiers(record.MutationTiers) || !coalescedMetricObserved(record.Ack) || !coalescedMetricObserved(record.Readback) ||
 		record.EvidenceBytes <= 0 || record.EvidenceLimit != editProbeRawLimit || record.EvidenceBytes > record.EvidenceLimit {
@@ -86,15 +100,6 @@ func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbe
 			return false
 		}
 	}
-	p := record.coalescedStatus
-	if !p.Matches(record.Receipt, record.MutationID, record.Accounting.RPCID, record.Accounting.Requested, record.Accounting.Applied) {
-		return false
-	}
-	copy := *p
-	record.CoalescedFunctional, record.Outcome, record.Errors = &copy, receiptproof.CoalescedFunctionalOutcome, nil
-	// P was measured for the independent winner, not the original requested edit.
-	// Preserve that measurement in the qualified proof and leave original P/B null.
-	record.Accounting.P, record.Accounting.B = nil, nil
 	return true
 }
 
