@@ -886,6 +886,19 @@ func (s *Server) decorateToolFreshnessChecked(ctx context.Context, name string, 
 			res = decorateResultWithFreshness(res, fields)
 		}
 	}
+	// The outer facade wrapper retains the compact request. Use the same
+	// lowering as the handler so nested output budgets, including explicit
+	// opt-outs and top-level overrides, survive this final fit.
+	if output, ok := req.GetArguments()["output"].(map[string]any); ok {
+		_, bytesPresent := output["max_bytes"]
+		_, tokensPresent := output["max_tokens"]
+		if (bytesPresent || tokensPresent) && isFacadeToolName(req.Params.Name) {
+			if spec, ok := s.viewFacadeOperation(&req); ok {
+				req.Params.Arguments = normalizeFacadeArguments(spec, req.GetArguments())
+				req.Params.RawArguments = nil
+			}
+		}
+	}
 	return fitToolFreshnessBudget(ctx, req, res), nil
 }
 
