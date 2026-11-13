@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/bench/receiptproof"
 )
@@ -20,6 +21,23 @@ func coalescedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 		r.GraphTerminal == nil || !*r.GraphTerminal || r.StaleClaimedFresh == nil || *r.StaleClaimedFresh ||
 		r.EvidenceBytes <= 0 || r.EvidenceBytes > r.EvidenceLimit || r.EvidenceLimit != 8<<20 && r.EvidenceLimit != 16<<20 {
 		return false
+	}
+	tiers := r.MutationTiers
+	if tiers == nil || tiers.State != "observed" || tiers.Reason != "" {
+		return false
+	}
+	previous := time.Time{}
+	for _, stamp := range []string{tiers.ACK, tiers.FileGraph, tiers.Relations, tiers.Derived} {
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil || at.IsZero() || !previous.IsZero() && at.Before(previous) {
+			return false
+		}
+		previous = at
+	}
+	for _, tier := range []string{"file_graph", "relations", "derived"} {
+		if tiers.Tiers[tier] != "fresh" {
+			return false
+		}
 	}
 	a := r.Accounting.A
 	if !(receiptproof.Window{WallNS: a.WallNS, SumNS: a.SumNS, ResidualNS: a.ResidualNS, WithinFivePercent: a.WithinFivePercent}).Complete() {

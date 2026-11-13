@@ -66,14 +66,23 @@ type editLoopWire struct {
 	Edits []struct {
 		Superseded          *receiptproof.Superseded `json:"superseded_receipt"`
 		CoalescedFunctional *receiptproof.Coalesced  `json:"coalesced_functional_receipt"`
-		FirstCorrect        map[string]metric        `json:"first_correct_ms"`
-		Readback            metric                   `json:"t_readback_ms"`
-		GraphTerminal       *bool                    `json:"graph_terminal"`
-		StaleClaimedFresh   *bool                    `json:"stale_claimed_fresh"`
-		EvidenceBytes       int                      `json:"evidence_bytes"`
-		EvidenceLimit       int                      `json:"evidence_limit_bytes"`
-		Receipt             string                   `json:"mutation_receipt"`
-		Accounting          struct {
+		MutationTiers       *struct {
+			State     string            `json:"observation_state"`
+			Reason    string            `json:"reason"`
+			ACK       string            `json:"ack_at"`
+			FileGraph string            `json:"file_graph_at"`
+			Relations string            `json:"relations_at"`
+			Derived   string            `json:"derived_at"`
+			Tiers     map[string]string `json:"tier_state"`
+		} `json:"mutation_tiers"`
+		FirstCorrect      map[string]metric `json:"first_correct_ms"`
+		Readback          metric            `json:"t_readback_ms"`
+		GraphTerminal     *bool             `json:"graph_terminal"`
+		StaleClaimedFresh *bool             `json:"stale_claimed_fresh"`
+		EvidenceBytes     int               `json:"evidence_bytes"`
+		EvidenceLimit     int               `json:"evidence_limit_bytes"`
+		Receipt           string            `json:"mutation_receipt"`
+		Accounting        struct {
 			State     string   `json:"state"`
 			Reasons   []string `json:"reasons"`
 			RPCID     string   `json:"bound_rpc_id"`

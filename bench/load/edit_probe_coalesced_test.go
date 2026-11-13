@@ -21,6 +21,10 @@ func coalescedFunctionalStatusFixture() map[string]any {
 	accounting := physical["patch_accounting"].(map[string]any)
 	accounting["attempt_ticket"], accounting["scope"] = json.Number("4"), "accepted_winning_physical_attempt"
 	status["coalesced_publication"] = winner
+	for _, key := range []string{"ack_at", "file_graph_at", "relations_at", "derived_at"} {
+		status[key] = "2026-01-01T00:00:00Z"
+	}
+	status["tier_state"] = map[string]any{"file_graph": "fresh", "relations": "fresh", "derived": "fresh"}
 	return status
 }
 
@@ -40,6 +44,7 @@ func coalescedFunctionalRecordFixture(t *testing.T) (editProbeRecord, map[string
 	record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
 	record.coalescedStatus = coalescedFunctionalStatus(decoded, raw, 34, record.Accounting)
 	record.Readback = measured(50, "ms")
+	record.MutationTiers = editProbeStatusTiers(decoded)
 	if record.coalescedStatus == nil {
 		t.Fatalf("invalid coalesced fixture: %+v", record.Accounting)
 	}
@@ -47,7 +52,7 @@ func coalescedFunctionalRecordFixture(t *testing.T) (editProbeRecord, map[string
 }
 
 func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
-	for _, mode := range []string{"qualified", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B"} {
+	for _, mode := range []string{"qualified", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
 		t.Run(mode, func(t *testing.T) {
 			record, _ := coalescedFunctionalRecordFixture(t)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
@@ -78,6 +83,14 @@ func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
 				record.Accounting.A = nil
 			case "missing_P":
 				record.Accounting.P = nil
+			case "missing_tiers":
+				record.MutationTiers = nil
+			case "pending_tier":
+				record.MutationTiers.Tiers["derived"] = "pending"
+			case "failed_tier":
+				record.MutationTiers.Tiers["relations"] = "failed"
+			case "malformed_stamp":
+				record.MutationTiers.Derived = "invalid"
 			case "invented_B":
 				record.Accounting.B = &editProbeWindow{WallNS: 1}
 			}

@@ -24,6 +24,7 @@ func coalescedEditLoopFixture(t *testing.T) (report, map[string]any, map[string]
 	first["accounting"].(map[string]any)["reasons"] = strings.Split(strings.TrimPrefix(proof["original_accounting_error"].(string), "A/P/B accounting unavailable: "), "; ")
 	first["graph_terminal"], first["stale_claimed_fresh"] = true, false
 	first["evidence_bytes"], first["evidence_limit_bytes"] = 1000, 8388608
+	first["mutation_tiers"] = map[string]any{"observation_state": "observed", "ack_at": "2026-01-01T00:00:00Z", "file_graph_at": "2026-01-01T00:00:00Z", "relations_at": "2026-01-01T00:00:00Z", "derived_at": "2026-01-01T00:00:00Z", "tier_state": map[string]any{"file_graph": "fresh", "relations": "fresh", "derived": "fresh"}}
 	first["t_readback_ms"] = map[string]any{"value": 50, "unit": "ms"}
 	first["first_correct_ms"] = map[string]any{}
 	for _, name := range []string{"source", "summary", "editing_context", "callers", "call_chain", "search_visible", "text"} {
@@ -36,11 +37,19 @@ func coalescedEditLoopFixture(t *testing.T) (report, map[string]any, map[string]
 }
 
 func TestEditLoopQualifiedCoalescedFunctionalChecksIndependently(t *testing.T) {
-	for _, mode := range []string{"qualified", "missing_proof", "wrong_rpc", "unknown_scope", "accepted_original", "wrong_ACK", "incorrect_read", "missing_oracle", "false_fresh", "capped", "wrong_winner", "invented_background", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch"} {
+	for _, mode := range []string{"qualified", "missing_proof", "wrong_rpc", "unknown_scope", "accepted_original", "wrong_ACK", "incorrect_read", "missing_oracle", "false_fresh", "capped", "wrong_winner", "invented_background", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
 		t.Run(mode, func(t *testing.T) {
 			r, raw, first := coalescedEditLoopFixture(t)
 			proof := first["coalesced_functional_receipt"].(map[string]any)
 			switch mode {
+			case "missing_tiers":
+				delete(first, "mutation_tiers")
+			case "pending_tier":
+				first["mutation_tiers"].(map[string]any)["tier_state"].(map[string]any)["derived"] = "pending"
+			case "failed_tier":
+				first["mutation_tiers"].(map[string]any)["tier_state"].(map[string]any)["relations"] = "failed"
+			case "malformed_stamp":
+				first["mutation_tiers"].(map[string]any)["derived_at"] = "invalid"
 			case "missing_proof":
 				delete(first, "coalesced_functional_receipt")
 			case "wrong_rpc":

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/bench/receiptproof"
 )
@@ -55,7 +56,7 @@ func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbe
 		record.Accounting.State != "terminal_unavailable_background" || record.Accounting.A == nil || !receiptproof.Window(*record.Accounting.A).Complete() || record.Accounting.P == nil ||
 		receiptproof.Window(*record.Accounting.P) != record.coalescedStatus.ServingPhysical || record.Accounting.B != nil || record.Accounting.R != nil || record.Accounting.Shared != nil ||
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || record.ACKReadbackExact == nil ||
-		!record.GraphTerminal || record.StaleClaimedFresh || !coalescedMetricObserved(record.Ack) || !coalescedMetricObserved(record.Readback) ||
+		!record.GraphTerminal || record.StaleClaimedFresh || !coalescedFreshTiers(record.MutationTiers) || !coalescedMetricObserved(record.Ack) || !coalescedMetricObserved(record.Readback) ||
 		record.EvidenceBytes <= 0 || record.EvidenceLimit != editProbeRawLimit || record.EvidenceBytes > record.EvidenceLimit {
 		return false
 	}
@@ -97,4 +98,26 @@ func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbe
 
 func coalescedMetricObserved(m Metric) bool {
 	return m.Unit == "ms" && m.Value != nil && !math.IsNaN(*m.Value) && !math.IsInf(*m.Value, 0) && *m.Value >= 0
+}
+
+// Reuse the serialized raw tier observations rather than deriving freshness from
+// the outcome label. Missing, pending, failed or malformed tiers cannot qualify.
+func coalescedFreshTiers(tiers *editProbeLiveTiers) bool {
+	if tiers == nil || tiers.State != "observed" || tiers.Reason != "" {
+		return false
+	}
+	previous := time.Time{}
+	for _, stamp := range []string{tiers.ACK, tiers.FileGraph, tiers.Relations, tiers.Derived} {
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil || at.IsZero() || !previous.IsZero() && at.Before(previous) {
+			return false
+		}
+		previous = at
+	}
+	for _, tier := range []string{"file_graph", "relations", "derived"} {
+		if tiers.Tiers[tier] != "fresh" {
+			return false
+		}
+	}
+	return true
 }
