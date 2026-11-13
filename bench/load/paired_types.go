@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// Paired native runs compare matched request latency under a shared, coupled
-// workload. They are never independent capacity/reference/floor measurements.
+// Paired runs compare matched request latency under a shared, coupled workload.
+// They do not establish independent throughput or saturation capacity.
 type pairedReport struct {
 	SchemaVersion int                               `json:"paired_schema_version"`
 	Kind          string                            `json:"kind"`
@@ -136,7 +136,7 @@ func matchedLatencyRatios(labels []string, records []pairedRecord) map[string]ma
 
 func validateBuildLabels(labels []string) error {
 	if len(labels) < 2 || len(labels) > 3 {
-		return fmt.Errorf("paired native requires 2–3 labeled builds")
+		return fmt.Errorf("paired requires 2–3 labeled builds")
 	}
 	seen := make(map[string]bool)
 	for _, label := range labels {

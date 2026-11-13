@@ -156,7 +156,7 @@ func (c *pairedCoordinator) execute() {
 	if c.group != "" {
 		groupBefore = cgroupMetrics(c.group, os.Getpagesize())
 	}
-	c.window = measurementWindow{Started: time.Now(), Method: "coupled native back-to-back requests; process counters bracket the common group window; per-build sample endpoints retained"}
+	c.window = measurementWindow{Started: time.Now(), Method: "coupled back-to-back requests; process counters bracket the common group window; per-build sample endpoints retained"}
 	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
 	switch base.phase.Name {
