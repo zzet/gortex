@@ -11,7 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// Plan locks for three reads that each turned into a scan of every edge of the
+// Plan locks for four reads that each turned into a scan of every edge of the
 // generation on a real store once sqlite_stat1 held some rows:
 //
 //   - baseEdgesByKindSQL (EdgesByKind on the base generation) drove from the
@@ -21,11 +21,14 @@ import (
 //     projection and the capability scan) was answered by a covering scan of
 //     edges_by_to;
 //   - the batched receiver rebind's two cleanup DELETEs scanned edges and
-//     probed the candidate table per edge.
+//     probed the candidate table per edge;
+//   - the repository-scoped edge walk (scopedEdgeSourceProjectionQuery with
+//     no file frontier) paged through edges_by_generation and so read every
+//     base edge to find one kind's rows.
 //
-// Each plan is checked under three statistics regimes: none; the rows a real
+// Each plan is checked under four statistics regimes: none; the rows a real
 // store carried when the misplans were measured (a partial set written by the
-// open-time repair); and a fresh full ANALYZE.
+// open-time repair); the rows of a larger store; and a fresh full ANALYZE.
 func TestGenerationScanPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 	regimes := []struct {
 		name  string
@@ -60,6 +63,37 @@ func TestGenerationScanPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 			}
 			reloadPlannerStats(t, ctx, conn)
 		}},
+		{"large_store_stats", func(t *testing.T, ctx context.Context, conn *sql.Conn) {
+			// Rows from a 122-repository store on which the repository-scoped
+			// edge walk read every base edge through edges_by_generation.
+			if _, err := conn.ExecContext(ctx, `ANALYZE edges_by_kind`); err != nil {
+				t.Fatalf("create sqlite_stat1: %v", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM sqlite_stat1`); err != nil {
+				t.Fatalf("clear statistics: %v", err)
+			}
+			// That store had no sqlite_stat4 samples. Fixture samples would
+			// tell the planner each kind's size and hide the misplan.
+			if _, err := conn.ExecContext(ctx, `DELETE FROM sqlite_stat4`); err != nil {
+				t.Fatalf("clear samples: %v", err)
+			}
+			for _, row := range [][3]string{
+				{"edges", "edges_by_from_line", "6693420 1001 9 2"},
+				{"edges", "edges_by_from_line_kind", "6693420 1001 9 2 2"},
+				{"edges", "edges_by_generation", "6693420 1001 1"},
+				{"edges", "edges_by_kind", "13793188 1001"},
+				{"nodes", "nodes_by_file", "1769650 18 18"},
+				{"nodes", "nodes_by_generation", "1769650 1001 1"},
+				{"nodes", "nodes_by_kind", "1769650 667 667"},
+				{"nodes", "nodes_by_repo", "1769650 1001 1001"},
+				{"nodes", "nodes_by_repo_kind", "1769650 1001 334"},
+			} {
+				if _, err := conn.ExecContext(ctx, `INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES (?, ?, ?)`, row[0], row[1], row[2]); err != nil {
+					t.Fatalf("write stat row %s: %v", row[1], err)
+				}
+			}
+			reloadPlannerStats(t, ctx, conn)
+		}},
 		{"fresh_analyze", func(t *testing.T, ctx context.Context, conn *sql.Conn) {
 			if _, err := conn.ExecContext(ctx, `ANALYZE`); err != nil {
 				t.Fatalf("analyze: %v", err)
@@ -76,6 +110,20 @@ func TestGenerationScanPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 				byKind := explainOnConn(t, ctx, conn, baseEdgesByKindSQL, string(graph.EdgeProvides), baseViewGeneration)
 				assertPlanShape(t, "edges_by_kind", byKind, "USING INDEX edges_by_kind (kind=?)", nil,
 					[]string{"edges_by_generation", "edges_by_to", "SCAN edges"})
+
+				// A dense kind of the fixture and a kind it has no rows of.
+				for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeExtends} {
+					repoQuery, repoArgs, ok := scopedEdgeSourceProjectionQuery(
+						[]string{"repo"}, nil, string(kind), baseViewGeneration)
+					if !ok {
+						t.Fatal("repository edge query was not built")
+					}
+					repoArgs = append(repoArgs, int64(0), int64(1<<40), scopedProjectionPage)
+					repoWalk := explainOnConn(t, ctx, conn, repoQuery, repoArgs...)
+					assertPlanShape(t, "repo_edge_walk_"+string(kind), repoWalk,
+						"USING INDEX edges_by_kind (kind=? AND rowid>? AND rowid<?)", nil,
+						[]string{"edges_by_generation", "TEMP B-TREE", "SCAN e", "INTEGER PRIMARY KEY"})
+				}
 
 				highWater := explainOnConn(t, ctx, conn, edgeGenerationHighWaterSQL(true), baseViewGeneration)
 				assertPlanShape(t, "high_water", highWater, "edges_by_generation (view_gen=?)", nil,
