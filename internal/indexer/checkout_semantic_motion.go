@@ -10,8 +10,9 @@ import (
 )
 
 // semanticMotionAttempt is private to one dirty build, not its refresh ticket.
-// Watcher events only request a verifier; only a successful sample different
-// from the build's exact before sample may cancel its unbounded semantic read.
+// Watcher events only request a verifier; motion requires a successful sample
+// different from the build's exact before sample. Live same-checkout contract
+// demand has a separate owned cancellation cause and never certifies motion.
 // One verifier per attempt bounds work even when the watcher keeps firing.
 // A missed change is still caught by the unchanged final publication fence.
 type semanticMotionAttempt struct {
@@ -31,6 +32,53 @@ func (*semanticMotionAttempt) Error() string {
 	return "indexer: verified movement during working-copy enrichment"
 }
 
+type contractSemanticDemand struct{ attempt *semanticMotionAttempt }
+
+func (*contractSemanticDemand) Error() string {
+	return "indexer: working-copy enrichment deferred for live contract demand"
+}
+
+func (a *semanticMotionAttempt) deferForContractDemand() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.stopped && a.ctx.Err() == nil {
+		a.cancel(&contractSemanticDemand{attempt: a})
+	}
+}
+
+// A joined cancellation can also carry an independent provider/storage error.
+// Only cancellation itself, possibly wrapped, authorizes owned demand retry.
+func contractDemandCancellation(err, ownedCause error) bool {
+	for err != nil {
+		if err == context.Canceled || ownedCause != nil && err == ownedCause {
+			return true
+		}
+		if joined, ok := err.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			if len(children) == 0 {
+				return false
+			}
+			for _, child := range children {
+				if !contractDemandCancellation(child, ownedCause) {
+					return false
+				}
+			}
+			return true
+		}
+		wrapped, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = wrapped.Unwrap()
+	}
+	return false
+}
+
+func (a *semanticMotionAttempt) ownsContractDemand(err error) bool {
+	demand, ok := err.(*contractSemanticDemand)
+	return ok && demand != nil && demand.attempt == a && context.Cause(a.ctx) == demand
+}
+
 func (c *CheckoutCoordinator) armSemanticMotion(a *semanticMotionAttempt, before gitstate.DirtySnapshot, started time.Time) func(error) {
 	a.before = before.Fingerprint
 	a.sample = func(ctx context.Context) (gitstate.DirtySnapshot, error) {
@@ -47,6 +95,9 @@ func (c *CheckoutCoordinator) armSemanticMotion(a *semanticMotionAttempt, before
 	m.mu.Unlock()
 	if hinted {
 		a.verify()
+	}
+	if c.pendingContractWork() {
+		a.deferForContractDemand()
 	}
 	return func(providerErr error) {
 		// Closing the arm and canceling/joining its verifier precede the return
@@ -94,14 +145,26 @@ func (a *semanticMotionAttempt) verify() {
 // deadline or unrelated failure into another build. The existing two-attempt
 // loop records motion, retires the failed payload and defers enrichment.
 func (a *semanticMotionAttempt) buildError(parent context.Context, generationID int64, root string, err error) error {
-	if !errors.Is(err, context.Canceled) || context.Cause(a.ctx) != a {
+	cause := context.Cause(a.ctx)
+	demand, isDemand := cause.(*contractSemanticDemand)
+	ownedDemand := isDemand && demand != nil && demand.attempt == a
+	if ownedDemand && !contractDemandCancellation(err, cause) || !ownedDemand && (cause != a || !errors.Is(err, context.Canceled)) {
 		return err
 	}
 	if parentErr := parent.Err(); parentErr != nil {
 		return parentErr
 	}
-	if a.providerErr != nil && !errors.Is(a.providerErr, context.Canceled) {
-		return a.providerErr
+	if a.providerErr != nil {
+		canceled := errors.Is(a.providerErr, context.Canceled)
+		if ownedDemand {
+			canceled = contractDemandCancellation(a.providerErr, cause)
+		}
+		if !canceled {
+			return a.providerErr
+		}
+	}
+	if ownedDemand {
+		return demand
 	}
 	return &DirtySnapshotChangedError{CheckoutRoot: root, GenerationID: generationID, Before: a.before, After: a.after}
 }

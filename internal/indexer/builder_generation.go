@@ -1276,7 +1276,7 @@ func (b *SparseGenerationBuilder) runEnrichment(
 	}
 	pass, err := func() (pass semantic.CheckoutEnrichReport, err error) {
 		if finishMotion != nil {
-			defer func() { finishMotion(err) }()
+			defer func() { finishMotion(errors.Join(err, pass.ProviderTerminalError())) }()
 		}
 		return b.Semantic.EnrichCheckoutContext(ctx, handle, semantic.CheckoutEnrichRequest{
 			RepoPrefix:       req.RepoPrefix,

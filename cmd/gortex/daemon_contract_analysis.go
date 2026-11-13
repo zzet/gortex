@@ -77,6 +77,7 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	linked := contractLinkedSchedule(state.contractAnalysis, os.Getenv, logger)
 	options.LinkedPolicy, options.LinkedIdleWindow, options.LinkedThrottleInterval = linked.Policy, linked.IdleWindow, linked.ThrottleInterval
 	options.Demand = state.mcpServer.ContractAnalysisDemand
+	options.LinkedInterest = state.lifecycle.ContractInterest
 	if adjust != nil {
 		adjust(&options)
 	}
@@ -86,6 +87,7 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 		return nil, err
 	}
 	runtime.coordinator = coordinator
+	state.lifecycle.SetContractAnalysisCoordinator(coordinator)
 	runner, err := indexer.NewContractStuckRepair(indexer.ContractStuckRepairOptions{Store: store, MultiIndexer: state.multiIndexer, Baseline: captureOptions, Coordinator: coordinator, Logger: logger})
 	if err != nil {
 		cancel()

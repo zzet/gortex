@@ -502,6 +502,14 @@ func (c *ContractAnalysisCoordinator) now() time.Time {
 // Schedule records a request's interest in its actor's inputs and returns.
 // It runs under c.mu: no store read, no census, no job slot, no lane.
 func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req ContractScheduleRequest) (result ContractScheduleResult, err error) {
+	defer func() {
+		if err == nil && req.Actor.Checkout != "" && req.Inputs != nil && req.Inputs.State.Accepted && c.options.LinkedInterest != nil {
+			switch result.Result {
+			case ContractScheduled, ContractCoalesced, ContractRunning:
+				c.options.LinkedInterest(req.Actor)
+			}
+		}
+	}()
 	label := ""
 	// The request's source is released unless the actor keeps it; a source
 	// the request's inputs replace is released too.
