@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -114,6 +116,28 @@ func TestEditProbeMissingOrContradictoryPublisherRefusesSuccess(t *testing.T) {
 				t.Fatalf("unproven R was accepted: %+v", got)
 			}
 		})
+	}
+}
+
+func TestEditProbeNativeDuplicateDoesNotIdentifyPriorPublisher(t *testing.T) {
+	body := editProbeRepairAccountingFixture()
+	delete(body, "read_assisted_publication")
+	got := checkEditProbeAccounting(body, "receipt-a")
+	if got.State != "unavailable" || got.R != nil || editProbeFinished(true, true, true, got) {
+		t.Fatalf("duplicate without publisher evidence completed: %+v", got)
+	}
+	if !slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") {
+		t.Fatalf("missing publisher was not reported without guessing its cause: %+v", got)
+	}
+	for _, reason := range got.Reasons {
+		if strings.Contains(reason, "read-assisted publisher") {
+			t.Fatalf("native duplicate does not establish a reader publisher: %s", reason)
+		}
+	}
+	for _, name := range append(editProbeRepairDeepPhases[:], "executor_control") {
+		if !slices.Contains(got.Reasons, "missing applicable P phase "+name) {
+			t.Fatalf("missing publisher waived deep phase %s: %+v", name, got)
+		}
 	}
 }
 
