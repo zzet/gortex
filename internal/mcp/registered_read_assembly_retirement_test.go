@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,7 +80,11 @@ func (s *assemblyRetirementStore) WithFileEditingContextReader(ctx context.Conte
 func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *testing.T) {
 	for _, tool := range []string{"get_editing_context", "get_file_summary"} {
 		for _, surface := range []string{"raw", "facade"} {
-			for _, transition := range []string{"unchanged", "canonical_retirement", "physical_peer_same_bytes", "changed_bytes", "source_event", "unchecked_eviction", "expired", "cancelled", "canonical_no_projection"} {
+			transitions := []string{"unchanged", "canonical_retirement", "physical_peer_same_bytes", "changed_bytes", "source_event", "unchecked_eviction", "expired", "cancelled", "canonical_no_projection"}
+			if tool == "get_editing_context" && surface == "facade" {
+				transitions = append(transitions, "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "malformed_options_container", "options_true_override_false")
+			}
+			for _, transition := range transitions {
 				t.Run(tool+"/"+surface+"/"+transition, func(t *testing.T) {
 					selectedProjectionRegistry(t)
 					s, sql, path := newAssemblyRetirementFixture(t)
@@ -171,7 +176,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							}
 							require.True(t, s.hasRequestProjectionFact(first, "main.go"))
 							switch transition {
-							case "canonical_retirement", "expired", "cancelled":
+							case "canonical_retirement", "expired", "cancelled", "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "malformed_options_container", "options_true_override_false":
 								require.NoError(t, s.indexer.IndexFile(path))
 								retirement.run()
 								require.True(t, entry.checkedRetired.Load())
@@ -221,12 +226,46 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							operation = "summary"
 						}
 						args = map[string]any{"operation": operation, "target": map[string]any{"file": "main.go"}, "output": map[string]any{"format": "json", "max_bytes": 0}}
+						if strings.HasPrefix(transition, "nested_") {
+							envelope := strings.Split(transition, "_")[1]
+							values, ok := args[envelope].(map[string]any)
+							if !ok {
+								values = make(map[string]any)
+								args[envelope] = values
+							}
+							values["compress_bodies"] = true
+							if strings.HasSuffix(transition, "_malformed") {
+								values["compress_bodies"] = "not a boolean"
+							}
+							if transition == "nested_context_override_false" {
+								args["compress_bodies"] = false
+							}
+						}
+						if transition == "malformed_options_container" {
+							args["options"] = "not an object"
+						}
+						if transition == "options_true_override_false" {
+							args["options"] = map[string]any{"compress_bodies": true}
+							args["compress_bodies"] = false
+						}
 					}
 					result, callErr := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
 						onOwner = dispatch
 						return externalVersionRegisteredCall(s, caller, 20, name, args)
 					})
 					joinCancelledWorker()
+					if transition == "malformed_options_container" {
+						require.Zero(t, callbacks, "malformed facade containers must refuse before SQL assembly")
+						require.Zero(t, calls)
+						require.Nil(t, first)
+						if callErr != nil {
+							require.ErrorContains(t, callErr, "-32602")
+						} else {
+							require.NotNil(t, result)
+							require.True(t, result.IsError)
+						}
+						return
+					}
 					require.Equal(t, 1, callbacks)
 					require.NotNil(t, first)
 					if transition == "cancelled" {
@@ -236,7 +275,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					} else {
 						require.NoError(t, callErr)
 						require.NotNil(t, result)
-						if transition == "unchanged" || transition == "canonical_retirement" {
+						if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
 							require.False(t, result.IsError, "checked retirement before leaf success must use the existing fresh attempt: %s", resultText(result))
 							var body map[string]any
 							require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body))
@@ -244,7 +283,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							require.Contains(t, resultText(result), "Target")
 							require.Contains(t, resultText(result), "Neighbor")
 							expectedCalls := 1
-							if transition == "canonical_retirement" {
+							if transition == "canonical_retirement" || transition == "nested_context_override_false" {
 								expectedCalls = 2
 								require.Equal(t, 8, sql.GetNode("main.go::Neighbor").StartLine)
 							}
