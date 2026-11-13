@@ -26,9 +26,19 @@ func edgeGenerationHighWaterSQL(indexed bool) string {
 // is probed per call (one catalog lookup) because the index can be dropped
 // and recreated under an open store.
 func (s *Store) edgeGenerationIndexPresent() bool {
+	return s.indexPresent(edgesByGenerationIndexName)
+}
+
+// edgeKindIndexPresent reports whether edges_by_kind exists. Like
+// edges_by_generation it is a bulk-droppable index, so it is probed per call.
+func (s *Store) edgeKindIndexPresent() bool {
+	return s.indexPresent(edgesByKindIndexName)
+}
+
+func (s *Store) indexPresent(name string) bool {
 	var present bool
 	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?)`,
-		edgesByGenerationIndexName).Scan(&present); err != nil {
+		name).Scan(&present); err != nil {
 		return false
 	}
 	return present

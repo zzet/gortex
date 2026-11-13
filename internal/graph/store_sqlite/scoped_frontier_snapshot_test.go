@@ -49,7 +49,7 @@ func TestScopedFileFrontierOrderingGenerationAndDeletedPage(t *testing.T) {
 			}
 			query, args, _ := scopedEdgeProjectionQuery([]string{"repo"}, files, "calls", 41)
 			if !canonical {
-				query, args, _ = scopedEdgeSourceProjectionQuery([]string{"repo"}, files, "calls", 41)
+				query, args, _ = scopedEdgeSourceProjectionQuery([]string{"repo"}, files, "calls", 41, false)
 			}
 			var want, got []graph.ScopedEdgeRow
 			current.streamScopedEdges(query, args, maxID, func(row graph.ScopedEdgeRow) bool {

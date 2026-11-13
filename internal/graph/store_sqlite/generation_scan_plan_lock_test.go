@@ -114,7 +114,7 @@ func TestGenerationScanPlansLockedAcrossStatisticsRegimes(t *testing.T) {
 				// A dense kind of the fixture and a kind it has no rows of.
 				for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeExtends} {
 					repoQuery, repoArgs, ok := scopedEdgeSourceProjectionQuery(
-						[]string{"repo"}, nil, string(kind), baseViewGeneration)
+						[]string{"repo"}, nil, string(kind), baseViewGeneration, true)
 					if !ok {
 						t.Fatal("repository edge query was not built")
 					}
@@ -194,6 +194,35 @@ func newGenerationScanPlanLockStore(t *testing.T) *Store {
 		FilePath: "pkg/file00.go", Line: 1, Meta: map[string]any{"provides_for": "X", "binding": "useClass"}})
 	s.AddBatch(nodes, edges)
 	return s
+}
+
+// edges_by_kind is bulk-droppable too: with it missing, the repository walk
+// does not pin it (INDEXED BY would fail the read) and returns the same rows.
+func TestScopedEdgeRepositoryWalkWithoutKindIndex(t *testing.T) {
+	s := newGenerationScanPlanLockStore(t)
+	read := func() []string {
+		var out []string
+		for row := range s.EdgesInScopeSeq([]string{"repo"}, nil, graph.EdgeCalls, graph.EdgeMemberOf) {
+			out = append(out, string(row.Edge.Kind)+" "+row.Edge.From+" -> "+row.Edge.To)
+		}
+		return out
+	}
+	if !s.edgeKindIndexPresent() {
+		t.Fatal("fixture lacks edges_by_kind")
+	}
+	want := read()
+	if len(want) <= scopedProjectionPage {
+		t.Fatalf("fixture projection has %d rows; want more than one page", len(want))
+	}
+	if _, err := s.writerDB.Exec(`DROP INDEX edges_by_kind`); err != nil {
+		t.Fatal(err)
+	}
+	if s.edgeKindIndexPresent() {
+		t.Fatal("index still reported after DROP")
+	}
+	if got := read(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("rows changed without the index:\n%v\nwant\n%v", got, want)
+	}
 }
 
 // The generation index is optional: a store without it still answers the

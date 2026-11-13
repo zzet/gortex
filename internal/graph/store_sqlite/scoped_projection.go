@@ -246,6 +246,8 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		fileIndexed := len(filePaths) > 0 && s.scopedEdgeFileProvenanceCanonical(
 			repoPrefixes, filePaths, kindValues, maxID,
 		)
+		// Only the repository walk, with no file frontier, pins edges_by_kind.
+		kindIndexed := len(filePaths) == 0 && s.edgeKindIndexPresent()
 		for _, kind := range kindValues {
 			var query string
 			var args []any
@@ -253,7 +255,7 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			if fileIndexed {
 				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
 			} else {
-				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
+				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen, kindIndexed)
 			}
 			if !ok {
 				return
@@ -537,7 +539,7 @@ func scopedEdgeProjectionQuery(
 	}
 	filesJSON, haveFiles := projectionJSON(filePaths)
 	if !haveFiles {
-		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen)
+		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen, false)
 	}
 	reposJSON, haveRepos := projectionJSON(repoPrefixes)
 	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
@@ -570,6 +572,7 @@ func scopedEdgeSourceProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
 	viewGen int64,
+	kindIndexed bool,
 ) (string, []any, bool) {
 	if kind == "" {
 		return "", nil, false
@@ -590,9 +593,11 @@ func scopedEdgeSourceProjectionQuery(
 		// through edges_by_generation, or for a dense kind under full
 		// statistics through the rowid itself; either way every page reads
 		// each base edge past the cursor and discards the other kinds. A
-		// sparse overlay generation keeps the planner's choice.
+		// sparse overlay generation keeps the planner's choice, and so does a
+		// store whose edges_by_kind is missing (dropped for a bulk window, or
+		// left absent by one that closed unsealed): INDEXED BY would fail.
 		edgeSource := "edges AS e"
-		if viewGen == baseViewGeneration {
+		if viewGen == baseViewGeneration && kindIndexed {
 			edgeSource = "edges AS e INDEXED BY edges_by_kind"
 		}
 		query := `WITH requested_repos(repo_prefix) AS (` +

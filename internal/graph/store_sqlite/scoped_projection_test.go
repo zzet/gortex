@@ -299,7 +299,7 @@ func TestScopedEdgeProjectionPlansStayInsideRequestedFiles(t *testing.T) {
 			required []string
 		} {
 			query, args, ok := scopedEdgeSourceProjectionQuery(
-				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls), baseViewGeneration,
+				[]string{"repo"}, []string{"pkg/caller.go"}, string(graph.EdgeCalls), baseViewGeneration, false,
 			)
 			if !ok {
 				t.Fatal("source fallback query was not built")
