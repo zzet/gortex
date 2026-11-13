@@ -4,7 +4,7 @@
     {"runner": "macos-latest", "goos": "darwin", "goarch": "arm64"},
     {"runner": "windows-latest", "goos": "windows", "goarch": "amd64"}
   ],
-  "partitions": ["indexer:1/2", "indexer:2/2", "mcp+store", "rest"],
+  "partitions": ["indexer:1/2", "indexer:2/2", "mcp", "store", "rest"],
   "groups": {
     "indexer": "/internal/indexer",
     "mcp": "/internal/mcp",
