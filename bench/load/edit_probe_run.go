@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zzet/gortex/bench/receiptproof"
 )
 
 const editProbeRawLimit = 8 << 20
@@ -36,6 +38,8 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	Superseded               *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
+	supersededStatus         *receiptproof.Status
 	SearchACK                map[string]any               `json:"search_ack,omitempty"`
 	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
 	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
@@ -1169,7 +1173,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
 		for callCtx.Err() == nil {
-			raw, _, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
+			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
+			s.mu.Lock()
+			s.record.supersededStatus = nil // Only the latest status call may supply evidence.
+			s.mu.Unlock()
 			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
 				break
 			}
@@ -1184,6 +1191,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
+					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
@@ -1411,6 +1419,7 @@ func (r *editProbeRuntime) finish() error {
 	}
 	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
 	r.phase.EditProbe.Records = nil
+	guards := r.supersededGuards()
 	for _, s := range r.states {
 		s.stopProbes()
 		s.finishRaw()
@@ -1439,8 +1448,13 @@ func (r *editProbeRuntime) finish() error {
 			record.Outcome = "harness_evidence_incomplete"
 			record.Errors = append(record.Errors, sinkErr.Error())
 		}
+		classified := false
+		if candidate := record.supersededStatus; candidate != nil && guards[candidate.Key] != nil {
+			proof := &receiptproof.Superseded{Status: *candidate, Guard: *guards[candidate.Key]}
+			classified = classifySupersededRecord(&record, r.phase.EditProbe.PhysicalWriteScope, proof)
+		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
-		if record.Outcome != "complete" || len(record.Errors) > 0 {
+		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {
 			failures = append(failures, fmt.Errorf("edit %d: %s (%s)", record.Ordinal, record.Outcome, strings.Join(record.Errors, "; ")))
 		}
 	}

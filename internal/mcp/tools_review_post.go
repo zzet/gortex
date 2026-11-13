@@ -43,9 +43,9 @@ func (s *Server) handlePostReview(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	repo := strings.TrimSpace(req.GetString("repo", ""))
-	repoRoot, _ := s.diffRepoScope(ctx, repo)
+	repoRoot, repoPrefix := s.diffRepoScope(ctx, repo)
 
-	findings, err := s.postReviewFindingsFor(ctx, req, repoRoot)
+	findings, err := s.postReviewFindingsFor(ctx, req, repoRoot, repoPrefix)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -115,7 +115,7 @@ func (s *Server) reviewAllowPublic(repo string) bool {
 // JSON array (gated findings from a prior review call) takes precedence;
 // otherwise the deterministic review rulepack runs over the changeset / pasted
 // diff and its report findings are used.
-func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequest, repoRoot string) ([]review.Finding, error) {
+func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequest, repoRoot, repoPrefix string) ([]review.Finding, error) {
 	if raw := strings.TrimSpace(req.GetString("findings", "")); raw != "" {
 		var findings []review.Finding
 		if err := json.Unmarshal([]byte(raw), &findings); err != nil {
@@ -134,7 +134,6 @@ func (s *Server) postReviewFindingsFor(ctx context.Context, req mcp.CallToolRequ
 		rulepack []astquery.Match
 		impact   map[string]*analysis.ImpactResult
 	)
-	repoPrefix := s.diffJoinPrefix(repoRoot)
 	var changedFiles []string
 	if diffText == "" {
 		diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)

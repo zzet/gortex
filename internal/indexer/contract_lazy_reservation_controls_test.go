@@ -14,7 +14,7 @@ import (
 
 func TestContractCoordinatorLazyFillResumesToPublication(t *testing.T) {
 	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-	for i := 0; i < 33; i++ {
+	for i := 0; i < 65; i++ {
 		files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 	}
 	f := newContractJobFixture(t, files)
@@ -58,7 +58,7 @@ func TestContractCoordinatorLazyFillResumesToPublication(t *testing.T) {
 		require.Equal(t, viewmetrics.ContractJobFillContinued, outcome)
 		require.NotNil(t, cache.continuation)
 		require.Greater(t, len(cache.units), before)
-		require.LessOrEqual(t, len(cache.units)-before, 16)
+		require.LessOrEqual(t, len(cache.units)-before, contractRoundFiles)
 		require.Empty(t, published, "incomplete coverage cannot publish")
 	}
 	require.True(t, completed, "a finite unchanged census must complete across fair slices")
