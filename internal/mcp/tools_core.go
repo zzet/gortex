@@ -3028,6 +3028,9 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	var bindErr error
 	ctx, bindErr = s.bindPendingRelationReads(ctx)
 	if bindErr != nil {
+		if errors.Is(bindErr, errProjectedSourceMoved) {
+			return nil, bindErr
+		}
 		return mcp.NewToolResultError(bindErr.Error()), nil
 	}
 	target, err := req.RequireString("id")
