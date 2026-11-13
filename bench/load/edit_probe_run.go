@@ -40,6 +40,8 @@ type editProbeReadback struct {
 type editProbeRecord struct {
 	Superseded               *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
 	supersededStatus         *receiptproof.Status
+	coalescedStatus          *receiptproof.Coalesced
+	CoalescedFunctional      *receiptproof.Coalesced      `json:"coalesced_functional_receipt,omitempty"`
 	SearchACK                map[string]any               `json:"search_ack,omitempty"`
 	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
 	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
@@ -1176,6 +1178,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
 			s.mu.Lock()
 			s.record.supersededStatus = nil // Only the latest status call may supply evidence.
+			s.record.coalescedStatus = nil
 			s.mu.Unlock()
 			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
 				break
@@ -1192,6 +1195,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
+					s.record.coalescedStatus = coalescedFunctionalStatus(status, raw, statusIdentity.ID, accounting)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
@@ -1452,6 +1456,9 @@ func (r *editProbeRuntime) finish() error {
 		if candidate := record.supersededStatus; candidate != nil && guards[candidate.Key] != nil {
 			proof := &receiptproof.Superseded{Status: *candidate, Guard: *guards[candidate.Key]}
 			classified = classifySupersededRecord(&record, r.phase.EditProbe.PhysicalWriteScope, proof)
+		}
+		if !classified {
+			classified = classifyCoalescedFunctionalRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
 		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
 		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {
