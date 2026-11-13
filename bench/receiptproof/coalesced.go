@@ -56,11 +56,16 @@ func (p *Coalesced) Matches(receipt, mutationID, rpcID string, requested, applie
 		return false
 	}
 	s, w := p.Status, p.Winner
+	// A complete, independently owned successor does not establish the
+	// original edit's scheduling window. Preserve either known refusal shape;
+	// the winner and missing original physical window are still checked below.
+	backgroundUnavailable := (s.Refusal == "preexisting_path_work" && s.BindingPredicate == "" && s.BackgroundStage == "" && s.AcceptedStage == "") ||
+		(s.Refusal == "serving_attempt_binding_mismatch" && s.BindingPredicate == "direct_physical_window_missing" &&
+			s.BackgroundStage == "returned" && s.AcceptedStage == "no_accepted_witness")
 	return s.Receipt == receipt && s.MutationID == mutationID && s.RPCID == rpcID &&
 		s.Requested == requested && s.Applied == applied && s.Key != "" && s.Ticket == requested &&
 		s.Source == "mcp_edit" && s.Clock == "monotonic" && s.Terminal && s.PUnavailable && s.BUnavailable && !s.CoalescedAbsent &&
-		s.Refusal == "serving_attempt_binding_mismatch" && s.BindingPredicate == "direct_physical_window_missing" &&
-		s.BackgroundStage == "returned" && s.AcceptedStage == "no_accepted_witness" &&
+		backgroundUnavailable &&
 		s.BackgroundRequest == requested && s.BackgroundLast == requested && s.NativeHandoffs != nil && *s.NativeHandoffs == 0 &&
 		s.WireID > 0 && digest(s.SHA256) &&
 		w.Key == s.Key+"/physical-"+strconv.FormatUint(applied, 10)+"-retry-0" && w.Ticket == applied &&
@@ -77,7 +82,7 @@ func coalescedTimingOnlyError(value string) bool {
 	}
 	for _, reason := range strings.Split(reasons, "; ") {
 		switch {
-		case reason == "requested B unavailable for actual topology/identity", reason == "requested B observed unavailable: serving_attempt_binding_mismatch", reason == "B: missing duration":
+		case reason == "requested B unavailable for actual topology/identity", reason == "requested B observed unavailable: serving_attempt_binding_mismatch", reason == "requested B observed unavailable: preexisting_path_work", reason == "B: missing duration":
 		case strings.HasPrefix(reason, "missing B phase "):
 			switch strings.TrimPrefix(reason, "missing B phase ") {
 			case "scheduling_admission_setup", "initial_timer_arm", "canceled_quiet_wait", "timer_stop", "coalescing_control", "successor_timer_arm", "successor_quiet_wait":

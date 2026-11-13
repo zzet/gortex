@@ -7,7 +7,7 @@ import (
 )
 
 func TestCoalescedFunctionalProofRejectsSupersessionAndUnknownAttempts(t *testing.T) {
-	for _, mode := range []string{"qualified", "same_generation", "accepted_original", "missing_handoff", "wrong_winner", "wrong_retry", "partial", "bad_window", "A_failure", "P_failure", "bad_status_digest", "foreign_rpc", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch"} {
+	for _, mode := range []string{"qualified", "preexisting_separate_winner", "preexisting_direct_original", "preexisting_accepted_stamps", "preexisting_physical_window", "same_generation", "accepted_original", "missing_handoff", "wrong_winner", "wrong_retry", "partial", "bad_window", "A_failure", "P_failure", "bad_status_digest", "foreign_rpc", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch"} {
 		t.Run(mode, func(t *testing.T) {
 			data, err := os.ReadFile("testdata/coalesced.json")
 			if err != nil {
@@ -18,6 +18,20 @@ func TestCoalescedFunctionalProofRejectsSupersessionAndUnknownAttempts(t *testin
 				t.Fatal(err)
 			}
 			switch mode {
+			case "preexisting_separate_winner", "preexisting_direct_original", "preexisting_accepted_stamps", "preexisting_physical_window":
+				p.Status.Refusal = "preexisting_path_work"
+				p.Status.BindingPredicate, p.Status.BackgroundStage, p.Status.AcceptedStage = "", "", ""
+				p.AccountingError = "A/P/B accounting unavailable: requested B observed unavailable: preexisting_path_work; B: missing duration"
+				if mode == "preexisting_accepted_stamps" {
+					p.Status.AcceptedStage = "accepted_stamps_retained"
+				}
+				if mode == "preexisting_physical_window" {
+					p.Status.AcceptedStage = "physical_window_retained"
+				}
+				if mode == "preexisting_direct_original" {
+					p.Status.PUnavailable = false
+					p.Status.Applied = 3
+				}
 			case "same_generation":
 				p.Status.Applied = 3
 			case "accepted_original":
@@ -49,7 +63,7 @@ func TestCoalescedFunctionalProofRejectsSupersessionAndUnknownAttempts(t *testin
 			case "foreign_rpc":
 				p.Status.RPCID = "foreign"
 			}
-			if p.Matches("commit-a", "edit-a", "rpc-2", 3, 4) != (mode == "qualified") {
+			if p.Matches("commit-a", "edit-a", "rpc-2", 3, 4) != (mode == "qualified" || mode == "preexisting_separate_winner") {
 				t.Fatalf("mode=%s proof misclassified", mode)
 			}
 		})
