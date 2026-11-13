@@ -389,6 +389,9 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		ctx = markRequestStoreBusy(ctx, fp)
 		bundle = requestLocalEditingContext(ctx, fp)
 	} else if bundleErr != nil {
+		if errors.Is(bundleErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+			return nil, errProjectedSourceMoved
+		}
 		return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
 	}
 

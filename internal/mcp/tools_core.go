@@ -2823,6 +2823,9 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		ctx = markRequestStoreBusy(ctx, fp)
 		sg = requestLocalFileSummary(ctx, fp, gcxOnly)
 	} else if storeErr != nil {
+		if errors.Is(storeErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+			return nil, errProjectedSourceMoved
+		}
 		return mcp.NewToolResultError("get_file_summary: " + storeErr.Error()), nil
 	}
 	if len(sg.Nodes) == 0 && !storeBusy {
@@ -3025,6 +3028,9 @@ func (s *Server) handleGetCallers(ctx context.Context, req mcp.CallToolRequest) 
 	var bindErr error
 	ctx, bindErr = s.bindPendingRelationReads(ctx)
 	if bindErr != nil {
+		if errors.Is(bindErr, errProjectedSourceMoved) {
+			return nil, bindErr
+		}
 		return mcp.NewToolResultError(bindErr.Error()), nil
 	}
 	target, err := req.RequireString("id")
