@@ -665,9 +665,12 @@ func extractTSGRPCConsumers(text string, lines []string, filePath string, fileNo
 	return contracts
 }
 
+// The grpc-web TypeScript generator uses <Service>ClientPb, alongside the usual _pb modules.
+const grpcWebClientSuffix = "ClientPb"
+
 func tsFileImportsGRPC(filePath string, src []byte) bool {
 	if !bytes.Contains(src, []byte("grpc")) && !bytes.Contains(src, []byte("@connectrpc/")) &&
-		!bytes.Contains(src, []byte("_pb")) {
+		!bytes.Contains(src, []byte("_pb")) && !bytes.Contains(src, []byte(grpcWebClientSuffix)) {
 		return false
 	}
 
@@ -711,7 +714,8 @@ func tsFileImportsGRPC(filePath string, src []byte) bool {
 }
 
 func isTSGRPCModule(module string) bool {
-	for _, pkg := range []string{"@grpc/grpc-js", "@grpc/proto-loader", "grpc-web"} {
+	for _, pkg := range []string{"@grpc/grpc-js", "@grpc/proto-loader", "grpc-web", "grpc",
+		"@protobuf-ts/grpc-transport", "@protobuf-ts/grpcweb-transport"} {
 		if module == pkg || strings.HasPrefix(module, pkg+"/") {
 			return true
 		}
@@ -724,7 +728,7 @@ func isTSGRPCModule(module string) bool {
 	case ".js", ".ts", ".cjs", ".mjs", ".cts", ".mts":
 		base = strings.TrimSuffix(base, ext)
 	}
-	return strings.HasSuffix(base, "_pb")
+	return strings.HasSuffix(base, "_pb") || strings.HasSuffix(base, grpcWebClientSuffix)
 }
 
 // detectTSGRPCRequestType picks out the request message type from
