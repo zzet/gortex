@@ -701,9 +701,11 @@ all failures and matched latency ratios; the summary uses the **median of
 matched per-request ratios**, never a ratio of raw percentile summaries. Failed,
 censored or mismatched pairs remain explicit exclusions. Workload and probe
 categories are separate. These are coupled comparisons, not independently
-measured saturation throughput or reference/floor capacity. Paired mode rejects
-saturation, reference/floor, cold/restart and CPU-profile options; use standalone
-runs for those measurements.
+measured saturation throughput or reference/floor capacity. Explicit
+`--host reference` uses the same host-profile admission as standalone `run`;
+the daemons share those validated limits, so the comparison remains coupled.
+Paired mode rejects saturation, floor, cold/restart and CPU-profile options;
+use standalone runs for those measurements.
 
 Edits apply the same logical marker to each build's independent clone. Each
 build has its own acknowledgement and visibility deadline. Visibility ends at
