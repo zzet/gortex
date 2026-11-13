@@ -138,7 +138,7 @@ func TestSelectionUnverifiedMergeMetadataFallsBackBeforeGoDiscovery(t *testing.T
 			e.PullRequest = &pr
 			edit(&e)
 			m, err := f.planner.Plan(t.Context(), e)
-			if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 12 || len(m.Packages) != 0 {
+			if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 15 || len(m.Packages) != 0 {
 				t.Fatalf("unsafe event selected partial tests: %+v %v", m, err)
 			}
 		})
