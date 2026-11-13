@@ -27,7 +27,11 @@ func init() {
 	if os.WriteFile(os.Getenv("LOAD_EDIT_PROBE_CLI_ARGV"), argv, 0o600) != nil {
 		os.Exit(7)
 	}
-	fmt.Fprint(os.Stdout, os.Getenv("LOAD_EDIT_PROBE_CLI_STDOUT"))
+	if os.Getenv("LOAD_EDIT_PROBE_CLI_FIXTURE") == "large" {
+		fmt.Fprint(os.Stdout, strings.Repeat("x", (8<<20)+1))
+	} else {
+		fmt.Fprint(os.Stdout, os.Getenv("LOAD_EDIT_PROBE_CLI_STDOUT"))
+	}
 	fmt.Fprint(os.Stderr, "fixture stderr")
 	if os.Getenv("LOAD_EDIT_PROBE_CLI_EXIT") != "" {
 		os.Exit(1)
@@ -129,6 +133,30 @@ func TestEditProbeCLIRefusesProseWrapperAndUnsafeNumbers(t *testing.T) {
 		if _, err := decodeEditProbeOutput([]byte(stdout), "cli", "read.summary"); err == nil {
 			t.Fatal("accepted", name)
 		}
+	}
+}
+
+func TestEditProbeCLIStdoutKeepsEightMiBLimit(t *testing.T) {
+	argvFile := filepath.Join(t.TempDir(), "argv.json")
+	run, state, oracle := editProbeCLIFixture(t, 10*time.Second, "LOAD_EDIT_PROBE_CLI_FIXTURE=large", "LOAD_EDIT_PROBE_CLI_ARGV="+argvFile)
+	_, _, err := run.performCLI(t.Context(), state, oracle.call, "oracle:summary", 11)
+	if !errors.Is(err, errEditProbeEvidenceIncomplete) || !strings.Contains(err.Error(), "CLI stdout exceeded") || run.phase.Attempts[0].Outcome != "error" {
+		t.Fatalf("oversized CLI stdout was not refused: %v %+v", err, run.phase.Attempts)
+	}
+	state.finishRaw()
+	if state.sinkErr != nil {
+		t.Fatalf("bounded CLI refusal evidence was lost: %v", state.sinkErr)
+	}
+	sink := state.sink.(*editProbeHeldSink)
+	var row struct {
+		Stdout string `json:"stdout"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(sink.data.Bytes(), &row); err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Stdout) != 8<<20 || row.Error == "" {
+		t.Fatalf("CLI stdout allowance changed or refusal omitted: retained=%d error=%q", len(row.Stdout), row.Error)
 	}
 }
 

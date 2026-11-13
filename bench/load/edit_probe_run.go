@@ -21,7 +21,9 @@ import (
 	"github.com/zzet/gortex/bench/receiptproof"
 )
 
-const editProbeRawLimit = 8 << 20
+// This cumulative per-edit artifact allowance includes written, pending and
+// in-flight JSONL bytes. It is separate from each CLI call's stdout limit.
+const editProbeRawLimit = 16 << 20
 
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
@@ -530,7 +532,7 @@ func (s *editProbeState) emit(value any) error {
 	}
 	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
 		// Preserve only first-refusal scalar facts in the existing error path.
-		// The rejected payload is never queued and the original cap is unchanged.
+		// The rejected payload is never queued or counted against accepted bytes.
 		row, _ := value.(map[string]any)
 		event, _ := row["event"].(string)
 		purpose, _ := row["purpose"].(string)
