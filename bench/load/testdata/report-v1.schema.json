@@ -1151,6 +1151,87 @@
                             {
                               "additionalProperties": false,
                               "properties": {
+                                "native_noop": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "background_control": {
+                                          "anyOf": [
+                                            {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "residual_ns": {
+                                                  "type": "integer"
+                                                },
+                                                "sum_ns": {
+                                                  "type": "integer"
+                                                },
+                                                "wall_ns": {
+                                                  "type": "integer"
+                                                },
+                                                "within_five_percent": {
+                                                  "type": "boolean"
+                                                }
+                                              },
+                                              "required": [
+                                                "wall_ns",
+                                                "sum_ns",
+                                                "residual_ns",
+                                                "within_five_percent"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        },
+                                        "execution_disposition": {
+                                          "type": "string"
+                                        },
+                                        "phase_states": {
+                                          "additionalProperties": {
+                                            "type": "string"
+                                          },
+                                          "type": [
+                                            "object",
+                                            "null"
+                                          ]
+                                        },
+                                        "phases_ns": {
+                                          "additionalProperties": {
+                                            "anyOf": [
+                                              {
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "type": [
+                                            "object",
+                                            "null"
+                                          ]
+                                        },
+                                        "sum_state": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "execution_disposition",
+                                        "sum_state",
+                                        "phases_ns",
+                                        "phase_states"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
                                 "original_accounting_error": {
                                   "type": "string"
                                 },

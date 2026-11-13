@@ -10,6 +10,7 @@ import (
 const CoalescedFunctionalOutcome = "qualified_coalesced_functional"
 
 type Coalesced struct {
+	NativeNoOp      *NativeNoOp     `json:"native_noop,omitempty"`
 	Status          Status          `json:"status"`
 	Winner          CoalescedWinner `json:"winner"`
 	ServingPhysical Window          `json:"serving_physical"`
@@ -45,7 +46,13 @@ func (w Window) Complete() bool {
 }
 
 func (p *Coalesced) Matches(receipt, mutationID, rpcID string, requested, applied uint64) bool {
-	if p == nil || receipt == "" || mutationID == "" || rpcID == "" || requested == 0 || applied <= requested {
+	if p == nil || receipt == "" || mutationID == "" || rpcID == "" || requested == 0 || applied < requested {
+		return false
+	}
+	if p.NativeNoOp != nil {
+		return p.nativeNoOpMatches(receipt, mutationID, rpcID, requested, applied)
+	}
+	if applied == requested {
 		return false
 	}
 	s, w := p.Status, p.Winner
@@ -84,6 +91,123 @@ func coalescedTimingOnlyError(value string) bool {
 				return false
 			}
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// NativeNoOp retains the observed early-return control partition. Deep phases
+// must remain explicitly unexecuted; this is never indexing timing evidence.
+type NativeNoOp struct {
+	ExecutionDisposition string            `json:"execution_disposition"`
+	SumState             string            `json:"sum_state"`
+	PhasesNS             map[string]*int64 `json:"phases_ns"`
+	PhaseStates          map[string]string `json:"phase_states"`
+	BackgroundControl    *Window           `json:"background_control,omitempty"`
+}
+
+var noOpDeepPhases = []string{"gate_wait", "patch_parse", "apply", "search_lap", "resolve", "mtimes", "derived", "patch_analysis", "executor_control"}
+var noOpControlPhases = []string{"attempt_setup", "patch_inspection", "attempt_finalize", "cohort_admission", "lane_wait"}
+
+func (n *NativeNoOp) complete(control Window) bool {
+	if n == nil || n.ExecutionDisposition != "native_mtime_duplicate" || n.SumState != "partial" || !control.Complete() || control.ResidualNS != 0 {
+		return false
+	}
+	known := make(map[string]bool)
+	for _, name := range noOpDeepPhases {
+		v, present := n.PhasesNS[name]
+		if !present || v != nil || n.PhaseStates[name] != "not_applicable" {
+			return false
+		}
+		known[name] = true
+	}
+	sum := int64(0)
+	for _, name := range noOpControlPhases {
+		v := n.PhasesNS[name]
+		if v == nil || *v < 0 || n.PhaseStates[name] != "measured" || *v > control.WallNS-sum {
+			return false
+		}
+		sum += *v
+		known[name] = true
+	}
+	// Batch admission is optional, but any observed interval still belongs to
+	// this control partition and cannot carry unknown or executed deep work.
+	known["batch_admission"] = true
+	if v, ok := n.PhasesNS["batch_admission"]; ok {
+		switch n.PhaseStates["batch_admission"] {
+		case "measured":
+			if v == nil || *v < 0 || *v > control.WallNS-sum {
+				return false
+			}
+			sum += *v
+		case "not_observed", "not_applicable":
+			if v != nil {
+				return false
+			}
+		default:
+			return false
+		}
+	} else if _, ok := n.PhaseStates["batch_admission"]; ok {
+		return false
+	}
+	for name := range n.PhasesNS {
+		if !known[name] {
+			return false
+		}
+	}
+	for name := range n.PhaseStates {
+		if !known[name] {
+			return false
+		}
+	}
+	return sum == control.SumNS && (n.BackgroundControl == nil || n.BackgroundControl.Complete())
+}
+
+func (p *Coalesced) nativeNoOpMatches(receipt, mutationID, rpcID string, requested, applied uint64) bool {
+	s, w := p.Status, p.Winner
+	if !p.NativeNoOp.complete(p.ServingPhysical) || s.Receipt != receipt || s.MutationID != mutationID || s.RPCID != rpcID || s.Requested != requested || s.Applied != applied ||
+		s.Key == "" || s.Ticket != requested || s.Source != "mcp_edit" || s.Clock != "monotonic" || !s.Terminal || s.WireID <= 0 || !digest(s.SHA256) ||
+		w.Ticket != applied || w.Requested != requested || w.Applied != applied || w.Clock != "monotonic" || !w.Terminal || w.AttemptTicket != applied || w.AttemptRetry != 0 || !w.PartitionComplete || w.PhysicalScope != "accepted_winning_physical_attempt" ||
+		w.BackgroundCoverage != "not_established" || !nativeNoOpTimingOnlyError(p.AccountingError) {
+		return false
+	}
+	if applied == requested {
+		if s.PUnavailable || !s.CoalescedAbsent || w.Key != s.Key || w.Source != "mcp_edit" || w.Scope != "requested_physical_noop" {
+			return false
+		}
+	} else if !s.PUnavailable || s.CoalescedAbsent || w.Key != s.Key+"/physical-"+strconv.FormatUint(applied, 10)+"-retry-0" || w.Source != "canonical_coalesced_attempt" || w.Scope != "independent_physical_winner_serving_coalesced_receipt" {
+		return false
+	}
+	if p.NativeNoOp.BackgroundControl != nil {
+		return !s.BUnavailable && s.Refusal == ""
+	}
+	return s.BUnavailable && s.BackgroundRequest == requested && s.BackgroundLast >= requested && s.BackgroundLast <= applied && s.NativeHandoffs != nil && (*s.NativeHandoffs == 0 || s.BackgroundLast > requested) && (s.Refusal == "preexisting_path_work" || s.Refusal == "serving_attempt_binding_mismatch")
+}
+
+func nativeNoOpTimingOnlyError(value string) bool {
+	reasons, ok := strings.CutPrefix(value, "A/P/B accounting unavailable: ")
+	if !ok || reasons == "" {
+		return false
+	}
+	for _, reason := range strings.Split(reasons, "; ") {
+		if coalescedTimingOnlyError("A/P/B accounting unavailable: " + reason) {
+			continue
+		}
+		if reason == "actual publisher deep coverage unavailable" || reason == "actual read-assisted publisher deep coverage unavailable" || reason == "requested B observed unavailable: preexisting_path_work" {
+			continue
+		}
+		name, missing := strings.CutPrefix(reason, "missing applicable P phase ")
+		found := false
+		if missing {
+			for _, deep := range noOpDeepPhases {
+				if name == deep {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
 			return false
 		}
 	}

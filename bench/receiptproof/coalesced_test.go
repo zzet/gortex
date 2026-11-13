@@ -55,3 +55,40 @@ func TestCoalescedFunctionalProofRejectsSupersessionAndUnknownAttempts(t *testin
 		})
 	}
 }
+
+func TestNativeNoOpEveryDeepPhaseMustBeExplicitlyUnexecuted(t *testing.T) {
+	for _, phase := range noOpDeepPhases {
+		for _, bad := range []string{"executed", "fabricated_zero", "missing_state"} {
+			t.Run(phase+"/"+bad, func(t *testing.T) {
+				n := &NativeNoOp{ExecutionDisposition: "native_mtime_duplicate", SumState: "partial", PhasesNS: map[string]*int64{}, PhaseStates: map[string]string{}}
+				for _, name := range noOpDeepPhases {
+					n.PhasesNS[name] = nil
+					n.PhaseStates[name] = "not_applicable"
+				}
+				for _, name := range noOpControlPhases {
+					v := int64(1000000)
+					n.PhasesNS[name] = &v
+					n.PhaseStates[name] = "measured"
+				}
+				w := Window{WallNS: 5000000, SumNS: 5000000, WithinFivePercent: true}
+				if !n.complete(w) {
+					t.Fatal("valid no-op partition rejected")
+				}
+				switch bad {
+				case "executed":
+					v := int64(1)
+					n.PhasesNS[phase] = &v
+					n.PhaseStates[phase] = "measured"
+				case "fabricated_zero":
+					v := int64(0)
+					n.PhasesNS[phase] = &v
+				case "missing_state":
+					delete(n.PhaseStates, phase)
+				}
+				if n.complete(w) {
+					t.Fatal("executed or unknown deep phase qualified as no-op")
+				}
+			})
+		}
+	}
+}

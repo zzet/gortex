@@ -1215,6 +1215,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						}
 					}
 					terminal := s.record.GraphTerminal
+					qualifiedCandidate := s.record.coalescedStatus
+					qualifiedTiers := s.record.MutationTiers
 					if terminal && status["graph_status"] != "fresh" {
 						s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
 					}
@@ -1228,7 +1230,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
+					if editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
 						break
 					}
 				}
