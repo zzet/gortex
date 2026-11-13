@@ -131,11 +131,11 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					}
 					caller, cancel := context.WithCancel(base)
 					defer cancel()
-					deadline := time.Now().Add(projectedReadBudget)
-					caller = context.WithValue(caller, projectedSourceDeadlineKey{}, deadline)
+					var deadline time.Time
 					var onOwner func(func()) bool
 					var first context.Context
 					var observed error
+					var remainingAtEntry, remainingAfterProducer time.Duration
 					calls, callbacks := 0, 0
 					captured, ok := s.facades.legacy(tool)
 					require.True(t, ok)
@@ -143,6 +143,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 						calls++
 						if calls == 1 {
 							first = ctx
+							remainingAtEntry = time.Until(deadline)
 						}
 						return captured.handler(ctx, req)
 					})
@@ -199,6 +200,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 								pendingFileProjections.drop(entry)
 							}
 							require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
+							remainingAfterProducer = time.Until(deadline)
 							require.True(t, time.Now().Before(deadline), "controlled producer work must fit ORIGINAL150ms")
 							if transition == "expired" {
 								timer := time.NewTimer(time.Until(deadline))
@@ -249,11 +251,23 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							args["compress_bodies"] = false
 						}
 					}
+					// Registration, canonical setup and argument construction are
+					// fixture work, not request execution. Start the one original
+					// allowance only when this registered request is dispatched.
+					deadline = time.Now().Add(projectedReadBudget)
+					caller = context.WithValue(caller, projectedSourceDeadlineKey{}, deadline)
 					result, callErr := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
 						onOwner = dispatch
 						return externalVersionRegisteredCall(s, caller, 20, name, args)
 					})
 					joinCancelledWorker()
+					attempts := int32(-1)
+					if first != nil {
+						if allowance, ok := first.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); ok {
+							attempts = allowance.attempts.Load()
+						}
+					}
+					t.Logf("tool=%s surface=%s transition=%s leaf_calls=%d attempts=%d remaining_at_entry=%s remaining_after_producer=%s remaining_at_return=%s scope_error=%v", tool, surface, transition, calls, attempts, remainingAtEntry, remainingAfterProducer, time.Until(deadline), observed)
 					if transition == "malformed_options_container" {
 						require.Zero(t, callbacks, "malformed facade containers must refuse before SQL assembly")
 						require.Zero(t, calls)
