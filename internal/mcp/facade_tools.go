@@ -1183,7 +1183,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 		// handler actually retrieved, not the riders bolted on afterwards.
 		raw := result
 		afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, spec.Legacy, raw) })
-		if spec.Legacy == "get_file_summary" || spec.Legacy == "get_symbol_source" {
+		if spec.Legacy == "get_file_summary" || spec.Legacy == "get_symbol_source" || spec.Legacy == "get_callers" {
 			// Keep a proven file-read transition typed until the outer audited
 			// attempt owner can discard this entire response and its bookkeeping.
 			var freshnessErr error
