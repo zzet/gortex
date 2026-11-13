@@ -21,6 +21,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "seed-search":
 			return readOnlySeedCommand(args[1:], stdout, stderr)
+		case "edit-qualify":
+			return editQualifyCommand(args[1:], stdout, stderr)
 		case "edit-loop":
 			return editLoopCommand(args[1:], stdout, stderr)
 		case "plan", "collect", "edit-plan", "edit-collect":

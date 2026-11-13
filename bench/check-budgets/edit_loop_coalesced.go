@@ -19,8 +19,14 @@ func coalescedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 
 func sharedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 	r := wire.Edits[index]
+	return absentEditLoopTiming(r.Accounting.P) && absentEditLoopTiming(r.Accounting.B) && absentEditLoopTiming(r.Accounting.R) && absentEditLoopTiming(r.Accounting.Shared) && sharedFunctionalEditLoopObservations(wire, index)
+}
+
+// Functional observations are common to qualified shared-worktree outcomes;
+// each outcome separately validates its applicable physical timing owner.
+func sharedFunctionalEditLoopObservations(wire editLoopWire, index int) bool {
+	r := wire.Edits[index]
 	if !sharedPhysicalEditLoop(wire) || r.Superseded != nil || r.Accounting.A == nil ||
-		!absentEditLoopTiming(r.Accounting.P) || !absentEditLoopTiming(r.Accounting.B) || !absentEditLoopTiming(r.Accounting.R) || !absentEditLoopTiming(r.Accounting.Shared) ||
 		r.ACKExact == nil || r.ACKStatus != "applied" || r.ACKDiskStatus != "committed" || r.MutationID == "" || r.ACKMutationID != r.MutationID || r.ACKCommitSeq == 0 ||
 		r.GraphTerminal == nil || !*r.GraphTerminal || r.StaleClaimedFresh == nil || *r.StaleClaimedFresh ||
 		r.EvidenceBytes <= 0 || r.EvidenceBytes > r.EvidenceLimit || r.EvidenceLimit != 8<<20 && r.EvidenceLimit != 16<<20 {
@@ -30,13 +36,8 @@ func sharedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 	if tiers == nil || tiers.State != "observed" || tiers.Reason != "" {
 		return false
 	}
-	previous := time.Time{}
-	for _, stamp := range []string{tiers.ACK, tiers.FileGraph, tiers.Relations, tiers.Derived} {
-		at, err := time.Parse(time.RFC3339Nano, stamp)
-		if err != nil || at.IsZero() || !previous.IsZero() && at.Before(previous) {
-			return false
-		}
-		previous = at
+	if !orderedEditLoopTierStamps(tiers.ACK, tiers.FileGraph, tiers.Relations, tiers.Derived) {
+		return false
 	}
 	for _, tier := range []string{"file_graph", "relations", "derived"} {
 		if tiers.Tiers[tier] != "fresh" {
@@ -76,4 +77,18 @@ func sharedFunctionalEditLoopRecord(wire editLoopWire, index int) bool {
 		}
 	}
 	return true
+}
+
+// Both the serialized observation and the last raw status must carry this
+// same complete ordered timeline. One cannot mask contradictions in the other.
+func orderedEditLoopTierStamps(stamps ...string) bool {
+	previous := time.Time{}
+	for _, stamp := range stamps {
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil || at.IsZero() || !previous.IsZero() && at.Before(previous) {
+			return false
+		}
+		previous = at
+	}
+	return len(stamps) == 4
 }
