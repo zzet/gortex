@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -15,6 +16,42 @@ import (
 // doctorPath rewrites one path for display. Replaced for the duration of a
 // redacted run; the identity default keeps the normal report verbatim.
 var doctorPath = func(p string) string { return p }
+
+// doctorLabel rewrites a non-path identifier for display: a family remote or a
+// repo prefix.
+//
+// Redacting only the root left `display_remote` and `repo_prefix` verbatim in
+// the JSON, and the human rendering printed the raw prefix. A --redact report
+// could therefore still name a private remote and the local family on disk,
+// which is the one thing the flag exists to prevent. Paths were hashed while
+// identity was not.
+var doctorLabel = func(s string) string { return s }
+
+// newDoctorLabelRedactor replaces identifiers with stable per-run pseudonyms.
+//
+// Stability within a report is what matters: two findings about the same family
+// must still read as the same family, or the report stops being a diagnosis. The
+// mapping is therefore per-run and ordinal (<family-1>, <family-2>, ...), which
+// leaks nothing about the identifier -- not even its length or shape -- and does
+// not let two reports be correlated by a shared pseudonym. The trade is that the
+// same repo is <family-1> in one report and <family-2> in the next; a reader who
+// needs cross-report linkage is asking for less redaction than this flag offers.
+func newDoctorLabelRedactor() func(string) string {
+	seen := make(map[string]string)
+	next := 0
+	return func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return s
+		}
+		if p, ok := seen[s]; ok {
+			return p
+		}
+		next++
+		p := fmt.Sprintf("<family-%d>", next)
+		seen[s] = p
+		return p
+	}
+}
 
 // newDoctorPathRedactor rewrites paths under the repo root to <repo>/… and
 // paths under the home directory to ~/…. Repo first: the repo usually lives
