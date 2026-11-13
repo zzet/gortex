@@ -270,6 +270,9 @@ type CheckoutCoordinatorConfig struct {
 	// Gate holds the loop's build cycles while the daemon warms up. nil admits
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
+	// ContractAnalysis is this lifecycle's installed contract producer. It
+	// admits owned semantic deferral only for live work in this checkout.
+	ContractAnalysis *ContractAnalysisCoordinator
 
 	// RequestBase asks the committed-base publisher for the primary's base.
 	//
@@ -470,11 +473,12 @@ type CheckoutCycle struct {
 // reconciliation reports an accessible automatic checkout, and closed when
 // that checkout leaves.
 type CheckoutCoordinator struct {
-	byteMu       sync.Mutex
-	byteAttempt  *byteMutationAttempt
-	byteDemand   int
-	byteAnchorMu sync.Mutex
-	byteAnchor   *checkoutByteAnchor
+	contractAnalysis atomic.Pointer[ContractAnalysisCoordinator]
+	byteMu           sync.Mutex
+	byteAttempt      *byteMutationAttempt
+	byteDemand       int
+	byteAnchorMu     sync.Mutex
+	byteAnchor       *checkoutByteAnchor
 
 	// racyHeal tracks the start-time index refresh (checkout_racy_index.go).
 	racyHeal racyHealState
@@ -924,6 +928,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		prewarm:        cfg.PrewarmRoute,
 		dirtyBarrier:   cfg.dirtyBarrier,
 	}
+	c.contractAnalysis.Store(cfg.ContractAnalysis)
 	if !cfg.debounceDemand {
 		c.demand = make(chan struct{}, 1)
 	}
@@ -1359,6 +1364,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		out.cycleStarted = cycleStarted
 		out = byteMutationCycleOutcome(ctx, out)
 		recordCoordinatorCycle(out)
+		c.resumeEnrichmentAfterCycle(ctx, out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
@@ -1589,11 +1595,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if out.CompactionScheduled {
 		c.scheduleDirtyChainCompaction(out)
 	}
-	if out.DirtyBuilt && out.Err == nil {
-		// The edit published without its semantic enrichment: the
-		// follow-up owes it once the checkout is quiet.
-		c.scheduleEnrichmentFollowup()
-	}
+	c.resumeEnrichmentAfterCycle(ctx, out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -3485,10 +3487,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 // generation and its logical reuse key, or the chained delta's refusal reason,
 // and the physical work of the attempt that decided it.
 type dirtyLayerBuild struct {
-	GenerationID int64
-	Key          string
-	Reason       string
-	Work         *GenerationWorkCounters
+	// contractDemandDeferred is set only by the current attempt's verified
+	// owned translation. A caller never infers this authority from an error.
+	contractDemandDeferred bool
+	GenerationID           int64
+	Key                    string
+	Reason                 string
+	Work                   *GenerationWorkCounters
 	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
 	// batch of a larger change set.
 	Remaining int
@@ -3617,6 +3622,20 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		var fallback *DirtyChainFallbackError
 		if errors.As(err, &fallback) {
 			return dirtyLayerBuild{Reason: fallback.Reason, Work: work}, nil
+		}
+		if motion.ownsContractDemand(err) {
+			// The provider has drained and the builder abandoned its private
+			// payload. Demand is not movement: retry the same ticket with
+			// truthful debt, through the unchanged sample/publication fences.
+			c.deferFailedGeneration(ctx, generationID)
+			c.noteContractDemandDeferral()
+			if len(req.followupPaths) > 0 {
+				return dirtyLayerBuild{Work: work, contractDemandDeferred: true}, err
+			}
+			if attempt+1 == 2 {
+				return dirtyLayerBuild{Work: work}, err
+			}
+			continue
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) || errors.Is(err, errImportPreparationChanged) {
 			// A build that died part way left its generation failed; it is

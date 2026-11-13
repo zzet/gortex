@@ -318,6 +318,9 @@ type EnrichOptions struct {
 	// provider at its next check instead of waiting for it. nil keeps the
 	// Manager lifecycle as the only parent.
 	Context context.Context
+	// terminalErrors is the checkout caller's private per-pass carrier. It
+	// outlives the public live-context partial return check until unarming.
+	terminalErrors *[]error
 }
 
 // defaultEnrichmentAdmissionFloor balances two measured failure modes:
@@ -427,6 +430,17 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	}
 
 	var results []*EnrichResult
+	// Optional provider failures remain partial, as before. A canceled
+	// working-copy checkout must also retain their actual terminal identity:
+	// its caller may authorize an owned retry only for pure cancellation.
+	var terminalErrors []error
+	var checkoutErrors *[]error
+	if opts.CheckoutScope != nil && !opts.CommittedTreeOnly && opts.Context != nil {
+		checkoutErrors = opts.terminalErrors
+		if checkoutErrors == nil {
+			checkoutErrors = &terminalErrors
+		}
+	}
 
 	// Deterministic, primary-language-first order: the language with the most
 	// enrichable nodes runs first, so on a multi-language repo the dominant
@@ -459,7 +473,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 			continue
 		}
 
-		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, results, partial)
+		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, checkoutErrors, results, partial)
 	}
 
 	// Router-backed LSP providers: arbitrate by priority per language
@@ -540,7 +554,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOneScoped(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
+					results = m.runEnrichOneScoped(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, checkoutErrors, results, partial)
 				}()
 			}
 		}
@@ -563,9 +577,12 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 		if gateOnPresence && !anyLangPresent(langs, present) {
 			continue
 		}
-		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, opts, results, partial)
+		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, opts, checkoutErrors, results, partial)
 	}
 
+	if checkoutErrors != nil && opts.Context.Err() != nil && len(*checkoutErrors) > 0 {
+		return results, partial, errors.Join(append([]error{opts.Context.Err()}, (*checkoutErrors)...)...)
+	}
 	return results, partial, nil
 }
 
@@ -693,9 +710,9 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, terminalErrors *[]error, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOneScoped(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, results, partial)
+		results = m.runEnrichOneScoped(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, terminalErrors, results, partial)
 	}
 	return results
 }
@@ -1068,13 +1085,13 @@ func shortSHA(sha string) string {
 // failed, or returned a Partial result flips partial[repoName] so the caller
 // knows the repo's enrichment must be retried.
 func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
-	return m.runEnrichOneScoped(g, repoName, repoRoot, lang, provider, nodeCount, rs, applyGate, nil, nil, results, partial)
+	return m.runEnrichOneScoped(g, repoName, repoRoot, lang, provider, nodeCount, rs, applyGate, nil, nil, nil, results, partial)
 }
 
 // runEnrichOneScoped is runEnrichOne for a pass that may carry a checkout
 // compiler scope. A nil scope leaves the pass context exactly as
 // runEnrichOne builds it.
-func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, checkoutScope *CheckoutCompilerScope, parent context.Context, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, checkoutScope *CheckoutCompilerScope, parent context.Context, terminalErrors *[]error, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	if !m.beginPass() {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, 0, nil,
@@ -1277,7 +1294,8 @@ func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang str
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
 				partial[repoName] = true
-				<-done // mandatory drain: never abandon an in-process writer
+				oc := <-done // mandatory drain: never abandon an in-process writer
+				err = oc.err
 			}
 		}
 	} else {
@@ -1298,8 +1316,14 @@ func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang str
 			)
 			m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
 			partial[repoName] = true
-			<-done // mandatory drain: the legacy interface cannot be cancelled
+			oc := <-done // mandatory drain: the legacy interface cannot be cancelled
+			err = oc.err
 		}
+	}
+	if terminalErrors != nil && err != nil {
+		// Only an observed terminal outcome, after the mandatory receive,
+		// enters this call-local proof. A still-running writer proves nothing.
+		*terminalErrors = append(*terminalErrors, err)
 	}
 	if abandoned {
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,

@@ -94,6 +94,12 @@ type enrichmentFollowup struct {
 	// it (noteBuildMotion); zero once a follow-up has caught up with every
 	// such build. While it is set, edits defer their enrichment.
 	motionAt time.Time
+	// contractDemandAt records owned attempt deferral for this checkout,
+	// separately from byte movement. It lasts until a follow-up pays its debt.
+	contractDemandAt time.Time
+	// recoveredDebt is restored from persisted deferred producer rows when
+	// a route is reused after restart, without inventing a cancellation cause.
+	recoveredDebt bool
 
 	// quiet is a test seam: the quiet interval (<0: none, 0: the default).
 	quiet time.Duration
@@ -285,7 +291,64 @@ func (c *CheckoutCoordinator) EnrichmentFollowupStats() EnrichmentFollowupStats 
 // and otherwise while the working tree moves under its builds
 // (enrichmentDeferredByMotion).
 func (c *CheckoutCoordinator) defersEnrichment() bool {
-	return c != nil && c.builder != nil && c.builder.Semantic != nil && (enrichmentFollowupEnabled() || c.enrichmentDeferredByMotion())
+	return c != nil && c.builder != nil && c.builder.Semantic != nil && (enrichmentFollowupEnabled() || c.enrichmentDeferredByMotion() || c.enrichmentDeferredForContract() || c.recoveredEnrichmentDebt())
+}
+
+func (c *CheckoutCoordinator) noteContractDemandDeferral() {
+	c.followup.mu.Lock()
+	c.followup.contractDemandAt = time.Now()
+	c.followup.mu.Unlock()
+}
+
+func (c *CheckoutCoordinator) enrichmentDeferredForContract() bool {
+	c.followup.mu.Lock()
+	defer c.followup.mu.Unlock()
+	return !c.followup.contractDemandAt.IsZero()
+}
+
+func (c *CheckoutCoordinator) recoveredEnrichmentDebt() bool {
+	c.followup.mu.Lock()
+	defer c.followup.mu.Unlock()
+	return c.followup.recoveredDebt
+}
+
+func (c *CheckoutCoordinator) recoverEnrichmentDebt(ctx context.Context) {
+	if c.defersEnrichment() || c.builder == nil || c.builder.Semantic == nil {
+		return
+	}
+	if debt, _, err := c.PendingDerived(ctx); err == nil && len(debt) > 0 {
+		c.followup.mu.Lock()
+		c.followup.recoveredDebt = true
+		c.followup.mu.Unlock()
+	}
+}
+
+func (c *CheckoutCoordinator) resumeEnrichmentAfterCycle(ctx context.Context, out CheckoutCycle) {
+	if out.Err != nil || out.Rescheduled || out.Deferred || out.DirtyGenerationID <= 0 {
+		return
+	}
+	if !out.DirtyBuilt {
+		// A preflight can inherit an exact route without entering reconcile
+		// or flipping a reuse slot. Persisted known deferred debt is still owed.
+		c.recoverEnrichmentDebt(ctx)
+	}
+	c.scheduleEnrichmentFollowup()
+}
+
+// A queued OR running fill owns the promised projection. Wait without the
+// build lane; context cancellation and the scheduler's live interest bound
+// the wait. Another checkout's interest never delays this debt.
+func (c *CheckoutCoordinator) awaitContractWork(ctx context.Context) error {
+	ticker := time.NewTicker(dirtyChainCompactionYieldPoll)
+	defer ticker.Stop()
+	for c.pendingContractWork() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return ctx.Err()
 }
 
 // Enrichment deferred by motion.
@@ -434,6 +497,11 @@ const (
 // when anything is owed, builds, publishes and routes one follow-up over the
 // routed top. It returns what it did.
 func (c *CheckoutCoordinator) runEnrichmentFollowup(ctx context.Context) EnrichmentFollowupOutcome {
+	if c.enrichmentDeferredForContract() || c.recoveredEnrichmentDebt() {
+		if err := c.awaitContractWork(ctx); err != nil {
+			return c.noteFollowup(followupCanceled, 0, 0, time.Time{}, err)
+		}
+	}
 	quiet := c.followup.quiet
 	if quiet == 0 {
 		quiet = enrichmentFollowupQuiet
@@ -457,6 +525,16 @@ func (c *CheckoutCoordinator) runEnrichmentFollowup(ctx context.Context) Enrichm
 	}
 	started := time.Now()
 	outcome := c.runEnrichmentFollowupBuild(ctx, started)
+	if (c.enrichmentDeferredForContract() || c.recoveredEnrichmentDebt()) && (outcome == followupLanded || outcome == followupNotNeeded) {
+		if debt, _, err := c.PendingDerived(ctx); err == nil && len(debt) == 0 {
+			c.followup.mu.Lock()
+			if !c.followup.contractDemandAt.After(started) {
+				c.followup.contractDemandAt = time.Time{}
+				c.followup.recoveredDebt = false
+			}
+			c.followup.mu.Unlock()
+		}
+	}
 	if c.enrichmentDeferredByMotion() && (outcome == followupLanded || outcome == followupNotNeeded) {
 		// The deferral ends only when nothing is owed any more: a debt the
 		// follow-up could not take (a chain at its bound) is still the
@@ -530,6 +608,14 @@ func (c *CheckoutCoordinator) runEnrichmentFollowupBuild(ctx context.Context, st
 	sort.Strings(paths)
 	built, err := c.buildEnrichmentFollowup(ctx, route, dirtyParentSelection{Parent: top, Depth: len(layers), Manifest: manifest}, paths)
 	if err != nil || built.GenerationID <= 0 {
+		if built.contractDemandDeferred {
+			// A new interest arrived after the wait. The canceled private
+			// follow-up published nothing; its worker retries after the fill.
+			c.followup.mu.Lock()
+			c.followup.again = true
+			c.followup.mu.Unlock()
+			return c.noteFollowup(followupCanceled, top, len(paths), started, nil)
+		}
 		if ctx.Err() != nil {
 			return c.noteFollowup(followupCanceled, top, len(paths), started, nil)
 		}
