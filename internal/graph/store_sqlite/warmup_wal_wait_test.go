@@ -208,3 +208,33 @@ func TestWarmupWALWaitGatesNextAllocationUntilReaderProgress(t *testing.T) {
 		})
 	}
 }
+
+// A warm-up refusal is typed only when the reclaim ran out of time, so the
+// daemon can retry the refused repository; the caller's own cancellation is
+// returned unwrapped.
+func TestWarmupWALRefusalIsTypedOnlyForReclaimTimeout(t *testing.T) {
+	s, db := warmupWALFixture(t)
+	_, err := checkpointWALOnceOn(t.Context(), db, "RESTART")
+	require.NoError(t, err)
+	s.writeMu.Lock()
+	_, err = s.writerDB.Exec(`UPDATE wal_churn SET payload='over-headroom' WHERE id=1`)
+	s.writeMu.Unlock()
+	require.NoError(t, err)
+	s.walReclaim.update(func(st *WALReclaimStats) { st.CeilingBytes = 8 << 20 })
+	require.Greater(t, walFileSize(s.dbPath+"-wal"), int64(4<<20))
+
+	oldMax := retirementWALWaitMax
+	t.Cleanup(func() { retirementWALWaitMax = oldMax })
+
+	retirementWALWaitMax = 50 * time.Millisecond
+	err = s.AwaitWarmupWAL(t.Context())
+	require.ErrorIs(t, err, ErrWarmupWALPressure)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	retirementWALWaitMax = time.Minute
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	err = s.AwaitWarmupWAL(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NotErrorIs(t, err, ErrWarmupWALPressure)
+}

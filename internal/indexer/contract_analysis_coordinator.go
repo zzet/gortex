@@ -94,6 +94,7 @@ type contractAnalysisJob struct {
 	queuedAt          time.Time
 	capture           time.Duration
 	otherActorWaiting func() bool
+	checkpointDemand  func() bool
 	priorityRepos     []string
 	targetPublished   func(ContractFollowupTargetResult)
 	backgroundCurrent func(context.Context) error
@@ -289,9 +290,8 @@ func (c *ContractAnalysisCoordinator) notifyLocked() {
 	c.changed = make(chan struct{})
 }
 
-// execute is a job's body: it reserves a payload per missing target, runs
-// the cohort job and reports how it ended, "" when every target was attached
-// already.
+// execute runs the cohort, reserving output payloads only after convergence.
+// It reports how the job ended, "" when every target was attached already.
 func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 	defer job.snapshot.Release()
 	if err := c.ctx.Err(); err != nil {
@@ -333,25 +333,27 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		if attachment != nil {
 			continue
 		}
+		target.Payload = nil // The coordinator owns each output reservation.
+		targets = append(targets, target)
+	}
+	reservePayload := func(ctx context.Context, target ContractFollowupTarget) (*store_sqlite.Store, error) {
 		attempt := make([]byte, 16)
 		if _, err := rand.Read(attempt); err != nil {
-			c.options.Logger.Warn("contract reservation identity failed", zap.Error(err))
-			return viewmetrics.ContractJobFailed
+			return nil, err
 		}
 		encoded, err := json.Marshal(target.Key)
 		if err != nil {
-			return viewmetrics.ContractJobFailed
+			return nil, err
 		}
 		keyDigest := sha256.Sum256(encoded)
 		graphDigest := sha256.Sum256([]byte(target.Key.RepoPrefix + "\x00" + target.Key.CheckoutID))
-		_, payload, err := target.Catalog.BeginPayloadGeneration(c.ctx, store_sqlite.PayloadGenerationRequest{OwnerKind: "dedicated_graph", GraphID: "contract-analysis:" + hex.EncodeToString(graphDigest[:]), CheckoutID: target.Key.CheckoutID, GenerationKind: "contract_analysis", LayerID: hex.EncodeToString(keyDigest[:]) + ":" + job.id + ":" + hex.EncodeToString(attempt), LowerViewFingerprint: job.id, CreatedAt: time.Now().Unix()})
+		_, payload, err := target.Catalog.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{OwnerKind: "dedicated_graph", GraphID: "contract-analysis:" + hex.EncodeToString(graphDigest[:]), CheckoutID: target.Key.CheckoutID, GenerationKind: "contract_analysis", LayerID: hex.EncodeToString(keyDigest[:]) + ":" + job.id + ":" + hex.EncodeToString(attempt), LowerViewFingerprint: job.id, CreatedAt: time.Now().Unix()})
 		if err != nil {
-			c.options.Logger.Warn("contract payload reservation failed", zap.Error(err))
-			return viewmetrics.ContractJobFailed
+			return nil, err
 		}
 		target.Payload = payload
-		targets = append(targets, target)
 		reserved = append(reserved, target)
+		return payload, nil
 	}
 	if len(targets) == 0 {
 		return ""
@@ -390,7 +392,7 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		yield = job.yield
 	}
 	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: yield,
-		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, delta: job.delta,
+		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, checkpointDemand: job.checkpointDemand, delta: job.delta, reservePayload: reservePayload,
 		PriorityRepos: job.priorityRepos, BackgroundCurrent: job.backgroundCurrent,
 		TargetPublished: func(result ContractFollowupTargetResult) {
 			// Record custody before an external wake-up can panic. A later

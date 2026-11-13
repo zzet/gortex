@@ -114,9 +114,15 @@ func printRows(w io.Writer, rows []result) bool {
 	pass := true
 	for _, row := range rows {
 		status := "PASS"
-		if !row.Pass {
-			status, pass = "FAIL", false
+		if row.Mode == "deferred" && row.Deferred {
+			status = "DEFERRED (target met)"
+			if !row.Pass {
+				status = "DEFERRED (target missed)"
+			}
+		} else if !row.Pass {
+			status = "FAIL"
 		}
+		pass = pass && row.passesGate()
 		detail := strings.Join(append([]string{row.Baseline, row.Reason}, row.Allowances...), "; ")
 		if row.Worst != nil {
 			detail += "; worst hard repeat=" + value(row.Worst)

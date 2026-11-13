@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 )
 
 // Install with both the work coverage and fair fill sources. Each fixture owes
@@ -15,12 +16,14 @@ import (
 // progress rather than a host-dependent completion deadline.
 func TestContractFillColdWorkMakesBoundedProgressAcrossActors(t *testing.T) {
 	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-	for i := 0; i < 33; i++ {
+	for i := 0; i < 143; i++ {
 		files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 	}
 	actors := []*contractJobFixture{newContractJobFixture(t, files), newContractJobFixture(t, files)}
 	caches := make([]*contractDeltaCache, len(actors))
 	complete := make([]bool, len(actors))
+	captures := make([]int, len(actors))
+	extractions := []map[string]int{{}, {}}
 	seen := []map[string]bool{{}, {}}
 	workIdentities := make([][]string, len(actors))
 	for turn := 0; turn < 10; turn++ {
@@ -32,11 +35,17 @@ func TestContractFillColdWorkMakesBoundedProgressAcrossActors(t *testing.T) {
 		newlyExtracted := map[string]bool{}
 		hooks := &contractConvergenceHooks{beforeExtract: func(path string) {
 			newlyExtracted[path] = true
+			extractions[actor][path]++
 		}}
 		f := actors[actor]
 		f.layers++
+		capture := NewContractFollowupCapture(f.options)
 		report, err := runFixtureContractJob(t, f.options, contractFixtureJob{
 			layer: f.layers, cache: &caches[actor], hooks: hooks,
+			capture: func(ctx context.Context, view *graphview.RepoView, inputs *graphview.SelectedContractInputs, repo, checkout string) (ContractFollowupSnapshot, []ContractFollowupTarget, error) {
+				captures[actor]++
+				return capture(ctx, view, inputs, repo, checkout)
+			},
 			otherActorWaiting: func() bool { return !complete[1-actor] },
 			adjust: func(snapshot *ContractFollowupSnapshot) {
 				require.Len(t, snapshot.Files, len(files), "each recapture includes the full cold census")
@@ -64,6 +73,10 @@ func TestContractFillColdWorkMakesBoundedProgressAcrossActors(t *testing.T) {
 			require.ErrorAs(t, err, new(*ContractFillContinued))
 			require.Greater(t, len(seen[actor]), before, "each continued slice must advance beyond the already extracted prefix")
 			require.False(t, report.Published)
+			require.LessOrEqual(t, len(seen[actor])-before, contractRoundFiles)
+			if captures[actor] == 1 {
+				require.Len(t, seen[actor], contractRoundFiles, "productive first turn amortizes four inner chunks")
+			}
 		} else {
 			require.True(t, report.Published)
 			complete[actor] = true
@@ -73,6 +86,10 @@ func TestContractFillColdWorkMakesBoundedProgressAcrossActors(t *testing.T) {
 	// Both actors index the same files: one cold build is the oracle of both.
 	want := contractMeta(coldContracts(t, files))
 	for actor, f := range actors {
+		require.Equal(t, 3, captures[actor], "145 files need three captures instead of ten 16-file captures")
+		for path, count := range extractions[actor] {
+			require.Equal(t, 1, count, "a certified unit is not re-extracted: %s", path)
+		}
 		require.Len(t, seen[actor], len(files), "completed cold fill extracted the entire census")
 		for name := range files {
 			require.Contains(t, seen[actor], "fixture/"+name)
@@ -88,7 +105,7 @@ func TestContractFillContinuationMembershipChangesAndEvictionFinish(t *testing.T
 	for _, change := range []string{"add_remove", "same_path_new_work", "evict", "cancel", "key_move"} {
 		t.Run(change, func(t *testing.T) {
 			files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-			for i := 0; i < 33; i++ {
+			for i := 0; i < 65; i++ {
 				files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 			}
 			f := newContractJobFixture(t, files)

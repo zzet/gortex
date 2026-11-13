@@ -14,7 +14,7 @@ go run ./bench/check-budgets --budgets bench/budgets.yaml \
 ```
 
 The output is a before → after table and an optional new JSON evidence file.
-Any breach, missing/null metric, wrong unit, omitted safety/censor count,
+Any blocking breach, missing/null metric, wrong unit, omitted safety/censor count,
 incomplete report, unavailable prerequisite or incomparable measurement exits
 nonzero. Existing output files are never overwritten. The separate
 `perf-gate.yml` workflow publishes readiness, explicitly named **not acceptance**.
@@ -52,7 +52,8 @@ Missing or non-hex plan hashes fail. No other load/scoping difference is silentl
 normalized. Paired native reports and saturation reports are rejected as formal
 capacity evidence rather than relabeled as independent agent runs.
 
-The policy has 837 rows: 689 block and 148 guard. Its 38 PR smoke targets use
+The policy has 885 rows: 733 block, 148 guard and 4 deferred. Its 38 PR smoke
+targets use
 `hosted_arm_smoke`, exclusively for the issue's `ubuntu-24.04-arm` lane. This is
 the public standard four-CPU runner, rather than reference-capacity evidence.
 The harness reports actual native Linux ARM64 CPU/memory/disk observations;
@@ -98,6 +99,18 @@ substituted for zero kills.
 median is more than 20% worse than main; `read_p95_vs_main` expresses the read
 comparison without inventing an absolute one-repo p95 ceiling.
 
+`deferred` is reserved for the four `search_symbols_p95` / `loadedit-4`
+400 ms rows moved out of the v0.64.12 blocking chain by the release owner's
+2026-11-12 decision in [#1420](https://github.com/zzet/gortex/issues/1420).
+The original target, measurements and target pass/fail remain in the table/JSON;
+a valid assessment prints `DEFERRED (target met/missed)` and does not block the
+lane. The JSON row `pass` retains the target verdict; `target_deferred` records
+that valid assessment's nonblocking status. Ownership is
+`unassigned`, not a new promised release. Missing/invalid/incomparable evidence,
+correctness and the independent smoke +20% p95 regression check still fail.
+The `read.source` p99 target and every other budget remain unchanged. Two-night
+misses remain visible as `DEFERRED TARGET`, not blocking target acceptance.
+
 `guard` starts with the shipped median × 1.15. Only a disk/memory cell whose
 pinned main median already exceeds shipped × 1.15 selects main instead. This
 selection is independent of the candidate. A missing shipped observation cannot
@@ -113,8 +126,8 @@ explicitly named/applicable, with their owning releases recorded.
 A guard can retain a known future absolute `target`, ignored until its mode
 changes to `block`. Guard allowances are not applied after that promotion.
 An unknown future target is explicitly null. Unresolved `owning_release` is
-explicitly `unassigned`, legal only for guards; those rows cannot be promoted
-without resolving ownership. No measured baseline numbers live in the policy.
+explicitly `unassigned`, legal only for guards and the #1420 deferred rows;
+those rows cannot be promoted without resolving ownership. No measured baseline numbers live in the policy.
 
 Known scheduling evidence: #1065 owns 15 MiB/edit at 1/4/8 agents in v0.64.15;
 #1061 owns the 8/16-worktree peak in v0.64.14; #1076 owns distinct 60-second
@@ -577,7 +590,9 @@ separate future work, requiring its own reviewed plan.
 The opt-in `nightly_workload_seed` schema1 `search-delay-v1` targets only the
 candidate `loadedit-4` cell. It delays actual workload `search.symbols` calls
 inside their existing measured interval by one cancellable second, so the
-unchanged 0.4-second absolute search p95 budget can observe the regression.
+retained 0.4-second search p95 target can observe the miss. Under the approved
+#1420 deferral that absolute miss is nonblocking and cannot prove a seeded
+blocking-budget failure.
 MAIN/tag, visibility probes, other cells and ordinary seed-off runs stay clean.
 Raw seed/delay provenance is required; a missing observation or unrelated
 collector failure is not an observed latency regression. Seeded reports never

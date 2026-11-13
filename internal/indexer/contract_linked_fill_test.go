@@ -14,7 +14,7 @@ import (
 
 func TestContractLinkedFillReacquiresMovedAncestryAndResumesPartialCache(t *testing.T) {
 	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-	for i := 0; i < 33; i++ {
+	for i := 0; i < 65; i++ {
 		files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 	}
 	f := newContractJobFixture(t, files)

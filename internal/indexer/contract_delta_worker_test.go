@@ -99,7 +99,7 @@ func TestContractDeltaWorkerProducerLifecycleEqualsIndependentCold(t *testing.T)
 
 func TestContractFillCheckpointResumesMissingUnitsAndEqualsCold(t *testing.T) {
 	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
-	for i := 0; i < 33; i++ {
+	for i := 0; i < 65; i++ {
 		files[fmt.Sprintf("helper%02d.go", i)] = fmt.Sprintf("package fixture\nfunc Helper%d() int { return %d }\n", i, i)
 	}
 	f := newContractJobFixture(t, files)
@@ -116,7 +116,7 @@ func TestContractFillCheckpointResumesMissingUnitsAndEqualsCold(t *testing.T) {
 	require.Zero(t, report.EnrichRuns, "a partial fill never enters enrichment")
 	require.NotNil(t, p)
 	require.False(t, p.complete)
-	require.Len(t, p.units, 16)
+	require.Len(t, p.units, contractRoundFiles)
 	require.Equal(t, beforeHeld, f.options.Materializer.Leases.Held(), "snapshot and payload leases return before continuation")
 	entries, err := os.ReadDir(scratch)
 	require.NoError(t, err)
@@ -171,7 +171,7 @@ func TestContractFillIdleCallbackPreservesDefaultRoundSize(t *testing.T) {
 	var p *contractDeltaCache
 	report, err := runFixtureContractJob(t, f.options, contractFixtureJob{layer: 1, cache: &p, otherActorWaiting: func() bool { return true }})
 	require.ErrorAs(t, err, new(*ContractFillContinued))
-	require.Equal(t, 16, report.Files, "contention limits the next admitted extraction round")
+	require.Equal(t, contractRoundFiles, report.Files, "productive contention yields within one normal-round equivalent")
 }
 
 func TestContractDeltaUnitRetainsItsMeasuredRawSize(t *testing.T) {

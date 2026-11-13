@@ -795,6 +795,58 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		changed: &changedRepos, files: &filesReindexed, unknown: &scopeUnknown,
 		prefixes: &changedPrefixes, frontier: deltaFrontier,
 	}
+	// walRetries holds repositories whose load was refused by the warmup WAL
+	// boundary. The refusal is transient — the reclaim was blocked by the other
+	// parallel loads — so they stay loading and are retried one at a time once
+	// the parallel phase has drained, instead of ending failed until restart.
+	var walRetries warmupWALRetries
+	// runRepoJob loads one repository and ends its load state, unless
+	// deferrable and the WAL boundary refused it: then the repository stays
+	// loading and is queued on walRetries. The retry (deferrable false)
+	// re-enters the record the first attempt left loading.
+	runRepoJob := func(batchCtx context.Context, entry config.RepoEntry, deferrable bool) {
+		// jobErr is what ended this repository's job, so its load state can
+		// leave "loading" with a reason.
+		var jobErr error
+		deferred := false
+		state.multiIndexer.StartRepoLoad(entry.Path)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("daemon: warmup repo panic recovered",
+					zap.String("path", entry.Path),
+					zap.Any("panic", r))
+				changedRepos.Add(1)
+				scopeUnknown.Store(true)
+				deltaFrontier.invalidate()
+				jobErr = fmt.Errorf("warmup crashed while loading this repository: %v", r)
+			}
+			if !deferred {
+				state.multiIndexer.FinishRepoLoad(entry.Path, jobErr)
+			}
+		}()
+		// Route repos the store already knows through ReconcileRepoCtx — it
+		// calls IncrementalReindexPaths, which evicts files deleted while the
+		// daemon was down and re-indexes only files whose mtime changed. Repos
+		// with no persisted mtimes (newly tracked, or first startup after a
+		// schema bump) fall back to TrackRepoCtx, which does a full walk. Both
+		// paths end with the repo registered on the MultiIndexer; contract
+		// reconciliation is deferred to the single RunGlobalResolve call below.
+		repoStart := time.Now()
+		priorMtimes := warmupPriorMtimes(state, entry, logger)
+		pathFn, loadErr := warmupLoadRepo(batchCtx, accounting, state, entry, priorMtimes, deferrable, logger)
+		jobErr = loadErr
+		if deferrable && warmupWALRetryable(batchCtx, loadErr) {
+			deferred = true
+			walRetries.add(entry, loadErr)
+		}
+		elapsed := time.Since(repoStart)
+		if elapsed > 2*time.Second {
+			logger.Info("daemon: warmup repo elapsed",
+				zap.String("path", entry.Path),
+				zap.String("path_fn", pathFn),
+				zap.Duration("elapsed", elapsed))
+		}
+	}
 	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
 		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
@@ -817,67 +869,7 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 					// reindex doesn't kill the worker — the bad repo logs
 					// and skips, the worker proceeds to the next job, and
 					// warmup completes.
-					func(entry config.RepoEntry) {
-						// jobErr is what ended this repository's job, so its
-						// load state can leave "loading" with a reason.
-						var jobErr error
-						state.multiIndexer.StartRepoLoad(entry.Path)
-						defer func() {
-							if r := recover(); r != nil {
-								logger.Error("daemon: warmup repo panic recovered",
-									zap.String("path", entry.Path),
-									zap.Any("panic", r))
-								changedRepos.Add(1)
-								scopeUnknown.Store(true)
-								deltaFrontier.invalidate()
-								jobErr = fmt.Errorf("warmup crashed while loading this repository: %v", r)
-							}
-							state.multiIndexer.FinishRepoLoad(entry.Path, jobErr)
-						}()
-						// Route repos the store already knows through
-						// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
-						// evicts files deleted while the daemon was down and
-						// re-indexes only files whose mtime changed. Repos with no
-						// persisted mtimes (newly tracked, or first startup after a
-						// schema bump) fall back to TrackRepoCtx, which does a
-						// full walk. Both paths end with the repo registered on
-						// the MultiIndexer; contract reconciliation is deferred
-						// to the single RunGlobalResolve call below.
-						repoStart := time.Now()
-						// The backend's FileMtime sidecar table is the sole source
-						// of prior mtimes. An empty result means the store has
-						// never seen this repo, which is a cold index rather than
-						// a reconcile with nothing to do — normalise it to nil so
-						// the full-walk branch below runs.
-						priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
-						if len(priorMtimes) == 0 {
-							priorMtimes = nil
-						}
-						// A backend that crossed a schema-rebuild migration rung
-						// (NeedsRebuild) has on-disk rows in the old shape that an
-						// incremental reconcile cannot fix. Drop prior mtimes so every
-						// file re-indexes into the new schema (the nil branch below
-						// runs a full TrackRepoCtx and marks the repo changed, so the
-						// global resolve/derivation passes re-run too). No-op for
-						// backends without the capability and whenever no rebuild rung
-						// was crossed — the common case.
-						if storeNeedsRebuild(state.graph) {
-							if len(priorMtimes) > 0 {
-								logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
-									zap.String("path", entry.Path))
-							}
-							priorMtimes = nil
-						}
-						pathFn, loadErr := accounting.load(batchCtx, state, entry, priorMtimes, logger)
-						jobErr = loadErr
-						elapsed := time.Since(repoStart)
-						if elapsed > 2*time.Second {
-							logger.Info("daemon: warmup repo elapsed",
-								zap.String("path", entry.Path),
-								zap.String("path_fn", pathFn),
-								zap.Duration("elapsed", elapsed))
-						}
-					}(entry)
+					runRepoJob(batchCtx, entry, true)
 				}
 			}()
 		}
@@ -891,6 +883,13 @@ func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *z
 		}
 		close(jobs)
 		wg.Wait()
+		walRetries.run(batchCtx, func(entry config.RepoEntry) {
+			logger.Info("daemon: retrying warmup repository after WAL pressure",
+				zap.String("path", entry.Path))
+			runRepoJob(batchCtx, entry, false)
+		}, func(entry config.RepoEntry, reason error) {
+			state.multiIndexer.FinishRepoLoad(entry.Path, reason)
+		})
 
 		// Materialize go.mod dependency contract nodes while the coordinated
 		// bulk connection is still pinned. The per-indexer drain is idempotent,

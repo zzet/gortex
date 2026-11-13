@@ -49,6 +49,7 @@ type job struct {
 	env             []string
 	race, windows   bool
 	workers         int
+	cliPackage      string
 	deadline        time.Time
 	stdout          io.Writer
 	mu, outputMu    sync.Mutex
@@ -347,7 +348,7 @@ func (j *job) runPackage(group, pkg string, part Partition, dir string, race boo
 	j.printf("%s: done in %.0fs\n", label, time.Since(started).Seconds())
 	return nil
 }
-func (j *job) goTest(packages []string, parallel int, tag string) (processResult, testEvents, error) {
+func (j *job) goTest(packages []string, parallel int, tag string, slot int) (processResult, testEvents, error) {
 	left, err := j.remaining()
 	if err != nil {
 		return processResult{}, testEvents{}, err
@@ -358,7 +359,7 @@ func (j *job) goTest(packages []string, parallel int, tag string) (processResult
 		args = append(args, coverFlags...)
 		args = append(args, "-coverprofile", j.profile(tag))
 	}
-	r, err := j.run(append(args, packages...), 0, tag, j.root)
+	r, err := j.run(append(args, packages...), slot, tag, j.root)
 	return r, parseEvents(r.output), err
 }
 func failedTests(events testEvents, pkg string) []string {
@@ -403,8 +404,29 @@ func eventEvidence(events testEvents, pkg, raw string) string {
 	return raw
 }
 func (j *job) runRest(packages []string) error {
+	if j.cliPackage == "" || !slices.Contains(packages, j.cliPackage) {
+		return j.runRestGroup(packages, 0, "rest")
+	}
+	others := make([]string, 0, len(packages)-1)
+	for _, pkg := range packages {
+		if pkg != j.cliPackage {
+			others = append(others, pkg)
+		}
+	}
+	// TestMain guards the CLI's ambient home before installing its own
+	// process sandbox. Other packages must not share that guarded namespace.
+	// Groups are serial: retain the worker ceiling and the existing deadline.
+	if len(others) > 0 {
+		if err := j.runRestGroup(others, 0, "rest"); err != nil {
+			return err
+		}
+	}
+	return j.runRestGroup([]string{j.cliPackage}, 1, "rest-cli")
+}
+
+func (j *job) runRestGroup(packages []string, slot int, tag string) error {
 	started := time.Now()
-	r, events, err := j.goTest(packages, j.workers, "rest")
+	r, events, err := j.goTest(packages, j.workers, tag, slot)
 	if err != nil {
 		return err
 	}
@@ -440,7 +462,11 @@ func (j *job) runRest(packages []string) error {
 		j.fail("rest", r.output)
 	}
 	for i, retry := range retries {
-		r, events, err := j.goTest([]string{retry.pkg}, 1, fmt.Sprintf("rerun-%d-%s", i, filepath.Base(retry.pkg)))
+		retryTag := fmt.Sprintf("rerun-%d-%s", i, filepath.Base(retry.pkg))
+		if tag != "rest" {
+			retryTag = tag + "-" + retryTag
+		}
+		r, events, err := j.goTest([]string{retry.pkg}, 1, retryTag, slot)
 		if err != nil {
 			return err
 		}
@@ -455,7 +481,7 @@ func (j *job) runRest(packages []string) error {
 			j.packageFailure(retry.pkg, events, text)
 		}
 	}
-	j.printf("rest: done in %.0fs\n", time.Since(started).Seconds())
+	j.printf("%s: done in %.0fs\n", tag, time.Since(started).Seconds())
 	return nil
 }
 func newJob(ctx context.Context, opts RunOptions, planner *Planner) (*job, error) {
@@ -567,6 +593,7 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if err != nil {
 		return report, err
 	}
+	j.cliPackage = module + "/cmd/gortex"
 	defer func() {
 		report = Report{j.scratch, j.failures, j.flaky, j.durations}
 		err = errors.Join(err, j.report())

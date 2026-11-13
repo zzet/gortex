@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+
+	"github.com/zzet/gortex/bench/receiptproof"
 )
 
 type editLoopRow struct {
@@ -25,7 +28,16 @@ type editLoopRow struct {
 }
 
 type editLoopWire struct {
+	PhysicalWriteScope *struct {
+		Kind    string `json:"kind"`
+		File    string `json:"file"`
+		Editors int    `json:"editors"`
+	} `json:"physical_write_scope"`
 	Plan struct {
+		Kind   string `json:"kind"`
+		Tool   string `json:"tool"`
+		File   string `json:"file"`
+		Sender string `json:"sender"`
 		Routes []struct {
 			ID       string `json:"id"`
 			Repo     string `json:"repo"`
@@ -52,16 +64,41 @@ type editLoopWire struct {
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
-		Editor      int    `json:"editor"`
-		Route       string `json:"route"`
-		TargetLines *int   `json:"admitted_target_lines"`
-		Ordinal     int    `json:"ordinal"`
-		Mode        string `json:"probe_mode"`
-		Outcome     string `json:"outcome"`
-		ACK         metric `json:"t_ack_ms"`
-		OneRead     metric `json:"t_gate_readback_ms"`
-		ACKExact    *bool  `json:"ack_readback_exact"`
-		Readbacks   []struct {
+		Superseded *receiptproof.Superseded `json:"superseded_receipt"`
+		Receipt    string                   `json:"mutation_receipt"`
+		Accounting struct {
+			State     string `json:"state"`
+			RPCID     string `json:"bound_rpc_id"`
+			Requested uint64 `json:"requested_generation"`
+			Applied   uint64 `json:"applied_generation"`
+			A         *struct {
+				WallNS            int64 `json:"wall_ns"`
+				SumNS             int64 `json:"sum_ns"`
+				ResidualNS        int64 `json:"residual_ns"`
+				WithinFivePercent bool  `json:"within_five_percent"`
+			} `json:"acknowledgement"`
+			P      json.RawMessage `json:"physical"`
+			B      json.RawMessage `json:"requested_background"`
+			R      json.RawMessage `json:"read_assisted_publisher"`
+			Shared json.RawMessage `json:"shared_owner"`
+		} `json:"accounting"`
+		CheckoutID       string `json:"checkout_id"`
+		MutationID       string `json:"mutation_id"`
+		ACKStatus        string `json:"ack_status"`
+		ACKDiskStatus    string `json:"ack_disk_status"`
+		ACKMutationID    string `json:"ack_mutation_id"`
+		ACKCommitSeq     uint64 `json:"ack_commit_seq"`
+		ACKContentSHA256 string `json:"ack_content_sha256"`
+		Editor           int    `json:"editor"`
+		Route            string `json:"route"`
+		TargetLines      *int   `json:"admitted_target_lines"`
+		Ordinal          int    `json:"ordinal"`
+		Mode             string `json:"probe_mode"`
+		Outcome          string `json:"outcome"`
+		ACK              metric `json:"t_ack_ms"`
+		OneRead          metric `json:"t_gate_readback_ms"`
+		ACKExact         *bool  `json:"ack_readback_exact"`
+		Readbacks        []struct {
 			Kind            string `json:"kind"`
 			Correct         *bool  `json:"correct"`
 			Error           string `json:"error"`
@@ -231,6 +268,9 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	if err != nil {
 		return err
 	}
+	if wire.PhysicalWriteScope != nil && (len(r.Corpus) != 1 || !sharedPhysicalEditLoop(wire)) {
+		return errors.New("shared ACK scope lacks the admitted single-worktree/file topology")
+	}
 	editors := wire.Plan.Editors
 	if editors == 0 && wire.Plan.Session == "one_editor_plus_one_separate_prober_per_edit" {
 		editors = 1
@@ -293,11 +333,45 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 	}
 	modes := []string{"json", "toon", "compact", "facade", "cli"}
 	for i, record := range wire.Edits {
-		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" || len(record.Errors) != 0 {
+		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome || len(record.Errors) != 0 {
 			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
+		}
+
+		if record.Outcome == receiptproof.SupersededOutcome {
+			a := record.Accounting.A
+			digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
+			if !sharedPhysicalEditLoop(wire) || !record.Superseded.Matches(record.Receipt, record.MutationID, record.Accounting.RPCID, record.Accounting.Requested, record.Accounting.Applied) ||
+				record.Accounting.State != "terminal_unavailable_background" || a == nil || !a.WithinFivePercent || a.WallNS < 0 || a.SumNS < 0 || a.SumNS > a.WallNS ||
+				a.ResidualNS != a.WallNS-a.SumNS || a.ResidualNS > a.WallNS/20 ||
+				string(record.Accounting.P) != "null" || string(record.Accounting.B) != "null" || !absentEditLoopTiming(record.Accounting.R) || !absentEditLoopTiming(record.Accounting.Shared) ||
+				record.ACKExact == nil || record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.ACKMutationID != record.MutationID ||
+				record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
+				return wire, errors.New("superseded receipt lacks exact shared-worktree status/guard/ACK proof")
+			}
 		}
 	}
 	return wire, nil
+}
+
+func absentEditLoopTiming(value json.RawMessage) bool {
+	return len(value) == 0 || string(value) == "null"
+}
+
+// Only the runtime's physical binding observation qualifies this exception.
+// Editor count or a common branch name alone never relaxes isolated checkouts.
+func sharedPhysicalEditLoop(wire editLoopWire) bool {
+	scope := wire.PhysicalWriteScope
+	if scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.File != wire.Plan.File || scope.Editors < 2 || scope.Editors != wire.Plan.Editors || wire.Plan.LinkedWorktrees != 0 || len(wire.Plan.Routes) != 0 || wire.Plan.Kind != "add_intrafile_call" || wire.Plan.Tool != "edit.file" || wire.Plan.Sender != "" {
+		return false
+	}
+	used := make(map[int]bool)
+	for i, record := range wire.Edits {
+		if record.Editor < 0 || record.Editor >= scope.Editors || record.Editor != wire.Plan.Steps[i].Editor || record.Route != "" || wire.Plan.Steps[i].Route != "" || record.CheckoutID != "" {
+			return false
+		}
+		used[record.Editor] = true
+	}
+	return len(used) > 1
 }
 
 func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
@@ -511,9 +585,18 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 	}
 	var values []float64
 	correct, total := 0, 0
+	sharedPhysical := sharedPhysicalEditLoop(wire)
 	for _, record := range wire.Edits {
 		if name == "edit_ack_p95" || name == "edit_ack_max" {
-			if record.ACKExact == nil || !*record.ACKExact {
+			if record.ACKExact == nil {
+				return 0, errors.New("ACK lacks exact readback proof")
+			}
+			if sharedPhysical {
+				digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
+				if record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
+					return 0, errors.New("ACK lacks confirmed shared-write commit evidence")
+				}
+			} else if !*record.ACKExact {
 				return 0, errors.New("ACK lacks exact readback proof")
 			}
 			value, err := number(record.ACK, "ms")

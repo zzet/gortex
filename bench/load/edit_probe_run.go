@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zzet/gortex/bench/receiptproof"
 )
 
 const editProbeRawLimit = 8 << 20
@@ -36,6 +38,8 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	Superseded               *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
+	supersededStatus         *receiptproof.Status
 	SearchACK                map[string]any               `json:"search_ack,omitempty"`
 	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
 	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
@@ -44,6 +48,11 @@ type editProbeRecord struct {
 	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
 	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
 	ACKReadbackExact         *bool                        `json:"ack_readback_exact,omitempty"`
+	ACKStatus                string                       `json:"ack_status,omitempty"`
+	ACKDiskStatus            string                       `json:"ack_disk_status,omitempty"`
+	ACKMutationID            string                       `json:"ack_mutation_id,omitempty"`
+	ACKCommitSeq             uint64                       `json:"ack_commit_seq,omitempty"`
+	ACKContentSHA256         string                       `json:"ack_content_sha256,omitempty"`
 	ProbeMode                string                       `json:"probe_mode,omitempty"`
 	Ordinal                  int                          `json:"ordinal"`
 	Editor                   int                          `json:"editor,omitempty"`
@@ -89,21 +98,66 @@ type editProbeRecord struct {
 	Errors                   []string                     `json:"errors"`
 }
 type editProbeReport struct {
-	SharedOwners       *editProbeSharedOwnerReport `json:"shared_owners,omitempty"`
-	SearchReadbacks    *searchReadbackAcceptance   `json:"search_readback_acceptance,omitempty"`
-	Role               string                      `json:"role,omitempty"`
-	Plan               editProbePlan               `json:"plan"`
-	PlanHash           string                      `json:"plan_sha256"`
-	AccountingRequired bool                        `json:"accounting_required"`
-	Records            []editProbeRecord           `json:"edits"`
-	Summary            *editProbeSummary           `json:"summary,omitempty"`
-	OutputModes        editProbeModes              `json:"output_modes,omitempty"`
-	Reads              editProbeReads              `json:"reads,omitempty"`
-	RestoreMS          Metric                      `json:"restore_batch_ms"`
-	Restore            json.RawMessage             `json:"restore_batch"`
-	StatsBefore        json.RawMessage             `json:"stats_before"`
-	StatsAfter         json.RawMessage             `json:"stats_after"`
-	Limitations        []string                    `json:"limitations"`
+	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
+	SharedOwners       *editProbeSharedOwnerReport  `json:"shared_owners,omitempty"`
+	SearchReadbacks    *searchReadbackAcceptance    `json:"search_readback_acceptance,omitempty"`
+	Role               string                       `json:"role,omitempty"`
+	Plan               editProbePlan                `json:"plan"`
+	PlanHash           string                       `json:"plan_sha256"`
+	AccountingRequired bool                         `json:"accounting_required"`
+	Records            []editProbeRecord            `json:"edits"`
+	Summary            *editProbeSummary            `json:"summary,omitempty"`
+	OutputModes        editProbeModes               `json:"output_modes,omitempty"`
+	Reads              editProbeReads               `json:"reads,omitempty"`
+	RestoreMS          Metric                       `json:"restore_batch_ms"`
+	Restore            json.RawMessage              `json:"restore_batch"`
+	StatsBefore        json.RawMessage              `json:"stats_before"`
+	StatsAfter         json.RawMessage              `json:"stats_after"`
+	Limitations        []string                     `json:"limitations"`
+}
+
+type editProbePhysicalWriteScope struct {
+	Kind    string `json:"kind"`
+	File    string `json:"file"`
+	Editors int    `json:"editors"`
+}
+
+// This evidence describes admitted physical bindings, never a shared branch
+// name. Unknown bindings and separate checkouts retain the strict ACK gate.
+func sharedEditProbePhysicalScope(p *privateRun, plan editProbePlan, editors []*socketClient) *editProbePhysicalWriteScope {
+	if p == nil || !plan.GateModes || len(p.Repos) != 1 || len(editors) < 2 || len(editors) != plan.Editors || plan.LinkedWorktrees != 0 || len(plan.Routes) != 0 || plan.Kind != "add_intrafile_call" || plan.Tool != "edit.file" || plan.Sender != "" || plan.File == "" {
+		return nil
+	}
+	root, err := os.Stat(p.Repos[0].Path)
+	if err != nil || !root.IsDir() {
+		return nil
+	}
+	file, err := os.Stat(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
+	if err != nil || !file.Mode().IsRegular() {
+		return nil
+	}
+	for _, editor := range editors {
+		if editor == nil || editor.cwd == "" {
+			return nil
+		}
+		boundRoot, rootErr := os.Stat(editor.cwd)
+		boundFile, fileErr := os.Stat(filepath.Join(editor.cwd, filepath.FromSlash(plan.File)))
+		if rootErr != nil || fileErr != nil || !os.SameFile(root, boundRoot) || !os.SameFile(file, boundFile) {
+			return nil
+		}
+	}
+	used := make(map[int]bool)
+	for _, step := range plan.Steps {
+		target, _ := step.Request.Arguments["target"].(map[string]any)
+		if step.Editor < 0 || step.Editor >= len(editors) || step.Route != "" || step.Request.name() != "edit.file" || target["file"] != plan.File {
+			return nil
+		}
+		used[step.Editor] = true
+	}
+	if len(used) < 2 {
+		return nil
+	}
+	return &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: plan.File, Editors: len(editors)}
 }
 
 type editProbeState struct {
@@ -324,6 +378,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	// the separate edit gate's full phase accounting. Binary role is unchanged.
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
 	phase.EditProbe.AccountingRequired = r.requireAccounting
+	phase.EditProbe.PhysicalWriteScope = sharedEditProbePhysicalScope(p, plan, editors)
 	if plan.SearchReadbackAcceptance {
 		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable", "one shared setup/diagnostic client; zero per-offer ordinary oracle loops; post-required diagnostics are serial, at most one sample per editor and three calls per sample, within the remaining original phase window and a 1s diagnostic-only cap", "retained owned keep-state clones are NON-PRISTINE, not restored and never reusable as fresh acceptance seeds")
 	}
@@ -962,6 +1017,11 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		if exact, ok := body["readback_exact"].(bool); ok {
 			s.record.ACKReadbackExact = &exact
 		}
+		s.record.ACKStatus, _ = body["status"].(string)
+		s.record.ACKDiskStatus, _ = body["disk_status"].(string)
+		s.record.ACKMutationID, _ = body["mutation_id"].(string)
+		s.record.ACKCommitSeq, _ = strconvEditProbeUint(body["commit_seq"])
+		s.record.ACKContentSHA256, _ = body["content_sha256"].(string)
 		s.mu.Unlock()
 	}
 	receipt, _ := body["mutation_receipt"].(string)
@@ -1113,7 +1173,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
 		for callCtx.Err() == nil {
-			raw, _, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
+			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
+			s.mu.Lock()
+			s.record.supersededStatus = nil // Only the latest status call may supply evidence.
+			s.mu.Unlock()
 			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
 				break
 			}
@@ -1128,6 +1191,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
 					s.mu.Lock()
 					s.record.Accounting = accounting
+					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
@@ -1355,6 +1419,7 @@ func (r *editProbeRuntime) finish() error {
 	}
 	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
 	r.phase.EditProbe.Records = nil
+	guards := r.supersededGuards()
 	for _, s := range r.states {
 		s.stopProbes()
 		s.finishRaw()
@@ -1383,8 +1448,13 @@ func (r *editProbeRuntime) finish() error {
 			record.Outcome = "harness_evidence_incomplete"
 			record.Errors = append(record.Errors, sinkErr.Error())
 		}
+		classified := false
+		if candidate := record.supersededStatus; candidate != nil && guards[candidate.Key] != nil {
+			proof := &receiptproof.Superseded{Status: *candidate, Guard: *guards[candidate.Key]}
+			classified = classifySupersededRecord(&record, r.phase.EditProbe.PhysicalWriteScope, proof)
+		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
-		if record.Outcome != "complete" || len(record.Errors) > 0 {
+		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {
 			failures = append(failures, fmt.Errorf("edit %d: %s (%s)", record.Ordinal, record.Outcome, strings.Join(record.Errors, "; ")))
 		}
 	}
