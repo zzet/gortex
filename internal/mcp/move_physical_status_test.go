@@ -247,12 +247,29 @@ func TestMovePhysicalStatusTracksRealQueuedPointPublicationWithoutReparse(t *tes
 	}
 	release.Do(func() { close(extractor.release) })
 	for _, path := range []string{source, target} {
+		var status map[string]any
+		// Ticket completion precedes the callback's actual return. Its P/B
+		// finalizers publish immutable evidence afterward; graph-fresh alone
+		// cannot make two successive full status snapshots comparable yet.
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Logf("last physical completion status for %s: %#v", path, status)
+			}
+		})
 		require.Eventually(t, func() bool {
-			status, _ := s.moveFileObservationPayload(ctx, move.records[path].id)
+			status, _ = s.moveFileObservationPayload(ctx, move.records[path].id)
 			child, ok := status["physical_commit"].(map[string]any)
-			return ok && child["graph_status"] == mutationGraphFresh && child["graph_status_terminal"] == true
+			if !ok || child["graph_status"] != mutationGraphFresh || child["graph_status_terminal"] != true {
+				return false
+			}
+			timing, ok := child["phase_timing"].(indexer.EditTimingWindow)
+			if !ok || timing.PatchWallMS == nil || timing.PatchAccounting == nil {
+				return false
+			}
+			// A truthful refusal also finishes B; it must not be relabeled as
+			// measured coverage just to obtain a stable snapshot.
+			return child["requested_background"] != nil || child["requested_background_unavailable"] != nil
 		}, 5*time.Second, time.Millisecond)
-		status, _ := s.moveFileObservationPayload(ctx, move.records[path].id)
 		child := status["physical_commit"].(map[string]any)
 		require.Equal(t, s.mutationStatusPayload(physical[path]), child)
 		phases, ok := child["publication_phases"].(indexer.PublicationPhaseSnapshot)

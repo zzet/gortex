@@ -70,6 +70,10 @@ const (
 	// worktree's view can be.
 	defaultCheckoutPollInterval = 15 * time.Second
 
+	// maxCheckoutPollBackoff caps how far the poll backs off, for a missing
+	// root and for a run of failed cycles alike, unless PollInterval is longer.
+	maxCheckoutPollBackoff = 5 * time.Minute
+
 	// defaultRetainedCommitLayers bounds how many commit generations one
 	// coordinator keeps for re-routing. Each retained generation costs the
 	// storage of one branch's difference from the base; four covers the
@@ -485,6 +489,9 @@ type CheckoutCoordinator struct {
 	// prewarmCommitGeneration is the commit generation whose stack was last
 	// pre-warmed (RewarmEditDeltaStacks warms it again when its key moved).
 	prewarmCommitGeneration atomic.Int64
+	// failedCycles counts consecutive cycles that ended in an error other
+	// than cancellation; the poll backs off while it is non-zero.
+	failedCycles atomic.Int64
 	// prewarmState is the last pre-warm decision (edit_delta_stack_prewarm.go).
 	prewarmState prewarmState
 
@@ -1211,14 +1218,14 @@ func (c *CheckoutCoordinator) run() {
 			// for explicit demand and leave clocks, routes and leases to the
 			// lifecycle, but do not fork git against a missing directory.
 			if _, err := os.Stat(c.root); errors.Is(err, os.ErrNotExist) {
-				limit := max(c.poll, 5*time.Minute)
+				limit := max(c.poll, maxCheckoutPollBackoff)
 				if pollDelay > limit/2 {
 					pollDelay = limit
 				} else {
 					pollDelay *= 2
 				}
 			} else {
-				pollDelay = c.poll
+				pollDelay = c.failedCyclePollDelay()
 				c.Signal("poll")
 			}
 			pollTimer.Reset(pollDelay)
@@ -1365,6 +1372,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		out = byteMutationCycleOutcome(ctx, out)
 		recordCoordinatorCycle(out)
 		c.resumeEnrichmentAfterCycle(ctx, out)
+		c.noteCycleFailure(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
@@ -1596,6 +1604,7 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		c.scheduleDirtyChainCompaction(out)
 	}
 	c.resumeEnrichmentAfterCycle(ctx, out)
+	c.noteCycleFailure(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -1620,6 +1629,35 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			zap.Bool("recomposed", out.Recomposed))
 	}
 	c.reportCheckoutCycle(ctx, through, out)
+}
+
+// noteCycleFailure extends the run of failed cycles the poll backs off by, or
+// ends it when a cycle settles or builds without an error. A cycle that was
+// canceled, deferred, or gave the lane up (a yield or a tree move, which clear
+// the error they rescheduled over) says nothing about the checkout and leaves
+// the run as it is.
+func (c *CheckoutCoordinator) noteCycleFailure(out CheckoutCycle) {
+	switch {
+	case out.YieldedTo != "" || out.Deferred:
+	case out.Err == nil:
+		c.failedCycles.Store(0)
+	case !errors.Is(out.Err, context.Canceled):
+		c.failedCycles.Add(1)
+	}
+}
+
+// failedCyclePollDelay is the wait before the next poll: the poll interval,
+// doubled for every consecutive failed cycle up to maxCheckoutPollBackoff (or
+// the interval, if longer). A failure that repeats on unchanged input would
+// otherwise re-enter the mutation lane every interval (#1458); a cycle that
+// succeeds, whatever woke it, resets the wait.
+func (c *CheckoutCoordinator) failedCyclePollDelay() time.Duration {
+	limit := max(c.poll, maxCheckoutPollBackoff)
+	delay := c.poll
+	for i := c.failedCycles.Load(); i > 0 && delay < limit; i-- {
+		delay *= 2
+	}
+	return min(delay, limit)
 }
 
 // refreshWantsNewSample reports whether a refresh ticket waits whose

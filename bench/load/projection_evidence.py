@@ -13,6 +13,10 @@ import re
 
 CATALOG_SHA256 = "e5d0770505cfe1c82a6a93d3cbbe3292cfdb72be19f8086c10bc06e06c1bdc41"
 BASELINE_TAG_REVISION = "defa9f8e7a670792b5b693744d88488f741a8160"
+V06410_BINARY_SHA256 = "51e84c3e133d530f21661623ec86633b741a3c75507ec3304b1f14a8a6d5c6be"
+V06410_ARCHIVE_SHA256 = "d36835c90ccdfcb6546757602bd82b520ce8d98593eda460faebdbe660d301a2"
+V06410_ARTIFACT_AUTHORITY_SHA256 = "7db2df96bf5144ed940c9797136c16003b1dd12e152e8f1899ddcf0ab969b408"
+V06410_POLICY_EVIDENCE = "legacy_default_unavailable: original v0.64.10 ACK has no ack_mode/content_sha256; emitted Git-blob new_sha verified"
 
 
 class Unbound(ValueError):
@@ -165,7 +169,7 @@ def validate_divergence(before, after):
     need(integer(b.get("retired"), "retirement census missing") > integer(a.get("retired"), "retirement census missing"), "no observed checked retirement")
 
 
-def validate_pair(packet, catalog):
+def validate_pair(packet, catalog, *, cohort=False):
     binding = packet["binding"]
     need(binding.get("baseline_tag") == "v0.64.10", "wrong baseline tag")
     need(binding.get("tag", {}).get("revision") == BASELINE_TAG_REVISION, "baseline revision is not the pinned v0.64.10 tag")
@@ -182,17 +186,189 @@ def validate_pair(packet, catalog):
     for role, report in zip(("candidate", "tag"), reports):
         validate_catalog_policy(report, catalog)
         latest = validate_report(report, binding[role], selected)
-        before, after, peak = validate_bookends(report, latest)
+        if cohort:
+            validate_legacy_tag_ack_contract(report, binding[role], role, selected)
+            before, after, peak = validate_cohort_bookends(report, binding[role], latest)
+        else:
+            before, after, peak = validate_bookends(report, latest)
         peaks.append(peak)
         if role == "candidate":
             candidate_books = before, after
     memory = "PASS" if peaks[0] <= peaks[1] + 64 * 1024**2 else "FAIL"
+    if cohort:
+        owners = [binding[role]["owned_cohort_outer"]["owned_cohort_peak"] for role in ("candidate", "tag")]
+        same_boot = owners[0]["boot_id"] == owners[1]["boot_id"]
+        need(not same_boot or owners[0]["cgroup"] != owners[1]["cgroup"], "candidate/tag reused the same unit cgroup")
+        need(owners[0]["invocation_id"] != owners[1]["invocation_id"], "candidate/tag unit invocation reused")
+        return {"version": 1, "metric_scope": "owned_cohort_peak_v1",
+                "total_owned_process_cohort_footprint": memory,
+                "candidate_cohort_peak_bytes": peaks[0], "tag_cohort_peak_bytes": peaks[1],
+                "allowance_bytes": 67108864,
+                "attribution": "Final fresh-unit lifetime memory.peak includes startup/warmup and whole-unit charge; not final minus initial peak",
+                "projection_divergence": "NOT_ASSESSED_BY_COHORT_METRIC",
+                "nightly_matrix_acceptance": "UNBOUND: one matched cell is not a nightly roster or other release criteria"}
     try:
         validate_divergence(*candidate_books)
         divergence = "OBSERVED_WINDOW_ZERO_WITH_PUBLICATION_AND_RETIREMENT"
     except Unbound as error:
         divergence = "UNBOUND_OR_FAILED: " + str(error)
     return {"daemon_lifetime_rss_bound": memory, "candidate_lifetime_rss_peak_bytes": peaks[0], "tag_lifetime_rss_peak_bytes": peaks[1], "difference_bytes": peaks[0] - peaks[1], "projection_divergence": divergence, "total_owned_process_cohort_footprint": "UNBOUND: daemon-PID VmHWM excludes children; no driver/proxy/cgroup or sampled substitution", "attribution": "Lifetime peak includes startup/warmup; paired difference is not workload-only attribution", "nightly_matrix_acceptance": "UNBOUND: one paired cell is not every required nightly run"}
+
+
+def validate_legacy_tag_ack_contract(report, bound, role, selected):
+    metadata = report.get("readiness", {}).get("legacy_tag_ack_contract")
+    legacy_rows = any(isinstance(row.get("ack_mode_evidence"), str) and row["ack_mode_evidence"].startswith("legacy_default_unavailable") for row in report["records"])
+    if metadata is None:
+        need(not legacy_rows, "original legacy policy lacks its version/artifact declaration")
+        return
+    expected = {"version": 1, "source_revision": BASELINE_TAG_REVISION,
+                "source_tree": "655071eb061f2647bd819ef30e0f42116f1dfcbf",
+                "artifact_sha256": V06410_BINARY_SHA256, "archive_sha256": V06410_ARCHIVE_SHA256,
+                "artifact_authority_sha256": V06410_ARTIFACT_AUTHORITY_SHA256,
+                "asset_id": 669760344, "cell_index": 72, "kind": "add_crossfile_call", "policy": "legacy_default_unavailable"}
+    need(role == "tag" and isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata == expected and bound["revision"] == BASELINE_TAG_REVISION
+         and bound["binary_sha256"] == V06410_BINARY_SHA256, "legacy baseline declaration/source/artifact mismatch")
+    need(selected["index"] == 72 and report["cell"].get("ack_mode") == "" and report["cell"].get("kind") == "add_crossfile_call"
+         and report["cell"].get("tool") == "edit.file", "legacy baseline is not the original default cell72")
+    need(all(row.get("observed_ack_mode", "") == "" and row.get("ack_mode_evidence") == V06410_POLICY_EVIDENCE
+             for row in report["records"]), "legacy unavailable policy was replaced/unknown")
+
+
+def cohort_uint(value, reason):
+    need(type(value) is int and 0 <= value <= 2**64-1, reason)
+    return value
+
+
+def cohort_identity(value):
+    need(isinstance(value, dict) and set(value) == {"device", "inode", "mount_id", "fs_type"}, "held cgroup FD identity missing")
+    for key in ("device", "inode", "mount_id"):
+        need(cohort_uint(value.get(key), "invalid FD " + key) > 0, "zero FD " + key)
+    need(value.get("fs_type") == 0x63677270, "held FD is not cgroup v2")
+    return value
+
+
+def cohort_proc(value, group):
+    pid = integer(value.get("pid"), "member PID missing")
+    need(pid > 0, "member PID zero")
+    result = None
+    for key in ("stat_before", "stat_after"):
+        stat = value.get(key, "")
+        need(isinstance(stat, str), "member proc stat missing")
+        close = stat.rfind(")")
+        fields = stat[close+1:].split()
+        need(close > 0 and stat.split("(", 1)[0].strip() == str(pid) and len(fields) > 19,
+             "member raw stat identity missing")
+        need(fields[1].isdecimal() and fields[19].isdecimal() and int(fields[19]) > 0, "member PPID/birth missing")
+        current = int(fields[1]), fields[19]
+        need(result is None or result == current, "member PID reused/reparented during snapshot")
+        result = current
+    need(isinstance(value.get("cgroup"), str), "member cgroup missing")
+    groups = [line[3:] for line in value["cgroup"].splitlines() if line.startswith("0::")]
+    need(len(groups) == 1 and (groups[0] == group or groups[0].startswith(group+"/")), "member outside owned unit")
+    need(all(part not in (".", "..", "") for part in groups[0].split("/")[1:]), "noncanonical member cgroup")
+    return pid, result
+
+
+def validate_cohort_bookends(report, bound, latest):
+    need(type(report.get("cell", {}).get("agents")) is int and report["cell"]["agents"] == 32, "actual 32-agent edit cohort missing")
+    outer = bound.get("owned_cohort_outer", {})
+    need(type(outer.get("client_exit")) is int and outer["client_exit"] == 0 and outer.get("cleanup_closed") is True
+         and outer.get("closure", {}).get("closed") is True and outer["closure"].get("forced") is False,
+         "actual outer normal closure unavailable")
+    owner = outer.get("owned_cohort_peak", {})
+    need(owner.get("version") == 1 and owner.get("fresh_unit") is True and owner.get("single_build") is True
+         and owner.get("inherited_unit_only") is True and owner.get("delegate") is False,
+         "fresh single-build inherited owned unit UNBOUND (shared paired scope refused)")
+    need(owner.get("binary_sha256") == bound["binary_sha256"], "unit build identity mismatch")
+    unit, group = owner.get("unit", ""), owner.get("group", "")
+    need(re.fullmatch(r"[A-Za-z0-9_.:-]+\.service", unit) and group == "/system.slice/" + unit,
+         "exact reference unit missing")
+    need(isinstance(owner.get("run_id"), str) and owner["run_id"] and outer.get("run_id") == owner["run_id"]
+         and outer.get("unit") == unit, "owned outer run/unit missing or contradictory")
+    invocation = owner.get("invocation_id", "")
+    creation = owner.get("exec_main_start_timestamp_monotonic", "")
+    need(re.fullmatch("[a-fA-F0-9]{32}", invocation) and int(invocation, 16) != 0,
+         "unit InvocationID missing")
+    need(isinstance(creation, str) and creation.isdecimal() and 0 < int(creation) <= 2**64-1,
+         "unit creation timestamp missing")
+    root = integer(owner.get("main_pid"), "owned unit main PID missing")
+    need(root > 0 and isinstance(owner.get("main_birth_ticks"), str) and owner["main_birth_ticks"].isdecimal()
+         and int(owner["main_birth_ticks"]) > 0 and isinstance(owner.get("boot_id"), str) and owner["boot_id"],
+         "owned unit process epoch missing")
+    identity = cohort_identity(owner.get("cgroup"))
+    same = ("unit", "group", "run_id", "invocation_id", "exec_main_start_timestamp_monotonic", "main_pid",
+            "main_birth_ticks", "boot_id", "binary_sha256", "single_build", "inherited_unit_only", "fresh_unit", "delegate", "cgroup")
+    books = []
+    driver_epoch = None
+    peak_identity = None
+    for phase in ("before", "after"):
+        live = owner.get(phase, {})
+        need(all(live.get(key) == owner.get(key) for key in same), "outer live unit epoch/ownership changed")
+        book = report.get("readiness", {}).get("owned_cohort_peak."+phase, {})
+        need(book.get("version") == 1 and book.get("phase") == phase and not book.get("unavailable_reason")
+             and book.get("scope") == "fresh_owned_reference_unit_lifetime_memory_peak", "cohort bookend unavailable")
+        need(book.get("unit") == unit and book.get("group") == group and book.get("boot_id") == owner["boot_id"]
+             and cohort_identity(book.get("cgroup")) == identity, "unit/boot/held FD identity changed")
+        raw = book.get("raw_memory_peak", "")
+        need(isinstance(raw, str) and re.fullmatch(r"[0-9]+\n?", raw), "raw memory.peak missing/malformed")
+        peak = cohort_uint(book.get("peak_bytes"), "memory.peak integer unavailable")
+        need(int(raw) == peak, "raw peak differs from exact integer")
+        current_peak_identity = cohort_identity(book.get("peak_file"))
+        need(current_peak_identity["device"] == identity["device"] and current_peak_identity["mount_id"] == identity["mount_id"], "peak outside held mount")
+        need(peak_identity is None or current_peak_identity == peak_identity, "peak file identity changed")
+        peak_identity = current_peak_identity
+        need(book.get("daemon_pid") == report["daemon_pid"], "cohort daemon mismatch")
+        driver = integer(book.get("driver_pid"), "driver PID missing")
+        need(driver > 0 and book.get("self_cgroup") == "0::"+group+"\n", "driver outside exact unit")
+        need(book.get("agent_connections") == ["fixed-editor-"+str(i) for i in range(32)],
+             "all32 initialized owned agent connections unavailable")
+        members = book.get("members")
+        need(isinstance(members, list) and 0 < len(members) <= 1024, "whole live unit census missing")
+        parsed = [cohort_proc(value, group) for value in members]
+        processes = dict(parsed)
+        need(len(processes) == len(parsed) and root in processes and driver in processes and report["daemon_pid"] in processes,
+             "duplicate/missing owned main/driver/daemon member")
+        need(processes[root][1] == owner["main_birth_ticks"], "owned main PID reused")
+        epoch = driver, processes[driver][1], report["daemon_pid"], processes[report["daemon_pid"]][1]
+        need(driver_epoch is None or epoch == driver_epoch, "driver/daemon restarted")
+        driver_epoch = epoch
+        for pid in processes:
+            seen = set()
+            while pid != root:
+                need(pid in processes and pid not in seen, "unowned/escaped process in cohort")
+                seen.add(pid)
+                pid = processes[pid][0]
+        monotonic = cohort_uint(book.get("monotonic_ns"), "bookend monotonic epoch missing")
+        need(monotonic >= int(creation)*1000, "unit creation is after the bookend")
+        if books:
+            need(monotonic >= books[0][0]["monotonic_ns"], "bookend monotonic clock reordered")
+        a, b = stamp(book.get("started_at")), stamp(book.get("observed_at"))
+        need(a <= b, "cohort bookend time reordered")
+        if phase == "before":
+            need(b <= stamp(report["started"]), "before bookend overlaps offers")
+        else:
+            need(latest <= a <= b <= stamp(report["finished"]), "after bookend precedes joined callbacks/outside report")
+        books.append((book, peak))
+    need(books[1][1] >= books[0][1], "decreasing/reset lifetime memory.peak")
+    terminal = owner.get("terminal", {})
+    need(type(terminal.get("main_pid")) is int and terminal["main_pid"] == 0
+         and terminal.get("active_state") == "inactive" and terminal.get("empty") is True,
+         "owned unit normal empty closure unavailable")
+    if terminal.get("load_state") == "not-found":
+        # Existing systemd-run --collect removes the stopped unit and its
+        # InvocationID. The two live epochs are already checked; normal outer
+        # exit plus this exact existing empty/collected shape closes custody.
+        need(terminal.get("control_group") == "" and terminal.get("invocation_id") in (None, "")
+             and terminal.get("result") in (None, "", "success"), "collected unit closure contradictory")
+    else:
+        need(terminal.get("load_state") == "loaded" and terminal.get("invocation_id") == invocation
+             and terminal.get("control_group") == group and terminal.get("result") == "success",
+             "loaded unit closure epoch/result unavailable")
+    return books[0][0], books[1][0], books[1][1]
+
+
+def validate_cohort_pair(packet, catalog):
+    return validate_pair(packet, catalog, cohort=True)
 
 
 def validate_nightly(packet, catalog):
@@ -218,21 +394,32 @@ def validate_catalog_policy(report, catalog):
     need(report["plan"].get("language", "") in ("", "go"), "Go catalog/language mismatch")
 
 
-def load_bound_report(bound):
+def load_bound_report(bound, *, cohort=False):
     raw = Path(bound["report_path"]).read_bytes()
     need(hashlib.sha256(raw).hexdigest() == bound["report_sha256"], "raw report digest mismatch")
     outer = json.loads(Path(bound["outer_result_path"]).read_text(encoding="utf-8"))
     need(outer.get("report_sha256") == bound["report_sha256"] and outer.get("client_exit") == 0 and outer.get("cleanup_closed") is True and outer.get("closure", {}).get("closed") is True and outer.get("closure", {}).get("forced") is False, "existing C outer raw/closure provenance unavailable")
-    flags = [x for x in outer.get("argv", []) if x.startswith("-readback-reference-projection-evidence")]
-    need(len(flags) == 1 and flags[0] in ("-readback-reference-projection-evidence", "-readback-reference-projection-evidence=true"), "opt-in collector build/argv UNBOUND")
-    return json.loads(raw)
+    flag = "-readback-reference-cohort-peak-evidence" if cohort else "-readback-reference-projection-evidence"
+    flags = [x for x in outer.get("argv", []) if x.startswith(flag)]
+    need(len(flags) == 1 and flags[0] in (flag, flag+"=true"), "opt-in collector build/argv UNBOUND")
+    if cohort:
+        # Always take ownership from the actual existing outer result, never a
+        # caller-supplied replacement embedded in the input binding.
+        bound["owned_cohort_outer"] = outer
+    report = json.loads(raw)
+    if cohort:
+        legacy_flag = "-readback-reference-v06410-original-ack"
+        legacy_flags = [x for x in outer.get("argv", []) if x.startswith(legacy_flag)]
+        declared = report.get("readiness", {}).get("legacy_tag_ack_contract") is not None
+        need((not legacy_flags and not declared) or (declared and len(legacy_flags) == 1 and legacy_flags[0] in (legacy_flag, legacy_flag+"=true")), "legacy original ACK declaration/actual opt-in argv mismatch")
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("packet")
     parser.add_argument("catalog")
-    parser.add_argument("--mode", choices=("pair", "nightly"), default="pair")
+    parser.add_argument("--mode", choices=("pair", "nightly", "cohort-pair"), default="pair")
     args = parser.parse_args()
     with open(args.packet, encoding="utf-8") as stream:
         packet = json.load(stream)
@@ -240,10 +427,11 @@ def main():
         raw_catalog = Path(args.catalog).read_bytes()
         need(hashlib.sha256(raw_catalog).hexdigest() == packet["binding"]["catalog_sha256"] == CATALOG_SHA256, "compiled C catalog digest mismatch")
         catalog = json.loads(raw_catalog)
-        if args.mode == "pair":
+        if args.mode in ("pair", "cohort-pair"):
+            cohort = args.mode == "cohort-pair"
             for role in ("candidate", "tag"):
-                packet[role] = load_bound_report(packet["binding"][role])
-            result = validate_pair(packet, catalog)
+                packet[role] = load_bound_report(packet["binding"][role], cohort=cohort)
+            result = validate_pair(packet, catalog, cohort=cohort)
         else:
             for case in packet["cases"]:
                 case["report"] = load_bound_report(case["bound"])
@@ -253,7 +441,8 @@ def main():
     print(json.dumps(result, indent=2, allow_nan=False))
     # A daemon-only metric cannot give the total-cohort criterion a green exit.
     # Its scoped numeric result remains available for the acceptance owner.
-    return 0 if result.get("projection_divergence_zero") == "PASS_FOR_COMPLETE_BOUND_CATALOG_ROSTER" else 2
+    return 0 if (result.get("projection_divergence_zero") == "PASS_FOR_COMPLETE_BOUND_CATALOG_ROSTER"
+                 or result.get("total_owned_process_cohort_footprint") == "PASS") else 2
 
 
 if __name__ == "__main__":
