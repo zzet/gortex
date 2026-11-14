@@ -55,7 +55,7 @@ func BenchmarkScopedFileFrontier(b *testing.B) {
 			}
 			query, args, _ := scopedEdgeProjectionQuery([]string{"fixture"}, files, string(graph.EdgeCalls), store.viewGen)
 			if !canonical {
-				query, args, _ = scopedEdgeSourceProjectionQuery([]string{"fixture"}, files, string(graph.EdgeCalls), store.viewGen)
+				query, args, _ = scopedEdgeSourceProjectionQuery([]string{"fixture"}, files, string(graph.EdgeCalls), store.viewGen, false)
 			}
 			for _, legacy := range []bool{true, false} {
 				b.Run(fmt.Sprintf("legacy=%t", legacy), func(b *testing.B) {

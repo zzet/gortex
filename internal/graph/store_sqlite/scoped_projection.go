@@ -246,6 +246,8 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		fileIndexed := len(filePaths) > 0 && s.scopedEdgeFileProvenanceCanonical(
 			repoPrefixes, filePaths, kindValues, maxID,
 		)
+		// Only the repository walk, with no file frontier, pins edges_by_kind.
+		kindIndexed := len(filePaths) == 0 && s.edgeKindIndexPresent()
 		for _, kind := range kindValues {
 			var query string
 			var args []any
@@ -253,7 +255,7 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			if fileIndexed {
 				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
 			} else {
-				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
+				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen, kindIndexed)
 			}
 			if !ok {
 				return
@@ -537,7 +539,7 @@ func scopedEdgeProjectionQuery(
 	}
 	filesJSON, haveFiles := projectionJSON(filePaths)
 	if !haveFiles {
-		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen)
+		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen, false)
 	}
 	reposJSON, haveRepos := projectionJSON(repoPrefixes)
 	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
@@ -562,13 +564,15 @@ func scopedEdgeProjectionQuery(
 }
 
 // scopedEdgeSourceProjectionQuery preserves source-node ownership when edge
-// provenance is not canonical. Explicit loop order prevents SQLite from
-// satisfying ORDER BY through edges_by_kind and filtering the whole kind
-// range after the fact.
+// provenance is not canonical. With a file frontier, explicit loop order
+// prevents SQLite from satisfying ORDER BY through edges_by_kind and
+// filtering the whole kind range after the fact. A repository walk with no
+// frontier is driven by edges_by_kind on purpose; see below.
 func scopedEdgeSourceProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
 	viewGen int64,
+	kindIndexed bool,
 ) (string, []any, bool) {
 	if kind == "" {
 		return "", nil, false
@@ -582,10 +586,24 @@ func scopedEdgeSourceProjectionQuery(
 		// Preserve the linear id-keyset repository walk. Forcing repository
 		// nodes first would require a temp B-tree to restore e.id order on
 		// every page, recreating the quadratic plan this projection replaced.
+		//
+		// On the base generation, drive the walk from edges_by_kind: its
+		// (kind, rowid) order is the keyset order, so a page reads only edges
+		// of the requested kind. Left to the planner, the base walk goes
+		// through edges_by_generation, or for a dense kind under full
+		// statistics through the rowid itself; either way every page reads
+		// each base edge past the cursor and discards the other kinds. A
+		// sparse overlay generation keeps the planner's choice, and so does a
+		// store whose edges_by_kind is missing (dropped for a bulk window, or
+		// left absent by one that closed unsealed): INDEXED BY would fail.
+		edgeSource := "edges AS e"
+		if viewGen == baseViewGeneration && kindIndexed {
+			edgeSource = "edges AS e INDEXED BY edges_by_kind"
+		}
 		query := `WITH requested_repos(repo_prefix) AS (` +
 			`SELECT CAST(value AS TEXT) FROM json_each(?))` +
 			` SELECT e.id, ` + lookupQualifiedEdgeCols +
-			` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id AND e.view_gen = n.view_gen` +
+			` FROM nodes AS n JOIN ` + edgeSource + ` ON e.from_id = n.id AND e.view_gen = n.view_gen` +
 			` JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix` +
 			` WHERE e.kind = ? AND e.view_gen = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
 		return query, []any{reposJSON, kind, viewGen}, true
