@@ -349,6 +349,21 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 		if matches {
 			return nil, nil
 		}
+	} else if expected == nil {
+		if allowance, ok := requestCtx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); ok && allowance.tool == "get_symbol_source" {
+			// Bind the normalized target to the SAME selected file identity,
+			// gen0/layer revisions and pending owner. Unknown proof
+			// keeps the ordinary bounded physical projection path below.
+			if id, _ := requestCtx.Value(indexedSymbolSourceTargetKey{}).(string); id != "" {
+				if _, matched := s.readIndexedSymbolSource(buildCtx, abs, graphPath, raw, id, nil); matched {
+					return nil, nil
+				}
+			} else if _, matched := s.readFileCompressionSymbols(buildCtx, abs, graphPath, raw); matched {
+				// Preserve the existing path for internal callers without a
+				// normalized source-handler target.
+				return nil, nil
+			}
+		}
 	}
 	if err := buildCtx.Err(); err != nil {
 		return nil, err

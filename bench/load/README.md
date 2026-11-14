@@ -274,8 +274,11 @@ than zero. Per-line rename rows that cannot identify the requested caller stay
 unassessed with unavailable stale counts and incomplete coverage. Missing or
 incorrect consumer observations fail the opt-in phase;
 they do not alter the default ACK/accounting predicates. Calls keep the
-original per-edit deadline and artifact limits. Compact consumer decoding is
-explicitly unsupported: no JSON fallback grants compact coverage. This option
+original per-edit deadline and artifact limits. Compact consumers use versioned, tab-separated records with quoted strings,
+actual row counts and bounded pending-file witnesses. Dry-run rename, verify,
+dead-code and detect dispatch their real compact producers; rich JSON fallback,
+unknown/omitted/capped rows and malformed scope evidence grant no coverage. No
+idle freshness field is invented, and pending is never completion. This option
 alone establishes no 1/8/32-agent runtime or all-mode acceptance.
 
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean

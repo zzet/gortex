@@ -387,6 +387,11 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 			result["barrier_wait_ms"] = label.waited.Milliseconds()
 			label.apply(result)
 		}
+		if isCompact(req) {
+			files, _ := result["changed_files"].([]string)
+			symbols, _ := result["changed_symbols"].([]analysis.ChangedSymbol)
+			return label.decorate(mcp.NewToolResultText(compactDetectConsumer(result, files, symbols, label))), nil
+		}
 		res, err := s.respondJSONOrTOON(ctx, req, result)
 		return label.decorate(res), err
 	}
@@ -537,7 +542,7 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	// Wait briefly for the edits these symbols' relations depend on, then
 	// answer; whatever is still lagging is labelled, not refused.
 	freshness := takeRequestFreshness(&req)
-	label := s.awaitRelationFreshness(ctx, ids, nil, relationWaitDeadline(ctx, freshness))
+	label := s.awaitImpactRelationFreshness(ctx, ids, freshness)
 	if freshness.requireFresh && label.state != "" {
 		return label.requireFreshError(), nil
 	}
