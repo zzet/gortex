@@ -608,9 +608,10 @@ WHERE view_gen > ? ORDER BY view_gen, id LIMIT 1`
 // and edges_by_kind never reads more. Otherwise either index can be the far
 // cheaper one, and which one can change along the id range.
 //
-// Overlay generations keep the planner's choice. Both indexes are
-// bulk-droppable and INDEXED BY a missing index fails the read, so a missing
-// index is never pinned.
+// Overlay generations keep the planner's choice. Either index can be missing
+// (edges_by_kind is bulk-droppable, edges_by_generation is optional) and
+// INDEXED BY a missing index fails the read, so a missing index is never
+// pinned.
 func (s *Store) scopedEdgeRepositoryWalkPlan(maxID int64) (edgeIndex string, adaptive bool) {
 	if s.viewGen != baseViewGeneration || !s.edgeKindIndexPresent() {
 		return "", false

@@ -29,8 +29,8 @@ func (s *Store) edgeGenerationIndexPresent() bool {
 	return s.indexPresent(edgesByGenerationIndexName)
 }
 
-// edgeKindIndexPresent reports whether edges_by_kind exists. Like
-// edges_by_generation it is a bulk-droppable index, so it is probed per call.
+// edgeKindIndexPresent reports whether edges_by_kind exists. It is
+// bulk-droppable, so like edges_by_generation it is probed per call.
 func (s *Store) edgeKindIndexPresent() bool {
 	return s.indexPresent(edgesByKindIndexName)
 }
