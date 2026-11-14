@@ -165,6 +165,68 @@ func TestExternalSourcePathConfined(t *testing.T) {
 	require.NotContains(t, resultText(res), "Hidden")
 }
 
+func TestExternalSourcePathConfinedThroughLinks(t *testing.T) {
+	srv, _, _ := newIsolationServer(t)
+	root := t.TempDir()
+	confineToTestRoot(t, root)
+
+	cached := filepath.Join(root, "golang.org", "x@v1.0.0")
+	require.NoError(t, os.MkdirAll(cached, 0o755))
+	realFile := filepath.Join(cached, "real.go")
+	require.NoError(t, os.WriteFile(realFile, []byte("package x\n\nfunc Real() {}\n"), 0o600))
+
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "secret.go")
+	require.NoError(t, os.WriteFile(secret, []byte("package secret\n\nfunc Hidden() {}\n"), 0o600))
+
+	add := func(id, file string) {
+		srv.graph.AddNode(&graph.Node{
+			ID: id, Kind: graph.KindFunction, Name: "Probe",
+			FilePath: "external::go:probe", Language: "go",
+			Meta: map[string]any{
+				"external":    true,
+				"module_kind": "module_cache",
+				"source_file": file,
+				"source_line": 3,
+			},
+		})
+	}
+
+	// A regular file in the root is served.
+	add("ext::go:probe::Real", realFile)
+	res, err := srv.handleGetSymbolSource(t.Context(),
+		makeReq("get_symbol_source", map[string]any{"id": "ext::go:probe::Real", "format": "json"}))
+	require.NoError(t, err)
+	source, _ := extractTextResult(t, res)["source"].(string)
+	require.Contains(t, source, "func Real()")
+
+	// A directory link inside the root that leaves it must not smuggle a
+	// regular file out: the leaf is not a link, only resolving the whole
+	// path sees the escape.
+	escaped := filepath.Join(root, "escaped")
+	require.NoError(t, os.Symlink(secretDir, escaped))
+	add("ext::go:probe::Ancestor", filepath.Join(escaped, "secret.go"))
+	res, err = srv.handleGetSymbolSource(t.Context(),
+		makeReq("get_symbol_source", map[string]any{"id": "ext::go:probe::Ancestor", "format": "json"}))
+	require.NoError(t, err)
+	out := extractTextResult(t, res)
+	assert.Nil(t, out["source"])
+	assert.NotEmpty(t, out["source_unavailable_reason"])
+	require.NotContains(t, resultText(res), "Hidden")
+
+	// A path spelled through a link to the root itself resolves back
+	// inside and stays servable (the /var -> /private/var alias case).
+	aliasParent := t.TempDir()
+	rootAlias := filepath.Join(aliasParent, "root-alias")
+	require.NoError(t, os.Symlink(root, rootAlias))
+	add("ext::go:probe::Aliased", filepath.Join(rootAlias, "golang.org", "x@v1.0.0", "real.go"))
+	res, err = srv.handleGetSymbolSource(t.Context(),
+		makeReq("get_symbol_source", map[string]any{"id": "ext::go:probe::Aliased", "format": "json"}))
+	require.NoError(t, err)
+	source, _ = extractTextResult(t, res)["source"].(string)
+	require.Contains(t, source, "func Real()")
+}
+
 func TestNavReadExternalSymbol(t *testing.T) {
 	srv, _, _ := newIsolationServer(t)
 	mapGo, loadLine := syncMapLoadLine(t)

@@ -88,18 +88,24 @@ func goModCacheRoot() string {
 }
 
 // confineExternalSource reports whether path may be served as external
-// declaration source: it must sit inside one of the allowed roots and
-// must not reach there through a link that leaves the root — the same
-// confinement rule pathguard enforces for indexed repositories.
+// declaration source. The stored path is read as given, so the candidate
+// and the roots are resolved before the containment check: a regular
+// file beneath a directory link that leaves the root is not itself a
+// link, and a leaf-only check would admit it while the read follows the
+// ancestor outside.
 func confineExternalSource(path string) bool {
+	resolved, err := pathguard.EvalLinks(path)
+	if err != nil {
+		return false
+	}
 	for _, root := range externalSourceRoots() {
 		if root == "" {
 			continue
 		}
-		if !pathguard.WithinRoot(path, pathguard.ResolveRoot(root)) {
+		if !pathguard.WithinRoot(resolved, pathguard.ResolveRoot(root)) {
 			continue
 		}
-		return !pathguard.SymlinkEscapes(path, root)
+		return true
 	}
 	return false
 }
