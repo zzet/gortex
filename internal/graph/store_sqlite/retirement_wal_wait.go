@@ -24,7 +24,7 @@ var ErrWarmupWALPressure = errors.New("warmup WAL reclaim did not reach its mark
 // defers and backs off, and the log grows (once from 8 KB to 2.6 GB in seven
 // minutes of warm-up rebuilds plus retirement). So before each chunk, while
 // the log is over the retirement mark, the sweep asks for the reclaim and
-// waits — holding nothing — for the log to come back under the mark, up to
+// waits — holding no store lock — for the log to come back under the mark, up to
 // retirementWALWaitMax (retirementWALWaitEditingMax while a checkout is being
 // edited). Then it proceeds regardless: retirement must always finish, so
 // the wait delays a chunk and never refuses it.
@@ -41,6 +41,13 @@ var (
 	// edits' reads pay for and a reset has to copy. Retirement can wait for a
 	// burst; it must still finish, so the wait ends here too.
 	retirementWALWaitEditingMax = 10 * time.Minute
+	// retirementWALYieldWait: how long a WithRetirementWALYield caller waits
+	// for the log to come under its mark before it stops. Its caller holds
+	// the lane or the sweep mutex, so everything queued behind it waits too;
+	// the deferred sweep finishes what it leaves. Unpinned waits in a
+	// worktree-churn run took a median of 0.4-3 s but up to 28 s, and a log a
+	// reader pins does not reset at all.
+	retirementWALYieldWait = 2 * time.Second
 )
 
 // retirementWALMark is the log size at which a retirement chunk waits for the
@@ -74,16 +81,29 @@ func (s *Store) walReclaimBounds() (threshold, ceiling int64) {
 	return s.walReclaim.stats.ThresholdBytes, s.walReclaim.stats.CeilingBytes
 }
 
+type retirementWALYieldKey struct{}
+
+// WithRetirementWALYield marks ctx for a retirement whose caller holds what
+// others wait for — the build lane, the sweep mutex. Over the retirement mark
+// its chunks wait only retirementWALYieldWait for the reclaim; a log still
+// over the mark then stops the pass at the chunk boundary with
+// ErrPayloadSweepBudgetExhausted, its fence in place, for the deferred sweep
+// to resume. A log a reader pins would otherwise hold that caller for up to
+// retirementWALWaitEditingMax per chunk.
+func WithRetirementWALYield(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retirementWALYieldKey{}, true)
+}
+
 // awaitWALUnderCeiling runs before a retirement chunk. It returns at once
 // when the log is under the ceiling (or no ceiling is known), else nudges the
 // reclaim and waits up to retirementWALWaitMax for the log to fall under it.
-// It never fails: a timeout or a cancelled context only ends the wait (the
-// caller checks ctx itself).
-func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, episode *retirementWALEpisode) {
+// A timeout or a cancelled context only ends the wait (the caller checks ctx
+// itself); only a WithRetirementWALYield caller's timeout is an error.
+func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, episode *retirementWALEpisode) error {
 	threshold, ceiling := s.walReclaimBounds()
 	ceiling = retirementWALMark(threshold, ceiling)
 	if ceiling <= 0 || s.dbPath == "" {
-		return
+		return nil
 	}
 	size := s.retirementLogBytes()
 	if size < ceiling {
@@ -92,7 +112,7 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 				generationID, size, ceiling, time.Since(episode.started).Round(time.Millisecond))
 			*episode = retirementWALEpisode{}
 		}
-		return
+		return nil
 	}
 	if !episode.active {
 		*episode = retirementWALEpisode{active: true, started: time.Now()}
@@ -101,13 +121,22 @@ func (s *Store) awaitWALUnderCeiling(ctx context.Context, generationID int64, ep
 	}
 	s.walReclaim.cycle.retirementWaits.Add(1)
 	s.RequestWALReclaim()
+	yield, _ := ctx.Value(retirementWALYieldKey{}).(bool)
 	waitMax := retirementWALWaitMax
-	if s.buildLaneBusy() || s.walCopy.editing(time.Now()) {
+	switch {
+	case yield:
+		waitMax = retirementWALYieldWait
+	case s.buildLaneBusy() || s.walCopy.editing(time.Now()):
 		waitMax = retirementWALWaitEditingMax
 	}
 	if err := s.waitForWALReclaim(ctx, waitMax, func() bool { return s.retirementLogBytes() < ceiling }); err != nil && ctx.Err() == nil {
 		s.walReclaim.cycle.retirementTimeouts.Add(1)
+		if yield {
+			return fmt.Errorf("%w: generation %d: wal_bytes=%d still over the retirement mark %d after %s",
+				ErrPayloadSweepBudgetExhausted, generationID, s.retirementLogBytes(), ceiling, waitMax)
+		}
 	}
+	return nil
 }
 
 // AwaitWarmupWAL is the producer boundary for bounded startup-restage chunks.
