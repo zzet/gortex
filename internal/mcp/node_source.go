@@ -53,12 +53,8 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 			if err != nil {
 				return 0, 0, err
 			}
-			if nodes, matched := s.readFileCompressionSymbols(ctx, abs, node.FilePath, content); matched {
-				for _, live := range nodes {
-					if live.ID == node.ID && live.RepoPrefix == node.RepoPrefix && live.Kind == node.Kind && live.StartLine == node.StartLine && live.EndLine == node.EndLine {
-						return node.StartLine, node.EndLine, nil
-					}
-				}
+			if live, matched := s.readIndexedSymbolSource(ctx, abs, node.FilePath, content, node.ID, node); matched {
+				return live.StartLine, live.EndLine, nil
 			}
 		}
 	}
