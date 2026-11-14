@@ -66,28 +66,63 @@ func (s *Server) awaitRelationFreshness(ctx context.Context, ids, files []string
 	return s.awaitScopedFreshness(ctx, "relations", ids, files, deadline)
 }
 
+// An unresolved impact seed already requires a pending partial. The default
+// maximum wait is not a promise to delay that answer: keep the scoped label
+// and still run the walk. An explicit freshness request retains its deadline.
+func (s *Server) awaitImpactRelationFreshness(ctx context.Context, ids []string, freshness requestFreshness) relationFreshness {
+	return s.awaitScopedFreshnessMode(ctx, "relations", ids, nil, relationWaitDeadline(ctx, freshness), !freshness.requireFresh)
+}
+
 // Relation verdicts and derived candidates share the existing scoped producer
 // and wait loop; each caller retains its pre-walk evidence for the answer.
 func (s *Server) awaitScopedFreshness(ctx context.Context, scope string, ids, files []string, deadline time.Time) relationFreshness {
+	return s.awaitScopedFreshnessMode(ctx, scope, ids, files, deadline, false)
+}
+
+func (s *Server) awaitScopedFreshnessMode(ctx context.Context, scope string, ids, files []string, deadline time.Time, partialOnDeadline bool) relationFreshness {
 	started := time.Now()
 	label := s.freshnessFor(ctx, scope, ids, files)
 	if label.state == "" || label.state == "failed" || !deadline.After(started) {
 		label.waited = time.Since(started)
 		return label
 	}
-	ticker := time.NewTicker(25 * time.Millisecond)
+	if partialOnDeadline && label.state == "pending" {
+		if reader := s.readerFor(ctx); reader != nil {
+			for _, id := range ids {
+				if id = strings.TrimSpace(id); id != "" && reader.GetNode(id) == nil {
+					label.waited = time.Since(started)
+					return label
+				}
+			}
+		}
+	}
+	const pollInterval = 25 * time.Millisecond
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	for {
 		select {
 		case <-ticker.C:
+			// Optional impact reads may answer with the last observed pending
+			// label. Do not start another scope walk once their budget expired.
+			if partialOnDeadline && !time.Now().Before(deadline) {
+				break
+			}
 			label = s.freshnessFor(ctx, scope, ids, files)
 			if label.state != "" && label.state != "failed" {
+				// An optional partial need not wait for a timer after its last
+				// useful poll. Keep this observed label when another full poll
+				// interval would reach or pass the absolute wait cap.
+				if partialOnDeadline && !time.Now().Add(pollInterval).Before(deadline) {
+					break
+				}
 				continue
 			}
 		case <-timer.C:
-			label = s.freshnessFor(ctx, scope, ids, files)
+			if !partialOnDeadline {
+				label = s.freshnessFor(ctx, scope, ids, files)
+			}
 		case <-ctx.Done():
 		}
 		label.waited = time.Since(started)
