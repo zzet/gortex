@@ -57,7 +57,7 @@ func bindEditConsumerPlan(c Corpus, p *editProbePlan) error {
 	}
 	p.NotSelected = append(p.NotSelected,
 		"consumer probes require actual pre-edit unexported dead-code membership; no empty-list baseline",
-		"consumer pending/error/missing/unsupported observations are separate from the seven visibility oracles; compact consumer decoding is unsupported, not JSON fallback coverage")
+		"consumer pending/error/missing/unsupported observations are separate from the seven visibility oracles; compact consumer coverage requires actual versioned compact rows, not JSON fallback")
 	return nil
 }
 
@@ -301,7 +301,7 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 		row.PostACKAttempts++
 		row.State = state
 		if state == "unassessed" {
-			row.Reason = "rename rows do not identify this caller; no stale or clean coverage"
+			row.Reason = "rows do not identify this subject or cannot prove a freshness claim; no stale or clean coverage"
 		}
 		switch state {
 		case "pending":
@@ -318,7 +318,9 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 		}
 	}
 	row.SilentStale = unavailable("answers", "consumer coverage missing, unsupported, failed or unassessed")
-	if row.PostACKAttempts > 0 && row.Unassessed == 0 && row.Errors == 0 && row.Assessed == row.PostACKAttempts {
+	if mode == "compact" {
+		row.SilentStale = unavailable("answers", "compact has no explicit idle freshness claim; subject and pending evidence are retained separately")
+	} else if row.PostACKAttempts > 0 && row.Unassessed == 0 && row.Errors == 0 && row.Assessed == row.PostACKAttempts {
 		row.SilentStale = measured(float64(row.stale), "answers")
 	}
 	s.record.Consumers[oracle.name] = row
@@ -329,6 +331,12 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c Corpus, step editProbeStep) string {
 	if !editConsumerPayloadValid(body) || !editConsumerShape(name, body, r.plan.Callee) {
 		return "malformed"
+	}
+	if proof, exists := body[editCompactConsumerWireKey]; exists {
+		wire, typed := proof.(editCompactConsumerWire)
+		if !typed || wire.operation != editCompactConsumerOperationFor(name) {
+			return "malformed"
+		}
 	}
 	scope := "relations"
 	if name == "consumer_dead_code" {
@@ -358,12 +366,16 @@ func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c C
 		if !editConsumerDeadContains(dead, c.File, r.plan.Callee) {
 			return "fresh_membership_transition"
 		}
+		if _, compact := body[editCompactConsumerWireKey].(editCompactConsumerWire); compact {
+			return "unassessed"
+		}
 		return "silent_stale"
 	}
 	if editConsumerSubject(name, body, c, step, r.plan.Callee) {
 		return "subject_observed"
 	}
-	if name == "consumer_rename" {
+	_, compact := body[editCompactConsumerWireKey].(editCompactConsumerWire)
+	if name == "consumer_rename" || compact {
 		// A valid rename can return a call-site-only line from a multiline
 		// caller. Without caller identity that line cannot prove this marker
 		// absent, and a sparse edit row cannot do so either.
@@ -433,12 +445,12 @@ func editConsumersFailure(rows map[string]editConsumerObservation) bool {
 	return false
 }
 
-// Only compact is explicitly unsupported here. No call is dispatched and no
-// JSON answer is substituted for the missing consumer compact adapter.
+// An unsupported observation stops waiting but never supplies coverage. Retained
+// as the denominator guard for unsupported output modes, not compact dispatch.
 func (s *editProbeState) markUnsupportedConsumer(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row := s.record.Consumers[name]
-	row.State, row.Reason = "unsupported", "no actual compact consumer decoder; no format or silent-stale credit"
+	row.State, row.Reason = "unsupported", "requested mode unsupported; no format or silent-stale credit"
 	s.record.Consumers[name] = row
 }

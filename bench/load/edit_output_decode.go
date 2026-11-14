@@ -164,7 +164,7 @@ const editProbeCompactKey = "\x00load.compact.rows"
 
 // Only these operations have a compact text producer; every other request
 // stays JSON.
-var editProbeCompactOperations = map[string]bool{"read.summary": true, "search.symbols": true, "relations.callers": true, "trace.call_chain": true}
+var editProbeCompactOperations = map[string]bool{"read.summary": true, "search.symbols": true, "relations.callers": true, "trace.call_chain": true, "refactor.rename": true, "change.verify": true, "change.detect": true, "analyze.dead_code": true}
 
 var (
 	editProbeCompactRowLine      = regexp.MustCompile(`^([a-z_]+) (\S+) (\S+):([1-9][0-9]*)( \(in (\S+)\))?$`)
@@ -175,6 +175,9 @@ var (
 )
 
 func decodeEditProbeCompactOutput(raw json.RawMessage, operation string) (map[string]any, error) {
+	if editCompactConsumerOperation(operation) {
+		return decodeEditCompactConsumer(raw, operation)
+	}
 	if !editProbeCompactOperations[operation] {
 		return nil, errors.New("operation has no compact text producer")
 	}

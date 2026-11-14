@@ -283,7 +283,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 		out.Limitations = append(out.Limitations, editProbeNativeLimitations(plan.Sender)...)
 	}
 	if plan.Mode == "compact" {
-		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
+		out.Limitations = append(out.Limitations, "compact text is requested from read.summary, search.symbols, relations.callers, trace.call_chain and the four opt-in relation consumers; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "legacy visibility-oracle compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
 	}
 	if plan.ConsumerProbes {
 		out.Limitations = append(out.Limitations, "opt-in relation consumers retain their own attempted/observed/pending/error/missing denominator; pending is not graph completion and unobserved/unsupported silent-stale counts remain unavailable", "unexported dead-code subject requires observed pre-edit membership; no JSON fallback grants compact consumer coverage; default seven first-correct and ACK/accounting predicates are unchanged")
@@ -886,10 +886,6 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 	corpus := repo.Corpus
 	corpus.EditOutput = r.stepProbeMode(s.step)
 	for index, oracle := range editProbeOracles(corpus, s.step) {
-		if isEditConsumer(oracle.name) && r.stepProbeMode(s.step) == "compact" {
-			s.markUnsupportedConsumer(oracle.name)
-			continue
-		}
 		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" && !isEditConsumer(oracle.name) {
 			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
 			oracle.call.Arguments["require_fresh"] = true

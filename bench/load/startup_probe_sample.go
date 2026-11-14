@@ -546,7 +546,9 @@ func ttyCommand(ctx context.Context, binary string, argv []string) (*exec.Cmd, e
 	}
 }
 
-// hookRead asks the PreToolUse hook about a native Read of an indexed file.
+// hookRead asks the PreToolUse hook about the actual fixture path. In the
+// explicit no-checkout fixture that linked path is absent, as the gate receipt
+// discloses; its decisions do not prove indexed-file hook coverage.
 func (s *startupProbe) hookRead(ctx context.Context, cwd probeCWD) probeSample {
 	payload, _ := json.Marshal(map[string]any{"hook_event_name": "PreToolUse", "session_id": "gortex-load-startup", "tool_name": "Read", "tool_input": map[string]any{"file_path": cwd.File}, "cwd": cwd.Dir})
 	callCtx, cancel := context.WithTimeout(ctx, startupCallTimeout)
