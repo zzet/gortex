@@ -879,6 +879,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
 	}
+	ctx = context.WithValue(ctx, indexedSymbolSourceTargetKey{}, id)
 
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
 		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
