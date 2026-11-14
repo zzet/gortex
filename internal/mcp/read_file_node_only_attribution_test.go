@@ -68,7 +68,10 @@ func TestRegisteredReadFileDoesNotLoadUnusedSymbolAdjacency(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			selectedProjectionRegistry(t)
-			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			cacheRoot := t.TempDir()
+			t.Setenv("XDG_CACHE_HOME", cacheRoot)
+			t.Setenv("GORTEX_QUERY_LOG", filepath.Join(cacheRoot, "query-log.jsonl"))
+			t.Setenv("GORTEX_QUERY_LOG_DISABLE", "0")
 			root := t.TempDir()
 			var source strings.Builder
 			source.WriteString("package probe\n\n")
@@ -99,6 +102,19 @@ func TestRegisteredReadFileDoesNotLoadUnusedSymbolAdjacency(t *testing.T) {
 			require.GreaterOrEqual(t, len(adjacent), 64)
 			backend := &readFileAttributionStore{Store: sql, target: "main.go"}
 			s := NewServer(query.NewEngine(backend), backend, idx, nil, zap.NewNop(), nil)
+			t.Cleanup(func() {
+				s.queryLog.mu.Lock()
+				ownedLog := s.queryLog.file
+				s.queryLog.mu.Unlock()
+				if facade {
+					require.NotNil(t, ownedLog, "the real facade request must exercise its owned query log")
+				}
+				s.queryLog.Close()
+				if ownedLog != nil {
+					_, statErr := ownedLog.Stat()
+					require.ErrorIs(t, statErr, os.ErrClosed, "close the owned handle before TempDir cleanup on every OS")
+				}
+			})
 			s.frecency = &frecencyTracker{mode: ModeAI, now: func() int64 { return 1000 }}
 			const session = "read-file-node-only"
 			require.NoError(t, s.ConnectSession(session, func([]byte) error { return nil }))

@@ -222,7 +222,12 @@ func TestGuardedRenameOriginalOwnersThroughRealSetPublication(t *testing.T) {
 	for i, record := range records {
 		require.Eventually(t, func() bool {
 			status := s.mutationStatusPayload(record)
-			return status["graph_status"] == mutationGraphFresh && status["phase_timing"].(indexer.EditTimingWindow).SharedSetExecution != nil
+			// The timer publishes executor completion before its owner-proof
+			// finalizer returns. Capture the purity baseline after both finish;
+			// status reads must not change either completed observation.
+			proofState, _ := publications[i].SharedOwnerProofAvailability()
+			proofFinished := proofState == "frozen" || proofState == "unavailable"
+			return status["graph_status"] == mutationGraphFresh && status["phase_timing"].(indexer.EditTimingWindow).SharedSetExecution != nil && proofFinished
 		}, 5*time.Second, time.Millisecond)
 		status := s.mutationStatusPayload(record)
 		completed[i] = status["publication_phases"].(indexer.PublicationPhaseSnapshot)
