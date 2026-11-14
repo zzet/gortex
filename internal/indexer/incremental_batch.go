@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -508,8 +509,15 @@ func (idx *Indexer) reindexIncrementalChunk(
 	// an inert one's: a read the file has since moved past is not recorded.
 	// Its row then describes bytes no longer on disk, which every reader
 	// that gates on the mtime rejects first, and the next read writes the
-	// row again.
-	idx.persistInertFileMeta(inertMeta)
+	// row again. A row that could not be written leaves its read unrecorded
+	// and the file failed, so it stays stale and is retried.
+	if unwritten, err := idx.persistInertFileMeta(inertMeta); err != nil {
+		receipts = withoutReceipts(receipts, unwritten)
+		for _, filePath := range unwritten {
+			idx.noteFileIndexFailure(filePath, err)
+			readFailed = append(readFailed, filePath)
+		}
+	}
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
 	mtimes.end()
 	receiptTiming.complete(nil, zap.Int("fresh_files", len(freshPaths)), zap.Int("stale_files", len(stalePaths)))
@@ -1844,9 +1852,12 @@ func (idx *Indexer) persistIncrementalSidecars(stages []*incrementalBatchStage) 
 // but the row's content hash and size are what every reader compares with
 // the file to prove its indexed bytes; left behind, the file looks moved to
 // them for good, while its equal mtime keeps the census from reading it.
-func (idx *Indexer) persistInertFileMeta(inertMeta map[string]graph.FileMetaRow) {
-	if len(inertMeta) == 0 {
-		return
+// The write is one upsert, so a failure leaves the prior rows in place; it
+// returns the files whose rows were not written with the error.
+func (idx *Indexer) persistInertFileMeta(inertMeta map[string]graph.FileMetaRow) ([]string, error) {
+	fw, ok := idx.graph.(graph.FileMetaWriter)
+	if !ok || len(inertMeta) == 0 {
+		return nil, nil
 	}
 	paths := make([]string, 0, len(inertMeta))
 	for _, row := range inertMeta {
@@ -1858,13 +1869,33 @@ func (idx *Indexer) persistInertFileMeta(inertMeta map[string]graph.FileMetaRow)
 		stored, _ = reader.FileMetasByPaths(idx.repoPrefix, paths)
 	}
 	rows := make([]graph.FileMetaRow, 0, len(inertMeta))
-	for _, row := range inertMeta {
+	files := make([]string, 0, len(inertMeta))
+	for filePath, row := range inertMeta {
 		if prior, found := stored[row.FilePath]; found && prior.ContentHash == row.ContentHash && prior.Size == row.Size {
 			continue
 		}
 		rows = append(rows, row)
+		files = append(files, filePath)
 	}
-	persistFileMetaRows(idx.graph, idx.repoPrefix, rows)
+	if err := fw.SetFileMetas(idx.repoPrefix, rows); err != nil {
+		return files, fmt.Errorf("persist inert file metadata: %w", err)
+	}
+	return nil, nil
+}
+
+// withoutReceipts drops the receipts of the given files.
+func withoutReceipts(receipts []fileReadReceipt, files []string) []fileReadReceipt {
+	drop := make(map[string]struct{}, len(files))
+	for _, filePath := range files {
+		drop[filePath] = struct{}{}
+	}
+	kept := receipts[:0]
+	for _, receipt := range receipts {
+		if _, dropped := drop[receipt.absPath]; !dropped {
+			kept = append(kept, receipt)
+		}
+	}
+	return kept
 }
 
 // recordFileReadVersionsBatched advances only receipts whose exact parsed
