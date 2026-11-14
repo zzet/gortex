@@ -570,6 +570,19 @@ type Indexer struct {
 	// reflects work this run performed.
 	fullReindexed atomic.Bool
 
+	// resumeUntrusted is raised with fullReindexed, and whenever a file's
+	// per-file ledger marker is written false after in-place enrichment
+	// (setReparsePendingEnrichments), and is consumed by the next whole-repo
+	// deferred pass. That pass must not resume a type pass from a point
+	// recorded before the re-parse or the in-place enrichment (it discards it
+	// at open; after a whole-repo re-parse the repo eviction already deleted
+	// the persisted row), but points it records itself are recorded over the
+	// current graph, so a later pass in this run may resume them.
+	// fullReindexed itself stays raised: it is also what forces the pass past
+	// a completion marker the re-parse invalidated, and a cut first pass
+	// writes no new marker.
+	resumeUntrusted atomic.Bool
+
 	// reparsedThisRun is the scoped analogue of fullReindexed: it is raised by a
 	// scoped incremental pass that re-parsed at least one stale file this run —
 	// IncrementalReindexPaths with a non-zero
@@ -1459,7 +1472,26 @@ func (idx *Indexer) runDeferredEnrich() {
 	// the freshly-unstamped nodes, so a scoped force stays bounded to those files.
 	opts := semantic.EnrichOptions{
 		RepoState: map[string]semantic.RepoEnrichState{
-			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load()},
+			idx.repoPrefix: {
+				SHA: sha, Dirty: dirty,
+				Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load(),
+				// A scoped re-parse either stamps its file on the per-file
+				// ledger, which a resumed pass re-applies, or re-enriches it
+				// in place and clears the marker, which raises the latch
+				// (setReparsePendingEnrichments): in-place enrichment does
+				// not restore the edges importers' type facts point into the
+				// file, and the ledger no longer names it. A whole-repo
+				// re-parse raises the latch too. Either way the latched pass
+				// starts from the first page. Consuming the latch here is safe
+				// only because every repo-scoped eviction a whole-repo
+				// re-parse goes through deletes the repo's enrichment_resume
+				// rows itself (store_sqlite file_batch_evict.go, in the
+				// eviction transaction; shadow_repo_evict.go, in a step that
+				// completes before the replacement rows are written): no
+				// point from before the re-parse survives for a later pass in
+				// this run to resume.
+				ReparsedFilesMarked: !idx.resumeUntrusted.Swap(false),
+			},
 		},
 		MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
 		ApplyGate:        idx.deferredApplyGate,
@@ -4951,6 +4983,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// edges — force the deferred pass past the completion-marker gate so
 		// they are restored even at an unchanged clean HEAD.
 		idx.fullReindexed.Store(true)
+		idx.resumeUntrusted.Store(true)
 	}
 	return result, nil
 }

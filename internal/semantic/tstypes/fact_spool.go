@@ -32,6 +32,7 @@ type factSpool struct {
 
 type factPageStats struct {
 	Class      factClass
+	Reapply    bool // applied again behind a resumed pass's cursor
 	Files      int
 	Facts      int
 	Bytes      int
@@ -84,7 +85,10 @@ CREATE TABLE resolved_aliases (
   trait_id TEXT NOT NULL,
   method TEXT NOT NULL
 );
-CREATE INDEX idx_resolved_alias_type ON resolved_aliases(type_id, seq);`); err != nil {
+CREATE INDEX idx_resolved_alias_type ON resolved_aliases(type_id, seq);
+CREATE TABLE reapply_files (
+  file_path TEXT PRIMARY KEY
+) WITHOUT ROWID;`); err != nil {
 		_ = db.Close()
 		_ = os.Remove(path)
 		return nil, err
@@ -347,13 +351,112 @@ ON CONFLICT(class,file_path) DO UPDATE SET repo_prefix=excluded.repo_prefix,payl
 // needs the import map in every phase. Files without facts of the class have
 // no row and are skipped wholesale.
 func (s *factSpool) pageClass(ctx context.Context, class factClass, after string) ([]*fileFacts, string, factPageStats, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT file_path,repo_prefix,payload FROM file_facts
-WHERE class = ? AND file_path > ? ORDER BY file_path LIMIT ?`, int(class), after, tstypesFactPageFiles)
+	return s.pageClassRange(ctx, class, after, factPageRange{})
+}
+
+// factPageRange narrows a class's keyset pages. after is where paging
+// starts when a resumed pass hands it in; through, when set, is the last
+// file path included. reapply keeps only the files markReapply named.
+type factPageRange struct {
+	after   string
+	through string
+	reapply bool
+}
+
+// importersOf lists, in path order, the staged files other than files with
+// an import naming one of them — the hint the apply phase resolves receiver
+// and super types through. Only the imports class is decoded.
+func (s *factSpool) importersOf(ctx context.Context, repoPrefix string, files []string) ([]string, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	named := make(map[string]bool, len(files))
+	for _, file := range files {
+		named[file] = true
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT file_path,payload FROM file_facts WHERE class = ? ORDER BY file_path`, int(classImports))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var importers []string
+	for rows.Next() {
+		var importer string
+		var payload []byte
+		if err := rows.Scan(&importer, &payload); err != nil {
+			return nil, err
+		}
+		if named[importer] {
+			continue
+		}
+		var imports []Import
+		if err := json.Unmarshal(payload, &imports); err != nil {
+			return nil, fmt.Errorf("decode imports for %s: %w", importer, err)
+		}
+		if importsAnyOf(imports, importer, repoPrefix, files) {
+			importers = append(importers, importer)
+		}
+	}
+	return importers, rows.Err()
+}
+
+// importsAnyOf matches like the apply phase's import hint, with and without
+// the repo prefix, so the set errs towards including a file.
+func importsAnyOf(imports []Import, importer, repoPrefix string, files []string) bool {
+	for _, imp := range imports {
+		if imp.Path == "" {
+			continue
+		}
+		for _, file := range files {
+			if importMatches(file, repoPrefix, imp.Path, importer) || importMatches(file, "", imp.Path, importer) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// fileCount is the number of staged files.
+func (s *factSpool) fileCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM files`).Scan(&n)
+	return n, err
+}
+
+// markReapply names the files whose pages a resumed pass applies again
+// behind its cursor.
+func (s *factSpool) markReapply(files []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO reapply_files(file_path) VALUES (?)`, file); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// pageClassRange is pageClass over the files rng admits, in the same order
+// and under the same page bounds.
+func (s *factSpool) pageClassRange(ctx context.Context, class factClass, after string, rng factPageRange) ([]*fileFacts, string, factPageStats, error) {
+	query := `SELECT file_path,repo_prefix,payload FROM file_facts WHERE class = ? AND file_path > ?`
+	args := []any{int(class), after}
+	if rng.through != "" {
+		query += ` AND file_path <= ?`
+		args = append(args, rng.through)
+	}
+	if rng.reapply {
+		query += ` AND file_path IN (SELECT file_path FROM reapply_files)`
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY file_path LIMIT ?`, append(args, tstypesFactPageFiles)...)
 	if err != nil {
 		return nil, after, factPageStats{}, err
 	}
 	page := make([]*fileFacts, 0, tstypesFactPageFiles)
-	stats := factPageStats{Class: class}
+	stats := factPageStats{Class: class, Reapply: rng.reapply}
 	last := after
 	for rows.Next() {
 		var filePath, repoPrefix string
