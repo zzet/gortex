@@ -478,7 +478,9 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 	// keeps its earlier refusal.
 	absent := make(map[string][]string)
 	// A linked actor's selection carries a witness of its own checkout. It
-	// reports an absent primary row too, but fails once instead of waiting.
+	// reports an absent primary row too, but fails once instead of waiting,
+	// and it keeps the earlier refusal of a first receipt rather than waiting
+	// on it.
 	linked := false
 	if options.selectedInputs != nil {
 		for _, w := range options.selectedInputs.Witnesses {
@@ -565,7 +567,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						// reads by (ContractReceiptStamp.quiescent): its mutation
 						// settled it, or staged it in this process and has ended its
 						// core writes (a watcher patch overtaken after its writes is
-						// never accepted or settled), so the file's core rows are
+						// settled, never accepted), so the file's core rows are
 						// complete. A row whose core-write window is open is
 						// admitted in flight: the job's stamp scans see the window,
 						// and its first read of the file waits for it to close.
@@ -594,6 +596,18 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 							policy = prior.Policy
 						} else if markerPolicy, overflow := contractReceiptOverflowPolicy(row); overflow && row.Accepted && row.RepoPrefix == repo && row.CheckoutID == actor && row.FilePath == path {
 							policy, opaque = markerPolicy, true
+						} else if !row.Accepted && row.Previous == nil && !state.Settled && !linked && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+							// An admitted primary row with no accepted predecessor
+							// whose mutation has not settled is normally a save of
+							// this process still to be accepted: a file's first
+							// save, or a forced reindex of a row an interrupted
+							// process never accepted. No accepted receipt names its
+							// policy until that save accepts it and announces
+							// Published, which reruns the capture. A settled row's
+							// mutation was overtaken and will never accept it, and a
+							// linked actor, whose stale capture is re-enqueued at
+							// once, keeps the earlier refusal.
+							return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 						} else {
 							return ContractFollowupSnapshot{}, graph.ErrContractProjectionIncomplete
 						}
