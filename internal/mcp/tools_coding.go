@@ -2914,6 +2914,9 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	reported := append(append([]renameEdit(nil), verified...), provisional...)
 	label := s.labelRelations(ctx, gaps, []string{id}, nil)
 	respond := func(payload map[string]any) (*mcp.CallToolResult, error) {
+		if isCompact(req) && dryRun {
+			return label.decorate(mcp.NewToolResultText(compactRenameConsumer(payload, reported, label))), nil
+		}
 		label.apply(payload)
 		res, err := s.respondJSONOrTOON(ctx, req, payload)
 		return label.decorate(res), err
