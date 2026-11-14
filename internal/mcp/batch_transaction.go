@@ -1025,6 +1025,35 @@ func applyBatchPlans(plans []plannedBatchEdit, buffers map[string]*batchFileBuff
 	return results, -1, nil
 }
 
+// Rebind symbol plans to the original bytes actually captured under the whole
+// path lock, before any coordinated item changes a working buffer. A repeated
+// fragment at a stale range is not proof that the requested declaration still
+// exists. Keep the graph's shared nodes immutable and the existing within-batch
+// ordering/fallback behavior on these private plan copies.
+func (s *Server) locateBatchSymbolsUnderLock(ctx context.Context, plans []plannedBatchEdit, buffers map[string]*batchFileBuffer) (int, error) {
+	for i := range plans {
+		plan := &plans[i]
+		if plan.op != "edit_symbol" {
+			continue
+		}
+		buffer := buffers[plan.absPath]
+		if buffer == nil || !buffer.existsBefore {
+			return i, errors.New("symbol file does not exist")
+		}
+		if indexer.LooksUTF16Source(buffer.original) {
+			return i, refuseUTF16Edit("batch edit_symbol", plan.node.FilePath)
+		}
+		start, end, err := s.symbolLinesUnderLock(ctx, plan.node, plan.absPath, buffer.original)
+		if err != nil {
+			return i, fmt.Errorf("locate %s before batch commit: %w", plan.edit.SymbolID, err)
+		}
+		current := *plan.node
+		current.StartLine, current.EndLine = start, end
+		plan.node = &current
+	}
+	return -1, nil
+}
+
 func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem, requestedID string) (result batchTransactionReceipt, retErr error) {
 	fingerprint := batchEditFingerprint(edits)
 	transactionID, err := normalizeBatchTransactionID(requestedID, fingerprint)
@@ -1093,6 +1122,11 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		receipt.Results = batchFailureResults(plans, 0, readErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", readErr.Error()), nil
+	}
+	if failed, err := s.locateBatchSymbolsUnderLock(ctx, plans, buffers); err != nil {
+		receipt.Results = batchFailureResults(plans, failed, err.Error())
+		receipt.Summary = batchSummary(receipt.Results)
+		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
 	}
 	results, _, applyErr := applyBatchPlans(plans, buffers)
 	receipt.Results = results
