@@ -42,6 +42,13 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 	})
 
+	t.Run("contract_detection_upgrade", func(t *testing.T) {
+		old := snapshotJSON(t, map[string]int{"go": 4, "typescript": 2})
+		if got, want := ExtractorVersionStaleLangs(old), []string{"go", "typescript"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("previous contract extraction must restage only Go and TypeScript: got %v, want %v", got, want)
+		}
+	})
+
 	t.Run("only_behind_langs", func(t *testing.T) {
 		stored := map[string]int{"go": 1, "python": 2, "ruby": 1}
 		current := map[string]int{"go": 2, "python": 2, "ruby": 1, "rust": 3, "lua": 1}
@@ -240,12 +247,12 @@ func TestStaleLangsDetection(t *testing.T) {
 			snapshotJSON(t, map[string]int{"javascript": 1, "typescript": 1})); !reflect.DeepEqual(got, []string{"javascript", "typescript"}) {
 			t.Errorf("snapshot stored before import_alias = %v, want [javascript typescript]", got)
 		}
-		for path, want := range map[string]string{"model.js": policySalt + "|javascript@2", "model.ts": policySalt + "|typescript@2"} {
+		for path, want := range map[string]string{"model.js": policySalt + "|javascript@2", "model.ts": policySalt + "|typescript@3"} {
 			if got := merkleSaltFor(path); got != want {
 				t.Errorf("extractor salt for %s = %q, want %q", path, got, want)
 			}
 		}
-		if got, want := merkleSaltFor("model.go"), policySalt+"|go@4"; got != want {
+		if got, want := merkleSaltFor("model.go"), policySalt+"|go@5"; got != want {
 			t.Errorf("Go extractor salt = %q, want %q", got, want)
 		}
 
