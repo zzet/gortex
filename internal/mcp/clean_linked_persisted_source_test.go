@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -88,12 +89,26 @@ func newCleanLinkedSourceFixtureWithSource(t *testing.T, source []byte, symbol s
 		require.NotNil(t, srv.lifecycle)
 		srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: srv.lifecycle.ViewLeases()})
 		f.store, f.srv, f.extractor = store, srv, e
-		f.close = sync.OnceFunc(func() { require.NoError(t, srv.lifecycle.Close()); require.NoError(t, store.Close()) })
+		f.close = sync.OnceFunc(func() {
+			// The lifecycle owns discovery/build actors, but the supplied MI,
+			// server background work and query logger are separately owned.
+			srv.DrainBackground()
+			lifecycleErr := srv.lifecycle.Close()
+			multiErr := mi.Close(context.Background())
+			srv.queryLog.Close()
+			storeErr := store.Close()
+			require.NoError(t, errors.Join(lifecycleErr, multiErr, storeErr))
+		})
 		t.Cleanup(f.close)
 		require.NoError(t, srv.lifecycle.Seed(ctx))
 		f.ids = nil
 		for _, root := range roots {
-			checkout, present, err := srv.lifecycle.ObserveCheckoutPath(ctx, root)
+			checkout, present, err := observeCleanLinkedSourceCheckout(ctx, root,
+				func(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
+					return srv.lifecycle.ObserveCheckoutPath(ctx, path)
+				}, func(err error) {
+					t.Logf("ACTUAL_FIXTURE_DISCOVERY_PENDING root=%q error=%v", root, err)
+				})
 			require.NoError(t, err)
 			require.True(t, present)
 			f.ids = append(f.ids, checkout)
@@ -131,6 +146,31 @@ func newCleanLinkedSourceFixtureWithSource(t *testing.T, source []byte, symbol s
 		require.Equal(t, before[i].Incarnation, f.ids[i].Incarnation)
 	}
 	return f
+}
+
+// Discovery deliberately bounds each request to 250ms while its shared
+// metadata worker continues. Fixture setup joins that work within its original
+// context; only the API's typed pending refusal authorizes another attempt.
+func observeCleanLinkedSourceCheckout(ctx context.Context, path string,
+	observe func(context.Context, string) (store_sqlite.Checkout, bool, error),
+	recordPending func(error),
+) (store_sqlite.Checkout, bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return store_sqlite.Checkout{}, false, err
+		}
+		checkout, found, err := observe(ctx, path)
+		var pending *indexer.CheckoutDiscoveryPendingError
+		if !errors.As(err, &pending) {
+			return checkout, found, err
+		}
+		recordPending(err)
+		select {
+		case <-ctx.Done():
+			return checkout, found, errors.Join(ctx.Err(), err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func (f *cleanLinkedSourceFixture) call(t *testing.T, root string, requestID int, withoutSelectedProof ...bool) *mcplib.CallToolResult {
