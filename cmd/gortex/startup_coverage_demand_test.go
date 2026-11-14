@@ -165,10 +165,10 @@ func TestStartupCoverageDemandsActivateNoCheckoutBeforeReady(t *testing.T) {
 	members := make(map[string]indexer.CheckoutOverview)
 	var beforeRows []observedMember
 	for _, row := range before.Families[0].Checkouts {
-		if row.RootPath != primary {
+		if filepath.Clean(row.RootPath) != filepath.Clean(primary) {
 			require.False(t, row.CoordinatorLive)
 			require.Empty(t, row.Transition)
-			members[row.RootPath] = row
+			members[filepath.Clean(row.RootPath)] = row
 			beforeRows = append(beforeRows, project(row))
 		}
 	}
@@ -208,7 +208,7 @@ func TestStartupCoverageDemandsActivateNoCheckoutBeforeReady(t *testing.T) {
 				errors <- err
 				return
 			}
-			if !response.OK || coverage.RepoState != daemon.RepoStateLoading || coverage.View == nil || coverage.View.CheckoutID != members[root].CheckoutID || coverage.View.Kind != daemon.ProbeViewUnrouted || coverage.View.Exact || c.IsReady() {
+			if !response.OK || coverage.RepoState != daemon.RepoStateLoading || coverage.View == nil || coverage.View.CheckoutID != members[filepath.Clean(root)].CheckoutID || coverage.View.Kind != daemon.ProbeViewUnrouted || coverage.View.Exact || c.IsReady() {
 				err := fmt.Errorf("wrong pre-ready native coverage: %+v, %+v", response, coverage)
 				row.Error = err.Error()
 				errors <- err
@@ -241,7 +241,7 @@ func TestStartupCoverageDemandsActivateNoCheckoutBeforeReady(t *testing.T) {
 	afterWire := time.Now()
 	var afterRows []observedMember
 	for _, row := range after.Families[0].Checkouts {
-		if _, expected := members[row.RootPath]; expected {
+		if _, expected := members[filepath.Clean(row.RootPath)]; expected {
 			afterRows = append(afterRows, project(row))
 		}
 	}
@@ -249,7 +249,7 @@ func TestStartupCoverageDemandsActivateNoCheckoutBeforeReady(t *testing.T) {
 	require.Len(t, afterRows, 24)
 	require.True(t, afterWire.Before(origin.Since.Add(2*time.Second)), "the public per-ID snapshot must also arrive within the native registration window")
 	for _, row := range after.Families[0].Checkouts {
-		if expected, ok := members[row.RootPath]; ok {
+		if expected, ok := members[filepath.Clean(row.RootPath)]; ok {
 			require.Equal(t, expected.CheckoutID, row.CheckoutID)
 			require.Equal(t, expected.Incarnation, row.Incarnation)
 			require.True(t, row.CoordinatorLive)
