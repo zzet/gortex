@@ -87,6 +87,9 @@ func validateMemoryOptions(o runOptions) error {
 
 // bootWorktrees is how many linked worktrees exist before the daemon starts.
 func bootWorktrees(o runOptions) int {
+	if o.Churn.Cycles > 0 {
+		return 0
+	}
 	if len(o.WorktreeSteps) > 0 {
 		return o.WorktreeSteps[0]
 	}
