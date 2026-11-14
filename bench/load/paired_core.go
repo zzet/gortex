@@ -222,6 +222,10 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 	baseRepo := c.states[0].p.Repos[repoIndex]
 	hash, hashErr := hashJSON(r)
 	tuple := requestTuple{Tool: r.name(), Role: role, Repo: baseRepo.Corpus.Label, Commit: baseRepo.Corpus.Commit, Agent: agent, Step: step, Slot: slot, RequestHash: hash}
+	transactionMode := c.options.PairedOwnACKTransactions && role == "workload" && slot == 0
+	if transactionMode {
+		tuple.Agent = c.states[0].phase.editProbeRuntime.plan.Steps[step].Editor
+	}
 	if r.ExpectedAbsentSymbol != "" {
 		tuple.ExpectedOutcome = "symbol_absent"
 	}
@@ -234,6 +238,7 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 	tupleHash, _ := hashJSON(tuple)
 	record := pairedRecord{Tuple: tuple, TupleHash: tupleHash, Order: order, Samples: make(map[string]pairedSample)}
 	results := make(map[string]pairedCallResult)
+	transactions := make(map[string]*pairedOwnACKTransaction)
 	for _, label := range order {
 		index := 0
 		for c.labels[index] != label {
@@ -253,6 +258,11 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 			if prepareErr != nil {
 				err = errors.Join(err, prepareErr)
 				c.abort(prepareErr)
+			}
+			if transactionMode && editCall.editing {
+				transaction := newPairedOwnACKTransaction(editCall.started)
+				editCall.state.pairedTransaction = transaction
+				transactions[label] = transaction
 			}
 		}
 		budget := timeout
@@ -303,9 +313,16 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 		if !identity.Finished.IsZero() {
 			sample.Ended = identity.Finished
 		}
-		// Start this build's own-ACK continuation before the loop awaits the
-		// partner response. Its readbacks/status remain explicitly unpaired.
+		// The default starts an unpaired own-ACK continuation. Explicit
+		// transaction mode waits only through this build's file/source reads,
+		// never through its publication/status controls, before partner edit.
+		if transaction := transactions[label]; transaction != nil {
+			transaction.acknowledge(identity, err)
+		}
 		editCall.continueAfterACK(c, data, identity, err)
+		if transaction := transactions[label]; transaction != nil {
+			transaction.wait(editCall.phaseContext, editCall.ctx)
+		}
 		record.Samples[label] = sample
 		results[label] = pairedCallResult{data: data, err: err, sample: sample, identity: identity, pending: editCall.pending}
 		if editCall.runtime == nil { // editProbe.perform already owns its attempt append.
@@ -317,6 +334,9 @@ func (c *pairedCoordinator) callAcrossWithEnds(ctx context.Context, r request, r
 	c.mu.Lock()
 	c.records = append(c.records, record)
 	c.mu.Unlock()
+	if transactionMode {
+		c.recordOwnACKTransactions(record, transactions)
+	}
 	return results
 }
 

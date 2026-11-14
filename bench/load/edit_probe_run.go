@@ -167,6 +167,7 @@ func sharedEditProbePhysicalScope(p *privateRun, plan editProbePlan, editors []*
 }
 
 type editProbeState struct {
+	pairedTransaction                                 *pairedOwnACKTransaction
 	mu                                                sync.Mutex
 	step                                              editProbeStep
 	record                                            editProbeRecord
@@ -638,6 +639,9 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 			}
 			c.state.mu.Unlock()
 		}
+	}
+	if transaction := c.state.pairedTransaction; transaction != nil && (c.purpose == "readback:file" || c.purpose == "readback:source") {
+		onWriteStart = func(at time.Time) { transaction.observeReadWrite(strings.TrimPrefix(c.purpose, "readback:"), at) }
 	}
 	data, identity, err := c.client.callWithWriteObserver(ctx, method, params, onWriteStart)
 	c.last = identity
@@ -1147,6 +1151,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if readbacksCorrect {
 		s.record.Readback = measured(float64(readbackEnd.Sub(started))/float64(time.Millisecond), "ms")
 	}
+	if s.pairedTransaction != nil {
+		s.pairedTransaction.finish(ctx, callCtx, readbackEnd, readbacksCorrect && len(s.record.Errors) == 0)
+	}
 	if r.plan.SearchReadbackAcceptance {
 		// This named profile certifies ACK plus its four immediate searches,
 		// never canonical publication, relation readiness or A/P/B accounting.
@@ -1360,6 +1367,9 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			}
 		}
 		back.ObservationOnly = observeOnly[kind]
+		if s.pairedTransaction != nil {
+			s.pairedTransaction.observeRead(req, begin, identity, back, readErr, callCtx.Err())
+		}
 		s.mu.Lock()
 		if r.plan.GateModes && index == 0 {
 			metric := unavailable("ms", "first same-editor symbol-source readback endpoint missing or incorrect")

@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	PairedOwnACKTransactions bool
 	RetainReadSourceFailures bool
 	NightlySeed              string
 	EditACKMode              string
@@ -351,6 +352,9 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	report.NightlySeed = o.NightlySeed
+	if o.PairedOwnACKTransactions {
+		report.Workload.PairedMeasurementUnit = pairedOwnACKTransactionMethod
+	}
 	report.Workload.EditGateSeed = o.EditGateSeed
 	report.Workload.EditACKMode = o.editACKPolicy()
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees

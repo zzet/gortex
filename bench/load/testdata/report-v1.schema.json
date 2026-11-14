@@ -5865,6 +5865,9 @@
             "null"
           ]
         },
+        "paired_measurement_unit": {
+          "type": "string"
+        },
         "pr_smoke_drain": {
           "anyOf": [
             {
