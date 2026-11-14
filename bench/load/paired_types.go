@@ -9,17 +9,19 @@ import (
 // Paired runs compare matched request latency under a shared, coupled workload.
 // They do not establish independent throughput or saturation capacity.
 type pairedReport struct {
-	SchemaVersion int                               `json:"paired_schema_version"`
-	Kind          string                            `json:"kind"`
-	RunID         string                            `json:"run_id"`
-	Window        measurementWindow                 `json:"group_window"`
-	BuildOrder    []string                          `json:"build_order"`
-	Builds        map[string]Report                 `json:"builds"`
-	Records       []pairedRecord                    `json:"requests"`
-	Ratios        map[string]map[string]pairedRatio `json:"matched_latency_ratios"`
-	Metrics       map[string]Metric                 `json:"group_metrics"`
-	Errors        []string                          `json:"errors"`
-	Complete      bool                              `json:"complete"`
+	MeasurementUnit    string                              `json:"measurement_unit,omitempty"`
+	TransactionTimings map[string]pairedTransactionSummary `json:"own_ack_transactions,omitempty"`
+	SchemaVersion      int                                 `json:"paired_schema_version"`
+	Kind               string                              `json:"kind"`
+	RunID              string                              `json:"run_id"`
+	Window             measurementWindow                   `json:"group_window"`
+	BuildOrder         []string                            `json:"build_order"`
+	Builds             map[string]Report                   `json:"builds"`
+	Records            []pairedRecord                      `json:"requests"`
+	Ratios             map[string]map[string]pairedRatio   `json:"matched_latency_ratios"`
+	Metrics            map[string]Metric                   `json:"group_metrics"`
+	Errors             []string                            `json:"errors"`
+	Complete           bool                                `json:"complete"`
 }
 
 type measurementWindow struct {
@@ -49,16 +51,17 @@ type pairedRecord struct {
 }
 
 type pairedSample struct {
-	Repo            string    `json:"repo"`
-	Commit          string    `json:"commit"`
-	RequestHash     string    `json:"request_sha256"`
-	Started         time.Time `json:"started"`
-	Ended           time.Time `json:"ended"`
-	Latency         Metric    `json:"logical_latency_ms"`
-	Outcome         string    `json:"outcome"`
-	ExpectedOutcome string    `json:"expected_outcome,omitempty"`
-	Code            int       `json:"code"`
-	Error           string    `json:"error"`
+	Transaction     *pairedOwnACKTiming `json:"own_ack_transaction,omitempty"`
+	Repo            string              `json:"repo"`
+	Commit          string              `json:"commit"`
+	RequestHash     string              `json:"request_sha256"`
+	Started         time.Time           `json:"started"`
+	Ended           time.Time           `json:"ended"`
+	Latency         Metric              `json:"logical_latency_ms"`
+	Outcome         string              `json:"outcome"`
+	ExpectedOutcome string              `json:"expected_outcome,omitempty"`
+	Code            int                 `json:"code"`
+	Error           string              `json:"error"`
 }
 
 type pairedRatio struct {

@@ -5878,6 +5878,9 @@
                   "null"
                 ]
               },
+              "paired_measurement_unit": {
+                "type": "string"
+              },
               "pr_smoke_drain": {
                 "anyOf": [
                   {
@@ -6118,6 +6121,162 @@
         "null"
       ]
     },
+    "measurement_unit": {
+      "type": "string"
+    },
+    "own_ack_transactions": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "outcomes": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "transactions": {
+            "type": "integer"
+          },
+          "whole_transaction_latency_ms": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "max": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              "p50": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              "p95": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              "p99": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit",
+                  "reason"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "count",
+              "p50",
+              "p95",
+              "p99",
+              "max"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "transactions",
+          "outcomes",
+          "whole_transaction_latency_ms"
+        ],
+        "type": "object"
+      },
+      "type": [
+        "object",
+        "null"
+      ]
+    },
     "paired_schema_version": {
       "type": "integer"
     },
@@ -6183,6 +6342,219 @@
                 },
                 "outcome": {
                   "type": "string"
+                },
+                "own_ack_transaction": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "ack_final_attempt_started": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "ack_logical_call_started": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "ack_logical_latency_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "reason": {
+                              "type": "string"
+                            },
+                            "unit": {
+                              "type": "string"
+                            },
+                            "value": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value",
+                            "unit",
+                            "reason"
+                          ],
+                          "type": "object"
+                        },
+                        "ack_rpc_finished": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "edit_started": {
+                          "format": "date-time",
+                          "type": "string"
+                        },
+                        "own_ack_to_file_dispatch_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "reason": {
+                              "type": "string"
+                            },
+                            "unit": {
+                              "type": "string"
+                            },
+                            "value": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value",
+                            "unit",
+                            "reason"
+                          ],
+                          "type": "object"
+                        },
+                        "reads": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "code": {
+                                "type": "integer"
+                              },
+                              "ended": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "error": {
+                                "type": "string"
+                              },
+                              "final_attempt_latency_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "final_attempt_started": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "final_wire_write_started": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "first_wire_write_started": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "kind": {
+                                "type": "string"
+                              },
+                              "logical_rpc_latency_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "outcome": {
+                                "type": "string"
+                              },
+                              "request_sha256": {
+                                "type": "string"
+                              },
+                              "started": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "wire_attempts": {
+                                "type": "integer"
+                              },
+                              "wire_id": {
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "request_sha256",
+                              "started",
+                              "final_wire_write_started",
+                              "first_wire_write_started",
+                              "final_attempt_started",
+                              "final_attempt_latency_ms",
+                              "wire_attempts",
+                              "ended",
+                              "wire_id",
+                              "logical_rpc_latency_ms",
+                              "outcome"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "edit_started",
+                        "ack_logical_call_started",
+                        "ack_final_attempt_started",
+                        "ack_rpc_finished",
+                        "ack_logical_latency_ms",
+                        "own_ack_to_file_dispatch_ms",
+                        "reads"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "repo": {
                   "type": "string"

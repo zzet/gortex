@@ -67,6 +67,9 @@ func (call pairedEditProbeCall) continueAfterACK(c *pairedCoordinator, data json
 		return
 	}
 	c.editContinuations.Go(func() {
+		if call.state.pairedTransaction != nil {
+			defer call.state.pairedTransaction.finish(call.phaseContext, call.ctx, time.Time{}, false)
+		}
 		defer call.state.stopProbes()
 		defer call.cancel()
 		call.runtime.finishEditAfterACK(call.phaseContext, call.ctx, call.state, call.state.step, call.started, data, identity, err)
@@ -87,6 +90,9 @@ func (c *pairedCoordinator) preparePairedEditProbe() error {
 	if base.plan.Sender != "" {
 		return errors.New("paired edit-and-probe pairs plain MCP edit cells; native, hot-file and restart cells run unpaired")
 	}
+	if c.options.PairedOwnACKTransactions && (base.plan.Kind != "add_intrafile_call" || base.plan.Tool != "edit.file" || base.plan.GateModes || base.plan.SearchReadbackAcceptance || len(base.plan.Routes) != 0) {
+		return errors.New("paired own-ACK transactions require the existing plain edit.file/add-intrafile-call plan")
+	}
 	for i, state := range c.states {
 		r := state.phase.editProbeRuntime
 		if r == nil || !reflect.DeepEqual(r.plan, base.plan) || r.options.Deadline != c.options.Deadline || r.requireAccounting != (i != 0) {
@@ -101,9 +107,13 @@ func (c *pairedCoordinator) preparePairedEditProbe() error {
 		if err != nil {
 			return err
 		}
+		readbackMethod := "immediate own-ACK readbacks and receipt/status controls are unpaired and excluded from matched latency ratios"
+		if c.options.PairedOwnACKTransactions {
+			readbackMethod = "matched edit-own-ACK-file-source transactions rotate at transaction boundaries; receipt/status controls remain unpaired; independent editor streams remain concurrent"
+		}
 		state.phase.EditProbe.Limitations = append(state.phase.EditProbe.Limitations,
 			"paired first-correct times are coupled probe observations, not independent 25ms freshness acceptance",
-			"immediate own-ACK readbacks and receipt/status controls are unpaired and excluded from matched latency ratios",
+			readbackMethod,
 			"absent baseline phases remain unavailable; candidate accounting stays required")
 	}
 	return nil

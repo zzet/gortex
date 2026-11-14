@@ -276,7 +276,8 @@ drop another editor's marker until the next write restored it; it is refused
 with more than one editor. An out-of-order `edit.batch` fails its `old_string`
 precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
-the paired no-regression cell stay one editor.
+the default paired no-regression cell stay one editor. The explicit paired
+own-ACK transaction method below admits four or eight editor streams.
 
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest
@@ -751,6 +752,26 @@ that edit's paired probes and is a failed/censored observation, never a product
 deadline or a successful pair. This initial cell does not establish reference
 capacity, the larger tool/language/native matrix, or a no-regression verdict
 without the actual qualified paired run.
+
+For the approved four/eight-editor own-ACK comparison, opt in with
+`--paired-own-ack-transactions --edit-agents 4` (or `8`) on that same two-build
+`edit-and-probe` command. It requires the plain `edit.file` / `add_intrafile_call`
+plan, zero readers, and the existing file-then-source readbacks. The first build
+finishes edit → its own ACK → immediate file read → source read before the
+partner receives that logical edit. Build order rotates at this whole
+transaction boundary. Other editor streams and the existing seven oracle
+probes remain concurrent; receipt/status controls remain build-local.
+
+The report and workload identify `edit_own_ack_file_source_v1`. Original ACK
+records remain separate. Transaction records retain ACK and individual RPC
+timestamps/latencies, own-ACK-to-file dispatch delay, and whole-transaction
+latency. Additional file/source pairs use their transaction's identity and build
+order. Logical ACK/read latencies include supported retries and backoff; final
+attempt timings remain separate. The dispatch gap uses the first actual file
+wire write, including when that attempt is busy. Every error, refusal, deadline and phase censor remains visible with
+explicit matched exclusions. A transaction population containing failed or
+censored entries has no success-only aggregate p95. This opt-in changes neither
+deadlines nor correctness, retries, no-regression limits or capacity claims.
 
 `delta` rejects incompatible workload/corpus/target/host-limit identities rather
 than printing an unqualified verdict. It lists every comparable timing metric

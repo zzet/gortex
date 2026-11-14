@@ -63,26 +63,27 @@ type request struct {
 // Workload is the complete normalized offered load. Binary paths, private
 // clone paths and revisions belong to the run identity, never the plan hash.
 type Workload struct {
-	EditACKMode      string         `json:"edit_ack_mode,omitempty"`
-	EditGateSeed     string         `json:"edit_gate_seed,omitempty"`
-	PRSmokeDrain     *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
-	Scenario         string         `json:"scenario"`
-	Agents           int            `json:"agents"`
-	EditAgents       int            `json:"edit_agents"`
-	LinkedWorktrees  int            `json:"linked_worktrees"`
-	DurationSec      float64        `json:"duration_seconds"`
-	DeadlineSec      float64        `json:"product_deadline_seconds"`
-	Seed             int64          `json:"seed"`
-	Profile          string         `json:"profile"`
-	Operations       []request      `json:"operations"`
-	CPUProfileSec    float64        `json:"cpu_profile_seconds"`
-	WarmTimeoutSec   float64        `json:"warm_timeout_seconds"`
-	StopTimeoutSec   float64        `json:"stop_timeout_seconds"`
-	KeepState        bool           `json:"keep_state"`
-	SessionModel     string         `json:"session_model"`
-	SweepRepetitions int            `json:"sweep_repetitions"`
-	SweepBudgetSec   float64        `json:"sweep_budget_seconds"`
-	EditProbe        *editProbePlan `json:"edit_probe,omitempty"`
+	PairedMeasurementUnit string         `json:"paired_measurement_unit,omitempty"`
+	EditACKMode           string         `json:"edit_ack_mode,omitempty"`
+	EditGateSeed          string         `json:"edit_gate_seed,omitempty"`
+	PRSmokeDrain          *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
+	Scenario              string         `json:"scenario"`
+	Agents                int            `json:"agents"`
+	EditAgents            int            `json:"edit_agents"`
+	LinkedWorktrees       int            `json:"linked_worktrees"`
+	DurationSec           float64        `json:"duration_seconds"`
+	DeadlineSec           float64        `json:"product_deadline_seconds"`
+	Seed                  int64          `json:"seed"`
+	Profile               string         `json:"profile"`
+	Operations            []request      `json:"operations"`
+	CPUProfileSec         float64        `json:"cpu_profile_seconds"`
+	WarmTimeoutSec        float64        `json:"warm_timeout_seconds"`
+	StopTimeoutSec        float64        `json:"stop_timeout_seconds"`
+	KeepState             bool           `json:"keep_state"`
+	SessionModel          string         `json:"session_model"`
+	SweepRepetitions      int            `json:"sweep_repetitions"`
+	SweepBudgetSec        float64        `json:"sweep_budget_seconds"`
+	EditProbe             *editProbePlan `json:"edit_probe,omitempty"`
 }
 
 func (r request) name() string {
