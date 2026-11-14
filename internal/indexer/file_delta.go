@@ -94,7 +94,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	return idx.prepareFileDeltaWithAdmissionObserved(filePath, tryOnly, nil)
 }
 
-func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation) (fileDeltaProbe, bool, bool) {
+func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation, reads ...*relationsReadFrontier) (fileDeltaProbe, bool, bool) {
 	var probe fileDeltaProbe
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -133,7 +133,7 @@ func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOn
 	relPath := idx.relKey(absPath)
 
 	started := time.Now()
-	src, readVersion, err := idx.readFileWithVersion(absPath)
+	src, readVersion, err := idx.readFileWithVersion(absPath, reads...)
 	probe.read = time.Since(started)
 	if err != nil {
 		probe.readErr = contractContentFailure(err)
@@ -271,7 +271,7 @@ func (idx *Indexer) takePreparedSnapshot(filePath string) (*preparedExtraction, 
 	return prepared, prepared != nil
 }
 
-func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, bool) {
+func (idx *Indexer) takePreparedRefresh(filePath string, reads ...*relationsReadFrontier) (*preparedExtraction, bool) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return nil, false
@@ -280,7 +280,7 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	if !ok {
 		return nil, false
 	}
-	current, readVersion, err := idx.readFileWithVersion(absPath)
+	current, readVersion, err := idx.readFileWithVersion(absPath, reads...)
 	if err != nil {
 		prepared.release()
 		return nil, false

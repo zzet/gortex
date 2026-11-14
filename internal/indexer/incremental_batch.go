@@ -345,7 +345,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if markerBatch != nil {
 			repair = markerBatch.readRepair
 		}
-		probe, probeOK, admissionBusy := idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair)
+		probe, probeOK, admissionBusy := idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair, markerBatch.relationsReadFrontier())
 		if admissionBusy {
 			break
 		}
@@ -413,7 +413,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if acceptPreparedSnapshot {
 			prepared, ok = idx.takePreparedSnapshot(filePath)
 		} else {
-			prepared, ok = idx.takePreparedRefresh(filePath)
+			prepared, ok = idx.takePreparedRefresh(filePath, markerBatch.relationsReadFrontier())
 		}
 		if !ok || prepared == nil || prepared.result == nil {
 			prepared.release()
@@ -562,6 +562,9 @@ func (idx *Indexer) reindexIncrementalFallback(
 	// on. The combined fallback has no proof for restating the old graph's
 	// inert rows, including when applying its new read fails.
 	delete(idx.inertReparsed, fallback.graphPath)
+	// Exceptional fallback has no read-bound point coverage; keep the original
+	// ticket cap rather than borrowing a previous prepared receipt.
+	markerBatch.relationsReadFrontier().invalidate(fallback.filePath)
 	resolve := markerBatch == nil || !markerBatch.deferResolverCatchup
 	if err := idx.indexFile(fallback.filePath, resolve, markerBatch); err != nil {
 		return err
@@ -1888,6 +1891,7 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 			continue
 		}
 		keep(receipt)
+		receipt.readVersion.relationsRead.accept(receipt.absPath, receipt.readVersion)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale
