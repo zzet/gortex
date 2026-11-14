@@ -109,10 +109,18 @@ func TestRegisteredReadFileDoesNotLoadUnusedSymbolAdjacency(t *testing.T) {
 				if facade {
 					require.NotNil(t, ownedLog, "the real facade request must exercise its owned query log")
 				}
+				if ownedLog != nil {
+					written, writeErr := ownedLog.Write(nil)
+					require.Zero(t, written)
+					require.NoError(t, writeErr, "the owned handle is live before cleanup")
+				}
 				s.queryLog.Close()
 				if ownedLog != nil {
-					_, statErr := ownedLog.Stat()
-					require.ErrorIs(t, statErr, os.ErrClosed, "close the owned handle before TempDir cleanup on every OS")
+					// Write uses Go's common closed-file normalization; Windows
+					// Stat instead exposes the platform's invalid-handle error.
+					written, writeErr := ownedLog.Write(nil)
+					require.Zero(t, written)
+					require.ErrorIs(t, writeErr, os.ErrClosed, "close the owned handle before TempDir cleanup on every OS")
 				}
 			})
 			s.frecency = &frecencyTracker{mode: ModeAI, now: func() int64 { return 1000 }}
