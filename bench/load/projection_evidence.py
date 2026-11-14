@@ -13,6 +13,10 @@ import re
 
 CATALOG_SHA256 = "e5d0770505cfe1c82a6a93d3cbbe3292cfdb72be19f8086c10bc06e06c1bdc41"
 BASELINE_TAG_REVISION = "defa9f8e7a670792b5b693744d88488f741a8160"
+V06410_BINARY_SHA256 = "51e84c3e133d530f21661623ec86633b741a3c75507ec3304b1f14a8a6d5c6be"
+V06410_ARCHIVE_SHA256 = "d36835c90ccdfcb6546757602bd82b520ce8d98593eda460faebdbe660d301a2"
+V06410_ARTIFACT_AUTHORITY_SHA256 = "7db2df96bf5144ed940c9797136c16003b1dd12e152e8f1899ddcf0ab969b408"
+V06410_POLICY_EVIDENCE = "legacy_default_unavailable: original v0.64.10 ACK has no ack_mode/content_sha256; emitted Git-blob new_sha verified"
 
 
 class Unbound(ValueError):
@@ -183,6 +187,7 @@ def validate_pair(packet, catalog, *, cohort=False):
         validate_catalog_policy(report, catalog)
         latest = validate_report(report, binding[role], selected)
         if cohort:
+            validate_legacy_tag_ack_contract(report, binding[role], role, selected)
             before, after, peak = validate_cohort_bookends(report, binding[role], latest)
         else:
             before, after, peak = validate_bookends(report, latest)
@@ -208,6 +213,25 @@ def validate_pair(packet, catalog, *, cohort=False):
     except Unbound as error:
         divergence = "UNBOUND_OR_FAILED: " + str(error)
     return {"daemon_lifetime_rss_bound": memory, "candidate_lifetime_rss_peak_bytes": peaks[0], "tag_lifetime_rss_peak_bytes": peaks[1], "difference_bytes": peaks[0] - peaks[1], "projection_divergence": divergence, "total_owned_process_cohort_footprint": "UNBOUND: daemon-PID VmHWM excludes children; no driver/proxy/cgroup or sampled substitution", "attribution": "Lifetime peak includes startup/warmup; paired difference is not workload-only attribution", "nightly_matrix_acceptance": "UNBOUND: one paired cell is not every required nightly run"}
+
+
+def validate_legacy_tag_ack_contract(report, bound, role, selected):
+    metadata = report.get("readiness", {}).get("legacy_tag_ack_contract")
+    legacy_rows = any(isinstance(row.get("ack_mode_evidence"), str) and row["ack_mode_evidence"].startswith("legacy_default_unavailable") for row in report["records"])
+    if metadata is None:
+        need(not legacy_rows, "original legacy policy lacks its version/artifact declaration")
+        return
+    expected = {"version": 1, "source_revision": BASELINE_TAG_REVISION,
+                "source_tree": "655071eb061f2647bd819ef30e0f42116f1dfcbf",
+                "artifact_sha256": V06410_BINARY_SHA256, "archive_sha256": V06410_ARCHIVE_SHA256,
+                "artifact_authority_sha256": V06410_ARTIFACT_AUTHORITY_SHA256,
+                "asset_id": 669760344, "cell_index": 72, "kind": "add_crossfile_call", "policy": "legacy_default_unavailable"}
+    need(role == "tag" and isinstance(metadata, dict) and type(metadata.get("version")) is int and metadata == expected and bound["revision"] == BASELINE_TAG_REVISION
+         and bound["binary_sha256"] == V06410_BINARY_SHA256, "legacy baseline declaration/source/artifact mismatch")
+    need(selected["index"] == 72 and report["cell"].get("ack_mode") == "" and report["cell"].get("kind") == "add_crossfile_call"
+         and report["cell"].get("tool") == "edit.file", "legacy baseline is not the original default cell72")
+    need(all(row.get("observed_ack_mode", "") == "" and row.get("ack_mode_evidence") == V06410_POLICY_EVIDENCE
+             for row in report["records"]), "legacy unavailable policy was replaced/unknown")
 
 
 def cohort_uint(value, reason):
@@ -382,7 +406,13 @@ def load_bound_report(bound, *, cohort=False):
         # Always take ownership from the actual existing outer result, never a
         # caller-supplied replacement embedded in the input binding.
         bound["owned_cohort_outer"] = outer
-    return json.loads(raw)
+    report = json.loads(raw)
+    if cohort:
+        legacy_flag = "-readback-reference-v06410-original-ack"
+        legacy_flags = [x for x in outer.get("argv", []) if x.startswith(legacy_flag)]
+        declared = report.get("readiness", {}).get("legacy_tag_ack_contract") is not None
+        need((not legacy_flags and not declared) or (declared and len(legacy_flags) == 1 and legacy_flags[0] in (legacy_flag, legacy_flag+"=true")), "legacy original ACK declaration/actual opt-in argv mismatch")
+    return report
 
 
 def main():
