@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
@@ -569,7 +570,7 @@ func (s *Server) guardBatchLifecycleDestination(ctx context.Context, absPath str
 			return nil
 		case statErr != nil:
 			return fmt.Errorf("could not inspect move destination %s: %w", current, statErr)
-		case info.Mode()&os.ModeSymlink != 0:
+		case pathguard.IsLink(current, info):
 			return fmt.Errorf("move destination contains symlink component %s", current)
 		}
 	}
