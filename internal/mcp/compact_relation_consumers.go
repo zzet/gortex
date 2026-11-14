@@ -8,8 +8,8 @@ import (
 	"github.com/zzet/gortex/internal/analysis"
 )
 
-// These compact records use tabs between fields and Go-quoted strings. A
-// source line or path containing tabs/newlines cannot inject another record.
+// New compact records use tabs between fields and Go-quoted strings. The
+// established return_usage line keeps its existing space-separated contract.
 // Census headers describe emitted semantic rows, not graph freshness. Only an
 // actual lagging scope gets the existing tier prefix and bounded path witness.
 func compactConsumerPendingFiles(b *strings.Builder, label relationFreshness) {
@@ -33,14 +33,17 @@ func compactVerifyConsumer(result *analysis.VerifyResult, label relationFreshnes
 	// Keep the existing return-usage information, including its full label
 	// distribution, without making it a source of caller/violation counts.
 	for _, row := range result.ReturnUsage {
-		fmt.Fprintf(&b, "return_usage\t%q\t%d\t%d", row.SymbolID, row.CallSites, row.Unclassified)
+		fmt.Fprintf(&b, "return_usage %s call_sites:%d", row.SymbolID, row.CallSites)
 		keys := make([]string, 0, len(row.Counts))
 		for key := range row.Counts {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			fmt.Fprintf(&b, "\t%q\t%d", key, row.Counts[key])
+			fmt.Fprintf(&b, " %s:%d", key, row.Counts[key])
+		}
+		if row.Unclassified > 0 {
+			fmt.Fprintf(&b, " unclassified:%d", row.Unclassified)
 		}
 		b.WriteByte('\n')
 	}

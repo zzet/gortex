@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -138,6 +139,9 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 			}
 			if got := runtime.consumerVerdict(oracle.name, body, corpus, step); got != want {
 				t.Fatalf("actual compact semantic evidence: got %q want %q body=%v", got, want, body)
+			}
+			if oracle.name == "consumer_verify" && (rich["return_usage"] == nil || !reflect.DeepEqual(body["return_usage"], rich["return_usage"])) {
+				t.Fatalf("compact lost actual JSON return-usage distribution: compact=%v JSON=%v", body["return_usage"], rich["return_usage"])
 			}
 		})
 	}

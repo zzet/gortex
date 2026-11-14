@@ -140,23 +140,20 @@ func decodeEditCompactConsumer(raw json.RawMessage, operation string) (map[strin
 			appendRow("violations", map[string]any{"kind": str(fields[1]), "symbol_id": str(fields[2]), "name": str(fields[3]), "file_path": str(fields[4]), "line": num(fields[5]), "description": str(fields[6])})
 		case operation == "change.verify" && tag == "error" && len(fields) == 2:
 			appendRow("errors", str(fields[1]))
-		case operation == "change.verify" && tag == "return_usage" && len(fields) >= 4 && len(fields)%2 == 0:
-			id := str(fields[1])
-			num(fields[2])
-			num(fields[3])
+		case operation == "change.verify" && strings.HasPrefix(line, "return_usage "):
+			row, err := editCompactLegacyReturnUsage(line)
+			if err != nil {
+				return nil, err
+			}
+			id := row["symbol_id"].(string)
 			if seen["return_usage:"+id] {
 				return nil, errors.New("duplicate return-usage subject")
 			}
 			seen["return_usage:"+id] = true
-			labels := make(map[string]bool)
-			for i := 4; i < len(fields); i += 2 {
-				label := str(fields[i])
-				num(fields[i+1])
-				if labels[label] {
-					return nil, errors.New("duplicate return-usage label")
-				}
-				labels[label] = true
+			if _, exists := body["return_usage"]; !exists {
+				body["return_usage"] = []any{}
 			}
+			appendRow("return_usage", row)
 		case operation == "analyze.dead_code" && (tag == "dead" || tag == "pending_unknown") && len(fields) == 6:
 			key := "dead_code"
 			if tag == "pending_unknown" {
@@ -256,4 +253,66 @@ func decodeEditCompactConsumer(raw json.RawMessage, operation string) (map[strin
 	}
 	body[editCompactConsumerWireKey] = editCompactConsumerWire{operation: operation}
 	return body, nil
+}
+
+// The legacy producer writes one distribution per changed function. Its
+// classified counts plus the optional final unclassified count must account
+// for every call site. This census is independent of CheckedCallers (which
+// also includes the verifier's traversal); it never supplies that field.
+func editCompactLegacyReturnUsage(line string) (map[string]any, error) {
+	if !strings.HasPrefix(line, "return_usage ") || strings.ContainsAny(line, "\t\r\n") || strings.Count(line, " call_sites:") != 1 {
+		return nil, errors.New("malformed legacy return-usage line")
+	}
+	id, tail, _ := strings.Cut(strings.TrimPrefix(line, "return_usage "), " call_sites:")
+	if id == "" || id != strings.TrimSpace(id) {
+		return nil, errors.New("missing legacy return-usage subject")
+	}
+	fields := strings.Split(tail, " ")
+	parse := func(raw string) (uint64, error) {
+		n, err := strconv.ParseUint(raw, 10, 63)
+		if err != nil || raw == "" || len(raw) > 1 && raw[0] == '0' || strings.HasPrefix(raw, "+") {
+			return 0, errors.New("invalid legacy return-usage count")
+		}
+		return n, nil
+	}
+	total, err := parse(fields[0])
+	if err != nil || total == 0 {
+		return nil, errors.New("invalid legacy call-site census")
+	}
+	row := map[string]any{"symbol_id": id, "call_sites": json.Number(fields[0])}
+	counts := make(map[string]any)
+	seen := make(map[string]bool)
+	sum := uint64(0)
+	for i, field := range fields[1:] {
+		label, raw, ok := strings.Cut(field, ":")
+		if !ok || label == "" || label == "call_sites" || seen[label] {
+			return nil, errors.New("invalid or duplicate legacy return-usage category")
+		}
+		for _, c := range label {
+			if c != '_' && (c < 'a' || c > 'z') {
+				return nil, errors.New("invalid legacy return-usage category")
+			}
+		}
+		seen[label] = true
+		n, err := parse(raw)
+		if err != nil || n > total-sum {
+			return nil, errors.New("legacy return-usage exceeds its call-site census")
+		}
+		sum += n
+		if label == "unclassified" {
+			if i != len(fields)-2 {
+				return nil, errors.New("legacy unclassified count must be last")
+			}
+			row["unclassified"] = json.Number(raw)
+		} else {
+			counts[label] = json.Number(raw)
+		}
+	}
+	if sum != total {
+		return nil, errors.New("legacy return-usage call-site census is incomplete")
+	}
+	if len(counts) > 0 {
+		row["counts"] = counts
+	}
+	return row, nil
 }

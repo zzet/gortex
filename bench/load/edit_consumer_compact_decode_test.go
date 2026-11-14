@@ -86,6 +86,57 @@ func TestEditConsumerCompactProofMatchesOperation(t *testing.T) {
 	}
 }
 
+func TestEditConsumerCompactLegacyReturnUsage(t *testing.T) {
+	// This is the established compact line asserted by the actual MCP
+	// TestVerifyChange_ReturnUsageCompactLine compatibility regression.
+	const header = "verify_v1\ttrue\t4\t0\t0\t0\n"
+	const legacy = "return_usage pkg/fetch.go::Fetch call_sites:4 assigned:1 discarded:1 returned:1 unclassified:1\n"
+	for name, tc := range map[string]struct {
+		text  string
+		valid bool
+	}{
+		"established_line":                   {legacy, true},
+		"zero_unclassified_omitted":          {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:2 discarded:1 returned:1\n", true},
+		"all_unclassified":                   {"return_usage pkg/fetch.go::Fetch call_sites:4 unclassified:4\n", true},
+		"spaced_symbol_path":                 {"return_usage pkg/cache path/fetch.go::Fetch call_sites:4 assigned:4\n", true},
+		"independent_checked_callers_census": {"return_usage pkg/fetch.go::Fetch call_sites:1 assigned:1\n", true},
+		"missing_distribution":               {"return_usage pkg/fetch.go::Fetch call_sites:4\n", false},
+		"missing_mass":                       {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:3\n", false},
+		"excess_mass":                        {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:5\n", false},
+		"duplicate_category":                 {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:1 assigned:3\n", false},
+		"duplicate_subject":                  {legacy + "return_usage pkg/fetch.go::Fetch call_sites:1 assigned:1\n", false},
+		"duplicate_call_sites":               {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:1 call_sites:3 returned:3\n", false},
+		"unclassified_not_last":              {"return_usage pkg/fetch.go::Fetch call_sites:4 unclassified:1 assigned:3\n", false},
+		"negative_count":                     {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:-1 unclassified:5\n", false},
+		"decimal_count":                      {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:4.0\n", false},
+		"noncanonical_integer":               {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:04\n", false},
+		"overflow_count":                     {"return_usage pkg/fetch.go::Fetch call_sites:4 assigned:18446744073709551616\n", false},
+		"missing_subject":                    {"return_usage  call_sites:4 assigned:4\n", false},
+		"unknown_text":                       {"return_usage pkg/fetch.go::Fetch call_sites:4 prose\n", false},
+		"replaced_tab_syntax_refused":        {"return_usage\t\"pkg/fetch.go::Fetch\"\t4\t1\t\"assigned\"\t1\t\"discarded\"\t1\t\"returned\"\t1\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := decodeEditProbeOutput(outputWire(header+tc.text, nil), "compact", "change.verify")
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v body=%v", tc.valid, err, body)
+			}
+			if tc.valid {
+				rows, ok := editConsumerRows(body, "return_usage")
+				if !ok || len(rows) != 1 {
+					t.Fatal("actual return-usage row was discarded")
+				}
+				if name == "established_line" {
+					row := rows[0].(map[string]any)
+					counts := row["counts"].(map[string]any)
+					if row["symbol_id"] != "pkg/fetch.go::Fetch" || row["call_sites"] != json.Number("4") || row["unclassified"] != json.Number("1") || counts["assigned"] != json.Number("1") || counts["discarded"] != json.Number("1") || counts["returned"] != json.Number("1") {
+						t.Fatalf("distribution changed: %v", row)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestEditConsumerCompactLiteralTextAndStatus(t *testing.T) {
 	// A quoted source string is data, even when it mentions the exact text
 	// that the byte-budget renderer uses as a separate truncation record.
