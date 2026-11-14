@@ -537,7 +537,7 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	// Wait briefly for the edits these symbols' relations depend on, then
 	// answer; whatever is still lagging is labelled, not refused.
 	freshness := takeRequestFreshness(&req)
-	label := s.awaitRelationFreshness(ctx, ids, nil, relationWaitDeadline(ctx, freshness))
+	label := s.awaitImpactRelationFreshness(ctx, ids, freshness)
 	if freshness.requireFresh && label.state != "" {
 		return label.requireFreshError(), nil
 	}

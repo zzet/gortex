@@ -98,8 +98,9 @@ presence of one:
   After a write, the affected file is re-indexed to keep the graph fresh.
 - File-path resolution is **confined to indexed repository roots.** A path —
   relative or absolute — is resolved against the roots of the tracked
-  repositories, and access outside every indexed root is refused. Symlinks are
-  resolved before the check so a link cannot be used to escape a root.
+  repositories, and access outside every indexed root is refused. Symlinks and
+  Windows directory junctions are resolved before the check so a link cannot
+  be used to escape a root.
 - Gortex does not require, and does not request, access to files outside the
   repositories you index.
 - The confinement boundary is the **union of every tracked repository root**,

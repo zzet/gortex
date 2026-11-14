@@ -162,10 +162,11 @@ func TestContractReplayProjectionBatchNeverNarrowsFullReadsOrUnlistedFiles(t *te
 func TestContractReplayProjectionBatchIsRejectedWhenClosingStampMoves(t *testing.T) {
 	f := newRouteConstantFixture(t)
 	batchReads := 0
+	revalidating := false
 	f.adjust = func(snapshot *ContractFollowupSnapshot) {
 		read := snapshot.ReadCoreFile
 		snapshot.ReadCoreFile = func(ctx context.Context, file ContractFollowupFile) (ContractFollowupCoreFile, error) {
-			if batch, _ := ctx.Value(contractReplayCoreBatchKey{}).(*contractReplayCoreBatch); batch != nil {
+			if batch, _ := ctx.Value(contractReplayCoreBatchKey{}).(*contractReplayCoreBatch); batch != nil && revalidating {
 				batchReads++
 			}
 			return read(ctx, file)
@@ -173,6 +174,7 @@ func TestContractReplayProjectionBatchIsRejectedWhenClosingStampMoves(t *testing
 	}
 	stage := 0
 	hooks := &contractConvergenceHooks{
+		beforeAsk: func() { revalidating = true },
 		afterExtract: func(path string) {
 			if stage == 0 && path == "fixture/routes.go" {
 				stage = 1

@@ -24,6 +24,7 @@ const editProbeMaxEditors = 32
 const editProbeFixedEditorModel = "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 
 type editProbeStep struct {
+	ConsumerProbes     bool    `json:"consumer_probes,omitempty"`
 	ProbeMode          string  `json:"probe_mode,omitempty"`
 	ExpectedSearchLine int     `json:"expected_search_line,omitempty"`
 	Ordinal            int     `json:"ordinal"`
@@ -62,6 +63,7 @@ type editProbeRoute struct {
 }
 
 type editProbePlan struct {
+	ConsumerProbes           bool             `json:"consumer_probes,omitempty"`
 	GateModes                bool             `json:"gate_modes,omitempty"`
 	SearchReadbackAcceptance bool             `json:"search_readback_acceptance,omitempty"`
 	Version                  int              `json:"version"`
@@ -149,6 +151,11 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	}
 	if err != nil {
 		return p, err
+	}
+	if o.EditConsumerProbes {
+		if err := bindEditConsumerPlan(c, &p); err != nil {
+			return editProbePlan{}, err
+		}
 	}
 	if o.EditGateModes {
 		if p.Count != 100 || p.MeanNS != int64(editProbeMean) || p.Mode != "json" || p.Kind != "add_intrafile_call" || p.Tool != "edit.file" {

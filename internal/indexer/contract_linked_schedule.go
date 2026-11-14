@@ -218,6 +218,11 @@ func (c *ContractAnalysisCoordinator) linkJob(a *contractActor, job *contractAna
 		return
 	}
 	job.yield = c.linkedYield(a, job)
+	job.checkpointDemand = func() bool {
+		// The existing checkpoint question runs first. Keep its recorded
+		// demand decision even if a strict request arrives between samples.
+		return job.demandStop.Load() || (job.demandSeen.Load() && !c.strict(a))
+	}
 	if other := job.otherActorWaiting; other != nil {
 		job.otherActorWaiting = func() bool {
 			if other() {

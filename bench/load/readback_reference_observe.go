@@ -70,7 +70,13 @@ func observeReadbackReference(ctx context.Context, client readbackReferenceCalle
 	return observeReadbackReferenceSurface(ctx, client, repo, trial, role, deadline, false)
 }
 
+type readbackReferenceACKDecoder func(map[string]any, privateRepo, readbackReferenceTrial) (string, string, error)
+
 func observeReadbackReferenceSurface(ctx context.Context, client readbackReferenceCaller, repo privateRepo, trial readbackReferenceTrial, role string, deadline time.Duration, compatibility bool) readbackReferenceRecord {
+	return observeReadbackReferenceSurfaceWithACKDecoder(ctx, client, repo, trial, role, deadline, compatibility, nil)
+}
+
+func observeReadbackReferenceSurfaceWithACKDecoder(ctx context.Context, client readbackReferenceCaller, repo privateRepo, trial readbackReferenceTrial, role string, deadline time.Duration, compatibility bool, decoder readbackReferenceACKDecoder) readbackReferenceRecord {
 	out := readbackReferenceRecord{Ordinal: trial.Ordinal, Editor: trial.Editor, CWD: repo.Path, DueNS: trial.DueNS, Session: fmt.Sprintf("fixed-editor-%d", trial.Editor), Probes: map[string]readbackReferenceRPC{}, Errors: []string{}}
 	out.ToolSurface = readbackReferenceFacadeSurface
 	parameters := func(req request) (map[string]any, error) {
@@ -175,6 +181,12 @@ func observeReadbackReferenceSurface(ctx context.Context, client readbackReferen
 		body, isError, ok := readbackReferenceBody(out.ACK.Raw)
 		if !ok || isError || out.ACK.Error != "" || out.ACK.ID == 0 || out.ACK.Latency.Value == nil {
 			out.Errors = append(out.Errors, "mutation acknowledgement refused or unavailable")
+		} else if decoder != nil {
+			mode, evidence, decodeErr := decoder(body, repo, trial)
+			out.ObservedACKMode, out.ACKModeEvidence = mode, evidence
+			if decodeErr != nil {
+				out.Errors = append(out.Errors, decodeErr.Error())
+			}
 		} else {
 			mode, evidence, policyErr := readbackReferenceACKPolicy(body, trial)
 			out.ObservedACKMode, out.ACKModeEvidence = mode, evidence

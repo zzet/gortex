@@ -105,9 +105,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
 			legacy, _ := s.legacyToolName(&request)
-			// Auditing full-symbol replay does not add a data-free pending
-			// response to that tool's existing wire contract.
-			if callerOwnsProjectionFacts || legacy == "get_symbol" {
+			// Auditing a complete-response replay does not add a data-free
+			// pending response to symbol metadata or caller traversals.
+			if callerOwnsProjectionFacts || legacy == "get_symbol" || legacy == "get_callers" {
 				return nil, nil
 			}
 			pending, err := s.lateStormTransitionPending(selected, request, failure)
@@ -381,7 +381,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
 		projectionTool := req.Params.Name
-		if legacyName == "get_file_summary" {
+		if legacyName == "get_file_summary" || legacyName == "get_callers" && auditedProjectionRead {
 			// The normalized facade leaf and outer final validation must own
 			// the same attempt-local facts, not two unrelated context values.
 			projectionTool = legacyName

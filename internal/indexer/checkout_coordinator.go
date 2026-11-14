@@ -70,6 +70,10 @@ const (
 	// worktree's view can be.
 	defaultCheckoutPollInterval = 15 * time.Second
 
+	// maxCheckoutPollBackoff caps how far the poll backs off, for a missing
+	// root and for a run of failed cycles alike, unless PollInterval is longer.
+	maxCheckoutPollBackoff = 5 * time.Minute
+
 	// defaultRetainedCommitLayers bounds how many commit generations one
 	// coordinator keeps for re-routing. Each retained generation costs the
 	// storage of one branch's difference from the base; four covers the
@@ -270,6 +274,9 @@ type CheckoutCoordinatorConfig struct {
 	// Gate holds the loop's build cycles while the daemon warms up. nil admits
 	// every cycle at once, which is what a coordinator outside a warmup has.
 	Gate *ViewBuildGate
+	// ContractAnalysis is this lifecycle's installed contract producer. It
+	// admits owned semantic deferral only for live work in this checkout.
+	ContractAnalysis *ContractAnalysisCoordinator
 
 	// RequestBase asks the committed-base publisher for the primary's base.
 	//
@@ -470,17 +477,21 @@ type CheckoutCycle struct {
 // reconciliation reports an accessible automatic checkout, and closed when
 // that checkout leaves.
 type CheckoutCoordinator struct {
-	byteMu       sync.Mutex
-	byteAttempt  *byteMutationAttempt
-	byteDemand   int
-	byteAnchorMu sync.Mutex
-	byteAnchor   *checkoutByteAnchor
+	contractAnalysis atomic.Pointer[ContractAnalysisCoordinator]
+	byteMu           sync.Mutex
+	byteAttempt      *byteMutationAttempt
+	byteDemand       int
+	byteAnchorMu     sync.Mutex
+	byteAnchor       *checkoutByteAnchor
 
 	// racyHeal tracks the start-time index refresh (checkout_racy_index.go).
 	racyHeal racyHealState
 	// prewarmCommitGeneration is the commit generation whose stack was last
 	// pre-warmed (RewarmEditDeltaStacks warms it again when its key moved).
 	prewarmCommitGeneration atomic.Int64
+	// failedCycles counts consecutive cycles that ended in an error other
+	// than cancellation; the poll backs off while it is non-zero.
+	failedCycles atomic.Int64
 	// prewarmState is the last pre-warm decision (edit_delta_stack_prewarm.go).
 	prewarmState prewarmState
 
@@ -924,6 +935,7 @@ func NewCheckoutCoordinator(cfg CheckoutCoordinatorConfig) (*CheckoutCoordinator
 		prewarm:        cfg.PrewarmRoute,
 		dirtyBarrier:   cfg.dirtyBarrier,
 	}
+	c.contractAnalysis.Store(cfg.ContractAnalysis)
 	if !cfg.debounceDemand {
 		c.demand = make(chan struct{}, 1)
 	}
@@ -1206,14 +1218,14 @@ func (c *CheckoutCoordinator) run() {
 			// for explicit demand and leave clocks, routes and leases to the
 			// lifecycle, but do not fork git against a missing directory.
 			if _, err := os.Stat(c.root); errors.Is(err, os.ErrNotExist) {
-				limit := max(c.poll, 5*time.Minute)
+				limit := max(c.poll, maxCheckoutPollBackoff)
 				if pollDelay > limit/2 {
 					pollDelay = limit
 				} else {
 					pollDelay *= 2
 				}
 			} else {
-				pollDelay = c.poll
+				pollDelay = c.failedCyclePollDelay()
 				c.Signal("poll")
 			}
 			pollTimer.Reset(pollDelay)
@@ -1359,6 +1371,8 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		out.cycleStarted = cycleStarted
 		out = byteMutationCycleOutcome(ctx, out)
 		recordCoordinatorCycle(out)
+		c.resumeEnrichmentAfterCycle(ctx, out)
+		c.noteCycleFailure(out)
 		c.reportCheckoutCycle(ctx, through, out)
 		return
 	}
@@ -1589,11 +1603,8 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	if out.CompactionScheduled {
 		c.scheduleDirtyChainCompaction(out)
 	}
-	if out.DirtyBuilt && out.Err == nil {
-		// The edit published without its semantic enrichment: the
-		// follow-up owes it once the checkout is quiet.
-		c.scheduleEnrichmentFollowup()
-	}
+	c.resumeEnrichmentAfterCycle(ctx, out)
+	c.noteCycleFailure(out)
 	switch {
 	case out.Err != nil && !errors.Is(out.Err, context.Canceled):
 		c.logger.Warn("checkout coordinator: reconcile failed",
@@ -1618,6 +1629,35 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 			zap.Bool("recomposed", out.Recomposed))
 	}
 	c.reportCheckoutCycle(ctx, through, out)
+}
+
+// noteCycleFailure extends the run of failed cycles the poll backs off by, or
+// ends it when a cycle settles or builds without an error. A cycle that was
+// canceled, deferred, or gave the lane up (a yield or a tree move, which clear
+// the error they rescheduled over) says nothing about the checkout and leaves
+// the run as it is.
+func (c *CheckoutCoordinator) noteCycleFailure(out CheckoutCycle) {
+	switch {
+	case out.YieldedTo != "" || out.Deferred:
+	case out.Err == nil:
+		c.failedCycles.Store(0)
+	case !errors.Is(out.Err, context.Canceled):
+		c.failedCycles.Add(1)
+	}
+}
+
+// failedCyclePollDelay is the wait before the next poll: the poll interval,
+// doubled for every consecutive failed cycle up to maxCheckoutPollBackoff (or
+// the interval, if longer). A failure that repeats on unchanged input would
+// otherwise re-enter the mutation lane every interval (#1458); a cycle that
+// succeeds, whatever woke it, resets the wait.
+func (c *CheckoutCoordinator) failedCyclePollDelay() time.Duration {
+	limit := max(c.poll, maxCheckoutPollBackoff)
+	delay := c.poll
+	for i := c.failedCycles.Load(); i > 0 && delay < limit; i-- {
+		delay *= 2
+	}
+	return min(delay, limit)
 }
 
 // refreshWantsNewSample reports whether a refresh ticket waits whose
@@ -3485,10 +3525,13 @@ func (c *CheckoutCoordinator) buildDirtyLayerOver(
 // generation and its logical reuse key, or the chained delta's refusal reason,
 // and the physical work of the attempt that decided it.
 type dirtyLayerBuild struct {
-	GenerationID int64
-	Key          string
-	Reason       string
-	Work         *GenerationWorkCounters
+	// contractDemandDeferred is set only by the current attempt's verified
+	// owned translation. A caller never infers this authority from an error.
+	contractDemandDeferred bool
+	GenerationID           int64
+	Key                    string
+	Reason                 string
+	Work                   *GenerationWorkCounters
 	// Remaining is BuildReport.BatchRemaining: > 0 when the build carried one
 	// batch of a larger change set.
 	Remaining int
@@ -3617,6 +3660,20 @@ func (c *CheckoutCoordinator) buildDirtyLayerAttempts(
 		var fallback *DirtyChainFallbackError
 		if errors.As(err, &fallback) {
 			return dirtyLayerBuild{Reason: fallback.Reason, Work: work}, nil
+		}
+		if motion.ownsContractDemand(err) {
+			// The provider has drained and the builder abandoned its private
+			// payload. Demand is not movement: retry the same ticket with
+			// truthful debt, through the unchanged sample/publication fences.
+			c.deferFailedGeneration(ctx, generationID)
+			c.noteContractDemandDeferral()
+			if len(req.followupPaths) > 0 {
+				return dirtyLayerBuild{Work: work, contractDemandDeferred: true}, err
+			}
+			if attempt+1 == 2 {
+				return dirtyLayerBuild{Work: work}, err
+			}
+			continue
 		}
 		if !errors.Is(err, ErrDirtySnapshotChanged) || errors.Is(err, errImportPreparationChanged) {
 			// A build that died part way left its generation failed; it is

@@ -86,10 +86,10 @@ func (s *Server) handleCritiqueReview(ctx context.Context, req mcp.CallToolReque
 		})
 	}
 
-	repoRoot := s.prReviewRepoRoot(ctx, req)
+	repoRoot, repoPrefix := s.prReviewRepoRoot(ctx, req)
 	diffText := strings.TrimSpace(req.GetString("diff", ""))
 
-	findings, err := s.critiqueFindingsFor(ctx, req, repoRoot)
+	findings, err := s.critiqueFindingsFor(ctx, req, repoRoot, repoPrefix)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -158,7 +158,7 @@ func (s *Server) critiqueLLMGen() review.LLMGen {
 // (or `prior_review`) JSON array takes precedence; otherwise the deterministic
 // review rulepack runs over the changeset / pasted diff and its report findings
 // are used. Mirrors postReviewFindingsFor.
-func (s *Server) critiqueFindingsFor(ctx context.Context, req mcp.CallToolRequest, repoRoot string) ([]review.Finding, error) {
+func (s *Server) critiqueFindingsFor(ctx context.Context, req mcp.CallToolRequest, repoRoot, repoPrefix string) ([]review.Finding, error) {
 	raw := strings.TrimSpace(req.GetString("findings", ""))
 	if raw == "" {
 		raw = strings.TrimSpace(req.GetString("prior_review", ""))
@@ -181,7 +181,6 @@ func (s *Server) critiqueFindingsFor(ctx context.Context, req mcp.CallToolReques
 		rulepack []astquery.Match
 		impact   map[string]*analysis.ImpactResult
 	)
-	repoPrefix := s.diffJoinPrefix(repoRoot)
 	var changedFiles []string
 	if diffText == "" {
 		diff, err := analysis.MapGitDiff(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)

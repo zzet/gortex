@@ -73,7 +73,7 @@ jobs:
     if: needs.plan.outputs.has_tests == 'true'
     runs-on: ${{ matrix.os }}
     # Whole selected packages retain the existing census, batching, failure
-    # evidence and platform behavior. Full mode includes all twelve rows.
+    # evidence and platform behavior. Full mode includes all fifteen rows.
     timeout-minutes: 45
     strategy:
       fail-fast: false

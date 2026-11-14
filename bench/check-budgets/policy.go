@@ -170,12 +170,12 @@ func validateBudget(b budget, allowances map[string]allowance) error {
 	if _, ok := scenarioSpecs[b.Scenario]; !ok {
 		return fmt.Errorf("unknown scenario %s", b.Scenario)
 	}
-	validOwner := releasePattern.MatchString(b.OwningRelease) || b.Mode == "guard" && b.OwningRelease == "unassigned"
+	validOwner := releasePattern.MatchString(b.OwningRelease) || (b.Mode == "guard" || b.Mode == "deferred") && b.OwningRelease == "unassigned"
 	if !knownHostClass(b.HostClass) || !validOwner {
 		return errors.New("invalid host class or owning release")
 	}
-	if b.HostClass == hostedSmokeClass && (b.Mode != "block" || len(b.Lane) != 1 || b.Lane[0] != "smoke") {
-		return errors.New("hosted ARM budgets are block-only PR smoke targets, never nightly/release capacity")
+	if b.HostClass == hostedSmokeClass && ((b.Mode != "block" && b.Mode != "deferred") || len(b.Lane) != 1 || b.Lane[0] != "smoke") {
+		return errors.New("hosted ARM budgets are PR smoke targets, never nightly/release capacity")
 	}
 	if !slices.Contains([]string{"le", "lt", "ge", "eq"}, b.Compare) || len(b.Lane) == 0 {
 		return errors.New("explicit comparison and lanes required")
@@ -197,8 +197,15 @@ func validateBudget(b budget, allowances map[string]allowance) error {
 		if (b.Target != nil && !finiteNonnegative(*b.Target)) || b.Compare != "le" {
 			return errors.New("guard needs a finite future target or explicit null, and comparison le")
 		}
+	case "deferred":
+		// The release owner deferred only this absolute target to #1420.
+		// This is not a waiver mechanism for other metrics or evidence checks.
+		lanesOK := b.HostClass == hostedSmokeClass || slices.Equal(b.Lane, []string{"nightly", "release"})
+		if b.Metric != "search_symbols_p95" || b.Scenario != "loadedit-4" || b.Target == nil || *b.Target != .4 || b.Compare != "le" || len(b.Allowance) != 0 || b.OwningRelease != "unassigned" || !lanesOK {
+			return errors.New("deferred is reserved for the unassigned four-agent 400ms search target in #1420")
+		}
 	default:
-		return errors.New("mode must be block or guard")
+		return errors.New("mode must be block, guard or the #1420 deferred search target")
 	}
 	if b.Unit == "fraction" && b.Target != nil && *b.Target > 1 {
 		return errors.New("fraction target must be in [0,1], not percent")

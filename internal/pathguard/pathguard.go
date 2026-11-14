@@ -66,7 +66,7 @@ func ResolveRoot(root string) string {
 	return filepath.Clean(root)
 }
 
-// SymlinkEscapes reports whether path is a symbolic link whose real target
+// SymlinkEscapes reports whether path is a link (see IsLink) whose real target
 // resolves outside root. A regular file is never an escape, and that fast
 // path costs a single Lstat — the root is resolved only for the rare entry
 // that actually is a link, which keeps this affordable on a walk that
@@ -76,7 +76,7 @@ func ResolveRoot(root string) string {
 // reported as an escape: it can serve no legitimate content, and refusing
 // it is strictly safer than guessing where it points.
 func SymlinkEscapes(path, root string) bool {
-	if !isSymlink(path) {
+	if !isLinkPath(path) {
 		return false
 	}
 	return linkTargetEscapes(path, ResolveRoot(root))
@@ -85,21 +85,45 @@ func SymlinkEscapes(path, root string) bool {
 // EscapesResolvedRoot is SymlinkEscapes for a caller that has already paid
 // for ResolveRoot once and is testing many paths under that same root.
 func EscapesResolvedRoot(path, resolvedRoot string) bool {
-	if !isSymlink(path) {
+	if !isLinkPath(path) {
 		return false
 	}
 	return linkTargetEscapes(path, resolvedRoot)
 }
 
-func isSymlink(path string) bool {
+// IsLink reports whether info, the os.Lstat result for path, is a link the
+// operating system follows: a symbolic link or a Windows directory junction.
+// Go reports a junction as ModeIrregular rather than ModeSymlink, so checking
+// for ModeSymlink alone mistakes one for an ordinary entry.
+func IsLink(path string, info os.FileInfo) bool {
+	return info.Mode()&os.ModeSymlink != 0 || isJunction(path, info)
+}
+
+// EvalLinks is filepath.EvalSymlinks for confinement checks. On Windows it also
+// follows directory junctions, which filepath.EvalSymlinks returns unchanged at
+// the end of a path and fails on anywhere else. A path with no junction in it
+// resolves exactly as filepath.EvalSymlinks would resolve it.
+func EvalLinks(path string) (string, error) {
+	return evalLinks(path)
+}
+
+func isLinkPath(path string) bool {
 	info, err := os.Lstat(path)
-	return err == nil && info.Mode()&os.ModeSymlink != 0
+	return err == nil && IsLink(path, info)
 }
 
 func linkTargetEscapes(path, resolvedRoot string) bool {
-	real, err := filepath.EvalSymlinks(path)
+	real, err := EvalLinks(path)
 	if err != nil {
 		return true
 	}
-	return !WithinRoot(real, resolvedRoot)
+	if WithinRoot(real, resolvedRoot) {
+		return false
+	}
+	// ResolveRoot keeps a junction in the root's own spelling, because its other
+	// callers compare it with paths spelled by filepath.EvalSymlinks. real has
+	// been through any such junction, so compare again with the root's real
+	// location before calling this an escape.
+	root, err := EvalLinks(resolvedRoot)
+	return err != nil || !WithinRoot(real, root)
 }

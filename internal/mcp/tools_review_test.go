@@ -785,6 +785,37 @@ func decodeReviewPack(t *testing.T, res *mcplib.CallToolResult) reviewPackOut {
 	return out
 }
 
+// TestReviewPack_WorktreeViewRendersTheWorktreeHunk: under a linked worktree's
+// view, the pack's changed-symbol hunk comes from the worktree's own diff, so it
+// carries the removed line, not a fallback that reads the span as all-new.
+func TestReviewPack_WorktreeViewRendersTheWorktreeHunk(t *testing.T) {
+	// Given a tracked repo with a clean working tree, and a linked worktree
+	// outside it whose working copy rewrites Beta's body.
+	dir, _, fileB, _ := siblingDiffGitRepo(t)
+	srv := indexedSiblingServer(t, dir)
+	worktree := filepath.Join(t.TempDir(), "wt")
+	runGitT(t, dir, "worktree", "add", "--detach", worktree, "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, filepath.FromSlash(fileB)),
+		[]byte("package alpha\n\nfunc Beta() int {\n\treturn 4\n}\n"), 0o644))
+
+	// When review_pack renders the default unstaged changeset through that view.
+	ctx := withRequestView(t.Context(), &requestView{kind: requestViewKindWorktree, viewRoot: worktree, reader: srv.graph})
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "review_pack"
+	req.Params.Arguments = map[string]any{"include_pack": true}
+	res, err := srv.handleReviewPack(ctx, req)
+	require.NoError(t, err)
+
+	// Then Beta's hunk shows the worktree's removed line.
+	out := decodeReviewPack(t, res)
+	require.NotNil(t, out.Pack)
+	diffs := map[string]string{}
+	for _, entry := range out.Pack.Changed {
+		diffs[entry.ID] = entry.Diff
+	}
+	require.Contains(t, diffs[fileB+"::Beta"], "-\ty := 2")
+}
+
 // TestReviewPack_Envelope asserts the packaged envelope carries the verdict,
 // per-symbol classification, per-file risk, line-anchored findings, the
 // impacted-test verification command, and the privacy-safe receipt on a staged

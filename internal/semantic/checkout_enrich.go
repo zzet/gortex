@@ -42,6 +42,10 @@ type CheckoutEnrichRequest struct {
 // which capabilities are whole, and what did not run decides what the
 // generation must not claim.
 type CheckoutEnrichReport struct {
+	// terminalError retains observed provider outcomes even when the public
+	// result is a live-context optional partial. An owned build attempt must
+	// retain that identity until it unarms against a concurrent cancellation.
+	terminalError error
 	// Ran lists the languages a provider enriched, sorted.
 	Ran []string
 	// Starved lists the languages the workspace cap could not admit, sorted.
@@ -64,6 +68,10 @@ type CheckoutEnrichReport struct {
 	// nil when no provider that ran reports counts.
 	Compiler *CompilerLoadStats
 }
+
+// ProviderTerminalError is private pass evidence for the owning build's
+// cancellation guard, not the public optional-partial result or completeness.
+func (r CheckoutEnrichReport) ProviderTerminalError() error { return r.terminalError }
 
 // EnrichCheckout runs the language-server enrichment stage over one routed
 // checkout's payload.
@@ -165,6 +173,7 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 	}
 
 	compiler := req.Compiler
+	var terminalErrors []error
 	results, partial, err := m.EnrichAll(g, roots, EnrichOptions{
 		RepoState: map[string]RepoEnrichState{req.RepoPrefix: {
 			SHA:        req.Fingerprint,
@@ -175,7 +184,9 @@ func (m *Manager) EnrichCheckoutContext(ctx context.Context, g graph.Store, req 
 		CheckoutScope:     &compiler,
 		CommittedTreeOnly: committed,
 		Context:           ctx,
+		terminalErrors:    &terminalErrors,
 	})
+	report.terminalError = errors.Join(terminalErrors...)
 	for _, result := range results {
 		if result == nil || result.Compiler == nil {
 			continue

@@ -26,12 +26,16 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	var raw buildFlags
 	f := flag.NewFlagSet("load paired", flag.ContinueOnError)
 	bindRunFlags(f, &o)
-	f.Var(&raw, "build", "labeled native binary, e.g. tag=/private/gortex (repeat 2–3 times; first is ratio baseline)")
+	f.BoolVar(&o.PairedOwnACKTransactions, "paired-own-ack-transactions", false, "opt-in matched edit/own-ACK/file/source transactions at 4 or 8 concurrent editor streams; rotate whole transactions")
+	f.Var(&raw, "build", "labeled binary, e.g. tag=/private/gortex (repeat 2–3 times; first is ratio baseline)")
 	if err := f.Parse(args); err != nil {
 		return o, nil, err
 	}
 	if o.PRSmokeDrain != 0 {
 		return o, nil, errors.New("offered-window/drain is standalone-only; coupled paired measurement is unchanged")
+	}
+	if o.EditConsumerProbes {
+		return o, nil, errors.New("consumer probes are standalone-only; coupled paired measurement is unchanged")
 	}
 	if f.NArg() != 0 || o.Binary != "" || o.GitSHA != "" {
 		return o, nil, errors.New("paired uses --build label=binary with embedded VCS revision; no positional --binary/--git-sha overrides")
@@ -56,8 +60,8 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	if err := validateRunOptions(o); err != nil {
 		return o, nil, err
 	}
-	if o.Host != "native" || o.Profile != "agent" || o.CPUProfile != 0 {
-		return o, nil, errors.New("paired is coupled native agent-profile latency only; reference/floor/saturation/CPU profiles must run standalone")
+	if (o.Host != "native" && o.Host != "reference") || o.Profile != "agent" || o.CPUProfile != 0 {
+		return o, nil, errors.New("paired requires native or reference agent-profile latency; floor/saturation/CPU profiles must run standalone")
 	}
 	switch o.Scenario {
 	case "read", "edit", "many", "many-edit", "worktrees", "sweep":
@@ -65,7 +69,10 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		if len(builds) != 2 {
 			return o, nil, errors.New("paired edit-and-probe requires one baseline and one candidate")
 		}
-		if o.Editors != 1 || o.Agents != 0 {
+		if o.PairedOwnACKTransactions && (o.Editors != 4 && o.Editors != 8 || o.Agents != 0 || o.EditGateModes || o.SearchReadbackAcceptance) {
+			return o, nil, errors.New("paired own-ACK transactions require 4 or 8 editors, no readers, and plain file/source readbacks")
+		}
+		if !o.PairedOwnACKTransactions && (o.Editors != 1 || o.Agents != 0) {
 			return o, nil, errors.New("paired edit-and-probe is the one-editor, no-reader no-regression cell")
 		}
 		if o.EditProbeRole != "" {
@@ -74,7 +81,14 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	default:
 		return o, nil, errors.New("paired supports workload scenarios; cold/restart/all use standalone runs")
 	}
+	if o.PairedOwnACKTransactions && o.Scenario != editProbeScenario {
+		return o, nil, errors.New("paired own-ACK transactions require edit-and-probe")
+	}
 	return o, builds, nil
+}
+
+func inspectPairedHost(o runOptions) (Host, string, error) {
+	return inspectHost(o.Host, o.Scratch)
 }
 
 func pairedCommand(ctx context.Context, args []string) error {
@@ -100,7 +114,7 @@ func pairedCommand(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(o.Scratch, 0o700); err != nil {
 		return err
 	}
-	host, group, err := inspectHost("native", o.Scratch)
+	host, group, err := inspectPairedHost(o)
 	if err != nil {
 		return err
 	}
@@ -116,7 +130,10 @@ func pairedCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	defer coordinator.cancel()
-	report := pairedReport{SchemaVersion: 1, Kind: "coupled_native_latency_not_independent_capacity", RunID: filepath.Base(root), BuildOrder: labels, Builds: make(map[string]Report)}
+	report := pairedReport{SchemaVersion: 1, Kind: "coupled_" + o.Host + "_latency_not_independent_capacity", RunID: filepath.Base(root), BuildOrder: labels, Builds: make(map[string]Report)}
+	if o.PairedOwnACKTransactions {
+		report.MeasurementUnit = pairedOwnACKTransactionMethod
+	}
 	var mu sync.Mutex
 	var workers sync.WaitGroup
 	for i, build := range builds {
@@ -161,6 +178,9 @@ func pairedCommand(ctx context.Context, args []string) error {
 		report.Errors = append(report.Errors, groupErr.Error())
 	}
 	report.Ratios = matchedLatencyRatios(labels, report.Records)
+	if o.PairedOwnACKTransactions {
+		report.TransactionTimings = ownACKTransactionSummaries(labels, report.Records)
+	}
 	report.Complete = len(report.Errors) == 0 && len(report.Builds) == len(labels) && !report.Window.Started.IsZero()
 	for label, individual := range report.Builds {
 		if !individual.Complete {
@@ -188,7 +208,7 @@ func pairedCommand(ctx context.Context, args []string) error {
 	if err := printPairedRatios(os.Stdout, report); err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "coupled native report:", o.Output)
+	fmt.Fprintln(os.Stderr, "coupled report:", o.Output)
 	if !report.Complete {
 		return fmt.Errorf("incomplete paired run; errors and censored samples retained in %s", o.Output)
 	}
@@ -197,7 +217,7 @@ func pairedCommand(ctx context.Context, args []string) error {
 
 func printPairedRatios(w io.Writer, report pairedReport) error {
 	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "coupled native comparison\tcategory\tmedian matched latency ratio\tmatched\texcluded")
+	fmt.Fprintln(table, "coupled comparison\tcategory\tmedian matched latency ratio\tmatched\texcluded")
 	var comparisons []string
 	for comparison := range report.Ratios {
 		comparisons = append(comparisons, comparison)

@@ -42,13 +42,13 @@ var extractorVersions = map[string]int{
 	"php":        2,                                      // class/interface inheritance now emits typed structural edges
 	"csharp":     24,                                     // receiverless calls bound by a local function / delegate parameter / local carry local_shadow (was: partial / conditionally-compiled properties carry their recorded ownership span)
 	"scala":      2,                                      // explicitly instantiated generic calls emit call edges
-	"go":         4,                                      // zero-initialized local declarations exist before reads/assignments (was: generic instantiations are marked)
+	"go":         5,                                      // GraphQL contract operations are limited to string literals
 	"cpp":        2,                                      // templated and namespace-qualified calls emit call edges
 	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
 	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
 	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
 	"javascript": 2,                                      // renamed per-binding imports persist import_alias Meta; older rows keyed a renamed import by its original name
-	"typescript": 2,                                      // renamed per-binding imports persist import_alias Meta; older rows keyed a renamed import by its original name
+	"typescript": 3,                                      // gRPC consumer contracts require an actual gRPC import
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

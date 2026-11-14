@@ -37,7 +37,7 @@ func LoadPolicy() (Policy, error) {
 	if err := json.Unmarshal(policyJSON, &p); err != nil {
 		return p, err
 	}
-	if len(p.Targets) != 3 || !slices.Equal(p.Partitions, []string{"indexer:1/2", "indexer:2/2", "mcp+store", "rest"}) || len(p.Groups) != 3 {
+	if len(p.Targets) != 3 || !slices.Equal(p.Partitions, []string{"indexer:1/2", "indexer:2/2", "mcp", "store", "rest"}) || len(p.Groups) != 3 {
 		return p, fmt.Errorf("invalid CI policy")
 	}
 	seen := set{}
