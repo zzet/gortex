@@ -106,8 +106,23 @@ type CheckoutOverview struct {
 	CoordinatorLive bool `json:"coordinator_live"`
 	// Intents names the active tracking-intent sources.
 	Intents []string `json:"intents,omitempty"`
+	// IntentDetails carries the provenance of each active intent: its id and
+	// when it was created. Intents above stays the source-kind list every
+	// existing consumer reads, so this is additive. A caller that has to tell
+	// a configured repo from one the daemon wrote for itself needs the
+	// intent's UUIDv7 timestamp, which the source kind alone cannot carry.
+	IntentDetails []IntentOverview `json:"intent_details,omitempty"`
 	// Transition is the in-flight mode change, empty when the slot is free.
 	Transition string `json:"transition,omitempty"`
+}
+
+// IntentOverview is one active tracking intent as the catalog records it.
+// IntentID is a UUIDv7, so its embedded timestamp is when the intent was
+// minted — the same clock that dates the checkout row through CheckoutID.
+type IntentOverview struct {
+	IntentID   string `json:"intent_id"`
+	SourceKind string `json:"source_kind"`
+	CreatedAt  int64  `json:"created_at,omitempty"`
 }
 
 // ClockOverview is one of the reconciler's clocks: when it started and when it
@@ -327,6 +342,11 @@ func (l *CheckoutLifecycle) checkoutOverview(
 	for _, intent := range intents {
 		if intent.Active {
 			out.Intents = append(out.Intents, string(intent.SourceKind))
+			out.IntentDetails = append(out.IntentDetails, IntentOverview{
+				IntentID:   intent.IntentID,
+				SourceKind: string(intent.SourceKind),
+				CreatedAt:  intent.CreatedAt,
+			})
 		}
 	}
 
