@@ -2,7 +2,12 @@ package goanalysis
 
 import (
 	"go/ast"
+	"go/build"
+	"go/token"
 	"go/types"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -50,7 +55,11 @@ type externalUseIdentity struct {
 }
 
 type externalsAttribution struct {
-	g            graph.Store
+	g graph.Store
+	// fset is the FileSet the pass's types were created in — the load's
+	// own set, which the typecheck cache retains even after
+	// releaseGoPackageCompilerState nils pkg.Fset on reused packages.
+	fset         *token.FileSet
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
 	// extByObj is a projection-only accelerator. It is cleared together with
@@ -97,7 +106,7 @@ type externalsAttribution struct {
 // roots' Imports maps hold ID-only stubs with an empty PkgPath, so the walk
 // alone would leave every dependency unclassifiable. Roots overlay the index
 // entries — they carry the fuller (typed) package for their own path.
-func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider, repoPrefix string, depIndex map[string]*packages.Package) *externalsAttribution {
+func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider, repoPrefix string, depIndex map[string]*packages.Package, fset *token.FileSet) *externalsAttribution {
 	pkgByPath := make(map[string]*packages.Package, len(depIndex))
 	var visit func(p *packages.Package)
 	visit = func(p *packages.Package) {
@@ -124,6 +133,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 	}
 	return &externalsAttribution{
 		g:            g,
+		fset:         fset,
 		pkgByPath:    pkgByPath,
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
@@ -233,7 +243,7 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 	}
 
 	if _, exists := e.knownNodeIDs[nodeID]; !exists {
-		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
+		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider, e.fset))
 		e.knownNodeIDs[nodeID] = struct{}{}
 		e.nodesAdded++
 	}
@@ -712,7 +722,7 @@ func externalUseIdentityFor(repoPrefix, importPath string, obj types.Object) *ex
 // buildExternalNode constructs a graph node for an external symbol. The
 // FilePath is a synthetic "external::go:<importPath>" string so byFile
 // lookups don't pollute real source-file buckets.
-func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID string, pkg *packages.Package, obj types.Object, provider string) *graph.Node {
+func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID string, pkg *packages.Package, obj types.Object, provider string, fset *token.FileSet) *graph.Node {
 	moduleKind, version := classifyPackage(pkg)
 	meta := map[string]any{
 		"external":        true,
@@ -721,6 +731,21 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 		"module_kind":     moduleKind,
 		"module_id":       moduleID,
 		"semantic_source": provider,
+	}
+	// Export data keeps the declaration's file and line, so the source
+	// can be served read-only later (get_symbol_source / nav read on
+	// ext:: symbols). StartLine/EndLine stay unset on purpose: the edit
+	// and analysis guards must keep treating the node as having no
+	// editable range, and the synthetic FilePath keeps byFile buckets clean.
+	// Positions resolve through the pass's FileSet — pkg.Fset is nil'ed
+	// by releaseGoPackageCompilerState on reused (cached) packages. A nil
+	// fset records nothing and reads on the node degrade to the
+	// structured answer.
+	if fset != nil {
+		if pos := fset.Position(obj.Pos()); pos.Filename != "" && pos.Line > 0 {
+			meta["source_file"] = externalSourceFilePath(pos.Filename, moduleKind)
+			meta["source_line"] = pos.Line
+		}
 	}
 	if version != "" {
 		meta["version"] = version
@@ -747,6 +772,65 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 		Language: "go",
 		Meta:     meta,
 	}
+}
+
+// externalSourceFilePath turns a declaration file name into an openable
+// absolute path. The toolchain records GOROOT files as "$GOROOT/..." in
+// export data, and the typecheck cache serves names relative to the tree
+// they were compiled in: GOROOT/src for the standard library, the module
+// cache for dependencies. A name that resolves under neither tree is kept
+// as-is; reads on that node degrade to the structured answer.
+func externalSourceFilePath(file, moduleKind string) string {
+	if rest, ok := strings.CutPrefix(file, "$GOROOT"); ok {
+		return runtime.GOROOT() + rest
+	}
+	if filepath.IsAbs(file) {
+		return file
+	}
+	for _, root := range externalSourceRootCandidates(moduleKind) {
+		if root == "" {
+			continue
+		}
+		candidate := filepath.Join(root, file)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return file
+}
+
+// externalSourceRootCandidates lists the trees a relative declaration
+// name may live under, most likely first: GOROOT/src for stdlib symbols,
+// the module cache for dependencies.
+func externalSourceRootCandidates(moduleKind string) []string {
+	if moduleKind == "stdlib" {
+		if goroot := runtime.GOROOT(); goroot != "" {
+			return []string{filepath.Join(goroot, "src")}
+		}
+		return nil
+	}
+	if mod := goModuleCacheRoot(); mod != "" {
+		return []string{mod}
+	}
+	return nil
+}
+
+// goModuleCacheRoot mirrors the go command's GOMODCACHE resolution:
+// $GOMODCACHE when set, else the first GOPATH entry + /pkg/mod
+// (build.Default.GOPATH applies the same default the go command does).
+func goModuleCacheRoot() string {
+	if mod := os.Getenv("GOMODCACHE"); mod != "" {
+		return mod
+	}
+	gopath := build.Default.GOPATH
+	if gopath == "" {
+		return ""
+	}
+	first := strings.SplitN(gopath, string(filepath.ListSeparator), 2)[0]
+	if first == "" {
+		return ""
+	}
+	return filepath.Join(first, "pkg", "mod")
 }
 
 // classifyPackage labels a loaded package as stdlib / module_cache / main.

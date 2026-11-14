@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -205,7 +206,7 @@ func (s *Server) handleTaintPaths(ctx context.Context, req mcp.CallToolRequest) 
 func (s *Server) dataflowRefiner(ctx context.Context) *dataflow.Refiner {
 	resolve := func(fn *graph.Node) (dataflow.FuncSource, error) {
 		if fn.StartLine == 0 || fn.EndLine == 0 {
-			return dataflow.FuncSource{}, fmt.Errorf("symbol has no line range: %s", fn.ID)
+			return dataflow.FuncSource{}, errors.New(externalRefusal(fn, fn.ID, "symbol has no line range: "+fn.ID))
 		}
 		absPath, err := s.resolveNodePath(ctx, fn)
 		if err != nil {

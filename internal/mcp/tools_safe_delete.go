@@ -104,7 +104,7 @@ func (s *Server) handleSafeDeleteSymbol(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("symbol not found: " + id), nil
 	}
 	if node.StartLine == 0 || node.EndLine == 0 {
-		return mcp.NewToolResultError("symbol has no line range: " + id), nil
+		return mcp.NewToolResultError(externalRefusal(node, id, "symbol has no line range: "+id)), nil
 	}
 
 	// Safety check: referencing edges. We keep the four edge kinds
