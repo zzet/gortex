@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/viewmetrics"
 	"go.uber.org/zap"
 )
 
@@ -77,6 +78,7 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	linked := contractLinkedSchedule(state.contractAnalysis, os.Getenv, logger)
 	options.LinkedPolicy, options.LinkedIdleWindow, options.LinkedThrottleInterval = linked.Policy, linked.IdleWindow, linked.ThrottleInterval
 	options.Demand = state.mcpServer.ContractAnalysisDemand
+	options.LinkedInterest = state.lifecycle.ContractInterest
 	if adjust != nil {
 		adjust(&options)
 	}
@@ -86,6 +88,7 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 		return nil, err
 	}
 	runtime.coordinator = coordinator
+	state.lifecycle.SetContractAnalysisCoordinator(coordinator)
 	runner, err := indexer.NewContractStuckRepair(indexer.ContractStuckRepairOptions{Store: store, MultiIndexer: state.multiIndexer, Baseline: captureOptions, Coordinator: coordinator, Logger: logger})
 	if err != nil {
 		cancel()
@@ -107,6 +110,11 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	state.multiIndexer.SetContractCoreRuntime(hooks)
 	state.mcpServer.SetContractAnalysisRuntime(&gortexmcp.ContractAnalysisRuntime{AcquireLastPublishedCohort: coordinator.AcquireLastPublishedCohort, Schedule: coordinator.Schedule, WaitActor: coordinator.WaitActor, WaitTarget: coordinator.WaitTarget,
 		WaitCapacity: coordinator.WaitCapacity, CapacityEpoch: coordinator.CapacityEpoch, InputEpoch: coordinator.InputEpoch, WaitInputs: coordinator.WaitInputs})
+	if options.LinkedPolicy == indexer.ContractLinkedIdle && options.LinkedInputs != nil && options.Demand != nil {
+		// Register availability only after installation succeeds. A zero is an
+		// installed idle producer with no holds, not a synthetic hold event.
+		viewmetrics.Add(viewmetrics.ContractLinkedJobsTotal, 0, viewmetrics.ContractLinkedIdle, viewmetrics.ContractLinkedDeferred)
+	}
 	return runtime, nil
 }
 

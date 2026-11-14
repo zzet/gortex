@@ -26,13 +26,18 @@ type projectedSourceAllowance struct {
 	symbolMetadata bool // Bound once to the actual audited full-JSON request.
 }
 
-// Only these nonpaginated file reads have audited replay-safe response work.
+// Only these nonpaginated reads have audited replay-safe response work.
 // Editing-context compression still uses its legacy physical source reader;
 // it keeps the existing refusal behavior rather than gaining another attempt.
 func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
 	switch tool {
 	case "get_symbol_source", "get_file_summary":
 		return true
+	case "get_callers":
+		// Ordinary traversals reuse the existing checked-transition boundary.
+		// Explicit freshness requests retain their own retry/deadline policy.
+		freshness := takeRequestFreshness(&req)
+		return freshness.err == nil && !freshness.requireExact && !freshness.requireFresh && !freshness.hasDeadline
 	case "get_symbol":
 		// Full JSON assembly has no cursor/compression state. The handler
 		// separately marks any active enrichment attempt replay-unsafe.
@@ -164,7 +169,7 @@ func checkedProjectionChange(ctx context.Context) bool {
 	return changed
 }
 
-// Audited file reads retry once after a checked version transition; source retains
+// Audited reads retry once after a checked version transition; source retains
 // its typed byte-mismatch retry. Every attempt has fresh facts/layers/leases
 // under the original shared deadline and two-attempt allowance.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {

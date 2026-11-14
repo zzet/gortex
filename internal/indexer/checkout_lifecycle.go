@@ -160,6 +160,7 @@ type CheckoutLifecycle struct {
 	mutationRefusals     map[string]*checkoutMutationRefusalSlot
 	mutationRefusalEpoch uint64
 	contractCoreRuntime  atomic.Pointer[ContractCoreRuntimeHooks]
+	contractAnalysis     atomic.Pointer[ContractAnalysisCoordinator]
 	// routePrewarm is the prewarmer every coordinator calls before a route
 	// flip (SetRoutePrewarmer).
 	routePrewarm routePrewarmerSlot
@@ -2754,23 +2755,24 @@ func (l *CheckoutLifecycle) buildCoordinator(
 	}
 	builder = l.installContractCoreBuilder(builder)
 	coordinator, err := NewCheckoutCoordinator(CheckoutCoordinatorConfig{
-		GitWork:        &l.gitWork,
-		PrewarmRoute:   l.routePrewarm.call,
-		CheckoutID:     checkout.CheckoutID,
-		CheckoutRoot:   checkout.RootPath,
-		FamilyID:       checkout.FamilyID,
-		HeadCommit:     checkout.HeadCommit,
-		HeadTree:       checkout.HeadTree,
-		RepoPrefix:     primary.RepoPrefix,
-		WorkspaceID:    idx.WorkspaceID(),
-		ProjectID:      idx.ProjectID(),
-		Store:          l.store,
-		Builder:        builder,
-		Leases:         l.leases,
-		Config:         index,
-		ConfigSections: dedicatedBaseConfigSections(repoCfg),
-		Logger:         l.logger,
-		Gate:           l.buildGate(),
+		GitWork:          &l.gitWork,
+		PrewarmRoute:     l.routePrewarm.call,
+		CheckoutID:       checkout.CheckoutID,
+		CheckoutRoot:     checkout.RootPath,
+		FamilyID:         checkout.FamilyID,
+		HeadCommit:       checkout.HeadCommit,
+		HeadTree:         checkout.HeadTree,
+		RepoPrefix:       primary.RepoPrefix,
+		WorkspaceID:      idx.WorkspaceID(),
+		ProjectID:        idx.ProjectID(),
+		Store:            l.store,
+		Builder:          builder,
+		Leases:           l.leases,
+		Config:           index,
+		ConfigSections:   dedicatedBaseConfigSections(repoCfg),
+		Logger:           l.logger,
+		Gate:             l.buildGate(),
+		ContractAnalysis: l.contractAnalysis.Load(),
 		// The on-demand half of the committed-base consumer gate. This
 		// coordinator IS a consumer — it is built for a ready automatic
 		// checkout, which is what dedicatedBaseConsumers counts — so the

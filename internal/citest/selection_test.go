@@ -196,7 +196,7 @@ func TestSelectionResourcesDependenciesAndCIAlwaysFull(t *testing.T) {
 			}
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != 12 {
+			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != 15 {
 				t.Fatalf("fallback %s %s", m.Mode, m.Reason)
 			}
 		})
@@ -236,7 +236,7 @@ func TestSelectionNestedCgoGeneratedAndUnsupportedInputs(t *testing.T) {
 			f.git("reset", "--hard", f.base)
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || len(m.Matrix.Include) != 12 {
+			if m.Mode != "full" || len(m.Matrix.Include) != 15 {
 				t.Fatalf("unsafe input optimized: %s", m.Reason)
 			}
 		})

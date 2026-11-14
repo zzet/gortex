@@ -21,7 +21,9 @@ import (
 	"github.com/zzet/gortex/bench/receiptproof"
 )
 
-const editProbeRawLimit = 8 << 20
+// This cumulative per-edit artifact allowance includes written, pending and
+// in-flight JSONL bytes. It is separate from each CLI call's stdout limit.
+const editProbeRawLimit = 16 << 20
 
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
@@ -38,66 +40,72 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
-	Superseded               *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
-	supersededStatus         *receiptproof.Status
-	SearchACK                map[string]any               `json:"search_ack,omitempty"`
-	SearchQueuedNS           *int64                       `json:"search_queued_ns,omitempty"`
-	SearchQueueWaitNS        *int64                       `json:"search_queue_wait_ns,omitempty"`
-	SearchTurnReleasedNS     *int64                       `json:"search_turn_released_ns,omitempty"`
-	AdmittedTargetLines      *int                         `json:"admitted_target_lines,omitempty"`
-	MutationTiers            *editProbeLiveTiers          `json:"mutation_tiers,omitempty"`
-	GateReadback             *Metric                      `json:"t_gate_readback_ms,omitempty"`
-	ACKReadbackExact         *bool                        `json:"ack_readback_exact,omitempty"`
-	ACKStatus                string                       `json:"ack_status,omitempty"`
-	ACKDiskStatus            string                       `json:"ack_disk_status,omitempty"`
-	ACKMutationID            string                       `json:"ack_mutation_id,omitempty"`
-	ACKCommitSeq             uint64                       `json:"ack_commit_seq,omitempty"`
-	ACKContentSHA256         string                       `json:"ack_content_sha256,omitempty"`
-	ProbeMode                string                       `json:"probe_mode,omitempty"`
-	Ordinal                  int                          `json:"ordinal"`
-	Editor                   int                          `json:"editor,omitempty"`
-	Route                    string                       `json:"route,omitempty"`
-	CheckoutID               string                       `json:"checkout_id,omitempty"`
-	Marker                   string                       `json:"marker"`
-	MutationID               string                       `json:"mutation_id"`
-	PlannedDueNS             int64                        `json:"planned_due_ns"`
-	ActivatedNS              *int64                       `json:"activated_ns"`
-	StartedNS                *int64                       `json:"started_ns"`
-	StartLatenessNS          *int64                       `json:"start_lateness_ns"`
-	Outcome                  string                       `json:"outcome"`
-	Receipt                  string                       `json:"mutation_receipt"`
-	Batch                    *editProbeBatchReferences    `json:"batch,omitempty"`
-	BatchSet                 *editProbeBatchSetReferences `json:"batch_set,omitempty"`
-	BatchAccounting          *editProbeBatchSetAccounting `json:"batch_accounting,omitempty"`
-	Move                     *editProbeMoveReferences     `json:"move,omitempty"`
-	MoveAccounting           *editProbeMoveAccounting     `json:"move_accounting,omitempty"`
-	Restart                  *editProbeRestartRecord      `json:"restart,omitempty"`
-	NativeWrite              *editProbeNativeWrite        `json:"native_write,omitempty"`
-	GraphTerminalBasis       string                       `json:"graph_terminal_basis,omitempty"`
-	Ack                      Metric                       `json:"t_ack_ms"`
-	PhasesMS                 map[string]Metric            `json:"phases_ms,omitempty"`
-	Readback                 Metric                       `json:"t_readback_ms,omitempty"`
-	FileGraph                Metric                       `json:"t_file_graph_ms,omitempty"`
-	Relations                Metric                       `json:"t_relations_ms,omitempty"`
-	Search                   Metric                       `json:"t_search_ms,omitempty"`
-	Derived                  Metric                       `json:"t_derived_ms,omitempty"`
-	Readbacks                []editProbeReadback          `json:"readbacks"`
-	FirstCorrect             map[string]Metric            `json:"first_correct_ms"`
-	Accounting               editProbeAccounting          `json:"accounting"`
-	PendingReads             int                          `json:"reads_while_receipt_observed_pending"`
-	ExpectedRefusals         int                          `json:"expected_refusals,omitempty"`
-	ProbeErrors              int                          `json:"probe_errors"`
-	StaleClaimedFresh        bool                         `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches int                          `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal            bool                         `json:"graph_terminal"`
-	Evidence                 string                       `json:"raw_evidence"`
-	EvidenceWriteMS          float64                      `json:"evidence_write_ms"`
-	EvidenceEncodeMS         float64                      `json:"evidence_encode_ms"`
-	EvidenceBytes            int                          `json:"evidence_bytes"`
-	EvidenceLimit            int                          `json:"evidence_limit_bytes"`
-	Errors                   []string                     `json:"errors"`
+	Consumers                   map[string]editConsumerObservation `json:"relation_consumers,omitempty"`
+	Superseded                  *receiptproof.Superseded           `json:"superseded_receipt,omitempty"`
+	supersededStatus            *receiptproof.Status
+	coalescedStatus             *receiptproof.Coalesced
+	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
+	FunctionalUnavailable       *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt,omitempty"`
+	CoalescedFunctional         *receiptproof.Coalesced             `json:"coalesced_functional_receipt,omitempty"`
+	SearchACK                   map[string]any                      `json:"search_ack,omitempty"`
+	SearchQueuedNS              *int64                              `json:"search_queued_ns,omitempty"`
+	SearchQueueWaitNS           *int64                              `json:"search_queue_wait_ns,omitempty"`
+	SearchTurnReleasedNS        *int64                              `json:"search_turn_released_ns,omitempty"`
+	AdmittedTargetLines         *int                                `json:"admitted_target_lines,omitempty"`
+	MutationTiers               *editProbeLiveTiers                 `json:"mutation_tiers,omitempty"`
+	GateReadback                *Metric                             `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact            *bool                               `json:"ack_readback_exact,omitempty"`
+	ACKStatus                   string                              `json:"ack_status,omitempty"`
+	ACKDiskStatus               string                              `json:"ack_disk_status,omitempty"`
+	ACKMutationID               string                              `json:"ack_mutation_id,omitempty"`
+	ACKCommitSeq                uint64                              `json:"ack_commit_seq,omitempty"`
+	ACKContentSHA256            string                              `json:"ack_content_sha256,omitempty"`
+	ProbeMode                   string                              `json:"probe_mode,omitempty"`
+	Ordinal                     int                                 `json:"ordinal"`
+	Editor                      int                                 `json:"editor,omitempty"`
+	Route                       string                              `json:"route,omitempty"`
+	CheckoutID                  string                              `json:"checkout_id,omitempty"`
+	Marker                      string                              `json:"marker"`
+	MutationID                  string                              `json:"mutation_id"`
+	PlannedDueNS                int64                               `json:"planned_due_ns"`
+	ActivatedNS                 *int64                              `json:"activated_ns"`
+	StartedNS                   *int64                              `json:"started_ns"`
+	StartLatenessNS             *int64                              `json:"start_lateness_ns"`
+	Outcome                     string                              `json:"outcome"`
+	Receipt                     string                              `json:"mutation_receipt"`
+	Batch                       *editProbeBatchReferences           `json:"batch,omitempty"`
+	BatchSet                    *editProbeBatchSetReferences        `json:"batch_set,omitempty"`
+	BatchAccounting             *editProbeBatchSetAccounting        `json:"batch_accounting,omitempty"`
+	Move                        *editProbeMoveReferences            `json:"move,omitempty"`
+	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
+	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
+	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
+	Ack                         Metric                              `json:"t_ack_ms"`
+	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
+	Readback                    Metric                              `json:"t_readback_ms,omitempty"`
+	FileGraph                   Metric                              `json:"t_file_graph_ms,omitempty"`
+	Relations                   Metric                              `json:"t_relations_ms,omitempty"`
+	Search                      Metric                              `json:"t_search_ms,omitempty"`
+	Derived                     Metric                              `json:"t_derived_ms,omitempty"`
+	Readbacks                   []editProbeReadback                 `json:"readbacks"`
+	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
+	Accounting                  editProbeAccounting                 `json:"accounting"`
+	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
+	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
+	ProbeErrors                 int                                 `json:"probe_errors"`
+	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal               bool                                `json:"graph_terminal"`
+	Evidence                    string                              `json:"raw_evidence"`
+	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
+	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
+	EvidenceBytes               int                                 `json:"evidence_bytes"`
+	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
+	Errors                      []string                            `json:"errors"`
 }
 type editProbeReport struct {
+	ConsumerBaseline   *editConsumerBaseline        `json:"consumer_baseline,omitempty"`
 	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
 	SharedOwners       *editProbeSharedOwnerReport  `json:"shared_owners,omitempty"`
 	SearchReadbacks    *searchReadbackAcceptance    `json:"search_readback_acceptance,omitempty"`
@@ -161,6 +169,7 @@ func sharedEditProbePhysicalScope(p *privateRun, plan editProbePlan, editors []*
 }
 
 type editProbeState struct {
+	pairedTransaction                                 *pairedOwnACKTransaction
 	mu                                                sync.Mutex
 	step                                              editProbeStep
 	record                                            editProbeRecord
@@ -218,6 +227,20 @@ type editProbeRuntime struct {
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
 	record := editProbeRecord{ProbeMode: step.ProbeMode, Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
+		if isEditConsumer(oracle.name) {
+			if record.Consumers == nil {
+				record.Consumers = make(map[string]editConsumerObservation)
+			}
+			mode := step.ProbeMode
+			if mode == "" {
+				mode = c.EditOutput
+			}
+			if mode == "" {
+				mode = "json"
+			}
+			record.Consumers[oracle.name] = editConsumerObservation{State: "missing", RequestedMode: mode, SilentStale: unavailable("answers", "no consumer response observed")}
+			continue
+		}
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
 	record.groupTimes()
@@ -261,6 +284,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	}
 	if plan.Mode == "compact" {
 		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
+	}
+	if plan.ConsumerProbes {
+		out.Limitations = append(out.Limitations, "opt-in relation consumers retain their own attempted/observed/pending/error/missing denominator; pending is not graph completion and unobserved/unsupported silent-stale counts remain unavailable", "unexported dead-code subject requires observed pre-edit membership; no JSON fallback grants compact consumer coverage; default seven first-correct and ACK/accounting predicates are unchanged")
 	}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
@@ -323,6 +349,9 @@ func (r *editProbeRuntime) calleeFor(repo privateRepo) string {
 }
 
 func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
+	if o.EditConsumerProbes && (len(p.Repos) != 1 || o.Worktrees != 0 || o.SearchReadbackAcceptance) {
+		return nil, nil, errors.New("consumer probes require one standalone primary fixture")
+	}
 	corpora := make([]Corpus, len(p.Repos))
 	for i, repo := range p.Repos {
 		corpora[i] = repo.Corpus
@@ -502,6 +531,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 			state.absenceBefore = map[string]bool{state.step.BeforeSymbol: true}
 		}
 	}
+	if plan.ConsumerProbes {
+		if err := r.admitConsumerBaseline(ctx); err != nil {
+			return r, clients, err
+		}
+	}
 	phase.Metrics["edit_probe_session_setup_seconds"] = measured(time.Since(setup).Seconds(), "s")
 	phase.Metrics["edit_probe_sessions"] = measured(float64(len(clients)), "sessions")
 	phase.Metrics["edit_probe_editor_sessions"] = measured(float64(len(editors)), "sessions")
@@ -528,7 +562,7 @@ func (s *editProbeState) emit(value any) error {
 	}
 	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
 		// Preserve only first-refusal scalar facts in the existing error path.
-		// The rejected payload is never queued and the original cap is unchanged.
+		// The rejected payload is never queued or counted against accepted bytes.
 		row, _ := value.(map[string]any)
 		event, _ := row["event"].(string)
 		purpose, _ := row["purpose"].(string)
@@ -633,6 +667,9 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 			c.state.mu.Unlock()
 		}
 	}
+	if transaction := c.state.pairedTransaction; transaction != nil && (c.purpose == "readback:file" || c.purpose == "readback:source") {
+		onWriteStart = func(at time.Time) { transaction.observeReadWrite(strings.TrimPrefix(c.purpose, "readback:"), at) }
+	}
 	data, identity, err := c.client.callWithWriteObserver(ctx, method, params, onWriteStart)
 	c.last = identity
 	c.state.mu.Lock()
@@ -723,6 +760,9 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	if isEditConsumer(oracle.name) {
+		return r.observeConsumer(s, oracle, data, identity, err)
+	}
 	repo, routeErr := r.repoFor(s.step)
 	if routeErr != nil {
 		return routeErr
@@ -846,7 +886,11 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 	corpus := repo.Corpus
 	corpus.EditOutput = r.stepProbeMode(s.step)
 	for index, oracle := range editProbeOracles(corpus, s.step) {
-		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" {
+		if isEditConsumer(oracle.name) && r.stepProbeMode(s.step) == "compact" {
+			s.markUnsupportedConsumer(oracle.name)
+			continue
+		}
+		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" && !isEditConsumer(oracle.name) {
 			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
 			oracle.call.Arguments["require_fresh"] = true
 		}
@@ -1141,6 +1185,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if readbacksCorrect {
 		s.record.Readback = measured(float64(readbackEnd.Sub(started))/float64(time.Millisecond), "ms")
 	}
+	if s.pairedTransaction != nil {
+		s.pairedTransaction.finish(ctx, callCtx, readbackEnd, readbacksCorrect && len(s.record.Errors) == 0)
+	}
 	if r.plan.SearchReadbackAcceptance {
 		// This named profile certifies ACK plus its four immediate searches,
 		// never canonical publication, relation readiness or A/P/B accounting.
@@ -1176,6 +1223,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
 			s.mu.Lock()
 			s.record.supersededStatus = nil // Only the latest status call may supply evidence.
+			s.record.coalescedStatus = nil
+			s.record.functionalUnavailableStatus = nil
 			s.mu.Unlock()
 			if errors.Is(statusErr, errEditProbeEvidenceIncomplete) {
 				break
@@ -1192,6 +1241,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
+					s.record.coalescedStatus = coalescedFunctionalStatus(status, raw, statusIdentity.ID, accounting)
+					s.record.functionalUnavailableStatus = functionalUnavailableStatus(status, raw, statusIdentity.ID, accounting)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
@@ -1209,6 +1260,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						}
 					}
 					terminal := s.record.GraphTerminal
+					qualifiedCandidate := s.record.coalescedStatus != nil || s.record.functionalUnavailableStatus != nil
+					qualifiedTiers := s.record.MutationTiers
+					consumersDone := editConsumersFinished(s.record.Consumers)
 					if terminal && status["graph_status"] != "fresh" {
 						s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
 					}
@@ -1222,7 +1276,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
+					if consumersDone && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
 						break
 					}
 				}
@@ -1348,6 +1402,9 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			}
 		}
 		back.ObservationOnly = observeOnly[kind]
+		if s.pairedTransaction != nil {
+			s.pairedTransaction.observeRead(req, begin, identity, back, readErr, callCtx.Err())
+		}
 		s.mu.Lock()
 		if r.plan.GateModes && index == 0 {
 			metric := unavailable("ms", "first same-editor symbol-source readback endpoint missing or incorrect")
@@ -1453,7 +1510,16 @@ func (r *editProbeRuntime) finish() error {
 			proof := &receiptproof.Superseded{Status: *candidate, Guard: *guards[candidate.Key]}
 			classified = classifySupersededRecord(&record, r.phase.EditProbe.PhysicalWriteScope, proof)
 		}
+		if !classified {
+			classified = classifyCoalescedFunctionalRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
+		}
+		if !classified {
+			classified = classifyFunctionalUnavailableRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
+		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
+		if editConsumersFailure(record.Consumers) {
+			failures = append(failures, fmt.Errorf("edit %d: relation consumer observations incomplete, unsupported or incorrect", record.Ordinal))
+		}
 		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {
 			failures = append(failures, fmt.Errorf("edit %d: %s (%s)", record.Ordinal, record.Outcome, strings.Join(record.Errors, "; ")))
 		}

@@ -64,13 +64,32 @@ type editLoopWire struct {
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
-		Superseded *receiptproof.Superseded `json:"superseded_receipt"`
-		Receipt    string                   `json:"mutation_receipt"`
-		Accounting struct {
-			State     string `json:"state"`
-			RPCID     string `json:"bound_rpc_id"`
-			Requested uint64 `json:"requested_generation"`
-			Applied   uint64 `json:"applied_generation"`
+		Superseded            *receiptproof.Superseded            `json:"superseded_receipt"`
+		FunctionalUnavailable *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt"`
+		PhasesMS              map[string]metric                   `json:"phases_ms"`
+		CoalescedFunctional   *receiptproof.Coalesced             `json:"coalesced_functional_receipt"`
+		MutationTiers         *struct {
+			State     string            `json:"observation_state"`
+			Reason    string            `json:"reason"`
+			ACK       string            `json:"ack_at"`
+			FileGraph string            `json:"file_graph_at"`
+			Relations string            `json:"relations_at"`
+			Derived   string            `json:"derived_at"`
+			Tiers     map[string]string `json:"tier_state"`
+		} `json:"mutation_tiers"`
+		FirstCorrect      map[string]metric `json:"first_correct_ms"`
+		Readback          metric            `json:"t_readback_ms"`
+		GraphTerminal     *bool             `json:"graph_terminal"`
+		StaleClaimedFresh *bool             `json:"stale_claimed_fresh"`
+		EvidenceBytes     int               `json:"evidence_bytes"`
+		EvidenceLimit     int               `json:"evidence_limit_bytes"`
+		Receipt           string            `json:"mutation_receipt"`
+		Accounting        struct {
+			State     string   `json:"state"`
+			Reasons   []string `json:"reasons"`
+			RPCID     string   `json:"bound_rpc_id"`
+			Requested uint64   `json:"requested_generation"`
+			Applied   uint64   `json:"applied_generation"`
 			A         *struct {
 				WallNS            int64 `json:"wall_ns"`
 				SumNS             int64 `json:"sum_ns"`
@@ -101,6 +120,7 @@ type editLoopWire struct {
 		Readbacks        []struct {
 			Kind            string `json:"kind"`
 			Correct         *bool  `json:"correct"`
+			Latency         metric `json:"latency_ms"`
 			Error           string `json:"error"`
 			ObservationOnly bool   `json:"observation_only"`
 		} `json:"readbacks"`
@@ -333,10 +353,16 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 	}
 	modes := []string{"json", "toon", "compact", "facade", "cli"}
 	for i, record := range wire.Edits {
-		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome || len(record.Errors) != 0 {
+		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome && record.Outcome != receiptproof.CoalescedFunctionalOutcome && record.Outcome != receiptproof.FunctionalUnavailableOutcome || len(record.Errors) != 0 {
 			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
 		}
 
+		if record.Outcome == receiptproof.FunctionalUnavailableOutcome && !functionalUnavailableEditLoopRecord(wire, i) {
+			return wire, errors.New("qualified functional receipt lacks owned unavailable-timing and functional proof")
+		}
+		if record.Outcome == receiptproof.CoalescedFunctionalOutcome && !coalescedFunctionalEditLoopRecord(wire, i) {
+			return wire, errors.New("qualified coalesced receipt lacks independent functional/status proof")
+		}
 		if record.Outcome == receiptproof.SupersededOutcome {
 			a := record.Accounting.A
 			digest, digestErr := hex.DecodeString(record.ACKContentSHA256)

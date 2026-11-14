@@ -15,10 +15,17 @@ import (
 	"github.com/zzet/gortex/internal/parser/languages"
 )
 
-// A real current-file extraction exhausts the original private allowance. The
-// requested new definition exists on disk but is absent from canonical state;
-// an unavailable view must not certify its absence or serve old source ranges.
+// The original private allowance can expire before extractor admission or
+// during extraction. Both real deferrals must preserve the same typed refusal;
+// neither may certify canonical absence or serve old source ranges.
 func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
+	for _, mode := range []string{"ordinary_admission", "spent_before_admission", "cancelled_caller"} {
+		t.Run(mode, func(t *testing.T) { registeredSourceProjectionDeferral(t, mode) })
+	}
+}
+
+func registeredSourceProjectionDeferral(t *testing.T, mode string) {
+	t.Helper()
 	selectedProjectionRegistry(t)
 	e := &pendingBudgetExtractor{base: languages.NewGoExtractor(), entered: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
 	reg := parser.NewRegistry()
@@ -41,9 +48,22 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	e.hold.Store(true)
 	release := sync.OnceFunc(func() { close(e.release) })
 	caller, cancel := context.WithTimeout(base, 3*time.Second)
+	if mode != "ordinary_admission" {
+		// Spend an actual production-sized allowance before dispatch. This
+		// controls the valid no-extractor branch without backdating a clock,
+		// extending the product budget or manufacturing deferral facts.
+		deadline := time.Now().Add(projectedReadBudget)
+		caller = context.WithValue(caller, projectedSourceDeadlineKey{}, deadline)
+		timer := time.NewTimer(time.Until(deadline))
+		<-timer.C
+		if mode == "cancelled_caller" {
+			cancel()
+		}
+	}
 	type answer struct {
-		result *mcplib.CallToolResult
-		err    error
+		result   *mcplib.CallToolResult
+		err      error
+		returned time.Time
 	}
 	done := make(chan answer, 1)
 	joined := false
@@ -77,19 +97,23 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	})
 	go func() {
 		result, callErr := externalVersionRegisteredCall(s, caller, 91, "read", map[string]any{"operation": "source", "target": map[string]any{"symbol": "main.go::SourceBeyondDeadline"}, "output": map[string]any{"format": "json", "max_bytes": 0}})
-		done <- answer{result, callErr}
+		done <- answer{result: result, err: callErr, returned: time.Now()}
 	}()
-	select {
-	case <-e.entered:
-	case <-caller.Done():
-		t.Fatal("actual source projection never entered extractor")
-	}
 	var got answer
 	select {
 	case got = <-done:
 		joined = true
-	case <-caller.Done():
-		t.Fatal("source read waited beyond original projection allowance")
+	case <-time.After(3 * time.Second):
+		t.Fatal("owned registered source read did not return")
+	}
+	if mode == "cancelled_caller" {
+		require.ErrorIs(t, caller.Err(), context.Canceled)
+		require.True(t, got.err != nil || got.result != nil && got.result.IsError)
+		if got.result != nil {
+			require.NotContains(t, resultText(got.result), "projection_deferred", "a cancelled caller has no live private-budget refusal")
+		}
+		require.True(t, e.hold.Load(), "cancelled dispatch must not admit extraction")
+		return
 	}
 	require.NoError(t, got.err)
 	require.NoError(t, caller.Err())
@@ -98,12 +122,22 @@ func TestRegisteredSourceMissAfterRealProjectionDeferralIsTyped(t *testing.T) {
 	require.Empty(t, requestProjectionLayers(observed))
 	deadline, ok := observed.Value(projectedSourceDeadlineKey{}).(time.Time)
 	require.True(t, ok)
-	require.False(t, time.Now().Before(deadline), "real private allowance must have expired")
+	require.False(t, got.returned.Before(deadline), "real private allowance must have expired before the registered response returned")
+	stage := "before_extractor_admission"
+	select {
+	case <-e.entered:
+		stage = "extracting"
+	default:
+		require.True(t, e.hold.Load(), "no-entry branch needs positive evidence extraction was not admitted")
+	}
+	if mode == "spent_before_admission" {
+		require.Equal(t, "before_extractor_admission", stage)
+	}
 	raw, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, after, raw)
 	require.Nil(t, s.engine.GetSymbol("main.go::SourceBeyondDeadline"), "read must not publish canonical state")
-	t.Logf("REAL_SOURCE_DEFERRAL_VERIFIED caller_live=true original_private_allowance_expired=true physical_target_present=true canonical_target_absent=true result=%s", resultText(got.result))
+	t.Logf("REAL_SOURCE_DEFERRAL_VERIFIED stage=%s caller_live=true original_private_allowance_expired=true physical_target_present=true canonical_target_absent=true result=%s", stage, resultText(got.result))
 	requireReadFreshnessContract(t, got.result, "file_view_pending")
 	var body StructuredError
 	require.NoError(t, json.Unmarshal([]byte(resultText(got.result)), &body))

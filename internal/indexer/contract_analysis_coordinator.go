@@ -80,6 +80,9 @@ type ContractAnalysisCoordinatorOptions struct {
 	// samples still counts. It is sampled outside the scheduler's lock and
 	// must not wait.
 	Demand func() (busy bool, seq uint64)
+	// LinkedInterest notifies the owning lifecycle of admitted work, outside
+	// every scheduler lock. It must not wait for the semantic provider to drain.
+	LinkedInterest func(ContractActor)
 }
 
 type contractAnalysisJob struct {

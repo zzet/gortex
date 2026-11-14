@@ -253,6 +253,31 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+`--edit-consumer-probes` adds opt-in dry-run rename, signature verification,
+dead-code and unstaged-change probes. It requires one primary Go
+`add_intrafile_call` / `edit.file` fixture with an unexported callee and an
+explicit `proposed_signature` of `func <callee>(probe int) int`. Before any
+edit, an actual complete JSON dead-code response must contain that callee;
+exported targets, missing membership, pending baselines and truncated results
+are refused. The fixture and reference population are never substituted.
+Rename always uses `dry_run:true` and the new caller's actual/provisional site;
+verification checks a typed caller mismatch for the deliberately incompatible
+signature, and detection checks the actual changed file and symbol.
+
+The report retains `consumer_baseline` with its raw evidence and per-edit
+`relation_consumers` observations. Their post-ACK attempted/assessed/pending,
+error and missing counts are separate from the seven first-correct gates.
+A pending answer is not completion, and an empty dead-code list proves a
+membership transition only after the actual pre-edit membership witness.
+Unobserved, failed or unsupported silent-stale counts stay unavailable rather
+than zero. Per-line rename rows that cannot identify the requested caller stay
+unassessed with unavailable stale counts and incomplete coverage. Missing or
+incorrect consumer observations fail the opt-in phase;
+they do not alter the default ACK/accounting predicates. Calls keep the
+original per-edit deadline and artifact limits. Compact consumer decoding is
+explicitly unsupported: no JSON fallback grants compact coverage. This option
+alone establishes no 1/8/32-agent runtime or all-mode acceptance.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
@@ -276,7 +301,8 @@ drop another editor's marker until the next write restored it; it is refused
 with more than one editor. An out-of-order `edit.batch` fails its `old_string`
 precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
-the paired no-regression cell stay one editor.
+the default paired no-regression cell stay one editor. The explicit paired
+own-ACK transaction method below admits four or eight editor streams.
 
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest
@@ -701,9 +727,11 @@ all failures and matched latency ratios; the summary uses the **median of
 matched per-request ratios**, never a ratio of raw percentile summaries. Failed,
 censored or mismatched pairs remain explicit exclusions. Workload and probe
 categories are separate. These are coupled comparisons, not independently
-measured saturation throughput or reference/floor capacity. Paired mode rejects
-saturation, reference/floor, cold/restart and CPU-profile options; use standalone
-runs for those measurements.
+measured saturation throughput or reference/floor capacity. Explicit
+`--host reference` uses the same host-profile admission as standalone `run`;
+the daemons share those validated limits, so the comparison remains coupled.
+Paired mode rejects saturation, floor, cold/restart and CPU-profile options;
+use standalone runs for those measurements.
 
 Edits apply the same logical marker to each build's independent clone. Each
 build has its own acknowledgement and visibility deadline. Visibility ends at
@@ -749,6 +777,26 @@ that edit's paired probes and is a failed/censored observation, never a product
 deadline or a successful pair. This initial cell does not establish reference
 capacity, the larger tool/language/native matrix, or a no-regression verdict
 without the actual qualified paired run.
+
+For the approved four/eight-editor own-ACK comparison, opt in with
+`--paired-own-ack-transactions --edit-agents 4` (or `8`) on that same two-build
+`edit-and-probe` command. It requires the plain `edit.file` / `add_intrafile_call`
+plan, zero readers, and the existing file-then-source readbacks. The first build
+finishes edit → its own ACK → immediate file read → source read before the
+partner receives that logical edit. Build order rotates at this whole
+transaction boundary. Other editor streams and the existing seven oracle
+probes remain concurrent; receipt/status controls remain build-local.
+
+The report and workload identify `edit_own_ack_file_source_v1`. Original ACK
+records remain separate. Transaction records retain ACK and individual RPC
+timestamps/latencies, own-ACK-to-file dispatch delay, and whole-transaction
+latency. Additional file/source pairs use their transaction's identity and build
+order. Logical ACK/read latencies include supported retries and backoff; final
+attempt timings remain separate. The dispatch gap uses the first actual file
+wire write, including when that attempt is busy. Every error, refusal, deadline and phase censor remains visible with
+explicit matched exclusions. A transaction population containing failed or
+censored entries has no success-only aggregate p95. This opt-in changes neither
+deadlines nor correctness, retries, no-regression limits or capacity claims.
 
 `delta` rejects incompatible workload/corpus/target/host-limit identities rather
 than printing an unqualified verdict. It lists every comparable timing metric
