@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/zzet/gortex/internal/gitcmd"
 	"github.com/zzet/gortex/internal/indexer/source"
@@ -128,54 +129,59 @@ func validGitOID(s string) bool {
 	return true
 }
 
-// diffTreeChanges reads the name-status difference between two trees.
+// diffTreeChanges reads the raw difference between two trees.
 //
 // -z is required rather than preferred: a path may contain spaces and
-// newlines, and a rename record spells its second path in its own
-// NUL-terminated chunk. The parser is the one the git watcher already runs on
-// exactly this output shape.
+// newlines. --no-renames splits a rename into its delete and its add, because
+// a generation's masks speak about paths and the two halves say everything a
+// rename record would.
 //
-// The status letters map onto the three change kinds a layer speaks:
-//
-//	A          added
-//	M, T       modified — content, or the type of the entry
-//	D          deleted
-//	R<score>   deleted at the source path plus added at the destination
-//	C<score>   added at the destination; the source is untouched
-//	U          modified — an unmerged path still has content on both sides
-//
-// A rename decomposes deliberately. The two states differ by a path that is
-// gone and a path that is new, and a generation's masks speak about paths;
-// carrying the rename as one record would say nothing the two halves do not.
+// Each record is classified by its two modes, not its status letter: a side
+// holds the path when its mode is neither absent (000000) nor a gitlink
+// (160000). Held on both sides is modified, only on the target side added,
+// only on the base side deleted, and on neither side the record is skipped.
+// Gitlinks are left out because the target is a GitTreeSource, which serves
+// files and symlinks only — a submodule pointer named as present would fail
+// the build's presence check (#1458) — so a pointer bump changes nothing, a
+// file replaced by a submodule is a deletion and the reverse an addition.
 func diffTreeChanges(ctx context.Context, repoDir, baseTree, targetTree string) ([]LayerPathChange, error) {
 	out, err := gitcmd.RunNoLazy(ctx, repoDir,
-		"diff", "--name-status", "--no-renames", "-z", baseTree, targetTree)
+		"diff", "--raw", "--no-renames", "--no-abbrev", "-z", baseTree, targetTree)
 	if err != nil {
 		return nil, fmt.Errorf("indexer: diff %s..%s in %s: %w", baseTree, targetTree, repoDir, err)
 	}
-	byPath := make(map[string]LayerChangeKind)
-	for _, change := range parseDiffNameStatus(out) {
-		switch change.Status {
-		case 'A', 'C':
-			byPath[path.Clean(change.Path)] = LayerPathAdded
-		case 'M', 'T', 'U':
-			byPath[path.Clean(change.Path)] = LayerPathModified
-		case 'D':
-			byPath[path.Clean(change.Path)] = LayerPathDeleted
-		case 'R':
-			byPath[path.Clean(change.Path)] = LayerPathAdded
-			if change.OldPath != "" {
-				old := path.Clean(change.OldPath)
-				if _, present := byPath[old]; !present {
-					byPath[old] = LayerPathDeleted
-				}
-			}
+	fields := strings.Split(string(out), "\x00")
+	var changes []LayerPathChange
+	for i := 0; i < len(fields); i++ {
+		header := fields[i]
+		if header == "" {
+			continue
 		}
-	}
-	changes := make([]LayerPathChange, 0, len(byPath))
-	for p, kind := range byPath {
-		changes = append(changes, LayerPathChange{Path: p, Kind: kind})
+		parts := strings.Fields(strings.TrimPrefix(header, ":"))
+		if !strings.HasPrefix(header, ":") || len(parts) < 5 || i+1 >= len(fields) {
+			return nil, fmt.Errorf("indexer: unexpected diff record %q", header)
+		}
+		i++
+		inBase, inTarget := treeModeHoldsContent(parts[0]), treeModeHoldsContent(parts[1])
+		var kind LayerChangeKind
+		switch {
+		case inBase && inTarget:
+			kind = LayerPathModified
+		case inTarget:
+			kind = LayerPathAdded
+		case inBase:
+			kind = LayerPathDeleted
+		default:
+			continue
+		}
+		changes = append(changes, LayerPathChange{Path: path.Clean(fields[i]), Kind: kind})
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes, nil
+}
+
+// treeModeHoldsContent reports whether a raw-diff mode names content a tree
+// source serves: not an absent side and not a submodule gitlink.
+func treeModeHoldsContent(mode string) bool {
+	return mode != "000000" && mode != "160000"
 }
