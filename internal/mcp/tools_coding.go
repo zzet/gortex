@@ -929,6 +929,13 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 		s.frecency.Record(id)
 	})
 
+	// External (ext::) symbols carry a recorded declaration position but
+	// no editable line range; serve their source read-only before the
+	// repo-symbol guard turns them into an error.
+	if externalNode(node) {
+		return s.externalSymbolSourceResult(ctx, req, node)
+	}
+
 	if node.StartLine == 0 || node.EndLine == 0 {
 		return mcp.NewToolResultError("symbol has no line range: " + id), nil
 	}
@@ -3050,7 +3057,7 @@ func (s *Server) handleEditSymbol(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	if node.StartLine == 0 || node.EndLine == 0 {
-		return mcp.NewToolResultError("symbol has no line range: " + id), nil
+		return mcp.NewToolResultError(externalRefusal(node, id, "symbol has no line range: "+id)), nil
 	}
 
 	// Resolve file path.

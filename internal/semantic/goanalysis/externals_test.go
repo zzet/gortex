@@ -1,6 +1,8 @@
 package goanalysis
 
 import (
+	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -101,6 +103,55 @@ func TestExternals_AttributesStdlibCallToModuleNode(t *testing.T) {
 	stringer := g.GetNode("ext::go:fmt::Stringer")
 	require.NotNil(t, stringer, "expected synthetic node for fmt.Stringer")
 	assert.Equal(t, graph.KindInterface, stringer.Kind)
+}
+
+// TestExternals_RecordsSourcePosition checks that external nodes carry
+// the declaration position source reads need: an absolute file under
+// GOROOT (or the module cache) and the line of the declaration.
+func TestExternals_RecordsSourcePosition(t *testing.T) {
+	root := resolvedTempDir(t)
+	stdlibCallerFixture(t, root)
+
+	g := graph.New()
+	g.AddNode(&graph.Node{
+		ID: "main.go::Greet", Kind: graph.KindFunction, Name: "Greet",
+		FilePath: "main.go", StartLine: 9, EndLine: 12, Language: "go",
+	})
+
+	p := newTestProvider(t)
+	_, err := p.Enrich(g, root)
+	require.NoError(t, err)
+
+	println := g.GetNode("ext::go:fmt::Println")
+	require.NotNil(t, println, "expected synthetic node for fmt.Println")
+	file, _ := println.Meta["source_file"].(string)
+	require.NotEmpty(t, file, "expected source_file recorded for ext::go:fmt::Println")
+	assert.True(t, strings.HasPrefix(file, runtime.GOROOT()),
+		"source_file %q should live under GOROOT %q", file, runtime.GOROOT())
+	require.FileExists(t, file)
+
+	line := metaLineNumber(println.Meta["source_line"])
+	require.Positive(t, line, "expected source_line recorded")
+	raw, err := os.ReadFile(file)
+	require.NoError(t, err)
+	sourceLines := strings.Split(string(raw), "\n")
+	require.GreaterOrEqual(t, len(sourceLines), line)
+	assert.Contains(t, sourceLines[line-1], "func Println",
+		"source_line should point at Println's declaration")
+}
+
+// metaLineNumber reads a Meta line number across the int / float64 forms
+// a fresh enrich pass and a JSON round-trip produce.
+func metaLineNumber(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
 }
 
 func TestExternals_DepInModuleCacheGetsModuleNode(t *testing.T) {

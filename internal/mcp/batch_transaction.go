@@ -299,7 +299,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 				}
 				plan.file = plan.node.FilePath
 				if plan.node.StartLine == 0 || plan.node.EndLine == 0 {
-					plan.err = "symbol has no line range"
+					plan.err = externalRefusal(plan.node, edit.SymbolID, "symbol has no line range")
 					break
 				}
 				if resolvePaths {

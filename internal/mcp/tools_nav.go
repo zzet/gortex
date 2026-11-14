@@ -369,6 +369,25 @@ func (s *Server) navRead(ctx context.Context, req mcp.CallToolRequest, eng engin
 	}
 	payload := s.navBasePayload(eng, cur, "read", staleReset)
 
+	// External (ext::) symbols carry a recorded declaration position but
+	// no editable line range; serve their source read-only instead of the
+	// "no line range" note.
+	if externalNode(node) {
+		src := externalDeclarationSource(node, 0)
+		payload["external"] = true
+		payload["read_only"] = true
+		addExternalMetaFields(payload, node)
+		if src.reason != "" {
+			payload["source"] = nil
+			payload["source_unavailable_reason"] = src.reason
+		} else {
+			payload["source"] = src.source
+			payload["start_line"] = src.startLine
+			payload["end_line"] = src.endLine
+		}
+		return s.respondJSONOrTOON(ctx, req, payload)
+	}
+
 	if node.StartLine == 0 || node.EndLine == 0 {
 		payload["source"] = ""
 		payload["note"] = "symbol has no line range"

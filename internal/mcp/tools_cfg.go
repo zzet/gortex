@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -59,7 +60,7 @@ func (s *Server) buildSymbolCFG(ctx context.Context, id string) (*symbolCFG, err
 		return nil, fmt.Errorf("control-flow graphs are not supported for language %q (supported: go, python, javascript, typescript, java, rust, ruby)", node.Language)
 	}
 	if node.StartLine == 0 || node.EndLine == 0 {
-		return nil, fmt.Errorf("symbol has no line range: %s", id)
+		return nil, errors.New(externalRefusal(node, id, "symbol has no line range: "+id))
 	}
 	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
