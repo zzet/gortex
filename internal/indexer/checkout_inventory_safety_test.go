@@ -37,6 +37,10 @@ func TestRegisterPoisonedProbeKeepsConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, report.InventoryUsable, "a damaged linked checkout must not be the only family probe")
 	require.Contains(t, f.configPaths(), root)
+	primary, found, err := f.catalog.GetCheckout(context.Background(), tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "a poisoned linked checkout must not retire the intended primary")
+	require.Equal(t, store_sqlite.CheckoutStateReady, primary.State, "successful fallback inventory must keep the primary ready")
 }
 
 func TestInRepoLaneForgetKeepsPrimaryWatcher(t *testing.T) {

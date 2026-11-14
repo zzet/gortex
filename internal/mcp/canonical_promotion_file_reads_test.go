@@ -230,7 +230,22 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 				borrowed := facts.entries[entry.key]
 				facts.mu.RUnlock()
 				require.Same(t, entry, borrowed)
-				if transition == "canonical_promotion" {
+				checkedSameBytes := tool == "get_file_summary" && transition == "same_bytes_event"
+				if transition == "canonical_promotion" || checkedSameBytes {
+					if checkedSameBytes {
+						current := liveEntry(pendingFileProjections, path)
+						require.NotNil(t, current)
+						require.NotSame(t, entry, current, "only a newly checked owner can authorize another attempt")
+						require.Zero(t, current.commitSeq)
+						require.Equal(t, entry.sourceCommitSeq, current.sourceCommitSeq)
+						require.Same(t, entry.layer, current.layer)
+						require.Equal(t, entry.rawHash, current.rawHash)
+						require.True(t, current.readVersionChecked)
+						require.True(t, entry.suspect.Load(), "the old context/ACK stays invalid")
+						physical, readErr := os.ReadFile(path)
+						require.NoError(t, readErr)
+						require.Equal(t, raw, physical)
+					}
 					requireCanonicalDefinitionRows(t, tool, result, raw)
 					require.Equal(t, 2, calls)
 					afterCount := s.tokenStatsFor(t.Context()).snapshot()["calls_counted"].(int64)

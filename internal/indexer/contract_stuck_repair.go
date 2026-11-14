@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -110,6 +111,13 @@ type contractRepoRepair struct {
 	// repair first found with no open window, and when.
 	pendingKey   string
 	pendingSince time.Time
+	// Failed baseline reconstruction can advance the pending key itself, so
+	// its capped retry delay is independent of that key and the lane backoff.
+	headerBackoff time.Duration
+	headerRetryAt time.Time
+	// A refused accepted receipt requires baseline reconstruction even when
+	// the namespace header was already accepted before the policy changed.
+	rebuildBaseline bool
 	// scan asks for a pass over the namespace's unaccepted rows.
 	scan bool
 	// retry keeps incomplete startup repairs on the periodic watch. It is
@@ -452,7 +460,7 @@ func (r *ContractStuckRepair) pass(state *contractRepoRepair) {
 func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRepoRepair) {
 	defer func() {
 		r.mu.Lock()
-		state.retry = !r.closed && (len(state.attempts) > 0 || state.pendingKey != "")
+		state.retry = !r.closed && (len(state.attempts) > 0 || state.pendingKey != "" || state.rebuildBaseline)
 		r.mu.Unlock()
 	}()
 	repo := state.repo
@@ -484,7 +492,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		}
 	}
 	for path := range candidates {
-		if !stuck[path] && r.restartLeft(ctx, store, repo, path) {
+		if !stuck[path] && (r.restartLeft(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path) || r.driftedRow(ctx, store, repo, path)) {
 			stuck[path] = true
 		}
 	}
@@ -497,6 +505,37 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 	for path := range suspects {
 		if !stuck[path] && !detected[path] {
 			healed = append(healed, path)
+			row, _, err := store.ContractBoundaryReceiptContext(ctx, repo, "", path)
+			idx, _, indexErr := r.repoIndexer(repo)
+			if err == nil && indexErr == nil && row != nil && row.Accepted {
+				policy, _ := contractReceiptOverflowPolicy(row)
+				language, _ := idx.registry.DetectLanguage(path)
+				if filepath.Base(path) == "go.mod" {
+					language = "go"
+				}
+				if prior, known, _ := contractCorePriorReceipt(row, true); known && prior != nil {
+					policy, language = prior.Policy, prior.Language
+				}
+				if policy != "" {
+					// Use capture's configuration authority, not the core indexer's
+					// earlier settings: a config reload need not mutate any source.
+					cfg := r.options.Baseline.Config
+					mi := r.options.MultiIndexer
+					mi.mu.RLock()
+					if mi.configMgr != nil {
+						cfg = mi.configMgr.GetRepoConfig(repo).Index
+					}
+					mi.mu.RUnlock()
+					current := &Indexer{config: cfg, registry: idx.registry, logger: r.options.Logger, repoPrefix: repo}
+					opts := idx.extractionOptionsValue()
+					current.extractionOptions.Store(&opts)
+					_, policyErr := current.contractFollowupPolicyMode(language, policy)
+					current.Close()
+					if policyErr != nil {
+						state.rebuildBaseline = true
+					}
+				}
+			}
 		}
 	}
 	if len(healed) > 0 {
@@ -524,7 +563,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		err := r.reindexPaths(ctx, repo, reindex)
 		r.logRepair(repo, viewmetrics.ContractRepairStuckReceipt, reindex, err)
 		for _, path := range reindex {
-			if !r.inFlight(ctx, store, repo, path) {
+			if !r.unrepaired(ctx, store, repo, path) {
 				delete(state.attempts, path)
 				continue
 			}
@@ -541,7 +580,7 @@ func (r *ContractStuckRepair) repairHeld(ctx context.Context, state *contractRep
 		countContractRepair(viewmetrics.ContractRepairStuckEnvelope)
 		err := r.envelopePaths(ctx, repo, []string{path})
 		r.logRepair(repo, viewmetrics.ContractRepairStuckEnvelope, []string{path}, err)
-		if !r.inFlight(ctx, store, repo, path) {
+		if !r.unrepaired(ctx, store, repo, path) {
 			delete(state.attempts, path)
 		}
 	}
@@ -601,6 +640,70 @@ func (r *ContractStuckRepair) restartLeft(ctx context.Context, store *store_sqli
 		return false
 	}
 	return store.ContractReceiptWriteStates(repo, "", []string{path})[path].Seq == 0
+}
+
+// absentRow reports whether path, a census file a capture reported or an
+// earlier repair attempted, is still on disk with no primary row in a
+// namespace whose baseline is at the current receipt version: nothing admits
+// it, and no live mutation will write the row while the file does not move. A
+// baseline that skipped the file as moved, while its save never came, leaves
+// this behind. A row of another version, or a namespace without a current
+// baseline, is the baseline rebuild's to replace, not a forced reindex's. A
+// file gone from disk needs no row: its deletion, once indexed, takes it out
+// of the census.
+func (r *ContractStuckRepair) absentRow(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	row, known, err := store.ContractBoundaryReceiptForVersionContext(ctx, repo, "", path, contractBoundaryReceiptVersion)
+	if err != nil || row != nil || !known {
+		return false
+	}
+	_, root, err := r.repoIndexer(repo)
+	return err == nil && contractCensusFileOnDisk(root, repo, path)
+}
+
+// contractCensusFileOnDisk reports whether a repository's census path names
+// a regular file under root. A capture asks it before reporting an absent row
+// and the repair asks it before taking one, so a request never waits on a
+// repair that would decline the file.
+func contractCensusFileOnDisk(root, repo, path string) bool {
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(path, repo+"/"))))
+	return err == nil && info.Mode().IsRegular()
+}
+
+// unrepaired reports whether a repair left path in flight or still without a
+// row, so its attempts keep counting toward the envelope.
+func (r *ContractStuckRepair) unrepaired(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	return r.inFlight(ctx, store, repo, path) || r.absentRow(ctx, store, repo, path) || r.driftedRow(ctx, store, repo, path)
+}
+
+// driftedRow reports whether path, a census file a capture reported or an
+// earlier repair attempted, has bytes on disk that, after the repository's
+// source transforms, no longer match its metadata row. Under the held lane no
+// save is in flight, so nothing will rewrite the row: a baseline rebuild
+// skips the file as moved and leaves its receipt as it stands, so a receipt
+// of an outdated policy is never replaced and the capture refuses it again.
+// The bytes are compared after the indexer's own source transforms, the
+// pipeline the forced reindex writes the row with, so a reindex always
+// clears what this reports. A file whose save is writing is left to it.
+func (r *ContractStuckRepair) driftedRow(ctx context.Context, store *store_sqlite.Store, repo, path string) bool {
+	if repo == "" || store.ContractReceiptWriteStates(repo, "", []string{path})[path].Writing {
+		return false
+	}
+	idx, root, err := r.repoIndexer(repo)
+	if err != nil || !contractCensusFileOnDisk(root, repo, path) {
+		return false
+	}
+	rows, err := store.FileMetasByPathsContext(ctx, repo, []string{path})
+	row, ok := rows[path]
+	if err != nil || !ok || row.ContentHash == "" {
+		return false
+	}
+	rel := strings.TrimPrefix(path, repo+"/")
+	raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		return false
+	}
+	src := idx.transforms.run(rel, raw)
+	return contentHashForSource(src) != row.ContentHash || len(src) != row.Size
 }
 
 // repoIndexer is the repository's live indexer and root.
@@ -697,8 +800,13 @@ func (r *ContractStuckRepair) repairHeader(ctx context.Context, state *contractR
 	repo := state.repo
 	store := r.options.Store.AtGeneration(0)
 	current, found, err := store.ContractInputStateContext(ctx, repo, "")
-	if err != nil || !found || current.Accepted {
+	if err != nil {
+		return
+	}
+	if !found || (current.Accepted && !state.rebuildBaseline) {
 		state.pendingKey = ""
+		state.rebuildBaseline = false
+		state.headerBackoff, state.headerRetryAt = 0, time.Time{}
 		return
 	}
 	work, err := store.PendingContractWorkForScopeContext(ctx, repo, "")
@@ -721,18 +829,23 @@ func (r *ContractStuckRepair) repairHeader(ctx context.Context, state *contractR
 			waited = true
 		}
 	}
-	if !waited {
+	if !waited || now.Before(state.headerRetryAt) {
 		return
 	}
 	countContractRepair(viewmetrics.ContractRepairPendingHeader)
 	options := r.options.Baseline
 	options.Context = ctx
+	options.rebuildBaseline = state.rebuildBaseline
 	err = reconcilePrimaryContractBaseline(ctx, options, repo)
 	r.logRepair(repo, viewmetrics.ContractRepairPendingHeader, nil, err)
 	if err != nil {
+		state.headerBackoff = min(max(r.period, 2*state.headerBackoff), contractRepairBusyBackoffMax*r.period)
+		state.headerRetryAt = time.Now().Add(state.headerBackoff)
 		return
 	}
 	state.pendingKey = ""
+	state.rebuildBaseline = false
+	state.headerBackoff, state.headerRetryAt = 0, time.Time{}
 	if hooks := r.options.MultiIndexer.contractCoreRuntime.Load(); hooks != nil && hooks.Published != nil {
 		hooks.Published(ctx, repo, "")
 	}

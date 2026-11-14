@@ -47,6 +47,17 @@ func (s *Server) nodeLinesIn(ctx context.Context, node *graph.Node, content []by
 			return node.StartLine, node.EndLine, nil
 		}
 	}
+	if requestViewFromContext(ctx).routed() {
+		if allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); ok && allowance.tool == "get_symbol_source" {
+			abs, err := s.resolveNodePath(ctx, node)
+			if err != nil {
+				return 0, 0, err
+			}
+			if live, matched := s.readIndexedSymbolSource(ctx, abs, node.FilePath, content, node.ID, node); matched {
+				return live.StartLine, live.EndLine, nil
+			}
+		}
+	}
 
 	s.noteAcknowledgementParser(ctx, "source_extraction_for_symbol_location")
 	parseLap := s.beginAcknowledgementLap(ctx, editAckParseGate)

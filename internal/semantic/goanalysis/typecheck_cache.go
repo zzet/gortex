@@ -515,9 +515,13 @@ func (p *Provider) runListing(ctx context.Context, loadDir string, patterns, bui
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedExportFile | packages.NeedModule |
 			packages.NeedTypesSizes,
-		Dir:        loadDir,
-		Tests:      false,
-		BuildFlags: buildFlags,
+		Dir:   loadDir,
+		Tests: false,
+		// Export artifacts otherwise embed this checkout's absolute paths,
+		// rebuilding unchanged dependencies in every linked checkout. Roots
+		// are parsed from their current absolute GoFiles below; imported
+		// declaration positions are restored only from listed checkout files.
+		BuildFlags: append(append([]string(nil), buildFlags...), "-trimpath"),
 	}
 	load := p.packagesLoad
 	if load == nil {

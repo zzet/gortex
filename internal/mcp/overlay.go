@@ -105,9 +105,9 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		}
 		terminalPending := func(selected context.Context, request mcp.CallToolRequest, failure error) (*mcp.CallToolResult, error) {
 			legacy, _ := s.legacyToolName(&request)
-			// Auditing full-symbol replay does not add a data-free pending
-			// response to that tool's existing wire contract.
-			if callerOwnsProjectionFacts || legacy == "get_symbol" {
+			// Auditing a complete-response replay does not add a data-free
+			// pending response to symbol metadata or caller traversals.
+			if callerOwnsProjectionFacts || legacy == "get_symbol" || legacy == "get_callers" {
 				return nil, nil
 			}
 			pending, err := s.lateStormTransitionPending(selected, request, failure)
@@ -380,7 +380,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 			ctx = withContractCoreReadErrors(ctx)
 		}
 		indexer.StampPublicationPhase(ctx, indexer.PublicationHandlerStarted)
-		ctx = withProjectedReadToolFacts(ctx, req.Params.Name)
+		projectionTool := req.Params.Name
+		if legacyName == "get_file_summary" || legacyName == "get_callers" && auditedProjectionRead {
+			// The normalized facade leaf and outer final validation must own
+			// the same attempt-local facts, not two unrelated context values.
+			projectionTool = legacyName
+		}
+		ctx = withProjectedReadToolFacts(ctx, projectionTool)
 		ctx, releaseExplicitFreshness := s.captureExplicitFreshness(ctx, req)
 		if releaseExplicitFreshness != nil {
 			defer releaseExplicitFreshness()
@@ -489,7 +495,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, err
 					}
 				}
-				if auditedProjectionRead && retryAfterCheckedProjectionChange(ctx) {
+				if auditedProjectionRead && (retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, freshnessErr)) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, freshnessErr)
@@ -510,7 +516,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, pendingErr
 					}
 				}
-				if retryAfterCheckedProjectionChange(ctx) {
+				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, err) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, annotateProjectionReadRefusal(projectionReadFinal, projectionOwnerLive, err))

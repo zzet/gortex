@@ -49,6 +49,7 @@ type ContractFollowupCoreFile struct {
 // extractor bytes with their exact source/policy proof; it never falls back to current
 // filesystem bytes. The runner owns Release on every exit.
 type ContractFollowupSnapshot struct {
+	inventoryValues *contractInventoryValues
 	// cohortWork is the complete admitted selected work universe, independent
 	// of which exact attachments still need payloads. Nil preserves legacy
 	// target-union capture; a non-nil empty slice certifies an empty capture.
@@ -169,10 +170,15 @@ type ContractFollowupRequest struct {
 	WaitPublished  func(context.Context, uint64, time.Time) bool
 	// OtherActorWaiting permits a fill to return a resumable checkpoint.
 	OtherActorWaiting func() bool
+	// checkpointDemand preserves prompt linked-demand release independently
+	// of the cooperative turn used for ordinary actor competition.
+	checkpointDemand func() bool
 	// convergenceHooks are test seams at the job's interleaving points.
 	convergenceHooks *contractConvergenceHooks
 	delta            *contractDeltaSession
 	coverageWork     []graph.ContractWork
+	// Only the batch worker supplies this after taking reservation custody.
+	reservePayload func(context.Context) (*store_sqlite.Store, error)
 }
 
 type ContractFollowupReport struct {
@@ -247,6 +253,7 @@ type ContractFollowupBatchRequest struct {
 	PublishedEpoch         func() uint64
 	WaitPublished          func(context.Context, uint64, time.Time) bool
 	OtherActorWaiting      func() bool
+	checkpointDemand       func() bool
 	// PriorityRepos opts into independently committing these targets before
 	// companion assembly. Nil preserves the original all-target atomic batch.
 	PriorityRepos []string
@@ -257,6 +264,9 @@ type ContractFollowupBatchRequest struct {
 	BackgroundCurrent func(context.Context) error
 	convergenceHooks  *contractConvergenceHooks
 	delta             *contractDeltaSession
+	// A coordinator may defer output reservation until convergence succeeds.
+	// All targets must then omit Payload; eager and lazy ownership cannot mix.
+	reservePayload func(context.Context, ContractFollowupTarget) (*store_sqlite.Store, error)
 }
 
 type ContractFollowupTargetResult struct {
@@ -298,14 +308,30 @@ func RunContractFollowupBatch(ctx context.Context, req ContractFollowupBatchRequ
 	}
 	seen := make(map[graph.ContractAttachmentKey]bool)
 	payloads := make(map[int64]bool)
+	var leases []*graphview.Lease
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+	leasePayload := func(payload *store_sqlite.Store) error {
+		if payload == nil || payload.ViewGeneration() <= 0 || payloads[payload.ViewGeneration()] {
+			return fmt.Errorf("contract followup batch: invalid or duplicate payload")
+		}
+		payloads[payload.ViewGeneration()] = true
+		leases = append(leases, req.Leases.Acquire(payload.ViewGeneration()))
+		return nil
+	}
 	for _, target := range req.Targets {
-		if target.Payload == nil || target.Catalog == nil || target.Payload.ViewGeneration() <= 0 || seen[target.Key] || payloads[target.Payload.ViewGeneration()] {
+		if target.Catalog == nil || seen[target.Key] || (req.reservePayload != nil && target.Payload != nil) || (req.reservePayload == nil && (target.Payload == nil || target.Payload.ViewGeneration() <= 0 || payloads[target.Payload.ViewGeneration()])) {
 			return batch, fmt.Errorf("contract followup batch: invalid or duplicate target")
 		}
 		seen[target.Key] = true
-		payloads[target.Payload.ViewGeneration()] = true
-		lease := req.Leases.Acquire(target.Payload.ViewGeneration())
-		defer lease.Release()
+		if req.reservePayload == nil {
+			if err := leasePayload(target.Payload); err != nil {
+				return batch, err
+			}
+		}
 	}
 	prepared := &contractFollowupPrepared{}
 	if req.Snapshot.cohortWork != nil {
@@ -376,7 +402,19 @@ func RunContractFollowupBatch(ctx context.Context, req ContractFollowupBatchRequ
 			}
 		}
 		single := ContractFollowupRequest{Snapshot: snap, RebuildReason: req.RebuildReason, Payload: target.Payload, Catalog: target.Catalog, Registry: req.Registry, Config: req.Config, Logger: req.Logger, Leases: req.Leases, WorkspaceID: req.WorkspaceID, ProjectID: req.ProjectID, RepoConfigs: req.RepoConfigs, ScratchParent: req.ScratchParent, Yield: yield,
-			PublishedEpoch: req.PublishedEpoch, WaitPublished: req.WaitPublished, OtherActorWaiting: req.OtherActorWaiting, convergenceHooks: req.convergenceHooks, delta: req.delta}
+			PublishedEpoch: req.PublishedEpoch, WaitPublished: req.WaitPublished, OtherActorWaiting: req.OtherActorWaiting, checkpointDemand: req.checkpointDemand, convergenceHooks: req.convergenceHooks, delta: req.delta}
+		if req.reservePayload != nil {
+			single.reservePayload = func(ctx context.Context) (*store_sqlite.Store, error) {
+				payload, err := req.reservePayload(ctx, target)
+				if err != nil {
+					return nil, err
+				}
+				if err := leasePayload(payload); err != nil {
+					return nil, err
+				}
+				return payload, nil
+			}
+		}
 		report, targetErr := buildContractFollowupPrepared(ctx, single, prepared)
 		batch.Targets[i].Report = report
 		if targetErr != nil {
@@ -449,6 +487,9 @@ func runContractFollowupPrepared(ctx context.Context, req ContractFollowupReques
 		defer req.Snapshot.Release()
 		req.Snapshot.Release = func() {}
 	}
+	if req.reservePayload != nil {
+		return report, fmt.Errorf("contract followup: lazy reservation requires batch ownership")
+	}
 	if req.Leases != nil && req.Payload != nil && req.Payload.ViewGeneration() > 0 {
 		lease := req.Leases.Acquire(req.Payload.ViewGeneration())
 		defer lease.Release()
@@ -479,7 +520,7 @@ func buildContractFollowupPrepared(ctx context.Context, req ContractFollowupRequ
 	if snap.Release != nil {
 		defer snap.Release()
 	}
-	if ctx == nil || snap.Release == nil || snap.Core == nil || snap.ReadAccepted == nil || snap.ReadCoreFile == nil || req.Payload == nil || req.Catalog == nil || req.Leases == nil || req.Yield == nil {
+	if ctx == nil || snap.Release == nil || snap.Core == nil || snap.ReadAccepted == nil || snap.ReadCoreFile == nil || (req.Payload == nil && req.reservePayload == nil) || (req.Payload != nil && req.reservePayload != nil) || req.Catalog == nil || req.Leases == nil || req.Yield == nil {
 		return report, fmt.Errorf("contract followup: incomplete selected handoff")
 	}
 	if err := ctx.Err(); err != nil {
@@ -494,13 +535,16 @@ func buildContractFollowupPrepared(ctx context.Context, req ContractFollowupRequ
 		return report, fmt.Errorf("contract followup: explicit rebuild reason required")
 	}
 	report.RebuildReason = req.RebuildReason
-	generation := req.Payload.ViewGeneration()
-	if generation <= 0 {
-		return report, fmt.Errorf("contract followup: payload must be isolated positive generation")
+	var generation int64
+	if req.Payload != nil {
+		generation = req.Payload.ViewGeneration()
+		if generation <= 0 {
+			return report, fmt.Errorf("contract followup: payload must be isolated positive generation")
+		}
+		lease := req.Leases.Acquire(generation)
+		defer lease.Release()
+		report.PayloadGeneration = generation
 	}
-	lease := req.Leases.Acquire(generation)
-	defer lease.Release()
-	report.PayloadGeneration = generation
 	logical, err := graph.ComposeContractInputState(snap.Key.RepoPrefix, snap.Key.CheckoutID, snap.Inputs)
 	if err != nil {
 		return report, err
@@ -673,6 +717,23 @@ func buildContractFollowupPrepared(ctx context.Context, req ContractFollowupRequ
 	}
 	if len(encodedRows) > contractFollowupCompactLimit || len(nodes)+len(edges) > graph.ContractProjectionRowLimit {
 		return report, graph.ErrContractProjectionLimit
+	}
+	if req.reservePayload != nil {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		req.Payload, err = req.reservePayload(ctx)
+		report.PayloadDuration = time.Since(payloadStart)
+		if err != nil {
+			return report, err
+		}
+		generation = req.Payload.ViewGeneration() // The batch validated and leased it.
+		lease := req.Leases.Acquire(generation)
+		defer lease.Release()
+		report.PayloadGeneration = generation
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
 	}
 	report.PayloadDuration = time.Since(payloadStart)
 	for start := 0; start < len(nodes); start += contractFrontierReadBatchSize {
@@ -1410,6 +1471,12 @@ func (e *contractFollowupEvidence) loadFileRowsContext(path string, ctx context.
 	if err != nil {
 		return nil, nil, err
 	}
+	return e.importSelectedFileRows(path, nodes, edges, extraction)
+}
+
+// Both extraction paths import the same already checked answer. In particular,
+// discovering a tracker must not ask a custom selected reader a second time.
+func (e *contractFollowupEvidence) importSelectedFileRows(path string, nodes []*graph.Node, edges []*graph.Edge, extraction bool) ([]*graph.Node, []*graph.Edge, error) {
 	if e.loadedFileNodes[path] {
 		// Node-only consumers may already have enriched these private rows.
 		// Extend their edge evidence without replacing scratch mutations or

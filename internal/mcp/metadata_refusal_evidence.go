@@ -51,6 +51,70 @@ func (guard projectionLivenessGuard) label() string {
 	}
 }
 
+// These copied scalars describe the last original check actually executed,
+// not the owner or event state at response serialization. In particular a
+// suspect-after refusal has not executed the owner-after check. Source-event
+// revisions require the registry mutex and are deliberately not sampled here.
+// No entry, path, content, clock or additional liveness check is retained.
+type acknowledgementProjectionFailure struct {
+	Guard                string  `json:"guard"`
+	Owner                string  `json:"owner"`
+	OwnerCheck           string  `json:"owner_check"`
+	Suspect              string  `json:"suspect"`
+	SuspectCheck         string  `json:"suspect_check"`
+	EntryCommitSeq       *uint64 `json:"entry_commit_seq,omitempty"`
+	EntrySourceCommitSeq *uint64 `json:"entry_source_commit_seq,omitempty"`
+	OwnerCommitSeq       *uint64 `json:"owner_commit_seq,omitempty"`
+	OwnerSourceCommitSeq *uint64 `json:"owner_source_commit_seq,omitempty"`
+}
+
+func acknowledgementProjectionLiveness(entry *projectionEntry) (projectionLivenessGuard, *acknowledgementProjectionFailure) {
+	if os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") != "1" {
+		return projectionLivenessFailure(entry), nil
+	}
+	diagnostic := &acknowledgementProjectionFailure{
+		Owner: "not_observed", OwnerCheck: "not_observed",
+		Suspect: "not_observed", SuspectCheck: "not_observed",
+	}
+	if entry != nil {
+		sequence, sourceSequence := entry.commitSeq, entry.sourceCommitSeq
+		diagnostic.EntryCommitSeq, diagnostic.EntrySourceCommitSeq = &sequence, &sourceSequence
+	}
+	guard := observeProjectionLiveness(entry, diagnostic)
+	if guard == projectionOwnerLive {
+		return guard, nil // The successful response remains unchanged.
+	}
+	diagnostic.Guard = guard.label()
+	return guard, diagnostic
+}
+
+func (diagnostic *acknowledgementProjectionFailure) observeSuspect(check string, suspect bool) {
+	if diagnostic == nil {
+		return
+	}
+	diagnostic.SuspectCheck, diagnostic.Suspect = check, "clear"
+	if suspect {
+		diagnostic.Suspect = "suspect"
+	}
+}
+
+func (diagnostic *acknowledgementProjectionFailure) observeOwner(check string, entry, owner *projectionEntry) {
+	if diagnostic == nil {
+		return
+	}
+	diagnostic.OwnerCheck, diagnostic.Owner = check, "missing"
+	diagnostic.OwnerCommitSeq, diagnostic.OwnerSourceCommitSeq = nil, nil
+	if owner == nil {
+		return
+	}
+	diagnostic.Owner = "same"
+	if owner != entry {
+		diagnostic.Owner = "replaced"
+	}
+	sequence, sourceSequence := owner.commitSeq, owner.sourceCommitSeq
+	diagnostic.OwnerCommitSeq, diagnostic.OwnerSourceCommitSeq = &sequence, &sourceSequence
+}
+
 type projectionReadStage uint8
 
 const (

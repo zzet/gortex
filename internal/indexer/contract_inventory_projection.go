@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -29,8 +30,100 @@ type contractInventoryProjectionEntry struct {
 	core          graph.Reader
 	handles       []*store_sqlite.Store
 	revisions     []store_sqlite.PayloadInputRevision
+	composition   []store_sqlite.PayloadInputRevision
 	rows          map[string]graph.FileMetaRow
 	bytes         int64
+	retainedRows  int64
+}
+
+// contractInventoryValues carries immutable owned rows and scalar revisions.
+// Projection entries replace, never mutate, these rows; returned maps are cloned.
+// Successor jobs bind their own readers and validate fresh selected revisions.
+type contractInventoryValues struct {
+	entries map[string]contractInventoryValueEntry
+	bytes   int64
+}
+
+type contractInventoryValueEntry struct {
+	revisions   []store_sqlite.PayloadInputRevision
+	composition []store_sqlite.PayloadInputRevision
+	rows        map[string]graph.FileMetaRow
+	bytes       int64
+	// Exact generic conservative charge of privately admitted immutable rows.
+	// Zero means unsealed values, which must keep the full reflective fallback.
+	retainedRows int64
+	// The current capture's physical projection reads, independent of the
+	// predecessor's count. This value grants no visibility or reuse authority.
+	physicalReads int
+}
+
+func (p *contractInventoryProjection) detachedValues() *contractInventoryValues {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Charge the detached map, keys and vectors before cloning its metadata.
+	charge := int64(256)
+	for repo, entry := range p.entries {
+		if entry.trusted && entry.rows != nil {
+			charge += int64(unsafe.Sizeof(contractInventoryValueEntry{})) + int64(unsafe.Sizeof("")) + 64
+			charge += contractDeltaAllocation(int64(len(repo))) + entry.bytes
+		}
+	}
+	if charge > int64(contractFollowupCompactLimit) {
+		return nil
+	}
+	out := &contractInventoryValues{entries: make(map[string]contractInventoryValueEntry), bytes: charge}
+	for repo, entry := range p.entries {
+		if entry.trusted && entry.rows != nil {
+			out.entries[strings.Clone(repo)] = contractInventoryValueEntry{revisions: slices.Clone(entry.revisions), composition: slices.Clone(entry.composition), rows: entry.rows, bytes: entry.bytes, retainedRows: entry.retainedRows, physicalReads: entry.physicalReads}
+		}
+	}
+	return out
+}
+
+// retainedSize keeps the generic conservative formula for every checkpoint's
+// fresh map, keys, revision vectors and scalar metadata. Only the unchanged
+// owned row maps skip a second traversal. Their nil placeholders still carry
+// the generic map-header charge, so add back just the recorded backing delta.
+func (v *contractInventoryValues) retainedSize() int64 {
+	if v == nil {
+		return contractRetainedSize(reflect.ValueOf(v))
+	}
+	metadata := *v
+	if v.entries != nil {
+		metadata.entries = make(map[string]contractInventoryValueEntry, len(v.entries))
+	}
+	rowBytes := int64(0)
+	for repo, entry := range v.entries {
+		if entry.retainedRows <= 0 || entry.rows == nil {
+			return contractRetainedSize(reflect.ValueOf(v))
+		}
+		rowBytes += entry.retainedRows - contractRetainedSize(reflect.ValueOf((map[string]graph.FileMetaRow)(nil)))
+		entry.rows = nil
+		metadata.entries[repo] = entry
+	}
+	return contractRetainedSize(reflect.ValueOf(&metadata)) + rowBytes
+}
+
+// seed imports only detached values; readSnapshot checks the newly bound
+// physical revisions and exact built-in composition before returning any row.
+func (p *contractInventoryProjection) seed(values *contractInventoryValues) {
+	if values == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for repo, value := range values.entries {
+		entry := p.entries[repo]
+		if entry == nil || !entry.trusted || entry.rows != nil || value.bytes > int64(contractFollowupCompactLimit)-p.bytes {
+			continue
+		}
+		entry.rows = value.rows
+		entry.revisions = slices.Clone(value.revisions)
+		entry.composition = slices.Clone(value.composition)
+		entry.bytes = value.bytes
+		entry.retainedRows = value.retainedRows
+		p.bytes += value.bytes
+	}
 }
 
 func newContractInventoryProjection(readers map[string]graph.Reader, handles map[string][]*store_sqlite.Store) *contractInventoryProjection {
@@ -78,11 +171,12 @@ func (p *contractInventoryProjection) readSnapshot(ctx context.Context, repo str
 	if err != nil {
 		return nil, err
 	}
-	if entry.trusted && entry.rows != nil && slices.Equal(before, entry.revisions) {
+	composition, known := contractInventoryCompositionValues(entry.core, 0)
+	if entry.trusted && known && entry.rows != nil && slices.Equal(before, entry.revisions) && slices.Equal(composition, entry.composition) {
 		return cloneContractInventoryRows(entry.rows), ctx.Err()
 	}
 	p.bytes -= entry.bytes
-	entry.rows, entry.revisions, entry.bytes = nil, nil, 0
+	entry.rows, entry.revisions, entry.composition, entry.bytes, entry.retainedRows = nil, nil, nil, 0, 0
 	entry.physicalReads++
 	rows, err := captureAcceptedContractInventory(ctx, entry.core, entry.handles, repo)
 	if err != nil {
@@ -95,11 +189,13 @@ func (p *contractInventoryProjection) readSnapshot(ctx context.Context, repo str
 	if err != nil {
 		return nil, err
 	}
-	if entry.trusted && slices.Equal(before, after) {
-		charge := contractInventoryRowsCharge(rows) + contractDeltaAllocation(int64(cap(after))*int64(unsafe.Sizeof(store_sqlite.PayloadInputRevision{})))
+	if entry.trusted && known && slices.Equal(before, after) {
+		charge := contractInventoryRowsCharge(rows) + contractDeltaAllocation(int64(cap(after)+cap(composition))*int64(unsafe.Sizeof(store_sqlite.PayloadInputRevision{})))
 		if charge <= int64(contractFollowupCompactLimit)-p.bytes {
 			entry.rows = cloneContractInventoryRows(rows)
+			entry.retainedRows = contractRetainedSize(reflect.ValueOf(entry.rows))
 			entry.revisions = after
+			entry.composition = composition
 			entry.bytes = charge
 			p.bytes += charge
 		}
@@ -160,4 +256,31 @@ func contractInventoryCompositionCovered(reader graph.Reader, handles []*store_s
 		}
 	}
 	return visit(reader, 0)
+}
+
+// The same physical handle set may serve a different overlay precedence.
+// Record the exact built-in leaf-to-layer chain without retaining its readers.
+func contractInventoryCompositionValues(reader graph.Reader, depth int) ([]store_sqlite.PayloadInputRevision, bool) {
+	if depth > graphview.MaxGenerationAncestryDepth+graphview.MaxDirtyChainDepth {
+		return nil, false
+	}
+	switch r := reader.(type) {
+	case *store_sqlite.Store:
+		if r == nil {
+			return nil, false
+		}
+		return []store_sqlite.PayloadInputRevision{r.PayloadInputRevision()}, true
+	case *graph.OverlaidView:
+		layer, ok := r.LayerReader().(*graphview.GenerationLayer)
+		if !ok || layer == nil || layer.ProjectionHandle() == nil || layer.ProjectionRevision() != layer.ProjectionHandle().PayloadInputRevision() {
+			return nil, false
+		}
+		base, ok := contractInventoryCompositionValues(r.Base(), depth+1)
+		if !ok {
+			return nil, false
+		}
+		return append(base, layer.ProjectionRevision()), true
+	default:
+		return nil, false
+	}
 }

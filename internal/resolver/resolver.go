@@ -4027,6 +4027,8 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	}
 
 	switch {
+	case e.Kind == graph.EdgeCalls && phpEdgeMetaString(e, "eloquent_model") != "" && r.resolvePHPDeclaredStatic(e, stats):
+		// A PHP class's declared method wins over the Eloquent shortcut.
 	case strings.HasPrefix(target, "grpc::"):
 		// gRPC client-stub call placeholder
 		// (`unresolved::grpc::<Service>::<Method>`). Landed on the
@@ -4103,6 +4105,10 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		// function/method passes would miss because they only accept
 		// method/function candidates.
 		r.resolveTokenRef(e, target, stats)
+	case e.Kind == graph.EdgeReferences && strings.HasSuffix(e.FilePath, ".vue") && e.Meta["template"] == true:
+		if !r.resolveVueTemplateImport(e, target, stats) {
+			r.resolveTypeOrFunc(e, target, stats)
+		}
 	case e.Kind == graph.EdgeRendersChild:
 		// A rendered child component (`<Button/>`) binds FIRST against the
 		// caller file's import bindings — ground truth that pins the exact
@@ -4935,7 +4941,10 @@ func pickTopLevelValueCallee(candidates []*graph.Node, funcName, callerDir strin
 // genuine cross-repo case with import-reachability evidence.
 func (r *Resolver) resolveTypeOrFunc(e *graph.Edge, name string, stats *ResolveStats) {
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	candidates, aliased := r.phpAliasTypeCandidates(e, name, callerRepo)
+	if !aliased {
+		candidates = r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	}
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -5003,7 +5012,10 @@ func (r *Resolver) resolveTypeRef(e *graph.Edge, name string, stats *ResolveStat
 	// the `*.` and resolve on the bare type name.
 	name = strings.TrimPrefix(name, "*.")
 	callerRepo := r.callerRepoPrefix(e)
-	candidates := r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	candidates, aliased := r.phpAliasTypeCandidates(e, name, callerRepo)
+	if !aliased {
+		candidates = r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e)
+	}
 	if len(candidates) == 0 {
 		stats.Unresolved++
 		return
@@ -5118,6 +5130,29 @@ func (r *Resolver) resolveFieldRef(e *graph.Edge, fieldName string, stats *Resol
 }
 
 func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *ResolveStats) {
+	if phpEdgeMetaString(e, "php_property_path") != "" && phpTypedReceiverCaller(r.cachedGetNode(e.From)) {
+		target, known := r.phpPropertyCallTarget(e, methodName)
+		if target != nil {
+			e.To, e.Origin, e.Confidence = target.ID, graph.OriginASTResolved, 0.95
+			stats.Resolved++
+			return
+		}
+		if known {
+			stats.Unresolved++
+			return
+		}
+	}
+	if phpEdgeMetaString(e, "receiver_fqn") != "" && phpTypedReceiverCaller(r.cachedGetNode(e.From)) {
+		if target := r.phpReceiverMethod(e, methodName); target != nil {
+			e.To = target.ID
+			e.Origin = graph.OriginASTResolved
+			e.Confidence = 0.95
+			stats.Resolved++
+		} else {
+			stats.Unresolved++
+		}
+		return
+	}
 	// Same-repo gate first: the per-repo Resolver never resolves a
 	// method call across a repo boundary by name. A cross-repo method
 	// call is left unresolved for CrossRepoResolver, which carries the
@@ -5161,6 +5196,17 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 		e.Meta["resolution"] = "scope"
 		stats.Resolved++
 		return
+	}
+
+	// PHP parent:: calls must bind through the ancestor chain, never through
+	// the caller's receiver or a same-directory guess. If the scope rule could
+	// not bind (including when reachability hid the parent), leave the call for
+	// resolvePHPOverrideDispatch; an external parent must stay unresolved.
+	if scopeMetaString(e.Meta, MetaScopeKind) == ScopeKindParent {
+		if caller := r.cachedGetNode(e.From); phpTypedReceiverCaller(caller) {
+			stats.Unresolved++
+			return
+		}
 	}
 
 	callerDir := r.dirFor(e.FilePath)

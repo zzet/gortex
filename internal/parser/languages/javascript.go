@@ -55,6 +55,9 @@ const qJSAll = `
     function: (identifier) @req.name
     arguments: (arguments (string (string_fragment) @req.path))) @req.def
 
+  (new_expression
+    constructor: (_) @new.ctor) @new.expr
+
   (call_expression
     function: (identifier) @call.name) @call.expr
 
@@ -158,6 +161,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		set[member] = id
 	}
 
+	var constructions []jsDeferredCall
 	var calls []jsDeferredCall
 	var vars []jsDeferredVar
 	// importPaths collects every imported / required module path so the
@@ -208,6 +212,21 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				if p := m.Captures["req.path"]; p != nil {
 					importPaths = append(importPaths, p.Text)
 				}
+			}
+
+		case m.Captures["new.expr"] != nil:
+			ctor := m.Captures["new.ctor"].Node
+			// A dynamic receiver does not identify a named constructor.
+			if ctor.Type() == "member_expression" {
+				obj := ctor.ChildByFieldName("object")
+				if obj == nil || (obj.Type() != "identifier" && obj.Type() != "member_expression") {
+					break
+				}
+			}
+			if name := tsCtorTypeName(ctor, src); name != "" {
+				constructions = append(constructions, jsDeferredCall{
+					name: name, line: m.Captures["new.expr"].StartLine + 1,
+				})
 			}
 
 		case m.Captures["callm.expr"] != nil:
@@ -307,6 +326,16 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	// Resolve calls against funcRanges.
 	funcRanges := buildFuncRanges(result)
+	for _, c := range constructions {
+		callerID := findEnclosingFunc(funcRanges, c.line)
+		if callerID == "" {
+			callerID = fileID
+		}
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: callerID, To: "unresolved::" + c.name, Kind: graph.EdgeInstantiates,
+			FilePath: filePath, Line: c.line, Origin: graph.OriginASTResolved,
+		})
+	}
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
@@ -574,6 +603,11 @@ func (e *JavaScriptExtractor) emitClass(m parser.QueryResult, filePath, fileID s
 	// a Web-Components base (HTMLElement / LitElement) makes this a
 	// component — heritage is the signal, so no JSX walk is needed.
 	if ext := jsxClassExtendsName(def.Node, src); ext != "" {
+		result.Edges = append(result.Edges, &graph.Edge{
+			From: id, To: "unresolved::" + ext, Kind: graph.EdgeExtends,
+			FilePath: filePath, Line: def.StartLine + 1, Origin: graph.OriginASTResolved,
+			Meta: map[string]any{"ref_context": graph.RefContextInherit},
+		})
 		if ui, ck := classHeritageComponentUI(ext, def.Node, src); ui != "" {
 			meta["ui_component"] = ui
 			meta["component_kind"] = ck

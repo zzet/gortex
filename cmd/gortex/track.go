@@ -40,14 +40,15 @@ var (
 // the tool's, so the CLI and an agent see the same one.
 var untrackDaemonTool = requireDaemonTool
 
-// Injectable seams keep the --wait orchestration testable without a live
-// daemon. The real notification receives the absolute deadline so dialing and
-// the control round trip consume one shared budget.
+// Injectable seams keep track orchestration and rollback failures testable
+// without a live daemon. The real notification receives the absolute deadline
+// so dialing and the control round trip consume one shared budget.
 var (
 	trackStatusFn            = fetchDaemonStatusForCLI
 	trackEnsureDaemonReadyFn = ensureDaemonReady
 	trackNotifyDaemonTrackFn = notifyDaemonTrack
 	trackInventoryFn         = gitstate.Inventory
+	trackRollbackSaveFn      = (*config.GlobalConfig).Save
 )
 
 // trackPollInterval is how often --wait re-queries the daemon. A package var so
@@ -487,7 +488,13 @@ func removeAddedRepoEntry(path string) error {
 	for i, entry := range gc.Repos {
 		if entry.Path == path {
 			gc.Repos = append(gc.Repos[:i], gc.Repos[i+1:]...)
-			return gc.Save()
+			if err := trackRollbackSaveFn(gc); err != nil {
+				return err
+			}
+			logger := newLogger().WithOptions(zap.WithCaller(false))
+			logger.Info("config: removed tracked repo", zap.String("root", path), zap.String("cause", "track_rejected"), zap.String("caller", "removeAddedRepoEntry"))
+			_ = logger.Sync()
+			return nil
 		}
 	}
 	return nil

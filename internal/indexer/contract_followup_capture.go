@@ -35,9 +35,14 @@ type ContractFollowupCaptureOptions struct {
 	// SuspectStuck, when set, receives the census paths a capture refused
 	// because their receipt row cannot be in flight in this process: a
 	// deleted row, or an unaccepted row no mutation of this process wrote.
-	// Nothing of a live mutation will make such a row admissible.
-	SuspectStuck   func(repo string, paths []string)
-	selectedInputs *graphview.SelectedContractInputs
+	// Policy-stale primary rows also need repair: no source mutation may
+	// arrive to replace their already accepted receipts. So does a primary
+	// census file on disk with no row at all in a current baseline: its file
+	// did not move, so no mutation will write one.
+	SuspectStuck func(repo string, paths []string)
+	// rebuildBaseline bypasses an old accepted baseline during policy repair.
+	rebuildBaseline bool
+	selectedInputs  *graphview.SelectedContractInputs
 }
 
 // ContractCaptureSource is what a capture takes from a request's selected
@@ -45,11 +50,13 @@ type ContractFollowupCaptureOptions struct {
 // view's generations and the view facts the capture reads. A primary actor
 // has no view and no source; its capture pins the base corpus itself.
 type ContractCaptureSource struct {
-	handoff      *graphview.ViewHandoff
-	repo         string
-	composesBase bool
-	sources      []graphview.GenerationSource
-	once         sync.Once
+	// inventoryValues is a detached same-actor hint, never a borrowed reader.
+	inventoryValues *contractInventoryValues
+	handoff         *graphview.ViewHandoff
+	repo            string
+	composesBase    bool
+	sources         []graphview.GenerationSource
+	once            sync.Once
 	// onRelease, set only by tests, observes the release.
 	onRelease func()
 }
@@ -75,6 +82,7 @@ func PrepareContractCaptureSource(view *graphview.RepoView) (*ContractCaptureSou
 func (s *ContractCaptureSource) Release() {
 	if s != nil {
 		s.once.Do(func() {
+			s.inventoryValues = nil
 			s.handoff.Close()
 			if s.onRelease != nil {
 				s.onRelease()
@@ -301,17 +309,23 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 	// by the receipt stamps of the files it read (contract_stamp_scan.go), so
 	// a save to a file it never read cannot fail it.
 	inventoryProjection := newContractInventoryProjection(readers, handlesByRepo)
+	if prepared != nil {
+		inventoryProjection.seed(prepared.inventoryValues)
+		prepared.inventoryValues = nil
+	}
 	metaByPath := make(map[string]graph.FileMetaRow)
 	sources := make(map[string]source.ContentSource)
 	configs := make(map[string]config.IndexConfig)
 	extractionOptions := make(map[string]parser.ExtractionOptions)
 	pathRepos := make(map[string]string)
 	scopes := make(map[string][2]string)
+	primaryRoots := make(map[string]string)
 	for _, repo := range repos {
 		root, ok := options.MultiIndexer.RepoRoot(repo)
 		if !ok {
 			return ContractFollowupSnapshot{}, fmt.Errorf("contract capture: source root unavailable for %q", repo)
 		}
+		primaryRoots[repo] = root
 		options.MultiIndexer.mu.RLock()
 		cfg := options.Config
 		if options.MultiIndexer.configMgr != nil {
@@ -361,6 +375,11 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			pathRepos[path] = repo
 		}
 
+	}
+	// Only linked captures can seed a successor through a prepared source.
+	// Primary captures have no consumer for detached inventory.
+	if prepared != nil {
+		snapshot.inventoryValues = inventoryProjection.detachedValues()
 	}
 	snapshot.RepoConfigs = configs
 	snapshot.RepoExtractionOptions = extractionOptions
@@ -450,6 +469,24 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	// absent holds, by repository, the census files a selected capture found
+	// on the primary disk with no primary receipt row in a current baseline.
+	// It is bounded by what a baseline skipped: a receipt version change
+	// leaves every row's namespace without a current baseline, and the
+	// baseline rebuild replaces those, not one forced reindex. A row of
+	// another version, an old failure envelope included, is not absent and
+	// keeps its earlier refusal.
+	absent := make(map[string][]string)
+	// A linked actor's selection carries a witness of its own checkout. It
+	// reports an absent primary row too, but fails once instead of waiting,
+	// and it keeps the earlier refusal of a first receipt rather than waiting
+	// on it.
+	linked := false
+	if options.selectedInputs != nil {
+		for _, w := range options.selectedInputs.Witnesses {
+			linked = linked || w.State.CheckoutID != ""
+		}
+	}
 	// Keep receipt payloads streaming and admission facts bounded to one
 	// existing frontier chunk. Sparse upper layers are resolved by indexed keys,
 	// rather than thousands of independently prepared point misses per layer.
@@ -492,7 +529,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 			// Admission reads durable receipt identities, never every source file.
 			// Missing legacy proof is usable only by background baseline rebuilding.
 			repoHandles := handlesByRepo[repo]
-			excluded := false
+			excluded, primaryAbsent := false, false
 			if options.selectedInputs == nil {
 				// Baseline repair derives its source proof from accepted core metadata,
 				// even when old optional analysis receipts are incomplete or obsolete.
@@ -509,9 +546,15 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 					}
 				}
 				for _, actor := range actors {
-					row, _, e := repoHandles[i].ContractBoundaryReceiptForVersionContext(ctx, repo, actor, path, contractBoundaryReceiptVersion)
+					row, known, e := repoHandles[i].ContractBoundaryReceiptForVersionContext(ctx, repo, actor, path, contractBoundaryReceiptVersion)
 					if e != nil {
 						return ContractFollowupSnapshot{}, e
+					}
+					// known is true for a missing row only when the namespace
+					// baseline is at the current receipt version; a row of
+					// another version reads as missing and not known.
+					if row == nil && known && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+						primaryAbsent = true
 					}
 					if row != nil {
 						if row.Accepted && contractReceiptIsFailureEnvelope(row) {
@@ -524,7 +567,7 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 						// reads by (ContractReceiptStamp.quiescent): its mutation
 						// settled it, or staged it in this process and has ended its
 						// core writes (a watcher patch overtaken after its writes is
-						// never accepted or settled), so the file's core rows are
+						// settled, never accepted), so the file's core rows are
 						// complete. A row whose core-write window is open is
 						// admitted in flight: the job's stamp scans see the window,
 						// and its first read of the file waits for it to close.
@@ -553,12 +596,27 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 							policy = prior.Policy
 						} else if markerPolicy, overflow := contractReceiptOverflowPolicy(row); overflow && row.Accepted && row.RepoPrefix == repo && row.CheckoutID == actor && row.FilePath == path {
 							policy, opaque = markerPolicy, true
+						} else if !row.Accepted && row.Previous == nil && !state.Settled && !linked && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+							// An admitted primary row with no accepted predecessor
+							// whose mutation has not settled is normally a save of
+							// this process still to be accepted: a file's first
+							// save, or a forced reindex of a row an interrupted
+							// process never accepted. No accepted receipt names its
+							// policy until that save accepts it and announces
+							// Published, which reruns the capture. A settled row's
+							// mutation was overtaken and will never accept it, and a
+							// linked actor, whose stale capture is re-enqueued at
+							// once, keeps the earlier refusal.
+							return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 						} else {
 							return ContractFollowupSnapshot{}, graph.ErrContractProjectionIncomplete
 						}
 						if policy != file.Policy {
 							projected, policyErr := idx.contractFollowupPolicyMode(language, policy)
 							if policyErr != nil || !projected || !contractGeneratedFileHint(readers[repo].GetNode(path), path) {
+								if options.SuspectStuck != nil && repoHandles[i].ViewGeneration() == 0 && actor == "" {
+									options.SuspectStuck(repo, []string{path})
+								}
 								return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 							}
 							// This is an admission hint from the exact accepted receipt
@@ -579,8 +637,40 @@ func captureAcceptedContractFiles(ctx context.Context, options ContractFollowupC
 				snapshot.Excluded = append(snapshot.Excluded, path)
 				continue
 			}
+			// Only a file on the primary disk is the primary repair's: a
+			// linked actor's census may hold a file only its worktree has.
+			if file.SourceFingerprint == "" && primaryAbsent && repo != "" && contractCensusFileOnDisk(primaryRoots[repo], repo, path) {
+				absent[repo] = append(absent[repo], path)
+				continue
+			}
 			snapshot.Files = append(snapshot.Files, file)
 		}
+	}
+	if len(absent) > 0 {
+		// A census file with no primary receipt row has nothing to admit,
+		// and no live mutation will write one: its file did not move, which
+		// a baseline that skipped it as moved (contract_baseline_reconcile.go)
+		// cannot tell. The repair reparses it under the repository's lane and
+		// announces the result; the request waits for that announcement. The
+		// report waits for the whole census, so one capture names every such
+		// file and the repair takes them in one forced reindex.
+		names := make([]string, 0, len(absent))
+		for repo := range absent {
+			names = append(names, repo)
+		}
+		sort.Strings(names)
+		for _, repo := range names {
+			if options.SuspectStuck != nil {
+				options.SuspectStuck(repo, absent[repo])
+			}
+		}
+		// A linked actor keeps its earlier refusal: it fails once, and the
+		// repair's accept of the primary row moves the primary witness its
+		// inputs select, which reruns it.
+		if linked {
+			return ContractFollowupSnapshot{}, graph.ErrContractProjectionIncomplete
+		}
+		return ContractFollowupSnapshot{}, graph.ErrContractProjectionStale
 	}
 
 	if options.selectedInputs != nil {

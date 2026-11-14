@@ -101,6 +101,16 @@ type PreselectionDeadlineEnricher interface {
 	UsePreselectionDeadline()
 }
 
+// QueueWaitExcludingEnricher marks a ContextEnricher that brackets its
+// uncancellable queue waits (acquiring the graph-wide resolve mutex) with
+// ExcludeQueueWait. The Manager arms a pausable outer ceiling for it, so a
+// pass queued behind another pass's apply keeps its time for its own work.
+// Other providers keep the plain timeout.
+type QueueWaitExcludingEnricher interface {
+	ContextEnricher
+	ExcludesQueueWaitFromCeiling()
+}
+
 // ReadinessProber is an optional interface a Provider MAY implement when its
 // server answers `initialize` quickly but is not ready to serve semantic
 // queries until a slower background load finishes — the Roslyn / MSBuild

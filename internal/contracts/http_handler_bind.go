@@ -267,10 +267,13 @@ func (h *HTTPExtractor) extractRailsResourceRoutes(filePath, text string, lines 
 }
 
 var (
-	laravelResourceRE = regexp.MustCompile(`Route::(resource|apiResource)\(\s*['"]([^'"]+)['"]\s*,\s*\\?([\w\\]+)::class\s*\)([^;\n]*)`)
-	laravelActionRE   = regexp.MustCompile(`['"](\w+)['"]`)
-	laravelOnlyRE     = regexp.MustCompile(`->only\(\s*\[([^\]]*)\]`)
-	laravelExceptRE   = regexp.MustCompile(`->except\(\s*\[([^\]]*)\]`)
+	laravelResourceRE            = regexp.MustCompile(`Route::(resource|apiResource)\(\s*['"]([^'"]+)['"]\s*,\s*\\?([\w\\]+)::class\s*(?:,|\))`)
+	laravelResourceChainFilterRE = regexp.MustCompile(`->(only|except)\s*\(\s*([^)]*)\)`)
+	laravelResourceOptionRE      = regexp.MustCompile(`(?s)^['"](\w+)['"]\s*=>\s*(.*)$`)
+	laravelActionListRE          = regexp.MustCompile(`^\[\s*(?:['"]\w+['"]\s*,?\s*)*\]$`)
+	laravelActionRE              = regexp.MustCompile(`['"](\w+)['"]`)
+	laravelOnlyRE                = regexp.MustCompile(`->only\(\s*\[([^\]]*)\]`)
+	laravelExceptRE              = regexp.MustCompile(`->except\(\s*\[([^\]]*)\]`)
 )
 
 // laravelResourceRoutes is the canonical RESTful 7-route expansion Laravel
@@ -296,17 +299,28 @@ var laravelApiResourceSkip = map[string]bool{"create": true, "edit": true}
 // `->except` filter the action set.
 func (h *HTTPExtractor) extractLaravelResourceRoutes(filePath, text string, lines []string, fileNodes []*graph.Node, lang string, tree *parser.ParseTree) []Contract {
 	var out []Contract
+	source := []byte(text)
 	for _, m := range laravelResourceRE.FindAllStringSubmatchIndex(text, -1) {
+		// Options may contain nested arrays, calls and quoted parentheses.
+		// Locate the registration's end before reading chained action filters.
+		open := m[0] + strings.IndexByte(text[m[0]:m[1]], '(')
+		end := balancedCloseParen(source, open)
+		if end < 0 {
+			continue
+		}
 		kind := text[m[2]:m[3]]
 		name := text[m[4]:m[5]]
 		controller := laravelSimpleClass(text[m[6]:m[7]])
-		rest := ""
-		if m[8] >= 0 {
-			rest = text[m[8]:m[9]]
+		rest := text[end+1:]
+		if stop := strings.IndexByte(rest, ';'); stop >= 0 {
+			rest = rest[:stop]
 		}
 		lineNum := lineAtOffset(lines, m[0])
 		isAPI := kind == "apiResource"
 		allowed := laravelActionFilter(rest)
+		if text[m[1]-1] == ',' {
+			allowed = laravelResourceOptionsFilter(text[m[1]:end], rest)
+		}
 		base := "/" + name
 
 		for _, r := range laravelResourceRoutes {
@@ -351,6 +365,51 @@ func (h *HTTPExtractor) extractLaravelResourceRoutes(filePath, text string, line
 		}
 	}
 	return out
+}
+
+// laravelResourceOptionsFilter reads top-level action filters only: a nested
+// names map can itself contain keys named "only" or "except".
+func laravelResourceOptionsFilter(options, rest string) map[string]bool {
+	options = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(options), ","))
+	if options == "" {
+		return laravelActionFilter(rest)
+	}
+	if !strings.HasPrefix(options, "[") || !strings.HasSuffix(options, "]") {
+		return map[string]bool{} // Dynamic options cannot safely determine routes.
+	}
+	filters := map[string]string{}
+	entries := strings.TrimSpace(options[1 : len(options)-1])
+	for entries != "" {
+		var entry string
+		entry, entries = splitFirstArg(entries)
+		m := laravelResourceOptionRE.FindStringSubmatch(entry)
+		if m == nil {
+			return map[string]bool{}
+		}
+		if m[1] == "only" || m[1] == "except" {
+			filters[m[1]] = strings.TrimSpace(m[2])
+		}
+	}
+	// Chained setters override the corresponding constructor options.
+	for _, m := range laravelResourceChainFilterRE.FindAllStringSubmatch(rest, -1) {
+		filters[m[1]] = strings.TrimSpace(m[2])
+	}
+	allowed := map[string]bool{}
+	for _, r := range laravelResourceRoutes {
+		allowed[r.action] = true
+	}
+	for name, value := range filters {
+		if !laravelActionListRE.MatchString(value) {
+			return map[string]bool{}
+		}
+		selected := laravelActionFilter("->" + name + "(" + value + ")")
+		for action := range allowed {
+			if !selected[action] {
+				delete(allowed, action)
+			}
+		}
+	}
+	return allowed
 }
 
 // laravelActionFilter reads a chained `->only([...])` / `->except([...])`

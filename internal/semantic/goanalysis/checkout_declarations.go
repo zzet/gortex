@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -71,6 +72,7 @@ func mapCheckoutContextDeclarations(
 	}
 	byPath := make(map[string][]pendingDeclaration)
 	seen := make(map[types.Object]struct{})
+	var trimmedFiles map[string]string
 	for _, pkg := range pkgs {
 		if pkg == nil || pkg.TypesInfo == nil {
 			continue
@@ -101,6 +103,12 @@ func mapCheckoutContextDeclarations(
 			}
 			pos := fset.Position(obj.Pos())
 			relPath := relativePath(pos.Filename, paths.absRoot)
+			if relPath == "" && !filepath.IsAbs(pos.Filename) {
+				if trimmedFiles == nil {
+					trimmedFiles = checkoutTrimmedDeclarationFiles(pkgs, paths.absRoot, modulePath)
+				}
+				relPath = trimmedFiles[filepath.ToSlash(pos.Filename)]
+			}
 			if relPath == "" || pos.Line <= 0 || !strings.HasSuffix(relPath, ".go") || excludedFromModuleLoad(relPath) {
 				continue
 			}
@@ -142,6 +150,52 @@ func mapCheckoutContextDeclarations(
 		}
 	}
 	return mapped
+}
+
+// checkoutTrimmedDeclarationFiles reverses the Go command's -trimpath file
+// names using this load's exact source-file inventory. Only files physically
+// inside the checkout and in the existing declaration namespace are eligible.
+// A local replacement can qualify; an outside replacement, unknown //line
+// target or generated file cannot acquire a checkout path by its basename.
+func checkoutTrimmedDeclarationFiles(pkgs []*packages.Package, absRoot, modulePath string) map[string]string {
+	files := make(map[string]string)
+	seen := make(map[*packages.Package]bool)
+	var visit func(*packages.Package)
+	visit = func(pkg *packages.Package) {
+		if pkg == nil || seen[pkg] {
+			return
+		}
+		seen[pkg] = true
+		for _, dependency := range pkg.Imports {
+			visit(dependency)
+		}
+		if pkg.Dir == "" || !mainModulePackage(pkg.PkgPath, modulePath) {
+			return
+		}
+		prefix := pkg.PkgPath
+		if module := pkg.Module; module != nil && module.Version != "" {
+			prefix = module.Path + "@" + module.Version + strings.TrimPrefix(pkg.PkgPath, module.Path)
+		}
+		for _, file := range pkg.GoFiles {
+			if !filepath.IsAbs(file) || filepath.Clean(filepath.Dir(file)) != filepath.Clean(pkg.Dir) {
+				continue
+			}
+			rel := relativePath(file, absRoot)
+			if rel == "" || excludedFromModuleLoad(rel) {
+				continue
+			}
+			alias := prefix + "/" + filepath.Base(file)
+			if previous, exists := files[alias]; exists && previous != rel {
+				files[alias] = "" // An ambiguous alias grants no file identity.
+			} else if !exists {
+				files[alias] = rel
+			}
+		}
+	}
+	for _, pkg := range pkgs {
+		visit(pkg)
+	}
+	return files
 }
 
 // handleFileUse reports whether ident's position, as resolveGoUse reads it,

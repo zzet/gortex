@@ -111,7 +111,7 @@ func TestCheckedReadWitnessCannotBeCopiedOrRepublished(t *testing.T) {
 	for range read.layer.Edges() {
 		edges++
 	}
-	require.Equal(t, int64(len(read.layer.FileNodes("main.go")))*projectionNodeBytes+int64(edges)*projectionEdgeBytes+read.names.chargedBytes+24, read.size, "admission witness is charged before publication")
+	require.Equal(t, int64(len(read.layer.FileNodes("main.go")))*projectionNodeBytes+int64(edges)*projectionEdgeBytes+read.names.chargedBytes+32, read.size, "state including the deferred ACK retirement revision is charged before publication")
 	require.Equal(t, read.size, pendingFileProjections.snap.Load().bytes)
 	for _, sequence := range []uint64{0, physical.commitSeq + 1} {
 		copied := read.committedCopy(sequence, read.disk)

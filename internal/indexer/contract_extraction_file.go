@@ -49,6 +49,20 @@ func (e *contractFollowupEvidence) loadExtractionFile(path string) ([]*graph.Nod
 // A replay question needs the selected input, not a second scratch import.
 // All rows and metadata still participate in the same answer digest and caps.
 func (e *contractFollowupEvidence) readExtractionFileAnswer(path string) ([]*graph.Node, []*graph.Edge, error) {
+	return e.readExtractionFileAnswerWithTrackers(path, false)
+}
+
+// Files without configured extractors still contribute full units, declared
+// keys and checked answers. Only their unused scratch import can be omitted.
+// Private loaded rows and tracker contributions retain the original path.
+func (e *contractFollowupEvidence) loadExtractorFreeFile(path string) ([]*graph.Node, []*graph.Edge, error) {
+	if e.loaded[path] || e.loadedExtraction[path] || e.loadedFileNodes[path] {
+		return e.loadExtractionFile(path)
+	}
+	return e.readExtractionFileAnswerWithTrackers(path, true)
+}
+
+func (e *contractFollowupEvidence) readExtractionFileAnswerWithTrackers(path string, materializeTrackers bool) ([]*graph.Node, []*graph.Edge, error) {
 	e.ledger.owner(path)
 	e.ledger.key("path:", path)
 	defer e.guard.enter()()
@@ -70,6 +84,12 @@ func (e *contractFollowupEvidence) readExtractionFileAnswer(path string) ([]*gra
 		e.fail(err)
 		return nil, nil, err
 	}
+	if materializeTrackers && contractExtractionTrackerRows(nodes, edges) {
+		nodes, edges, err = e.importSelectedFileRows(path, nodes, edges, true)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	var seeds []*graph.Edge
 	for _, edge := range edges {
 		if contractUnitSeedEdge(edge) {
@@ -82,6 +102,26 @@ func (e *contractFollowupEvidence) readExtractionFileAnswer(path string) ([]*gra
 	}
 	e.ledger.read(contractReadExtractionFile, []string{path}, contractFileAnswer{Nodes: nodes, Edges: seeds}, path)
 	return nodes, seeds, nil
+}
+
+// These are the side trackers maintained by AddBatch, including their shared
+// aggregate bound. Rows without any such contribution have no import effect
+// consumed outside this file's extraction answer.
+func contractExtractionTrackerRows(nodes []*graph.Node, edges []*graph.Edge) bool {
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if _, spring := node.Meta["spring_config_keys"]; spring || node.Kind == graph.KindMethod && node.Language == "java" || node.Kind == graph.KindConfigKey || (node.Kind == graph.KindType || node.Kind == graph.KindInterface) && node.Meta["shape"] != nil {
+			return true
+		}
+	}
+	for _, edge := range edges {
+		if edge != nil && (edge.Kind == graph.EdgeReadsConfig || contractUnitSeedEdge(edge)) {
+			return true
+		}
+	}
+	return false
 }
 
 func contractEvidenceRowsWithinLimit(nodes []*graph.Node, edges []*graph.Edge) error {

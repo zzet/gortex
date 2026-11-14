@@ -2,9 +2,19 @@ package store_sqlite
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 )
+
+// ErrWarmupWALPressure marks an AwaitWarmupWAL refusal that came from the WAL
+// reclaim not reaching its mark in time, not from the caller's context. It is
+// transient by construction: the reclaim is blocked by concurrent warm-up
+// readers and writers, so a caller may retry the refused work once they are
+// gone. An error AwaitWarmupWAL returns carrying it also matches
+// context.DeadlineExceeded.
+var ErrWarmupWALPressure = errors.New("warmup WAL reclaim did not reach its mark in time")
 
 // Retirement yields to the WAL reclaim.
 //
@@ -123,7 +133,17 @@ func (s *Store) AwaitWarmupWAL(ctx context.Context) error {
 	}
 	s.warmupWALWaiters.Add(1)
 	defer s.warmupWALWaiters.Add(-1)
-	return s.waitForWALReclaim(ctx, retirementWALWaitMax, ready)
+	if err := s.waitForWALReclaim(ctx, retirementWALWaitMax, ready); err != nil {
+		if ctx.Err() == nil {
+			// Name the reclaim's last attempt, so a refusal says what kept
+			// the log over its mark (a reader, an edit burst, a busy lane).
+			st := s.WALReclaimStats()
+			return fmt.Errorf("%w (wal_bytes=%d mark=%d reclaim_last=%s/%s): %w",
+				ErrWarmupWALPressure, s.retirementLogBytes(), mark, st.LastOutcome, st.LastReason, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) waitForWALReclaim(ctx context.Context, maxWait time.Duration, ready func() bool) error {

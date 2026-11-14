@@ -21,6 +21,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "seed-search":
 			return readOnlySeedCommand(args[1:], stdout, stderr)
+		case "edit-qualify":
+			return editQualifyCommand(args[1:], stdout, stderr)
 		case "edit-loop":
 			return editLoopCommand(args[1:], stdout, stderr)
 		case "plan", "collect", "edit-plan", "edit-collect":
@@ -114,9 +116,15 @@ func printRows(w io.Writer, rows []result) bool {
 	pass := true
 	for _, row := range rows {
 		status := "PASS"
-		if !row.Pass {
-			status, pass = "FAIL", false
+		if row.Mode == "deferred" && row.Deferred {
+			status = "DEFERRED (target met)"
+			if !row.Pass {
+				status = "DEFERRED (target missed)"
+			}
+		} else if !row.Pass {
+			status = "FAIL"
 		}
+		pass = pass && row.passesGate()
 		detail := strings.Join(append([]string{row.Baseline, row.Reason}, row.Allowances...), "; ")
 		if row.Worst != nil {
 			detail += "; worst hard repeat=" + value(row.Worst)

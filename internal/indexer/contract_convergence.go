@@ -114,7 +114,30 @@ const (
 	contractRoundFiles = 64
 	contractRoundWait  = 3 * time.Second
 	contractIdleRounds = 3
+	// contractFirstPassRounds bounds the first rounds one batch of pending
+	// files takes. Each first round opens with a full scan of the job's whole
+	// census, so a fixed round size makes a batch cost census*batch/size: a
+	// large cold batch spends its time and allocations rescanning, not
+	// extracting. A batch above contractRoundFiles*contractFirstPassRounds
+	// files takes proportionally larger rounds instead. Every round still
+	// takes its own full scan before its reads and proves its units against
+	// one scan after its last extraction, so a larger round only widens that
+	// window. A larger round whose rows outgrow one evidence store is
+	// retried with its files and the rest of the batch in rounds of half the
+	// size, down to contractRoundFiles. A round taken while another actor
+	// waits keeps the cooperative 16-file size.
+	contractFirstPassRounds = 256
 )
+
+// contractFirstPassRoundSize is the first-round size for a batch of files:
+// contractRoundFiles, or larger once the batch would take more than rounds
+// rounds.
+func contractFirstPassRoundSize(files, rounds int) int {
+	if rounds <= 0 {
+		return contractRoundFiles
+	}
+	return max(contractRoundFiles, (files+rounds-1)/rounds)
+}
 
 var (
 	errContractJobKeyMoved      = errors.New("contract analysis: attachment input key moved")
@@ -796,6 +819,12 @@ func (l *contractUnitLedger) nodes(nodes ...*graph.Node) {
 type contractConvergenceHooks struct {
 	// roundFiles narrows a proof round to place files in separate rounds.
 	roundFiles int
+	// firstPassRounds replaces contractFirstPassRounds.
+	firstPassRounds int
+	// evidenceFiles, when positive, fails a round's evidence with
+	// graph.ErrContractProjectionLimit once it has extracted that many files,
+	// as a round whose files outgrow one evidence store's rows fails.
+	evidenceFiles int
 	// roundWait replaces contractRoundWait.
 	roundWait      time.Duration
 	openedEvidence func(*store_sqlite.Store)
@@ -861,6 +890,9 @@ type contractConvergence struct {
 	// progress counts the job's proofs: units proven, changed units dropped
 	// for extraction, enrichment rounds run or re-checked current.
 	progress int
+	// fillTurnProven amortizes capture across productive cooperative chunks.
+	// It is job-local scheduling state, never a reusable proof or work clock.
+	fillTurnProven int
 	// idle counts the unblocked rounds without progress since the last
 	// progress that saw an input move or waited out contractRoundWait (a run
 	// of waited-out rounds only while no unblocked event-woken round came
@@ -1535,10 +1567,13 @@ func (c *contractConvergence) extract(idx *Indexer, evidence *contractFollowupEv
 	// its evict and add is in the round's point scan.
 	ledger.owner(file.Path)
 	ledger.key("path:", file.Path)
+	_, byLanguage := idx.buildPerFileContractExtractors()
 	var nodes []*graph.Node
 	var edges []*graph.Edge
 	if projected {
 		nodes, edges, err = evidence.loadFile(file.Path)
+	} else if len(byLanguage[file.Language]) == 0 && file.Language != "gomod" && file.Path != "go.mod" && !strings.HasSuffix(file.Path, "/go.mod") && !contractRouterCensus(file) {
+		nodes, edges, err = evidence.loadExtractorFreeFile(file.Path)
 	} else {
 		nodes, edges, err = evidence.loadExtractionFile(file.Path)
 	}
@@ -1549,7 +1584,6 @@ func (c *contractConvergence) extract(idx *Indexer, evidence *contractFollowupEv
 	if err != nil {
 		return nil, err
 	}
-	_, byLanguage := idx.buildPerFileContractExtractors()
 	var tree *parser.ParseTree
 	if projected {
 		if !idx.contractGeneratedCoreProof(c.ctx, file, src, nodes, edges, c.snap.Core) {
@@ -1705,6 +1739,18 @@ func (c *contractConvergence) round(paths []string, point bool) (proven []*contr
 		return nil, nil, err
 	}
 	defer closeContractEvidence(scratch, dir)
+	// Prefetch only inside this round's opening stamp scan. Every later
+	// extraction still enters the installed callback and proves its own rows
+	// and source against the same R0 and its closing scan.
+	batch := &contractReplayCoreBatch{}
+	for _, path := range paths {
+		stamp, stamped := r0.Stamps[path]
+		if file, ok := c.files[path]; ok && c.live[path] && stamped && stamp.quiescent() {
+			batch.add(file)
+		}
+	}
+	defer batch.close()
+	evidence.ctx = context.WithValue(evidence.ctx, contractReplayCoreBatchKey{}, batch)
 	var current *contractUnitLedger
 	reader := &contractPinnedReader{c: c, stamps: r0.Stamps, ledger: func() *contractUnitLedger { return current }, moved: make(map[string]bool)}
 	indexers := c.indexers(evidence, reader.read)
@@ -1738,6 +1784,9 @@ func (c *contractConvergence) round(paths []string, point bool) (proven []*contr
 		}
 		if c.hooks != nil && c.hooks.beforeExtract != nil {
 			c.hooks.beforeExtract(path)
+		}
+		if c.hooks != nil && c.hooks.evidenceFiles > 0 && len(extracted) >= c.hooks.evidenceFiles {
+			evidence.fail(graph.ErrContractProjectionLimit)
 		}
 		ledger := newContractUnitLedger()
 		current = ledger
@@ -2806,7 +2855,7 @@ func (c *contractConvergence) installExcluded(path string) {
 }
 
 // rounds proves every pending path. A path's first attempt runs in a full
-// round of up to contractRoundFiles files; a path left unproven retries in
+// round of contractFirstPassRoundSize files; a path left unproven retries in
 // point rounds, each started by the next Published or receipt event (or by a
 // wait of contractRoundWait that saw none), until it is proven. The job ends
 // superseded after contractIdleRounds counted rounds without progress.
@@ -2873,12 +2922,13 @@ func (c *contractConvergence) rounds(pending map[string]string) error {
 				continue
 			}
 			paths = extracted
-			size := contractRoundFiles
+			rounds := contractFirstPassRounds
+			if c.hooks != nil && c.hooks.firstPassRounds > 0 {
+				rounds = c.hooks.firstPassRounds
+			}
+			size := contractFirstPassRoundSize(len(paths), rounds)
 			if c.hooks != nil && c.hooks.roundFiles > 0 {
 				size = c.hooks.roundFiles
-			}
-			if c.fillContended() {
-				size = min(size, 16)
 			}
 			// A first round is not accounted, but its retry waits for what
 			// its refusals name, beside what the files already unproven
@@ -2886,13 +2936,35 @@ func (c *contractConvergence) rounds(pending map[string]string) error {
 			if len(unproven) == 0 {
 				c.waitOn, c.waitAny = nil, false
 			}
-			for start := 0; start < len(paths); start += size {
-				chunk := paths[start:min(start+size, len(paths))]
-				for _, path := range chunk {
+			// counted is how many of paths, from its start, were counted.
+			counted := 0
+			for len(paths) > 0 {
+				// A round is not preemptible: a competitor that starts
+				// waiting mid-batch gets the cooperative 16-file rounds from
+				// the next round on, not after the batch.
+				if c.fillContended() {
+					size = min(size, 16)
+				}
+				chunk := paths[:min(size, len(paths))]
+				for _, path := range chunk[min(counted, len(chunk)):] {
 					countContractFiles(pending[path], 1)
 				}
+				counted = max(counted, len(chunk))
 				epoch := c.wake()
 				proven, missed, err := c.round(chunk, false)
+				if errors.Is(err, graph.ErrContractProjectionLimit) && len(chunk) > contractRoundFiles {
+					// One evidence store holds a bounded number of rows, and a
+					// round larger than contractRoundFiles can exceed it where
+					// smaller rounds fit. The failed round accepted nothing:
+					// its files and the rest of the batch take rounds of half
+					// the size, never below contractRoundFiles, so a cohort
+					// whose files are row-dense does not fall back to the
+					// quadratic rounds of contractRoundFiles at once.
+					size = max(contractRoundFiles, size/2)
+					continue
+				}
+				paths = paths[len(chunk):]
+				counted -= len(chunk)
 				if err != nil {
 					return err
 				}
@@ -2963,9 +3035,20 @@ func (c *contractConvergence) continueFill(proven int, more bool) error {
 	if err := c.ctx.Err(); err != nil {
 		return err
 	}
+	c.fillTurnProven = min(contractRoundFiles, c.fillTurnProven+proven)
 	if proven > 0 && more && c.fillContended() {
-		c.req.delta.continued = true
-		return &ContractFillContinued{}
+		// OtherActorWaiting also includes linked-idle demand. Its original
+		// accounting runs before this separate prompt-checkpoint question.
+		demand := c.req.checkpointDemand != nil && c.req.checkpointDemand()
+		// Keep each existing 16-file scan/yield boundary. Only productive
+		// competitor turns coalesce to one normal-round equivalent; partial
+		// progress and foreground demand still hand off immediately. A first
+		// round taken before the competitor arrived can be larger: the turn
+		// then hands off after that one round.
+		if demand || proven < 16 || c.fillTurnProven >= contractRoundFiles {
+			c.req.delta.continued = true
+			return &ContractFillContinued{}
+		}
 	}
 	return nil
 }

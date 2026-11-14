@@ -245,7 +245,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}()
 	}
 	coldStart := time.Now()
-	if err := p.startWithSearchRefusalEvidence(scenario == editProbeScenario && o.SearchReadbackAcceptance); err != nil {
+	if err := p.startWithScenarioRefusalEvidence(scenario, o); err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
 	startupMonitor := startMonitor(p, newProcessSampler(), group)
@@ -695,4 +695,10 @@ func containsIdentity(data json.RawMessage, marker string) bool {
 
 func editRequest(corpus Corpus, marker string) request {
 	return request{Tool: "edit", Operation: "file", Arguments: map[string]any{"operation": "file", "target": map[string]any{"file": corpus.File}, "match": corpus.EditAnchor, "replacement": corpus.EditAnchor + strings.ReplaceAll(corpus.EditTemplate, "{{marker}}", marker)}}
+}
+
+// Use the existing daemon-only opt-in for explicitly selected edit diagnostics.
+// Generic scenarios and the private CLI/Git environment keep their isolation.
+func (p *privateRun) startWithScenarioRefusalEvidence(scenario string, o runOptions) error {
+	return p.startWithSearchRefusalEvidence(scenario == editProbeScenario && (o.SearchReadbackAcceptance || o.EditGateModes))
 }

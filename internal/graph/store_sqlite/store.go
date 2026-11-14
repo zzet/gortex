@@ -66,6 +66,9 @@ type backgroundCheckpointCoordination struct {
 }
 
 type storeCore struct {
+	// payloadInputIdentity is an opaque process-unique value, not an owner handle.
+	payloadInputIdentity atomic.Uint64
+
 	firstIndexDrainsMu sync.Mutex
 	firstIndexDrains   map[string]graph.FirstIndexDrain
 
@@ -1890,6 +1893,10 @@ func (s *Store) Close() (closeErr error) {
 	if !s.ownsCore {
 		return nil
 	}
+	// Detached input values cannot survive this owner's teardown. Invalidate
+	// after the pools close, including values sampled while Close was joining
+	// its workers. Borrowed handles above leave the shared owner unchanged.
+	defer s.payloadInputAdminRevision.Add(1)
 	policy := resolveCloseCheckpointPolicy()
 	started := time.Now()
 	defer func() {

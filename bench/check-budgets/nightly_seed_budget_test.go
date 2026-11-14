@@ -9,7 +9,7 @@ import (
 // Arithmetic/raw-contract control only: these samples are not an actual
 // seeded nightly campaign. Use the shipped policy and gate evaluator, not a
 // test-only budget that could accidentally give the wrong target RED credit.
-func TestNightlySeedSelectedCallsReachExistingAbsoluteGate(t *testing.T) {
+func TestNightlySeedSelectedCallsRetainDeferredSearchMiss(t *testing.T) {
 	data, err := os.ReadFile("../budgets.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -25,8 +25,8 @@ func TestNightlySeedSelectedCallsReachExistingAbsoluteGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Independent one-second raw search observations must fail the unchanged
-	// actual absolute budget in the scenario that receives the real fault.
+	// Independent one-second raw search observations retain the original target
+	// miss. The approved #1420 deferral no longer supplies blocking RED proof.
 	raw := report{Phases: []phase{{Tools: map[string]toolResult{
 		"search.symbols": {Latency: distribution{Count: 3, P95: metric{Value: pointer(1000), Unit: "ms"}}},
 	}}}}
@@ -41,7 +41,7 @@ func TestNightlySeedSelectedCallsReachExistingAbsoluteGate(t *testing.T) {
 			continue
 		}
 		for _, b := range p.Budgets {
-			if b.HostClass != c.HostClass || b.Scenario != task.Scenario || b.Metric != "search_symbols_p95" || b.Mode != "block" {
+			if b.HostClass != c.HostClass || b.Scenario != task.Scenario || b.Metric != "search_symbols_p95" || b.Mode != "deferred" {
 				continue
 			}
 			matched++
@@ -49,12 +49,12 @@ func TestNightlySeedSelectedCallsReachExistingAbsoluteGate(t *testing.T) {
 				t.Fatalf("existing absolute budget changed: %+v", b)
 			}
 			verdict := assess(p, b, repeated(observed), repeated(.1), nil, "nightly")
-			if verdict.Pass || verdict.After == nil || *verdict.After != 1 || verdict.Limit == nil || *verdict.Limit != .4 {
-				t.Fatalf("real gate did not propagate delayed raw search to RED: %+v", verdict)
+			if verdict.Pass || !verdict.Deferred || !verdict.passesGate() || verdict.After == nil || *verdict.After != 1 || verdict.Limit == nil || *verdict.Limit != .4 {
+				t.Fatalf("deferred target miss was lost or made blocking: %+v", verdict)
 			}
 		}
 	}
 	if matched != c.Repeats {
-		t.Fatalf("fault/budget mismatch: %d selected absolute-search gates, want %d; existing selector does not establish a seeded budget RED", matched, c.Repeats)
+		t.Fatalf("fault/budget mismatch: %d selected deferred search targets, want %d", matched, c.Repeats)
 	}
 }

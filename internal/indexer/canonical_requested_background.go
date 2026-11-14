@@ -50,6 +50,8 @@ type canonicalBackgroundOwner struct {
 	stage                           canonicalBackgroundStage
 	invalid                         bool
 	reason                          string
+	bindingPredicate                string
+	bindingStage                    canonicalBackgroundStage
 }
 
 func newCanonicalBackground(record *PublicationPhaseRecord, w *Watcher, path string, requested uint64, entered time.Time) *canonicalBackgroundOwner {
@@ -62,6 +64,41 @@ func (b *canonicalBackgroundOwner) failLocked(reason string) {
 	b.invalid = true
 	if b.reason == "" {
 		b.reason = reason
+	}
+}
+
+// Preserve the first refused predicate without changing the existing reason.
+func (b *canonicalBackgroundOwner) failBindingLocked(predicate string) {
+	if b.reason == "" {
+		b.bindingPredicate, b.bindingStage = predicate, b.stage
+	}
+	b.failLocked("serving_attempt_binding_mismatch")
+}
+func (b *canonicalBackgroundOwner) invalidateBinding(predicate string) {
+	b.mu.Lock()
+	b.failBindingLocked(predicate)
+	b.mu.Unlock()
+}
+func (stage canonicalBackgroundStage) diagnosticName() string {
+	switch stage {
+	case backgroundAdmission:
+		return "admission"
+	case backgroundInitialArm:
+		return "initial_arm"
+	case backgroundInitialQuiet:
+		return "initial_quiet"
+	case backgroundHandoff:
+		return "handoff"
+	case backgroundNativeArm:
+		return "native_arm"
+	case backgroundNativeQuiet:
+		return "native_quiet"
+	case backgroundExecuting:
+		return "executing"
+	case backgroundReturned:
+		return "returned"
+	default:
+		return "unknown"
 	}
 }
 func (b *canonicalBackgroundOwner) invalidate(reason string) {
@@ -215,10 +252,19 @@ type RequestedBackgroundUnavailable struct {
 	RequestedGeneration    uint64 `json:"requested_generation"`
 	LastObservedGeneration uint64 `json:"last_observed_generation"`
 	ObservedNativeHandoffs uint64 `json:"observed_native_handoffs"`
+	BindingPredicate       string `json:"binding_predicate,omitempty"`
+	BackgroundStage        string `json:"background_stage,omitempty"`
+	AcceptedAttemptStage   string `json:"accepted_attempt_stage,omitempty"`
 }
 
 func (b *canonicalBackgroundOwner) unavailableLocked(reason string) RequestedBackgroundUnavailable {
-	return RequestedBackgroundUnavailable{Scope: "requested_background_observation", Reason: reason, PublicationKey: b.key, RequestedGeneration: b.requested, LastObservedGeneration: b.current, ObservedNativeHandoffs: b.handoffs}
+	evidence := RequestedBackgroundUnavailable{Scope: "requested_background_observation", Reason: reason, PublicationKey: b.key, RequestedGeneration: b.requested, LastObservedGeneration: b.current, ObservedNativeHandoffs: b.handoffs}
+	if reason == "serving_attempt_binding_mismatch" && b.bindingPredicate != "" {
+		evidence.BindingPredicate = b.bindingPredicate
+		evidence.BackgroundStage = b.bindingStage.diagnosticName()
+		evidence.AcceptedAttemptStage = "not_inspected"
+	}
+	return evidence
 }
 
 // Caller must not hold watcher/coordinator locks. Recorder membership fencing
@@ -273,8 +319,17 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 		b.publishUnavailable()
 		return
 	}
-	if b.stage != backgroundExecuting || b.entered != entered || end.Before(entered) {
-		b.failLocked("serving_attempt_binding_mismatch")
+	predicate := ""
+	switch {
+	case b.stage != backgroundExecuting:
+		predicate = "background_stage_not_executing"
+	case b.entered != entered:
+		predicate = "callback_entry_mismatch"
+	case end.Before(entered):
+		predicate = "return_before_callback_entry"
+	}
+	if predicate != "" {
+		b.failBindingLocked(predicate)
 		b.mu.Unlock()
 		b.publishUnavailable()
 		return
@@ -295,8 +350,17 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 		b.finishDirect(record, owner, attempt, evidence, entered, end, diagnostic)
 		return
 	}
-	if attempt.record == nil || attempt.record == record || attempt.record.owner.Value() != owner {
-		b.invalidate("serving_attempt_binding_mismatch")
+	predicate = ""
+	switch {
+	case attempt.record == nil:
+		predicate = "independent_attempt_record_missing"
+	case attempt.record == record:
+		predicate = "independent_attempt_reuses_request"
+	case attempt.record.owner.Value() != owner:
+		predicate = "independent_attempt_owner_mismatch"
+	}
+	if predicate != "" {
+		b.invalidateBinding(predicate)
 		b.publishUnavailable()
 		return
 	}
@@ -310,7 +374,21 @@ func (b *canonicalBackgroundOwner) finish(attempt *pointPublicationAttempt, ente
 	if owner.byKey[record.key] != record || owner.byKey[winner.key] != winner || record.ticket != b.requested || record.background != nil || record.backgroundUnavailable != nil {
 		return
 	}
-	if record.coalescedWinner.Value() != winner || winner.attemptWindow == nil || winner.debounce == nil || winner.ticket != evidence.applied || winner.ticket <= b.requested {
+	predicate = ""
+	switch {
+	case record.coalescedWinner.Value() != winner:
+		predicate = "coalesced_winner_link_mismatch"
+	case winner.attemptWindow == nil:
+		predicate = "coalesced_physical_window_missing"
+	case winner.debounce == nil:
+		predicate = "coalesced_debounce_missing"
+	case winner.ticket != evidence.applied:
+		predicate = "coalesced_ticket_mismatch"
+	case winner.ticket <= b.requested:
+		predicate = "coalesced_ticket_not_newer"
+	}
+	if predicate != "" {
+		diagnostic = canonicalBindingUnavailableLocked(diagnostic, predicate, winner)
 		record.backgroundUnavailable = &diagnostic
 		return
 	}
@@ -426,7 +504,23 @@ func (b *canonicalBackgroundOwner) finishDirect(record *PublicationPhaseRecord, 
 	if owner.byKey[record.key] != record || record.ticket != b.requested || record.background != nil || record.backgroundUnavailable != nil {
 		return
 	}
-	if attempt.record != record || evidence.requested != evidence.applied || evidence.handoffs != 0 || record.coalescedWinner.Value() != nil || record.attemptWindow == nil || record.debounce == nil {
+	predicate := ""
+	switch {
+	case attempt.record != record:
+		predicate = "direct_attempt_record_mismatch"
+	case evidence.requested != evidence.applied:
+		predicate = "direct_generation_mismatch"
+	case evidence.handoffs != 0:
+		predicate = "direct_handoff_present"
+	case record.coalescedWinner.Value() != nil:
+		predicate = "direct_coalesced_winner_present"
+	case record.attemptWindow == nil:
+		predicate = "direct_physical_window_missing"
+	case record.debounce == nil:
+		predicate = "direct_debounce_missing"
+	}
+	if predicate != "" {
+		diagnostic = canonicalBindingUnavailableLocked(diagnostic, predicate, record)
 		record.backgroundUnavailable = &diagnostic
 		return
 	}
@@ -442,4 +536,19 @@ func (b *canonicalBackgroundOwner) finishDirect(record *PublicationPhaseRecord, 
 		}
 	}
 	record.background = &evidence
+}
+
+// record.mu must be held. These checks follow the existing transition to
+// backgroundReturned. Keep only scalar facts from this refusal, not a record
+// pointer, timing history, or a claim that an absent witness never existed.
+func canonicalBindingUnavailableLocked(diagnostic RequestedBackgroundUnavailable, predicate string, record *PublicationPhaseRecord) RequestedBackgroundUnavailable {
+	diagnostic.BindingPredicate = predicate
+	diagnostic.BackgroundStage = "returned"
+	diagnostic.AcceptedAttemptStage = "no_accepted_witness"
+	if record.attemptWindow != nil {
+		diagnostic.AcceptedAttemptStage = "physical_window_retained"
+	} else if record.acceptedAttempt != nil {
+		diagnostic.AcceptedAttemptStage = "accepted_stamps_retained"
+	}
+	return diagnostic
 }

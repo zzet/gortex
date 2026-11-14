@@ -1,0 +1,25 @@
+{
+  "status": {
+    "receipt": "commit-a", "mutation_id": "edit-a", "acknowledgement_rpc_id": "rpc-2",
+    "requested_generation": 3, "applied_generation": 3,
+    "publication_key": "mutation-a", "publication_ticket": 3,
+    "publication_source": "mcp_edit", "publication_clock": "monotonic", "publication_terminal": true,
+    "physical_unavailable_observed": true, "background_unavailable_observed": true, "coalesced_absent_observed": true,
+    "background_refusal": "serving_attempt_binding_mismatch", "binding_predicate": "direct_physical_window_missing",
+    "background_stage": "returned", "accepted_attempt_stage": "no_accepted_witness",
+    "background_requested_generation": 3, "background_last_observed_generation": 3, "observed_native_handoffs": 0,
+    "status_wire_id": 34, "status_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "guard": {
+    "msg": "graph patch attempt timing unavailable", "patch_lap_scope": "physical_attempt_timing_unavailable", "attempt_rejection_reason": "accepted_stamps_mismatch", "repo": "repo",
+    "attempt_guard_observed": true, "attempt_guard_recorder": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "attempt_guard_publication_key": "mutation-a", "attempt_guard_ticket": 3, "attempt_guard_collector_ticket": 3,
+    "attempt_guard_accepted_stamps": "absent", "attempt_guard_window_present": false, "attempt_guard_terminal": false,
+    "attempt_guard_patch_present": false, "attempt_retry": 0, "attempt_completion_observed": true,
+    "attempt_completion_disposition": "covered_without_acceptance", "attempt_completion_fallback": true,
+    "attempt_completion_applied": 3, "attempt_completion_pending_at_check": 4, "attempt_completion_count": 1,
+    "source_log": "daemon-1.stderr.log", "line_number": 17,
+    "line_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "original_accounting_error": "A/P/B accounting unavailable: applicable physical P unavailable; requested B observed unavailable: serving_attempt_binding_mismatch"
+}

@@ -173,7 +173,8 @@ func TestWarmupRetriesAStalledBackgroundListingAtNormalPriority(t *testing.T) {
 	var stalled, retried int
 	p.packagesLoad = func(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
 		if warmupListingFlags(cfg) {
-			switch strings.Join(cfg.BuildFlags, " ") {
+			// Export path normalization does not change listing priority.
+			switch strings.TrimSuffix(strings.Join(cfg.BuildFlags, " "), " -trimpath") {
 			case strings.Join(background, " "):
 				mu.Lock()
 				first := stalled == 0

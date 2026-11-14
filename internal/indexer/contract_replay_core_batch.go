@@ -8,8 +8,9 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// A batch exists only between one revalidation's R0 and R1. It never replaces
-// the installed ReadCoreFile callback, nor survives into an actor checkpoint.
+// A batch exists only within one extraction or revalidation round, after R0
+// and before its closing scans finish. It never replaces the installed
+// ReadCoreFile callback, nor survives into an actor checkpoint.
 // Declaration/enrichment reads do not set the extraction context marker.
 type contractReplayCoreBatchKey struct{}
 type contractReplayCoreBatch struct {

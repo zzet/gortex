@@ -502,6 +502,14 @@ func (c *ContractAnalysisCoordinator) now() time.Time {
 // Schedule records a request's interest in its actor's inputs and returns.
 // It runs under c.mu: no store read, no census, no job slot, no lane.
 func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req ContractScheduleRequest) (result ContractScheduleResult, err error) {
+	defer func() {
+		if err == nil && req.Actor.Checkout != "" && req.Inputs != nil && req.Inputs.State.Accepted && c.options.LinkedInterest != nil {
+			switch result.Result {
+			case ContractScheduled, ContractCoalesced, ContractRunning:
+				c.options.LinkedInterest(req.Actor)
+			}
+		}
+	}()
 	label := ""
 	// The request's source is released unless the actor keeps it; a source
 	// the request's inputs replace is released too.
@@ -1478,6 +1486,12 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 			return
 		}
 	}
+	// The actor has no concurrent job while capturing. Only its detached
+	// immutable inventory values cross this boundary; current capture owns all
+	// readers, leases and input/publication checks again.
+	// An eviction during capture can leave at most one compact-bounded active
+	// capture memo; it owns no reservation or authority, and is cleared on seed.
+	c.bindCaptureInventory(a.id, source)
 	snapshot, targets, err := c.options.Capture(ctx, source, want.inputs, want.repo, want.checkout)
 	captureDuration := time.Since(captureStart)
 	inner := snapshot.Release
@@ -1726,6 +1740,19 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 	release()
 	source.Release()
 	c.endJob(a, want, outcome, time.Since(body), job.publication)
+}
+
+// bindCaptureInventory transfers only the actor's detached immutable hint.
+// The fresh capture still owns all selected readers and authority checks.
+func (c *ContractAnalysisCoordinator) bindCaptureInventory(actor ContractActor, source *ContractCaptureSource) {
+	if source == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached := c.deltaCaches.get(actor); cached != nil {
+		source.inventoryValues = cached.inventoryValues
+	}
 }
 
 // otherActorWaiting includes dispatchers already waiting for a global slot.

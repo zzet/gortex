@@ -1,0 +1,48 @@
+{
+  "status": {
+    "receipt": "commit-a",
+    "mutation_id": "edit-a",
+    "acknowledgement_rpc_id": "rpc-2",
+    "requested_generation": 3,
+    "applied_generation": 4,
+    "publication_key": "mutation-a",
+    "publication_ticket": 3,
+    "publication_source": "mcp_edit",
+    "publication_clock": "monotonic",
+    "publication_terminal": true,
+    "physical_unavailable_observed": true,
+    "background_unavailable_observed": true,
+    "coalesced_absent_observed": false,
+    "background_refusal": "serving_attempt_binding_mismatch",
+    "binding_predicate": "direct_physical_window_missing",
+    "background_stage": "returned",
+    "accepted_attempt_stage": "no_accepted_witness",
+    "background_requested_generation": 3,
+    "background_last_observed_generation": 3,
+    "observed_native_handoffs": 0,
+    "status_wire_id": 34,
+    "status_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "winner": {
+    "key": "mutation-a/physical-4-retry-0",
+    "ticket": 4,
+    "source": "canonical_coalesced_attempt",
+    "clock": "monotonic",
+    "terminal": true,
+    "requested_generation": 3,
+    "applied_generation": 4,
+    "scope": "independent_physical_winner_serving_coalesced_receipt",
+    "background_coverage": "not_established",
+    "attempt_ticket": 4,
+    "attempt_retry": 0,
+    "observed_partition_complete": true,
+    "physical_scope": "accepted_winning_physical_attempt"
+  },
+  "serving_physical": {
+    "wall_ns": 13000000,
+    "sum_ns": 13000000,
+    "residual_ns": 0,
+    "within_five_percent": true
+  },
+  "original_accounting_error": "A/P/B accounting unavailable: requested B unavailable for actual topology/identity; requested B observed unavailable: serving_attempt_binding_mismatch; missing B phase initial_timer_arm; B/P phase mismatch: apply; B: missing duration"
+}

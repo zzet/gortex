@@ -2182,7 +2182,7 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 	if w.mutationTimerArmed != nil {
 		w.mutationTimerArmed(delay)
 	}
-	timer = time.AfterFunc(delay, func() {
+	callback := func() {
 		if observation != nil {
 			observation.entered = time.Now() // callback entry precedes claim/admission
 			if observation.background != nil {
@@ -2215,12 +2215,19 @@ func (w *Watcher) armPointMutationTimerLocked(path string, kind ChangeKind, gene
 			observation.background.invalidate("serving_attempt_unavailable")
 			observation.background.publishUnavailable()
 		}
-	})
-	w.pending[path] = timer
-	if observation != nil && observation.background != nil {
-		observation.background.armFinished(w, path, generation, observation.successor, time.Now())
+	}
+	if observation != nil {
+		armObservedMutationTimer(delay, callback, func(armed *time.Timer) {
+			timer = armed
+			w.pending[path] = armed
+			if observation.background != nil {
+				observation.background.armFinished(w, path, generation, observation.successor, time.Now())
+			}
+		})
 		return observation.background
 	}
+	timer = time.AfterFunc(delay, callback)
+	w.pending[path] = timer
 	return nil
 }
 
@@ -2294,14 +2301,23 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 			if w.mutationBeforeComplete != nil {
 				w.mutationBeforeComplete(path, generation)
 			}
-			if !w.completeMutationWaitersObserved(path, generation, patchErr, fanout, true, publication) && patchErr == nil {
+			current, completion := w.completeMutationWaitersObserved(path, generation, patchErr, fanout, true, publication)
+			if publication != nil {
+				publication.completion = completion
+			}
+			if !current && patchErr == nil {
 				if !supersededRecorded {
 					w.noteMutationSuperseded()
 				}
 				// The graph body landed, but a successor won admission before
 				// this completion. Cover only older receipts without accepting
 				// this attempt as the current timing/publication winner.
-				w.completeMutationWaitersGuarded(path, generation, nil, fanout, false)
+				_, covered := w.completeMutationWaitersObserved(path, generation, nil, fanout, false, nil)
+				if publication != nil {
+					covered.fallback = true
+					covered.pendingGeneration = completion.pendingGeneration
+					publication.completion = covered
+				}
 			}
 		}
 	}()
@@ -2398,7 +2414,8 @@ func (w *Watcher) completeMutationWaitersGuarded(
 	fanout DerivedFanoutCompleteness,
 	requireCurrent bool,
 ) bool {
-	return w.completeMutationWaitersObserved(path, appliedGeneration, err, fanout, requireCurrent, nil)
+	completed, _ := w.completeMutationWaitersObserved(path, appliedGeneration, err, fanout, requireCurrent, nil)
+	return completed
 }
 
 func (w *Watcher) completeMutationWaitersObserved(
@@ -2408,7 +2425,7 @@ func (w *Watcher) completeMutationWaitersObserved(
 	fanout DerivedFanoutCompleteness,
 	requireCurrent bool,
 	publication *pointPublicationAttempt,
-) bool {
+) (bool, pointCompletionDiagnostic) {
 	type completion struct {
 		requested   uint64
 		done        chan MutationResult
@@ -2423,9 +2440,14 @@ func (w *Watcher) completeMutationWaitersObserved(
 		fanout = DerivedFanoutCompleteness{}
 	}
 	w.mu.Lock()
+	diagnostic := pointCompletionDiagnostic{
+		observed: true, appliedGeneration: appliedGeneration,
+		pendingGeneration: w.pendingGeneration[path],
+	}
 	if requireCurrent && w.pendingGeneration[path] > appliedGeneration {
 		w.mu.Unlock()
-		return false
+		diagnostic.kind = "superseded_before_completion"
+		return false, diagnostic
 	}
 	_, hasAppliedWaiter := w.mutationWaiters[path][appliedGeneration]
 	// The successful executor's finishGeneration may already have removed the
@@ -2459,6 +2481,17 @@ func (w *Watcher) completeMutationWaitersObserved(
 	if w.observedMutationGeneration[path] <= appliedGeneration {
 		delete(w.observedMutationGeneration, path)
 	}
+	diagnostic.completed = len(completions)
+	switch {
+	case err != nil:
+		diagnostic.kind = "failed_completion"
+	case accepted != nil:
+		diagnostic.kind = "selected_for_absorb"
+	case len(completions) > 0:
+		diagnostic.kind = "covered_without_acceptance"
+	default:
+		diagnostic.kind = "no_completions"
+	}
 	w.mu.Unlock()
 	if accepted != nil {
 		accepted.Absorb(publication.stamps)
@@ -2481,7 +2514,7 @@ func (w *Watcher) completeMutationWaitersObserved(
 		close(completion.done)
 	}
 	w.drainHeldNative(path)
-	return true
+	return true, diagnostic
 }
 
 func (w *Watcher) failMutationWaiters(err error) {
@@ -2654,7 +2687,7 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 		}
 	}
 	w.stormTimerObservation = observation
-	w.stormTimer = time.AfterFunc(delay, func() {
+	callback := func() {
 		defer w.stormWork.Done()
 		attempt := w.drainStormObserved(observation)
 		returned := time.Now()
@@ -2662,10 +2695,15 @@ func (w *Watcher) armStormTimerLocked(delay time.Duration) {
 			w.sharedOwnerBeforeProjection(returned)
 		}
 		w.finishSharedOwnerProof(attempt, observation, returned)
-	})
-	if observation != nil {
-		observation.armFinished = time.Now()
 	}
+	if observation != nil {
+		armObservedMutationTimer(delay, callback, func(armed *time.Timer) {
+			w.stormTimer = armed
+			observation.armFinished = time.Now()
+		})
+		return
+	}
+	w.stormTimer = time.AfterFunc(delay, callback)
 }
 
 // stopStormTimerLocked cancels the currently published quiet timer. A timer
@@ -3718,10 +3756,10 @@ func pickKind(types []fswatcher.EventType) ChangeKind {
 // mutations) funnels through here, so one check covers them all.
 func (w *Watcher) isExcluded(path string) bool {
 	root := w.indexer.rootPath
-	// One Lstat serves both the symlink check and the folder check; only a
-	// symlink pays for resolving its target.
+	// One Lstat serves both the link check and the folder check; only a
+	// link pays for resolving its target.
 	info, err := os.Lstat(path)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 && pathguard.SymlinkEscapes(path, root) {
+	if err == nil && pathguard.IsLink(path, info) && pathguard.SymlinkEscapes(path, root) {
 		return true
 	}
 	m := w.currentExcludeMatcher()

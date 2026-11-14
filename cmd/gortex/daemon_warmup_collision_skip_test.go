@@ -52,7 +52,7 @@ func TestWarmupCollisionTypedSkip(t *testing.T) {
 			var pathFn string
 			var jobErr error
 			require.NoError(t, state.multiIndexer.RunRepositoryTopologyBatch(t.Context(), func(ctx context.Context) error {
-				pathFn, jobErr = accounting.load(ctx, state, entry, prior, zap.NewNop())
+				pathFn, jobErr = accounting.load(ctx, state, entry, prior, false, zap.NewNop())
 				return nil
 			}))
 			var skip *indexer.RepositoryCollisionSkip
@@ -92,7 +92,7 @@ func TestWarmupCollisionTypedSkip(t *testing.T) {
 			require.Equal(t, "present", load.OwnerState)
 			// Positive control uses the same accounting and real queue. A
 			// registered owner's warm no-op still schedules its own base.
-			_, err = accounting.load(t.Context(), state, config.RepoEntry{Path: owner, Name: "src"}, map[string]int64{"main.go": 1}, zap.NewNop())
+			_, err = accounting.load(t.Context(), state, config.RepoEntry{Path: owner, Name: "src"}, map[string]int64{"main.go": 1}, false, zap.NewNop())
 			require.NoError(t, err)
 			require.Equal(t, 1, state.basePublisher.Pending())
 			require.Zero(t, changed.Load())
@@ -113,7 +113,7 @@ func TestWarmupNonCollisionFailureStillInvalidates(t *testing.T) {
 	var prefixes sync.Map
 	frontier := newWarmupDeltaFrontier()
 	accounting := warmupRepoAccounting{changed: &changed, files: &files, unknown: &unknown, prefixes: &prefixes, frontier: frontier}
-	_, err = accounting.load(t.Context(), state, config.RepoEntry{Path: filepath.Join(base, "missing"), Name: "missing"}, map[string]int64{"old.go": 1}, zap.NewNop())
+	_, err = accounting.load(t.Context(), state, config.RepoEntry{Path: filepath.Join(base, "missing"), Name: "missing"}, map[string]int64{"old.go": 1}, false, zap.NewNop())
 	require.Error(t, err)
 	var skip *indexer.RepositoryCollisionSkip
 	require.NotErrorAs(t, err, &skip)
