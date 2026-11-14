@@ -8383,8 +8383,11 @@ func (idx *Indexer) resolveProviderHandlers(reg *contracts.Registry) {
 			p.trail, p.fallback, p.repoHint, p.srcDir, p.handlerClass, handlerCandidates,
 		)
 		// A handler with no file, such as a stdlib or dependency stub, has no
-		// body to enrich from: the contract keeps its registration.
-		if handler == nil || handler.FilePath == "" {
+		// body to enrich from: the contract keeps its registration. So does a
+		// handler in another repository, which the name lookup falls back to
+		// when the route's own repository declares nothing by that name: a
+		// contract's owner must be in its own repository's namespace.
+		if handler == nil || handler.FilePath == "" || handler.RepoPrefix != p.repoHint {
 			continue
 		}
 		resolvedTodo = append(resolvedTodo, resolvedPending{pending: p, handler: handler})
