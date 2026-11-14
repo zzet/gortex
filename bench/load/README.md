@@ -570,6 +570,17 @@ upgrade; the source is only read. `--restarts N` adds N warm restarts. Each
 boot lasts until every configured repository is ready and enriched, plus
 `--duration`.
 
+Linked worktrees are populated by default. The startup-only
+`--startup-no-checkout` option uses real `git worktree add --detach
+--no-checkout` worktrees: their Git metadata and pinned HEAD exist, but their
+tracked files are absent. Probes still run from the linked cwd; its Read hook
+keeps the genuinely absent linked target. The `startup_probe` receipt
+records `no_checkout: true` and `linked_hook_file_scope:
+"absent_tracked_path_no_indexed_file_coverage"`. Raw hook decisions and
+counters remain observations of that absent path and do not prove the
+indexed-file hook criterion. This option does not create a coordinator
+transition cohort or establish the 24-checkout liveness criterion.
+
 Every second, from the primary, the first linked worktree, and a directory
 whose `.gortex.yaml` names a workspace that a private `servers.toml` roster
 claims, the probe opens fresh sessions: `initialize` (the instructions
