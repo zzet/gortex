@@ -406,6 +406,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		retainProjectionBookend(&report, value)
 		projectionBefore = &value
 	}
+	cohortEvidence := beginCohortPeakEvidence(parent, *readbackCohortPeakEvidence, &report, newCohortPeakObserver, len(clients))
 	report.Started = time.Now()
 	phaseCtx, phaseCancel := context.WithTimeout(parent, time.Duration(schedule.PhaseBoundNS))
 	defer phaseCancel()
@@ -449,6 +450,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		row.Correct = row.Correct && row.PhysicalBytesCorrect && len(row.Errors) == 0
 		report.Records[i] = row
 	})
+	finishCohortPeakEvidence(parent, cohortEvidence, &report)
 	if *readbackProjectionEvidence {
 		retainProjectionBookend(&report, collectProjectionBookend(parent, clients[0], report.DaemonPID, "after", projectionBefore))
 	}

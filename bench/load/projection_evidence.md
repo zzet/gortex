@@ -70,3 +70,59 @@ catalog. Missing runtime inputs return unavailable/failure, never numeric zero.
 
 The small Go and Python contract tests use fake raw data only. Their passes
 are source controls, not daemon, reference-host, memory, or nightly evidence.
+
+### Opt-in whole-unit peak (separate from daemon VmHWM)
+
+The acceptance test driver can opt into
+`-readback-reference-cohort-peak-evidence=true`. This is not compiled into the
+ordinary LOAD CLI. The default performs no added reads and emits no added fields.
+The two `readiness.owned_cohort_peak.{before,after}` version-1 records surround
+existing offered probes and callback joining. They read Linux cgroup-v2
+`memory.peak` through the same held unit-directory FD, retaining exact integer
+bytes, raw data, mount/device/inode identity, boot/monotonic epochs and the live
+recursive unit process census. This collector does not reset the peak, create a
+cgroup, alter resource limits, add a sampling loop, or issue tool RPCs.
+
+Use `projection_evidence.py PACKET CATALOG --mode cohort-pair` only for a matched
+32-agent **editing and read-back** candidate/v0.64.10 pair. This mode reuses the
+strict full-report, catalog, source, arrival, correctness and normal-close checks.
+It compares the final **lifetime** whole-unit peak directly:
+
+```
+candidate_final_memory_peak_bytes <= tag_final_memory_peak_bytes + 67108864
+```
+
+The initial peak is an epoch/monotonicity witness, not a value to subtract.
+Startup, warmup, driver, proxies, child processes and kernel/file-cache charges
+in the fresh unit remain included. This is neither daemon RSS nor an isolated
+projection allocation estimate. A shared paired unit remains UNBOUND: its peak
+cannot be attributed to individual builds. A raw read alone gives no acceptance.
+
+The existing selected one-build outer must additionally retain
+`owned_cohort_peak` version 1 in its **actual outer-result file**. Its `unit` and
+`run_id` must agree with that outer. This record binds `group`, `boot_id`,
+`invocation_id` (actual systemd InvocationID),
+`exec_main_start_timestamp_monotonic` (actual systemd microseconds as a decimal
+string), `main_pid`/`main_birth_ticks`, `binary_sha256` and the held directory
+`cgroup` identity (`device`, `inode`, `mount_id`, `fs_type`; the held directory and peak file must themselves report the cgroup-v2 filesystem type). It records actual
+`fresh_unit=true`, `single_build=true`, `inherited_unit_only=true`, `delegate=false`.
+The existing before/after unit/profile captures must carry these same fields;
+normal `terminal` evidence must retain `main_pid=0`, `active_state=inactive`,
+`empty=true`. A still-loaded inactive unit also retains the same `invocation_id`,
+`control_group` and `result=success`. The existing `systemd-run --collect` lifecycle
+may instead yield `load_state=not-found`, empty `control_group` and unavailable
+InvocationID after collection. That exact collected shape is accepted only with
+both matching live creation/FD epochs and the actual outer's zero client exit,
+closed/unforced normal cleanup; an explicit failed/unknown result is refused.
+These facts must come from the existing controller's actual systemd/profile/FD
+bookends and normal closure, not a report binding assembled after the run.
+The reducer obtains this record from the hash-linked outer result; an embedded
+replacement in the packet cannot substitute for it.
+
+No retained old controller proved all these new unit-creation/FD facts. Until a
+selected one-build outer actually records them, `cohort-pair` remains UNBOUND.
+Missing or changed ownership, unit restart/reuse, unowned members, missing peak,
+failed/censored offers, read-only or non-32 workloads never become zero or PASS.
+A cohort PASS is scoped to this one matched numeric criterion; it gives no
+nightly-roster, latency, matrix, capacity or whole-issue acceptance. Legacy `pair`
+and `nightly` modes retain their original daemon-only/divergence semantics.
