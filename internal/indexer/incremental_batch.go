@@ -1200,7 +1200,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
 	} else {
-		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), stagePriorDeclarations(stages), priorPending)
+		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), paths, stagePriorDeclarations(stages), priorPending)
 	}
 
 	// A global-using edit changes every dependent file's visibility
