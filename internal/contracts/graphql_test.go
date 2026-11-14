@@ -6,6 +6,33 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
+func TestGraphQLExtractor_GoQueriesMustBeStringLiterals(t *testing.T) {
+	extractor := &GraphQLExtractor{}
+	src := []byte("package test\n" +
+		"type query struct { _ int }\n" +
+		"// query { fakeComment }\n" +
+		"func use() {\n" +
+		"  e.Query(ctx, query{})\n" +
+		"  e.Query(ctx, `query {\r\n    rawField\r\n  }`)\n" +
+		"  e.Query(ctx, \"query { quotedField }\")\n" +
+		"}\n")
+	got := extractor.Extract("query_test.go", src, nil, nil)
+	if len(got) != 2 {
+		t.Fatalf("expected only the two query documents, got %+v", got)
+	}
+	for i, want := range []struct {
+		id   string
+		line int
+	}{
+		{"graphql::Query::rawField", 6},
+		{"graphql::Query::quotedField", 9},
+	} {
+		if got[i].ID != want.id || got[i].Line != want.line || got[i].Role != RoleConsumer {
+			t.Errorf("contract %d = %+v; want %s at line %d", i, got[i], want.id, want.line)
+		}
+	}
+}
+
 func TestGraphQLExtractor_SchemaProvider(t *testing.T) {
 	ext := &GraphQLExtractor{}
 	src := []byte(`
