@@ -55,6 +55,9 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 	if step.BeforeSymbol != "" {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
+	if step.ConsumerProbes {
+		oracles = append(oracles, editConsumerOracles(c)...)
+	}
 	return editProbeOutputOracles(c, oracles)
 }
 
@@ -101,6 +104,9 @@ func editProbeSourceID(id, file, name string) bool {
 }
 
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
+	if isEditConsumer(oracle) {
+		return editConsumerSubject(oracle, body, c, step, callee)
+	}
 	if step.File != "" {
 		return editProbeLifecycleCorrect(oracle, body, c, step, callee)
 	}

@@ -576,6 +576,33 @@
                         "accounting_required": {
                           "type": "boolean"
                         },
+                        "consumer_baseline": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "raw_evidence": {
+                                  "type": "string"
+                                },
+                                "state": {
+                                  "type": "string"
+                                },
+                                "symbol": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "state",
+                                "symbol",
+                                "raw_evidence"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "edits": {
                           "items": {
                             "additionalProperties": false,
@@ -2305,6 +2332,87 @@
                               "reads_while_receipt_observed_pending": {
                                 "type": "integer"
                               },
+                              "relation_consumers": {
+                                "additionalProperties": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "attempts": {
+                                      "type": "integer"
+                                    },
+                                    "errors": {
+                                      "type": "integer"
+                                    },
+                                    "post_ack_assessed": {
+                                      "type": "integer"
+                                    },
+                                    "post_ack_attempts": {
+                                      "type": "integer"
+                                    },
+                                    "post_ack_pending": {
+                                      "type": "integer"
+                                    },
+                                    "post_ack_silent_stale": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "unit": {
+                                          "type": "string"
+                                        },
+                                        "value": {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "value",
+                                        "unit",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "post_ack_subject_matches": {
+                                      "type": "integer"
+                                    },
+                                    "post_ack_unassessed": {
+                                      "type": "integer"
+                                    },
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "requested_mode": {
+                                      "type": "string"
+                                    },
+                                    "state": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "state",
+                                    "requested_mode",
+                                    "attempts",
+                                    "post_ack_attempts",
+                                    "post_ack_assessed",
+                                    "post_ack_pending",
+                                    "post_ack_subject_matches",
+                                    "errors",
+                                    "post_ack_unassessed",
+                                    "post_ack_silent_stale"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
                               "restart": {
                                 "anyOf": [
                                   {
@@ -3189,6 +3297,9 @@
                             "commit": {
                               "type": "string"
                             },
+                            "consumer_probes": {
+                              "type": "boolean"
+                            },
                             "count": {
                               "type": "integer"
                             },
@@ -3321,6 +3432,9 @@
                                   },
                                   "before_symbol": {
                                     "type": "string"
+                                  },
+                                  "consumer_probes": {
+                                    "type": "boolean"
                                   },
                                   "deleted": {
                                     "type": "boolean"
@@ -5575,6 +5689,9 @@
                       "commit": {
                         "type": "string"
                       },
+                      "consumer_probes": {
+                        "type": "boolean"
+                      },
                       "count": {
                         "type": "integer"
                       },
@@ -5707,6 +5824,9 @@
                             },
                             "before_symbol": {
                               "type": "string"
+                            },
+                            "consumer_probes": {
+                              "type": "boolean"
                             },
                             "deleted": {
                               "type": "boolean"

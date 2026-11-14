@@ -34,6 +34,9 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	if o.PRSmokeDrain != 0 {
 		return o, nil, errors.New("offered-window/drain is standalone-only; coupled paired measurement is unchanged")
 	}
+	if o.EditConsumerProbes {
+		return o, nil, errors.New("consumer probes are standalone-only; coupled paired measurement is unchanged")
+	}
 	if f.NArg() != 0 || o.Binary != "" || o.GitSHA != "" {
 		return o, nil, errors.New("paired uses --build label=binary with embedded VCS revision; no positional --binary/--git-sha overrides")
 	}

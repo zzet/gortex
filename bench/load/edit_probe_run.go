@@ -40,7 +40,8 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
-	Superseded                  *receiptproof.Superseded `json:"superseded_receipt,omitempty"`
+	Consumers                   map[string]editConsumerObservation `json:"relation_consumers,omitempty"`
+	Superseded                  *receiptproof.Superseded           `json:"superseded_receipt,omitempty"`
 	supersededStatus            *receiptproof.Status
 	coalescedStatus             *receiptproof.Coalesced
 	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
@@ -104,6 +105,7 @@ type editProbeRecord struct {
 	Errors                      []string                            `json:"errors"`
 }
 type editProbeReport struct {
+	ConsumerBaseline   *editConsumerBaseline        `json:"consumer_baseline,omitempty"`
 	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
 	SharedOwners       *editProbeSharedOwnerReport  `json:"shared_owners,omitempty"`
 	SearchReadbacks    *searchReadbackAcceptance    `json:"search_readback_acceptance,omitempty"`
@@ -225,6 +227,20 @@ type editProbeRuntime struct {
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
 	record := editProbeRecord{ProbeMode: step.ProbeMode, Ordinal: step.Ordinal, Editor: step.Editor, Route: step.Route, Marker: step.Marker, MutationID: step.MutationID, PlannedDueNS: step.DueNS, Outcome: "phase_censored", Ack: unavailable("ms", "edit not sent"), PhasesMS: editProbePhases(nil, "no receipt status observed"), Readback: unavailable("ms", "edit not acknowledged"), Derived: unavailable("ms", "no receipt status observed"), FirstCorrect: make(map[string]Metric), Accounting: editProbeAccounting{State: "not_observed"}, Errors: []string{"scenario never reached edit dispatch"}}
 	for _, oracle := range editProbeOracles(c, step) {
+		if isEditConsumer(oracle.name) {
+			if record.Consumers == nil {
+				record.Consumers = make(map[string]editConsumerObservation)
+			}
+			mode := step.ProbeMode
+			if mode == "" {
+				mode = c.EditOutput
+			}
+			if mode == "" {
+				mode = "json"
+			}
+			record.Consumers[oracle.name] = editConsumerObservation{State: "missing", RequestedMode: mode, SilentStale: unavailable("answers", "no consumer response observed")}
+			continue
+		}
 		record.FirstCorrect[oracle.name] = unavailable("ms", "not observed")
 	}
 	record.groupTimes()
@@ -268,6 +284,9 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	}
 	if plan.Mode == "compact" {
 		out.Limitations = append(out.Limitations, "compact text is requested only from read.summary, search.symbols, relations.callers and trace.call_chain; source, editing_context and text probes, readbacks, the edit ACK and timing controls stay JSON", "compact rows carry no node IDs, edge rows, signatures or freshness fields: they prove the marker's presence only, relation rows prove membership of the traversal answer with a nonzero edge footer but not the edge or its tier, and stale-claimed-fresh is unavailable rather than 0", "an empty compact answer is zero rows; a JSON answer to a compact request, such as not-found guidance, counts as a decode failure")
+	}
+	if plan.ConsumerProbes {
+		out.Limitations = append(out.Limitations, "opt-in relation consumers retain their own attempted/observed/pending/error/missing denominator; pending is not graph completion and unobserved/unsupported silent-stale counts remain unavailable", "unexported dead-code subject requires observed pre-edit membership; no JSON fallback grants compact consumer coverage; default seven first-correct and ACK/accounting predicates are unchanged")
 	}
 	for _, step := range plan.Steps {
 		out.Records = append(out.Records, newEditProbeRecord(c, step))
@@ -330,6 +349,9 @@ func (r *editProbeRuntime) calleeFor(repo privateRepo) string {
 }
 
 func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers, editors []*socketClient, phase *Phase) (*editProbeRuntime, []*socketClient, error) {
+	if o.EditConsumerProbes && (len(p.Repos) != 1 || o.Worktrees != 0 || o.SearchReadbackAcceptance) {
+		return nil, nil, errors.New("consumer probes require one standalone primary fixture")
+	}
 	corpora := make([]Corpus, len(p.Repos))
 	for i, repo := range p.Repos {
 		corpora[i] = repo.Corpus
@@ -507,6 +529,11 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 				return r, clients, fmt.Errorf("original symbol presence admission failed: %s: %v", state.step.BeforeSymbol, readErr)
 			}
 			state.absenceBefore = map[string]bool{state.step.BeforeSymbol: true}
+		}
+	}
+	if plan.ConsumerProbes {
+		if err := r.admitConsumerBaseline(ctx); err != nil {
+			return r, clients, err
 		}
 	}
 	phase.Metrics["edit_probe_session_setup_seconds"] = measured(time.Since(setup).Seconds(), "s")
@@ -733,6 +760,9 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	if isEditConsumer(oracle.name) {
+		return r.observeConsumer(s, oracle, data, identity, err)
+	}
 	repo, routeErr := r.repoFor(s.step)
 	if routeErr != nil {
 		return routeErr
@@ -856,7 +886,11 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 	corpus := repo.Corpus
 	corpus.EditOutput = r.stepProbeMode(s.step)
 	for index, oracle := range editProbeOracles(corpus, s.step) {
-		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" {
+		if isEditConsumer(oracle.name) && r.stepProbeMode(s.step) == "compact" {
+			s.markUnsupportedConsumer(oracle.name)
+			continue
+		}
+		if r.plan.GateModes && r.stepProbeMode(s.step) != "compact" && !isEditConsumer(oracle.name) {
 			oracle.call.Arguments = copyJSON(oracle.call.Arguments)
 			oracle.call.Arguments["require_fresh"] = true
 		}
@@ -1228,6 +1262,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					terminal := s.record.GraphTerminal
 					qualifiedCandidate := s.record.coalescedStatus != nil || s.record.functionalUnavailableStatus != nil
 					qualifiedTiers := s.record.MutationTiers
+					consumersDone := editConsumersFinished(s.record.Consumers)
 					if terminal && status["graph_status"] != "fresh" {
 						s.record.Errors = append(s.record.Errors, "terminal graph status is not fresh")
 					}
@@ -1241,7 +1276,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+					if consumersDone && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
 						break
 					}
 				}
@@ -1482,6 +1517,9 @@ func (r *editProbeRuntime) finish() error {
 			classified = classifyFunctionalUnavailableRecord(&record, r.phase.EditProbe.PhysicalWriteScope)
 		}
 		r.phase.EditProbe.Records = append(r.phase.EditProbe.Records, record)
+		if editConsumersFailure(record.Consumers) {
+			failures = append(failures, fmt.Errorf("edit %d: relation consumer observations incomplete, unsupported or incorrect", record.Ordinal))
+		}
 		if record.Outcome != "complete" && !classified || len(record.Errors) > 0 {
 			failures = append(failures, fmt.Errorf("edit %d: %s (%s)", record.Ordinal, record.Outcome, strings.Join(record.Errors, "; ")))
 		}
