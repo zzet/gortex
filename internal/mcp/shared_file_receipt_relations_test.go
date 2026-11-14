@@ -395,7 +395,7 @@ func (f *sharedReceiptFixture) captureFailure(ctx context.Context, offer *shared
 		d["physical_before_mtime_ns"], d["physical_after_mtime_ns"] = before.ModTime().UnixNano(), after.ModTime().UnixNano()
 		d["physical_before_size"], d["physical_after_size"] = before.Size(), after.Size()
 		d["physical_same_file"] = os.SameFile(before, after)
-		d["physical_stable_metadata"] = os.SameFile(before, after) && before.ModTime() == after.ModTime() && before.Size() == after.Size()
+		d["physical_stable_metadata"] = os.SameFile(before, after) && before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size()
 	} else {
 		d["physical_stat_errors"] = fmt.Sprintf("%v / %v", beforeErr, afterErr)
 	}
