@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -451,10 +452,34 @@ func runSharedReceiptPopulation(tb testing.TB, loaded bool, perAgent int) []*sha
 
 func sharedReceiptComparison(tb testing.TB, perAgent int, enforceLatency bool) float64 {
 	tb.Helper()
+	retainReferenceRaw := os.Getenv("GORTEX_TEST_SHARED_RECEIPT_REFERENCE_RAW") == "1"
+	if retainReferenceRaw {
+		profile := map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "logical_cpus": runtime.NumCPU(), "gomaxprocs": runtime.GOMAXPROCS(0), "goenv": map[string]string{"GOMAXPROCS": os.Getenv("GOMAXPROCS"), "GOMEMLIMIT": os.Getenv("GOMEMLIMIT"), "GOGC": os.Getenv("GOGC"), "GODEBUG": os.Getenv("GODEBUG")}}
+		raw, err := json.Marshal(profile)
+		require.NoError(tb, err)
+		tb.Logf("reference own receipt process: %s", raw)
+	}
 	tb.Setenv("GORTEX_QUERY_LOG", filepath.Join(tb.TempDir(), "query-log.jsonl"))
 	tb.Setenv(batchTransactionDirEnv, filepath.Join(tb.TempDir(), "transactions"))
 	idle := runSharedReceiptPopulation(tb, false, perAgent)
 	loaded := runSharedReceiptPopulation(tb, true, perAgent)
+	if retainReferenceRaw {
+		for _, population := range [][]*sharedReceiptOffer{idle, loaded} {
+			for _, row := range population {
+				// Both populations and all callbacks are already joined. Emit
+				// their buffered first replies before any fail-fast assertion;
+				// never add a read, retry, or work inside the native metric.
+				var nativeElapsed any
+				if !row.relationsAt.IsZero() {
+					nativeElapsed = row.relationsAt.Sub(row.started).Nanoseconds()
+				}
+				evidence := map[string]any{"population": row.population, "stream": row.agent, "edit": row.ordinal, "receipt": row.receipt, "generation": row.generation, "applied_generation": row.applied, "offered_at": row.started, "relations_at": row.relationsAt, "native_elapsed_ns": nativeElapsed, "readbacks_finished_at": row.finished, "error": fmt.Sprint(row.err), "first_responses": row.content}
+				raw, err := json.Marshal(evidence)
+				require.NoError(tb, err)
+				tb.Logf("reference own receipt first replies: %s", raw)
+			}
+		}
+	}
 	for _, population := range [][]*sharedReceiptOffer{idle, loaded} {
 		for _, row := range population {
 			if row.err != nil {
