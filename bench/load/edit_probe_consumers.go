@@ -300,6 +300,9 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 	if postACK {
 		row.PostACKAttempts++
 		row.State = state
+		if state == "unassessed" {
+			row.Reason = "rename rows do not identify this caller; no stale or clean coverage"
+		}
 		switch state {
 		case "pending":
 			row.Pending++
@@ -359,6 +362,12 @@ func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c C
 	}
 	if editConsumerSubject(name, body, c, step, r.plan.Callee) {
 		return "subject_observed"
+	}
+	if name == "consumer_rename" {
+		// A valid rename can return a call-site-only line from a multiline
+		// caller. Without caller identity that line cannot prove this marker
+		// absent, and a sparse edit row cannot do so either.
+		return "unassessed"
 	}
 	return "silent_stale"
 }

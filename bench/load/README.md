@@ -270,7 +270,9 @@ error and missing counts are separate from the seven first-correct gates.
 A pending answer is not completion, and an empty dead-code list proves a
 membership transition only after the actual pre-edit membership witness.
 Unobserved, failed or unsupported silent-stale counts stay unavailable rather
-than zero. Missing or incorrect consumer observations fail the opt-in phase;
+than zero. Per-line rename rows that cannot identify the requested caller stay
+unassessed with unavailable stale counts and incomplete coverage. Missing or
+incorrect consumer observations fail the opt-in phase;
 they do not alter the default ACK/accounting predicates. Calls keep the
 original per-edit deadline and artifact limits. Compact consumer decoding is
 explicitly unsupported: no JSON fallback grants compact coverage. This option
