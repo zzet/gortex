@@ -20,9 +20,10 @@ import (
 // Readers and editors work the primary for the whole run, two sessions stay
 // parked on it, and one more session repeats a whole-graph analysis. Over that
 // load the mode links --worktree-churn worktrees one at a time, keeping at most
-// --worktrees alive: each new one is linked at one of four commits of the corpus
-// history, gets a session and --churn-edits edits, and the oldest live one is
-// then closed and removed. After the last cycle every worktree is removed, the daemon sits
+// --worktrees alive: when that many are live the oldest is closed and removed
+// first, then the new one is linked at one of four commits of the corpus
+// history and gets a session and --churn-edits edits. After the last cycle
+// every worktree is removed, the daemon sits
 // idle for --churn-idle, and a read-only census of the store reports what is
 // still there. A daemon that retires removed checkouts ends near one node row
 // per node id; one that keeps them ends with a copy per kept generation.
@@ -69,44 +70,13 @@ type churnWorktree struct {
 
 func measureWorktreeChurn(ctx context.Context, o runOptions, p *privateRun, clients []*socketClient, phase *Phase, sampler processSampler, group string) error {
 	phase.SessionModel = fmt.Sprintf("per_agent_with_worktree_churn:%d/%d", o.Churn.Cycles, o.Worktrees)
-	phase.Started = time.Now()
-	monitor := startMonitor(p, sampler, group)
-	// The churn loop records into its own phase: the agents append to phase
-	// concurrently under a lock this loop does not share.
-	churn := Phase{Gate: make(map[string]json.RawMessage), Metrics: make(map[string]Metric)}
+	// Everything that can fail is set up before the monitor and the agents
+	// start: from there on every path below stops and joins both.
 	if o.Churn.Advance > 0 {
 		if err := os.WriteFile(filepath.Join(p.Root, "gitconfig"), []byte("[user]\n\tname = load\n\temail = load@invalid\n"), 0o600); err != nil {
 			return err
 		}
 	}
-	var extra []*socketClient
-	defer func() { closeClients(extra) }()
-	for range 3 { // two parked sessions and the analysis session
-		client, err := openMCP(ctx, p.Socket, p.Repos[0].Path)
-		if err != nil {
-			return err
-		}
-		extra = append(extra, client)
-	}
-
-	agentCtx, stopAgents := context.WithCancel(ctx)
-	defer stopAgents()
-	var agents sync.WaitGroup
-	agentOptions := o
-	agentOptions.Duration = 24 * time.Hour // the churn decides when the load ends
-	agents.Go(func() { _ = runAgents(agentCtx, agentOptions, p, clients, o.Editors > 0, phase) })
-	var analyses []Attempt
-	agents.Go(func() {
-		r := request{Tool: "analyze", Operation: "dead_code", Arguments: map[string]any{"kind": "dead_code"}}
-		for step := 0; agentCtx.Err() == nil; step++ {
-			_, rows, _ := callTool(agentCtx, extra[2], r, dispatchArgs(r, p.Repos[0]), "workload", -1, step, 0, o.Deadline, waitContext)
-			analyses = append(analyses, rows...)
-			if waitContext(agentCtx, 2*time.Second) != nil {
-				return
-			}
-		}
-	})
-
 	var pin *sql.Tx
 	if o.Churn.PinWAL {
 		db, err := sql.Open("sqlite", "file:"+p.Store+"?mode=ro")
@@ -123,6 +93,39 @@ func measureWorktreeChurn(ctx context.Context, o runOptions, p *privateRun, clie
 			return err
 		}
 	}
+
+	var extra []*socketClient
+	defer func() { closeClients(extra) }()
+	for range 3 { // two parked sessions and the analysis session
+		client, err := openMCP(ctx, p.Socket, p.Repos[0].Path)
+		if err != nil {
+			return err
+		}
+		extra = append(extra, client)
+	}
+
+	phase.Started = time.Now()
+	monitor := startMonitor(p, sampler, group)
+	// The churn loop records into its own phase: the agents append to phase
+	// concurrently under a lock this loop does not share.
+	churn := Phase{Gate: make(map[string]json.RawMessage), Metrics: make(map[string]Metric)}
+	agentCtx, stopAgents := context.WithCancel(ctx)
+	var agents sync.WaitGroup
+	agentOptions := o
+	agentOptions.Duration = 24 * time.Hour // the churn decides when the load ends
+	agents.Go(func() { _ = runAgents(agentCtx, agentOptions, p, clients, o.Editors > 0, phase) })
+	var analyses []Attempt
+	agents.Go(func() {
+		r := request{Tool: "analyze", Operation: "dead_code", Arguments: map[string]any{"kind": "dead_code"}}
+		for step := 0; agentCtx.Err() == nil; step++ {
+			_, rows, _ := callTool(agentCtx, extra[2], r, dispatchArgs(r, p.Repos[0]), "workload", -1, step, 0, o.Deadline, waitContext)
+			analyses = append(analyses, rows...)
+			if waitContext(agentCtx, 2*time.Second) != nil {
+				return
+			}
+		}
+	})
+
 	var live []churnWorktree
 	removeOldest := func() error {
 		w := live[0]
@@ -133,6 +136,11 @@ func measureWorktreeChurn(ctx context.Context, o runOptions, p *privateRun, clie
 	}
 	churnErr := func() error {
 		for i := range o.Churn.Cycles {
+			for len(live) >= o.Worktrees { // make room first, so at most --worktrees are ever alive
+				if err := removeOldest(); err != nil {
+					return err
+				}
+			}
 			w, err := linkChurnWorktree(ctx, o, p, i, &churn)
 			if w.client != nil {
 				live = append(live, w)
@@ -142,11 +150,6 @@ func measureWorktreeChurn(ctx context.Context, o runOptions, p *privateRun, clie
 			}
 			if o.Churn.Advance > 0 && i%o.Churn.Advance == o.Churn.Advance-1 {
 				if err := advancePrimary(ctx, p, i); err != nil {
-					return err
-				}
-			}
-			for len(live) > o.Worktrees {
-				if err := removeOldest(); err != nil {
 					return err
 				}
 			}

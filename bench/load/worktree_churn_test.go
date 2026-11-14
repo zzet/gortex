@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -74,6 +75,30 @@ func TestChurnOptionsValidate(t *testing.T) {
 	} {
 		if bad() == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// Setup failures must return before the monitor and the agents start: the
+// run has no daemon process, so a started monitor would panic on its pid.
+func TestWorktreeChurnSetupFailuresStartNothing(t *testing.T) {
+	root := t.TempDir()
+	p := &privateRun{Root: root, Socket: filepath.Join(root, "missing.sock"), Store: filepath.Join(root, "missing", "store.db"), Repos: []privateRepo{{Path: root}}}
+	for name, churn := range map[string]churnOptions{
+		"wal pin":  {Cycles: 1, Edits: 1, PinWAL: true},
+		"mcp dial": {Cycles: 1, Edits: 1},
+	} {
+		o := runOptions{Worktrees: 1, Churn: churn}
+		before := runtime.NumGoroutine()
+		if err := measureWorktreeChurn(t.Context(), o, p, nil, &Phase{}, nil, ""); err == nil {
+			t.Errorf("%s: setup failure not reported", name)
+		}
+		// database/sql's opener goroutine exits shortly after Close returns.
+		for wait := 0; runtime.NumGoroutine() > before && wait < 100; wait++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if after := runtime.NumGoroutine(); after > before {
+			t.Errorf("%s: %d goroutines left running", name, after-before)
 		}
 	}
 }

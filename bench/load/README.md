@@ -881,13 +881,13 @@ and what one more worktree retains with
 what removed linked worktrees leave behind. The readers (and editors) work the
 primary throughout, two sessions stay parked on it and one more repeats a
 dead-code analysis. Over that load the run links N worktrees one at a time,
-keeping at most `--worktrees` alive: each is detached at one of four commits
-of the corpus history (the pinned commit and its 8th, 16th and 24th
-first-parent ancestors), gets a session and `--churn-edits` edits, and the
-oldest live one is then closed and removed. `--churn-advance K` commits a
-one-line change on the primary every K cycles, so the committed base moves
-under live worktrees (it requires `--edit-agents 0`, since an editor's edit
-races the commit). `--churn-pin-wal` holds one read transaction on the store
+keeping at most `--worktrees` alive: when that many are live, the oldest is
+closed and removed first. Each new one is detached at one of four commits of
+the corpus history (the pinned commit and its 8th, 16th and 24th
+first-parent ancestors) and gets a session and `--churn-edits` edits.
+`--churn-advance K` commits a one-line change on the primary every K
+cycles, so the committed base moves under live worktrees (it requires
+`--edit-agents 0`, since an editor's edit races the commit). `--churn-pin-wal` holds one read transaction on the store
 from the first cycle to the live census, standing in for a long reader that
 keeps the WAL from resetting. After the last cycle the run takes a status
 receipt (`gate.live_status.0`) and a read-only store census (`live_census_*`:
