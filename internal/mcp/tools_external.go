@@ -92,7 +92,9 @@ func goModCacheRoot() string {
 // and the roots are resolved before the containment check: a regular
 // file beneath a directory link that leaves the root is not itself a
 // link, and a leaf-only check would admit it while the read follows the
-// ancestor outside.
+// ancestor outside. Both sides resolve with the same resolver: ResolveRoot
+// keeps a Windows junction in the root's spelling, so a root configured
+// as a junction, or beneath one, would never contain a resolved candidate.
 func confineExternalSource(path string) bool {
 	resolved, err := pathguard.EvalLinks(path)
 	if err != nil {
@@ -102,7 +104,11 @@ func confineExternalSource(path string) bool {
 		if root == "" {
 			continue
 		}
-		if !pathguard.WithinRoot(resolved, pathguard.ResolveRoot(root)) {
+		resolvedRoot, err := pathguard.EvalLinks(root)
+		if err != nil {
+			continue
+		}
+		if !pathguard.WithinRoot(resolved, resolvedRoot) {
 			continue
 		}
 		return true
