@@ -103,6 +103,48 @@ func editProbeSourceID(id, file, name string) bool {
 	return !strings.HasPrefix(id, "ext::") && (id == file+"::"+name || strings.HasSuffix(id, "/"+file+"::"+name))
 }
 
+// Source responses can start inside a surrounding declaration, such as the
+// tail of an import block. Parse only the producer's advertised target span;
+// context and neighboring declarations cannot supply the required call.
+func editProbeSourceDeclaration(body map[string]any, file, marker string) (string, bool) {
+	source, ok := body["source"].(string)
+	if !ok || source == "" || body["complete"] == false || body["truncated"] == true ||
+		body["bodies_elided"] == true || body["salience_truncated"] == true || body["_truncated_by_budget"] == true ||
+		body["source_state"] == "pending" || body["source_state"] == "unavailable" {
+		return "", false
+	}
+	_, hasFrom := body["from_line"]
+	_, hasStart := body["start_line"]
+	_, hasEnd := body["end_line"]
+	if !hasFrom && !hasStart && !hasEnd {
+		return source, true // Existing complete-source fixtures lack span metadata.
+	}
+	from, fromErr := strconvEditProbeUint(body["from_line"])
+	start, startErr := strconvEditProbeUint(body["start_line"])
+	end, endErr := strconvEditProbeUint(body["end_line"])
+	id, _ := body["id"].(string)
+	path, _ := body["file_path"].(string)
+	if fromErr != nil || startErr != nil || endErr != nil || from == 0 || start < from || end < start ||
+		body["name"] != marker || !editProbeSourceID(id, file, marker) || !editProbeFixturePath(path, file) {
+		return "", false
+	}
+	lines := strings.SplitAfter(source, "\n")
+	first, last := start-from, end-from
+	if last >= uint64(len(lines)) {
+		return "", false
+	}
+	declaration := strings.Join(lines[int(first):int(last)+1], "")
+	parsed, err := parser.ParseFile(token.NewFileSet(), "target.go", "package probe\n"+declaration, 0)
+	if err != nil || len(parsed.Decls) != 1 {
+		return "", false
+	}
+	fn, ok := parsed.Decls[0].(*ast.FuncDecl)
+	if !ok || fn.Name.Name != marker || fn.Body == nil {
+		return "", false
+	}
+	return declaration, true
+}
+
 func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editProbeStep, callee string) bool {
 	if isEditConsumer(oracle) {
 		return editConsumerSubject(oracle, body, c, step, callee)
@@ -136,6 +178,13 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	switch oracle {
 	case "source":
 		source, _ := body["source"].(string)
+		if filepath.Ext(c.File) == ".go" {
+			var valid bool
+			source, valid = editProbeSourceDeclaration(body, c.File, step.Marker)
+			if !valid {
+				return false
+			}
+		}
 		if filepath.Ext(c.File) == ".ts" || filepath.Ext(c.File) == ".py" || (c.EditTool == "edit.write" || c.EditTool == "edit.batch" || c.EditTool == "edit.symbol" || c.EditKind != "") {
 			id, _ := body["id"].(string)
 			path, _ := body["file_path"].(string)
