@@ -201,6 +201,10 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 	if err != nil {
 		return report, err
 	}
+	legacyContract, legacyDecoder, legacyErr := selectedV06410ACKContract(plan, schedule, role)
+	if legacyErr != nil {
+		return report, legacyErr
+	}
 	report.ToolSurface = surface
 	report.RefusalEvidenceOptIn = *readbackReferenceRefusalEvidence
 	operationRole := role
@@ -341,6 +345,12 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 	}
 	gate, _, err := p.awaitReady(warmCtx, started, configured)
 	report.Readiness = gate
+	if len(legacyContract) > 0 {
+		if report.Readiness == nil {
+			report.Readiness = map[string]json.RawMessage{}
+		}
+		report.Readiness["legacy_tag_ack_contract"] = legacyContract
+	}
 	if err != nil {
 		return report, err
 	}
@@ -406,13 +416,16 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		retainProjectionBookend(&report, value)
 		projectionBefore = &value
 	}
+	cohortEvidence := beginCohortPeakEvidence(parent, *readbackCohortPeakEvidence, &report, newCohortPeakObserver, len(clients))
 	report.Started = time.Now()
 	phaseCtx, phaseCancel := context.WithTimeout(parent, time.Duration(schedule.PhaseBoundNS))
 	defer phaseCancel()
 	runReadbackReferenceOffers(phaseCtx, report.Started, trials, func(i int, trial readbackReferenceTrial) {
 		actual := time.Now()
 		var row readbackReferenceRecord
-		if surface == readbackReferenceCompatibilitySurface {
+		if legacyDecoder != nil {
+			row = observeReadbackReferenceSurfaceWithACKDecoder(phaseCtx, clients[trial.Editor], repo, trial, operationRole, time.Duration(plan.ProductDeadlineSeconds)*time.Second, true, legacyDecoder)
+		} else if surface == readbackReferenceCompatibilitySurface {
 			row = observeReadbackReferenceCompatibility(phaseCtx, clients[trial.Editor], repo, trial, operationRole, time.Duration(plan.ProductDeadlineSeconds)*time.Second)
 		} else {
 			row = observeReadbackReference(phaseCtx, clients[trial.Editor], repo, trial, operationRole, time.Duration(plan.ProductDeadlineSeconds)*time.Second)
@@ -449,6 +462,7 @@ func runReadbackReferenceCase(parent context.Context, plan readbackReferencePlan
 		row.Correct = row.Correct && row.PhysicalBytesCorrect && len(row.Errors) == 0
 		report.Records[i] = row
 	})
+	finishCohortPeakEvidence(parent, cohortEvidence, &report)
 	if *readbackProjectionEvidence {
 		retainProjectionBookend(&report, collectProjectionBookend(parent, clients[0], report.DaemonPID, "after", projectionBefore))
 	}
