@@ -25,7 +25,6 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
-	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -1779,16 +1778,15 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 	// Tool-call observer: credit the recent search for the symbols in
 	// the file the agent is reading.
-	var sg *query.SubGraph
+	var fileSymbols []*graph.Node
 	if sourceRequestView(ctx) == nil && !compressionPending {
 		afterFreshSymbolAcceptance(ctx, func() { s.creditFileConsumption(ctx, relPath) })
-		sg = s.engineFor(ctx).GetFileSymbols(relPath)
+		// Compression and frecency consume nodes only. Keep the selected
+		// request reader without fetching every symbol's unused adjacency.
+		fileSymbols = s.engineFor(ctx).Reader().GetFileNodes(relPath)
 	}
 	if !compressionPending && req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
-		var symbols []*graph.Node
-		if sg != nil {
-			symbols = sg.Nodes
-		}
+		symbols := fileSymbols
 		if compressionBound {
 			symbols = compressionSymbols // Never re-query ranges after their proof.
 		}
@@ -1818,13 +1816,11 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// budget.
 	afterFreshSymbolAcceptance(ctx, func() {
 		s.sessionFor(ctx).recordFile(relPath)
-		if sg != nil {
-			for _, n := range sg.Nodes {
-				if n == nil || n.Kind == graph.KindFile {
-					continue
-				}
-				s.frecency.Record(n.ID)
+		for _, n := range fileSymbols {
+			if n == nil || n.Kind == graph.KindFile {
+				continue
 			}
+			s.frecency.Record(n.ID)
 		}
 	})
 
