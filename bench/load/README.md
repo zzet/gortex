@@ -253,6 +253,31 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+`--edit-consumer-probes` adds opt-in dry-run rename, signature verification,
+dead-code and unstaged-change probes. It requires one primary Go
+`add_intrafile_call` / `edit.file` fixture with an unexported callee and an
+explicit `proposed_signature` of `func <callee>(probe int) int`. Before any
+edit, an actual complete JSON dead-code response must contain that callee;
+exported targets, missing membership, pending baselines and truncated results
+are refused. The fixture and reference population are never substituted.
+Rename always uses `dry_run:true` and the new caller's actual/provisional site;
+verification checks a typed caller mismatch for the deliberately incompatible
+signature, and detection checks the actual changed file and symbol.
+
+The report retains `consumer_baseline` with its raw evidence and per-edit
+`relation_consumers` observations. Their post-ACK attempted/assessed/pending,
+error and missing counts are separate from the seven first-correct gates.
+A pending answer is not completion, and an empty dead-code list proves a
+membership transition only after the actual pre-edit membership witness.
+Unobserved, failed or unsupported silent-stale counts stay unavailable rather
+than zero. Per-line rename rows that cannot identify the requested caller stay
+unassessed with unavailable stale counts and incomplete coverage. Missing or
+incorrect consumer observations fail the opt-in phase;
+they do not alter the default ACK/accounting predicates. Calls keep the
+original per-edit deadline and artifact limits. Compact consumer decoding is
+explicitly unsupported: no JSON fallback grants compact coverage. This option
+alone establishes no 1/8/32-agent runtime or all-mode acceptance.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
