@@ -954,6 +954,24 @@ func (idx *Indexer) coordinateRepositoryReindex(
 // source gate is taken after batch admission and the repository lane, which is
 // the order graphview's raw mutation API requires.
 func (idx *Indexer) coordinateRepositoryMutation(ctx context.Context, entry OutputMutationEntry, fn func() error) error {
+	var body func(func(*OutputSourceContent)) error
+	if fn != nil {
+		body = func(func(*OutputSourceContent)) error { return fn() }
+	}
+	return idx.coordinateRepositoryMutationSource(ctx, entry, body)
+}
+
+// coordinateRepositoryMutationSource retains the same lane and pre-write source
+// gate while allowing a producer to report positively established source work.
+// No report retains the conservative revision-derived completion.
+func (idx *Indexer) coordinateRepositoryMutationSource(ctx context.Context, entry OutputMutationEntry, fn func(func(*OutputSourceContent)) error) error {
+	return idx.coordinateRepositoryMutationPreparedSource(ctx, entry, nil, fn)
+}
+
+// Only the typed built-in point preparer can execute before the raw source
+// gate. It owns read/extract resources, never the mutating executor. All normal
+// normalization, journal, failure persistence and payload work stays below Begin.
+func (idx *Indexer) coordinateRepositoryMutationPreparedSource(ctx context.Context, entry OutputMutationEntry, preparation *watcherPointPreparation, fn func(func(*OutputSourceContent)) error) error {
 	// External primary watcher patches carry no checkout refresh ticket. Keep
 	// their upcoming writes visible through lane admission and the read/resolve
 	// gaps between transactions, so background work cannot mistake them for an
@@ -963,7 +981,14 @@ func (idx *Indexer) coordinateRepositoryMutation(ctx context.Context, entry Outp
 		defer release()
 	}
 	return idx.repositoryMutations().runExclusive(ctx, func() error {
-		return idx.withOutputGeneration(ctx, entry, fn)
+		if entry == OutputEntryWatcherPatchGraph && preparation != nil && fn != nil {
+			defer preparation.release()
+			preparation.prepare(ctx)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		return idx.withOutputGenerationSource(ctx, entry, fn)
 	})
 }
 

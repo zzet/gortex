@@ -7169,6 +7169,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 // owns an explicit filesystem receipt. Reconcile, storm, and discovery callers
 // retain their historical mtime/Merkle filtering.
 type incrementalPathMode struct {
+	pointPreparation          *watcherPointPreparation // single-use checked built-in parse, never a mutation authority
 	detectDeletions           bool
 	forceExplicitFiles        bool
 	surfaceFirstVersionChange bool

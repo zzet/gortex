@@ -225,7 +225,8 @@ func (s *Server) relationScope(ctx context.Context, ids, files []string) func(ab
 		hit, seen := named[absPath]
 		if !seen && len(names) > 0 {
 			data, err := os.ReadFile(absPath)
-			hit = err == nil && namesAnyIdentifier(data, names)
+			// Unknown pending bytes cannot establish that a new caller is unrelated.
+			hit = err != nil || namesAnyIdentifier(data, names)
 			named[absPath] = hit
 		}
 		return hit

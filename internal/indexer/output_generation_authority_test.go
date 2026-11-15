@@ -41,14 +41,16 @@ import (
 // unconditionally by the lane worker (drain -> outputGeneration, bound for both
 // lane flavours), which TestEveryMutationLaneIsBoundToTheAuthority pins.
 var mutationDoorNames = map[string]bool{
-	"coordinateRepositoryMutation":         true,
-	"withOutputGeneration":                 true,
-	"withOutputGenerationSource":           true,
-	"withRepositoryOutputGenerationSource": true,
-	"withRepositoryMutationLanes":          true,
-	"runExclusive":                         true,
-	"runExclusiveLaneOnly":                 true,
-	"runExclusiveMode":                     true,
+	"coordinateRepositoryMutation":               true,
+	"coordinateRepositoryMutationSource":         true,
+	"coordinateRepositoryMutationPreparedSource": true,
+	"withOutputGeneration":                       true,
+	"withOutputGenerationSource":                 true,
+	"withRepositoryOutputGenerationSource":       true,
+	"withRepositoryMutationLanes":                true,
+	"runExclusive":                               true,
+	"runExclusiveLaneOnly":                       true,
+	"runExclusiveMode":                           true,
 }
 
 // authorityPlumbingDoorCount exempts the functions inside the authority's own
@@ -67,15 +69,17 @@ var mutationDoorNames = map[string]bool{
 // The exemption is keyed on that file only: a plumbing-shaped name anywhere
 // else is still scanned door by door.
 var authorityPlumbingDoorCount = map[string]int{
-	"coordinateRepositoryMutation":         2, // entry is a parameter: runExclusive + withOutputGeneration
-	"coordinateRepositoryReindex":          0, // the lane worker holds the receipt
-	"withRepositoryMutationLanes":          1, // lane acquisition; callers name entries
-	"runExclusive":                         1,
-	"runExclusiveLaneOnly":                 1,
-	"runExclusiveMode":                     0,
-	"withOutputGeneration":                 1, // entry is a parameter
-	"withOutputGenerationSource":           0, // entry is a parameter
-	"withRepositoryOutputGenerationSource": 0, // entry is a parameter
+	"coordinateRepositoryMutation":               1, // delegates with the same entry to the observed lane
+	"coordinateRepositoryMutationSource":         1, // same entry forwarded to typed preparation lane
+	"coordinateRepositoryMutationPreparedSource": 2, // runExclusive + withOutputGenerationSource; typed preparation is read/extract only
+	"coordinateRepositoryReindex":                0, // the lane worker holds the receipt
+	"withRepositoryMutationLanes":                1, // lane acquisition; callers name entries
+	"runExclusive":                               1,
+	"runExclusiveLaneOnly":                       1,
+	"runExclusiveMode":                           0,
+	"withOutputGeneration":                       1, // entry is a parameter
+	"withOutputGenerationSource":                 0, // entry is a parameter
+	"withRepositoryOutputGenerationSource":       0, // entry is a parameter
 }
 
 const authorityPlumbingFile = "repository_mutation_coordinator.go"
