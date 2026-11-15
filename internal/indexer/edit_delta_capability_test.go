@@ -122,6 +122,7 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.EdgeIdentityBatchFinder":                        "whole-graph pass (ResolveAll, a cold warm-up, a whole-repository derived rebuild); a delta resolves and re-derives by its receipt frontier",
 	"graph.EdgeKindEvicter":                                "whole-graph eviction of an edge kind; not a file delta (DeltaWriter's EvictRepo-class refusal would apply)",
 	"graph.EdgesByKindsBatchScanner":                       "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
+	"graph.EdgesByNodeIDsKindsReader":                      "read accelerator: without it OutEdgesByNodeIDsOfKinds/InEdgesByNodeIDsOfKinds take the unfiltered GetOut/InEdgesByNodeIDs batch read, which DeltaWriter answers through the composed view, and filter it in order (a cost, not a different answer)",
 	"graph.EdgesByKindsScanner":                            "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.ExistingNodeIDFinder":                           "read accelerator: without it the caller takes the Store/Reader form, which DeltaWriter answers through the composed view (a cost, not a different answer)",
 	"graph.ExternalCallCandidates":                         "external-call synthesis candidate projection; absent, the synthesis scopes itself through Store reads",
