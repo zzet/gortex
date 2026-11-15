@@ -126,7 +126,8 @@ func TestEnrichmentResumeTableAppearsOnUpgradedStore(t *testing.T) {
 // A whole-repository eviction drops every enrichment edge and stamp, so it
 // must take the repository's resume points with it, durably and on every
 // eviction path a re-track uses. A file eviction (a re-parse) keeps them: the
-// provider re-applies re-parsed files itself.
+// re-parse puts the file on the per-file ledger, and the provider does not
+// resume a point recorded over another ledger.
 func TestRepoEvictionDropsEnrichmentResume(t *testing.T) {
 	seed := func(t *testing.T, s *Store) {
 		t.Helper()

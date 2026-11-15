@@ -22,6 +22,8 @@ func TestResumeRefusalNamesEachCause(t *testing.T) {
 	otherSHA.IndexedSHA = "def"
 	aliases := prior
 	aliases.Phase = int(stagedAliases)
+	otherLedger := prior
+	otherLedger.LedgerDigest = "other"
 
 	cases := []struct {
 		name    string
@@ -38,6 +40,7 @@ func TestResumeRefusalNamesEachCause(t *testing.T) {
 		{"other revision", nil, scope, otherSHA, "v1", "recorded at another revision"},
 		{"other build", nil, scope, prior, "v2", "recorded by another build"},
 		{"unresumable phase", nil, scope, aliases, "v1", "recorded in a phase that is not resumable"},
+		{"ledger changed", nil, scope, otherLedger, "v1", "a file was re-parsed, added or removed since it was recorded"},
 		// When several causes hold, the pass outranks the point, and a
 		// missing identity outranks what the point recorded.
 		{"pass may not resume at another revision", nil, noResume, otherSHA, "v2", mayNotResume},
@@ -46,7 +49,7 @@ func TestResumeRefusalNamesEachCause(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, resumeRefusal(c.readErr, c.scope, c.prior, c.version))
+			assert.Equal(t, c.want, resumeRefusal(c.readErr, c.scope, c.prior, c.version, ""))
 		})
 	}
 }

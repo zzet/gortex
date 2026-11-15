@@ -1458,9 +1458,9 @@ type EnrichmentResumePoint struct {
 	Phase      int
 	After      string
 	Covered    int
-	// LedgerDigest names the re-parse-pending files (and their on-disk
-	// versions) whose enrichment the recorded pages already cover; "" when
-	// none were pending.
+	// LedgerDigest names the provider's files, their re-parse epochs and
+	// the on-disk versions of the re-parse-pending ones, as the pass that
+	// recorded the pages saw them when it started.
 	LedgerDigest string
 	UpdatedAt    int64 // unix seconds
 }

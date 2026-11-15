@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/semantic"
 )
 
@@ -63,9 +65,9 @@ func attachScopeSpyWith(idx *Indexer, spy *scopeSpyProvider, cfg semantic.Config
 }
 
 // A scoped re-parse leaves its files on the per-file ledger, so the forced
-// pass may still resume and re-apply them; a whole-repo re-parse leaves
-// nothing a resumed pass could re-apply, so it must start from the first
-// page.
+// pass may still resume, and the provider decides from the ledger; a
+// whole-repo re-parse leaves no ledger to decide from, so it must start
+// from the first page.
 func TestRunDeferredEnrich_ResumeScopeFollowsReparseKind(t *testing.T) {
 	t.Run("scoped re-parse", func(t *testing.T) {
 		idx, spy, _ := newScopeSpyIndexer(t)
@@ -184,8 +186,8 @@ func TestRunDeferredEnrich_InPlaceReenrichDistrustsResume(t *testing.T) {
 // fresh Indexer starts with the latch down and nothing on the ledger names
 // the file, so a point recorded before the save would be honoured over the
 // importers' lost edges. The save therefore deletes the repository's points
-// for every provider; a save left on the ledger keeps them, since a resumed
-// pass re-applies the files the ledger names.
+// for every provider; a save left on the ledger keeps them, since the
+// changed ledger already keeps a pass from resuming them.
 func TestRunDeferredEnrich_InPlaceReenrichDropsPersistedResume(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -244,4 +246,153 @@ func TestRunDeferredEnrich_InPlaceReenrichDropsPersistedResume(t *testing.T) {
 			assert.True(t, scopes[0].Resume, "nothing in the restarted process distrusts a stored point")
 		})
 	}
+}
+
+// clearResumeFailStore fails the repository-wide discard of resume points
+// and lets every other write through.
+type clearResumeFailStore struct {
+	*store_sqlite.Store
+}
+
+func (clearResumeFailStore) ClearRepoEnrichmentResume(string) error {
+	return errors.New("injected: discard resume points failed")
+}
+
+func reparseEpoch(t *testing.T, g graph.Store, path string) string {
+	t.Helper()
+	for _, n := range g.GetFileNodes(path) {
+		if n.Kind == graph.KindFile {
+			epoch, _ := n.Meta[graph.MetaReparseEpoch].(string)
+			return epoch
+		}
+	}
+	t.Fatalf("no file node for %s", path)
+	return ""
+}
+
+// When the in-place re-enrich cannot discard the persisted points, the file
+// stays on the ledger under the epoch its re-parse stamped, so a restarted
+// process sees a ledger no stored point covers. A later deferred re-parse
+// names a new epoch, and the marker goes once a discard succeeds.
+func TestRunDeferredEnrich_FailedResumeDiscardKeepsFileOnLedger(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	t.Setenv("GORTEX_WARMUP_FORCE_ENRICH", "")
+	repo := commitGitRepo(t)
+	store := clearResumeFailStore{openTestSqlite(t)}
+	idx := New(store, newTestRegistry(), config.Default().Index, zap.NewNop())
+	idx.SetRepoPrefix("r")
+	idx.SetRootPath(repo)
+	_, err := idx.Index(repo)
+	require.NoError(t, err)
+	// A point the discard cannot remove.
+	require.NoError(t, store.SetEnrichmentResume(graph.EnrichmentResumePoint{
+		RepoPrefix: "r", Provider: "spy", IndexedSHA: "abc", Phase: 1, After: "r/z.go",
+	}))
+	attachScopeSpyWith(idx, &scopeSpyProvider{}, semantic.Config{Enabled: true, EnrichOnWatch: true})
+
+	main := filepath.Join(repo, "main.go")
+	require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() { helper() }\n\nfunc helper() {}\n"), 0o644))
+	require.NoError(t, idx.IndexFile(main))
+	require.Equal(t, []string{"r/main.go"}, pendingLedger(t, idx), "the failed discard keeps the file on the ledger")
+	first := reparseEpoch(t, store, "r/main.go")
+	require.NotEmpty(t, first)
+
+	restarted := New(store, newTestRegistry(), config.Default().Index, zap.NewNop())
+	restarted.SetRepoPrefix("r")
+	restarted.SetRootPath(repo)
+	assert.Equal(t, []string{"r/main.go"}, pendingLedger(t, restarted))
+
+	attachScopeSpyWith(restarted, &scopeSpyProvider{}, semantic.Config{Enabled: true})
+	require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() { helper(); helper() }\n\nfunc helper() {}\n"), 0o644))
+	require.NoError(t, restarted.IndexFile(main))
+	assert.Equal(t, []string{"r/main.go"}, pendingLedger(t, restarted))
+	second := reparseEpoch(t, store, "r/main.go")
+	assert.NotEqual(t, first, second)
+
+	// Once the discard succeeds, the in-place re-enrich clears it, under a
+	// new epoch: a point recorded over the marked ledger, or over the one
+	// before it, must not match the ledger after the clear.
+	healed := New(store.Store, newTestRegistry(), config.Default().Index, zap.NewNop())
+	healed.SetRepoPrefix("r")
+	healed.SetRootPath(repo)
+	attachScopeSpyWith(healed, &scopeSpyProvider{}, semantic.Config{Enabled: true, EnrichOnWatch: true})
+	require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() {}\n\nfunc helper() {}\n"), 0o644))
+	require.NoError(t, healed.IndexFile(main))
+	assert.Empty(t, pendingLedger(t, healed))
+	third := reparseEpoch(t, store, "r/main.go")
+	assert.NotEmpty(t, third)
+	assert.NotEqual(t, second, third)
+}
+
+// markerWriteLostStore drops marker-only node writes once lose is set, as a
+// crash after a re-parse's fact write and before its marker write would.
+type markerWriteLostStore struct {
+	*store_sqlite.Store
+	lose    bool
+	dropped int
+}
+
+func (s *markerWriteLostStore) AddBatch(nodes []*graph.Node, edges []*graph.Edge) {
+	if s.lose && len(edges) == 0 && len(nodes) > 0 {
+		markerOnly := true
+		for _, n := range nodes {
+			if n == nil || n.Kind != graph.KindFile {
+				markerOnly = false
+				break
+			}
+		}
+		if markerOnly {
+			s.dropped++
+			return
+		}
+	}
+	s.Store.AddBatch(nodes, edges)
+}
+
+// A re-parse whose enrichment is deferred puts the file on the ledger in
+// the same write that replaces its facts, on the batched path and on the
+// per-file fallback, so no later write the process may not live to make is
+// needed.
+func TestReparseStampsLedgerInFactWrite(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "0")
+	repo := commitGitRepo(t)
+	store := &markerWriteLostStore{Store: openTestSqlite(t)}
+	idx := New(store, newTestRegistry(), config.Default().Index, zap.NewNop())
+	idx.SetRepoPrefix("r")
+	idx.SetRootPath(repo)
+	_, err := idx.Index(repo)
+	require.NoError(t, err)
+	attachScopeSpyWith(idx, &scopeSpyProvider{}, semantic.Config{Enabled: true})
+	store.lose = true
+
+	epochs := map[string]bool{}
+	newEpoch := func(step string) {
+		t.Helper()
+		epoch := reparseEpoch(t, store, "r/main.go")
+		assert.NotEmpty(t, epoch, step)
+		assert.False(t, epochs[epoch], "%s: the epoch must be new", step)
+		epochs[epoch] = true
+	}
+	main := filepath.Join(repo, "main.go")
+	require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() { helper() }\n\nfunc helper() {}\n"), 0o644))
+	require.NoError(t, idx.IndexFile(main))
+	newEpoch("point re-parse")
+
+	other := filepath.Join(repo, "other.go")
+	require.NoError(t, os.WriteFile(other, []byte("package main\n\nfunc other() { helper() }\n"), 0o644))
+	require.NoError(t, os.WriteFile(main, []byte("package main\n\nfunc main() { helper(); other() }\n\nfunc helper() {}\n"), 0o644))
+	_, err = idx.IncrementalReindexPaths(repo, []string{main, other})
+	require.NoError(t, err)
+	newEpoch("batched re-parse")
+
+	// The per-file fallback, resolving in place and deferring the resolver.
+	require.NoError(t, idx.indexFile(main, true))
+	newEpoch("fallback re-parse")
+	require.NoError(t, idx.indexFile(main, false, &reparsePendingEnrichmentBatch{deferResolverCatchup: true}))
+	newEpoch("fallback re-parse with the resolver deferred")
+
+	restarted := New(store.Store, newTestRegistry(), config.Default().Index, zap.NewNop())
+	restarted.SetRepoPrefix("r")
+	restarted.SetRootPath(repo)
+	assert.Equal(t, []string{"r/main.go", "r/other.go"}, pendingLedger(t, restarted))
 }

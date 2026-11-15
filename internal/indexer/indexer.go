@@ -1476,7 +1476,7 @@ func (idx *Indexer) runDeferredEnrich() {
 				SHA: sha, Dirty: dirty,
 				Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load(),
 				// A scoped re-parse either stamps its file on the per-file
-				// ledger, which a resumed pass re-applies, or re-enriches it
+				// ledger, which no earlier point covers, or re-enriches it
 				// in place and clears the marker, which raises the latch
 				// (setReparsePendingEnrichments): in-place enrichment does
 				// not restore the edges importers' type facts point into the
@@ -5371,6 +5371,10 @@ func (idx *Indexer) indexFile(
 			n := sizeSkipNode(skippedFile{
 				relPath: relPath, lang: lang, size: int64(len(src)),
 			}, maxSize)
+			if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+				return err
+			}
+			stampSkipEpoch([]*graph.Node{n})
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
 			if journal := idx.contractCoreInputs; journal != nil {
 				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
@@ -5395,6 +5399,10 @@ func (idx *Indexer) indexFile(
 			n := contentSkipNode(skippedFile{
 				relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
 			})
+			if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+				return err
+			}
+			stampSkipEpoch([]*graph.Node{n})
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
 			if journal := idx.contractCoreInputs; journal != nil {
 				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
@@ -5457,7 +5465,14 @@ func (idx *Indexer) indexFile(
 		}
 		return err
 	}
-	if !skipped {
+	if skipped {
+		// A binary, minified or timed-out parse replaces the file's facts
+		// with a synthetic node, as the size and content skips above do.
+		if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+			return err
+		}
+		stampSkipEpoch(result.Nodes)
+	} else {
 		fallbackObservation.next(patchApply)
 	}
 	omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
@@ -5509,6 +5524,7 @@ func (idx *Indexer) indexFile(
 			return err
 		}
 	}
+	idx.retractUnchangedMtimeReceipts(map[string]fileReadVersion{mtimeKey: readVersion})
 	evictExisting(result)
 
 	// Coverage extractors (todos, licenses, ownership). A prepared watcher
@@ -5561,6 +5577,12 @@ func (idx *Indexer) indexFile(
 	// the node.
 	idx.replaceContentSections(graphPath, result.Nodes, false)
 
+	// The paths below that write the ledger marker find it already set
+	// when enrichment does not run in place.
+	ledgerStamped := !skipped && (resolve || deferredResolverCatchup) && idx.reparseLedgerApplies(result)
+	if ledgerStamped {
+		stampReparseLedger(result.Nodes)
+	}
 	idx.graph.AddBatch(result.Nodes, append(result.Edges, legacyCarried...))
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
@@ -5717,9 +5739,12 @@ func (idx *Indexer) indexFile(
 			// is diagnosable rather than silently dropped. Cleared when
 			// enrichment did re-run for the file.
 			pendingReparseEnrichment := providersPresent && !omitSecondarySourceScans && !reEnriched
-			if markerBatch == nil {
+			switch {
+			case pendingReparseEnrichment && ledgerStamped:
+				// Stamped in the fact write above.
+			case markerBatch == nil:
 				idx.setReparsePendingEnrichment(graphPath, pendingReparseEnrichment)
-			} else if markerBatch.add(graphPath, pendingReparseEnrichment) {
+			case markerBatch.add(graphPath, pendingReparseEnrichment):
 				idx.flushReparsePendingEnrichment(markerBatch)
 			}
 		}
@@ -5733,8 +5758,8 @@ func (idx *Indexer) indexFile(
 			result:    result,
 			abSnap:    abSnap,
 		}}))
-		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-		if markerBatch.add(graphPath, providersPresent && !omitSecondarySourceScans) {
+		// Stamped in the fact write above when the file has a type tier.
+		if !ledgerStamped && markerBatch.add(graphPath, false) {
 			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 		// A global-using change re-prices unit-wide dependents even on
@@ -6046,8 +6071,13 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
 		return nil // file gone / evicted; nothing to re-resolve
 	}
-	idx.resolver.ResolveFileAndIncoming(graphPath)
 	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+	if providersPresent {
+		// On the ledger before the re-resolve rewrites any edge, as a
+		// re-parse's fact write puts it there.
+		idx.setReparsePendingEnrichment(graphPath, true)
+	}
+	idx.resolver.ResolveFileAndIncoming(graphPath)
 	watchEnrichment := providersPresent && idx.semanticMgr.EnrichesOnWatch()
 	reEnriched := false
 	if watchEnrichment {
@@ -6060,7 +6090,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	}
 	// Keep the find_usages staleness marker consistent with the enrichment
 	// that actually ran during this forced re-resolve (mirrors indexFile).
-	idx.setReparsePendingEnrichment(graphPath, providersPresent && !reEnriched)
+	// A pending marker was written above.
+	if !providersPresent || reEnriched {
+		idx.setReparsePendingEnrichment(graphPath, false)
+	}
 	return nil
 }
 

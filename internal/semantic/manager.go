@@ -255,8 +255,8 @@ type RepoEnrichState struct {
 	// re-parse that re-enriched its file in place cleared that marker without
 	// restoring the edges its importers point into it, so it leaves this
 	// false, as a whole-repo re-parse does. A provider that resumes a cut pass
-	// may then keep its recorded progress and re-apply the marked files,
-	// instead of starting over. The marker gate ignores it.
+	// may then keep progress it recorded over the same ledger instead of
+	// starting over. The marker gate ignores it.
 	ReparsedFilesMarked bool
 
 	// CheckoutID scopes the pass to one routed automatic checkout's working

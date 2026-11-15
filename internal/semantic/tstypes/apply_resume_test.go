@@ -61,10 +61,14 @@ type resumeCut struct {
 	fault        func(factPageStats) error
 	unidentified bool
 	logger       *zap.Logger // defaults to a no-op logger
-	reapplied    *int        // counts pages applied again behind the cursor
 	// gateCancelled parks the apply phase behind a gate that never opens
 	// and cancels the pass while it waits there, after parsing finished.
 	gateCancelled bool
+	// duringStaging runs on the pass's store after the pass decided where
+	// to start and before it parses.
+	duringStaging func(graph.Store)
+	// afterFileScan runs on the pass's store once the pass listed its files.
+	afterFileScan func(graph.Store)
 }
 
 const resumeTestVersion = "tstypes/test"
@@ -160,15 +164,18 @@ func resumeRunOn(t *testing.T, ctx context.Context, cancel context.CancelFunc, g
 		if stats.Class != classAliases {
 			pages++
 		}
-		if stats.Reapply && cut.reapplied != nil {
-			*cut.reapplied++
-		}
 		if cut.afterPages > 0 && seen == cut.afterPages {
 			cancel() // the pass deadline expiring right after this page
 		}
 	}
 	if cut.beforeApply {
 		p.observeSpool = func(string) { cancel() }
+	}
+	if cut.duringStaging != nil {
+		p.observeSpool = func(string) { cut.duringStaging(g) }
+	}
+	if cut.afterFileScan != nil {
+		p.observeFiles = func() { cut.afterFileScan(g) }
 	}
 	mgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
 	defer mgr.Close()
@@ -293,6 +300,12 @@ func markReparsePending(t *testing.T, s *store_sqlite.Store, path string) {
 // ledger because it was not enriched.
 func reparseResumeFile(t *testing.T, dbPath, root, path string) {
 	t.Helper()
+	editResumeStore(t, dbPath, func(s *store_sqlite.Store) { reparseResumeFileIn(t, s, root, path) })
+}
+
+// reparseResumeFileIn is reparseResumeFile on an open store.
+func reparseResumeFileIn(t *testing.T, s *store_sqlite.Store, root, path string) {
+	t.Helper()
 	content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 	require.NoError(t, err)
 	reg := parser.NewRegistry()
@@ -306,11 +319,9 @@ func reparseResumeFile(t *testing.T, dbPath, root, path string) {
 	if res.Tree != nil {
 		res.Tree.Close()
 	}
-	editResumeStore(t, dbPath, func(s *store_sqlite.Store) {
-		s.EvictFile(path)
-		s.AddBatch(res.Nodes, res.Edges)
-		markReparsePending(t, s, path)
-	})
+	s.EvictFile(path)
+	s.AddBatch(res.Nodes, res.Edges)
+	markReparsePending(t, s, path)
 	touchResumeFile(t, root, path)
 }
 
@@ -380,8 +391,9 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 
 	provider := TypeScriptSpec().ProviderName
 	const (
-		mayNotResume = "this pass may not resume (dirty tree, forced re-enrich, or a re-parse this run the ledger does not cover)"
-		noIdentity   = "this build has no identity"
+		mayNotResume  = "this pass may not resume (dirty tree, forced re-enrich, or a re-parse this run the ledger does not cover)"
+		noIdentity    = "this build has no identity"
+		reparsedSince = "a file was re-parsed, added or removed since it was recorded"
 	)
 	cases := []struct {
 		name         string
@@ -390,7 +402,6 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 		unidentified bool
 		prepare      func(*testing.T, *store_sqlite.Store)
 		resumes      bool
-		reapplied    int    // pages applied again behind the cursor
 		refusal      string // the logged reason a stored point was discarded
 	}{
 		{name: "same revision on a clean tree", rs: clean, resumes: true},
@@ -409,14 +420,13 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 			point.Version = "tstypes/0/older-build"
 			require.NoError(t, s.SetEnrichmentResume(point))
 		}},
-		// The cut lands in the supers phase, past d000.ts: its supers facts
-		// are applied again as one page, everything else resumes.
-		{name: "re-parse awaiting enrichment", rs: clean, resumes: true, reapplied: 1, prepare: func(t *testing.T, s *store_sqlite.Store) {
+		// A file re-parsed since the point was recorded, behind the cursor
+		// or ahead of it: no bounded set names every file whose facts bound
+		// into it, so the pass applies from the first page.
+		{name: "re-parse behind the cursor", rs: clean, refusal: reparsedSince, prepare: func(t *testing.T, s *store_sqlite.Store) {
 			markReparsePending(t, s, "src/d000.ts")
 		}},
-		// A marked file still ahead of the cursor is applied once, by the
-		// forward pages.
-		{name: "re-parse ahead of the cursor", rs: clean, resumes: true, prepare: func(t *testing.T, s *store_sqlite.Store) {
+		{name: "re-parse ahead of the cursor", rs: clean, refusal: reparsedSince, prepare: func(t *testing.T, s *store_sqlite.Store) {
 			markReparsePending(t, s, "src/d099.ts")
 		}},
 		{name: "point recorded without a build identity", rs: clean, unidentified: true, refusal: noIdentity, prepare: func(t *testing.T, s *store_sqlite.Store) {
@@ -451,7 +461,7 @@ func TestStreamedApplyResumesOnlyUnderTrustedScope(t *testing.T) {
 				assert.Equal(t, []any{tc.refusal}, reasons, "a refused point is logged once with its cause")
 			}
 			if tc.resumes {
-				assert.Equal(t, totalPages-cutAfter+tc.reapplied, pages, "the committed pages must be skipped")
+				assert.Equal(t, totalPages-cutAfter, pages, "the committed pages must be skipped")
 			} else {
 				assert.Equal(t, totalPages, pages, "the pass must apply from the first page")
 			}
@@ -567,17 +577,13 @@ func TestStreamedApplyResumedCallsSeeTraitAliases(t *testing.T) {
 }
 
 // A file re-parsed between cut runs lost the enrichment its committed pages
-// applied. Resumed runs keep their cursor and apply that file again in every
-// phase behind it, so the runs still reach the uncut graph. Re-applying
-// comes before the cursor in each phase, so a run makes progress only when
-// its budget covers the re-parsed files' pages (one per phase here) plus a
-// page. The marker stays until a pass completes; the indexer discharges it
-// then (see TestRunDeferredEnrich_FullPassDischargesLedger).
-func TestStreamedApplyResumeReappliesReparsedFiles(t *testing.T) {
+// applied, and so did the files whose facts bound into it. The next run
+// does not resume over the changed ledger: it applies from the first page
+// and records points over the new ledger, which the run after it resumes.
+// The marker stays until a pass completes; the indexer discharges it then
+// (see TestRunDeferredEnrich_FullPassDischargesLedger).
+func TestStreamedApplyRestartsAfterReparse(t *testing.T) {
 	files := resumeFixture(100)
-	// Sorts into the first page of every phase and has supers, metas and
-	// calls facts. No other file references it, so re-parsing it loses
-	// nothing a pass over its own facts cannot restore.
 	const reparsed = "src/b000l.ts"
 	files[reparsed] = `import { B000, R000 } from "./b000";
 class L000 extends B000 { own(): R000 { return this.run(); } }
@@ -590,26 +596,25 @@ export function leaf(): void { new L000().own().done(); new L000().run().done();
 	wantSnapshot := resumeSnapshot(t, wantDB)
 
 	dbPath, root := newResumeStore(t, files)
-	const reappliedPhases = 3 // supers, metas, calls
-	const cutAfter = reappliedPhases + 1
-	var got *semantic.EnrichResult
-	runs, applied := 0, 0
-	for runs < totalPages+2 {
-		runs++
-		var pages int
-		got, pages = resumeRun(t, dbPath, root, clean, cutAfter)
-		applied += pages
-		if !got.Partial {
-			break
-		}
-		reparseResumeFile(t, dbPath, root, reparsed)
-		require.Equal(t, []string{reparsed}, reparsePendingFiles(t, dbPath))
-	}
-	require.False(t, got.Partial, "still partial after %d runs", runs)
-	require.Greater(t, runs, reappliedPhases, "the cursor must pass the re-parsed file in several phases")
-	assert.Greater(t, applied, totalPages, "the re-parsed file's pages are applied again")
-	assert.LessOrEqual(t, applied, totalPages+(runs-1)*reappliedPhases, "only the re-parsed file is applied again")
-	assert.Equal(t, wantSnapshot, resumeSnapshot(t, dbPath), "resumed runs must restore the re-parsed file")
+	const cutAfter = 4
+	cut, _ := resumeRun(t, dbPath, root, clean, cutAfter)
+	require.True(t, cut.Partial)
+	cut, _ = resumeRun(t, dbPath, root, clean, cutAfter)
+	require.True(t, cut.Partial)
+	before := resumePoint(t, dbPath)
+	reparseResumeFile(t, dbPath, root, reparsed)
+	require.Equal(t, []string{reparsed}, reparsePendingFiles(t, dbPath))
+
+	cut, _ = resumeRun(t, dbPath, root, clean, cutAfter)
+	require.True(t, cut.Partial)
+	fresh := resumePoint(t, dbPath)
+	assert.True(t, pointAfter(before, fresh), "the run after the re-parse starts from the first page")
+	assert.NotEqual(t, before.LedgerDigest, fresh.LedgerDigest, "its points cover the new ledger")
+
+	got, pages := resumeRun(t, dbPath, root, clean, 0)
+	require.False(t, got.Partial)
+	assert.Less(t, pages, totalPages, "the run over an unchanged ledger resumes")
+	assert.Equal(t, wantSnapshot, resumeSnapshot(t, dbPath), "the runs must restore the re-parsed file")
 	assert.Equal(t, want.SymbolsCovered, got.SymbolsCovered)
 	assert.Equal(t, []string{reparsed}, reparsePendingFiles(t, dbPath),
 		"the provider leaves the ledger to the indexer")
@@ -721,250 +726,15 @@ func TestStreamedApplyStopsRecordingAfterPointWriteFails(t *testing.T) {
 	assert.Equal(t, wantSnapshot, resumeSnapshot(t, dbPath))
 }
 
-// A re-parse that drops the references into a file (eviction removes every
-// edge touching the file's nodes; the indexer re-parks only some of them)
-// takes with it what the type engine bound there from the file's importers.
-// Resumed runs apply those importers again behind the cursor too.
-func TestStreamedApplyResumeReappliesImportersOfEvictedFiles(t *testing.T) {
-	files := resumeFixture(100)
-	const reparsed = "src/a.ts"
-	files[reparsed] = `export class Svc { run(): void {} }
-export class Base { done(): void {} }
-`
-	files["src/b.ts"] = `import { Svc } from "./a";
-export function callB(s: Svc): void { s.run(); }
-`
-	files["src/c.ts"] = `import { Base } from "./a";
-export class C extends Base { finish(): void { this.done(); } }
-`
-	clean := semantic.RepoEnrichState{SHA: resumeSHA}
-
-	dbPath, root := newResumeStore(t, files)
-	const reappliedPhases = 3 // supers, metas, calls; the three files share a page
-	const cutAfter = reappliedPhases + 1
-	var got *semantic.EnrichResult
-	runs := 0
-	for runs < 64 {
-		runs++
-		got, _ = resumeRun(t, dbPath, root, clean, cutAfter)
-		if !got.Partial {
-			break
-		}
-		reparseResumeFile(t, dbPath, root, reparsed)
-	}
-	require.False(t, got.Partial, "still partial after %d runs", runs)
-	require.Greater(t, runs, reappliedPhases, "the cursor must pass the importers in several phases")
-
-	wantDB, wantRoot := newResumeStore(t, files)
-	reparseResumeFile(t, wantDB, wantRoot, reparsed)
-	want, _ := resumeRun(t, wantDB, wantRoot, clean, 0)
-	require.False(t, want.Partial)
-	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath), "resumed runs must restore what importers bound into the re-parsed file")
-}
-
-// An import that binds no single local name still names the module the file
-// depends on. A file reaching a re-parsed file only through a namespace
-// import, `import x = require()` or a CommonJS require binds its types by
-// name, so resumed runs must find it among the importers and apply it again.
-func TestStreamedApplyResumeReappliesPathOnlyImporters(t *testing.T) {
-	for _, tc := range []struct {
-		name, file, src string
-	}{
-		{name: "namespace import", file: "src/b.ts", src: `import * as a from "./a";
-export function callB(s: a.Svc): void { s.run(); }
-`},
-		{name: "import require", file: "src/b.ts", src: `import a = require("./a");
-export function callB(s: a.Svc): void { s.run(); }
-`},
-		{name: "await dynamic import", file: "src/b.ts", src: `export async function callB(): Promise<void> {
-  const { Svc } = await import("./a");
-  const s = new Svc();
-  s.run();
-}
-`},
-		{name: "dynamic import then", file: "src/b.ts", src: `export function callB(): void {
-  import("./a").then(({ Svc }) => {
-    const s = new Svc();
-    s.run();
-  });
-}
-`},
-		{name: "CommonJS require", file: "src/b.js", src: `const { Svc } = require("./a");
-function callB() { const s = new Svc(); s.run(); }
-module.exports = { callB };
-`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			files := resumeFixture(100)
-			const reparsed = "src/a.ts"
-			files[reparsed] = `export class Svc { run(): void {} }
-`
-			files[tc.file] = tc.src
-			clean := semantic.RepoEnrichState{SHA: resumeSHA}
-
-			wantDB, wantRoot := newResumeStore(t, files)
-			reparseResumeFile(t, wantDB, wantRoot, reparsed)
-			want, _ := resumeRun(t, wantDB, wantRoot, clean, 0)
-			require.False(t, want.Partial)
-			require.Positive(t, semanticEdgesBetween(t, wantDB, tc.file, reparsed),
-				"the engine must bind the dependent into the re-parsed file")
-
-			dbPath, root := newResumeStore(t, files)
-			const reappliedPhases = 3 // supers, metas, calls; the files share a page
-			var got *semantic.EnrichResult
-			runs := 0
-			for runs < 64 {
-				runs++
-				got, _ = resumeRun(t, dbPath, root, clean, reappliedPhases+1)
-				if !got.Partial {
-					break
-				}
-				reparseResumeFile(t, dbPath, root, reparsed)
-			}
-			require.False(t, got.Partial, "still partial after %d runs", runs)
-			require.Greater(t, runs, reappliedPhases, "the cursor must pass the dependent in several phases")
-			assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath),
-				"resumed runs must restore what the dependent bound into the re-parsed file")
-		})
-	}
-}
-
-// semanticEdgesBetween counts the type-engine edges from nodes of one file
-// to nodes of another.
-func semanticEdgesBetween(t *testing.T, dbPath, fromFile, toFile string) int {
-	t.Helper()
-	count := 0
-	editResumeStore(t, dbPath, func(s *store_sqlite.Store) {
-		inFile := func(id, file string) bool {
-			n := s.GetNode(id)
-			return n != nil && n.FilePath == file
-		}
-		for _, e := range s.AllEdges() {
-			if e == nil || e.Meta == nil {
-				continue
-			}
-			if src, _ := e.Meta["semantic_source"].(string); src == "" {
-				continue
-			}
-			if inFile(e.From, fromFile) && inFile(e.To, toFile) {
-				count++
-			}
-		}
-	})
-	return count
-}
-
-// The re-apply is paid once per ledger: a resumed run that re-applied the
-// re-parsed files records that its points cover them, and the next cut run
-// over the same ledger re-applies nothing and spends its budget moving the
-// cursor.
-func TestStreamedApplyReappliesALedgerOnce(t *testing.T) {
-	files := resumeFixture(100)
-	const reparsed = "src/b000l.ts"
-	files[reparsed] = `import { B000, R000 } from "./b000";
-class L000 extends B000 { own(): R000 { return this.run(); } }
-export function leaf(): void { new L000().own().done(); }
-`
-	clean := semantic.RepoEnrichState{SHA: resumeSHA}
-	dbPath, root := newResumeStore(t, files)
-	cut, _ := resumeRun(t, dbPath, root, clean, 2)
-	require.True(t, cut.Partial)
-	reparseResumeFile(t, dbPath, root, reparsed)
-
-	first := 0
-	cut, _ = resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 4, reapplied: &first})
-	require.True(t, cut.Partial)
-	require.Positive(t, first, "the first resumed run re-applies the re-parsed file")
-	covered := resumePoint(t, dbPath)
-
-	again := 0
-	cut, pages := resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 2, reapplied: &again})
-	require.True(t, cut.Partial)
-	assert.Zero(t, again, "the same ledger is not re-applied twice")
-	assert.Equal(t, 2, pages)
-	assert.True(t, pointAfter(resumePoint(t, dbPath), covered), "the run moves the cursor")
-
-	got, _ := resumeRun(t, dbPath, root, clean, 0)
-	require.False(t, got.Partial)
-	wantDB, wantRoot := newResumeStore(t, files)
-	reparseResumeFile(t, wantDB, wantRoot, reparsed)
-	_, _ = resumeRun(t, wantDB, wantRoot, clean, 0)
-	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath))
-}
-
-// Re-applied pages never move the cursor, so a resumed run cut while
-// re-applying would leave the point with the old ledger digest, and every
-// later run would repeat the same re-apply and be cut at the same place. The
-// run discards the point instead; the next run applies from the first page
-// and records the new digest, and runs that are each cut after one page
-// still converge to the uncut graph.
-func TestStreamedApplyCutInsideReapplyStartsFresh(t *testing.T) {
-	files := resumeFixture(100)
-	const reparsed = "src/b000l.ts"
-	files[reparsed] = `import { B000, R000 } from "./b000";
-class L000 extends B000 { own(): R000 { return this.run(); } }
-export function leaf(): void { new L000().own().done(); }
-`
-	clean := semantic.RepoEnrichState{SHA: resumeSHA}
-	wantDB, wantRoot := newResumeStore(t, files)
-	reparseResumeFile(t, wantDB, wantRoot, reparsed)
-	want, totalPages := resumeRun(t, wantDB, wantRoot, clean, 0)
-	require.False(t, want.Partial)
-
-	dbPath, root := newResumeStore(t, files)
-	cut, _ := resumeRun(t, dbPath, root, clean, 2)
-	require.True(t, cut.Partial)
-	before := resumePoint(t, dbPath)
-	reparseResumeFile(t, dbPath, root, reparsed)
-
-	reapplied := 0
-	cut, _ = resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 1, reapplied: &reapplied})
-	require.True(t, cut.Partial)
-	require.Equal(t, 1, reapplied, "the run is cut on a re-applied page")
-	editResumeStore(t, dbPath, func(s *store_sqlite.Store) {
-		_, found, err := s.GetEnrichmentResume("", TypeScriptSpec().ProviderName)
-		require.NoError(t, err)
-		assert.False(t, found, "a run cut before it moved its cursor discards the point")
-	})
-
-	reapplied = 0
-	cut, _ = resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 2, reapplied: &reapplied})
-	require.True(t, cut.Partial)
-	assert.Zero(t, reapplied, "the next run applies from the first page")
-	fresh := resumePoint(t, dbPath)
-	assert.Equal(t, before.Phase, fresh.Phase, "the next run started from the first page")
-	assert.Equal(t, before.After, fresh.After, "the next run started from the first page")
-	assert.NotEqual(t, before.LedgerDigest, fresh.LedgerDigest, "its points cover the new ledger")
-
-	var got *semantic.EnrichResult
-	runs := 0
-	for runs < totalPages+2 {
-		runs++
-		got, _ = resumeRun(t, dbPath, root, clean, 1)
-		if !got.Partial {
-			break
-		}
-	}
-	require.False(t, got.Partial, "still partial after %d runs cut every page", runs)
-	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath), "the runs must reach the uncut graph")
-	assert.Equal(t, want.SymbolsCovered, got.SymbolsCovered)
-}
-
-// A run that ends before its apply phase starts has re-applied nothing, so
-// the point it resumed still describes the store and must survive: a restart
-// or a parse that uses up a small budget would otherwise throw away every
-// committed page. The next run re-applies against the same point and the
-// runs converge to the uncut graph.
+// A run that ends before its apply phase starts has applied nothing, so the
+// point it resumed still describes the store and must survive: a restart or
+// a parse that uses up a small budget would otherwise throw away every
+// committed page. The next run resumes the same point and the runs converge
+// to the uncut graph.
 func TestStreamedApplyExitBeforeApplyKeepsThePoint(t *testing.T) {
 	files := resumeFixture(100)
-	const reparsed = "src/b000l.ts"
-	files[reparsed] = `import { B000, R000 } from "./b000";
-class L000 extends B000 { own(): R000 { return this.run(); } }
-export function leaf(): void { new L000().own().done(); }
-`
 	clean := semantic.RepoEnrichState{SHA: resumeSHA}
 	wantDB, wantRoot := newResumeStore(t, files)
-	reparseResumeFile(t, wantDB, wantRoot, reparsed)
 	want, _ := resumeRun(t, wantDB, wantRoot, clean, 0)
 	require.False(t, want.Partial)
 
@@ -972,7 +742,6 @@ export function leaf(): void { new L000().own().done(); }
 	cut, _ := resumeRun(t, dbPath, root, clean, 2)
 	require.True(t, cut.Partial)
 	before := resumePoint(t, dbPath)
-	reparseResumeFile(t, dbPath, root, reparsed)
 
 	for _, exit := range []struct {
 		name string
@@ -981,107 +750,86 @@ export function leaf(): void { new L000().own().done(); }
 		{name: "cut while parsing", cut: resumeCut{beforeApply: true}},
 		{name: "cut waiting on the apply gate", cut: resumeCut{gateCancelled: true}},
 	} {
-		reapplied := 0
-		exit.cut.reapplied = &reapplied
 		cut, pages := resumeRunCut(t, dbPath, root, clean, exit.cut)
 		require.True(t, cut.Partial, exit.name)
 		require.Zero(t, pages, "%s: the run applies nothing", exit.name)
-		require.Zero(t, reapplied, exit.name)
 		assert.Equal(t, before, resumePoint(t, dbPath), "%s: the point survives", exit.name)
 	}
 
-	reapplied := 0
-	cut, _ = resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 4, reapplied: &reapplied})
+	cut, _ = resumeRun(t, dbPath, root, clean, 2)
 	require.True(t, cut.Partial)
-	assert.Positive(t, reapplied, "the next run still re-applies against the point")
-	assert.True(t, pointAfter(resumePoint(t, dbPath), before), "and moves its cursor")
+	assert.True(t, pointAfter(resumePoint(t, dbPath), before), "the next run resumes and moves the cursor")
 
 	got, _ := resumeRun(t, dbPath, root, clean, 0)
 	require.False(t, got.Partial)
 	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath))
 }
 
-// A re-parsed file most of the repository imports would be replayed at
-// about the cost of a whole pass, so the pass starts from the first page
-// instead; it covers the ledger, and the run after it resumes without
-// re-applying anything.
-func TestStreamedApplyHighFanInLedgerStartsFresh(t *testing.T) {
-	files := resumeFixture(20)
-	const hub = "src/a.ts"
-	files[hub] = `export class Hub { ping(): void {} }
-`
-	for i := 0; i < 100; i++ {
-		id := strings.NewReplacer("#", fmt.Sprintf("%03d", i))
-		files[id.Replace("src/h#.ts")] = id.Replace(`import { Hub } from "./a";
-export class H# extends Hub { go(): void { this.ping(); } }
-`)
-	}
+// The C# and Kotlin engines bind cross-file types by repo-unique name, so
+// removing a file can change what other files' facts bind to although no
+// edge pointed into it and nothing was re-parsed. A pass must not resume a
+// point recorded before the removal.
+func TestStreamedApplyRefusesResumeAfterFileRemoved(t *testing.T) {
+	files := resumeFixture(100)
 	clean := semantic.RepoEnrichState{SHA: resumeSHA}
-	wantDB, wantRoot := newResumeStore(t, files)
-	reparseResumeFile(t, wantDB, wantRoot, hub)
-	want, totalPages := resumeRun(t, wantDB, wantRoot, clean, 0)
-
 	dbPath, root := newResumeStore(t, files)
 	cut, _ := resumeRun(t, dbPath, root, clean, 2)
 	require.True(t, cut.Partial)
-	before := resumePoint(t, dbPath)
-	reparseResumeFile(t, dbPath, root, hub)
 
-	reapplied := 0
-	cut, _ = resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 2, reapplied: &reapplied})
-	require.True(t, cut.Partial)
-	assert.Zero(t, reapplied, "the importers are not replayed")
-	fresh := resumePoint(t, dbPath)
-	assert.Equal(t, before.Phase, fresh.Phase, "the run started from the first page")
-	assert.Equal(t, before.After, fresh.After, "the run started from the first page")
-	assert.NotEqual(t, before.LedgerDigest, fresh.LedgerDigest, "its points cover the new ledger")
+	const removed = "src/u050.ts" // nothing imports it
+	require.NoError(t, os.Remove(filepath.Join(root, filepath.FromSlash(removed))))
+	editResumeStore(t, dbPath, func(s *store_sqlite.Store) { s.EvictFile(removed) })
+	require.Empty(t, reparsePendingFiles(t, dbPath))
 
-	reapplied = 0
-	got, pages := resumeRunCut(t, dbPath, root, clean, resumeCut{reapplied: &reapplied})
+	core, logs := observer.New(zap.InfoLevel)
+	got, _ := resumeRunCut(t, dbPath, root, clean, resumeCut{logger: zap.New(core)})
 	require.False(t, got.Partial)
-	assert.Zero(t, reapplied)
-	assert.Equal(t, totalPages-2, pages, "the next run resumes")
-	assert.Equal(t, want.SymbolsCovered, got.SymbolsCovered, "the fresh run walked coverage again")
-	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath))
+	assert.Equal(t, []any{"a file was re-parsed, added or removed since it was recorded"}, refusalReasons(logs))
 }
 
-// An engine whose import hints do not name every dependent of a file
-// (same-package or wildcard references bind with no import) cannot bound the
-// re-apply to the importers it can see, so a changed ledger sends the pass
-// back to the first page even though its files carry import hints.
-func TestStreamedApplyLedgerWithoutAuthoritativeImportsStartsFresh(t *testing.T) {
-	spec := *TypeScriptSpec()
-	spec.ImportHintsAuthoritative = false
-	require.NotNil(t, spec.Imports, "the engine still records import hints")
-	files := resumeFixture(100)
+// The repo-unique name lookup reads every file node of the pass's
+// languages, including those the pass does not analyze: vendored files,
+// files over the size cap and files missing on disk. A re-parse of one of
+// them must refuse a resume like a re-parse of any other.
+func TestStreamedApplyRefusesResumeAfterUnanalyzedFileReparsed(t *testing.T) {
+	const vendored = "src/vendor/v.ts"
 	clean := semantic.RepoEnrichState{SHA: resumeSHA}
-	wantDB, wantRoot := newResumeStore(t, files)
-	_, totalPages := resumeRunCut(t, wantDB, wantRoot, clean, resumeCut{spec: &spec})
+	for _, tc := range []struct {
+		name, path string
+		prepare    func(t *testing.T, root string)
+	}{
+		{name: "vendored", path: vendored},
+		{name: "over the size cap", path: "src/u050.ts", prepare: func(t *testing.T, root string) {
+			require.NoError(t, os.Truncate(filepath.Join(root, "src", "u050.ts"), maxFileBytes+1))
+		}},
+		{name: "missing on disk", path: "src/u050.ts", prepare: func(t *testing.T, root string) {
+			require.NoError(t, os.Remove(filepath.Join(root, "src", "u050.ts")))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := resumeFixture(100)
+			files[vendored] = "export class V { run(): void {} }\n"
+			dbPath, root := newResumeStore(t, files)
+			if tc.prepare != nil {
+				tc.prepare(t, root)
+			}
+			cut, _ := resumeRun(t, dbPath, root, clean, 2)
+			require.True(t, cut.Partial)
 
-	dbPath, root := newResumeStore(t, files)
-	cut, _ := resumeRunCut(t, dbPath, root, clean, resumeCut{afterPages: 2, spec: &spec})
-	require.True(t, cut.Partial)
-	editResumeStore(t, dbPath, func(s *store_sqlite.Store) { markReparsePending(t, s, "src/d000.ts") })
+			editResumeStore(t, dbPath, func(s *store_sqlite.Store) {
+				markReparsePending(t, s, tc.path)
+				for _, n := range s.GetFileNodes(tc.path) {
+					if n.Kind == graph.KindFile {
+						n.Meta[graph.MetaReparseEpoch] = "e1"
+						s.AddBatch([]*graph.Node{n}, nil)
+					}
+				}
+			})
 
-	reapplied := 0
-	got, pages := resumeRunCut(t, dbPath, root, clean, resumeCut{spec: &spec, reapplied: &reapplied})
-	require.False(t, got.Partial)
-	assert.Zero(t, reapplied)
-	assert.Equal(t, totalPages, pages, "the pass applies from the first page")
-	assert.Equal(t, resumeSnapshot(t, wantDB), resumeSnapshot(t, dbPath))
-}
-
-// Only TypeScript records an import for every direct cross-file reference.
-// The other engines see direct references that carry no import naming the
-// file — same-package or same-namespace names, wildcard imports,
-// module-qualified access — so they must not bound a resumed re-apply to the
-// importers.
-func TestImportHintsAuthoritativeOnlyForTypeScript(t *testing.T) {
-	for _, p := range DefaultProviders(zap.NewNop()) {
-		want := p.spec.ProviderName == TypeScriptSpec().ProviderName
-		assert.Equal(t, want, p.spec.ImportHintsAuthoritative, p.spec.ProviderName)
-		if p.spec.ImportHintsAuthoritative {
-			assert.NotNil(t, p.spec.Imports, "%s: authoritative hints need an import decoder", p.spec.ProviderName)
-		}
+			core, logs := observer.New(zap.InfoLevel)
+			got, _ := resumeRunCut(t, dbPath, root, clean, resumeCut{logger: zap.New(core)})
+			require.False(t, got.Partial)
+			assert.Equal(t, []any{"a file was re-parsed, added or removed since it was recorded"}, refusalReasons(logs))
+		})
 	}
 }

@@ -52,7 +52,8 @@ func EnrichResumeFrom(ctx context.Context) (EnrichResumeScope, bool) {
 // operator asked for a full re-enrich), so they start from the first page;
 // their own points stay valid for the next run. A Force raised only by
 // scoped re-parses whose files are all on the per-file ledger
-// (ReparsedFilesMarked) still resumes: the provider re-applies those files.
+// (ReparsedFilesMarked) may still resume: the provider does not resume a
+// point recorded over another ledger.
 func enrichResumeScope(rs RepoEnrichState) (EnrichResumeScope, bool) {
 	if rs.SHA == "" || rs.CheckoutID != "" {
 		return EnrichResumeScope{}, false

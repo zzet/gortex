@@ -32,35 +32,21 @@ import (
 // The aliases phase writes only to the pass's temp spool, so it re-runs
 // whenever the calls phase is reached again.
 //
-// A file re-parsed since then lost what its committed pages applied. The
-// indexer leaves such a file on the per-file ledger
-// (graph.MetaReparsePendingEnrichment) until a whole pass completes, so a
-// resumed pass applies those files again in every phase behind its cursor.
-// Their direct importers are applied again too: an importer's calls and
-// supers that the type engine bound into a re-parsed file went with it.
-// Everything else pointing into a re-parsed file is left to the indexer:
-// its restub pass parks incoming reference edges before eviction and
-// restores their resolved provenance when the structural resolver rebinds
-// them to the same target. Only an engine whose import hints are
-// authoritative (LangSpec.ImportHintsAuthoritative) re-applies this way:
-// elsewhere even a direct reference can bind across files with no import
-// naming the file (same-package and wildcard references). Even there the
-// importers are the direct dependents only. Files that bound into a
-// re-parsed file by a route no recorded import reveals are not re-applied:
-// ambient, global and script-mode names, specifiers that are not literals,
-// type queries such as import("m").T, and binding through an intermediate
-// module (a factory's return type, a member inherited through a middle
-// class).
-//
-// Re-applying is paid once per ledger, not once per cut run. Every point
-// carries the digest of the ledger its pages cover (each file's path and
-// on-disk version): a pass from the first page covers the ledger present at
-// its start, and a resumed pass covers the set it re-applied, which all runs
-// before its first forward page commits. A resumed pass whose ledger
-// digest matches the point's re-applies nothing. When it differs and the
-// re-apply cannot be bounded — the engine's import hints are not
-// authoritative, or the set is over half the staged files — the pass starts
-// again from the first page instead, which covers the new ledger outright.
+// A file re-parsed since then lost what its committed pages applied, and so
+// did every file whose facts the type engine bound into it: importers, and
+// files reaching it through inheritance, return types or repo-unique names.
+// No bounded set names them all, so a pass does not resume over a re-parse.
+// The indexer leaves a re-parsed file on the per-file ledger
+// (graph.MetaReparsePendingEnrichment) until a whole pass completes, and
+// stamps each re-parse, and each clearing of the marker, with a new
+// graph.MetaReparseEpoch. Every point carries the digest of the ledger
+// its pass listed its files from (ledgerDigest), and a pass resumes only a
+// point whose digest matches its own, checked when it opens and again right
+// before it skips the committed pages: any re-parse of a ledger-eligible
+// file, a skip that replaces a file's facts with a synthetic node, or a file
+// added or removed, since the point changes the digest and the pass applies
+// from the first page. Resuming is kept for passes cut by
+// the deadline alone.
 
 // applyResumeFormat versions what a resume point means: the fact classes,
 // their keyset page order and the phase sequence. Bump it when any of those
@@ -98,29 +84,23 @@ func resumeVersionFor(info *debug.BuildInfo) string {
 }
 
 type applyResume struct {
-	store    graph.EnrichmentResumeStore
-	point    graph.EnrichmentResumePoint
-	record   bool
-	resumed  bool
-	reparsed []string // ledger-marked files a resumed pass re-applies
-	// uncommitted is set from the moment a resumed pass starts re-applying
-	// files until it records a forward page: the stored point still carries
-	// the old ledger digest, so a pass cut in between must not leave it
-	// behind. It stays clear before the apply phase starts, when nothing
-	// was re-applied and the point is still the one to resume.
-	uncommitted bool
-	logger      *zap.Logger
+	store  graph.EnrichmentResumeStore
+	point  graph.EnrichmentResumePoint
+	record bool
+	logger *zap.Logger
+	// resumed says the pass starts at point rather than the first page.
+	resumed bool
 }
 
 // openApplyResume decides where a pass starts. It runs before the pass parses
 // or writes anything, so a point it discards can never be read again and a
 // point it honours describes state committed by an earlier pass; passes for
 // one (repo, provider) never overlap, so nothing else writes the row
-// meanwhile. reparsed names the candidate files on the per-file ledger and
-// digest their current versions; a resumed pass applies them again unless
-// the point already covers that digest. A nil result means the pass neither
-// reads nor records points.
-func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefix string, reparsed []string, digest string) *applyResume {
+// meanwhile. digest computes the ledger digest over the file nodes the pass
+// lists its files from (digestLedger), only once the pass can read and
+// record points; revalidate checks a resume against the ledger again before
+// the apply. A nil result means the pass neither reads nor records points.
+func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefix string, digest func() string) *applyResume {
 	scope, ok := semantic.EnrichResumeFrom(ctx)
 	if !ok {
 		return nil
@@ -129,6 +109,7 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 	if !ok {
 		return nil
 	}
+	current := digest()
 	r := &applyResume{
 		store: store,
 		point: graph.EnrichmentResumePoint{
@@ -136,11 +117,11 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 			Provider:   p.Name(),
 			IndexedSHA: scope.SHA,
 			Version:    p.resumeVersion,
-			// Every point this pass records covers the current ledger: a
-			// pass from the first page reaches every ledger file after its
-			// re-parse, and a resumed pass re-applies them before its first
-			// forward page commits.
-			LedgerDigest: digest,
+			// Every point this pass records covers the ledger it started
+			// with: a pass from the first page applies every ledger file
+			// after its re-parse, and a resumed pass continues one that
+			// started over the same ledger.
+			LedgerDigest: current,
 		},
 		record: scope.Record && p.resumeVersion != "",
 		logger: p.logger,
@@ -154,7 +135,7 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 	if !found {
 		return r
 	}
-	if why := resumeRefusal(err, scope, prior, r.point.Version); why != "" {
+	if why := resumeRefusal(err, scope, prior, r.point.Version, current); why != "" {
 		if err == nil {
 			// Say why: a point recorded by another build or revision is
 			// discarded by design, but silently it reads as a resume that
@@ -166,22 +147,12 @@ func (p *Provider) openApplyResume(ctx context.Context, g graph.Store, repoPrefi
 				zap.String("recorded_version", prior.Version), zap.String("version", r.point.Version))
 		}
 	} else {
-		reapply := len(reparsed) > 0 && prior.LedgerDigest != digest
-		if !reapply || p.spec.ImportHintsAuthoritative {
-			r.point.Phase, r.point.After, r.point.Covered = prior.Phase, prior.After, prior.Covered
-			r.resumed = true
-			if reapply {
-				r.reparsed = reparsed
-			}
-			r.logger.Info("tstypes: apply resuming after committed pages",
-				zap.String("provider", p.Name()), zap.String("repo_prefix", repoPrefix),
-				zap.Int("phase", prior.Phase), zap.String("after", prior.After),
-				zap.Int("reparsed_files", len(r.reparsed)))
-			return r
-		}
-		r.logger.Info("tstypes: re-parsed files changed and this engine's import hints do not name all their dependents; applying from the first page",
+		r.point.Phase, r.point.After, r.point.Covered = prior.Phase, prior.After, prior.Covered
+		r.resumed = true
+		r.logger.Info("tstypes: apply resuming after committed pages",
 			zap.String("provider", p.Name()), zap.String("repo_prefix", repoPrefix),
-			zap.Int("reparsed_files", len(reparsed)))
+			zap.Int("phase", prior.Phase), zap.String("after", prior.After))
+		return r
 	}
 	if err := store.ClearEnrichmentResume(repoPrefix, p.Name()); err != nil {
 		// A stale point this pass cannot remove must not outlive it either:
@@ -200,7 +171,7 @@ const resumeRefusedMsg = "tstypes: resume point not honoured; applying from the 
 
 // resumeRefusal names why a stored point cannot be resumed, or returns ""
 // when it can. Every refusal discards the point.
-func resumeRefusal(err error, scope semantic.EnrichResumeScope, prior graph.EnrichmentResumePoint, version string) string {
+func resumeRefusal(err error, scope semantic.EnrichResumeScope, prior graph.EnrichmentResumePoint, version, digest string) string {
 	switch {
 	case err != nil:
 		return "read failed"
@@ -214,6 +185,8 @@ func resumeRefusal(err error, scope semantic.EnrichResumeScope, prior graph.Enri
 		return "recorded by another build"
 	case !resumablePhase(prior.Phase):
 		return "recorded in a phase that is not resumable"
+	case prior.LedgerDigest != digest:
+		return "a file was re-parsed, added or removed since it was recorded"
 	}
 	return ""
 }
@@ -228,39 +201,38 @@ func resumablePhase(phase int) bool {
 	return false
 }
 
-func (r *applyResume) reapplying() bool { return r != nil && r.resumed && len(r.reparsed) > 0 }
-
-// restart turns a resumed pass back into one from the first page and
-// discards the point it resumed, which no longer describes this pass.
-func (r *applyResume) restart() {
-	if r == nil || !r.resumed {
-		return
-	}
-	r.resumed, r.reparsed, r.uncommitted = false, nil, false
-	r.point.Phase, r.point.After, r.point.Covered = 0, "", 0
-	if err := r.store.ClearEnrichmentResume(r.point.RepoPrefix, r.point.Provider); err != nil {
-		r.record = false
-		r.logger.Warn("tstypes: discard resume point failed",
-			zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix), zap.Error(err))
-	}
-}
-
-func (r *applyResume) reapplyFiles() []string { return r.reparsed }
-
-// beginReapply marks the start of the re-apply, before the importers are
-// looked up: a cut from here until the first forward commit would repeat
-// the same work on every later pass, so it discards the point instead.
-func (r *applyResume) beginReapply() {
-	if r.reapplying() {
-		r.uncommitted = true
-	}
-}
-
 func (r *applyResume) start() (stagedFactPhase, string, int, bool) {
 	if r == nil || !r.resumed {
 		return stagedSupers, "", 0, false
 	}
 	return stagedFactPhase(r.point.Phase), r.point.After, r.point.Covered, true
+}
+
+// revalidate drops the resume when current, the ledger digest now, differs
+// from the one it was decided over. The decision is made before the pass
+// stages its facts, and a covered file re-parsed meanwhile lost facts the
+// pages behind the point applied. Callers invoke it right before the apply
+// skips those pages. Re-parses do not take the resolve mutex the apply
+// holds, so a file can still be re-parsed after this check, during the
+// apply. That is safe because every point the pass records keeps the digest
+// it started with while the re-parse moves the file's epoch, so the next
+// pass refuses those points, and the indexer discharges the ledger after a
+// completed pass only when no change was queued during it
+// (clearPendingEnrich's generation check).
+//
+// A refused resume keeps the digest the pass opened with, so the next pass
+// refuses every point this one records: its staged facts may predate the
+// re-parse. Recording current instead would be unsound.
+func (r *applyResume) revalidate(current func() string) {
+	if r == nil || !r.resumed || current() == r.point.LedgerDigest {
+		return
+	}
+	r.logger.Info(resumeRefusedMsg,
+		zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix),
+		zap.String("reason", "a file was re-parsed while the pass staged"),
+		zap.Int("phase", r.point.Phase), zap.String("after", r.point.After))
+	r.point.Phase, r.point.After, r.point.Covered = int(stagedSupers), "", 0
+	r.resumed = false
 }
 
 // commit records that every page of phase up to and including after is in
@@ -276,31 +248,6 @@ func (r *applyResume) commit(phase stagedFactPhase, after string, covered int) {
 		r.record = false
 		r.logger.Warn("tstypes: record resume point failed",
 			zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix), zap.Error(err))
-		return
-	}
-	r.uncommitted = false
-}
-
-// abandonUncommitted discards the point of a resumed pass that started
-// re-applying files and ends, cut or failed, before it records a forward
-// page.
-// Re-applied pages never move the cursor, so the stored point would keep the
-// old ledger digest and cursor, and every later pass would repeat the same
-// re-apply and be cut at the same place. The next pass applies from the
-// first page instead and records the new digest as it moves forward. Callers
-// defer it once the point is opened; it does nothing before the re-apply
-// starts, after a forward page commits, after restart, or after complete.
-func (r *applyResume) abandonUncommitted() {
-	if r == nil || !r.uncommitted {
-		return
-	}
-	r.uncommitted = false
-	r.logger.Info("tstypes: apply ended while re-applying re-parsed files, before it moved past its resume point; discarding the point so the next pass applies from the first page",
-		zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix),
-		zap.Int("reparsed_files", len(r.reparsed)))
-	if err := r.store.ClearEnrichmentResume(r.point.RepoPrefix, r.point.Provider); err != nil {
-		r.logger.Warn("tstypes: discard resume point failed",
-			zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix), zap.Error(err))
 	}
 }
 
@@ -309,48 +256,55 @@ func (r *applyResume) complete() {
 	if r == nil {
 		return
 	}
-	r.uncommitted = false
 	if err := r.store.ClearEnrichmentResume(r.point.RepoPrefix, r.point.Provider); err != nil {
 		r.logger.Warn("tstypes: clear resume point failed",
 			zap.String("provider", r.point.Provider), zap.String("repo_prefix", r.point.RepoPrefix), zap.Error(err))
 	}
 }
 
-// ledgerFiles lists the candidate files carrying the indexer's
-// re-parsed-without-enrichment marker, by graph path, and digests them with
-// their on-disk versions. The marker alone cannot tell a second re-parse of
-// a file from the first; the version can, since a re-parse that evicts a
-// file's enrichment follows a write to it. The digest is "" when no file is
-// marked.
-func ledgerFiles(files []fileRef) ([]string, string) {
+// ledgerDigest digests the repository's file nodes of the spec's languages
+// by graph path, with each file's re-parse epoch and, while it carries the
+// indexer's re-parsed-without-enrichment marker, its on-disk version. It
+// reads every such node, not only the files the pass analyzes: the C# and
+// Kotlin engines bind cross-file types by repo-unique name, and that lookup
+// counts vendored, over-cap and missing files' nodes too. The path set
+// moves when a file is added or removed. The epoch tells a second re-parse
+// of a file from the first, including one with no write to the file (the
+// importer of a deleted file) and a skip that replaced its facts with a
+// synthetic node, and is replaced rather than removed when the marker is
+// cleared. The on-disk version covers markers written before epochs were.
+// It is "" when there are no files.
+func ledgerDigest(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) string {
+	return digestLedger(repoFileNodes(g, spec, repoPrefix), repoRoot)
+}
+
+// digestLedger is ledgerDigest over nodes already read by repoFileNodes.
+func digestLedger(nodes []*graph.Node, repoRoot string) string {
 	type entry struct {
 		path, version string
 	}
 	var entries []entry
-	for _, ref := range files {
-		if ref.node == nil || ref.node.Meta == nil {
-			continue
-		}
-		if pending, _ := ref.node.Meta[graph.MetaReparsePendingEnrichment].(bool); pending {
-			version := "missing"
-			if info, err := os.Stat(ref.absPath); err == nil {
-				version = strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10)
+	for _, n := range nodes {
+		version, _ := n.Meta[graph.MetaReparseEpoch].(string)
+		if pending, _ := n.Meta[graph.MetaReparsePendingEnrichment].(bool); pending {
+			if info, err := os.Stat(fileAbsPath(n, repoRoot)); err == nil {
+				version += ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10)
+			} else {
+				version += ":missing"
 			}
-			entries = append(entries, entry{ref.node.FilePath, version})
 		}
+		entries = append(entries, entry{n.FilePath, version})
 	}
 	if len(entries) == 0 {
-		return nil, ""
+		return ""
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
-	paths := make([]string, len(entries))
 	h := sha256.New()
-	for i, e := range entries {
-		paths[i] = e.path
+	for _, e := range entries {
 		h.Write([]byte(e.path))
 		h.Write([]byte{0})
 		h.Write([]byte(e.version))
 		h.Write([]byte{'\n'})
 	}
-	return paths, hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
