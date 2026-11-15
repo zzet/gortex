@@ -185,6 +185,12 @@ func computePackRoot(result map[string]any) string {
 			}
 		}
 		h.Write([]byte{1})
+		// The capped list can stay identical while the full count grows,
+		// so the count is part of the pack's identity too.
+		if total, ok := br["covering_tests_total"].(int); ok {
+			h.Write([]byte(strconv.Itoa(total)))
+		}
+		h.Write([]byte{1})
 		if warning, ok := br["warning"].(string); ok {
 			h.Write([]byte(warning))
 		}
