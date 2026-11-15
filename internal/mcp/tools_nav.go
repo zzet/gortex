@@ -373,7 +373,13 @@ func (s *Server) navRead(ctx context.Context, req mcp.CallToolRequest, eng engin
 	// no editable line range; serve their source read-only instead of the
 	// "no line range" note.
 	if externalNode(node) {
-		src := externalDeclarationSource(node, 0)
+		src := externalDeclarationSource(ctx, node, 0)
+		// The root lookup waits on the request context; if the
+		// deadline fired there, surface it rather than answering a
+		// dead request.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		payload["external"] = true
 		payload["read_only"] = true
 		addExternalMetaFields(payload, node)

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"go/ast"
 	"go/build"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -59,32 +61,125 @@ func metaInt(n *graph.Node, key string) int {
 	return 0
 }
 
+// goRootTimeout bounds the go env GOROOT subprocess used when GOROOT is
+// unset. Discovery runs inside the first request that needs it, so a
+// slow or wedged toolchain must not hold that request open for good.
+const goRootTimeout = 10 * time.Second
+
+// goRootWaitDelay stops the wait even when the killed subprocess's
+// output pipes stay open, for example because a grandchild holds them.
+const goRootWaitDelay = 2 * time.Second
+
+// goRootOutputLimit caps the captured go env output: GOROOT is a single
+// path, so more than this is a wedged child, not a longer answer.
+const goRootOutputLimit = 64 << 10
+
+// goRootFlight is one discovery subprocess in flight. Waiters watch done
+// instead of their own contexts, so the outcome stays independent of
+// whichever request happened to trigger the discovery.
+type goRootFlight struct {
+	done chan struct{}
+	root string
+}
+
+var (
+	goRootMu     sync.Mutex
+	goRootCached string
+	goRootOK     bool
+	goRootActive *goRootFlight
+)
+
 // goRoot resolves the Go installation root the way the go command does:
 // $GOROOT when set, else the GOROOT of the `go` binary on PATH.
 // runtime.GOROOT is deprecated and answers the root the binary was built
 // in, which may be empty or point at a tree that does not exist on the
 // machine serving the source. An empty result means no Go root is known
 // and external reads degrade to the structured answer.
-var goRoot = sync.OnceValue(func() string {
+//
+// The discovery subprocess is bounded (deadline, output cap, wait delay)
+// and shared through a single flight. A caller whose context ends while
+// waiting returns without the root instead of blocking on the toolchain,
+// and only a discovered root is cached: a canceled or failed first
+// request must not poison the process-wide cache.
+func goRoot(ctx context.Context) string {
 	if root := os.Getenv("GOROOT"); root != "" {
 		return root
 	}
+	goRootMu.Lock()
+	if goRootOK {
+		root := goRootCached
+		goRootMu.Unlock()
+		return root
+	}
+	flight := goRootActive
+	if flight == nil {
+		flight = &goRootFlight{done: make(chan struct{})}
+		goRootActive = flight
+		go func() {
+			root := discoverGoRoot()
+			flight.root = root
+			close(flight.done)
+			goRootMu.Lock()
+			if root != "" {
+				goRootCached, goRootOK = root, true
+			}
+			goRootActive = nil
+			goRootMu.Unlock()
+		}()
+	}
+	goRootMu.Unlock()
+
+	select {
+	case <-flight.done:
+		return flight.root
+	case <-ctx.Done():
+		return ""
+	}
+}
+
+// discoverGoRoot runs one bounded `go env GOROOT`. The context kill is
+// the child cleanup: exec.CommandContext terminates the process at the
+// deadline, and WaitDelay keeps the wait itself bounded when pipes stay
+// open after the kill.
+func discoverGoRoot() string {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		return ""
 	}
-	out, err := exec.Command(goBin, "env", "GOROOT").Output()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), goRootTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBin, "env", "GOROOT")
+	cmd.WaitDelay = goRootWaitDelay
+	var out goRootOutput
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
-})
+	return strings.TrimSpace(out.buf.String())
+}
+
+// goRootOutput captures the subprocess output up to goRootOutputLimit
+// and drops the rest, reporting success so the child keeps draining
+// until the deadline kill instead of dying on a full pipe.
+type goRootOutput struct {
+	buf bytes.Buffer
+}
+
+func (w *goRootOutput) Write(p []byte) (int, error) {
+	if room := goRootOutputLimit - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		w.buf.Write(p)
+	}
+	return len(p), nil
+}
 
 // externalSourceRoots returns the only trees an external symbol's
 // recorded source_file may be served from: the Go standard library and
 // the module cache. A var so tests can point it at a fixture tree.
-var externalSourceRoots = func() []string {
-	roots := []string{goRoot()}
+var externalSourceRoots = func(ctx context.Context) []string {
+	roots := []string{goRoot(ctx)}
 	if mod := goModCacheRoot(); mod != "" {
 		roots = append(roots, mod)
 	}
@@ -117,12 +212,12 @@ func goModCacheRoot() string {
 // ancestor outside. Both sides resolve with the same resolver: ResolveRoot
 // keeps a Windows junction in the root's spelling, so a root configured
 // as a junction, or beneath one, would never contain a resolved candidate.
-func confineExternalSource(path string) bool {
+func confineExternalSource(ctx context.Context, path string) bool {
 	resolved, err := pathguard.EvalLinks(path)
 	if err != nil {
 		return false
 	}
-	for _, root := range externalSourceRoots() {
+	for _, root := range externalSourceRoots(ctx) {
 		if root == "" {
 			continue
 		}
@@ -153,13 +248,13 @@ type externalSourceResult struct {
 // declaration position to its read-only source. Only the start line was
 // stored at index time, so the extent comes from the AST: the declaration
 // covering source_line, including its doc comment.
-func externalDeclarationSource(node *graph.Node, contextLines int) externalSourceResult {
+func externalDeclarationSource(ctx context.Context, node *graph.Node, contextLines int) externalSourceResult {
 	sourceFile := metaString(node, "source_file")
 	sourceLine := metaInt(node, "source_line")
 	if sourceFile == "" || sourceLine <= 0 {
 		return externalSourceResult{reason: "no recorded source position"}
 	}
-	if !confineExternalSource(sourceFile) {
+	if !confineExternalSource(ctx, sourceFile) {
 		return externalSourceResult{reason: "source file outside the allowed roots"}
 	}
 	raw, err := os.ReadFile(sourceFile)
@@ -215,7 +310,12 @@ func addExternalMetaFields(out map[string]any, node *graph.Node) {
 // confined and read, otherwise a successful structured answer saying why
 // there is no source — never the "no line range" error.
 func (s *Server) externalSymbolSourceResult(ctx context.Context, req mcp.CallToolRequest, node *graph.Node) (*mcp.CallToolResult, error) {
-	src := externalDeclarationSource(node, req.GetInt("context_lines", 3))
+	src := externalDeclarationSource(ctx, node, req.GetInt("context_lines", 3))
+	// The root lookup waits on the request context; if the deadline fired
+	// there, surface it rather than answering a dead request.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	result := map[string]any{
 		"id":        node.ID,

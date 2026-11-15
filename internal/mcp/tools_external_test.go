@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"go/ast"
 	goparser "go/parser"
 	"go/token"
@@ -19,7 +20,7 @@ import (
 // fixture matches the real stdlib whatever Go version is installed.
 func syncMapLoadLine(t *testing.T) (string, int) {
 	t.Helper()
-	mapGo := filepath.Join(goRoot(), "src", "sync", "map.go")
+	mapGo := filepath.Join(goRoot(t.Context()), "src", "sync", "map.go")
 	require.FileExists(t, mapGo)
 	fset := token.NewFileSet()
 	file, err := goparser.ParseFile(fset, mapGo, nil, 0)
@@ -40,7 +41,7 @@ func syncMapLoadLine(t *testing.T) (string, int) {
 func confineToTestRoot(t *testing.T, root string) {
 	t.Helper()
 	orig := externalSourceRoots
-	externalSourceRoots = func() []string { return []string{root} }
+	externalSourceRoots = func(_ context.Context) []string { return []string{root} }
 	t.Cleanup(func() { externalSourceRoots = orig })
 }
 

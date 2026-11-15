@@ -1,6 +1,8 @@
 package goanalysis
 
 import (
+	"bytes"
+	"context"
 	"go/ast"
 	"go/build"
 	"go/token"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/tools/go/packages"
 
@@ -783,7 +786,7 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 // as-is; reads on that node degrade to the structured answer.
 func externalSourceFilePath(file, moduleKind string) string {
 	if rest, ok := strings.CutPrefix(file, "$GOROOT"); ok {
-		return filepath.Join(goRoot(), rest)
+		return filepath.Join(goRoot(context.Background()), rest)
 	}
 	if filepath.IsAbs(file) {
 		return file
@@ -800,33 +803,128 @@ func externalSourceFilePath(file, moduleKind string) string {
 	return file
 }
 
+// goRootTimeout bounds the go env GOROOT subprocess used when GOROOT is
+// unset. Discovery runs inside the first request that needs it, so a
+// slow or wedged toolchain must not hold that request open for good.
+const goRootTimeout = 10 * time.Second
+
+// goRootWaitDelay stops the wait even when the killed subprocess's
+// output pipes stay open, for example because a grandchild holds them.
+const goRootWaitDelay = 2 * time.Second
+
+// goRootOutputLimit caps the captured go env output: GOROOT is a single
+// path, so more than this is a wedged child, not a longer answer.
+const goRootOutputLimit = 64 << 10
+
+// goRootFlight is one discovery subprocess in flight. Waiters watch done
+// instead of their own contexts, so the outcome stays independent of
+// whichever request happened to trigger the discovery.
+type goRootFlight struct {
+	done chan struct{}
+	root string
+}
+
+var (
+	goRootMu     sync.Mutex
+	goRootCached string
+	goRootOK     bool
+	goRootActive *goRootFlight
+)
+
 // goRoot resolves the Go installation root the way the go command does:
 // $GOROOT when set, else the GOROOT of the `go` binary on PATH.
 // runtime.GOROOT is deprecated and answers the root the binary was built
 // in, which may be empty or point at a tree that does not exist on the
 // machine serving the source. An empty result means no Go root is known
 // and external reads degrade to the structured answer.
-var goRoot = sync.OnceValue(func() string {
+//
+// The discovery subprocess is bounded (deadline, output cap, wait delay)
+// and shared through a single flight. A caller whose context ends while
+// waiting returns without the root instead of blocking on the toolchain,
+// and only a discovered root is cached: a canceled or failed first
+// request must not poison the process-wide cache. Enrichment passes
+// context.Background because the pass holds no request deadline; the
+// subprocess bound is what keeps discovery finite there.
+func goRoot(ctx context.Context) string {
 	if root := os.Getenv("GOROOT"); root != "" {
 		return root
 	}
+	goRootMu.Lock()
+	if goRootOK {
+		root := goRootCached
+		goRootMu.Unlock()
+		return root
+	}
+	flight := goRootActive
+	if flight == nil {
+		flight = &goRootFlight{done: make(chan struct{})}
+		goRootActive = flight
+		go func() {
+			root := discoverGoRoot()
+			flight.root = root
+			close(flight.done)
+			goRootMu.Lock()
+			if root != "" {
+				goRootCached, goRootOK = root, true
+			}
+			goRootActive = nil
+			goRootMu.Unlock()
+		}()
+	}
+	goRootMu.Unlock()
+
+	select {
+	case <-flight.done:
+		return flight.root
+	case <-ctx.Done():
+		return ""
+	}
+}
+
+// discoverGoRoot runs one bounded `go env GOROOT`. The context kill is
+// the child cleanup: exec.CommandContext terminates the process at the
+// deadline, and WaitDelay keeps the wait itself bounded when pipes stay
+// open after the kill.
+func discoverGoRoot() string {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		return ""
 	}
-	out, err := exec.Command(goBin, "env", "GOROOT").Output()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), goRootTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBin, "env", "GOROOT")
+	cmd.WaitDelay = goRootWaitDelay
+	var out goRootOutput
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
-})
+	return strings.TrimSpace(out.buf.String())
+}
+
+// goRootOutput captures the subprocess output up to goRootOutputLimit
+// and drops the rest, reporting success so the child keeps draining
+// until the deadline kill instead of dying on a full pipe.
+type goRootOutput struct {
+	buf bytes.Buffer
+}
+
+func (w *goRootOutput) Write(p []byte) (int, error) {
+	if room := goRootOutputLimit - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		w.buf.Write(p)
+	}
+	return len(p), nil
+}
 
 // externalSourceRootCandidates lists the trees a relative declaration
 // name may live under, most likely first: GOROOT/src for stdlib symbols,
 // the module cache for dependencies.
 func externalSourceRootCandidates(moduleKind string) []string {
 	if moduleKind == "stdlib" {
-		if goroot := goRoot(); goroot != "" {
+		if goroot := goRoot(context.Background()); goroot != "" {
 			return []string{filepath.Join(goroot, "src")}
 		}
 		return nil

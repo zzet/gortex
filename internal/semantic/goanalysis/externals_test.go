@@ -126,7 +126,7 @@ func TestExternals_RecordsSourcePosition(t *testing.T) {
 	require.NotNil(t, println, "expected synthetic node for fmt.Println")
 	file, _ := println.Meta["source_file"].(string)
 	require.NotEmpty(t, file, "expected source_file recorded for ext::go:fmt::Println")
-	goroot := goRoot()
+	goroot := goRoot(t.Context())
 	assert.True(t, strings.HasPrefix(file, goroot),
 		"source_file %q should live under GOROOT %q", file, goroot)
 	require.FileExists(t, file)
@@ -147,7 +147,7 @@ func TestExternals_RecordsSourcePosition(t *testing.T) {
 // spelling, or a warm pass writes different metadata than a whole-module
 // load for the same node (a mixed-separator divergence on Windows).
 func TestExternals_SourceFilePathFormsAgree(t *testing.T) {
-	require.FileExists(t, filepath.Join(goRoot(), "src", "sync", "map.go"))
+	require.FileExists(t, filepath.Join(goRoot(t.Context()), "src", "sync", "map.go"))
 	assert.Equal(t,
 		externalSourceFilePath("sync/map.go", "stdlib"),
 		externalSourceFilePath("$GOROOT/src/sync/map.go", "stdlib"))
