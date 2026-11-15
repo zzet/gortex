@@ -193,7 +193,7 @@ func TestRetirementWaitsAtTheReclaimThreshold(t *testing.T) {
 
 	var episode retirementWALEpisode
 	started := time.Now()
-	s.awaitWALUnderCeiling(context.Background(), 7, &episode)
+	require.NoError(t, s.awaitWALUnderCeiling(context.Background(), 7, &episode), "an unmarked wait never stops the pass")
 	require.GreaterOrEqual(t, time.Since(started), 150*time.Millisecond, "the chunk did not wait")
 	require.Equal(t, int64(1), s.WALReclaimStats().RetirementWaits)
 	require.True(t, episode.active)
@@ -264,4 +264,70 @@ func TestARunningRetirementStopsAtTheMarkWithTheDaemonDefaults(t *testing.T) {
 	require.Positive(t, st.RetirementWaits, "the sweep never stopped at the mark")
 	require.Contains(t, logs.String(), "retirement waiting for the wal reclaim")
 	require.LessOrEqual(t, firstWaitAt, mark+2*perChunk+(1<<20), "the sweep ran past the mark by more than a chunk")
+}
+
+// A caller that holds what others wait for marks its retirement to yield: over
+// the mark its chunk waits only the short yield wait, then stops with the
+// resumable budget error. Under the mark it runs as before.
+func TestMarkedRetirementYieldsOverTheWALMarkInsteadOfWaiting(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	seedPayloadControlPlane(t, store)
+	generationID := publishedPayloadGeneration(t, store)
+	_, err := store.writerDB.Exec(`UPDATE view_generations SET state = ? WHERE generation_id = ?`, string(ViewGenerationRetiring), generationID)
+	require.NoError(t, err)
+	prevMax, prevYield := retirementWALWaitMax, retirementWALYieldWait
+	retirementWALWaitMax, retirementWALYieldWait = 5*time.Second, 50*time.Millisecond
+	t.Cleanup(func() { retirementWALWaitMax, retirementWALYieldWait = prevMax, prevYield })
+
+	chunks := 0
+	chunk := func(ctx context.Context, tx *sql.Tx) (int64, error) {
+		if chunks >= 2 {
+			return 0, nil
+		}
+		chunks++
+		_, err := tx.ExecContext(ctx, `UPDATE view_generations SET state = state WHERE generation_id = ?`, generationID)
+		return 1, err
+	}
+	marked := WithRetirementWALYield(context.Background())
+
+	store.walReclaim.update(func(st *WALReclaimStats) { st.CeilingBytes = 1 }) // always over
+	store.walReclaimNudged.Store(false)
+	started := time.Now()
+	err = store.deletePayloadChunks(marked, generationID, chunk, nil)
+	require.ErrorIs(t, err, ErrPayloadSweepBudgetExhausted)
+	require.Less(t, time.Since(started), time.Second, "the marked chunk waited the full retirement wait")
+	require.Zero(t, chunks, "a chunk ran over the mark")
+	require.Equal(t, int64(1), store.WALReclaimStats().RetirementWaitTimeouts)
+	require.True(t, store.walReclaimNudged.Load(), "the yield did not ask for the reclaim")
+
+	store.walReclaim.update(func(st *WALReclaimStats) { st.CeilingBytes = 0 }) // no mark
+	require.NoError(t, store.deletePayloadChunks(marked, generationID, chunk, nil))
+	require.Equal(t, 2, chunks)
+}
+
+// A full retirement stopped by the yield keeps its fence and finishes on the
+// next pass, as a budget stop does.
+func TestYieldedRetirementResumesOnTheNextPass(t *testing.T) {
+	t.Setenv("GORTEX_SQLITE_WAL_RECLAIM_MB", "0")
+	store := openPayloadStore(t)
+	seedPayloadBase(t, store)
+	seedPayloadControlPlane(t, store)
+	generationID := publishedPayloadGeneration(t, store)
+	prevYield := retirementWALYieldWait
+	retirementWALYieldWait = 10 * time.Millisecond
+	t.Cleanup(func() { retirementWALYieldWait = prevYield })
+
+	store.walReclaim.update(func(st *WALReclaimStats) { st.CeilingBytes = 1 })
+	err := store.RetirePayloadGeneration(WithRetirementWALYield(context.Background()), generationID, nil)
+	require.ErrorIs(t, err, ErrPayloadSweepBudgetExhausted)
+	state, found := generationState(t, store, generationID)
+	require.True(t, found)
+	require.Equal(t, ViewGenerationRetiring, state)
+
+	store.walReclaim.update(func(st *WALReclaimStats) { st.CeilingBytes = 0 })
+	require.NoError(t, store.RetirePayloadGeneration(context.Background(), generationID, nil))
+	_, found = generationState(t, store, generationID)
+	require.False(t, found)
 }

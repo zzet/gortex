@@ -130,7 +130,7 @@ const (
 	stagedCalls
 )
 
-func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, res *semantic.EnrichResult) error {
+func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPrefix string, spool *factSpool, resume *applyResume, res *semantic.EnrichResult) error {
 	if counter, ok := g.(graph.RepoLanguageSymbolCounter); ok {
 		res.SymbolsTotal = counter.CountRepoLanguageSymbols(repoPrefix, p.spec.Languages)
 	} else {
@@ -160,21 +160,31 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 	// flushes no edges, so an expiry during it yields a zero-edge partial —
 	// accepted because the walk is decode-free: a budget too small for it
 	// could not have completed any apply phase either.
-	after := ""
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+	//
+	// A resumed pass skips the walk: the count it would produce is the one
+	// the interrupted pass recorded with its point, and later phases hydrate
+	// the file groups they need on demand.
+	startPhase, startAfter, covered, resumed := resume.start()
+	if resumed {
+		res.SymbolsCovered = covered
+	} else {
+		after := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			page, last, err := spool.pageFiles(ctx, after)
+			if err != nil {
+				return err
+			}
+			if len(page) == 0 {
+				break
+			}
+			ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+			res.SymbolsCovered += ap.coverFiles(page)
+			after = last
 		}
-		page, last, err := spool.pageFiles(ctx, after)
-		if err != nil {
-			return err
-		}
-		if len(page) == 0 {
-			break
-		}
-		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
-		res.SymbolsCovered += ap.coverFiles(page)
-		after = last
+		resume.commit(stagedSupers, "", res.SymbolsCovered)
 	}
 
 	classForPhase := map[stagedFactPhase]factClass{
@@ -184,13 +194,23 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 		stagedCalls:   classCalls,
 	}
 	for phase := stagedSupers; phase <= stagedCalls; phase++ {
+		// A phase before the resume point was committed by an earlier pass
+		// at this revision; its edges and stamps are read back from the
+		// store. Aliases resolve into this pass's spool only, so that phase
+		// always runs before calls.
+		after := ""
+		switch {
+		case phase < startPhase && phase != stagedAliases:
+			continue
+		case phase == startPhase:
+			after = startAfter
+		}
 		// Adjacency is only valid within one phase: the supers phase
 		// synthesizes inheritance edges that later phases' frontier walks
 		// must observe. Nodes and name groups survive phase boundaries —
 		// apply never creates nodes, and the shared pointers carry every
 		// same-pass Meta stamp.
 		hot.flushAdjacency()
-		after := ""
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -225,6 +245,9 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 					err = ap.applyCallsPage(ctx, page, aliases, res)
 				}
 			}
+			if err == nil && p.pageFault != nil {
+				err = p.pageFault(stats)
+			}
 			if p.observePage != nil {
 				p.observePage(ap.pageStats(stats))
 			}
@@ -235,6 +258,11 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 				return err
 			}
 			after = last
+			// The page's writes have returned (metas flushed above), so
+			// the next pass may start after it.
+			if phase != stagedAliases {
+				resume.commit(phase, after, res.SymbolsCovered)
+			}
 		}
 	}
 	stats := hot.statsSnapshot()

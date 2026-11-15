@@ -225,6 +225,8 @@ func (s *Store) EvictRepoForShadowReplacement(ctx context.Context, repo string) 
 	for _, statement := range []string{
 		`DELETE FROM semantic_binding_types WHERE (view_gen, repo_prefix, file_path, line, name) IN (SELECT view_gen, repo_prefix, file_path, line, name FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ? LIMIT 256)`,
 		`DELETE FROM file_index_failures WHERE (view_gen, repo_prefix, file_path) IN (SELECT view_gen, repo_prefix, file_path FROM file_index_failures WHERE view_gen = ? AND repo_prefix = ? LIMIT 256)`,
+		// The indexer's resumeUntrusted latch (runDeferredEnrich) relies on this.
+		`DELETE FROM enrichment_resume WHERE (view_gen, repo_prefix, provider) IN (SELECT view_gen, repo_prefix, provider FROM enrichment_resume WHERE view_gen = ? AND repo_prefix = ? LIMIT 256)`,
 	} {
 		for {
 			n, err := s.shadowEvictStep(ctx, func(tx *sql.Tx) (int, *sqliteMutationReceiptAccumulator, error) {

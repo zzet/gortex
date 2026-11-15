@@ -389,6 +389,9 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		ctx = markRequestStoreBusy(ctx, fp)
 		bundle = requestLocalEditingContext(ctx, fp)
 	} else if bundleErr != nil {
+		if errors.Is(bundleErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+			return nil, errProjectedSourceMoved
+		}
 		return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
 	}
 
@@ -876,6 +879,7 @@ func (s *Server) handleGetSymbolSource(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError("id is required"), nil
 	}
+	ctx = context.WithValue(ctx, indexedSymbolSourceTargetKey{}, id)
 
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
 		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
@@ -2910,6 +2914,9 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 	reported := append(append([]renameEdit(nil), verified...), provisional...)
 	label := s.labelRelations(ctx, gaps, []string{id}, nil)
 	respond := func(payload map[string]any) (*mcp.CallToolResult, error) {
+		if isCompact(req) && dryRun {
+			return label.decorate(mcp.NewToolResultText(compactRenameConsumer(payload, reported, label))), nil
+		}
 		label.apply(payload)
 		res, err := s.respondJSONOrTOON(ctx, req, payload)
 		return label.decorate(res), err

@@ -26,12 +26,16 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 	var raw buildFlags
 	f := flag.NewFlagSet("load paired", flag.ContinueOnError)
 	bindRunFlags(f, &o)
+	f.BoolVar(&o.PairedOwnACKTransactions, "paired-own-ack-transactions", false, "opt-in matched edit/own-ACK/file/source transactions at 4 or 8 concurrent editor streams; rotate whole transactions")
 	f.Var(&raw, "build", "labeled binary, e.g. tag=/private/gortex (repeat 2–3 times; first is ratio baseline)")
 	if err := f.Parse(args); err != nil {
 		return o, nil, err
 	}
 	if o.PRSmokeDrain != 0 {
 		return o, nil, errors.New("offered-window/drain is standalone-only; coupled paired measurement is unchanged")
+	}
+	if o.EditConsumerProbes {
+		return o, nil, errors.New("consumer probes are standalone-only; coupled paired measurement is unchanged")
 	}
 	if f.NArg() != 0 || o.Binary != "" || o.GitSHA != "" {
 		return o, nil, errors.New("paired uses --build label=binary with embedded VCS revision; no positional --binary/--git-sha overrides")
@@ -65,7 +69,10 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		if len(builds) != 2 {
 			return o, nil, errors.New("paired edit-and-probe requires one baseline and one candidate")
 		}
-		if o.Editors != 1 || o.Agents != 0 {
+		if o.PairedOwnACKTransactions && (o.Editors != 4 && o.Editors != 8 || o.Agents != 0 || o.EditGateModes || o.SearchReadbackAcceptance) {
+			return o, nil, errors.New("paired own-ACK transactions require 4 or 8 editors, no readers, and plain file/source readbacks")
+		}
+		if !o.PairedOwnACKTransactions && (o.Editors != 1 || o.Agents != 0) {
 			return o, nil, errors.New("paired edit-and-probe is the one-editor, no-reader no-regression cell")
 		}
 		if o.EditProbeRole != "" {
@@ -73,6 +80,9 @@ func parsePaired(args []string) (runOptions, []buildSpec, error) {
 		}
 	default:
 		return o, nil, errors.New("paired supports workload scenarios; cold/restart/all use standalone runs")
+	}
+	if o.PairedOwnACKTransactions && o.Scenario != editProbeScenario {
+		return o, nil, errors.New("paired own-ACK transactions require edit-and-probe")
 	}
 	return o, builds, nil
 }
@@ -121,6 +131,9 @@ func pairedCommand(ctx context.Context, args []string) error {
 	}
 	defer coordinator.cancel()
 	report := pairedReport{SchemaVersion: 1, Kind: "coupled_" + o.Host + "_latency_not_independent_capacity", RunID: filepath.Base(root), BuildOrder: labels, Builds: make(map[string]Report)}
+	if o.PairedOwnACKTransactions {
+		report.MeasurementUnit = pairedOwnACKTransactionMethod
+	}
 	var mu sync.Mutex
 	var workers sync.WaitGroup
 	for i, build := range builds {
@@ -165,6 +178,9 @@ func pairedCommand(ctx context.Context, args []string) error {
 		report.Errors = append(report.Errors, groupErr.Error())
 	}
 	report.Ratios = matchedLatencyRatios(labels, report.Records)
+	if o.PairedOwnACKTransactions {
+		report.TransactionTimings = ownACKTransactionSummaries(labels, report.Records)
+	}
 	report.Complete = len(report.Errors) == 0 && len(report.Builds) == len(labels) && !report.Window.Started.IsZero()
 	for label, individual := range report.Builds {
 		if !individual.Complete {

@@ -12,10 +12,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
-	"github.com/zzet/gortex/internal/query"
 )
 
 type mutationTestWatcher struct {
@@ -333,24 +331,22 @@ func TestAtomicBatchSerializesConcurrentFileEdits(t *testing.T) {
 }
 
 func TestAtomicBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "shifted.go")
+	t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
 	content := "package sample\n\nfunc target() {\n\tprintln(\"old\")\n}\n\nfunc other() {}\n"
+	// Index a real previous snapshot, then remove its leading blank lines
+	// without publishing the edit. The current declaration is still present
+	// but no longer at the graph's recorded span.
+	s, root := setupMoveInlineRepo(t, map[string]string{"shifted.go": "\n\n\n\n" + content})
+	s.SetWatcher(mutationTestWatcher{})
+	path := filepath.Join(root, "shifted.go")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	g := graph.New()
-	node := &graph.Node{
-		ID:        "sample::target",
-		Name:      "target",
-		Kind:      graph.KindFunction,
-		FilePath:  path,
-		StartLine: 7,
-		EndLine:   7,
+	node := s.engine.GetSymbol("shifted.go::target")
+	if node == nil || node.StartLine != 7 {
+		t.Fatalf("indexed original target must retain its actual old span: %+v", node)
 	}
-	g.AddNode(node)
-	s := newAtomicBatchTestServer(t, mutationTestWatcher{})
-	s.engine, s.graph = query.NewEngine(g), g
+	indexedStart, indexedEnd := node.StartLine, node.EndLine
 	receipt, runErr := s.runBatchTransaction(context.Background(), []batchEditItem{{
 		Op:        "edit_symbol",
 		SymbolID:  node.ID,
@@ -371,6 +367,9 @@ func TestAtomicBatchSymbolEditFallsBackAfterPendingLineShift(t *testing.T) {
 	want := "package sample\n\nfunc target() {\n\tprintln(\"new\")\n}\n\nfunc other() {}\n"
 	if string(got) != want {
 		t.Fatalf("stale-range fallback result:\n%s\nwant:\n%s", got, want)
+	}
+	if node.StartLine != indexedStart || node.EndLine != indexedEnd {
+		t.Fatal("batch location must not rewrite the shared graph node's indexed span")
 	}
 }
 

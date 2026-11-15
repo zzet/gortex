@@ -43,5 +43,6 @@ func editProbeCanonicalTool(operation string) string {
 	return map[string]string{
 		"read.file": "read_file", "read.source": "get_symbol_source", "read.summary": "get_file_summary", "read.editing_context": "get_editing_context",
 		"search.symbols": "search_symbols", "search.text": "search_text", "relations.callers": "get_callers", "trace.call_chain": "get_call_chain",
+		"refactor.rename": "rename_symbol", "change.verify": "verify_change", "change.detect": "detect_changes", "analyze.dead_code": "analyze",
 	}[operation]
 }

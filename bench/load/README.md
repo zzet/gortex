@@ -253,6 +253,34 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+`--edit-consumer-probes` adds opt-in dry-run rename, signature verification,
+dead-code and unstaged-change probes. It requires one primary Go
+`add_intrafile_call` / `edit.file` fixture with an unexported callee and an
+explicit `proposed_signature` of `func <callee>(probe int) int`. Before any
+edit, an actual complete JSON dead-code response must contain that callee;
+exported targets, missing membership, pending baselines and truncated results
+are refused. The fixture and reference population are never substituted.
+Rename always uses `dry_run:true` and the new caller's actual/provisional site;
+verification checks a typed caller mismatch for the deliberately incompatible
+signature, and detection checks the actual changed file and symbol.
+
+The report retains `consumer_baseline` with its raw evidence and per-edit
+`relation_consumers` observations. Their post-ACK attempted/assessed/pending,
+error and missing counts are separate from the seven first-correct gates.
+A pending answer is not completion, and an empty dead-code list proves a
+membership transition only after the actual pre-edit membership witness.
+Unobserved, failed or unsupported silent-stale counts stay unavailable rather
+than zero. Per-line rename rows that cannot identify the requested caller stay
+unassessed with unavailable stale counts and incomplete coverage. Missing or
+incorrect consumer observations fail the opt-in phase;
+they do not alter the default ACK/accounting predicates. Calls keep the
+original per-edit deadline and artifact limits. Compact consumers use versioned, tab-separated records with quoted strings,
+actual row counts and bounded pending-file witnesses. Dry-run rename, verify,
+dead-code and detect dispatch their real compact producers; rich JSON fallback,
+unknown/omitted/capped rows and malformed scope evidence grant no coverage. No
+idle freshness field is invented, and pending is never completion. This option
+alone establishes no 1/8/32-agent runtime or all-mode acceptance.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
@@ -276,7 +304,8 @@ drop another editor's marker until the next write restored it; it is refused
 with more than one editor. An out-of-order `edit.batch` fails its `old_string`
 precondition and stays a failed record, and `edit.file` anchor insertions do
 not depend on order. The 1-edit diagnostic and
-the paired no-regression cell stay one editor.
+the default paired no-regression cell stay one editor. The explicit paired
+own-ACK transaction method below admits four or eight editor streams.
 
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest
@@ -544,6 +573,17 @@ upgrade; the source is only read. `--restarts N` adds N warm restarts. Each
 boot lasts until every configured repository is ready and enriched, plus
 `--duration`.
 
+Linked worktrees are populated by default. The startup-only
+`--startup-no-checkout` option uses real `git worktree add --detach
+--no-checkout` worktrees: their Git metadata and pinned HEAD exist, but their
+tracked files are absent. Probes still run from the linked cwd; its Read hook
+keeps the genuinely absent linked target. The `startup_probe` receipt
+records `no_checkout: true` and `linked_hook_file_scope:
+"absent_tracked_path_no_indexed_file_coverage"`. Raw hook decisions and
+counters remain observations of that absent path and do not prove the
+indexed-file hook criterion. This option does not create a coordinator
+transition cohort or establish the 24-checkout liveness criterion.
+
 Every second, from the primary, the first linked worktree, and a directory
 whose `.gortex.yaml` names a workspace that a private `servers.toml` roster
 claims, the probe opens fresh sessions: `initialize` (the instructions
@@ -752,6 +792,26 @@ deadline or a successful pair. This initial cell does not establish reference
 capacity, the larger tool/language/native matrix, or a no-regression verdict
 without the actual qualified paired run.
 
+For the approved four/eight-editor own-ACK comparison, opt in with
+`--paired-own-ack-transactions --edit-agents 4` (or `8`) on that same two-build
+`edit-and-probe` command. It requires the plain `edit.file` / `add_intrafile_call`
+plan, zero readers, and the existing file-then-source readbacks. The first build
+finishes edit → its own ACK → immediate file read → source read before the
+partner receives that logical edit. Build order rotates at this whole
+transaction boundary. Other editor streams and the existing seven oracle
+probes remain concurrent; receipt/status controls remain build-local.
+
+The report and workload identify `edit_own_ack_file_source_v1`. Original ACK
+records remain separate. Transaction records retain ACK and individual RPC
+timestamps/latencies, own-ACK-to-file dispatch delay, and whole-transaction
+latency. Additional file/source pairs use their transaction's identity and build
+order. Logical ACK/read latencies include supported retries and backoff; final
+attempt timings remain separate. The dispatch gap uses the first actual file
+wire write, including when that attempt is busy. Every error, refusal, deadline and phase censor remains visible with
+explicit matched exclusions. A transaction population containing failed or
+censored entries has no success-only aggregate p95. This opt-in changes neither
+deadlines nor correctness, retries, no-regression limits or capacity claims.
+
 `delta` rejects incompatible workload/corpus/target/host-limit identities rather
 than printing an unqualified verdict. It lists every comparable timing metric
 more than 15% slower, without introducing budgets or CI pass/fail lanes.
@@ -816,6 +876,27 @@ Inspect a profile with
 `go tool pprof -sample_index=inuse_space -top worktrees.step3.heap-load-peak.pprof`,
 and what one more worktree retains with
 `go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.
+
+`--worktree-churn N` (worktrees scenario, without `--worktree-steps`) measures
+what removed linked worktrees leave behind. The readers (and editors) work the
+primary throughout, two sessions stay parked on it and one more repeats a
+dead-code analysis. Over that load the run links N worktrees one at a time,
+keeping at most `--worktrees` alive: when that many are live, the oldest is
+closed and removed first. Each new one is detached at one of four commits of
+the corpus history (the pinned commit and its 8th, 16th and 24th
+first-parent ancestors) and gets a session and `--churn-edits` edits.
+`--churn-advance K` commits a one-line change on the primary every K
+cycles, so the committed base moves under live worktrees (it requires
+`--edit-agents 0`, since an editor's edit races the commit). `--churn-pin-wal` holds one read transaction on the store
+from the first cycle to the live census, standing in for a long reader that
+keeps the WAL from resetting. After the last cycle the run takes a status
+receipt (`gate.live_status.0`) and a read-only store census (`live_census_*`:
+file and freelist bytes, node rows per node id, generations and their stored
+bytes by state and kind, linked checkouts by state and those whose directory
+is gone), removes every worktree, idles for `--churn-idle` and repeats the
+census (`census_*`). The retirement and build-lane counters of the first and
+last status receipts are reported as deltas (`counter.*`).
+`--reconcile-interval` passes `GORTEX_RECONCILE_INTERVAL` to the owned daemon.
 
 ### Live checkout discovery containment
 

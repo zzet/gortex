@@ -316,6 +316,54 @@ func wire(s *grpc.Server, impl interface{}) {
 	}
 }
 
+func TestGRPCExtractor_TSClientsRequireGRPCEvidence(t *testing.T) {
+	extractor := &GRPCExtractor{}
+	for _, tc := range []struct {
+		name, imports string
+		want          bool
+	}{
+		{"LSP", `import { LanguageClient } from "vscode-languageclient";`, false},
+		{"WebSocket", `import { PreviewClient } from "./preview";`, false},
+		{"comment", `// import { credentials } from "@grpc/grpc-js";`, false},
+		{"line comment", `// example; import "@grpc/grpc-js";`, false},
+		{"block comment", "/*\nimport \"@grpc/grpc-js\";\n*/", false},
+		{"template literal", "const sample = `\nimport \"@grpc/grpc-js\";\n`;", false},
+		{"dynamic", `const { PreviewClient } = await import("./preview_pb.js");`, true},
+		{"dynamic comment", `const { PreviewClient } = await import(/* chunk */ "./preview_pb.js");`, true},
+		{"require comment", `const { PreviewClient } = require(/* note */ "./preview_pb.cjs");`, true},
+		{"require later argument", `const other = require(resolvePath, "./preview_pb.cjs");`, false},
+		{"import equals", `import grpc = require("@grpc/grpc-js");`, true},
+		{"package prefix", `import "grpc-websocket";`, false},
+		{"grpc-js", `import { credentials } from "@grpc/grpc-js";`, true},
+		{"proto loader", `import * as protoLoader from "@grpc/proto-loader";`, true},
+		{"Connect", `import { createClient } from "@connectrpc/connect";`, true},
+		{"grpc-web", `import "grpc-web";`, true},
+		{"grpc-web generated client", `import { PreviewClient } from "./PreviewServiceClientPb";`, true},
+		{"grpc-web generated client js extension", `import { PreviewClient } from "./generated/PreviewServiceClientPb.js";`, true},
+		{"legacy grpc runtime", `import * as grpc from "grpc"; import { PreviewClient } from "./preview.client";`, true},
+		{"protobuf-ts grpc transport", `import { GrpcTransport } from "@protobuf-ts/grpc-transport"; import { PreviewClient } from "./preview.client";`, true},
+		{"protobuf-ts grpc-web transport", `import { GrpcWebFetchTransport } from "@protobuf-ts/grpcweb-transport"; import { PreviewClient } from "./preview.client";`, true},
+		{"protobuf-ts runtime only", `import "@protobuf-ts/runtime"; import { PreviewClient } from "./preview.client";`, false},
+		{"grpc package name lookalike", `import "grpc-client"; import { PreviewClient } from "./preview.client";`, false},
+		{"generated name in a comment", `// import { PreviewClient } from "./PreviewServiceClientPb";`, false},
+		{"generated", `import { PreviewClient } from "./preview_grpc_pb.js";`, true},
+		{"require", `const { PreviewClient } = require("./preview_pb.cjs");`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte(tc.imports + "\nconst preview = new PreviewClient(open);\npreview.start();\nnew HubClient();\n")
+			got := extractor.Extract("editor.ts", src, nil, nil)
+			if !tc.want {
+				if len(got) != 0 {
+					t.Fatalf("expected no gRPC contracts, got %+v", got)
+				}
+				return
+			}
+			findContract(t, got, "grpc::Preview::start", RoleConsumer)
+			findContract(t, got, "grpc::Hub", RoleConsumer)
+		})
+	}
+}
+
 func assertContract(t *testing.T, c Contract, id string, ctype ContractType, role Role) {
 	t.Helper()
 	if c.ID != id {

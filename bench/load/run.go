@@ -14,6 +14,7 @@ import (
 )
 
 type runOptions struct {
+	PairedOwnACKTransactions bool
 	RetainReadSourceFailures bool
 	NightlySeed              string
 	EditACKMode              string
@@ -46,12 +47,14 @@ type runOptions struct {
 	EditCount                int
 	SearchReadbackAcceptance bool
 	EditGateModes            bool
+	EditConsumerProbes       bool
 	EditGateSeed             string
 	EditRepos                int
 	EditProbeRole            string
 	editProbeBaseline        bool
 	Discovery                discoveryOptions
 	Startup                  startupOptions
+	Churn                    churnOptions
 	pairedDriver             func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 	smokeState               *privateRun // only the fixed smoke entry lends its freshly owned store
 	smokeMarkers             []string
@@ -63,6 +66,7 @@ func parseRun(args []string) (runOptions, error) {
 	bindRunFlags(f, &o)
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
+	bindChurnFlags(f, &o.Churn)
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
@@ -73,7 +77,7 @@ func parseRun(args []string) (runOptions, error) {
 		return o, errors.New("--edit-repos must be positive")
 	}
 	o.editProbeBaseline = o.EditProbeRole == "baseline"
-	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o))
+	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o), o.Churn.validate(o.Scenario, o.Worktrees, o.Editors, o.WorktreeSteps))
 }
 
 func bindRunFlags(f *flag.FlagSet, o *runOptions) {
@@ -107,6 +111,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.IntVar(&o.EditCount, "edit-count", 100, "edit-and-probe: 100 logical edits, or explicit 1-edit diagnostic")
 	f.BoolVar(&o.SearchReadbackAcceptance, "search-readback-acceptance", false, "explicit search acceptance: 1000 immediate same-session search witnesses at 1, 4 or 8 editors")
 	f.BoolVar(&o.EditGateModes, "edit-gate-modes", false, "edit-and-probe gate: rotate five probe surfaces over 100 total edits; JSON ACKs remain unchanged")
+	f.BoolVar(&o.EditConsumerProbes, "edit-consumer-probes", false, "opt-in typed rename/verify/dead-code/detect observations; requires an admitted unexported Go callee and actual dead-code baseline")
 	f.StringVar(&o.NightlySeed, "nightly-workload-seed", "", "opt-in measured one-second search delay: search-delay-v1 (edit4), search-delay-read16-v1 (read16)")
 	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
@@ -122,6 +127,9 @@ func (o runOptions) editACKPolicy() string {
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditConsumerProbes && (o.Scenario != editProbeScenario || o.Worktrees != 0 || o.EditRepos != 1 || o.SearchReadbackAcceptance) {
+		return errors.New("--edit-consumer-probes requires one primary edit-and-probe fixture without linked worktrees or search-readback acceptance")
+	}
 	if err := validateNightlyWorkloadSeed(o); err != nil {
 		return err
 	}
@@ -351,6 +359,9 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	report.NightlySeed = o.NightlySeed
+	if o.PairedOwnACKTransactions {
+		report.Workload.PairedMeasurementUnit = pairedOwnACKTransactionMethod
+	}
 	report.Workload.EditGateSeed = o.EditGateSeed
 	report.Workload.EditACKMode = o.editACKPolicy()
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees

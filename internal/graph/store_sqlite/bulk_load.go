@@ -161,6 +161,7 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 const (
 	nodesByGenerationIndexName = "nodes_by_generation"
 	edgesByGenerationIndexName = "edges_by_generation"
+	edgesByKindIndexName       = "edges_by_kind"
 
 	nodesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS nodes_by_generation ON nodes(view_gen, id)`
 	edgesByGenerationIndexDDL = `CREATE INDEX IF NOT EXISTS edges_by_generation ON edges(view_gen, id)`
