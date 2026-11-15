@@ -1,7 +1,9 @@
 package store_sqlite
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"iter"
 	"slices"
 	"strconv"
@@ -246,6 +248,15 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		fileIndexed := len(filePaths) > 0 && s.scopedEdgeFileProvenanceCanonical(
 			repoPrefixes, filePaths, kindValues, maxID,
 		)
+		if len(filePaths) == 0 {
+			edgeIndex, adaptive := s.scopedEdgeRepositoryWalkPlan(maxID)
+			for _, kind := range kindValues {
+				if !s.streamScopedRepositoryEdges(repoPrefixes, kind, maxID, edgeIndex, adaptive, yield) {
+					return
+				}
+			}
+			return
+		}
 		for _, kind := range kindValues {
 			var query string
 			var args []any
@@ -253,16 +264,12 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 			if fileIndexed {
 				query, args, ok = scopedEdgeProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
 			} else {
-				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen)
+				query, args, ok = scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, s.viewGen, "")
 			}
 			if !ok {
 				return
 			}
-			if len(filePaths) > 0 {
-				if !s.streamScopedFileEdges(query, args, maxID, yield) {
-					return
-				}
-			} else if !s.streamScopedEdges(query, args, maxID, yield) {
+			if !s.streamScopedFileEdges(query, args, maxID, yield) {
 				return
 			}
 		}
@@ -362,9 +369,14 @@ func scopedEdgeIDPageQuery(count int) string {
 // endpoints per page. It reports false when the consumer stopped the sequence,
 // true when the cursor is exhausted.
 func (s *Store) streamScopedEdges(query string, args []any, maxID int64, yield func(graph.ScopedEdgeRow) bool) bool {
-	lastID := int64(0)
-	for lastID < maxID {
-		pageArgs := append(append([]any(nil), args...), lastID, maxID, scopedProjectionPage)
+	return s.streamScopedEdgeRange(query, args, 0, maxID, yield)
+}
+
+// streamScopedEdgeRange is streamScopedEdges over the ids in (after, end].
+func (s *Store) streamScopedEdgeRange(query string, args []any, after, end int64, yield func(graph.ScopedEdgeRow) bool) bool {
+	lastID := after
+	for lastID < end {
+		pageArgs := append(append([]any(nil), args...), lastID, end, scopedProjectionPage)
 		rows, err := s.db.Query(query, pageArgs...)
 		if err != nil {
 			panicOnFatal(err)
@@ -537,7 +549,7 @@ func scopedEdgeProjectionQuery(
 	}
 	filesJSON, haveFiles := projectionJSON(filePaths)
 	if !haveFiles {
-		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen)
+		return scopedEdgeSourceProjectionQuery(repoPrefixes, filePaths, kind, viewGen, "")
 	}
 	reposJSON, haveRepos := projectionJSON(repoPrefixes)
 	ctes := []string{`requested_files(file_path) AS (SELECT CAST(value AS TEXT) FROM json_each(?))`}
@@ -561,14 +573,176 @@ func scopedEdgeProjectionQuery(
 	return query, args, true
 }
 
+// Index-only steps for scopedEdgeWalkSegment: the id OFFSET+1 entries past
+// the cursor, among one kind's edges in every generation or among one
+// generation's edges of every kind.
+const (
+	scopedEdgeKindStepSQL = `SELECT id FROM edges INDEXED BY edges_by_kind
+WHERE kind = ? AND id > ? AND id <= ? ORDER BY id LIMIT 1 OFFSET ?`
+	scopedEdgeGenerationStepSQL = `SELECT id FROM edges INDEXED BY edges_by_generation
+WHERE view_gen = ? AND id > ? AND id <= ? ORDER BY id LIMIT 1 OFFSET ?`
+	// Entries each index is probed for per segment: the first segment's
+	// count, doubled per segment up to the cap.
+	scopedEdgeWalkProbeFirstStep = 32
+	scopedEdgeWalkProbeMaxStep   = 1 << 14
+)
+
+// scopedEdgeNextGenerationSQL seeks the lowest edge id of the next
+// generation above the cursor.
+const (
+	scopedEdgeNextGenerationSQL = `SELECT view_gen, id FROM edges INDEXED BY edges_by_generation
+WHERE view_gen > ? ORDER BY view_gen, id LIMIT 1`
+	scopedEdgeWalkGenerationLimit = 64
+)
+
+// scopedEdgeRepositoryWalkPlan picks how a repository walk is driven: pinned
+// to edgeIndex for the whole walk ("" leaves the plan to SQLite), or, when
+// adaptive, pinned per segment by scopedEdgeWalkSegment.
+//
+// Left to the planner, the base walk goes through edges_by_generation, or for
+// a dense kind under full statistics through the rowid itself, and reads every
+// base edge past the cursor to find one kind. edges_by_kind reads only that
+// kind, already in keyset order, but it cannot narrow view_gen, so it also
+// reads the kind's edges in every other generation. When no other generation
+// has an edge in the id range, the kind's range is a subset of the base range
+// and edges_by_kind never reads more. Otherwise either index can be the far
+// cheaper one, and which one can change along the id range.
+//
+// Overlay generations keep the planner's choice. Either index can be missing
+// (edges_by_kind is bulk-droppable, edges_by_generation is optional) and
+// INDEXED BY a missing index fails the read, so a missing index is never
+// pinned.
+func (s *Store) scopedEdgeRepositoryWalkPlan(maxID int64) (edgeIndex string, adaptive bool) {
+	if s.viewGen != baseViewGeneration || !s.edgeKindIndexPresent() {
+		return "", false
+	}
+	if !s.edgeGenerationIndexPresent() {
+		return edgesByKindIndexName, false
+	}
+	// The census only picks a plan. On error the walk runs unpinned and
+	// reports its own failure.
+	inRange, err := s.scopedEdgeOtherGenerationAtOrBelow(maxID)
+	if err != nil {
+		return "", false
+	}
+	if !inRange {
+		return edgesByKindIndexName, false
+	}
+	return "", true
+}
+
+// streamScopedRepositoryEdges walks one kind's edges of the repository scope
+// in id order up to maxID, driven as scopedEdgeRepositoryWalkPlan chose. An
+// adaptive walk goes segment by segment, each pinned to the index that
+// covers it with fewer entries; the probes are bounded per segment, so the
+// first page never waits on a probe of the whole id range.
+func (s *Store) streamScopedRepositoryEdges(
+	repoPrefixes []string,
+	kind string,
+	maxID int64,
+	edgeIndex string,
+	adaptive bool,
+	yield func(graph.ScopedEdgeRow) bool,
+) bool {
+	if !adaptive {
+		query, args, ok := scopedEdgeSourceProjectionQuery(repoPrefixes, nil, kind, s.viewGen, edgeIndex)
+		return ok && s.streamScopedEdges(query, args, maxID, yield)
+	}
+	kindQuery, args, ok := scopedEdgeSourceProjectionQuery(repoPrefixes, nil, kind, s.viewGen, edgesByKindIndexName)
+	if !ok {
+		return false
+	}
+	genQuery, _, _ := scopedEdgeSourceProjectionQuery(repoPrefixes, nil, kind, s.viewGen, edgesByGenerationIndexName)
+	after, budget := int64(0), int64(scopedEdgeWalkProbeFirstStep)
+	for after < maxID {
+		index, end, err := s.scopedEdgeWalkSegment(kind, after, maxID, budget)
+		query := kindQuery
+		switch {
+		case err != nil:
+			// The probe only picks a plan. On error the rest of the walk runs
+			// unpinned and reports its own failure.
+			query, _, _ = scopedEdgeSourceProjectionQuery(repoPrefixes, nil, kind, s.viewGen, "")
+			end = maxID
+		case index == edgesByGenerationIndexName:
+			query = genQuery
+		}
+		if !s.streamScopedEdgeRange(query, args, after, end, yield) {
+			return false
+		}
+		after, budget = end, min(2*budget, scopedEdgeWalkProbeMaxStep)
+	}
+	return true
+}
+
+// scopedEdgeWalkSegment picks the index for the next segment of a walk past
+// after, and the segment's last id. Each index is probed, index-only, for
+// the id of its budget-th entry past the cursor. An index whose range ends
+// first covers the rest of the walk with fewer than budget entries and takes
+// it. Otherwise the index whose budget-th entry lies further along takes the
+// segment up to that entry: it reads budget entries there, and the other
+// index more. So each segment reads no more than the cheaper index would, and
+// the probes cost at most twice the segment's own entries.
+func (s *Store) scopedEdgeWalkSegment(kind string, after, maxID, budget int64) (string, int64, error) {
+	step := func(query string, key any) (int64, bool, error) {
+		var id int64
+		err := s.db.QueryRow(query, key, after, maxID, budget-1).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		return id, err == nil, err
+	}
+	kindEnd, kindMore, err := step(scopedEdgeKindStepSQL, kind)
+	if err != nil {
+		return "", 0, err
+	}
+	if !kindMore {
+		return edgesByKindIndexName, maxID, nil
+	}
+	baseEnd, baseMore, err := step(scopedEdgeGenerationStepSQL, s.viewGen)
+	if err != nil {
+		return "", 0, err
+	}
+	if !baseMore {
+		return edgesByGenerationIndexName, maxID, nil
+	}
+	if baseEnd > kindEnd {
+		return edgesByGenerationIndexName, baseEnd, nil
+	}
+	return edgesByKindIndexName, kindEnd, nil
+}
+
+// scopedEdgeOtherGenerationAtOrBelow reports whether a non-base generation
+// holds an edge with id <= maxID. It takes one index seek per generation;
+// past scopedEdgeWalkGenerationLimit generations it answers true.
+func (s *Store) scopedEdgeOtherGenerationAtOrBelow(maxID int64) (bool, error) {
+	after := baseViewGeneration
+	for range scopedEdgeWalkGenerationLimit {
+		var gen, id int64
+		err := s.db.QueryRow(scopedEdgeNextGenerationSQL, after).Scan(&gen, &id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if id <= maxID {
+			return true, nil
+		}
+		after = gen
+	}
+	return true, nil
+}
+
 // scopedEdgeSourceProjectionQuery preserves source-node ownership when edge
-// provenance is not canonical. Explicit loop order prevents SQLite from
-// satisfying ORDER BY through edges_by_kind and filtering the whole kind
-// range after the fact.
+// provenance is not canonical. With a file frontier, explicit loop order
+// prevents SQLite from satisfying ORDER BY through edges_by_kind and
+// filtering the whole kind range after the fact. A repository walk with no
+// frontier may be pinned to edgeIndex instead.
 func scopedEdgeSourceProjectionQuery(
 	repoPrefixes, filePaths []string,
 	kind string,
 	viewGen int64,
+	edgeIndex string,
 ) (string, []any, bool) {
 	if kind == "" {
 		return "", nil, false
@@ -582,10 +756,17 @@ func scopedEdgeSourceProjectionQuery(
 		// Preserve the linear id-keyset repository walk. Forcing repository
 		// nodes first would require a temp B-tree to restore e.id order on
 		// every page, recreating the quadratic plan this projection replaced.
+		//
+		// edgeIndex, when set, pins the edge index that drives the walk;
+		// streamScopedRepositoryEdges picks it.
+		edgeSource := "edges AS e"
+		if edgeIndex != "" {
+			edgeSource += " INDEXED BY " + edgeIndex
+		}
 		query := `WITH requested_repos(repo_prefix) AS (` +
 			`SELECT CAST(value AS TEXT) FROM json_each(?))` +
 			` SELECT e.id, ` + lookupQualifiedEdgeCols +
-			` FROM nodes AS n JOIN edges AS e ON e.from_id = n.id AND e.view_gen = n.view_gen` +
+			` FROM nodes AS n JOIN ` + edgeSource + ` ON e.from_id = n.id AND e.view_gen = n.view_gen` +
 			` JOIN requested_repos AS r ON r.repo_prefix = n.repo_prefix` +
 			` WHERE e.kind = ? AND e.view_gen = ? AND e.id > ? AND e.id <= ? ORDER BY e.id LIMIT ?`
 		return query, []any{reposJSON, kind, viewGen}, true
