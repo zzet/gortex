@@ -30,6 +30,7 @@ type sharedReceiptOffer struct {
 	agent, ordinal int
 	population     string
 	ticket         chan *indexer.MutationTicket
+	ticketObserved sync.Once
 	due            time.Time
 	started        time.Time
 	relationsAt    time.Time
@@ -51,7 +52,9 @@ type sharedReceiptWatcher struct{ *indexer.Watcher }
 func (w *sharedReceiptWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	ticket, err := w.Watcher.EnqueueToolMutation(ctx, path)
 	if offer, ok := ctx.Value(sharedReceiptOfferKey{}).(*sharedReceiptOffer); ok && ticket != nil {
-		offer.ticket <- ticket
+		// Read-built catch-up inherits the offer context too. Keep only its
+		// first native ticket; observation must never block later admissions.
+		offer.ticketObserved.Do(func() { offer.ticket <- ticket })
 	}
 	return ticket, err
 }
