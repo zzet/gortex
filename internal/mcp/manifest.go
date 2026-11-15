@@ -381,6 +381,11 @@ func (s *Server) manifestSiblingCount(ctx context.Context, n *graph.Node) int {
 // keeps the ring — and therefore the pack root — deterministic.
 const ringScanLimit = 64
 
+// blastRadiusTestLimit caps smart_context's covering_tests. A shared helper
+// can be covered by over a thousand tests, which made that one list more than
+// 90% of the response.
+const blastRadiusTestLimit = 20
+
 // manifestRing collects the distance-1 adjacency ring of the focus
 // set — direct callers and callees, skipping anything already placed.
 // The ring is returned sorted by node ID so the manifest, its token
