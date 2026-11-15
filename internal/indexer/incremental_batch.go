@@ -1158,6 +1158,12 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	}
 
 	idx.applyLap("structural_prepare")
+	// Before the first write below that removes facts.
+	receipts := make(map[string]fileReadVersion, len(stages))
+	for _, stage := range stages {
+		receipts[stage.mtimeKey] = stage.readVersion
+	}
+	idx.retractUnchangedMtimeReceipts(receipts)
 	if deferResolverCatchup && idx.resolver.EvidenceScoping() {
 		// Read before the eviction below: the prior bindings and their
 		// targets are part of what it deletes.
@@ -1187,6 +1193,13 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	// restubIncomingRefsFromView.
 	// A function re-derived unchanged keeps its clone rows (clone_carry.go).
 	carried = append(carried, idx.carryCloneRowsOfUnchangedBodies(stages, view, nodes)...)
+	// enrichAndMarkIncrementalStages clears the marker for files it
+	// enriches in place and leaves it on the rest.
+	for _, stage := range stages {
+		if idx.reparseLedgerApplies(stage.result) {
+			stampReparseLedger(stage.result.Nodes)
+		}
+	}
 	idx.graph.AddBatch(nodes, append(edges, carried...))
 	idx.restateUnchangedContracts(stages)
 	idx.applyLap("add_batch")
@@ -2052,6 +2065,9 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 		}
 	}
 	for graphPath, value := range pending {
+		if value {
+			continue // stamped in the structural fact write
+		}
 		if markerBatch == nil {
 			idx.setReparsePendingEnrichment(graphPath, value)
 			continue
