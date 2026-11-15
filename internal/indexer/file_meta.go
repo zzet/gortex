@@ -18,10 +18,12 @@ import (
 var errFileVersionChanged = errors.New("file changed while index mutation was in progress")
 
 type fileReadVersion struct {
-	info  os.FileInfo
-	mtime int64
-	size  int64
-	valid bool
+	relationsRead       *relationsReadFrontier
+	relationsGeneration uint64
+	info                os.FileInfo
+	mtime               int64
+	size                int64
+	valid               bool
 	// snapshot marks a version read from an immutable content source.
 	// There is no on-disk file to restat and no mtime to stamp: the bytes
 	// cannot change under the reader, so the version is valid by
@@ -195,8 +197,9 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 const reparsePendingEnrichmentBatchSize = 256
 
 type reparsePendingEnrichmentBatch struct {
-	publication *PublicationStamps // optional local canonical attempt; never a live record
-	readRepair  *ReadRepairObservation
+	publication   *PublicationStamps // optional local canonical attempt; never a live record
+	readRepair    *ReadRepairObservation
+	relationsRead *relationsReadFrontier
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
 	byFile                map[string]bool
@@ -207,6 +210,9 @@ type reparsePendingEnrichmentBatch struct {
 	// to the deferred resolver catch-up (resolver_scope.go).
 	deferredPriorDeclarations map[string]resolver.DeclarationSurface
 	deferredPriorPending      []*graph.Edge
+	// First structural observation is independent of declaration eligibility:
+	// a C# visibility change or an empty pending set must still mark the file.
+	deferredResolverFiles map[string]struct{}
 	// deferredPriorBindings are the forward leg's carried bindings
 	// (edit_delta_prior_bindings.go); dropped when the batch deletes files.
 	deferredPriorBindings map[string]resolver.PriorBinding

@@ -78,16 +78,20 @@ func (idx *Indexer) sourceRelPath(absPath string) (string, bool) {
 // answer. The version comes back marked snapshot: valid by construction,
 // carrying no os.FileInfo, and accepted by every restat check without a
 // syscall.
-func (idx *Indexer) readFileWithVersion(absPath string) ([]byte, fileReadVersion, error) {
+func (idx *Indexer) readFileWithVersion(absPath string, reads ...*relationsReadFrontier) ([]byte, fileReadVersion, error) {
 	src := idx.contentSource()
+	frontier := firstRelationsRead(reads)
 	if src == nil {
 		// A build that proves its reads records every one of them: the
 		// parse, and the re-reads of a file whose speculative parse went
 		// stale (takePreparedRefresh, the legacy fallback's indexFile).
+		generation := frontier.beforeRead(absPath)
 		data, version, err := readOSFileWithVersion(absPath)
+		version.relationsRead, version.relationsGeneration = frontier, generation
 		idx.contentProof.recordRead(absPath, data, err)
 		return data, version, err
 	}
+	frontier.invalidate(absPath) // Immutable source snapshots are not OS tool-write proof.
 	rel, ok := idx.sourceRelPath(absPath)
 	if !ok {
 		return nil, fileReadVersion{}, fmt.Errorf(
