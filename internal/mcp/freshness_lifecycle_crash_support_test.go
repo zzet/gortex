@@ -99,7 +99,7 @@ func freshnessLifecycleCall(t *testing.T, s *Server, ctx context.Context, id int
 	if res != nil {
 		raw, marshalErr := json.Marshal(res)
 		require.NoError(t, marshalErr)
-		if len(raw) > 64<<10 && !(t.Name() == "TestFreshnessLifecycleUnrelatedTwoEditsPerSecond" && id == 12) {
+		if len(raw) > 64<<10 && (t.Name() != "TestFreshnessLifecycleUnrelatedTwoEditsPerSecond" || id != 12) {
 			t.Logf("ACTUAL_REGISTERED_RESPONSE tool=%s id=%d bytes=%d diagnostic_capped=true prefix=%s", tool, id, len(raw), raw[:64<<10])
 		} else {
 			t.Logf("ACTUAL_REGISTERED_RESPONSE tool=%s id=%d body=%s", tool, id, raw)
