@@ -80,6 +80,192 @@ func injectHubAdjacency(s graph.Store, fan int) {
 	s.AddBatch(callers, edges)
 }
 
+const calleeSyntheticFile = "zz_hub/callees.syn"
+
+// injectOutgoingCalls gives every callable fan outgoing calls edges (with
+// meta) on its own first line, to synthetic callees no call fact names: the
+// shape of a large repository's frontier members, whose bodies make many
+// calls. Only a calls application reads them, and only for a caller in the
+// applying file; the frontier walk loads every member of every supertype.
+func injectOutgoingCalls(s graph.Store, fan int) {
+	if fan <= 0 {
+		return
+	}
+	var callables []*graph.Node
+	for _, n := range s.AllNodes() {
+		if (n.Kind == graph.KindMethod || n.Kind == graph.KindFunction) &&
+			n.FilePath != hubSyntheticFile && n.FilePath != calleeSyntheticFile {
+			callables = append(callables, n)
+		}
+	}
+	sort.Slice(callables, func(i, j int) bool { return callables[i].ID < callables[j].ID })
+	callees := make([]*graph.Node, fan)
+	for i := range callees {
+		callees[i] = &graph.Node{
+			ID: fmt.Sprintf("%s::callee%05d", calleeSyntheticFile, i), Name: fmt.Sprintf("callee%05d", i),
+			Kind: graph.KindFunction, FilePath: calleeSyntheticFile, Language: "synthetic",
+			StartLine: i + 1, EndLine: i + 1,
+		}
+	}
+	var edges []*graph.Edge
+	for _, from := range callables {
+		for _, callee := range callees {
+			edges = append(edges, &graph.Edge{From: from.ID, To: callee.ID, Kind: graph.EdgeCalls,
+				FilePath: from.FilePath, Line: from.StartLine, Confidence: 0.8, Origin: graph.OriginASTInferred,
+				Meta: map[string]any{"semantic_source": "hub-lsp", "resolution": "name", "receiver": "hub"}})
+		}
+	}
+	s.AddBatch(callees, edges)
+}
+
+// injectSiblingStubs doubles every unresolved calls / extends / implements
+// stub with a sibling of the other unresolved shape (`unresolved::*.M` and
+// `unresolved::M`) on the same source, line and kind, inserted after it. The
+// applier claims the FIRST claimable same-line stub whose trailing name
+// matches (upgradeExistingCall, applySuper), so which of the two it retargets
+// — and so the resulting graph — is decided by the within-kind list order: a
+// preload read that orders a kind differently from the unfiltered read (an
+// ORDER BY that drops or flips the insertion tiebreak) fails parity.
+func injectSiblingStubs(s graph.Store) {
+	type key struct {
+		from, to string
+		kind     graph.EdgeKind
+	}
+	existing := map[key]bool{}
+	var stubs []*graph.Edge
+	for _, e := range s.AllEdges() {
+		existing[key{e.From, e.To, e.Kind}] = true
+		switch e.Kind {
+		case graph.EdgeCalls, graph.EdgeExtends, graph.EdgeImplements:
+			if strings.HasPrefix(e.To, "unresolved::") {
+				stubs = append(stubs, e)
+			}
+		}
+	}
+	sort.Slice(stubs, func(i, j int) bool {
+		a, b := stubs[i], stubs[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		return a.To < b.To
+	})
+	var edges []*graph.Edge
+	for _, e := range stubs {
+		name := strings.TrimPrefix(e.To, "unresolved::")
+		sibling := "unresolved::*." + name
+		if rest, ok := strings.CutPrefix(name, "*."); ok {
+			sibling = "unresolved::" + rest
+		}
+		if existing[key{e.From, sibling, e.Kind}] {
+			continue
+		}
+		existing[key{e.From, sibling, e.Kind}] = true
+		meta := map[string]any{"sibling_stub": true}
+		for k, v := range e.Meta {
+			meta[k] = v
+		}
+		edges = append(edges, &graph.Edge{From: e.From, To: sibling, Kind: e.Kind, FilePath: e.FilePath,
+			Line: e.Line, Confidence: e.Confidence, Origin: e.Origin, Meta: meta})
+	}
+	s.AddBatch(nil, edges)
+}
+
+// adjacencyIdentity is the part of an edge the coherence check compares.
+type adjacencyIdentity struct {
+	From, To, Kind, FilePath, Origin string
+	Line                             int
+	Confidence                       float64
+}
+
+// byKindIdentities groups a list per kind, keeping order within each kind —
+// the order the kind-filtered reads promise to preserve.
+func byKindIdentities(edges []*graph.Edge, kinds []graph.EdgeKind) string {
+	groups := map[graph.EdgeKind][]*graph.Edge{}
+	for _, e := range edges {
+		if e != nil && (kinds == nil || edgeKindIn(e.Kind, kinds)) {
+			groups[e.Kind] = append(groups[e.Kind], e)
+		}
+	}
+	names := make([]string, 0, len(groups))
+	for kind := range groups {
+		names = append(names, string(kind))
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, kind := range names {
+		fmt.Fprintf(&b, "%s%v ", kind, adjacencyIdentities(groups[graph.EdgeKind(kind)]))
+	}
+	return b.String()
+}
+
+func adjacencyIdentities(edges []*graph.Edge) []adjacencyIdentity {
+	out := make([]adjacencyIdentity, 0, len(edges))
+	for _, e := range edges {
+		if e != nil {
+			out = append(out, adjacencyIdentity{e.From, e.To, string(e.Kind), e.FilePath, e.Origin, e.Line, e.Confidence})
+		}
+	}
+	return out
+}
+
+// adjacencyCoherence is a Provider.observePreload hook asserting that every
+// list a page's applier starts from — whether the pass hot cache served it or
+// the store did — holds, kind by kind and in order, exactly the edges the
+// store's UNFILTERED adjacency read returns right now. An earlier page that
+// mutated a list without dropping its cache entry (forgetOut / forgetIn)
+// leaves a stale or reordered snapshot that fails here, in either preload
+// mode; so does a kind-filtered read whose within-kind order departs from
+// the unfiltered one (on the incoming side no reader is order-sensitive, so
+// only this check sees it).
+type adjacencyCoherence struct {
+	mu       sync.Mutex
+	failures []string
+	pages    int
+}
+
+func (c *adjacencyCoherence) observe(ap *applier) {
+	compare := func(dir string, have map[string][]*graph.Edge, loaded map[string]bool, kinds []graph.EdgeKind, read func([]string) map[string][]*graph.Edge) {
+		ids := make([]string, 0, len(loaded))
+		for id := range loaded {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		fresh := read(ids)
+		for _, id := range ids {
+			got, want := byKindIdentities(have[id], nil), byKindIdentities(fresh[id], kinds)
+			if got != want {
+				c.mu.Lock()
+				if len(c.failures) < 5 {
+					c.failures = append(c.failures, fmt.Sprintf("page %d %s %s:\n  served %v\n  store  %v", c.pages, dir, id, got, want))
+				}
+				c.mu.Unlock()
+			}
+		}
+	}
+	c.mu.Lock()
+	c.pages++
+	c.mu.Unlock()
+	compare("out", ap.outByID, ap.outLoaded, ap.outKinds, ap.g.GetOutEdgesByNodeIDs)
+	compare("in", ap.inByID, ap.inLoaded, ap.inKinds, ap.g.GetInEdgesByNodeIDs)
+	compare("calls", ap.callsByID, ap.callsLoaded, adjacencyCallKinds, ap.g.GetOutEdgesByNodeIDs)
+}
+
+func (c *adjacencyCoherence) check(t testing.TB, label string) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.failures) > 0 {
+		t.Fatalf("%s: a page started from adjacency that differs from the store (stale hot-cache entry):\n%s",
+			label, strings.Join(c.failures, "\n"))
+	}
+}
+
 type parityEdge struct {
 	From, To, Kind, FilePath, Origin, Tier, ConfidenceLabel string
 	Line                                                    int
@@ -354,42 +540,111 @@ export class C%03d extends Base {
 }
 `, i)
 	}
-	return []map[string]string{cs, ts}
+	// A base class in the last-sorted file whose members call each other:
+	// earlier calls-phase pages load its members as frontier nodes only
+	// (structural kinds, cached in the pass hot cache), the last page loads
+	// the same nodes again as callers and must see their outgoing calls.
+	late := map[string]string{
+		"src/zz_base.ts": "export class Base {\n  run(): void {\n    this.stop(1);\n    this.stop(2);\n  }\n  stop(n: number): void {\n    this.run();\n  }\n}\n",
+	}
+	for i := 0; i < 70; i++ {
+		late[fmt.Sprintf("src/c%03d.ts", i)] = fmt.Sprintf(`import { Base } from "./zz_base";
+
+export class L%03d extends Base {
+  go(): void {
+    this.run();
+    this.stop(%d);
+  }
+}
+`, i, i)
+	}
+	// An interface chain across pages: each file's base list names the
+	// previous file's interface and a shared root, so a supers page loads
+	// (and may serve from the hot cache) the lists an earlier page just
+	// retargeted, and the root's incoming list grows on every page.
+	chain := map[string]string{
+		"w/IRoot.cs": "namespace W { public interface IRoot { void Root(); } }\n",
+		"w/I000.cs":  "namespace W { public interface I000 : IRoot { void M000(); } }\n",
+	}
+	for i := 1; i < 100; i++ {
+		chain[fmt.Sprintf("w/I%03d.cs", i)] = fmt.Sprintf(
+			"namespace W { public interface I%03d : I%03d, IRoot { void M%03d(); } }\n", i, i-1, i)
+	}
+	return []map[string]string{cs, ts, late, chain}
+}
+
+// parityRun is one enrichment of a salted fixture.
+type parityRun struct {
+	sqlite bool
+	fan    int
+	// full selects the legacy all-kinds preload.
+	full bool
+	// perFile drives EnrichFile over every fixture file (one applier running
+	// all four phases per file) instead of the streamed EnrichRepo pass.
+	perFile bool
+}
+
+// enrichSnapshot builds the fixture on the chosen backend, salts it (hub
+// adjacency of unread kinds, outgoing calls on every callable, sibling
+// stubs), runs every provider and snapshots the graph. Every page is
+// checked for hot-cache coherence on the way.
+func enrichSnapshot(t *testing.T, label string, fixture map[string]string, providers []*Provider, run parityRun) paritySnapshot {
+	t.Helper()
+	var s graph.Store
+	var root string
+	if run.sqlite {
+		st, dir := buildSQLiteFixture(t, filepath.Join(t.TempDir(), "store.sqlite"), fixture)
+		t.Cleanup(func() { _ = st.Close() })
+		s, root = st, dir
+	} else {
+		g, dir := buildFixture(t, fixture)
+		s, root = g, dir
+	}
+	injectHubAdjacency(s, run.fan)
+	injectOutgoingCalls(s, run.fan/4)
+	injectSiblingStubs(s)
+	files := make([]string, 0, len(fixture))
+	for rel := range fixture {
+		files = append(files, rel)
+	}
+	sort.Strings(files)
+	coherence := &adjacencyCoherence{}
+	var results []string
+	for _, base := range providers {
+		// Drop the toolchain-fallback gate (the Go spec no-ops whenever
+		// `go` is on PATH, as it always is under go test).
+		spec := *base.spec
+		spec.Suppressed = nil
+		p := NewProvider(&spec, zap.NewNop())
+		p.fullAdjacency = run.full
+		p.observePreload = coherence.observe
+		if run.perFile {
+			for _, rel := range files {
+				res, err := p.EnrichFile(s, root, rel)
+				if err != nil {
+					t.Fatalf("%s: enrich %s %s: %v", label, p.Name(), rel, err)
+				}
+				results = append(results, takeParitySnapshot(t, s, res).Result)
+			}
+			continue
+		}
+		res, err := p.EnrichRepo(s, "", root)
+		if err != nil {
+			t.Fatalf("%s: enrich %s: %v", label, p.Name(), err)
+		}
+		results = append(results, takeParitySnapshot(t, s, res).Result)
+	}
+	coherence.check(t, fmt.Sprintf("%s (full=%v)", label, run.full))
+	snap := takeParitySnapshot(t, s, nil)
+	snap.Result = strings.Join(results, "\n")
+	return snap
 }
 
 func runParity(t *testing.T, label string, fixture map[string]string, providers []*Provider, sqlite bool, fan int) {
 	t.Helper()
-	enrich := func(full bool) paritySnapshot {
-		var s graph.Store
-		var root string
-		if sqlite {
-			st, dir := buildSQLiteFixture(t, filepath.Join(t.TempDir(), "store.sqlite"), fixture)
-			t.Cleanup(func() { _ = st.Close() })
-			s, root = st, dir
-		} else {
-			g, dir := buildFixture(t, fixture)
-			s, root = g, dir
-		}
-		injectHubAdjacency(s, fan)
-		var results []string
-		for _, base := range providers {
-			// Drop the toolchain-fallback gate (the Go spec no-ops whenever
-			// `go` is on PATH, as it always is under go test).
-			spec := *base.spec
-			spec.Suppressed = nil
-			p := NewProvider(&spec, zap.NewNop())
-			p.fullAdjacency = full
-			res, err := p.EnrichRepo(s, "", root)
-			if err != nil {
-				t.Fatalf("%s: enrich %s: %v", label, p.Name(), err)
-			}
-			results = append(results, takeParitySnapshot(t, s, res).Result)
-		}
-		snap := takeParitySnapshot(t, s, nil)
-		snap.Result = strings.Join(results, "\n")
-		return snap
-	}
-	diffParity(t, label, enrich(true), enrich(false))
+	legacy := enrichSnapshot(t, label, fixture, providers, parityRun{sqlite: sqlite, fan: fan, full: true})
+	filtered := enrichSnapshot(t, label, fixture, providers, parityRun{sqlite: sqlite, fan: fan})
+	diffParity(t, label, legacy, filtered)
 }
 
 type parityCase struct {
@@ -452,21 +707,54 @@ func TestAdjacencyKindFilterParitySQLite(t *testing.T) {
 }
 
 // Multi-page passes share adjacency through the pass hot cache, including
-// entries mutated by an earlier page. A tiny budget forces generation
-// rotation, so cache residency differs between the two modes; the result must
-// not.
+// entries mutated by an earlier page, and run four phases whose appliers
+// reload the same nodes: a page-file caller of the calls phase was a seed or
+// frontier node of every earlier phase (and of earlier calls pages, whose
+// cache entries hold no calls). A tiny budget forces generation rotation, so
+// cache residency differs between the modes. Every run — legacy and
+// filtered, on every budget — must equal the filtered run with the hot cache
+// off, and every page must start from adjacency equal to the store's.
 func TestAdjacencyKindFilterParityMultiPage(t *testing.T) {
-	for _, budget := range []string{"", "1"} {
-		t.Run("budget="+budget, func(t *testing.T) {
-			if budget != "" {
-				t.Setenv("GORTEX_TSTYPES_HOTCACHE_MB", budget)
-			}
-			for i, fixture := range multiPageFixtures() {
-				providers := fixtureProviders(t, fixture)
-				runParity(t, fmt.Sprintf("memory multipage %d", i), fixture, providers, false, 60)
-				runParity(t, fmt.Sprintf("sqlite multipage %d", i), fixture, providers, true, 60)
-			}
-		})
+	for i, fixture := range multiPageFixtures() {
+		providers := fixtureProviders(t, fixture)
+		for _, sqlite := range []bool{false, true} {
+			backend := map[bool]string{false: "memory", true: "sqlite"}[sqlite]
+			t.Run(fmt.Sprintf("%s/fixture%d", backend, i), func(t *testing.T) {
+				var reference paritySnapshot
+				t.Run("cache=off", func(t *testing.T) {
+					t.Setenv("GORTEX_TSTYPES_HOTCACHE", "off")
+					reference = enrichSnapshot(t, "cache off", fixture, providers, parityRun{sqlite: sqlite, fan: 60})
+				})
+				for _, budget := range []string{"", "1"} {
+					t.Run("budget="+budget, func(t *testing.T) {
+						if budget != "" {
+							t.Setenv("GORTEX_TSTYPES_HOTCACHE_MB", budget)
+						}
+						for _, full := range []bool{true, false} {
+							label := fmt.Sprintf("%s multipage %d budget=%q full=%v", backend, i, budget, full)
+							got := enrichSnapshot(t, label, fixture, providers, parityRun{sqlite: sqlite, fan: 60, full: full})
+							diffParity(t, label+" vs cache off", reference, got)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+// The single-file pass runs all four phases on one applier: adjacency the
+// supers phase loaded (structural kinds only) is what the calls phase reads,
+// with the file's callers' calls loaded beside it.
+func TestAdjacencyKindFilterParityEnrichFile(t *testing.T) {
+	fixtures := append(multiPageFixtures(), goldenFixtureFiles())
+	for i, fixture := range fixtures {
+		providers := fixtureProviders(t, fixture)
+		for _, sqlite := range []bool{false, true} {
+			label := fmt.Sprintf("enrichfile fixture%d sqlite=%v", i, sqlite)
+			legacy := enrichSnapshot(t, label, fixture, providers, parityRun{sqlite: sqlite, fan: 20, full: true, perFile: true})
+			filtered := enrichSnapshot(t, label, fixture, providers, parityRun{sqlite: sqlite, fan: 20, perFile: true})
+			diffParity(t, label, legacy, filtered)
+		}
 	}
 }
 
@@ -509,35 +797,53 @@ func (s *adjacencyLoadStore) GetInEdgesByNodeIDsKinds(ids []string, kinds []grap
 }
 
 // hubPreloadFixture is the C# golden fixture with every symbol turned into a
-// hub of fan unread edges.
-func hubPreloadFixture(t testing.TB, fan int) (graph.Store, string) {
+// hub of fan unread edges and, when outCalls > 0, every callable making
+// outCalls outgoing calls.
+func hubPreloadFixture(t testing.TB, fan, outCalls int) (graph.Store, string) {
 	t.Helper()
 	st, root := buildSQLiteFixture(t, filepath.Join(t.TempDir(), "store.sqlite"), goldenFixtureFiles())
 	t.Cleanup(func() { _ = st.Close() })
 	injectHubAdjacency(st, fan)
+	injectOutgoingCalls(st, outCalls)
 	return st, root
 }
 
+// phaseLoads is the calls rows the preload read during one page.
+type phaseLoads struct {
+	class factClass
+	calls int
+}
+
 func preloadAllPhases(t testing.TB, s graph.Store, root string, full bool) (pages []factPageStats, loads *adjacencyLoadStore) {
+	pages, loads, _ = preloadAllPhasesByPage(t, s, root, full)
+	return pages, loads
+}
+
+func preloadAllPhasesByPage(t testing.TB, s graph.Store, root string, full bool) (pages []factPageStats, loads *adjacencyLoadStore, perPage []phaseLoads) {
 	t.Helper()
 	loads = &adjacencyLoadStore{Store: s, kinds: map[graph.EdgeKind]int{}}
 	p := NewProvider(CSharpSpec(), zap.NewNop())
 	p.fullAdjacency = full
-	p.observePage = func(stats factPageStats) { pages = append(pages, stats) }
+	seen := 0
+	p.observePage = func(stats factPageStats) {
+		pages = append(pages, stats)
+		perPage = append(perPage, phaseLoads{class: stats.Class, calls: loads.kinds[graph.EdgeCalls] - seen})
+		seen = loads.kinds[graph.EdgeCalls]
+	}
 	if _, err := p.EnrichRepo(loads, "", root); err != nil {
 		t.Fatal(err)
 	}
-	return pages, loads
+	return pages, loads, perPage
 }
 
 // The hub fixture's adjacency preload must load only the kinds the applier
 // reads: no references/typed_as/reads/writes, and no incoming calls.
 func TestAdjacencyPreloadSkipsUnreadHubKinds(t *testing.T) {
 	const fan = 2000
-	s, root := hubPreloadFixture(t, fan)
+	s, root := hubPreloadFixture(t, fan, 0)
 	legacyPages, legacy := preloadAllPhases(t, s, root, true)
 
-	s2, root2 := hubPreloadFixture(t, fan)
+	s2, root2 := hubPreloadFixture(t, fan, 0)
 	pages, filtered := preloadAllPhases(t, s2, root2, false)
 
 	sum := func(stats []factPageStats) (edges int) {
@@ -564,24 +870,141 @@ func TestAdjacencyPreloadSkipsUnreadHubKinds(t *testing.T) {
 	}
 }
 
-// BenchmarkHubAdjacencyPreload measures one full enrich pass over the hub
-// fixture on SQLite, legacy all-kinds preload versus the kind-filtered one.
-func BenchmarkHubAdjacencyPreload(b *testing.B) {
-	for _, mode := range []struct {
-		name string
-		full bool
-	}{{"legacy_all_kinds", true}, {"kind_filtered", false}} {
-		b.Run(mode.name, func(b *testing.B) {
-			s, root := hubPreloadFixture(b, 2000)
-			b.ReportAllocs()
-			b.ResetTimer()
-			var rows int
-			for i := 0; i < b.N; i++ {
-				_, loads := preloadAllPhases(b, s, root, mode.full)
-				rows += loads.edges
+// Outgoing calls are loaded in the calls phase only, and only for the nodes
+// of call-bearing files: frontier members — every member of every supertype,
+// each with a body full of calls — never load theirs, and the supers, metas
+// and aliases phases load none at all.
+func TestAdjacencyPreloadLoadsCallsOnlyForCallers(t *testing.T) {
+	const fan, outCalls = 200, 400
+	s, root := hubPreloadFixture(t, fan, outCalls)
+	_, legacy, legacyPages := preloadAllPhasesByPage(t, s, root, true)
+	s2, root2 := hubPreloadFixture(t, fan, outCalls)
+	_, filtered, pages := preloadAllPhasesByPage(t, s2, root2, false)
+
+	var legacyEarly, early, calls int
+	for _, page := range legacyPages {
+		if page.class != classCalls {
+			legacyEarly += page.calls
+		}
+	}
+	for _, page := range pages {
+		if page.class != classCalls {
+			early += page.calls
+		} else {
+			calls += page.calls
+		}
+	}
+	t.Logf("calls rows: legacy=%d (%d outside the calls phase) filtered=%d (%d outside)",
+		legacy.kinds[graph.EdgeCalls], legacyEarly, filtered.kinds[graph.EdgeCalls], early)
+	if legacyEarly == 0 {
+		t.Fatal("fixture does not exercise frontier calls: the legacy preload loaded none outside the calls phase")
+	}
+	if early != 0 {
+		t.Fatalf("supers/metas/aliases pages loaded %d outgoing calls rows, want 0", early)
+	}
+
+	// Exactly the callers of call-bearing files: every non-file node of a
+	// file with call facts, whose outgoing calls the store holds.
+	callBearing := map[string]bool{}
+	for rel := range goldenFixtureFiles() {
+		for _, n := range s2.GetFileNodes(rel) {
+			if n.Kind != graph.KindFile {
+				continue
 			}
-			b.ReportMetric(float64(rows)/float64(b.N), "adj_rows/op")
-		})
+			facts, err := analyzeFile(CSharpSpec(), fileRef{node: n, absPath: filepath.Join(root2, filepath.FromSlash(rel))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if facts != nil && len(facts.calls) > 0 {
+				callBearing[rel] = true
+			}
+		}
+	}
+	if len(callBearing) == 0 || len(callBearing) == len(goldenFixtureFiles()) {
+		t.Fatalf("call-bearing files %v: want a strict, non-empty subset of the fixture", callBearing)
+	}
+	want := 0
+	for _, n := range s2.AllNodes() {
+		if n.Kind == graph.KindFile || !callBearing[n.FilePath] {
+			continue
+		}
+		for _, e := range s2.GetOutEdges(n.ID) {
+			if e.Kind == graph.EdgeCalls {
+				want++
+			}
+		}
+	}
+	if calls != want {
+		t.Fatalf("calls phase loaded %d outgoing calls rows, want %d (the call-bearing files' callers)", calls, want)
+	}
+}
+
+// A hot-cache out entry holds the structural kinds only. A later page that
+// reads the same node as a caller must still get its outgoing calls.
+func TestCallsNeverServedFromStructuralHotEntry(t *testing.T) {
+	g := graph.New()
+	caller := &graph.Node{ID: "repo/a.cs::A.M", Kind: graph.KindMethod, Name: "M", FilePath: "repo/a.cs", Language: "csharp", StartLine: 1, EndLine: 3}
+	owner := &graph.Node{ID: "repo/a.cs::A", Kind: graph.KindType, Name: "A", FilePath: "repo/a.cs", Language: "csharp", StartLine: 1, EndLine: 4}
+	g.AddBatch([]*graph.Node{caller, owner}, []*graph.Edge{
+		{From: caller.ID, To: owner.ID, Kind: graph.EdgeMemberOf, FilePath: "repo/a.cs", Line: 1},
+		{From: caller.ID, To: "unresolved::*.Run", Kind: graph.EdgeCalls, FilePath: "repo/a.cs", Line: 2},
+	})
+	hot := newApplyHotCache(defaultApplyHotCacheBytes)
+	frontier := NewProvider(CSharpSpec(), zap.NewNop()).newApplier(g).withHotCache(hot)
+	frontier.loadAdjacency([]string{caller.ID})
+	if cached, ok := hot.getOut(caller.ID); !ok || len(cached) != 1 || cached[0].Kind != graph.EdgeMemberOf {
+		t.Fatalf("hot out entry = %v (cached=%v), want the member_of edge only", adjacencyIdentities(cached), ok)
+	}
+
+	page := NewProvider(CSharpSpec(), zap.NewNop()).newApplier(g).withHotCache(hot)
+	page.rememberNode(caller)
+	page.rememberNode(owner)
+	page.fileLoaded["repo/a.cs"] = true
+	page.loadAdjacency([]string{caller.ID, owner.ID})
+	page.loadCallerCalls([]*fileFacts{{file: "repo/a.cs", calls: []callFact{{line: 2, method: "Run"}}}})
+	calls := page.outCalls(caller.ID)
+	if len(calls) != 1 || calls[0].To != "unresolved::*.Run" {
+		t.Fatalf("caller's outgoing calls = %v, want the stub", adjacencyIdentities(calls))
+	}
+	for _, e := range page.outEdges(caller.ID) {
+		if e.Kind == graph.EdgeCalls {
+			t.Fatalf("structural out list holds %s", e.Kind)
+		}
+	}
+	// A loaded node missed by the batch still reads its calls.
+	lazy := NewProvider(CSharpSpec(), zap.NewNop()).newApplier(g).withHotCache(hot)
+	lazy.loadAdjacency([]string{caller.ID})
+	if got := lazy.outCalls(caller.ID); len(got) != 1 {
+		t.Fatalf("lazy calls read = %v, want the stub", adjacencyIdentities(got))
+	}
+}
+
+// BenchmarkHubAdjacencyPreload measures one full enrich pass over the hub
+// fixture on SQLite, legacy all-kinds preload versus the kind-filtered one,
+// without and with an outgoing-calls fan on every callable.
+func BenchmarkHubAdjacencyPreload(b *testing.B) {
+	for _, fixture := range []struct {
+		name     string
+		outCalls int
+	}{{"hub", 0}, {"hub_out_calls", 500}} {
+		for _, mode := range []struct {
+			name string
+			full bool
+		}{{"legacy_all_kinds", true}, {"kind_filtered", false}} {
+			b.Run(fixture.name+"/"+mode.name, func(b *testing.B) {
+				s, root := hubPreloadFixture(b, 2000, fixture.outCalls)
+				b.ReportAllocs()
+				b.ResetTimer()
+				var rows, calls int
+				for i := 0; i < b.N; i++ {
+					_, loads := preloadAllPhases(b, s, root, mode.full)
+					rows += loads.edges
+					calls += loads.kinds[graph.EdgeCalls]
+				}
+				b.ReportMetric(float64(rows)/float64(b.N), "adj_rows/op")
+				b.ReportMetric(float64(calls)/float64(b.N), "calls_rows/op")
+			})
+		}
 	}
 }
 
@@ -658,7 +1081,8 @@ func TestAdjacencyKindsCoverEveryReader(t *testing.T) {
 			// inheritance walk kind, which must be loaded outgoing.
 			allowed := edgeKindIn(kind, superEdgeKinds)
 			if path == "engine.go" {
-				allowed = edgeKindIn(kind, adjacencyOutKinds(nil)) || edgeKindIn(kind, adjacencyInKinds)
+				allowed = edgeKindIn(kind, adjacencyOutKinds(nil)) || edgeKindIn(kind, adjacencyInKinds) ||
+					edgeKindIn(kind, adjacencyCallKinds)
 			}
 			if !allowed {
 				t.Errorf("%s names %s (%s), which the adjacency preload does not load: extend adjacencyOutKinds/adjacencyInKinds (and its parity tests) first",
@@ -670,14 +1094,20 @@ func TestAdjacencyKindsCoverEveryReader(t *testing.T) {
 
 	for _, p := range DefaultProviders(zap.NewNop()) {
 		out := adjacencyOutKinds(p.spec)
-		for _, kind := range append(append([]graph.EdgeKind{graph.EdgeCalls, graph.EdgeMemberOf}, superEdgeKinds...), p.spec.inheritEdgeKinds()...) {
+		for _, kind := range append(append([]graph.EdgeKind{graph.EdgeMemberOf}, superEdgeKinds...), p.spec.inheritEdgeKinds()...) {
 			if !edgeKindIn(kind, out) {
 				t.Errorf("%s: outgoing preload kinds %v miss %s", p.Name(), out, kind)
 			}
 		}
+		for _, kind := range adjacencyCallKinds {
+			// Calls are loaded for callers only, never with the frontier.
+			if edgeKindIn(kind, out) {
+				t.Errorf("%s: outgoing frontier kinds %v load %s", p.Name(), out, kind)
+			}
+		}
 		ap := p.newApplier(graph.New())
-		if !slicesEqualKinds(ap.outKinds, out) || !slicesEqualKinds(ap.inKinds, adjacencyInKinds) {
-			t.Errorf("%s: applier kinds out=%v in=%v", p.Name(), ap.outKinds, ap.inKinds)
+		if !slicesEqualKinds(ap.outKinds, out) || !slicesEqualKinds(ap.inKinds, adjacencyInKinds) || !ap.splitCalls {
+			t.Errorf("%s: applier kinds out=%v in=%v splitCalls=%v", p.Name(), ap.outKinds, ap.inKinds, ap.splitCalls)
 		}
 	}
 }

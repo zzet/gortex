@@ -29,8 +29,11 @@ import (
 //     only change if nodes are created mid-pass, which apply never does.
 //   - adjacency: out/in edge slices per node ID, including empty results,
 //     holding only the kinds the pass's appliers load (one provider, one
-//     kind set per pass). An entry the applier mutates in the store is
-//     dropped (forgetOut / forgetIn) so later pages re-read it. Valid only
+//     kind set per pass). Outgoing calls are never among them: appliers
+//     load those per page for callers only (applier.loadCalls), so an out
+//     entry is never served to a calls reader. An entry the applier mutates
+//     in the store is dropped (forgetOut / forgetIn) so later pages re-read
+//     it. Valid only
 //     WITHIN a phase: the supers phase synthesizes inheritance
 //     edges that later phases must observe (a call may resolve through an
 //     extends edge another file's facts just synthesized), so the driver

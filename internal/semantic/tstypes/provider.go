@@ -25,14 +25,18 @@ type Provider struct {
 	// hook only: the parity tests run every fixture both ways and require
 	// identical graphs.
 	fullAdjacency bool
+	// observePreload is run by every applier once its page's adjacency is
+	// loaded, before any fact applies (test hook: hot-cache coherence).
+	observePreload func(*applier)
 }
 
 // newApplier builds one pass/page applier for this provider's spec.
 func (p *Provider) newApplier(g graph.Store) *applier {
 	ap := newApplier(g, p.spec, p.Name())
 	if p.fullAdjacency {
-		ap.outKinds, ap.inKinds = nil, nil
+		ap.outKinds, ap.inKinds, ap.splitCalls = nil, nil, false
 	}
+	ap.afterPreload = p.observePreload
 	return ap
 }
 

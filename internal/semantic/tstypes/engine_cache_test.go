@@ -250,8 +250,19 @@ func TestApplicationFrontierBatchQueriesDoNotScalePerSymbol(t *testing.T) {
 			if got := ap.methodOn(child, "run", 1, 0); got == nil || got.ID != selected[i] {
 				t.Fatalf("methodOn(%s, run/1) = %#v, want %s", child.ID, got, selected[i])
 			}
+			// The frontier preload loads the structural kinds only; the
+			// child's outgoing call is no caller's (the page has no call
+			// facts), so it is never read.
 			gotEdges := ap.outEdges(child.ID)
-			wantEdges := base.GetOutEdges(child.ID)
+			var wantEdges []*graph.Edge
+			for _, e := range base.GetOutEdges(child.ID) {
+				if edgeKindIn(e.Kind, ap.outKinds) {
+					wantEdges = append(wantEdges, e)
+				}
+			}
+			if ap.callsLoaded[child.ID] {
+				t.Fatalf("frontier preload loaded the outgoing calls of %s", child.ID)
+			}
 			if len(gotEdges) != len(wantEdges) {
 				t.Fatalf("out edge count for %s = %d, want %d", child.ID, len(gotEdges), len(wantEdges))
 			}
