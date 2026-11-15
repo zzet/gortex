@@ -254,14 +254,14 @@ func TestRunnerCorruptManifestFailsBeforeTestExecution(t *testing.T) {
 		t.Fatalf("corrupt manifest reached execution: %v %s", err, &out)
 	}
 }
-func TestRunnerDarwinSelectedIndexerKeepsRestWatcherRace(t *testing.T) {
+func TestRunnerDarwinSelectedIndexerKeepsIndependentWatcherRace(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("native macOS watcher-race contract")
 	}
 	f := newFixture(t)
 	m := f.plan(f.change("internal/indexer/value.go"))
 	var out bytes.Buffer
-	report, err := RunPartition(t.Context(), RunOptions{Root: f.root, Partition: "rest", SelectionFile: writeManifest(t, f, m), Target: nativeTarget(t), Workers: 2, Env: fixtureEnv(), Output: &out})
+	report, err := RunPartition(t.Context(), RunOptions{Root: f.root, Partition: "indexer-race", SelectionFile: writeManifest(t, f, m), Target: nativeTarget(t), Workers: 2, Env: fixtureEnv(), Output: &out})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, &out)
 	}
@@ -362,7 +362,7 @@ func TestRunnerWorkflowRowsSupportDynamicAndLegacyLayouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"rest\"]\n"} {
+	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"rest\"]\n    include: [{os: macos-latest, partition: indexer-race}]\n"} {
 		rows, err := WorkflowRows(text, p)
 		if err != nil {
 			t.Fatal(err)

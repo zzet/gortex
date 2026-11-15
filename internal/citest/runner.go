@@ -540,6 +540,9 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if opts.Workers < 1 || opts.Windows && opts.Race {
 		return report, fmt.Errorf("invalid worker count or Windows race setting")
 	}
+	if opts.Partition == darwinRacePartition && (runtime.GOOS != "darwin" || opts.Windows) {
+		return report, fmt.Errorf("indexer-race requires native macOS")
+	}
 	planner := NewPlanner(opts.Root)
 	planner.Env = baseEnv(opts.Env)
 	module, err := planner.exec(ctx, planner.Env, "go", "list", "-m")
@@ -621,7 +624,10 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 					return report, err
 				}
 			}
-			if runtime.GOOS == "darwin" && !opts.Race && (selected == nil || selected.has(large["indexer"])) {
+		} else if part.Group == darwinRacePartition {
+			// Preserve the all-race override: its normal indexer shards already
+			// execute these roots under the race detector.
+			if !opts.Race && (selected == nil || selected.has(large["indexer"])) {
 				dir, err := planner.exec(ctx, planner.Env, "go", "list", "-f", "{{.Dir}}", large["indexer"])
 				if err != nil {
 					return report, err

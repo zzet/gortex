@@ -14,6 +14,8 @@ import (
 //go:embed policy.json
 var policyJSON []byte
 
+const darwinRacePartition = "indexer-race"
+
 type Target struct {
 	Runner string `json:"runner"`
 	GOOS   string `json:"goos"`
@@ -63,6 +65,9 @@ func (p Policy) FullMatrix() Matrix {
 		for _, part := range p.Partitions {
 			m.Include = append(m.Include, MatrixRow{t.Runner, part})
 		}
+		if t.GOOS == "darwin" {
+			m.Include = append(m.Include, MatrixRow{t.Runner, darwinRacePartition})
+		}
 	}
 	return m
 }
@@ -83,9 +88,6 @@ func (p Policy) SelectedMatrix(module string, byTarget map[string][]string) Matr
 				groups.add("rest")
 			}
 		}
-		if t.GOOS == "darwin" && groups.has("indexer") {
-			groups.add("rest")
-		}
 		for _, part := range p.Partitions {
 			items, _ := ParsePartition(part, p)
 			for _, item := range items {
@@ -94,6 +96,9 @@ func (p Policy) SelectedMatrix(module string, byTarget map[string][]string) Matr
 					break
 				}
 			}
+		}
+		if t.GOOS == "darwin" && groups.has("indexer") {
+			m.Include = append(m.Include, MatrixRow{t.Runner, darwinRacePartition})
 		}
 	}
 	return m
@@ -105,6 +110,10 @@ type Partition struct {
 }
 
 func ParsePartition(spec string, p Policy) ([]Partition, error) {
+	// This owner must retain an independent budget, never a combined alias.
+	if spec == darwinRacePartition {
+		return []Partition{{Group: darwinRacePartition, Count: 1}}, nil
+	}
 	var out []Partition
 	seen := set{}
 	for _, text := range strings.Split(spec, "+") {
@@ -143,7 +152,14 @@ func CheckLayout(rows []MatrixRow, p Policy) error {
 		}
 	}
 	for os, groups := range byOS {
-		if len(groups) != len(p.Groups)+1 {
+		darwin := slices.ContainsFunc(p.Targets, func(t Target) bool { return t.Runner == os && t.GOOS == "darwin" })
+		expected := len(p.Groups) + 1
+		if darwin {
+			expected++
+		} else if len(groups[darwinRacePartition]) != 0 {
+			return fmt.Errorf("%s cannot own the macOS race group", os)
+		}
+		if len(groups) != expected {
 			return fmt.Errorf("%s has incomplete CI groups", os)
 		}
 		for group, items := range groups {
