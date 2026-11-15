@@ -3091,12 +3091,13 @@ func (w *Watcher) patchGraphWithReceiptStateObserved(
 	// the raw patch.
 	laneCtx, cancelLane := w.mutationLaneContext()
 	laneCtx = publication.withContext(laneCtx)
-	err := w.indexer.coordinateRepositoryMutation(laneCtx, OutputEntryWatcherPatchGraph, func() error {
+	preparation := &watcherPointPreparation{watcher: w, path: path, kind: kind, generation: generation, receiptChecked: receiptChecked}
+	err := w.indexer.coordinateRepositoryMutationPreparedSource(laneCtx, OutputEntryWatcherPatchGraph, preparation, func(observe func(*OutputSourceContent)) error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
 			return errWatcherIndexerMissing
 		}
-		return w.patchGraphWithReceiptStateRawModern(laneCtx, idx, path, kind, generation, receiptChecked, &pending, fanout)
+		return w.patchGraphWithReceiptStateRawSource(laneCtx, idx, path, kind, generation, receiptChecked, &pending, fanout, observe, preparation)
 	})
 	cancelLane()
 	// User callbacks are deliberately outside the repository lane. Their
@@ -3134,7 +3135,7 @@ func pointMutationClassification(
 // reindexPointPathRaw runs after the caller has acquired the repository lane.
 // MultiWatcher supplies the cross-repository resolver and derived tail; a
 // standalone Watcher falls back to the equivalent single-repository tail.
-func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, generation uint64, stamps *PublicationStamps) (*IndexResult, error) {
+func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, generation uint64, stamps *PublicationStamps, preparation *watcherPointPreparation) (*IndexResult, error) {
 	if w.pointReindexRaw != nil {
 		return w.pointReindexRaw(path, stamps)
 	}
@@ -3142,7 +3143,7 @@ func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, generation uint
 		return nil, errWatcherIndexerMissing
 	}
 	mode := incrementalPathMode{
-		detectDeletions: true, forceExplicitFiles: true, publication: stamps,
+		detectDeletions: true, forceExplicitFiles: true, publication: stamps, pointPreparation: preparation,
 		onRelations: func() { w.markRelations(path, generation) },
 	}
 	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
@@ -3164,6 +3165,21 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	pending *symbolChangeNotification,
 	fanout *DerivedFanoutCompleteness,
 ) error {
+	return w.patchGraphWithReceiptStateRawSource(ctx, idx, path, kind, generation, receiptChecked, pending, fanout, nil, nil)
+}
+
+func (w *Watcher) patchGraphWithReceiptStateRawSource(
+	ctx context.Context,
+	idx *Indexer,
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	receiptChecked bool,
+	pending *symbolChangeNotification,
+	fanout *DerivedFanoutCompleteness,
+	observe func(*OutputSourceContent),
+	preparation *watcherPointPreparation,
+) error {
 	stamps := PublicationStampsFrom(ctx)
 	if stamps.switchAttemptControl(patchInspection) {
 		// Registered before the existing patchMu unlock: early-return inspection
@@ -3182,12 +3198,18 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	start := time.Now()
 	writes := idx.writeCounterMark()
 	kind = w.reconcileKindWithDisk(path, kind)
-	// This is the identity duplicate gate for native watcher events. A Darwin
-	// startup replay already checked the persisted receipt, so it bypasses this
-	// cheap in-memory mtime test and forces the exact observed path.
-	if kind == ChangeModified && !receiptChecked && idx.fileMtimeMatches(path) {
-		stamps.recordNativeMtimeDuplicate()
-		return nil
+	// A startup replay that already checked a receipt still forces its original
+	// exact path. Otherwise the persisted hash/size/version gate identifies a
+	// duplicate; only its checked source proof may restore the prior witness.
+	if kind == ChangeModified && !receiptChecked {
+		duplicate, content := idx.pointDuplicateSourceContent(ctx, path)
+		if duplicate {
+			if observe != nil && content != nil {
+				observe(content)
+			}
+			stamps.recordNativeMtimeDuplicate()
+			return nil
+		}
 	}
 
 	relPath := idx.relKey(path)
@@ -3233,7 +3255,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawModern(
 	observation := beginDerivedFanoutObservation(idx)
 	defer observation.close()
 	stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
-	result, err := w.reindexPointPathRaw(idx, path, generation, PublicationStampsFrom(ctx))
+	result, err := w.reindexPointPathRaw(idx, path, generation, PublicationStampsFrom(ctx), preparation)
 	stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
 	observed := observation.close()
 	if err != nil {

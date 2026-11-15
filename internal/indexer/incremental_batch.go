@@ -345,7 +345,15 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if markerBatch != nil {
 			repair = markerBatch.readRepair
 		}
-		probe, probeOK, admissionBusy := idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair)
+		var probe fileDeltaProbe
+		probeOK := false
+		if markerBatch != nil {
+			probe, probeOK = markerBatch.pointPreparation.takeProbe(idx, filePath)
+		}
+		admissionBusy := false
+		if !probeOK {
+			probe, probeOK, admissionBusy = idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair)
+		}
 		if admissionBusy {
 			break
 		}

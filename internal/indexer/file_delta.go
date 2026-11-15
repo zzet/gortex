@@ -95,6 +95,12 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 }
 
 func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation) (fileDeltaProbe, bool, bool) {
+	return idx.prepareFileDeltaWithPointAdmissionObserved(filePath, tryOnly, repair, nil)
+}
+
+// The optional typed point preparation may refuse the actual read's detected
+// extractor before it is invoked. All ordinary callers retain the old path.
+func (idx *Indexer) prepareFileDeltaWithPointAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation, preparation *watcherPointPreparation) (fileDeltaProbe, bool, bool) {
 	var probe fileDeltaProbe
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -148,6 +154,9 @@ func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOn
 	}
 	ext, _ := idx.registry.GetByLanguage(lang)
 	if ext == nil {
+		return probe, false, false
+	}
+	if preparation != nil && !preparation.allowsExtraction(idx, lang, ext) {
 		return probe, false, false
 	}
 	if maxSize := idx.config.MaxFileSize; maxSize > 0 && int64(len(src)) > maxSize {
