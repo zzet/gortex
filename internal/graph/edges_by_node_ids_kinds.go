@@ -16,6 +16,11 @@ package graph
 //     line, kind, then insertion (within a kind, GetOutEdges' declared order)
 //     and incoming edges by kind then insertion (GetInEdges' declared order);
 //     the in-memory backend keeps its insertion order;
+//   - across kinds the order is backend-specific: the in-memory backend
+//     keeps insertion order, while SQLite orders same-line outgoing edges of
+//     different kinds by kind name, where the unfiltered read's cross-kind
+//     order is plan-dependent. A caller whose first-match loop spans kinds
+//     must not rely on matching the unfiltered read across kinds;
 //   - empty or nil kinds requests every kind (the unfiltered read);
 //   - missing IDs are absent or map to an empty slice.
 //

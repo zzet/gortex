@@ -78,3 +78,48 @@ func TestEdgesByNodeIDsKindsSkipsHubRows(t *testing.T) {
 		t.Fatalf("filtered read allocs = %.0f, want < 1/20 of unfiltered %.0f", filtered, full)
 	}
 }
+
+// Across kinds on one source line the kind-filtered outgoing read orders by
+// kind name, whatever the insertion order: the statement's ORDER BY is
+// explicit, so the order does not follow the plan. tstypes applySuper's fallback loop takes the first claimable
+// extends-or-implements stub across both kinds, so this tie-break decides
+// which stub it retargets on SQLite; the unfiltered batch read has no
+// ORDER BY and its cross-kind order follows the plan.
+func TestOutEdgesByNodeIDsKindsCrossKindTieBreak(t *testing.T) {
+	s := openCatalogStore(t)
+	const from = "repo/a.ts::Widget"
+	nodes := []*graph.Node{{ID: from, Name: "Widget", Kind: graph.KindType, FilePath: "repo/a.ts", Language: "typescript"}}
+	// Inserted against the expected order: implements before extends on
+	// line 5, member_of first, a later line before an earlier one.
+	edges := []*graph.Edge{
+		{From: from, To: "repo/a.ts::Mod", Kind: graph.EdgeMemberOf, FilePath: "repo/a.ts", Line: 5},
+		{From: from, To: "unresolved::Base", Kind: graph.EdgeImplements, FilePath: "repo/a.ts", Line: 5},
+		{From: from, To: "unresolved::Other.Base", Kind: graph.EdgeExtends, FilePath: "repo/a.ts", Line: 5},
+		{From: from, To: "unresolved::Late", Kind: graph.EdgeImplements, FilePath: "repo/a.ts", Line: 9},
+		{From: from, To: "unresolved::Early", Kind: graph.EdgeExtends, FilePath: "repo/a.ts", Line: 2},
+	}
+	s.AddBatch(nodes, edges)
+
+	type key struct {
+		line int
+		kind graph.EdgeKind
+		to   string
+	}
+	want := []key{
+		{2, graph.EdgeExtends, "unresolved::Early"},
+		{5, graph.EdgeExtends, "unresolved::Other.Base"},
+		{5, graph.EdgeImplements, "unresolved::Base"},
+		{5, graph.EdgeMemberOf, "repo/a.ts::Mod"},
+		{9, graph.EdgeImplements, "unresolved::Late"},
+	}
+	kinds := []graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeImplements, graph.EdgeExtends}
+	got := s.GetOutEdgesByNodeIDsKinds([]string{from}, kinds)[from]
+	if len(got) != len(want) {
+		t.Fatalf("got %d edges, want %d", len(got), len(want))
+	}
+	for i, e := range got {
+		if k := (key{e.Line, e.Kind, e.To}); k != want[i] {
+			t.Fatalf("edge %d = %+v, want %+v", i, k, want[i])
+		}
+	}
+}

@@ -317,13 +317,23 @@ var adjacencyInKinds = []graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeParamOf}
 // only for callers (adjacencyCallKinds, loadCallerCalls).
 //
 // Every reader filters by kind before using an edge, and the only
-// order-sensitive readers are first-match loops within these kinds, so
-// loading just these kinds is invisible to every phase: on the in-memory
-// store each list is the order-preserving subsequence of the full list, and
-// on SQLite the kind-filtered read keeps the unfiltered read's order within
-// each kind. Loading the rest — on a hub type, every calls / references /
-// typed_as row pointing at it and at each of its members, with meta — was
-// the bulk of the pass's allocation on large repositories.
+// order-sensitive readers are first-match loops over these kinds. On the
+// in-memory store each list is the order-preserving subsequence of the full
+// list, so loading just these kinds is invisible there. On SQLite the
+// kind-filtered read keeps the unfiltered read's order within each kind;
+// across kinds on one source line it is ordered by kind name (extends before
+// implements). One first-match loop spans two kinds — applySuper's fallback
+// takes the first claimable extends-or-implements stub whose trailing name
+// matches — so on SQLite its pick can differ from some unfiltered-read plans
+// when one type carries such stubs of both kinds on one line. That order was
+// never defined: the unfiltered batch read has no ORDER BY, its cross-kind
+// order follows the query plan (it changes with planner statistics) and
+// already differs from the in-memory insertion order. The kind-filtered read
+// makes it deterministic. No extractor emits both stubs for one declaration.
+//
+// Loading the rest — on a hub type, every calls / references / typed_as row
+// pointing at it and at each of its members, with meta — was the bulk of the
+// pass's allocation on large repositories.
 func adjacencyOutKinds(spec *LangSpec) []graph.EdgeKind {
 	kinds := []graph.EdgeKind{graph.EdgeMemberOf}
 	kinds = append(kinds, superEdgeKinds...)
