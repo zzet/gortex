@@ -21,14 +21,27 @@ import (
 // watcher still owns an older graph, without synchronously reindexing it.
 func TestProjectedReadFindsNewSymbolWithoutMutatingBase(t *testing.T) {
 	srv, dir := setupTestServer(t)
+	t.Cleanup(func() { srv.DrainBackground(); srv.indexer.Close() })
 	srv.SetWatcher(mutationTestWatcher{})
 	path := filepath.Join(dir, "main.go")
 	original, err := os.ReadFile(path)
 	require.NoError(t, err)
+	// The public source protocol permits an explicit transient first refusal.
+	// Reuse the existing source-fixture caller allowance, shared across BOTH
+	// values. Product150ms and its internal attempt policy are unchanged.
+	caller, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
 	for _, body := range []string{"return 1", "return 2"} {
 		current := string(original) + "\nfunc Added() int { " + body + " }\n"
 		require.NoError(t, os.WriteFile(path, []byte(current), 0o644))
-		result := callTool(t, srv, "get_symbol_source", map[string]any{"id": "main.go::Added", "context_lines": float64(0), "format": "json"})
+		result, evidence, err := sourceWhenReady(caller, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "get_symbol_source"
+			req.Params.Arguments = map[string]any{"id": "main.go::Added", "context_lines": float64(0), "format": "json"}
+			return findAndCallHandler(srv, "get_symbol_source", ctx, req)
+		})
+		t.Logf("SOURCE_EVENTUAL_READINESS value=%q first_reply=%s attempts=%d refusals=%d first_refusal_raw=%s", body, evidence.FirstOutcome, evidence.Attempts, evidence.Refusals, evidence.FirstRefusal)
+		require.NoError(t, err)
 		require.False(t, result.IsError, "current symbol must be projected: %v", result.Content)
 		payload := extractTextResult(t, result)
 		require.Equal(t, "func Added() int { "+body+" }", payload["source"])

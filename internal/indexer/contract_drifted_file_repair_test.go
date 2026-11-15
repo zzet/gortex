@@ -73,7 +73,7 @@ func TestContractRepairTakesADriftedRowOnlyWhileTheBytesDiffer(t *testing.T) {
 	require.False(t, f.r.driftedRow(t.Context(), store, "fixture", helper), "an indexed file is not drifted")
 	driftContractFile(t, f.contractJobFixture, "helper.go", jobHelper+"// drifted\n")
 	require.True(t, f.r.driftedRow(t.Context(), store, "fixture", helper))
-	require.NoError(t, f.r.realReindex(t.Context(), "fixture", []string{helper}))
+	require.NoError(t, f.reindexUnderLane(t.Context(), "fixture", []string{helper}))
 	require.False(t, f.r.driftedRow(t.Context(), store, "fixture", helper), "a forced reindex rewrites the row")
 	driftContractFile(t, f.contractJobFixture, "helper.go", jobHelper+"// drifted again\n")
 	require.NoError(t, os.Remove(filepath.Join(f.root, "helper.go")))
