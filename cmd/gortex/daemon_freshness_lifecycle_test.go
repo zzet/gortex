@@ -284,15 +284,18 @@ func daemonFreshnessDefaultRuntimeCase(t *testing.T, baselineOnly bool, pendingC
 		daemonFreshnessPendingPreparationCase(t, ctx, s, root, w, gate, baselineCtx, pendingCase)
 		return
 	}
-	baseline := func() map[string]any {
+	baseline, baselineErr := daemonBaselineReadiness(baselineCtx, func(readCtx context.Context) map[string]any {
 		observeBaselineWatcher("before_original_id12")
 		// Also runs when the existing helper fails via FailNow, before any
 		// watcher/store teardown. The helper retains the original RPC result.
 		defer observeBaselineWatcher("after_original_id12_before_cleanup")
-		return daemonFreshnessCall(t, s, baselineCtx, 12, "get_callers", map[string]any{
+		return daemonFreshnessCall(t, s, readCtx, 12, "get_callers", map[string]any{
 			"id": "repo/target.go::Target", "format": "json", "require_fresh": true, "freshness_scope": "relations",
 		})
-	}()
+	}, func(attempt int, verdict string) {
+		t.Logf("ACTUAL_BASELINE_READINESS attempt=%d reply=%s first_partial_never_PASS=true shared_original_5s_context=true pressure_not_started=true", attempt, verdict)
+	})
+	require.NoError(t, baselineErr, "baseline setup must become actually fresh within its original shared caller context")
 	require.Equal(t, "fresh", daemonFreshnessTier(t, baseline)["graph_freshness"])
 	daemonFreshnessHasCaller(t, baseline, "Caller")
 	t.Logf("ACTUAL_HEALTHY_BASELINE receipt=%s relations_at=%s registered_callers_fresh=true untouched_cold_owner_not_claimed=true", receipt, relationsAt)
