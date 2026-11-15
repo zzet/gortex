@@ -6,7 +6,6 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,7 +19,7 @@ import (
 // fixture matches the real stdlib whatever Go version is installed.
 func syncMapLoadLine(t *testing.T) (string, int) {
 	t.Helper()
-	mapGo := filepath.Join(runtime.GOROOT(), "src", "sync", "map.go")
+	mapGo := filepath.Join(goRoot(), "src", "sync", "map.go")
 	require.FileExists(t, mapGo)
 	fset := token.NewFileSet()
 	file, err := goparser.ParseFile(fset, mapGo, nil, 0)

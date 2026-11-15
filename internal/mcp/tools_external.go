@@ -7,9 +7,10 @@ import (
 	goparser "go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -58,11 +59,32 @@ func metaInt(n *graph.Node, key string) int {
 	return 0
 }
 
+// goRoot resolves the Go installation root the way the go command does:
+// $GOROOT when set, else the GOROOT of the `go` binary on PATH.
+// runtime.GOROOT is deprecated and answers the root the binary was built
+// in, which may be empty or point at a tree that does not exist on the
+// machine serving the source. An empty result means no Go root is known
+// and external reads degrade to the structured answer.
+var goRoot = sync.OnceValue(func() string {
+	if root := os.Getenv("GOROOT"); root != "" {
+		return root
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return ""
+	}
+	out, err := exec.Command(goBin, "env", "GOROOT").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+})
+
 // externalSourceRoots returns the only trees an external symbol's
 // recorded source_file may be served from: the Go standard library and
 // the module cache. A var so tests can point it at a fixture tree.
 var externalSourceRoots = func() []string {
-	roots := []string{runtime.GOROOT()}
+	roots := []string{goRoot()}
 	if mod := goModCacheRoot(); mod != "" {
 		roots = append(roots, mod)
 	}

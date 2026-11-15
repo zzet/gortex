@@ -6,9 +6,10 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 
@@ -782,7 +783,7 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 // as-is; reads on that node degrade to the structured answer.
 func externalSourceFilePath(file, moduleKind string) string {
 	if rest, ok := strings.CutPrefix(file, "$GOROOT"); ok {
-		return runtime.GOROOT() + rest
+		return filepath.Join(goRoot(), rest)
 	}
 	if filepath.IsAbs(file) {
 		return file
@@ -799,12 +800,33 @@ func externalSourceFilePath(file, moduleKind string) string {
 	return file
 }
 
+// goRoot resolves the Go installation root the way the go command does:
+// $GOROOT when set, else the GOROOT of the `go` binary on PATH.
+// runtime.GOROOT is deprecated and answers the root the binary was built
+// in, which may be empty or point at a tree that does not exist on the
+// machine serving the source. An empty result means no Go root is known
+// and external reads degrade to the structured answer.
+var goRoot = sync.OnceValue(func() string {
+	if root := os.Getenv("GOROOT"); root != "" {
+		return root
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return ""
+	}
+	out, err := exec.Command(goBin, "env", "GOROOT").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+})
+
 // externalSourceRootCandidates lists the trees a relative declaration
 // name may live under, most likely first: GOROOT/src for stdlib symbols,
 // the module cache for dependencies.
 func externalSourceRootCandidates(moduleKind string) []string {
 	if moduleKind == "stdlib" {
-		if goroot := runtime.GOROOT(); goroot != "" {
+		if goroot := goRoot(); goroot != "" {
 			return []string{filepath.Join(goroot, "src")}
 		}
 		return nil

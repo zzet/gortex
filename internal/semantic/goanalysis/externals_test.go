@@ -2,7 +2,7 @@ package goanalysis
 
 import (
 	"os"
-	"runtime"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -126,8 +126,9 @@ func TestExternals_RecordsSourcePosition(t *testing.T) {
 	require.NotNil(t, println, "expected synthetic node for fmt.Println")
 	file, _ := println.Meta["source_file"].(string)
 	require.NotEmpty(t, file, "expected source_file recorded for ext::go:fmt::Println")
-	assert.True(t, strings.HasPrefix(file, runtime.GOROOT()),
-		"source_file %q should live under GOROOT %q", file, runtime.GOROOT())
+	goroot := goRoot()
+	assert.True(t, strings.HasPrefix(file, goroot),
+		"source_file %q should live under GOROOT %q", file, goroot)
 	require.FileExists(t, file)
 
 	line := metaLineNumber(println.Meta["source_line"])
@@ -138,6 +139,18 @@ func TestExternals_RecordsSourcePosition(t *testing.T) {
 	require.GreaterOrEqual(t, len(sourceLines), line)
 	assert.Contains(t, sourceLines[line-1], "func Println",
 		"source_line should point at Println's declaration")
+}
+
+// TestExternals_SourceFilePathFormsAgree pins the contract the typecheck
+// cache-equivalence tests rely on: the $GOROOT form export data records
+// and the cache-relative form must resolve to the same source_file
+// spelling, or a warm pass writes different metadata than a whole-module
+// load for the same node (a mixed-separator divergence on Windows).
+func TestExternals_SourceFilePathFormsAgree(t *testing.T) {
+	require.FileExists(t, filepath.Join(goRoot(), "src", "sync", "map.go"))
+	assert.Equal(t,
+		externalSourceFilePath("sync/map.go", "stdlib"),
+		externalSourceFilePath("$GOROOT/src/sync/map.go", "stdlib"))
 }
 
 // metaLineNumber reads a Meta line number across the int / float64 forms
