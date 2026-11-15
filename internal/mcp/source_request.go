@@ -103,6 +103,9 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 	if selector.Kind == graphview.SelectorAuto && !graphview.ServesAutomaticView(checkout) {
 		return nil, nil
 	}
+	if scope == "file" && selector.Kind == graphview.SelectorAuto && s.readsSiblingRepo(ctx, req.GetString("path", ""), checkout.RootPath, control.RepoPrefix) {
+		return nil, nil
+	}
 	if checkout.State != store_sqlite.CheckoutStateReady {
 		return nil, graphview.NewViewError(graphview.CodeCheckoutInaccessible, fmt.Sprintf("checkout %q is %s", checkout.CheckoutID, checkout.State))
 	}
@@ -163,6 +166,44 @@ func (s *Server) resolveSourceRequestView(ctx context.Context, selector graphvie
 		view.freshness = &requestFreshnessOutcome{deadline: freshness.effectiveDeadline(time.Now(), ctx)}
 	}
 	return view, nil
+}
+
+// readsSiblingRepo reports whether a cwd-bound file read names a file in
+// another tracked repository of the session's workspace. The source lane
+// proves bytes of its own checkout only, so such a read takes the ordinary
+// path — the one a session in the primary checkout reads the same file
+// through. A repository outside the session workspace stays on the lane and
+// keeps its refusal.
+func (s *Server) readsSiblingRepo(ctx context.Context, rawPath, checkoutRoot, ownPrefix string) bool {
+	// Without its own prefix the checkout cannot tell its primary from a
+	// sibling, so the lane keeps the read and its existing refusal.
+	if s.multiIndexer == nil || rawPath == "" || ownPrefix == "" {
+		return false
+	}
+	abs := filepath.Clean(rawPath)
+	if !filepath.IsAbs(abs) {
+		slashPath := filepath.ToSlash(abs)
+		prefix := matchedRepoPrefix(s.multiIndexer, slashPath)
+		if prefix == "" || prefix == ownPrefix {
+			return false
+		}
+		root, ok := s.multiIndexer.RepoRoot(prefix)
+		if !ok {
+			return false
+		}
+		abs = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(slashPath, prefix+"/")))
+	}
+	if (viewPathRoot{root: checkoutRoot}).contains(abs) {
+		return false
+	}
+	prefix := s.multiIndexer.RepoForFile(abs)
+	if prefix == "" || prefix == ownPrefix {
+		return false
+	}
+	if allowed, bound := s.sessionWorkspaceRepoSet(ctx); bound && !allowed[prefix] {
+		return false
+	}
+	return true
 }
 
 func sourceRequestView(ctx context.Context) *requestView {

@@ -117,3 +117,59 @@ func TestSourceCarrierRejectsReplacedPhysicalRoot(t *testing.T) {
 	require.NoError(t, os.MkdirAll(stack.worktreeRoot, 0755))
 	require.ErrorContains(t, stack.srv.validateSourceCheckoutIdentity(ctx, view), "physical root changed")
 }
+
+// A worktree session reads a sibling repository of its own workspace the way a
+// primary-checkout session does: the source lane, which proves bytes of its own
+// checkout only, steps aside instead of refusing the path.
+func TestWorktreeSessionReadsSiblingRepoFile(t *testing.T) {
+	stack := newViewStackWithSibling(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+	siblingFile := filepath.Join(stack.siblingRoot, "sibling.go")
+
+	res, err := stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": siblingFile}, stack.srv.handleReadFile)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Contains(t, viewResultText(t, res), "func Sibling()")
+
+	res, err = stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": "sibling/sibling.go"}, stack.srv.handleReadFile)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Contains(t, viewResultText(t, res), "func Sibling()")
+
+	facade := mcplib.CallToolRequest{}
+	facade.Params.Name = "read"
+	facade.Params.Arguments = map[string]any{"operation": "file", "target": map[string]any{"file": siblingFile}}
+	view, err := stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &facade, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.Nil(t, view, "a facade read of a sibling repo must leave the source lane")
+
+	own := mcplib.CallToolRequest{}
+	own.Params.Arguments = map[string]any{"path": filepath.Join(stack.worktreeRoot, "keep.go")}
+	view, err = stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &own, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, view, "a read of the worktree's own file keeps the source lane")
+
+	require.True(t, stack.srv.readsSiblingRepo(ctx, siblingFile, stack.worktreeRoot, "repo"))
+	require.False(t, stack.srv.readsSiblingRepo(ctx, filepath.Join(stack.repoRoot, "keep.go"), stack.worktreeRoot, ""),
+		"a checkout with no known prefix cannot tell its primary from a sibling")
+	require.False(t, stack.srv.readsSiblingRepo(ctx, "repo/keep.go", stack.worktreeRoot, "repo"),
+		"its own prefix is not a sibling")
+}
+
+// The sibling exception stops at the session workspace and at an explicit
+// worktree selector: both still refuse a path outside the checkout.
+func TestWorktreeSessionSiblingReadStaysInsideWorkspace(t *testing.T) {
+	stack := newViewStackWithSibling(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+
+	res, err := stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": filepath.Join(stack.otherRoot, "other.go")}, stack.srv.handleReadFile)
+	require.NoError(t, err)
+	require.True(t, res.IsError, "a repo in another workspace must stay refused")
+	require.Contains(t, viewResultText(t, res), "outside the selected checkout")
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": filepath.Join(stack.siblingRoot, "sibling.go")}
+	view, err := stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: viewTestWorktree}, &req, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, view, "an explicit worktree selector keeps the checkout boundary")
+}

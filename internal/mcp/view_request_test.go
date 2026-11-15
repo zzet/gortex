@@ -47,6 +47,7 @@ type viewStack struct {
 	dbPath       string
 	repoRoot     string
 	otherRoot    string
+	siblingRoot  string
 	worktreeRoot string
 	graphID      string
 	commit       int64
@@ -114,6 +115,18 @@ func newViewStack(t *testing.T) *viewStack {
 // bare path gets no shortcut past it.
 func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 	t.Helper()
+	return buildViewStack(t, includeOther, false)
+}
+
+// newViewStackWithSibling adds a "sibling" repo in the worktree family's own
+// workspace, so a worktree session has a second repository it may read.
+func newViewStackWithSibling(t *testing.T) *viewStack {
+	t.Helper()
+	return buildViewStack(t, true, true)
+}
+
+func buildViewStack(t *testing.T, includeOther, includeSibling bool) *viewStack {
+	t.Helper()
 	base := t.TempDir()
 	repoRoot := writeViewRepo(t, filepath.Join(base, "repo"), "main-ws", map[string]string{
 		"edit.go": "package repo\n\nfunc Old() {}\n",
@@ -126,6 +139,13 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 			"other.go": "package other\n\nfunc Other() {}\n",
 		})
 		repos = append(repos, config.RepoEntry{Path: otherRoot, Name: "other"})
+	}
+	var siblingRoot string
+	if includeSibling {
+		siblingRoot = writeViewRepo(t, filepath.Join(base, "sibling"), "main-ws", map[string]string{
+			"sibling.go": "package sibling\n\nfunc Sibling() {}\n",
+		})
+		repos = append(repos, config.RepoEntry{Path: siblingRoot, Name: "sibling"})
 	}
 	worktreeRoot := filepath.Join(base, "wt")
 	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
@@ -163,6 +183,7 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 		dbPath:       dbPath,
 		repoRoot:     repoRoot,
 		otherRoot:    otherRoot,
+		siblingRoot:  siblingRoot,
 		worktreeRoot: worktreeRoot,
 		graphID:      graphID,
 	}
