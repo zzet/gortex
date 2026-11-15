@@ -1218,7 +1218,7 @@ func (p *Provider) enrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 
 	refsStart := time.Now()
-	externals = newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex)
+	externals = newExternalsAttribution(g, pkgs, p.Name(), repoPrefix, depIndex, fset)
 	// Prefetch only the externals a projected use can name: resolveGoUse
 	// drops a use outside a function of a file the projection indexes
 	// before it asks the externals attribution for anything.

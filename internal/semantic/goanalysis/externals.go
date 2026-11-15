@@ -1,9 +1,18 @@
 package goanalysis
 
 import (
+	"bytes"
+	"context"
 	"go/ast"
+	"go/build"
+	"go/token"
 	"go/types"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/tools/go/packages"
 
@@ -50,7 +59,11 @@ type externalUseIdentity struct {
 }
 
 type externalsAttribution struct {
-	g            graph.Store
+	g graph.Store
+	// fset is the FileSet the pass's types were created in — the load's
+	// own set, which the typecheck cache retains even after
+	// releaseGoPackageCompilerState nils pkg.Fset on reused packages.
+	fset         *token.FileSet
 	pkgByPath    map[string]*packages.Package
 	moduleByPath map[string]string
 	// extByObj is a projection-only accelerator. It is cleared together with
@@ -97,7 +110,7 @@ type externalsAttribution struct {
 // roots' Imports maps hold ID-only stubs with an empty PkgPath, so the walk
 // alone would leave every dependency unclassifiable. Roots overlay the index
 // entries — they carry the fuller (typed) package for their own path.
-func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider, repoPrefix string, depIndex map[string]*packages.Package) *externalsAttribution {
+func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider, repoPrefix string, depIndex map[string]*packages.Package, fset *token.FileSet) *externalsAttribution {
 	pkgByPath := make(map[string]*packages.Package, len(depIndex))
 	var visit func(p *packages.Package)
 	visit = func(p *packages.Package) {
@@ -124,6 +137,7 @@ func newExternalsAttribution(g graph.Store, roots []*packages.Package, provider,
 	}
 	return &externalsAttribution{
 		g:            g,
+		fset:         fset,
 		pkgByPath:    pkgByPath,
 		moduleByPath: make(map[string]string),
 		extByObj:     make(map[types.Object]string),
@@ -233,7 +247,7 @@ func (e *externalsAttribution) resolveSymbol(obj types.Object) string {
 	}
 
 	if _, exists := e.knownNodeIDs[nodeID]; !exists {
-		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider))
+		e.pendingNodes = append(e.pendingNodes, buildExternalNode(nodeID, kind, importPath, moduleID, pkg, obj, e.provider, e.fset))
 		e.knownNodeIDs[nodeID] = struct{}{}
 		e.nodesAdded++
 	}
@@ -712,7 +726,7 @@ func externalUseIdentityFor(repoPrefix, importPath string, obj types.Object) *ex
 // buildExternalNode constructs a graph node for an external symbol. The
 // FilePath is a synthetic "external::go:<importPath>" string so byFile
 // lookups don't pollute real source-file buckets.
-func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID string, pkg *packages.Package, obj types.Object, provider string) *graph.Node {
+func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID string, pkg *packages.Package, obj types.Object, provider string, fset *token.FileSet) *graph.Node {
 	moduleKind, version := classifyPackage(pkg)
 	meta := map[string]any{
 		"external":        true,
@@ -721,6 +735,21 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 		"module_kind":     moduleKind,
 		"module_id":       moduleID,
 		"semantic_source": provider,
+	}
+	// Export data keeps the declaration's file and line, so the source
+	// can be served read-only later (get_symbol_source / nav read on
+	// ext:: symbols). StartLine/EndLine stay unset on purpose: the edit
+	// and analysis guards must keep treating the node as having no
+	// editable range, and the synthetic FilePath keeps byFile buckets clean.
+	// Positions resolve through the pass's FileSet — pkg.Fset is nil'ed
+	// by releaseGoPackageCompilerState on reused (cached) packages. A nil
+	// fset records nothing and reads on the node degrade to the
+	// structured answer.
+	if fset != nil {
+		if pos := fset.Position(obj.Pos()); pos.Filename != "" && pos.Line > 0 {
+			meta["source_file"] = externalSourceFilePath(pos.Filename, moduleKind)
+			meta["source_line"] = pos.Line
+		}
 	}
 	if version != "" {
 		meta["version"] = version
@@ -747,6 +776,181 @@ func buildExternalNode(nodeID string, kind graph.NodeKind, importPath, moduleID 
 		Language: "go",
 		Meta:     meta,
 	}
+}
+
+// externalSourceFilePath turns a declaration file name into an openable
+// absolute path. The toolchain records GOROOT files as "$GOROOT/..." in
+// export data, and the typecheck cache serves names relative to the tree
+// they were compiled in: GOROOT/src for the standard library, the module
+// cache for dependencies. A name that resolves under neither tree is kept
+// as-is; reads on that node degrade to the structured answer.
+func externalSourceFilePath(file, moduleKind string) string {
+	if rest, ok := strings.CutPrefix(file, "$GOROOT"); ok {
+		return filepath.Join(goRoot(context.Background()), rest)
+	}
+	if filepath.IsAbs(file) {
+		return file
+	}
+	for _, root := range externalSourceRootCandidates(moduleKind) {
+		if root == "" {
+			continue
+		}
+		candidate := filepath.Join(root, file)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return file
+}
+
+// goRootTimeout bounds the go env GOROOT subprocess used when GOROOT is
+// unset. Discovery runs inside the first request that needs it, so a
+// slow or wedged toolchain must not hold that request open for good.
+const goRootTimeout = 10 * time.Second
+
+// goRootWaitDelay stops the wait even when the killed subprocess's
+// output pipes stay open, for example because a grandchild holds them.
+const goRootWaitDelay = 2 * time.Second
+
+// goRootOutputLimit caps the captured go env output: GOROOT is a single
+// path, so more than this is a wedged child, not a longer answer.
+const goRootOutputLimit = 64 << 10
+
+// goRootFlight is one discovery subprocess in flight. Waiters watch done
+// instead of their own contexts, so the outcome stays independent of
+// whichever request happened to trigger the discovery.
+type goRootFlight struct {
+	done chan struct{}
+	root string
+}
+
+var (
+	goRootMu     sync.Mutex
+	goRootCached string
+	goRootOK     bool
+	goRootActive *goRootFlight
+)
+
+// goRoot resolves the Go installation root the way the go command does:
+// $GOROOT when set, else the GOROOT of the `go` binary on PATH.
+// runtime.GOROOT is deprecated and answers the root the binary was built
+// in, which may be empty or point at a tree that does not exist on the
+// machine serving the source. An empty result means no Go root is known
+// and external reads degrade to the structured answer.
+//
+// The discovery subprocess is bounded (deadline, output cap, wait delay)
+// and shared through a single flight. A caller whose context ends while
+// waiting returns without the root instead of blocking on the toolchain,
+// and only a discovered root is cached: a canceled or failed first
+// request must not poison the process-wide cache. Enrichment passes
+// context.Background because the pass holds no request deadline; the
+// subprocess bound is what keeps discovery finite there.
+func goRoot(ctx context.Context) string {
+	if root := os.Getenv("GOROOT"); root != "" {
+		return root
+	}
+	goRootMu.Lock()
+	if goRootOK {
+		root := goRootCached
+		goRootMu.Unlock()
+		return root
+	}
+	flight := goRootActive
+	if flight == nil {
+		flight = &goRootFlight{done: make(chan struct{})}
+		goRootActive = flight
+		go func() {
+			root := discoverGoRoot()
+			flight.root = root
+			close(flight.done)
+			goRootMu.Lock()
+			if root != "" {
+				goRootCached, goRootOK = root, true
+			}
+			goRootActive = nil
+			goRootMu.Unlock()
+		}()
+	}
+	goRootMu.Unlock()
+
+	select {
+	case <-flight.done:
+		return flight.root
+	case <-ctx.Done():
+		return ""
+	}
+}
+
+// discoverGoRoot runs one bounded `go env GOROOT`. The context kill is
+// the child cleanup: exec.CommandContext terminates the process at the
+// deadline, and WaitDelay keeps the wait itself bounded when pipes stay
+// open after the kill.
+func discoverGoRoot() string {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), goRootTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, goBin, "env", "GOROOT")
+	cmd.WaitDelay = goRootWaitDelay
+	var out goRootOutput
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out.buf.String())
+}
+
+// goRootOutput captures the subprocess output up to goRootOutputLimit
+// and drops the rest, reporting success so the child keeps draining
+// until the deadline kill instead of dying on a full pipe.
+type goRootOutput struct {
+	buf bytes.Buffer
+}
+
+func (w *goRootOutput) Write(p []byte) (int, error) {
+	if room := goRootOutputLimit - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		w.buf.Write(p)
+	}
+	return len(p), nil
+}
+
+// externalSourceRootCandidates lists the trees a relative declaration
+// name may live under, most likely first: GOROOT/src for stdlib symbols,
+// the module cache for dependencies.
+func externalSourceRootCandidates(moduleKind string) []string {
+	if moduleKind == "stdlib" {
+		if goroot := goRoot(context.Background()); goroot != "" {
+			return []string{filepath.Join(goroot, "src")}
+		}
+		return nil
+	}
+	if mod := goModuleCacheRoot(); mod != "" {
+		return []string{mod}
+	}
+	return nil
+}
+
+// goModuleCacheRoot mirrors the go command's GOMODCACHE resolution:
+// $GOMODCACHE when set, else the first GOPATH entry + /pkg/mod
+// (build.Default.GOPATH applies the same default the go command does).
+func goModuleCacheRoot() string {
+	if mod := os.Getenv("GOMODCACHE"); mod != "" {
+		return mod
+	}
+	gopath := build.Default.GOPATH
+	if gopath == "" {
+		return ""
+	}
+	first := strings.SplitN(gopath, string(filepath.ListSeparator), 2)[0]
+	if first == "" {
+		return ""
+	}
+	return filepath.Join(first, "pkg", "mod")
 }
 
 // classifyPackage labels a loaded package as stdlib / module_cache / main.

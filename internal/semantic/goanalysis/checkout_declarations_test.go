@@ -187,7 +187,7 @@ func Sibling() string {
 	require.NoError(t, err)
 	require.Len(t, pkgs, 1)
 	fset := pkgs[0].Fset
-	externals := newExternalsAttribution(graph.New(), pkgs, "go-types", "", nil)
+	externals := newExternalsAttribution(graph.New(), pkgs, "go-types", "", nil, fset)
 	hasOS := func(ids []string) bool {
 		return slices.ContainsFunc(ids, func(id string) bool { return strings.Contains(id, "go:os") })
 	}

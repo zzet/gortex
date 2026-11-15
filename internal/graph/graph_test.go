@@ -194,6 +194,23 @@ func TestValidNodeKind(t *testing.T) {
 	assert.False(t, ValidNodeKind(NodeKind("unknown")))
 }
 
+func TestNodeBriefMarksExternalSymbols(t *testing.T) {
+	ext := &Node{
+		ID: "ext::go:fmt::Println", Kind: KindFunction, Name: "Println",
+		FilePath: "external::go:fmt", Language: "go",
+		Meta: map[string]any{"external": true, "module_kind": "stdlib"},
+	}
+	b := ext.Brief()
+	assert.Equal(t, true, b["external"])
+
+	repo := &Node{
+		ID: "a.go::Foo", Kind: KindFunction, Name: "Foo",
+		FilePath: "a.go", StartLine: 10, EndLine: 20, Language: "go",
+	}
+	_, hasExternal := repo.Brief()["external"]
+	assert.False(t, hasExternal, "repo symbols must not be marked external")
+}
+
 func makeRepoNode(id, name string, kind NodeKind, file, lang, repo string) *Node {
 	return &Node{
 		ID:         id,
