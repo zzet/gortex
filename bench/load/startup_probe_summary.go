@@ -28,11 +28,13 @@ type bootSummary struct {
 // no_socket before the socket answered, loading until the primary was ready,
 // and ready after.
 type startupSummary struct {
-	PrimaryRepo     string        `json:"primary_repo"`
-	LinkedWorktrees int           `json:"linked_worktrees"`
-	WatchIntervalMS float64       `json:"watch_interval_ms"`
-	CLITTY          string        `json:"cli_tty"`
-	Boots           []bootSummary `json:"boots"`
+	PrimaryRepo         string        `json:"primary_repo"`
+	LinkedWorktrees     int           `json:"linked_worktrees"`
+	NoCheckout          bool          `json:"no_checkout,omitempty"`
+	LinkedHookFileScope string        `json:"linked_hook_file_scope,omitempty"`
+	WatchIntervalMS     float64       `json:"watch_interval_ms"`
+	CLITTY              string        `json:"cli_tty"`
+	Boots               []bootSummary `json:"boots"`
 	// Outcomes counts each answer as ok, ok:<status>, an error code (with
 	// repo_loading(incomplete) for a loading refusal missing retryable=true,
 	// phase or percent), an initialize instructions variant, or a hook
