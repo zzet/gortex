@@ -38,7 +38,7 @@ func (s *sharedReceiptFreshContractStore) BulkSetFileMtimes(repo string, mtimes 
 	if err := s.Store.BulkSetFileMtimes(repo, mtimes); err != nil {
 		return err
 	}
-	if s.armed.Load() && s.Store.GetNode("main.go::Stream1Edit00") != nil && s.armed.CompareAndSwap(true, false) {
+	if s.armed.Load() && s.GetNode("main.go::Stream1Edit00") != nil && s.armed.CompareAndSwap(true, false) {
 		close(s.applied)
 		<-s.release
 	}
@@ -212,7 +212,7 @@ func TestSharedReceiptCallersWaitForFreshRelationsWithinOriginalDeadline(t *test
 	// Independent setup: A is genuinely indexed and checked-retired before B.
 	// The existing method verifies canonical bytes/nodes; no registry erasure,
 	// fabricated tier/receipt or claim to reproduce R26 is involved.
-	ownOut := store.Store.GetOutEdges(own)
+	ownOut := store.GetOutEdges(own)
 	require.Len(t, ownOut, 1)
 	require.Equal(t, "main.go::Target", ownOut[0].To)
 	f.server.canonicalProjectionRetirement(filepath.Join(f.root, "main.go")).run()
