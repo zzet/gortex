@@ -209,12 +209,14 @@ type applier struct {
 	// outKinds / inKinds are the edge kinds the adjacency preload loads per
 	// direction; nil loads every kind (the legacy preload). See
 	// adjacencyOutKinds for why the restriction is invisible to the phases.
+	// Set only through setAdjacencyKinds, which derives splitCalls.
 	outKinds []graph.EdgeKind
 	inKinds  []graph.EdgeKind
 	// splitCalls keeps outgoing calls out of outByID: they are loaded into
 	// callsByID only for the callers a calls application can read (see
 	// loadCallerCalls), never for frontier nodes or in the other phases.
-	// False under the legacy preload, whose outByID holds every kind.
+	// Derived from outKinds (splitsCalls), never set on its own: false under
+	// the legacy preload, whose outByID holds every kind.
 	splitCalls  bool
 	callsByID   map[string][]*graph.Edge
 	callsLoaded map[string]bool
@@ -249,7 +251,7 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 			languages[language] = true
 		}
 	}
-	return &applier{
+	a := &applier{
 		g:                    g,
 		spec:                 spec,
 		provider:             provider,
@@ -269,12 +271,31 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 		repoProjectionLoaded: make(map[string]bool),
 		outLoaded:            make(map[string]bool),
 		inLoaded:             make(map[string]bool),
-		outKinds:             adjacencyOutKinds(spec),
-		inKinds:              adjacencyInKinds,
-		splitCalls:           true,
 		callsByID:            make(map[string][]*graph.Edge),
 		callsLoaded:          make(map[string]bool),
 	}
+	a.setAdjacencyKinds(adjacencyOutKinds(spec), adjacencyInKinds)
+	return a
+}
+
+// setAdjacencyKinds sets the edge kinds the adjacency preload loads per
+// direction (nil: every kind) and derives splitCalls from them. Must run
+// before the first load.
+func (a *applier) setAdjacencyKinds(out, in []graph.EdgeKind) {
+	a.outKinds, a.inKinds = out, in
+	a.splitCalls = splitsCalls(out)
+}
+
+// splitsCalls reports whether outgoing calls live in callsByID rather than
+// outByID: exactly when the outgoing preload does not load them, so a calls
+// edge is held in at most one outgoing list and never in a structural hot
+// cache entry. The mutation upkeep (reindexEdge, removeEdge, addASTEdge)
+// relies on that: its calls branch maintains callsByID alone and skips the
+// outByID/forgetOut upkeep, while the incoming upkeep stays keyed on
+// inKinds for every kind, calls included — so a kind set that also loads
+// incoming calls keeps its in-lists and hot in entries coherent.
+func splitsCalls(out []graph.EdgeKind) bool {
+	return !edgeKindLoaded(out, graph.EdgeCalls)
 }
 
 // superEdgeKinds are the relation kinds applySuper confirms, retargets and
@@ -694,11 +715,8 @@ func (a *applier) inEdges(id string) []*graph.Edge {
 // (which the per-entry size, and so the loaded kind set, decides).
 func (a *applier) reindexEdge(edge *graph.Edge, oldTo string) {
 	a.g.ReindexEdge(edge, oldTo)
-	if a.splitCalls && edge.Kind == graph.EdgeCalls {
-		// callsByID holds the retargeted pointer in place; calls are in no
-		// hot cache entry and in no loaded in-list.
-		return
-	}
+	// A split calls edge is not in outByID (splitsCalls): callsByID holds the
+	// retargeted pointer in place, so only the incoming side needs upkeep.
 	if edgeKindLoaded(a.outKinds, edge.Kind) {
 		// The store reinserts the row, so the source's list order changes too.
 		a.hot.forgetOut(edge.From)
@@ -724,9 +742,7 @@ func (a *applier) removeEdge(edge *graph.Edge) {
 		if a.callsLoaded[edge.From] {
 			a.callsByID[edge.From] = withoutEdge(a.callsByID[edge.From], edge)
 		}
-		return
-	}
-	if edgeKindLoaded(a.outKinds, edge.Kind) {
+	} else if edgeKindLoaded(a.outKinds, edge.Kind) {
 		a.hot.forgetOut(edge.From)
 		if a.outLoaded[edge.From] {
 			a.outByID[edge.From] = withoutEdge(a.outByID[edge.From], edge)
@@ -2087,19 +2103,17 @@ func (a *applier) addASTEdge(from, to string, kind graph.EdgeKind, file string, 
 	if strategy != strategyDirect {
 		e.Meta["resolution_strategy"] = string(strategy)
 	}
-	if a.splitCalls && kind == graph.EdgeCalls {
-		if a.outLoaded[from] && !a.callsLoaded[from] {
-			// Snapshot before the add, as the legacy preload's list was.
-			a.loadCalls([]string{from})
-		}
-		a.g.AddEdge(e)
+	splitCall := a.splitCalls && kind == graph.EdgeCalls
+	if splitCall && a.outLoaded[from] && !a.callsLoaded[from] {
+		// Snapshot before the add, as the legacy preload's list was.
+		a.loadCalls([]string{from})
+	}
+	a.g.AddEdge(e)
+	if splitCall {
 		if a.callsLoaded[from] {
 			a.callsByID[from] = append(a.callsByID[from], e)
 		}
-		return e
-	}
-	a.g.AddEdge(e)
-	if edgeKindLoaded(a.outKinds, kind) {
+	} else if edgeKindLoaded(a.outKinds, kind) {
 		a.hot.forgetOut(from)
 		if a.outLoaded[from] {
 			a.outByID[from] = append(a.outByID[from], e)

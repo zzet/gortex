@@ -34,7 +34,7 @@ type Provider struct {
 func (p *Provider) newApplier(g graph.Store) *applier {
 	ap := newApplier(g, p.spec, p.Name())
 	if p.fullAdjacency {
-		ap.outKinds, ap.inKinds, ap.splitCalls = nil, nil, false
+		ap.setAdjacencyKinds(nil, nil)
 	}
 	ap.afterPreload = p.observePreload
 	return ap

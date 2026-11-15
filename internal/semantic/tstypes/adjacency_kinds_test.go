@@ -582,6 +582,8 @@ type parityRun struct {
 	// perFile drives EnrichFile over every fixture file (one applier running
 	// all four phases per file) instead of the streamed EnrichRepo pass.
 	perFile bool
+	// compat hides the store's optional capabilities (compatOnlyStore).
+	compat bool
 }
 
 // enrichSnapshot builds the fixture on the chosen backend, salts it (hub
@@ -603,6 +605,9 @@ func enrichSnapshot(t *testing.T, label string, fixture map[string]string, provi
 	injectHubAdjacency(s, run.fan)
 	injectOutgoingCalls(s, run.fan/4)
 	injectSiblingStubs(s)
+	if run.compat {
+		s = compatOnlyStore{s}
+	}
 	files := make([]string, 0, len(fixture))
 	for rel := range fixture {
 		files = append(files, rel)
@@ -759,11 +764,14 @@ func TestAdjacencyKindFilterParityEnrichFile(t *testing.T) {
 }
 
 // adjacencyLoadStore counts what the preload pulls through either read path,
-// in edges and an approximation of decoded bytes.
+// in edges and an approximation of decoded bytes, and the caller-calls reads
+// (adjacencyCallKinds) by query and by requested node ID.
 type adjacencyLoadStore struct {
 	graph.Store
 	edges, bytes int
 	kinds        map[graph.EdgeKind]int
+	callQueries  int
+	callIDs      map[string]int
 }
 
 func (s *adjacencyLoadStore) count(m map[string][]*graph.Edge) map[string][]*graph.Edge {
@@ -789,6 +797,15 @@ func (s *adjacencyLoadStore) GetInEdgesByNodeIDs(ids []string) map[string][]*gra
 }
 
 func (s *adjacencyLoadStore) GetOutEdgesByNodeIDsKinds(ids []string, kinds []graph.EdgeKind) map[string][]*graph.Edge {
+	if slicesEqualKinds(kinds, adjacencyCallKinds) {
+		s.callQueries++
+		if s.callIDs == nil {
+			s.callIDs = map[string]int{}
+		}
+		for _, id := range ids {
+			s.callIDs[id]++
+		}
+	}
 	return s.count(graph.OutEdgesByNodeIDsOfKinds(s.Store, ids, kinds))
 }
 
