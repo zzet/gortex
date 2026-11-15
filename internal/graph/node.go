@@ -418,6 +418,13 @@ func (n *Node) Brief() map[string]any {
 	if v, ok := n.Meta["is_test"].(bool); ok && v {
 		b["is_test"] = true
 	}
+	// External (ext::) symbols are stamped by the goanalysis externals
+	// pass. Surfacing the flag on the listing row lets an agent tell
+	// stdlib / module-cache hits apart from repo symbols before it
+	// spends a source read on one.
+	if v, ok := n.Meta["external"].(bool); ok && v {
+		b["external"] = true
+	}
 	if r, ok := n.Meta["test_role"].(string); ok && r != "" {
 		b["test_role"] = r
 	}
