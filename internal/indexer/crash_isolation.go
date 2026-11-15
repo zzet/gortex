@@ -313,7 +313,7 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 			idx.logger.Warn("indexer: file extraction exceeded budget; skipped",
 				zap.String("file", relPath), zap.Int("budget_ms", budget))
 			return timeoutSkipResult(relPath, lang, budget), true,
-				fmt.Errorf("extraction exceeded %dms budget: %s", budget, relPath)
+				&extractBudgetError{budgetMS: budget, path: relPath}
 		}
 		// An extractor panic was recovered in-process: isolate the file
 		// like the subprocess pool does — emit a quarantine node so it

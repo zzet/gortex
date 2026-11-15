@@ -146,6 +146,12 @@ func (j *contractCoreInputJournal) stage(change contractCoreInputChange) {
 // analysis excludes the file instead of reading prior or partial facts.
 const contractFileIndexFailed = "file_index_failed"
 
+// contractFileParseTimeout is the extra cause a baseline envelope carries when
+// the file's parse ran out of time. A timeout depends on load, not on the
+// file's bytes, so the next baseline rebuild parses the file again instead of
+// keeping the envelope until the file is edited.
+const contractFileParseTimeout = "parse_timeout"
+
 // errContractJournalWrite marks a refused journal begin. The core write that
 // needed it was refused too, so the file's prior receipt still describes it
 // and no failure envelope may stand in for it.
@@ -189,6 +195,41 @@ func contractFailureEnvelopeEligible(err error, cold bool) bool {
 	}
 	var content *contractContentError
 	return errors.As(err, &content) || errors.Is(err, errSilentZeroExtraction)
+}
+
+// contractBaselineEnvelopeEligible decides whether a file failure during
+// baseline reconstruction is excluded as a failure envelope, and whether that
+// failure was a timeout. Beyond the rule above it admits two timeouts: a
+// content failure that wraps a deadline (the parser bounds each parse with its
+// own timeout on a background context) and the configured per-file extraction
+// budget. While the caller's context is live either is the file's parse
+// budget, not the caller's; elsewhere a deadline cannot be told apart from the
+// caller's, so the general rule refuses it. A cancellation is never the
+// file's own failure, and with the caller's context done nothing qualifies.
+func contractBaselineEnvelopeEligible(ctx context.Context, err error) (eligible, timeout bool) {
+	if err == nil || ctx.Err() != nil {
+		return false, false
+	}
+	switch {
+	case errors.Is(err, errFileVersionChanged), errors.Is(err, errContractJournalWrite),
+		errors.Is(err, fs.ErrNotExist), errors.Is(err, context.Canceled):
+		return false, false
+	case errors.Is(err, errExtractTimeout):
+		return true, true
+	}
+	var content *contractContentError
+	if !errors.As(err, &content) {
+		return false, false
+	}
+	return true, errors.Is(err, context.DeadlineExceeded)
+}
+
+// contractFailureEnvelopeChange is the input change that excludes path as a
+// failure envelope.
+func contractFailureEnvelopeChange(path string) contractCoreInputChange {
+	change := contractCoreInputChange{FilePath: path, SourceFingerprint: contractFailureEnvelopeSource(path), Uncertainty: contractFileIndexFailed}
+	change.Delta.Scope = graph.ContractWorkScope{Unknown: true, Causes: []string{contractFileIndexFailed}}
+	return change
 }
 
 // contractFailureEnvelopeSource is the source identity of an envelope whose
@@ -244,9 +285,7 @@ func (j *contractCoreInputJournal) stageFailureEnvelopesOver(ctx context.Context
 		if !over && j.priorFailureEnvelope(ctx, path) && !j.coldNamespace() {
 			continue
 		}
-		change := contractCoreInputChange{FilePath: path, SourceFingerprint: contractFailureEnvelopeSource(path), Uncertainty: contractFileIndexFailed}
-		change.Delta.Scope = graph.ContractWorkScope{Unknown: true, Causes: []string{contractFileIndexFailed}}
-		j.stage(change)
+		j.stage(contractFailureEnvelopeChange(path))
 		staged = append(staged, path)
 	}
 	if len(staged) == 0 {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -179,9 +180,10 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			if err := yield(ctx); err != nil {
 				return err
 			}
-			if row := prior[file.Path]; row != nil && row.Accepted && contractReceiptIsFailureEnvelope(row) {
+			if row := prior[file.Path]; row != nil && row.Accepted && contractReceiptIsFailureEnvelope(row) && !slices.Contains(row.Scope.Causes, contractFileParseTimeout) {
 				// An accepted failure envelope stays: the file is excluded, and
-				// its envelope is folded as it stands below.
+				// its envelope is folded as it stands below. A timeout envelope
+				// is parsed again: its cause was load, not the file's bytes.
 				continue
 			}
 			accepted, err := snapshot.ReadAccepted(ctx, file)
@@ -191,7 +193,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 				continue
 			}
 			if err != nil {
-				return err
+				return contractBaselineFileFailure(ctx, file.Path, err)
 			}
 			cfg, ok := snapshot.RepoConfigs[repo]
 			if !ok {
@@ -214,11 +216,32 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			}
 			idx.Close()
 			if collectErr != nil {
-				return collectErr
+				eligible, timeout := contractBaselineEnvelopeEligible(ctx, collectErr)
+				if !eligible {
+					return contractBaselineFileFailure(ctx, file.Path, collectErr)
+				}
+				// The file's own bytes failed to extract: exclude it as the
+				// cold and incremental paths do, so one file cannot hold the
+				// whole namespace header pending.
+				row, err := contractCoreStoredReceipt(repo, "", contractFailureEnvelopeChange(file.Path))
+				if err != nil {
+					return contractBaselineFileFailure(ctx, file.Path, err)
+				}
+				if timeout {
+					// Tag the scope only: the payload, and so the envelope's
+					// fingerprint, stays the one every envelope of path has.
+					row.Scope.Causes = appendUniqueSorted(row.Scope.Causes, contractFileParseTimeout)
+				}
+				if options.Logger != nil {
+					options.Logger.Warn("contract baseline: file excluded as a failure envelope", zap.String("repo", repo), zap.String("path", file.Path), zap.Error(collectErr))
+				}
+				rows = append(rows, row)
+				reconstructed[file.Path] = row.Payload
+				continue
 			}
 			row, err := contractCoreStoredReceipt(repo, "", contractCoreInputChange{FilePath: file.Path, Current: &receipt, SourceFingerprint: accepted.SourceFingerprint})
 			if err != nil {
-				return err
+				return contractBaselineFileFailure(ctx, file.Path, err)
 			}
 			if row.Scope.Unknown {
 				if _, overflow := contractReceiptOverflowPolicy(&row); !overflow {
@@ -308,6 +331,28 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 	})
 }
 
+// contractBaselineFileError names the file whose reconstruction failed, so a
+// refused baseline logs which file holds it.
+type contractBaselineFileError struct {
+	Path string
+	Err  error
+}
+
+func (e *contractBaselineFileError) Error() string {
+	return fmt.Sprintf("contract baseline: %s: %v", e.Path, e.Err)
+}
+
+func (e *contractBaselineFileError) Unwrap() error { return e.Err }
+
+// contractBaselineFileFailure returns the caller's own context error once its
+// context is done, and otherwise err named with path.
+func contractBaselineFileFailure(ctx context.Context, path string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return &contractBaselineFileError{Path: path, Err: err}
+}
+
 // beginContractBaseline records a live reconstruction before it asks for a
 // repository lane. Overlapping reconstructions each retain their own claim.
 func (mi *MultiIndexer) beginContractBaseline(repo string) func() {
@@ -342,7 +387,7 @@ func collectContractBaselineAcceptedReceipt(ctx context.Context, idx *Indexer, f
 	}
 	ext, ok := idx.registry.GetByLanguage(file.Language)
 	if !ok || ext == nil {
-		return contractBoundaryReceipt{}, fmt.Errorf("contract baseline: accepted extractor unavailable for %s", file.Language)
+		return contractBoundaryReceipt{}, fmt.Errorf("accepted extractor unavailable for %s", file.Language)
 	}
 	rel := strings.TrimPrefix(file.Path, file.RepoPrefix+"/")
 	// A content skip (binary or minified) is a successful read with a nil
@@ -356,7 +401,7 @@ func collectContractBaselineAcceptedReceipt(ctx context.Context, idx *Indexer, f
 		return contractBoundaryReceipt{}, err
 	}
 	if result == nil {
-		return contractBoundaryReceipt{}, fmt.Errorf("contract baseline: accepted extraction incomplete for %s", file.Path)
+		return contractBoundaryReceipt{}, errors.New("accepted extraction incomplete")
 	}
 	return idx.collectContractBoundaryReceipt(ctx, file.Path, file.Language, accepted.Bytes, result)
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +26,8 @@ type currentReceiptParseSpy struct {
 	parser.Extractor
 	reads  atomic.Int64
 	forbid atomic.Bool
+	// fail, when set, answers a path with its error instead of parsing it.
+	fail atomic.Pointer[func(path string) error]
 }
 
 func (s *currentReceiptParseSpy) Extract(path string, src []byte) (*parser.ExtractionResult, error) {
@@ -32,6 +36,11 @@ func (s *currentReceiptParseSpy) Extract(path string, src []byte) (*parser.Extra
 
 func (s *currentReceiptParseSpy) ExtractWithOptions(path string, src []byte, opts parser.ExtractionOptions) (*parser.ExtractionResult, error) {
 	s.reads.Add(1)
+	if fail := s.fail.Load(); fail != nil {
+		if err := (*fail)(path); err != nil {
+			return nil, err
+		}
+	}
 	if s.forbid.Load() {
 		return nil, errors.New("current accepted receipt must not be extracted again")
 	}
@@ -39,6 +48,13 @@ func (s *currentReceiptParseSpy) ExtractWithOptions(path string, src []byte, opt
 }
 
 func currentReceiptBaselineFixture(t *testing.T, helpers []string) (ContractFollowupCaptureOptions, *currentReceiptParseSpy, *Indexer, *graph.ContractBoundaryReceipt) {
+	t.Helper()
+	return currentReceiptBaselineFixtureWith(t, helpers, nil)
+}
+
+// currentReceiptBaselineFixtureWith also indexes extra files (relative path to
+// source) next to routes.go.
+func currentReceiptBaselineFixtureWith(t *testing.T, helpers []string, extra map[string]string) (ContractFollowupCaptureOptions, *currentReceiptParseSpy, *Indexer, *graph.ContractBoundaryReceipt) {
 	t.Helper()
 	ctx := t.Context()
 	idx, store := newSQLiteIndexer(t)
@@ -54,6 +70,9 @@ func currentReceiptBaselineFixture(t *testing.T, helpers []string) (ContractFoll
 	idx.initializeExtractionOptions(root)
 	idx.extractionOptions.Store(&opts)
 	writeFile(t, filepath.Join(root, "routes.go"), "package fixture\nconst route = \"/reused-current\"\nfunc register(router *Router) { router.GET(route, serve) }\nfunc serve() {}\n")
+	for rel, content := range extra {
+		writeFile(t, filepath.Join(root, rel), content)
+	}
 	backend, err := newPrimaryContractCoreStorageBackend(ctx, store, "fixture")
 	require.NoError(t, err)
 	idx.contractCoreInputs, err = newContractCoreInputJournal(ctx, backend)
@@ -590,4 +609,280 @@ func TestContractReceiptPolicyIncludesNormalizedFrozenParserOptions(t *testing.T
 	restored, err := contractBoundaryPolicy(idx, "go", 0)
 	require.NoError(t, err)
 	require.Equal(t, defaultPolicy, restored)
+}
+
+// slowBaselineFixture indexes routes.go and slow.go, accepts their baseline,
+// then changes the extraction policy so the next baseline must reparse both
+// files from accepted source.
+func slowBaselineFixture(t *testing.T) (ContractFollowupCaptureOptions, *currentReceiptParseSpy, *graph.ContractBoundaryReceipt) {
+	t.Helper()
+	options, spy, _, original := currentReceiptBaselineFixtureWith(t, nil, map[string]string{"slow.go": "package fixture\nfunc slow() {}\n"})
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	options.Config.HTTPClientAliases = []string{"apiGet"}
+	options.rebuildBaseline = true
+	spy.reads.Store(0)
+	return options, spy, original
+}
+
+// failSlowParse makes the spy answer slow.go with the parser's own timeout
+// error after running hook, and counts those parses.
+func failSlowParse(spy *currentReceiptParseSpy, hook func()) *atomic.Int64 {
+	var reads atomic.Int64
+	fail := func(path string) error {
+		if filepath.Base(path) != "slow.go" {
+			return nil
+		}
+		reads.Add(1)
+		if hook != nil {
+			hook()
+		}
+		return fmt.Errorf("tree-sitter parse: %w", context.DeadlineExceeded)
+	}
+	spy.fail.Store(&fail)
+	return &reads
+}
+
+// A file whose parse hits the parser's own timeout while the caller's context
+// is live is excluded as a failure envelope; the other files are rebuilt and
+// the header is accepted instead of the whole baseline failing.
+func TestContractBaselineExcludesFileWithParserTimeout(t *testing.T) {
+	options, spy, original := slowBaselineFixture(t)
+	slowReads := failSlowParse(spy, nil)
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load())
+	state, found, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, state.Accepted, "one slow file must not hold the namespace header pending")
+	slow, known, err := options.Store.ContractBoundaryReceiptContext(t.Context(), "fixture", "", "fixture/slow.go")
+	require.NoError(t, err)
+	require.True(t, known)
+	require.True(t, slow.Accepted)
+	require.True(t, contractReceiptIsFailureEnvelope(slow), "the timed-out file is excluded as a failure envelope")
+	routes, _, err := options.Store.ContractBoundaryReceiptContext(t.Context(), "fixture", "", original.FilePath)
+	require.NoError(t, err)
+	require.True(t, routes.Accepted)
+	require.False(t, contractReceiptIsFailureEnvelope(routes))
+	var before, after contractBoundaryReceipt
+	require.NoError(t, json.Unmarshal(original.Payload, &before))
+	require.NoError(t, json.Unmarshal(routes.Payload, &after))
+	require.NotEqual(t, before.Policy, after.Policy, "the other file carries the new policy")
+	require.Contains(t, slow.Scope.Causes, contractFileParseTimeout, "a timeout envelope says so")
+	// Without a rebuild trigger the accepted baseline stands and nothing is
+	// parsed again; only a later reconstruction retries the timed-out file.
+	options.rebuildBaseline = false
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load(), "an accepted envelope is not parsed again")
+	state, _, err = options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, state.Accepted)
+}
+
+// The parser's timeout is only a content failure while the caller's context
+// is live: a caller cancellation or deadline still aborts the baseline with
+// the context's error and excludes nothing.
+func TestContractBaselineParserTimeoutKeepsCallerCancellation(t *testing.T) {
+	for _, mode := range []string{"canceled", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			options, spy, _ := slowBaselineFixture(t)
+			// Both modes end the caller's context from inside the slow
+			// file's parse, so setup time cannot end it earlier.
+			var ctx context.Context
+			var end func()
+			want := context.Canceled
+			if mode == "deadline" {
+				expiring := newExpiringContext(t.Context())
+				ctx, end, want = expiring, expiring.expire, context.DeadlineExceeded
+			} else {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(t.Context())
+				defer cancel()
+				end = cancel
+			}
+			slowReads := failSlowParse(spy, end)
+			err := reconcilePrimaryContractBaseline(ctx, options, "fixture")
+			require.EqualValues(t, 1, slowReads.Load(), "the slow file's parse was reached")
+			require.ErrorIs(t, err, want)
+			require.Equal(t, ctx.Err(), err, "the caller's own context error is returned")
+			slow, _, err := options.Store.ContractBoundaryReceiptContext(t.Context(), "fixture", "", "fixture/slow.go")
+			require.NoError(t, err)
+			require.False(t, contractReceiptIsFailureEnvelope(slow))
+			state, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+			require.NoError(t, err)
+			require.False(t, state.Accepted)
+		})
+	}
+}
+
+// expiringContext reports a deadline once expire is called, so a test can end
+// the caller's context at an exact point instead of after a wall-clock delay.
+type expiringContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiringContext(parent context.Context) *expiringContext {
+	return &expiringContext{Context: parent, done: make(chan struct{})}
+}
+
+func (c *expiringContext) Done() <-chan struct{} { return c.done }
+
+func (c *expiringContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *expiringContext) expire() { c.once.Do(func() { close(c.done) }) }
+
+// A failure that is not the file's content still aborts the baseline, and the
+// error names the file so the repair log shows which one.
+func TestContractBaselineNonContentFailureNamesFile(t *testing.T) {
+	options, spy, _ := slowBaselineFixture(t)
+	fail := func(path string) error {
+		if filepath.Base(path) == "slow.go" {
+			panic("injected extractor panic")
+		}
+		return nil
+	}
+	spy.fail.Store(&fail)
+	err := reconcilePrimaryContractBaseline(t.Context(), options, "fixture")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "fixture/slow.go")
+	var panicked *extractorPanicError
+	require.ErrorAs(t, err, &panicked, "the wrapped cause stays reachable")
+	slow, _, err := options.Store.ContractBoundaryReceiptContext(t.Context(), "fixture", "", "fixture/slow.go")
+	require.NoError(t, err)
+	require.False(t, contractReceiptIsFailureEnvelope(slow))
+	state, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.False(t, state.Accepted)
+}
+
+// slowEnvelope reads slow.go's stored receipt.
+func slowEnvelope(t *testing.T, options ContractFollowupCaptureOptions) *graph.ContractBoundaryReceipt {
+	t.Helper()
+	slow, known, err := options.Store.ContractBoundaryReceiptContext(t.Context(), "fixture", "", "fixture/slow.go")
+	require.NoError(t, err)
+	require.True(t, known)
+	require.True(t, slow.Accepted)
+	return slow
+}
+
+// A timeout depends on load, not on the file's bytes, so a later baseline
+// rebuild parses the file again and replaces its envelope with a real receipt.
+func TestContractBaselineRebuildRetriesTimedOutEnvelope(t *testing.T) {
+	options, spy, _ := slowBaselineFixture(t)
+	slowReads := failSlowParse(spy, nil)
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load())
+	slow := slowEnvelope(t, options)
+	require.True(t, contractReceiptIsFailureEnvelope(slow))
+	require.Contains(t, slow.Scope.Causes, contractFileParseTimeout)
+	spy.fail.Store(nil)
+	spy.reads.Store(0)
+	options.rebuildBaseline = true
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.Positive(t, spy.reads.Load(), "the rebuild parses the timed-out file again")
+	slow = slowEnvelope(t, options)
+	require.False(t, contractReceiptIsFailureEnvelope(slow), "a parse that now succeeds replaces the envelope")
+	var receipt contractBoundaryReceipt
+	require.NoError(t, json.Unmarshal(slow.Payload, &receipt))
+	require.Equal(t, slow.SourceFingerprint, receipt.Source)
+	state, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, state.Accepted)
+}
+
+// An envelope for a content failure that is not a timeout stays on a rebuild:
+// the same bytes would fail the same way.
+func TestContractBaselineRebuildKeepsContentEnvelope(t *testing.T) {
+	options, spy, _ := slowBaselineFixture(t)
+	var slowReads atomic.Int64
+	fail := func(path string) error {
+		if filepath.Base(path) != "slow.go" {
+			return nil
+		}
+		slowReads.Add(1)
+		return errors.New("unparseable bytes")
+	}
+	spy.fail.Store(&fail)
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load())
+	slow := slowEnvelope(t, options)
+	require.True(t, contractReceiptIsFailureEnvelope(slow))
+	require.NotContains(t, slow.Scope.Causes, contractFileParseTimeout)
+	options.rebuildBaseline = true
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load(), "a content envelope is not parsed again on a rebuild")
+	require.True(t, contractReceiptIsFailureEnvelope(slowEnvelope(t, options)))
+}
+
+// The configured per-file extraction budget is a timeout too: with the
+// caller's context live the file is excluded and tagged as a timeout.
+func TestContractBaselineExcludesFileOverExtractBudget(t *testing.T) {
+	options, spy, _ := slowBaselineFixture(t)
+	options.Config.MaxExtractMillis = 200
+	var slowReads atomic.Int64
+	fail := func(path string) error {
+		if filepath.Base(path) == "slow.go" {
+			slowReads.Add(1)
+			time.Sleep(800 * time.Millisecond)
+		}
+		return nil
+	}
+	spy.fail.Store(&fail)
+	require.NoError(t, reconcilePrimaryContractBaseline(t.Context(), options, "fixture"))
+	require.EqualValues(t, 1, slowReads.Load())
+	slow := slowEnvelope(t, options)
+	require.True(t, contractReceiptIsFailureEnvelope(slow))
+	require.Contains(t, slow.Scope.Causes, contractFileParseTimeout)
+	state, _, err := options.Store.ContractInputStateContext(t.Context(), "fixture", "")
+	require.NoError(t, err)
+	require.True(t, state.Accepted)
+}
+
+func TestContractBaselineEnvelopeEligible(t *testing.T) {
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	budget := &extractBudgetError{budgetMS: 10, path: "slow.go"}
+	for _, tc := range []struct {
+		name          string
+		ctx           context.Context
+		err           error
+		want, timeout bool
+	}{
+		{"nil", t.Context(), nil, false, false},
+		{"plain", t.Context(), errors.New("boom"), false, false},
+		{"content", t.Context(), contractContentFailure(errors.New("bad bytes")), true, false},
+		{"content_parser_deadline", t.Context(), contractContentFailure(fmt.Errorf("parse: %w", context.DeadlineExceeded)), true, true},
+		{"extract_budget", t.Context(), budget, true, true},
+		{"content_version_changed", t.Context(), contractContentFailure(errFileVersionChanged), false, false},
+		{"content_not_exist", t.Context(), contractContentFailure(fmt.Errorf("read: %w", fs.ErrNotExist)), false, false},
+		{"content_journal_write", t.Context(), contractContentFailure(errContractJournalWrite), false, false},
+		{"content_internal_canceled", t.Context(), contractContentFailure(fmt.Errorf("extract: %w", context.Canceled)), false, false},
+		{"bare_deadline", t.Context(), context.DeadlineExceeded, false, false},
+		{"caller_canceled", canceled, contractContentFailure(errors.New("bad bytes")), false, false},
+		{"caller_canceled_budget", canceled, budget, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eligible, timeout := contractBaselineEnvelopeEligible(tc.ctx, tc.err)
+			require.Equal(t, tc.want, eligible)
+			require.Equal(t, tc.timeout, timeout)
+		})
+	}
+}
+
+func TestContractBaselineFileErrorPrefixOnce(t *testing.T) {
+	idx := &Indexer{registry: parser.NewRegistry()}
+	file := ContractFollowupFile{RepoPrefix: "fixture", Path: "fixture/a.unknown", Language: "unknown"}
+	_, err := collectContractBaselineAcceptedReceipt(t.Context(), idx, file, ContractAcceptedSource{})
+	require.Error(t, err)
+	err = contractBaselineFileFailure(t.Context(), file.Path, err)
+	require.Equal(t, 1, strings.Count(err.Error(), "contract baseline:"), err.Error())
+	require.Equal(t, 1, strings.Count(err.Error(), file.Path), err.Error())
 }

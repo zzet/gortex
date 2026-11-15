@@ -16,6 +16,19 @@ import (
 // exceeds IndexConfig.MaxExtractMillis.
 var errExtractTimeout = errors.New("extraction exceeded time budget")
 
+// extractBudgetError reports a file whose extraction exceeded its budget.
+// errors.Is matches it to errExtractTimeout.
+type extractBudgetError struct {
+	budgetMS int
+	path     string
+}
+
+func (e *extractBudgetError) Error() string {
+	return fmt.Sprintf("extraction exceeded %dms budget: %s", e.budgetMS, e.path)
+}
+
+func (e *extractBudgetError) Unwrap() error { return errExtractTimeout }
+
 // extractorPanicError wraps a recovered extractor panic so callers can
 // tell a parser crash (quarantine the file, keep indexing) apart from
 // an ordinary extraction error. The original panic value and a stack
