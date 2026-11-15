@@ -38,7 +38,7 @@ func (idx *Indexer) incrementalReindexPathsWithReceiptMode(
 	paths []string,
 	mode incrementalPathMode,
 ) (result *IndexResult, receipt *graph.MutationReceipt, batch *reparsePendingEnrichmentBatch, err error) {
-	batch = &reparsePendingEnrichmentBatch{deferResolverCatchup: true, publication: mode.publication, readRepair: mode.readRepair}
+	batch = &reparsePendingEnrichmentBatch{deferResolverCatchup: true, publication: mode.publication, readRepair: mode.readRepair, relationsRead: mode.relationsRead}
 	receiptStore, _ := idx.graph.(graph.MutationReceiptStore)
 	if receiptStore == nil {
 		result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)

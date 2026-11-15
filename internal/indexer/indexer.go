@@ -7110,9 +7110,10 @@ type incrementalPathMode struct {
 	// publication carries only a canonical point attempt's local collector.
 	// Existing batch/reconcile/direct callers leave it nil. No live receipt or
 	// mutable Indexer tracing state is installed by this per-call observation.
-	publication *PublicationStamps
-	readRepair  *ReadRepairObservation
-	onRelations func() // resolver and file publication complete, before derived work
+	publication   *PublicationStamps
+	readRepair    *ReadRepairObservation
+	relationsRead *relationsReadFrontier // optional point-only validated read coverage
+	onRelations   func()                 // resolver and file publication complete, before derived work
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
