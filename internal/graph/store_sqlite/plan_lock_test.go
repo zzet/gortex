@@ -123,6 +123,27 @@ func TestHotQueryPlansLocked(t *testing.T) {
 			},
 			forbid: []string{"SCAN n", "SCAN e", "USE TEMP B-TREE"},
 		},
+		{
+			// The tstypes adjacency preload reads a few kinds of every page
+			// node's out-edges. The (view_gen, from_id) prefix must seed the
+			// probe on the kind-bearing line index, so an unrequested kind is
+			// rejected on the index entry and the (line, kind, id) order comes
+			// off the index: a sorter would buffer a hub caller's rows.
+			name:   "out_edges_by_node_ids_kinds",
+			query:  edgesByNodeIDsKindsQuery(true, 3, 4),
+			args:   8,
+			want:   []string{"SEARCH edges USING INDEX edges_by_from_line_kind (view_gen=? AND from_id=?)"},
+			forbid: []string{"SCAN edges", "USE TEMP B-TREE"},
+		},
+		{
+			// Incoming twin: the full (view_gen, to_id, kind) seek, so a hub
+			// type's calls/references in-edges are never visited at all.
+			name:   "in_edges_by_node_ids_kinds",
+			query:  edgesByNodeIDsKindsQuery(false, 3, 2),
+			args:   6,
+			want:   []string{"SEARCH edges USING INDEX edges_by_to (view_gen=? AND to_id=? AND kind=?)"},
+			forbid: []string{"SCAN edges", "USE TEMP B-TREE"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

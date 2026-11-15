@@ -21,6 +21,19 @@ type Provider struct {
 	logger       *zap.Logger
 	observePage  func(factPageStats) // synchronous test/diagnostic hook
 	observeSpool func(string)        // synchronous cleanup test hook
+	// fullAdjacency restores the legacy all-kinds adjacency preload. Test
+	// hook only: the parity tests run every fixture both ways and require
+	// identical graphs.
+	fullAdjacency bool
+}
+
+// newApplier builds one pass/page applier for this provider's spec.
+func (p *Provider) newApplier(g graph.Store) *applier {
+	ap := newApplier(g, p.spec, p.Name())
+	if p.fullAdjacency {
+		ap.outKinds, ap.inKinds = nil, nil
+	}
+	return ap
 }
 
 var (
@@ -273,7 +286,7 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 		// race a concurrent watcher / resolver pass on another file.
 		mu := g.ResolveMutex()
 		mu.Lock()
-		ap := newApplier(g, p.spec, p.Name())
+		ap := p.newApplier(g)
 		ap.applyAll([]*fileFacts{facts}, res)
 		ap.flush()
 		p.countCoverage(g, fileNode.RepoPrefix, map[string]bool{facts.file: true}, res)

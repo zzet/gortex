@@ -147,6 +147,7 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
+	t.Run("EdgesByNodeIDsKinds", func(t *testing.T) { testEdgesByNodeIDsKinds(t, factory) })
 	t.Run("GetRepoNodesByLanguage", func(t *testing.T) { testGetRepoNodesByLanguage(t, factory) })
 	t.Run("DistinctExternalTargets", func(t *testing.T) { testDistinctExternalTargets(t, factory) })
 	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })

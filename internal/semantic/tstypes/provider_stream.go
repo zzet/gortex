@@ -172,7 +172,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 		if len(page) == 0 {
 			break
 		}
-		ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+		ap := p.newApplier(g).withHotCache(hot)
 		res.SymbolsCovered += ap.coverFiles(page)
 		after = last
 	}
@@ -202,7 +202,7 @@ func (p *Provider) applyStagedFacts(ctx context.Context, g graph.Store, repoPref
 			if len(page) == 0 {
 				break
 			}
-			ap := newApplier(g, p.spec, p.Name()).withHotCache(hot)
+			ap := p.newApplier(g).withHotCache(hot)
 			switch phase {
 			case stagedSupers:
 				err = ap.applySupersPage(ctx, page, res)
