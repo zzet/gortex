@@ -52,8 +52,10 @@ func TestBFSQueryUsesEdgeIndex(t *testing.T) {
 
 	forwardQ := buildBFSQuery(graph.DirectionForward, 1, 1, true)
 	forwardPlan := queryPlan(t, s, forwardQ, "A", 3, string(graph.EdgeCalls), baseViewGeneration, 50)
-	if !strings.Contains(forwardPlan, "edges_by_from") {
-		t.Fatalf("forward BFS plan does not use edges_by_from:\n%s", forwardPlan)
+	// Naming the index is not enough: a plan that seeks edges_by_from on
+	// view_gen alone reads the whole generation for every hop.
+	if !strings.Contains(forwardPlan, "edges_by_from (view_gen=? AND from_id=?") {
+		t.Fatalf("forward BFS plan does not seek edges_by_from on the frontier node:\n%s", forwardPlan)
 	}
 	// The edges table must not be reached by a full scan (alias e).
 	if strings.Contains(forwardPlan, "SCAN edges") || strings.Contains(forwardPlan, "SCAN e ") {
@@ -62,8 +64,8 @@ func TestBFSQueryUsesEdgeIndex(t *testing.T) {
 
 	backwardQ := buildBFSQuery(graph.DirectionBackward, 1, 1, true)
 	backwardPlan := queryPlan(t, s, backwardQ, "C", 3, string(graph.EdgeCalls), baseViewGeneration, 50)
-	if !strings.Contains(backwardPlan, "edges_by_to") {
-		t.Fatalf("backward BFS plan does not use edges_by_to:\n%s", backwardPlan)
+	if !strings.Contains(backwardPlan, "edges_by_to (view_gen=? AND to_id=?") {
+		t.Fatalf("backward BFS plan does not seek edges_by_to on the frontier node:\n%s", backwardPlan)
 	}
 	if strings.Contains(backwardPlan, "SCAN edges") || strings.Contains(backwardPlan, "SCAN e ") {
 		t.Fatalf("backward BFS plan scans edges instead of using an index:\n%s", backwardPlan)
