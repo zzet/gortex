@@ -348,11 +348,11 @@ func (idx *Indexer) reindexIncrementalChunk(
 		var probe fileDeltaProbe
 		probeOK := false
 		if markerBatch != nil {
-			probe, probeOK = markerBatch.pointPreparation.takeProbe(idx, filePath)
+			probe, probeOK = markerBatch.pointPreparation.takeProbe(idx, filePath, markerBatch.relationsReadFrontier())
 		}
 		admissionBusy := false
 		if !probeOK {
-			probe, probeOK, admissionBusy = idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair)
+			probe, probeOK, admissionBusy = idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair, markerBatch.relationsReadFrontier())
 		}
 		if admissionBusy {
 			break
@@ -421,7 +421,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if acceptPreparedSnapshot {
 			prepared, ok = idx.takePreparedSnapshot(filePath)
 		} else {
-			prepared, ok = idx.takePreparedRefresh(filePath)
+			prepared, ok = idx.takePreparedRefresh(filePath, markerBatch.relationsReadFrontier())
 		}
 		if !ok || prepared == nil || prepared.result == nil {
 			prepared.release()
@@ -570,6 +570,9 @@ func (idx *Indexer) reindexIncrementalFallback(
 	// on. The combined fallback has no proof for restating the old graph's
 	// inert rows, including when applying its new read fails.
 	delete(idx.inertReparsed, fallback.graphPath)
+	// Exceptional fallback has no read-bound point coverage; keep the original
+	// ticket cap rather than borrowing a previous prepared receipt.
+	markerBatch.relationsReadFrontier().invalidate(fallback.filePath)
 	resolve := markerBatch == nil || !markerBatch.deferResolverCatchup
 	if err := idx.indexFile(fallback.filePath, resolve, markerBatch); err != nil {
 		return err
@@ -1208,7 +1211,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
 	} else {
-		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), stagePriorDeclarations(stages), priorPending)
+		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), paths, stagePriorDeclarations(stages), priorPending)
 	}
 
 	// A global-using edit changes every dependent file's visibility
@@ -1896,6 +1899,7 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 			continue
 		}
 		keep(receipt)
+		receipt.readVersion.relationsRead.accept(receipt.absPath, receipt.readVersion)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale

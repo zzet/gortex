@@ -38,25 +38,44 @@ func stagePriorDeclarations(stages []*incrementalBatchStage) map[string]resolver
 // last attempted against, not an intermediate one. enabled is the
 // repository resolver's evidence-scoping choice (Resolver.EvidenceScoping);
 // with it off nothing is recorded and the catch-up keeps the exhaustive legs.
+// files names every staged file, including an empty pending set or an omitted
+// declaration surface, so later retries cannot manufacture first evidence.
 func (b *reparsePendingEnrichmentBatch) recordDeferredResolverEvidence(
 	enabled bool,
+	files []string,
 	prior map[string]resolver.DeclarationSurface,
 	priorPending []*graph.Edge,
 ) {
 	if b == nil || !enabled {
 		return
 	}
-	b.deferredPriorPending = append(b.deferredPriorPending, priorPending...)
-	if len(prior) == 0 {
-		return
+	// Like declarations, pending references must describe the first surface.
+	// A retry may see unresolved rows written by an earlier structural chunk
+	// whose deferred resolver has not run; those are not historical verdicts.
+	for _, edge := range priorPending {
+		if edge != nil {
+			if _, recorded := b.deferredResolverFiles[edge.FilePath]; recorded {
+				continue
+			}
+		}
+		b.deferredPriorPending = append(b.deferredPriorPending, edge)
 	}
-	if b.deferredPriorDeclarations == nil {
+	if len(prior) > 0 && b.deferredPriorDeclarations == nil {
 		b.deferredPriorDeclarations = make(map[string]resolver.DeclarationSurface, len(prior))
 	}
 	for path, surface := range prior {
+		if _, recorded := b.deferredResolverFiles[path]; recorded {
+			continue
+		}
 		if _, recorded := b.deferredPriorDeclarations[path]; !recorded {
 			b.deferredPriorDeclarations[path] = surface
 		}
+	}
+	if b.deferredResolverFiles == nil {
+		b.deferredResolverFiles = make(map[string]struct{}, len(files))
+	}
+	for _, path := range files {
+		b.deferredResolverFiles[path] = struct{}{}
 	}
 }
 
@@ -90,6 +109,7 @@ func (b *reparsePendingEnrichmentBatch) takeDeferredResolverEvidence() (map[stri
 	}
 	prior, pending := b.deferredPriorDeclarations, b.deferredPriorPending
 	b.deferredPriorDeclarations, b.deferredPriorPending = nil, nil
+	b.deferredResolverFiles = nil
 	if len(prior) == 0 {
 		prior = nil
 	}

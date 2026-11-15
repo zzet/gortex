@@ -3142,10 +3142,8 @@ func (w *Watcher) reindexPointPathRaw(idx *Indexer, path string, generation uint
 	if idx == nil || idx.rootPath == "" {
 		return nil, errWatcherIndexerMissing
 	}
-	mode := incrementalPathMode{
-		detectDeletions: true, forceExplicitFiles: true, publication: stamps, pointPreparation: preparation,
-		onRelations: func() { w.markRelations(path, generation) },
-	}
+	mode := w.pointRelationsMode(path, generation, stamps)
+	mode.pointPreparation = preparation
 	if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
 		return owner.incrementalReindexRepoRawMode(idx.repoPrefix, []string{path}, mode)
 	}

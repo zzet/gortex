@@ -76,18 +76,58 @@ func TestPointPreparationRejectsUnknownOrChangedHandoff(t *testing.T) {
 				path = filepath.Join(filepath.Dir(path), "other.go")
 			}
 			_, ok := p.takeProbe(idx, path)
-			if name == "same_stat_bytes" {
-				require.True(t, ok, "unchanged stat is insufficient; existing consumer must still re-read the bytes")
-				prepared, known := idx.takePreparedRefresh(path)
-				prepared.release()
-				require.False(t, known, "same-stat changed bytes cannot be committed from the earlier parse")
-			} else {
-				require.False(t, ok)
-				require.Nil(t, p.prepared)
-				require.Nil(t, p.installed)
-			}
+			require.False(t, ok, "every handoff re-reads actual bytes before returning a probe")
+			require.Nil(t, p.prepared)
+			require.Nil(t, p.installed)
 			_, again := p.takeProbe(idx, path)
 			require.False(t, again, "single-use carrier cannot be replayed")
+		})
+	}
+}
+
+// This is a private read-fence control, not a public tool receipt. The real
+// two-ticket point integration roots exercise admission and publication.
+func TestPointPreparationHandoffUsesProtectedReadFrontier(t *testing.T) {
+	for _, name := range []string{"validated_read", "changed_after_read", "different_frontier"} {
+		t.Run(name, func(t *testing.T) {
+			path, idx, _ := pointSourceProofFixture(t)
+			require.NoError(t, os.WriteFile(path, []byte("package p\nfunc Edited() {}\n"), 0600))
+			watcher, err := NewWatcher(idx, config.Default().Watch, zap.NewNop())
+			require.NoError(t, err)
+			watcher.degradedNoFsnotify = true
+			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+			watcher.pendingGeneration[path] = 1
+			p := &watcherPointPreparation{watcher: watcher, path: path, kind: ChangeModified, generation: 1}
+			p.prepare(t.Context())
+			t.Cleanup(p.release)
+			require.NotNil(t, p.prepared)
+			require.Nil(t, p.probe.readVersion.relationsRead, "early extraction predates the executor's read frontier")
+			reads := 0
+			frontier := &relationsReadFrontier{path: path, capture: func() uint64 { reads++; return 2 }}
+			probe, ok := p.takeProbe(idx, path, frontier)
+			require.True(t, ok)
+			require.Equal(t, 1, reads, "handoff must perform an actual protected read even for inert work")
+			require.Same(t, frontier, probe.readVersion.relationsRead)
+			require.Equal(t, uint64(2), probe.readVersion.relationsGeneration)
+			require.Zero(t, frontier.covered, "handoff alone never accepts a relation frontier")
+			if name == "changed_after_read" {
+				require.NoError(t, os.WriteFile(path, []byte("package p\nfunc NewerAfterRead() {}\n"), 0600))
+			}
+			fresh, stale := idx.recordFileReadVersionsBatched([]fileReadReceipt{{absPath: path, mtimeKey: idx.relKey(path), readVersion: probe.readVersion}})
+			if name == "changed_after_read" {
+				require.Empty(t, fresh)
+				require.Equal(t, []string{path}, stale)
+				require.Zero(t, frontier.covered)
+			} else {
+				require.Empty(t, stale)
+				require.Equal(t, []string{path}, fresh)
+				require.Equal(t, uint64(2), frontier.covered)
+			}
+			if name == "different_frontier" {
+				next := &relationsReadFrontier{path: path, capture: func() uint64 { return 9 }}
+				next.accept(path, probe.readVersion)
+				require.Zero(t, next.covered, "a prepared read cannot be borrowed by a later executor")
+			}
 		})
 	}
 }

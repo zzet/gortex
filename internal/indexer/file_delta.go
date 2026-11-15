@@ -94,13 +94,13 @@ func (idx *Indexer) prepareFileDeltaWithAdmission(filePath string, tryOnly bool)
 	return idx.prepareFileDeltaWithAdmissionObserved(filePath, tryOnly, nil)
 }
 
-func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation) (fileDeltaProbe, bool, bool) {
-	return idx.prepareFileDeltaWithPointAdmissionObserved(filePath, tryOnly, repair, nil)
+func (idx *Indexer) prepareFileDeltaWithAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation, reads ...*relationsReadFrontier) (fileDeltaProbe, bool, bool) {
+	return idx.prepareFileDeltaWithPointAdmissionObserved(filePath, tryOnly, repair, nil, reads...)
 }
 
 // The optional typed point preparation may refuse the actual read's detected
 // extractor before it is invoked. All ordinary callers retain the old path.
-func (idx *Indexer) prepareFileDeltaWithPointAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation, preparation *watcherPointPreparation) (fileDeltaProbe, bool, bool) {
+func (idx *Indexer) prepareFileDeltaWithPointAdmissionObserved(filePath string, tryOnly bool, repair *ReadRepairObservation, preparation *watcherPointPreparation, reads ...*relationsReadFrontier) (fileDeltaProbe, bool, bool) {
 	var probe fileDeltaProbe
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
@@ -139,7 +139,7 @@ func (idx *Indexer) prepareFileDeltaWithPointAdmissionObserved(filePath string, 
 	relPath := idx.relKey(absPath)
 
 	started := time.Now()
-	src, readVersion, err := idx.readFileWithVersion(absPath)
+	src, readVersion, err := idx.readFileWithVersion(absPath, reads...)
 	probe.read = time.Since(started)
 	if err != nil {
 		probe.readErr = contractContentFailure(err)
@@ -280,7 +280,7 @@ func (idx *Indexer) takePreparedSnapshot(filePath string) (*preparedExtraction, 
 	return prepared, prepared != nil
 }
 
-func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, bool) {
+func (idx *Indexer) takePreparedRefresh(filePath string, reads ...*relationsReadFrontier) (*preparedExtraction, bool) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return nil, false
@@ -289,7 +289,14 @@ func (idx *Indexer) takePreparedRefresh(filePath string) (*preparedExtraction, b
 	if !ok {
 		return nil, false
 	}
-	current, readVersion, err := idx.readFileWithVersion(absPath)
+	return idx.refreshPreparedRead(absPath, prepared, reads...)
+}
+
+// refreshPreparedRead binds an owned extraction to a new actual read. Point
+// handoff uses this inside the protected executor, so even an inert batch gets
+// that executor's read frontier. Only the existing final version fence accepts it.
+func (idx *Indexer) refreshPreparedRead(absPath string, prepared *preparedExtraction, reads ...*relationsReadFrontier) (*preparedExtraction, bool) {
+	current, readVersion, err := idx.readFileWithVersion(absPath, reads...)
 	if err != nil {
 		prepared.release()
 		return nil, false

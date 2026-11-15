@@ -138,7 +138,7 @@ func (p *watcherPointPreparation) prepare(ctx context.Context) {
 // re-reading bytes/version before commit; a raced file is reparsed only AFTER
 // Begin, never stamped from the earlier snapshot. Reject/release before a new
 // admission, including an unexpected first file, to avoid budget self-deadlock.
-func (p *watcherPointPreparation) takeProbe(idx *Indexer, path string) (fileDeltaProbe, bool) {
+func (p *watcherPointPreparation) takeProbe(idx *Indexer, path string, reads ...*relationsReadFrontier) (fileDeltaProbe, bool) {
 	if p == nil || p.used {
 		return fileDeltaProbe{}, false
 	}
@@ -149,6 +149,16 @@ func (p *watcherPointPreparation) takeProbe(idx *Indexer, path string) (fileDelt
 		p.release()
 		return fileDeltaProbe{}, false
 	}
+	// Preparation precedes the point executor's frontier. Re-read through its
+	// actual protected read before either inert or structural consumption; an
+	// earlier parse cannot stand in for a later tool admission's source read.
+	prepared, ok := idx.refreshPreparedRead(path, p.prepared, reads...)
+	if !ok {
+		p.release()
+		return fileDeltaProbe{}, false
+	}
+	p.prepared = prepared
+	p.probe.readVersion = prepared.readVersion
 	idx.preparedMu.Lock()
 	if idx.prepared == nil {
 		idx.prepared = make(map[string]*preparedExtraction)
