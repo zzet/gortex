@@ -236,6 +236,13 @@ func (f *sharedReceiptFixture) edit(offer *sharedReceiptOffer) {
 	}
 }
 
+// C4 requests current relations explicitly; completion of one receipt does
+// not freeze later same-file edits. Historical C4 comparisons require the
+// same declared request contract on both sides; unflagged runs stay historical.
+func sharedReceiptCallersArguments() map[string]any {
+ return map[string]any{"id":"main.go::Target","format":"json","max_bytes":0,"require_fresh":true,"freshness_scope":"relations"}
+}
+
 func (f *sharedReceiptFixture) observe(offer *sharedReceiptOffer) {
 	if offer.err != nil {
 		f.captureFailure(f.contexts[offer.agent], offer)
@@ -312,7 +319,7 @@ func (f *sharedReceiptFixture) observe(offer *sharedReceiptOffer) {
 	}
 	name := fmt.Sprintf("Stream%dEdit%02d", offer.agent, offer.ordinal)
 	want := "main.go::" + name
-	callers, err := sharedReceiptJSON(f.server, ctx, 300+offer.ordinal, "get_callers", map[string]any{"id": "main.go::Target", "format": "json", "max_bytes": 0})
+	callers, err := sharedReceiptJSON(f.server, ctx, 300+offer.ordinal, "get_callers", sharedReceiptCallersArguments())
 	if err != nil {
 		offer.err = err
 	} else {
