@@ -170,6 +170,10 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		// Family remotes and repo prefixes are identity too, and they are not
 		// paths, so the path rewriter never touched them.
 		doctorLabel = newDoctorLabelRedactor()
+		// The legacy-state census is daemon-wide: it can name a checkout root
+		// in a sibling home, or outside home entirely. doctorPath leaves
+		// those alone, so the census gets its own root alias.
+		doctorRoot = newDoctorRootRedactor()
 	}
 
 	doctorEnv := doctorEnvironment()

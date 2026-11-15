@@ -27,6 +27,14 @@ var doctorPath = func(p string) string { return p }
 // identity was not.
 var doctorLabel = func(s string) string { return s }
 
+// doctorRoot rewrites a root the daemon reports -- a checkout root or a
+// configured repo path -- for display. Unlike doctorPath it applies to
+// roots wherever they live, because the legacy-state census is daemon-wide
+// and can name a repository in a sibling home or outside home entirely.
+// Replaced for the duration of a redacted run; the identity default keeps
+// the normal report verbatim.
+var doctorRoot = func(p string) string { return p }
+
 // newDoctorLabelRedactor replaces identifiers with stable per-run pseudonyms.
 //
 // Stability within a report is what matters: two findings about the same family

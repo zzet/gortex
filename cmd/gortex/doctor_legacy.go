@@ -155,7 +155,32 @@ func collectLegacyState(home string) DoctorLegacyState {
 
 	state.DedicatedCorpora = dedicatedWorktreeCorpora(overview)
 	state.Unattributed, state.Intentless = classifyConfiguredRepos(overview, doctorConfiguredPaths(home))
+	redactLegacyRoots(&state)
 	return state
+}
+
+// redactLegacyRoots replaces every root the section reports with a stable
+// per-run alias.
+//
+// doctorPath is the report-wide path redactor, and it is right for paths
+// under the current checkout and under home. It is wrong here: the census is
+// daemon-wide, so a root can live in a sibling home or outside home
+// entirely, and doctorPath returns those unchanged -- leaking the name of
+// a repository the user never asked this report to name.
+//
+// The alias keeps the report usable: the same root always renders as the
+// same alias, so a dedicated corpus and the config entry that points at it
+// still read as the same thing.
+func redactLegacyRoots(state *DoctorLegacyState) {
+	for i := range state.DedicatedCorpora {
+		state.DedicatedCorpora[i].Root = doctorRoot(state.DedicatedCorpora[i].Root)
+	}
+	for i := range state.Unattributed {
+		state.Unattributed[i].Path = doctorRoot(state.Unattributed[i].Path)
+	}
+	for i := range state.Intentless {
+		state.Intentless[i].Path = doctorRoot(state.Intentless[i].Path)
+	}
 }
 
 // doctorLegacyEnv is the environment probe the collector reads. Stubbed in
@@ -288,7 +313,7 @@ func classifyConfiguredRepos(overview indexer.FamiliesOverview, configured []str
 			intentless = append(intentless, DoctorLegacyEntry{Path: doctorPath(cfgPath)})
 			continue
 		}
-		if hasRecordedIntent(co.Intents) {
+		if !isManualConfigOnly(co.Intents) {
 			continue
 		}
 		entry := DoctorLegacyEntry{Path: doctorPath(cfgPath), SourceKinds: append([]string(nil), co.Intents...)}
@@ -301,15 +326,29 @@ func classifyConfiguredRepos(overview indexer.FamiliesOverview, configured []str
 	return unattributed, intentless
 }
 
-// hasRecordedIntent reports whether the user actually asked for this checkout.
-// A manual_config intent is what config seeding writes, so it does not count.
-func hasRecordedIntent(kinds []string) bool {
-	for _, k := range kinds {
-		if k == "cli_track" || k == "mcp_track" {
-			return true
-		}
+// isManualConfigOnly reports whether a checkout's active intents are exactly
+// the one kind that config seeding writes, and nothing else.
+//
+// The question this section asks is "did anyone ask for this?". A
+// manual_config intent is what config seeding writes, so it is evidence of
+// nobody asking. Every OTHER intent kind is evidence that somebody did:
+// cli_track is an explicit command, mcp_track is an explicit tool call, and
+// project_membership means the repository is in a project somebody tracked.
+//
+// The earlier guard excluded only cli_track and mcp_track, so a checkout
+// tracked purely by project_membership -- known provenance, the user chose
+// the project -- was reported as unattributed and offered the auto-indexed
+// heuristic and a remediation. That was wrong in both directions: it
+// mislabelled a healthy tracked repo and told the user to re-track it.
+//
+// Only an intent set of exactly {manual_config} is unattributed. Anything
+// else -- including manual_config mixed with project_membership -- is
+// attributed and is not reported here.
+func isManualConfigOnly(kinds []string) bool {
+	if len(kinds) != 1 {
+		return false
 	}
-	return false
+	return kinds[0] == string(indexer.TrackSourceConfig)
 }
 
 // intentCheckoutGap is how long after its checkout an entry's manual_config

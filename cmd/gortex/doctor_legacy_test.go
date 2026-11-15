@@ -437,3 +437,212 @@ func TestLabelRedactorIsStable(t *testing.T) {
 		t.Error("an empty identifier stays empty")
 	}
 }
+
+// TestLegacyStateRootsAreRedacted covers the P2 finding that a daemon-wide
+// census can name a checkout root the report has no business naming.
+//
+// doctorPath rewrites paths under the current checkout and under home. The
+// census is daemon-wide: a root can live in a sibling home, or outside home
+// entirely, and doctorPath returned those verbatim -- leaking the name of a
+// repository the user never asked the report to name.
+func TestLegacyStateRootsAreRedacted(t *testing.T) {
+	origPath, origLabel, origRoot := doctorPath, doctorLabel, doctorRoot
+	t.Cleanup(func() { doctorPath, doctorLabel, doctorRoot = origPath, origLabel, origRoot })
+
+	// Identity on purpose: doctorPath is not the guard under test here.
+	doctorPath = func(p string) string { return p }
+	doctorLabel = newDoctorLabelRedactor()
+	doctorRoot = newDoctorRootRedactor()
+
+	// Roots that doctorPath leaves alone: a sibling home, an outside-home
+	// path, and a path under home that still names another checkout.
+	roots := []string{
+		"/home/other/code/some-other-repo",
+		"/srv/checkouts/another-repo",
+		"/home/u/code/private-remote-wt",
+	}
+
+	overview := indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID:      "fam",
+		DisplayRemote: "github.com/acme/private-remote",
+		Graphs: []indexer.GraphOverview{
+			{GraphID: "g1", RepoPrefix: "acme/private-prefix", State: "ready"},
+		},
+		Checkouts: []indexer.CheckoutOverview{
+			{CheckoutID: "c1", RootPath: roots[0], AdminName: "wt1",
+				EffectiveMode: "dedicated", GraphID: "g1"},
+			{CheckoutID: "c2", RootPath: roots[1], AdminName: "wt2",
+				EffectiveMode: "dedicated", GraphID: "g1"},
+		},
+	}}}
+
+	corpora := dedicatedWorktreeCorpora(overview)
+	if len(corpora) != 2 {
+		t.Fatalf("corpora = %d, want 2", len(corpora))
+	}
+
+	state := DoctorLegacyState{Checked: true, DedicatedCorpora: corpora}
+	redactLegacyRoots(&state)
+
+	for i, c := range state.DedicatedCorpora {
+		for _, leak := range roots {
+			if strings.Contains(c.Root, leak) {
+				t.Errorf("corpus %d root leaked %q: %q", i, leak, c.Root)
+			}
+		}
+		if !strings.HasPrefix(c.Root, "<root-") {
+			t.Errorf("corpus %d root is not an alias: %q", i, c.Root)
+		}
+	}
+
+	// The human rendering must not reintroduce the root either.
+	var buf bytes.Buffer
+	printDoctorLegacy(&buf, state)
+	for _, leak := range roots {
+		if strings.Contains(buf.String(), leak) {
+			t.Errorf("human rendering leaked %q", leak)
+		}
+	}
+}
+
+// TestLegacyStateRootAliasIsStable proves two findings about the same root
+// render as the same alias, so a redacted report still reads as a diagnosis.
+func TestLegacyStateRootAliasIsStable(t *testing.T) {
+	red := newDoctorRootRedactor()
+	a := red("/home/other/code/repo")
+	b := red("/home/other/code/repo")
+	c := red("/home/other/code/other-repo")
+	if a != b {
+		t.Errorf("same root got %q then %q; the alias must be stable", a, b)
+	}
+	if a == c {
+		t.Error("distinct roots must not collide")
+	}
+	if red("") != "" {
+		t.Error("an empty root stays empty")
+	}
+}
+
+// TestLegacyStateUnattributedIsManualConfigOnly covers the P2 finding that a
+// checkout tracked purely by project_membership was reported as unattributed.
+//
+// project_membership is known provenance: the repository belongs to a project
+// the user tracked. Reporting it as unattributed mislabelled a healthy repo
+// and offered it the auto-indexed heuristic and a remediation.
+func TestLegacyStateUnattributedIsManualConfigOnly(t *testing.T) {
+	origPath := doctorPath
+	t.Cleanup(func() { doctorPath = origPath })
+	doctorPath = func(p string) string { return p }
+
+	overview := indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID: "fam",
+		Checkouts: []indexer.CheckoutOverview{
+			{CheckoutID: "c1", RootPath: "/cfg/manual-only", Intents: []string{"manual_config"}},
+			{CheckoutID: "c2", RootPath: "/cfg/project-only", Intents: []string{"project_membership"}},
+			{CheckoutID: "c3", RootPath: "/cfg/mixed", Intents: []string{"manual_config", "project_membership"}},
+			{CheckoutID: "c4", RootPath: "/cfg/cli", Intents: []string{"cli_track"}},
+			{CheckoutID: "c5", RootPath: "/cfg/mcp", Intents: []string{"mcp_track"}},
+		},
+	}}}
+
+	configured := []string{
+		"/cfg/manual-only",
+		"/cfg/project-only",
+		"/cfg/mixed",
+		"/cfg/cli",
+		"/cfg/mcp",
+	}
+
+	unattributed, intentless := classifyConfiguredRepos(overview, configured)
+
+	var got []string
+	for _, u := range unattributed {
+		got = append(got, u.Path)
+	}
+	if len(got) != 1 || got[0] != "/cfg/manual-only" {
+		t.Errorf("unattributed = %v, want only [/cfg/manual-only]", got)
+	}
+	if len(intentless) != 0 {
+		t.Errorf("intentless = %v, want none; every configured path has an intent", intentless)
+	}
+}
+
+// TestLegacyStateCollectorRedactsRoots drives the REAL collector end to end --
+// census stubbed, config stubbed, the whole collectLegacyState path -- and
+// asserts that no root it reports survives in either output format.
+//
+// The reviewer reproduced the leak through the real collector and redactor,
+// so the regression has to run through the same path: a root in a sibling
+// home, and a root outside home entirely, must not appear in the JSON and
+// must not appear in the human rendering.
+func TestLegacyStateCollectorRedactsRoots(t *testing.T) {
+	origPath, origLabel, origRoot := doctorPath, doctorLabel, doctorRoot
+	t.Cleanup(func() { doctorPath, doctorLabel, doctorRoot = origPath, origLabel, origRoot })
+
+	// The redacted run: path redactor is the report-wide one, label and root
+	// are the per-run pseudonyms.
+	doctorPath = newDoctorPathRedactor("/home/u/current-checkout", "/home/u")
+	doctorLabel = newDoctorLabelRedactor()
+	doctorRoot = newDoctorRootRedactor()
+
+	siblingHome := "/home/other/code/sibling-repo"
+	outsideHome := "/srv/checkouts/outside-repo"
+
+	// Build the census as JSON so the roots are real values, not text
+	// spliced into a literal.
+	censusBytes, err := json.Marshal(map[string]any{
+		"families": []any{map[string]any{
+			"family_id":      "fam",
+			"display_remote": "github.com/acme/private-remote",
+			"state":          "ready",
+			"graphs": []any{map[string]any{
+				"graph_id": "g1", "repo_prefix": "acme/private-prefix", "state": "ready",
+			},
+				"checkouts": []any{
+					map[string]any{"checkout_id": "c1", "root_path": siblingHome, "admin_name": "wt1", "effective_mode": "dedicated", "graph_id": "g1"},
+					map[string]any{"checkout_id": "c2", "root_path": outsideHome, "admin_name": "wt2", "effective_mode": "dedicated", "graph_id": "g1"},
+				},
+			},
+		}}})
+	if err != nil {
+		t.Fatalf("census marshal: %v", err)
+	}
+
+	stubCensus(t, string(censusBytes), nil)
+
+	origPaths := doctorConfiguredPaths
+	t.Cleanup(func() { doctorConfiguredPaths = origPaths })
+	doctorConfiguredPaths = func(home string) []string { return []string{siblingHome, outsideHome} }
+
+	state := collectLegacyState(t.TempDir())
+	if !state.Checked {
+		t.Fatalf("collector did not check: %s", state.Skipped)
+	}
+	if len(state.DedicatedCorpora) != 2 {
+		t.Fatalf("corpora = %d, want 2", len(state.DedicatedCorpora))
+	}
+	if len(state.Unattributed) != 2 && len(state.Intentless) != 2 {
+		t.Fatalf("configured roots not classified: unattributed=%d intentless=%d",
+			len(state.Unattributed), len(state.Intentless))
+	}
+
+	// JSON: marshal the section exactly as doctor does.
+	raw, err := json.Marshal(map[string]any{"legacy_state": state})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, leak := range []string{siblingHome, outsideHome, "acme/private-prefix", "private-remote"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("JSON leaked %q:\n%s", leak, raw)
+		}
+	}
+
+	// Human rendering.
+	var buf bytes.Buffer
+	printDoctorLegacy(&buf, state)
+	for _, leak := range []string{siblingHome, outsideHome, "acme/private-prefix", "private-remote"} {
+		if strings.Contains(buf.String(), leak) {
+			t.Errorf("human rendering leaked %q:\n%s", leak, buf.String())
+		}
+	}
+}
