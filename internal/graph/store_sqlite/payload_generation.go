@@ -1336,7 +1336,9 @@ func (s *Store) deletePayloadChunks(
 		// first (bounded; the chunk runs afterwards regardless).
 		if pass == nil || pass.budget.quantum == nil {
 			if pass == nil || !pass.budget.emptyPayload {
-				s.awaitWALUnderCeiling(ctx, generationID, &walEpisode)
+				if err := s.awaitWALUnderCeiling(ctx, generationID, &walEpisode); err != nil {
+					return err
+				}
 			}
 			// An edit's writes go first: the chunk waits (bounded) while an
 			// edit-path mutation is announced or a writer is parked on the gate.

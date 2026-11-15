@@ -877,6 +877,27 @@ Inspect a profile with
 and what one more worktree retains with
 `go tool pprof -sample_index=inuse_space -top -base worktrees.step2.heap-idle.pprof worktrees.step3.heap-idle.pprof`.
 
+`--worktree-churn N` (worktrees scenario, without `--worktree-steps`) measures
+what removed linked worktrees leave behind. The readers (and editors) work the
+primary throughout, two sessions stay parked on it and one more repeats a
+dead-code analysis. Over that load the run links N worktrees one at a time,
+keeping at most `--worktrees` alive: when that many are live, the oldest is
+closed and removed first. Each new one is detached at one of four commits of
+the corpus history (the pinned commit and its 8th, 16th and 24th
+first-parent ancestors) and gets a session and `--churn-edits` edits.
+`--churn-advance K` commits a one-line change on the primary every K
+cycles, so the committed base moves under live worktrees (it requires
+`--edit-agents 0`, since an editor's edit races the commit). `--churn-pin-wal` holds one read transaction on the store
+from the first cycle to the live census, standing in for a long reader that
+keeps the WAL from resetting. After the last cycle the run takes a status
+receipt (`gate.live_status.0`) and a read-only store census (`live_census_*`:
+file and freelist bytes, node rows per node id, generations and their stored
+bytes by state and kind, linked checkouts by state and those whose directory
+is gone), removes every worktree, idles for `--churn-idle` and repeats the
+census (`census_*`). The retirement and build-lane counters of the first and
+last status receipts are reported as deltas (`counter.*`).
+`--reconcile-interval` passes `GORTEX_RECONCILE_INTERVAL` to the owned daemon.
+
 ### Live checkout discovery containment
 
 `--scenario worktree-discovery` starts with the first two pinned repositories
