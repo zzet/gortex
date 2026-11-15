@@ -161,7 +161,10 @@ func buildBFSQuery(dir graph.Direction, nSeeds, nKinds int, withLimit bool) stri
 	// which on a hot kind would scan every edge of that kind per frontier
 	// node. If the index is ever absent (a bulk-load window drops it) the
 	// query errors and the engine falls back to the in-memory walk.
-	b.WriteString("  JOIN edges e INDEXED BY " + edgeIdx + " ON " + joinCol + " = b.node_id\n")
+	// CROSS JOIN keeps bfs as the outer loop. With a plain JOIN the planner
+	// may put edges outside, which matches the index on view_gen alone and
+	// reads the whole generation for every BFS call.
+	b.WriteString("  CROSS JOIN edges e INDEXED BY " + edgeIdx + " ON " + joinCol + " = b.node_id\n")
 	// The node-backed gate pairs generations: a target that exists only in
 	// another generation must read as absent, not as a followable hop.
 	b.WriteString("  JOIN nodes n ON n.id = " + nextCol + " AND n.view_gen = e.view_gen\n")
