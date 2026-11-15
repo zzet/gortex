@@ -3,22 +3,22 @@
 package mcp
 
 import (
- "context"
- "encoding/json"
- "os"
- "path/filepath"
- "testing"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
 
- "github.com/stretchr/testify/require"
- "go.uber.org/zap"
- "github.com/zzet/gortex/internal/config"
- "github.com/zzet/gortex/internal/graph/store_sqlite"
- "github.com/zzet/gortex/internal/graphview"
- "github.com/zzet/gortex/internal/indexer"
- "github.com/zzet/gortex/internal/parser"
- "github.com/zzet/gortex/internal/parser/languages"
- "github.com/zzet/gortex/internal/query"
- "github.com/zzet/gortex/internal/search"
+	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search"
+	"go.uber.org/zap"
 )
 
 // Original C6 native crash fixture support; no abandoned minimal C5 or private

@@ -42,18 +42,21 @@ func daemonFreshnessPendingPreparationCase(t *testing.T, ctx context.Context, s 
 	require.True(t, w.TierState(path).RelationsAt.IsZero())
 	if name == "unknown_pending_bytes" {
 		require.NoError(t, os.Remove(path))
-  relative,relErr:=filepath.Rel(root,path)
-  require.NoError(t,relErr);require.Equal(t,"other_a.go",relative)
-  _,statErr:=os.Stat(path)
-  require.ErrorIs(t,statErr,os.ErrNotExist,"actual pending source bytes must be unavailable")
-  // These are one-time non-atomic observations of the real watcher, not
-  // fabricated tiers or an authority for the answer. The registered refusal
-  // below must itself name this exact unknown path.
-  canonical,known:=w.TierPaths()[filepath.Clean(path)]
-  require.True(t,known);require.NotZero(t,canonical.Generation)
-  require.GreaterOrEqual(t,canonical.Generation,ticket.Generation)
-  require.True(t,canonical.RelationsAt.IsZero());require.False(t,canonical.Failed)
-  t.Logf("ACTUAL_UNKNOWN_PENDING_PATH path=%q ticket_generation=%d observed_canonical_generation=%d relations_pending=true stat_error=%v snapshot_non_atomic=true",path,ticket.Generation,canonical.Generation,statErr)
+		relative, relErr := filepath.Rel(root, path)
+		require.NoError(t, relErr)
+		require.Equal(t, "other_a.go", relative)
+		_, statErr := os.Stat(path)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "actual pending source bytes must be unavailable")
+		// These are one-time non-atomic observations of the real watcher, not
+		// fabricated tiers or an authority for the answer. The registered refusal
+		// below must itself name this exact unknown path.
+		canonical, known := w.TierPaths()[filepath.Clean(path)]
+		require.True(t, known)
+		require.NotZero(t, canonical.Generation)
+		require.GreaterOrEqual(t, canonical.Generation, ticket.Generation)
+		require.True(t, canonical.RelationsAt.IsZero())
+		require.False(t, canonical.Failed)
+		t.Logf("ACTUAL_UNKNOWN_PENDING_PATH path=%q ticket_generation=%d observed_canonical_generation=%d relations_pending=true stat_error=%v snapshot_non_atomic=true", path, ticket.Generation, canonical.Generation, statErr)
 	}
 	client, ok := ctx.Value(daemonFreshnessTransportKey{}).(*daemonFreshnessTransport)
 	require.True(t, ok)

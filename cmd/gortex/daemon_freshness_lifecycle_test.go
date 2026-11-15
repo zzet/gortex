@@ -265,24 +265,25 @@ func daemonFreshnessDefaultRuntimeCase(t *testing.T, baselineOnly bool, pendingC
 		require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(expectedSource))), row.SourceFingerprint, "accepted source must match this fixture's real indexed bytes")
 		t.Logf("ACTUAL_DEFAULT_CONTRACT_ACCEPTANCE file=%s version=%s source=%s fingerprint=%s accepted=%t", file, row.Version, row.SourceFingerprint, row.Fingerprint, row.Accepted)
 	}
- // The separate unknown-bytes safeguard needs a real prior publication,
- // not another positive caller read that may itself admit catch-up. Its actual
- // write/status winner and all four accepted source receipts above establish
- // that prior publication; the ordinary full C5 still takes its original id12.
- if pendingCase == "unknown_pending_bytes" {
-  require.Equal(t,true,edit["reindexed"])
-  require.Equal(t,true,status["found"])
-  require.Equal(t,true,status["graph_status_terminal"])
-  require.Equal(t,receipt,status["receipt"])
-  applied,known:=status["applied_generation"].(float64)
-  require.True(t,known);require.Positive(t,applied)
-  require.Equal(t,edit["reindex_generation"],applied)
-  require.Equal(t,edit["applied_generation"],applied)
-  t.Logf("ACTUAL_UNKNOWN_NEGATIVE_PRIOR_PUBLICATION receipt=%s reindexed=true terminal=true winning_generation=%.0f relations_at=%s accepted_source_receipts=4 positive_id12_NOT_SENT",receipt,applied,relationsAt)
-  gate.arm()
-  daemonFreshnessPendingPreparationCase(t,ctx,s,root,w,gate,baselineCtx,pendingCase)
-  return
- }
+	// The separate unknown-bytes safeguard needs a real prior publication,
+	// not another positive caller read that may itself admit catch-up. Its actual
+	// write/status winner and all four accepted source receipts above establish
+	// that prior publication; the ordinary full C5 still takes its original id12.
+	if pendingCase == "unknown_pending_bytes" {
+		require.Equal(t, true, edit["reindexed"])
+		require.Equal(t, true, status["found"])
+		require.Equal(t, true, status["graph_status_terminal"])
+		require.Equal(t, receipt, status["receipt"])
+		applied, known := status["applied_generation"].(float64)
+		require.True(t, known)
+		require.Positive(t, applied)
+		require.Equal(t, edit["reindex_generation"], applied)
+		require.Equal(t, edit["applied_generation"], applied)
+		t.Logf("ACTUAL_UNKNOWN_NEGATIVE_PRIOR_PUBLICATION receipt=%s reindexed=true terminal=true winning_generation=%.0f relations_at=%s accepted_source_receipts=4 positive_id12_NOT_SENT", receipt, applied, relationsAt)
+		gate.arm()
+		daemonFreshnessPendingPreparationCase(t, ctx, s, root, w, gate, baselineCtx, pendingCase)
+		return
+	}
 	baseline := func() map[string]any {
 		observeBaselineWatcher("before_original_id12")
 		// Also runs when the existing helper fails via FailNow, before any
