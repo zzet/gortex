@@ -1129,6 +1129,20 @@ const enrichmentStateTableBody = ` (
     PRIMARY KEY (view_gen, repo_prefix, provider)
 ) WITHOUT ROWID`
 
+const enrichmentResumeTableBody = ` (
+    view_gen    INTEGER NOT NULL DEFAULT 0,
+    repo_prefix TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    indexed_sha TEXT NOT NULL DEFAULT '',
+    version     TEXT NOT NULL DEFAULT '',
+    phase       INTEGER NOT NULL DEFAULT 0,
+    after_path  TEXT NOT NULL DEFAULT '',
+    covered     INTEGER NOT NULL DEFAULT 0,
+    ledger_digest TEXT NOT NULL DEFAULT '',
+    updated_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (view_gen, repo_prefix, provider)
+) WITHOUT ROWID`
+
 const contractStateTableBody = ` (
     view_gen       INTEGER NOT NULL DEFAULT 0,
     repo_prefix    TEXT NOT NULL,
@@ -1321,6 +1335,18 @@ node_count, edge_count, extractor_versions`,
 		table:   "enrichment_state",
 		body:    enrichmentStateTableBody,
 		columns: `repo_prefix, provider, indexed_sha, completed_at, coverage`,
+	},
+	// enrichment_resume records, per (repo, semantic provider), how far a cut
+	// whole-repo apply pass got: the last committed page of the phase it was
+	// in, at the revision and engine version it ran with. A pass bounded by a
+	// deadline it cannot finish within would otherwise replay its already-
+	// applied pages on every restart and be cut at the same place each time.
+	// The row is deleted when the pass completes. Like the other state tables
+	// it needs no schema step: schemaSQL creates it on an existing store.
+	{
+		table:   "enrichment_resume",
+		body:    enrichmentResumeTableBody,
+		columns: `repo_prefix, provider, indexed_sha, version, phase, after_path, covered, ledger_digest, updated_at`,
 	},
 	// contract_state records, per repo, that a WHOLE-REPO contract pass
 	// committed against this store: the revision it ran at, when it finished,

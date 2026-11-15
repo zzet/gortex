@@ -46,6 +46,7 @@ var purgeSidecarTables = []string{
 	"repo_index_state",
 	"symbol_fts_state",
 	"enrichment_state",
+	"enrichment_resume",
 	"contract_state",
 	"semantic_binding_types",
 	"clone_shingles",
@@ -262,7 +263,8 @@ var rekeyMoveTables = []string{
 // so their old-id rows are already dangling against the evicted nodes.
 // semantic_binding_types is the exception: it is keyed by repo_prefix and
 // file_path, but a re-mint rewrites every file path too, so relabeling would
-// preserve unusable stale keys.
+// preserve unusable stale keys. enrichment_resume is dropped for the same
+// reason: its cursor is a file path under the old prefix.
 // Dropping these tables is correct: re-index rewrites index-time sidecars
 // and semantic bindings under the new IDs and paths, while enrichment
 // sidecars must re-run for the new IDs regardless. The FTS vtables sit here
@@ -270,6 +272,7 @@ var rekeyMoveTables = []string{
 // column is awkward, so delete-then-reindex is the clean path.
 var rekeyDropTables = []string{
 	"file_index_failures",
+	"enrichment_resume",
 	"semantic_binding_types",
 	"clone_shingles",
 	"clone_corpus_state",

@@ -762,6 +762,14 @@ const (
 // making a hidden-but-real usage diagnosable instead of silently dropped.
 const MetaReparsePendingEnrichment = "reparse_pending_enrichment"
 
+// MetaReparseEpoch is a KindFile-node Meta key the indexer writes, with a
+// new value, every time it sets or clears MetaReparsePendingEnrichment. It
+// names the re-parse rather than the file's bytes, so a type pass sees every
+// re-parse since its resume point, including one with no write to the file
+// (the importer of a deleted file) and one enriched in place since, and
+// does not resume over it.
+const MetaReparseEpoch = "reparse_epoch"
+
 // OriginRank returns a numeric rank for origin comparison. Higher = more
 // confident. Unknown or empty origin returns 0 so it sorts below all known
 // tiers; filters treat it as "untagged" and fall back to legacy inference.

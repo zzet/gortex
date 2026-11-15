@@ -151,8 +151,16 @@ WHERE file_path IN (SELECT file_path FROM nodes WHERE id IN
 	}
 	// File eviction is also used while reparsing. Keep its failure ledger until
 	// the indexer confirms that indexing succeeded or the file was deleted.
+	// A whole-repository eviction also removes every enrichment edge and stamp
+	// the repository carried, so a recorded enrichment resume point no longer
+	// describes the graph; it goes in the same transaction, durably, before a
+	// later run could honour it.
 	if predicate == evictRepoPredicate || predicate == evictNonEmptyRepoPredicate {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM file_index_failures WHERE `+scoped, scopeArgs...); err != nil {
+			return 0, 0, err
+		}
+		// The indexer's resumeUntrusted latch (runDeferredEnrich) relies on this.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM enrichment_resume WHERE `+scoped, scopeArgs...); err != nil {
 			return 0, 0, err
 		}
 	}

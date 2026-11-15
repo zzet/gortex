@@ -76,15 +76,25 @@ type fileRef struct {
 // repo being enriched. In single-repo mode every real node carries the
 // empty prefix, so repoPrefix == "" selects them all.
 func languageFiles(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) []fileRef {
-	langs := make(map[string]bool, len(spec.Languages))
-	for _, l := range spec.Languages {
-		langs[l] = true
-	}
-	var out []fileRef
+	return analyzedFiles(repoFileNodes(g, spec, repoPrefix), repoRoot)
+}
+
+// repoFileNodes reads the repo's file nodes of the spec's languages in one
+// scan.
+func repoFileNodes(g graph.Store, spec *LangSpec, repoPrefix string) []*graph.Node {
+	var out []*graph.Node
 	for n := range g.NodesByKind(graph.KindFile) {
-		if !langs[n.Language] || n.RepoPrefix != repoPrefix {
-			continue
+		if n != nil && n.RepoPrefix == repoPrefix && spec.handles(n.Language) {
+			out = append(out, n)
 		}
+	}
+	return out
+}
+
+// analyzedFiles keeps the repoFileNodes a pass parses.
+func analyzedFiles(nodes []*graph.Node, repoRoot string) []fileRef {
+	var out []fileRef
+	for _, n := range nodes {
 		// Match the manager/LSP enrichment policy: vendored and generated
 		// sources are intentionally outside semantic coverage. Without this
 		// gate, one real source file can make the provider reparse an entire
@@ -108,15 +118,20 @@ func languageFiles(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) [
 // graph file key into bytes-on-disk for both the full and incremental
 // passes.
 func fileRefFor(n *graph.Node, repoRoot string) (fileRef, bool) {
-	rel := n.FilePath
-	if n.RepoPrefix != "" {
-		rel = strings.TrimPrefix(rel, n.RepoPrefix+"/")
-	}
-	abs := filepath.Join(repoRoot, filepath.FromSlash(rel))
+	abs := fileAbsPath(n, repoRoot)
 	if fi, err := os.Stat(abs); err != nil || fi.IsDir() || fi.Size() > maxFileBytes {
 		return fileRef{}, false
 	}
 	return fileRef{node: n, absPath: abs}, true
+}
+
+// fileAbsPath maps a graph file node to its path under repoRoot.
+func fileAbsPath(n *graph.Node, repoRoot string) string {
+	rel := n.FilePath
+	if n.RepoPrefix != "" {
+		rel = strings.TrimPrefix(rel, n.RepoPrefix+"/")
+	}
+	return filepath.Join(repoRoot, filepath.FromSlash(rel))
 }
 
 // analyzeFile parses one file and runs the binder walk. Pure with
