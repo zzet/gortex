@@ -28,21 +28,23 @@ const (
 )
 
 type startupOptions struct {
-	Restarts  int
-	SeedStore string
+	Restarts   int
+	SeedStore  string
+	NoCheckout bool
 }
 
 func bindStartupFlags(f *flag.FlagSet, o *startupOptions) {
 	f.IntVar(&o.Restarts, "restarts", 0, "startup: warm restarts after the initial boot, each probed from before its socket exists")
 	f.StringVar(&o.SeedStore, "seed-store", "", "startup: store file copied into the private run before the initial boot, e.g. one written by an older schema; the source is only read")
+	f.BoolVar(&o.NoCheckout, "startup-no-checkout", false, "startup: create linked Git worktrees without checking out files; linked Read hook targets remain absent")
 }
 
 func (o startupOptions) validate(scenario string) error {
 	if o.Restarts < 0 {
 		return errors.New("--restarts must be nonnegative")
 	}
-	if scenario != startupScenario && (o.Restarts != 0 || o.SeedStore != "") {
-		return errors.New("--restarts and --seed-store apply to the startup scenario only")
+	if scenario != startupScenario && (o.Restarts != 0 || o.SeedStore != "" || o.NoCheckout) {
+		return errors.New("--restarts, --seed-store and --startup-no-checkout apply to the startup scenario only")
 	}
 	return nil
 }
@@ -102,7 +104,7 @@ func runStartupPhase(ctx context.Context, o runOptions, corpora []Corpus, output
 			resultErr = errors.Join(resultErr, p.removeState())
 		}
 	}()
-	linked, err := addLinkedCheckouts(ctx, p, o.Worktrees)
+	linked, err := addLinkedCheckouts(ctx, p, o.Worktrees, o.Startup.NoCheckout)
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
@@ -167,6 +169,10 @@ func runStartupPhase(ctx context.Context, o runOptions, corpora []Corpus, output
 	samples, probeErr := probe.finish()
 	resultErr = errors.Join(resultErr, probeErr)
 	summary := summarizeStartup(samples, boots, p.Repos[0].Corpus.Label, len(linked))
+	if o.Startup.NoCheckout {
+		summary.NoCheckout = true
+		summary.LinkedHookFileScope = "absent_tracked_path_no_indexed_file_coverage"
+	}
 	summary.CLITTY = probe.ttyStatus
 	for name, metric := range summary.metrics() {
 		phase.Metrics[name] = metric
@@ -293,17 +299,29 @@ func readCoordinators(ctx context.Context, p *privateRun, timing *bootTiming) {
 
 // addLinkedCheckouts adds linked worktrees of the first manifest repository.
 // They are not configured: the daemon discovers them through the primary.
-func addLinkedCheckouts(ctx context.Context, p *privateRun, count int) ([]probeCWD, error) {
+func addLinkedCheckouts(ctx context.Context, p *privateRun, count int, noCheckout bool) ([]probeCWD, error) {
 	primary := p.Repos[0]
 	var linked []probeCWD
 	for i := range count {
 		path := filepath.Join(p.Root, "repos", fmt.Sprintf("linked-%d", i+1))
-		if _, err := p.git(ctx, primary.Path, "worktree", "add", "--detach", path, primary.Corpus.Commit); err != nil {
+		args := []string{"worktree", "add", "--detach"}
+		if noCheckout {
+			args = append(args, "--no-checkout")
+		}
+		args = append(args, path, primary.Corpus.Commit)
+		if _, err := p.git(ctx, primary.Path, args...); err != nil {
 			return nil, err
 		}
-		file, err := ownedFile(path, primary.Corpus.File)
-		if err != nil {
-			return nil, err
+		// Keep the actual linked path even when it is absent. The report
+		// discloses that its hook decisions cannot prove indexed-file coverage;
+		// never create a file or substitute the primary checkout's target.
+		file := filepath.Join(path, filepath.FromSlash(primary.Corpus.File))
+		if !noCheckout {
+			var err error
+			file, err = ownedFile(path, primary.Corpus.File)
+			if err != nil {
+				return nil, err
+			}
 		}
 		linked = append(linked, probeCWD{Role: "worktree", Dir: path, File: file})
 	}

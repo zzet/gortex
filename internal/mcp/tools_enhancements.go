@@ -355,32 +355,7 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 	label := s.labelRelations(ctx, gaps, ids, nil)
 
 	if isCompact(req) {
-		var b strings.Builder
-		for _, v := range result.Violations {
-			fmt.Fprintf(&b, "%s %s %s:%d %s\n", v.Kind, v.SymbolID, v.FilePath, v.Line, v.Description)
-		}
-		// One line per changed function: how its call sites consume the
-		// return value, so a return-signature change shows exactly which
-		// sites bind / return / branch on the result.
-		for _, ru := range result.ReturnUsage {
-			fmt.Fprintf(&b, "return_usage %s call_sites:%d", ru.SymbolID, ru.CallSites)
-			labels := make([]string, 0, len(ru.Counts))
-			for label := range ru.Counts {
-				labels = append(labels, label)
-			}
-			sort.Strings(labels)
-			for _, label := range labels {
-				fmt.Fprintf(&b, " %s:%d", label, ru.Counts[label])
-			}
-			if ru.Unclassified > 0 {
-				fmt.Fprintf(&b, " unclassified:%d", ru.Unclassified)
-			}
-			b.WriteString("\n")
-		}
-		if result.Clean {
-			fmt.Fprintf(&b, "clean: checked %d callers, %d implementors\n", result.CheckedCallers, result.CheckedImpls)
-		}
-		return label.decorate(mcp.NewToolResultText(b.String())), nil
+		return label.decorate(mcp.NewToolResultText(compactVerifyConsumer(result, label))), nil
 	}
 
 	res, err := s.respondJSONOrTOON(ctx, req, label.labelled(result))
@@ -2621,20 +2596,8 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	}
 
 	if isCompact(req) {
-		var b strings.Builder
-		for _, e := range entries {
-			fmt.Fprintf(&b, "%s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
-		}
-		for _, e := range pendingUnknown {
-			fmt.Fprintf(&b, "pending_unknown %s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
-		}
-		if len(entries) == 0 && len(pendingUnknown) == 0 {
-			b.WriteString("no dead code found\n")
-		}
-		if variablesNote != "" {
-			fmt.Fprintf(&b, "\nnote: %s\n", variablesNote)
-		}
-		return label.decorate(mcp.NewToolResultText(b.String())), nil
+		text := compactDeadCodeConsumer(entries, pendingUnknown, totalEntries, totalUnknown, deadTruncated, variablesNote, label)
+		return label.decorate(mcp.NewToolResultText(text)), nil
 	}
 
 	result := map[string]any{
