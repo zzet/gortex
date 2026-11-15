@@ -2533,6 +2533,9 @@ func (s *Server) handleSmartContext(ctx context.Context, req mcp.CallToolRequest
 // path-name heuristic. Every list is sorted so the block is byte-stable
 // and feeds a deterministic pack root. Returns nil when there is no
 // graph/engine to walk.
+//
+// covering_tests keeps the first blastRadiusTestLimit tests of that sorted
+// list and reports the full count; get_test_targets returns all of them.
 func (s *Server) buildBlastRadius(ctx context.Context, workingSet []*graph.Node) map[string]any {
 	eng := s.engineFor(ctx)
 	if eng == nil || s.graph == nil || len(workingSet) == 0 {
@@ -2604,6 +2607,10 @@ func (s *Server) buildBlastRadius(ctx context.Context, workingSet []*graph.Node)
 		}
 		return tests[i].function < tests[j].function
 	})
+	totalTests := len(tests)
+	if totalTests > blastRadiusTestLimit {
+		tests = tests[:blastRadiusTestLimit]
+	}
 	coveringTests := make([]map[string]any, 0, len(tests))
 	for _, tr := range tests {
 		coveringTests = append(coveringTests, map[string]any{
@@ -2615,6 +2622,10 @@ func (s *Server) buildBlastRadius(ctx context.Context, workingSet []*graph.Node)
 	br := map[string]any{
 		"callers_by_file": callerGroups,
 		"covering_tests":  coveringTests,
+	}
+	if totalTests > len(tests) {
+		br["covering_tests_total"] = totalTests
+		br["covering_tests_truncated"] = true
 	}
 	if !anyTesters {
 		br["warning"] = "no covering tests found"

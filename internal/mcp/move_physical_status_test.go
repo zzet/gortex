@@ -6,6 +6,7 @@ import (
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
+	"github.com/zzet/gortex/internal/pathkey"
 	"go.uber.org/zap"
 	"os"
 	"path/filepath"
@@ -257,6 +258,12 @@ func TestMovePhysicalStatusTracksRealQueuedPointPublicationWithoutReparse(t *tes
 			}
 		})
 		require.Eventually(t, func() bool {
+			// The pending projection is retired asynchronously after the graph
+			// catches up, which flips file_view to projection_not_live. Check
+			// before sampling so the snapshot cannot straddle that retirement.
+			if pendingFileProjections.snap.Load().entries[pathkey.MutationKey(path)] != nil {
+				return false
+			}
 			status, _ = s.moveFileObservationPayload(ctx, move.records[path].id)
 			child, ok := status["physical_commit"].(map[string]any)
 			if !ok || child["graph_status"] != mutationGraphFresh || child["graph_status_terminal"] != true {

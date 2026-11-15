@@ -1720,9 +1720,13 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 		}
 
 		tests, _ := br["covering_tests"].([]map[string]any)
+		testMeta := []string{"count", fmt.Sprintf("%d", len(tests))}
+		if total, ok := br["covering_tests_total"].(int); ok {
+			testMeta = append(testMeta, "total", fmt.Sprintf("%d", total), "truncated", "true")
+		}
 		testEnc := newGCX(&buf, "smart_context.blast_tests",
 			[]string{"file", "function"},
-			"count", fmt.Sprintf("%d", len(tests)),
+			testMeta...,
 		)
 		for _, tr := range tests {
 			if err := testEnc.WriteRow(str(tr["file"]), str(tr["function"])); err != nil {
