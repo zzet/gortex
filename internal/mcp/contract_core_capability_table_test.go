@@ -309,6 +309,7 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"EdgeMetaBatchPersister", capOf[graph.EdgeMetaBatchPersister]},
 		{"EdgePersister", capOf[graph.EdgePersister]},
 		{"EdgesByKindsBatchScanner", capOf[graph.EdgesByKindsBatchScanner]},
+		{"EdgesByNodeIDsKindsReader", capOf[graph.EdgesByNodeIDsKindsReader]},
 		{"EdgeTerminalStampPersister", capOf[graph.EdgeTerminalStampPersister]},
 		{"EnrichmentResumeStore", capOf[graph.EnrichmentResumeStore]},
 		{"EnrichmentStateStore", capOf[graph.EnrichmentStateStore]},
