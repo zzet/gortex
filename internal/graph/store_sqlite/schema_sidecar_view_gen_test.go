@@ -221,6 +221,9 @@ func seedSidecarRows(t *testing.T, store *Store) {
 	mustNoErr(t, "enrichment state", store.SetEnrichmentState(graph.EnrichmentState{
 		RepoPrefix: sidecarSeedRepo, Provider: "gopls", IndexedSHA: "sha-1", CompletedAt: 43, Coverage: 0.5,
 	}))
+	mustNoErr(t, "enrichment resume", store.SetEnrichmentResume(graph.EnrichmentResumePoint{
+		RepoPrefix: sidecarSeedRepo, Provider: "typescript-types", IndexedSHA: "sha-1", Phase: 1, After: "a.go",
+	}))
 	mustNoErr(t, "contract state", store.SetContractState(graph.ContractState{
 		RepoPrefix: sidecarSeedRepo, IndexedSHA: "sha-1", CompletedAt: 44, ContractCount: 2,
 	}))
@@ -280,12 +283,16 @@ func mustNoErr(t *testing.T, what string, err error) {
 // v14 shape, keeping only the base-generation rows, and stamps the file at
 // user_version 14. The result is a store the shipped v14 build could have
 // written.
+// sidecarAddedAfterV14 names the sidecars a v14 store did not have.
+var sidecarAddedAfterV14 = map[string]bool{"file_index_failures": true, "enrichment_resume": true}
+
 func downgradeSidecarsToV14(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, sidecar := range viewGenSidecars {
-		if sidecar.table == "file_index_failures" {
-			// This sidecar was introduced at v21; v14 had no table or rows.
-			execDDL(t, db, `DROP TABLE file_index_failures`)
+		if sidecarAddedAfterV14[sidecar.table] {
+			// Introduced after v14 (failures at v21; the resume table needs
+			// no step): a v14 store had no table or rows.
+			execDDL(t, db, `DROP TABLE `+sidecar.table)
 			continue
 		}
 		legacy, ok := legacySidecarShapes[sidecar.table]
@@ -424,9 +431,9 @@ func TestSchemaV14StoreGainsSidecarViewGenerationKeys(t *testing.T) {
 	// Every sidecar kept exactly its seeded rows, all at the base generation.
 	for _, sidecar := range viewGenSidecars {
 		gens := rowViewGens(t, migrated.writerDB, sidecar.table)
-		if sidecar.table == "file_index_failures" {
+		if sidecarAddedAfterV14[sidecar.table] {
 			if len(gens) != 0 {
-				t.Fatal("new failure sidecar must start empty after migrating v14")
+				t.Fatalf("%s did not exist at v14 and must start empty after migrating it", sidecar.table)
 			}
 			continue
 		}

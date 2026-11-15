@@ -4,11 +4,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/zeebo/blake3"
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
@@ -192,8 +196,8 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 // whether the most recent live re-parse resolved the file without re-running
 // semantic enrichment. It round-trips the node through AddNode so a disk
 // backend persists the meta change (an in-place map write is lost on sqlite),
-// and skips the write entirely when the marker is already in the desired state
-// so a save storm never re-persists unchanged nodes.
+// and skips the write when clearing a marker that is not set while no type
+// tier is configured.
 const reparsePendingEnrichmentBatchSize = 256
 
 type reparsePendingEnrichmentBatch struct {
@@ -243,18 +247,74 @@ func (idx *Indexer) setReparsePendingEnrichment(graphPath string, pending bool) 
 	idx.setReparsePendingEnrichments(map[string]bool{graphPath: pending})
 }
 
+// setReparsePendingEnrichments applies setReparsePendingEnrichment to many
+// files in one batch.
+//
+// Writing the marker false for any file also raises resumeUntrusted, whether
+// or not the marker was set. The write that matters follows enrichment that
+// ran for the file in place (a watch save, a batched or point semantic
+// catch-up, a forced re-resolve, a file-scoped deferred pass). That
+// enrichment re-applies only the file's own facts, but the re-parse also
+// evicted the edges other files' type facts point into the file, and only a
+// pass that re-applies those files restores them. The ledger no longer
+// names the file, so a resumed pass would seal the gap with a completion
+// marker; the next whole-repo pass must start from the first page. The other
+// false writes are harmless to distrust: a whole-repo discharge follows a
+// non-partial pass that already cleared its points, and a file with no type
+// tier to wait for (no providers, or an omitted file) costs at most one pass
+// that does not resume.
+//
+// The latch covers only this process, and a restart at the same clean
+// revision would honour the persisted points, so the same write first
+// deletes the repository's points for every provider. When that fails the
+// markers stay on. Every re-parse that can be enriched in place puts its
+// file on the ledger under a new graph.MetaReparseEpoch in its own fact
+// write (stampReparseLedger), and a type pass never resumes a point recorded
+// over another ledger. So a crash anywhere before the marker comes off, or
+// a failed delete, leaves a ledger no surviving point covers.
+//
+// Every write stamps a new epoch, even when the marker is already set: the
+// re-parse that preceded it dropped facts a stored point says were applied,
+// whether or not the file was written. Clearing the marker replaces the
+// epoch rather than removing it, so the ledger digest never returns to one
+// a point recorded before the clear carries: a type pass staging meanwhile
+// may record such a point after the discard above. A file with no
+// marker gets one too while a type tier is configured, since its re-parse
+// may have dropped the epoch with the node. The epoch on a clear overlaps
+// the one stamped by the write that preceded it (the fact write in
+// stampReparseLedger, or a pending write here): on every path that clears
+// today either alone moves the digest. The clear keeps its own so the
+// guarantee does not rest on that earlier write.
 func (idx *Indexer) setReparsePendingEnrichments(pendingByFile map[string]bool) {
 	if len(pendingByFile) == 0 {
 		return
 	}
 	paths := make([]string, 0, len(pendingByFile))
-	for graphPath := range pendingByFile {
-		if graphPath != "" {
-			paths = append(paths, graphPath)
+	distrust := false
+	for graphPath, pending := range pendingByFile {
+		if graphPath == "" {
+			continue
+		}
+		paths = append(paths, graphPath)
+		if !pending {
+			distrust = true
+		}
+	}
+	keepMarkers := false
+	if distrust {
+		idx.resumeUntrusted.Store(true)
+		if rs, ok := idx.graph.(graph.EnrichmentResumeStore); ok {
+			if err := rs.ClearRepoEnrichmentResume(idx.repoPrefix); err != nil {
+				idx.logger.Warn("indexer: discard enrichment resume points failed; leaving the files on the re-parse ledger",
+					zap.String("repo", idx.repoPrefix), zap.Error(err))
+				keepMarkers = true
+			}
 		}
 	}
 	sort.Strings(paths)
 	nodesByFile := idx.graph.GetFileNodesByPaths(paths)
+	epoch := newReparseEpoch()
+	typeTier := idx.semanticProvidersPresent()
 	updates := make([]*graph.Node, 0, len(paths))
 	for _, graphPath := range paths {
 		pending := pendingByFile[graphPath]
@@ -263,23 +323,137 @@ func (idx *Indexer) setReparsePendingEnrichments(pendingByFile map[string]bool) 
 				continue
 			}
 			_, had := n.Meta[graph.MetaReparsePendingEnrichment]
-			switch {
-			case pending && !had:
-				if n.Meta == nil {
-					n.Meta = map[string]any{}
-				}
-				n.Meta[graph.MetaReparsePendingEnrichment] = true
-			case !pending && had:
-				delete(n.Meta, graph.MetaReparsePendingEnrichment)
-			default:
-				continue // already in the desired state — no write
+			if !pending && (keepMarkers || (!had && !typeTier)) {
+				continue // kept on, or nothing a type pass reads — no write
 			}
+			if n.Meta == nil {
+				n.Meta = map[string]any{}
+			}
+			if pending {
+				n.Meta[graph.MetaReparsePendingEnrichment] = true
+			} else {
+				delete(n.Meta, graph.MetaReparsePendingEnrichment)
+			}
+			n.Meta[graph.MetaReparseEpoch] = epoch
 			updates = append(updates, n)
 			break
 		}
 	}
 	if len(updates) > 0 {
 		idx.graph.AddBatch(updates, nil)
+	}
+}
+
+// retractUnchangedMtimeReceipts deletes the persisted mtime receipts of
+// files about to be evicted and re-derived when the receipt already names
+// the version being read: a file re-derived with no write to it (the
+// importer of a deleted file). A warm-restart census would find such a file
+// unchanged, so a crash between its eviction and its fact write would leave
+// it with no nodes, off the ledger, while an old resume point survives.
+// Without the receipt the restart re-derives it. The fact write's version
+// record puts the receipt back. Files whose receipt already differs need
+// nothing: the census sees them changed.
+func (idx *Indexer) retractUnchangedMtimeReceipts(versions map[string]fileReadVersion) {
+	deleter, ok := idx.graph.(graph.FileMtimeDeleter)
+	if !ok || len(versions) == 0 {
+		return
+	}
+	var keys []string
+	idx.mtimeMu.RLock()
+	for key, version := range versions {
+		if !version.valid || version.snapshot {
+			continue
+		}
+		if recorded, tracked := idx.fileMtimes[key]; tracked && recorded == version.mtime {
+			keys = append(keys, key)
+		}
+	}
+	idx.mtimeMu.RUnlock()
+	if len(keys) == 0 {
+		return
+	}
+	sort.Strings(keys)
+	if err := deleter.DeleteFileMtimes(idx.repoPrefix, keys); err != nil {
+		idx.logger.Warn("indexer: retract mtime receipts before a re-parse failed",
+			zap.String("repo", idx.repoPrefix), zap.Int("files", len(keys)), zap.Error(err))
+	}
+}
+
+// discardResumeBeforeSkipEviction deletes the repository's resume points
+// before a skip (size, content, binary, minified or timeout) replaces a
+// file's facts with a synthetic node. Other files' type facts may have bound
+// into the evicted ones, and no re-parse puts the file on the ledger. A
+// failed delete fails the re-index before anything is written, so the file
+// keeps its prior state and is retried. The synthetic node also carries a
+// new epoch (stampSkipEpoch) for a point recorded after the delete.
+func (idx *Indexer) discardResumeBeforeSkipEviction(prior []*graph.Node) error {
+	hasFacts := false
+	for _, n := range prior {
+		if n != nil && n.Kind != graph.KindFile {
+			hasFacts = true
+			break
+		}
+	}
+	rs, ok := idx.graph.(graph.EnrichmentResumeStore)
+	if !hasFacts || !ok {
+		return nil
+	}
+	idx.resumeUntrusted.Store(true)
+	if err := rs.ClearRepoEnrichmentResume(idx.repoPrefix); err != nil {
+		return fmt.Errorf("discard enrichment resume points before a skip eviction: %w", err)
+	}
+	return nil
+}
+
+// stampSkipEpoch stamps a new graph.MetaReparseEpoch on the synthetic file
+// node a skip installs. A type pass that opened before the skip can record
+// a point over the old ledger after discardResumeBeforeSkipEviction ran,
+// and a restart drops the in-process latch; the epoch moves the ledger
+// digest so that point is not resumed.
+func stampSkipEpoch(nodes []*graph.Node) {
+	for _, n := range nodes {
+		if n == nil || n.Kind != graph.KindFile {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		n.Meta[graph.MetaReparseEpoch] = newReparseEpoch()
+		return
+	}
+}
+
+// newReparseEpoch names one re-parse for graph.MetaReparseEpoch.
+func newReparseEpoch() string { return strconv.FormatUint(rand.Uint64(), 36) }
+
+// reparseLedgerApplies reports whether a re-parse of the file result came
+// from goes on the per-file ledger: there is a type tier for it to fall
+// short of.
+func (idx *Indexer) reparseLedgerApplies(result *parser.ExtractionResult) bool {
+	return idx.semanticProvidersPresent() && !extractionDispositionFor(result).omitSecondarySourceScans()
+}
+
+func (idx *Indexer) semanticProvidersPresent() bool {
+	return idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+}
+
+// stampReparseLedger marks a re-parsed file on the per-file ledger, under a
+// new epoch, in the node write that replaces its facts, so no crash can
+// leave the new facts stored with the file off the ledger while an old
+// resume point survives. Enrichment that runs in place afterwards clears
+// the marker through setReparsePendingEnrichments, which discards the
+// resume points first.
+func stampReparseLedger(nodes []*graph.Node) {
+	for _, n := range nodes {
+		if n == nil || n.Kind != graph.KindFile {
+			continue
+		}
+		if n.Meta == nil {
+			n.Meta = map[string]any{}
+		}
+		n.Meta[graph.MetaReparsePendingEnrichment] = true
+		n.Meta[graph.MetaReparseEpoch] = newReparseEpoch()
+		return
 	}
 }
 

@@ -19,8 +19,13 @@ import (
 type Provider struct {
 	spec         *LangSpec
 	logger       *zap.Logger
-	observePage  func(factPageStats) // synchronous test/diagnostic hook
-	observeSpool func(string)        // synchronous cleanup test hook
+	observePage  func(factPageStats)       // synchronous test/diagnostic hook
+	observeSpool func(string)              // synchronous cleanup test hook
+	observeFiles func()                    // synchronous test hook: the pass listed its files
+	pageFault    func(factPageStats) error // test hook: fail a page after it applied
+	// resumeVersion identifies this engine build in resume points; empty
+	// means the build cannot be identified and the provider never resumes.
+	resumeVersion string
 }
 
 var (
@@ -33,7 +38,7 @@ func NewProvider(spec *LangSpec, logger *zap.Logger) *Provider {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Provider{spec: spec, logger: logger}
+	return &Provider{spec: spec, logger: logger, resumeVersion: applyResumeVersion()}
 }
 
 // DefaultProviders returns the in-process type resolvers for every
@@ -109,7 +114,18 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return res, nil
 	}
 
-	files := languageFiles(g, p.spec, repoPrefix, repoRoot)
+	// One read of the file nodes serves both the ledger digest the pass's
+	// points carry and the files it stages, so a point never covers a file
+	// state the pass did not list: a file indexed after the read moves the
+	// digest, and the next pass refuses the point.
+	nodes := repoFileNodes(g, p.spec, repoPrefix)
+	// Decided before any early return, so a point this run must not honour
+	// is discarded even when the pass is cut before it applies anything.
+	resume := p.openApplyResume(ctx, g, repoPrefix, func() string { return digestLedger(nodes, repoRoot) })
+	files := analyzedFiles(nodes, repoRoot)
+	if p.observeFiles != nil {
+		p.observeFiles()
+	}
 	// The budget is charged phase by phase against a movable deadline instead
 	// of arming one context up front: the wait for the graph-wide resolve
 	// mutex below is ANOTHER pass's work, and letting it burn this pass's
@@ -199,7 +215,10 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
-		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res)
+		// The resume was decided before staging; a file re-parsed since
+		// shows only in the ledger as it is now.
+		resume.revalidate(func() string { return ledgerDigest(g, p.spec, repoPrefix, repoRoot) })
+		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, resume, res)
 		mu.Unlock()
 		applyCtxErr := context.Cause(applyCtx)
 		cancelApply()
@@ -214,6 +233,9 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	}
 	if err := context.Cause(ctx); err != nil {
 		markContextPartial(res, err)
+	}
+	if !res.Partial {
+		resume.complete()
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()

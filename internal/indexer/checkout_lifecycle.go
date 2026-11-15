@@ -3571,6 +3571,12 @@ func (l *CheckoutLifecycle) liveCoordinators(familyID string) int {
 // refused while the route still names them and collectable the moment the
 // teardown removes it.
 func (l *CheckoutLifecycle) sweepRetirements(ctx context.Context) int {
+	// The sweep holds retirementSweepMu, which every queued caller and the
+	// deferred worker's bursts wait for. With that worker running, a
+	// generation over the WAL mark stops and stays owed to its bursts.
+	if l.deferredSeedRetirementsEnabled() {
+		ctx = store_sqlite.WithRetirementWALYield(ctx)
+	}
 	l.retirementSweepWaiting.Add(1)
 	l.retirementSweepMu.Lock()
 	l.retirementSweepWaiting.Add(-1)

@@ -106,7 +106,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			selected = corpora[:2]
 		}
 	}
-	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario || scenario == checkoutDiscoveryScenario && o.Editors > 0
+	editing := scenario == "edit" || scenario == "many-edit" || scenario == editProbeScenario || scenario == checkoutDiscoveryScenario && o.Editors > 0 || scenario == "worktrees" && o.Churn.Cycles > 0 && o.Editors > 0
 	for _, corpus := range selected {
 		operations, planErr := readingPlan(corpus)
 		if planErr != nil {
@@ -150,6 +150,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		return phase, nil, artifacts, crashes, "", err
 	}
 	p.Env = append(p.Env, seedEnv...)
+	if o.Churn.ReconcileInterval > 0 {
+		p.Env = append(p.Env, "GORTEX_RECONCILE_INTERVAL="+o.Churn.ReconcileInterval.String())
+	}
 	artifacts["private_root"] = p.Root
 	if scenario == checkoutDiscoveryScenario && o.Discovery.Resume != "" {
 		raw, err := os.ReadFile(o.Discovery.Resume)
@@ -488,6 +491,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 }
 
 func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients, sweepClients []*socketClient, sweepRequests []request, sweep []SweepEntry, phase *Phase, artifacts map[string]string, series *gaugeSeries, sampler processSampler, group string) error {
+	if o.Churn.Cycles > 0 {
+		return measureWorktreeChurn(ctx, o, p, clients, phase, sampler, group)
+	}
 	if len(o.WorktreeSteps) > 0 {
 		return measureWorktreeSteps(ctx, o, p, clients[0], phase, artifacts, series, sampler, group)
 	}

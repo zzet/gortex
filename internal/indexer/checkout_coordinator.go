@@ -4343,7 +4343,9 @@ func (c *CheckoutCoordinator) offerRetire(ctx context.Context, generationID int6
 	if c.retireCalled != nil {
 		c.retireCalled(generationID)
 	}
-	if err := c.store.RetirePayloadGeneration(ctx, generationID, c.inUse()); err != nil {
+	// An offer runs inside a cycle that holds the build lane: it must not wait
+	// for the WAL reclaim there, so over the mark it stops and stays owed.
+	if err := c.store.RetirePayloadGeneration(store_sqlite.WithRetirementWALYield(ctx), generationID, c.inUse()); err != nil {
 		if errors.Is(err, store_sqlite.ErrCatalogNotFound) {
 			return
 		}

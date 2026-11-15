@@ -2226,6 +2226,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.EdgesByKindsBatchScanner)(nil), probe: "ScanEdgesByKindsBatched"},
 		{iface: (*graph.EdgesByKindsScanner)(nil), probe: "EdgesByKinds"},
 		{iface: (*graph.EdgeTerminalStampPersister)(nil), skip: skipWrite, writeFence: writerFamilyFence("edge_terminal_stamps")},
+		{iface: (*graph.EnrichmentResumeStore)(nil), skip: skipSidecar},
 		{iface: (*graph.EnrichmentStateStore)(nil), skip: skipSidecar},
 		{iface: (*graph.ExactEdgeBatchRemover)(nil), skip: skipWrite, writeFence: "TestGenerationScopedExactEdgeDelete"},
 		{iface: (*graph.ExistingNodeIDFinder)(nil), probe: "ExistingNodeIDs"},

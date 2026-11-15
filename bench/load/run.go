@@ -54,6 +54,7 @@ type runOptions struct {
 	editProbeBaseline        bool
 	Discovery                discoveryOptions
 	Startup                  startupOptions
+	Churn                    churnOptions
 	pairedDriver             func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 	smokeState               *privateRun // only the fixed smoke entry lends its freshly owned store
 	smokeMarkers             []string
@@ -65,6 +66,7 @@ func parseRun(args []string) (runOptions, error) {
 	bindRunFlags(f, &o)
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
+	bindChurnFlags(f, &o.Churn)
 	if err := f.Parse(args); err != nil {
 		return o, err
 	}
@@ -75,7 +77,7 @@ func parseRun(args []string) (runOptions, error) {
 		return o, errors.New("--edit-repos must be positive")
 	}
 	o.editProbeBaseline = o.EditProbeRole == "baseline"
-	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o))
+	return o, errors.Join(validateRunOptions(o), validateMemoryOptions(o), o.Churn.validate(o.Scenario, o.Worktrees, o.Editors, o.WorktreeSteps))
 }
 
 func bindRunFlags(f *flag.FlagSet, o *runOptions) {
