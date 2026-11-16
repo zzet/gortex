@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -362,7 +363,7 @@ func TestLegacyStateSeparateWorkspaces(t *testing.T) {
 	// A daemon-wide config lists both repos, including the one in the other
 	// workspace. Stub the reader: the real one resolves the platform config
 	// path and would answer from the developer's own config.
-	doctorConfiguredPaths = func(string) []string { return []string{"/r/repo", otherRoot} }
+	doctorConfiguredPaths = func(string) ([]string, error) { return []string{"/r/repo", otherRoot}, nil }
 
 	state := collectLegacyState(t.TempDir())
 	if !state.Checked {
@@ -612,7 +613,7 @@ func TestLegacyStateCollectorRedactsRoots(t *testing.T) {
 
 	origPaths := doctorConfiguredPaths
 	t.Cleanup(func() { doctorConfiguredPaths = origPaths })
-	doctorConfiguredPaths = func(home string) []string { return []string{siblingHome, outsideHome} }
+	doctorConfiguredPaths = func(home string) ([]string, error) { return []string{siblingHome, outsideHome}, nil }
 
 	state := collectLegacyState(t.TempDir())
 	if !state.Checked {
@@ -704,5 +705,75 @@ func TestLegacyStateUnattributedExcludesMixedIntentRows(t *testing.T) {
 
 	if len(unattributed) != 0 {
 		t.Errorf("unattributed = %v, want none; any attributed kind disqualifies the row", unattributed)
+	}
+}
+
+// TestLegacyStateConfigFailureIsNotAnEmptyConfig covers the P2 finding that a
+// global-config read or parse failure was treated as an empty configured-repo
+// list, so the section reported a completed check with no legacy state.
+//
+// An unreadable config is not an empty config. config.LoadGlobal already
+// tells the two apart - a missing file returns (gc, nil), a parse failure
+// returns (nil, err) - and the collector now propagates that failure as an
+// incomplete check in BOTH the JSON and the human output.
+func TestLegacyStateConfigFailureIsNotAnEmptyConfig(t *testing.T) {
+	origCensus, origEnv := doctorCensusTool, doctorLegacyEnv
+	origPaths := doctorConfiguredPaths
+	t.Cleanup(func() {
+		doctorCensusTool, doctorLegacyEnv = origCensus, origEnv
+		doctorConfiguredPaths = origPaths
+	})
+	doctorLegacyEnv = func() DoctorEnvironment { return DoctorEnvironment{DaemonRunning: true} }
+	doctorCensusTool = func(tool string, args map[string]any) (json.RawMessage, error) {
+		return json.RawMessage(`{"families":[]}`), nil
+	}
+	doctorConfiguredPaths = func(string) ([]string, error) {
+		return nil, errors.New("parsing global config: yaml: line 3: found character that cannot start any token")
+	}
+
+	state := collectLegacyState(t.TempDir())
+
+	if state.Checked {
+		t.Error("checked = true, want false: a config that could not be read was not a completed check")
+	}
+	if state.Skipped == "" {
+		t.Error("a failed check must say why")
+	}
+	if !strings.Contains(state.Skipped, "global config") {
+		t.Errorf("skipped = %q, want it to name the global config", state.Skipped)
+	}
+	if len(state.Unattributed) != 0 || len(state.Intentless) != 0 {
+		t.Errorf("findings reported from an unreadable config: unattributed=%d intentless=%d",
+			len(state.Unattributed), len(state.Intentless))
+	}
+
+	// JSON output: the section must not claim a completed check.
+	raw, err := json.Marshal(map[string]any{"legacy_state": state})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back map[string]map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	legacy, ok := back["legacy_state"]
+	if !ok {
+		t.Fatalf("legacy_state key missing: %s", raw)
+	}
+	if legacy["checked"] != false {
+		t.Errorf("JSON checked = %v, want false", legacy["checked"])
+	}
+	if legacy["skipped"] == "" || legacy["skipped"] == nil {
+		t.Errorf("JSON skipped = %v, want the reason", legacy["skipped"])
+	}
+
+	// Human output: same requirement.
+	var buf bytes.Buffer
+	printDoctorLegacy(&buf, state)
+	if !strings.Contains(buf.String(), "global config") {
+		t.Errorf("human rendering did not say the config failed:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "no legacy state found") {
+		t.Errorf("human rendering claimed no legacy state after a config failure:\n%s", buf.String())
 	}
 }

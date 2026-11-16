@@ -154,7 +154,16 @@ func collectLegacyState(home string) DoctorLegacyState {
 	state.Checked = true
 
 	state.DedicatedCorpora = dedicatedWorktreeCorpora(overview)
-	state.Unattributed, state.Intentless = classifyConfiguredRepos(overview, doctorConfiguredPaths(home))
+	configured, err := doctorConfiguredPaths(home)
+	if err != nil {
+		// Fail closed. Reporting a completed check with no legacy state
+		// would claim a complete inventory on the strength of a config
+		// file we never managed to load.
+		state.Checked = false
+		state.Skipped = "could not read the global config; legacy state not checked: " + err.Error()
+		return state
+	}
+	state.Unattributed, state.Intentless = classifyConfiguredRepos(overview, configured)
 	redactLegacyRoots(&state)
 	return state
 }
@@ -242,14 +251,20 @@ var doctorConfiguredPaths = configuredRepoPaths
 // configuredRepoPaths reads the repo list out of config.yaml. Reading the file
 // is not writing it, and it is the only place a `manual_config` entry can be
 // said to come from.
-func configuredRepoPaths(home string) []string {
+func configuredRepoPaths(home string) ([]string, error) {
 	path := filepath.Join(home, ".gortex", "config.yaml")
 	if p := config.DefaultGlobalConfigPath(); p != "" {
 		path = p
 	}
 	gc, err := config.LoadGlobal(path)
-	if err != nil || gc == nil {
-		return nil
+	if err != nil {
+		// A config that could not be read or parsed is NOT an empty config.
+		// config.LoadGlobal already tells the two apart: a missing file
+		// returns (gc, nil), a parse failure returns (nil, err).
+		return nil, err
+	}
+	if gc == nil {
+		return nil, nil
 	}
 	out := make([]string, 0, len(gc.Repos))
 	for _, r := range gc.Repos {
@@ -257,7 +272,7 @@ func configuredRepoPaths(home string) []string {
 			out = append(out, r.Path)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // dedicatedWorktreeCorpora finds every checkout that is a linked worktree
