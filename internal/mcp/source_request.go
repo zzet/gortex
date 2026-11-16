@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -195,7 +196,8 @@ func (s *Server) readsSiblingRepo(ctx context.Context, rawPath, checkoutRoot, ow
 	}
 	// Ownership is the physical target's: an alias beneath a sibling that
 	// resolves into this checkout's family stays on the lane and its refusal.
-	resolved, err := filepath.EvalSymlinks(abs)
+	// EvalLinks also follows Windows directory junctions.
+	resolved, err := pathguard.EvalLinks(abs)
 	if err != nil {
 		return false
 	}
