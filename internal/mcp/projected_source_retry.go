@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,12 @@ type projectedSourceAllowance struct {
 	attempts       atomic.Int32
 	tool           string
 	symbolMetadata bool // Bound once to the actual audited full-JSON request.
+	// A plain require_fresh caller first waits on the original watcher bound.
+	// Its projection window starts only afterward and is shared by rebounds.
+	afterFreshness bool
+	deadlineMu     sync.Mutex
+	deadline       time.Time
+	watchedWait    time.Duration
 }
 
 // Only these nonpaginated reads have audited replay-safe response work.
@@ -34,10 +41,11 @@ func auditedProjectionReadRetry(tool string, req mcplib.CallToolRequest) bool {
 	case "get_symbol_source", "get_file_summary":
 		return true
 	case "get_callers":
-		// Ordinary traversals reuse the existing checked-transition boundary.
-		// Explicit freshness requests retain their own retry/deadline policy.
 		freshness := takeRequestFreshness(&req)
-		return freshness.err == nil && !freshness.requireExact && !freshness.requireFresh && !freshness.hasDeadline
+		// Exact-view requests retain their existing freshness controller. A
+		// plain fresh traversal can replay a checked retirement after its wait,
+		// never a physical replacement or an unobserved owner transition.
+		return freshness.err == nil && !freshness.requireExact && (freshness.requireFresh || !freshness.hasDeadline)
 	case "get_symbol":
 		// Full JSON assembly has no cursor/compression state. The handler
 		// separately marks any active enrichment attempt replay-unsafe.
@@ -76,6 +84,16 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 			return next(ctx, req)
 		}
 		if _, exists := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); !exists {
+			freshness := takeRequestFreshness(&req)
+			if legacy == "get_callers" && freshness.requireFresh {
+				started := time.Now()
+				ctx = withToolReceivedAt(ctx, started)
+				// Latch the caller's wait ceiling once, rather than renewing it
+				// when a complete attempt is rebound after checked retirement.
+				ctx = context.WithValue(ctx, freshSymbolDeadlineKey{}, freshness.effectiveDeadline(started, ctx))
+				ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, afterFreshness: true})
+				return next(ctx, req)
+			}
 			deadline := time.Now().Add(projectedReadBudget)
 			if prior, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && prior.Before(deadline) {
 				deadline = prior
@@ -85,6 +103,44 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 		}
 		return next(ctx, req)
 	}
+}
+
+// The freshness wait is not charged against a projection window that did not
+// exist yet. Once established, this same absolute ceiling covers both attempts;
+// inherited projection/caller deadlines may shorten it, never extend it.
+func projectedReadBudgetAfterFreshness(ctx context.Context) context.Context {
+	allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	if allowance == nil || !allowance.afterFreshness {
+		return ctx
+	}
+	allowance.deadlineMu.Lock()
+	defer allowance.deadlineMu.Unlock()
+	if allowance.deadline.IsZero() {
+		deadline := time.Now().Add(projectedReadBudget)
+		for _, key := range []any{projectedSourceDeadlineKey{}, freshSymbolDeadlineKey{}} {
+			if prior, ok := ctx.Value(key).(time.Time); ok && prior.Before(deadline) {
+				deadline = prior
+			}
+		}
+		if caller, ok := ctx.Deadline(); ok && caller.Before(deadline) {
+			deadline = caller
+		}
+		allowance.deadline = deadline
+	}
+	return context.WithValue(ctx, projectedSourceDeadlineKey{}, allowance.deadline)
+}
+
+// Only observed time inside the watcher barrier is cumulative. In particular
+// projection/handler work between attempts never becomes reported wait time.
+func recordProjectedWatchedWait(ctx context.Context, waited time.Duration) time.Duration {
+	allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	if allowance == nil || !allowance.afterFreshness {
+		return waited
+	}
+	allowance.deadlineMu.Lock()
+	defer allowance.deadlineMu.Unlock()
+	allowance.watchedWait += waited
+	return allowance.watchedWait
 }
 
 func (a *projectedSourceAllowance) claim() bool {
@@ -131,6 +187,8 @@ func checkedProjectionChange(ctx context.Context) bool {
 	}
 	facts.mu.RLock()
 	defer facts.mu.RUnlock()
+	allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	retirementOnly := allowance != nil && allowance.afterFreshness
 	changed := false
 	for _, entry := range facts.entries {
 		if entry == nil || ctx.Err() != nil {
@@ -161,7 +219,7 @@ func checkedProjectionChange(ctx context.Context) bool {
 		if unchanged {
 			continue
 		}
-		if !retired && !readCOW {
+		if !retired && (retirementOnly || !readCOW) {
 			return false
 		}
 		changed = true
@@ -184,7 +242,22 @@ func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) m
 			}
 			copy := req
 			copy.Params.Arguments = cloneFreshSymbolArguments(req.GetArguments())
-			result, err := runProjectedSourceAttempt(ctx, copy, attempt)
+			attemptCtx, cancel := ctx, func() {}
+			if allowance.afterFreshness {
+				allowance.deadlineMu.Lock()
+				deadline := allowance.deadline
+				allowance.deadlineMu.Unlock()
+				if !deadline.IsZero() {
+					if !time.Now().Before(deadline) {
+						return mcplib.NewToolResultError(errProjectedSourceMoved.Error()), nil
+					}
+					// A rebound's watcher barrier and assembly share the already
+					// started ceiling too. The original caller remains unchanged.
+					attemptCtx, cancel = context.WithDeadline(ctx, deadline)
+				}
+			}
+			result, err := runProjectedSourceAttempt(attemptCtx, copy, attempt)
+			cancel()
 			if !errors.Is(err, errProjectedSourceMoved) {
 				return result, err
 			}

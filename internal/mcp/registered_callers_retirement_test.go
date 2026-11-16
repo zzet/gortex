@@ -189,11 +189,17 @@ func TestCallersProjectionBudgetPreservesExplicitFreshness(t *testing.T) {
 				handler := s.withProjectedSourceReadBudget(func(ctx context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 					called = true
 					allowance, exists := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
-					if mode == "ordinary" {
+					switch mode {
+					case "ordinary":
 						require.True(t, exists)
 						require.Equal(t, "get_callers", allowance.tool)
 						require.True(t, ctx.Value(projectedSourceDeadlineKey{}).(time.Time).Before(original))
-					} else {
+					case "fresh":
+						require.True(t, exists)
+						require.True(t, allowance.afterFreshness)
+						require.True(t, allowance.deadline.IsZero(), "the watcher wait must not spend the projection window")
+						require.Equal(t, original, ctx.Value(projectedSourceDeadlineKey{}))
+					default:
 						require.False(t, exists, "explicit freshness keeps its existing controller")
 						require.Equal(t, original, ctx.Value(projectedSourceDeadlineKey{}))
 					}

@@ -41,6 +41,11 @@ func auditedSourceProjectionMismatch(ctx context.Context, err error) bool {
 	if !audited {
 		return false
 	}
+	if allowance.afterFreshness {
+		// This policy grants only a complete rebound after a checked canonical
+		// retirement of retained facts, not an early unknown-owner retry.
+		return false
+	}
 	// A competing read can replace the same suspect ACK owner with a checked
 	// same-byte COW entry before this request borrows it. All audited file
 	// reads must restart the whole attempt instead of losing their file layer
@@ -120,6 +125,9 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			if errors.Is(err, errProjectionStorm) {
 				markRequestProjectionStorm(ctx, graphPath)
 				continue
+			}
+			if allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); allowance != nil && allowance.afterFreshness && errors.Is(err, projectionSuperseded) {
+				return ctx, err // Unknown/physical replacement is not fresh evidence.
 			}
 			if auditedSourceProjectionMismatch(ctx, err) {
 				return ctx, errProjectedSourceMoved

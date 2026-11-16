@@ -51,6 +51,8 @@ func helper() {}
 	g := graph.New()
 	cfg := config.Default()
 	idx := indexer.New(g, reg, cfg.Index, zap.NewNop())
+	// Timed-out projections can retain extraction leases after their caller returns.
+	t.Cleanup(idx.Close)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 

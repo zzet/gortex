@@ -302,6 +302,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		if refusal := s.awaitWatchedFreshness(ctx, legacyName, req, freshness); refusal != nil {
 			return refusal, nil
 		}
+		ctx = projectedReadBudgetAfterFreshness(ctx)
 		if requireExactView && view != nil && view.rider != nil && !view.rider.Exact {
 			return mcp.NewToolResultError(graphview.NewViewError(graphview.CodeViewBuilding,
 				"the requested exact checkout view is unavailable; retry after publication; no fallback was served").Error()), nil

@@ -1138,17 +1138,22 @@ func (s *Server) awaitWatchedFreshness(ctx context.Context, name string, req mcp
 	for {
 		label := s.freshnessFor(ctx, scope, ids, files)
 		if label.state == "" {
-			annotateRequestFreshness(view, &requestFreshnessOutcome{fresh: true, deadline: deadline}, started)
+			waited := recordProjectedWatchedWait(ctx, time.Since(started))
+			if view != nil {
+				view.mu.Lock()
+				view.freshness = &requestFreshnessOutcome{fresh: true, deadline: deadline, waited: waited}
+				view.mu.Unlock()
+			}
 			return nil
 		}
 		if label.state == "failed" || !time.Now().Before(deadline) {
-			label.waited = time.Since(started)
+			label.waited = recordProjectedWatchedWait(ctx, time.Since(started))
 			return label.requireFreshError()
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			label.waited = time.Since(started)
+			label.waited = recordProjectedWatchedWait(ctx, time.Since(started))
 			return label.requireFreshError()
 		}
 	}
