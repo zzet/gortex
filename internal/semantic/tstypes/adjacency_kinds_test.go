@@ -124,8 +124,9 @@ func injectOutgoingCalls(s graph.Store, fan int) {
 // applier claims the FIRST claimable same-line stub whose trailing name
 // matches (upgradeExistingCall, applySuper), so which of the two it retargets
 // — and so the resulting graph — is decided by the within-kind list order: a
-// preload read that orders a kind differently from the unfiltered read (an
-// ORDER BY that drops or flips the insertion tiebreak) fails parity.
+// preload read that drops or flips the same-site insertion tiebreak fails
+// parity. This does not imply equivalence of filtered and unfiltered batch
+// order across different lines on SQLite.
 func injectSiblingStubs(s graph.Store) {
 	type key struct {
 		from, to string
@@ -184,7 +185,7 @@ type adjacencyIdentity struct {
 }
 
 // byKindIdentities groups a list per kind, keeping order within each kind —
-// the order the kind-filtered reads promise to preserve.
+// useful for checking the order of a fresh read through the same capability.
 func byKindIdentities(edges []*graph.Edge, kinds []graph.EdgeKind) string {
 	groups := map[graph.EdgeKind][]*graph.Edge{}
 	for _, e := range edges {
@@ -217,12 +218,11 @@ func adjacencyIdentities(edges []*graph.Edge) []adjacencyIdentity {
 // adjacencyCoherence is a Provider.observePreload hook asserting that every
 // list a page's applier starts from — whether the pass hot cache served it or
 // the store did — holds, kind by kind and in order, exactly the edges the
-// store's UNFILTERED adjacency read returns right now. An earlier page that
+// store's corresponding adjacency read returns right now. An earlier page that
 // mutated a list without dropping its cache entry (forgetOut / forgetIn)
 // leaves a stale or reordered snapshot that fails here, in either preload
-// mode; so does a kind-filtered read whose within-kind order departs from
-// the unfiltered one (on the incoming side no reader is order-sensitive, so
-// only this check sees it).
+// mode. Filtered reads are compared with filtered reads: SQLite's unfiltered
+// batch ordering is not guaranteed to match, even within one kind.
 type adjacencyCoherence struct {
 	mu       sync.Mutex
 	failures []string
@@ -251,9 +251,15 @@ func (c *adjacencyCoherence) observe(ap *applier) {
 	c.mu.Lock()
 	c.pages++
 	c.mu.Unlock()
-	compare("out", ap.outByID, ap.outLoaded, ap.outKinds, ap.g.GetOutEdgesByNodeIDs)
-	compare("in", ap.inByID, ap.inLoaded, ap.inKinds, ap.g.GetInEdgesByNodeIDs)
-	compare("calls", ap.callsByID, ap.callsLoaded, adjacencyCallKinds, ap.g.GetOutEdgesByNodeIDs)
+	compare("out", ap.outByID, ap.outLoaded, ap.outKinds, func(ids []string) map[string][]*graph.Edge {
+		return graph.OutEdgesByNodeIDsOfKinds(ap.g, ids, ap.outKinds)
+	})
+	compare("in", ap.inByID, ap.inLoaded, ap.inKinds, func(ids []string) map[string][]*graph.Edge {
+		return graph.InEdgesByNodeIDsOfKinds(ap.g, ids, ap.inKinds)
+	})
+	compare("calls", ap.callsByID, ap.callsLoaded, adjacencyCallKinds, func(ids []string) map[string][]*graph.Edge {
+		return graph.OutEdgesByNodeIDsOfKinds(ap.g, ids, adjacencyCallKinds)
+	})
 }
 
 func (c *adjacencyCoherence) check(t testing.TB, label string) {
@@ -283,20 +289,33 @@ type paritySnapshot struct {
 func takeParitySnapshot(t testing.TB, s graph.Store, res *semantic.EnrichResult) paritySnapshot {
 	t.Helper()
 	var snap paritySnapshot
+	type keyedEdge struct {
+		edge parityEdge
+		key  string
+	}
+	var edges []keyedEdge
 	for _, e := range s.AllEdges() {
 		meta, err := json.Marshal(e.Meta)
 		if err != nil {
 			t.Fatalf("marshal edge meta: %v", err)
 		}
-		snap.Edges = append(snap.Edges, parityEdge{
+		edge := parityEdge{
 			From: e.From, To: e.To, Kind: string(e.Kind), FilePath: e.FilePath, Origin: e.Origin,
 			Tier: e.Tier, ConfidenceLabel: e.ConfidenceLabel, Line: e.Line, Confidence: e.Confidence,
 			CrossRepo: e.CrossRepo, Meta: string(meta),
-		})
+		}
+		// Keep the existing canonical order, but format each record only
+		// once. Formatting both operands on every comparison dominates the
+		// race-enabled multi-page test with tens of thousands of hub edges.
+		edges = append(edges, keyedEdge{edge: edge, key: fmt.Sprint(edge)})
 	}
-	sort.Slice(snap.Edges, func(i, j int) bool {
-		return fmt.Sprint(snap.Edges[i]) < fmt.Sprint(snap.Edges[j])
+	sort.Slice(edges, func(i, j int) bool {
+		return edges[i].key < edges[j].key
 	})
+	snap.Edges = make([]parityEdge, 0, len(edges))
+	for _, e := range edges {
+		snap.Edges = append(snap.Edges, e.edge)
+	}
 	for _, n := range s.AllNodes() {
 		meta, err := json.Marshal(n.Meta)
 		if err != nil {
@@ -305,16 +324,24 @@ func takeParitySnapshot(t testing.TB, s graph.Store, res *semantic.EnrichResult)
 		snap.Nodes = append(snap.Nodes, n.ID+" "+string(meta))
 	}
 	sort.Strings(snap.Nodes)
-	if res != nil {
-		r := *res
-		r.DurationMs, r.LockWaitMs = 0, 0
-		blob, err := json.Marshal(r)
-		if err != nil {
-			t.Fatalf("marshal result: %v", err)
-		}
-		snap.Result = string(blob)
-	}
+	snap.Result = parityResult(t, res)
 	return snap
+}
+
+// Most intermediate checks need only the result, not another complete graph
+// snapshot. Keep result normalization identical for both paths.
+func parityResult(t testing.TB, res *semantic.EnrichResult) string {
+	t.Helper()
+	if res == nil {
+		return ""
+	}
+	r := *res
+	r.DurationMs, r.LockWaitMs = 0, 0
+	blob, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	return string(blob)
 }
 
 func diffParity(t testing.TB, label string, legacy, filtered paritySnapshot) {
@@ -629,7 +656,7 @@ func enrichSnapshot(t *testing.T, label string, fixture map[string]string, provi
 				if err != nil {
 					t.Fatalf("%s: enrich %s %s: %v", label, p.Name(), rel, err)
 				}
-				results = append(results, takeParitySnapshot(t, s, res).Result)
+				results = append(results, parityResult(t, res))
 			}
 			continue
 		}
@@ -637,7 +664,7 @@ func enrichSnapshot(t *testing.T, label string, fixture map[string]string, provi
 		if err != nil {
 			t.Fatalf("%s: enrich %s: %v", label, p.Name(), err)
 		}
-		results = append(results, takeParitySnapshot(t, s, res).Result)
+		results = append(results, parityResult(t, res))
 	}
 	coherence.check(t, fmt.Sprintf("%s (full=%v)", label, run.full))
 	snap := takeParitySnapshot(t, s, nil)

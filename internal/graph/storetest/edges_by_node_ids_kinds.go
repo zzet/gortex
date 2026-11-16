@@ -3,6 +3,7 @@ package storetest
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -10,10 +11,10 @@ import (
 
 // testEdgesByNodeIDsKinds pins the kind-filtered batched adjacency read: per
 // node, the result must be exactly the unfiltered batch read restricted to the
-// requested kinds, with the full payload (Meta included) and, within each
-// kind, the unfiltered read's order. Both the optional capability (when the
-// backend has it) and the graph-level helper (capability or fallback) are
-// held to that.
+// requested kinds, with the full payload (Meta included). Order is
+// backend-specific and need not match the unordered SQLite batch read.
+// Both the optional capability (when the backend has it) and the graph-level
+// helper (capability or fallback) are held to that.
 func testEdgesByNodeIDsKinds(t *testing.T, factory Factory) {
 	t.Helper()
 	s := factory(t)
@@ -111,7 +112,8 @@ func nonEmptyEdgeLists(in map[string][]*graph.Edge) map[string][]*graph.Edge {
 }
 
 // assertKindFilteredEdges compares per ID: the same edges with the same
-// payload, and the same sequence within every kind.
+// payload, independent of backend-specific ordering. Backend tests pin the
+// in-memory insertion order and SQLite's explicit line/kind/insertion order.
 func assertKindFilteredEdges(t *testing.T, label string, kinds []graph.EdgeKind, want, got map[string][]*graph.Edge) {
 	t.Helper()
 	got = nonEmptyEdgeLists(got)
@@ -129,10 +131,13 @@ func assertKindFilteredEdges(t *testing.T, label string, kinds []graph.EdgeKind,
 			for _, e := range edges {
 				out[e.Kind] = append(out[e.Kind], describeEdge(e))
 			}
+			for _, list := range out {
+				sort.Strings(list)
+			}
 			return out
 		}
 		if g, w := perKind(gotEdges), perKind(wantEdges); !reflect.DeepEqual(g, w) {
-			t.Fatalf("%s(%v)[%s] per-kind sequence = %v, want %v", label, kinds, id, g, w)
+			t.Fatalf("%s(%v)[%s] per-kind payloads = %v, want %v", label, kinds, id, g, w)
 		}
 	}
 }

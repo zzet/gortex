@@ -15,9 +15,8 @@ import (
 
 // repeatedStublessCallFixture makes one caller apply the same desugared
 // operator call twice on different lines. Desugared operator calls carry no
-// extracted stub, so the first application mints the caller's calls edge
-// (addASTEdge) and the second can only confirm it by finding that edge in the
-// caller's loaded calls list — or mint a duplicate.
+// extracted stub, so each source site must mint its own calls edge
+// (addASTEdge). Reapplying the facts must reuse those site-specific edges.
 func repeatedStublessCallFixture() map[string]string {
 	return map[string]string{
 		"A.kt": `class A {
@@ -92,8 +91,8 @@ func TestAdjacencyUpkeepParity(t *testing.T) {
 	}
 }
 
-// The second `a + b` must reuse the edge the first minted, not mint another:
-// the minted edge has to be in the caller's calls list.
+// Distinct source sites retain distinct edges. A second enrichment must reuse
+// each site's minted edge rather than duplicate it or collapse the two sites.
 func TestRepeatedStublessCallReusesMintedEdge(t *testing.T) {
 	g, dir := buildFixture(t, repeatedStublessCallFixture())
 	caller := nodeByNameKind(t, g, "run", graph.KindMethod)
@@ -107,16 +106,30 @@ func TestRepeatedStublessCallReusesMintedEdge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var calls int
-	for _, e := range g.GetOutEdges(caller.ID) {
-		if e.Kind == graph.EdgeCalls && e.To == plus.ID {
-			calls++
+	checkSites := func() {
+		t.Helper()
+		lines := map[int]int{}
+		for _, e := range g.GetOutEdges(caller.ID) {
+			if e.Kind == graph.EdgeCalls && e.To == plus.ID {
+				lines[e.Line]++
+			}
+		}
+		if len(lines) != 2 || lines[3] != 1 || lines[4] != 1 {
+			t.Fatalf("call sites = %v, want one edge each on lines 3 and 4", lines)
 		}
 	}
-	// The second application finds the minted edge already at the AST
-	// grade: it is handled without an upgrade, so nothing is confirmed.
-	if res.EdgesAdded != 1 || calls != 1 {
-		t.Fatalf("added=%d calls edges=%d, want the second application to reuse the minted edge", res.EdgesAdded, calls)
+	checkSites()
+	if res.EdgesAdded != 2 {
+		t.Fatalf("added=%d, want one edge per source site", res.EdgesAdded)
+	}
+	res, err = NewProvider(KotlinSpec(), zap.NewNop()).EnrichRepo(g, "", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSites()
+	if res.EdgesAdded != 0 || res.EdgesConfirmed != 0 {
+		t.Fatalf("repeated enrichment added=%d confirmed=%d, want to reuse both resolved sites",
+			res.EdgesAdded, res.EdgesConfirmed)
 	}
 }
 

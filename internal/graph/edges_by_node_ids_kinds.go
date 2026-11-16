@@ -11,16 +11,13 @@ package graph
 //   - the result holds exactly the edges GetOut/InEdgesByNodeIDs would return
 //     whose Kind is in kinds, with the same payload (full Meta and promoted
 //     columns, so a caller may persist a returned edge back unchanged);
-//   - within one kind, edges appear in the order the unfiltered batch read
-//     yields them. On the SQLite store outgoing edges are ordered by source
-//     line, kind, then insertion (within a kind, GetOutEdges' declared order)
-//     and incoming edges by kind then insertion (GetInEdges' declared order);
-//     the in-memory backend keeps its insertion order;
-//   - across kinds the order is backend-specific: the in-memory backend
-//     keeps insertion order, while SQLite orders same-line outgoing edges of
-//     different kinds by kind name, where the unfiltered read's cross-kind
-//     order is plan-dependent. A caller whose first-match loop spans kinds
-//     must not rely on matching the unfiltered read across kinds;
+//   - order is backend-specific: the in-memory backend keeps insertion
+//     order. SQLite orders outgoing edges by source line, kind, then
+//     insertion (within a kind, GetOutEdges' declared order), and incoming
+//     edges by kind then insertion (GetInEdges' declared order). SQLite's
+//     unfiltered batch queries have no ORDER BY: even within one kind their
+//     order can differ under ordinary planner statistics. Callers must not
+//     rely on matching the unfiltered batch order, within or across kinds;
 //   - empty or nil kinds requests every kind (the unfiltered read);
 //   - missing IDs are absent or map to an empty slice.
 //

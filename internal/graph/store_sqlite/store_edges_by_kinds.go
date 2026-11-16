@@ -13,9 +13,11 @@ var _ graph.EdgesByNodeIDsKindsReader = (*Store)(nil)
 // kind, then insertion: within one kind exactly GetOutEdges' (line, id) order.
 // Across kinds on one line the order is kind name ascending (extends before
 // implements, whatever the insertion order). The unfiltered batch read has no
-// ORDER BY, so its cross-kind order on one line follows the query plan; a
-// first-match loop spanning two kinds (tstypes applySuper) sees this fixed
-// order instead (TestOutEdgesByNodeIDsKindsCrossKindTieBreak).
+// ORDER BY, so its order follows the query plan even within a single kind;
+// ordinary planner statistics can make it differ from this line order.
+// Callers must select the intended source site rather than the first target
+// match. A first-match loop spanning two kinds (tstypes applySuper) also sees
+// this fixed order instead (TestOutEdgesByNodeIDsKindsCrossKindTieBreak).
 func (s *Store) GetOutEdgesByNodeIDsKinds(ids []string, kinds []graph.EdgeKind) map[string][]*graph.Edge {
 	if len(kinds) == 0 {
 		return s.GetOutEdgesByNodeIDs(ids)

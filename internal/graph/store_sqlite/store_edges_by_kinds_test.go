@@ -123,3 +123,49 @@ func TestOutEdgesByNodeIDsKindsCrossKindTieBreak(t *testing.T) {
 		}
 	}
 }
+
+// Pin the filtered reader's own order, not equivalence with an unordered
+// batch query. Same-kind calls at different sites may come back in a
+// different order from that query after ANALYZE.
+func TestEdgesByNodeIDsKindsWithinKindOrderWithStats(t *testing.T) {
+	s := openCatalogStore(t)
+	const from = "repo/App.java::handle"
+	edges := []*graph.Edge{
+		{From: from, To: "hub", Kind: graph.EdgeCalls, Line: 30},
+		{From: from, To: "z", Kind: graph.EdgeCalls, Line: 3},
+		{From: from, To: "a", Kind: graph.EdgeCalls, Line: 3},
+		{From: from, To: "hub", Kind: graph.EdgeCalls, Line: 3},
+	}
+	s.AddBatch(nil, edges)
+	if _, err := s.writerDB.Exec("ANALYZE"); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{from, "hub"}
+	for len(ids) < 5000 {
+		ids = append(ids, fmt.Sprintf("missing::%04d", len(ids)))
+	}
+	kinds := []graph.EdgeKind{graph.EdgeCalls}
+	// Outgoing: line, then insertion at a same-line/same-kind tie (not
+	// target name order). Incoming: insertion within the requested kind.
+	for _, tc := range []struct {
+		name string
+		got  []*graph.Edge
+		want []*graph.Edge
+	}{
+		{"out", s.GetOutEdgesByNodeIDsKinds(ids, kinds)[from], []*graph.Edge{edges[1], edges[2], edges[3], edges[0]}},
+		{"in", s.GetInEdgesByNodeIDsKinds(ids, kinds)["hub"], []*graph.Edge{edges[0], edges[3]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.got) != len(tc.want) {
+				t.Fatalf("got %d edges, want %d", len(tc.got), len(tc.want))
+			}
+			for i, got := range tc.got {
+				want := tc.want[i]
+				if got.From != want.From || got.To != want.To || got.Line != want.Line {
+					t.Errorf("edge %d = %s->%s at %d, want %s->%s at %d",
+						i, got.From, got.To, got.Line, want.From, want.To, want.Line)
+				}
+			}
+		})
+	}
+}

@@ -335,13 +335,16 @@ var adjacencyInKinds = []graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeParamOf}
 // order-sensitive readers are first-match loops over these kinds. On the
 // in-memory store each list is the order-preserving subsequence of the full
 // list, so loading just these kinds is invisible there. On SQLite the
-// kind-filtered read keeps the unfiltered read's order within each kind;
-// across kinds on one source line it is ordered by kind name (extends before
+// kind-filtered read orders outgoing edges by line, kind, then insertion.
+// The unfiltered batch read has no ORDER BY, so its order can differ even
+// within a kind under ordinary planner statistics. Call confirmation must
+// match the fact's source line, not just its target. Across kinds on one
+// source line the filtered read orders by kind name (extends before
 // implements). One first-match loop spans two kinds — applySuper's fallback
 // takes the first claimable extends-or-implements stub whose trailing name
 // matches — so on SQLite its pick can differ from some unfiltered-read plans
 // when one type carries such stubs of both kinds on one line. That order was
-// never defined: the unfiltered batch read has no ORDER BY, its cross-kind
+// never defined: the unfiltered batch read has no ORDER BY, its
 // order follows the query plan (it changes with planner statistics) and
 // already differs from the in-memory insertion order. The kind-filtered read
 // makes it deterministic. No extractor emits both stubs for one declaration.
@@ -1802,7 +1805,10 @@ func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, f
 func (a *applier) upgradeExistingCall(caller, target *graph.Node, cf callFact, res *semantic.EnrichResult, strategy resolutionStrategy, confidence float64) bool {
 	outs := a.outCalls(caller.ID)
 	for _, e := range outs {
-		if e.Kind == graph.EdgeCalls && e.To == target.ID {
+		// A target match at another line is a different call site: it
+		// must neither receive this fact's provenance nor prevent this
+		// site's stub from being claimed (or a fresh edge being added).
+		if e.Kind == graph.EdgeCalls && e.To == target.ID && e.Line == cf.line {
 			if a.confirmCall(e, strategy, confidence) {
 				res.EdgesConfirmed++
 			}
