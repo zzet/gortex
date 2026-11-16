@@ -156,6 +156,52 @@ func TestWorktreeSessionReadsSiblingRepoFile(t *testing.T) {
 		"its own prefix is not a sibling")
 }
 
+// Ownership follows the physical file: an alias beneath a sibling that
+// resolves into the worktree family's primary keeps the source-lane refusal,
+// the same as naming the primary file directly.
+func TestWorktreeSessionSiblingAliasIntoPrimaryStaysRefused(t *testing.T) {
+	stack := newViewStackWithSibling(t)
+	ctx := WithSessionCWD(WithSessionID(context.Background(), viewTestSession), stack.worktreeRoot)
+	require.NoError(t, os.WriteFile(filepath.Join(stack.worktreeRoot, "keep.go"), []byte("package repo\n\nfunc WorktreeMarker() {}\n"), 0o644))
+	primaryAlias := filepath.Join(stack.siblingRoot, "primary-alias.go")
+	require.NoError(t, os.Symlink(filepath.Join(stack.repoRoot, "keep.go"), primaryAlias))
+	siblingAlias := filepath.Join(stack.siblingRoot, "sibling-alias.go")
+	require.NoError(t, os.Symlink(filepath.Join(stack.siblingRoot, "sibling.go"), siblingAlias))
+
+	for name, path := range map[string]string{
+		"primary path":             filepath.Join(stack.repoRoot, "keep.go"),
+		"primary alias (abs)":      primaryAlias,
+		"primary alias (prefixed)": "sibling/primary-alias.go",
+	} {
+		res, err := stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": path}, stack.srv.handleReadFile)
+		require.NoError(t, err, name)
+		require.True(t, res.IsError, "%s: %s", name, viewResultText(t, res))
+		require.Contains(t, viewResultText(t, res), "outside the selected checkout", name)
+		require.NotContains(t, viewResultText(t, res), "func Keeper()", name)
+	}
+
+	for name, path := range map[string]string{
+		"sibling path":  filepath.Join(stack.siblingRoot, "sibling.go"),
+		"sibling alias": siblingAlias,
+	} {
+		res, err := stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": path}, stack.srv.handleReadFile)
+		require.NoError(t, err, name)
+		require.False(t, res.IsError, "%s: %s", name, viewResultText(t, res))
+		require.Contains(t, viewResultText(t, res), "func Sibling()", name)
+	}
+
+	res, err := stack.callHandler(t, stack.worktreeRoot, "read_file", map[string]any{"path": filepath.Join(stack.worktreeRoot, "keep.go")}, stack.srv.handleReadFile)
+	require.NoError(t, err)
+	require.False(t, res.IsError, viewResultText(t, res))
+	require.Contains(t, viewResultText(t, res), "func WorktreeMarker()")
+
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": primaryAlias}
+	view, err := stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorWorktree, CheckoutID: viewTestWorktree}, &req, "read_file", requestFreshness{}, capabilityRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, view, "an explicit worktree selector keeps the checkout boundary")
+}
+
 // The sibling exception stops at the session workspace and at an explicit
 // worktree selector: both still refuse a path outside the checkout.
 func TestWorktreeSessionSiblingReadStaysInsideWorkspace(t *testing.T) {

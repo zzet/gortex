@@ -193,15 +193,21 @@ func (s *Server) readsSiblingRepo(ctx context.Context, rawPath, checkoutRoot, ow
 		}
 		abs = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(slashPath, prefix+"/")))
 	}
-	if (viewPathRoot{root: checkoutRoot}).contains(abs) {
+	// Ownership is the physical target's: an alias beneath a sibling that
+	// resolves into this checkout's family stays on the lane and its refusal.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
 		return false
 	}
-	prefix := s.multiIndexer.RepoForFile(abs)
-	if prefix == "" || prefix == ownPrefix {
-		return false
-	}
-	if allowed, bound := s.sessionWorkspaceRepoSet(ctx); bound && !allowed[prefix] {
-		return false
+	allowed, bound := s.sessionWorkspaceRepoSet(ctx)
+	for _, path := range []string{abs, resolved} {
+		if (viewPathRoot{root: checkoutRoot}).contains(path) {
+			return false
+		}
+		prefix := s.multiIndexer.RepoForFile(path)
+		if prefix == "" || prefix == ownPrefix || (bound && !allowed[prefix]) {
+			return false
+		}
 	}
 	return true
 }
