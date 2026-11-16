@@ -24,6 +24,7 @@ type projectedSourceAllowanceKey struct{}
 type projectedSourceAllowance struct {
 	attempts       atomic.Int32
 	tool           string
+	diagnostic     *projectionPredicateTrace
 	symbolMetadata bool // Bound once to the actual audited full-JSON request.
 	// A plain require_fresh caller first waits on the original watcher bound.
 	// Its projection window starts only afterward and is shared by rebounds.
@@ -90,8 +91,13 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 				ctx = withToolReceivedAt(ctx, started)
 				// Latch the caller's wait ceiling once, rather than renewing it
 				// when a complete attempt is rebound after checked retirement.
-				ctx = context.WithValue(ctx, freshSymbolDeadlineKey{}, freshness.effectiveDeadline(started, ctx))
-				ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, afterFreshness: true})
+				originalDeadline := freshness.effectiveDeadline(started, ctx)
+				ctx = context.WithValue(ctx, freshSymbolDeadlineKey{}, originalDeadline)
+				diagnostic := newProjectionPredicateTrace()
+				if diagnostic != nil {
+					diagnostic.originalDeadline = originalDeadline
+				}
+				ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, afterFreshness: true, diagnostic: diagnostic})
 				return next(ctx, req)
 			}
 			deadline := time.Now().Add(projectedReadBudget)
@@ -147,9 +153,17 @@ func (a *projectedSourceAllowance) claim() bool {
 	for {
 		before := a.attempts.Load()
 		if before >= 2 {
+			if a.diagnostic != nil {
+				r := predicateSample("attempt.limit", nil, nil)
+				r.decision = "exhausted"
+				recordPredicateTrace(a.diagnostic, r, false)
+			}
 			return false
 		}
 		if a.attempts.CompareAndSwap(before, before+1) {
+			if a.diagnostic != nil {
+				a.diagnostic.attempt.Store(before + 1)
+			}
 			return true
 		}
 	}
@@ -170,10 +184,10 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 		return false
 	}
 	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
-	if !ok || !time.Now().Before(deadline) {
+	if !ok || !predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.entry_budget") {
 		return false
 	}
-	return checkedProjectionChange(ctx) && ctx.Err() == nil && time.Now().Before(deadline)
+	return checkedProjectionChange(ctx) && ctx.Err() == nil && predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.final_budget")
 }
 
 // Structural ownership proof, independent of permission or time for another attempt.
@@ -202,7 +216,9 @@ func checkedProjectionChange(ctx context.Context) bool {
 		pendingFileProjections.mu.Lock()
 		current := pendingFileProjections.snap.Load().entries[entry.key]
 		unchanged := current == entry && current == candidate && live
-		retired := current == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+		sample := predicateSample("recovery.checked_change", entry, current)
+		sample.currentSeen = true
+		retired := current == nil && predicateBool(&sample.retired, entry.checkedRetired.Load()) && !predicateBool(&sample.suspect, entry.suspect.Load())
 		// A zero sequence never becomes a physical receipt. An externally
 		// built version may authorize a new attempt only when BOTH owners
 		// earned checked-read publication and share this immutable version.
@@ -210,12 +226,21 @@ func checkedProjectionChange(ctx context.Context) bool {
 			(current.sourceCommitSeq != 0 || entry.commitSeq == 0 && current.readVersionChecked && entry.readVersionChecked)
 		readCOW := current != nil && current != entry && current == candidate && live &&
 			current.commitSeq == 0 && versionChecked &&
-			!current.suspect.Load() && current.sourceEvents == 0 && !current.checkedRetired.Load() &&
+			!predicateBool(&sample.currentSuspect, current.suspect.Load()) && predicateEventZero(sample, current.sourceEvents) && !predicateBool(&sample.currentRetired, current.checkedRetired.Load()) &&
 			!current.tombstone && !entry.tombstone && current.layer != nil && current.layer == entry.layer &&
 			current.key == entry.key && current.graphPath == entry.graphPath && current.repoPrefix == entry.repoPrefix &&
 			current.hash == entry.hash && current.rawHash == entry.rawHash && current.contentSHA256 == entry.contentSHA256 &&
 			sameDisk
 		pendingFileProjections.mu.Unlock()
+		if !unchanged {
+			sample.decision = "refused"
+			if retired {
+				sample.decision = "checked_retirement"
+			} else if !retirementOnly && readCOW {
+				sample.decision = "checked_read_cow"
+			}
+			recordPredicate(ctx, sample, false)
+		}
 		if unchanged {
 			continue
 		}
@@ -231,7 +256,8 @@ func checkedProjectionChange(ctx context.Context) bool {
 // its typed byte-mismatch retry. Every attempt has fresh facts/layers/leases
 // under the original shared deadline and two-attempt allowance.
 func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) mcpserver.ToolHandlerFunc {
-	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return func(ctx context.Context, req mcplib.CallToolRequest) (result *mcplib.CallToolResult, err error) {
+		defer func() { attachPredicateDiagnostic(ctx, result) }()
 		allowance, ok := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
 		if !ok {
 			return attempt(ctx, req)
@@ -248,7 +274,7 @@ func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) m
 				deadline := allowance.deadline
 				allowance.deadlineMu.Unlock()
 				if !deadline.IsZero() {
-					if !time.Now().Before(deadline) {
+					if !predicateDeadlineBefore(ctx, deadline, time.Now(), "attempt.rebound_budget") {
 						return mcplib.NewToolResultError(errProjectedSourceMoved.Error()), nil
 					}
 					// A rebound's watcher barrier and assembly share the already

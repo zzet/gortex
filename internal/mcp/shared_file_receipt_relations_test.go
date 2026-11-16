@@ -519,6 +519,8 @@ func sharedReceiptComparison(tb testing.TB, perAgent int, enforceLatency bool) f
 }
 
 func TestSharedFileOwnReceiptsReachExactRelationsAtFourEditsPerSecond(t *testing.T) {
+	t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+	t.Setenv("GORTEX_TEST_SHARED_RECEIPT_REFERENCE_RAW", "1")
 	sharedReceiptComparison(t, 8, false)
 }
 

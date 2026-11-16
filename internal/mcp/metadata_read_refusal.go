@@ -24,6 +24,7 @@ func metadataTransientResult(code ErrorCode, message, reason string) *mcplib.Cal
 // Classification is at the existing refusal boundary: no selection, replay,
 // new allowance, physical guard or successful response changes here.
 func (s *Server) metadataReadError(ctx context.Context, req mcplib.CallToolRequest, err error) *mcplib.CallToolResult {
+	retainPredicateError(ctx, err)
 	original := searchRefusalToolResult(err)
 	if ctx.Err() != nil || !s.metadataReadRetryScope(req) || !errors.Is(err, projectionSuperseded) {
 		return original

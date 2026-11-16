@@ -122,6 +122,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 		}
 		entry, err := s.projectCurrentTrackedFile(buildCtx, ctx, abs, graphPath, rel)
 		if err != nil {
+			retainPredicateError(ctx, err)
 			if errors.Is(err, errProjectionStorm) {
 				markRequestProjectionStorm(ctx, graphPath)
 				continue
@@ -308,7 +309,7 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 			// Ownership can move while bounded current bytes are read even
 			// though their content did not change. Refuse this selection without
 			// inventing source invalidation on a checked historical owner.
-			if pendingFileProjections.snap.Load().entries[key] != expected {
+			if currentOwner := pendingFileProjections.snap.Load().entries[key]; currentOwner != expected {
 				// No file layer or facts have been retained at this boundary.
 				// A competing checked read may already own these exact immutable
 				// bytes. Use search binding's same-version authority proof instead
@@ -317,7 +318,7 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 				if current := checkedPendingSearchCOWSuccessor(buildCtx, expected); current != nil {
 					return current, nil
 				}
-				return nil, projectionSuperseded
+				return nil, predicateError("selection.owner_before_retain", expected, currentOwner, func(r *projectionPredicateSample) { r.currentSeen = true; r.decision = "owner_changed_before_retain" })
 			}
 			if err := buildCtx.Err(); err != nil {
 				return nil, err
@@ -497,7 +498,7 @@ func requestStoreBusyFiles(ctx context.Context) []string {
 // with candidate and row selection. It adds no registry or publication owner.
 func retainRequestProjection(ctx context.Context, entry *projectionEntry) (context.Context, error) {
 	ctx = withRequestProjectionFacts(ctx)
-	if guard := projectionLivenessFailure(entry); guard != projectionOwnerLive {
+	if guard, _ := predicateRefusal(ctx, projectionReadRetain, entry); guard != projectionOwnerLive {
 		return ctx, annotateProjectionReadRefusal(projectionReadRetain, guard, projectionSuperseded)
 	}
 	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
@@ -531,7 +532,7 @@ func validateRequestProjectionStage(ctx context.Context, stage projectionReadSta
 		return err
 	}
 	for _, entry := range facts.entries {
-		if guard := projectionLivenessFailure(entry); guard != projectionOwnerLive {
+		if guard, _ := predicateRefusal(ctx, stage, entry); guard != projectionOwnerLive {
 			return annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
 		}
 	}
