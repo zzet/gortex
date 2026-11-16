@@ -224,8 +224,8 @@ require (
 	github.com/davalillo/tree-sitter-mql5 v0.2.0
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/go-viper/mapstructure/v2 v2.5.0
-	github.com/gofrs/flock v0.13.1
-	github.com/gomlx/go-huggingface v0.4.26
+	github.com/gofrs/flock v0.13.2
+	github.com/gomlx/go-huggingface v0.4.32
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/renameio v1.0.1
 	github.com/google/uuid v1.6.0
@@ -237,9 +237,9 @@ require (
 	github.com/gortexhq/tree-sitter-protobuf v0.1.0
 	github.com/gortexhq/tree-sitter-sql v0.1.0
 	github.com/gortexhq/tree-sitter-swift v0.1.1-0.20260424235305-8dde3a3327dd
-	github.com/jackc/pgx/v5 v5.12.0
-	github.com/jedib0t/go-pretty/v6 v6.8.3
-	github.com/knights-analytics/hugot v0.8.5
+	github.com/jackc/pgx/v5 v5.13.0
+	github.com/jedib0t/go-pretty/v6 v6.9.1
+	github.com/knights-analytics/hugot v0.8.6
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/mark3labs/mcp-go v1.5.0
 	github.com/muesli/termenv v0.16.0
@@ -273,22 +273,22 @@ require (
 	github.com/tree-sitter/tree-sitter-python v0.25.0
 	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
-	github.com/tree-sitter/tree-sitter-scala v0.26.4
+	github.com/tree-sitter/tree-sitter-scala v0.26.12
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/yalue/onnxruntime_go v1.38.0
 	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/zap v1.28.0
-	golang.org/x/image v0.47.0
-	golang.org/x/mod v0.42.0
-	golang.org/x/sync v0.24.0
-	golang.org/x/sys v0.49.0
-	golang.org/x/term v0.47.0
-	golang.org/x/text v0.43.0
-	golang.org/x/tools v0.52.0
+	golang.org/x/image v0.48.0
+	golang.org/x/mod v0.43.0
+	golang.org/x/sync v0.25.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
+	golang.org/x/text v0.44.0
+	golang.org/x/tools v0.52.1-0.20261106145633-d407941a339a
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/libc v1.80.1
-	modernc.org/sqlite v1.61.1
+	modernc.org/libc v1.81.0
+	modernc.org/sqlite v1.62.0
 	pgregory.net/rapid v1.3.0
 )
 
@@ -307,25 +307,25 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
-	github.com/gomlx/compute v0.1.24 // indirect
-	github.com/gomlx/compute-onnx v0.1.23 // indirect
+	github.com/gomlx/compute v0.1.28 // indirect
+	github.com/gomlx/compute-onnx v0.1.28 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
-	github.com/gomlx/go-xla v0.4.24 // indirect
-	github.com/gomlx/gomlx v0.28.28 // indirect
-	github.com/gomlx/onnx-gomlx v0.5.21 // indirect
+	github.com/gomlx/go-xla v0.4.28 // indirect
+	github.com/gomlx/gomlx v0.28.34 // indirect
+	github.com/gomlx/onnx-gomlx v0.5.31 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
-	github.com/knights-analytics/ortgenai v0.3.4 // indirect
+	github.com/knights-analytics/ortgenai v0.3.5 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.27 // indirect
-	github.com/microsoft/onnxruntime/go v0.0.0-20261030073735-b5fe413d0b05 // indirect
+	github.com/microsoft/onnxruntime/go v0.0.0-20261111070922-6cc3c09506ec // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
@@ -344,8 +344,8 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/zeebo/assert v1.3.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
+	golang.org/x/exp v0.0.0-20261109185158-a52e3aef5920 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
