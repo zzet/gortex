@@ -341,14 +341,26 @@ func classifyConfiguredRepos(overview indexer.FamiliesOverview, configured []str
 // heuristic and a remediation. That was wrong in both directions: it
 // mislabelled a healthy tracked repo and told the user to re-track it.
 //
-// Only an intent set of exactly {manual_config} is unattributed. Anything
-// else -- including manual_config mixed with project_membership -- is
-// attributed and is not reported here.
+// Only an intent set whose kinds are ALL manual_config is unattributed.
+// Anything else -- including manual_config mixed with project_membership --
+// is attributed and is not reported here.
+//
+// The list holds one entry per active intent ROW, not one per distinct
+// source kind. The catalog's upsert key is (checkout_id, source_kind,
+// source_locator), so the same kind can appear twice with different
+// locators -- a checkout recorded under an old root and then under a new
+// one yields [manual_config manual_config]. That is still nobody asking
+// for it, so duplicates are allowed; a count would get it wrong.
 func isManualConfigOnly(kinds []string) bool {
-	if len(kinds) != 1 {
+	if len(kinds) == 0 {
 		return false
 	}
-	return kinds[0] == string(indexer.TrackSourceConfig)
+	for _, k := range kinds {
+		if k != string(indexer.TrackSourceConfig) {
+			return false
+		}
+	}
+	return true
 }
 
 // intentCheckoutGap is how long after its checkout an entry's manual_config

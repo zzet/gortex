@@ -646,3 +646,63 @@ func TestLegacyStateCollectorRedactsRoots(t *testing.T) {
 		}
 	}
 }
+
+// TestLegacyStateUnattributedAllowsDuplicateManualConfigRows covers the P2
+// finding that the guard counted intent ROWS instead of classifying the
+// source-kind set.
+//
+// CheckoutOverview.Intents carries one entry per active tracking row. The
+// catalog's upsert key is (checkout_id, source_kind, source_locator), so the
+// same kind can appear twice with different locators - a checkout recorded
+// under an old root and then under a new one yields two manual_config
+// entries. There is no CLI, MCP or project attribution, so it is still
+// unattributed and the warning must still be raised.
+func TestLegacyStateUnattributedAllowsDuplicateManualConfigRows(t *testing.T) {
+	origPath := doctorPath
+	t.Cleanup(func() { doctorPath = origPath })
+	doctorPath = func(p string) string { return p }
+
+	overview := indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID: "fam",
+		Checkouts: []indexer.CheckoutOverview{
+			{CheckoutID: "c1", RootPath: "/cfg/two-manual", Intents: []string{"manual_config", "manual_config"}},
+			{CheckoutID: "c2", RootPath: "/cfg/three-manual", Intents: []string{"manual_config", "manual_config", "manual_config"}},
+		},
+	}}}
+
+	configured := []string{"/cfg/two-manual", "/cfg/three-manual"}
+	unattributed, intentless := classifyConfiguredRepos(overview, configured)
+
+	if len(unattributed) != 2 {
+		t.Errorf("unattributed = %d, want 2; duplicate manual_config rows are still unattributed", len(unattributed))
+	}
+	if len(intentless) != 0 {
+		t.Errorf("intentless = %v, want none", intentless)
+	}
+}
+
+// TestLegacyStateUnattributedExcludesMixedIntentRows keeps the earlier fix
+// intact now that duplicates are allowed: a manual_config row alongside any
+// attributed kind is NOT unattributed.
+func TestLegacyStateUnattributedExcludesMixedIntentRows(t *testing.T) {
+	origPath := doctorPath
+	t.Cleanup(func() { doctorPath = origPath })
+	doctorPath = func(p string) string { return p }
+
+	overview := indexer.FamiliesOverview{Families: []indexer.FamilyOverview{{
+		FamilyID: "fam",
+		Checkouts: []indexer.CheckoutOverview{
+			{CheckoutID: "c1", RootPath: "/cfg/manual-plus-project", Intents: []string{"manual_config", "project_membership"}},
+			{CheckoutID: "c2", RootPath: "/cfg/manual-plus-cli", Intents: []string{"manual_config", "cli_track"}},
+			{CheckoutID: "c3", RootPath: "/cfg/manual-plus-mcp", Intents: []string{"manual_config", "mcp_track"}},
+			{CheckoutID: "c4", RootPath: "/cfg/manual-project-cli", Intents: []string{"manual_config", "project_membership", "cli_track"}},
+		},
+	}}}
+
+	configured := []string{"/cfg/manual-plus-project", "/cfg/manual-plus-cli", "/cfg/manual-plus-mcp", "/cfg/manual-project-cli"}
+	unattributed, _ := classifyConfiguredRepos(overview, configured)
+
+	if len(unattributed) != 0 {
+		t.Errorf("unattributed = %v, want none; any attributed kind disqualifies the row", unattributed)
+	}
+}
