@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"go.uber.org/zap"
 )
 
@@ -15,14 +17,27 @@ func TestContractDeltaMemoryBudgetHonorsInstalledLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		limit, want int64
+		hostRAM     uint64
 	}{
-		{"unknown", 0, 64 << 20}, {"unavailable", -1, 64 << 20},
-		{"unlimited", math.MaxInt64, 64 << 20}, {"tiny explicit", 1, 1},
-		{"low explicit", 256 << 20, 16 << 20}, {"one GiB", 1 << 30, 64 << 20},
-		{"four GiB", 4 << 30, 256 << 20}, {"eight GiB", 8 << 30, 512 << 20},
-		{"large capped", 32 << 30, 512 << 20},
+		{name: "unknown", limit: 0, want: 64 << 20}, {name: "unavailable", limit: -1, want: 64 << 20},
+		{name: "unlimited", limit: math.MaxInt64, want: 64 << 20}, {name: "tiny explicit", limit: 1, want: 1},
+		{name: "low explicit", limit: 256 << 20, want: 16 << 20}, {name: "one GiB", limit: 1 << 30, want: 64 << 20},
+		{name: "four GiB", limit: 4 << 30, want: 256 << 20}, {name: "eight GiB", limit: 8 << 30, want: 512 << 20},
+		{name: "large capped", limit: 32 << 30, want: 512 << 20},
+		// Without an installed limit, known host RAM sizes the budget as the
+		// daemon's default standing limit would.
+		{name: "no limit large host", limit: 0, hostRAM: 48 << 30, want: 512 << 20},
+		{name: "no limit mid host", limit: 0, hostRAM: 16 << 30, want: 256 << 20},
+		{name: "unlimited mid host", limit: math.MaxInt64, hostRAM: 16 << 30, want: 256 << 20},
+		{name: "unavailable mid host", limit: -1, hostRAM: 16 << 30, want: 256 << 20},
+		{name: "no limit small host", limit: 0, hostRAM: 2 << 30, want: 64 << 20},
+		{name: "no limit unknown host", limit: 0, hostRAM: 0, want: 64 << 20},
+		// An installed limit is authoritative whatever the host has.
+		{name: "explicit eight GiB large host", limit: 8 << 30, hostRAM: 48 << 30, want: 512 << 20},
+		{name: "explicit eight GiB small host", limit: 8 << 30, hostRAM: 2 << 30, want: 512 << 20},
+		{name: "explicit small large host", limit: 256 << 20, hostRAM: 48 << 30, want: 16 << 20},
 	} {
-		t.Run(tc.name, func(t *testing.T) { require.Equal(t, tc.want, contractDeltaMemoryBudget(tc.limit)) })
+		t.Run(tc.name, func(t *testing.T) { require.Equal(t, tc.want, contractDeltaMemoryBudget(tc.limit, tc.hostRAM)) })
 	}
 }
 
@@ -30,7 +45,7 @@ func TestContractDeltaMemoryBudgetRetainsFiveActorsAndHonorsPinnedPressure(t *te
 	// Conservative measured charge of the full20-repository checkpoint. Exercise
 	// registry policy without allocating hundreds of megabytes of synthetic data.
 	const measuredCheckpoint int64 = 84243420
-	l := &contractDeltaLRU{budget: contractDeltaMemoryBudget(8 << 30)}
+	l := &contractDeltaLRU{budget: contractDeltaMemoryBudget(8<<30, 0)}
 	actors := make([]ContractActor, 7)
 	caches := make([]*contractDeltaCache, 7)
 	for i := range actors {
@@ -68,7 +83,7 @@ func TestContractDeltaMemoryBudgetRetainsFiveActorsAndHonorsPinnedPressure(t *te
 	require.Same(t, caches[6], l.borrow(actors[6]))
 	require.Len(t, l.entries, 6)
 	require.LessOrEqual(t, l.bytes, l.budget)
-	low := &contractDeltaLRU{budget: contractDeltaMemoryBudget(1 << 30)}
+	low := &contractDeltaLRU{budget: contractDeltaMemoryBudget(1<<30, 0)}
 	require.Equal(t, "over_budget", low.put(actors[0], caches[0]).reason)
 	require.Nil(t, low.borrow(actors[0]))
 }
@@ -88,7 +103,7 @@ func TestContractDeltaColdLowBudgetDoesNotCaptureOptionalNames(t *testing.T) {
 	snapshot.positiveNameCapture = func(context.Context, int64) (*contractPositiveNameProjection, error) { nameCalls++; return nil, nil }
 	session, err := newContractDeltaSession(nil, snapshot, options.Config)
 	require.NoError(t, err)
-	session.cacheBudget = contractDeltaMemoryBudget(1)
+	session.cacheBudget = contractDeltaMemoryBudget(1, 0)
 	_, payload, err := options.Store.BeginPayloadGeneration(ctx, store_sqlite.PayloadGenerationRequest{OwnerKind: "dedicated_graph", GraphID: "low-budget-job", LayerID: "cold", GenerationKind: "contract_analysis", CreatedAt: 1})
 	require.NoError(t, err)
 	report, err := RunContractFollowup(ctx, ContractFollowupRequest{RebuildReason: ContractFollowupUnknownInterval, Snapshot: snapshot, Payload: payload, Catalog: targets[0].Catalog, Registry: options.Registry, Config: options.Config, RepoConfigs: snapshot.RepoConfigs, Leases: options.Materializer.Leases, Logger: zap.NewNop(), Yield: options.Yield, PublishedEpoch: f.epoch.Load, WaitPublished: f.waitPublished, delta: session})
@@ -96,4 +111,39 @@ func TestContractDeltaColdLowBudgetDoesNotCaptureOptionalNames(t *testing.T) {
 	require.True(t, report.Published)
 	require.Zero(t, witnessCalls, "a cold job must check its small budget before acquiring optional proof")
 	require.Zero(t, nameCalls, "a cold job must not allocate the optional name projection above its budget")
+}
+
+// TestContractAnalysisCoordinatorAdmitsLargeCheckpointWithoutInstalledLimit
+// pins the coordinator plumbing: with no installed limit, known host RAM lets
+// the global registry admit a key-moved job's full-cohort checkpoint (the
+// observed 246 MB charge) that the 64 MiB fallback refused, while unknown RAM
+// and an explicit limit keep their bounds.
+func TestContractAnalysisCoordinatorAdmitsLargeCheckpointWithoutInstalledLimit(t *testing.T) {
+	const observedCheckpoint int64 = 246388586
+	f := newContractWorkerFixture(t)
+	for _, tc := range []struct {
+		name    string
+		limit   int64
+		hostRAM uint64
+		reason  string
+	}{
+		{"no limit known host", math.MaxInt64, 48 << 30, "admitted"},
+		{"no limit unknown host", math.MaxInt64, 0, "over_budget"},
+		{"explicit limit large host", 1 << 30, 48 << 30, "over_budget"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg,
+				MemoryLimitBytes: tc.limit, HostMemoryBytes: tc.hostRAM, Logger: zap.NewNop(), Yield: func(ctx context.Context) error { return ctx.Err() },
+				Capture: func(context.Context, *ContractCaptureSource, *graphview.SelectedContractInputs, string, string) (ContractFollowupSnapshot, []ContractFollowupTarget, error) {
+					return ContractFollowupSnapshot{}, nil, graph.ErrContractProjectionStale
+				}})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			actor := NewContractActor("", []string{"full-cohort"})
+			c.mu.Lock()
+			admission := c.deltaCaches.put(actor, &contractDeltaCache{retainedBytes: observedCheckpoint, complete: true})
+			c.mu.Unlock()
+			require.Equal(t, tc.reason, admission.reason, "requested=%d budget=%d", admission.requested, admission.budget)
+		})
+	}
 }
