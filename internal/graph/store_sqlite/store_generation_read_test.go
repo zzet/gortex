@@ -801,6 +801,11 @@ func generationReadProbes() []genProbe {
 		{name: "GetInEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetInEdgesByNodeIDs(genReadProbeIDs()))
 		}},
+		{name: "EdgesByNodeIDsKinds", run: func(t *testing.T, s *Store) []string {
+			kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeMemberOf}
+			out := edgeSliceMapTokens(s.GetOutEdgesByNodeIDsKinds(genReadProbeIDs(), kinds))
+			return append(out, edgeSliceMapTokens(s.GetInEdgesByNodeIDsKinds(genReadProbeIDs(), kinds))...)
+		}},
 		{name: "GetOutEdgesByNodeIDsContext", run: func(t *testing.T, s *Store) []string {
 			m, _, err := s.GetOutEdgesByNodeIDsContext(context.Background(), genReadProbeIDs(), 64)
 			if err != nil {
@@ -2218,6 +2223,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.DeadCodeCandidator)(nil), probe: "DeadCodeCandidates"},
 		{iface: (*graph.DerivedContractReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("derived_contract_replace")},
 		{iface: (*graph.EdgeAdjacencyForKinds)(nil), probe: "EdgeAdjacencyForKinds"},
+		{iface: (*graph.EdgesByNodeIDsKindsReader)(nil), probe: "EdgesByNodeIDsKinds"},
 		{iface: (*graph.EdgeEndpointReader)(nil), probe: "EdgeEndpointProjections"},
 		{iface: (*graph.EdgeIdentityBatchFinder)(nil), probe: "FindEdgesByIdentities"},
 		{iface: (*graph.EdgeKindCounter)(nil), probe: "EdgeKindCounts"},

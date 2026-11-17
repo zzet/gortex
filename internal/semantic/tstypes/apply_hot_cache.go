@@ -27,8 +27,14 @@ import (
 //   - name groups: the RAW FindNodesByNamesInRepoLanguages result per
 //     (repo, name), including empty (negative) groups. Group membership can
 //     only change if nodes are created mid-pass, which apply never does.
-//   - adjacency: out/in edge slices per node ID, including empty results.
-//     Valid only WITHIN a phase: the supers phase synthesizes inheritance
+//   - adjacency: out/in edge slices per node ID, including empty results,
+//     holding only the kinds the pass's appliers load (one provider, one
+//     kind set per pass). Outgoing calls are never among them: appliers
+//     load those per page for callers only (applier.loadCalls), so an out
+//     entry is never served to a calls reader. An entry the applier mutates
+//     in the store is dropped (forgetOut / forgetIn) so later pages re-read
+//     it. Valid only
+//     WITHIN a phase: the supers phase synthesizes inheritance
 //     edges that later phases must observe (a call may resolve through an
 //     extends edge another file's facts just synthesized), so the driver
 //     flushes adjacency at every phase boundary via flushAdjacency.
@@ -281,6 +287,42 @@ func (c *applyHotCache) putIn(id string, edges []*graph.Edge) {
 	c.rotateIfNeeded()
 	c.cur.in[id] = edges
 	c.cur.bytes += int64(len(id)) + applyHotEdgesBytes(edges)
+}
+
+// forgetOut drops id's cached out-adjacency from both generations. The
+// applier calls it whenever it changes that list in the store, so a later
+// page re-reads it instead of a pre-mutation snapshot.
+func (c *applyHotCache) forgetOut(id string) {
+	if c == nil {
+		return
+	}
+	for _, gen := range []*applyHotGen{c.cur, c.prev} {
+		gen.forget(gen.out, id)
+	}
+}
+
+// forgetIn is forgetOut's incoming twin.
+func (c *applyHotCache) forgetIn(id string) {
+	if c == nil {
+		return
+	}
+	for _, gen := range []*applyHotGen{c.cur, c.prev} {
+		gen.forget(gen.in, id)
+	}
+}
+
+func (g *applyHotGen) forget(adjacency map[string][]*graph.Edge, id string) {
+	edges, ok := adjacency[id]
+	if !ok {
+		return
+	}
+	delete(adjacency, id)
+	// A retarget may have changed an edge's strings since the entry was
+	// charged, so the refund is approximate; never let it go negative.
+	g.bytes -= int64(len(id)) + applyHotEdgesBytes(edges)
+	if g.bytes < 0 {
+		g.bytes = 0
+	}
 }
 
 // applyHotCacheStats reports the funnel counters for the pass-end log line —
