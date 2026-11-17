@@ -59,6 +59,10 @@ type ContractAnalysisCoordinatorOptions struct {
 	// warmup. It sizes the global retained checkpoint budget, not an actor budget
 	// or a new runtime limit. Zero/unknown preserves the standalone default.
 	MemoryLimitBytes int64
+	// HostMemoryBytes is host physical RAM, zero when unknown. When no limit is
+	// installed it sizes the checkpoint budget as the default standing limit
+	// would, so large checkpoints are not refused for want of a limit.
+	HostMemoryBytes uint64
 	// JobSlots is the number of global job slots; zero means one.
 	JobSlots int
 	// Now replaces time.Now for interest and backoff.
@@ -196,7 +200,7 @@ func NewContractAnalysisCoordinator(options ContractAnalysisCoordinatorOptions) 
 		options.LinkedThrottleInterval = contractLinkedThrottleInterval
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &ContractAnalysisCoordinator{deltaCaches: contractDeltaLRU{budget: contractDeltaMemoryBudget(options.MemoryLimitBytes)}, options: options, ctx: ctx, cancel: cancel, changed: make(chan struct{}),
+	c := &ContractAnalysisCoordinator{deltaCaches: contractDeltaLRU{budget: contractDeltaMemoryBudget(options.MemoryLimitBytes, options.HostMemoryBytes)}, options: options, ctx: ctx, cancel: cancel, changed: make(chan struct{}),
 		acceptedEpoch: make(map[string]uint64), acceptedAt: make(map[string]time.Time), actors: make(map[ContractActor]*contractActor), rings: make(map[string]*contractRing),
 		slots: &contractJobSlots{free: contractJobSlotCount(options.JobSlots)}, capacityChanged: make(chan struct{})}
 	// A daemon that just started has not been idle for a window yet.

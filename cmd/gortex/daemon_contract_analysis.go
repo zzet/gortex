@@ -12,6 +12,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/viewmetrics"
 	"go.uber.org/zap"
 )
@@ -70,7 +71,7 @@ func installDaemonContractAnalysisWith(state *daemonState, logger *zap.Logger, a
 	// exists; a report before then is dropped.
 	var repair atomic.Pointer[indexer.ContractStuckRepair]
 	captureOptions.SuspectStuck = func(repo string, paths []string) { repair.Load().Suspect(repo, paths) }
-	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
+	options := indexer.ContractAnalysisCoordinatorOptions{MemoryLimitBytes: debug.SetMemoryLimit(-1), HostMemoryBytes: platform.HostPhysicalMemoryBytes(), RequireRepoConfigs: true, Store: store, Leases: materializer.Leases, Registry: state.indexer.Registry(), Config: cfg, Logger: logger, Capture: indexer.NewContractFollowupSourceCapture(captureOptions), Inputs: indexer.NewContractPrimaryInputCapture(materializer), LinkedInputs: indexer.NewContractLinkedInputCapture(materializer), ReconcileBaseline: indexer.NewContractBaselineReconciler(captureOptions), Yield: contractAnalysisYield(state.mcpServer.ContractAnalysisShouldYield)}
 	options.RetireReservation = state.lifecycle.DeferContractReservationRetirement
 	// Linked worktrees' fills follow the configured policy; the demand
 	// signal is the same foreground work the shared yield gives way to,
