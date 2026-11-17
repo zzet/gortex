@@ -58,6 +58,8 @@ func TestDecodeProbeFrameReadsAdmissionAnswers(t *testing.T) {
 			frame: mustInitialize(t, "Gortex is LOADING app after a restart (starting, 0%). Graph tools return repo_loading (retryable) until it is ready; Do not re-track it or change tracking configuration: the repository is already configured.\n\n"+active)},
 		{name: "admission pending instructions", outcome: "admission_pending", ok: true,
 			frame: mustInitialize(t, "Gortex is LOADING graph admission after a restart (identity_resolution, 0%). Graph admission for this path is not yet established.")},
+		{name: "checkout loading instructions", outcome: "checkout_loading", ok: true,
+			frame: mustInitialize(t, "Gortex is LOADING checkout /w/wt (view_building). Graph tools return view_building (retryable) until the checkout is admitted. Do not change tracking configuration to resolve this.\n\n"+active)},
 		{name: "unavailable instructions", outcome: "unavailable", ok: true, advice: true,
 			frame: mustInitialize(t, "Gortex is connected but could not load /w after the restart: boom.\n\nGraph tools return repo_unavailable for it. To repair, run `gortex track /w` to index it again.")},
 		{name: "untracked instructions", outcome: "untracked", ok: true, advice: true,

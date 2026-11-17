@@ -1680,11 +1680,14 @@ func (s *Server) stateAwareInstructionsForClient(cwd, client string) string {
 }
 
 func (s *Server) stateAwareInstructionsForPolicy(ctx context.Context, cwd string, policy *toolPolicy) string {
-	base := serverInstructions
+	return s.stateAwareInstructionsContext(ctx, cwd, instructionsBase(policy))
+}
+
+func instructionsBase(policy *toolPolicy) string {
 	if policy != nil && policy.preset == FacadeSurfaceVersion {
-		base = codingAgentInstructions
+		return codingAgentInstructions
 	}
-	return s.stateAwareInstructionsContext(ctx, cwd, base)
+	return serverInstructions
 }
 
 func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
@@ -1712,7 +1715,7 @@ func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, ba
 				return s.instructionsForRepoLoad(cwd, base, rec)
 			}
 			if serves, err := lookup(ctx, cwd); err != nil {
-				return CheckoutAdmissionInstructions(cwd, err)
+				return CheckoutAdmissionInstructions(cwd, err, base)
 			} else if serves {
 				return s.appendLiveInstructions(cwd, base)
 			}
@@ -1724,7 +1727,7 @@ func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, ba
 						return s.appendLiveInstructions(cwd, base)
 					}
 					if serves, err := lookup(ctx, cwd); err != nil {
-						return CheckoutAdmissionInstructions(cwd, err)
+						return CheckoutAdmissionInstructions(cwd, err, base)
 					} else if serves {
 						return s.appendLiveInstructions(cwd, base)
 					}
