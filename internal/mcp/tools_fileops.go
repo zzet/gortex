@@ -494,6 +494,16 @@ func (s *Server) guardResolvedPathWithinRepo(ctx context.Context, requestedPath,
 			return nil
 		}
 	}
+	// An absolute path that resolves inside a *routed* linked worktree stays
+	// inside the indexed corpus even with no view selector. guardRepoRoots only
+	// adds a checkout root when its view is bound, so an unrouted-but-ready
+	// worktree is absent from it. Admit the path when it lands in exactly one
+	// registered checkout whose route is ready — RegisteredCheckoutForPath
+	// returns the innermost checkout, and one absolute path has one physical
+	// location, so the match is unambiguous.
+	if _, routed, err := s.routedCheckoutForPath(ctx, real); err == nil && routed {
+		return nil
+	}
 	return fmt.Errorf("%w: %q resolves to %q, outside every indexed repository root", errPathEscape, requestedPath, real)
 }
 
