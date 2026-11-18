@@ -248,9 +248,16 @@ jobs:
 
       - name: Install ONNX Runtime
         run: |
-          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz
-          tar xzf onnxruntime-linux-x64-1.24.4.tgz
-          sudo cp onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so* /usr/local/lib/
+          # The official ONNX Runtime CPU package matches the C API 31 used by onnxruntime_go v1.38.0.
+          version=1.31.0
+          package="$RUNNER_TEMP/microsoft.ml.onnxruntime.$version.nupkg"
+          library="libonnxruntime.so.$version"
+          curl -fsSL --retry 3 -o "$package" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$version/microsoft.ml.onnxruntime.$version.nupkg"
+          echo "7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b  $package" | sha256sum --check
+          unzip -p "$package" runtimes/linux-x64/native/libonnxruntime.so > "$RUNNER_TEMP/$library"
+          sudo install -m 0644 "$RUNNER_TEMP/$library" /usr/local/lib/
+          sudo ln -sfn "$library" /usr/local/lib/libonnxruntime.so
           sudo ldconfig
 
       - name: Build with ONNX tag
