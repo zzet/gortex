@@ -8,7 +8,7 @@ Gortex exposes three transports — stdio MCP (the default `gortex mcp`), a Unix
 
 ## Server mode (`/v1/*` JSON API)
 
-The daemon exposes all MCP tools as an HTTP/JSON API under versioned `/v1/*` routes once you give it an HTTP address with `--http-addr`. The daemon serves the repos you track, so add the repo first, then bring the HTTP surface up:
+The daemon exposes all MCP tools as an HTTP/JSON API under versioned `/v1/*` routes once you give it an HTTP address: the `--http-addr` flag, the `GORTEX_DAEMON_HTTP_ADDR` env var, or `daemon.http_addr` in the global config (`~/.gortex/config.yaml`, or `$XDG_CONFIG_HOME/gortex/config.yaml` when `XDG_CONFIG_HOME` is an absolute path), in that order of precedence. The address is read at startup. A daemon run by `gortex daemon install-service` starts without flags, so use the config key there. The daemon serves the repos you track, so add the repo first, then bring the HTTP surface up:
 
 ```bash
 # Track the repo (or run from inside it — the cwd's repo auto-tracks), then start the HTTP backend
@@ -17,6 +17,11 @@ gortex daemon start --http-addr 127.0.0.1:7411
 
 # Non-localhost bind requires an auth token
 gortex daemon start --http-addr 0.0.0.0:7411 --http-auth-token "$(openssl rand -hex 32)"
+
+# Or keep the address in config, e.g. for the install-service daemon:
+#   ~/.gortex/config.yaml (or $XDG_CONFIG_HOME/gortex/config.yaml)
+#   daemon:
+#     http_addr: 127.0.0.1:7411
 
 # Optional one-shot HTTP API alongside MCP stdio; first enable
 # mcp.allow_embedded in the user-level config.
@@ -34,7 +39,11 @@ gortex mcp --index /path/to/repo --server --port 8765
 | `/v1/graph` | GET | Full brief-graph dump (nodes + edges + stats); accepts `?project=` and/or `?repo=` for scoping |
 | `/v1/events` | GET | SSE stream of graph-change events (the daemon watches tracked repos by default). Accepts `?token=<t>` for `EventSource` auth |
 
-**Auth & binding.** A localhost `--http-addr` (e.g. `127.0.0.1:7411`) runs unauthenticated. Pass `--http-auth-token <token>` or set `$GORTEX_DAEMON_HTTP_TOKEN` to require `Authorization: Bearer <token>` on every `/mcp` and `/v1/*` request (constant-time compare; CORS preflights bypass). Non-localhost binds without a token are rejected at startup. CORS origin is configurable via `--cors-origin` (default `*`); it applies to both `/mcp` and `/v1`. `/healthz` is exempt from auth so liveness probes work.
+**Auth & binding.** A localhost `--http-addr` (e.g. `127.0.0.1:7411`) permits local clients without a token. Pass `--http-auth-token <token>` or set `$GORTEX_DAEMON_HTTP_TOKEN` to require `Authorization: Bearer <token>` on every `/mcp` and `/v1/*` request (constant-time compare; CORS preflights bypass auth). A token is recommended even on loopback; non-localhost binds without one are rejected at startup. `/healthz` is exempt from auth so liveness probes work.
+
+**Browser access.** Loopback is reachable by web pages. Both `/mcp` and `/v1`, including preflights, reject every browser Origin by default. To permit a trusted web UI, set both `--http-allowed-origin https://ui.example` (authorization to call the API) and `--cors-origin https://ui.example` (CORS response headers). Origin checks still apply when a valid token is supplied. CORS defaults to disabled; an explicit `--cors-origin '*'` does not bypass the Origin allowlist. Requests without an Origin header, such as ordinary CLI clients, retain their existing access and token checks.
+
+The embedded `gortex mcp --server` REST listener follows the same deny-by-default browser policy. Its `--cors-origin https://ui.example` flag both permits that specific origin and enables its CORS response headers; `'*'` does not grant browser access. Use `--auth-token` or `$GORTEX_SERVER_TOKEN` to require a token there. Authorizing a web origin grants that site's scripts access to the tool API with the server's filesystem privileges; name only a site you trust.
 
 **Scoping the graph.** The daemon serves every tracked repo from one shared index, so the HTTP surface spans all of them. Add or remove repos from the served set with `gortex track <path>` / `gortex untrack <path>`; query-time `?project=` / `?repo=` parameters (see the `/v1/graph` row above) narrow a request to a single workspace or repo without restarting the daemon.
 
@@ -62,7 +71,8 @@ The web UI lives in its own repo at [`gortexhq/web`](https://github.com/gortexhq
 ```bash
 # 1) Track the repo and start the HTTP backend (bearer-auth required for non-localhost binds)
 gortex track /path/to/repo
-gortex daemon start --http-addr 127.0.0.1:7411
+gortex daemon start --http-addr 127.0.0.1:7411 \
+  --http-allowed-origin http://localhost:3000 --cors-origin http://localhost:3000
 
 # 2) Clone and run the UI in another terminal
 git clone https://github.com/gortexhq/web.git gortex-web && cd gortex-web

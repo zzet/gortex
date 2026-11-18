@@ -17,7 +17,7 @@ import (
 // the real per-language extractors, and loads the nodes/edges into a
 // fresh on-disk SQLite store at dbPath. Returns the store and the on-disk
 // source root.
-func buildSQLiteFixture(t *testing.T, dbPath string, files map[string]string) (*store_sqlite.Store, string) {
+func buildSQLiteFixture(t testing.TB, dbPath string, files map[string]string) (*store_sqlite.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store_sqlite.Open(dbPath)

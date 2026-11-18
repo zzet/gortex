@@ -25,37 +25,40 @@ var (
 	nestControllersListRE = regexp.MustCompile(`controllers\s*:\s*\[([^\]]*)\]`)
 )
 
-// buildNestModulePrefixes resolves, across all scanned files, the mounted route
-// prefix for every NestJS controller class: it walks the RouterModule route
-// tree (module -> mounted prefix, inheriting parent paths through `children`),
-// maps each `@Module` to the controllers it declares, and composes the two into
-// controllerClass -> mounted prefix.
-func buildNestModulePrefixes(files map[string]bool, srcFor func(string) []byte) map[string]string {
-	modulePrefix := map[string]string{}    // module class -> mounted prefix
-	controllerModule := map[string]string{} // controller class -> module class
-
-	for path := range files {
-		src := srcFor(path)
-		if src == nil {
-			continue
-		}
-		text := string(src)
-		if strings.Contains(text, "RouterModule.") {
-			for _, call := range []string{"RouterModule.register(", "RouterModule.forRoot(", "RouterModule.forChild("} {
-				for _, idx := range indexAll(text, call) {
-					if arr, end := balancedSlice(text, idx, '[', ']'); end >= 0 {
-						walkNestRouterRoutes(arr, "", modulePrefix)
-					}
+func nestFileModuleFacts(text string) (map[string]string, map[string]string) {
+	modulePrefix := map[string]string{}
+	controllerModule := map[string]string{}
+	if strings.Contains(text, "RouterModule.") {
+		for _, call := range []string{"RouterModule.register(", "RouterModule.forRoot(", "RouterModule.forChild("} {
+			for _, idx := range indexAll(text, call) {
+				if arr, end := balancedSlice(text, idx, '[', ']'); end >= 0 {
+					walkNestRouterRoutes(arr, "", modulePrefix)
 				}
 			}
 		}
-		if strings.Contains(text, "@Module(") {
-			for _, mod := range extractNestModules(text) {
-				for _, ctrl := range mod.controllers {
-					if _, ok := controllerModule[ctrl]; !ok {
-						controllerModule[ctrl] = mod.name
-					}
+	}
+	if strings.Contains(text, "@Module(") {
+		for _, mod := range extractNestModules(text) {
+			for _, ctrl := range mod.controllers {
+				if _, ok := controllerModule[ctrl]; !ok {
+					controllerModule[ctrl] = mod.name
 				}
+			}
+		}
+	}
+	return detachRouterMap(modulePrefix), detachRouterMap(controllerModule)
+}
+
+func joinNestModuleFacts(paths []string, facts map[string]RouterFacts) map[string]string {
+	modulePrefix := map[string]string{}
+	controllerModule := map[string]string{}
+	for _, path := range paths {
+		for mod, prefix := range facts[path].ModulePrefix {
+			modulePrefix[mod] = prefix
+		}
+		for ctrl, mod := range facts[path].ControllerModule {
+			if _, ok := controllerModule[ctrl]; !ok {
+				controllerModule[ctrl] = mod
 			}
 		}
 	}
@@ -126,20 +129,6 @@ func extractNestModules(text string) []nestModule {
 		out = append(out, nestModule{name: name, controllers: controllers})
 	}
 	return out
-}
-
-// nestControllerClass returns the @Controller-decorated class name in a
-// contract's file — the key into the module-prefix map.
-func nestControllerClass(c Contract, srcFor func(string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	text := string(src)
-	if idx := strings.Index(text, "@Controller"); idx >= 0 {
-		return firstSubmatch(nestControllerClassRE, text[idx:])
-	}
-	return ""
 }
 
 // --- small parsing helpers ----------------------------------------------

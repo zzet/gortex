@@ -169,7 +169,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 	wantDiffCtx := wantSection("diff_context")
 	wantSimulate := wantSection("simulate")
 
-	repoRoot := s.prReviewRepoRoot(ctx, req)
+	repoRoot, repoPrefix := s.prReviewRepoRoot(ctx, req)
 
 	scope, baseRef := siblingDiffScope(req)
 
@@ -188,7 +188,7 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 		if repoRoot == "" {
 			return mcp.NewToolResultError("could not resolve a repository root for the changeset diff"), nil
 		}
-		d, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), scope, baseRef)
+		d, err := analysis.MapGitDiffContext(ctx, s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -259,9 +259,9 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 
 	// --- contracts gate (always evaluated for the verdict) ---
 	if len(ids) > 0 {
-		contracts := s.computeContractImpact(ids)
+		contracts := s.computeContractImpactContext(ctx, ids)
 		out.Contracts = contracts
-		out.Gates = append(out.Gates, prReviewContractGate(contracts))
+		out.Gates = append(out.Gates, optionalContractReviewGate(contractConsumerStatusFromContext(ctx), contracts))
 	}
 
 	// --- section: verify_change gate (result computed above) ---
@@ -311,9 +311,10 @@ func (s *Server) handlePRReviewContext(ctx context.Context, req mcp.CallToolRequ
 // prReviewRepoRoot resolves the working-tree root for the changeset diff,
 // mirroring the review tools' resolution order: an explicit repo selector
 // (prefix or path), the lone tracked repo, or the session's cwd-bound repo.
-func (s *Server) prReviewRepoRoot(ctx context.Context, req mcp.CallToolRequest) string {
-	repoRoot, _ := s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
-	return repoRoot
+// The prefix comes from that resolution, not from the root: a worktree view's
+// root can sit outside every tracked root.
+func (s *Server) prReviewRepoRoot(ctx context.Context, req mcp.CallToolRequest) (repoRoot, repoPrefix string) {
+	return s.diffRepoScope(ctx, strings.TrimSpace(req.GetString("repo", "")))
 }
 
 // prReviewDiffFromIDs synthesises a DiffResult from caller-supplied symbol
@@ -465,7 +466,7 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 
 	sessionID := strings.TrimSpace(req.GetString("session_id", ""))
 	if sessionID == "" {
-		sessionID = SessionIDFromContext(ctx)
+		sessionID = OverlayCohortIDFromContext(ctx)
 	}
 	if sessionID == "" {
 		return &prReviewSimulation{
@@ -489,9 +490,9 @@ func (s *Server) buildPRReviewSimulation(ctx context.Context, req mcp.CallToolRe
 	}
 
 	// Run the chain on top of the named session's overlay. buildSimulation
-	// reads the session via the request context, so thread the explicit
-	// session id onto the context it consumes.
-	simCtx := WithSessionID(ctx, sessionID)
+	// reads the overlay cohort via the request context, so thread the
+	// explicit session id onto the context it consumes.
+	simCtx := WithOverlayCohortID(ctx, sessionID)
 	sim, simErr := s.buildSimulation(simCtx, edits, true)
 	if simErr != nil {
 		if ctxErr := requestContextError(simCtx, simErr); ctxErr != nil {

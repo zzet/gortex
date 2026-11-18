@@ -26,18 +26,23 @@ func (idx *Indexer) indexStateTarget(diskTarget graph.Store) graph.Store {
 	return idx.graph
 }
 
-// persistRepoIndexState records the per-repo freshness provenance at the
-// end of a (re)index. diskTarget is the durable store when indexing
-// streams to disk; nil falls back to idx.graph. Backends without durable
-// state (the in-memory graph) do not implement RepoIndexStateWriter, so
-// the write is skipped — exactly like the file-mtime ledger.
+// persistRepoIndexState records the per-repo freshness provenance. Callers:
+// a full (re)index at its end, and on the shadow path only after the drain
+// succeeds; an edit-delta pass for the payload generation it built;
+// reconcileRepoIndexState after an incremental reconcile; and the census,
+// which stores counts when none are stored. diskTarget is the durable
+// destination (the shadow's store or the edit delta's generation handle);
+// nil falls back to idx.graph.
+// Backends without durable state (the in-memory graph) do not implement
+// RepoIndexStateWriter, so the write is skipped — exactly like the file-mtime
+// ledger.
 func (idx *Indexer) persistRepoIndexState(diskTarget graph.Store, rootAbs, workspaceFP string, nodes, edges int) {
 	target := idx.indexStateTarget(diskTarget)
 	w, ok := target.(graph.RepoIndexStateWriter)
 	if !ok {
 		return
 	}
-	sha, dirty := repoHeadAndDirty(rootAbs)
+	sha, dirty := idx.headAndDirty(rootAbs)
 	vers, _ := json.Marshal(extractorVersionsSnapshot())
 	st := graph.RepoIndexState{
 		RepoPrefix:        idx.repoPrefix,
@@ -173,6 +178,32 @@ func repoHeadAndDirty(rootAbs string) (sha string, dirty bool) {
 		return sha, false
 	}
 	return sha, status != ""
+}
+
+// repoHeadProvenance is a HEAD commit and dirty bit a caller already holds.
+type repoHeadProvenance struct {
+	sha   string
+	dirty bool
+}
+
+// headAndDirty is repoHeadAndDirty, answered from the caller's provenance
+// when it supplied one: a working-tree generation build sampled HEAD and the
+// dirty set before it started, and asking git again (rev-parse plus a
+// whole-checkout status, through the shared git limiter) cost every edit
+// hundreds of milliseconds on a busy daemon.
+func (idx *Indexer) headAndDirty(rootAbs string) (string, bool) {
+	if p := idx.headProvenance; p != nil {
+		return p.sha, p.dirty
+	}
+	return repoHeadAndDirty(rootAbs)
+}
+
+// head is repoHead, answered from the caller's provenance when set.
+func (idx *Indexer) head(rootAbs string) string {
+	if p := idx.headProvenance; p != nil {
+		return p.sha
+	}
+	return repoHead(rootAbs)
 }
 
 // repoHead returns the working tree's current commit SHA, or "" for a non-git

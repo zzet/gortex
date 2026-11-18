@@ -120,7 +120,7 @@ func newHugotProviderWithSpec(spec HugotVariant) (Provider, error) {
 		},
 	}
 
-	pipeline, err := hugot.NewPipeline(session, config)
+	pipeline, err := session.NewPipeline(config)
 	if err != nil {
 		_ = session.Destroy()
 		return nil, fmt.Errorf("hugot pipeline: %w", err)

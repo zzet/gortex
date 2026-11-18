@@ -62,12 +62,6 @@ func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []by
 		return nil, fmt.Errorf("prepared source exceeds bounded extraction limit (%d bytes)", limit)
 	}
 
-	var pool *crashpool.Pool
-	var quarantine *crashpool.Quarantine
-	if idx.crashIsolationEnabled() {
-		pool, quarantine = idx.sharedParsePool()
-	}
-	nativeAdmission := newNativeParseExtractionAdmission(0, nil, idx.nativeParseAdmission.Load())
 	rawLease, err := acquireParseAdmission(
 		ctx, int64(len(prepared)), 0, nil, idx.parseAdmission.Load(),
 	)
@@ -75,10 +69,34 @@ func (idx *Indexer) ExtractSource(ctx context.Context, filePath string, src []by
 		return nil, fmt.Errorf("source admission: %w", err)
 	}
 	defer rawLease.Release()
+	nativeAdmission := newNativeParseExtractionAdmission(0, nil, idx.nativeParseAdmission.Load())
+	return idx.extractSourceWith(
+		ctx, rawLease, nativeAdmission,
+		path, filePath, language, extractor, prepared,
+	)
+}
 
+// extractSourceWith parses prepared caller-owned bytes admitted under
+// rawLease, with the native-tree admission, crash isolation and index
+// safeguards of a normal parse. Interactive callers admit the bytes against
+// a reserved budget so a full shared budget cannot hold them behind bulk
+// indexing.
+func (idx *Indexer) extractSourceWith(
+	ctx context.Context,
+	rawLease *parseAdmissionLease,
+	nativeAdmission *nativeParseExtractionAdmission,
+	path, relPath, language string,
+	extractor parser.Extractor,
+	src []byte,
+) (*parser.ExtractionResult, error) {
+	var pool *crashpool.Pool
+	var quarantine *crashpool.Quarantine
+	if idx.crashIsolationEnabled() {
+		pool, quarantine = idx.sharedParsePool()
+	}
 	result, skipped, err := idx.extractFileCtxWithRawLease(
 		ctx, nativeAdmission, rawLease, pool, quarantine,
-		path, filePath, language, extractor, prepared,
+		path, relPath, language, extractor, src,
 	)
 	if err != nil {
 		if result != nil {

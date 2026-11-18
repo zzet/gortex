@@ -56,16 +56,9 @@ func (r *Reconciler) ObserveCheckoutWithAdmission(ctx context.Context, familyID,
 	if entry, found, err := r.observedCheckout(ctx, familyID, selected); err != nil || found {
 		return entry, err
 	}
-	graphs, err := r.catalog.ListDedicatedGraphs(ctx, familyID)
-	if err != nil {
-		return CheckoutReport{}, err
-	}
 	pass := &familyPass{family: family, inventory: inv, now: r.now(), beforeAllocate: beforeAllocate}
-	for _, graph := range graphs {
-		if graph.IsPrimaryBase {
-			pass.primaryGraphID = graph.GraphID
-			break
-		}
+	if pass.primaryGraphID, err = r.servingPrimary(ctx, familyID); err != nil {
+		return CheckoutReport{}, err
 	}
 	entry, err := r.observeNew(ctx, pass, selected)
 	if err != nil {

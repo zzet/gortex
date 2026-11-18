@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/profiles"
@@ -162,6 +163,10 @@ func fetchDaemonProbeAsStatus() (*daemon.StatusResponse, error) {
 		return nil, err
 	}
 
+	return sessionStartStatusFromProbe(probe), nil
+}
+
+func sessionStartStatusFromProbe(probe daemon.ProbeResponse) *daemon.StatusResponse {
 	status := &daemon.StatusResponse{
 		Version:            probe.Version,
 		PID:                probe.PID,
@@ -173,14 +178,20 @@ func fetchDaemonProbeAsStatus() (*daemon.StatusResponse, error) {
 	}
 	for _, r := range probe.TrackedRepos {
 		status.TrackedRepos = append(status.TrackedRepos, daemon.TrackedRepoStatus{
-			Path:      r.Path,
-			Prefix:    r.Prefix,
-			Name:      r.Name,
-			Workspace: r.Workspace,
-			Project:   r.Project,
+			Path:       r.Path,
+			Prefix:     r.Prefix,
+			Name:       r.Name,
+			Workspace:  r.Workspace,
+			Project:    r.Project,
+			Loading:    r.State == daemon.RepoStateLoading,
+			Unloaded:   r.State == daemon.RepoStateLoading || r.State == daemon.RepoStateFailed || r.State == daemon.RepoStateMissing || r.State == daemon.RepoStatePrefixCollision,
+			Missing:    r.State == daemon.RepoStateMissing,
+			ErrorCode:  r.ErrorCode,
+			OwnerPath:  r.OwnerPath,
+			OwnerState: r.OwnerState,
 		})
 	}
-	return status, nil
+	return status
 }
 
 // sessionStartProbeBudget bounds the fallback. Probe touches no store, no
@@ -238,8 +249,41 @@ func buildSessionStartBriefing(cwd string) string {
 		sb.WriteString(renderCwdCoverage(cwd, status))
 	}
 	sb.WriteString("\n")
+	// No tracked repo covers this cwd, so the graph tools are legitimately
+	// absent: the MCP-required rule would be an unliftable stop (#900).
+	if cwdUntracked(cwd, status.TrackedRepos) {
+		sb.WriteString(untrackedCwdPreamble)
+		return sb.String()
+	}
 	sb.WriteString(rulePreamble())
 	return sb.String()
+}
+
+// untrackedCwdPreamble replaces rulePreamble when the daemon confirms no
+// tracked repo covers the session's cwd (an agent-created clone, a scratch
+// checkout). Restating "native Gortex MCP is mandatory … stop" there leaves
+// the agent nothing it may do, and a session-start block outranks the user's
+// own "ignore Gortex", so the rule is scoped out instead of restated.
+const untrackedCwdPreamble = "**Rule:** No tracked repo covers this directory, so the Gortex MCP-required and localization rules do not apply here. " +
+	"Work with your native read, search, edit, and shell tools; missing Gortex tools are expected in this directory, not an integration failure.\n"
+
+// cwdUntracked reports whether cwd is outside every tracked repo: not a
+// tracked repo or inside one, not a workspace root containing one, and not a
+// checkout awaiting automatic discovery into an already-tracked family. An
+// empty cwd is never untracked — there is nothing to scope the rules by.
+func cwdUntracked(cwd string, repos []daemon.TrackedRepoStatus) bool {
+	if strings.TrimSpace(cwd) == "" {
+		return false
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		abs = cwd
+	}
+	exact, contained := classifyCwd(abs, repos)
+	if exact != nil || len(contained) > 0 {
+		return false
+	}
+	return !pendingAutomaticCheckout(abs, repos)
 }
 
 // activeHookTier reads the machine's hook-verbosity tier from the
@@ -287,8 +331,11 @@ func renderLeanReadiness(cwd string, s *daemon.StatusResponse) string {
 		}
 	}
 	if abs != "" {
+		if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+			return line + "\n\n" + collision
+		}
 		if exact, _ := classifyCwd(abs, s.TrackedRepos); exact != nil {
-			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, exact.Name)
+			return fmt.Sprintf("%s cwd tracked as `%s` — enforcement active.\n", line, trackedRepoName(*exact))
 		}
 		// Workspace-root and not-covered explanations stay verbatim.
 		return line + "\n\n" + renderCwdCoverage(cwd, s)
@@ -340,6 +387,9 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 	if err != nil {
 		abs = cwd
 	}
+	if collision := prefixCollisionCoverage(abs, s.TrackedRepos); collision != "" {
+		return collision
+	}
 
 	exact, contained := classifyCwd(abs, s.TrackedRepos)
 	switch {
@@ -347,17 +397,23 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 		// Coverage is the load-bearing claim here and the probe can answer it;
 		// the node count is colour, and an uncomputed zero would misreport an
 		// indexed repo as empty.
+		name := trackedRepoName(*exact)
+		// A repo still warming up reports zero nodes; that is not its size.
+		if exact.Loading || (!s.Ready && exact.Nodes == 0) {
+			return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`, still loading). Enforcement is active.\n",
+				abs, name, exact.Workspace)
+		}
 		if s.CountsUnknown {
 			return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`). Enforcement is active.\n",
-				abs, exact.Name, exact.Workspace)
+				abs, name, exact.Workspace)
 		}
 		return fmt.Sprintf("**cwd `%s` is tracked** as repo `%s` (workspace: `%s`, %d nodes). Enforcement is active.\n",
-			abs, exact.Name, exact.Workspace, exact.Nodes)
+			abs, name, exact.Workspace, exact.Nodes)
 	case len(contained) > 0:
 		// cwd is a parent of one or more tracked repos.
 		names := make([]string, 0, len(contained))
 		for _, r := range contained {
-			names = append(names, r.Name)
+			names = append(names, trackedRepoName(r))
 		}
 		sort.Strings(names)
 		shown := names
@@ -382,11 +438,47 @@ func renderCwdCoverage(cwd string, s *daemon.StatusResponse) string {
 			abs, len(contained), summary, len(contained), example)
 	default:
 		if pendingAutomaticCheckout(abs, s.TrackedRepos) {
-			return fmt.Sprintf("⏳ **cwd `%s` is a Git checkout awaiting automatic discovery.** Its Git family is already tracked, but the overlay route is not published yet. Do not run `gortex track`; wait for reconciliation and reconnect. Explicit tracking is only for a user-requested dedicated graph.\n", abs)
+			if view := routedAutomaticCheckout(abs); view != nil {
+				return fmt.Sprintf("**cwd `%s` is tracked** as an automatic checkout of repo `%s` (checkout `%s`). Enforcement is active.\n",
+					abs, view.RepoPrefix, view.CheckoutID)
+			}
+			return fmt.Sprintf("⏳ **Checkout discovery is pending for cwd `%s`.** %s\n", abs, agents.PendingAutomaticCheckoutGuidance)
 		}
 		return fmt.Sprintf("⚠️  **cwd `%s` is not covered by any tracked repo.** Read/Grep/Glob/Bash will fall through to soft guidance only — graph tools won't be available for this directory.\n\nTo enable enforcement: `gortex track %s`\n",
 			abs, abs)
 	}
+}
+
+func prefixCollisionCoverage(cwd string, repos []daemon.TrackedRepoStatus) string {
+	var collision *daemon.TrackedRepoStatus
+	for i := range repos {
+		rec := &repos[i]
+		if rec.ErrorCode == daemon.ErrPrefixCollision && (pathkey.EqualPaths(cwd, rec.Path) || hasPathPrefix(cwd, rec.Path)) &&
+			(collision == nil || len(rec.Path) > len(collision.Path)) {
+			collision = rec
+		}
+	}
+	if collision == nil {
+		return ""
+	}
+	remedy := "Set a unique name in the global config and run `gortex daemon reload`."
+	if collision.OwnerState == "missing" {
+		remedy = fmt.Sprintf("The owner no longer exists; inspect `gortex untrack %s` for that owner before retrying.", collision.OwnerPath)
+	}
+	return fmt.Sprintf("Gortex cannot admit `%s`: prefix_collision for `%s`, owned by `%s`. %s Native file reads and edits remain available.\n", collision.Path, collision.Prefix, collision.OwnerPath, remedy)
+}
+
+// trackedRepoName labels a tracked repo for display. The daemon leaves Name
+// empty unless the config entry names the repo, so fall back to its prefix,
+// then to the checkout directory's base name (#933).
+func trackedRepoName(r daemon.TrackedRepoStatus) string {
+	if r.Name != "" {
+		return r.Name
+	}
+	if r.Prefix != "" {
+		return r.Prefix
+	}
+	return filepath.Base(r.Path)
 }
 
 func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool {
@@ -396,16 +488,45 @@ func pendingAutomaticCheckout(cwd string, repos []daemon.TrackedRepoStatus) bool
 			roots = append(roots, repo.Path)
 		}
 	}
-	return agents.PendingAutomaticCheckout(cwd, roots)
+	return agents.PendingAutomaticCheckout(cwd, agents.FamilyRepoRoots(roots, hookConfiguredRepoRoots()))
+}
+
+// routedAutomaticCheckout returns the view serving cwd when the daemon routes
+// it to the checkout's own composed view. Tracked repos never list automatic
+// checkouts, so family identity alone cannot tell a routed worktree from one
+// still awaiting discovery; the daemon's answer is the one explain_view and
+// the dispatcher use (#933).
+func routedAutomaticCheckout(cwd string) *daemon.ProbeView {
+	result, ok := dirCoverageFn(cwd, sessionStartProbeBudget)
+	if !ok || result.View == nil || result.View.Kind != daemon.ProbeViewWorktree || !result.View.Exact {
+		return nil
+	}
+	return result.View
+}
+
+// Hooks read only declarations; an unavailable config does not invent family
+// membership. Tests can supply a private snapshot without reading user state.
+var hookConfiguredRepoRoots = func() []string {
+	gc, err := config.LoadGlobal()
+	if err != nil {
+		return nil
+	}
+	return gc.ConfiguredRepoRoots()
 }
 
 // classifyCwd partitions the relationship between cwd and the daemon's
-// tracked repos. Returns either an exact match (cwd == repo path) or
-// the list of tracked repos contained under cwd (workspace-root case).
+// tracked repos. Returns either the covering repo (cwd == repo path, or
+// cwd inside it — the deepest one wins, matching the daemon's own
+// ScopeForCWD) or the list of tracked repos contained under cwd
+// (workspace-root case).
 func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.TrackedRepoStatus, contained []daemon.TrackedRepoStatus) {
 	cwd = filepath.Clean(cwd)
+	var enclosing *daemon.TrackedRepoStatus
 	for i := range repos {
 		repo := repos[i]
+		if repo.Unloaded && !repo.Loading {
+			continue // a terminal configured declaration is not live graph coverage
+		}
 		repoPath := filepath.Clean(repo.Path)
 		if pathkey.EqualPaths(repoPath, cwd) {
 			exact = &repos[i]
@@ -413,7 +534,15 @@ func classifyCwd(cwd string, repos []daemon.TrackedRepoStatus) (exact *daemon.Tr
 		}
 		if hasPathPrefix(repoPath, cwd) {
 			contained = append(contained, repo)
+			continue
 		}
+		if hasPathPrefix(cwd, repoPath) &&
+			(enclosing == nil || len(repoPath) > len(filepath.Clean(enclosing.Path))) {
+			enclosing = &repos[i]
+		}
+	}
+	if exact == nil {
+		exact = enclosing
 	}
 	return exact, contained
 }
@@ -432,7 +561,7 @@ func hasPathPrefix(path, prefix string) bool {
 // — this is just enough that an agent in the very first turn knows
 // to reach for graph tools first.
 func rulePreamble() string {
-	return "**Rule:** For an explicitly named file that the user asks you to read, review, or summarize, on the first direct file read caused by a new user request call `read(operation:\"file\", target:{file:\"<path>\"}, options:{new_user_task:true})`; do not start localization. " +
+	return "**Rule:** When Gortex can serve the step: For an explicitly named file that the user asks you to read, review, or summarize, on the first direct file read caused by a new user request call `read(operation:\"file\", target:{file:\"<path>\"}, options:{new_user_task:true})`; do not start localization. " +
 		"Otherwise choose by requested output: when the requested output is files, symbols, or supporting evidence, call the mounted tool `mcp__gortex__explore` (never a bare `explore`) with `operation:\"localize\"`; it returns terminal evidence. " +
 		"Its localize task may be concise, but must faithfully preserve the issue title and every user-supplied technical identifier, path, literal, error, symptom, and stated hypothesis; never invent a causal hypothesis. " +
 		"A clearly framed problem section may be restored exactly at execution only for a clearly lossy model task, so evidence can reflect details beyond a concise tool argument. " +
@@ -440,7 +569,6 @@ func rulePreamble() string {
 		"After starting localization, obey `completion.required_action`. For `needs_recovery`, make one accepted, bounded Gortex MCP `search` or `read` call. If Gortex explicitly rejects an overbroad request and preserves the recovery allowance, correct it using only Gortex MCP `search` or `read`; the rejected request does not count as the accepted recovery. Do not call host Read, Grep, Glob, or Bash. At `answer_ready`, respond from `completion.final_response` and make no further tool calls. In that final response, each PRIMARY or SUPPORTING row is one aligned file/symbol tuple; preserve the PRIMARY file and symbol identities in the answer, while SUPPORTING rows are optional context. " +
 		"Any later Gortex navigation call for that same task is intentionally not executed and replays the same retained terminal payload; identical output is expected, not stale or canned output or an integration failure. " +
 		"Inspect indexed code with `search`, `read`, `relations`, or `trace`. " +
-		"Outside an active localization contract, use native read, search, or edit tools only when Gortex performance or integration is actually bad. " +
 		"Before mutation call `change(operation:\"impact\")`; " +
 		"for a signature change also call `change(operation:\"verify\")` with the proposed signature. " +
 		"Mutate with `edit` or `refactor`. After mutation call `change(operation:\"detect\")`; " +

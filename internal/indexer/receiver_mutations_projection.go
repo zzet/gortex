@@ -1,6 +1,10 @@
 package indexer
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"sort"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 const receiverMutationProjectionPageSize = 4096
 
@@ -22,7 +26,7 @@ func indirectMutationEdgesProjected(scanner graph.ReceiverMutationScanner) []ind
 	scanner.ScanReceiverMutationMethods(receiverMutationProjectionPageSize, func(page []graph.ReceiverMutationMethod) bool {
 		for _, row := range page {
 			if row.Receiver != "" {
-				recvType[row.ID] = row.Receiver
+				recvType[row.ID] = receiverOwnerKey(row.ID, row.Receiver)
 			}
 		}
 		return true
@@ -38,11 +42,16 @@ func indirectMutationEdgesProjected(scanner graph.ReceiverMutationScanner) []ind
 			if row.Receiver == "" || row.Name == "" {
 				continue
 			}
-			if fieldByOwner[row.Receiver] == nil {
-				fieldByOwner[row.Receiver] = map[string]string{}
+			owner := receiverOwnerKey(row.ID, row.Receiver)
+			if fieldByOwner[owner] == nil {
+				fieldByOwner[owner] = map[string]string{}
 			}
-			fieldByOwner[row.Receiver][row.Name] = row.ID
-			fieldByID[row.ID] = projectedReceiverField{id: row.ID, name: row.Name, owner: row.Receiver}
+			// One field per (owner, name): the smallest ID when build-tagged
+			// files declare the same type twice, as the per-save path picks.
+			if current := fieldByOwner[owner][row.Name]; current == "" || row.ID < current {
+				fieldByOwner[owner][row.Name] = row.ID
+			}
+			fieldByID[row.ID] = projectedReceiverField{id: row.ID, name: row.Name, owner: owner}
 		}
 		return true
 	})
@@ -89,6 +98,11 @@ func indirectMutationEdgesProjected(scanner graph.ReceiverMutationScanner) []ind
 			})
 		}
 		return true
+	})
+	sort.Slice(calls, func(i, j int) bool {
+		a, b := calls[i], calls[j]
+		return receiverCallLess(a.from, a.file, a.line, a.calleeID, a.recvField, a.recvSelf,
+			b.from, b.file, b.line, b.calleeID, b.recvField, b.recvSelf)
 	})
 
 	for {

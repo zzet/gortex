@@ -1,6 +1,13 @@
 package resolver
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"context"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 // ResolveFilesAndIncoming runs one scoped cross-repository pass for a complete
 // mutation batch. The frontier contains unresolved edges emitted by the changed
@@ -19,23 +26,85 @@ func (cr *CrossRepoResolver) ResolveMutationFiles(resolutionFiles, materializati
 	return cr.ResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
 }
 
+// CrossRepoIncomingAdmission is one cross-repository mutation pass's bounded
+// incoming-stub admission: the completeness fact plus the typed refusal that
+// produced it (*graph.BoundedLocalizationLimitError, nil when nothing was
+// refused).
+//
+// It is returned beside CrossRepoStats rather than folded into it because a
+// refused incoming leg is not a count of resolutions — it is the statement that
+// this pass never looked at Dropped parked references, and a consumer that
+// cannot read it cannot tell a cross-repo pass that had no incoming work from
+// one that refused to admit the incoming work it had.
+type CrossRepoIncomingAdmission struct {
+	graph.IncomingSourceAdmission
+	Refusal error
+}
+
 // ResolveMutationFrontiers preserves the distinct edge-source and changed-
-// definition roles through candidate selection.
+// definition roles through candidate selection. It discards the incoming
+// admission fact after logging it; callers that must react to a bounded pass
+// use ResolveMutationFrontiersBounded.
 func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) *CrossRepoStats {
+	stats, _ := cr.ResolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles)
+	return stats
+}
+
+// ResolveMutationFrontiersBounded is ResolveMutationFrontiers plus the incoming
+// leg's completeness fact. The frontier's incoming admission is charged against
+// the same shared ceiling the single-repository legs use (the constant, not one
+// budget object: every leg passes a nil budget and gets a fresh one), and a
+// refusal empties
+// the incoming half of the frontier: the pass then resolves only the changed
+// files' own outgoing edges, and its CrossRepoStats — which count exactly that
+// — would otherwise read as a complete pass.
+func (cr *CrossRepoResolver) ResolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string) (*CrossRepoStats, CrossRepoIncomingAdmission) {
+	return cr.resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+}
+
+func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) (*CrossRepoStats, CrossRepoIncomingAdmission) {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	var admission CrossRepoIncomingAdmission
 	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
-		return stats
+		return stats, admission
 	}
 
+	var started, acquired time.Time
+	if observe != nil {
+		started = time.Now()
+	}
 	cr.mu.Lock()
+	if observe != nil {
+		acquired = time.Now()
+	}
 	defer cr.mu.Unlock()
+	if observe != nil {
+		observe(started, acquired)
+	}
 
 	if len(resolutionFiles) > 0 {
 		frontier := collectIncrementalFileFrontier(cr.graph, resolutionFiles, nil)
+		admission = CrossRepoIncomingAdmission{
+			IncomingSourceAdmission: frontier.incomingAdmission,
+			Refusal:                 frontier.incomingRefusal,
+		}
+		logIncomingAdmissionRefusal(cr.logger, "cross_repo_preparation", len(frontier.stubKeys),
+			frontier.incomingAdmission, frontier.incomingRefusal)
+		// Per-repo resolution has already made registry imports external.
+		// Keep outgoing imports for the tracked-package retry as well.
+		if cr.npmPackages != nil {
+			for _, edges := range frontier.outByNode {
+				for _, edge := range edges {
+					if trackedNpmImportSpec(edge) != "" {
+						frontier.pending = append(frontier.pending, edge)
+					}
+				}
+			}
+		}
 		pending := make([]*graph.Edge, 0, len(frontier.pending))
 		seen := make(map[graph.EdgeIdentity]struct{}, len(frontier.pending))
 		for _, edge := range frontier.pending {
-			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) && trackedNpmImportSpec(edge) == "" {
 				continue
 			}
 			identity := graph.EdgeIdentityFor(edge)
@@ -49,8 +118,34 @@ func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourc
 			stats = cr.resolveScopedLocked(pending)
 		}
 	}
+	if len(definitionFiles) > 0 && len(cr.goModules) > 0 && !admission.Refused {
+		budget := &graph.IncomingSourceBudget{}
+		if admission.Inspected > 0 {
+			if err := budget.Charge(admission.Inspected); err != nil {
+				admission.Refused, admission.Refusal = true, err
+			}
+		}
+		if !admission.Refused {
+			nodes := cr.graph.GetFileNodesByPaths(definitionFiles)
+			edges, fact, err := cr.goModuleIncomingEdgesBounded(nodes, definitionFiles, budget)
+			admission.Keys += fact.Keys
+			admission.Inspected += fact.Inspected
+			admission.Limit = fact.Limit
+			admission.Dropped += fact.Dropped
+			admission.Refused, admission.Refusal = fact.Refused, err
+			logIncomingAdmissionRefusal(cr.logger, "go_module_incoming", fact.Keys, fact, err)
+			cr.resolveGoModuleEdgesLocked(edges, stats)
+		}
+	}
+	// A newly tracked module also makes old dep/stdlib terminals eligible.
+	// This indexed sweep runs at most once per module/config revision.
+	if !admission.Refused {
+		if err := cr.retryGoModuleDeps(context.Background(), stats); err != nil {
+			cr.logger.Error("cross-repo resolve: retry Go module terminals", zap.Error(err))
+		}
+	}
 	DetectCrossRepoEdgesForMutationFiles(cr.graph, edgeSourceFiles, definitionFiles)
-	return stats
+	return stats, admission
 }
 
 // DetectCrossRepoEdgesForFiles materializes the cross-repo layer only for base

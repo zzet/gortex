@@ -17,9 +17,10 @@ import (
 //
 // A Client is not safe for concurrent use — each caller owns its own.
 type Client struct {
-	Conn   net.Conn
-	reader *bufio.Reader
-	Ack    HandshakeAck
+	Conn    net.Conn
+	reader  *bufio.Reader
+	Ack     HandshakeAck
+	PeerPID int // kernel socket peer identity; zero when unavailable
 }
 
 // Dial connects to the daemon on the default socket path and completes a
@@ -36,7 +37,15 @@ func Dial(h Handshake) (*Client, error) {
 // DialTo is Dial with an explicit socket path. Useful for tests and for
 // clients that want to talk to a daemon on a non-default socket.
 func DialTo(socketPath string, h Handshake) (*Client, error) {
-	d := &net.Dialer{Timeout: 500 * time.Millisecond}
+	return DialToWithDeadline(socketPath, h, time.Time{})
+}
+
+// DialToWithDeadline bounds both socket connection and handshake by one
+// absolute deadline. Zero preserves DialTo's existing timeouts. A nonzero
+// deadline remains installed after the handshake for an immediate bounded
+// exchange; callers may then manage or clear it for a longer-lived connection.
+func DialToWithDeadline(socketPath string, h Handshake, deadline time.Time) (*Client, error) {
+	d := &net.Dialer{Timeout: 500 * time.Millisecond, Deadline: deadline}
 	conn, err := d.Dial("unix", socketPath)
 	if err != nil {
 		if isNoDaemonErr(err) {
@@ -45,6 +54,9 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 		return nil, err
 	}
 
+	// Capture the connected endpoint before a rejecting peer writes its ack
+	// and immediately closes; the kernel identity belongs to this connection.
+	peerPID := peerProcessID(conn)
 	if h.Version == 0 {
 		h.Version = ProtocolVersion
 	}
@@ -57,7 +69,12 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	// "is the daemon usable?" probes whose whole job is to degrade quickly.
 	// Cleared below: the connection that follows is long-lived (an MCP proxy
 	// relay streams on it for the life of the session).
-	_ = conn.SetDeadline(time.Now().Add(controlHandshakeTimeoutForTest))
+	handshakeDeadline := time.Now().Add(controlHandshakeTimeoutForTest)
+	if !deadline.IsZero() && deadline.Before(handshakeDeadline) {
+		handshakeDeadline = deadline
+	}
+	handshakeBudget := time.Until(handshakeDeadline)
+	_ = conn.SetDeadline(handshakeDeadline)
 	if err := WriteJSONLine(conn, h); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send handshake: %w", err)
@@ -68,11 +85,11 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 		_ = conn.Close()
 		if isTimeoutErr(err) {
 			return nil, fmt.Errorf("%w: no handshake ack within %s (the daemon is up but not answering — it may be busy indexing; check `gortex daemon status`)",
-				ErrDaemonUnresponsive, controlHandshakeTimeoutForTest)
+				ErrDaemonUnresponsive, handshakeBudget)
 		}
 		return nil, fmt.Errorf("read handshake ack: %w", err)
 	}
-	_ = conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(deadline)
 	var ack HandshakeAck
 	if err := json.Unmarshal(ackLine, &ack); err != nil {
 		_ = conn.Close()
@@ -80,14 +97,16 @@ func DialTo(socketPath string, h Handshake) (*Client, error) {
 	}
 	if !ack.OK {
 		_ = conn.Close()
-		// A protocol-version rejection is recoverable: wrap the sentinel so the
-		// proxy's startup policy can decide whether embedded mode is allowed.
+		// Preserve mismatch identity for direction-aware startup handoff. It is
+		// never evidence that the daemon is absent or embedded mode is safe.
 		if ack.ErrorCode == ErrProtocolMismatch {
-			return nil, fmt.Errorf("%w: %s", ErrProtocolVersionMismatch, ack.ErrorMsg)
+			mismatch := protocolMismatch(ack, h.Version)
+			mismatch.PeerPID = peerPID
+			return nil, mismatch
 		}
 		return nil, fmt.Errorf("daemon rejected handshake [%s]: %s", ack.ErrorCode, ack.ErrorMsg)
 	}
-	return &Client{Conn: conn, reader: reader, Ack: ack}, nil
+	return &Client{Conn: conn, reader: reader, Ack: ack, PeerPID: peerPID}, nil
 }
 
 // Close tears down the connection.
@@ -204,8 +223,7 @@ var ErrDaemonUnavailable = errors.New("daemon unavailable")
 // ErrProtocolVersionMismatch is returned by Dial when the daemon answers the
 // handshake with a protocol_mismatch rejection — the running daemon speaks a
 // different wire version than this binary (a stale daemon after an upgrade).
-// Like ErrDaemonUnavailable it is recoverable for startup selection: the
-// caller may use an explicitly allowed embedded server or report the mismatch.
+// It never permits embedded fallback: the live daemon still owns its store.
 var ErrProtocolVersionMismatch = errors.New("daemon protocol version mismatch")
 
 // ErrDaemonUnresponsive is returned when the daemon accepted the connection
@@ -227,11 +245,11 @@ func isTimeoutErr(err error) bool {
 
 // ShouldFallBackToEmbedded reports whether a Dial error permits the MCP
 // startup policy to consider an embedded in-process server: the daemon isn't
-// running, or it is running a mismatched protocol version. Any other error
+// running. A mismatch still means a live daemon owns its store. Any other error
 // (permissions, a genuinely broken socket) is a real failure the caller must
 // surface.
 func ShouldFallBackToEmbedded(err error) bool {
-	return errors.Is(err, ErrDaemonUnavailable) || errors.Is(err, ErrProtocolVersionMismatch)
+	return errors.Is(err, ErrDaemonUnavailable) && !errors.Is(err, ErrProtocolVersionMismatch)
 }
 
 // isNoDaemonErr returns true for the subset of dial errors that mean

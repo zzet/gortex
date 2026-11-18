@@ -34,19 +34,31 @@ func TestCLIFallbackUsesCompactPublicSurface(t *testing.T) {
 
 func TestMCPRequiredLineRejectsTransportFallback(t *testing.T) {
 	t.Parallel()
+	want := "  - Native Gortex MCP is the transport for indexed code. " + TransportClause() + " " + DegradedModeLine() + "\n"
+	if got := MCPRequiredLine(); got != want {
+		t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
+	}
+}
 
-	got := MCPRequiredLine()
-	for _, want := range []string{
-		"Native Gortex MCP is mandatory",
-		"surface a Gortex MCP integration failure",
-		"Do not start a daemon",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("MCPRequiredLine() = %q, want %q", got, want)
+func TestDegradedModeAndTransportBounds(t *testing.T) {
+	t.Parallel()
+	line := DegradedModeLine()
+	if len(line) > 240 {
+		t.Fatalf("degraded guidance grew to %d bytes", len(line))
+	}
+	for _, text := range []string{"Never start a daemon", "empty tool search is not absence", "verify a write before resending", "do other work natively", "report only the step"} {
+		if !strings.Contains(line, text) {
+			t.Errorf("degraded guidance lost %q", text)
 		}
 	}
-	if strings.Contains(got, "gortex call ") {
-		t.Fatalf("MCP-required guidance advertised a CLI fallback: %q", got)
+	for _, text := range []string{"and stop", "gortex call "} {
+		if strings.Contains(line, text) {
+			t.Errorf("degraded guidance contains %q", text)
+		}
+	}
+	clause := TransportClause()
+	if len(clause) > 80 || !strings.Contains(clause, "`gortex call`") || !strings.Contains(clause, "git, build, and test") {
+		t.Fatalf("transport clause lost its bounded contract: %q (%d bytes)", clause, len(clause))
 	}
 }
 

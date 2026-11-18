@@ -32,6 +32,12 @@ const (
 // of an OR expression. Ordinary node frontiers stay in SQLite; only affected
 // shared contract records are read to preserve surviving owners.
 func (s *Store) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) {
+	return s.EvictFilesWithNodeIDs(filePaths, nil)
+}
+
+// EvictFilesWithNodeIDs adds only the caller's exact legacy ordinary IDs, not
+// every shared target anchored to their old file spelling.
+func (s *Store) EvictFilesWithNodeIDs(filePaths, nodeIDs []string) (nodesRemoved, edgesRemoved int) {
 	paths := make([]string, 0, len(filePaths))
 	seen := make(map[string]struct{}, len(filePaths))
 	for _, filePath := range filePaths {
@@ -51,7 +57,12 @@ func (s *Store) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 	if !ok {
 		return 0, 0
 	}
-	return s.evictByPredicate(evictFilesPredicate, pathsJSON, evictThisGeneration)
+	nodesRemoved, edgesRemoved, err := s.evictByPredicateResult(evictFilesPredicate, pathsJSON, evictThisGeneration, nodeIDs...)
+	if err != nil {
+		panicOnFatal(err)
+		return 0, 0
+	}
+	return nodesRemoved, edgesRemoved
 }
 
 // evictByPredicate is the common SQLite-native scope eviction path. The
@@ -78,7 +89,12 @@ func (s *Store) evictByPredicate(predicate string, arg any, scope evictScope) (n
 // pattern as mutationNodeIdentitiesTx — paid only while receipts observe) so
 // the receipt can stay complete instead of forcing the whole-graph fallback
 // resolve.
-func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictScope) (nodesRemoved, edgesRemoved int, retErr error) {
+func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictScope, extraNodeIDs ...string) (nodesRemoved, edgesRemoved int, retErr error) {
+	// An administrative sweep changes every view, regardless of the calling
+	// handle. Base invalidation advances every view's mutation witness too.
+	if scope == evictAllGenerations && s.viewGen != baseViewGeneration {
+		return s.atBase().evictByPredicateResult(predicate, arg, scope, extraNodeIDs...)
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -104,16 +120,47 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 		scopeArgs = append(scopeArgs, s.viewGen)
 		edgeScope = ` AND view_gen = ?`
 	}
+	extraJSON := ""
+	if len(extraNodeIDs) > 0 {
+		var ok bool
+		extraJSON, ok = projectionJSON(extraNodeIDs)
+		if !ok || scope != evictThisGeneration {
+			return 0, 0, errors.New("invalid bounded file identity eviction")
+		}
+	}
+	candidateScoped, candidateArgs := fileIdentityEvictionScope(scoped, scopeArgs, extraJSON, s.viewGen)
 	// The binding sidecar follows the node/edge scope: an unscoped sweep would
 	// strand bindings against nodes that no longer exist, and a scoped one must
 	// not touch another generation's bindings for the same path.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+scoped, scopeArgs...); err != nil {
+	bindingsResult, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types WHERE `+scoped, scopeArgs...)
+	if err != nil {
 		return 0, 0, err
+	}
+	bindingsChanged := semanticBindingWriteChanged(bindingsResult)
+	if extraJSON != "" {
+		// A compiler binding belongs to the physical source file, even when
+		// its old node IDs or scalar path used a native separator spelling.
+		result, err := tx.ExecContext(ctx, `DELETE FROM semantic_binding_types
+WHERE file_path IN (SELECT file_path FROM nodes WHERE id IN
+  (SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?) AND view_gen = ?`,
+			extraJSON, s.viewGen, s.viewGen)
+		if err != nil {
+			return 0, 0, err
+		}
+		bindingsChanged = semanticBindingWriteChanged(result) || bindingsChanged
 	}
 	// File eviction is also used while reparsing. Keep its failure ledger until
 	// the indexer confirms that indexing succeeded or the file was deleted.
+	// A whole-repository eviction also removes every enrichment edge and stamp
+	// the repository carried, so a recorded enrichment resume point no longer
+	// describes the graph; it goes in the same transaction, durably, before a
+	// later run could honour it.
 	if predicate == evictRepoPredicate || predicate == evictNonEmptyRepoPredicate {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM file_index_failures WHERE `+scoped, scopeArgs...); err != nil {
+			return 0, 0, err
+		}
+		// The indexer's resumeUntrusted latch (runDeferredEnrich) relies on this.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM enrichment_resume WHERE `+scoped, scopeArgs...); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -124,7 +171,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	// Sidecar cleanup stays above this guard because bindings and failures can
 	// outlive every candidate node.
 	var hasCandidates bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE `+scoped+` LIMIT 1)`, scopeArgs...).Scan(&hasCandidates); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE `+candidateScoped+` LIMIT 1)`, candidateArgs...).Scan(&hasCandidates); err != nil {
 		return 0, 0, err
 	}
 	if !hasCandidates {
@@ -132,20 +179,27 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 			return 0, 0, err
 		}
 		s.finishAnalysisMutationLocked(false)
+		if bindingsChanged {
+			if scope == evictAllGenerations {
+				s.payloadInputAdminRevision.Add(1)
+			} else {
+				s.noteContractUnknownSemanticBindingsLocked()
+			}
+		}
 		return 0, 0, nil
 	}
 
 	// File eviction may retain shared canonicals or retire off-file targets
 	// whose final source owner is removed. Repository eviction is unchanged.
-	nodeScoped, nodeArgs := scoped, append([]any(nil), scopeArgs...)
+	nodeScoped, nodeArgs := candidateScoped, append([]any(nil), candidateArgs...)
 	plan := contractFileEvictionPlan{}
 	if scope == evictThisGeneration && (predicate == evictFilePredicate || predicate == evictFilesPredicate) {
-		plan, err = s.planContractFileEvictionTx(tx, predicate, arg, scoped, scopeArgs)
+		plan, err = s.planContractFileEvictionTx(tx, predicate, arg, candidateScoped, candidateArgs, extraJSON)
 		if err != nil {
 			return 0, 0, err
 		}
 		if plan.affectedJSON != "" {
-			nodeScoped = `((` + scoped + `) AND kind <> ?) OR (id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND kind = ? AND view_gen = ?)`
+			nodeScoped = `((` + candidateScoped + `) AND kind <> ?) OR (id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND kind = ? AND view_gen = ?)`
 			nodeArgs = append(nodeArgs, string(graph.KindContract), plan.orphanJSON, string(graph.KindContract), s.viewGen)
 		}
 	}
@@ -208,7 +262,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 
 	scopedNodes := `SELECT id FROM nodes WHERE ` + nodeScoped
 	for _, column := range []string{"from_id", "to_id"} {
-		result, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`+edgeScope, edgeArgs...)
+		result, err := countEdgeWrite(tx.ExecContext(ctx, `DELETE FROM edges WHERE `+column+` IN (`+scopedNodes+`)`+edgeScope, edgeArgs...))
 		if err != nil {
 			return 0, 0, err
 		}
@@ -218,7 +272,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 		}
 		edgesRemoved += int(removed)
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE `+nodeScoped, nodeArgs...)
+	result, err := countNodeWrite(tx.ExecContext(ctx, `DELETE FROM nodes WHERE `+nodeScoped, nodeArgs...))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -230,7 +284,7 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	changed := nodesRemoved > 0 || edgesRemoved > 0 || scalarChanges > 0
 	invalidatedAnalysis := false
 	if changed && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, 0, err
 		}
 		invalidatedAnalysis = true
@@ -240,9 +294,14 @@ func (s *Store) evictByPredicateResult(predicate string, arg any, scope evictSco
 	}
 
 	if invalidatedAnalysis {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 	s.finishAnalysisMutationLocked(changed)
+	if (changed || bindingsChanged) && scope == evictAllGenerations {
+		s.payloadInputAdminRevision.Add(1)
+	} else if bindingsChanged {
+		s.noteContractUnknownSemanticBindingsLocked()
+	}
 	if changed {
 		if receiptDelta != nil && scalarChanges == 0 {
 			s.mergeMutationReceiptLocked(receiptDelta)
@@ -314,7 +373,28 @@ type contractFileEvictionPlan struct {
 	scalarUpdates []*graph.Node
 }
 
-func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any, scoped string, scopeArgs []any) (contractFileEvictionPlan, error) {
+// contractFileEvictionFrontierSQL selects the contract records a file eviction
+// endangers: contract nodes of the doomed files, and contract nodes their doomed
+// source nodes own through provides/consumes/handles_route edges. The second
+// arm follows only outgoing owners of doomed source nodes; an owner whose file
+// matches but whose two endpoints both survive was outside EvictFiles' old
+// frontier and remains outside it here.
+//
+// UNION ALL, not UNION: the list only feeds an IN test, so duplicates are
+// irrelevant, and a de-duplicating UNION is planned as a sorted MERGE whose arms
+// the planner drives from the generation indexes (id order for free), a scan of
+// every node and every edge of the generation per save (4.8 s on a 946k-edge
+// store).
+func contractFileEvictionFrontierSQL(scoped string) string {
+	affected := `SELECT id FROM nodes WHERE ` + scoped + `
+UNION ALL
+SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
+  AND view_gen = ? AND kind IN (?, ?, ?)`
+	return `SELECT ` + lookupNodeCols + ` FROM nodes
+WHERE view_gen = ? AND kind = ? AND id IN (` + affected + `)`
+}
+
+func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any, scoped string, scopeArgs []any, extraIDsJSON string) (contractFileEvictionPlan, error) {
 	var plan contractFileEvictionPlan
 	if predicate != evictFilePredicate && predicate != evictFilesPredicate {
 		return plan, nil
@@ -333,24 +413,41 @@ func (s *Store) planContractFileEvictionTx(tx *sql.Tx, predicate string, arg any
 			return plan, err
 		}
 	}
+	if extraIDsJSON != "" {
+		rows, err := tx.Query(`SELECT DISTINCT file_path FROM nodes WHERE id IN
+(SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?`, extraIDsJSON, s.viewGen)
+		if err != nil {
+			return plan, err
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				_ = rows.Close()
+				return plan, err
+			}
+			if path != "" {
+				files = append(files, path)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return plan, err
+		}
+		if err := rows.Close(); err != nil {
+			return plan, err
+		}
+		plan.filesJSON, _ = projectionJSON(files)
+	}
 	fileSet := make(map[string]struct{}, len(files))
 	for _, path := range files {
 		fileSet[path] = struct{}{}
 	}
-	// The second arm follows only outgoing owners of doomed source nodes.
-	// An owner whose file matches but whose two endpoints both survive was
-	// outside EvictFiles' old frontier and remains outside it here.
-	affected := `SELECT id FROM nodes WHERE ` + scoped + `
-UNION
-SELECT to_id FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE ` + scoped + `)
-  AND view_gen = ? AND kind IN (?, ?, ?)`
 	args := []any{s.viewGen, string(graph.KindContract)}
 	args = append(args, scopeArgs...)
 	args = append(args, scopeArgs...)
 	args = append(args, s.viewGen, string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute))
 	//nolint:rowserrcheck // readNodes checks Err and closes every result below.
-	rows, err := tx.Query(`SELECT `+lookupNodeCols+` FROM nodes
-WHERE view_gen = ? AND kind = ? AND id IN (`+affected+`)`, args...)
+	rows, err := tx.Query(contractFileEvictionFrontierSQL(scoped), args...)
 	if err != nil {
 		return plan, err
 	}
@@ -564,15 +661,28 @@ func (s *Store) applyContractFileEvictionTx(tx *sql.Tx, plan contractFileEvictio
 	// A retained canonical used to be deleted wholesale. Retire its removed
 	// file's incident owner rows even when their symbolic source survives.
 	// Do not discover unrelated FilePath-only edges outside affectedJSON.
-	result, err := tx.Exec(`DELETE FROM edges
+	result, err := countEdgeWrite(tx.Exec(`DELETE FROM edges
 WHERE to_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
   AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
   AND view_gen = ? AND kind IN (?, ?, ?)`,
 		plan.affectedJSON, plan.filesJSON, s.viewGen,
-		string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute))
+		string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute)))
 	if err != nil {
 		return 0, 0, err
 	}
 	count, err := result.RowsAffected()
 	return nodesChanged, int(count), err
 }
+
+// Keep the two indexed legs separate: a path frontier and a primary-key ID
+// frontier. The outer node read/delete is itself driven by those exact IDs.
+func fileIdentityEvictionScope(scoped string, args []any, extraIDsJSON string, generation int64) (string, []any) {
+	if extraIDsJSON == "" {
+		return scoped, args
+	}
+	query := `id IN (SELECT id FROM nodes WHERE ` + scoped + `
+UNION ALL SELECT id FROM nodes WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?) AND view_gen = ?`
+	return query, append(append([]any(nil), args...), extraIDsJSON, generation, generation)
+}
+
+var _ graph.FileIdentityBatchEvicter = (*Store)(nil)

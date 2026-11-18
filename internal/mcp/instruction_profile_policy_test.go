@@ -58,12 +58,12 @@ func TestInstructionProfilePolicy_AppliesOnDefaultConfig(t *testing.T) {
 	require.False(t, p.allows("edit_file"), "the localization surface is read-only")
 
 	// Session resolution: the profile beats the client-aware default…
-	sp := srv.resolveSessionPolicy("", "", "claude-code")
+	sp := srv.resolveSessionPolicy("", "", true)
 	require.NotNil(t, sp)
 	require.Equal(t, "localization", sp.preset)
 
 	// …but a forwarded spec beats the profile.
-	sp = srv.resolveSessionPolicy("edit", "", "claude-code")
+	sp = srv.resolveSessionPolicy("edit", "", true)
 	require.NotNil(t, sp)
 	require.Equal(t, "edit", sp.preset)
 }

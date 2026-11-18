@@ -96,7 +96,7 @@ func (s *Server) expandEquivalenceClasses(query string) []string {
 	}
 
 	table := s.equivalence
-	auto := s.getAutoConcepts()
+	auto := s.autoConceptsForAnswer()
 
 	var (
 		out  []string

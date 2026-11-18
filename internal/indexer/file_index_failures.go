@@ -193,6 +193,40 @@ func (idx *Indexer) fileIndexFailurePaths() []string {
 	return paths
 }
 
+// failedFilesSafelyRetryable proves that advancing the language versions will
+// not strand failed files after a restart. In-memory observations alone are not
+// enough: a failed ledger write must retain the old language-wide retry fence.
+func (idx *Indexer) failedFilesSafelyRetryable(failed []string) bool {
+	if len(failed) == 0 {
+		return true
+	}
+	idx.flushFileIndexFailures()
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.loaded || state.loadErr != nil || state.dirty {
+		return false
+	}
+	reader, ok := idx.graph.(graph.FileIndexFailureReader)
+	if !ok {
+		return false
+	}
+	rows, err := reader.FileIndexFailuresForRepo(idx.repoPrefix)
+	if err != nil {
+		return false
+	}
+	persisted := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		persisted[row.Path] = struct{}{}
+	}
+	for _, path := range failed {
+		if _, ok := persisted[idx.prefixPath(idx.relKey(path))]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (idx *Indexer) pruneMissingFileIndexFailures() {
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		relPath, ok := idx.graphPathRelKey(graphPath)
@@ -213,6 +247,11 @@ func (idx *Indexer) pruneMissingFileIndexFailures() {
 }
 
 func (idx *Indexer) flushFileIndexFailures() {
+	// Drain the silent-zero pending set first, inside the same lock the
+	// persistence below reads: the notes must be in state.rows before the
+	// rows slice is built, and this runs after the pass's version
+	// receipts, so nothing clears them again this pass.
+	idx.flushSilentZeroNotes()
 	state := &idx.fileIndexFailures
 	state.mu.Lock()
 	defer state.mu.Unlock()

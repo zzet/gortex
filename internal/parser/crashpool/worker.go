@@ -115,6 +115,7 @@ func serveOne(reg *parser.Registry, req extractRequest) (resp extractResponse) {
 			resp.Edges = nil
 			resp.Err = fmt.Sprintf("extractor panic: %v\n%s", rec, debug.Stack())
 			resp.Panicked = true
+			resp.ParseChecked, resp.ParseErrors = false, 0
 		}
 	}()
 
@@ -132,13 +133,15 @@ func serveOne(reg *parser.Registry, req extractRequest) (resp extractResponse) {
 	if result != nil {
 		resp.Nodes = result.Nodes
 		resp.Edges = result.Edges
-		if result.Tree != nil {
-			if result.Tree.HasParseErrors() {
-				resp.HasParseErr = true
-				resp.ParseErrors = result.Tree.CountParseErrors()
-			}
-			result.Tree.Release()
+		if result.ParseChecked && result.ParseErrors >= 0 {
+			resp.ParseChecked, resp.ParseErrors = true, result.ParseErrors
+			resp.HasParseErr = result.ParseErrors > 0
+		} else if result.Tree != nil && result.Tree.HasParseErrors() {
+			// Legacy/plugin trees retain their old error metadata, but absence
+			// of an explicit full-parse proof cannot become checked zero.
+			resp.HasParseErr, resp.ParseErrors = true, result.Tree.CountParseErrors()
 		}
+		result.ReleaseTree()
 	}
 	return resp
 }

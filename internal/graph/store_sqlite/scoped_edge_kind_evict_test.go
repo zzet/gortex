@@ -55,11 +55,20 @@ func TestEvictEdgesFromSourcesByKindsIsScopedSetOrientedAndCancellable(t *testin
 		t.Fatalf("base edge was touched: %#v", got)
 	}
 
-	plan := sqliteExplainPlan(t, store.db, `
+	// Mirrors the production DELETE in EvictEdgesFromSourcesByKinds,
+	// including its handle-generation predicate: the generation-first
+	// edges_by_from key is only seekable when view_gen is bound.
+	for _, generation := range []int64{baseViewGeneration, 17} {
+		plan := sqliteExplainPlan(t, store.db, `
 DELETE FROM edges
 WHERE from_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-  AND kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))`, `["changed"]`, `["accesses_field"]`)
-	if !strings.Contains(plan, "edges_by_from") {
-		t.Fatalf("scoped eviction must seek the (from_id, kind) index; plan:\n%s", plan)
+  AND kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+  AND view_gen = ?`, `["changed"]`, `["accesses_field"]`, generation)
+		if !strings.Contains(plan, "edges_by_from (view_gen=? AND from_id=? AND kind=?)") {
+			t.Fatalf("generation %d: scoped eviction must seek the (view_gen, from_id, kind) index; plan:\n%s", generation, plan)
+		}
+		if strings.Contains(plan, "SCAN edges") {
+			t.Fatalf("generation %d: scoped eviction scanned the edge table; plan:\n%s", generation, plan)
+		}
 	}
 }

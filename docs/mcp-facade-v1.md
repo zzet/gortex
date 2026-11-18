@@ -180,7 +180,7 @@ The following invariants apply:
 
 ## 7. Eager surface and client defaults
 
-Every MCP connection with a non-empty `clientInfo.name` defaults to the compact surface in `hide` mode unless a higher-precedence forwarded, operator, or instruction-profile policy selects another surface. Its first `tools/list` advertises exactly all 21 compact names and no legacy tool names. Direct calls to hidden legacy tools are hard-blocked; compact dispatch reaches their captured handlers internally.
+Every MCP client connection, with or without a `clientInfo.name`, defaults to the compact surface in `hide` mode unless a higher-precedence forwarded, operator, or instruction-profile policy selects another surface. Its first `tools/list` advertises exactly all 21 compact names and no legacy tool names. Direct calls to hidden legacy tools are hard-blocked; compact dispatch reaches their captured handlers internally.
 
 The 21 names are static for the connection. `read` is therefore always directly callable, and neither ordinary nor rare facade operations depend on `tools_search`, inline promotion, or `notifications/tools/list_changed`. `capabilities` discovers operation summaries and schemas without changing `tools/list`.
 
@@ -427,10 +427,10 @@ The server exposes the compact surface under the `facade-v1` operator/config pre
 
 | Selection | Advertised tools | Intended use |
 | --- | --- | --- |
-| `facade-v1` (`compact`, `facade`, `agent-v2`) | Exactly 21 compact tools in `hide` mode | Every named MCP client and explicitly pinned sessions |
-| `agent`, `core`, `full`, and specialist presets | Existing legacy tool definitions and behavior | Explicit compatibility/rollback and empty or pre-initialize server defaults |
+| `facade-v1` (`compact`, `facade`, `agent-v2`) | Exactly 21 compact tools in `hide` mode | Every MCP client connection and explicitly pinned sessions |
+| `agent`, `core`, `full`, and specialist presets | Existing legacy tool definitions and behavior | Explicit compatibility/rollback and the server default for internal session-less callers |
 
-Every connection with a non-empty MCP `clientInfo.name` selects the compact surface in `hide` mode when no higher-precedence surface is selected. Empty or pre-initialize sessions retain the server default. `GORTEX_TOOLS` or `--tools` has the highest precedence, so `GORTEX_TOOLS=full` (or another legacy preset) deliberately restores that connection's legacy surface.
+Every MCP client connection selects the compact surface in `hide` mode when no higher-precedence surface is selected; `clientInfo.name` is informational and an empty name does not change the surface. Only internal session-less callers (the HTTP dashboard and `/v1` REST routes) retain the server default. `GORTEX_TOOLS` or `--tools` has the highest precedence, so `GORTEX_TOOLS=full` (or another legacy preset) deliberately restores that connection's legacy surface.
 
 Several facade names intentionally reuse strong existing names, including `explore`, `analyze`, `ask`, and `review`. Tool definitions are therefore session-surface-specific:
 

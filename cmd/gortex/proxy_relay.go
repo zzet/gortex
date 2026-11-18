@@ -41,6 +41,9 @@ type proxyRelayState struct {
 	stdout    io.Writer
 	stderr    io.Writer
 	surface   *gortexmcp.ToolSurface
+	// clientCWD reports the host's current directory for stamping onto each
+	// tools/call (see stampClientCWD). Nil disables stamping.
+	clientCWD clientCWDProbe
 
 	client         *daemon.Client
 	responses      <-chan proxyFrameEvent
@@ -59,6 +62,22 @@ func relayProxySession(
 	surface *gortexmcp.ToolSurface,
 	orphan <-chan struct{},
 ) error {
+	return relayProxySessionWithClientCWD(ctx, h, initial, stdin, stdout, stderr, surface, orphan, nil)
+}
+
+// relayProxySessionWithClientCWD is relayProxySession with a probe for the
+// host's current directory, stamped onto every tools/call so the daemon
+// follows a host that changes directory mid-session.
+func relayProxySessionWithClientCWD(
+	ctx context.Context,
+	h daemon.Handshake,
+	initial *daemon.Client,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	surface *gortexmcp.ToolSurface,
+	orphan <-chan struct{},
+	clientCWD clientCWDProbe,
+) error {
 	relayCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -68,6 +87,7 @@ func relayProxySession(
 		stdout:    stdout,
 		stderr:    stderr,
 		surface:   surface,
+		clientCWD: clientCWD,
 		pending:   make(map[string]*proxyPendingRequest),
 	}
 	state.attach(initial)
@@ -117,6 +137,7 @@ func relayProxySession(
 				}
 			}
 
+			event.frame = stampClientCWD(event.frame, liveClientCWD(state.clientCWD))
 			state.noteProtocolFrame(event.frame)
 			pending, hasID := pendingRequest(event.frame)
 			if hasID {
@@ -287,7 +308,7 @@ func (s *proxyRelayState) noteProtocolFrame(frame []byte) {
 		return
 	}
 	switch envelope.Method {
-	case "initialize":
+	case "initialize", "server/discover":
 		s.initialize = append(s.initialize[:0], frame...)
 	case "notifications/initialized":
 		s.initialized = append(s.initialized[:0], frame...)
@@ -343,6 +364,9 @@ func (s *proxyRelayState) restoreProtocolState(client *daemon.Client) (err error
 	}
 	initialized := bytes.TrimSpace(s.initialized)
 	if len(initialized) == 0 {
+		if peekFrameMethod(s.initialize) == "server/discover" {
+			return nil
+		}
 		initialized = []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	}
 	return client.WriteMCPFrame(initialized)
@@ -565,7 +589,7 @@ func retryableProxyRequest(frame []byte) bool {
 		return false
 	}
 	switch envelope.Method {
-	case "initialize", "ping", "tools/list", "resources/list", "resources/templates/list", "prompts/list":
+	case "initialize", "server/discover", "ping", "tools/list", "resources/list", "resources/templates/list", "prompts/list":
 		return true
 	case "tools/call":
 		switch envelope.Params.Name {

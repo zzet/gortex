@@ -7,15 +7,14 @@ import (
 
 // CORSOptions configures CORS behavior for the server HTTP API.
 type CORSOptions struct {
-	AllowOrigins []string // Allowed origins; default ["*"].
+	AllowOrigins []string // Allowed origins; empty disables CORS response headers.
 }
 
-// WithCORS wraps an http.Handler with CORS headers.
+// WithCORS wraps an http.Handler with CORS headers. It does not authorize
+// requests: callers must install an Origin guard outside this middleware to
+// reject untrusted browser requests, including POSTs that need no preflight.
 func WithCORS(h http.Handler, opts CORSOptions) http.Handler {
 	origins := opts.AllowOrigins
-	if len(origins) == 0 {
-		origins = []string{"*"}
-	}
 	wildcard := len(origins) == 1 && origins[0] == "*"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

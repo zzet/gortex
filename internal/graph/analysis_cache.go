@@ -6,6 +6,9 @@ import (
 )
 
 var (
+	// ErrAnalysisStoreBusy means an optional analysis read could not acquire
+	// the store mutation gate without waiting. Callers may omit the signal.
+	ErrAnalysisStoreBusy = errors.New("analysis store is busy")
 	// ErrAnalysisGenerationCorrupt reports a poisoned active generation. The
 	// store clears the active pointer before returning it, so callers may log
 	// the diagnostic and safely recompute.
@@ -168,7 +171,9 @@ type AnalysisGenerationStore interface {
 	SealAnalysisComponent(expectedRevision uint64, generationID int64, component AnalysisComponent, expectedRows int) (accepted bool, err error)
 	ActivateAnalysisGeneration(expectedRevision uint64, generationID int64) (accepted bool, err error)
 	AbortAnalysisGeneration(generationID int64) error
-	PruneAnalysisGenerations(ctx context.Context, keep, batch int) error
+	// PruneAnalysisGenerations returns the number of rows deleted by committed
+	// chunks, including when a later chunk returns an error.
+	PruneAnalysisGenerations(ctx context.Context, keep, batch int) (removed int64, err error)
 }
 
 // AnalysisQueryStore exposes bounded point, batch, top-N, and keyset-paged
@@ -188,4 +193,23 @@ type AnalysisQueryStore interface {
 	AnalysisConcepts(generationID int64, tokens []string, direction AnalysisConceptDirection) (AnalysisConceptQueryResult, error)
 	ListAnalysisConcepts(generationID int64, limit int, cursorToken string) (AnalysisConceptQueryResult, string, error)
 	LoadAnalysisBlob(generationID int64, component AnalysisBlobComponent) ([]byte, bool, error)
+}
+
+// TryAnalysisQueryStore optionally supplies the ranking reads without waiting
+// for a store writer. A busy mutation gate returns ErrAnalysisStoreBusy; other
+// validation, generation-currentness, and query semantics match AnalysisQueryStore.
+// Callers whose store does not implement this interface retain blocking reads.
+type TryAnalysisQueryStore interface {
+	TryAnalysisNodeMetrics(generationID int64, nodeIDs []string) ([]AnalysisNodeMetric, error)
+	TryTopAnalysisNodeMetrics(generationID int64, metric AnalysisMetric, limit int, cursor *AnalysisMetricCursor) ([]AnalysisNodeMetric, *AnalysisMetricCursor, error)
+}
+
+// ScopedAnalysisCommunityReader returns only community metadata, in community
+// ID order, when at least one persisted member exists in this reader's payload
+// generation and passes scope. Files and member IDs are deliberately omitted.
+// An inactive or foreign-generation receipt returns ErrAnalysisGenerationInactive.
+// Overlay/composed readers omit this capability so their node visibility is
+// still decided through the selected reader.
+type ScopedAnalysisCommunityReader interface {
+	ScopedAnalysisCommunitySummaries(generationID int64, scope NodeScope, limit int, cursorID string) ([]AnalysisCommunitySummary, string, error)
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -106,14 +107,25 @@ func LooksBinary(src []byte) bool {
 	return bytes.IndexByte(src, 0) >= 0
 }
 
+// parseCount counts the sources ParseFile handed to tree-sitter.
+var parseCount atomic.Uint64
+
+// ParseCount reports how many sources ParseFile has handed to tree-sitter
+// since the process started. Callers compare two readings to pin how many
+// parses a code path costs.
+func ParseCount() uint64 { return parseCount.Load() }
+
 // ParseFile parses source bytes with the given language and returns the tree.
 // The caller must call tree.Close() when done.
 func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
 	// Guard before the parser pool. The UTF-16 check must run BEFORE any
 	// binary/NUL sniff: a UTF-16 source's NUL-interleaved bytes would
 	// otherwise be labelled "binary" instead of "UTF-16", and nothing would
-	// name the real cause. The indexer's BOM-strip transform deliberately
-	// leaves UTF-16 marks in place so this check can fire.
+	// name the real cause. The indexer's utf16-decode transform decodes
+	// healthy UTF-16 sources ahead of extraction (its BOM-strip then
+	// removes the mark), and a coordinate-stable preparation refuses a
+	// declined UTF-16 source outright — so this guard is a backstop for
+	// direct ParseFile callers, not the primary defence.
 	if hasUTF16BOM(src) {
 		return nil, ErrUTF16Source
 	}
@@ -141,6 +153,7 @@ func ParseFile(src []byte, lang *sitter.Language) (*sitter.Tree, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
 	defer cancel()
 
+	parseCount.Add(1)
 	tree, err := parser.ParseCtx(ctx, nil, src)
 	if err != nil {
 		return nil, fmt.Errorf("tree-sitter parse: %w", err)

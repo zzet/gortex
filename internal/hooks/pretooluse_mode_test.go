@@ -398,21 +398,18 @@ func TestRunPreToolUse_AutoApprove_GortexToolUnderPermissiveMode(t *testing.T) {
 	}
 }
 
-// TestRunPreToolUse_AutoApprove_BypassPermissionsNotApproved verifies
-// the allowlist excludes "bypassPermissions" — this branch must not
-// emit an allow for it.
-func TestRunPreToolUse_AutoApprove_BypassPermissionsNotApproved(t *testing.T) {
+// TestRunPreToolUse_AutoApprove_BypassPermissionsApproved verifies
+// "bypassPermissions" is on the allowlist — the most permissive host
+// mode must not make Gortex's own tools prompt (#841).
+func TestRunPreToolUse_AutoApprove_BypassPermissionsApproved(t *testing.T) {
 	payload := []byte(`{"hook_event_name":"PreToolUse","tool_name":"mcp__gortex__search_symbols","permission_mode":"bypassPermissions","tool_input":{"query":"Foo"}}`)
 	out := captureStdout(t, func() { runPreToolUse(payload, 0, ModeDeny) })
-	// The auto-approve branch must not fire. A gortex tool is otherwise
-	// not handled by the enrich switch, so the call produces no output
-	// at all — and in particular never an "allow".
-	if out != "" {
-		dec := decodeHookOutput(t, out)
-		if dec.HookSpecificOutput != nil && dec.HookSpecificOutput.PermissionDecision == "allow" {
-			t.Errorf("bypassPermissions must NOT be auto-approved by this branch, got: %+v",
-				dec.HookSpecificOutput)
-		}
+	if out == "" {
+		t.Fatal("expected an allow payload for a gortex tool under bypassPermissions")
+	}
+	dec := decodeHookOutput(t, out)
+	if dec.HookSpecificOutput == nil || dec.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Errorf("expected permissionDecision=allow, got: %+v", dec.HookSpecificOutput)
 	}
 }
 
@@ -451,15 +448,32 @@ func TestRunPreToolUse_AutoApprove_FiresInAnyMode(t *testing.T) {
 	}
 }
 
+// TestRunPreToolUse_AutoApprove_RecordsConsultMarker verifies an
+// auto-approved Gortex call under ModeConsultUnlock still records the
+// consult marker — otherwise a permissive permission mode would keep
+// fallback reads locked for the whole session.
+func TestRunPreToolUse_AutoApprove_RecordsConsultMarker(t *testing.T) {
+	withSessionDir(t)
+	payload := []byte(`{"hook_event_name":"PreToolUse","tool_name":"mcp__gortex__get_symbol","permission_mode":"acceptEdits","session_id":"aa-consult","tool_input":{}}`)
+	out := captureStdout(t, func() { runPreToolUse(payload, 0, ModeConsultUnlock) })
+	dec := decodeHookOutput(t, out)
+	if dec.HookSpecificOutput == nil || dec.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Fatalf("expected auto-approve allow, got: %+v", dec.HookSpecificOutput)
+	}
+	if !loadSessionState("aa-consult").GraphConsulted {
+		t.Error("auto-approved gortex call must record the consult-unlock marker")
+	}
+}
+
 // TestIsPermissivePermissionMode exercises the allowlist directly:
-// only "acceptEdits" and "auto" are permissive; everything else,
-// including unknown future modes, is not.
+// only "acceptEdits", "auto", and "bypassPermissions" are permissive;
+// everything else, including unknown future modes, is not.
 func TestIsPermissivePermissionMode(t *testing.T) {
 	cases := map[string]bool{
 		"acceptEdits":       true,
 		"auto":              true,
 		"  acceptEdits  ":   true, // trimmed
-		"bypassPermissions": false,
+		"bypassPermissions": true,
 		"default":           false,
 		"plan":              false,
 		"":                  false,

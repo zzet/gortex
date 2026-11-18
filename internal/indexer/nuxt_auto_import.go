@@ -39,14 +39,14 @@ func invalidateNuxtImports(root string) {
 	nuxtImportCache.Unlock()
 }
 
-func resolveNuxtBinding(root, prefix, caller, name string) (string, string) {
+func resolveNuxtBinding(coll *nuxtimports.Collection, prefix, caller, name string) (string, string) {
 	if prefix != "" {
 		if !strings.HasPrefix(caller, prefix+"/") {
 			return "", ""
 		}
 		caller = strings.TrimPrefix(caller, prefix+"/")
 	}
-	binding := loadNuxtImports(root).Resolve(caller, name)
+	binding := coll.Resolve(caller, name)
 	if binding.File == "" {
 		return "", ""
 	}
@@ -54,14 +54,29 @@ func resolveNuxtBinding(root, prefix, caller, name string) (string, string) {
 }
 
 func (idx *Indexer) resolveNuxtAutoImport(caller, name string) (string, string) {
-	return resolveNuxtBinding(idx.rootPath, idx.repoPrefix, caller, name)
+	tree, ref := idx.manifestTreeWithRef()
+	if ref == nil {
+		idx.contentProof.noteUnboundedReader()
+		return resolveNuxtBinding(loadNuxtImports(tree.root()), idx.repoPrefix, caller, name)
+	}
+	idx.nuxtMu.Lock()
+	if idx.nuxtRef != ref {
+		idx.nuxtColl = nuxtimports.LoadTree(tree.(sourceManifestTree))
+		idx.nuxtRef = ref
+	}
+	coll := idx.nuxtColl
+	idx.nuxtMu.Unlock()
+	return resolveNuxtBinding(coll, idx.repoPrefix, caller, name)
 }
 
 func (mi *MultiIndexer) nuxtAutoImportResolver() resolver.NuxtAutoImportResolver {
 	return func(caller, name string) (string, string) {
 		for _, meta := range mi.AllMetadata() {
 			if meta.RepoPrefix != "" && strings.HasPrefix(caller, meta.RepoPrefix+"/") {
-				return resolveNuxtBinding(meta.RootPath, meta.RepoPrefix, caller, name)
+				if idx := mi.GetIndexer(meta.RepoPrefix); idx != nil && idx.contentSrc.Load() != nil {
+					return idx.resolveNuxtAutoImport(caller, name)
+				}
+				return resolveNuxtBinding(loadNuxtImports(meta.RootPath), meta.RepoPrefix, caller, name)
 			}
 		}
 		return "", ""

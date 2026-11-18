@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -225,35 +224,18 @@ func (s *Store) FindNodesByNamesInRepoLanguages(names []string, repoPrefix strin
 	// binding for repo_prefix, one for the generation, and one for every
 	// compatible language; bound values do not expand the SQL text, so the
 	// placeholder string stays small.
-	nameChunkSize := lookupChunkSize - len(uniqLanguages) - 2
-	if nameChunkSize < 1 {
-		nameChunkSize = 1
-	}
 	out := make(map[string][]*graph.Node, len(uniqNames))
-	languagePlaceholders := strings.Repeat(",?", len(uniqLanguages))[1:]
-	for start := 0; start < len(uniqNames); start += nameChunkSize {
-		end := minInt(start+nameChunkSize, len(uniqNames))
-		chunk := uniqNames[start:end]
-		namePlaceholders := strings.Repeat(",?", len(chunk))[1:]
-		query := `SELECT ` + lookupNodeCols + ` FROM nodes
-WHERE repo_prefix = ?
-  AND language IN (` + languagePlaceholders + `)
-  AND name IN (` + namePlaceholders + `)
-  AND name <> ''
-  AND view_gen = ?`
-		args := make([]any, 0, 2+len(uniqLanguages)+len(chunk))
-		args = append(args, repoPrefix)
-		for _, language := range uniqLanguages {
-			args = append(args, language)
-		}
-		for _, name := range chunk {
-			args = append(args, name)
-		}
-		args = append(args, s.viewGen)
-		for _, node := range s.queryNodesSQL(query, args...) {
-			if node != nil {
-				out[node.Name] = append(out[node.Name], node)
-			}
+	namesJSON, okNames := projectionJSON(uniqNames)
+	languagesJSON, okLanguages := projectionJSON(uniqLanguages)
+	if !okNames || !okLanguages {
+		return out
+	}
+	if observe := nameLookupSQLObserver; observe != nil {
+		observe(repoLanguageNamesSeekSQL)
+	}
+	for _, node := range s.queryNodesSQL(repoLanguageNamesSeekSQL, languagesJSON, namesJSON, repoPrefix, s.viewGen) {
+		if node != nil {
+			out[node.Name] = append(out[node.Name], node)
 		}
 	}
 	return out
@@ -287,3 +269,30 @@ func uniqueStrings(values []string) []string {
 	}
 	return out
 }
+
+// repoLanguageNamesSeekSQL reads a repository's nodes of the given names and
+// languages in one generation, one index seek per (language, name) pair.
+//
+// The IN-list form (repo_prefix = ? AND language IN (...) AND name IN (...)
+// AND view_gen = ?) lets the planner choose, and with two or more languages
+// and a hundred or so names the store's sampled statistics (about 167 rows
+// per repository and language, against 1.75 million on the live store) make a
+// range scan of (repo_prefix, language) look cheaper than the seeks: the
+// query then walked every generation's index entries for the repository, 2 s
+// a query, once per layer of a stack. Driving the seeks from the lists
+// (CROSS JOIN keeps them outer) leaves the planner only the full-key seek.
+// No INDEXED BY: the index is dropped during a bulk window, and a missing
+// named index is an error rather than a slower plan.
+//
+// The generation is written +n.view_gen so the choice does not rest on the
+// statistics either: nodes_by_repo (repo_prefix, view_gen) and nodes_by_name
+// (name, view_gen) then key one column each, against three for
+// nodes_by_repo_language_name, whose (repository, language, name) entries of
+// every generation lie together and are checked for the generation in the
+// index, before any table row is read.
+var repoLanguageNamesSeekSQL = `SELECT ` + qualifiedNodeColumns("n", lookupNodeCols) + `
+  FROM json_each(?) AS l
+  CROSS JOIN json_each(?) AS w
+  CROSS JOIN nodes AS n
+ WHERE n.repo_prefix = ? AND n.language = l.value AND n.name = w.value
+   AND n.name <> '' AND +n.view_gen = ?`

@@ -24,7 +24,7 @@ The backend is chosen by the `llm.provider` key. Every provider except `local` i
 | `gemini` | Google Gemini `generateContent` REST | `GEMINI_API_KEY` |
 | `bedrock` | AWS Bedrock Converse API (SigV4-signed, no AWS SDK) | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) |
 | `deepseek` | DeepSeek Chat Completions (OpenAI-compatible) | `DEEPSEEK_API_KEY` |
-| `requesty` | Requesty gateway (OpenAI-compatible, one key for many vendors) | `REQUESTY_API_KEY` |
+| `requesty` | Requesty gateway (OpenAI-compatible, one key for many vendors) — a [gateway preset](#gateway-presets) | `REQUESTY_API_KEY` |
 | _`<custom>`_ | any OpenAI-compatible endpoint | registered with `gortex provider add` — see [Custom providers](#custom-providers) |
 
 ## Configuration
@@ -110,7 +110,7 @@ llm:
     api_key_env: DEEPSEEK_API_KEY
     # base_url: https://api.deepseek.com
 
-  requesty:                  # provider: requesty, OpenAI-compatible gateway (https://docs.requesty.ai)
+  requesty:                  # provider: requesty, OpenAI-compatible gateway preset (https://docs.requesty.ai); every field optional, overrides the preset default
     model: openai/gpt-4o-mini   # vendor/model ids, e.g. anthropic/claude-sonnet-4-5, google/gemini-2.5-flash
     api_key_env: REQUESTY_API_KEY   # key from https://app.requesty.ai/api-keys
     # base_url: https://router.requesty.ai/v1   # EU: https://router.eu.requesty.ai/v1
@@ -137,11 +137,11 @@ Every one of these is skipped when `llm.claudecli.args` already carries the same
 
 When `llm.routing.enabled` is true, each `ask` run is scored by graph-derived task complexity — chain-tracing mode, multi-hop keywords, and how broad a slice of the multi-repo graph is in scope — and dispatched to `simple_model` or `complex_model` *within the active provider* (a cheap single-hop lookup costs less; a cross-system trace gets the capable model). The chosen `model` and `complexity` ride on the `ask` response. An empty tier model falls back to the provider's configured model.
 
-Env overrides: `GORTEX_LLM_PROVIDER`, `GORTEX_LLM_MODEL` (targets the active provider's model — for `azure` it sets the deployment), `GORTEX_LLM_MAX_STEPS`, `GORTEX_LLM_{CLAUDECLI,CODEX,COPILOT,CURSOR,OPENCODE}_BINARY`, `GORTEX_LLM_BEDROCK_REGION`, `GORTEX_LLM_AZURE_{ENDPOINT,DEPLOYMENT,API_VERSION}`, `GORTEX_LLM_EFFORT`, `GORTEX_LLM_IDLE_TTL` (`local` provider only), and `GORTEX_LLM_ANTHROPIC_{PROMPT_CACHING,THINKING_MODE,HAIKU_MODEL,SONNET_MODEL,OPUS_MODEL}`. API keys are read from the env var named by `api_key_env` — never stored in the config file.
+Env overrides: `GORTEX_LLM_PROVIDER`, `GORTEX_LLM_MODEL` (targets the active provider's model — for `azure` it sets the deployment; for a custom provider or gateway preset its `model`), `GORTEX_LLM_MAX_STEPS`, `GORTEX_LLM_{CLAUDECLI,CODEX,COPILOT,CURSOR,OPENCODE}_BINARY`, `GORTEX_LLM_BEDROCK_REGION`, `GORTEX_LLM_AZURE_{ENDPOINT,DEPLOYMENT,API_VERSION}`, `GORTEX_LLM_EFFORT` (a custom provider or preset sends it as `reasoning_effort`), `GORTEX_LLM_IDLE_TTL` (`local` provider only), and `GORTEX_LLM_ANTHROPIC_{PROMPT_CACHING,THINKING_MODE,HAIKU_MODEL,SONNET_MODEL,OPUS_MODEL}`. API keys are read from the env var named by `api_key_env` — never stored in the config file.
 
 If the active provider can't be constructed (missing model or API key, `local` without a `-tags llama` build, `claudecli` / `codex` without the `claude` / `codex` binary on `$PATH`, `bedrock` without AWS credentials), the daemon logs a warning and the LLM features stay absent — the rest of Gortex is unaffected. If the `ask` tool isn't in `tools/list`, no provider is configured.
 
-The `assist` prompts are tiered automatically — terser for hosted frontier models, rule-heavy for small local ones. `deep` mode in particular benefits from a 7B-class or hosted model; small local models are unreliable on its disambiguation cases.
+The `assist` prompts are tiered — terser for hosted frontier models, rule-heavy for small local ones. Built-in providers pick their tier automatically; a custom provider declares it with `prompt_profile` (default `small`, see below). `deep` mode in particular benefits from a 7B-class or hosted model; small local models are unreliable on its disambiguation cases.
 
 ## Custom providers
 
@@ -152,10 +152,49 @@ gortex provider add groq \
   --base-url https://api.groq.com/openai/v1 \
   --model llama-3.3-70b-versatile \
   --api-key-env GROQ_API_KEY \
+  --prompt-profile frontier \
   --price-input 0.59 --price-output 0.79
 gortex provider list
 gortex provider show groq
 gortex provider remove groq
 ```
 
-Then set `llm.provider: groq` (or `GORTEX_LLM_PROVIDER=groq`). Entries are stored in `providers.json` next to your config; a repo-local `.gortex/providers.json` is loaded only when `GORTEX_ALLOW_LOCAL_PROVIDERS=1` (so a cloned repo can't silently repoint your LLM calls). A custom provider may not shadow a built-in name. Per entry: `base_url` (http/https, including any version segment — gortex appends `/chat/completions`), `model`, optional `api_key_env` (omit for keyless local endpoints), `schema_mode` (`json_schema` (default) | `json_object` | `prompt` — use the looser modes for gateways without strict structured-output support), extra headers, and informational USD pricing.
+Then set `llm.provider: groq` (or `GORTEX_LLM_PROVIDER=groq`). Entries are stored in `providers.json` next to your config; a repo-local `.gortex/providers.json` is loaded only when `GORTEX_ALLOW_LOCAL_PROVIDERS=1` (so a cloned repo can't silently repoint your LLM calls). A custom provider may not shadow a built-in name; it may reuse a [gateway preset](#gateway-presets) name, and then replaces that preset. Per entry: `base_url` (http/https, including any version segment — gortex appends `/chat/completions`), `model`, optional `api_key_env` (omit for keyless local endpoints), `schema_mode` (`json_schema` (default) | `json_object` | `prompt` — use the looser modes for gateways without strict structured-output support), `prompt_profile`, `reasoning_effort`, extra headers, and informational USD pricing.
+
+`prompt_profile` picks the `assist` prompt tier: `small` (the default — verbose, rule-heavy prompts written for small local models, the safe choice for a self-hosted 3B–8B model) or `frontier` (terse prompts for hosted frontier models, which lose quality when over-constrained). Set `--prompt-profile frontier` when the endpoint serves a frontier-class model, e.g. a gateway in front of Claude, GPT or Gemini. The same entries can live inline under `llm.custom.<name>` in config, with the same field names.
+
+### Gateway presets
+
+A gateway preset is a built-in, ready-made custom provider for a well-known OpenAI-compatible gateway: `llm.provider: <preset>` works with no `provider add` step, using the preset's base URL, default model, key env var, schema mode and prompt tier. `gortex provider list` shows the presets in their own section, and `gortex provider show <preset>` prints one.
+
+| Preset | Base URL | Default model | Key | Prompt tier |
+|--------|----------|---------------|-----|-------------|
+| `api-route` | `https://global.api-route.com/v1` | `gpt-6.1-sol` | `API_ROUTE_API_KEY` | `frontier` |
+| `cheapaimodel` | `https://api.cheapaimodel.ai/v1` | `deepseek-v4-1-flash` | `CHEAPAIMODEL_API_KEY` | `frontier` |
+| `cheaperinference` | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini` | `CHEAPER_INFERENCE_API_KEY` | `frontier` |
+| `cloudgpu` | `https://cloudgpu.app/v1` | `deepseek-v4.1-flash` | `CLOUDGPU_API_KEY` | `frontier` |
+| `llm-buzz` | `https://api.llm.buzz/api/v1` | `openai/gpt-5.4-mini` | `LLM_BUZZ_API_KEY` | `frontier` |
+| `opper` | `https://api.opper.ai/v3/compat` | `gpt-6.1-terra` | `OPPER_API_KEY` | `frontier` |
+| `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
+| `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
+| `standardcompute` | `https://api.stdcmpt.com/v1` (US: `https://us.stdcmpt.com/v1`) | `deepseek/deepseek-v4-flash` | `STANDARDCOMPUTE_API_KEY` | `frontier` |
+| `uberllm` | `https://api.uberllm.dev/v1` | `deepseek/deepseek-v4-flash` | `UBERLLM_API_KEY` | `frontier` |
+
+The `cheapaimodel` preset also sends `reasoning_effort: none`: its default model reasons by default, and the reasoning can use up the small output budget of the `assist` passes before any JSON is written. Kimi models accept `none` too. GLM models always reason: with `none` they returned HTTP 400 or an empty answer, and with the default effort they used up the 192-token expand budget, so they are not a good fit for `assist`.
+
+When `llm.provider` names `X`, gortex resolves it in this order: a true built-in provider `X` → your custom provider `X` (global `providers.json`, the opt-in repo-local one, or inline `llm.custom.X`) → the preset `X`. Your own entry always wins over a same-named preset, as a whole — no preset field leaks into it. `GORTEX_LLM_MODEL` / `GORTEX_LLM_EFFORT` apply on top of whichever entry is resolved.
+
+To customise a preset, copy it into your own entry and override fields:
+
+```bash
+gortex provider add requesty-eu --preset requesty \
+  --base-url https://router.eu.requesty.ai/v1 \
+  --model anthropic/claude-sonnet-4-5
+```
+
+The legacy `llm.requesty:` block (from when `requesty` was a built-in provider) is still honoured: its `model`, `api_key_env`, `base_url` (with or without the `/v1` segment) and `effort` override the preset defaults, so existing configs need no change.
+
+### Adding a provider
+
+- A new **wire protocol or auth scheme** (a non-OpenAI request format, SigV4, a deployment-in-path URL, a CLI subprocess) is a built-in provider: a package under `internal/llm/provider/`.
+- A new **OpenAI-compatible gateway** (`/chat/completions` with a Bearer key) is not: users can register it today with `gortex provider add <name> --base-url … --model … --api-key-env … --prompt-profile frontier`, and a widely used one can ship as a one-entry addition to the preset table in `internal/llm/presets.go`.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -166,21 +167,21 @@ exit 0
 	_ = atomic.LoadInt32(&spawned)
 }
 
-// TestCancelWhileWaitingForSlot asserts that when the limiter is
+// TestCancelWhileHoldingOrWaitingForSlot asserts that when the limiter is
 // saturated, a Run whose ctx is cancelled while waiting for a slot
-// returns ctx.Err() and never spawns its own git.
-func TestCancelWhileWaitingForSlot(t *testing.T) {
+// returns ctx.Err() and never spawns its own git, and that a Run whose ctx
+// is cancelled while its git runs reports ctx.Err() beside git's exit
+// status.
+func TestCancelWhileHoldingOrWaitingForSlot(t *testing.T) {
+	// The fake git runs until it is killed.
 	withFakeGit(t, `
 echo "start $$" >> "$GITCMD_TRACK"
-while [ ! -f "$GITCMD_RELEASE" ]; do
+while :; do
   sleep 0.005
 done
-exit 0
 `)
 	trackFile := filepath.Join(t.TempDir(), "track")
-	releaseFile := filepath.Join(t.TempDir(), "release")
 	t.Setenv("GITCMD_TRACK", trackFile)
-	t.Setenv("GITCMD_RELEASE", releaseFile)
 	if err := os.WriteFile(trackFile, nil, 0o644); err != nil {
 		t.Fatalf("seed track file: %v", err)
 	}
@@ -189,12 +190,14 @@ exit 0
 	t.Cleanup(func() { SetConcurrency(int(defaultConcurrency())) })
 
 	// Saturate the single slot.
-	blockerDone := make(chan struct{})
+	holderCtx, cancelHolder := context.WithCancel(context.Background())
+	defer cancelHolder()
+	holderErr := make(chan error, 1)
 	go func() {
-		defer close(blockerDone)
-		_, _ = Run(context.Background(), "", "status")
+		_, err := Run(holderCtx, "", "status")
+		holderErr <- err
 	}()
-	// Wait until the blocker is actually running git.
+	// Wait until the holder is actually running git.
 	waitForStarts(t, trackFile, 1, 5*time.Second)
 
 	// Now a waiter whose ctx we cancel while it blocks on Acquire.
@@ -217,16 +220,27 @@ exit 0
 		t.Fatal("waiter did not return after ctx cancel")
 	}
 
-	// Only the blocker should have spawned git; the waiter must not.
+	// Only the holder should have spawned git; the waiter must not.
 	if starts, _ := countTrack(t, trackFile); starts != 1 {
-		t.Fatalf("expected exactly 1 spawned git (the blocker), saw %d", starts)
+		t.Fatalf("expected exactly 1 spawned git (the holder), saw %d", starts)
 	}
 
-	// Release the blocker.
-	if err := os.WriteFile(releaseFile, nil, 0o644); err != nil {
-		t.Fatalf("write release file: %v", err)
+	// Cancel the holder while its git runs. exec kills the child and reports
+	// only its exit status ("signal: killed"), which alone does not tell the
+	// caller that its own context ended the command.
+	cancelHolder()
+	select {
+	case err := <-holderErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("holder: expected context.Canceled, got %v", err)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("holder: git's exit status is not reachable: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("holder did not return after ctx cancel")
 	}
-	<-blockerDone
 }
 
 func waitForStarts(t *testing.T, path string, want int, timeout time.Duration) {

@@ -67,8 +67,7 @@ func newContainedFixture(t *testing.T) containedFixture {
 	g := graph.New()
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(g, testRegistry(), bm, cm, zap.NewNop())
-	_, err = mi.IndexScoped("", "")
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, mi, cm)
 
 	eng := query.NewEngine(g)
 	eng.SetSearch(bm)

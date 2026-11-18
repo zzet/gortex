@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"fmt"
+	"iter"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -281,5 +282,50 @@ func TestResolveFilesAndIncomingAmbiguousWildcardStaysUnresolved(t *testing.T) {
 
 	if pending.To != graph.UnresolvedMarker+"*.Target" {
 		t.Fatalf("ambiguous wildcard-stub edge target = %q, want it to stay parked", pending.To)
+	}
+}
+
+// namesScopeStore records the repository scopes the directory index is read
+// with.
+type namesScopeStore struct {
+	graph.Store
+	scopes [][]string
+}
+
+func (s *namesScopeStore) FileNodeIdentitiesSeq(repoPrefixes []string) iter.Seq[graph.FileNodeIdentity] {
+	s.scopes = append(s.scopes, append([]string(nil), repoPrefixes...))
+	if repoPrefixes == nil {
+		s.scopes[len(s.scopes)-1] = nil
+	}
+	return graph.FileNodeIdentitiesSeq(s.Store, repoPrefixes)
+}
+
+// The names pass builds its indexes for the references it resolves: their
+// repository, never a graph-wide index over every tracked repository (tens of
+// seconds per renamed declaration on a large store).
+func TestResolveIncomingForNamesBuildsIndexesForItsReferences(t *testing.T) {
+	bare := &graph.Edge{From: "repo/c.go::CallerA", To: graph.UnresolvedMarker + "Target", Kind: graph.EdgeCalls, FilePath: "repo/c.go", Line: 3}
+	g := graph.New()
+	g.AddBatch([]*graph.Node{
+		{ID: "repo/c.go", Kind: graph.KindFile, Name: "c.go", FilePath: "repo/c.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/b.go", Kind: graph.KindFile, Name: "b.go", FilePath: "repo/b.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "other/o.go", Kind: graph.KindFile, Name: "o.go", FilePath: "other/o.go", RepoPrefix: "other", Language: "go"},
+		{ID: "repo/c.go::CallerA", Kind: graph.KindFunction, Name: "CallerA", FilePath: "repo/c.go", RepoPrefix: "repo", Language: "go"},
+		{ID: "repo/b.go::Target", Kind: graph.KindFunction, Name: "Target", FilePath: "repo/b.go", RepoPrefix: "repo", Language: "go"},
+	}, []*graph.Edge{bare})
+	store := &namesScopeStore{Store: g}
+	New(store).ResolveIncomingForNames([]string{"Target"}, []string{"repo"})
+	if bare.To != "repo/b.go::Target" {
+		t.Fatalf("edge target = %q, want repo/b.go::Target", bare.To)
+	}
+	for _, scope := range store.scopes {
+		if scope == nil {
+			t.Fatalf("the names pass read the directory index graph-wide: %v", store.scopes)
+		}
+		for _, prefix := range scope {
+			if prefix != "repo" {
+				t.Fatalf("the names pass read another repository's directory index: %v", store.scopes)
+			}
+		}
 	}
 }

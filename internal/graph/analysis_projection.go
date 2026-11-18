@@ -2,11 +2,26 @@ package graph
 
 import "iter"
 
+// AnalysisPageBinder provides bounded read snapshots for whole-store analysis.
+// Pages can observe different revisions; callers must validate generation and
+// revision before publishing. Ordinary readers keep their snapshot semantics.
+type AnalysisPageBinder interface {
+	BindAnalysisPages() Store
+}
+
+// BindAnalysisPages selects the optional bounded analysis projection.
+func BindAnalysisPages(s Store) Store {
+	if paged, ok := s.(AnalysisPageBinder); ok {
+		return paged.BindAnalysisPages()
+	}
+	return s
+}
+
 // NodeLightSequencer streams the metadata-free node projection used by
 // whole-graph analysis. Unlike NodeLightScanner it does not require a backend
 // to retain one []*Node containing the complete corpus before the consumer can
-// start. Disk backends should keep their row cursor open only for the lifetime
-// of the sequence and honour early stop.
+// start. Disk backends should honour early stop. Revision-validated analyses can opt
+// into bounded snapshots through AnalysisPageBinder.
 type NodeLightSequencer interface {
 	NodesLightSeq() iter.Seq[*Node]
 }

@@ -1,0 +1,142 @@
+name: Edit-loop reference gates
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Reference lane (three consecutive runs per cell)
+        type: choice
+        options: [smoke, nightly]
+        default: smoke
+      seed:
+        description: Test-only regression; the selected row must fail
+        type: choice
+        options: [none, ack-wait, closed-read-gate]
+        default: none
+
+permissions:
+  contents: read
+
+# Requires a separately registered owned reference runner and reviewed cgroup/host bindings.
+# Never cancel a run while its owned daemon still needs shutdown receipts.
+concurrency:
+  group: edit-loop-reference
+  cancel-in-progress: false
+
+env:
+  CGO_ENABLED: '1'
+  CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+  CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+  GOTOOLCHAIN: local
+
+jobs:
+  smoke:
+    # This does not provision a runner or enable a repository variable. A
+    # missing/unreviewed host/config is unavailable, never a hosted substitute.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.lane == 'smoke' && vars.EDIT_GATE_REFERENCE_SMOKE_ENABLED == 'true'
+    runs-on: [self-hosted, perf-reference-linux]
+    # Three separate <=15m smoke runs; each run retains its own wall receipt.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build the exact candidate and gate commands
+        env:
+          EDIT_GATE_SEED: ${{ inputs.seed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags=()
+          case "$EDIT_GATE_SEED" in
+            none) ;;
+            ack-wait|closed-read-gate) tags=(-tags=gortex_edit_gate_seed) ;;
+            *) exit 2 ;;
+          esac
+          go build -buildvcs=true "${tags[@]}" -o "$RUNNER_TEMP/edit-candidate" ./cmd/gortex
+          go build -buildvcs=true -o "$RUNNER_TEMP/edit-load" ./bench/load
+          go build -buildvcs=true -o "$RUNNER_TEMP/edit-check-budgets" ./bench/check-budgets
+      - name: Collect three smoke runs and enforce every blocking row
+        env:
+          EDIT_GATE_SEED: ${{ inputs.seed }}
+          EDIT_GATE_REFERENCE_SMOKE_CONFIG: ${{ vars.EDIT_GATE_REFERENCE_SMOKE_CONFIG }}
+          EDIT_GATE_ACK_SEED_CONFIG: ${{ vars.EDIT_GATE_ACK_SEED_CONFIG }}
+          EDIT_GATE_CLOSED_SEED_CONFIG: ${{ vars.EDIT_GATE_CLOSED_SEED_CONFIG }}
+          EXPECTED_CANDIDATE: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$EDIT_GATE_SEED" in
+            none) config="$EDIT_GATE_REFERENCE_SMOKE_CONFIG" ;;
+            ack-wait) config="$EDIT_GATE_ACK_SEED_CONFIG" ;;
+            closed-read-gate) config="$EDIT_GATE_CLOSED_SEED_CONFIG" ;;
+            *) exit 2 ;;
+          esac
+          # Keep the reviewed config in place: its corpus/build paths are
+          # config-relative. Verify the requested fault matches actual tasks.
+          python3 - "$config" "$EDIT_GATE_SEED" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as source:
+              config = json.load(source)
+          expected = "" if sys.argv[2] == "none" else sys.argv[2]
+          if config.get("edit_gate_seed", "") != expected:
+              raise SystemExit("reviewed config disagrees with the requested fault")
+          PY
+          "$RUNNER_TEMP/edit-check-budgets" edit-collect \
+            --config "$config" --require-lane smoke \
+            --expected-candidate "$EXPECTED_CANDIDATE" \
+            --candidate-binary "$RUNNER_TEMP/edit-candidate" \
+            --load-binary "$RUNNER_TEMP/edit-load" \
+            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID"
+      - name: Preserve raw JSON, failed rows and owned stop receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: edit-smoke-${{ inputs.seed }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}/
+          retention-days: 90
+          if-no-files-found: error
+
+  nightly:
+    if: github.ref == 'refs/heads/main' && vars.EDIT_GATE_REFERENCE_NIGHTLY_ENABLED == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.lane == 'nightly'))
+    runs-on: [self-hosted, perf-reference-linux]
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build the normal production candidate and gate commands
+        env:
+          EDIT_GATE_SEED: ${{ inputs.seed || 'none' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$EDIT_GATE_SEED" = none
+          go build -buildvcs=true -o "$RUNNER_TEMP/edit-candidate" ./cmd/gortex
+          go build -buildvcs=true -o "$RUNNER_TEMP/edit-load" ./bench/load
+          go build -buildvcs=true -o "$RUNNER_TEMP/edit-check-budgets" ./bench/check-budgets
+      - name: Collect the full edit matrix and enforce every blocking row
+        env:
+          EDIT_GATE_REFERENCE_NIGHTLY_CONFIG: ${{ vars.EDIT_GATE_REFERENCE_NIGHTLY_CONFIG }}
+          EXPECTED_CANDIDATE: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/edit-check-budgets" edit-collect \
+            --config "$EDIT_GATE_REFERENCE_NIGHTLY_CONFIG" --require-lane nightly \
+            --expected-candidate "$EXPECTED_CANDIDATE" \
+            --candidate-binary "$RUNNER_TEMP/edit-candidate" \
+            --load-binary "$RUNNER_TEMP/edit-load" \
+            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID"
+      - name: Preserve every matrix report, failure and owned stop receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: edit-nightly-${{ github.run_id }}
+          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}/
+          retention-days: 90
+          if-no-files-found: error

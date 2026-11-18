@@ -1,12 +1,16 @@
 package hooks
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/toolref"
 
 	"github.com/zzet/gortex/internal/modelhint"
 )
@@ -241,7 +245,7 @@ func TestRunCodexPreToolUseGortexMCPReadSoftAdditionalContext(t *testing.T) {
 			if hso.HookEventName != "PreToolUse" {
 				t.Fatalf("hookEventName=%q want PreToolUse", hso.HookEventName)
 			}
-			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", toolref.TransportClause(), toolref.DegradedModeLine()} {
 				if !strings.Contains(hso.AdditionalContext, want) {
 					t.Fatalf("additionalContext missing %q: %q", want, hso.AdditionalContext)
 				}
@@ -904,5 +908,53 @@ func TestCodexModelHintIgnoresEmpty(t *testing.T) {
 	got, ok := modelhint.Read("/repo")
 	if !ok || got.Model != "gpt-5.6-sol" {
 		t.Errorf("an empty model must not clobber a good hint: %+v ok=%v", got, ok)
+	}
+}
+
+// TestRunCodexPostToolUseRecordsEveryDispatchedRun pins #832: doctor counts
+// PostToolUse effectiveness records as runs, so a dispatched invocation that
+// has nothing to enrich (a non-search Bash command, a localization navigation call
+// without a terminal receipt) must still land exactly one record, or a hook
+// Codex demonstrably ran reads as "configured but never ran".
+func TestRunCodexPostToolUseRecordsEveryDispatchedRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "effectiveness.jsonl")
+	t.Setenv("GORTEX_HOOK_EFFECTIVENESS_LOG", path)
+	oldReachable := daemonReachableFn
+	daemonReachableFn = func() bool { return true }
+	t.Cleanup(func() { daemonReachableFn = oldReachable })
+
+	payloads := [][]byte{
+		[]byte(`{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"go build ./..."},"tool_response":""}`),
+		[]byte(`{"hook_event_name":"PostToolUse","tool_name":"gortex__search","tool_input":{"query":"Foo"},"tool_response":"{}"}`),
+	}
+	modes := []CodexMode{CodexModeEnrich, CodexModeSuppress}
+	for _, mode := range modes {
+		for _, data := range payloads {
+			out := captureStdout(t, func() { runCodex(data, 0, mode) })
+			if out != "" {
+				t.Fatalf("mode %v: non-enriching PostToolUse should be silent, got %q", mode, out)
+			}
+		}
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read effectiveness telemetry: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if want := len(modes) * len(payloads); len(lines) != want {
+		t.Fatalf("records=%d want %d (one per dispatched run): %s", len(lines), want, raw)
+	}
+	for _, line := range lines {
+		var rec hookEffectiveness
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("invalid effectiveness JSONL %q: %v", line, err)
+		}
+		if rec.Event != "PostToolUse" || rec.EmittedContext {
+			t.Fatalf("record=%+v want a non-emitting PostToolUse run", rec)
+		}
+		if rec.DaemonReachable != nil {
+			t.Fatalf("record=%+v: a run that did no daemon I/O must leave reachability unknown", rec)
+		}
 	}
 }

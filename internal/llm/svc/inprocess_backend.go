@@ -34,9 +34,9 @@ func NewInProcessBackend(engine *query.Engine, contractsFn func() *contracts.Reg
 var _ llm.Backend = (*InProcessBackend)(nil)
 
 // SearchSymbols delegates to engine.SearchSymbolsScoped and adapts
-// the result. WorkspaceID + ProjectID on QueryOptions absorb the
-// Scope's Repo/Project; Ref is not yet plumbed through the engine
-// query layer.
+// the result. RepoAllow + ProjectID on QueryOptions preserve repository
+// and project scoping independently of the repository's workspace. Ref
+// is not yet plumbed through the engine query layer.
 func (b *InProcessBackend) SearchSymbols(_ context.Context, q string, scope llm.Scope, limit int) ([]llm.Match, error) {
 	if limit <= 0 {
 		limit = 20
@@ -197,16 +197,14 @@ func nodeToCaller(n *graph.Node) llm.Caller {
 	return llm.Caller{ID: n.ID, File: n.FilePath, Repo: n.RepoPrefix}
 }
 
-// scopeToOptions maps our backend Scope into the query engine's
-// QueryOptions. Engine.QueryOptions uses WorkspaceID/ProjectID which
-// fall back to RepoPrefix at filter time (see
-// internal/query/subgraph.go::scopeAllows), so passing scope.Repo
-// to WorkspaceID works for repo-level scoping in the common case
-// where each repo is its own workspace.
+// scopeToOptions keeps repository identity separate from workspace identity.
+// Multiple repositories may share a workspace, and the repository prefix need
+// not equal that workspace. An explicit repo also disambiguates ProjectID.
+// Project-only scope retains the query engine's existing unqualified behavior.
 func scopeToOptions(scope llm.Scope) query.QueryOptions {
 	opts := query.DefaultOptions()
 	if scope.Repo != "" {
-		opts.WorkspaceID = scope.Repo
+		opts.RepoAllow = map[string]bool{scope.Repo: true}
 	}
 	if scope.Project != "" {
 		opts.ProjectID = scope.Project

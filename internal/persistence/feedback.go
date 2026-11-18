@@ -97,12 +97,12 @@ func SaveFeedback(dir string, store *FeedbackStore) error {
 		store.Entries = store.Entries[len(store.Entries)-maxFeedbackCap:]
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir feedback: %w", err)
 	}
 
 	path := filepath.Join(dir, feedbackFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create feedback: %w", err)
 	}

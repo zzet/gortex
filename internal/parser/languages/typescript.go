@@ -49,6 +49,9 @@ const tsQAll = `
   (class_declaration
     name: (type_identifier) @class.name) @class.def
 
+  (abstract_class_declaration
+    name: (type_identifier) @class.name) @class.def
+
   (interface_declaration
     name: (type_identifier) @iface.name) @iface.def
 
@@ -186,7 +189,8 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	defer tree.Close()
 
 	root := tree.RootNode()
-	result := &parser.ExtractionResult{}
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
@@ -1478,11 +1482,11 @@ func (e *TypeScriptExtractor) emitClassProperty(m parser.QueryResult, filePath s
 }
 
 // findEnclosingClass walks up the parent chain looking for the nearest
-// class_declaration ancestor. Returns nil when the node is not inside
-// a class.
+// class_declaration or abstract_class_declaration ancestor. Returns nil
+// when the node is not inside a class.
 func findEnclosingClass(n *sitter.Node) *sitter.Node {
 	for p := n.Parent(); p != nil; p = p.Parent() {
-		if p.Type() == "class_declaration" {
+		if p.Type() == "class_declaration" || p.Type() == "abstract_class_declaration" {
 			return p
 		}
 	}

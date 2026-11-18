@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/intern"
 	"github.com/zzet/gortex/internal/serverstack"
 )
@@ -300,5 +303,67 @@ func TestRotateColdInternGeneration(t *testing.T) {
 		if got := intern.Len(); got != 0 {
 			t.Fatalf("interner length after %q rotation = %d, want 0", phase, got)
 		}
+	}
+}
+
+// TestBuildDaemonStateInstallsDedicatedBasePublisherRuntime traces the daemon
+// entry point itself. buildDaemonState is the only path `gortex daemon start`
+// takes to a stack, and it must hand back a lifecycle that already owns the
+// dedicated-base publisher runtime: warmup calls Seed a few hundred lines
+// later (daemon.go), Seed registers owners through bindDedicatedGraph, and
+// SetDedicatedBaseCleanupRuntime refuses every installation after the first
+// owner. Installing from cmd/ instead of the shared constructor is what would
+// leave the embedded one-shot server without an authority, so this asserts the
+// daemon inherits the stack's runtime rather than minting its own.
+func TestBuildDaemonStateInstallsDedicatedBasePublisherRuntime(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+
+	// A private config file: the daemon's own repo config must not decide
+	// whether this wiring exists, and semantic enrichment would spawn
+	// language servers that have nothing to do with it.
+	configPath := filepath.Join(base, ".gortex.yaml")
+	if err := os.WriteFile(configPath, []byte("semantic:\n  enabled: false\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	restoreCfg, restoreBackendPath := cfgFile, daemonBackendPath
+	t.Cleanup(func() { cfgFile, daemonBackendPath = restoreCfg, restoreBackendPath })
+	cfgFile = configPath
+	daemonBackendPath = filepath.Join(base, "store.sqlite")
+
+	state, err := buildDaemonState(zap.NewNop())
+	if err != nil {
+		t.Fatalf("buildDaemonState: %v", err)
+	}
+	t.Cleanup(func() {
+		if state.shared != nil {
+			_ = state.shared.Close()
+		}
+	})
+
+	if state.shared == nil || state.shared.DedicatedBaseRuntime == nil {
+		t.Fatal("the daemon's stack constructed no dedicated base publisher runtime")
+	}
+	if state.lifecycle == nil {
+		t.Fatal("the daemon's stack grew no checkout lifecycle")
+	}
+	installed := state.lifecycle.DedicatedBasePublisherRuntime()
+	if installed == nil {
+		t.Fatal("the daemon reaches warmup with no publisher runtime installed; Seed would close the window")
+	}
+	if installed != indexer.DedicatedBaseCleanupRuntime(state.shared.DedicatedBaseRuntime) {
+		t.Fatal("the daemon's lifecycle holds a different runtime than the stack published")
+	}
+	if state.shared.DedicatedBaseRuntime.ViewLeases() != state.lifecycle.ViewLeases() {
+		t.Fatal("the daemon's publisher runtime does not share the lifecycle's lease domain")
 	}
 }

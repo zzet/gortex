@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -171,6 +172,71 @@ func TestReconcileRepoCtxUsesCleanCensusNoOp(t *testing.T) {
 	assert.Equal(t, result.FileCount, restarted.GetIndexer("repo").TotalDetected())
 
 	entries := logs.FilterMessage("daemon: reconciled repo from snapshot").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "census_noop", entries[0].ContextMap()["route"])
+}
+
+// TestReconcileRepoCtxRestagesStaleExtractorVersionsWithoutChurn pins #695:
+// a quiet non-Merkle repository whose persisted extractor-version snapshot is
+// behind the running binary must not take census_noop, which never consults
+// the snapshot. It must take the full-tree incremental route that restages the
+// stale languages and re-stamps the snapshot, after which the next restart is
+// a census_noop again.
+func TestReconcileRepoCtxRestagesStaleExtractorVersionsWithoutChurn(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "main.go"), "package sample\nfunc Alpha() {}\n")
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	cm := newTestConfigManager(t)
+	cm.Global().Repos = []config.RepoEntry{entry}
+
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+	_, err = seed.IndexAll()
+	require.NoError(t, err)
+	seedIdx := seed.GetIndexer("repo")
+	require.False(t, seedIdx.merkleEnabled())
+	prior := seedIdx.FileMtimes()
+	repoPrefix := seedIdx.repoPrefix
+
+	// Simulate a snapshot written by an older binary: no post-extraction
+	// policy epoch, so every tracked language is stale against this one.
+	state, found, err := store.GetRepoIndexState(repoPrefix)
+	require.NoError(t, err)
+	require.True(t, found)
+	legacy := extractorVersionsSnapshot()
+	delete(legacy, postExtractionPolicySnapshotKey)
+	encoded, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	state.ExtractorVersions = string(encoded)
+	require.NoError(t, store.SetRepoIndexState(state))
+	require.NotEmpty(t, ExtractorVersionStaleLangs(state.ExtractorVersions))
+
+	core, logs := observer.New(zap.DebugLevel)
+	restarted := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core))
+	result, err := restarted.ReconcileRepoCtx(t.Context(), entry, prior)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.GreaterOrEqual(t, result.StaleFileCount, 1,
+		"a stale extractor snapshot must restage unchanged source")
+
+	entries := logs.FilterMessage("daemon: reconciled repo from snapshot").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "incremental", entries[0].ContextMap()["route"])
+
+	state, found, err = store.GetRepoIndexState(repoPrefix)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Empty(t, ExtractorVersionStaleLangs(state.ExtractorVersions),
+		"the restage must re-stamp the snapshot so it fires once per bump")
+
+	core2, logs2 := observer.New(zap.DebugLevel)
+	again := NewMultiIndexer(graph.Store(store), newTestRegistry(), search.NewNull(), cm, zap.New(core2))
+	_, err = again.ReconcileRepoCtx(t.Context(), entry, restarted.GetIndexer("repo").FileMtimes())
+	require.NoError(t, err)
+	entries = logs2.FilterMessage("daemon: reconciled repo from snapshot").All()
 	require.Len(t, entries, 1)
 	assert.Equal(t, "census_noop", entries[0].ContextMap()["route"])
 }

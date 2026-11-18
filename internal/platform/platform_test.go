@@ -18,6 +18,17 @@ func TestProcessAlive(t *testing.T) {
 	}
 }
 
+func TestProcessExists(t *testing.T) {
+	if !ProcessExists(os.Getpid()) {
+		t.Error("ProcessExists(self) = false, want true")
+	}
+	for _, pid := range []int{0, -1} {
+		if ProcessExists(pid) {
+			t.Errorf("ProcessExists(%d) = true, want false", pid)
+		}
+	}
+}
+
 func TestShutdownSignals(t *testing.T) {
 	if len(ShutdownSignals()) == 0 {
 		t.Error("ShutdownSignals() returned no signals")

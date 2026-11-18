@@ -5,12 +5,54 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
+func TestFamilyRepoRootsAndPendingText(t *testing.T) {
+	registered := []string{"/registered", "/shared"}
+	configured := []string{"/unloaded", "/shared", " "}
+	got := FamilyRepoRoots(registered, configured)
+	want := []string{"/registered", "/shared", "/unloaded"}
+	if !reflect.DeepEqual(got, want) || registered[0] != "/registered" || configured[0] != "/unloaded" {
+		t.Fatalf("root union changed inputs or lost declaration: %v", got)
+	}
+	text := strings.ReplaceAll(PendingAutomaticCheckoutGuidance, "no reconnect is needed", "")
+	if strings.Contains(strings.ToLower(text), "reconnect") || !strings.Contains(text, "view_building") || strings.Contains(text, "repo_not_tracked") {
+		t.Fatalf("pending guidance gave a reconnect/untracked remedy: %s", text)
+	}
+}
+
+func TestNearestGitRootAbstainsAtUnknownNestedBoundary(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var inspected []string
+	got := nearestGitRootWithLstat(nested, func(path string) (os.FileInfo, error) {
+		inspected = append(inspected, path)
+		if path == filepath.Join(nested, ".git") {
+			return nil, &os.PathError{Op: "lstat", Path: path, Err: os.ErrPermission}
+		}
+		return os.Lstat(path)
+	})
+	if got != "" || len(inspected) != 1 {
+		t.Fatalf("unknown nested boundary fell through to known ancestor: root=%q probes=%v", got, inspected)
+	}
+	if got := nearestGitRoot(nested); got != root {
+		t.Fatalf("a genuinely absent nested .git should still find ancestor: %q", got)
+	}
+}
+
 func worktreeGuidanceGit(t testing.TB, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	gitArgs := append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GIT_CONFIG_GLOBAL=/dev/null",
@@ -112,6 +154,10 @@ func TestPendingAutomaticCheckoutMatchesBothFamilyDirections(t *testing.T) {
 
 	if !PendingAutomaticCheckout(nested, []string{main}) {
 		t.Fatal("linked worktree of a tracked family was not recognized as pending automatic discovery")
+	}
+	checkout, represented := AutomaticCheckoutFamily(nested, []string{"", main})
+	if checkout != linked || represented != main {
+		t.Fatalf("family lookup lost checkout or configured representative: %q %q", checkout, represented)
 	}
 	if !PendingAutomaticCheckout(main, []string{linked}) {
 		t.Fatal("primary checkout was not recognized when a linked checkout is the tracked family member")

@@ -33,6 +33,22 @@ func snapshotJSON(t *testing.T, overrides map[string]int, drop ...string) string
 // only their language, while a missing or behind global epoch restages every
 // real current language. An empty baseline remains fail-inert.
 func TestStaleLangsDetection(t *testing.T) {
+	t.Run("zero_initialized_go_declaration_upgrade", func(t *testing.T) {
+		if got := ExtractorVersionStaleLangs(snapshotJSON(t, map[string]int{"go": 3})); !reflect.DeepEqual(got, []string{"go"}) {
+			t.Fatalf("previous Go extraction must restage only Go: %v", got)
+		}
+		if got := ExtractorVersionStaleLangs(snapshotJSON(t, nil)); len(got) != 0 {
+			t.Fatalf("current extraction must remain stable: %v", got)
+		}
+	})
+
+	t.Run("contract_detection_upgrade", func(t *testing.T) {
+		old := snapshotJSON(t, map[string]int{"go": 4, "typescript": 2})
+		if got, want := ExtractorVersionStaleLangs(old), []string{"go", "typescript"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("previous contract extraction must restage only Go and TypeScript: got %v, want %v", got, want)
+		}
+	})
+
 	t.Run("only_behind_langs", func(t *testing.T) {
 		stored := map[string]int{"go": 1, "python": 2, "ruby": 1}
 		current := map[string]int{"go": 2, "python": 2, "ruby": 1, "rust": 3, "lua": 1}
@@ -219,12 +235,24 @@ func TestStaleLangsDetection(t *testing.T) {
 		}
 
 		policySalt := "_post_extraction_policy@2"
-		for _, path := range []string{"model.py", "Model.java", "model.rb", "model.ts", "schema.ex", "model.js"} {
+		for _, path := range []string{"model.py", "Model.java", "model.rb", "schema.ex"} {
 			if got := merkleSaltFor(path); got != policySalt {
 				t.Errorf("global policy salt for %s = %q, want %q", path, got, policySalt)
 			}
 		}
-		if got, want := merkleSaltFor("model.go"), policySalt+"|go@3"; got != want {
+		// Renamed per-binding JavaScript and TypeScript imports now persist
+		// import_alias Meta. Rows extracted before that keyed a renamed
+		// import by its original name, so stored files must re-extract once.
+		if got := ExtractorVersionStaleLangs(
+			snapshotJSON(t, map[string]int{"javascript": 1, "typescript": 1})); !reflect.DeepEqual(got, []string{"javascript", "typescript"}) {
+			t.Errorf("snapshot stored before import_alias = %v, want [javascript typescript]", got)
+		}
+		for path, want := range map[string]string{"model.js": policySalt + "|javascript@2", "model.ts": policySalt + "|typescript@3"} {
+			if got := merkleSaltFor(path); got != want {
+				t.Errorf("extractor salt for %s = %q, want %q", path, got, want)
+			}
+		}
+		if got, want := merkleSaltFor("model.go"), policySalt+"|go@5"; got != want {
 			t.Errorf("Go extractor salt = %q, want %q", got, want)
 		}
 

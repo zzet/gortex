@@ -65,12 +65,17 @@ const hitsIterations = 40
 //
 // then L2-normalises both vectors so the scores stay bounded. A nil
 // or empty graph yields an empty, safe-to-query result.
-func ComputeHITS(g graph.Store) *HITSResult {
+func ComputeHITS(g graph.Store) *HITSResult { return ComputeHITSPaced(g, nil) }
+
+// ComputeHITSPaced is ComputeHITS with a cooperative scheduling point in every
+// hot loop (see Pace). A nil Pace never parks.
+func ComputeHITSPaced(g graph.Store, pace *Pace) *HITSResult {
 	if g == nil {
 		return &HITSResult{Authorities: map[string]float64{}, Hubs: map[string]float64{}}
 	}
 	ids := make([]string, 0, g.NodeCount())
 	for node := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
 			ids = append(ids, node.ID)
 		}
@@ -93,6 +98,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 	// Meta-less kind-scoped scan (see LightEdgeScanner): only e.Kind, endpoints,
 	// and graph.ProvenanceWeight are read here.
 	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
+		pace.Tick()
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
@@ -116,6 +122,7 @@ func ComputeHITS(g graph.Store) *HITSResult {
 		// scores of the nodes pointing at it.
 		nextAuth := make(map[string]float64, n)
 		for _, id := range ids {
+			pace.Tick()
 			var sum float64
 			for _, src := range inLinks[id] {
 				sum += src.w * hub[src.id]
@@ -126,14 +133,15 @@ func ComputeHITS(g graph.Store) *HITSResult {
 		// updated) authority scores of the nodes it points at.
 		nextHub := make(map[string]float64, n)
 		for _, id := range ids {
+			pace.Tick()
 			var sum float64
 			for _, dst := range outLinks[id] {
 				sum += dst.w * nextAuth[dst.id]
 			}
 			nextHub[id] = sum
 		}
-		normalizeL2(nextAuth)
-		normalizeL2(nextHub)
+		normalizeL2(nextAuth, ids)
+		normalizeL2(nextHub, ids)
 		auth, hub = nextAuth, nextHub
 	}
 
@@ -154,9 +162,12 @@ func ComputeHITS(g graph.Store) *HITSResult {
 // normalizeL2 scales a score vector in place to unit L2 norm. A
 // zero vector (no edges in the participating set) is left untouched
 // so the next iteration starts from a defined state.
-func normalizeL2(m map[string]float64) {
+func normalizeL2(m map[string]float64, ids []string) {
 	var sumSq float64
-	for _, v := range m {
+	// Use the same node order as the updates so replaying an ordered input
+	// also reproduces the floating-point normalization exactly.
+	for _, id := range ids {
+		v := m[id]
 		sumSq += v * v
 	}
 	if sumSq == 0 {

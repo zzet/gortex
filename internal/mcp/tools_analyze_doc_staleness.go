@@ -50,8 +50,8 @@ func analyzeDocStaleness(g graph.Reader, limit int) docStalenessResult {
 	}
 	bySource := map[string]*acc{}
 	assessed := 0
-	for _, e := range g.AllEdges() {
-		if e == nil || e.Kind != graph.EdgeMotivates {
+	for e := range g.EdgesByKind(graph.EdgeMotivates) {
+		if e == nil {
 			continue
 		}
 		assessed++
@@ -163,8 +163,8 @@ func (s *Server) handleAnalyzeDocStaleness(ctx context.Context, req mcp.CallTool
 		// Recompute assessed_links as the in-scope motivates edges —
 		// those whose knowledge source node is visible.
 		assessed := 0
-		for _, e := range reader.AllEdges() {
-			if e == nil || e.Kind != graph.EdgeMotivates {
+		for e := range reader.EdgesByKind(graph.EdgeMotivates) {
+			if e == nil {
 				continue
 			}
 			if s.analyzeNodeVisible(ctx, reader.GetNode(e.From)) {

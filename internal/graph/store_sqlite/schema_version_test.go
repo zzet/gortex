@@ -130,11 +130,10 @@ func TestOpenPreVersionStoreRequiresRebuild(t *testing.T) {
 	}
 }
 
-// TestOpenRebuildsNewerDB: a store written by a NEWER build (user_version above
-// current) cannot be trusted, so Open drops and rebuilds it — the data is gone
-// and the version is re-stamped to current. Proves the wipe path (and that the
-// -wal/-shm companions are cleared along with the main file).
-func TestOpenRebuildsNewerDB(t *testing.T) {
+// TestOpenRefusesNewerDBEvenWithRebuild: WithRebuild permits known older-schema
+// rebuilds, not destructive downgrades. A newer database must remain intact and
+// return a typed refusal so the caller can select a compatible binary.
+func TestOpenRefusesNewerDBEvenWithRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 
 	s, err := Open(path)
@@ -153,24 +152,38 @@ func TestOpenRebuildsNewerDB(t *testing.T) {
 		}
 	})
 
-	s2, err := Open(path, WithRebuild()) // simulate the daemon: holds the lock, may rebuild
-	if err != nil {
-		t.Fatalf("reopen newer DB: %v", err)
+	s2, err := Open(path, WithRebuild()) // even the exclusive daemon must not downgrade
+	if s2 != nil {
+		defer s2.Close()
+		t.Fatal("newer database unexpectedly returned an open store")
 	}
-	defer s2.Close()
-	if v, _ := readUserVersion(s2.db); v != currentSchemaVersion {
-		t.Fatalf("user_version after rebuild = %d, want %d", v, currentSchemaVersion)
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Fatalf("reopen newer DB = %v, want ErrSchemaTooNew", err)
 	}
-	if n := nodeCount(t, s2.db); n != 0 {
-		t.Fatalf("node count after rebuild = %d, want 0 (newer DB must be wiped)", n)
+	var tooNew *SchemaTooNewError
+	if !errors.As(err, &tooNew) || tooNew.Stored != 999 || tooNew.Supported != currentSchemaVersion {
+		t.Fatalf("newer DB refusal = %#v, want stored 999 / supported %d", tooNew, currentSchemaVersion)
 	}
+	withRawDB(t, path, func(db *sql.DB) {
+		if v, err := readUserVersion(db); err != nil || v != 999 {
+			t.Fatalf("user_version after refusal = %d (err %v), want 999", v, err)
+		}
+		if n := nodeCount(t, db); n != 1 {
+			t.Fatalf("node count after refusal = %d, want 1", n)
+		}
+		var kind, name, file string
+		if err := db.QueryRow(`SELECT kind, name, file_path FROM nodes WHERE id = 'n1'`).Scan(&kind, &name, &file); err != nil {
+			t.Fatalf("read preserved node: %v", err)
+		}
+		if kind != "func" || name != "Foo" || file != "f.go" {
+			t.Fatalf("node after refusal = (%q, %q, %q), want (func, Foo, f.go)", kind, name, file)
+		}
+	})
 }
 
-// TestOpenRefusesWipeWithoutOptIn: the default Open must NOT destroy an
-// incompatible on-disk database. Without WithRebuild it returns
-// ErrSchemaRebuildRequired and leaves the file (and its rows) intact, so a
-// caller that does not hold the store lock cannot silently corrupt a store
-// another process may have open.
+// TestOpenRefusesWipeWithoutOptIn: the default Open must NOT destroy a newer
+// on-disk database. It returns ErrSchemaTooNew and leaves the file and its rows
+// intact, so a caller cannot silently downgrade another build's store.
 func TestOpenRefusesWipeWithoutOptIn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 	s, err := Open(path)
@@ -189,8 +202,13 @@ func TestOpenRefusesWipeWithoutOptIn(t *testing.T) {
 		}
 	})
 
-	if _, err := Open(path); !errors.Is(err, ErrSchemaRebuildRequired) {
-		t.Fatalf("Open without WithRebuild = %v, want ErrSchemaRebuildRequired", err)
+	refused, err := Open(path)
+	if refused != nil {
+		defer refused.Close()
+		t.Fatal("newer database unexpectedly returned an open store")
+	}
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Fatalf("Open without WithRebuild = %v, want ErrSchemaTooNew", err)
 	}
 	withRawDB(t, path, func(db *sql.DB) {
 		if n := nodeCount(t, db); n != 1 {
@@ -219,18 +237,28 @@ func TestPlanSchemaMigration(t *testing.T) {
 		wantWipe        bool
 		wantStamp       bool
 		wantInPlace     int
+		wantErr         error
 	}{
-		{"up to date", 1, 1, nil, false, false, 0},
-		{"fresh at v1 baseline-stamps", 0, 1, nil, false, true, 0},
-		{"newer DB rebuilds", 2, 1, nil, true, true, 0},
-		{"v0 with only in-place pending upgrades in place, no wipe", 0, 2, []schemaMigration{inPlace}, false, true, 1},
-		{"v0 with a pending rebuild wipes", 0, 2, []schemaMigration{rebuild}, true, true, 0},
-		{"v1->v2 in-place", 1, 2, []schemaMigration{inPlace}, false, true, 1},
-		{"v1->v2 rebuild", 1, 2, []schemaMigration{rebuild}, true, true, 0},
+		{"up to date", 1, 1, nil, false, false, 0, nil},
+		{"fresh at v1 baseline-stamps", 0, 1, nil, false, true, 0, nil},
+		{"newer DB refuses without wipe or stamp", 2, 1, nil, false, false, 0, ErrSchemaTooNew},
+		{"v0 with only in-place pending upgrades in place, no wipe", 0, 2, []schemaMigration{inPlace}, false, true, 1, nil},
+		{"v0 with a pending rebuild wipes", 0, 2, []schemaMigration{rebuild}, true, true, 0, nil},
+		{"v1->v2 in-place", 1, 2, []schemaMigration{inPlace}, false, true, 1, nil},
+		{"v1->v2 rebuild", 1, 2, []schemaMigration{rebuild}, true, true, 0, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := planSchemaMigrationWith(c.stored, c.current, c.migs)
+			if !errors.Is(got.err, c.wantErr) {
+				t.Fatalf("plan(%d->%d) error = %v, want %v", c.stored, c.current, got.err, c.wantErr)
+			}
+			if c.wantErr != nil {
+				var tooNew *SchemaTooNewError
+				if !errors.As(got.err, &tooNew) || tooNew.Stored != c.stored || tooNew.Supported != c.current {
+					t.Fatalf("plan(%d->%d) refusal = %#v, want matching stored/supported versions", c.stored, c.current, tooNew)
+				}
+			}
 			if got.wipe != c.wantWipe || got.stamp != c.wantStamp || len(got.inPlace) != c.wantInPlace {
 				t.Fatalf("plan(%d->%d) = {wipe:%v stamp:%v inPlace:%d}, want {wipe:%v stamp:%v inPlace:%d}",
 					c.stored, c.current, got.wipe, got.stamp, len(got.inPlace), c.wantWipe, c.wantStamp, c.wantInPlace)
@@ -696,8 +724,9 @@ func TestOpenWithMemoryUnderWipePlanStampsWithoutError(t *testing.T) {
 	}
 }
 
-// TestNeedsRebuildSignalAfterWipe: a store written by a newer build is wiped on
-// open and reports NeedsRebuild so the daemon forces a full re-index.
+// TestNeedsRebuildSignalAfterWipe: an explicitly permitted older v2 rebuild
+// reports NeedsRebuild so the daemon forces a full re-index. Future schemas
+// must be refused instead and are covered by the newer-schema tests above.
 func TestNeedsRebuildSignalAfterWipe(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite")
 	s, err := Open(path)
@@ -708,13 +737,13 @@ func TestNeedsRebuildSignalAfterWipe(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	withRawDB(t, path, func(db *sql.DB) {
-		if _, err := db.Exec(`PRAGMA user_version = 999`); err != nil {
-			t.Fatalf("set future version: %v", err)
+		if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+			t.Fatalf("set older v2 version: %v", err)
 		}
 	})
 	s2, err := Open(path, WithRebuild()) // daemon-equivalent: lock held, rebuild permitted
 	if err != nil {
-		t.Fatalf("reopen newer DB: %v", err)
+		t.Fatalf("reopen older v2 DB: %v", err)
 	}
 	defer s2.Close()
 	if !s2.NeedsRebuild() {

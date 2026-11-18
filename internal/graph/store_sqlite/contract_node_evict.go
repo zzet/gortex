@@ -67,7 +67,7 @@ func (s *Store) EvictContractNodesByIDs(ids []string) (nodesRemoved, edgesRemove
 		contractIDs := `SELECT id FROM nodes WHERE kind = 'contract' AND id IN (` + placeholders + `) AND view_gen = ?`
 		edgeArgs := append(append([]any{}, args...), s.viewGen)
 		for _, column := range []string{"from_id", "to_id"} {
-			result, execErr := tx.Exec(`DELETE FROM edges WHERE `+column+` IN (`+contractIDs+`) AND view_gen = ?`, edgeArgs...)
+			result, execErr := countEdgeWrite(tx.Exec(`DELETE FROM edges WHERE `+column+` IN (`+contractIDs+`) AND view_gen = ?`, edgeArgs...))
 			if execErr != nil {
 				panicOnFatal(execErr)
 				return 0, edgesRemoved
@@ -79,7 +79,7 @@ func (s *Store) EvictContractNodesByIDs(ids []string) (nodesRemoved, edgesRemove
 			}
 			edgesRemoved += int(rows)
 		}
-		result, execErr := tx.Exec(`DELETE FROM nodes WHERE kind = 'contract' AND id IN (`+placeholders+`) AND view_gen = ?`, args...)
+		result, execErr := countNodeWrite(tx.Exec(`DELETE FROM nodes WHERE kind = 'contract' AND id IN (`+placeholders+`) AND view_gen = ?`, args...))
 		if execErr != nil {
 			panicOnFatal(execErr)
 			return nodesRemoved, edgesRemoved

@@ -199,7 +199,15 @@ func (s *Store) dataflowLightEdgesByNodeIDs(
 	for start := 0; start < len(uniq); start += lookupChunkSize {
 		end := minInt(start+lookupChunkSize, len(uniq))
 		chunk := uniq[start:end]
-		query := `SELECT ` + edgeColsLight + ` FROM edges WHERE ` + column + ` IN (` +
+		// The index is named: (view_gen, <column>, kind) seeks every id of
+		// the chunk. Left to the planner, a store whose statistics are stale
+		// or missing drives from edges_by_generation on view_gen alone — every
+		// edge of the generation, once per chunk.
+		index := "edges_by_from"
+		if column == "to_id" {
+			index = "edges_by_to"
+		}
+		query := `SELECT ` + edgeColsLight + ` FROM edges INDEXED BY ` + index + ` WHERE ` + column + ` IN (` +
 			inPlaceholders(len(chunk)) + `) AND kind = ? AND view_gen = ? ORDER BY id`
 		args := toAnyArgs(chunk)
 		args = append(args, string(kind), s.viewGen)

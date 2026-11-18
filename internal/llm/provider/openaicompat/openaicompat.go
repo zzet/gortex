@@ -61,10 +61,10 @@ const DefaultMaxTokensField = "max_completion_tokens"
 // llm.Provider directly: the openai / azure / custom constructors each
 // build a configured Client and return it.
 type Client struct {
-	// ProviderID is the provider identifier returned by Name() and used
-	// to pick the prompt tier (see llm.ProfileForProvider). For Azure
-	// and custom OpenAI-compatible endpoints this is "azure" / "custom"
-	// so they inherit the frontier prompt tier.
+	// ProviderID is the provider identifier returned by Name(). For
+	// Azure and custom OpenAI-compatible endpoints this is "azure" /
+	// "custom"; a custom endpoint's prompt tier comes from its
+	// prompt_profile (see llm.ProfileFor), not from this name.
 	ProviderID string
 	// Tag is the short label used in the exhausted-retry error message
 	// and httpx diagnostics. May be more specific than Name (e.g.

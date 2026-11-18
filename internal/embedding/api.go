@@ -180,6 +180,33 @@ func isHTTPSHost(rawURL string, hosts []string) bool {
 	return false
 }
 
+// ValidateEmbeddingAPIURL rejects a configured embedding endpoint that isn't
+// a clear, routable http(s) request. A non-http(s) scheme (file://,
+// gopher://, unix://) can't carry the OpenAI-compatible embedding request,
+// and link-local or unspecified hosts — e.g. the AWS metadata endpoint
+// 169.254.169.254, or an attacker pointing a repo-local api_url at
+// 0.0.0.0/169.254.x — would let the daemon reach a target it can't control
+// and hit the cloud metadata service. Loopback (for Ollama) and private/VPC
+// hosts stay allowed, since they aren't the unreachable-from-nowhere exfil
+// targets link-local cloud metadata is.
+func ValidateEmbeddingAPIURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("embedding base url %q: %w", rawURL, err)
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("embedding base url %q: scheme must be http or https, got %q", rawURL, u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("embedding base url %q: missing host", rawURL)
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+		return fmt.Errorf("embedding base url %q: refusing link-local or unspecified host %q", rawURL, host)
+	}
+	return nil
+}
+
 func (p *APIProvider) Embed(ctx context.Context, text string) ([]float32, error) {
 	vecs, err := p.EmbedBatch(ctx, []string{text})
 	if err != nil {

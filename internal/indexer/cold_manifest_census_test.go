@@ -472,7 +472,7 @@ func TestColdDeferredCohortRetainsRegisteredUniverseScope(t *testing.T) {
 	mi.mu.Unlock()
 	// The explicit cold route is valid only while this cohort's lane is
 	// held. The two other registered Indexers are not admitted as work.
-	err := idx.coordinateRepositoryMutation(context.Background(), func() error {
+	err := idx.coordinateRepositoryMutation(context.Background(), OutputEntryIndexFile, func() error {
 		run := mi.beginDeferredPasses(context.Background(), nil, []*Indexer{idx}, true)
 		defer run.FinishTailResult()
 		require.Len(t, run.workIndexers, 1)
@@ -777,7 +777,7 @@ func TestColdScopedDeferredTailPreservesUnselectedAttempt(t *testing.T) {
 	// This is the actual cold orchestration entry whose sorted lane set only
 	// contains "selected". The previously registered "overlap" repository's
 	// lane is not part of this batch, despite its pending deferred contracts.
-	results, err := mi.indexMultiRepo([]config.RepoEntry{{Path: selectedRoot, Name: "selected"}})
+	results, err := mi.indexFixtureRepos([]config.RepoEntry{{Path: selectedRoot, Name: "selected"}})
 	require.NoError(t, err)
 	require.Contains(t, results, "selected")
 	assert.Same(t, registry, unselected.pendingContractReg,

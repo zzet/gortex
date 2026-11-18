@@ -111,83 +111,82 @@ func (v *lspGraphView) addEdges(edges []*graph.Edge) {
 }
 
 func (v *lspGraphView) matchNodeByFileLine(filePath string, line int) *graph.Node {
-	filePath = viewPathKey(filePath)
-	var best *graph.Node
-	bestSize := int(^uint(0) >> 1)
-	for _, n := range v.nodesByFile[filePath] {
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		if n.StartLine <= line && line <= n.EndLine {
-			size := n.EndLine - n.StartLine
-			if size < bestSize {
-				best = n
-				bestSize = size
-			}
-		}
-	}
-	if best != nil {
-		return best
-	}
-	bestDist := int(^uint(0) >> 1)
-	for _, n := range v.nodesByFile[filePath] {
-		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
-			continue
-		}
-		dist := lspAbs(n.StartLine - line)
-		if dist < bestDist {
-			best = n
-			bestDist = dist
-		}
-	}
-	if bestDist <= 2 {
-		return best
-	}
-	return nil
+	return v.matchNodeAt(filePath, lineSite(line))
 }
 
 func (v *lspGraphView) matchCallableByFileLine(filePath string, line int) *graph.Node {
-	filePath = viewPathKey(filePath)
-	callable := func(k graph.NodeKind) bool {
+	return v.matchCallableAt(filePath, lineSite(line))
+}
+
+// matchNodeAt returns the innermost non-file / non-import node whose span
+// contains site, or the nearest one starting within two lines of it.
+func (v *lspGraphView) matchNodeAt(filePath string, site lspSite) *graph.Node {
+	return v.matchInnermostAt(filePath, site, func(k graph.NodeKind) bool {
+		return k != graph.KindFile && k != graph.KindImport
+	})
+}
+
+// matchCallableAt is matchNodeAt restricted to callables — the owner of a
+// call site or the target of a call-hierarchy hop.
+func (v *lspGraphView) matchCallableAt(filePath string, site lspSite) *graph.Node {
+	return v.matchInnermostAt(filePath, site, func(k graph.NodeKind) bool {
 		return k == graph.KindFunction || k == graph.KindMethod || k == graph.KindClosure
-	}
-	var best *graph.Node
+	})
+}
+
+// matchInnermostAt picks the accepted node with the smallest line span
+// containing site.line, falling back to the nearest start within two lines.
+// Spans are line-granular, so several members sharing a line tie; the tie is
+// broken by disambiguateSameLine from the site's column and item name, and
+// an unbreakable tie matches nothing.
+func (v *lspGraphView) matchInnermostAt(filePath string, site lspSite, accept func(graph.NodeKind) bool) *graph.Node {
+	nodes := v.nodesByFile[viewPathKey(filePath)]
+	var tied []*graph.Node
 	bestSize := int(^uint(0) >> 1)
-	for _, n := range v.nodesByFile[filePath] {
-		if !callable(n.Kind) {
+	for _, n := range nodes {
+		if !accept(n.Kind) || n.StartLine > site.line || site.line > n.EndLine {
 			continue
 		}
-		if n.StartLine <= line && line <= n.EndLine {
-			size := n.EndLine - n.StartLine
-			if size < bestSize {
-				best = n
-				bestSize = size
-			}
+		size := n.EndLine - n.StartLine
+		switch {
+		case size < bestSize:
+			tied, bestSize = []*graph.Node{n}, size
+		case size == bestSize:
+			tied = append(tied, n)
 		}
 	}
-	if best != nil {
-		return best
+	if len(tied) > 0 {
+		return disambiguateSameLine(tied, site)
 	}
 	bestDist := int(^uint(0) >> 1)
-	for _, n := range v.nodesByFile[filePath] {
-		if !callable(n.Kind) {
+	for _, n := range nodes {
+		if !accept(n.Kind) {
 			continue
 		}
-		dist := lspAbs(n.StartLine - line)
-		if dist < bestDist {
-			best = n
-			bestDist = dist
+		dist := lspAbs(n.StartLine - site.line)
+		switch {
+		case dist < bestDist:
+			tied, bestDist = []*graph.Node{n}, dist
+		case dist == bestDist:
+			tied = append(tied, n)
 		}
 	}
 	if bestDist <= 2 {
-		return best
+		return disambiguateSameLine(tied, site)
 	}
 	return nil
 }
 
+// findDeclarationNode locates the node declared as name at (filePath,
+// oneBasedLine). Exact StartLine match wins; a ±1 slack covers servers that
+// anchor the definition on the identifier line of a multi-line declaration
+// header. Several same-named declarations starting on the answered line —
+// `class Leaf { serialize() {} } class Box { serialize() {} }` — cannot be
+// told apart by line, so that answer matches nothing rather than whichever
+// one the file listed first.
 func (v *lspGraphView) findDeclarationNode(filePath string, oneBasedLine int, name string) *graph.Node {
 	filePath = viewPathKey(filePath)
-	var near *graph.Node
+	var exact, near *graph.Node
 	for _, n := range v.nodesByFile[filePath] {
 		if n == nil || n.Name != name {
 			continue
@@ -196,11 +195,18 @@ func (v *lspGraphView) findDeclarationNode(filePath string, oneBasedLine int, na
 			continue
 		}
 		if n.StartLine == oneBasedLine {
-			return n
+			if exact != nil && exact.ID != n.ID {
+				return nil
+			}
+			exact = n
+			continue
 		}
 		if near == nil && n.StartLine >= oneBasedLine-1 && n.StartLine <= oneBasedLine+1 {
 			near = n
 		}
+	}
+	if exact != nil {
+		return exact
 	}
 	return near
 }

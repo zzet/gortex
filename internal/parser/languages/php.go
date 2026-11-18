@@ -1102,6 +1102,8 @@ func (e *PHPExtractor) emitPHPCallSiteEdges(
 				if obj != nil {
 					if rt := env.phpReceiverTypeFor(obj, src); rt != "" {
 						edge.Meta = map[string]any{"receiver_type": rt}
+					} else if property := env.phpPropertyReceiver(obj, src); property != nil {
+						edge.Meta = property
 					} else {
 						// Chained-factory receiver: `make()->with()->build()` --
 						// carry the receiver object (`->` normalised to `.`) so

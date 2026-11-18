@@ -356,6 +356,13 @@ func fillImpactLive(ctx context.Context, g graph.Reader, result *ImpactResult, s
 	}
 }
 
+// impactReachReader is a request reader that hides part of a store's
+// adjacency yet can run the bounded reach traversal over the edges it shows.
+// hit=false sends impact to the live walk, as a store's miss does.
+type impactReachReader interface {
+	ImpactReachContext(ctx context.Context, seedID string) (d1, d2, d3 []reach.Entry, hit, truncated bool)
+}
+
 // fillImpactFromReach is the indexed fast path. Returns false if any seed
 // cannot produce a complete reach record — the caller must then run
 // fillImpactLive. A merely stamped but incomplete record is never a hit.
@@ -372,16 +379,24 @@ func fillImpactLive(ctx context.Context, g graph.Reader, result *ImpactResult, s
 //
 // The reach index is built over the base corpus and is keyed off node Meta
 // plus the store's resolve mutex, so it is only consulted when the reader is
-// the base store itself. A reader that layers unsaved edits over the base
-// (a request overlay view) is not a store, and the miss sends the caller to
+// the base store itself. A reader that only hides some of the base store's
+// edges runs the same bounded traversal over the edges it shows through
+// impactReachReader. A reader that layers unsaved edits over the base (a
+// request overlay view) is neither, and the miss sends the caller to
 // fillImpactLive, which walks the reader's own edges and so reflects the
 // layered state.
 func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResult, symbolIDs []string) bool {
 	if len(symbolIDs) == 0 {
 		return true
 	}
-	g, ok := r.(graph.Store)
-	if !ok {
+	var lookup func(context.Context, string) (d1, d2, d3 []reach.Entry, hit, truncated bool)
+	if g, ok := r.(graph.Store); ok {
+		lookup = func(ctx context.Context, seedID string) (d1, d2, d3 []reach.Entry, hit, truncated bool) {
+			return reach.LookupContext(ctx, g, seedID)
+		}
+	} else if filtered, ok := r.(impactReachReader); ok {
+		lookup = filtered.ImpactReachContext
+	} else {
 		return false
 	}
 	// Single-seed shortcut. The precomputed tier slices are already
@@ -393,7 +408,7 @@ func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResu
 	// generic path).
 	if len(symbolIDs) == 1 {
 		seedID := symbolIDs[0]
-		d1, d2, d3, hit, truncated := reach.LookupContext(ctx, g, seedID)
+		d1, d2, d3, hit, truncated := lookup(ctx, seedID)
 		result.Truncated = result.Truncated || truncated
 		if !hit {
 			if truncated {
@@ -422,7 +437,7 @@ func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResu
 			for i := range selected {
 				ids[i] = selected[i].ID
 			}
-			nodes, err := getImpactNodesContext(ctx, g, ids)
+			nodes, err := getImpactNodesContext(ctx, r, ids)
 			if err != nil {
 				result.Truncated = true
 				return true
@@ -458,7 +473,7 @@ func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResu
 
 	perSeed := make([][3][]reach.Entry, len(symbolIDs))
 	for i, id := range symbolIDs {
-		d1, d2, d3, hit, truncated := reach.LookupContext(ctx, g, id)
+		d1, d2, d3, hit, truncated := lookup(ctx, id)
 		result.Truncated = result.Truncated || truncated
 		if !hit {
 			if truncated {
@@ -500,7 +515,7 @@ func fillImpactFromReach(ctx context.Context, r graph.Reader, result *ImpactResu
 		for i := range tier {
 			ids[i] = tier[i].ID
 		}
-		nodes, err := getImpactNodesContext(ctx, g, ids)
+		nodes, err := getImpactNodesContext(ctx, r, ids)
 		if err != nil {
 			result.Truncated = true
 			return true

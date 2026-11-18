@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -105,33 +106,34 @@ type sqliteAddBatchStats struct {
 // probe and every subsequent AddBatch transaction observe the same limit.
 // The hard cap is a memory policy, not a SQLite assumption.
 func (s *Store) sqliteBatchVariableLimitLocked() int {
-	if s.batchVariableLimit > 0 {
-		return s.batchVariableLimit
-	}
+	limit, _ := s.sqliteBatchVariableLimitLockedContext(context.Background())
+	return limit
+}
 
+func (s *Store) sqliteBatchVariableLimitLockedContext(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.batchVariableLimit > 0 {
+		return s.batchVariableLimit, nil
+	}
 	limit := sqliteFallbackVariableLimit
-	conn := s.bulkConn
-	release := false
-	if conn == nil {
-		var err error
-		conn, err = s.writerDB.Conn(context.Background())
-		if err == nil {
-			release = true
-		}
+	conn, release, err := s.acquireWriteConnContext(ctx)
+	if err != nil {
+		return limit, err
 	}
-	if conn != nil {
-		if observed, err := modernsqlite.Limit(conn, int(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER), -1); err == nil && observed > 0 {
-			limit = observed
-		}
+	observed, probeErr := modernsqlite.Limit(conn, int(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER), -1)
+	if err := errors.Join(ctx.Err(), release()); err != nil {
+		return limit, err
 	}
-	if release {
-		_ = conn.Close()
+	if probeErr == nil && observed > 0 {
+		limit = observed
 	}
 	if limit > sqliteBatchVariableHardCap {
 		limit = sqliteBatchVariableHardCap
 	}
 	s.batchVariableLimit = limit
-	return limit
+	return limit, nil
 }
 
 func batchRowsForVariableLimit(variableLimit, paramsPerRow, maxRows int) int {
@@ -253,6 +255,16 @@ func insertNodeChunksTx(tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnCh
 }
 
 func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnChanged bool, variableLimit *int) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+	return insertNodeChunksTxWithConflict(tx, viewGen, nodes, returnChanged, variableLimit, nodeUpsertClause)
+}
+
+// Generated fallback sentinels use DO NOTHING rather than the real-node upsert:
+// materialization must never replace an explicit or already stored node.
+func insertNodeChunksTxWithConflict(tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnChanged bool, variableLimit *int, conflict string) (rowsChanged, statements int, changedIDs map[string]int, err error) {
+	return insertNodeChunksTxWithConflictContext(context.Background(), tx, viewGen, nodes, returnChanged, variableLimit, conflict)
+}
+
+func insertNodeChunksTxWithConflictContext(ctx context.Context, tx *sql.Tx, viewGen int64, nodes []*graph.Node, returnChanged bool, variableLimit *int, conflict string) (rowsChanged, statements int, changedIDs map[string]int, err error) {
 	if returnChanged {
 		changedIDs = make(map[string]int)
 	}
@@ -265,16 +277,22 @@ func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, r
 	var fullStmt *sql.Stmt
 	defer func() {
 		if fullStmt != nil {
-			_ = fullStmt.Close()
+			err = errors.Join(err, fullStmt.Close())
 		}
 	}()
 
 	for pos := 0; pos < len(nodes); {
+		if err := ctx.Err(); err != nil {
+			return rowsChanged, statements, changedIDs, err
+		}
 		chunkStart := pos
 		chunk := make([]*graph.Node, 0, rowLimit)
 		args := make([]any, 0, rowLimit*nodeInsertParams)
 		argBytes := 0
 		for pos < len(nodes) && len(chunk) < rowLimit {
+			if err := ctx.Err(); err != nil {
+				return rowsChanged, statements, changedIDs, err
+			}
 			node := nodes[pos]
 			if node == nil || node.ID == "" || graph.IsProxyNode(node) {
 				pos++
@@ -297,7 +315,7 @@ func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, r
 			continue
 		}
 
-		query := `INSERT INTO nodes (` + nodeInsertColumns + `) VALUES ` + multiValues(len(chunk), nodeInsertParams) + nodeUpsertClause
+		query := `INSERT INTO nodes (` + nodeInsertColumns + `) VALUES ` + multiValues(len(chunk), nodeInsertParams) + conflict
 		if returnChanged {
 			query += ` RETURNING id`
 		}
@@ -319,7 +337,7 @@ func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, r
 		var stmt *sql.Stmt
 		if len(chunk) == rowLimit {
 			if fullStmt == nil {
-				fullStmt, err = tx.Prepare(query)
+				fullStmt, err = tx.PrepareContext(ctx, query)
 				if err != nil {
 					if retryAtLowerLimit(err) {
 						continue
@@ -331,11 +349,12 @@ func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, r
 		}
 
 		if returnChanged {
+			rowsAt := rowsChanged
 			var rows *sql.Rows
 			if stmt != nil {
-				rows, err = stmt.Query(args...)
+				rows, err = stmt.QueryContext(ctx, args...)
 			} else {
-				rows, err = tx.Query(query, args...)
+				rows, err = tx.QueryContext(ctx, query, args...)
 			}
 			if err != nil {
 				if retryAtLowerLimit(err) {
@@ -359,14 +378,15 @@ func insertNodeChunksTxLimited(tx *sql.Tx, viewGen int64, nodes []*graph.Node, r
 			if closeErr := rows.Close(); closeErr != nil {
 				return rowsChanged, statements, changedIDs, closeErr
 			}
+			nodeRowsWritten.Add(int64(rowsChanged - rowsAt))
 			continue
 		}
 
 		var result sql.Result
 		if stmt != nil {
-			result, err = stmt.Exec(args...)
+			result, err = countNodeWrite(stmt.ExecContext(ctx, args...))
 		} else {
-			result, err = tx.Exec(query, args...)
+			result, err = countNodeWrite(tx.ExecContext(ctx, query, args...))
 		}
 		if err != nil {
 			if retryAtLowerLimit(err) {
@@ -389,6 +409,10 @@ func insertEdgeChunksTx(tx *sql.Tx, viewGen int64, edges []*graph.Edge, returnIn
 }
 
 func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, returnInserted bool, variableLimit *int) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
+	return insertEdgeChunksTxLimitedContext(context.Background(), tx, viewGen, edges, returnInserted, variableLimit)
+}
+
+func insertEdgeChunksTxLimitedContext(ctx context.Context, tx *sql.Tx, viewGen int64, edges []*graph.Edge, returnInserted bool, variableLimit *int) (rowsInserted, statements int, insertedKeys map[sqliteEdgeIdentity]int, err error) {
 	if returnInserted {
 		insertedKeys = make(map[sqliteEdgeIdentity]int)
 	}
@@ -401,16 +425,22 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, r
 	var fullStmt *sql.Stmt
 	defer func() {
 		if fullStmt != nil {
-			_ = fullStmt.Close()
+			err = errors.Join(err, fullStmt.Close())
 		}
 	}()
 
 	for pos := 0; pos < len(edges); {
+		if err := ctx.Err(); err != nil {
+			return rowsInserted, statements, insertedKeys, err
+		}
 		chunkStart := pos
 		chunk := make([]*graph.Edge, 0, rowLimit)
 		args := make([]any, 0, rowLimit*edgeInsertParams)
 		argBytes := 0
 		for pos < len(edges) && len(chunk) < rowLimit {
+			if err := ctx.Err(); err != nil {
+				return rowsInserted, statements, insertedKeys, err
+			}
 			edge := edges[pos]
 			if edge == nil || graph.IsProxyID(edge.From) || graph.IsProxyID(edge.To) {
 				pos++
@@ -455,7 +485,7 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, r
 		var stmt *sql.Stmt
 		if len(chunk) == rowLimit {
 			if fullStmt == nil {
-				fullStmt, err = tx.Prepare(query)
+				fullStmt, err = tx.PrepareContext(ctx, query)
 				if err != nil {
 					if retryAtLowerLimit(err) {
 						continue
@@ -467,11 +497,12 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, r
 		}
 
 		if returnInserted {
+			rowsAt := rowsInserted
 			var rows *sql.Rows
 			if stmt != nil {
-				rows, err = stmt.Query(args...)
+				rows, err = stmt.QueryContext(ctx, args...)
 			} else {
-				rows, err = tx.Query(query, args...)
+				rows, err = tx.QueryContext(ctx, query, args...)
 			}
 			if err != nil {
 				if retryAtLowerLimit(err) {
@@ -495,14 +526,15 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, r
 			if closeErr := rows.Close(); closeErr != nil {
 				return rowsInserted, statements, insertedKeys, closeErr
 			}
+			edgeRowsWritten.Add(int64(rowsInserted - rowsAt))
 			continue
 		}
 
 		var result sql.Result
 		if stmt != nil {
-			result, err = stmt.Exec(args...)
+			result, err = countEdgeWrite(stmt.ExecContext(ctx, args...))
 		} else {
-			result, err = tx.Exec(query, args...)
+			result, err = countEdgeWrite(tx.ExecContext(ctx, query, args...))
 		}
 		if err != nil {
 			if retryAtLowerLimit(err) {
@@ -519,8 +551,34 @@ func insertEdgeChunksTxLimited(tx *sql.Tx, viewGen int64, edges []*graph.Edge, r
 	return rowsInserted, statements, insertedKeys, nil
 }
 
+// SetBatchWriteHookForTest installs a hook every AddBatch-family write on this
+// store calls inside its transaction, under the write gate and before any row
+// is written, with the batch's node and edge counts. A returned error fails the
+// batch exactly as a failed insert would (the transaction rolls back and the
+// error reaches the caller the way that caller reports storage errors); a panic
+// unwinds the batch the same way. The hook runs under the write gate, so it
+// must not call the store's write methods. restore puts the previous hook back.
+func (s *Store) SetBatchWriteHookForTest(hook func(nodeRows, edgeRows int) error) (restore func()) {
+	previous := s.batchWriteHook.Swap(&hook)
+	return func() { s.batchWriteHook.Store(previous) }
+}
+
+func (s *Store) runBatchWriteHook(nodeRows, edgeRows int) error {
+	hook := s.batchWriteHook.Load()
+	if hook == nil || *hook == nil {
+		return nil
+	}
+	return (*hook)(nodeRows, edgeRows)
+}
+
 func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (sqliteAddBatchStats, error) {
-	var stats sqliteAddBatchStats
+	return s.addBatchSetOrientedContext(context.Background(), nodes, edges)
+}
+
+func (s *Store) addBatchSetOrientedContext(ctx context.Context, nodes []*graph.Node, edges []*graph.Edge) (stats sqliteAddBatchStats, err error) {
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if len(nodes) == 0 && len(edges) == 0 {
 		return stats, nil
 	}
@@ -532,7 +590,16 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		edges = kept
 		inputRepos := structuralInputNodeRepos(nodes)
 		for _, edge := range rejected {
-			repo := s.structuralWriteRepo(edge, inputRepos)
+			repo := inputRepos[edge.From]
+			if repo == "" {
+				source, readErr := s.GetNodeContext(ctx, edge.From)
+				if ctx.Err() != nil {
+					return stats, errors.Join(ctx.Err(), readErr)
+				}
+				if source != nil {
+					repo = source.RepoPrefix
+				}
+			}
 			s.recordStructuralEdge(graph.StructuralDropWrite, graph.StructuralPathSQLiteAddBatch, repo, edge)
 		}
 	}
@@ -546,7 +613,9 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// builtinSeen is shared by every generation handle over one store. Pair its
 	// admission with the writer lock so another batch cannot observe a key whose
 	// transaction later rolls back and omit the corresponding stub.
-	s.writeMu.Lock()
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return stats, err
+	}
 	defer s.writeMu.Unlock()
 	var freshBuiltinKeys []string
 	builtinKeysCommitted := false
@@ -558,19 +627,38 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			s.builtinSeen.Delete(key)
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+	realNodes := nodes
+	var fallbackBuiltins []*graph.Node
 	if stubs := graph.BuiltinStubNodes(edges); len(stubs) > 0 {
+		explicit := make(map[string]struct{}, len(nodes))
+		for _, node := range nodes {
+			if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
+				explicit[node.ID] = struct{}{}
+			}
+		}
 		var fresh []*graph.Node
 		for _, stub := range stubs {
+			if _, supplied := explicit[stub.ID]; supplied {
+				continue
+			}
 			key := builtinSeenKey(s.viewGen, stub.ID)
 			if _, dup := s.builtinSeen.LoadOrStore(key, struct{}{}); !dup {
 				fresh = append(fresh, stub)
+				freshBuiltinKeys = append(freshBuiltinKeys, key)
 			}
 		}
 		if len(fresh) > 0 {
-			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), nodes...), fresh...)
+			fallbackBuiltins = fresh
+			nodes = append(append(make([]*graph.Node, 0, len(nodes)+len(fresh)), fresh...), nodes...)
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	hasGraphInput := false
 	for _, node := range nodes {
 		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
@@ -596,7 +684,10 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		}
 	}
 
-	variableLimit := s.sqliteBatchVariableLimitLocked()
+	variableLimit, err := s.sqliteBatchVariableLimitLockedContext(ctx)
+	if err != nil {
+		return stats, err
+	}
 	defer func() {
 		// Persist any automatic fallback discovered by a connection-specific
 		// "too many SQL variables" error for subsequent AddBatch calls.
@@ -604,36 +695,42 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	}()
 
 	if s.analysisGenerationPresent {
-		nodesChanged, statements, err := s.batchContainsAnalysisNodeChangeLocked(nodes)
+		nodesChanged, statements, err := s.batchContainsAnalysisNodeChangeLockedContext(ctx, nodes)
 		stats.analysisNodeStatements = statements
 		if err != nil {
 			return stats, err
 		}
-		if nodesChanged && !s.invalidateAnalysisBeforeMutationLocked() {
-			return stats, nil
+		if nodesChanged {
+			if err := s.invalidateAnalysisGenerationLockedContext(ctx); err != nil {
+				return stats, err
+			}
 		}
 		if s.analysisGenerationPresent {
-			edgesChanged, statements, err := s.batchContainsNewEdgeLocked(edges)
+			edgesChanged, statements, err := s.batchContainsNewEdgeLockedContext(ctx, edges)
 			stats.analysisEdgeStatements = statements
 			if err != nil {
 				return stats, err
 			}
-			if edgesChanged && !s.invalidateAnalysisBeforeMutationLocked() {
-				return stats, nil
+			if edgesChanged {
+				if err := s.invalidateAnalysisGenerationLockedContext(ctx); err != nil {
+					return stats, err
+				}
 			}
 		}
 	}
 
-	tx, err := s.beginWrite()
+	if err := s.refuseSealedPayloadWriteContext(ctx); err != nil {
+		return stats, err
+	}
+	owner, err := s.beginOwnedWrite(ctx)
 	if err != nil {
 		return stats, err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
+	defer owner.finish(&err)
+	tx := owner.tx
+	if err := s.runBatchWriteHook(len(nodes), len(edges)); err != nil {
+		return stats, err
+	}
 
 	var (
 		receiptDelta  *sqliteMutationReceiptAccumulator
@@ -653,8 +750,11 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 				ids = append(ids, edge.From)
 			}
 		}
-		identities, err = mutationNodeIdentitiesTx(tx, s.viewGen, ids)
+		identities, err = mutationNodeIdentitiesTxContext(ctx, tx, s.viewGen, ids)
 		if err != nil {
+			if ctx.Err() != nil {
+				return stats, errors.Join(ctx.Err(), err)
+			}
 			identityExact = false
 			identities = make(map[string]sqliteMutationNodeIdentity)
 		}
@@ -664,7 +764,13 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	// of thousands of per-row variable binds (see add_batch_json.go). Active
 	// receipts collect exact identities through bounded RETURNING result sets;
 	// the placeholder writer remains the kill-switch/compatibility fallback.
-	useJSONB := jsonbIngestEnabled() && jsonbIngestSupported(tx)
+	useJSONB := false
+	if jsonbIngestEnabled() {
+		useJSONB, err = jsonbIngestSupportedContext(ctx, tx)
+		if err != nil {
+			return stats, err
+		}
+	}
 	if useJSONB {
 		defer func() {
 			if s.bulkConn == nil && !s.coordinatedBulkLoad {
@@ -676,15 +782,34 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 	}
 	var changedNodeIDs map[string]int
 	if useJSONB {
-		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffers(tx, s.viewGen, nodes, receiptDelta != nil, &s.jsonbIngestBuffers)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksJSONBTxWithBuffersContext(ctx, tx, s.viewGen, realNodes, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
-		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxLimited(tx, s.viewGen, nodes, receiptDelta != nil, &variableLimit)
+		stats.nodeRowsChanged, stats.nodeStatements, changedNodeIDs, err = insertNodeChunksTxWithConflictContext(ctx, tx, s.viewGen, realNodes, receiptDelta != nil, &variableLimit, nodeUpsertClause)
 	}
 	if err != nil {
 		return stats, err
 	}
+	if len(fallbackBuiltins) > 0 {
+		inserted, statements, ids, insertErr := insertNodeChunksTxWithConflictContext(ctx, tx, s.viewGen, fallbackBuiltins, receiptDelta != nil, &variableLimit, ` ON CONFLICT(id, view_gen) DO NOTHING`)
+		if insertErr != nil {
+			return stats, insertErr
+		}
+		stats.nodeRowsChanged += inserted
+		stats.nodeStatements += statements
+		if receiptDelta != nil {
+			if changedNodeIDs == nil {
+				changedNodeIDs = make(map[string]int, len(ids))
+			}
+			for id, count := range ids {
+				changedNodeIDs[id] += count
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if corpusRows := cloneCorpusRowsFromNodes(nodes); len(corpusRows) > 0 {
-		if err := upsertCloneCorpusTx(tx, s.viewGen, "", corpusRows); err != nil {
+		if err := upsertCloneCorpusTxContext(ctx, tx, s.viewGen, "", corpusRows); err != nil {
 			return stats, err
 		}
 	}
@@ -718,15 +843,20 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 			}
 		}
 		for id, node := range lastNodes {
-			identities[id] = sqliteIdentityForNode(node)
+			if changedNodeIDs[id] > 0 {
+				identities[id] = sqliteIdentityForNode(node)
+			}
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	var insertedEdgeKeys map[sqliteEdgeIdentity]int
 	if useJSONB {
-		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffers(tx, s.viewGen, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksJSONBTxWithBuffersContext(ctx, tx, s.viewGen, edges, receiptDelta != nil, &s.jsonbIngestBuffers)
 	} else {
-		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimited(tx, s.viewGen, edges, receiptDelta != nil, &variableLimit)
+		stats.edgeRowsInserted, stats.edgeStatements, insertedEdgeKeys, err = insertEdgeChunksTxLimitedContext(ctx, tx, s.viewGen, edges, receiptDelta != nil, &variableLimit)
 	}
 	if err != nil {
 		return stats, err
@@ -753,10 +883,10 @@ func (s *Store) addBatchSetOriented(nodes []*graph.Node, edges []*graph.Edge) (s
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := owner.commit(ctx); err != nil {
 		return stats, err
 	}
-	committed = true
+	builtinKeysCommitted = true
 	changed := stats.nodeRowsChanged > 0 || stats.edgeRowsInserted > 0
 	s.finishAnalysisMutationLocked(changed)
 	if changed {

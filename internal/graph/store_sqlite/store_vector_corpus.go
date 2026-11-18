@@ -225,8 +225,12 @@ func validateVectorCorpusOwnershipTx(
 			end = len(targetIDs)
 		}
 		batch := targetIDs[start:end]
-		stmt := make([]byte, 0, 72+len(batch)*2)
-		stmt = append(stmt, "SELECT id, repo_prefix FROM nodes WHERE id IN ("...)
+		const (
+			stmtHead = "SELECT id, repo_prefix FROM " + nodesByIDSource + " WHERE id IN ("
+			stmtTail = ") AND view_gen = ?"
+		)
+		stmt := make([]byte, 0, len(stmtHead)+len(batch)*2+len(stmtTail))
+		stmt = append(stmt, stmtHead...)
 		args := make([]any, 0, len(batch))
 		for i, id := range batch {
 			if i > 0 {
@@ -235,7 +239,7 @@ func validateVectorCorpusOwnershipTx(
 			stmt = append(stmt, '?')
 			args = append(args, id)
 		}
-		stmt = append(stmt, ") AND view_gen = ?"...)
+		stmt = append(stmt, stmtTail...)
 		args = append(args, viewGen)
 
 		rows, err := tx.QueryContext(ctx, string(stmt), args...)

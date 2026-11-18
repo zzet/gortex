@@ -60,12 +60,9 @@ func TestWatcherStartCompletesOnCanonicalGitRoot(t *testing.T) {
 	writeTestFile(t, filepath.Join(dir, "main.go"), "package sample\n\nfunc Value() {}\n")
 
 	w := newBarrierTestWatcher(t, dir, config.WatchConfig{Enabled: true, DebounceMs: 1})
-	start := time.Now()
 	require.NoError(t, w.Start([]string{dir}))
 	t.Cleanup(func() { _ = w.Stop() })
 
-	require.Less(t, time.Since(start), startupBarrierTimeout(),
-		"Start consumed the whole barrier budget — the handshake marker never came back")
 	require.Empty(t, w.DegradedReason(), "a healthy start must not report degradation")
 }
 

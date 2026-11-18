@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/zzet/gortex/internal/agents"
 )
 
 // external_agent.go handles lifecycle hooks for the non-Claude agents
@@ -42,9 +44,17 @@ func RunExternalAgent() {
 // event gets a concise stale-index hint, emitted only when something is
 // actionable (so the hook stays quiet on the happy path).
 func handleExternalAgent(data []byte) {
+	if out := externalAgentResponse(data); out != "" {
+		fmt.Print(out)
+	}
+}
+
+// externalAgentResponse builds the stdout body handleExternalAgent emits,
+// or "" when there is nothing to say.
+func externalAgentResponse(data []byte) string {
 	var input ExternalAgentInput
 	if err := json.Unmarshal(data, &input); err != nil {
-		return
+		return ""
 	}
 
 	var ctx string
@@ -54,10 +64,10 @@ func handleExternalAgent(data []byte) {
 	case "aftertool":
 		ctx = buildStaleIndexHint(input.CWD)
 	default:
-		return
+		return ""
 	}
 	if strings.TrimSpace(ctx) == "" {
-		return
+		return ""
 	}
 
 	out, err := json.Marshal(HookOutput{HookSpecificOutput: &HookSpecificOutput{
@@ -65,9 +75,9 @@ func handleExternalAgent(data []byte) {
 		AdditionalContext: ctx,
 	}})
 	if err != nil {
-		return
+		return ""
 	}
-	fmt.Print(string(out))
+	return string(out)
 }
 
 // normalizeExternalEvent maps the agent's event name onto the two
@@ -97,6 +107,15 @@ func buildStaleIndexHint(cwd string) string {
 	case err != nil:
 		return ""
 	}
+	if cwd != "" {
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			abs = cwd
+		}
+		if collision := prefixCollisionCoverage(abs, status.TrackedRepos); collision != "" {
+			return "[Gortex] " + collision
+		}
+	}
 	if !status.Ready {
 		return fmt.Sprintf("[Gortex] daemon is warming up (%s elapsed); graph answers may be partial until it is ready.", formatDuration(status.WarmupSeconds))
 	}
@@ -108,7 +127,10 @@ func buildStaleIndexHint(cwd string) string {
 		exact, contained := classifyCwd(abs, status.TrackedRepos)
 		if exact == nil && len(contained) == 0 {
 			if pendingAutomaticCheckout(abs, status.TrackedRepos) {
-				return fmt.Sprintf("[Gortex] cwd `%s` is a Git checkout awaiting automatic discovery; do not run `gortex track`. Wait for reconciliation and reconnect.", abs)
+				if routedAutomaticCheckout(abs) != nil {
+					return ""
+				}
+				return fmt.Sprintf("[Gortex] checkout discovery is pending for cwd `%s`. %s", abs, agents.PendingAutomaticCheckoutGuidance)
 			}
 			return fmt.Sprintf("[Gortex] cwd `%s` is not tracked — run `gortex track %s` to enable graph context here.", abs, abs)
 		}

@@ -87,8 +87,9 @@ func TestNeverRanWithoutTrustGateAvoidsTheTrustRemedy(t *testing.T) {
 	}
 }
 
-// TestSingleStaleHookIsReported covers the upgrade case: trust is recorded
-// per hook hash, so changing one hook's definition silences only that hook.
+// TestSingleStaleHookIsReported: one event silent while its siblings run is
+// still worth naming, but the siblings prove the harness runs Gortex's hooks,
+// so it is a WARN without the trust remedy rather than a blocker (#766).
 func TestSingleStaleHookIsReported(t *testing.T) {
 	now := time.Now()
 	findings := Diagnose(codexAgent(), activity(map[string]hooks.EventActivity{
@@ -99,13 +100,109 @@ func TestSingleStaleHookIsReported(t *testing.T) {
 	}), Adoption{GortexCalls: 10, ShellCalls: 1}, now)
 
 	got := findingWith(t, findings, "SessionStart is configured but never ran")
-	if got.Severity != SeverityBlocker {
-		t.Errorf("severity=%s want BLOCKER", got.Severity)
+	if got.Severity != SeverityWarn {
+		t.Errorf("severity=%s want WARN", got.Severity)
+	}
+	// Codex records trust per hook, so a single entry's trust can lapse when
+	// its definition changes: the remedy offers re-trusting that one entry
+	// as an alternative, not the agent-wide "none has run" diagnosis.
+	if !strings.Contains(got.Remedy, "re-trust that entry") || !strings.Contains(got.Remedy, "/hooks") {
+		t.Errorf("remedy should offer re-trusting the one entry: %q", got.Remedy)
 	}
 	if !strings.Contains(got.Summary, "3d ago") {
 		t.Errorf("should date the last run so a stale hook is distinguishable: %q", got.Summary)
 	}
 	assertNoFindingWith(t, findings, "none has run")
+	if HasBlocker(findings) {
+		t.Errorf("a single silent event beside running siblings is not a blocker: %+v", findings)
+	}
+}
+
+// TestSilentStopBesideRunningHooksIsNotABlocker is #766: Codex ran its other
+// hooks thousands of times and Stop never, because the user's long-lived
+// sessions were killed rather than ended cleanly. Trust is demonstrably fine,
+// so the /hooks remedy is wrong and nothing is blocked.
+func TestSilentStopBesideRunningHooksIsNotABlocker(t *testing.T) {
+	agent := codexAgent()
+	agent.Configured["Stop"] = 1
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart":     {Runs: 139, Emitted: 139, DaemonKnown: 139, DaemonUp: 139},
+		"UserPromptSubmit": {Runs: 236, Emitted: 13, DaemonKnown: 236, DaemonUp: 236},
+		"PreToolUse":       {Runs: 10219, Emitted: 102, DaemonKnown: 10219, DaemonUp: 10219},
+		"PostToolUse":      {Runs: 3352, Emitted: 56, DaemonKnown: 3352, DaemonUp: 3352},
+	}), Adoption{GortexCalls: 87}, time.Now())
+
+	got := findingWith(t, findings, "Stop is configured but never ran")
+	if got.Severity != SeverityInfo {
+		t.Errorf("severity=%s want INFO", got.Severity)
+	}
+	if !strings.Contains(got.Summary, "session ends cleanly") {
+		t.Errorf("should explain when Stop fires: %q", got.Summary)
+	}
+	for _, f := range findings {
+		if strings.Contains(f.Remedy, "/hooks") {
+			t.Errorf("trust remedy offered while sibling hooks ran: %+v", f)
+		}
+	}
+	if HasBlocker(findings) {
+		t.Errorf("a silent Stop beside running hooks is not a blocker: %+v", findings)
+	}
+}
+
+// TestSilentClaudeStopIsAWarn: Claude Code's Stop fires at the end of every
+// turn, so unlike Codex's it cannot be explained away by sessions that never
+// end cleanly. Silence beside running siblings stays a WARN, and Claude Code
+// has no per-hook trust, so the remedy carries no re-trust hint.
+func TestSilentClaudeStopIsAWarn(t *testing.T) {
+	agent := AgentHooks{
+		Agent:      "claude-code",
+		Configured: map[string]int{"SessionStart": 1, "UserPromptSubmit": 1, "PreToolUse": 1, "PostToolUse": 1, "Stop": 1},
+	}
+
+	findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+		"SessionStart":     {Runs: 12, Emitted: 12},
+		"UserPromptSubmit": {Runs: 40, Emitted: 5},
+		"PreToolUse":       {Runs: 300, Emitted: 30},
+		"PostToolUse":      {Runs: 120, Emitted: 10},
+	}), Adoption{GortexCalls: 20}, time.Now())
+
+	got := findingWith(t, findings, "Stop is configured but never ran")
+	if got.Severity != SeverityWarn {
+		t.Errorf("severity=%s want WARN", got.Severity)
+	}
+	if strings.Contains(got.Summary, "session ends cleanly") {
+		t.Errorf("Claude Code's Stop is per turn, not session-end: %q", got.Summary)
+	}
+	if strings.Contains(got.Remedy, "trust") {
+		t.Errorf("trust hint offered to an agent without per-hook trust: %q", got.Remedy)
+	}
+	if HasBlocker(findings) {
+		t.Errorf("a silent Stop beside running hooks is not a blocker: %+v", findings)
+	}
+}
+
+// TestSessionEndEventsArePerAgent: the same event name means different
+// things on different hosts, so the classification is keyed by agent.
+func TestSessionEndEventsArePerAgent(t *testing.T) {
+	for _, tc := range []struct {
+		agent, event string
+		want         bool
+	}{
+		{"codex", "Stop", true},
+		{"codex", "SessionStart", false},
+		{"claude-code", "Stop", false},
+		{"claude-code", "SubagentStop", false},
+		{"claude-code", "SessionEnd", true},
+		{"copilot-cli", "sessionEnd", true},
+		{"copilot-cli", "agentStop", false},
+		{"opencode", "Stop", false},
+		{"unknown-agent", "Stop", false},
+	} {
+		if got := isSessionEndEvent(tc.agent, tc.event); got != tc.want {
+			t.Errorf("isSessionEndEvent(%q, %q)=%v want %v", tc.agent, tc.event, got, tc.want)
+		}
+	}
 }
 
 // TestHookThatRunsButNeverInjectsIsAWarn separates "never fires" from "fires
@@ -308,10 +405,11 @@ func TestMixedAttributionDoesNotAccuse(t *testing.T) {
 	}
 }
 
-// TestAttributedSilenceStillBlocks: once the window holds no unattributed
-// runs of an event, an empty bucket really is silence and must still block —
-// the guard above must not swallow the finding it exists to protect.
-func TestAttributedSilenceStillBlocks(t *testing.T) {
+// TestAttributedSilenceStillReported: once the window holds no unattributed
+// runs of an event, an empty bucket really is silence and must still be
+// reported — the guard above must not swallow the finding it exists to
+// protect. A sibling ran, so it is a WARN rather than a blocker (#766).
+func TestAttributedSilenceStillReported(t *testing.T) {
 	now := time.Now()
 	clean := hooks.EffectivenessSummary{
 		Present:    true,
@@ -327,10 +425,10 @@ func TestAttributedSilenceStillBlocks(t *testing.T) {
 
 	findings := Diagnose(codexAgent(), clean, Adoption{FilesFound: 1, InWindow: 1, GortexCalls: 9, ShellCalls: 1}, now)
 	got := findingWith(t, findings, "SessionStart is configured but never ran")
-	if got.Severity != SeverityBlocker {
-		t.Errorf("severity=%s want BLOCKER", got.Severity)
+	if got.Severity != SeverityWarn {
+		t.Errorf("severity=%s want WARN", got.Severity)
 	}
-	if !strings.Contains(got.Remedy, "/hooks") {
+	if !strings.Contains(got.Remedy, "re-trust that entry") {
 		t.Errorf("remedy=%q", got.Remedy)
 	}
 }
@@ -518,6 +616,85 @@ func TestPostToolUseSilenceUnderDenyPostureIsExpected(t *testing.T) {
 		t.Errorf("summary should name the posture so the reader learns why: %q", got.Summary)
 	}
 	assertNoFindingWith(t, findings, "nothing to say")
+}
+
+// TestPostToolUseNeverRunUnderDenyPostureIsExpected: under the deny posture
+// PostToolUse only watches Gortex tool calls, so when the window's
+// transcripts show none, zero runs beside running siblings is not a broken
+// entry. With no transcripts, or once they show Gortex calls, zero runs may
+// mean the matcher missed them, so the warning stands; enrich keeps it too.
+func TestPostToolUseNeverRunUnderDenyPostureIsExpected(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		agent       string
+		deny        bool
+		sessions    int
+		gortexCalls int
+		want        Severity
+	}{
+		{"deny, transcripts show no Gortex calls", "antigravity", true, 3, 0, SeverityInfo},
+		{"deny, Gortex calls missed", "antigravity", true, 3, 25, SeverityWarn},
+		{"deny, no transcripts to confirm", "antigravity", true, 0, 0, SeverityWarn},
+		{"enrich", "claude-code", false, 3, 0, SeverityWarn},
+		// Claude Code's scan misses plugin-prefixed Gortex tools, so its
+		// zero proves nothing.
+		{"deny, Claude Code transcripts", "claude-code", true, 3, 0, SeverityWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := codexAgent()
+			agent.Agent = tc.agent
+			agent.RequiresTrust = false
+			agent.PostToolUseDenyPosture = tc.deny
+
+			findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+				"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+				"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PreToolUse":       {Runs: 40, Emitted: 3, DaemonKnown: 40, DaemonUp: 40},
+			}), Adoption{FilesFound: tc.sessions, InWindow: tc.sessions, GortexCalls: tc.gortexCalls, ShellCalls: 9}, time.Now())
+
+			got := findingWith(t, findings, "PostToolUse is configured but never ran")
+			if got.Severity != tc.want {
+				t.Errorf("severity=%s want %s", got.Severity, tc.want)
+			}
+			if tc.want == SeverityInfo && got.Remedy != "" {
+				t.Errorf("expected silence needs no remedy, got %q", got.Remedy)
+			}
+		})
+	}
+}
+
+// TestAntigravityStopSilenceIsExpected: Antigravity's Stop only ever emits
+// the claim-check correction, so zero injections on a healthy install is the
+// steady state. Claude Code's Stop carries the post-task briefing, so its
+// silence keeps the warning.
+func TestAntigravityStopSilenceIsExpected(t *testing.T) {
+	for _, tc := range []struct {
+		agent string
+		want  Severity
+	}{{"antigravity", SeverityInfo}, {"claude-code", SeverityWarn}} {
+		t.Run(tc.agent, func(t *testing.T) {
+			agent := codexAgent()
+			agent.Agent = tc.agent
+			agent.RequiresTrust = false
+			agent.Configured["Stop"] = 1
+
+			findings := Diagnose(agent, activity(map[string]hooks.EventActivity{
+				"SessionStart":     {Runs: 4, Emitted: 4, DaemonKnown: 4, DaemonUp: 4},
+				"UserPromptSubmit": {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PreToolUse":       {Runs: 9, Emitted: 3, DaemonKnown: 9, DaemonUp: 9},
+				"PostToolUse":      {Runs: 9, Emitted: 1, DaemonKnown: 9, DaemonUp: 9},
+				"Stop":             {Runs: 6, Emitted: 0, DaemonKnown: 6, DaemonUp: 6},
+			}), Adoption{GortexCalls: 20, ShellCalls: 2}, time.Now())
+
+			got := findingWith(t, findings, "Stop ran 6 time(s) and injected context 0 times")
+			if got.Severity != tc.want {
+				t.Errorf("severity=%s want %s", got.Severity, tc.want)
+			}
+			if tc.want == SeverityInfo && !strings.Contains(got.Summary, "claim") && !strings.Contains(got.Summary, "correct") {
+				t.Errorf("summary should say why the silence is expected: %q", got.Summary)
+			}
+		})
+	}
 }
 
 // TestPostToolUseSilenceStillWarnsUnderEnrich is the guard the downgrade

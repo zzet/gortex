@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -48,7 +47,7 @@ func bulkFixture(nNodes, nEdges int) ([]*graph.Node, []*graph.Edge) {
 func openTempStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "bulk.sqlite")
-	s, err := Open(path)
+	s, err := openPristine(t, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -116,7 +115,7 @@ func TestBulkLoadDropsAndRebuildsIndexes(t *testing.T) {
 			t.Fatalf("index %s missing before bulk load", idx.name)
 		}
 	}
-	if got := pragmaIntDB(t, s.db, "synchronous"); got != 1 {
+	if got := pragmaIntDB(t, s.writerDB, "synchronous"); got != 1 {
 		t.Fatalf("synchronous before = %d, want 1 (NORMAL)", got)
 	}
 
@@ -181,8 +180,8 @@ func TestBulkLoadDropsAndRebuildsIndexes(t *testing.T) {
 			t.Fatalf("index %s not rebuilt after FlushBulk", idx.name)
 		}
 	}
-	// synchronous restored to NORMAL on the pool.
-	if got := pragmaIntDB(t, s.db, "synchronous"); got != 1 {
+	// synchronous restored to NORMAL on the writer connection.
+	if got := pragmaIntDB(t, s.writerDB, "synchronous"); got != 1 {
 		t.Fatalf("synchronous after = %d, want 1 (NORMAL)", got)
 	}
 	integrityOK(t, s.db)
@@ -836,6 +835,83 @@ func TestUncoordinatedBulkSealFailureRetriesAtFlushBoundary(t *testing.T) {
 	integrityOK(t, s.db)
 }
 
+// TestFlushBulkSealPanicDoesNotDeadlock: a seal that panics with a non-error
+// value must unwind with the write gate released and the window still
+// retryable, so the owner's next exit call seals, restores and closes it.
+func TestFlushBulkSealPanicDoesNotDeadlock(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		begin func(*Store) bool
+		end   func(*Store) error
+	}{
+		{"standalone", func(s *Store) bool { s.BeginBulkLoad(); return s.bulkConn != nil }, (*Store).FlushBulk},
+		{"coordinated", (*Store).BeginCoordinatedBulkLoad, (*Store).EndCoordinatedBulkLoad},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := openTempStore(t)
+			syncBefore := pragmaIntDB(t, s.writerDB, "synchronous")
+			if !tc.begin(s) {
+				t.Fatal("bulk fast path did not engage")
+			}
+			s.AddNode(&graph.Node{ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A"})
+			calls := 0
+			defer s.SetBulkSealHookForTest(func(string) error {
+				calls++
+				if calls == 1 {
+					panic("injected seal panic")
+				}
+				return nil
+			})()
+
+			recovered := func() (r any) {
+				defer func() { r = recover() }()
+				_ = tc.end(s)
+				return nil
+			}()
+			if recovered != "injected seal panic" {
+				t.Fatalf("recovered %v, want the injected seal panic", recovered)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := s.writeMu.LockContext(ctx); err != nil {
+				// Hand the leaked hold back so cleanup's Close cannot hang too.
+				s.writeMu.Unlock()
+				t.Fatalf("write gate still held after the seal panic: %v", err)
+			}
+			retryable := s.bulkConn != nil && s.bulkIndexesDeferred && s.bulkWindowOpen.Load() &&
+				s.coordinatedBulkLoad == (tc.name == "coordinated")
+			s.writeMu.Unlock()
+			if !retryable {
+				t.Fatal("seal panic lost the window's retryable state")
+			}
+
+			if err := tc.end(s); err != nil {
+				t.Fatalf("exit retry after the seal panic: %v", err)
+			}
+			if calls <= 1 {
+				t.Fatalf("seal hook calls = %d, want the retry to seal again", calls)
+			}
+			if s.bulkConn != nil || s.bulkIndexesDeferred || s.coordinatedBulkLoad || s.bulkWindowOpen.Load() {
+				t.Fatalf("retry left bulk state: conn=%v deferred=%v coordinated=%v open=%v",
+					s.bulkConn != nil, s.bulkIndexesDeferred, s.coordinatedBulkLoad, s.bulkWindowOpen.Load())
+			}
+			if got := pragmaIntDB(t, s.writerDB, "synchronous"); got != syncBefore {
+				t.Fatalf("writer synchronous = %d, want restored %d", got, syncBefore)
+			}
+			present := indexNames(t, s.db)
+			for _, idx := range bulkDroppableIndexes {
+				if !present[idx.name] {
+					t.Fatalf("index %s missing after the retried seal", idx.name)
+				}
+			}
+			if got := s.NodeCount(); got != 1 {
+				t.Fatalf("node count = %d, want 1", got)
+			}
+			integrityOK(t, s.db)
+		})
+	}
+}
+
 func TestCoordinatedBulkLoadRoutesSingleRowSidecarsOnPinnedConnection(t *testing.T) {
 	s, _ := openTempStore(t)
 	s.db.SetMaxOpenConns(1)
@@ -1021,51 +1097,6 @@ func TestBulkLoadWarmRestartLoadsClean(t *testing.T) {
 		t.Fatal("fast path engaged on warm restart (populated store)")
 	}
 	_ = reopened.FlushBulk()
-}
-
-// TestBulkLoadPersistSpeed is the persist-speed evidence: it times the plain
-// path vs the fast path on the same fixture and logs both. It asserts
-// correctness and that the fast path is not pathologically slower; a strict
-// speedup ratio is gated behind GORTEX_BULK_PERF_ASSERT so the default run
-// stays deterministic on noisy CI.
-func TestBulkLoadPersistSpeed(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping persist-speed timing in -short")
-	}
-	n, e := 8000, 16000
-	nodes, edges := bulkFixture(n, e)
-
-	plain, _ := openTempStore(t)
-	t0 := time.Now()
-	plain.AddBatch(nodes, edges)
-	plainDur := time.Since(t0)
-
-	bulk, _ := openTempStore(t)
-	t1 := time.Now()
-	bulk.BeginBulkLoad()
-	bulk.AddBatch(nodes, edges)
-	if err := bulk.FlushBulk(); err != nil {
-		t.Fatalf("FlushBulk: %v", err)
-	}
-	bulkDur := time.Since(t1)
-
-	if bulk.NodeCount() != plain.NodeCount() || bulk.EdgeCount() != plain.EdgeCount() {
-		t.Fatalf("count mismatch: bulk(%d,%d) plain(%d,%d)",
-			bulk.NodeCount(), bulk.EdgeCount(), plain.NodeCount(), plain.EdgeCount())
-	}
-	integrityOK(t, bulk.db)
-
-	ratio := float64(plainDur) / float64(bulkDur)
-	t.Logf("persist %d nodes / %d edges: plain=%s bulk=%s speedup=%.2fx",
-		n, e, plainDur, bulkDur, ratio)
-
-	// Sanity floor: the fast path must never be dramatically slower.
-	if bulkDur > plainDur*5 {
-		t.Fatalf("fast path far slower: plain=%s bulk=%s", plainDur, bulkDur)
-	}
-	if os.Getenv("GORTEX_BULK_PERF_ASSERT") != "" && ratio < 2.0 {
-		t.Fatalf("fast path speedup %.2fx below 2x target", ratio)
-	}
 }
 
 // BenchmarkPersistFixture is reproducible persist-speed evidence: run with

@@ -39,11 +39,26 @@ func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpt
 	if _, err := os.Stat(root); err != nil {
 		return nil, nil
 	}
+	return skillpack.Sync(w, routingSkillSpec(home), allowed, opts)
+}
+
+// routingSkillSpec is the routing pack under home, shared by the profile
+// switch and the post-upgrade refresh.
+func routingSkillSpec(home string) skillpack.SyncSpec {
 	rendered := RoutingSkills()
-	return skillpack.Sync(w, skillpack.SyncSpec{
-		Dir:         root,
+	return skillpack.SyncSpec{
+		Dir:         filepath.Join(hermesDir(home), "skills"),
 		Rendered:    rendered,
 		KnownHashes: skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeHermesSkillHashes()),
 		DirFor:      func(id string) string { return filepath.Dir(skillPath(home, id)) },
-	}, allowed, opts)
+	}
+}
+
+// OwnedFiles makes the routing skills part of the post-upgrade refresh. The
+// native master skill is left out: it is not part of the shared pack.
+func (a *Adapter) OwnedFiles(env agents.Env) []agents.OwnedFile {
+	if env.Home == "" {
+		return nil
+	}
+	return skillpack.OwnedFiles(routingSkillSpec(env.Home))
 }

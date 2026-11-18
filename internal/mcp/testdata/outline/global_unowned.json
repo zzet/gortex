@@ -1,0 +1,49 @@
+{
+  "summary": {
+    "total_nodes": 2,
+    "total_edges": 0,
+    "primary_language": "go",
+    "languages": [
+      {
+        "name": "go",
+        "nodes": 1
+      }
+    ]
+  },
+  "communities": {
+    "count": 1,
+    "modularity": 0.75,
+    "top": [
+      {
+        "id": "global",
+        "label": "Global",
+        "size": 1,
+        "cohesion": 0.7
+      }
+    ]
+  },
+  "hotspots": [
+    {
+      "id": "global-main",
+      "name": "main",
+      "kind": "function",
+      "file_path": "external::go:fmt",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    }
+  ],
+  "most_imported_files": [
+    {
+      "path": "external::go:fmt",
+      "import_count": 2
+    }
+  ],
+  "entry_points": [
+    {
+      "id": "global-main",
+      "name": "main",
+      "file_path": "external::go:fmt"
+    }
+  ]
+}

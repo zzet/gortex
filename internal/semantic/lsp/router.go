@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -131,9 +132,19 @@ type Router struct {
 	// override wins over both.
 	enrichMaxParallel int
 
-	mu        sync.Mutex
-	providers map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
-	enabled   map[string]*ServerSpec          // spec.Name → spec marked enabled by config (no spawn until For/ForSpec)
+	mu           sync.Mutex
+	closed       bool
+	starting     map[*Provider]*routedProvider
+	starts       sync.WaitGroup
+	closeOwners  map[*Provider]routerCloseOwner
+	closeWorkers sync.WaitGroup
+	reapers      sync.WaitGroup
+	closeOnce    sync.Once
+	closeDone    chan struct{}
+	closeErr     error
+	closeErrors  map[*Provider]error
+	providers    map[providerKey]*routedProvider // (spec.Name, workspace) → cached provider
+	enabled      map[string]*ServerSpec          // spec.Name → spec marked enabled by config (no spawn until For/ForSpec)
 
 	// limits — zero means "no limit / no reaping". maxAlive is guarded by
 	// r.mu; SetMaxAlive mutates it at runtime (batch enrichment raises the
@@ -448,6 +459,10 @@ func (r *Router) WithEnrichMaxParallel(n int) *Router {
 // reaper. A zero duration disables reaping.
 func (r *Router) WithReaperInterval(d time.Duration) *Router {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return r
+	}
 	if r.stopReaper != nil {
 		close(r.stopReaper)
 		r.stopReaper = nil
@@ -455,7 +470,8 @@ func (r *Router) WithReaperInterval(d time.Duration) *Router {
 	if d > 0 {
 		stop := make(chan struct{})
 		r.stopReaper = stop
-		go r.reaperLoop(d, stop)
+		r.reapers.Add(1)
+		go func() { defer r.reapers.Done(); r.reaperLoop(d, stop) }()
 	}
 	r.reaperInterval = d
 	r.mu.Unlock()
@@ -586,6 +602,12 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 			r.timing.reuseNanos.Add(int64(elapsed))
 		}
 	}()
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return nil, errRouterClosed
+	}
 	if !r.specAvailable(spec) {
 		return nil, fmt.Errorf("LSP server %q not available on PATH", spec.Name)
 	}
@@ -602,6 +624,10 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	lockStarted := time.Now()
 	r.mu.Lock()
 	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errRouterClosed
+	}
 	rp, ok := r.providers[key]
 	if ok {
 		rp.lastUsed = time.Now()
@@ -612,7 +638,9 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		success, reused = true, true
 		return rp.provider, nil
 	}
+	r.starts.Add(1)
 	r.mu.Unlock()
+	defer r.starts.Done()
 
 	// The workspace becomes the subprocess's working directory, so validate
 	// it before spawning. A caller that handed us a path anchored on the
@@ -649,13 +677,26 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 			return nil, fmt.Errorf("ruby-lsp: no Gemfile in %s; skipping composed-bundle install", workspace)
 		}
 	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.Join(errRouterClosed, p.Close())
+	}
+	if r.starting == nil {
+		r.starting = make(map[*Provider]*routedProvider)
+	}
+	r.starting[p] = &routedProvider{spec: spec, workspace: workspace, provider: p}
+	r.mu.Unlock()
+	defer func() { r.mu.Lock(); delete(r.starting, p); r.mu.Unlock() }()
 	if err := r.ensureTimedProvider(p, spec.Name, workspace, time.Since(constructStarted)); err != nil {
 		// A binary that resolves on PATH but cannot launch (e.g. a rustup
 		// `rust-analyzer` shim whose toolchain lacks the component) would
 		// otherwise be re-attempted on every repo. Mark it unavailable so the
 		// router stops retrying it for this session.
-		r.markSpawnFailed(spec.Name, err)
-		return nil, fmt.Errorf("spawn %s: %w", spec.Name, err)
+		if !errors.Is(err, errProviderClosed) {
+			r.markSpawnFailed(spec.Name, err)
+		}
+		return nil, errors.Join(fmt.Errorf("spawn %s: %w", spec.Name, err), p.Close())
 	}
 	// Attach the diagnostics hook (if any) before publishing to the
 	// providers map so we don't drop the first publishDiagnostics
@@ -665,7 +706,10 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	lockStarted = time.Now()
 	r.mu.Lock()
 	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
-	defer r.mu.Unlock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.Join(errRouterClosed, p.Close())
+	}
 	// Race: another goroutine may have spawned it while we were
 	// initializing. Prefer the existing one and shut down our duplicate.
 	if existing, ok := r.providers[key]; ok {
@@ -673,7 +717,11 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		if pin {
 			existing.inUse++
 		}
-		go func() { _ = r.closeTimedProvider(p, spec.Name, workspace, "duplicate") }()
+		owner, admitted := r.registerCloseLocked(p, spec.Name, workspace, "duplicate")
+		r.mu.Unlock()
+		if admitted {
+			go r.finishClose(owner)
+		}
 		r.timing.raceReuses.Add(1)
 		success = true
 		return existing.provider, nil
@@ -691,6 +739,7 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	}
 	r.providers[key] = newRP
 	r.maybeEvictLRULocked()
+	r.mu.Unlock()
 	success = true
 	return p, nil
 }
@@ -866,21 +915,30 @@ func (r *Router) Reap() []string {
 	}
 	cut := time.Now().Add(-r.idleTimeout)
 	r.mu.Lock()
-	var victims []*routedProvider
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	var victims []routerCloseOwner
 	for key, rp := range r.providers {
 		if rp.inUse > 0 {
 			continue // a provider held by an in-flight pass is not idle
 		}
 		if rp.lastUsed.Before(cut) {
-			victims = append(victims, rp)
+			if owner, ok := r.registerCloseLocked(rp.provider, rp.spec.Name, rp.workspace, "idle"); ok {
+				victims = append(victims, owner)
+			}
 			delete(r.providers, key)
 		}
 	}
 	r.mu.Unlock()
 	names := make([]string, 0, len(victims))
 	for _, v := range victims {
-		names = append(names, formatProviderKey(v.spec.Name, v.workspace))
-		_ = r.closeTimedProvider(v.provider, v.spec.Name, v.workspace, "idle")
+		v.provider.BeginClose()
+	}
+	for _, v := range victims {
+		names = append(names, formatProviderKey(v.spec, v.workspace))
+		r.finishClose(v)
 	}
 	if len(names) > 0 {
 		r.logger.Info("LSP router reaped idle providers", zap.Strings("names", names))
@@ -908,7 +966,11 @@ func (r *Router) CloseCheckoutWorkspace(language, workspace string) int {
 	}
 	root := absWorkspace(workspace)
 	r.mu.Lock()
-	var victims []*routedProvider
+	if r.closed {
+		r.mu.Unlock()
+		return 0
+	}
+	var victims []routerCloseOwner
 	for key, rp := range r.providers {
 		if key.workspace != root || rp.inUse > 0 {
 			continue
@@ -916,17 +978,22 @@ func (r *Router) CloseCheckoutWorkspace(language, workspace string) int {
 		if !specServesLanguage(rp.spec, language) {
 			continue
 		}
-		victims = append(victims, rp)
+		if owner, ok := r.registerCloseLocked(rp.provider, rp.spec.Name, rp.workspace, "checkout"); ok {
+			victims = append(victims, owner)
+		}
 		delete(r.providers, key)
 	}
 	r.mu.Unlock()
 	for _, victim := range victims {
-		_ = r.closeTimedProvider(victim.provider, victim.spec.Name, victim.workspace, "checkout")
+		victim.provider.BeginClose()
+	}
+	for _, victim := range victims {
+		r.finishClose(victim)
 	}
 	if len(victims) > 0 {
 		names := make([]string, 0, len(victims))
 		for _, victim := range victims {
-			names = append(names, formatProviderKey(victim.spec.Name, victim.workspace))
+			names = append(names, formatProviderKey(victim.spec, victim.workspace))
 		}
 		r.logger.Info("LSP router stopped a checkout workspace's providers",
 			zap.String("language", language),
@@ -954,6 +1021,9 @@ func specServesLanguage(spec *ServerSpec, language string) bool {
 // the cap by more than one settles in a single call; the fast path
 // (already within cap) returns before scanning.
 func (r *Router) maybeEvictLRULocked() {
+	if r.closed {
+		return
+	}
 	for r.maxAlive > 0 && len(r.providers) > r.maxAlive {
 		var oldest *routedProvider
 		var oldestKey providerKey
@@ -971,9 +1041,15 @@ func (r *Router) maybeEvictLRULocked() {
 		}
 		delete(r.providers, oldestKey)
 		r.evictions.Add(1)
-		go func() { _ = r.closeTimedProvider(oldest.provider, oldestKey.specName, oldestKey.workspace, "lru") }()
-		r.logger.Info("LSP router evicted LRU provider",
-			zap.String("name", formatProviderKey(oldestKey.specName, oldestKey.workspace)))
+		if owner, admitted := r.registerCloseLocked(oldest.provider, oldestKey.specName, oldestKey.workspace, "lru"); admitted {
+			go func() {
+				// Logger hooks are external callbacks too. Keep the owned
+				// eviction receipt, but never invoke one under router admission.
+				r.logger.Info("LSP router evicted LRU provider",
+					zap.String("name", formatProviderKey(owner.spec, owner.workspace)))
+				r.finishClose(owner)
+			}()
+		}
 	}
 }
 
@@ -999,24 +1075,11 @@ func (r *Router) reaperLoop(d time.Duration, stop chan struct{}) {
 	}
 }
 
-// Close shuts down every active provider. Safe to call multiple times.
+// Close permanently closes lazy-spawn admission and joins providers,
+// constructors, detached closes and every reaper this router started.
 func (r *Router) Close() error {
-	r.mu.Lock()
-	if r.stopReaper != nil {
-		close(r.stopReaper)
-		r.stopReaper = nil
-	}
-	provs := r.providers
-	r.providers = make(map[providerKey]*routedProvider)
-	r.mu.Unlock()
-
-	var firstErr error
-	for _, rp := range provs {
-		if err := r.closeTimedProvider(rp.provider, rp.spec.Name, rp.workspace, "shutdown"); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	<-r.BeginClose()
+	return r.closeErr
 }
 
 // RouterTimingStats is a process-lifetime diagnostic snapshot. Durations sum

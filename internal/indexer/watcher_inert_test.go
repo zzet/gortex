@@ -264,14 +264,19 @@ func TestWatcher_OldDatabaseFirstPatchIsConservative(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.go")
 	writeTestFile(t, path, "package main\n\nfunc Stable() {}\n")
-	idx := newTestIndexer(graph.New())
+	g := graph.New()
+	idx := newTestIndexer(g)
 	idx.search = search.NewNull()
 	idx.SetRootPath(dir)
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
-	// Cold indexing deliberately skips edit-routing fingerprints. The first
-	// patch must therefore fail closed to a structural file refresh; that patch
-	// stamps the exact extraction so subsequent edits can take narrower routes.
+	// An old database: a cold index written before whole indexes stamped the
+	// edit-routing fingerprints (a current whole index stamps the ones a
+	// per-save stamps — TestWholeIndexStampsTheFileFingerprintsAPerSaveStamps).
+	// The first patch must therefore fail closed to a structural file refresh;
+	// that patch stamps the exact extraction so subsequent edits can take
+	// narrower routes.
+	stripFileFingerprints(t, g)
 	coldNodes := idx.graph.GetFileNodes("main.go")
 	assert.Equal(t, fileDeltaFingerprints{}, storedExtractionGraphFingerprints(coldNodes))
 	assert.False(t, storedDerivedFingerprints(coldNodes).complete())

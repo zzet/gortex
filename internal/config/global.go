@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/google/renameio"
 	"gopkg.in/yaml.v3"
 
@@ -67,6 +68,7 @@ type ProjectConfig struct {
 
 // GlobalConfig is the user-level config at ~/.gortex/config.yaml.
 type GlobalConfig struct {
+	Edit          EditConfig               `mapstructure:"edit" yaml:"edit,omitempty"`
 	Projects      map[string]ProjectConfig `mapstructure:"projects"       yaml:"projects,omitempty"`
 	Repos         []RepoEntry              `mapstructure:"repos"          yaml:"repos,omitempty"`
 	ActiveProject string                   `mapstructure:"active_project" yaml:"active_project,omitempty"`
@@ -98,8 +100,26 @@ type GlobalConfig struct {
 	// must not be able to authorize extra in-process servers on the machine.
 	MCP GlobalMCPConfig `mapstructure:"mcp" yaml:"mcp,omitempty"`
 
+	// Agents carries policy for the agent files Gortex generates.
+	Agents AgentsConfig `mapstructure:"agents" yaml:"agents,omitempty"`
+
 	// configPath stores the file path used for Save(). Set by LoadGlobal or SetConfigPath.
 	configPath string `yaml:"-"`
+	// repoRevision invalidates ConfigManager's root lookup after list edits.
+	repoRevision uint64
+}
+
+// AgentsConfig is the `agents:` block in ~/.gortex/config.yaml.
+type AgentsConfig struct {
+	// AutoRefresh, when false, stops a new binary from rewriting the agent
+	// files an older one generated. Stale files are still detected and
+	// reported by `gortex doctor`. Unset means on.
+	AutoRefresh *bool `mapstructure:"auto_refresh" yaml:"auto_refresh,omitempty"`
+}
+
+// AutoRefreshEnabled reports the effective agents.auto_refresh value.
+func (a AgentsConfig) AutoRefreshEnabled() bool {
+	return a.AutoRefresh == nil || *a.AutoRefresh
 }
 
 // DaemonConfig is the `daemon:` block in ~/.gortex/config.yaml.
@@ -117,6 +137,14 @@ type DaemonConfig struct {
 	// overridden by GORTEX_DAEMON_HTTP_ADDR; a non-empty --http-addr flag
 	// overrides both. Non-loopback binds require an auth token.
 	HTTPAddr string `mapstructure:"http_addr" yaml:"http_addr,omitempty"`
+
+	// LogMaxSize is the daemon log rotation threshold in MB (default 50).
+	// Zero disables rotation and keeps logging to stderr. Pointers distinguish
+	// an omitted value from an explicit zero.
+	LogMaxSize *int `mapstructure:"log_max_size" yaml:"log_max_size,omitempty"`
+	// LogMaxBackups is the number of rotated logs to retain (default 3,
+	// minimum 1). Smaller values warn and use the default.
+	LogMaxBackups *int `mapstructure:"log_max_backups" yaml:"log_max_backups,omitempty"`
 }
 
 // GlobalMCPConfig is the `mcp:` block in ~/.gortex/config.yaml. It contains
@@ -205,6 +233,60 @@ func UnknownGlobalKeys(configPath ...string) []string {
 	if len(configPath) > 0 && configPath[0] != "" {
 		path = configPath[0]
 	}
+	return unknownTopLevelKeysIn(path, knownGlobalTopLevelKeys)
+}
+
+// UnknownWorkspaceKeys returns the dotted paths of keys present in the
+// repo-level `.gortex.yaml` at path that gortex does not recognise — at
+// any depth, so `index.ignore` (a typo for the real index.exclude) is
+// caught, not just a misplaced top-level block. The key set is not
+// maintained by hand: it is the mapstructure tag tree of config.Config,
+// validated via mapstructure metadata. It never fails: a missing
+// or unparseable file yields no keys, so forward compatibility is
+// preserved and the parse failure is reported through the
+// malformed-config warning instead.
+func UnknownWorkspaceKeys(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return unknownWorkspaceKeys(data)
+}
+
+func unknownWorkspaceKeys(data []byte) []string {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	md := &mapstructure.Metadata{}
+	dec, derr := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		Result:   Default(),
+		Metadata: md,
+		TagName:  "mapstructure",
+	})
+	if derr != nil {
+		return nil
+	}
+	if err := dec.Decode(raw); err != nil && len(md.Unused) == 0 {
+		// The decode failed (e.g. a type error such as
+		// `index: {workers: lots, ignore: [x]}`) before unused-key
+		// accounting produced anything — yield no keys and let the
+		// malformed-config warning report the file instead of guessing
+		// at a partial key list.
+		return nil
+	}
+	if len(md.Unused) == 0 {
+		return nil
+	}
+	sort.Strings(md.Unused)
+	return md.Unused
+}
+
+// unknownTopLevelKeysIn reads the YAML file at path and returns its
+// top-level keys that are not in the known set, sorted. Read and parse
+// errors yield no keys — the caller is expected to report the parse
+// failure through its own channel.
+func unknownTopLevelKeysIn(path string, known map[string]bool) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -215,7 +297,7 @@ func UnknownGlobalKeys(configPath ...string) []string {
 	}
 	var unknown []string
 	for k := range top {
-		if !knownGlobalTopLevelKeys[k] {
+		if !known[k] {
 			unknown = append(unknown, k)
 		}
 	}
@@ -282,6 +364,9 @@ func LoadGlobal(configPath ...string) (*GlobalConfig, error) {
 		return nil, fmt.Errorf("parsing global config: %w", err)
 	}
 
+	if _, err := gc.Edit.AckMode(); err != nil {
+		return nil, err
+	}
 	gc.configPath = path
 	return gc, nil
 }
@@ -304,6 +389,7 @@ func (gc *GlobalConfig) ConfigPath() string {
 func (gc *GlobalConfig) Save() error {
 	globalConfigMu.Lock()
 	defer globalConfigMu.Unlock()
+	gc.repoRevision++
 	return saveGlobalConfigLocked(gc)
 }
 
@@ -317,7 +403,7 @@ func saveGlobalConfigLocked(gc *GlobalConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshaling global config: %w", err)
 	}
-	if err := globalConfigWriteFile(path, data, 0644); err != nil {
+	if err := globalConfigWriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing global config to %s: %w", path, err)
 	}
 	return nil
@@ -386,6 +472,29 @@ func (gc *GlobalConfig) ReposSnapshot() []RepoEntry {
 	return append([]RepoEntry(nil), gc.Repos...)
 }
 
+// ConfiguredRepoRoots snapshots every configured repository root, including
+// project entries and roots not yet registered by warmup. It is a declaration
+// inventory for guidance, not evidence that a graph or checkout is admitted.
+func (gc *GlobalConfig) ConfiguredRepoRoots() []string {
+	if gc == nil {
+		return nil
+	}
+	globalConfigMu.Lock()
+	entries := gc.repoEntriesLocked()
+	globalConfigMu.Unlock()
+	seen := make(map[string]bool, len(entries))
+	var roots []string
+	for _, entry := range entries {
+		root := strings.TrimSpace(entry.Path)
+		if root != "" && !seen[root] {
+			roots = append(roots, root)
+			seen[root] = true
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
 // FindRepoByPrefix searches top-level Repos and all Projects for an entry
 // whose ResolvePrefix matches. Returns nil when no entry matches.
 func (gc *GlobalConfig) FindRepoByPrefix(prefix string) *RepoEntry {
@@ -405,6 +514,149 @@ func (gc *GlobalConfig) FindRepoByPrefix(prefix string) *RepoEntry {
 		}
 	}
 	return nil
+}
+
+// FindRepoByPath searches top-level Repos and all Projects for the given root.
+// Callers that know the loaded root must not take settings from a prefix collision.
+func (gc *GlobalConfig) FindRepoByPath(root string) *RepoEntry {
+	if gc == nil || root == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil
+	}
+	var canonical string
+	matches := func(path string) bool {
+		entryAbs, _ := filepath.Abs(path)
+		if pathkey.SamePathIdentity(entryAbs, abs) {
+			return true
+		}
+		if canonical == "" {
+			canonical = pathkey.CanonicalPath(root)
+		}
+		return pathkey.SamePathIdentity(pathkey.CanonicalPath(path), canonical)
+	}
+	for i := range gc.Repos {
+		if matches(gc.Repos[i].Path) {
+			return &gc.Repos[i]
+		}
+	}
+	for _, proj := range gc.Projects {
+		for i := range proj.Repos {
+			if matches(proj.Repos[i].Path) {
+				return &proj.Repos[i]
+			}
+		}
+	}
+	return nil
+}
+
+// RepoPathLookup reads repository overrides from a fixed configuration snapshot.
+type RepoPathLookup func(root string) *RepoEntry
+
+// SnapshotRepoPaths canonicalizes configured roots once for a multi-repository pass.
+func (gc *GlobalConfig) SnapshotRepoPaths() RepoPathLookup {
+	return gc.snapshotRepoPaths(pathkey.CanonicalPath)
+}
+
+func (gc *GlobalConfig) snapshotRepoPaths(canonicalize func(string) string) RepoPathLookup {
+	globalConfigMu.Lock()
+	entries := gc.repoEntriesLocked()
+	globalConfigMu.Unlock()
+	return gc.repoPathLookup(entries, canonicalize)
+}
+
+func (gc *GlobalConfig) repoEntriesLocked() []RepoEntry {
+	if gc == nil {
+		return nil
+	}
+	entries := append([]RepoEntry(nil), gc.Repos...)
+	for _, project := range gc.Projects {
+		entries = append(entries, project.Repos...)
+	}
+	return entries
+}
+
+// RepoPathSnapshot shares canonical roots and entry lookups for one config revision.
+// Known roots need no filesystem work. Unknown roots use the caller's fallback.
+type RepoPathSnapshot struct {
+	Lookup         RepoPathLookup
+	canonicalRoots map[string]string
+	prefixCounts   map[string]int
+}
+
+// IsOnlyRepoForPrefix recognizes an unambiguous configured owner. Derived
+// instance prefixes still need the ownership resolver's workspace checks.
+func (s *RepoPathSnapshot) IsOnlyRepoForPrefix(prefix, root string) bool {
+	if strings.Contains(prefix, "@") || s.prefixCounts[prefix] != 1 {
+		return false
+	}
+	entry := s.Lookup(root)
+	return entry != nil && ResolvePrefix(*entry) == prefix
+}
+
+func (s *RepoPathSnapshot) CanonicalRoot(root string, canonicalize func(string) string) string {
+	if canonical, ok := s.canonicalRoots[root]; ok {
+		return canonical
+	}
+	return canonicalize(root)
+}
+
+func (gc *GlobalConfig) repoPathLookup(entries []RepoEntry, canonicalize func(string) string) RepoPathLookup {
+	return gc.repoPathSnapshot(entries, canonicalize).Lookup
+}
+
+func (gc *GlobalConfig) repoPathSnapshot(entries []RepoEntry, canonicalize func(string) string) *RepoPathSnapshot {
+	type repoRoot struct {
+		path  string
+		entry RepoEntry
+	}
+	// CanonicalPath has already cleaned paths and normalized volumes. Fold
+	// Unicode and case for bucketing, then retain SamePathIdentity's file
+	// check within each bucket for case-sensitive mounts.
+	lookupKey := func(root string) string {
+		root = pathkey.Normalize(root)
+		if pathkey.CaseInsensitivePaths {
+			root = strings.ToLower(root)
+		}
+		return root
+	}
+	roots := make(map[string][]repoRoot)
+	canonicalRoots := make(map[string]string)
+	prefixCounts := make(map[string]int)
+	if gc != nil {
+		for _, entry := range entries {
+			prefixCounts[ResolvePrefix(entry)]++
+			root := canonicalize(entry.Path)
+			canonicalRoots[entry.Path] = root
+			canonicalRoots[root] = root
+			key := lookupKey(root)
+			roots[key] = append(roots[key], repoRoot{root, entry})
+		}
+	}
+	snapshot := &RepoPathSnapshot{canonicalRoots: canonicalRoots, prefixCounts: prefixCounts}
+	snapshot.Lookup = func(root string) *RepoEntry {
+		if canonical, ok := canonicalRoots[root]; ok {
+			root = canonical
+		} else {
+			root = pathkey.CanonicalPath(root)
+		}
+		candidates := roots[lookupKey(root)]
+		for i := range candidates {
+			if pathkey.SamePathIdentity(candidates[i].path, root) {
+				return &candidates[i].entry
+			}
+		}
+		globalConfigMu.Lock()
+		defer globalConfigMu.Unlock()
+		if entry := gc.FindRepoByPath(root); entry != nil {
+			copy := *entry
+			return &copy
+		}
+		return nil
+	}
+	return snapshot
 }
 
 // checkDuplicatePrefixes returns errors for any duplicate Repo_Prefix values.
@@ -496,6 +748,7 @@ func (gc *GlobalConfig) AddRepo(entry RepoEntry) error {
 	}
 
 	gc.Repos = append(gc.Repos, entry)
+	gc.repoRevision++
 	return nil
 }
 
@@ -535,6 +788,7 @@ func (gc *GlobalConfig) RemoveRepoIfPresent(path string) (bool, error) {
 		}
 		if matched {
 			gc.Repos = append(gc.Repos[:i], gc.Repos[i+1:]...)
+			gc.repoRevision++
 			return true, nil
 		}
 	}
@@ -609,6 +863,7 @@ func (gc *GlobalConfig) RemoveRepoAndSaveIfPresent(path string) (bool, error) {
 	}
 	gc.Repos = candidate.Repos
 	gc.Projects = candidate.Projects
+	gc.repoRevision++
 	return true, nil
 }
 

@@ -10,7 +10,9 @@ import (
 // full identities. The IN-over-JOIN shape is load-bearing: a correlated
 // WHERE EXISTS against a constant VALUES table cannot be inverted by the
 // planner and scans the whole edges table per chunk; driving the join
-// from the VALUES side probes the edges primary key per identity.
+// from the VALUES side probes the edges primary key per identity. CROSS
+// JOIN pins that order: when the planner statistics were taken while the
+// store was tiny, a plain JOIN scans the generation per identity instead.
 //
 // The generation is the sixth and last column of that key, so binding it after
 // the five identity columns completes the seek instead of demoting it to a
@@ -20,8 +22,8 @@ func edgeExactDeleteByIdentitySQL(values string) string {
 DELETE FROM edges
 WHERE id IN (
     SELECT e.id
-    FROM edges AS e
-    JOIN wanted AS w
+    FROM wanted AS w
+    CROSS JOIN edges AS e
       ON e.from_id = w.from_id
      AND e.to_id = w.to_id
      AND e.kind = w.kind
@@ -92,7 +94,7 @@ func (s *Store) RemoveEdgesExact(edges []*graph.Edge) int {
 			args = append(args, k.from, k.to, k.kind, k.file, k.line)
 		}
 		args = append(args, s.viewGen)
-		result, execErr := tx.Exec(edgeExactDeleteByIdentitySQL(values.String()), args...)
+		result, execErr := countEdgeWrite(tx.Exec(edgeExactDeleteByIdentitySQL(values.String()), args...))
 		if execErr != nil {
 			panicOnFatal(execErr)
 			return 0

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -32,11 +33,16 @@ import (
 //
 // Returns the store, a cleanup func the caller must defer (it closes the
 // handle on disk), and any open error.
-// allowRebuild permits the backend to drop and recreate a database whose
-// schema version is incompatible. The caller must hold the store lock;
-// NewSharedServer passes true only in the branch where it acquired the
+// allowRebuild permits rebuilding supported older schemas when necessary and
+// backing an existing store up before an in-place schema upgrade; a schema
+// newer than this binary is always refused and retained. The caller must
+// hold the store lock. NewSharedServer passes true only after acquiring the
 // exclusive flock.
-func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
+func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
+	return openBackendWithUpgradeOption(name, path, logger, allowRebuild, nil, observers...)
+}
+
+func openBackendWithUpgradeOption(name, path string, logger *zap.Logger, allowRebuild bool, upgradeOption store_sqlite.Option, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	if err := checkBackend(name); err != nil {
 		return nil, nil, err
 	}
@@ -47,7 +53,10 @@ func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, obser
 	if logger != nil {
 		logger.Info("opening sqlite backend", zap.String("path", resolved))
 	}
-	return openSqliteBackend(resolved, allowRebuild, observers...)
+	if upgradeOption == nil {
+		return openSqliteBackend(resolved, allowRebuild, observers...)
+	}
+	return openSqliteBackendWithUpgradeOption(resolved, allowRebuild, upgradeOption, observers...)
 }
 
 // checkBackend validates a requested backend name. It is split out of
@@ -93,24 +102,59 @@ func resolveBackendPath(in, filename string) (string, error) {
 	return abs, nil
 }
 
+// ResolveStorePath applies the same path/default/parent rules as the daemon
+// stack without opening SQLite. Detached startup needs this before exec so
+// SQLITE_TMPDIR is present in SQLite's process-start environment.
+func ResolveStorePath(path string) (string, error) {
+	return resolveBackendPath(path, "store.sqlite")
+}
+
 // openSqliteBackend opens (or creates) the SQLite store at path. The
 // pure-Go modernc.org/sqlite driver keeps the binary CGo-free while still
 // getting a real query planner that drives the graph's secondary indexes.
-func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func(), error) {
+func openSqliteBackend(path string, allowRebuild bool, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
+	return openSqliteBackendWithUpgradeOption(path, allowRebuild, nil, observers...)
+}
+
+func openSqliteBackendWithUpgradeOption(path string, allowRebuild bool, upgradeOption store_sqlite.Option, observers ...store_sqlite.MigrationObserver) (graph.Store, func() error, error) {
 	var opts []store_sqlite.Option
 	if len(observers) > 0 && observers[0] != nil {
 		opts = append(opts, store_sqlite.WithMigrationObserver(observers[0]))
 	}
 	if allowRebuild {
-		opts = append(opts, store_sqlite.WithRebuild())
+		// Both need exclusive access to the store, which allowRebuild attests.
+		opts = append(opts, store_sqlite.WithRebuild(), store_sqlite.WithUpgradeBackup())
+	}
+	if upgradeOption != nil {
+		opts = append(opts, upgradeOption)
 	}
 	s, err := store_sqlite.Open(path, opts...)
 	if err != nil {
+		if errors.Is(err, store_sqlite.ErrSchemaTooNew) || errors.Is(err, store_sqlite.ErrInsufficientUpgradeSpace) {
+			// Restarting another process cannot make this binary compatible,
+			// nor free the disk space an upgrade needs.
+			return nil, nil, fmt.Errorf("open sqlite store at %q: %w", path, err)
+		}
 		hint := "if another gortex daemon is using this store, stop it first (`gortex daemon status` / `gortex daemon stop`)"
 		if pid, ok := daemon.RunningPID(); ok {
 			hint = fmt.Sprintf("a gortex daemon is already running (pid %d) — stop it with `gortex daemon stop`, or use `gortex daemon restart`", pid)
 		}
 		return nil, nil, fmt.Errorf("open sqlite store at %q: %w (%s)", path, err, hint)
 	}
-	return s, func() { _ = s.Close() }, nil
+	return s, s.Close, nil
+}
+
+// pruneStoreUpgradeBackups removes the pre-upgrade backups of storePath that
+// have outlived store_sqlite.UpgradeBackupRetention at now, along with any
+// partial copy an interrupted upgrade left behind. The caller must hold the
+// store lock. Failures are logged, never fatal: a backup that cannot be
+// removed costs disk space, not correctness.
+func pruneStoreUpgradeBackups(storePath string, logger *zap.Logger, now time.Time) {
+	removed, err := store_sqlite.PruneUpgradeBackups(storePath, store_sqlite.UpgradeBackupRetention, now)
+	for _, path := range removed {
+		logger.Info("serverstack: removed expired store upgrade backup", zap.String("path", path))
+	}
+	if err != nil {
+		logger.Warn("serverstack: could not prune store upgrade backups", zap.String("store", storePath), zap.Error(err))
+	}
 }

@@ -494,10 +494,12 @@ func (s *ToolSurface) Preset() string {
 
 // effectiveSessionPolicy resolves the tool-surface policy in force for the
 // current request's session. A forwarded, operator-pinned, or active-profile
-// selection wins; otherwise every identified client gets the compact closed
-// surface and an unidentified/pre-initialize session keeps the server default.
-// The result is cached on the session so it is derived once, not on every
-// tools/list. Never nil.
+// selection wins; otherwise every MCP client connection gets the compact
+// closed surface — whether or not its initialize carried a clientInfo.name,
+// which is informational and routinely left empty by SDKs and proxies — and
+// only an internal session-less caller keeps the server default. The result
+// is cached on the session so it is derived once, not on every tools/list.
+// Never nil.
 //
 // This is the single authoritative resolution point the diet relies on:
 // wherever tools/list is answered on the daemon, the surface for THIS
@@ -511,8 +513,13 @@ func (s *Server) effectiveSessionPolicy(ctx context.Context) *toolPolicy {
 	if sess == nil {
 		return s.toolPolicy
 	}
+	connected := isClientConnection(ctx)
 	sess.mu.Lock()
-	if sess.toolPolicyResolved {
+	// A fallback cached by an internal caller sharing this session must not
+	// pin a client connection to the server default: re-resolve once. An
+	// operator pin resolves to the same fallback, so it keeps the cache.
+	stale := connected && sess.resolvedToolPolicy == nil && !s.toolPolicyOperatorPinned
+	if sess.toolPolicyResolved && !stale {
 		p := sess.resolvedToolPolicy
 		sess.mu.Unlock()
 		if p != nil {
@@ -523,7 +530,7 @@ func (s *Server) effectiveSessionPolicy(ctx context.Context) *toolPolicy {
 	spec, mode, client := sess.toolSpec, sess.toolMode, sess.clientName
 	sess.mu.Unlock()
 
-	p := s.resolveSessionPolicy(spec, mode, client)
+	p := s.resolveSessionPolicy(spec, mode, connected || strings.TrimSpace(client) != "")
 
 	sess.mu.Lock()
 	sess.resolvedToolPolicy = p
@@ -537,11 +544,12 @@ func (s *Server) effectiveSessionPolicy(ctx context.Context) *toolPolicy {
 }
 
 // resolveSessionPolicy builds the effective policy from a client-forwarded
-// spec + mode and the client name, or returns nil to fall back to the
-// server's global policy. A forwarded spec inherits the server's mode when
-// the client did not pin one, so a bare `GORTEX_TOOLS=nav` keeps the
-// daemon's defer semantics instead of silently switching to hide.
-func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
+// spec + mode and whether the session is an MCP client connection, or
+// returns nil to fall back to the server's global policy. A forwarded spec
+// inherits the server's mode when the client did not pin one, so a bare
+// `GORTEX_TOOLS=nav` keeps the daemon's defer semantics instead of silently
+// switching to hide.
+func (s *Server) resolveSessionPolicy(spec, mode string, identified bool) *toolPolicy {
 	if strings.TrimSpace(spec) != "" {
 		cfg := parseToolSpec(spec)
 		switch {
@@ -566,8 +574,8 @@ func (s *Server) resolveSessionPolicy(spec, mode, client string) *toolPolicy {
 	if p := s.instructionProfilePolicy(); p != nil {
 		return p
 	}
-	if p := s.clientDefaultPolicy(client); p != nil {
-		return p
+	if identified {
+		return s.clientSurfacePolicy()
 	}
 	return nil
 }
@@ -632,16 +640,24 @@ func operatorPinnedToolPolicy(base ToolPolicyConfig) bool {
 	return true
 }
 
-// clientDefaultPolicy returns the compact, closed coding surface for every
-// identified MCP client. Surface selection is intentionally independent of
-// wire-format decoding: an unknown editor can use the JSON-safe compact tools,
-// while only decoder-allowlisted clients default to GCX. Empty/pre-initialize
-// sessions retain the server default. Explicit forwarded, operator-pinned, and
-// instruction-profile policies are resolved before this fallback.
+// clientDefaultPolicy returns the client surface for a named MCP client. A
+// name alone cannot tell an unnamed client from an internal caller, so an
+// empty name returns nil here; effectiveSessionPolicy gives an unnamed
+// client connection the same surface (see isClientConnection).
 func (s *Server) clientDefaultPolicy(client string) *toolPolicy {
 	if strings.TrimSpace(client) == "" {
 		return nil
 	}
+	return s.clientSurfacePolicy()
+}
+
+// clientSurfacePolicy is the compact, closed coding surface every MCP client
+// connection gets by default, independent of its clientInfo.name. Surface
+// selection is intentionally independent of wire-format decoding: an unknown
+// editor can use the JSON-safe compact tools, while only decoder-allowlisted
+// clients default to GCX. Explicit forwarded, operator-pinned, and
+// instruction-profile policies are resolved before this fallback.
+func (s *Server) clientSurfacePolicy() *toolPolicy {
 	return newToolPolicy(ToolPolicyConfig{Preset: FacadeSurfaceVersion, Mode: toolPolicyModeHide}, s.logger)
 }
 

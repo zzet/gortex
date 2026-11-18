@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -16,6 +17,7 @@ type scopedBundleBackend struct {
 	flood         []search.SymbolBundle
 	scoped        []search.SymbolBundle
 	scopedCalls   int
+	scopedLimit   int
 	unscopedCalls int
 	searchCalls   int
 }
@@ -34,8 +36,9 @@ func (b *scopedBundleBackend) SearchSymbolBundles(string, int) []search.SymbolBu
 	return append([]search.SymbolBundle(nil), b.flood...)
 }
 
-func (b *scopedBundleBackend) SearchSymbolBundlesScoped(_ string, _ []string, _ int) []search.SymbolBundle {
+func (b *scopedBundleBackend) SearchSymbolBundlesScoped(_ string, _ []string, limit int) []search.SymbolBundle {
 	b.scopedCalls++
+	b.scopedLimit = limit
 	// Preserve nil-vs-empty: a non-nil empty scoped answer is the
 	// sentinel contract the engine must honour (append would flatten
 	// it back to nil).
@@ -121,5 +124,49 @@ func TestGatherSymbolCandidates_NoScopeKeepsUnscopedBundles(t *testing.T) {
 	}
 	if backend.scopedCalls != 0 {
 		t.Fatalf("scoped path used without a repo narrow (%d calls)", backend.scopedCalls)
+	}
+}
+
+// TestGatherSymbolCandidates_RepoScopedAnswerNeedsNoSlack: the scoped query
+// already applied RepoAllow, so when that is the whole scope it is sized and
+// saturates like an unscoped query, and a full answer skips the supplemental
+// name lookups. A constraint the query cannot apply keeps the over-fetch for
+// the post-filter.
+func TestGatherSymbolCandidates_RepoScopedAnswerNeedsNoSlack(t *testing.T) {
+	const limit = 5
+	for _, tc := range []struct {
+		name      string
+		opts      QueryOptions
+		wantLimit int
+		saturates bool
+	}{
+		{name: "repo only", wantLimit: limit * 2, saturates: true},
+		{name: "workspace", opts: QueryOptions{WorkspaceID: "ws"}, wantLimit: limit * 4 * 2},
+		{name: "node filter", opts: QueryOptions{SearchNodeFilter: func(*graph.Node) bool { return true }}, wantLimit: limit * 4 * 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			// Absent from the scoped answer: only the exact-name splice adds it.
+			g.AddNode(&graph.Node{ID: "app/x.go::Extensions", Name: "Extensions", Kind: graph.KindFunction, RepoPrefix: "app"})
+			noise := &graph.Node{ID: "noise/f.go::Extensions", Name: "Extensions", Kind: graph.KindFunction, RepoPrefix: "noise"}
+			backend := &scopedBundleBackend{flood: []search.SymbolBundle{{Node: noise, Score: 10}}, scoped: []search.SymbolBundle{}}
+			for i := 0; i < limit*2; i++ {
+				n := &graph.Node{ID: fmt.Sprintf("app/w.go::WidgetExtensions%d", i), Name: fmt.Sprintf("WidgetExtensions%d", i), Kind: graph.KindType, RepoPrefix: "app"}
+				backend.scoped = append(backend.scoped, search.SymbolBundle{Node: n, Score: 1})
+			}
+			engine := NewEngine(g)
+			engine.SetSearch(backend)
+
+			opts := tc.opts
+			opts.RepoAllow = map[string]bool{"app": true}
+			opts.SkipInnerRerank, opts.SkipVectorChannel = true, true
+			got := engine.GatherSymbolCandidates("Extensions", limit, opts, nil)
+			if backend.scopedLimit != tc.wantLimit {
+				t.Fatalf("scoped bundle limit = %d, want %d", backend.scopedLimit, tc.wantLimit)
+			}
+			if tc.saturates && len(got) != limit*2 {
+				t.Fatalf("saturated scoped answer gathered %d candidates, want only its %d rows", len(got), limit*2)
+			}
+		})
 	}
 }

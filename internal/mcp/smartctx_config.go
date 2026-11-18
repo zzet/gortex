@@ -13,6 +13,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/search/rerank"
 )
 
 // smartContextSections resolves which in-pack enrichment sections a
@@ -277,15 +278,26 @@ func confidenceVerdict(rec quality.ConfidenceRecord) string {
 // anchored solely by speculative (best-guess dynamic-dispatch) edges. It is
 // suppressed for single-symbol / distinctive-identifier lookups. Returns nil
 // when the retrieval looks sound or there is nothing to assess.
-func (s *Server) lowConfidenceRetrievalNote(ctx context.Context, task string, syms []*graph.Node) map[string]any {
+//
+// taskRankedKnown says taskRanked already holds the ranked search of the whole
+// task, which then replaces the identical search here.
+func (s *Server) lowConfidenceRetrievalNote(ctx context.Context, task string, syms []*graph.Node, taskRanked []*rerank.Candidate, taskRankedKnown bool, scope query.QueryOptions) map[string]any {
 	if strings.TrimSpace(task) == "" || len(syms) == 0 {
+		return nil
+	}
+	// retrievalNoteFor never hedges a distinctive identifier, whatever the
+	// ranking says, so there is nothing to search for.
+	if isDistinctiveIdentifierQuery(task) {
 		return nil
 	}
 	eng := s.engineFor(ctx)
 	if eng == nil {
 		return nil
 	}
-	cands := eng.SearchSymbolsRanked(task, 10, query.QueryOptions{}, nil)
+	cands := taskRanked
+	if !taskRankedKnown {
+		cands = eng.SearchSymbolsRankedContext(ctx, task, 10, scope, nil)
+	}
 	scores := make([]float64, 0, len(cands))
 	for _, c := range cands {
 		if c != nil {

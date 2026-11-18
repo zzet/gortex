@@ -39,7 +39,7 @@ func TestIndexMultiRepoPublishesCombinedDurableVectorCorpus(t *testing.T) {
 	mi := NewMultiIndexer(store, coldOrchestrationRegistry(), sw, nil, zap.NewNop())
 	mi.SetEmbedder(&poolEmbedder{})
 
-	results, err := mi.indexMultiRepo(repos)
+	results, err := mi.indexFixtureRepos(repos)
 	require.NoError(t, err)
 	require.Len(t, results, len(repos))
 	stats, err := store.VectorCorpusStats(context.Background(), 3)
@@ -64,7 +64,7 @@ func TestUntrackRepoRemovesVectorsAndRepublishesAggregateStats(t *testing.T) {
 	sw := search.NewSwappable(initialSearchBackend(store))
 	mi := NewMultiIndexer(store, coldOrchestrationRegistry(), sw, cm, zap.NewNop())
 	mi.SetEmbedder(&poolEmbedder{})
-	_, err = mi.indexMultiRepo(repos)
+	_, err = mi.indexFixtureRepos(repos)
 	require.NoError(t, err)
 
 	prefixA := config.ResolvePrefix(repos[0])

@@ -26,11 +26,14 @@ func sqliteIdentityForEdge(e *graph.Edge) sqliteEdgeIdentity {
 // It runs only while an active analysis generation exists; ordinary indexing
 // pays no preflight cost. Composite keys are checked in bounded queries so an
 // idempotent enrichment batch preserves the expensive warm analysis cache.
-func (s *Store) batchContainsNewEdgeLocked(edges []*graph.Edge) (bool, int, error) {
+func (s *Store) batchContainsNewEdgeLockedContext(ctx context.Context, edges []*graph.Edge) (bool, int, error) {
 	const keysPerQuery = 180 // five bound values per key plus the generation; remain below SQLite's 999 limit
 	unique := make(map[sqliteEdgeIdentity]struct{}, len(edges))
 	keys := make([]sqliteEdgeIdentity, 0, len(edges))
 	for _, edge := range edges {
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
 		if edge == nil || graph.IsProxyID(edge.From) || graph.IsProxyID(edge.To) {
 			continue
 		}
@@ -48,6 +51,9 @@ func (s *Store) batchContainsNewEdgeLocked(edges []*graph.Edge) (bool, int, erro
 	found := make(map[sqliteEdgeIdentity]struct{}, len(keys))
 	statements := 0
 	for start := 0; start < len(keys); start += keysPerQuery {
+		if err := ctx.Err(); err != nil {
+			return false, statements, err
+		}
 		end := start + keysPerQuery
 		if end > len(keys) {
 			end = len(keys)
@@ -65,16 +71,7 @@ func (s *Store) batchContainsNewEdgeLocked(edges []*graph.Edge) (bool, int, erro
 		// The insert this gates writes at the handle's generation, so an
 		// identical edge in another one is still a new edge here.
 		args = append(args, s.viewGen)
-		rows, err := s.queryActiveWriteLocked(context.Background(),
-			`WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES `+values.String()+`)
-             SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line
-             FROM wanted AS w
-             JOIN edges AS e
-               ON e.from_id = w.from_id AND e.to_id = w.to_id
-              AND e.kind = w.kind AND e.file_path = w.file_path AND e.line = w.line
-              AND e.view_gen = ?`,
-			args...,
-		)
+		rows, err := s.queryActiveWriteLocked(ctx, existingEdgeIdentitiesSQL(values.String()), args...)
 		if err != nil {
 			return false, statements, err
 		}
@@ -98,14 +95,28 @@ func (s *Store) batchContainsNewEdgeLocked(edges []*graph.Edge) (bool, int, erro
 	return len(found) != len(keys), statements, nil
 }
 
+// CROSS JOIN keeps the identity list outer under stale planner statistics.
+func existingEdgeIdentitiesSQL(values string) string {
+	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` + values + `)
+             SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line
+             FROM wanted AS w
+             CROSS JOIN edges AS e
+               ON e.from_id = w.from_id AND e.to_id = w.to_id
+              AND e.kind = w.kind AND e.file_path = w.file_path AND e.line = w.line
+              AND e.view_gen = ?`
+}
+
 // batchContainsAnalysisNodeChangeLocked compares every analysis-facing node
 // field in bounded VALUES joins. The old AddBatch path called the single-node
 // preflight once per input row, yielding one SELECT + Meta decode per node.
-func (s *Store) batchContainsAnalysisNodeChangeLocked(nodes []*graph.Node) (bool, int, error) {
+func (s *Store) batchContainsAnalysisNodeChangeLockedContext(ctx context.Context, nodes []*graph.Node) (bool, int, error) {
 	const idsPerQuery = 450
 	incoming := make(map[string][]*graph.Node, len(nodes))
 	ordered := make([]string, 0, len(nodes))
 	for _, node := range nodes {
+		if err := ctx.Err(); err != nil {
+			return false, 0, err
+		}
 		if node == nil || node.ID == "" || graph.IsProxyNode(node) {
 			continue
 		}
@@ -120,6 +131,9 @@ func (s *Store) batchContainsAnalysisNodeChangeLocked(nodes []*graph.Node) (bool
 
 	statements := 0
 	for start := 0; start < len(ordered); start += idsPerQuery {
+		if err := ctx.Err(); err != nil {
+			return false, statements, err
+		}
 		end := start + idsPerQuery
 		if end > len(ordered) {
 			end = len(ordered)
@@ -137,7 +151,7 @@ func (s *Store) batchContainsAnalysisNodeChangeLocked(nodes []*graph.Node) (bool
 		// Same generation the upsert lands on: a row missing from this
 		// generation is a new node even when another generation carries its id.
 		args = append(args, s.viewGen)
-		rows, err := s.queryActiveWriteLocked(context.Background(), `
+		rows, err := s.queryActiveWriteLocked(ctx, `
 WITH wanted(id) AS (VALUES `+values.String()+`)
 SELECT n.id, n.kind, n.name, n.qual_name, n.file_path,
        n.start_line, n.end_line, n.start_column, n.end_column,

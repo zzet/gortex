@@ -15,6 +15,8 @@ package cochange
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"os/exec"
 	"sort"
@@ -85,10 +87,21 @@ type Result struct {
 // not a git repository or git is unavailable — co-change is a
 // best-effort enrichment.
 func Mine(ctx context.Context, root string, opts Options) Result {
+	res, _ := MineContext(ctx, root, opts)
+	return res
+}
+
+// MineContext retains cancellation and Git failures instead of making an
+// interrupted mine look like an empty successful history. No partial result
+// is returned on error. Mine keeps the historical best-effort contract.
+func MineContext(ctx context.Context, root string, opts Options) (Result, error) {
 	opts = opts.withDefaults()
 	empty := Result{FileChanges: map[string]int{}}
+	if err := ctx.Err(); err != nil {
+		return empty, err
+	}
 	if root == "" {
-		return empty
+		return empty, nil
 	}
 	// %x00 emits a NUL before each commit record; --name-only appends
 	// the changed file list. The format body is empty — we only need
@@ -96,9 +109,9 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 	cmd := exec.CommandContext(ctx, "git", "-C", root, "log", "--no-merges", //nolint:gosec // root is daemon-internal
 		"-n", strconv.Itoa(opts.MaxCommits), "--name-only", "--format=%x00")
 	platform.ConfigureBackgroundCommand(cmd)
-	out, err := cmd.Output()
+	out, err := mineCommandOutput(ctx, cmd)
 	if err != nil {
-		return empty
+		return empty, fmt.Errorf("cochange git log: %w", err)
 	}
 
 	pairCounts := map[[2]string]int{}
@@ -106,6 +119,9 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 	commitsScanned := 0
 
 	for _, chunk := range strings.Split(string(out), "\x00") {
+		if err := ctx.Err(); err != nil {
+			return empty, err
+		}
 		files := parseCommitFiles(chunk)
 		if len(files) == 0 {
 			continue
@@ -115,6 +131,9 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 		// including solo and sweeping commits — so the association
 		// denominator honestly reflects how often the file moves.
 		for _, f := range files {
+			if err := ctx.Err(); err != nil {
+				return empty, err
+			}
 			fileChanges[f]++
 		}
 		// Pair counting skips solo commits (no pair) and sweeping
@@ -125,6 +144,9 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 		}
 		for i := 0; i < len(files); i++ {
 			for j := i + 1; j < len(files); j++ {
+				if err := ctx.Err(); err != nil {
+					return empty, err
+				}
 				pairCounts[orderedPair(files[i], files[j])]++
 			}
 		}
@@ -132,6 +154,9 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 
 	pairs := make([]Pair, 0, len(pairCounts))
 	for key, cnt := range pairCounts {
+		if err := ctx.Err(); err != nil {
+			return empty, err
+		}
 		if cnt < opts.MinCount {
 			continue
 		}
@@ -148,6 +173,10 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 		}
 		pairs = append(pairs, Pair{FileA: a, FileB: b, Count: cnt, Score: score})
 	}
+	if err := ctx.Err(); err != nil {
+		return empty, err
+	}
+	// The loaded sort is not interruptible; ownership includes its real return.
 	sort.Slice(pairs, func(i, j int) bool {
 		if pairs[i].Score != pairs[j].Score {
 			return pairs[i].Score > pairs[j].Score
@@ -158,7 +187,24 @@ func Mine(ctx context.Context, root string, opts Options) Result {
 		return pairs[i].FileB < pairs[j].FileB
 	})
 
-	return Result{Pairs: pairs, FileChanges: fileChanges, CommitsScanned: commitsScanned}
+	if err := ctx.Err(); err != nil {
+		return empty, err
+	}
+	return Result{Pairs: pairs, FileChanges: fileChanges, CommitsScanned: commitsScanned}, nil
+}
+
+// mineCommandOutput waits for the exact exec-owned direct child, including cancellation
+// and pipe-copy completion. Keep both context and exit/wait errors; a kill is
+// not successful mining. This does not claim arbitrary descendant containment.
+func mineCommandOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out, err := cmd.Output()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, errors.Join(ctxErr, err)
+	}
+	return out, err
 }
 
 // parseCommitFiles extracts the changed-file list from one NUL-
@@ -211,6 +257,28 @@ func EnrichGraphWith(g graph.Store, root, repoPrefix string, opts Options) (int,
 	return AddEdges(g, res.Pairs, repoPrefix), nil
 }
 
+// EnrichGraphContext is the cancellation/error-aware sibling of EnrichGraph.
+// Completed earlier batches remain durable on cancellation; no subsequent
+// batch is admitted, and the error must not be reported as completed enrichment.
+func EnrichGraphContext(ctx context.Context, g graph.Store, root, repoPrefix string) (int, error) {
+	return EnrichGraphWithContext(ctx, g, root, repoPrefix, Options{})
+}
+
+// EnrichGraphWithContext is EnrichGraphContext with explicit scan tuning.
+func EnrichGraphWithContext(ctx context.Context, g graph.Store, root, repoPrefix string, opts Options) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if g == nil || root == "" {
+		return 0, nil
+	}
+	res, err := MineContext(ctx, root, opts)
+	if err != nil {
+		return 0, err
+	}
+	return AddEdgesContext(ctx, g, res.Pairs, repoPrefix)
+}
+
 // coChangeEdgeBatchSize bounds the temporary edge set while filling one large
 // SQLite JSONB ingest payload per store call. Keeping this package-owned avoids
 // coupling co-change semantics to a specific backend; Graph.AddBatch uses the
@@ -226,8 +294,40 @@ const coChangeEdgeBatchSize = 8 * 1024
 // node path (the pairs hold git-relative paths). Pass "" for a
 // single-repo graph. Idempotent — graph.AddBatch dedupes.
 func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
+	added, _ := addEdges(context.Background(), g, pairs, repoPrefix, func(edges []*graph.Edge) error {
+		g.AddBatch(nil, edges)
+		return nil
+	})
+	return added
+}
+
+// AddEdgesContext returns directed edges submitted by completed batches (the
+// same count as AddEdges on success, including deduplicated repeats). Errors
+// retain already completed batches; pending rows are never counted as written.
+// Legacy store calls themselves remain joined, not physically interruptible.
+func AddEdgesContext(ctx context.Context, g graph.Store, pairs []Pair, repoPrefix string) (int, error) {
+	return addEdges(ctx, g, pairs, repoPrefix, func(edges []*graph.Edge) error {
+		if checked, ok := g.(interface {
+			AddBatchCheckedContext(context.Context, []*graph.Node, []*graph.Edge) error
+		}); ok {
+			return checked.AddBatchCheckedContext(ctx, nil, edges)
+		}
+		if checked, ok := g.(interface {
+			AddBatchChecked([]*graph.Node, []*graph.Edge) error
+		}); ok {
+			return checked.AddBatchChecked(nil, edges)
+		}
+		g.AddBatch(nil, edges)
+		return nil
+	})
+}
+
+func addEdges(ctx context.Context, g graph.Store, pairs []Pair, repoPrefix string, write func([]*graph.Edge) error) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if g == nil || len(pairs) == 0 {
-		return 0
+		return 0, nil
 	}
 	// Map repo-relative path -> file node ID. Ask the store for file nodes
 	// directly: the SQLite implementation pushes KindFile into its indexed
@@ -238,7 +338,10 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 	// A file node's FilePath carries the multi-repo prefix; key on the
 	// prefix-stripped path so a git-relative path matches.
 	idByPath := make(map[string]string)
-	for n := range g.NodesByKind(graph.KindFile) {
+	for n := range graph.BindReadContext(g, ctx).NodesByKind(graph.KindFile) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		if n == nil || n.Kind != graph.KindFile || n.FilePath == "" {
 			continue
 		}
@@ -252,17 +355,30 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	edgeBatch := make([]*graph.Edge, 0, coChangeEdgeBatchSize)
-	flush := func() {
-		if len(edgeBatch) == 0 {
-			return
+	added := 0
+	flush := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		g.AddBatch(nil, edgeBatch)
+		if len(edgeBatch) == 0 {
+			return nil
+		}
+		if err := write(edgeBatch); err != nil {
+			return errors.Join(ctx.Err(), err)
+		}
+		added += len(edgeBatch)
 		edgeBatch = edgeBatch[:0]
+		return ctx.Err()
 	}
 
-	added := 0
 	for _, p := range pairs {
+		if err := ctx.Err(); err != nil {
+			return added, err
+		}
 		idA, okA := idByPath[p.FileA]
 		idB, okB := idByPath[p.FileB]
 		if !okA || !okB || idA == idB {
@@ -272,13 +388,14 @@ func AddEdges(g graph.Store, pairs []Pair, repoPrefix string) int {
 			coChangeEdge(idA, idB, p.FileA, p),
 			coChangeEdge(idB, idA, p.FileB, p),
 		)
-		added += 2
 		if len(edgeBatch) >= coChangeEdgeBatchSize {
-			flush()
+			if err := flush(); err != nil {
+				return added, err
+			}
 		}
 	}
-	flush()
-	return added
+	err := flush()
+	return added, err
 }
 
 // coChangeEdge builds one directed EdgeCoChange edge. Meta is cloned

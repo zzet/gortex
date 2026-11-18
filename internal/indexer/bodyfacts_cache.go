@@ -78,11 +78,16 @@ func (c *bodyFactsCache) entryFor(handler *graph.Node) *bfCacheEntry {
 // bytes. Mirrors the path-resolution dance in resolveProviderHandlers
 // (strip repo prefix, join with rootPath).
 func (c *bodyFactsCache) readFile(handler *graph.Node) []byte {
+	if c.idx.contractAnalysisOnly {
+		return c.idx.contractFileSrc(handler.FilePath)
+	}
 	disk := c.idx.ResolveFilePath(handler.FilePath)
 	if disk == "" {
 		return nil
 	}
 	data, err := os.ReadFile(disk)
+	// A build that proves its reads records this one too.
+	c.idx.contentProof.recordRead(disk, data, err)
 	if err != nil {
 		return nil
 	}

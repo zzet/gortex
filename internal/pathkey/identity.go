@@ -75,6 +75,21 @@ func EqualPaths(a, b string) bool {
 	return foldPath(a, CaseInsensitivePaths) == foldPath(b, CaseInsensitivePaths)
 }
 
+// IdentityKey returns the folded identity EqualPaths compares, for use as a
+// map key: two paths EqualPaths accepts share one key. Lexical only — it never
+// touches the filesystem, so aliases such as /tmp and /private/tmp keep
+// distinct keys unless the caller canonicalises first.
+func IdentityKey(p string) string {
+	return foldPath(p, CaseInsensitivePaths)
+}
+
+// IdentityKeyForCase is IdentityKey with a fixed case policy. Persisted SQL
+// index collations use it so changing the host comparison policy selects a
+// different index instead of changing the ordering of an existing index.
+func IdentityKeyForCase(p string, caseInsensitive bool) string {
+	return foldPath(p, caseInsensitive)
+}
+
 // HasPathPrefix reports whether path is root itself or lies beneath it,
 // comparing on folded identity and respecting path-component boundaries:
 // "/Users/me/Doc" is not under "/Users/me/Documents". The volume root

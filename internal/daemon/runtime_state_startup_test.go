@@ -46,3 +46,24 @@ func TestWriteRuntimeStatePublishesWholeJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestReadRuntimeStateOfOutlivesItsWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.state.json")
+	t.Setenv("GORTEX_DAEMON_STATEFILE", path)
+	// No platform hands out a PID this large, so the writer is certainly gone.
+	const exited = 1 << 30
+	record := `{"pid":1073741824,"backend_path":"","startup_phase":"failed","startup_error":"refused"}`
+	if err := os.WriteFile(path, []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadRuntimeState(); ok {
+		t.Fatal("a dead writer's record must not route live readers")
+	}
+	st, ok := ReadRuntimeStateOf(exited)
+	if !ok || st.StartupPhase != StartupFailed || st.StartupError != "refused" {
+		t.Fatalf("the spawning parent must still read its child's last record: %+v ok=%v", st, ok)
+	}
+	if _, ok := ReadRuntimeStateOf(exited + 1); ok {
+		t.Fatal("another process's record must not be reported")
+	}
+}

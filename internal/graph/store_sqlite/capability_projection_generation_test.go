@@ -66,7 +66,7 @@ func scanCapabilityGenerationControl(tb testing.TB, s *Store, generation int64, 
 		queryGeneration = 0
 	}
 	var highWater int64
-	if err := s.db.QueryRow(capabilityProjectionHighWaterQuery(queryGeneration), generation).Scan(&highWater); err != nil {
+	if err := s.db.QueryRow(capabilityProjectionHighWaterQuery(queryGeneration, s.edgeGenerationIndexPresent()), generation).Scan(&highWater); err != nil {
 		tb.Fatal(err)
 	}
 	if highWater == 0 {
@@ -229,12 +229,17 @@ func TestCapabilityGenerationQueryPlan(t *testing.T) {
 			t.Fatal("base-generation access path changed")
 		}
 	}
-	plan := capabilityGenerationPlan(t, s, capabilityProjectionHighWaterQuery(7), int64(7))
+	plan := capabilityGenerationPlan(t, s, capabilityProjectionHighWaterQuery(7, true), int64(7))
 	if !strings.Contains(plan, "edges_by_generation") {
 		t.Fatalf("derived highwater must use generation index:\n%s", plan)
 	}
-	if got := capabilityProjectionHighWaterQuery(0); got != `SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?` {
+	// The base highwater is pinned to the generation index when it exists
+	// and falls back to the unpinned legacy form when it does not.
+	if got := capabilityProjectionHighWaterQuery(0, true); got != `SELECT COALESCE(MAX(id), 0) FROM edges INDEXED BY edges_by_generation WHERE view_gen = ?` {
 		t.Fatalf("base highwater changed: %s", got)
+	}
+	if got := capabilityProjectionHighWaterQuery(0, false); got != `SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?` {
+		t.Fatalf("index-less base highwater changed: %s", got)
 	}
 }
 

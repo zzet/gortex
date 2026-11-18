@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -86,6 +87,34 @@ func TestWarmRestart_PrunesDeletedFileMtimes_FastPath(t *testing.T) {
 	idxR2.SetFileMtimes(s.LoadFileMtimes("repo"))
 	assert.False(t, idxR2.HasChangesSinceMtimes(repoPath),
 		"after pruning, an unchanged warm restart must take the fast path")
+}
+
+// The warm-restart probe counts the root go.mod, as the census does: an
+// unchanged one is no change, and an edited one is.
+func TestWarmRestart_ProbeSeesGoModEdits(t *testing.T) {
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	writeExcludeFixture(t, filepath.Join(repoPath, "go.mod"), "module example.com/repo\n")
+	writeExcludeFixture(t, filepath.Join(repoPath, "a.go"), "package main\nfunc Alpha() {}\n")
+
+	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	newIdx := func() *Indexer {
+		idx := New(graph.Store(s), newTestRegistry(), config.Default().Index, zap.NewNop())
+		idx.SetRepoPrefix("repo")
+		idx.SetRootPath(repoPath)
+		idx.SetFileMtimes(s.LoadFileMtimes("repo"))
+		return idx
+	}
+	_, err = newIdx().IndexCtx(context.Background(), repoPath)
+	require.NoError(t, err)
+	require.Contains(t, s.LoadFileMtimes("repo"), "go.mod")
+
+	assert.False(t, newIdx().HasChangesSinceMtimes(repoPath), "nothing changed since the index")
+
+	later := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(filepath.Join(repoPath, "go.mod"), later, later))
+	assert.True(t, newIdx().HasChangesSinceMtimes(repoPath), "an edited go.mod is a change")
 }
 
 // TestIncrementalReindex_PrunesDeletedFileMtimes covers the watcher /

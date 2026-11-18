@@ -590,3 +590,51 @@ func TestWatcher_PatchStoragePanicRecoveredNotCrash(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond,
 		"a storage panic in the debounced patch must be recovered and logged, not crash the daemon")
 }
+
+func TestPatchGraphModify_BinarySkipEvictsSymbolsAndRestoresText(t *testing.T) {
+	idx, ext, store := newToggleIndexer(t)
+	dir := t.TempDir()
+	idx.SetRootPath(dir)
+	path := filepath.Join(dir, "main.fk")
+	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 10}, zap.NewNop())
+	require.NoError(t, err)
+
+	ext.setFuncs("Alpha")
+	writeFile(t, path, "alpha body")
+	require.NoError(t, w.patchGraph(path, ChangeCreated))
+	alphaID := "main.fk::Alpha"
+	require.NotNil(t, store.GetNode(alphaID))
+	requireSymbolFTS(t, store)
+	require.True(t, searchHasID(idx, "Alpha", alphaID))
+
+	// A binary verdict is a successful skip, unlike a parse failure that
+	// preserves prior declarations. The watcher must replace the old corpus
+	// and record the bytes it consumed so reconciles do not retry them.
+	ext.setFail(true)
+	writeFile(t, path, "binary\x00cache")
+	require.NoError(t, w.patchGraph(path, ChangeModified))
+	require.Nil(t, store.GetNode(alphaID))
+	require.False(t, searchHasID(idx, "Alpha", alphaID))
+	nodes := store.GetFileNodes("main.fk")
+	require.Len(t, nodes, 1)
+	require.Equal(t, graph.KindFile, nodes[0].Kind)
+	require.Equal(t, true, nodes[0].Meta["skipped_due_to_binary"])
+	require.True(t, idx.indexedFileReceiptMatches(path), "the successful skip must commit a current receipt")
+	require.Empty(t, idx.fileIndexFailurePaths(), "binary bytes must not enter the retry ledger")
+	require.NoError(t, w.patchGraph(path, ChangeModified), "unchanged binary content remains an admitted skip")
+	require.True(t, idx.indexedFileReceiptMatches(path))
+	require.Empty(t, idx.fileIndexFailurePaths())
+
+	ext.setFail(false)
+	ext.setFuncs("Beta")
+	writeFile(t, path, "beta body")
+	require.NoError(t, w.patchGraph(path, ChangeModified))
+	betaID := "main.fk::Beta"
+	require.NotNil(t, store.GetNode(betaID))
+	require.True(t, searchHasID(idx, "Beta", betaID))
+	require.Nil(t, store.GetNode(alphaID))
+	require.False(t, searchHasID(idx, "Alpha", alphaID))
+	require.NotEqual(t, true, store.GetNode("main.fk").Meta["skipped_due_to_binary"])
+	require.True(t, idx.indexedFileReceiptMatches(path))
+	require.Empty(t, idx.fileIndexFailurePaths())
+}

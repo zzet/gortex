@@ -256,7 +256,7 @@ func downloadPotion() (string, error) {
 	// Test binaries never reach the network: a `go test` run that
 	// exercises a search path must stay hermetic and fall back to the
 	// baked vectors instead of pulling 32MB mid-suite.
-	if strings.HasSuffix(os.Args[0], ".test") {
+	if strings.HasSuffix(os.Args[0], ".test") || strings.HasSuffix(os.Args[0], ".test.exe") {
 		return "", fmt.Errorf("model download disabled in test binaries")
 	}
 	dir := filepath.Join(platform.ModelsDir(), potionModelName)

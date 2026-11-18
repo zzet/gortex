@@ -16,6 +16,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/gitcmd"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathkey"
 )
@@ -55,7 +57,36 @@ type checkoutRefreshRequest struct {
 	headCommit  string
 	headTree    string
 	fingerprint string // Exact snapshot consumed by the published dirty generation.
+	// bindAtCompletion marks a ticket admitted without a working-copy sample
+	// of its own: it promises the first published generation that a sample
+	// begun after its admission describes (fingerprint is empty). An edit
+	// lease's ticket binds the committed bytes by contentHash and HEAD by the
+	// lease's admission sample; a require_fresh ticket binds nothing more.
+	bindAtCompletion bool
+	// headUnbound marks a ticket whose admission pinned no HEAD (a
+	// require_fresh ticket admitted without a sample): the completion sample's
+	// fingerprint, which covers HEAD's tree, is the whole check.
+	headUnbound bool
+	// admittedAt is when the ticket joined the waiters.
+	admittedAt time.Time
+	// freshAfter is the instant any working-copy sample that decides this
+	// ticket must have begun at or after: the start of its own capture sample
+	// (which began after the caller's request, and after an edit's disk
+	// commit), or its admission when it brought no sample of its own start.
+	// A cycle may decide on, and complete the ticket with, any sample begun at
+	// or after it.
+	freshAfter  time.Time
 	contentHash string
+	batchFiles  []CheckoutBatchFile
+	// record is the caller's publication record (WithPublicationRecord),
+	// bound to the ticket at admission, before the coordinator is woken.
+	record *PublicationPhaseRecord
+	// releaseWrite ends the store write announcement the ticket holds from
+	// its admission until it completes or fails (AnnounceCheckoutRefresh):
+	// WAL reclaim still yields while a ticket waits. Chain folds instead yield
+	// to ordinary announcements and actual writer-gate waiters, so a ticket
+	// does not block its own inline fold or background copy during CPU work.
+	releaseWrite func()
 }
 
 // Identity returns the immutable checkout identity admitted before a disk edit.
@@ -87,13 +118,18 @@ func (m *CheckoutMutation) EnqueueRefresh(ctx context.Context, path string) (*Ch
 	if err := m.validateCheckout(ctx); err != nil {
 		return nil, err
 	}
-	request, err := m.coordinator.captureCheckoutRefresh(ctx, m.checkout, m.rootInfo, path)
+	// The prepared lease already pins checkout identity and HEAD. Bind only
+	// the committed file here; sampling the entire working copy belongs to
+	// the coordinator after this reserved ticket owns publication. A slow
+	// sampler must never strand a committed write before ticket admission.
+	canonical, hash, err := checkoutRefreshFileHash(ctx, m.checkout.RootPath, m.rootInfo, path)
 	if err != nil {
 		return nil, err
 	}
-	if request.headRef != m.headRef || request.headCommit != m.headCommit || request.headTree != m.headTree {
-		return nil, ErrCheckoutRefreshSuperseded
-	}
+	request := m.committedRefreshRequest(ctx, canonical)
+	request.contentHash, request.ticket.ContentHash = hash, hash
+	StampPublicationPhase(ctx, PublicationTicketCaptured)
+
 	ticket, err := m.coordinator.enqueueCheckoutRefresh(request, true)
 	m.refreshReserved = false
 	if err == nil {
@@ -102,57 +138,185 @@ func (m *CheckoutMutation) EnqueueRefresh(ctx context.Context, path string) (*Ch
 	return ticket, err
 }
 
+// committedRefreshRequest transfers the prepared lease's authority to a
+// completion-bound ticket. The coordinator must publish a sample begun after
+// admission, with this HEAD and these bytes, before completing it successfully.
+func (m *CheckoutMutation) committedRefreshRequest(ctx context.Context, path string) *checkoutRefreshRequest {
+	done := make(chan MutationResult, 1)
+	return &checkoutRefreshRequest{
+		checkout: m.checkout, rootInfo: m.rootInfo,
+		headRef: m.headRef, headCommit: m.headCommit, headTree: m.headTree,
+		bindAtCompletion: true, record: publicationRecordFrom(ctx), done: done,
+		ticket: &CheckoutRefreshTicket{
+			CheckoutID: m.checkout.CheckoutID, Incarnation: m.checkout.Incarnation,
+			Root: m.checkout.RootPath, RepoPrefix: m.coordinator.repoPrefix,
+			Ticket: &MutationTicket{Path: path, Done: done},
+		},
+	}
+}
+
 // RequestCheckoutRefresh explicitly retries an automatic checkout whose route
 // may be missing, pending or failed. Identity and availability remain strict,
 // but graph readiness is deliberately not a precondition for graph recovery.
 func (l *CheckoutLifecycle) RequestCheckoutRefresh(ctx context.Context, checkoutID, expectedRoot string) (*CheckoutRefreshTicket, error) {
+	return l.requestCheckoutRefresh(ctx, checkoutID, expectedRoot, nil)
+}
+
+// RequestCheckoutRefreshFromSample is RequestCheckoutRefresh admitting the
+// ticket against a working-copy sample the caller already took, instead of
+// taking another. The caller must have taken sample after its request arrived
+// (a freshness proof that found the tree changed does exactly that), and the
+// sample must be of this checkout. The ticket still completes only through
+// the post-admission verification against a sample the cycle takes after the
+// ticket was admitted.
+func (l *CheckoutLifecycle) RequestCheckoutRefreshFromSample(
+	ctx context.Context, checkoutID, expectedRoot string, sample gitstate.DirtySnapshot,
+) (*CheckoutRefreshTicket, error) {
+	return l.requestCheckoutRefresh(ctx, checkoutID, expectedRoot, &sample)
+}
+
+func (l *CheckoutLifecycle) requestCheckoutRefresh(
+	ctx context.Context, checkoutID, expectedRoot string, sample *gitstate.DirtySnapshot,
+) (*CheckoutRefreshTicket, error) {
 	if l == nil || l.catalog == nil || checkoutID == "" || expectedRoot == "" {
 		return nil, fmt.Errorf("%w: checkout identity and root are required", ErrCheckoutMutationStale)
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	ctx, c, checkout, rootInfo, cancel, err := l.checkoutRefreshTarget(ctx, checkoutID, expectedRoot)
 	if err != nil {
 		return nil, err
 	}
-	if !found || !sameMutationRoot(checkout.RootPath, expectedRoot) {
-		return nil, fmt.Errorf("%w: checkout root changed", ErrCheckoutMutationStale)
-	}
-	rootInfo, err := checkoutRootFileInfo(checkout.RootPath)
-	if err != nil || !rootInfo.IsDir() {
-		return nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
-	}
-	l.coordMu.Lock()
-	c, closing := l.coordinators[checkoutID], l.coordinatorClosing
-	l.coordMu.Unlock()
-	if closing {
-		return nil, ErrCheckoutRefreshStopped
-	}
-	if c == nil {
-		l.ActivateCheckout(checkoutID, "explicit checkout refresh requested")
-		return nil, fmt.Errorf("%w: checkout coordinator is activating; retry recovery", ErrCheckoutMutationBusy)
-	}
-	if !sameMutationRoot(c.root, expectedRoot) {
-		return nil, ErrCheckoutRefreshStopped
-	}
-	ctx, cancel := context.WithTimeout(ctx, checkoutRefreshCaptureTimeout)
 	defer cancel()
-	ctx, cancelLifetime := checkoutMutationContext(ctx, c.lifetimeContext())
-	defer cancelLifetime()
-	identity := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
-	if err := identity.validateCheckout(ctx); err != nil {
-		return nil, err
-	}
-	request, err := c.captureCheckoutRefresh(ctx, checkout, rootInfo, "")
+	request, err := c.captureCheckoutRefreshFrom(ctx, checkout, rootInfo, "", sample)
 	if err != nil {
 		return nil, err
 	}
 	return c.enqueueCheckoutRefresh(request, false)
 }
 
+// checkoutRefreshTarget resolves and validates the live coordinator an
+// explicit refresh of checkoutID at expectedRoot is admitted to, and returns
+// the admission's bounded context (capture timeout, coordinator lifetime).
+// The returned cancel releases it; it is set only on success.
+func (l *CheckoutLifecycle) checkoutRefreshTarget(ctx context.Context, checkoutID, expectedRoot string) (
+	context.Context, *CheckoutCoordinator, store_sqlite.Checkout, os.FileInfo, context.CancelFunc, error,
+) {
+	if l == nil || l.catalog == nil || checkoutID == "" || expectedRoot == "" {
+		return nil, nil, store_sqlite.Checkout{}, nil, nil, fmt.Errorf("%w: checkout identity and root are required", ErrCheckoutMutationStale)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checkout, found, err := l.catalog.GetCheckout(ctx, checkoutID)
+	if err != nil {
+		return nil, nil, checkout, nil, nil, err
+	}
+	if !found || !sameMutationRoot(checkout.RootPath, expectedRoot) {
+		return nil, nil, checkout, nil, nil, fmt.Errorf("%w: checkout root changed", ErrCheckoutMutationStale)
+	}
+	rootInfo, err := checkoutRootFileInfo(checkout.RootPath)
+	if err != nil || !rootInfo.IsDir() {
+		return nil, nil, checkout, nil, nil, fmt.Errorf("%w: checkout root is unavailable", ErrCheckoutMutationStale)
+	}
+	l.coordMu.Lock()
+	c, closing := l.coordinators[checkoutID], l.coordinatorClosing
+	l.coordMu.Unlock()
+	if closing {
+		return nil, nil, checkout, nil, nil, ErrCheckoutRefreshStopped
+	}
+	if c == nil {
+		l.ActivateCheckout(checkoutID, "explicit checkout refresh requested")
+		return nil, nil, checkout, nil, nil, fmt.Errorf("%w: checkout coordinator is activating; retry recovery", ErrCheckoutMutationBusy)
+	}
+	if !sameMutationRoot(c.root, expectedRoot) {
+		return nil, nil, checkout, nil, nil, ErrCheckoutRefreshStopped
+	}
+	bounded, cancel := context.WithTimeout(ctx, checkoutRefreshCaptureTimeout)
+	bounded, cancelLifetime := checkoutMutationContext(bounded, c.lifetimeContext())
+	release := func() { cancelLifetime(); cancel() }
+	identity := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
+	if err := identity.validateCheckout(bounded); err != nil {
+		release()
+		return nil, nil, checkout, nil, nil, err
+	}
+	return bounded, c, checkout, rootInfo, release, nil
+}
+
+// RequestBoundCheckoutRefresh admits a ticket bound at completion
+// (requestBoundCheckoutRefresh) for a caller outside the package: a
+// require_fresh wait re-admitting after its ticket was superseded.
+// A ticket pinned to its capture sample is superseded by every publication of
+// another state, and a working copy saved faster than it builds publishes
+// another state each cycle, so a pinned re-admission can chain until the
+// wait's deadline. A bound ticket completes on the first publication whose
+// own sample began after its admission — at worst the build that starts
+// after it — which is all require_fresh promises.
+func (l *CheckoutLifecycle) RequestBoundCheckoutRefresh(ctx context.Context, checkoutID, expectedRoot string) (*CheckoutRefreshTicket, error) {
+	return l.requestBoundCheckoutRefresh(ctx, checkoutID, expectedRoot)
+}
+
+// requestBoundCheckoutRefresh is RequestCheckoutRefresh admitting the ticket
+// without a working-copy sample (bindAtCompletion, HEAD unbound): the caller's
+// promise — the route describes the working copy at some instant after its
+// request arrived — is exactly what the completion check proves with the
+// first sample begun after admission. A ticket admitted while the checkout's
+// build is in flight is then completed by that build's own pre-publish sample
+// when it began after the admission (completeCheckoutRefreshTickets), instead
+// of by a further cycle.
+func (l *CheckoutLifecycle) requestBoundCheckoutRefresh(ctx context.Context, checkoutID, expectedRoot string) (*CheckoutRefreshTicket, error) {
+	ctx, c, checkout, rootInfo, cancel, err := l.checkoutRefreshTarget(ctx, checkoutID, expectedRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	request, err := c.captureBoundCheckoutRefresh(ctx, checkout, rootInfo)
+	if err != nil {
+		return nil, err
+	}
+	return c.enqueueCheckoutRefresh(request, false)
+}
+
+// captureBoundCheckoutRefresh captures a root ticket without sampling the
+// working copy (bindAtCompletion, headUnbound): the first sample begun after
+// its admission decides it.
+func (c *CheckoutCoordinator) captureBoundCheckoutRefresh(
+	ctx context.Context, checkout store_sqlite.Checkout, rootInfo os.FileInfo,
+) (*checkoutRefreshRequest, error) {
+	request := &checkoutRefreshRequest{
+		checkout: checkout, rootInfo: rootInfo, record: publicationRecordFrom(ctx),
+		bindAtCompletion: true, headUnbound: true,
+	}
+	if arrived, ok := FreshRequestArrival(ctx); ok && !arrived.After(time.Now()) {
+		// The request's arrival is the instant its promise is about: any
+		// sample begun at or after it decides the ticket, the one a build
+		// already in flight took among them.
+		request.freshAfter = arrived
+	}
+	identity := &CheckoutMutation{coordinator: c, checkout: checkout, rootInfo: rootInfo}
+	if err := identity.validateCheckout(ctx); err != nil {
+		return nil, err
+	}
+	request.done = make(chan MutationResult, 1)
+	request.ticket = &CheckoutRefreshTicket{
+		CheckoutID: checkout.CheckoutID, Incarnation: checkout.Incarnation,
+		Root: checkout.RootPath, RepoPrefix: c.repoPrefix,
+		Ticket: &MutationTicket{Path: checkout.RootPath, Done: request.done},
+	}
+	return request, nil
+}
+
 func (c *CheckoutCoordinator) captureCheckoutRefresh(ctx context.Context, checkout store_sqlite.Checkout, rootInfo os.FileInfo, path string) (*checkoutRefreshRequest, error) {
-	request := &checkoutRefreshRequest{checkout: checkout, rootInfo: rootInfo}
+	return c.captureCheckoutRefreshFrom(ctx, checkout, rootInfo, path, nil)
+}
+
+// captureCheckoutRefreshFrom captures a ticket against given, or against a
+// new sample when given is nil.
+func (c *CheckoutCoordinator) captureCheckoutRefreshFrom(
+	ctx context.Context, checkout store_sqlite.Checkout, rootInfo os.FileInfo, path string, given *gitstate.DirtySnapshot,
+) (*checkoutRefreshRequest, error) {
+	request := &checkoutRefreshRequest{checkout: checkout, rootInfo: rootInfo, record: publicationRecordFrom(ctx)}
 	if path != "" {
 		canonical, hash, err := checkoutRefreshFileHash(ctx, checkout.RootPath, rootInfo, path)
 		if err != nil {
@@ -160,9 +324,19 @@ func (c *CheckoutCoordinator) captureCheckoutRefresh(ctx context.Context, checko
 		}
 		path, request.contentHash = canonical, hash
 	}
-	sample, err := c.sampler.Sample(ctx)
-	if err != nil {
-		return nil, err
+	var sample gitstate.DirtySnapshot
+	if given != nil {
+		sample = *given
+	} else {
+		var err error
+		if sample, request.freshAfter, err = c.refreshSampleSince(ctx, time.Now()); err != nil {
+			if workingTreeMovedWhileSampling(err) {
+				// The tree moved under the capture: there is no snapshot to
+				// pin, and the caller asks again against the newer tree.
+				return nil, fmt.Errorf("%w: %w", ErrCheckoutRefreshSuperseded, err)
+			}
+			return nil, err
+		}
 	}
 	request.headRef, request.headCommit, request.headTree = sample.HeadRef, sample.HeadCommit, sample.HeadTree
 	request.fingerprint = sample.Fingerprint
@@ -190,6 +364,15 @@ func (c *CheckoutCoordinator) captureCheckoutRefresh(ctx context.Context, checko
 		Ticket: &MutationTicket{Path: path, Done: request.done},
 	}
 	return request, nil
+}
+
+// refreshSampleSince is the working-copy sample a refresh ticket is captured
+// or completed against: one begun at or after since (SampleSinceStarted).
+func (c *CheckoutCoordinator) refreshSampleSince(ctx context.Context, since time.Time) (gitstate.DirtySnapshot, time.Time, error) {
+	if c.refreshSample != nil {
+		return c.refreshSample(ctx, since)
+	}
+	return c.sampler.SampleSinceStarted(ctx, since)
 }
 
 func (c *CheckoutCoordinator) reserveCheckoutRefresh() error {
@@ -229,10 +412,35 @@ func (c *CheckoutCoordinator) enqueueCheckoutRefresh(request *checkoutRefreshReq
 	}
 	sequence := checkoutRefreshSequence.Add(1)
 	request.ticket.Ticket.Generation = sequence
+	request.admittedAt = time.Now()
+	if request.freshAfter.IsZero() {
+		request.freshAfter = request.admittedAt
+	}
+	c.ticketDemand.Store(request.admittedAt.UnixNano())
 	c.refreshHighWater = sequence
 	c.refreshWaiters[sequence] = request
+	request.releaseWrite = c.announceTicketWrite()
+	// Bind before the wake: the cycle SignalDemand starts marks every record
+	// bound at or below its high-water mark, and one bound after this call
+	// returns could miss cycle_started and admitted.
+	if request.record != nil {
+		request.record.BindTicket(sequence)
+		request.record.MarkAt(PublicationTicketEnqueued, request.admittedAt)
+	}
 	c.refreshMu.Unlock()
-	c.Signal("checkout refresh ticket admitted")
+	// A ticket is demand: its cycle starts now rather than after a quiet
+	// window. It still completes only through completeCheckoutRefreshTickets'
+	// verification against a sample taken after it was admitted.
+	// A ticket is a use: the cycle it demands applies a pending base
+	// advance (checkout_propagation.go). Recorded before the selection below,
+	// which would otherwise signal a second window for it.
+	c.wantRebase("refresh ticket", false)
+	c.SignalDemand("checkout refresh ticket admitted")
+	// A cycle of this checkout already queued for the build lane at
+	// background priority (a filesystem change the loop found first) now
+	// serves a waiting caller: promote it to the interactive queue rather
+	// than leave it behind other checkouts' background work.
+	c.PrioritizeSelection()
 	return request.ticket, nil
 }
 
@@ -246,7 +454,21 @@ func (c *CheckoutCoordinator) checkoutRefreshHighWater() uint64 {
 }
 
 func (c *CheckoutCoordinator) reportCheckoutCycle(ctx context.Context, through uint64, out CheckoutCycle) {
+	if a, _ := ctx.Value(byteMutationAttemptKey{}).(*byteMutationAttempt); a != nil {
+		out = a.outcome(out)
+	}
+	if out.Err == nil && !out.Rescheduled && !out.Deferred && out.DirtyGenerationID > 0 {
+		c.byteAnchorMu.Lock()
+		hasAnchor := c.byteAnchor != nil
+		c.byteAnchorMu.Unlock()
+		if hasAnchor {
+			if route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID); err == nil && found && route.State == store_sqlite.RouteActive && route.CommitGenerationID == out.CommitGenerationID && route.DirtyGenerationID == out.DirtyGenerationID {
+				_ = c.captureByteAnchor(ctx, route)
+			}
+		}
+	}
 	c.completeCheckoutRefreshTickets(ctx, through, out)
+	finishObservedChangeRecord(ctx, out)
 	if c.cycleDone != nil {
 		c.cycleDone(out)
 	}
@@ -273,20 +495,31 @@ func (c *CheckoutCoordinator) guardCheckoutRefreshCycle(ctx context.Context, thr
 // completeCheckoutRefreshTickets observes a real loop result. A ticket admitted
 // during a cycle cannot inherit that earlier cycle's error or stale success;
 // its signal schedules a subsequent cycle (usually the cheap settled path).
+//
+// A successful publication completes every ticket the completion sample was
+// taken after, not only the ones admitted before the cycle started: a ticket
+// admitted while the build was in flight (a require_fresh request that found
+// the route withdrawn by the edit it waits for, say) is answered by the
+// build's own pre-publish sample when that sample's git status began after the
+// ticket was admitted and it equals the published generation — the same
+// guarantee a further cycle's sample would give, without the cycle.
 func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context, through uint64, out CheckoutCycle) {
 	c.refreshMu.Lock()
-	requests := make([]*checkoutRefreshRequest, 0, len(c.refreshWaiters))
+	owed := make([]*checkoutRefreshRequest, 0, len(c.refreshWaiters))
+	var riders []*checkoutRefreshRequest
 	for sequence, request := range c.refreshWaiters {
 		if sequence <= through {
-			requests = append(requests, request)
+			owed = append(owed, request)
+		} else {
+			riders = append(riders, request)
 		}
 	}
 	c.refreshMu.Unlock()
-	if len(requests) == 0 {
+	if len(owed) == 0 && len(riders) == 0 {
 		return
 	}
 	if c.lifetimeContext().Err() != nil {
-		c.failCheckoutRefreshRequests(requests, ErrCheckoutRefreshStopped)
+		c.failCheckoutRefreshRequests(owed, ErrCheckoutRefreshStopped)
 		return
 	}
 	if out.Deferred || out.Rescheduled {
@@ -296,7 +529,7 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 		if retryableCheckoutRefreshError(out.Err) && c.lifetimeContext().Err() == nil {
 			return
 		}
-		for _, request := range requests {
+		for _, request := range owed {
 			c.finishCheckoutRefresh(request, 0, out.Err)
 		}
 		return
@@ -306,7 +539,7 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 	}
 	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
 	if err != nil {
-		c.failCheckoutRefreshRequests(requests, err)
+		c.failCheckoutRefreshRequests(owed, err)
 		return
 	}
 	if !found || route.State != store_sqlite.RouteActive || route.CommitGenerationID != out.CommitGenerationID || route.DirtyGenerationID != out.DirtyGenerationID {
@@ -314,18 +547,112 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 	}
 	dirty, found, err := c.catalog.GetViewGeneration(ctx, out.DirtyGenerationID)
 	if err != nil {
-		c.failCheckoutRefreshRequests(requests, err)
+		c.failCheckoutRefreshRequests(owed, err)
 		return
 	}
-	if !found || !servableGeneration(dirty.State) || dirty.BaseGenerationID != out.CommitGenerationID {
+	if !found || !servableGeneration(dirty.State) {
 		return
 	}
-	sample, err := c.sampler.Sample(ctx)
+	// Rooted at the routed commit generation, directly or through a chain.
+	rooted, err := c.dirtyRootedAt(ctx, dirty, out.CommitGenerationID)
 	if err != nil {
-		c.failCheckoutRefreshRequests(requests, err)
+		c.failCheckoutRefreshRequests(owed, err)
 		return
+	}
+	if !rooted {
+		return
+	}
+	// A ticket completes against a sample whose git status began at or after
+	// its freshAfter (after the request it answers arrived, after an edit's
+	// disk commit). The newest such sample is taken for the tickets the
+	// cycle owes — usually its own pre-publish fence, or the ticket's capture
+	// sample for a cycle that settled on it — and a cycle that started
+	// nowhere (a direct caller) samples afresh. A ticket admitted while the
+	// cycle ran rides on that same sample when it began after the ticket's
+	// freshAfter; no sample is ever taken for such a ticket alone.
+	var sample gitstate.DirtySnapshot
+	var sampleStarted time.Time
+	if len(owed) > 0 {
+		since := time.Now()
+		if !out.cycleStarted.IsZero() {
+			since = time.Time{}
+			for _, request := range owed {
+				if request.freshAfter.After(since) {
+					since = request.freshAfter
+				}
+			}
+		}
+		sample, sampleStarted, err = c.refreshSampleSince(ctx, since)
+		if workingTreeMovedWhileSampling(err) && c.lifetimeContext().Err() == nil {
+			// The tree moved while the completion sample was taken: no
+			// answer either way. The owed tickets wait for the next cycle,
+			// which the move itself is reason to run now.
+			c.SignalDemand("the working tree moved while refresh tickets were completed")
+			return
+		}
+		if err != nil {
+			c.failCheckoutRefreshRequests(owed, err)
+			return
+		}
+	} else {
+		earliest := riders[0].freshAfter
+		for _, request := range riders[1:] {
+			if request.freshAfter.Before(earliest) {
+				earliest = request.freshAfter
+			}
+		}
+		var ok bool
+		if sample, sampleStarted, ok = c.sampler.LatestSampleSince(earliest); !ok {
+			return
+		}
+	}
+	requests := owed
+	for _, request := range riders {
+		if !sampleStarted.Before(request.freshAfter) {
+			requests = append(requests, request)
+		}
 	}
 	if sample.Fingerprint != dirty.LowerViewFingerprint {
+		// A sample of another state has replaced the one this publication
+		// describes as the latest (a rider's prepublish demand, a freshness
+		// proof, the fence of a build that was outpaced). The publication
+		// still answers every ticket admitted at or before an instant a
+		// sample found the working copy in the published state — the
+		// cycle's own build holds the sample it published, and the
+		// sampler's recent samples stand in when the routed generation is
+		// not the cycle's build — and any other ticket waits for the next
+		// cycle, which an outpaced publication has already signalled.
+		if out.cycleStarted.IsZero() {
+			return
+		}
+		waiting := make([]*checkoutRefreshRequest, 0, len(owed)+len(riders))
+		waiting = append(append(waiting, owed...), riders...)
+		earliest := waiting[0].freshAfter
+		for _, request := range waiting[1:] {
+			if request.freshAfter.Before(earliest) {
+				earliest = request.freshAfter
+			}
+		}
+		published, publishedStarted, ok := out.dirtySample, time.Time{}, false
+		if published.Fingerprint == dirty.LowerViewFingerprint {
+			publishedStarted, ok = published.SampleStarted()
+			ok = ok && !publishedStarted.Before(earliest)
+		}
+		if !ok {
+			published, publishedStarted, ok = c.sampler.LatestSampleOf(dirty.LowerViewFingerprint, earliest)
+		}
+		if !ok {
+			return
+		}
+		sample, sampleStarted = published, publishedStarted
+		requests = nil
+		for _, request := range waiting {
+			if !sampleStarted.Before(request.freshAfter) {
+				requests = append(requests, request)
+			}
+		}
+	}
+	if len(requests) == 0 {
 		return
 	}
 	current, found, err := c.catalog.GetCheckout(ctx, c.checkoutID)
@@ -344,17 +671,21 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 	}
 	// A coalesced cycle hashes each requested file at most once, even when many
 	// callers are waiting for the same content.
-	hashes := make(map[string]string)
+	type fileHashes struct{ raw, blob string }
+	hashes := make(map[string]fileHashes)
 	for _, request := range requests {
-		if current.Incarnation != request.checkout.Incarnation || !os.SameFile(request.rootInfo, rootInfo) || request.headRef != sample.HeadRef || request.headCommit != sample.HeadCommit || request.headTree != sample.HeadTree {
+		if current.Incarnation != request.checkout.Incarnation || !os.SameFile(request.rootInfo, rootInfo) {
 			c.finishCheckoutRefresh(request, 0, ErrCheckoutRefreshSuperseded)
 			continue
 		}
-		// The graph's persisted publication fingerprint, not a later disk hash
-		// alone, must identify the state admitted by this ticket. Until the
-		// builder exposes per-file publication receipts, even an unrelated
-		// intervening edit explicitly supersedes this exact-snapshot promise.
-		if request.fingerprint != dirty.LowerViewFingerprint {
+		if !request.headUnbound && (request.headRef != sample.HeadRef || request.headCommit != sample.HeadCommit || request.headTree != sample.HeadTree) {
+			c.finishCheckoutRefresh(request, 0, ErrCheckoutRefreshSuperseded)
+			continue
+		}
+		// Snapshot-bound recovery requires its entire captured fingerprint.
+		// Completion-bound edits instead prove their committed paths against
+		// this publication sample below; unrelated edits may coalesce.
+		if !request.bindAtCompletion && request.fingerprint != dirty.LowerViewFingerprint {
 			c.finishCheckoutRefresh(request, 0, ErrCheckoutRefreshSuperseded)
 			continue
 		}
@@ -362,17 +693,50 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 			path := request.ticket.Ticket.Path
 			hash, ok := hashes[path]
 			if !ok {
-				_, hash, err = checkoutRefreshFileHash(ctx, current.RootPath, rootInfo, path)
+				_, hash.raw, err = checkoutRefreshFileHash(ctx, current.RootPath, rootInfo, path, &hash.blob)
 				if err != nil {
 					c.finishCheckoutRefresh(request, 0, fmt.Errorf("%w: %v", ErrCheckoutRefreshSuperseded, err))
 					continue
 				}
 				hashes[path] = hash
 			}
-			if hash != request.contentHash {
+			if hash.raw != request.contentHash {
 				c.finishCheckoutRefresh(request, 0, ErrCheckoutRefreshSuperseded)
 				continue
 			}
+			if err := checkoutSampleContainsFile(ctx, current.RootPath, sample, CheckoutBatchFile{Path: path, SHA256: request.contentHash}, hash.blob); err != nil {
+				c.finishCheckoutRefresh(request, 0, err)
+				continue
+			}
+		}
+		if err := validateCheckoutBatchFiles(ctx, current.RootPath, rootInfo, request.batchFiles); err != nil {
+			c.finishCheckoutRefresh(request, 0, err)
+			continue
+		}
+		var batchErr error
+		for _, file := range request.batchFiles {
+			var blob string
+			if !file.Absent {
+				_, raw, err := checkoutRefreshFileHash(ctx, current.RootPath, rootInfo, file.Path, &blob)
+				if err != nil || raw != file.SHA256 {
+					batchErr = ErrCheckoutRefreshSuperseded
+					break
+				}
+			}
+			if batchErr = checkoutSampleContainsFile(ctx, current.RootPath, sample, file, blob); batchErr != nil {
+				break
+			}
+		}
+		if batchErr != nil {
+			c.finishCheckoutRefresh(request, 0, batchErr)
+			continue
+		}
+
+		if request.record != nil && request.ticket.Ticket.Generation > through {
+			// Association follows verification, not admission. Keep the real
+			// cycle timestamps even when publication preceded ticket enqueue;
+			// events before this request's origin are naturally omitted.
+			request.record.Absorb(PublicationStampsFrom(ctx))
 		}
 		c.finishCheckoutRefresh(request, uint64(out.DirtyGenerationID), nil)
 	}
@@ -387,6 +751,18 @@ func (c *CheckoutCoordinator) finishCheckoutRefresh(request *checkoutRefreshRequ
 	}
 	delete(c.refreshWaiters, sequence)
 	c.refreshMu.Unlock()
+	if request.releaseWrite != nil {
+		request.releaseWrite()
+	}
+	// The coordinator's own completion instant, on the record the ticket was
+	// admitted with (first-wins: the caller's later mark of the same phase,
+	// taken when it receives the result, is a no-op). A failure is left to
+	// the caller to mark: ticket_failed is terminal, and a caller may retry a
+	// superseded ticket on the same record.
+	if request.record != nil && err == nil {
+		request.record.SetGeneration(int64(generation))
+		request.record.Mark(PublicationTicketCompleted)
+	}
 	request.done <- MutationResult{RequestedGeneration: sequence, AppliedGeneration: generation, Reindexed: err == nil, Err: err}
 	close(request.done)
 }
@@ -431,10 +807,72 @@ func (c *CheckoutCoordinator) closeCheckoutRefreshTickets() {
 	}
 }
 
+// checkoutSampleContainsFile proves the publication sample itself contains the
+// committed bytes (or absence). A later disk restoration cannot certify an
+// older generation built from different bytes. Unreported paths equal the
+// sample's immutable HEAD tree, so only that exact tree supplies the fallback.
+func checkoutSampleContainsFile(ctx context.Context, root string, sample gitstate.DirtySnapshot, file CheckoutBatchFile, blob string) error {
+	root = pathkey.CanonicalExistingRoot(root)
+	path := pathkey.CanonicalPath(file.Path)
+	if !filepath.IsAbs(path) || !pathkey.HasPathPrefix(path, root) || pathkey.EqualPaths(path, root) {
+		return ErrCheckoutRefreshSuperseded
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return ErrCheckoutRefreshSuperseded
+	}
+	rel = filepath.ToSlash(rel)
+	for _, content := range sample.Contents {
+		if content.Path != rel {
+			continue
+		}
+		if file.Absent && content.State == gitstate.DirtyContentAbsent {
+			return nil
+		}
+		if !file.Absent && content.State == gitstate.DirtyContentPresent && content.Mode != "120000" && content.SHA256 == blob {
+			return nil
+		}
+		return ErrCheckoutRefreshSuperseded
+	}
+	if sample.HeadTree == "" {
+		if file.Absent {
+			return nil
+		}
+		return ErrCheckoutRefreshSuperseded
+	}
+	entry, err := gitcmd.RunNoLazy(ctx, root, "--literal-pathspecs", "ls-tree", "-z", "--full-tree", sample.HeadTree, "--", rel)
+	if err != nil {
+		return err
+	}
+	if len(entry) == 0 {
+		if file.Absent {
+			return nil
+		}
+		return ErrCheckoutRefreshSuperseded
+	}
+	if file.Absent {
+		return ErrCheckoutRefreshSuperseded
+	}
+	metadata, _, ok := strings.Cut(string(entry), "\t")
+	fields := strings.Fields(metadata)
+	if !ok || len(fields) != 3 || fields[1] != "blob" || fields[0] == "120000" {
+		return ErrCheckoutRefreshSuperseded
+	}
+	data, err := gitcmd.RunNoLazy(ctx, root, "cat-file", "blob", fields[2])
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(data)
+	if hex.EncodeToString(hash[:]) != file.SHA256 {
+		return ErrCheckoutRefreshSuperseded
+	}
+	return nil
+}
+
 // checkoutRefreshFileHash confines ticket content reads to the captured physical
 // checkout, including aliases and case-normalized paths. os.Root keeps a later
 // symlink swap from escaping the selected working copy.
-func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileInfo, path string) (string, string, error) {
+func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileInfo, path string, blobHash ...*string) (string, string, error) {
 	root = pathkey.CanonicalExistingRoot(root)
 	path = pathkey.CanonicalPath(path)
 	if !filepath.IsAbs(path) || !pathkey.HasPathPrefix(path, root) || pathkey.EqualPaths(path, root) {
@@ -486,6 +924,8 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 		return "", "", fmt.Errorf("checkout refresh target is not a regular file: %q", path)
 	}
 	hash := sha256.New()
+	blob := sha256.New()
+	_, _ = fmt.Fprintf(blob, "blob %d\x00", before.Size())
 	buffer := make([]byte, 32*1024)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -494,6 +934,7 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 		n, readErr := file.Read(buffer)
 		if n > 0 {
 			_, _ = hash.Write(buffer[:n])
+			_, _ = blob.Write(buffer[:n])
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
@@ -509,5 +950,20 @@ func checkoutRefreshFileHash(ctx context.Context, root string, rootInfo os.FileI
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		return "", "", ErrCheckoutRefreshSuperseded
 	}
+	if len(blobHash) > 0 && blobHash[0] != nil {
+		*blobHash[0] = hex.EncodeToString(blob.Sum(nil))
+	}
 	return path, hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// announceTicketWrite announces a waiting ticket's mutation to the store (see
+// checkoutRefreshRequest.releaseWrite); announceWrite is the test seam.
+func (c *CheckoutCoordinator) announceTicketWrite() func() {
+	if c.announceWrite != nil {
+		return c.announceWrite()
+	}
+	if c.store == nil {
+		return nil
+	}
+	return c.store.AnnounceCheckoutRefresh()
 }

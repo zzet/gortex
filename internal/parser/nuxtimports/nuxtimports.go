@@ -38,10 +38,10 @@ func Load(repoRoot string) *Collection {
 		if !entry.IsDir() {
 			return nil
 		}
-		switch entry.Name() {
-		case "node_modules", ".git", ".hg", ".svn", "vendor", "build", "dist", "target", ".next":
+		if skipDir(entry.Name()) {
 			return filepath.SkipDir
-		case ".nuxt":
+		}
+		if entry.Name() == ".nuxt" {
 			data, readErr := os.ReadFile(filepath.Join(p, "imports.d.ts"))
 			if readErr != nil {
 				return filepath.SkipDir
@@ -59,10 +59,56 @@ func Load(repoRoot string) *Collection {
 		}
 		return nil
 	})
+	return collection(scopes)
+}
+
+func skipDir(name string) bool {
+	switch name {
+	case "node_modules", ".git", ".hg", ".svn", "vendor", "build", "dist", "target", ".next":
+		return true
+	}
+	return false
+}
+
+// LoadTree reads only generated lists present in the snapshot, never the checkout.
+func LoadTree(tree interface {
+	Files(func(string))
+	Read(string) ([]byte, bool)
+}) *Collection {
+	var scopes []scope
+	tree.Files(func(rel string) {
+		dir := path.Dir(rel)
+		if path.Base(dir) != ".nuxt" || path.Base(rel) != "imports.d.ts" {
+			return
+		}
+		root := path.Dir(dir)
+		for ancestor := root; ancestor != "." && ancestor != "/"; ancestor = path.Dir(ancestor) {
+			if name := path.Base(ancestor); skipDir(name) || name == ".nuxt" {
+				return
+			}
+		}
+		data, ok := tree.Read(rel)
+		if !ok {
+			return
+		}
+		if root == "." {
+			root = ""
+		}
+		scopes = append(scopes, scope{Root: root, Bindings: parse(".", dir, string(data))})
+	})
+	return collection(scopes)
+}
+
+func collection(scopes []scope) *Collection {
 	if len(scopes) == 0 {
 		return nil
 	}
-	sort.Slice(scopes, func(i, j int) bool { return len(scopes[i].Root) > len(scopes[j].Root) })
+	sort.Slice(scopes, func(i, j int) bool {
+		if len(scopes[i].Root) != len(scopes[j].Root) {
+			return len(scopes[i].Root) > len(scopes[j].Root)
+		}
+		return scopes[i].Root < scopes[j].Root
+	})
 	return &Collection{scopes: scopes}
 }
 

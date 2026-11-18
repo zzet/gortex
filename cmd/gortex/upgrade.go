@@ -28,6 +28,7 @@ const (
 	InstallScoop     InstallMethod = "scoop"      // Scoop apps dir (Windows)
 	InstallGoInstall InstallMethod = "go-install" // $GOPATH/bin or ~/go/bin
 	InstallScript    InstallMethod = "script"     // get.gortex.dev installer → ~/.local/bin
+	InstallScriptPS  InstallMethod = "script-ps"  // get.gortex.dev/install.ps1 → %LOCALAPPDATA%\Programs\gortex
 	InstallUnknown   InstallMethod = "unknown"    // manual download / packaged elsewhere
 )
 
@@ -36,10 +37,11 @@ const upgradeRepoURL = "https://github.com/zzet/gortex"
 // detectInstallMethod infers the install method from the binary's path. brew
 // and scoop are recognised by their well-known directory anchors; a binary
 // under the Go bin dir is a `go install`; one under ~/.local/bin is the
-// installer script's target. Everything else is unknown (the user gets the
+// installer script's target, and one under %LOCALAPPDATA%\Programs\gortex is
+// the PowerShell installer's. Everything else is unknown (the user gets the
 // release-page fallback). Paths are slash-normalised so the same logic works on
 // Windows.
-func detectInstallMethod(execPath, goBinDir, homeDir string) InstallMethod {
+func detectInstallMethod(execPath, goBinDir, homeDir, localAppData string) InstallMethod {
 	// Normalise backslashes explicitly rather than via filepath.ToSlash, which
 	// only converts on Windows — a Windows path can be classified on any OS.
 	p := strings.ReplaceAll(execPath, "\\", "/")
@@ -52,6 +54,10 @@ func detectInstallMethod(execPath, goBinDir, homeDir string) InstallMethod {
 		return InstallGoInstall
 	case homeDir != "" && underDir(p, filepath.Join(homeDir, ".local", "bin")):
 		return InstallScript
+	// Windows paths are case-insensitive, and %LOCALAPPDATA% need not match the
+	// casing os.Executable reports, so this anchor compares case-folded.
+	case localAppData != "" && underDirFold(p, localAppData+"/Programs/gortex"):
+		return InstallScriptPS
 	default:
 		return InstallUnknown
 	}
@@ -62,6 +68,18 @@ func underDir(p, dir string) bool {
 	d := strings.ReplaceAll(dir, "\\", "/")
 	return p == d || strings.HasPrefix(p, strings.TrimSuffix(d, "/")+"/")
 }
+
+// underDirFold is underDir with a case-insensitive comparison, for anchors on
+// Windows filesystems.
+func underDirFold(p, dir string) bool {
+	return underDir(strings.ToLower(p), strings.ToLower(dir))
+}
+
+// installPSScript is the PowerShell installer one-liner documented in
+// docs/installation.md. It honours GORTEX_VERSION for a pin and upgrades in
+// place, moving the old binary aside as gortex.exe.previous — a rename Windows
+// permits on a running executable, so it works while `gortex upgrade` runs.
+const installPSScript = "irm https://get.gortex.dev/install.ps1 | iex"
 
 // upgradeInstructions returns the command that updates gortex for the detected
 // install method, honouring a version pin where the method supports it, and
@@ -82,6 +100,15 @@ func upgradeInstructions(m InstallMethod, pinVersion string) (command string, ma
 		return "go install " + upgradeModulePath + "@" + v, false
 	case InstallScript:
 		return "curl -fsSL https://get.gortex.dev | sh", false
+	case InstallScriptPS:
+		// A PowerShell command, printed for the user to paste into PowerShell
+		// and run by --run through powershell.exe (see upgradeExecCommand).
+		// runUpgrade has validated the pin as a semver tag, so it is safe to
+		// splice into the single-quoted literal.
+		if pinVersion != "" && pinVersion != "latest" {
+			return "$env:GORTEX_VERSION='" + normalizeSemver(pinVersion) + "'; " + installPSScript, false
+		}
+		return installPSScript, false
 	default:
 		return "", true
 	}
@@ -145,7 +172,7 @@ var upgradeCmd = &cobra.Command{
 	Aliases: []string{"update"},
 	Short:   "Update gortex to the latest release using the method it was installed with",
 	Long: "Detects how this gortex binary was installed (Homebrew, Scoop, go install, or the " +
-		"installer script) and runs the matching update command. Pass a version (or set " +
+		"installer script — install.sh or install.ps1) and runs the matching update command. Pass a version (or set " +
 		"GORTEX_VERSION) to pin a specific release. By default the command is printed; pass --run to " +
 		"execute it. cosign + SHA256 verification is preserved by every supported method.",
 	Args: cobra.MaximumNArgs(1),
@@ -170,7 +197,11 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		execPath = ""
 	}
-	method := detectInstallMethod(execPath, goBinDir(), homeDirOrEmpty())
+	method := detectInstallMethod(execPath, goBinDir(), homeDirOrEmpty(), os.Getenv("LOCALAPPDATA"))
+
+	if err := validateUpgradePin(method, pin); err != nil {
+		return err
+	}
 
 	current := normalizeSemver(version)
 	target := normalizeSemver(pin)
@@ -207,7 +238,7 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Fprintf(out, "$ %s\n", command)
 		run := func() error {
-			ex := upgradeExecCommand(cmd.Context(), command)
+			ex := upgradeExecCommand(cmd.Context(), method, command)
 			ex.Stdout, ex.Stderr, ex.Stdin = out, cmd.ErrOrStderr(), os.Stdin
 			return ex.Run()
 		}
@@ -227,12 +258,28 @@ func runUpgrade(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// validateUpgradePin rejects a pin the install method can't take safely. The
+// PowerShell installer receives the pin spliced into a command string, so only
+// a well-formed release tag (or "latest") may reach it; other methods pass the
+// pin as an argv element (go install also accepts branches and commits).
+func validateUpgradePin(method InstallMethod, pin string) error {
+	if method == InstallScriptPS && pin != "" && pin != "latest" && !semver.IsValid(normalizeSemver(pin)) {
+		return fmt.Errorf("invalid version %q: expected a release tag such as v0.64.0", pin)
+	}
+	return nil
+}
+
 // upgradeExecCommand builds the command that --run executes. The installer
 // script is a shell pipeline (`curl … | sh`), so it must run through `sh -c`;
 // splitting it on whitespace would hand `|` and `sh` to curl as extra
-// hostnames (issue #281). Plain-argv methods (go install / brew / scoop) keep
-// direct execution so no shell is spawned when one isn't needed.
-func upgradeExecCommand(ctx context.Context, command string) *exec.Cmd {
+// hostnames (issue #281). The PowerShell installer is a PowerShell pipeline,
+// so it runs through powershell.exe — always present on Windows 10+, unlike sh.
+// Plain-argv methods (go install / brew / scoop) keep direct execution so no
+// shell is spawned when one isn't needed.
+func upgradeExecCommand(ctx context.Context, method InstallMethod, command string) *exec.Cmd {
+	if method == InstallScriptPS {
+		return exec.CommandContext(ctx, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command) //nolint:gosec // fixed installer template; pin validated as semver
+	}
 	if upgradeCommandNeedsShell(command) {
 		return exec.CommandContext(ctx, "sh", "-c", command) //nolint:gosec // fixed installer template, needs shell for pipe
 	}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 
 	"github.com/spf13/cobra"
@@ -47,7 +48,7 @@ func computePurgePlan() purgePlan {
 
 	if exe, err := os.Executable(); err == nil {
 		p.binary = exe
-		p.binMethod = detectInstallMethod(exe, goBinDir(), homeDirOrEmpty())
+		p.binMethod = detectInstallMethod(exe, goBinDir(), homeDirOrEmpty(), os.Getenv("LOCALAPPDATA"))
 	}
 
 	p.servicePresent = serviceUnitPresent()
@@ -171,6 +172,11 @@ func purgeBinaryNote(p purgePlan) string {
 		return "Binary left in place — remove it with `scoop uninstall gortex`."
 	case InstallGoInstall:
 		return fmt.Sprintf("Binary left in place — delete it with `rm %s`.", p.binary)
+	case InstallScriptPS:
+		// Windows will not delete a running executable, so purge can't remove
+		// it from here; the installer also put its directory on the user PATH.
+		dir := filepath.Dir(p.binary)
+		return fmt.Sprintf("Binary left in place (Windows can't delete a running executable) — delete the %s folder and remove it from your user PATH.", dir)
 	default:
 		return fmt.Sprintf("Binary left in place at %s — delete it manually.", p.binary)
 	}

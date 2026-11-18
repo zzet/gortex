@@ -11,13 +11,16 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"go.uber.org/zap"
 )
 
 // newSafeDeleteTestServer builds a server with one indexed file
 // containing two symbols: Live (called by Caller) and DeadCode
-// (unused). resolveNodePath uses the indexer root, so the test
-// server fakes an indexer with the temp root.
+// (unused). The absolute graph-path fixture has a real parser-owning indexer
+// so current-byte declaration resolution does not trust its manual spans.
 func newSafeDeleteTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 
@@ -58,7 +61,10 @@ func Caller() int {
 	})
 	g.AddEdge(&graph.Edge{From: abs + "::Caller", To: abs + "::Live", Kind: graph.EdgeCalls})
 
+	idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+	idx.SetRootPath(dir)
 	s := &Server{
+		indexer:    idx,
 		graph:      g,
 		session:    newSessionState(),
 		tokenStats: &tokenStats{},

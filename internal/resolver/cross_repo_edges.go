@@ -1,6 +1,10 @@
 package resolver
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
+)
 
 const crossRepoAddBatchSize = 4096
 
@@ -28,10 +32,35 @@ const crossRepoAddBatchSize = 4096
 // Returns the count of cross-repo relationships found this pass — the
 // number of parallel edges that exist after it, modulo graph dedup.
 func DetectCrossRepoEdges(g graph.Store) int {
+	edges, _ := DetectCrossRepoEdgesWithSkip(g)
+	return edges
+}
+
+// DetectCrossRepoEdgesWithSkip runs DetectCrossRepoEdges and also reports
+// whether it skipped the scan because the store holds fewer than two repos.
+func DetectCrossRepoEdgesWithSkip(g graph.Store) (edges int, skipped bool) {
 	if g == nil {
-		return 0
+		return 0, false
 	}
-	return materializeCrossRepoCandidates(g, crossRepoCandidates(g))
+	if !hasMultipleRepoPrefixes(g) {
+		return 0, true
+	}
+	return materializeCrossRepoCandidates(g, crossRepoCandidates(g)), false
+}
+
+func hasMultipleRepoPrefixes(g graph.Store) bool {
+	first := ""
+	for _, prefix := range g.RepoPrefixes() {
+		if prefix == "" {
+			continue
+		}
+		if first == "" {
+			first = prefix
+		} else if prefix != first {
+			return true
+		}
+	}
+	return false
 }
 
 // DetectCrossRepoEdgesForRepos materializes only relationships incident to the
@@ -90,6 +119,24 @@ func DetectCrossRepoEdgesForReindexes(g graph.Store, batch []graph.EdgeReindex) 
 		})
 	}
 	return materializeCrossRepoCandidates(g, rows)
+}
+
+// crossRepoReindexes keeps the rows whose endpoints carry two different
+// repository prefixes, so a whole-repository pass fetches endpoint ownership
+// only for rebinds that can cross repositories.
+func crossRepoReindexes(batch []graph.EdgeReindex) []graph.EdgeReindex {
+	var out []graph.EdgeReindex
+	for _, reindex := range batch {
+		if reindex.Edge == nil {
+			continue
+		}
+		from, to := graph.RepoPrefixOfID(reindex.Edge.From), graph.RepoPrefixOfID(reindex.Edge.To)
+		if from == "" || to == "" || from == to || strings.Contains(from, "::") || strings.Contains(to, "::") {
+			continue
+		}
+		out = append(out, reindex)
+	}
+	return out
 }
 
 func materializeCrossRepoCandidates(g graph.Store, rows []graph.CrossRepoCandidateRow) int {

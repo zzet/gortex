@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -59,16 +60,20 @@ func (s *Server) buildSymbolCFG(ctx context.Context, id string) (*symbolCFG, err
 		return nil, fmt.Errorf("control-flow graphs are not supported for language %q (supported: go, python, javascript, typescript, java, rust, ruby)", node.Language)
 	}
 	if node.StartLine == 0 || node.EndLine == 0 {
-		return nil, fmt.Errorf("symbol has no line range: %s", id)
+		return nil, errors.New(externalRefusal(node, id, "symbol has no line range: "+id))
 	}
 	absPath, err := s.resolveNodePath(ctx, node)
 	if err != nil {
 		return nil, err
 	}
-	source, fromLine, _, err := s.readLinesForCtx(ctx, absPath, node.StartLine, node.EndLine, 0)
+	ns, err := s.readNodeSource(ctx, node, absPath)
 	if err != nil {
 		return nil, fmt.Errorf("could not read source: %v", err)
 	}
+	resolved := *node
+	resolved.StartLine, resolved.EndLine = ns.startLine, ns.endLine
+	node = &resolved
+	source, fromLine, _, _ := extractLinesFromContent(ns.content, ns.startLine, ns.endLine, 0)
 	c, err := cfg.Build([]byte(source), node.Language, cfg.Options{
 		LineOffset: fromLine - 1,
 		FuncName:   node.Name,
@@ -85,9 +90,11 @@ func (s *Server) handleGetCFG(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError("id is required"), nil
 	}
 
-	// Auto re-index stale file before querying.
 	if parts := strings.SplitN(id, "::", 2); len(parts) == 2 {
-		s.ensureFresh([]string{parts[0]})
+		ctx, err = s.ensureProjected(ctx, []string{parts[0]})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	sc, buildErr := s.buildSymbolCFG(ctx, id)

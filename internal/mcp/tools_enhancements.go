@@ -1,8 +1,10 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -11,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -25,92 +28,12 @@ import (
 	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/tokens"
-	"go.uber.org/zap"
 )
-
-// ensureFresh re-indexes any of the given file paths whose on-disk content has
-// drifted from the indexed snapshot, so a subsequent graph read serves current
-// data instead of a stale body. Returns the paths that were refreshed (capped at
-// a handful per call).
-//
-// The self-heal is gated on IsTrackedStale, which is false for untracked, new,
-// or already-current files — only a genuinely changed, already-indexed file is
-// re-indexed. That gate is what makes this safe in multi-repo mode: an earlier
-// version keyed the staleness check off the lone single-Indexer, whose mtime
-// map is empty for cross-repo paths, so every file looked stale and the
-// resulting mass re-index raced the live read surface and crashed the transport.
-// Routing each path to its owning per-repo indexer keeps the check accurate and
-// the work bounded to the file the caller is about to read.
-func (s *Server) ensureFresh(filePaths []string) []string {
-	var refreshed []string
-	const limit = 5
-	for _, fp := range filePaths {
-		if len(refreshed) >= limit {
-			break
-		}
-		idx, absPath := s.freshnessIndexer(fp)
-		if idx == nil {
-			continue
-		}
-		root := idx.RootPath()
-		if root == "" {
-			continue
-		}
-		rel, ok := relativeWithinRoot(root, absPath)
-		if !ok {
-			continue
-		}
-		// IsTrackedStale is false for untracked / new / current files, so
-		// only a known-and-changed file triggers a re-index — no mass churn.
-		if !idx.IsTrackedStale(rel) {
-			continue
-		}
-		if !s.reindexFile(absPath) {
-			s.logger.Warn("auto re-index failed",
-				zap.String("file", fp),
-				zap.String("resolved", absPath))
-			continue
-		}
-		// Advance the recorded mtime so a follow-up read in the same window
-		// sees the file as current and skips a redundant re-index.
-		idx.RefreshFileMtime(absPath)
-		refreshed = append(refreshed, fp)
-	}
-	return refreshed
-}
-
-// freshnessIndexer resolves a repo-prefixed, repo-relative, or absolute path to
-// the indexer that owns it and the file's absolute path, for both single- and
-// multi-repo daemons. In single-repo mode an active file watcher already owns
-// freshness, so on-read auto-refresh stands down rather than fight it; in
-// multi-repo mode each path is routed to its per-repo indexer, whose mtime map
-// is populated — which is what makes the staleness check trustworthy.
-func (s *Server) freshnessIndexer(fp string) (*indexer.Indexer, string) {
-	if s.multiIndexer != nil {
-		abs := fp
-		if !filepath.IsAbs(abs) {
-			if resolved := s.multiIndexer.ResolveFilePath(fp); resolved != "" {
-				abs = resolved
-			}
-		}
-		idx, _ := s.multiIndexer.IndexerForFile(abs)
-		return idx, abs
-	}
-	if s.indexer == nil || s.currentWatcher() != nil {
-		return nil, ""
-	}
-	abs := fp
-	if !filepath.IsAbs(abs) {
-		if root := s.indexer.RootPath(); root != "" {
-			abs = filepath.Join(root, fp)
-		}
-	}
-	return s.indexer, abs
-}
 
 func (s *Server) registerEnhancementTools() {
 	// verify_change
@@ -171,13 +94,23 @@ func (s *Server) registerEnhancementTools() {
 			mcp.WithBoolean("include_linkname_targets", mcp.Description("(dead_code) Include //go:linkname targets — default false; they are linked by name from outside the package")),
 			mcp.WithBoolean("skip_cross_repo_nodes", mcp.Description("(dead_code) Drop nodes whose RepoPrefix is set — useful when cross-repo linking is incomplete")),
 			mcp.WithNumber("threshold", mcp.Description("(hotspots) Complexity score threshold (default: mean + 2σ)")),
-			mcp.WithString("repo", mcp.Description("Narrow this analysis to a single repository prefix, clamped to the session workspace. Applies to graph-node, edge-walk, graph-algorithm, framework, and file/AST-scan kinds (dead_code, hotspots, cycles, health_score, todos, stale_code, ownership, coverage_gaps, impact, bottlenecks, k8s_resources, dbt_models, external_calls, channel_ops, pubsub, routes, models, pagerank, sast, …). Community / git-mining / per-id / synthesizer kinds are workspace-bound but not repo-narrowed in v1. NOTE: for kind=cross_repo this names the repo whose cross-repo boundary dependencies to report (its existing meaning), not a result narrow.")),
+			// blame and coverage ARE repo-narrowed, and `repo` is the argument
+			// that does it: it names the one repository a multi-repo daemon
+			// enriches, and coverage now refuses the call rather than picking
+			// one. They used to be enumerated under `scope` as workspace-bound
+			// kinds that are "not repo-narrowed", which is what an agent read
+			// in tools/list immediately before hitting the refusal that tells
+			// it to pass `repo`. Both lists now say the same thing.
+			mcp.WithString("repo", mcp.Description("Narrow this analysis to a single repository prefix, clamped to the session workspace. Applies to graph-node, edge-walk, graph-algorithm, framework, and file/AST-scan kinds (dead_code, hotspots, cycles, health_score, todos, stale_code, ownership, coverage_gaps, impact, bottlenecks, k8s_resources, dbt_models, external_calls, channel_ops, pubsub, routes, models, pagerank, sast, blame, coverage, …). Other community / per-id / synthesizer kinds are workspace-bound but not repo-narrowed in v1. NOTE: for kind=cross_repo this names the repo whose cross-repo boundary dependencies to report (its existing meaning), not a result narrow.")),
 			mcp.WithString("project", mcp.Description("Narrow this analysis to the repositories in a project, clamped to the session workspace. Applies to graph-node kinds (see `repo`).")),
 			mcp.WithString("workspace", mcp.Description("Restrict the analysis to the active workspace slug; daemon sessions may only name their own workspace.")),
-			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow graph-node analyses, clamped to the session workspace. NOTE: for kind=cycles this is instead a file-path / package prefix that limits the cycle search (its existing meaning), not a saved-scope name. Community / git-mining / per-id / synthesizer kinds (clusters, concepts, suggest_boundaries, blame, coverage, fixes_history, retrieval_log, temporal_verify, would_create_cycle, def_use, synthesizers, resolution_outcomes, sql_rebuild) are workspace-bound but not repo-narrowed in v1.")),
+			mcp.WithString("scope", mcp.Description("Name of a saved scope (see save_scope) — its repositories narrow graph-node analyses, clamped to the session workspace. NOTE: for kind=cycles this is instead a file-path / package prefix that limits the cycle search (its existing meaning), not a saved-scope name. Community / git-mining / per-id / synthesizer kinds (clusters, concepts, suggest_boundaries, fixes_history, retrieval_log, temporal_verify, would_create_cycle, def_use, synthesizers, resolution_outcomes, sql_rebuild) are workspace-bound but not repo-narrowed in v1.")),
 			mcp.WithString("from_id", mcp.Description("(would_create_cycle) Source symbol ID")),
 			mcp.WithString("to_id", mcp.Description("(would_create_cycle) Target symbol ID")),
-			mcp.WithString("profile", mcp.Description("(coverage) Path to a Go cover.out profile, absolute or relative to the indexed repo root")),
+			// Kept to one byte over the previous wording on purpose: the
+			// tools/list byte ceiling is a hard gate, and the caller who needs
+			// the multi-repo rule gets it from the refusal, which names `repo`.
+			mcp.WithString("profile", mcp.Description("(coverage) Path to a Go cover.out profile, absolute or relative to the enriched repo root")),
 			mcp.WithNumber("older_than", mcp.Description("(stale_code) Symbols last touched more than this many days ago — default 365")),
 			mcp.WithString("email", mcp.Description("(stale_code) Filter to a single author email")),
 			mcp.WithString("kinds", mcp.Description("(stale_code, ownership) Comma-separated kinds — default function,method; pass 'all' for every blame-eligible kind")),
@@ -410,38 +343,23 @@ func (s *Server) handleVerifyChange(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError("changes array is empty"), nil
 	}
 
+	ids := make([]string, 0, len(changes))
+	for _, change := range changes {
+		ids = append(ids, change.SymbolID)
+	}
+	if err := s.awaitConsumerFreshness(ctx, req, "relations", ids, nil, time.Time{}); err != nil {
+		return nil, err
+	}
+	gaps := s.laggingMutationReceipts(ctx)
 	result := analysis.VerifyChanges(s.readerFor(ctx), s.engineFor(ctx), changes)
+	label := s.labelRelations(ctx, gaps, ids, nil)
 
 	if isCompact(req) {
-		var b strings.Builder
-		for _, v := range result.Violations {
-			fmt.Fprintf(&b, "%s %s %s:%d %s\n", v.Kind, v.SymbolID, v.FilePath, v.Line, v.Description)
-		}
-		// One line per changed function: how its call sites consume the
-		// return value, so a return-signature change shows exactly which
-		// sites bind / return / branch on the result.
-		for _, ru := range result.ReturnUsage {
-			fmt.Fprintf(&b, "return_usage %s call_sites:%d", ru.SymbolID, ru.CallSites)
-			labels := make([]string, 0, len(ru.Counts))
-			for label := range ru.Counts {
-				labels = append(labels, label)
-			}
-			sort.Strings(labels)
-			for _, label := range labels {
-				fmt.Fprintf(&b, " %s:%d", label, ru.Counts[label])
-			}
-			if ru.Unclassified > 0 {
-				fmt.Fprintf(&b, " unclassified:%d", ru.Unclassified)
-			}
-			b.WriteString("\n")
-		}
-		if result.Clean {
-			fmt.Fprintf(&b, "clean: checked %d callers, %d implementors\n", result.CheckedCallers, result.CheckedImpls)
-		}
-		return mcp.NewToolResultText(b.String()), nil
+		return label.decorate(mcp.NewToolResultText(compactVerifyConsumer(result, label))), nil
 	}
 
-	return s.respondJSONOrTOON(ctx, req, result)
+	res, err := s.respondJSONOrTOON(ctx, req, label.labelled(result))
+	return label.decorate(res), err
 }
 
 // ---------------------------------------------------------------------------
@@ -992,7 +910,8 @@ func (s *Server) handleAnalyze(ctx context.Context, req mcp.CallToolRequest) (*m
 	// misleading a caller whose kind ignored the narrowing ("no silent
 	// no-ops").
 	if err == nil && res != nil && resolved.RepoAllow != nil &&
-		!analyzeScopeAwareKinds[kind] && !analyzeWorkspaceClampedKinds[kind] {
+		!analyzeScopeAwareKinds[kind] && !analyzeWorkspaceClampedKinds[kind] &&
+		!analyzeEnrichmentRepoNarrowedKinds[kind] {
 		stampScopeNote(res, kind)
 	}
 	return withScopeResult(res, err, resolved)
@@ -1014,6 +933,27 @@ func requestWithoutArgs(req mcp.CallToolRequest, keys ...string) mcp.CallToolReq
 	out := req
 	out.Params.Arguments = dst
 	return out
+}
+
+// analyzeEnrichmentRepoNarrowedKinds are the two enrichment kinds in THIS file
+// whose handlers narrow by `repo` for real, and which the scope-note predicate
+// would otherwise disclose as a no-op.
+//
+// It is not a taste call: `analyze kind=blame` resolves its targets with
+// s.enrichmentTargets(ctx, req.GetString("repo", "")), and `analyze
+// kind=coverage` REFUSES a multi-repo call that does not name `repo`, because
+// the named root both resolves the profile path and supplies the module path
+// the projection keys on. Stamping "this kind ignored your narrowing" on an
+// answer that obeyed it — and on one that would have refused without it — is
+// the same class of untruth the note exists to prevent, in the other direction.
+//
+// The honest home for these two entries is analyzeScopeAwareKinds in
+// analyze_kinds.go, beside the rest of the vocabulary. The predicate is
+// extended at the one site that reads it (this file's dispatcher) rather than
+// there; folding the two sets together is a mechanical follow-up.
+var analyzeEnrichmentRepoNarrowedKinds = map[string]bool{
+	"blame":    true,
+	"coverage": true,
 }
 
 // stampScopeNote records on the response that the caller asked to narrow
@@ -1181,7 +1121,11 @@ func stringArg(args map[string]any, key string) string {
 // meta.coverage_pct + meta.coverage on every executable symbol it
 // can map to a profile segment by line range. Requires a `profile`
 // argument with the path to the cover.out file (relative paths
-// resolve against the indexed repo root).
+// resolve against the enriched repository's root).
+//
+// Which repository that is, is never guessed: a daemon tracking more
+// than one requires `repo` to name it, because the root both resolves
+// the profile path and supplies the module path the projection keys on.
 //
 // Re-runnable: each call re-reads the profile and overwrites
 // existing meta — the desired behaviour after a fresh test run.
@@ -1190,25 +1134,79 @@ func (s *Server) handleAnalyzeCoverage(ctx context.Context, req mcp.CallToolRequ
 	if profileArg == "" {
 		return mcp.NewToolResultError("coverage enrichment requires a `profile` argument with the cover.out path"), nil
 	}
-	if s.indexer == nil {
+	prefix, root := "", ""
+	if s.indexer != nil {
+		prefix, root = s.indexer.RepoPrefix(), s.indexer.RootPath()
+	}
+	if root == "" {
+		// A multi-repo daemon has no lone indexer. The root resolved here is
+		// load-bearing twice over on the INPUT side: it resolves a relative
+		// `profile` path, and it supplies the module path that decides which
+		// symbols the write lands on. So it is never guessed. Exactly one
+		// candidate is unambiguous; more than one means the caller must name
+		// the repository with `repo`, because picking one here would read a
+		// profile out of — and stamp coverage onto — a repository the call
+		// never named. That is the same wrong-root input read the enrichment
+		// narrowing closes, and it does not get re-opened as a convenience.
+		targets := s.enrichmentTargets(ctx, strings.TrimSpace(req.GetString("repo", "")))
+		switch len(targets) {
+		case 0:
+			// Either nothing is tracked, or the request reads a checkout of
+			// its own (enrichmentTargets covers none). beginEnrichmentOutput
+			// below says which; both leave root empty.
+		case 1:
+			for candidate, candidateRoot := range targets {
+				prefix, root = candidate, candidateRoot
+			}
+		default:
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"coverage enrichment: this daemon tracks %d repositories (%s); name the one to enrich "+
+					"with `repo` — choosing one here would resolve the profile path against, and stamp "+
+					"coverage onto, a repository this call never named",
+				len(targets), strings.Join(slices.Sorted(maps.Keys(targets)), ", "))), nil
+		}
+	}
+	// The output generation is admitted BEFORE the profile is read, because the
+	// root a relative profile path resolves against is the snapshot's own
+	// working copy — the routed checkout's root, not the tracked primary's.
+	out, err := s.beginEnrichmentOutput(ctx, EnrichProducerCoverage, prefix, root)
+	if err != nil {
+		return mcp.NewToolResultError("coverage enrichment: " + err.Error()), nil
+	}
+	defer out.Abandon()
+	if out.Root == "" {
 		return mcp.NewToolResultError("coverage enrichment requires an active indexer"), nil
 	}
-	root := s.indexer.RootPath()
 	if !filepath.IsAbs(profileArg) {
-		profileArg = filepath.Join(root, profileArg)
+		profileArg = filepath.Join(out.Root, profileArg)
 	}
 	segments, err := coverage.ParseFile(profileArg)
 	if err != nil {
 		return mcp.NewToolResultError("read profile: " + err.Error()), nil
 	}
-	modulePath := coverage.ReadModulePath(root)
-	count := coverage.EnrichGraph(s.graph, segments, modulePath)
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	modulePath := coverage.ReadModulePath(out.Root)
+	count := coverage.EnrichGraph(out.Store, segments, modulePath)
+	superseded, err := out.Settle()
+	if err != nil {
+		return mcp.NewToolResultError("coverage enrichment: " + err.Error()), nil
+	}
+	answer := map[string]any{
 		"enriched":    count,
 		"segments":    len(segments),
 		"profile":     profileArg,
 		"module_path": modulePath,
-	})
+		"generation":  out.Generation,
+		"repo":        prefix,
+		"root":        out.Root,
+		// A cover profile is a file the caller produced; nothing ties it to the
+		// generation it is being stamped onto. The write is bound; the input is
+		// declared narrowed rather than claimed snapshot-exact.
+		"input_narrowing": coverageProfileInputNarrowing,
+	}
+	if superseded {
+		answer["superseded"] = true
+	}
+	return s.respondJSONOrTOON(ctx, req, answer)
 }
 
 // handleAnalyzeStaleCode lists symbols whose meta.last_authored is
@@ -2364,26 +2362,62 @@ func releaseKey(repoPrefix, tag string) string {
 // existing meta.last_authored, which is the desired behaviour for
 // post-commit refresh.
 func (s *Server) handleAnalyzeBlame(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	roots := s.collectRepoRoots(req.GetString("repo", ""))
+	roots := s.enrichmentTargets(ctx, req.GetString("repo", ""))
 	if len(roots) == 0 {
+		if requestViewFromContext(ctx).readsOwnCheckout() {
+			return mcp.NewToolResultError(ErrEnrichmentSnapshotNotWritable.Error() + ": blame enrichment"), nil
+		}
 		return mcp.NewToolResultError("blame enrichment requires at least one indexed repo with a root path"), nil
 	}
 	total := 0
+	// The answer-level generation is an ANSWER-level fact: every target a
+	// corpus enrichment admits names generation zero (BeginBaseEnrichment
+	// passes Generation: 0 and the authority refuses a legacy target that
+	// carries anything else), so one number describes the whole run. It is set
+	// from the first admitted output rather than re-assigned per repository, so
+	// it can never quietly become "whatever the last repository named"; the
+	// per-repo rows below carry their own, which is where a divergence would
+	// have to show up first.
+	generation := int64(0)
+	generationNamed := false
 	perRepo := make(map[string]any, len(roots))
 	for prefix, root := range roots {
+		// The output generation and the ROOT git blame reads are resolved
+		// together, and both are the corpus's: a request that reads a checkout
+		// of its own never gets here (enrichmentTargets covered nothing for it,
+		// and beginEnrichmentOutput refuses it), so `git blame` is never run
+		// over a working copy the answer does not describe.
+		out, err := s.beginEnrichmentOutput(ctx, EnrichProducerBlame, prefix, root)
+		if err != nil {
+			return mcp.NewToolResultError("blame enrichment: " + err.Error()), nil
+		}
 		// prefix scopes the pass: without it the walk over one repo's root can
 		// stamp another repo's identically-pathed nodes.
-		count, err := blame.EnrichGraph(s.graph, root, prefix)
+		count, err := blame.EnrichGraph(out.Store, out.Root, prefix)
 		if err != nil {
-			perRepo[prefix] = map[string]any{"root": root, "error": err.Error()}
+			out.Abandon()
+			perRepo[prefix] = map[string]any{"root": out.Root, "error": err.Error()}
 			continue
 		}
+		superseded, serr := out.Settle()
+		if serr != nil {
+			perRepo[prefix] = map[string]any{"root": out.Root, "error": serr.Error()}
+			continue
+		}
+		if !generationNamed {
+			generation, generationNamed = out.Generation, true
+		}
 		total += count
-		perRepo[prefix] = map[string]any{"root": root, "enriched": count}
+		entry := map[string]any{"root": out.Root, "enriched": count, "generation": out.Generation}
+		if superseded {
+			entry["superseded"] = true
+		}
+		perRepo[prefix] = entry
 	}
 	return s.respondJSONOrTOON(ctx, req, map[string]any{
-		"enriched": total,
-		"per_repo": perRepo,
+		"enriched":   total,
+		"per_repo":   perRepo,
+		"generation": generation,
 	})
 }
 
@@ -2443,23 +2477,73 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		opts.SkipCrossRepoNodes = true
 	}
 
+	// Preserve pre-walk tier evidence even when derived publication completes
+	// while the analysis is reading graph rows. An outer request snapshot
+	// remains authoritative when the middleware already captured it.
+	if _, captured := ctx.Value(toolFreshnessSnapshotKey{}).(toolFreshnessSnapshot); !captured {
+		ctx = s.captureToolFreshness(ctx)
+	}
+	freshness := takeRequestFreshness(&req)
+	deadline := time.Time{}
+	if freshness.requireFresh {
+		deadline = freshness.effectiveDeadline(time.Now(), ctx)
+	}
+	gaps := s.laggingMutationReceipts(ctx)
 	reader := s.readerFor(ctx)
-	entries := analysis.FindDeadCode(reader, s.getProcesses(), nil, opts)
+	opts.RepoPrefixes = s.deadCodeRepoPrefixes(ctx)
+	if scope, active := s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx)); active {
+		opts.NodeScope = &graph.NodeScope{WorkspaceID: scope.WorkspaceID, ProjectID: scope.ProjectID, RepoAllow: scope.RepoAllow}
+	}
+	// Keep scope capabilities on the context-bound request reader. Unsupported
+	// composed readers retain their exact visibility-aware fallback.
+	var processes *analysis.ProcessResult
+	if opts.RepoPrefixes == nil || len(opts.RepoPrefixes) > 0 {
+		var err error
+		processes, err = s.deadCodeProcesses(ctx, reader)
+		if err != nil {
+			return nil, err
+		}
+	}
+	entries := analysis.FindDeadCode(graph.BindReadContext(reader, ctx), processes, nil, opts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	// dead_code reads the whole graph directly, bypassing the scoped-node
-	// accessors, so narrow its rows to the session workspace + optional
-	// repo allow-set here. This also closes the latent cross-workspace
-	// leak for this kind. Strict no-op for an unbound session with no
-	// RepoAllow. Counts below are computed after this filter.
+	// Ownership travels with each candidate. Preserve the original workspace
+	// and repo policy without fetching every surviving node again.
 	if s.scopeFiltersActive(ctx) {
 		kept := make([]analysis.DeadCodeEntry, 0, len(entries))
 		for _, e := range entries {
-			if s.analyzeNodeVisible(ctx, reader.GetNode(e.ID)) {
+			if s.analyzeNodeVisible(ctx, &graph.Node{
+				ID: e.ID, RepoPrefix: e.RepoPrefix, WorkspaceID: e.WorkspaceID,
+				ProjectID: e.ProjectID, FilePath: e.FilePath,
+			}) {
 				kept = append(kept, e)
 			}
 		}
 		entries = kept
 	}
+
+	// A pending definition or an unindexed caller cannot support a dead-code
+	// verdict. Keep those candidates separate in every output mode.
+	var label relationFreshness
+	var pendingUnknown []analysis.DeadCodeEntry
+	dead := make([]analysis.DeadCodeEntry, 0, len(entries))
+	for _, entry := range entries {
+		candidate := s.freshnessFor(ctx, "derived", []string{entry.ID}, nil, gaps)
+		if candidate.state != "" {
+			// Keep a pre-walk pending candidate unknown even if publication lands
+			// during the wait: these analysis rows preceded that publication.
+			if err := s.awaitConsumerFreshness(ctx, req, "derived", []string{entry.ID}, nil, deadline); err != nil {
+				return nil, err
+			}
+			pendingUnknown = append(pendingUnknown, entry)
+			label = label.merge(candidate)
+		} else {
+			dead = append(dead, entry)
+		}
+	}
+	entries = dead
 
 	// Cap response size — large repos surface thousands of dead-code
 	// candidates and the default JSON encoding spills past the MCP
@@ -2469,12 +2553,15 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 	if v, ok := args["limit"].(float64); ok && v > 0 {
 		limit = int(v)
 	}
-	totalEntries := len(entries)
-	deadTruncated := false
-	if len(entries) > limit {
-		entries = entries[:limit]
-		deadTruncated = true
+	totalEntries, totalUnknown := len(entries), len(pendingUnknown)
+	if len(pendingUnknown) > limit {
+		pendingUnknown = pendingUnknown[:limit]
 	}
+	remaining := limit - len(pendingUnknown)
+	if len(entries) > remaining {
+		entries = entries[:remaining]
+	}
+	deadTruncated := len(entries) < totalEntries || len(pendingUnknown) < totalUnknown
 
 	variablesNote := buildDeadCodeNote(opts)
 
@@ -2489,21 +2576,28 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 				Line: e.Line,
 			})
 		}
-		return s.gcxResponseWithBudget(req)(encodeAnalyze("dead_code", items))
+		data, err := encodeAnalyze("dead_code", items)
+		if err != nil {
+			return nil, err
+		}
+		if len(pendingUnknown) > 0 {
+			unknown := make([]deadCodeItem, 0, len(pendingUnknown))
+			for _, e := range pendingUnknown {
+				unknown = append(unknown, deadCodeItem{ID: e.ID, Kind: e.Kind, Name: e.Name, Path: e.FilePath, Line: e.Line})
+			}
+			section, err := encodeAnalyze("pending_unknown", unknown)
+			if err != nil {
+				return nil, err
+			}
+			data = append(data, section...)
+		}
+		res, err := s.gcxResponseWithBudget(req)(data, nil)
+		return label.decorate(res), err
 	}
 
 	if isCompact(req) {
-		var b strings.Builder
-		for _, e := range entries {
-			fmt.Fprintf(&b, "%s %s %s:%d\n", e.Kind, e.ID, e.FilePath, e.Line)
-		}
-		if len(entries) == 0 {
-			b.WriteString("no dead code found\n")
-		}
-		if variablesNote != "" {
-			fmt.Fprintf(&b, "\nnote: %s\n", variablesNote)
-		}
-		return mcp.NewToolResultText(b.String()), nil
+		text := compactDeadCodeConsumer(entries, pendingUnknown, totalEntries, totalUnknown, deadTruncated, variablesNote, label)
+		return label.decorate(mcp.NewToolResultText(text)), nil
 	}
 
 	result := map[string]any{
@@ -2511,13 +2605,19 @@ func (s *Server) handleFindDeadCode(ctx context.Context, req mcp.CallToolRequest
 		"total":     totalEntries,
 		"truncated": deadTruncated,
 	}
+	if totalUnknown > 0 {
+		result["pending_unknown"] = pendingUnknown
+		result["pending_unknown_count"] = totalUnknown
+	}
 	if deadTruncated {
 		result["limit"] = limit
 	}
 	if variablesNote != "" {
 		result["note"] = variablesNote
 	}
-	return s.respondJSONOrTOON(ctx, req, result)
+	label.apply(result)
+	res, err := s.respondJSONOrTOON(ctx, req, result)
+	return label.decorate(res), err
 }
 
 // buildDeadCodeNote summarises which low-signal kinds the analyzer
@@ -2555,6 +2655,15 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 		defer scheduleOSMemoryReleaseAfterBurst(s.logger, "analyze_hotspots")
 	}
 
+	// Both arms answer from the BASE corpus: the cached rollup, and the
+	// explicit-threshold recompute, which ranks `s.graph` against the
+	// server-wide community partition rather than the request's reader. Under a
+	// routed view the rows therefore describe the base, and the rider says so —
+	// the same statement get_architecture already makes for the hotspots
+	// section it serves out of the same cache. The scope filter below narrows
+	// which rows are VISIBLE to the session; it does not change which corpus
+	// they were computed over.
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph, graphview.CapResolutionLocal)
 	var entries []analysis.HotspotEntry
 	if threshold == 0 {
 		// getHotspots serves the cached ranking, which does not exist
@@ -2569,7 +2678,7 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 		}
 		entries = s.getHotspots()
 	} else {
-		entries = analysis.FindHotspots(s.graph, s.getCommunities(), threshold)
+		entries = analysis.FindHotspots(graph.BindReadContext(s.graph, ctx), s.getCommunities(), threshold)
 	}
 
 	// K17: optional novelty / directional reranking modes. Default
@@ -2596,8 +2705,25 @@ func (s *Server) handleFindHotspots(ctx context.Context, req mcp.CallToolRequest
 	// Strict no-op for an unbound session with no RepoAllow.
 	if s.scopeFiltersActive(ctx) {
 		reader := s.readerFor(ctx)
+		var excludedRepos map[string]bool
+		if s.multiIndexer != nil && s.multiIndexer.IsMultiRepo() {
+			workspaceRepos, bound := s.sessionWorkspaceRepoSet(ctx)
+			allow := repoAllowFromContext(ctx)
+			excludedRepos = make(map[string]bool)
+			for _, prefix := range s.multiIndexer.RepoPrefixes() {
+				if (bound && !workspaceRepos[prefix]) || (len(allow) > 0 && !allow[prefix]) {
+					excludedRepos[prefix] = true
+				}
+			}
+		}
 		kept := make([]analysis.HotspotEntry, 0, len(entries))
 		for _, e := range entries {
+			// Only multi-repo source IDs encode ownership as prefix/path::symbol.
+			// Unprefixed, stub and unknown IDs still need the node visibility check.
+			path, symbol, sourceID := strings.Cut(e.ID, "::")
+			if sourceID && symbol != "" && excludedRepos[graph.RepoPrefixOfID(path)] {
+				continue
+			}
 			if s.analyzeNodeVisible(ctx, reader.GetNode(e.ID)) {
 				kept = append(kept, e)
 			}
@@ -2666,13 +2792,38 @@ type scaffoldReader struct {
 	ctx context.Context
 }
 
-func (r scaffoldReader) Graph() graph.Store { return r.s.graph }
+func (r scaffoldReader) Graph() graph.Reader { return r.s.readerFor(r.ctx) }
 func (r scaffoldReader) ResolveFilePath(graphPath string) string {
 	abs, err := r.s.resolveGraphPath(r.ctx, graphPath)
 	if err != nil {
 		return ""
 	}
 	return abs
+}
+
+func (r scaffoldReader) ScaffoldNodeSource(node *graph.Node) (string, int, int, error) {
+	path := r.ResolveFilePath(node.FilePath)
+	if path == "" {
+		return "", 0, 0, fmt.Errorf("could not resolve %s", node.FilePath)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	var start, end int
+	if mutationPathAdmitted(r.ctx, pathkey.MutationKey(path)) {
+		start, end, err = r.s.symbolLinesUnderLock(r.ctx, node, path, raw)
+	} else {
+		start, end, err = r.s.nodeLinesIn(r.ctx, node, raw)
+	}
+	if err != nil {
+		return "", 0, 0, err
+	}
+	lines := strings.Split(string(indexer.DecodeUTF16Source(raw)), "\n")
+	if start < 1 || end < start || end > len(lines) {
+		return "", 0, 0, fmt.Errorf("invalid current source range for %s", node.ID)
+	}
+	return strings.Join(lines[start-1:end], "\n"), start, end, nil
 }
 
 func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2691,7 +2842,7 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 		dryRun = v
 	}
 
-	result, err := analysis.GenerateScaffold(s.engine, scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+	result, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2703,28 +2854,71 @@ func (s *Server) handleScaffold(ctx context.Context, req mcp.CallToolRequest) (*
 	}
 
 	if !dryRun && s.indexer != nil {
-		// Apply edits by writing files
+		paths := make([]string, 0, len(result.Edits))
 		for _, edit := range result.Edits {
-			absPath := edit.FilePath
-			if root := s.indexer.RootPath(); root != "" {
-				absPath = filepath.Join(root, edit.FilePath)
+			abs, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
 			}
-			content, readErr := os.ReadFile(absPath)
+			paths = append(paths, abs)
+		}
+		ctx, release, err := acquireMutationPaths(ctx, paths)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
+		// Rebuild under the complete source frontier: a queued edit must not
+		// resurrect an example removed while it waited for a source lock.
+		current, err := analysis.GenerateScaffold(s.engineFor(ctx), scaffoldReader{s: s, ctx: ctx}, exampleID, newName)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		grouped := make(map[string][]analysis.ScaffoldEdit)
+		for _, edit := range current.Edits {
+			path, err := s.resolveGraphPath(ctx, edit.FilePath)
+			if err != nil || !mutationPathAdmitted(ctx, pathkey.MutationKey(path)) {
+				return mcp.NewToolResultError("scaffold source paths changed while waiting; rebuild the preview"), nil
+			}
+			grouped[path] = append(grouped[path], edit)
+		}
+		var writes []committedSourceMutation
+		finish := sync.OnceFunc(func() { s.completeCommittedSourceMutations(ctx, writes, release) })
+		defer finish()
+		ordered := slices.Sorted(maps.Keys(grouped))
+		for _, path := range ordered {
+			edits := grouped[path]
+			content, readErr := os.ReadFile(path)
 			if readErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edit.FilePath, readErr)), nil
+				return mcp.NewToolResultError(fmt.Sprintf("could not read %s: %v", edits[0].FilePath, readErr)), nil
 			}
+			// Apply all positions against one source version, from the bottom
+			// up, then parse and commit just one final candidate for this file.
+			slices.SortStableFunc(edits, func(a, b analysis.ScaffoldEdit) int { return cmp.Compare(b.InsertionLine, a.InsertionLine) })
 			lines := strings.Split(string(content), "\n")
-			insertIdx := max(edit.InsertionLine-1, 0)
-			insertIdx = min(insertIdx, len(lines))
-			newLines := make([]string, 0, len(lines)+strings.Count(edit.Code, "\n")+2)
-			newLines = append(newLines, lines[:insertIdx]...)
-			newLines = append(newLines, "")
-			newLines = append(newLines, edit.Code)
-			newLines = append(newLines, lines[insertIdx:]...)
-			if writeErr := os.WriteFile(absPath, []byte(strings.Join(newLines, "\n")), 0o644); writeErr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("could not write %s: %v", edit.FilePath, writeErr)), nil
+			for _, edit := range edits {
+				at := min(max(edit.InsertionLine-1, 0), len(lines))
+				lines = append(slices.Clone(lines[:at]), append([]string{"", edit.Code}, lines[at:]...)...)
+			}
+			after := []byte(strings.Join(lines, "\n"))
+			projection, gate := s.prepareAcknowledgedProjection(ctx, edits[0].FilePath, path, content, after)
+			if gate.Blocked {
+				return mcp.NewToolResultError("scaffold refused: candidate introduces syntax errors"), nil
+			}
+			perm := os.FileMode(0o644)
+			if info, statErr := os.Stat(path); statErr == nil {
+				perm = info.Mode().Perm()
+			}
+			commit, writeErr := s.commitFileMutation(ctx, "scaffold", "", "", edits[0].FilePath, path,
+				after, perm, sourceMutationOperation{kind: sourceWrite, projection: projection})
+			if commit != nil && commit.snapshot().DiskStatus == mutationDiskCommitted {
+				writes = append(writes, captureCommittedSourceMutation(ctx, path, commit))
+			}
+			if writeErr != nil {
+				return mcp.NewToolResultError(mutationNotAppliedMessage("scaffold", commit, writeErr)), nil
 			}
 		}
+		finish()
+		resp["edits"], resp["notes"] = current.Edits, current.Notes
 		resp["applied"] = true
 	}
 
@@ -3096,7 +3290,17 @@ func (s *Server) handleIndexHealth(ctx context.Context, req mcp.CallToolRequest)
 		result, updatedAt, refreshing = s.indexHealthSnapshot()
 	}
 	if result != nil {
-		result = s.refreshIndexHealthFileFailures(ctx, result)
+		// Stamped on the same terms as the resource below, so the PAYLOAD the
+		// resource's description calls "the same payload as the index_health
+		// tool" keeps saying the same thing on both surfaces. The two results
+		// are not byte-equal and never were: a routed tool result additionally
+		// carries the view rider attachViewRider renders around it
+		// (freshness.base_scoped among it), which a resources/read has no
+		// channel for at all. On the tool the stamp is therefore a second copy
+		// of a statement the rider already makes; on the resource it is the
+		// only copy there is, and stamping both is what keeps a caller from
+		// reading two different answers to "which corpus is this".
+		result = withIndexHealthCorpusScope(ctx, s.refreshIndexHealthFileFailures(ctx, result))
 	}
 
 	if isCompact(req) {
@@ -3161,7 +3365,11 @@ func (s *Server) buildIndexHealthPayloadCtx(ctx context.Context) (map[string]any
 	if err != nil || baseline == nil {
 		return baseline, err
 	}
-	return s.refreshIndexHealthFileFailures(ctx, baseline), nil
+	// The gortex://index-health resource's only channel for saying which corpus
+	// it describes: it reads through requestScoped like gortex://stats does,
+	// but unlike stats the payload underneath is generation zero's whatever the
+	// session is bound to, and a resource carries no rider to say so.
+	return withIndexHealthCorpusScope(ctx, s.refreshIndexHealthFileFailures(ctx, baseline)), nil
 }
 
 func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string]any, error) {
@@ -3494,6 +3702,19 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			plannerStats["last_refresh_at"] = planner.LastRefreshAt.UTC().Format(time.RFC3339)
 			plannerStats["last_refresh_reason"] = planner.LastRefreshReason
 		}
+		// Named, not counted: they are what an operator checks the schema for,
+		// and the reason above alone does not say which lookups are scanning.
+		if len(planner.DenseIndexesMissing) > 0 {
+			plannerStats["dense_indexes_missing"] = planner.DenseIndexesMissing
+			msg := "A bulk index load ended without rebuilding these SQLite indexes: " + strings.Join(planner.DenseIndexesMissing, ", ") +
+				". Queries that use them scan instead until they are back. The store rebuilds them in the background once " +
+				"its volume has free space at least the size of the store, and a daemon restart rebuilds them too."
+			if recommendation == "" {
+				recommendation = msg
+			} else {
+				recommendation = msg + " " + recommendation
+			}
+		}
 		result["planner_stats"] = plannerStats
 		if planner.Stale {
 			msg := "SQLite planner statistics are stale (" + planner.Reason + "): the graph has grown past what the query " +
@@ -3504,6 +3725,13 @@ func (s *Server) buildIndexHealthBasePayloadCtx(ctx context.Context) (map[string
 			} else {
 				recommendation = msg + " " + recommendation
 			}
+		}
+	}
+	if reporter, ok := s.graph.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		if observations := reporter.LastFirstIndexDrains(); len(observations) > 0 {
+			result["last_first_index_drain"] = observations
 		}
 	}
 	if prefixAuditOK {
@@ -4178,232 +4406,6 @@ func (s *Server) handleBatchEdit(ctx context.Context, req mcp.CallToolRequest) (
 	return s.handleAtomicBatchEdit(ctx, req)
 }
 
-// applyBatchSymbolEdit applies one edit_symbol operation: it locates the
-// symbol's source range, replaces old_source with new_source inside it, writes
-// the file, and re-indexes. Semantics match the legacy single-op batch_edit.
-func (s *Server) applyBatchSymbolEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
-	res := batchEditResult{Op: "edit_symbol", SymbolID: edit.SymbolID}
-	if edit.OldSource == edit.NewSource {
-		res.Status, res.Error = "failed", "old_source and new_source are identical"
-		return res
-	}
-	node := s.engineFor(ctx).GetSymbol(edit.SymbolID)
-	if node == nil {
-		res.Status, res.Error = "failed", "symbol not found: "+edit.SymbolID
-		return res
-	}
-	res.FilePath = node.FilePath
-	if node.StartLine == 0 || node.EndLine == 0 {
-		res.Status, res.Error = "failed", "symbol has no line range"
-		return res
-	}
-	absPath, resolveErr := s.resolveNodePath(ctx, node)
-	if resolveErr != nil {
-		res.Status, res.Error = "failed", resolveErr.Error()
-		return res
-	}
-	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
-		if lockErr != nil {
-			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
-			return res
-		}
-		defer releaseMutation()
-	}
-	content, readErr := os.ReadFile(absPath)
-	if readErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
-		return res
-	}
-	fileStr := string(content)
-	lines := strings.Split(fileStr, "\n")
-
-	// Prefer the indexed symbol range, including preceding documentation. If a
-	// prior edit in this batch shifted line numbers while watcher reindex is
-	// pending, fall back only when old_source is unique in the current file.
-	regionMatches := findEOLMatches(fileStr, edit.OldSource)
-	symbolStart := 0
-	rangeMatched := false
-	if node.StartLine <= len(lines) && node.EndLine <= len(lines) {
-		symbolSource := strings.Join(lines[node.StartLine-1:node.EndLine], "\n")
-		effectiveStart := node.StartLine
-		if findEOLMatches(symbolSource, edit.OldSource).count == 0 {
-			expandedStart := node.StartLine - 1
-			for expandedStart > 0 {
-				trimmed := strings.TrimSpace(lines[expandedStart-1])
-				if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") ||
-					strings.HasPrefix(trimmed, "*") || trimmed == "" {
-					expandedStart--
-				} else {
-					break
-				}
-			}
-			if expandedStart < node.StartLine-1 {
-				expanded := strings.Join(lines[expandedStart:node.EndLine], "\n")
-				if findEOLMatches(expanded, edit.OldSource).count > 0 {
-					symbolSource = expanded
-					effectiveStart = expandedStart + 1
-				}
-			}
-		}
-		for i := 0; i < effectiveStart-1 && i < len(lines); i++ {
-			symbolStart += len(lines[i]) + 1
-		}
-		symbolEnd := min(symbolStart+len(symbolSource), len(fileStr))
-		candidate := findEOLMatches(fileStr[symbolStart:symbolEnd], edit.OldSource)
-		if candidate.count == 1 {
-			regionMatches = candidate
-			rangeMatched = true
-		}
-	}
-	if !rangeMatched {
-		symbolStart = 0
-		switch regionMatches.count {
-		case 0:
-			res.Status, res.Error = "failed", "old_source not found within symbol or current file"
-			return res
-		case 1:
-			// Safe stale-range fallback.
-		default:
-			res.Status, res.Error = "failed", "symbol range is stale and old_source is not unique in the current file"
-			return res
-		}
-	}
-	span := regionMatches.spans[0]
-	editStart := symbolStart + span.start
-	editEnd := symbolStart + span.end
-	effectiveNew := edit.NewSource
-	if regionMatches.normalized {
-		effectiveNew = adaptToDominantEOL(edit.NewSource, fileStr[editStart:editEnd])
-		res.EOLNormalized = true
-	}
-	newContent := fileStr[:editStart] + effectiveNew + fileStr[editEnd:]
-	if newContent == fileStr {
-		res.Status, res.Error = "failed", "old_source and new_source are identical after line-ending normalization"
-		return res
-	}
-	if !write {
-		res.Status = "validated"
-		return res
-	}
-	perm := os.FileMode(0o644)
-	if info, statErr := os.Stat(absPath); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", node.FilePath, absPath, []byte(newContent), perm)
-	if writeErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
-		return res
-	}
-	sess := s.sessionFor(ctx)
-	sess.recordModified(node.FilePath)
-	sess.recordSymbol(edit.SymbolID)
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
-	commit.recordGraph(reindexOutcome)
-	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
-	res.ReindexReceipt = reindexOutcome.Receipt
-	res.ReindexGeneration = reindexOutcome.Generation
-	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
-	if reindexOutcome.Err != nil {
-		res.ReindexError = reindexOutcome.Err.Error()
-	}
-	res.Status = "applied"
-	return res
-}
-
-// applyBatchFileEdit applies one edit_file operation: it replaces old_string
-// with new_string in the file at path, mirroring edit_file's uniqueness and
-// replace_all semantics, then re-indexes.
-func (s *Server) applyBatchFileEdit(ctx context.Context, edit batchEditItem, write bool) batchEditResult {
-	res := batchEditResult{Op: "edit_file", FilePath: edit.Path}
-	if edit.Path == "" {
-		res.Status, res.Error = "failed", "edit_file op requires path"
-		return res
-	}
-	if edit.OldString == edit.NewString {
-		res.Status, res.Error = "failed", "old_string and new_string are identical"
-		return res
-	}
-	absPath, relPath, resolveErr := s.resolveFilePath(ctx, edit.Path)
-	if resolveErr != nil {
-		res.Status, res.Error = "failed", resolveErr.Error()
-		return res
-	}
-	res.FilePath = relPath
-	if write {
-		releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
-		if lockErr != nil {
-			res.Status, res.Error = "failed", "edit cancelled while waiting for exclusive file access: "+lockErr.Error()
-			return res
-		}
-		defer releaseMutation()
-	}
-	content, readErr := os.ReadFile(absPath)
-	if readErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not read file: %v", readErr)
-		return res
-	}
-	fileStr := string(content)
-	matches := findEOLMatches(fileStr, edit.OldString)
-	count := matches.count
-	if count == 0 {
-		res.Status, res.Error = "failed", "old_string not found in file"
-		return res
-	}
-	if count > 1 && !edit.ReplaceAll {
-		res.Status, res.Error = "failed", fmt.Sprintf(
-			"old_string matches %d locations%s. Provide a larger fragment for uniqueness or set replace_all=true.",
-			count, matchSpansHint(fileStr, matches.spans))
-		return res
-	}
-	var newContent string
-	switch {
-	case matches.normalized:
-		// The CRLF<->LF fallback matched: splice the real byte spans and
-		// write new_string with each region's own line terminators so the
-		// edit never introduces mixed endings.
-		limit := 1
-		if edit.ReplaceAll {
-			limit = -1
-		}
-		newContent = spliceSpansEOL(fileStr, matches.spans, edit.NewString, limit)
-		if newContent == fileStr {
-			res.Status, res.Error = "failed", "old_string and new_string are identical after line-ending normalization"
-			return res
-		}
-		res.EOLNormalized = true
-	case edit.ReplaceAll:
-		newContent = strings.ReplaceAll(fileStr, edit.OldString, edit.NewString)
-	default:
-		newContent = strings.Replace(fileStr, edit.OldString, edit.NewString, 1)
-	}
-	if !write {
-		res.Status = "validated"
-		return res
-	}
-	perm := os.FileMode(0o644)
-	if info, statErr := os.Stat(absPath); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	commit, writeErr := s.commitFileMutation(ctx, "batch_edit", "", "", relPath, absPath, []byte(newContent), perm)
-	if writeErr != nil {
-		res.Status, res.Error = "failed", fmt.Sprintf("could not write file: %v", writeErr)
-		return res
-	}
-	s.sessionFor(ctx).recordModified(relPath)
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
-	commit.recordGraph(reindexOutcome)
-	res.Reindexed, res.ReindexPending = reindexOutcome.Reindexed, reindexOutcome.Pending
-	res.ReindexReceipt = reindexOutcome.Receipt
-	res.ReindexGeneration = reindexOutcome.Generation
-	res.ReindexAppliedGeneration = reindexOutcome.AppliedGeneration
-	if reindexOutcome.Err != nil {
-		res.ReindexError = reindexOutcome.Err.Error()
-	}
-	res.Status = "applied"
-	return res
-}
-
 // ---------------------------------------------------------------------------
 // handleContracts — unified dispatcher for contracts (replaces 2 tools)
 // ---------------------------------------------------------------------------
@@ -4429,7 +4431,10 @@ func (s *Server) handleContracts(ctx context.Context, req mcp.CallToolRequest) (
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGetContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		// A repository indexed with a lost contract tail reaches here too:
 		// nothing ever committed the tier, so no registry was retained. Name
@@ -4677,7 +4682,10 @@ func contractInResolvedScope(c contracts.Contract, resolved ResolvedScope, repoA
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCheckContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
@@ -4767,7 +4775,10 @@ func (s *Server) handleCheckContracts(ctx context.Context, req mcp.CallToolReque
 // parameters as `check` so callers can limit the diff to one project.
 
 func (s *Server) handleValidateContracts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	registry := s.effectiveContractRegistry()
+	registry, registryErr := s.contractRegistryForContext(ctx)
+	if registryErr != nil {
+		return mcp.NewToolResultError(registryErr.Error()), nil
+	}
 	if registry == nil {
 		return mcp.NewToolResultError("no contract registry available — index a repository first"), nil
 	}
@@ -4785,24 +4796,7 @@ func (s *Server) handleValidateContracts(ctx context.Context, req mcp.CallToolRe
 		}
 	}
 
-	// Shape lookup pulls Shape out of the type node's meta — the
-	// indexer attaches it during commitContracts (see
-	// snapshotContractShapes in internal/indexer/indexer.go).
-	lookup := contracts.ShapeLookup(func(symbolID string) *contracts.Shape {
-		// Base read on purpose: only the indexer stamps the shape meta this
-		// reads, so no other view can carry it.
-		n := s.graph.GetNode(symbolID)
-		if n == nil || n.Meta == nil {
-			return nil
-		}
-		switch v := n.Meta["shape"].(type) {
-		case *contracts.Shape:
-			return v
-		case contracts.Shape:
-			return &v
-		}
-		return nil
-	})
+	lookup := s.contractShapeLookup(ctx)
 
 	issues := contracts.Validate(reg, lookup)
 
@@ -5279,7 +5273,7 @@ func (s *Server) coverageByID() map[string]graph.CoverageEnrichment {
 // and each row falls back to the node's own meta — the buffer's symbols
 // simply carry no coverage rather than borrowing the indexed numbers.
 func coverageRowsByID(g graph.Reader) map[string]graph.CoverageEnrichment {
-	r, ok := g.(graph.CoverageEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.CoverageEnrichmentReader)
 	if !ok {
 		return nil
 	}
@@ -5308,7 +5302,7 @@ func coveragePctFrom(cov map[string]graph.CoverageEnrichment, n *graph.Node) (fl
 // view has none, so an overlay-active request falls back to each
 // node's meta.
 func releaseRowsByID(g graph.Reader) map[string]string {
-	r, ok := g.(graph.ReleaseEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.ReleaseEnrichmentReader)
 	if !ok {
 		return nil
 	}
@@ -5337,7 +5331,7 @@ func addedInFrom(rel map[string]string, n *graph.Node) (string, bool) {
 // blameRowsByID batch-loads the blame sidecar (change A) into an
 // id->row map; nil when the backend lacks the capability.
 func blameRowsByID(g graph.Reader) map[string]graph.BlameEnrichment {
-	r, ok := g.(graph.BlameEnrichmentReader)
+	r, ok := contractCoreSelectedReader(g).(graph.BlameEnrichmentReader)
 	if !ok {
 		return nil
 	}
@@ -5373,4 +5367,277 @@ func lastAuthoredTSFrom(blame map[string]graph.BlameEnrichment, n *graph.Node) (
 		return e.Timestamp, true
 	}
 	return 0, false
+}
+
+// ---------------------------------------------------------------------------
+// Enrichment output generation
+// ---------------------------------------------------------------------------
+//
+// Blame, churn, coverage, release and LSP enrichment all WRITE: they stamp
+// derived meta onto an already-built payload. Until this block existed every
+// one of them wrote through the server's un-selected `s.graph` field (and the
+// daemon controller's `c.graph`), which is generation zero — the shared corpus
+// — no matter which view the request had read. A request routed to a
+// checkout's own generation therefore read one snapshot and enriched another.
+//
+// The rule here is the writable counterpart of readerFor(ctx):
+//
+//   - an unrouted request — and every `gortex enrich` run, which reaches the
+//     daemon over the control socket and therefore has no request view at all —
+//     names generation ZERO explicitly, through the authority, rather than by
+//     the absence of a decision;
+//   - a request that reads a checkout of its own is REFUSED. It has no writable
+//     output generation, so writing base instead would enrich a snapshot the
+//     request never read, which is the defect this block removes.
+//
+// The refusal is not a policy choice, it is the payload model. Every generation
+// a request can read is PUBLISHED, and publication seals the payload: a write
+// through a published generation's handle is refused with
+// store_sqlite.ErrPayloadGenerationSealed (payload_generation.go:33-35, :89,
+// :110, :122; only ViewGenerationBuilding admits a write —
+// payload_generation_managed.go:44-47). There is no writable counterpart of
+// readerFor(ctx) for a routed view, so "route the write to the generation the
+// request read" is not implementable at this layer; naming the corpus and
+// refusing anything else is.
+//
+// The same refusal closes the INPUT side channel. The enrichment inputs
+// that read a working copy — `git blame` of the live tree, cover profiles on
+// disk — ran against the TRACKED repository root no matter which checkout the
+// request had selected. A routed request no longer reaches them at all, so a
+// committed identity cannot read the dirty worktree through them; a corpus
+// enrichment reads the corpus's own root, which is the snapshot it writes.
+//
+// Owner keys are producer-scoped on purpose. An enrichment names the same
+// output generation an index mutation does, but it is not the same work: two
+// runs of one producer against one output supersede each other (the later
+// decision wins), while an enrichment must never take the authority away from
+// a live reindex or a live checkout source edit. Enrichment also takes NO raw
+// source witness: it changes no source byte, and claiming the repository's
+// source image is mid-mutation would be a false witness.
+
+// Enrichment producer names. They are the owner-key namespace (see
+// enrichmentOwnerKey), so they are part of the authority's serialization
+// identity, not decoration: two runs that name the same producer over the same
+// output are one output decision and supersede each other.
+//
+// They are EXPORTED because the CLI front door writes the same corpus through
+// the same authority (cmd/gortex/daemon_controller.go). A string literal there
+// and a constant here would be two spellings of one identity, and renaming the
+// constant would silently split the two doors' owner keys so a `gortex enrich
+// blame` and a tool-surface blame run stopped superseding each other. One
+// symbol, one identity, compile-enforced.
+const (
+	EnrichProducerBlame        = "blame"
+	EnrichProducerChurn        = "churn"
+	EnrichProducerCoverage     = "coverage"
+	EnrichProducerReleases     = "releases"
+	EnrichProducerCochange     = "cochange"
+	EnrichProducerRepoCounters = "repo_counters"
+	EnrichProducerSemanticType = "lsp_semantic_type"
+	EnrichProducerSymbolRefs   = "lsp_symbol_refs"
+)
+
+// coverageProfileInputNarrowing is the declared narrowing a coverage answer
+// carries. A cover profile is a file the CALLER produced; nothing ties it to
+// the generation it is stamped onto, so the answer declares that rather than
+// letting the reader assume the input was snapshot-exact.
+const coverageProfileInputNarrowing = "cover profile is a caller-supplied producer input and is not tied to this snapshot"
+
+// ErrEnrichmentSnapshotNotWritable refuses an enrichment write raised under a
+// view that reads a checkout of its own. Every generation such a view reads is
+// published and therefore sealed, so the snapshot the request read cannot be
+// enriched — and enriching the corpus instead would stamp a snapshot the
+// request never read.
+var ErrEnrichmentSnapshotNotWritable = errors.New(
+	"mcp: the selected view reads a published generation, which is sealed and has no writable output; " +
+		"enrichment is served for the indexed corpus only — run it from a base view or with `gortex enrich`")
+
+// EnrichmentOutput is one enrichment write's admitted output generation: the
+// store handle it must write through, the generation that handle is pinned to,
+// and the receipt that names it.
+//
+// Settle it exactly once. A producer that stamps as it goes — every enricher
+// here — settles with Settle, which reports a supersession as the ordering
+// statement it is; Abandon settles a write that did not happen. Complete is the
+// raw form underneath both and is only the right call where a supersession
+// really is a failure, which for an enrichment it never is.
+type EnrichmentOutput struct {
+	// Store is the handle the enricher writes through — the one pinned to
+	// Generation, so a row it writes lands in that generation and nowhere else.
+	Store graph.Store
+	// Generation is the output generation named. It is zero today for every
+	// admitted enrichment: the corpus is the only writable output (see the
+	// block comment), and the field exists so an answer states which
+	// generation it enriched rather than leaving the caller to assume.
+	Generation int64
+	// Owner is the authority's serialization identity for this write.
+	Owner string
+	// Root is the working copy this write's INPUT side may read: the root of
+	// the repository whose corpus is being enriched. Empty when the caller
+	// named none, which the producers treat as "nothing to read".
+	Root string
+
+	receipt *indexer.OutputMutationReceipt
+}
+
+// Complete fulfils the output generation this write named. It returns
+// indexer.ErrOutputMutationReceiptSuperseded when a newer enrichment for the
+// same owner took the authority over while this one ran.
+func (o *EnrichmentOutput) Complete() error {
+	if o == nil || o.receipt == nil {
+		return nil
+	}
+	return o.receipt.Complete()
+}
+
+// Settle settles an enrichment whose producer ALREADY RAN, and separates the
+// two things Complete conflates for such a producer.
+//
+// A supersession is not a failed write. The authority's contract is that the
+// older decision must not publish over the newer one — but an enrichment
+// producer stamps meta as it goes and has published everything it is going to
+// publish before Complete is called. Reporting that repository as "skipped" or
+// as an error would under-report work that demonstrably happened, which is the
+// opposite lie from the one the authority removes. So a superseded settlement is
+// reported as such, alongside the counts the run actually wrote, and only a
+// genuine settlement failure is an error.
+//
+// It is EXPORTED for the same reason the producer constants are: the control
+// socket's `gortex enrich` runs the same producers against the same corpus
+// through the same authority (cmd/gortex/daemon_controller.go), so the two
+// doors must settle a supersession the same way. A second spelling there is how
+// one door ended up reporting landed work as a hard error while the other
+// reported it as landed.
+func (o *EnrichmentOutput) Settle() (superseded bool, err error) {
+	switch err := o.Complete(); {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, indexer.ErrOutputMutationReceiptSuperseded):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+// Abandon settles a write that did not fulfil its generation.
+func (o *EnrichmentOutput) Abandon() {
+	if o == nil || o.receipt == nil {
+		return
+	}
+	o.receipt.Abandon()
+}
+
+// enrichmentOutputIdentity discriminates the OUTPUT an enrichment writes, the
+// same way the indexer's own owner keys do: a repository identity is not an
+// output identity, and two handles on two payloads are two outputs.
+func enrichmentOutputIdentity(store graph.Store) string {
+	if store == nil {
+		return "store:none"
+	}
+	return fmt.Sprintf("store:%T/%p", store, store)
+}
+
+// enrichmentOwnerKey builds the producer-scoped owner key. See the block
+// comment above for why the producer is part of the identity.
+func enrichmentOwnerKey(store graph.Store, producer, scope string) string {
+	return "enrich:" + producer + "|" + enrichmentOutputIdentity(store) + "|" + scope
+}
+
+// fallbackEnrichmentAuthority is the indexer's OWN process fallback — the same
+// object its lanes resolve to when a stack installed none — not a second one
+// with the same shape.
+//
+// That distinction is the whole point. An authority is a serialization
+// universe: owner keys in one cannot supersede, order, or collide with owner
+// keys in another. A package-local `sync.Once` here would mean an enrichment
+// admitted on a server with no indexer named an output nothing else in the
+// process could see, which is exactly the "every mutation names ONE output
+// generation" property the authority establishes. There is one fallback per
+// process and it lives in internal/indexer.
+func fallbackEnrichmentAuthority() *indexer.OutputGenerationAuthority {
+	return indexer.DefaultOutputGenerationAuthority()
+}
+
+// BeginBaseEnrichment admits one enrichment write against the indexed corpus —
+// generation ZERO, named explicitly. It is the door the CLI `gortex enrich`
+// path and every unrouted tool call goes through.
+//
+// RepoPrefix rides on the target for diagnosis; RootPath deliberately does not,
+// because a non-empty root is what makes the authority take the repository's
+// exclusive raw-source witness, and an enrichment mutates no source byte.
+func BeginBaseEnrichment(
+	ctx context.Context, authority *indexer.OutputGenerationAuthority,
+	store graph.Store, producer, repoPrefix, root string,
+) (*EnrichmentOutput, error) {
+	if store == nil {
+		return nil, fmt.Errorf("mcp: %s enrichment has no graph to write", producer)
+	}
+	if authority == nil {
+		authority = fallbackEnrichmentAuthority()
+	}
+	scope := "prefix:" + repoPrefix
+	if repoPrefix == "" {
+		scope = "corpus"
+	}
+	receipt, err := authority.Begin(ctx, indexer.OutputEntryEnrichmentCorpus, indexer.OutputMutationTarget{
+		Kind:       indexer.OutputGenerationLegacy,
+		OwnerKey:   enrichmentOwnerKey(store, producer, scope),
+		RepoPrefix: repoPrefix,
+		Generation: 0,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &EnrichmentOutput{
+		Store:      store,
+		Generation: 0,
+		Owner:      receipt.Target().OwnerKey,
+		Root:       root,
+		receipt:    receipt,
+	}, nil
+}
+
+// outputGenerationAuthority resolves the authority this server admits writes
+// through: the one the stack installed on its indexers, or the process default.
+func (s *Server) outputGenerationAuthority() *indexer.OutputGenerationAuthority {
+	if s != nil && s.multiIndexer != nil {
+		if a := s.multiIndexer.ResolvedOutputGenerationAuthority(); a != nil {
+			return a
+		}
+	}
+	if s != nil && s.indexer != nil {
+		if a := s.indexer.ResolvedOutputGenerationAuthority(); a != nil {
+			return a
+		}
+	}
+	return fallbackEnrichmentAuthority()
+}
+
+// beginEnrichmentOutput is the one door every enrichment write in this package
+// goes through. A request that reads a checkout of its own is refused; anything
+// else names generation zero with the caller's prefix and root.
+//
+// readsOwnCheckout, not routed(): a base-scoped narrowing has a reader and
+// still reads the shared corpus, so it names generation zero exactly as an
+// unrouted request does.
+func (s *Server) beginEnrichmentOutput(
+	ctx context.Context, producer, repoPrefix, root string,
+) (*EnrichmentOutput, error) {
+	if requestViewFromContext(ctx).readsOwnCheckout() {
+		return nil, fmt.Errorf("%w (%s enrichment)", ErrEnrichmentSnapshotNotWritable, producer)
+	}
+	return BeginBaseEnrichment(ctx, s.outputGenerationAuthority(), s.graph, producer, repoPrefix, root)
+}
+
+// enrichmentTargets is the (prefix → root) set an enrichment run covers.
+//
+// A request reading a checkout of its own covers NOTHING: it has no writable
+// generation, and sweeping the tracked repositories on its behalf is exactly
+// the mixed-snapshot write the output-generation rule removes. Every other
+// request covers the tracked repositories, as before.
+func (s *Server) enrichmentTargets(ctx context.Context, scope string) map[string]string {
+	if requestViewFromContext(ctx).readsOwnCheckout() {
+		return nil
+	}
+	return s.collectRepoRoots(scope)
 }

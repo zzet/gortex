@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 func TestRunKimiUserPromptSubmitPlainStdout(t *testing.T) {
@@ -88,7 +90,7 @@ func TestRunKimiPreToolUseGortexReadPlainStdout(t *testing.T) {
 			if out == "" {
 				t.Fatal("expected Kimi MCP read PreToolUse guidance, got empty output")
 			}
-			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", "Native Gortex MCP is mandatory"} {
+			for _, want := range []string{"compress_bodies", `search(operation:"text", query:`, "keep", toolref.TransportClause(), toolref.DegradedModeLine()} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("stdout guidance missing %q: %q", want, out)
 				}

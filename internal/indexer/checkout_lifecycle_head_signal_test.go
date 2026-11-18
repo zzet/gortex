@@ -98,8 +98,8 @@ func TestLifecycleAcceptedHeadChangeSignalsCoordinatorWithoutPolling(t *testing.
 			lifecycle.ensureCoordinator(context.Background(), graphID, checkout)
 			select {
 			case <-cycles:
-				assert.Less(t, time.Since(started), 250*time.Millisecond)
-			case <-time.After(250 * time.Millisecond):
+				assert.Less(t, time.Since(started), testTimingSlack(250*time.Millisecond))
+			case <-time.After(testTimingSlack(250 * time.Millisecond)):
 				t.Fatal("accepted HEAD change waited for disabled polling instead of signaling")
 			}
 

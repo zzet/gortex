@@ -10,6 +10,9 @@ import (
 // routes /mcp to the streamable surface and /v1 to the REST handler, that
 // /v1 is bearer-auth gated, and that CORS headers are emitted.
 func TestComposeDaemonHTTPHandler(t *testing.T) {
+	savedOrigins := daemonHTTPAllowedOrigins
+	daemonHTTPAllowedOrigins = []string{"https://app.example.com"}
+	t.Cleanup(func() { daemonHTTPAllowedOrigins = savedOrigins })
 	streamH := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("MCP"))
 	})
@@ -69,6 +72,9 @@ func TestComposeDaemonHTTPHandler_NoCORS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
 	req.Header.Set("Origin", "https://app.example.com")
 	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("untrusted browser origin = %d, want 403", rec.Code)
+	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("CORS header present with empty origin: %q", got)
 	}

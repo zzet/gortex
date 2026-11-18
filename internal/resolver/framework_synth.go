@@ -197,6 +197,27 @@ func UnstampSynthesized(e *graph.Edge) {
 type FrameworkSynthesizerSelection struct {
 	configured bool
 	names      map[string]struct{}
+	// fnValuePrior, on a scoped run, lets the fn-value gate republish what a
+	// save cannot have moved (WithFnValuePrior).
+	fnValuePrior *FnValuePrior
+	// factoryChainPrior, on a scoped run, lets the factory-chain pass skip
+	// the chains that failed before a declaration-preserving save
+	// (WithFactoryChainPrior).
+	factoryChainPrior *FactoryChainPrior
+}
+
+// WithFactoryChainPrior returns the selection with the changed files'
+// factory-chain prior for a scoped run (FactoryChainPrior).
+func (s FrameworkSynthesizerSelection) WithFactoryChainPrior(prior *FactoryChainPrior) FrameworkSynthesizerSelection {
+	s.factoryChainPrior = prior
+	return s
+}
+
+// WithFnValuePrior returns the selection with the changed files' fn-value
+// prior for a scoped run (FnValuePrior).
+func (s FrameworkSynthesizerSelection) WithFnValuePrior(prior *FnValuePrior) FrameworkSynthesizerSelection {
+	s.fnValuePrior = prior
+	return s
 }
 
 // AllFrameworkSynthesizers returns the legacy, all-enabled selection.
@@ -354,6 +375,12 @@ type frameworkCandidateSummary struct {
 	// Absence-proof gates (edge census, family/receiver tails) may only
 	// trust counts from a full walk; a partial summary cannot prove absence.
 	fullCensus bool
+	// frontierCSharp counts the C# nodes of an exact changed-file frontier
+	// (partial runs with filePaths only). The receiver-type tail demotes a
+	// call only when both its caller and its target are C#, and a frontier
+	// run reads only calls out of or into the frontier's nodes, so a
+	// frontier with no C# node cannot demote anything.
+	frontierCSharp int
 	// streams carries the shared-stream candidate buffers the census edge
 	// walks collected for the converted synthesizers. Full-census runs only;
 	// nil on a partial run, where every pass keeps its own scoped scans.
@@ -498,6 +525,85 @@ func summarizeFrameworkCandidatesForFiles(
 	return summarizeFrameworkCandidatesCensus(g, scope, filePaths, false)
 }
 
+// frameworkFileFrontierNodes yields the nodes of an exact changed-file frontier
+// whose repository is in prefixes (every repository when prefixes is empty) and,
+// when kinds are given, whose kind is one of them; kind by kind in the order
+// given, each kind in node-ID order. That is the row set and order of
+// graph.NodesInScopeSeq(prefixes, filePaths, kinds...) (and, with no kinds, of
+// NodesLightInScopeSeq(prefixes, filePaths)), read through the file index in
+// one batch. The SQLite projections keep an ID-ordered keyset walk for their
+// paging contract, which the planner drives from the generation index when a
+// file list is given: every node of the generation per call (0.2-2 s on a
+// 185k-node store) for a frontier of a few hundred rows. The file batch carries
+// every column, so the census's identity/kind/name/file/language reads and the
+// synthesizers' full-node reads see the same values.
+func frameworkFileFrontierNodes(g graph.Store, prefixes, filePaths []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		if g == nil || len(filePaths) == 0 {
+			return
+		}
+		wantRepo := make(map[string]struct{}, len(prefixes))
+		for _, prefix := range prefixes {
+			wantRepo[prefix] = struct{}{}
+		}
+		files := make([]string, 0, len(filePaths))
+		seen := make(map[string]struct{}, len(filePaths))
+		for _, file := range filePaths {
+			if file == "" {
+				continue
+			}
+			if _, dup := seen[file]; dup {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+		}
+		byFile := g.GetFileNodesByPaths(files)
+		byID := make(map[string]*graph.Node)
+		for _, file := range files {
+			for _, node := range byFile[file] {
+				if node == nil || node.ID == "" {
+					continue
+				}
+				if len(wantRepo) > 0 {
+					if _, ok := wantRepo[node.RepoPrefix]; !ok {
+						continue
+					}
+				}
+				byID[node.ID] = node
+			}
+		}
+		ids := make([]string, 0, len(byID))
+		for id := range byID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if len(kinds) == 0 {
+			for _, id := range ids {
+				if !yield(byID[id]) {
+					return
+				}
+			}
+			return
+		}
+		seenKind := make(map[graph.NodeKind]struct{}, len(kinds))
+		for _, kind := range kinds {
+			if kind == "" {
+				continue
+			}
+			if _, dup := seenKind[kind]; dup {
+				continue
+			}
+			seenKind[kind] = struct{}{}
+			for _, id := range ids {
+				if node := byID[id]; node.Kind == kind && !yield(node) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // summarizeFrameworkCandidatesCensus is the census-aware form. censusEligible
 // carries the daemon's attestation that a non-nil scope covers every tracked
 // repository (a cold / full-reconciliation batch): the summary then reads the
@@ -523,7 +629,9 @@ func summarizeFrameworkCandidatesCensus(
 	var observerRoles map[string]uint8
 	observerRolesOverflow := false
 	var nodes iter.Seq[*graph.Node]
-	if !fullCensus {
+	if !fullCensus && len(filePaths) > 0 {
+		nodes = frameworkFileFrontierNodes(g, frameworkScopePrefixes(scope), filePaths)
+	} else if !fullCensus {
 		nodes = graph.NodesLightInScopeSeq(g, frameworkScopePrefixes(scope), filePaths)
 	} else {
 		nodes = graph.NodesLightSeq(g)
@@ -548,6 +656,9 @@ func summarizeFrameworkCandidatesCensus(
 		}
 		if !fullCensus {
 			recordFrameworkNodeCandidates(summary.scopedMarkers, n, family)
+			if len(filePaths) > 0 && strings.EqualFold(strings.TrimSpace(n.Language), "csharp") {
+				summary.frontierCSharp++
+			}
 		}
 		if family == "" {
 			continue
@@ -1127,6 +1238,9 @@ type SynthCount struct {
 	// kind across the whole graph before concluding there is nothing to
 	// bind — so this rides on every row, not just the ones with edges.
 	Millis int64 `json:"ms,omitempty"`
+	// Faults is the process's major page faults during the pass (disk reads
+	// of the store's pages it could not find in memory).
+	Faults int64 `json:"faults,omitempty"`
 	// ScopeRows/ScopeBytes expose the bounded seed plus this pass's private
 	// dependency expansion. They make accidental cross-pass widening visible
 	// without retaining candidate objects after the pass completes.
@@ -1149,6 +1263,16 @@ type FrameworkSynthReport struct {
 	// tier because they attach to a same-named member of a type unrelated to
 	// the edge's receiver_type.
 	ReceiverGated int `json:"receiver_type_gated,omitempty"`
+	// CandidateGated names the scoped passes that did not run because the
+	// change carries no row they select (passCandidate).
+	CandidateGated []string `json:"candidate_gated,omitempty"`
+	// CandidateWitness names, for each candidate-gated pass that ran, the row
+	// that made it run ("kind from -> to via=…"), so a pass that should have
+	// been skipped can be traced to its row.
+	CandidateWitness map[string]string `json:"candidate_witness,omitempty"`
+	// CandidateCheckMillis times the candidate checks (passCandidate),
+	// which read the run's shared seed; it is not in any pass's row.
+	CandidateCheckMillis int64 `json:"candidate_check_ms,omitempty"`
 	// GDScriptReceiverGated counts the same demotion for GDScript, where the
 	// receiver is stated at every call site and a same-named method in the
 	// caller's own directory is the standing phantom.
@@ -1165,9 +1289,11 @@ type FrameworkSynthReport struct {
 	// here with every synthesizer gated to zero — the census, not the
 	// synthesizers, owned the pass. It must never be silent again.
 	CensusMillis int64 `json:"census_ms,omitempty"`
-	// ScopeMillis times the scoped-store seed construction between the census
-	// and the loop. ScopeRows/ScopeBytes describe that immutable seed; each
-	// SynthCount then reports the seed plus only its private expansion.
+	// ScopeMillis times the scoped seed's reads: the changed files' nodes and
+	// every declared part the passes loaded (each once per run). ScopeRows
+	// counts the rows those reads returned; ScopeBytes the bounded legacy
+	// seed's retained bytes when a legacy pass built it. Each SynthCount
+	// reports its own view plus its private expansion.
 	ScopeMillis int64 `json:"scope_ms,omitempty"`
 	ScopeRows   int   `json:"scope_rows,omitempty"`
 	ScopeBytes  int   `json:"scope_bytes,omitempty"`
@@ -1326,13 +1452,13 @@ func runFrameworkSynthesizersScoped(
 		executionScope = nil
 	}
 
-	scopeStart := time.Now()
-	var genericSeed *frameworkScopedSeed
+	var genericSeed *frameworkDeclaredSeed
 	var fullReadCache *frameworkFullReadCache
 	if executionScope != nil {
-		genericSeed = newFrameworkScopedSeed(g, executionScope, filePaths)
-		rep.ScopeRows = genericSeed.retainedRows
-		rep.ScopeBytes = genericSeed.retainedBytes
+		// Each pass reads the parts of the change its declaration names,
+		// loaded once on first use (framework_seed_declarations.go); the
+		// seed's time and rows are reported after the loop.
+		genericSeed = newFrameworkDeclaredSeed(g, executionScope, filePaths)
 	} else {
 		// Node declarations are immutable throughout the framework registry.
 		// Share their decoded projections across passes under a hard run-local
@@ -1340,13 +1466,29 @@ func runFrameworkSynthesizersScoped(
 		// mutation so this optimization cannot return stale declaration state.
 		fullReadCache = newFrameworkFullReadCache()
 	}
-	rep.ScopeMillis = time.Since(scopeStart).Milliseconds()
 	for _, s := range defaultFrameworkSynthesizers() {
 		if !selection.allows(s.Name()) {
 			candidates.streams.releasePass(s.Name(), nil)
 			continue
 		}
-		start := time.Now()
+		// The candidate check reads the run's shared seed (the incident read,
+		// the changed files' rows) on behalf of every pass that asks next; it
+		// is timed apart so a pass's row is its own work.
+		candidateGated := false
+		if genericSeed != nil && executionScope != nil && frameworkCandidateGatedPasses[s.Name()] {
+			checkStart := time.Now()
+			has, witness := genericSeed.passCandidate(s.Name())
+			candidateGated = !has
+			if witness != nil {
+				if rep.CandidateWitness == nil {
+					rep.CandidateWitness = make(map[string]string)
+				}
+				via, _ := witness.Meta["via"].(string)
+				rep.CandidateWitness[s.Name()] = fmt.Sprintf("%s %s -> %s via=%s", witness.Kind, witness.From, witness.To, via)
+			}
+			rep.CandidateCheckMillis += time.Since(checkStart).Milliseconds()
+		}
+		start, startFaults := time.Now(), processMajorFaults()
 		var n int
 		var bundle *frameworkPassCandidates
 		var passScope *frameworkScopedStore
@@ -1365,8 +1507,23 @@ func runFrameworkSynthesizersScoped(
 					n = runLegacyFrameworkSynthWithCache(g, fullReadCache, sf.fn)
 				case sf.scopedFn != nil:
 					n = sf.scopedFn(g, executionScope)
+				case candidateGated:
+					// The change carries no row this pass selects.
+					rep.CandidateGated = append(rep.CandidateGated, sf.name)
+				case sf.name == SynthFnValue && selection.fnValuePrior != nil:
+					passScope = genericSeed.passStore(sf.name)
+					prior := selection.fnValuePrior
+					n = runLegacyFrameworkSynth(passScope, func(store graph.Store) int {
+						return resolveFnValueCallbacksWithPrior(store, nil, prior)
+					})
+				case sf.name == SynthFactoryChain && selection.factoryChainPrior != nil:
+					passScope = genericSeed.passStore(sf.name)
+					prior := selection.factoryChainPrior
+					n = runLegacyFrameworkSynth(passScope, func(store graph.Store) int {
+						return resolveFactoryChainsWithPrior(store, prior)
+					})
 				default:
-					passScope = genericSeed.newPassStore()
+					passScope = genericSeed.passStore(sf.name)
 					n = runLegacyFrameworkSynth(passScope, sf.fn)
 				}
 			} else if ss, ok := s.(scopedSynthesizer); ok {
@@ -1379,7 +1536,7 @@ func runFrameworkSynthesizersScoped(
 				panic("framework partial run has an unscoped synthesizer: " + s.Name())
 			}
 		}
-		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds()}
+		count := SynthCount{Name: s.Name(), Edges: n, Millis: time.Since(start).Milliseconds(), Faults: processMajorFaults() - startFaults}
 		if passScope != nil {
 			stats := passScope.stats()
 			count.ScopeRows = stats.RetainedRows
@@ -1388,6 +1545,13 @@ func runFrameworkSynthesizersScoped(
 		rep.Per = append(rep.Per, count)
 		rep.Total += n
 		candidates.streams.releasePass(s.Name(), bundle)
+	}
+	if genericSeed != nil {
+		rep.ScopeMillis = genericSeed.elapsed.Milliseconds()
+		rep.ScopeRows = genericSeed.rows
+		if genericSeed.legacy != nil {
+			rep.ScopeBytes = genericSeed.legacy.retainedBytes
+		}
 	}
 	// Capture observability before dropping the run-local cache. Tail gates and
 	// claiming resolvers use different projections and must not prolong its
@@ -1426,7 +1590,8 @@ func runFrameworkSynthesizersScoped(
 	// Receiver-type gate runs last: it corrects (demotes) already-bound C#
 	// member calls, so it must see the settled call graph.
 	demoteStart := time.Now()
-	if frameworkReceiverGateNeeded(executionScope, candidates) {
+	if frameworkReceiverGateNeeded(executionScope, candidates) &&
+		frameworkReceiverGateReachesFrontier(filePaths, csharpHierarchyChanged, candidates) {
 		rep.ReceiverGated = demoteCSharpMisattributedMemberCallsScopedForFiles(
 			g, executionScope, filePaths, csharpHierarchyChanged,
 		)
@@ -1489,6 +1654,18 @@ func frameworkGDScriptGateNeeded(summary frameworkCandidateSummary) bool {
 		return summary.allMarkers[frameworkMarkerGDScript] > 0
 	}
 	return summary.scopedMarkers[frameworkMarkerGDScript] > 0
+}
+
+// frameworkReceiverGateReachesFrontier gates the receiver-type tail of an
+// exact changed-file run by language before it reads anything: with an
+// unchanged C# hierarchy the tail examines only calls out of or into the
+// frontier's nodes (csharpCallCandidatesForFiles) and demotes only C#-to-C#
+// member calls, so a frontier without a C# node yields nothing.
+func frameworkReceiverGateReachesFrontier(filePaths []string, csharpHierarchyChanged bool, summary frameworkCandidateSummary) bool {
+	if len(filePaths) == 0 || csharpHierarchyChanged || summary.fullCensus {
+		return true
+	}
+	return summary.frontierCSharp > 0
 }
 
 func frameworkReceiverGateNeeded(_ map[string]bool, summary frameworkCandidateSummary) bool {

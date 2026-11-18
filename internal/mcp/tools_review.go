@@ -1072,6 +1072,7 @@ type reviewEnvelope struct {
 	FileRisk            []review.FileRisk         `json:"file_risk"`
 	Findings            []inlineComment           `json:"findings"`
 	Contracts           *contractImpact           `json:"contracts,omitempty"`
+	ContractWarning     string                    `json:"contract_warning,omitempty"`
 	Guards              []analysis.GuardViolation `json:"guards"`
 	HighRiskPreviews    []reviewPreview           `json:"high_risk_previews,omitempty"`
 	TestTargets         []string                  `json:"test_targets"`
@@ -1196,7 +1197,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	}
 
 	// Gate: contract-boundary impact.
-	contracts := s.computeContractImpact(ids)
+	contracts := s.computeContractImpactContext(ctx, ids)
 
 	// Gate: guard + architecture rules.
 	var guards []analysis.GuardViolation
@@ -1212,9 +1213,19 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 	if (contracts != nil && contracts.Breaking > 0) || len(guards) > 0 {
 		verdict = review.VerdictBlock
 	}
+	contractWarning := optionalContractWarning(contractConsumerStatusFromContext(ctx))
+	summary := report.Summary
+	if contractWarning != "" {
+		summary += "; " + contractWarning
+	}
+	verdict = optionalContractReviewVerdict(verdict, contractConsumerStatusFromContext(ctx))
 
 	// Per-symbol semantic classification, graph-grounded on the diff-hunk text.
-	changedSyms := s.classifyChangedSymbols(ctx, diff, impact)
+	var changeView *review.ChangeView
+	if diff != nil {
+		changeView = s.reviewChangeView(ctx, repoRoot, repoPrefix, scope, baseRef)
+	}
+	changedSyms := s.classifyChangedSymbols(ctx, diff, changeView, impact)
 
 	verCmd := review.VerificationCommand(testTargets, reviewPackLang(diff))
 
@@ -1231,11 +1242,12 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 
 	env := reviewEnvelope{
 		Verdict:             string(verdict),
-		Summary:             report.Summary,
+		Summary:             summary,
 		ChangedSymbols:      changedSyms,
 		FileRisk:            report.FileRisk,
 		Findings:            reviewFindingsToComments(report),
 		Contracts:           contracts,
+		ContractWarning:     contractWarning,
 		Guards:              guards,
 		HighRiskPreviews:    previews,
 		TestTargets:         testTargets,
@@ -1246,7 +1258,7 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 		Cost:                report.Cost,
 	}
 	if requestBoolDefault(req, "include_pack", false) {
-		env.Pack = s.buildReviewPack(ctx, diff, impact, intArg(req.GetArguments(), "max_tokens", 0))
+		env.Pack = s.buildReviewPack(ctx, diff, changeView, impact, intArg(req.GetArguments(), "max_tokens", 0))
 	}
 
 	payload := reviewPackPayload(env)
@@ -1263,12 +1275,11 @@ func (s *Server) handleReviewPack(ctx context.Context, req mcp.CallToolRequest) 
 // classifyChangedSymbols stamps a change class + impact-risk tier on every
 // changed symbol. The class is graph-grounded on the symbol's diff-hunk text;
 // the risk tier is the symbol's AnalyzeImpact tier (LOW when no impact entry).
-func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
+func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.DiffResult, view *review.ChangeView, impact map[string]*analysis.ImpactResult) []classifiedSymbol {
 	if diff == nil {
 		return []classifiedSymbol{}
 	}
 	reader := s.readerFor(ctx)
-	view, _ := s.reviewChangeView(ctx, diff)
 	out := make([]classifiedSymbol, 0, len(diff.ChangedSymbols))
 	for _, cs := range diff.ChangedSymbols {
 		hunk := review.SymbolHunk(reader, view, cs)
@@ -1290,17 +1301,17 @@ func (s *Server) classifyChangedSymbols(ctx context.Context, diff *analysis.Diff
 }
 
 // reviewChangeView builds the ChangeView the classify/pack rendering reads its
-// diff-hunk text from. Errors degrade to a nil view (the renderers tolerate it).
-func (s *Server) reviewChangeView(ctx context.Context, diff *analysis.DiffResult) (*review.ChangeView, *analysis.DiffResult) {
-	repoRoot := ""
-	if s.indexer != nil {
-		repoRoot = s.indexer.RootPath()
+// diff-hunk text from, over the same working tree, prefix and diff range as the
+// changeset. Errors degrade to a nil view (the renderers tolerate it).
+func (s *Server) reviewChangeView(ctx context.Context, repoRoot, repoPrefix, scope, baseRef string) *review.ChangeView {
+	if repoRoot == "" {
+		return nil
 	}
-	view, err := review.BuildChangeView(s.readerFor(ctx), repoRoot, s.diffJoinPrefix(repoRoot), "", "")
+	view, err := review.BuildChangeView(s.readerFor(ctx), repoRoot, repoPrefix, scope, baseRef)
 	if err != nil {
-		return nil, diff
+		return nil
 	}
-	return view, diff
+	return view
 }
 
 // reviewTestTargets walks the impacted symbols to their covering test files,
@@ -1458,11 +1469,10 @@ func (s *Server) reviewReceipt(ctx context.Context, ids []string, diff *analysis
 
 // buildReviewPack renders the FG9 tiered review pack for the envelope: changed
 // symbols as diff hunks, direct callers as full source, the rest as an outline.
-func (s *Server) buildReviewPack(ctx context.Context, diff *analysis.DiffResult, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
+func (s *Server) buildReviewPack(ctx context.Context, diff *analysis.DiffResult, view *review.ChangeView, impact map[string]*analysis.ImpactResult, budget int) *review.ReviewPack {
 	if diff == nil {
 		return nil
 	}
-	view, _ := s.reviewChangeView(ctx, diff)
 	return review.BuildReviewPack(s.readerFor(ctx), view, diff, review.MergeImpact(impact), budget)
 }
 
@@ -1590,6 +1600,9 @@ func reviewPackPayload(env reviewEnvelope) map[string]any {
 	}
 	if env.Contracts != nil {
 		payload["contracts"] = env.Contracts
+	}
+	if env.ContractWarning != "" {
+		payload["contract_warning"] = env.ContractWarning
 	}
 	if len(previews) > 0 {
 		payload["high_risk_previews"] = previews

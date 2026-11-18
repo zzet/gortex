@@ -6,6 +6,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+	"github.com/zzet/gortex/internal/parser/tsitter/php"
 )
 
 // PHP namespace identity.
@@ -48,6 +49,17 @@ type phpNameResolver struct {
 	// funcAliases holds only the `use function X as y` entries, which the
 	// resolver's scope_use_aliases contract keeps separate from class imports.
 	funcAliases map[string]string
+}
+
+// PHPClassNameResolver resolves class references through a file's namespaces and
+// use imports. The returned resolver owns only strings; no tree is retained.
+func PHPClassNameResolver(src []byte) func(string, int) string {
+	tree, err := parser.ParseFile(src, php.GetLanguage())
+	if err != nil || tree == nil {
+		return nil
+	}
+	defer tree.Close()
+	return newPHPNameResolver(tree.RootNode(), src).resolve
 }
 
 // newPHPNameResolver reads a file's namespace declarations and `use` imports.
@@ -134,7 +146,7 @@ func (r *phpNameResolver) readUseDeclaration(node *sitter.Node, src []byte) {
 		if kind == "const" {
 			return
 		}
-		r.imports[local] = fqn
+		r.imports[strings.ToLower(local)] = fqn
 	}
 
 	if group := node.ChildByFieldName("body"); group != nil {
@@ -199,7 +211,7 @@ func (r *phpNameResolver) resolve(raw string, line int) string {
 	if i := strings.Index(raw, `\`); i >= 0 {
 		head, rest = raw[:i], raw[i:]
 	}
-	if fqn, ok := r.imports[head]; ok {
+	if fqn, ok := r.imports[strings.ToLower(head)]; ok {
 		return fqn + rest
 	}
 	ns := r.namespaceAt(line)
@@ -238,9 +250,6 @@ func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.Ext
 		return
 	}
 	nr := newPHPNameResolver(root, src)
-	if len(nr.ranges) == 0 && len(nr.imports) == 0 && len(nr.funcAliases) == 0 {
-		return // global-namespace file with no imports: nothing to qualify
-	}
 
 	for _, n := range result.Nodes {
 		if n == nil || n.Language != "php" || !phpNamespaceScopedKind(n.Kind) {
@@ -265,6 +274,21 @@ func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.Ext
 		if e == nil {
 			continue
 		}
+		if rt, _ := e.Meta["receiver_type"].(string); rt != "" {
+			// Keep the public short-name hint, but retain class identity for
+			// calls before the resolver can choose an unrelated homonym.
+			e.Meta["receiver_type"] = canonicalizePHPTypeRef(rt)
+			if e.Kind == graph.EdgeCalls && strings.HasPrefix(e.To, "unresolved::*.") &&
+				e.Meta["facade"] == nil && e.Meta["via"] != "constructor" {
+				fqn := nr.resolve(rt, e.Line)
+				if fqn != rt || strings.Contains(rt, `\`) || nr.namespaceAt(e.Line) != "" || len(nr.imports) > 0 {
+					e.Meta["receiver_fqn"] = fqn
+				}
+			}
+		}
+		if root, _ := e.Meta["php_property_root"].(string); root != "" {
+			e.Meta["php_property_root"] = nr.resolve(root, e.Line)
+		}
 		if aliases != "" && e.Kind == graph.EdgeCalls {
 			if e.Meta == nil {
 				e.Meta = map[string]any{}
@@ -287,7 +311,9 @@ func applyPHPNamespaceIdentity(root *sitter.Node, src []byte, result *parser.Ext
 			delete(e.Meta, phpRawTypeRefKey)
 		}
 		fqn := nr.resolve(written, e.Line)
-		if fqn == "" || fqn == name {
+		// Receiver ancestry also needs explicit global names: a resolved
+		// short-name parent edge may already point at an unrelated namespace.
+		if fqn == "" || (fqn == name && e.Kind != graph.EdgeExtends && e.Kind != graph.EdgeImplements) {
 			continue
 		}
 		if e.Meta == nil {

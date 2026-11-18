@@ -10,9 +10,11 @@ import (
 )
 
 // resolveNameToIDs returns the path-qualified node ids of every definition
-// (function / method / type / …) whose short name equals the given bare name,
-// sorted and de-duped — so a caller can pass "Bar" instead of
-// "pkg/foo.go::Bar". Returns nil for an empty name or no match.
+// (function / method / type / …) whose short name equals the given bare name
+// and that the session may see, sorted and de-duped — so a caller can pass
+// "Bar" instead of "pkg/foo.go::Bar". Returns nil for an empty name or no
+// match. The ids reach the agent in the ambiguity answer, so another
+// workspace's definitions must never be among them.
 func (s *Server) resolveNameToIDs(ctx context.Context, name string) []string {
 	reader := s.readerFor(ctx)
 	if reader == nil || name == "" {
@@ -20,8 +22,8 @@ func (s *Server) resolveNameToIDs(ctx context.Context, name string) []string {
 	}
 	seen := map[string]bool{}
 	var ids []string
-	for _, n := range reader.FindNodesByName(name) {
-		if n == nil || n.ID == "" || seen[n.ID] || !nodeIsDefinitionKind(n.Kind) {
+	for _, n := range s.sessionNameCandidates(ctx, reader, name, reader.FindNodesByName) {
+		if n == nil || n.ID == "" || seen[n.ID] || !nodeIsDefinitionKind(n.Kind) || !s.nodeInSessionScope(ctx, n) {
 			continue
 		}
 		seen[n.ID] = true

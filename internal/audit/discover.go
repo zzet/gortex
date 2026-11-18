@@ -15,6 +15,7 @@ func DefaultConfigPaths() []string {
 		"CLAUDE.md",
 		"CLAUDE.local.md",
 		"AGENTS.md",
+		"GEMINI.md",
 		".cursorrules",
 		".cursor/rules",
 		".github/copilot-instructions.md",
@@ -26,6 +27,7 @@ func DefaultConfigPaths() []string {
 		".windsurfrules",
 		".windsurf/rules",
 		".antigravity/rules",
+		".agents/rules",
 		".aider.conf.yml",
 		// Skill trees. These carry the same stale symbol refs and dead
 		// paths as a rules file, and Gortex now writes into them, so a

@@ -8,6 +8,7 @@
 package platform
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -19,15 +20,30 @@ func ShutdownSignals() []os.Signal {
 	return []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 }
 
-// ProcessAlive reports whether a process with the given PID currently
-// exists. Signalling 0 is the canonical Unix liveness probe: it runs
-// every permission check but delivers nothing, so a nil error means the
-// process is there (and reachable).
+// ProcessAlive reports whether a process with the given PID is alive and
+// reachable by the caller. On Darwin and Linux, a zombie counts as dead even
+// though kill(pid, 0) succeeds until its parent reaps it.
 func ProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	return syscall.Kill(pid, 0) == nil && !processIsZombie(pid)
+}
+
+// ProcessExists reports whether a process with the given PID exists.
+// On Darwin and Linux, a zombie counts as dead. It includes a live process
+// owned by another user that the caller may not signal
+// (kill(pid, 0) fails with EPERM). Use it where the PID belongs to a
+// different process that may run under another UID, such as an MCP
+// client of a shared daemon. A PID the caller recorded for itself (e.g.
+// a PID file) should keep using ProcessAlive: if it can no longer be
+// signalled, the PID has been reused.
+func ProcessExists(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return (err == nil || errors.Is(err, syscall.EPERM)) && !processIsZombie(pid)
 }
 
 // TerminateProcess asks the process to exit gracefully (SIGTERM).

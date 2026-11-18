@@ -41,10 +41,10 @@ func purgeUnprefixedRepoRows(tx *sql.Tx) error {
 	// dropped when EITHER endpoint is an unprefixed code node: a half-
 	// dangling edge is worse than none, because the resolver would keep
 	// re-materialising its missing target as an unresolved stub.
-	if _, err := tx.Exec(`
+	if _, err := countEdgeWrite(tx.Exec(`
 DELETE FROM edges
 WHERE from_id IN (SELECT id FROM nodes WHERE repo_prefix = '' AND file_path <> '')
-   OR to_id   IN (SELECT id FROM nodes WHERE repo_prefix = '' AND file_path <> '')`); err != nil {
+   OR to_id   IN (SELECT id FROM nodes WHERE repo_prefix = '' AND file_path <> '')`)); err != nil {
 		return fmt.Errorf("delete unprefixed edges: %w", err)
 	}
 
@@ -57,7 +57,7 @@ WHERE node_id IN (SELECT id FROM nodes WHERE repo_prefix = '' AND file_path <> '
 		return fmt.Errorf("delete unprefixed vectors: %w", err)
 	}
 
-	if _, err := tx.Exec(`DELETE FROM nodes WHERE repo_prefix = '' AND file_path <> ''`); err != nil {
+	if _, err := countNodeWrite(tx.Exec(`DELETE FROM nodes WHERE repo_prefix = '' AND file_path <> ''`)); err != nil {
 		return fmt.Errorf("delete unprefixed nodes: %w", err)
 	}
 

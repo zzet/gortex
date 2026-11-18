@@ -1,6 +1,9 @@
 package store_sqlite
 
-import "github.com/zzet/gortex/internal/graph"
+import (
+	"database/sql"
+	"github.com/zzet/gortex/internal/graph"
+)
 
 var _ graph.SemanticBindingTypeStore = (*Store)(nil)
 
@@ -21,9 +24,11 @@ func (s *Store) ReplaceSemanticBindingTypes(repoPrefix string, rows []graph.Sema
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
-	if _, err := tx.Exec("DELETE FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ?", s.viewGen, repoPrefix); err != nil {
+	result, err := tx.Exec("DELETE FROM semantic_binding_types WHERE view_gen = ? AND repo_prefix = ?", s.viewGen, repoPrefix)
+	if err != nil {
 		return err
 	}
+	changed := semanticBindingWriteChanged(result)
 	for start := 0; start < len(rows); start += semanticBindingChunk {
 		end := start + semanticBindingChunk
 		if end > len(rows) {
@@ -40,11 +45,19 @@ func (s *Store) ReplaceSemanticBindingTypes(repoPrefix string, rows []graph.Sema
 			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
 			args = append(args, s.viewGen, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
 		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		changed = semanticBindingWriteChanged(result) || changed
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		s.noteContractSemanticBindingsLocked(repoPrefix, nil, nil, true)
+	}
+	return nil
 }
 
 // ReplaceSemanticBindingTypesForFiles atomically drops and replaces bindings
@@ -62,6 +75,7 @@ func (s *Store) ReplaceSemanticBindingTypesForFiles(repoPrefix string, files []s
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(files); start += semanticBindingChunk {
 		end := start + semanticBindingChunk
 		if end > len(files) {
@@ -80,9 +94,11 @@ func (s *Store) ReplaceSemanticBindingTypesForFiles(repoPrefix string, files []s
 			args = append(args, filePath)
 		}
 		stmt = append(stmt, ')')
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		changed = semanticBindingWriteChanged(result) || changed
 	}
 	for start := 0; start < len(rows); start += semanticBindingChunk {
 		end := start + semanticBindingChunk
@@ -100,11 +116,19 @@ func (s *Store) ReplaceSemanticBindingTypesForFiles(repoPrefix string, files []s
 			stmt = append(stmt, "(?, ?, ?, ?, ?, ?)"...)
 			args = append(args, s.viewGen, repoPrefix, row.Site.FilePath, row.Site.Line, row.Site.Name, row.TypeName)
 		}
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		changed = semanticBindingWriteChanged(result) || changed
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		s.noteContractSemanticBindingsLocked(repoPrefix, files, rows, false)
+	}
+	return nil
 }
 
 // DeleteSemanticBindingTypesByFiles invalidates compiler bindings for changed
@@ -122,6 +146,7 @@ func (s *Store) DeleteSemanticBindingTypesByFiles(repoPrefix string, files []str
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
 
+	changed := false
 	for start := 0; start < len(files); start += semanticBindingChunk {
 		end := start + semanticBindingChunk
 		if end > len(files) {
@@ -140,11 +165,19 @@ func (s *Store) DeleteSemanticBindingTypesByFiles(repoPrefix string, files []str
 			args = append(args, filePath)
 		}
 		stmt = append(stmt, ')')
-		if _, err := tx.Exec(string(stmt), args...); err != nil {
+		result, err := tx.Exec(string(stmt), args...)
+		if err != nil {
 			return err
 		}
+		changed = semanticBindingWriteChanged(result) || changed
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		s.noteContractSemanticBindingsLocked(repoPrefix, files, nil, false)
+	}
+	return nil
 }
 
 // SemanticBindingTypes performs one predicate-shaped VALUES join per chunk.
@@ -213,4 +246,11 @@ JOIN semantic_binding_types AS b
 		_ = rows.Close()
 	}
 	return out, nil
+}
+
+// Row-count uncertainty is a conservative changed input, never an unchanged
+// semantic proof. This does not alter the writer's existing error contract.
+func semanticBindingWriteChanged(result sql.Result) bool {
+	count, err := result.RowsAffected()
+	return err != nil || count > 0
 }

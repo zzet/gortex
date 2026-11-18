@@ -32,7 +32,7 @@ Checkout removal and primary changes are destructive administration. Preview pri
 | --------------- | ----------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------- |
 | `claude-code`   | `.mcp.json`, `.claude/*`, `AGENTS.md` communities block, `CLAUDE.md` import/overview, `.claude/skills/generated/*`, `~/.claude/skills/gortex-*`, `~/.claude/commands/gortex-*.md`, `~/.claude.json` | both       | https://docs.claude.com/en/docs/claude-code/overview                |
 | `aider`         | `.aiderignore` block, `CONVENTIONS.md` communities block                                        | project    | https://aider.chat/docs/config/aider_conf.html                      |
-| `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + Knowledge Item                                        | user       | https://antigravity.google/docs/mcp                                 |
+| `antigravity`   | `~/.gemini/antigravity/mcp_config.json` + `~/.gemini/config/mcp_config.json`, Knowledge Item, `~/.gemini/config/hooks.json`, `~/.gemini/config/plugins/gortex/rules/AGENTS.md` rule block, `~/.gemini/config/skills/gortex-*`, repo `AGENTS.md` (or `GEMINI.md`) communities block, repo `.agents/skills/gortex-*` | both       | https://antigravity.google/docs/mcp                                 |
 | `cline`         | `cline_mcp_settings.json` (per VS Code / Cursor globalStorage), `.clinerules/gortex-communities.md` | both     | https://docs.cline.bot/mcp/mcp-overview                             |
 | `codex`         | `~/.codex/config.toml` (`[mcp_servers.gortex]` + `SessionStart`, `UserPromptSubmit`, Bash/Gortex-read `PreToolUse`, and Bash/`apply_patch` `PostToolUse` hooks), `~/.codex/AGENTS.md` rule block, `~/.agents/skills/gortex-*`, `~/.codex/agents/gortex-*.toml`, repo `AGENTS.md` communities block, repo `.agents/skills/gortex-*` | both       | https://learn.chatgpt.com/docs/extend/mcp                           |
 | `copilot-cli`   | `~/.copilot/mcp-config.json` (`mcpServers`), `~/.copilot/copilot-instructions.md` rule block, `~/.copilot/skills/gortex-*`, `~/.copilot/agents/gortex-*.agent.md`, `~/.copilot/hooks/gortex.json`, repo `.github/copilot-instructions.md` communities block, repo `.github/skills/gortex-*` | both       | https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers |
@@ -135,12 +135,13 @@ lives in per-repo instruction files because it is workspace-specific.
 
 ## Compact MCP surface
 
-Every MCP connection with a non-empty `clientInfo.name` receives the
-same 21-tool compact surface in `hide` mode by default. The complete
-static roster is documented in [`mcp.md`](mcp.md#compact-mcp-surface).
-Empty and pre-initialize sessions retain the server default. Explicit
-forwarded, operator, or instruction-profile policy wins over the
-named-client default. Wire-format negotiation is independent, so an
+Every MCP client connection receives the same 21-tool compact surface
+in `hide` mode by default, whether or not its `initialize` carried a
+`clientInfo.name`. The complete static roster is documented in
+[`mcp.md`](mcp.md#compact-mcp-surface). Only internal session-less
+callers (the HTTP dashboard and `/v1` REST routes) retain the server
+default. Explicit forwarded, operator, or instruction-profile policy
+wins over the client default. Wire-format negotiation is independent, so an
 unknown named client remains on JSON unless it is separately
 GCX-capable.
 
@@ -178,7 +179,9 @@ automatically inherit every tool the parent has.
   `gortex-search` (locate / trace / explore) and `gortex-impact`
   (blast-radius / verification) — each with an explicit
   `tools: mcp__gortex__…` frontmatter listing exactly the graph tools it
-  needs. The allowlist is **graph-only by construction**: it contains no
+  needs. The plugin ships the same two subagents with
+  `tools: mcp__plugin_gortex_gortex__…` names for its plugin-scoped MCP server.
+  The allowlist is **graph-only by construction**: it contains no
   `Bash`/`Grep`/`Glob`, so a spawned subagent cannot escape the graph.
   A `PreToolUse` Task hook additionally briefs spawned subagents. The
   allowlists are validated in CI (`subagents_test.go`) so a tool rename
@@ -294,8 +297,8 @@ The primary integration, split across the two commands.
 - `.claude/skills/generated/<DirName>/SKILL.md` — one per detected
   community, regenerated each run so the content tracks the graph
 
-Hooks installed today: **PreToolUse**, **PostToolUse**, **PreCompact**,
-**Stop**, **SessionStart**, **UserPromptSubmit**, **SubagentStart**,
+Hooks installed today: **PreToolUse**, **PostToolUse**, **Stop**,
+**SessionStart**, **UserPromptSubmit**, **SubagentStart**,
 **SubagentStop**.
 
 SessionStart carries the orientation block. It is registered with no
@@ -306,8 +309,11 @@ rebuilds a compacted window from the summary, the most recent exchanges,
 and up to five recently-read files that it re-reads and re-injects as
 `system-reminder` blocks, and SessionStart is the only compaction-adjacent
 event that can inject context to say so. PreCompact cannot — its output
-contract is `decision: "block"` only — so gortex's PreCompact handler
-records telemetry and deliberately emits nothing.
+contract is `decision: "block"` only — so gortex no longer installs a
+PreCompact hook, and re-running `gortex init` / `gortex install` removes
+the one older releases wrote (PreCompact hooks of your own are kept). The
+`gortex hook` handler still accepts the event from an install that has not
+been refreshed; it records telemetry and deliberately emits nothing.
 
 > **Daemon outage = per-call enforcement stands down.** Every per-call
 > surface (PreToolUse denies and graph advisories, PostToolUse follow-ups,
@@ -329,11 +335,34 @@ tokens ingesting them.
 
 ### antigravity
 
-Two artifacts: a native MCP registration at
-`~/.gemini/antigravity/mcp_config.json` (new in 2026) plus a
-Knowledge Item at `~/.gemini/antigravity/knowledge/gortex-workflow/`
-that documents how to use Gortex via `run_command`. The KI stays
-because it gives workflow intent the raw MCP registration doesn't.
+MCP is registered in both `~/.gemini/antigravity/mcp_config.json`
+(IDE) and `~/.gemini/config/mcp_config.json` (agy CLI / Antigravity
+2.0), and a Knowledge Item at
+`~/.gemini/antigravity/knowledge/gortex-workflow/` feeds the IDE's
+knowledge panel.
+
+`gortex install` also writes the user-level pieces: a `gortex` entry in
+`~/.gemini/config/hooks.json` (SessionStart, PreInvocation, PreToolUse,
+PostToolUse and Stop, each running `gortex hook --agent=antigravity
+--event=<event>`; `--hook-mode` is honoured), the rule block in
+`~/.gemini/config/plugins/gortex/rules/AGENTS.md`, and the curated
+skills under `~/.gemini/config/skills/`. PreToolUse matches every tool;
+PostToolUse matches MCP calls only, since it just watches Gortex
+localization results. A `"enabled": false` you set on the `gortex` hook
+entry is kept across re-installs.
+
+Antigravity's MCP config has no working-directory field, so `gortex
+mcp` inherits the directory of the process that starts it. When that is
+`$HOME` or `/` (as seen with the IDE), graph tools answer
+`repo_not_tracked` rather than guess a repo. If you work in one repo,
+start Antigravity with `ANTIGRAVITY_WORKSPACE=/path/to/repo` in its
+environment; the MCP server inherits it.
+
+`gortex init` merges the communities block into `AGENTS.md` (or into an
+existing `GEMINI.md` when the repo has no `AGENTS.md`) and writes the
+generated skills to `.agents/skills/`. `gortex uninstall --global`
+removes the hook entry, rule block, plugin manifest, unedited skills and
+the shipped KI, keeping anything you changed.
 
 ### cline
 
@@ -369,6 +398,13 @@ To tell the two states apart, run `gortex doctor`. It correlates the Codex
 config, the hook-invocation log, the Codex session transcripts, and the savings
 ledger into one verdict — *hooks configured but none has run* is the
 untrusted-hook signature, reported as a blocker with the `/hooks` remedy.
+A single event that never ran while its siblings did is a different
+diagnosis: the siblings prove the hooks run, so it is never a blocker.
+Codex's `Stop` fires only when a session ends cleanly — long-lived sessions
+that are killed or still open never reach it — so its silence is reported as
+INFO. Any other silent event is a WARN pointing at that event's entry, with a
+hint to re-trust that one entry via `/hooks`, since Codex records trust per
+hook and an upgrade that changes one definition lapses only its trust.
 `--redact` hashes repo paths and branch names so the report can be pasted into
 an issue, `--json` emits it machine-readably, and the exit status is non-zero
 when a blocker is found.
@@ -400,7 +436,7 @@ Current Codex hook coverage:
 | ------- | -------- |
 | `SessionStart` | Matches `startup|resume|clear|compact` and emits graph-tools orientation for new, resumed, cleared, and compacted sessions. |
 | Hook-observable local-tool `PreToolUse` terminal gate | Uses one match-all installer-owned hook so an enforceable localization `answer_ready` contract blocks every local tool Codex routes through `PreToolUse`, including Bash, `apply_patch`, MCP tools, and other local function tools. Hosted tools such as `WebSearch`, and specialized paths that opt out of the default hook path, are outside this host boundary. Without a terminal marker it is a local no-op; advisory completion still permits non-navigation contract operations. |
-| Bash `PreToolUse` | Advises by default; `deny` hard-blocks graph-detectable fallback reads/searches; `rewrite` converts only an unambiguous indexed `cat <source>` into the exact public `gortex call read` mirror. Compound or ambiguous commands remain advisory. A shell command that would *rewrite* indexed source — `sed -i` / `perl -pi`, a `>` / `>>` redirect, `tee`, or an inline interpreter script opening the path for writing — gets the same redirect Edit and Write get, escalating to a hard block under `GORTEX_HOOK_BLOCK_EDIT`. Writing a path the daemon does not know is a new file and passes through. |
+| Bash `PreToolUse` | Advises by default; `deny` hard-blocks graph-detectable fallback reads/searches; `rewrite` converts only an unambiguous indexed `cat <source>` into the exact public `gortex call read` mirror. Compound or ambiguous commands remain advisory. A shell command that would *rewrite* indexed source — `sed -i` / `perl -pi`, a `>` / `>>` redirect, `tee`, or an inline interpreter script opening the path for writing (or reading it and writing it back) — gets the same redirect Edit and Write get, escalating to a hard block under `GORTEX_HOOK_BLOCK_EDIT`. Writing a path the daemon does not know is a new file and passes through. Inline Python (`python3 -c`, a `python3 - <<EOF` heredoc, also behind `uv run` / `env` / `timeout` and, for inline scripts and nested shells only, `exec` / `nohup` / `setsid` / `nice` / `command` / `nvm exec` / `direnv exec` — not `chroot` or other roots/hosts) is parsed with the tree-sitter Python grammar: a script that opens an indexed source file — by literal path, or through a variable holding one — gets the verdict Read gets, and a script that reads a file and writes it back is an edit and gets the shell-write answer above; `os.open` with literal read-only `os.O_*` flags is a read, and with write flags gets the shell-write answer unless the rest of the command is denied. A command run as text — the `-c` string of `bash` / `sh` / `dash` / `zsh`, or a literal command line passed to `os.system`, `os.popen` or `subprocess` — gets the whole Bash answer, one level deep, where its working directory is known. A script that walks a literal directory and reads the files it finds gets the deny Grep with that `path:` gets when the daemon reports source under it. Only the loops agents write for this are matched, whole: `for root, dirs, files in os.walk(…)` with one `for f in files`, `for f in os.listdir(…)`, or `for p in glob.glob(…)` / `Path(…).rglob(…)`, with optional `'.git' in root` prunes and an optional `endswith` filter (or one `and` a test on the file's contents), where the file's name and path are only built into the path, read, printed or filtered. As with Grep's `glob`, a walk filtered to docs or data passes; so does any other loop shape, a script that writes a path it builds (a codemod is an edit), and one that only lists names. A standalone syntax check (`ast.parse(open(p).read())` whose result is discarded), data files, paths outside the tracked repos, scripts that do not parse, and other interpreters pass through; so does a relative path after a `cd`, a `chdir`, or a launcher option (`env -C`, `uv run --directory`) the hook cannot follow. |
 | Gortex MCP `read` `PreToolUse` | Advises broad file/editing-context reads by default; `deny` blocks them; `rewrite` preserves the request and adds `options.compress_bodies=true`. Selector-driven reads with no explicit operation are covered. |
 | Bash `PostToolUse` | Adds graph context for grep/search, source reads, and conservative file-list shapes: `find -name`, `fd`, `ls`, `tree -fi`, and `git ls-files`; bounded `sed`/`awk` reads get file graph context. Execution-capable or ambiguous forms are no-ops. |
 | `apply_patch` `PostToolUse` | Runs `detect_changes`, extracts affected symbol IDs, then reports tests, guards, and contracts. The completed mutation is never rolled back by the hook. Codex payloads carry no `session_id`, so this path reports the whole working tree with an explicit label instead of attributing the diff to the session. |
@@ -435,7 +471,7 @@ coverage:
 | Surface | Intentional status |
 | ------- | ------------------ |
 | `PreCompact` / `PostCompact` | Not installed. `SessionStart(source="compact")` restores the mandatory workflow after compaction without paying for two more lifecycle hooks. |
-| `Stop` | Not installed. A Stop hook can continue a turn, so adding it is a separate policy decision rather than implicit mutation handling. |
+| `Stop` | Installed. The post-turn working-tree diagnostics ride a top-level `systemMessage`, because Codex's Stop output schema has no `hookSpecificOutput`; the hook continues a turn (`decision: block`) only when a localization claim check fails. |
 | Native output-suppression fields | Not emitted while Codex rejects `suppressOutput` and `updatedMCPToolOutput`; the opt-in `suppress` posture uses supported PostToolUse result replacement. |
 
 `apply_patch` mutation handling and opt-in deny/rewrite/suppress postures are

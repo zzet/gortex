@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reach"
 )
 
@@ -36,20 +38,91 @@ func (idx *Indexer) incrementalReindexPathsWithReceiptMode(
 	paths []string,
 	mode incrementalPathMode,
 ) (result *IndexResult, receipt *graph.MutationReceipt, batch *reparsePendingEnrichmentBatch, err error) {
-	batch = &reparsePendingEnrichmentBatch{deferResolverCatchup: true}
+	batch = &reparsePendingEnrichmentBatch{deferResolverCatchup: true, publication: mode.publication, readRepair: mode.readRepair, pointPreparation: mode.pointPreparation, relationsRead: mode.relationsRead}
 	receiptStore, _ := idx.graph.(graph.MutationReceiptStore)
 	if receiptStore == nil {
 		result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)
 		return result, nil, batch, err
 	}
 
-	token := receiptStore.BeginMutationReceipt()
+	owner, _ := receiptStore.(mutationFanoutOwningReceiptStore)
+	var token graph.MutationReceiptToken
+	if owner != nil {
+		token = owner.BeginMutationReceiptOwningFanout()
+	} else {
+		token = receiptStore.BeginMutationReceipt()
+	}
+	// The receipt's fan-out axis is keyed to THIS mutation and bounded to THIS
+	// batch, and both halves of that need the observation below.
+	//
+	// Bounded: the axis documents "every bounded derived pass that ran inside
+	// this receipt's window", and this window is exactly the parse/evict batch
+	// — the resolver and derived catch-up run after it closes, on purpose (see
+	// the boundary note above). The observation opens and closes with the
+	// window, so a pass that ran outside it contributes nothing here. The
+	// mutation's own verdict, which DOES span the catch-up, is carried
+	// separately by the watcher's wider window (watcher.go
+	// patchGraphWithReceiptStateRawModern) and is unaffected by this.
+	//
+	// Keyed: the store is shared by every repository the daemon indexes, so
+	// the store-wide broadcast a bounded pass emits
+	// (carryAffectedByTruncationOnReceipt) cannot say which open window ran
+	// it. An owning window refuses that broadcast and takes only what this
+	// indexer observed, addressed by this window's own token — so a sibling
+	// repository's cut can never land on this mutation's receipt.
+	fanout := beginDerivedFanoutObservation(idx)
 	defer func() {
+		facts := fanout.closeReceiptFanoutFacts()
+		if owner != nil {
+			for _, fact := range facts {
+				owner.RecordMutationFanoutTruncationIn(token, fact)
+			}
+		}
 		observed := receiptStore.EndMutationReceipt(token)
 		receipt = &observed
 	}()
 	result, err = idx.incrementalReindexPathsMode(root, paths, mode, batch)
 	return result, receipt, batch, err
+}
+
+// mutationFanoutOwningReceiptStore is the OPTIONAL store capability that lets
+// ONE mutation own the bounded-derived-pass axis of its own receipt.
+//
+// It is declared here, at the consumer, rather than widening
+// graph.MutationReceiptStore: a backend that has not implemented it must keep
+// satisfying that interface, or the `store.(graph.MutationReceiptStore)`
+// assertion above would disable receipts entirely and trade an unattributed
+// fan-out fact for a whole-graph fallback on every save. A store without the
+// capability keeps the store-wide broadcast, which can name a sibling
+// repository's dropped files — over-reporting the hole, never hiding one.
+type mutationFanoutOwningReceiptStore interface {
+	BeginMutationReceiptOwningFanout() graph.MutationReceiptToken
+	RecordMutationFanoutTruncationIn(graph.MutationReceiptToken, graph.ReceiptFanoutTruncation)
+}
+
+// The daemon holds exactly one graph.Store — *store_sqlite.Store
+// (serverstack openSqliteBackend) — so if that backend ever stopped satisfying
+// the capability, every shipped mutation would silently fall back to the
+// store-wide axis. Fail to compile instead.
+var _ mutationFanoutOwningReceiptStore = (*store_sqlite.Store)(nil)
+
+// closeReceiptFanoutFacts closes a per-Indexer fan-out observation and returns
+// the RAW per-pass facts it saw, in the shape the receipt axis carries.
+//
+// close() is the same deregistration and seal the verdict path uses — calling
+// it first is what makes reading o.facts afterwards safe, because a sealed
+// window rejects every later record. The lowered verdict it returns is the
+// summary a mutation CALLER reads; a receipt consumer needs the facts
+// themselves (the cap, the union considered, and the file names), so this
+// reads them directly instead of re-deriving them from the summary.
+func (o *derivedFanoutObservation) closeReceiptFanoutFacts() []graph.ReceiptFanoutTruncation {
+	if o == nil {
+		return nil
+	}
+	o.close()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]graph.ReceiptFanoutTruncation(nil), o.facts...)
 }
 
 // incrementalResolutionFrontier chooses the narrowest quality-safe resolver
@@ -128,8 +201,13 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 		return nil
 	}
 	idx.observeIncrementalCatchup("resolve", files)
-	resolveFiles(files)
+	resolve := batch.publicationStamps().beginPatchLap(patchResolve)
+	idx.resolveWithDeferredEvidence(batch, func() { resolveFiles(files) })
+	resolve.end()
 
+	// Measure this concrete follow-up block, not a gap inferred between two
+	// resolver laps. The attempt's existing ordered collector rejects overlap.
+	bookkeeping := batch.publicationStamps().beginPatchLap(patchBookkeeping)
 	idx.observeIncrementalCatchup("dataflow", files)
 	idx.materializeDataflowParamsForFiles(files)
 
@@ -142,6 +220,7 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 	factFiles := appendUniqueSorted(files, affected.files...)
 	idx.observeIncrementalCatchup("ref_facts", factFiles)
 	idx.persistRefFactsForFiles(factFiles)
+	bookkeeping.end()
 	return factFiles
 }
 
@@ -258,7 +337,7 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncoming(frontier)
+			idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver())
 		})
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
@@ -282,9 +361,14 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 // complete resolver/semantic/derived tail without re-entering a public
 // coordinated API.
 func (idx *Indexer) incrementalPointWatcherPath(root, path string) (*IndexResult, error) {
+	return idx.incrementalPointWatcherPathObserved(root, path, nil)
+}
+
+func (idx *Indexer) incrementalPointWatcherPathObserved(root, path string, stamps *PublicationStamps) (*IndexResult, error) {
 	return idx.incrementalWatcherPaths(root, []string{path}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
+		publication:        stamps,
 	})
 }
 
@@ -292,7 +376,9 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	// The coordinator owns the repository lane before invoking this executor.
 	// Take the reachability topology gate second and retain it through resolver
 	// and derived catch-up so readers observe the complete old or new graph.
+	gate := mode.publication.beginPatchLap(patchGateWait)
 	finishTopologyMutation := reach.BeginTopologyMutation(idx.graph)
+	gate.end()
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
@@ -301,18 +387,28 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		return result, err
 	}
 	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	if result == nil || result.DeletedFileCount > 0 {
+		batch.dropDeferredPriorBindings()
+	}
+	if !needed || len(files) == 0 {
+		mode.publication.markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered")
+	}
 	if needed && len(files) > 0 {
 		idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			idx.resolver.ResolveFilesAndIncoming(frontier)
+			idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
 		})
+		names := mode.publication.beginPatchLap(patchResolve)
 		idx.resolveReceiptNamePendings(receipt)
+		names.end()
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
+		resolve := mode.publication.beginPatchLap(patchResolve)
 		idx.ResolveAll()
+		resolve.end()
 	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
 		if mode.exactPointSemantic {
@@ -320,8 +416,13 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		} else {
 			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
 		}
+		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+			mode.onRelations()
+		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
-		idx.runStandaloneIncrementalDerivedPasses(result.DerivedInvalidation)
+		derived := mode.publication.beginDerivedPatchLap()
+		idx.runStandaloneIncrementalDerivedPassesWithPrior(result.DerivedInvalidation, result.capabilityPrior)
+		derived.endDerived()
 	}
 	topologyChanged = incrementalTopologyChanged(result)
 	return result, nil
@@ -336,17 +437,124 @@ func (idx *Indexer) resolveReceiptNamePendings(receipt *graph.MutationReceipt) {
 	if receipt == nil || !receipt.Complete || len(receipt.EvictedNames) == 0 || idx.resolver == nil {
 		return
 	}
-	idx.resolver.ResolveIncomingForNames(receipt.EvictedNames, []string{idx.repoPrefix})
+	names := vanishedReceiptNames(idx.graph, receipt)
+	if len(names) == 0 {
+		return
+	}
+	idx.resolver.ResolveIncomingForNames(names, []string{idx.repoPrefix})
 }
 
-func (w *Watcher) reindexStormPaths(paths []string) (*IndexResult, error) {
-	if w.batchReindex != nil {
-		return w.batchReindex(paths)
+// vanishedReceiptNames is the part of receipt.EvictedNames that no definition
+// file of the receipt declares any more. A reparse evicts every node of the
+// file before it re-adds them, so the receipt records every name the file
+// declares — including the ones the same save re-declares. Those names are
+// already covered: the definition files are in the resolution frontier, whose
+// incoming leg enumerates the stub forms of every name they declare (the
+// contract EvictedNames documents). Re-resolving them by name again re-attempted
+// every reference parked on them (thousands for a widely used file, 1.7 s per
+// save) and bypassed the incoming leg's declaration evidence. Only a name the
+// definition files no longer declare is reachable by name alone.
+func vanishedReceiptNames(g graph.Store, receipt *graph.MutationReceipt) []string {
+	if receipt == nil || len(receipt.EvictedNames) == 0 {
+		return nil
+	}
+	if g == nil || len(receipt.DefinitionFiles) == 0 {
+		return receipt.EvictedNames
+	}
+	declared := make(map[string]struct{})
+	for _, nodes := range g.GetFileNodesByPaths(receipt.DefinitionFiles) {
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			names, exact := graph.ReceiptNamesForEvictedSymbol(node.Kind, node.Name, node.QualName)
+			if !exact {
+				continue
+			}
+			for _, name := range names {
+				declared[name] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(receipt.EvictedNames))
+	for _, name := range receipt.EvictedNames {
+		if _, still := declared[name]; !still {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// reindexExplicitMutationPaths preserves forced point-read semantics for the
+// complete admitted set, with one lane-owned resolver/derived tail.
+func (w *Watcher) reindexExplicitMutationPaths(paths []string, admitted ...map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
+	frontier := w.mutationTierFrontier(paths)
+	if len(admitted) > 0 {
+		frontier = admitted[0]
+	}
+	return w.reindexMutationPaths(paths, true, frontier)
+}
+
+func (w *Watcher) reindexMutationPaths(paths []string, force bool, frontier map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
+	return w.reindexMutationPathsObserved(paths, force, frontier, nil)
+}
+
+func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, frontier map[string]uint64, stamps *PublicationStamps) (*IndexResult, DerivedFanoutCompleteness, error) {
+	var result *IndexResult
+	var fanout DerivedFanoutCompleteness
+	ctx, cancel := w.mutationLaneContext()
+	defer cancel()
+	if stamps != nil {
+		stamps.markDirectSharedOwnerEntry()
+		ctx = context.WithValue(ctx, publicationStampsKey{}, stamps)
+	}
+	err := w.indexer.coordinateRepositoryMutation(ctx, OutputEntryWatcherPatchGraph, func() error {
+		idx := w.currentMutationIndexer()
+		if idx == nil {
+			return errWatcherIndexerMissing
+		}
+		observation := beginDerivedFanoutObservation(idx)
+		defer observation.close()
+		if !force && idx.deferGlobalPasses.Load() {
+			w.markDeferredMutationTiers(frontier)
+		}
+		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, publication: stamps,
+			onRelations: func() { w.markRelationsFrontier(frontier) }}
+		var err error
+		stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
+		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
+			result, err = owner.incrementalReindexRepoRawMode(idx.repoPrefix, paths, mode)
+		} else {
+			result, err = idx.incrementalWatcherPaths(idx.rootPath, paths, mode)
+		}
+		stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
+		measured := observation.close()
+		if err == nil {
+			fanout = measured
+		}
+		return err
+	})
+	return result, fanout, err
+}
+
+func (w *Watcher) reindexStormPaths(paths []string, admitted ...map[string]uint64) (*IndexResult, error) {
+	result, _, err := w.reindexStormPathsObserved(paths, admitted...)
+	return result, err
+}
+
+func (w *Watcher) reindexStormPathsObserved(paths []string, admitted ...map[string]uint64) (*IndexResult, DerivedFanoutCompleteness, error) {
+	if w.batchReindex != nil && (w.indexer == nil || w.indexer.repositoryMutationOwner == nil) {
+		result, err := w.batchReindex(paths)
+		return result, DerivedFanoutCompleteness{}, err
 	}
 	if w.indexer == nil || w.indexer.rootPath == "" {
-		return nil, fmt.Errorf("watcher: index root is not initialized")
+		return nil, DerivedFanoutCompleteness{}, fmt.Errorf("watcher: index root is not initialized")
 	}
-	return w.indexer.IncrementalReindexPaths(w.indexer.rootPath, paths)
+	frontier := w.mutationTierFrontier(paths)
+	if len(admitted) > 0 {
+		frontier = admitted[0]
+	}
+	return w.reindexMutationPaths(paths, false, frontier)
 }
 
 func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) {
@@ -364,13 +572,15 @@ func (gw *GitWatcher) reindexChangedPaths(paths []string) (*IndexResult, error) 
 // when the store cannot certify its eviction shape, the indexer's conservative
 // successful-file frontier. A whole-graph fallback is reserved for the
 // exceptional case where neither source yields any safe scope.
+// It returns the files where passes may have rebound edges, or nil when a
+// name-based or whole-graph pass may have changed edges outside that frontier.
 func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	repoPrefix string,
 	result *IndexResult,
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
-) {
-	mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
+) []string {
+	return mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
 }
 
 func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
@@ -379,36 +589,59 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
 	exactPointSemantic bool,
-) {
+) []string {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
+	wide := false
+	if result == nil || result.DeletedFileCount > 0 {
+		batch.dropDeferredPriorBindings()
+	}
 	crossRepoFiles := appendUniqueSorted(nil, files...)
+	if batch != nil {
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, batch.npmConsumerFiles...)
+	}
 	if result != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
 	}
 	idx := mi.GetIndexer(repoPrefix)
+	if !needed || len(files) == 0 || idx == nil {
+		batch.publicationStamps().markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered")
+	}
 	if needed && len(files) > 0 && idx != nil {
 		resolvedFiles := idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
 				return
 			}
-			mi.runMasterResolveFiles(frontier, false)
+			mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {
-			mi.runMasterResolveNames(receipt.EvictedNames)
+			names := batch.publicationStamps().beginPatchLap(patchResolve)
+			vanished := vanishedReceiptNames(mi.graph, receipt)
+			wide = len(vanished) > 0
+			mi.runMasterResolveNames(vanished)
+			names.end()
 		}
 	} else if needed && len(files) > 0 {
-		mi.runMasterResolveFiles(files, false)
+		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
+		mi.runMasterResolveFilesObserved(files, false, nil, batch.publicationStamps().mutationResolveMutexObserver())
+		resolve.end()
 		if receipt != nil && receipt.Complete {
-			mi.runMasterResolveNames(receipt.EvictedNames)
+			names := batch.publicationStamps().beginPatchLap(patchResolve)
+			vanished := vanishedReceiptNames(mi.graph, receipt)
+			wide = len(vanished) > 0
+			mi.runMasterResolveNames(vanished)
+			names.end()
 		}
 	} else if needed {
+		wide = true
 		scope := map[string]struct{}{repoPrefix: {}}
 		if repoPrefix == "" {
 			scope = nil
 		}
+		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
 		mi.runMasterResolve(scope, false)
+		resolve.end()
 		// No scoped frontier survived. Refresh any known files without adding a
 		// second graph-wide dataflow or durable-fact scan.
 		if idx != nil && result != nil {
@@ -430,14 +663,21 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, semanticFiles...)
 	}
-	if needed || len(semanticFiles) > 0 {
+	if needed || len(semanticFiles) > 0 || batch != nil && len(batch.npmConsumerFiles) > 0 {
 		if idx != nil {
 			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
 		}
+		cross := batch.publicationStamps().beginPatchLap(patchResolve)
 		if len(crossRepoFiles) > 0 {
-			mi.runCrossRepoResolveFiles(crossRepoFiles)
+			mi.runCrossRepoResolveMutationFrontiersObserved(crossRepoFiles, crossRepoFiles, crossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver())
 		} else {
+			wide = true
 			mi.runCrossRepoResolve(false)
 		}
+		cross.end()
 	}
+	if wide {
+		return nil
+	}
+	return crossRepoFiles
 }

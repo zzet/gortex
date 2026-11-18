@@ -305,6 +305,8 @@ func (a *applier) coverFiles(page []*fileFacts) int {
 func (a *applier) preparePage(all []*fileFacts) []*fileIndex {
 	sort.Slice(all, func(i, j int) bool { return all[i].file < all[j].file })
 	a.preload(all)
+	a.loadCallerCalls(all)
+	a.preparedAdjacency()
 	indexes := make([]*fileIndex, len(all))
 	for i, facts := range all {
 		indexes[i] = a.buildIndex(facts)
@@ -419,6 +421,9 @@ func (a *applier) pageStats(base factPageStats) factPageStats {
 		base.CacheEdges += len(edges)
 	}
 	for _, edges := range a.inByID {
+		base.CacheEdges += len(edges)
+	}
+	for _, edges := range a.callsByID {
 		base.CacheEdges += len(edges)
 	}
 	return base

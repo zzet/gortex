@@ -3,11 +3,15 @@ package resolver
 import (
 	"fmt"
 	"iter"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 )
@@ -44,6 +48,9 @@ func TestResolveFilesAndIncomingLogsPhasesAndAdmissions(t *testing.T) {
 		case "resolver: incremental phase complete":
 			completions = append(completions, entry.ContextMap()["phase"].(string))
 			assert.Contains(t, entry.ContextMap(), "elapsed")
+			for _, key := range []string{"phase_wal_bytes", "phase_main_bytes", "phase_rows", "phase_txns", "phase_wal_bytes_reset"} {
+				assert.Contains(t, entry.ContextMap(), key)
+			}
 		}
 	}
 	want := []string{"wait_lock", "visibility", "pending_collect", "build_indexes", "warm_lookup", "resolve_outgoing", "resolve_incoming", "attribution"}
@@ -990,4 +997,65 @@ func TestResolveMethodCall_InterfaceDispatchFanOut(t *testing.T) {
 		"edge should be marked as interface dispatch when receiver is an interface and multiple impls exist")
 	assert.Equal(t, graph.OriginASTInferred, callEdge.Origin,
 		"a locality-heuristic pick is ast_inferred — stamping an LSP tier without server evidence poisons min_tier filtering")
+}
+
+type phaseWriteSource struct {
+	graph.Store
+	txns atomic.Int64
+}
+
+func (s *phaseWriteSource) WriteMark() store_sqlite.VFSIOMark {
+	return store_sqlite.VFSIOMark{Available: true, Transactions: s.txns.Load()}
+}
+func TestIncrementalPhaseWriteSourceRetargetAndExplicitOverride(t *testing.T) {
+	a := &phaseWriteSource{Store: graph.New()}
+	b := &phaseWriteSource{Store: graph.New()}
+	a.txns.Store(10)
+	b.txns.Store(100)
+	core, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	r := New(a)
+	finish := r.startIncrementalPhase(logger, "before_retarget")
+	a.txns.Add(2)
+	r.SetGraph(b)
+	finish()
+	require.Equal(t, int64(2), logs.FilterMessage("resolver: incremental phase complete").All()[0].ContextMap()["phase_txns"], "one interval must not mix sources")
+	finish = r.startIncrementalPhase(logger, "after_retarget")
+	b.txns.Add(3)
+	finish()
+	require.Equal(t, int64(3), logs.FilterMessage("resolver: incremental phase complete").All()[1].ContextMap()["phase_txns"], "the next phase must use the retargeted store")
+	overridden := New(a)
+	overridden.SetWriteCounterSource(a.WriteMark)
+	overridden.SetGraph(b) // a read-graph swap must preserve the explicit writer.
+	finish = overridden.startIncrementalPhase(logger, "explicit")
+	a.txns.Add(4)
+	b.txns.Add(50)
+	finish()
+	require.Equal(t, int64(4), logs.FilterMessage("resolver: incremental phase complete").All()[2].ContextMap()["phase_txns"])
+}
+func TestIncrementalPhaseSamplingConcurrentWithSetGraph(t *testing.T) {
+	a := &phaseWriteSource{Store: graph.New()}
+	b := &phaseWriteSource{Store: graph.New()}
+	a.txns.Store(10)
+	b.txns.Store(100)
+	r := New(a)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			if i%2 == 0 {
+				r.SetGraph(a)
+			} else {
+				r.SetGraph(b)
+			}
+			runtime.Gosched()
+		}
+	}()
+	logger := zap.NewNop()
+	for i := 0; i < 1000; i++ {
+		finish := r.startIncrementalPhase(logger, "wait_lock")
+		finish()
+	}
+	wg.Wait()
 }

@@ -131,6 +131,7 @@ type Manager struct {
 	activePasses    sync.WaitGroup
 	closing         bool
 	closeOnce       sync.Once
+	closeDone       chan struct{}
 	closeErr        error
 }
 
@@ -248,6 +249,16 @@ type RepoEnrichState struct {
 	// non-partial completion still refreshes the marker afterwards.
 	Force bool
 
+	// ReparsedFilesMarked qualifies Force: every re-parse since a whole-repo
+	// pass last saw the graph was a scoped one that left its file on the
+	// durable per-file ledger (graph.MetaReparsePendingEnrichment). A scoped
+	// re-parse that re-enriched its file in place cleared that marker without
+	// restoring the edges its importers point into it, so it leaves this
+	// false, as a whole-repo re-parse does. A provider that resumes a cut pass
+	// may then keep progress it recorded over the same ledger instead of
+	// starting over. The marker gate ignores it.
+	ReparsedFilesMarked bool
+
 	// CheckoutID scopes the pass to one routed automatic checkout's working
 	// copy. Empty — every caller but EnrichCheckout — means the repository's
 	// base corpus, and keeps the legacy marker key exactly as it was.
@@ -297,6 +308,29 @@ type EnrichOptions struct {
 	// enrichment pool overlaps the resolve phase so compute proceeds but no
 	// apply can starve the resolver on the shared ResolveMutex.
 	ApplyGate <-chan struct{}
+
+	// CheckoutScope, when non-nil, marks the pass as a checkout pass over a
+	// generation handle and carries its compiler scope to the providers (see
+	// CheckoutCompilerScope). nil is every other caller: providers behave
+	// exactly as before.
+	CheckoutScope *CheckoutCompilerScope
+
+	// CommittedTreeOnly restricts the pass to providers that read a committed
+	// tree through the scope's overlay (CommittedTreeReader). A pass over a
+	// committed tree whose checkout root holds a different working copy sets
+	// it: any other provider reads the working copy, which is not the tree
+	// the generation describes.
+	CommittedTreeOnly bool
+
+	// Context, when non-nil, is the caller's context: its cancellation
+	// reaches every provider pass (each pass context derives from it), so a
+	// caller that abandons the work (a yielding compaction) stops the
+	// provider at its next check instead of waiting for it. nil keeps the
+	// Manager lifecycle as the only parent.
+	Context context.Context
+	// terminalErrors is the checkout caller's private per-pass carrier. It
+	// outlives the public live-context partial return check until unarming.
+	terminalErrors *[]error
 }
 
 // defaultEnrichmentAdmissionFloor balances two measured failure modes:
@@ -406,6 +440,17 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	}
 
 	var results []*EnrichResult
+	// Optional provider failures remain partial, as before. A canceled
+	// working-copy checkout must also retain their actual terminal identity:
+	// its caller may authorize an owned retry only for pure cancellation.
+	var terminalErrors []error
+	var checkoutErrors *[]error
+	if opts.CheckoutScope != nil && !opts.CommittedTreeOnly && opts.Context != nil {
+		checkoutErrors = opts.terminalErrors
+		if checkoutErrors == nil {
+			checkoutErrors = &terminalErrors
+		}
+	}
 
 	// Deterministic, primary-language-first order: the language with the most
 	// enrichable nodes runs first, so on a multi-language repo the dominant
@@ -430,8 +475,15 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 			)
 			continue
 		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(provider) {
+			m.logger.Debug("semantic provider skipped, it cannot read a committed tree",
+				zap.String("provider", provider.Name()),
+				zap.String("language", lang),
+			)
+			continue
+		}
 
-		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, results, partial)
+		results = m.runEnrichForProvider(g, roots, lang, provider, nodeCounts, opts, checkoutErrors, results, partial)
 	}
 
 	// Router-backed LSP providers: arbitrate by priority per language
@@ -447,7 +499,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 	// Leaving it out of the synchronous pass is what keeps cold/warm start
 	// fast; the router is still wired, so a query can lazy-spawn a server on
 	// demand.
-	if m.config.EagerLSP && m.lspRouter != nil {
+	if m.config.EagerLSP && m.lspRouter != nil && !opts.CommittedTreeOnly {
 		// Pre-pass: pure metadata, no spawn.
 		bestSpec := make(map[string]string) // language → winning spec name
 		bestPrio := make(map[string]int)
@@ -512,7 +564,7 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 					if len(langs) == 0 {
 						return
 					}
-					results = m.runEnrichOne(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+					results = m.runEnrichOneScoped(g, repoName, repoRoot, langs[0], provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, checkoutErrors, results, partial)
 				}()
 			}
 		}
@@ -525,6 +577,9 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 		if !isSupplemental(p) || !p.Available() || m.providerDisabled(p.Name()) {
 			continue
 		}
+		if opts.CommittedTreeOnly && !readsCommittedTree(p) {
+			continue
+		}
 		langs := p.Languages()
 		if len(langs) == 0 {
 			continue
@@ -532,9 +587,12 @@ func (m *Manager) EnrichAll(g graph.Store, roots map[string]string, opts EnrichO
 		if gateOnPresence && !anyLangPresent(langs, present) {
 			continue
 		}
-		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, opts, results, partial)
+		results = m.runEnrichForProvider(g, roots, langs[0], p, nodeCounts, opts, checkoutErrors, results, partial)
 	}
 
+	if checkoutErrors != nil && opts.Context.Err() != nil && len(*checkoutErrors) > 0 {
+		return results, partial, errors.Join(append([]error{opts.Context.Err()}, (*checkoutErrors)...)...)
+	}
 	return results, partial, nil
 }
 
@@ -662,9 +720,9 @@ func (m *Manager) configPriorityFor(name string) (int, bool) {
 // repo root and appends the results. Extracted so EnrichAll can share
 // the logging + lastResults bookkeeping between eager and Router-backed
 // providers.
-func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+func (m *Manager) runEnrichForProvider(g graph.Store, roots map[string]string, lang string, provider Provider, nodeCounts map[string]int, opts EnrichOptions, terminalErrors *[]error, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	for _, repoName := range sortedRootNames(roots, nodeCounts) {
-		results = m.runEnrichOne(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, results, partial)
+		results = m.runEnrichOneScoped(g, repoName, roots[repoName], lang, provider, nodeCounts[repoName], opts.RepoState[repoName], opts.ApplyGate, opts.CheckoutScope, opts.Context, terminalErrors, results, partial)
 	}
 	return results
 }
@@ -1037,6 +1095,13 @@ func shortSHA(sha string) string {
 // failed, or returned a Partial result flips partial[repoName] so the caller
 // knows the repo's enrichment must be retried.
 func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
+	return m.runEnrichOneScoped(g, repoName, repoRoot, lang, provider, nodeCount, rs, applyGate, nil, nil, nil, results, partial)
+}
+
+// runEnrichOneScoped is runEnrichOne for a pass that may carry a checkout
+// compiler scope. A nil scope leaves the pass context exactly as
+// runEnrichOne builds it.
+func (m *Manager) runEnrichOneScoped(g graph.Store, repoName, repoRoot, lang string, provider Provider, nodeCount int, rs RepoEnrichState, applyGate <-chan struct{}, checkoutScope *CheckoutCompilerScope, parent context.Context, terminalErrors *[]error, results []*EnrichResult, partial map[string]bool) []*EnrichResult {
 	if !m.beginPass() {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, 0, nil,
@@ -1073,7 +1138,7 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// not implement the interface, so gopls / rust-analyzer never wait. Bounded
 	// and best-effort: a probe timeout or error just proceeds.
 	if rp, ok := provider.(ReadinessProber); ok && enrichReadinessBudget > 0 {
-		lifecycleCtx, stopLifecycle := m.passContext(context.Background())
+		lifecycleCtx, stopLifecycle := m.passContext(parent)
 		rctx, rcancel := context.WithTimeout(lifecycleCtx, enrichReadinessBudget)
 		err := rp.WaitReady(rctx, repoRoot)
 		rcancel()
@@ -1144,18 +1209,37 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	// every path below receives from done before returning: a timed-out
 	// in-process writer is never detached and the next provider/repo cannot
 	// overlap it.
-	baseCtx, stopLifecycle := m.passContext(context.Background())
+	baseCtx, stopLifecycle := m.passContext(parent)
 	defer stopLifecycle()
 	if ctxErr := baseCtx.Err(); ctxErr != nil {
 		partial[repoName] = true
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
-			"semantic manager closed before provider dispatch")
+			"semantic manager closed (or the caller cancelled) before provider dispatch")
 		return results
 	}
 	ctx := baseCtx
 	cancel := func() {}
 	if d > 0 {
-		ctx, cancel = context.WithTimeout(baseCtx, d)
+		if _, pausable := provider.(QueueWaitExcludingEnricher); pausable {
+			// The provider stops this clock while it queues behind another
+			// pass's apply (see ExcludeQueueWait).
+			var ceiling *enrichCeiling
+			// The alarm can still be running after the pass returns, when d
+			// is reassigned below; log the ceiling it was armed for.
+			armed := d
+			ctx, ceiling = newEnrichCeiling(baseCtx, d, func(queued time.Duration) {
+				m.logger.Warn("semantic enrichment: pass queued on the resolve mutex past its outer ceiling; ceiling paused until it gets the mutex",
+					zap.String("provider", provider.Name()),
+					zap.String("language", lang),
+					zap.String("repo", repoName),
+					zap.Duration("queued", queued),
+					zap.Duration("ceiling", armed),
+				)
+			})
+			cancel = ceiling.stop
+		} else {
+			ctx, cancel = context.WithTimeout(baseCtx, d)
+		}
 	}
 	// Compiler-backed providers use the repository census only to choose an
 	// admission class. Keeping the hint on this pass-owned context avoids
@@ -1163,6 +1247,12 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 	ctx = WithEnrichmentAdmissionNodes(ctx, nodeCount)
 	if applyGate != nil {
 		ctx = WithApplyGate(ctx, applyGate)
+	}
+	if checkoutScope != nil {
+		ctx = WithCheckoutCompilerScope(ctx, *checkoutScope)
+	}
+	if scope, ok := enrichResumeScope(rs); ok {
+		ctx = WithEnrichResume(ctx, scope)
 	}
 	defer cancel()
 
@@ -1217,7 +1307,8 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 				)
 				m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
 				partial[repoName] = true
-				<-done // mandatory drain: never abandon an in-process writer
+				oc := <-done // mandatory drain: never abandon an in-process writer
+				err = oc.err
 			}
 		}
 	} else {
@@ -1238,8 +1329,14 @@ func (m *Manager) runEnrichOne(g graph.Store, repoName, repoRoot, lang string, p
 			)
 			m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateDraining, d, nil, abandonDetail)
 			partial[repoName] = true
-			<-done // mandatory drain: the legacy interface cannot be cancelled
+			oc := <-done // mandatory drain: the legacy interface cannot be cancelled
+			err = oc.err
 		}
+	}
+	if terminalErrors != nil && err != nil {
+		// Only an observed terminal outcome, after the mandatory receive,
+		// enters this call-local proof. A still-running writer proves nothing.
+		*terminalErrors = append(*terminalErrors, err)
 	}
 	if abandoned {
 		m.setEnrichStatus(repoName, provider.Name(), lang, EnrichStateAbandoned, d, nil,
@@ -1562,40 +1659,70 @@ func (m *Manager) Stats() []ProviderStatus {
 	return statuses
 }
 
-// Close shuts down all providers, including any LSP subprocesses
-// owned by the installed LSPRouter. It first cancels every context-aware pass,
-// then closes provider resources to interrupt subprocess-backed legacy calls,
-// and finally waits for every admitted pass to stop mutating before returning.
-func (m *Manager) Close() error {
+// BeginClose cancels admitted passes and starts every provider/router close
+// before joining any one owner. Registration is boot-only: callers install all
+// providers/router before publishing the manager or admitting its first pass.
+// The completion includes each admitted pass's terminal graph writes.
+func (m *Manager) BeginClose() <-chan struct{} {
 	m.closeOnce.Do(func() {
 		m.lifecycleMu.Lock()
 		m.closing = true
-		if m.lifecycleCancel != nil {
-			m.lifecycleCancel()
-		}
+		m.closeDone = make(chan struct{})
+		cancel := m.lifecycleCancel
 		providers := append([]Provider(nil), m.providers...)
 		router := m.lspRouter
 		m.lifecycleMu.Unlock()
-
-		var errs []error
-		for _, p := range providers {
-			if err := p.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("closing %s: %w", p.Name(), err))
+		if cancel != nil {
+			cancel()
+		}
+		// These optional nonjoining boundaries revoke lazy LSP construction
+		// before the actual Close calls below. Other providers are interrupted
+		// by their Close, which is always launched without waiting on a peer.
+		for _, provider := range providers {
+			if owner, ok := provider.(interface{ BeginClose() <-chan struct{} }); ok {
+				owner.BeginClose()
 			}
+		}
+		if owner, ok := router.(interface{ BeginClose() <-chan struct{} }); ok {
+			owner.BeginClose()
+		}
+		var closing sync.WaitGroup
+		errs := make([]error, len(providers)+1)
+		for i, provider := range providers {
+			closing.Add(1)
+			go func() {
+				defer closing.Done()
+				if err := provider.Close(); err != nil {
+					errs[i] = fmt.Errorf("closing %s: %w", provider.Name(), err)
+				}
+			}()
 		}
 		if router != nil {
-			if err := router.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("closing lsp router: %w", err))
-			}
+			closing.Add(1)
+			go func() {
+				defer closing.Done()
+				if err := router.Close(); err != nil {
+					errs[len(providers)] = fmt.Errorf("closing lsp router: %w", err)
+				}
+			}()
 		}
-
-		// No pass can be admitted after closing was set under lifecycleMu.
-		// Every admitted run drains its provider goroutine before endPass.
-		m.activePasses.Wait()
-		if len(errs) > 0 {
-			m.closeErr = fmt.Errorf("semantic manager close errors: %v", errs)
-		}
+		go func() {
+			defer close(m.closeDone)
+			closing.Wait()
+			// No Add can follow closing=true under lifecycleMu. A provider's
+			// cancellation/Close is never proof its manager-owned terminal
+			// marker writes ended; every complete pass must also be joined.
+			m.activePasses.Wait()
+			m.closeErr = errors.Join(errs...)
+		}()
 	})
+	return m.closeDone
+}
+
+// Close waits for actual provider resources and terminal pass writes. Later
+// callers receive the same cached error; no timeout certifies quiescence.
+func (m *Manager) Close() error {
+	<-m.BeginClose()
 	return m.closeErr
 }
 
@@ -1654,4 +1781,43 @@ func (m *Manager) ProviderForLanguage(lang string) Provider {
 	}
 	candidates := m.selectProviders()
 	return candidates[lang]
+}
+
+// CheckoutPreparationProviders describes every eager provider this checkout
+// language can dispatch, including supplemental passes. A router-only winner
+// is unknown until instantiated and must stay in ordinary lane admission.
+// This metadata query never spawns a language server.
+func (m *Manager) CheckoutPreparationProviders(language string) ([]Provider, bool) {
+	if m == nil || !m.config.Enabled || !m.config.checkoutLSPEnabled() {
+		return nil, true
+	}
+	selected := m.selectProviders()
+	var out []Provider
+	if provider := selected[language]; provider != nil {
+		out = append(out, provider)
+	}
+	for _, provider := range m.providers {
+		if !isSupplemental(provider) || !provider.Available() || m.providerDisabled(provider.Name()) {
+			continue
+		}
+		for _, lang := range provider.Languages() {
+			if lang == language {
+				out = append(out, provider)
+				break
+			}
+		}
+	}
+	if m.config.EagerLSP && m.lspRouter != nil && selected[language] == nil {
+		for _, name := range m.lspRouter.EnabledSpecNames() {
+			if !m.lspRouter.SpecAvailable(name) {
+				continue
+			}
+			for _, lang := range m.lspRouter.SpecLanguages(name) {
+				if lang == language {
+					return nil, false
+				}
+			}
+		}
+	}
+	return out, true
 }

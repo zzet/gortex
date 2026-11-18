@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -372,18 +373,7 @@ func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contra
 	bySlug := make(map[string]slugs, len(repoMeta))
 	// Map each repo prefix to its global-config RepoEntry so we honour
 	// the user-level workspace/project override even on backfill.
-	entryByPrefix := make(map[string]config.RepoEntry, len(repoMeta))
-	// ReposSnapshot copies the list under the config mutation mutex, the same
-	// reason the crossWorkspaceLookup path below takes it: the deferred
-	// receipt tail reaches this backfill through RunPreEnrichResolve while
-	// UntrackRepo and TrackRepoCtx edit the live Repos slice in place.
-	for _, e := range mi.configMgr.Global().ReposSnapshot() {
-		p := config.ResolvePrefix(e)
-		if p == "" || p == "." {
-			continue
-		}
-		entryByPrefix[p] = e
-	}
+	lookup := mi.configMgr.RepoPathLookup()
 	for prefix, root := range repoMeta {
 		// Make sure the per-repo `.gortex.yaml` is loaded — at warmup
 		// time TrackRepoCtx/ReconcileRepoCtx already calls this, but
@@ -391,11 +381,7 @@ func (mi *MultiIndexer) backfillWorkspaceSlugsWithImpact() (nodesStamped, contra
 		// on a path that didn't.
 		mi.configMgr.LoadWorkspaceConfig(prefix, root)
 		cfg := mi.configMgr.GetRepoConfig(prefix)
-		var entryPtr *config.RepoEntry
-		if e, ok := entryByPrefix[prefix]; ok {
-			entryCopy := e
-			entryPtr = &entryCopy
-		}
+		entryPtr := lookup(root)
 		bySlug[prefix] = slugs{
 			ws:   resolveWorkspaceID(entryPtr, cfg, prefix),
 			proj: resolveProjectID(entryPtr, cfg, prefix),
@@ -474,6 +460,15 @@ func (mi *MultiIndexer) RunGlobalResolve() {
 	mi.runCrossRepoResolve(true)
 }
 
+// RunGlobalResolveContext is the producer-owned variant used during daemon
+// startup, so shutdown does not replace an expired context with Background.
+func (mi *MultiIndexer) RunGlobalResolveContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return mi.runCrossRepoResolveContext(ctx, true)
+}
+
 // runCrossRepoResolve runs the cross-repo resolver over the shared graph,
 // lifting references that span repo boundaries. When reconcileContracts is
 // true it also reconciles contract-bridge edges; the pre-enrichment resolve
@@ -496,8 +491,13 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	cr := resolver.NewCrossRepo(mi.graph)
 	cr.SetLogger(mi.logger)
 	cr.SetCrossWorkspaceDepLookup(mi.crossWorkspacePassLookup())
+	modules, revision := mi.goModuleSnapshot()
+	cr.SetGoModules(modules)
+	cr.SetGoModuleReplacements(mi.trackedGoModuleReplacements())
+	cr.SetGoModuleDepRetry(&mi.goModuleRetry, revision)
 	cr.SetNpmAliasResolver(mi.npmAliasResolver())
 	cr.SetNpmDependencyLookup(mi.npmDependencyLookup())
+	cr.SetNpmPackageLookup(mi.npmPackageLookup())
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	mi.applyRemoteStitch(cr)
@@ -515,6 +515,19 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	if cr == nil {
 		return nil
 	}
+	mi.mu.RLock()
+	indexers := make([]*Indexer, 0, len(mi.indexers))
+	for _, idx := range mi.indexers {
+		indexers = append(indexers, idx)
+	}
+	mi.mu.RUnlock()
+	for _, idx := range indexers {
+		edges := idx.resolver.TakeDeferredGoModuleEdges()
+		if err := cr.ResolveDeferredGoModuleEdges(edges); err != nil {
+			return err
+		}
+		mi.synthesizeDeferredGoModuleCalls(idx, edges)
+	}
 	if _, err := cr.ResolveAllContext(ctx); err != nil {
 		return err
 	}
@@ -523,14 +536,16 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	}
 	// Bounded by the calls this pass actually bound; the deferred
 	// fallback lane runs with no global test-edges pass behind it.
+	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 	return nil
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
 // for one coordinated mutation frontier. Its caller owns the repository lane
-// and global topology-writer gate, so the graph cannot expose a half-resolved
-// batch between same-repo, semantic, and cross-repository phases.
+// and the topology-writer gates of every repository the mutation can affect, so
+// the graph cannot expose a half-resolved batch between same-repo, semantic,
+// and cross-repository phases.
 func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
 	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
@@ -540,6 +555,10 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materi
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
+	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return
 	}
@@ -547,7 +566,8 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, ed
 	if cr == nil {
 		return
 	}
-	cr.ResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles)
+	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 }
 
@@ -600,36 +620,25 @@ func (mi *MultiIndexer) collectCrossWorkspaceRules() (map[string][]resolver.Cros
 	rulesByWorkspace := make(map[string][]resolver.CrossWorkspaceDepRule)
 	mi.mu.RLock()
 	repoPrefixes := make([]string, 0, len(mi.repos))
-	for prefix := range mi.repos {
+	roots := make(map[string]string, len(mi.repos))
+	for prefix, meta := range mi.repos {
 		repoPrefixes = append(repoPrefixes, prefix)
+		if meta != nil {
+			roots[prefix] = meta.RootPath
+		}
 	}
 	repoCount := len(mi.repos)
 	mi.mu.RUnlock()
 	sort.Strings(repoPrefixes)
-	// Per-repo crossWorkspaceLookup needs the same precedence as the
-	// stamp path: a global-config Workspace override changes which
-	// source-workspace bucket receives the repo's dependency rules.
-	// ReposSnapshot copies the list under the config mutation mutex — the
-	// deferred receipt tail runs this concurrently with UntrackRepo, which
-	// edits the live Repos slice in place.
-	entryByPrefix := make(map[string]config.RepoEntry)
-	for _, e := range mi.configMgr.Global().ReposSnapshot() {
-		p := config.ResolvePrefix(e)
-		if p == "" || p == "." {
-			continue
-		}
-		entryByPrefix[p] = e
-	}
+	// Live prefixes already have an owner. Read overrides by that owner's
+	// root without resolving configured collisions or reading other workspaces.
+	lookup := mi.configMgr.RepoPathLookup()
 	for _, prefix := range repoPrefixes {
 		cfg := mi.configMgr.GetRepoConfig(prefix)
 		if cfg == nil {
 			continue
 		}
-		var entryPtr *config.RepoEntry
-		if e, ok := entryByPrefix[prefix]; ok {
-			entryCopy := e
-			entryPtr = &entryCopy
-		}
+		entryPtr := lookup(roots[prefix])
 		repoWS := resolveWorkspaceID(entryPtr, cfg, prefix)
 		for _, dep := range cfg.CrossWorkspaceDeps {
 			if dep.Workspace == "" {
@@ -686,4 +695,97 @@ func (mi *MultiIndexer) crossWorkspaceLookup() resolver.CrossWorkspaceDepLookup 
 		// returning them directly keeps this hot lookup allocation-free.
 		return snapshot.rulesByWorkspace[sourceWS]
 	}
+}
+
+// resolveDeferredGoModules is the post-publication tail shared by cold-shadow callers.
+func (mi *MultiIndexer) resolveDeferredGoModules(idx *Indexer) error {
+	edges := idx.resolver.TakeDeferredGoModuleEdges()
+	if len(edges) == 0 {
+		return nil
+	}
+	cr := mi.newCrossRepoResolver()
+	if err := cr.ResolveDeferredGoModuleEdges(edges); err != nil {
+		return err
+	}
+	mi.synthesizeDeferredGoModuleCalls(idx, edges)
+	mi.finishGoModuleCalls(cr)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return nil
+}
+
+func (mi *MultiIndexer) resolveIncomingGoModules(repo string) error {
+	if mi.graph == nil || len(mi.graph.RepoPrefixes()) < 2 || mi.trackedGoModules()[repo] == "" {
+		return nil
+	}
+	cr := mi.newCrossRepoResolver()
+	if err := cr.ResolveGoModuleIncomingForRepo(repo); err != nil {
+		return err
+	}
+	mi.finishGoModuleCalls(cr)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return nil
+}
+
+// postPublishGoModules keeps every full-index caller on the same module tail.
+// New providers need the revision sweep; re-indexes probe their definitions.
+func (mi *MultiIndexer) postPublishGoModules(ctx context.Context, idx *Indexer, newProvider bool) error {
+	if err := mi.resolveDeferredGoModules(idx); err != nil {
+		return err
+	}
+	if idx.deferResolve.Load() {
+		return nil // the batch's shared pass owns resolution
+	}
+	if err := mi.resolveIncomingGoModules(idx.repoPrefix); err != nil {
+		return err
+	}
+	if !newProvider {
+		return nil
+	}
+	cr := mi.newCrossRepoResolver()
+	if err := cr.RetryGoModuleDeps(ctx); err != nil {
+		return err
+	}
+	mi.finishGoModuleCalls(cr)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return nil
+}
+
+func (mi *MultiIndexer) synthesizeDeferredGoModuleCalls(idx *Indexer, edges []*graph.Edge) {
+	if !idx.externalCallSynthesisEnabled() || len(edges) == 0 {
+		return
+	}
+	seen := make(map[string]bool)
+	var files []string
+	for _, e := range edges {
+		if e != nil && e.FilePath != "" && !seen[e.FilePath] {
+			seen[e.FilePath] = true
+			files = append(files, e.FilePath)
+		}
+	}
+	resolver.SynthesizeExternalCallsForFiles(mi.graph, true, files)
+}
+
+func (mi *MultiIndexer) synthesizeDemotedGoModuleCalls(files []string) {
+	var enabled []string
+	for _, file := range files {
+		if idx := mi.GetIndexer(graph.RepoPrefixOfID(file)); idx != nil && idx.externalCallSynthesisEnabled() {
+			enabled = append(enabled, file)
+		}
+	}
+	resolver.SynthesizeDemotedGoCallsForFiles(mi.graph, true, enabled)
+}
+
+// SeedGoModuleDeps warms the persisted-binding retry state. The daemon's
+// background warmup owns this call after readiness, before starting watchers.
+func (mi *MultiIndexer) SeedGoModuleDeps(ctx context.Context) error {
+	cr := mi.newCrossRepoResolver()
+	if cr == nil {
+		return nil
+	}
+	if err := cr.RetryGoModuleDeps(ctx); err != nil {
+		return err
+	}
+	mi.finishGoModuleCalls(cr)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return nil
 }

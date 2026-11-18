@@ -22,7 +22,81 @@ A session's boundary comes from its working directory. Inside a tracked repo it 
 
 Such a session has no single workspace slug, so `_meta.scope_applied` reports `repos:N` rather than `workspace`. `repo:`, `project:`, `workspace:` and `scope:` narrow *within* the contained set; naming a repo or workspace outside it is refused with an error rather than answered empty. `repo:"*"` widens only back to the session's own repos.
 
-A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
+A directory that neither lies inside nor contains a tracked repo still fails closed with the structured `repo_not_tracked` error — tracking the parent of your repos is not required, and doing so would index every child a second time. The error preserves the attempted path and points to `gortex repos` to list tracked repositories. Reconnect MCP with its working directory inside the intended repository, or track the current directory if it is a new repository. Tool-level `path` or `repo` arguments do not change this session admission check. A configured repo that warmup has not registered yet after a daemon start is not "untracked": its sessions get `repo_loading` (retryable) until it is ready, then work in place without reconnecting — see [Startup states](mcp.md#startup-states). Over the HTTP surface (`gortex daemon start --http-addr ...`) the `/v1/graph` route accepts `?project=` and `?repo=` to narrow the dump, so a typo'd value returns an empty result for that request instead of bringing the whole index up empty.
+
+## Tracking and temporary outages
+
+The daemon never untracks a repository on its own. A failed Git family inventory
+freezes availability and removal clocks. A checkout whose root and `.git` marker
+remain reachable stays ready even if a linked worktree has damaged Git metadata.
+
+An explicitly tracked checkout that is genuinely unavailable after its grace
+period keeps its catalog identity, graph and configuration entry. Its serving
+layers become unavailable. When the root returns, the daemon reconciles edits
+made during the outage and reattaches its watcher before marking it ready.
+Automatic linked worktrees can still expire when removal is confirmed.
+
+Unknown family inventories retry after 30 seconds, 2 minutes, 8 minutes, then
+every 30 minutes. A successful inventory resets this process-local backoff;
+restarting begins with the 30-second interval. Tracking intent, lifecycle clocks,
+filesystem evidence and cleanup authorization remain durable.
+
+Configuration removal requires an explicit untrack or forget, a requested
+demotion, or removal from the configuration file. Ordinary logs record each
+removal with its cause. See the [upgrade notes](upgrade-v0.64.12.md) before
+running an older build against an unfinished cleanup journal.
+
+## Repository prefixes
+
+Each indexed root needs a unique repository prefix. The default is its directory
+basename, so two unrelated directories named `src` cannot both use `src`.
+Use `gortex track --name other-src /path/to/other/src` for the second root.
+The MCP `track_repository` tool accepts the equivalent `name` parameter.
+Re-tracking the same root does not create another corpus.
+
+The CLI rejects configured collisions before writing a new entry, including
+when the daemon is unavailable. The daemon also checks live and configured
+ownership, including requests that race for one prefix or arrive before warmup loads the owner.
+For a linked worktree, the first configured member of its Git family supplies
+`<family-base>@<admin>`, where `admin` is Git's stable worktree administration
+name. That member can be a linked checkout or a bare repository. Workspace-based
+instance naming is the fallback when no family corpus supplies a base.
+Online, the daemon chooses the name. Offline, the CLI inventories the target's
+Git family once and applies the same admin-name rule.
+
+For a collision already stored in config, startup prefers the root bound in the
+live metadata. A checkout catalog binding wins only while a base publication
+protects it and its root is still configured under that prefix. Otherwise the
+first config entry wins. Startup can repair a wrong unpublished binding from
+older versions when both roots remain configured and no live owner protects it.
+The repair changes identity metadata only. It retains the corpus for reconcile.
+An abandoned unpublished binding can also move to a replacement root when the
+old owner is neither configured nor live. Published, configured and live owners
+remain protected against that rebind.
+
+The skipped entry does not replace the owner's workspace, excludes, gitignore
+root, or catalog graph. For an already configured path, CLI `--name`, MCP `name`
+and control `Track` refuse a different name rather than accepting a rename that
+would disappear on restart. Set `name:` in the global config and run
+`gortex daemon reload`. Tracking a configured but unloaded root without a name
+keeps its configured name.
+
+Collisions use the `prefix_collision` code across control, MCP and probe
+responses, with the prefix, owner path and captured owner state. A missing
+owner is different from an owner whose availability could not be established:
+only a confirmed missing owner produces advice to inspect its untrack preview.
+The colliding path is never a remedy for removing the owner's corpus.
+
+Same-directory spellings and same-folder-name symlink aliases remain no-ops.
+Selected configured roots retain their pinned name and workspace; admission
+does not scan unrelated configured filesystems.
+
+Alternatively, `gortex untrack <absolute-path>` can remove an exact configured
+root that the daemon proves is not loaded, then reload the config. It does not
+untrack a containing live root or start retirement of an implicit live root.
+An older daemon that omits loaded-root information cannot prove this condition;
+restart with the matching daemon build before using this fallback. For a loaded
+root, inspect the untrack preview before confirming removal.
 
 ## Configuration
 
@@ -31,9 +105,9 @@ Two-tier config hierarchy:
 - **Global config** (`~/.gortex/config.yaml`) — projects, repo lists, active project, reference tags, and machine-level MCP policy
 - **Workspace config** (`.gortex.yaml` per repo) — guards, excludes, local overrides
 
-Excludes are layered — builtin → the repo's `.gitignore` chain → global → per-repo entry → workspace — with gitignore semantics. `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include something an earlier layer excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
+Excludes are layered — builtin → the repo's `.gitignore` chain → global → per-repo entry → workspace — with gitignore semantics. `.gitignore` is respected by default so you don't have to re-declare entries already curated for git; opt out per-workspace with `respect_gitignore: false` in `.gortex.yaml`. Use `!pattern` in a later layer to re-include an excluded path only if all its parent folders are included, as in Git. To keep only `agent/skills/` after `/*`, reopen each parent in order: `!/agent/`, `/agent/*`, then `!/agent/skills/`. The matcher propagates folder negations to descendants, so repeat dependency and generated-file excludes (for example `node_modules/`, `dist/`, `*.tmp`) after this chain to retain them. `include:` is a separate force-include override. A leading `/` or an inner `/` anchors an entry to the repo root; otherwise it matches at any depth. An anchored literal path such as `vendor/acme/lib/` keeps its ancestors open and overrides the exclude layers. An unanchored literal such as `Pods/` reopens that folder at any depth when its parent is open; it cannot reopen an excluded ancestor. Wildcard includes can reopen their matching folder when its parents are open (for example `gen*/`, `gen?/`, `**/generated/`, or `out*`). They cannot reach through an excluded ancestor: `*.proto` does not reopen `node_modules/`, and `vendor/**` or `build/**` does not reopen an excluded `vendor/` or `build/` itself. Use `/Pods/` or `ios/Pods/` to reopen a specific excluded folder. Per-directory `.gortexignore`, `.ignore`, and `.rgignore` files still apply to force-included paths. Git metadata, non-MCP agent state, and escaping symlinks remain excluded. Beyond `.gitignore`, the index walk also honors per-directory `.gortexignore` files (Gortex's own ignore file, a sibling to `.gitignore`) and ripgrep's `.ignore` / `.rgignore` — each scoped to the directory that contains it.
 
-When a tracked root sits below its git root — the monorepo case, `gortex track repo/projects/App` with the repository at `repo/` — every `.gitignore` from the git root down to the tracked root applies, as it would for git, with ancestor patterns re-anchored onto the tracked root. A deeper file overrides a shallower one, so a `!pattern` next to your code still wins over the repository-wide rule. Ancestor patterns that describe a sibling subtree are dropped, and so is one that would ignore the tracked root itself: you asked Gortex to index that directory explicitly.
+When a tracked root sits below its git root — the monorepo case, `gortex track repo/projects/App` with the repository at `repo/` — every `.gitignore` from the git root down to the tracked root applies, as it would for git, with ancestor patterns re-anchored onto the tracked root. A deeper file can override a shallower rule, but a `!pattern` next to your code cannot re-include a path below an excluded parent folder. Ancestor patterns that describe a sibling subtree are dropped, and so is one that would ignore the tracked root itself: you asked Gortex to index that directory explicitly.
 
 ```yaml
 # ~/.gortex/config.yaml
@@ -41,6 +115,11 @@ active_project: my-saas
 
 mcp:
   allow_embedded: false               # Require the shared daemon (default)
+
+# daemon:
+#   http_addr: 127.0.0.1:7411         # Opt in to /mcp + /v1 over HTTP (unset: socket only)
+#   log_max_size: 50                  # Rotate daemon.log at this many MB (0 disables)
+#   log_max_backups: 3                # Number of rotated logs to retain (minimum 1)
 
 exclude:                            # Applies to every tracked repo
   - "**/*.generated.*"
@@ -81,6 +160,35 @@ workspace where every repository opts out to avoid the scans entirely.
 
 ## Daemon tuning (optional)
 
+The background daemon writes JSON lines to `daemon.log` and rotates it while
+running. In the global config, `daemon.log_max_size` sets the size in MB
+(default `50`, where 1 MB = 1,048,576 bytes). `daemon.log_max_backups` sets the
+number of timestamped backups to retain (default `3`, minimum `1`). Out-of-range
+integers warn and use the default for that setting. A non-integer value such as
+`log_max_size: many` makes the global config fail to load; the daemon warns and
+uses the default log policy. Collectors should follow `daemon.log` by name
+(`tail -F` style), because rotation renames the file. On upgrade, a large legacy
+`daemon.log` becomes the newest backup; it can be deleted by hand.
+
+Launchers capture crashes and other output in `daemon.stderr.log`, in the same
+directory. Existing Unix and Windows installs that inherit `daemon.log` handles
+are redirected there automatically when rotation is enabled; no reinstall is
+needed for those installs.
+New Windows Task Scheduler logon tasks explicitly enable log capture: rotating
+JSON goes to `daemon.log`, and raw stdout/stderr and Go runtime panic output go
+to `daemon.stderr.log`. Reinstall an existing scheduled task with
+`gortex daemon install-service` to capture logs in these files; an old task
+captures no logs. Other Windows starts keep
+their output destinations, including terminals, pipes, shell redirections, CI
+captures, and third-party service wrappers such as NSSM and WinSW.
+
+If inherited descriptors cannot be redirected, the daemon warns and keeps stderr
+logging without rotation. Setting `daemon.log_max_size: 0` also keeps stderr
+logging without rotation and leaves existing descriptors unchanged, so legacy
+installs continue writing to their inherited destination, including `daemon.log`.
+New launchers and new Windows logon tasks capture both JSON and raw output in
+`daemon.stderr.log` when rotation is disabled.
+
 The daemon's defaults handle typical workflows without configuration. These knobs exist for monorepos, branch-heavy workflows, or filesystems without fsnotify support.
 
 ```yaml
@@ -106,14 +214,15 @@ Environment variables:
 - The daemon also watches each tracked repo's `.git/HEAD`, so branch switches and rebases reconcile incrementally (via `git diff --name-status`) rather than by re-indexing every changed file individually — no configuration needed.
 - `GORTEX_WARMUP_FULL_RETRACK=1` — force every repo through a whole-repo re-track (evict + re-parse every file) on the next warm restart instead of the default scoped reconcile. An escape hatch for when the on-disk change census itself is suspect.
 - `GORTEX_WARMUP_FULL_RESOLVE=1` — force the warm-restart master resolve to re-examine the whole graph instead of scoping to changed repos; also makes the resolver ignore the durable terminal-edge stamp and re-attempt every previously-given-up-on edge. Use when a scoped resolve is suspected of missing edges.
-- `GORTEX_WARMUP_FORCE_ENRICH=1` — bypass the persisted per-repo enrichment-completion markers and re-run semantic enrichment for every repo on warm restart, even ones whose marker already matches HEAD on a clean tree.
+- `GORTEX_WARMUP_FORCE_ENRICH=1` — bypass the persisted per-repo enrichment-completion markers and re-run semantic enrichment for every repo on warm restart, even ones whose marker already matches HEAD on a clean tree. An in-process type pass (`typescript-types`, `csharp-types`, …) cut by its deadline normally resumes after its last committed page on the next start; with this set it starts again from the first page, so unset it again once the forced pass has run — while it stays set, a pass cut by its deadline repeats the same first pages on every start and never completes.
 - `GORTEX_DAEMON_HTTP_ADDR` — TCP listen address for the daemon HTTP surface (`/mcp` + `/v1`), e.g. `127.0.0.1:7411`. Overrides the `daemon.http_addr` global config value; a non-empty `--http-addr` flag wins over both. Resolved at startup only. Unset in all three leaves HTTP disabled. Non-loopback binds require `--http-auth-token` or `GORTEX_DAEMON_HTTP_TOKEN`.
 - `GORTEX_DAEMON_MEMLIMIT` — standing soft memory limit installed at daemon boot, as a human size (`4GiB`, `2048MiB`, `2G`) or `off` / `0` to disable. The daemon is a long-lived background service; a soft limit makes the GC pace against a ceiling and resist heap balloon growth rather than letting the high-water climb toward machine RAM. Overrides the `daemon.memory_limit` config value; an explicit `GOMEMLIMIT` overrides both (the runtime already honors it). Unset applies the default policy: a quarter of host RAM, clamped to `[1GiB, 8GiB]`. The cold-index window temporarily raises this to a larger budget and restores it afterward.
-- `GORTEX_POTION=0` — pin the rerank semantic-cosine channel to the small baked GloVe word vectors instead of the bundled `potion-code-16M-v2` code model, saving roughly 31 MiB of resident heap at the cost of natural-language rerank quality. The code model is loaded on the first search that reranks, independently of the `embedding:` section (that drives vector indexing; this drives rerank scoring), and is dropped again after 30 minutes with no rerank traffic. The supported config form is `search.rerank_embedder: false`, which disables the channel entirely.
+- `GORTEX_POTION=0` — pin the rerank semantic-cosine channel to the small baked GloVe word vectors instead of the bundled `potion-code-16M-v2` code model, saving roughly 31 MiB of resident heap at the cost of natural-language rerank quality. For symbol search, natural-language and other nonliteral queries can initialize the model; symbol, path, and signature queries only reuse an already loaded provider. The effective `query_class` override controls this choice. Other reranking consumers retain their existing initialization behavior. This is independent of the `embedding:` section (that drives vector indexing; this drives rerank scoring), and the provider is dropped after 30 minutes with no rerank traffic. The supported config form is `search.rerank_embedder: false`, which disables the channel entirely.
 - `GORTEX_TRIGRAM_MAX_MB` — ceiling on the summed estimated heap of every live trigram searcher (default `256`; `0` disables the byte ceiling). The trigram index is the in-memory literal-search structure behind `search_text` / `find_declaration`, built lazily per repo on first use. A count cap alone does not bound it — three indexes of an arbitrarily large repo is still arbitrarily large — so this is the rule that makes the worst case a number. `gortex daemon status` prints a `trigram` line with the live count, current heap and the active budget.
 - `GORTEX_TRIGRAM_MAX_LIVE` — how many repos may hold a built trigram index at once (default `3`). `0` means never build one: every text search then streams over the repo's known file list, holding no index state at the cost of scan latency. Binary files are excluded from the index and from literal search regardless of these settings.
 - `GORTEX_TRIGRAM_IDLE_TTL` — how long an unused trigram index is kept before it is dropped (default `10m`, any Go duration string). A repo being actively grepped re-touches its entry on every query, so the TTL only reclaims repos that have gone quiet.
 - `GORTEX_WATCHER_STARTUP_BARRIER_TIMEOUT` — how long a macOS watcher waits at startup for FSEvents to hand back its own handshake marker, proving the stream is live and its replay has been ordered. Default `5s`; any Go duration string. Raise it if `daemon: some repositories are not being watched` appears on a very large tree or a busy machine. Exceeding it no longer stops the repo from being watched — the watcher continues in a degraded state, backed by the adaptive poller, and reports the reason.
+- `GORTEX_CONTRACT_LINKED_POLICY` — when the daemon spends CPU on contract analysis for linked git worktrees: `idle` (default), `throttled` or `eager`. Overrides `contract_analysis.linked_policy`; see [Contract analysis in linked worktrees](#contract-analysis-in-linked-worktrees).
 - `GORTEX_DAEMON_MEMRELEASE=0` — disable the post-burst heap-to-OS release. By default the daemon calls `debug.FreeOSMemory()` at allocation-burst boundaries (warmup completion, a reconcile-janitor tick that reindexed something, the close of a cold-index window, and a whole-graph analysis pass) so a burst's high-water footprint is returned to the OS promptly instead of pinning resident memory at the peak. It only ever fires at those boundaries, never on a timer.
 
 ### When a repository stops being watched
@@ -267,11 +376,75 @@ warmup tail re-resolves the graph while every automatic checkout the catalog
 remembers wants its two layers built, all through one store writer. Build work
 is therefore held until warmup completes. Nothing else is: registration,
 catalog seeding, route reads and serving a generation that is already published
-never consult the gate, so a warming daemon keeps answering from whatever the
-last run left behind. Held work is not dropped either — a coordinator cycle
+never consult the gate. A repository answers graph calls once warmup registers
+it; until then its sessions get `repo_loading` (see
+[Startup states](mcp.md#startup-states)). A coordinator that could not start
+because its primary was not registered yet is started when that primary
+registers, not at the janitor's next pass. Held work is not dropped either — a coordinator cycle
 reschedules onto the gate's own wake, and a ref view's build keeps its claim, so
 the selection that made it still gets a token to poll and later selections
 coalesce onto the same one.
+
+### Contract analysis in linked worktrees
+
+Contract analysis (the HTTP route, env-var and other contract layers) runs in
+the background per checkout. Each linked worktree is analyzed apart from the
+primary checkout, and those fills compete for CPU with the reads agents make in
+the same worktrees. The linked policy decides when a linked worktree's analysis
+may run:
+
+- `idle` (default): a linked worktree's job starts only once the daemon has had
+  no foreground work for the idle window (5 s): no tool call has started or
+  ended, none is in flight, and no edit is being applied. Requests still record
+  what each worktree needs, and a waiting worktree does not take a place in the
+  analysis queue; only the start waits. A fill that is running when work comes
+  back pauses, stops at its next checkpoint, and resumes from there in the next
+  idle window.
+- `throttled`: at most one linked worktree's job runs at a time, and one
+  worktree's jobs start at least the throttle interval (30 s) apart. Foreground
+  work does not matter.
+- `eager`: linked worktrees are analyzed as soon as they ask, as the primary
+  checkout is. This was the behavior before the policy existed.
+
+The policy never applies to the primary checkout, nor to a request that waits
+for fresh contract results (`contracts`, `api_impact`, `analyze kind=routes`,
+or any call that requires the contracts capability): such a request starts its
+worktree's analysis at once under every policy. The exemption lasts until the
+request's deadline, capped at 60 s; completion or cancellation does not shorten
+it. Other jobs for that worktree can start during that remaining budget. A
+strict request joining a held job reacquires the worktree's inputs before the
+job starts. An ordinary read in a worktree
+whose analysis is waiting does not block: it answers from the worktree's last
+published contract analysis, with `contract_analysis.state` `building` and
+reason `contract_analysis_pending`, or reports that there is no attachment yet.
+
+```yaml
+# the daemon's own config file
+contract_analysis:
+  linked_policy: idle            # idle | throttled | eager
+  linked_idle_window: 5s         # idle: quiet time before a linked job starts
+  linked_throttle_interval: 30s  # throttled: least time between one worktree's starts
+```
+
+The block is read once, at daemon start, from the daemon's own config file: the
+one `--config` names, else `.gortex.yaml` in the directory the daemon was
+started from, else `.gortex.yaml` in the Gortex config directory (`~/.gortex`
+by default). A `contract_analysis:` block in a tracked repository's
+`.gortex.yaml` is not read.
+
+`GORTEX_CONTRACT_LINKED_POLICY` overrides `linked_policy`. A value that does not
+parse is logged and its default is used; the daemon still starts. The daemon
+logs the policy in effect at startup (`contract analysis linked policy`).
+
+`gortex daemon status` counts what the policy did in
+`views_contract_linked_jobs_total{policy,event}`: `deferred` (a linked job held
+back, once per hold), `checkpoint_stopped` (a running fill stopped for returning
+work), `started`, and `strict_started` (a job started during a strict request's
+remaining budget). The
+`contract analysis job started` and `contract analysis job` log lines carry the
+job id, `checkout` and `trigger`; linked jobs add `policy` and `strict`. The
+start line also carries `since_gate_ms`, how long before it the policy let the
+job start, and the completion line `demand_stop`.
 
 ## CLI
 
@@ -411,6 +584,13 @@ Scoped tool responses carry a `scope_applied` meta field plus a one-line widen h
 ## How it works
 
 - **Qualified node IDs** — IDs are always `<repo_prefix>/<path>::<Symbol>` (e.g., `frontend/src/app.ts::App`), including for a workspace tracking a single repo: a lone repo is simply the first tracked repo. Tools still accept an unqualified path (`src/app.ts`) when exactly one repo is tracked, since there is then nothing to be ambiguous about.
-- **Cross-repo edges** — the resolver links symbols across repo boundaries with same-repo preference. Cross-repo edges carry a `cross_repo: true` flag.
+- **Cross-repo edges** — the resolver links symbols across repo boundaries with same-repo preference. Cross-repo edges carry a `cross_repo: true` flag. JS/TS imports can link a declared npm dependency to a tracked repository whose `package.json` claims that package name, including npm and pnpm workspace members. A provider in the caller's workspace wins over eligible foreign providers. Multiple manifest claims in the winning tier keep the import external, even if only one entry is indexed.
+  - Entry lookup respects `exports` keys, wildcard subpaths and `null` blocks. It probes the selected `import`/`default` target first, then a `types` condition when that file is not indexed. Without `exports`, it tries `types`, `main` and directory indexes. Unsupported-condition subpaths never guess a directory target.
+  - Bare calls use the caller file's named import binding, including its local alias, not another same-named function anywhere in the provider. A per-binding import links to a symbol marked public by the extractor; otherwise it stays at `external::<specifier>::<name>` with its `npm_import` marker and creates no call binding. Linked imports retain their specifier, survive provider eviction as external imports, and are rechecked by whole-graph resolution.
+  - **Limits:** Build-output-only entries, such as `main` and `types` pointing into excluded `dist/`, stay external unless an indexed target is declared. Gortex does not infer `src/` from `dist/`. The importing repository's own packages, `npm:` aliases and workspace paths that escape the repository are not linked by this pass. Sibling dependencies declared with `file:`, `link:` or `portal:` are not supported. Default-import bare calls have no exact binding evidence yet and stay unresolved. After an upgrade, JavaScript and TypeScript files are re-extracted once (extractor version 2), so existing imports acquire the specifier and alias metadata; their links appear after that pass. Namespace member calls, CommonJS `require` calls and package re-exports are not linked by this npm import pass. Export targets without `./` are accepted leniently, as in workspace resolution, even though Node rejects them. Call binding is file-scoped: a parameter or local callable with the imported name can bind to the import.
+  - Go package-selector calls such as `library.Hello()` use tracked roots' `go.mod` module paths, not checkout names. An import of `example.org/library/sub` can bind to `<provider>/sub/file.go::Hello` even when the provider prefix is `b`.
+  - Precise own-module, vendor and staging paths take priority. Otherwise the longest matching module path wins. A primary/non-worktree checkout wins a tie with dedicated worktree copies; ties between independent primary checkouts are refused. Cross-workspace calls still require the caller's `cross_workspace_deps` declaration.
+  - A cross-repo module binding carries confidence `0.6` and origin `ast_inferred`. It is a source hint, not proof that the tracked checkout matches the required version. The edge retains its symbol-bearing import identity so provider edits and full reindexes can rebind it without editing the caller. Module-map changes re-check existing bindings.
+  - **Limits:** Only root `go.mod` identities are used; nested modules and `go.work` selection are not resolved. Required versions and module/version replacements are not verified. A local `replace` whose destination is untracked prevents module-path binding instead of selecting another checkout with the same module name. Tracked local replacements remain source hints, not full Go build-list resolution. Calls on values typed from another module, such as `client.Do()` for a `library.Client`, can remain `unresolved::*.Do`; receiver-type linking is not implemented here.
 - **Impact analysis** — `explain_change_impact`, `verify_change`, and `get_test_targets` follow cross-repo edges automatically, grouping results by repository.
 - **Shared repos** — the same repo can appear in multiple projects with different reference tags. It's indexed once and shared across projects.

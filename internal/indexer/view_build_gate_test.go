@@ -524,6 +524,10 @@ func TestViewBuildGateBoundsInteractiveOvertaking(t *testing.T) {
 		for range maxInteractiveBuildBurst + 1 {
 			queue(ViewBuildInteractive)
 		}
+		// Background work overtakes a burst only once it has waited past the
+		// starvation bound (below it an interactive waiter never waits behind
+		// it: TestViewBuildGateInteractiveTicketNeverWaitsBehindQueuedBackground).
+		time.Sleep(viewBuildBackgroundStarvation)
 		active()
 
 		got := make([]ViewBuildPriority, 0, maxInteractiveBuildBurst+2)

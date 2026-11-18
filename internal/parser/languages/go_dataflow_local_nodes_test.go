@@ -116,3 +116,61 @@ func Iter(xs []int) int {
 		assert.Truef(t, names[want], "missing KindLocal for range binding %q; got %v", want, names)
 	}
 }
+
+func TestGoDataflowZeroInitializedLocalsOwnTheirInitialReads(t *testing.T) {
+	fix := runGoExtract(t, `package foo
+func Consume(...int) {}
+func Run() {
+ var total int
+ var left, right int
+ Consume(total, left, right)
+ total += 1
+ Consume(total)
+}
+`)
+	owner := "pkg/foo.go::Run"
+	initial := map[string]string{}
+	for _, n := range fix.nodesByKind[graph.KindLocal] {
+		if n.StartLine == 4 || n.StartLine == 5 {
+			initial[n.Name] = n.ID
+		}
+	}
+	for _, name := range []string{"total", "left", "right"} {
+		require.NotEmpty(t, initial[name], "zero-value declaration must own %s before an assignment", name)
+		assert.True(t, strings.HasPrefix(initial[name], owner+"#local:"+name+"@+"))
+		found := false
+		for _, e := range fix.edgesByKind[graph.EdgeArgOf] {
+			if e.Line == 6 && e.From == initial[name] {
+				found = true
+			}
+		}
+		assert.True(t, found, "initial argument must use %s declaration identity", name)
+	}
+	later := false
+	for _, e := range fix.edgesByKind[graph.EdgeArgOf] {
+		if e.Line == 8 {
+			later = true
+			assert.NotEqual(t, initial["total"], e.From, "later assignment retains its own existing flow identity")
+			assert.True(t, strings.HasPrefix(e.From, owner+"#local:total@+"))
+		}
+	}
+	require.True(t, later, "later argument flow must be present")
+	blank := runGoExtract(t, `package foo
+type Count int
+func Named() {
+ var number, _ Count
+ _ = number
+}
+`)
+	var named []*graph.Node
+	for _, n := range blank.nodesByKind[graph.KindLocal] {
+		require.NotEqual(t, "_", n.Name, "blank identifiers do not introduce bindings")
+		require.NotEqual(t, "Count", n.Name, "the named type is not a declared identifier")
+		if n.Name == "number" {
+			named = append(named, n)
+		}
+	}
+	require.Len(t, named, 1)
+	require.Equal(t, 4, named[0].StartLine)
+
+}

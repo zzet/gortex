@@ -17,6 +17,8 @@ Setup is split into two commands so codebase-agnostic machinery lives once per u
 
 You can run them independently — `gortex init` doesn't require `gortex install` first; it just writes less if the user-level wiring isn't there.
 
+Using Claude Code? Gortex also ships as a Claude Code plugin; see [Claude Code plugin](installation.md#claude-code-plugin) for how it fits with these two commands.
+
 ```bash
 # One-time: machine-wide user-level setup
 gortex install --start --track         # install, start daemon, track current dir
@@ -68,7 +70,7 @@ gortex init
 
 - `.mcp.json` — tells MCP clients (Claude Code, Cursor, VS Code) how to start the Gortex server
 - `CLAUDE.md` — codebase overview (with `--analyze`) plus a marker-guarded community-routing block
-- `.claude/settings.local.json` — installs three hooks: `PreToolUse` (redirects `Read` / `Grep` / `Glob` / `Task`), `PreCompact` (injects orientation snapshot before context compaction), `Stop` (post-task diagnostics)
+- `.claude/settings.local.json` — installs the Gortex hooks, among them `PreToolUse` (redirects `Read` / `Grep` / `Glob` / `Task`), `SessionStart` (orientation snapshot, including after context compaction), and `Stop` (post-task diagnostics)
 - `.claude/skills/generated/<DirName>/SKILL.md` — one per detected community (via `--skills`, default on)
 - `.cursor/mcp.json`, `.kiro/settings/mcp.json`, `.vscode/mcp.json`, etc. — per-agent MCP configs
 - Marker-guarded "Gortex Communities" routing block in each detected agent's per-repo instructions file (`AGENTS.md`, `.windsurfrules`, `GEMINI.md`, `.cursor/rules/gortex-communities.mdc`, etc.)
@@ -144,12 +146,35 @@ Once installed, three things happen without you lifting a finger:
 
 - **PreToolUse on `Read` / `Grep` / `Glob`** — Gortex suggests the right graph tool instead and, for indexed source files, blocks whole-file reads.
 - **PreToolUse on `Task`** — spawned subagents get a task-scoped briefing with `smart_context` results + a tool-swap table, so they don't inherit the bad habit of reaching for `Read`.
-- **PreCompact** — just before Claude Code compacts the conversation, Gortex injects an orientation snapshot (recent edits, hotspots, feedback-ranked symbols) so the agent survives compaction without re-exploring.
+- **SessionStart** — at session start, and again right after Claude Code compacts the conversation (`source="compact"`), Gortex injects an orientation snapshot so the agent survives compaction without re-exploring. Claude Code discards PreCompact output, which is why the snapshot rides on SessionStart.
 - **Stop** — after the agent finishes a turn, Gortex runs `detect_changes` → `get_test_targets`, `check_guards`, `analyze dead_code`, `contracts check` and feeds the results back so the agent self-corrects before handoff. The diagnostics are scoped to the symbols *this session* edited: PreToolUse records each write target, and the Stop hook partitions the working-tree diff against that set, so a sibling session editing the same checkout does not turn up as your work. Files it cannot attribute are listed separately rather than dropped, and when the session cannot be identified at all the briefing reports the whole tree and labels itself as such.
 
 All four degrade silently when the bridge is unreachable — they never block your normal flow.
 
 ## Troubleshooting
+
+### Recovering from a runaway warmup
+
+If you accidentally tracked a home directory, repository parent or another
+large tree, stop the daemon before removing it from the tracked configuration:
+
+```sh
+gortex daemon stop
+gortex untrack /absolute/path/to/unwanted-repository
+gortex daemon start
+```
+
+When an installed service manager owns the daemon, `daemon stop` goes through
+that manager. The stop intent also keeps an editor's MCP proxy from immediately
+restarting it. With the daemon down, `untrack` edits configuration only and
+prints `(config only)`; use the absolute repository path, not its bare prefix.
+Keep the daemon stopped until that command succeeds.
+
+On the next start, the orphan-prefix purge removes the untracked repository's
+stored rows instead of warming it again. Run `gortex daemon status` in another
+terminal: the unwanted repository should be absent, and the repositories you
+kept should become ready. This procedure does not promise that online untrack
+can interrupt a repository that is still warming.
 
 **"Gortex MCP server failed to start" in the IDE.**
 Check that `gortex` is on your `PATH` (`which gortex` should resolve). If you installed via Homebrew, restart the IDE — it caches PATH at launch.
@@ -179,7 +204,7 @@ Once the basics are working:
 - **Token savings + cost tracking** — `gortex savings` prints cumulative tokens saved + dollars avoided per model across all sessions. Accumulates automatically; no setup.
 - **Compact wire format (GCX1)** — every list-shaped tool accepts `format: "gcx"` for a round-trippable compact response. Median **−27.4% tokens** vs JSON on the benchmark, 100% round-trip integrity. Spec: [docs/wire-format.md](wire-format.md). TypeScript decoder on npm: [`@gortex/wire`](https://www.npmjs.com/package/@gortex/wire). Agents pick it up automatically — the PreToolUse and subagent hooks surface the opt-in. Applies to: `search_symbols`, `find_usages`, `analyze`, `contracts`, `batch_symbols`, `get_callers` / `get_call_chain` / `get_dependencies` / `get_dependents` / `find_implementations`, `get_file_summary`, `get_editing_context`, `smart_context`.
 - **Feedback loop** — after a successful task, call the `feedback` MCP tool with `action: "record"`. Future `smart_context` results rerank based on what was actually useful.
-- **Custom HTTP integration** — `gortex daemon start --http-addr 127.0.0.1:7411 --cors-origin '*'` exposes every MCP tool as HTTP (`/v1/*` + `/mcp`) for the tracked repos. Good for editor plugins, CI hooks, custom dashboards.
+- **Custom HTTP integration** — `gortex daemon start --http-addr 127.0.0.1:7411` exposes the MCP tools over HTTP (`/v1/*` + `/mcp`) for the tracked repos. Set `--http-auth-token` even on loopback. Browser dashboards also need their specific origin in both `--http-allowed-origin` and `--cors-origin`; see [browser access](server.md#server-mode-v1-json-api).
 
 ## Daemon Mode
 
@@ -215,7 +240,7 @@ gortex daemon start --detach  # spawn in background
 gortex daemon stop            # graceful shutdown; the graph store is already on disk
 gortex daemon restart         # stop + start
 gortex daemon reload          # re-read config, pick up new/removed repos
-gortex daemon logs -n 50      # tail the log
+gortex daemon logs -n 50      # tail daemon.log (background/service daemon: rotated; crash and raw stderr in daemon.stderr.log)
 ```
 
 `reload` re-reads the global `~/.gortex/config.yaml` *and* every tracked
@@ -237,6 +262,8 @@ gortex daemon uninstall-service # remove unit, stop service
 On macOS the unit lands at `~/Library/LaunchAgents/com.zzet.gortex.plist`; on Linux at `~/.config/systemd/user/com.zzet.gortex.service`. After `install-service`, plain `gortex daemon start / stop` still work — they just fight the service for socket ownership, so prefer `gortex daemon service-status` and `launchctl` / `systemctl --user` commands for lifecycle.
 
 If you run an XDG layout (any absolute `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME`), `install-service` captures those values into the unit so the supervised daemon resolves the same paths as your shell — service supervisors otherwise start with a near-empty environment and the daemon would fall back to `~/.gortex`. Re-run `install-service` if you later change where those variables point.
+
+`install-service` also captures the installing shell's `PATH` (absolute entries only), so the supervised daemon finds language servers installed outside the system directories, such as `~/go/bin` or `~/.cargo/bin`. Run it from the shell whose `PATH` you want the daemon to use, and re-run it after that `PATH` changes. The unit always runs a bare `gortex daemon start`, so set daemon options in config rather than as flags: for the HTTP surface, put `daemon.http_addr` in the global config, `~/.gortex/config.yaml` or its XDG location (see [server.md](server.md)).
 
 ### How it works
 

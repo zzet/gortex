@@ -76,15 +76,25 @@ type fileRef struct {
 // repo being enriched. In single-repo mode every real node carries the
 // empty prefix, so repoPrefix == "" selects them all.
 func languageFiles(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) []fileRef {
-	langs := make(map[string]bool, len(spec.Languages))
-	for _, l := range spec.Languages {
-		langs[l] = true
-	}
-	var out []fileRef
+	return analyzedFiles(repoFileNodes(g, spec, repoPrefix), repoRoot)
+}
+
+// repoFileNodes reads the repo's file nodes of the spec's languages in one
+// scan.
+func repoFileNodes(g graph.Store, spec *LangSpec, repoPrefix string) []*graph.Node {
+	var out []*graph.Node
 	for n := range g.NodesByKind(graph.KindFile) {
-		if !langs[n.Language] || n.RepoPrefix != repoPrefix {
-			continue
+		if n != nil && n.RepoPrefix == repoPrefix && spec.handles(n.Language) {
+			out = append(out, n)
 		}
+	}
+	return out
+}
+
+// analyzedFiles keeps the repoFileNodes a pass parses.
+func analyzedFiles(nodes []*graph.Node, repoRoot string) []fileRef {
+	var out []fileRef
+	for _, n := range nodes {
 		// Match the manager/LSP enrichment policy: vendored and generated
 		// sources are intentionally outside semantic coverage. Without this
 		// gate, one real source file can make the provider reparse an entire
@@ -108,15 +118,20 @@ func languageFiles(g graph.Store, spec *LangSpec, repoPrefix, repoRoot string) [
 // graph file key into bytes-on-disk for both the full and incremental
 // passes.
 func fileRefFor(n *graph.Node, repoRoot string) (fileRef, bool) {
-	rel := n.FilePath
-	if n.RepoPrefix != "" {
-		rel = strings.TrimPrefix(rel, n.RepoPrefix+"/")
-	}
-	abs := filepath.Join(repoRoot, filepath.FromSlash(rel))
+	abs := fileAbsPath(n, repoRoot)
 	if fi, err := os.Stat(abs); err != nil || fi.IsDir() || fi.Size() > maxFileBytes {
 		return fileRef{}, false
 	}
 	return fileRef{node: n, absPath: abs}, true
+}
+
+// fileAbsPath maps a graph file node to its path under repoRoot.
+func fileAbsPath(n *graph.Node, repoRoot string) string {
+	rel := n.FilePath
+	if n.RepoPrefix != "" {
+		rel = strings.TrimPrefix(rel, n.RepoPrefix+"/")
+	}
+	return filepath.Join(repoRoot, filepath.FromSlash(rel))
 }
 
 // analyzeFile parses one file and runs the binder walk. Pure with
@@ -206,6 +221,23 @@ type applier struct {
 	outLoaded            map[string]bool
 	inLoaded             map[string]bool
 	allNodes             []*graph.Node
+	// outKinds / inKinds are the edge kinds the adjacency preload loads per
+	// direction; nil loads every kind (the legacy preload). See
+	// adjacencyOutKinds for why the restriction is invisible to the phases.
+	// Set only through setAdjacencyKinds, which derives splitCalls.
+	outKinds []graph.EdgeKind
+	inKinds  []graph.EdgeKind
+	// splitCalls keeps outgoing calls out of outByID: they are loaded into
+	// callsByID only for the callers a calls application can read (see
+	// loadCallerCalls), never for frontier nodes or in the other phases.
+	// Derived from outKinds (splitsCalls), never set on its own: false under
+	// the legacy preload, whose outByID holds every kind.
+	splitCalls  bool
+	callsByID   map[string][]*graph.Edge
+	callsLoaded map[string]bool
+	// afterPreload is a test hook run once the page's adjacency is loaded,
+	// before any fact applies (Provider.observePreload).
+	afterPreload func(*applier)
 }
 
 // extKey indexes an extension function by its receiver type name and its
@@ -234,7 +266,7 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 			languages[language] = true
 		}
 	}
-	return &applier{
+	a := &applier{
 		g:                    g,
 		spec:                 spec,
 		provider:             provider,
@@ -254,7 +286,99 @@ func newApplier(g graph.Store, spec *LangSpec, provider string) *applier {
 		repoProjectionLoaded: make(map[string]bool),
 		outLoaded:            make(map[string]bool),
 		inLoaded:             make(map[string]bool),
+		callsByID:            make(map[string][]*graph.Edge),
+		callsLoaded:          make(map[string]bool),
 	}
+	a.setAdjacencyKinds(adjacencyOutKinds(spec), adjacencyInKinds)
+	return a
+}
+
+// setAdjacencyKinds sets the edge kinds the adjacency preload loads per
+// direction (nil: every kind) and derives splitCalls from them. Must run
+// before the first load.
+func (a *applier) setAdjacencyKinds(out, in []graph.EdgeKind) {
+	a.outKinds, a.inKinds = out, in
+	a.splitCalls = splitsCalls(out)
+}
+
+// splitsCalls reports whether outgoing calls live in callsByID rather than
+// outByID: exactly when the outgoing preload does not load them, so a calls
+// edge is held in at most one outgoing list and never in a structural hot
+// cache entry. The mutation upkeep (reindexEdge, removeEdge, addASTEdge)
+// relies on that: its calls branch maintains callsByID alone and skips the
+// outByID/forgetOut upkeep, while the incoming upkeep stays keyed on
+// inKinds for every kind, calls included — so a kind set that also loads
+// incoming calls keeps its in-lists and hot in entries coherent.
+func splitsCalls(out []graph.EdgeKind) bool {
+	return !edgeKindLoaded(out, graph.EdgeCalls)
+}
+
+// superEdgeKinds are the relation kinds applySuper confirms, retargets and
+// synthesizes. Every spec's SuperRef.Kind is one of them or empty (decided
+// by the resolved target's node kind, again one of them).
+var superEdgeKinds = []graph.EdgeKind{graph.EdgeExtends, graph.EdgeImplements}
+
+// adjacencyInKinds are the only incoming edge kinds any phase reads: the
+// member_of frontier/member lookups (preloadApplicationFrontier,
+// relevantEndpointIDs, methodOn, typeHasRealMember) and param_of arity
+// (paramArity). No phase mutates an incoming list of these kinds.
+var adjacencyInKinds = []graph.EdgeKind{graph.EdgeMemberOf, graph.EdgeParamOf}
+
+// adjacencyOutKinds are the structural outgoing edge kinds the frontier
+// preload loads for every seed and frontier node: member_of (ownerType,
+// relevantEndpointIDs), the super relations (applySuper) and the spec's
+// inheritance walk kinds (methodOn and the frontier walk). The only other
+// outgoing kind any phase reads or mutates is calls, loaded separately and
+// only for callers (adjacencyCallKinds, loadCallerCalls).
+//
+// Every reader filters by kind before using an edge, and the only
+// order-sensitive readers are first-match loops over these kinds. On the
+// in-memory store each list is the order-preserving subsequence of the full
+// list, so loading just these kinds is invisible there. On SQLite the
+// kind-filtered read orders outgoing edges by line, kind, then insertion.
+// The unfiltered batch read has no ORDER BY, so its order can differ even
+// within a kind under ordinary planner statistics. Call confirmation must
+// match the fact's source line, not just its target. Across kinds on one
+// source line the filtered read orders by kind name (extends before
+// implements). One first-match loop spans two kinds — applySuper's fallback
+// takes the first claimable extends-or-implements stub whose trailing name
+// matches — so on SQLite its pick can differ from some unfiltered-read plans
+// when one type carries such stubs of both kinds on one line. That order was
+// never defined: the unfiltered batch read has no ORDER BY, its
+// order follows the query plan (it changes with planner statistics) and
+// already differs from the in-memory insertion order. The kind-filtered read
+// makes it deterministic. No extractor emits both stubs for one declaration.
+//
+// Loading the rest — on a hub type, every calls / references / typed_as row
+// pointing at it and at each of its members, with meta — was the bulk of the
+// pass's allocation on large repositories.
+func adjacencyOutKinds(spec *LangSpec) []graph.EdgeKind {
+	kinds := []graph.EdgeKind{graph.EdgeMemberOf}
+	kinds = append(kinds, superEdgeKinds...)
+	if spec != nil {
+		for _, kind := range spec.inheritEdgeKinds() {
+			if !edgeKindIn(kind, kinds) {
+				kinds = append(kinds, kind)
+			}
+		}
+	}
+	return kinds
+}
+
+// adjacencyCallKinds is the outgoing kind loaded for callers only. Calls are
+// read by buildIndex (a call-bearing file's stub owners), upgradeExistingCall
+// and strongerEdge, always from a node of the file whose call facts apply
+// (idx.funcs or a stub owner), and nothing outside a calls application reads
+// them. On a large repository every frontier member is a method with many
+// outgoing calls, so loading them with the structural kinds — for every
+// seed and frontier node, in every phase — was most of what the supers phase
+// still read.
+var adjacencyCallKinds = []graph.EdgeKind{graph.EdgeCalls}
+
+// edgeKindLoaded reports whether the preload loads kind for a direction
+// whose loaded set is kinds; nil means every kind.
+func edgeKindLoaded(kinds []graph.EdgeKind, kind graph.EdgeKind) bool {
+	return kinds == nil || edgeKindIn(kind, kinds)
 }
 
 var tstypesFileNodeKinds = []graph.NodeKind{
@@ -282,6 +406,62 @@ func (a *applier) rememberNode(node *graph.Node) {
 
 func (a *applier) preload(all []*fileFacts) {
 	a.preloadBounded(all)
+}
+
+// loadCallerCalls batch-loads the outgoing calls of every node a calls
+// application of these facts can read them for: the nodes of each file that
+// carries call facts (buildIndex snapshots their stubs; applyCall picks its
+// caller among them). Only the calls phase's pages carry call facts — the
+// fact spool decodes one class per phase — so no other phase loads any; and
+// frontier nodes, whose calls nothing reads, are never loaded. Must run after
+// preload and before the first buildIndex, so every caller's list is a
+// pre-mutation snapshot exactly as the legacy preload's was.
+func (a *applier) loadCallerCalls(all []*fileFacts) {
+	if !a.splitCalls {
+		return
+	}
+	var ids []string
+	for _, facts := range all {
+		if facts == nil || len(facts.calls) == 0 {
+			continue
+		}
+		for _, n := range a.fileNodes(facts.file) {
+			if n.Kind != graph.KindFile && a.outLoaded[n.ID] && !a.callsLoaded[n.ID] {
+				ids = append(ids, n.ID)
+			}
+		}
+	}
+	a.loadCalls(ids)
+}
+
+// loadCalls reads the outgoing calls of ids not loaded yet. They bypass the
+// pass hot cache: a caller is a node of the file whose call facts apply, and
+// the spool pages each file into exactly one calls-phase page, so a cached
+// calls list could never be hit — and the cache's out entries, which hold
+// only the structural kinds, can never be served to a calls reader.
+func (a *applier) loadCalls(ids []string) {
+	ids = uniqueSortedIDs(ids)
+	missing := ids[:0]
+	for _, id := range ids {
+		if !a.callsLoaded[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	loaded := graph.OutEdgesByNodeIDsOfKinds(a.g, missing, adjacencyCallKinds)
+	for _, id := range missing {
+		a.callsByID[id] = loaded[id]
+		a.callsLoaded[id] = true
+	}
+}
+
+// preparedAdjacency runs the test hook once a page's adjacency is loaded.
+func (a *applier) preparedAdjacency() {
+	if a.afterPreload != nil {
+		a.afterPreload(a)
+	}
 }
 
 // preloadApplicationFrontier loads exactly the adjacency the ordered apply
@@ -362,9 +542,10 @@ func (a *applier) preloadApplicationFrontier(seedIDs []string) {
 }
 
 // loadAdjacency merges bounded bulk reads into the mutation-aware caches.
-// Loaded IDs, including misses, are never queried again. Edge slices are
-// retained in store order so overload and edge arbitration semantics stay
-// identical to the underlying backend.
+// Loaded IDs, including misses, are never queried again. Only the kinds in
+// outKinds / inKinds are read (see adjacencyOutKinds); edge slices are
+// retained in store order within each kind so overload and edge arbitration
+// semantics stay identical to the underlying backend.
 func (a *applier) loadAdjacency(ids []string) {
 	ids = uniqueSortedIDs(ids)
 	outMissing := make([]string, 0, len(ids))
@@ -390,7 +571,7 @@ func (a *applier) loadAdjacency(ids []string) {
 		}
 	}
 	if len(outMissing) > 0 {
-		loaded := a.g.GetOutEdgesByNodeIDs(outMissing)
+		loaded := graph.OutEdgesByNodeIDsOfKinds(a.g, outMissing, a.outKinds)
 		for _, id := range outMissing {
 			a.outByID[id] = loaded[id]
 			a.outLoaded[id] = true
@@ -398,7 +579,7 @@ func (a *applier) loadAdjacency(ids []string) {
 		}
 	}
 	if len(inMissing) > 0 {
-		loaded := a.g.GetInEdgesByNodeIDs(inMissing)
+		loaded := graph.InEdgesByNodeIDsOfKinds(a.g, inMissing, a.inKinds)
 		for _, id := range inMissing {
 			a.inByID[id] = loaded[id]
 			a.inLoaded[id] = true
@@ -525,20 +706,56 @@ func (a *applier) outEdges(id string) []*graph.Edge {
 	return a.outByID[id]
 }
 
+// outCalls returns id's outgoing calls. A node whose adjacency was never
+// loaded has none, exactly as under the legacy preload (outEdges); a loaded
+// node missed by loadCallerCalls falls back to a one-node read, so a calls
+// reader is never handed a list loaded without calls.
+func (a *applier) outCalls(id string) []*graph.Edge {
+	if !a.splitCalls {
+		return a.outByID[id]
+	}
+	if !a.outLoaded[id] {
+		return nil
+	}
+	if !a.callsLoaded[id] {
+		a.loadCalls([]string{id})
+	}
+	return a.callsByID[id]
+}
+
+// outEdgesOfKind is the outgoing list a reader of kind must scan.
+func (a *applier) outEdgesOfKind(id string, kind graph.EdgeKind) []*graph.Edge {
+	if a.splitCalls && kind == graph.EdgeCalls {
+		return a.outCalls(id)
+	}
+	return a.outByID[id]
+}
+
 func (a *applier) inEdges(id string) []*graph.Edge {
 	return a.inByID[id]
 }
 
+// reindexEdge persists a retarget. The mutation upkeep here, in removeEdge
+// and in addASTEdge keeps this applier's lists equal to the store's rows of
+// the loaded kinds, and drops the pass hot cache's entry for every list the
+// store changed: later pages then re-read it from the store rather than a
+// pre-mutation snapshot, so a page's view never depends on cache residency
+// (which the per-entry size, and so the loaded kind set, decides).
 func (a *applier) reindexEdge(edge *graph.Edge, oldTo string) {
 	a.g.ReindexEdge(edge, oldTo)
+	// A split calls edge is not in outByID (splitsCalls): callsByID holds the
+	// retargeted pointer in place, so only the incoming side needs upkeep.
+	if edgeKindLoaded(a.outKinds, edge.Kind) {
+		// The store reinserts the row, so the source's list order changes too.
+		a.hot.forgetOut(edge.From)
+	}
+	if !edgeKindLoaded(a.inKinds, edge.Kind) {
+		return
+	}
+	a.hot.forgetIn(oldTo)
+	a.hot.forgetIn(edge.To)
 	if a.inLoaded[oldTo] {
-		filtered := a.inByID[oldTo][:0]
-		for _, candidate := range a.inByID[oldTo] {
-			if candidate != edge {
-				filtered = append(filtered, candidate)
-			}
-		}
-		a.inByID[oldTo] = filtered
+		a.inByID[oldTo] = withoutEdge(a.inByID[oldTo], edge)
 	}
 	if a.inLoaded[edge.To] {
 		a.inByID[edge.To] = append(a.inByID[edge.To], edge)
@@ -549,24 +766,34 @@ func (a *applier) removeEdge(edge *graph.Edge) {
 	if edge == nil || !a.g.RemoveEdge(edge.From, edge.To, edge.Kind) {
 		return
 	}
-	if a.outLoaded[edge.From] {
-		filtered := a.outByID[edge.From][:0]
-		for _, candidate := range a.outByID[edge.From] {
-			if candidate != edge {
-				filtered = append(filtered, candidate)
-			}
+	if a.splitCalls && edge.Kind == graph.EdgeCalls {
+		if a.callsLoaded[edge.From] {
+			a.callsByID[edge.From] = withoutEdge(a.callsByID[edge.From], edge)
 		}
-		a.outByID[edge.From] = filtered
-	}
-	if a.inLoaded[edge.To] {
-		filtered := a.inByID[edge.To][:0]
-		for _, candidate := range a.inByID[edge.To] {
-			if candidate != edge {
-				filtered = append(filtered, candidate)
-			}
+	} else if edgeKindLoaded(a.outKinds, edge.Kind) {
+		a.hot.forgetOut(edge.From)
+		if a.outLoaded[edge.From] {
+			a.outByID[edge.From] = withoutEdge(a.outByID[edge.From], edge)
 		}
-		a.inByID[edge.To] = filtered
 	}
+	if edgeKindLoaded(a.inKinds, edge.Kind) {
+		a.hot.forgetIn(edge.To)
+		if a.inLoaded[edge.To] {
+			a.inByID[edge.To] = withoutEdge(a.inByID[edge.To], edge)
+		}
+	}
+}
+
+// withoutEdge filters edge out of edges in place. Safe only because the hot
+// cache entry sharing the backing array has just been dropped.
+func withoutEdge(edges []*graph.Edge, edge *graph.Edge) []*graph.Edge {
+	filtered := edges[:0]
+	for _, candidate := range edges {
+		if candidate != edge {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
 }
 
 // receiverTypeKinds is the node-kind set a call receiver's type may
@@ -697,7 +924,7 @@ func (a *applier) buildIndex(facts *fileFacts) *fileIndex {
 			continue
 		}
 		stampLo, stampHi, stamped := recordedOwnershipSpan(n)
-		for _, e := range a.outEdges(n.ID) {
+		for _, e := range a.outCalls(n.ID) {
 			if e == nil || e.Kind != graph.EdgeCalls || e.Line == 0 {
 				continue
 			}
@@ -772,6 +999,8 @@ func metaLine(v any) (int, bool) {
 func (a *applier) applyAll(all []*fileFacts, res *semantic.EnrichResult) {
 	sort.Slice(all, func(i, j int) bool { return all[i].file < all[j].file })
 	a.preload(all)
+	a.loadCallerCalls(all)
+	a.preparedAdjacency()
 	idxs := make([]*fileIndex, len(all))
 	for i, facts := range all {
 		idxs[i] = a.buildIndex(facts)
@@ -1574,9 +1803,12 @@ func (a *applier) upgradeOrCreateCall(caller, target *graph.Node, cf callFact, f
 // self-target path (a SELF-typed receiver field, where target == caller)
 // can claim the extracted stub without ever being allowed to create.
 func (a *applier) upgradeExistingCall(caller, target *graph.Node, cf callFact, res *semantic.EnrichResult, strategy resolutionStrategy, confidence float64) bool {
-	outs := a.outEdges(caller.ID)
+	outs := a.outCalls(caller.ID)
 	for _, e := range outs {
-		if e.Kind == graph.EdgeCalls && e.To == target.ID {
+		// A target match at another line is a different call site: it
+		// must neither receive this fact's provenance nor prevent this
+		// site's stub from being claimed (or a fresh edge being added).
+		if e.Kind == graph.EdgeCalls && e.To == target.ID && e.Line == cf.line {
 			if a.confirmCall(e, strategy, confidence) {
 				res.EdgesConfirmed++
 			}
@@ -1902,12 +2134,27 @@ func (a *applier) addASTEdge(from, to string, kind graph.EdgeKind, file string, 
 	if strategy != strategyDirect {
 		e.Meta["resolution_strategy"] = string(strategy)
 	}
-	a.g.AddEdge(e)
-	if a.outLoaded[from] {
-		a.outByID[from] = append(a.outByID[from], e)
+	splitCall := a.splitCalls && kind == graph.EdgeCalls
+	if splitCall && a.outLoaded[from] && !a.callsLoaded[from] {
+		// Snapshot before the add, as the legacy preload's list was.
+		a.loadCalls([]string{from})
 	}
-	if a.inLoaded[to] {
-		a.inByID[to] = append(a.inByID[to], e)
+	a.g.AddEdge(e)
+	if splitCall {
+		if a.callsLoaded[from] {
+			a.callsByID[from] = append(a.callsByID[from], e)
+		}
+	} else if edgeKindLoaded(a.outKinds, kind) {
+		a.hot.forgetOut(from)
+		if a.outLoaded[from] {
+			a.outByID[from] = append(a.outByID[from], e)
+		}
+	}
+	if edgeKindLoaded(a.inKinds, kind) {
+		a.hot.forgetIn(to)
+		if a.inLoaded[to] {
+			a.inByID[to] = append(a.inByID[to], e)
+		}
 	}
 	return e
 }
@@ -1922,7 +2169,7 @@ func (a *applier) addASTEdge(from, to string, kind graph.EdgeKind, file string, 
 // confidence) both win.
 func (a *applier) strongerEdge(from, to string, kind graph.EdgeKind, confidence float64) *graph.Edge {
 	gradedRank := graph.OriginRank(graph.OriginASTResolved)
-	for _, e := range a.outEdges(from) {
+	for _, e := range a.outEdgesOfKind(from, kind) {
 		if e.Kind != kind || e.To != to {
 			continue
 		}

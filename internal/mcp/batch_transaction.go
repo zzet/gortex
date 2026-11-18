@@ -16,7 +16,10 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 )
@@ -63,19 +66,28 @@ type batchTransactionFile struct {
 }
 
 type batchTransactionReceipt struct {
-	Version       int                    `json:"version"`
-	TransactionID string                 `json:"transaction_id"`
-	Fingerprint   string                 `json:"fingerprint"`
-	Status        string                 `json:"status"`
-	DiskStatus    string                 `json:"disk_status"`
-	GraphStatus   string                 `json:"graph_status"`
-	Error         string                 `json:"error,omitempty"`
-	Results       []batchEditResult      `json:"results,omitempty"`
-	Summary       map[string]int         `json:"summary,omitempty"`
-	Files         []batchTransactionFile `json:"files,omitempty"`
-	StartedAt     time.Time              `json:"started_at"`
-	CompletedAt   *time.Time             `json:"completed_at,omitempty"`
-	Recovered     bool                   `json:"recovered,omitempty"`
+	AckMode            string                 `json:"ack_mode,omitempty"`
+	Version            int                    `json:"version"`
+	CheckoutGeneration int64                  `json:"checkout_generation,omitempty"`
+	HeadRef            string                 `json:"checkout_head_ref,omitempty"`
+	HeadCommit         string                 `json:"checkout_head_commit,omitempty"`
+	HeadTree           string                 `json:"checkout_head_tree,omitempty"`
+	CheckoutID         string                 `json:"checkout_id,omitempty"`
+	Incarnation        string                 `json:"checkout_incarnation,omitempty"`
+	CheckoutRoot       string                 `json:"checkout_root,omitempty"`
+	RootIdentity       string                 `json:"checkout_root_identity,omitempty"`
+	TransactionID      string                 `json:"transaction_id"`
+	Fingerprint        string                 `json:"fingerprint"`
+	Status             string                 `json:"status"`
+	DiskStatus         string                 `json:"disk_status"`
+	GraphStatus        string                 `json:"graph_status"`
+	Error              string                 `json:"error,omitempty"`
+	Results            []batchEditResult      `json:"results,omitempty"`
+	Summary            map[string]int         `json:"summary,omitempty"`
+	Files              []batchTransactionFile `json:"files,omitempty"`
+	StartedAt          time.Time              `json:"started_at"`
+	CompletedAt        *time.Time             `json:"completed_at,omitempty"`
+	Recovered          bool                   `json:"recovered,omitempty"`
 }
 
 type batchTransactionState struct {
@@ -83,8 +95,14 @@ type batchTransactionState struct {
 	done        chan struct{}
 	doneOnce    sync.Once
 	graphMu     sync.Mutex
+	recoveryMu  sync.Mutex
 	mu          sync.RWMutex
 	receipt     batchTransactionReceipt
+	// A scalar reference only: the bounded mutation ledger owns timing data.
+	// This is neither durable journal metadata nor a pointer to an RPC history.
+	acknowledgementReceipt string
+	// Scalar only; never persisted or reconstructed from durable journal state.
+	projectionCommitSeq uint64
 }
 
 // cloneBatchReceipt returns a receipt that shares no slice or map storage with
@@ -281,7 +299,7 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 				}
 				plan.file = plan.node.FilePath
 				if plan.node.StartLine == 0 || plan.node.EndLine == 0 {
-					plan.err = "symbol has no line range"
+					plan.err = externalRefusal(plan.node, edit.SymbolID, "symbol has no line range")
 					break
 				}
 				if resolvePaths {
@@ -301,6 +319,16 @@ func (s *Server) planBatchTransaction(ctx context.Context, edits []batchEditItem
 			}
 		default:
 			plan.err = fmt.Sprintf("unsupported batch edit op %q", plan.op)
+		}
+		if plan.err == "" {
+			for _, path := range []string{plan.absPath, plan.destinationPath} {
+				if path != "" {
+					if err := guardCheckoutMutationPath(ctx, path); err != nil {
+						plan.err = err.Error()
+						break
+					}
+				}
+			}
 		}
 		plans = append(plans, plan)
 	}
@@ -542,7 +570,7 @@ func (s *Server) guardBatchLifecycleDestination(ctx context.Context, absPath str
 			return nil
 		case statErr != nil:
 			return fmt.Errorf("could not inspect move destination %s: %w", current, statErr)
-		case info.Mode()&os.ModeSymlink != 0:
+		case pathguard.IsLink(current, info):
 			return fmt.Errorf("move destination contains symlink component %s", current)
 		}
 	}
@@ -614,6 +642,9 @@ func (s *Server) readBatchBuffers(ctx context.Context, plans []plannedBatchEdit)
 	add := func(path, relPath string) error {
 		if _, exists := buffers[path]; exists {
 			return nil
+		}
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return err
 		}
 		buffer := &batchFileBuffer{absPath: path, relPath: relPath, mode: 0o644, existenceSet: true}
 		info, content, err := batchPathBytes(path, relPath)
@@ -836,6 +867,11 @@ func batchAliasedPathPairs(paths []string, followed func(string) os.FileInfo) []
 }
 
 func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, error) {
+	// Same UTF-16 refusal as edit_file: the match below would fail with
+	// a misleading "not found" against NUL-interleaved bytes (#846).
+	if indexer.LooksUTF16Source(content) {
+		return nil, false, refuseUTF16Edit("batch edit_file", edit.Path)
+	}
 	fileStr := string(content)
 	matches := findEOLMatches(fileStr, edit.OldString)
 	if matches.count == 0 {
@@ -866,6 +902,12 @@ func applyBatchFileToContent(edit batchEditItem, content []byte) ([]byte, bool, 
 }
 
 func applyBatchSymbolToContent(edit batchEditItem, node *graph.Node, content []byte) ([]byte, bool, error) {
+	// A UTF-16 file's text is NUL-interleaved, so the match would fail
+	// with a misleading "old_source not found"; the batch refuses with
+	// the same message the single edit tools use (#846).
+	if indexer.LooksUTF16Source(content) {
+		return nil, false, refuseUTF16Edit("batch edit_symbol", node.FilePath)
+	}
 	fileStr := string(content)
 	lines := strings.Split(fileStr, "\n")
 	regionMatches := findEOLMatches(fileStr, edit.OldSource)
@@ -983,13 +1025,42 @@ func applyBatchPlans(plans []plannedBatchEdit, buffers map[string]*batchFileBuff
 	return results, -1, nil
 }
 
-func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem, requestedID string) (batchTransactionReceipt, error) {
+// Rebind symbol plans to the original bytes actually captured under the whole
+// path lock, before any coordinated item changes a working buffer. A repeated
+// fragment at a stale range is not proof that the requested declaration still
+// exists. Keep the graph's shared nodes immutable and the existing within-batch
+// ordering/fallback behavior on these private plan copies.
+func (s *Server) locateBatchSymbolsUnderLock(ctx context.Context, plans []plannedBatchEdit, buffers map[string]*batchFileBuffer) (int, error) {
+	for i := range plans {
+		plan := &plans[i]
+		if plan.op != "edit_symbol" {
+			continue
+		}
+		buffer := buffers[plan.absPath]
+		if buffer == nil || !buffer.existsBefore {
+			return i, errors.New("symbol file does not exist")
+		}
+		if indexer.LooksUTF16Source(buffer.original) {
+			return i, refuseUTF16Edit("batch edit_symbol", plan.node.FilePath)
+		}
+		start, end, err := s.symbolLinesUnderLock(ctx, plan.node, plan.absPath, buffer.original)
+		if err != nil {
+			return i, fmt.Errorf("locate %s before batch commit: %w", plan.edit.SymbolID, err)
+		}
+		current := *plan.node
+		current.StartLine, current.EndLine = start, end
+		plan.node = &current
+	}
+	return -1, nil
+}
+
+func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem, requestedID string) (result batchTransactionReceipt, retErr error) {
 	fingerprint := batchEditFingerprint(edits)
 	transactionID, err := normalizeBatchTransactionID(requestedID, fingerprint)
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
-	state, action, err := s.loadOrCreateBatchTransaction(transactionID, fingerprint)
+	state, action, err := s.loadOrCreateBatchTransaction(ctx, transactionID, fingerprint)
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
@@ -1000,10 +1071,23 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		s.recoverBatchTransaction(ctx, state)
 		return state.snapshot(), nil
 	case "refresh_graph":
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraph(ctx, state)
 		return state.snapshot(), nil
 	}
+	s.bindBatchAcknowledgement(ctx, state)
+	var fileObservations map[string]*mutationCommitRecord
 
+	// Only the original new transaction owns source effects. Duplicate/status
+	// and recovery replies above must not count another logical edit. This
+	// defer stays on the actual handler, including non-cancellable commits
+	// that finish after its caller has received a deadline response.
+	defer func() {
+		for _, observation := range fileObservations {
+			s.finishBatchFileObservation(observation, result)
+		}
+		committed := result.Status == "committed" && result.DiskStatus == "committed"
+		observeEditSourceTerminal(ctx, committed, committed && (result.Error != "" || retErr != nil), result.DiskStatus == "rolled_back")
+	}()
 	receipt := state.snapshot()
 	plans := s.planBatchTransaction(ctx, edits, true)
 	for i, plan := range plans {
@@ -1020,7 +1104,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			paths = append(paths, plan.destinationPath)
 		}
 	}
-	release, lockErr := acquireMutationPaths(ctx, paths)
+	ctx, release, lockErr := acquireMutationPaths(ctx, paths)
 	if lockErr != nil {
 		receipt.Results = batchFailureResults(plans, 0, "edit cancelled while waiting for exclusive file access: "+lockErr.Error())
 		receipt.Summary = batchSummary(receipt.Results)
@@ -1039,12 +1123,18 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		receipt.Summary = batchSummary(receipt.Results)
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", readErr.Error()), nil
 	}
+	if failed, err := s.locateBatchSymbolsUnderLock(ctx, plans, buffers); err != nil {
+		receipt.Results = batchFailureResults(plans, failed, err.Error())
+		receipt.Summary = batchSummary(receipt.Results)
+		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
+	}
 	results, _, applyErr := applyBatchPlans(plans, buffers)
 	receipt.Results = results
 	receipt.Summary = batchSummary(results)
 	if applyErr != nil {
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", applyErr.Error()), nil
 	}
+	preparedProjections := s.prepareBatchProjections(ctx, buffers, orderedPaths)
 	if err := s.prepareBatchJournal(&receipt, buffers, orderedPaths); err != nil {
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "could not persist transaction journal: "+err.Error()), nil
 	}
@@ -1054,20 +1144,27 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 		return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", "edit cancelled before commit: "+err.Error()), nil
 	}
 
+	if mutation := checkoutMutationFromContext(ctx); mutation != nil {
+		if err := mutation.mutation.Prepare(ctx); err != nil {
+			return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
+		}
+	}
+
+	if mutation := checkoutMutationFromContext(ctx); mutation != nil {
+		if authority, ok := mutation.mutation.(checkoutBatchAuthority); ok {
+			receipt.CheckoutGeneration, receipt.HeadRef, receipt.HeadCommit, receipt.HeadTree = authority.BatchAuthority()
+		}
+		if err := s.persistBatchManifest(receipt); err != nil {
+			return s.finishBatchTransaction(state, receipt, "aborted", "unchanged", "not_started", err.Error()), nil
+		}
+		state.publish(receipt, false)
+	}
+
 	// Commit is deliberately non-cancellable. Once the first rename succeeds,
 	// every remaining write or rollback must run to a terminal disk state.
-	writer := s.batchDurability().writeFile
-	remover := s.batchDurability().removeFile
-	if s.batchWriteOverride != nil {
-		// Preserve the target-only fault-injection seam used by commit tests;
-		// journal and rollback writes always retain the durability discipline.
-		writer = s.batchWriteOverride
-	}
-	if s.batchRemoveOverride != nil {
-		remover = s.batchRemoveOverride
-	}
+	fileObservations = s.beginBatchFileObservations(ctx, receipt, buffers, orderedPaths)
 	finishCommitFailure := func(failedPath, message string) batchTransactionReceipt {
-		status, rollbackErr := s.rollbackBatchReceipt(receipt)
+		status, rollbackErr := s.rollbackBatchReceipt(receipt, ctx)
 		if rollbackErr != nil {
 			message += "; " + rollbackErr.Error()
 		}
@@ -1088,35 +1185,44 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			continue
 		}
 		var commitErr error
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return finishCommitFailure(buffer.relPath, err.Error()), nil
+		}
 		if !buffer.existsBefore {
 			if targetErr := s.validateBatchCreateTarget(ctx, path, buffer.relPath); targetErr != nil {
 				commitErr = targetErr
 			} else {
-				commitErr = writer(path, buffer.content, buffer.mode)
+				_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservations[path]})
 			}
 		} else {
-			commitErr = writer(path, buffer.content, buffer.mode)
+			_, commitErr = s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, buffer.content, buffer.mode, sourceMutationOperation{kind: batchForwardWrite, observation: fileObservations[path]})
 		}
 		if commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
 			return finishCommitFailure(buffer.relPath, message), nil
 		}
+		observeEditSourceReplacement(ctx, buffer.original, buffer.content, buffer.existsBefore, true)
 	}
 	for _, path := range orderedPaths {
 		buffer := buffers[path]
 		if buffer.existsAfter {
 			continue
 		}
-		if commitErr := remover(path); commitErr != nil {
+		if err := guardCheckoutMutationPath(ctx, path); err != nil {
+			return finishCommitFailure(buffer.relPath, err.Error()), nil
+		}
+		if _, commitErr := s.commitFileMutation(ctx, "batch_edit", "", "", buffer.relPath, path, nil, 0, sourceMutationOperation{kind: batchForwardRemove}); commitErr != nil {
 			message := fmt.Sprintf("could not commit %s: %v", buffer.relPath, commitErr)
 			return finishCommitFailure(buffer.relPath, message), nil
 		}
+		observeEditSourceEffect(ctx, buffer.existsBefore, true)
 	}
-	if syncErr := s.syncBatchDirectories(batchPathDirectories(orderedPaths)...); syncErr != nil {
+	if syncErr := s.syncAcknowledgedBatchDirectories(ctx, batchPathDirectories(orderedPaths)...); syncErr != nil {
 		failedPath := buffers[orderedPaths[len(orderedPaths)-1]].relPath
 		message := "could not persist committed files: " + syncErr.Error()
 		return finishCommitFailure(failedPath, message), nil
 	}
+	observeEditSourceComplete(ctx) // all forward effects and directory durability completed
 
 	for i := range receipt.Results {
 		receipt.Results[i].Status = "applied"
@@ -1127,7 +1233,11 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 	if persistErr := s.persistBatchManifest(receipt); persistErr != nil {
 		receipt.Error = "disk committed; terminal journal update failed: " + persistErr.Error()
 	}
+	s.publishBatchProjections(context.WithoutCancel(ctx), state, receipt, preparedProjections)
 	state.publish(receipt, false)
+	for _, observation := range fileObservations {
+		s.finishBatchFileObservation(observation, receipt)
+	}
 
 	for _, plan := range plans {
 		session := s.sessionFor(ctx)
@@ -1139,7 +1249,7 @@ func (s *Server) runBatchTransaction(ctx context.Context, edits []batchEditItem,
 			session.recordSymbol(plan.edit.SymbolID)
 		}
 	}
-	s.refreshBatchGraph(state)
+	s.refreshBatchGraphReleasing(ctx, state, release)
 	return state.snapshot(), nil
 }
 
@@ -1166,12 +1276,18 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 		if !valid {
 			return batchTransactionReceipt{}, fmt.Errorf("invalid transaction state for %q", id)
 		}
-		if existingBatchTransactionAction(state) == "refresh_graph" {
-			s.refreshBatchGraph(state)
+		if err := s.validateBatchCheckout(ctx, state.snapshot()); err != nil {
+			return batchTransactionReceipt{}, err
+		}
+		switch existingBatchTransactionAction(state) {
+		case "refresh_graph":
+			s.refreshBatchGraph(ctx, state)
+		case "recover":
+			s.recoverBatchTransaction(ctx, state)
 		}
 		return state.snapshot(), nil
 	}
-	state, action, err := s.loadOrCreateBatchTransaction(id, "")
+	state, action, err := s.loadOrCreateBatchTransaction(ctx, id, "")
 	if err != nil {
 		return batchTransactionReceipt{}, err
 	}
@@ -1179,30 +1295,83 @@ func (s *Server) batchTransactionStatus(ctx context.Context, transactionID strin
 	case "recover":
 		s.recoverBatchTransaction(ctx, state)
 	case "refresh_graph":
-		s.refreshBatchGraph(state)
+		s.refreshBatchGraph(ctx, state)
 	}
 	return state.snapshot(), nil
 }
 
-func (s *Server) beginBatchGraphRefresh(absPath string) mutationReindexOutcome {
-	ctx := context.Background()
+// Compatibility entry for callers which do not own a source frontier.
+func (s *Server) beginBatchGraphRefresh(observationCtx context.Context, absPath string, transaction batchTransactionReceipt) mutationReindexOutcome {
+	admission := s.admitBatchGraphRefresh(observationCtx, absPath, transaction)
+	if admission.inlinePath != "" {
+		return mutationReindexOutcome{Reindexed: s.reindexFile(admission.inlinePath)}
+	}
+	return admission.immediate
+}
+
+func (s *Server) admitBatchGraphRefresh(observationCtx context.Context, absPath string, transaction batchTransactionReceipt) sourceMutationAdmission {
+	ctx := context.Background() // preserve the original scheduler's lifetime
 	if watcher := s.currentWatcher(); watcher != nil {
 		if scheduler, ok := watcher.(mutationScheduler); ok {
-			ticket, err := scheduler.EnqueueFileMutation(ctx, absPath)
+			lap := s.beginAcknowledgementLap(observationCtx, editAckTicketAdmission)
+			var record *mutationCommitRecord
+			if editAcknowledgementFrom(observationCtx, s) != nil {
+				record = s.batchPublicationObservation(transaction, absPath)
+			}
+			var publication *indexer.PublicationPhaseRecord
+			if record != nil {
+				publication = s.openOwnedPublicationRecord(observationCtx, record)
+			}
+			ticket, err := scheduler.EnqueueToolMutation(indexer.WithPublicationRecord(ctx, publication), absPath)
+			lap.finish()
 			if err != nil {
-				return mutationReindexOutcome{Err: err}
+				return sourceMutationAdmission{immediate: mutationReindexOutcome{Err: err}}
 			}
 			if ticket != nil {
 				receipt := s.trackMutationTicket(ticket)
-				return receipt.outcome(true)
+				s.bindBatchFilePublication(record, receipt.outcome(true))
+				s.bindReadRepairAdmission(absPath, ticket.PublicationRecord, receipt)
+				return sourceMutationAdmission{immediate: receipt.outcome(true)}
 			}
 		}
 	}
-	return mutationReindexOutcome{Reindexed: s.reindexFile(absPath)}
+	return sourceMutationAdmission{inlinePath: absPath}
 }
 
-func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
+// batchReceiptsPublished closes once every tracked receipt of files has
+// published, so a passive wait still queued for slow-lane capacity can stop
+// queueing: nothing is left to wait for. It stops watching when ctx ends.
+func (s *Server) batchReceiptsPublished(ctx context.Context, files []batchTransactionFile) <-chan struct{} {
+	var receipts []*mutationReceipt
+	for _, file := range files {
+		if file.ReindexReceipt == "" {
+			continue
+		}
+		if value, ok := s.mutationReceipts.Load(file.ReindexReceipt); ok {
+			if receipt, ok := value.(*mutationReceipt); ok {
+				receipts = append(receipts, receipt)
+			}
+		}
+	}
+	published := make(chan struct{})
+	go func() {
+		for _, receipt := range receipts {
+			select {
+			case <-receipt.done:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(published)
+	}()
+	return published
+}
+
+func (s *Server) waitBatchGraphReceipts(ctx context.Context, files []batchTransactionFile) {
 	deadline := time.Now().Add(s.mutationWaitDuration())
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	var resumeIntent func()
 	for _, file := range files {
 		if file.ReindexReceipt == "" {
 			continue
@@ -1223,9 +1392,33 @@ func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
 		if remaining <= 0 {
 			return
 		}
+		waitLap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+		if resumeIntent == nil {
+			// All disk writes and admissions (including synchronous fallback)
+			// finished before this passive wait. Restore ordinary priority
+			// before the caller persists the durable receipt.
+			resumeIntent = suspendSourceMutationWriteIntent(ctx)
+			defer resumeIntent()
+			// Only waiting from here on: let other requests use this
+			// dispatch slot. Publications that all land first need none.
+			if !s.releaseDispatchSlotForWait(waitCtx, s.batchReceiptsPublished(waitCtx, files)) {
+				waitLap.finish()
+				return
+			}
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			waitLap.finish()
+			return
+		}
 		timer := time.NewTimer(remaining)
+		// Preserve the bounded post-commit wait after successful admission,
+		// even if the caller canceled while committing. Already-admitted
+		// publication can still make this durable receipt fresh. The slow-lane
+		// admission above remains cancellation-aware and can leave it pending.
 		select {
 		case <-receipt.done:
+			waitLap.finish()
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -1233,12 +1426,36 @@ func (s *Server) waitBatchGraphReceipts(files []batchTransactionFile) {
 				}
 			}
 		case <-timer.C:
+			waitLap.finish()
 			return
 		}
 	}
 }
 
-func (s *Server) refreshBatchGraph(state *batchTransactionState) {
+func (s *Server) refreshBatchGraph(ctx context.Context, state *batchTransactionState) {
+	s.refreshBatchGraphReleasing(ctx, state, func() {})
+}
+
+// Original forward path ownership ends only after the full durable frontier
+// has been admitted. Publication/inline compatibility work cannot retain it.
+func (s *Server) refreshBatchGraphReleasing(ctx context.Context, state *batchTransactionState, releasePaths func()) {
+	defer releasePaths()
+	// Acquire checkout authority before graphMu, matching the initial commit
+	// and prepared recovery. Waiting for a lease while holding graphMu would
+	// deadlock a committer that owns that lease and is admitting its ticket.
+	var admissionErr error
+	initial := state.snapshot()
+	if initial.CheckoutID != "" && initial.Status == "committed" && initial.GraphStatus != "fresh" {
+		live := false
+		if len(initial.Files) > 0 && initial.Files[0].ReindexReceipt != "" {
+			_, live = s.mutationReceiptState(initial.Files[0].ReindexReceipt)
+		}
+		if !live {
+			var release func()
+			ctx, release, admissionErr = s.acquireBatchRecovery(ctx, initial)
+			defer release()
+		}
+	}
 	state.graphMu.Lock()
 	defer state.graphMu.Unlock()
 
@@ -1252,9 +1469,73 @@ func (s *Server) refreshBatchGraph(state *batchTransactionState) {
 		return
 	}
 
+	if receipt.CheckoutID != "" {
+		s.refreshCheckoutBatchGraph(ctx, state, receipt, admissionErr)
+		return
+	}
 	outcomes := make(map[string]mutationReindexOutcome, len(receipt.Files))
+	var inlinePaths []string
+	// A durable transaction readmits its complete frontier after any receipt loss.
+	// Live receipt sets retain their original status and generation identities.
+	needsAdmission := false
+	for _, file := range receipt.Files {
+		if _, live := s.mutationReceiptState(file.ReindexReceipt); file.ReindexReceipt == "" || !live {
+			needsAdmission = true
+			break
+		}
+	}
+	if needsAdmission && len(receipt.Files) > 1 {
+		if scheduler, ok := s.currentWatcher().(mutationSetScheduler); ok {
+			paths := make([]string, 0, len(receipt.Files))
+			for _, file := range receipt.Files {
+				paths = append(paths, file.Path)
+			}
+			// Only original retained forward writes can enter the set carrier.
+			// Recovery/status has no original acknowledgement and cannot mint clocks.
+			records := make(map[string]*indexer.PublicationPhaseRecord, len(paths))
+			observations := make(map[string]*mutationCommitRecord, len(paths))
+			if editAcknowledgementFrom(ctx, s) != nil {
+				for _, path := range paths {
+					if record := s.batchPublicationObservation(receipt, path); record != nil {
+						observations[path] = record
+						records[path] = s.openOwnedPublicationRecord(ctx, record)
+					}
+				}
+			}
+			lap := s.beginAcknowledgementLap(ctx, editAckTicketAdmission)
+			tickets, err := scheduler.EnqueueFileMutations(indexer.WithFilePublicationRecords(context.Background(), records), paths)
+			lap.finish()
+			if err != nil {
+				for _, path := range paths {
+					outcomes[path] = mutationReindexOutcome{Err: err}
+				}
+			} else if tickets != nil {
+				// Validate the returned coverage before attaching receipt identities.
+				for _, path := range paths {
+					if tickets[filepath.Clean(path)] == nil {
+						err = errors.New("mutation set scheduler returned incomplete coverage")
+						break
+					}
+				}
+				for _, path := range paths {
+					if err != nil {
+						outcomes[path] = mutationReindexOutcome{Err: err}
+						continue
+					}
+					tracked := s.trackMutationTicket(tickets[filepath.Clean(path)])
+					outcomes[path] = tracked.outcome(true)
+					s.bindBatchFilePublication(observations[path], outcomes[path])
+				}
+			}
+		}
+	}
 	for i := range receipt.Files {
 		file := &receipt.Files[i]
+		if outcome, admitted := outcomes[file.Path]; admitted {
+			file.ReindexReceipt = outcome.Receipt
+			file.ReindexGeneration = outcome.Generation
+			continue
+		}
 		if file.ReindexReceipt != "" {
 			if outcome, ok := s.mutationReceiptState(file.ReindexReceipt); ok {
 				outcomes[file.Path] = outcome
@@ -1265,15 +1546,45 @@ func (s *Server) refreshBatchGraph(state *batchTransactionState) {
 			file.ReindexReceipt = ""
 			file.ReindexGeneration = 0
 		}
-		outcome := s.beginBatchGraphRefresh(file.Path)
+		admission := s.admitBatchGraphRefresh(ctx, file.Path, receipt)
+		if admission.inlinePath != "" {
+			inlinePaths = append(inlinePaths, admission.inlinePath)
+		}
+		outcome := admission.immediate
 		outcomes[file.Path] = outcome
 		file.ReindexReceipt = outcome.Receipt
 		file.ReindexGeneration = outcome.Generation
 	}
 
+	releasePaths()
+	for _, path := range inlinePaths {
+		outcomes[path] = mutationReindexOutcome{Reindexed: s.reindexFile(path)}
+	}
+
 	// Admit the entire file set before waiting. The bounded wait is shared by
 	// the batch, rather than multiplied by the number of files.
-	s.waitBatchGraphReceipts(receipt.Files)
+	policy := s.sourceAckPolicy(ctx)
+	// A journal captures the original transaction choice; manifests from
+	// before the option existed retain the historical full policy.
+	policy.mode = config.EditAckFull
+	if receipt.AckMode == string(config.EditAckLocal) {
+		policy.mode = config.EditAckLocal
+	}
+	if policy.freshness.requireFresh {
+		paths := make([]string, 0, len(receipt.Files))
+		for _, file := range receipt.Files {
+			paths = append(paths, file.Path)
+		}
+		_ = s.awaitSourceAckTier(ctx, policy, paths, s.batchReceiptsPublished(ctx, receipt.Files))
+	} else if !policy.local() {
+		s.waitBatchGraphReceipts(ctx, receipt.Files)
+	} else {
+		// This executed local policy deliberately performs neither wait.
+		// Record applicability, never a synthetic zero-duration wait.
+		lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+		lap.applicable = false
+		lap.finish()
+	}
 	graphStatus := "fresh"
 	for i := range receipt.Files {
 		file := &receipt.Files[i]
@@ -1359,14 +1670,16 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 	statusOnly, _ := args["status_only"].(bool)
 	rawEdits, hasEdits := args["edits"]
 	if statusOnly || !hasEdits || rawEdits == nil {
+		s.noteAcknowledgementParser(ctx, "not_applicable_text_splice")
 		receipt, err := s.batchTransactionStatus(ctx, transactionID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		response := s.batchProjectionResponse(receipt)
 		if isCompact(req) {
-			return mcp.NewToolResultText(fmt.Sprintf("%s %s disk=%s graph=%s\n", receipt.TransactionID, receipt.Status, receipt.DiskStatus, receipt.GraphStatus)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("%s %s disk=%s graph=%s\n", receipt.TransactionID, receipt.Status, receipt.DiskStatus, receipt.GraphStatus) + response.referenceLine()), nil
 		}
-		return s.respondJSONOrTOON(ctx, req, receipt)
+		return s.respondJSONOrTOON(ctx, req, response)
 	}
 
 	edits, err := parseBatchEdits(rawEdits)
@@ -1377,6 +1690,7 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("edits array is empty"), nil
 	}
 	if dryRun, _ := args["dry_run"].(bool); dryRun {
+		s.noteAcknowledgementParser(ctx, "not_applicable_text_splice")
 		// Paths are resolved exactly as the commit resolves them, symbol edits
 		// included: without that a symbol edit has no path, and the rules that
 		// compare paths — lifecycle overlap, then aliasing — see a shorter
@@ -1428,6 +1742,7 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	response := s.batchProjectionResponse(receipt)
 	if isCompact(req) {
 		var out strings.Builder
 		fmt.Fprintf(&out, "%s %s disk=%s graph=%s\n", receipt.TransactionID, receipt.Status, receipt.DiskStatus, receipt.GraphStatus)
@@ -1438,7 +1753,8 @@ func (s *Server) handleAtomicBatchEdit(ctx context.Context, req mcp.CallToolRequ
 			}
 			fmt.Fprintf(&out, "%s %s %s\n", result.Op, target, result.Status)
 		}
+		out.WriteString(response.referenceLine())
 		return mcp.NewToolResultText(out.String()), nil
 	}
-	return s.respondJSONOrTOON(ctx, req, receipt)
+	return s.respondJSONOrTOON(ctx, req, response)
 }

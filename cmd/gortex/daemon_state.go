@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,9 @@ type daemonState struct {
 	indexer       *indexer.Indexer
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
+	// contractAnalysis is the daemon config's contract_analysis block, read
+	// from the same file as its views block.
+	contractAnalysis config.ContractAnalysisConfig
 	// lifecycle is the shared owner of checkout lifecycle side effects —
 	// track, forget, reload, the periodic sweep. The controller, the MCP
 	// tools and the janitor all drive this one instance.
@@ -71,17 +75,35 @@ type daemonState struct {
 	// teardown chain (savings flush, backend close) at daemon shutdown.
 	shared *serverstack.SharedServer
 
+	// basePublisher publishes each dedicated repository's initial committed
+	// base once that repository's warmup index is complete. It is held here
+	// because warmup is where the per-repository completion signal is, and
+	// because a test needs to join the publications the daemon started.
+	// nil when the stack installed no publisher runtime.
+	basePublisher *indexer.InitialBasePublisher
+
 	// backendPath is the graph store file this daemon actually opened, with
 	// --backend-path already resolved. Published in the daemon's runtime
 	// record so out-of-band readers (`gortex repos`) can find the same store
 	// instead of assuming the platform default.
 	backendPath string
+	// migratedStore is scoped to this open/boot, not persisted. A migration
+	// gets one complete re-index/enrichment boot before VACUUM is reconsidered.
+	migratedStore bool
 }
+
+// buildDaemonStateForStart keeps the foreground startup boundary injectable for
+// owned-process migration/listener regressions. Production uses the same builder.
+var buildDaemonStateForStart = buildDaemonState
 
 // buildDaemonState builds the daemon's stack through the shared
 // serverstack constructor and returns the long-lived daemonState the
 // warmup loop and controller share.
 func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
+	return buildDaemonStateWithUpgradeCheckpoint(logger, nil, observers...)
+}
+
+func buildDaemonStateWithUpgradeCheckpoint(logger *zap.Logger, checkpoint func(string, int), observers ...store_sqlite.MigrationObserver) (*daemonState, error) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -96,7 +118,16 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 	if len(observers) > 0 {
 		migrationObserver = observers[0]
 	}
-	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
+	migrated := false
+	observeMigration := func(progress store_sqlite.MigrationProgress) {
+		if progress.Phase == store_sqlite.MigrationStarted {
+			migrated = true
+		}
+		if migrationObserver != nil {
+			migrationObserver(progress)
+		}
+	}
+	sharedConfig := serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
 		Backend:           daemonBackend,
 		BackendPath:       daemonBackendPath,
@@ -104,7 +135,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 		Global:            gc,
 		Logger:            logger,
 		Version:           version,
-		MigrationObserver: migrationObserver,
+		MigrationObserver: observeMigration,
 		Embedder: serverstack.EmbedderRequest{
 			FlagChanged: daemonEmbeddingsChanged,
 			FlagEnabled: daemonEmbeddings,
@@ -120,38 +151,63 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 			NotesRepo:    "daemon",
 			NotebookPath: filepath.Join(platform.DataDir(), "notebook-cache"),
 		},
-	})
+	}
+	configureDaemonUpgradeCheckpoint(&sharedConfig, checkpoint)
+	ss, err := serverstack.NewSharedServer(sharedConfig)
 	if err != nil {
 		return nil, fmt.Errorf("build server stack: %w", err)
 	}
 
-	return &daemonState{
+	state := &daemonState{
 		graph:               ss.Graph,
 		indexer:             ss.Indexer,
 		multiIndexer:        ss.MultiIndexer,
 		configManager:       ss.ConfigMgr,
+		contractAnalysis:    cfg.ContractAnalysis,
 		lifecycle:           ss.CheckoutLifecycle,
 		mcpServer:           ss.MCP,
 		overlays:            ss.Overlays,
 		shared:              ss,
 		backendPath:         ss.StorePath,
+		migratedStore:       migrated || storeNeedsRebuild(ss.Graph),
 		resolverLSPRegistry: ss.ResolverLSPRegistry,
 		lspRouter:           ss.LSPRouter,
-	}, nil
+	}
+	// Bind the initial committed-base publisher to the runtime NewSharedServer
+	// installed. Constructing it here publishes nothing: warmup schedules one
+	// publication per repository once that repository's generation-0 index is
+	// complete. A stack without the runtime (a non-sqlite backend, or no
+	// MultiIndexer at all) has nothing to publish under, and the daemon runs
+	// exactly as it did before.
+	if state.lifecycle != nil {
+		publisher, perr := indexer.NewInitialBasePublisher(state.lifecycle)
+		if perr != nil {
+			logger.Warn("daemon: no committed-base publisher; dedicated bases stay unpublished", zap.Error(perr))
+		} else {
+			state.basePublisher = publisher
+		}
+	}
+	return state, nil
 }
 
 const daemonStartupHeartbeatInterval = 2 * time.Second
 
 type daemonStartupReporter struct {
-	mu       sync.Mutex
-	state    daemon.RuntimeState
-	logger   *zap.Logger
-	stop     chan struct{}
-	done     chan struct{}
-	stopOnce sync.Once
+	mu         sync.Mutex
+	state      daemon.RuntimeState
+	logger     *zap.Logger
+	stop       chan struct{}
+	done       chan struct{}
+	stopOnce   sync.Once
+	closing    atomic.Bool
+	writeState func(daemon.RuntimeState) error
 }
 
 func newDaemonStartupReporter(logger *zap.Logger) *daemonStartupReporter {
+	return newDaemonStartupReporterWithWriter(logger, daemon.WriteRuntimeState)
+}
+
+func newDaemonStartupReporterWithWriter(logger *zap.Logger, write func(daemon.RuntimeState) error) *daemonStartupReporter {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -161,9 +217,10 @@ func newDaemonStartupReporter(logger *zap.Logger) *daemonStartupReporter {
 			StartupPhase:     daemon.StartupOpeningStore,
 			StartupStartedAt: now,
 		},
-		logger: logger,
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
+		logger:     logger,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		writeState: write,
 	}
 	r.publishLocked()
 	go r.heartbeat()
@@ -204,16 +261,38 @@ func (r *daemonStartupReporter) ObserveMigration(progress store_sqlite.Migration
 		r.logger.Info("daemon: schema migration complete",
 			zap.Int("version", progress.Version), zap.String("name", progress.Name),
 			zap.Duration("elapsed", progress.Elapsed))
-		r.state.StartupPhase = daemon.StartupOpeningStore
-		r.state.MigrationVersion = 0
-		r.state.MigrationName = ""
+		// A step finishes before its transaction commits and before Open
+		// recreates indexes and stamps the schema. Keep the upgrade refusal
+		// phase until the successful builder return records StoreOpened.
 	case store_sqlite.MigrationFailed:
 		r.logger.Error("daemon: schema migration failed",
 			zap.Int("version", progress.Version), zap.String("name", progress.Name),
 			zap.Duration("elapsed", progress.Elapsed), zap.Error(progress.Error))
 		r.state.StartupPhase = daemon.StartupFailed
 		r.state.StartupError = boundedStartupError(progress.Error)
+	case store_sqlite.MigrationBackupCreated:
+		r.logger.Info("daemon: backed up the store before its schema upgrade",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail),
+			zap.Duration("elapsed", progress.Elapsed))
+	case store_sqlite.MigrationBackupKept:
+		r.logger.Info("daemon: kept the existing pre-upgrade store backup",
+			zap.Int("from_version", progress.Version), zap.String("backup", progress.Detail))
+	case store_sqlite.MigrationBackupSkipped:
+		r.logger.Warn("daemon: upgrading the store schema without a backup",
+			zap.Int("from_version", progress.Version), zap.String("reason", progress.Detail))
 	}
+	r.publishLocked()
+}
+
+// StoreOpened records successful completion of the actual daemon store builder,
+// after commit, index recreation and schema stamping. Remaining runtime wiring
+// retains the ordinary opening_store phase until Serving.
+func (r *daemonStartupReporter) StoreOpened() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.StartupPhase = daemon.StartupOpeningStore
+	r.state.MigrationVersion = 0
+	r.state.MigrationName = ""
 	r.publishLocked()
 }
 
@@ -236,25 +315,52 @@ func (r *daemonStartupReporter) Serving(backendPath string) {
 	r.publishLocked()
 }
 
-func (r *daemonStartupReporter) Stop() {
+// Cancel closes publication admission without acquiring the publication mutex
+// or waiting for a filesystem write already in progress.
+func (r *daemonStartupReporter) Cancel() {
+	r.closing.Store(true)
 	r.stopOnce.Do(func() { close(r.stop) })
+}
+
+func (r *daemonStartupReporter) Stop() {
+	r.Cancel()
 	<-r.done
+	// Serving/Fail/migration publication may have been admitted independently
+	// of the heartbeat. Retain its actual completion before runtime removal.
+	r.mu.Lock()
+	r.mu.Unlock() //nolint:staticcheck // Join the actual admitted publication before runtime removal; cancellation alone is not completion.
 }
 
 func (r *daemonStartupReporter) publishLocked() {
-	if err := daemon.WriteRuntimeState(r.state); err != nil && r.logger != nil {
+	if r.closing.Load() {
+		return
+	}
+	if err := r.writeState(r.state); err != nil && r.logger != nil {
 		r.logger.Warn("daemon: could not record startup state", zap.Error(err))
 	}
 }
+
+// startupFailedMessage is the recorded reason for every startup failure that
+// has no typed, safe rendering of its own.
+const startupFailedMessage = "startup failed; check the daemon log"
 
 func boundedStartupError(err error) string {
 	if err == nil {
 		return ""
 	}
+	// A refused store upgrade is the one failure the user has to act on
+	// before a restart can succeed, so it is recorded with its numbers. It is
+	// rendered from the typed fields only, never from the wrapped chain; the
+	// path is this daemon's own resolved store, the same value BackendPath
+	// records once it serves.
+	var short *store_sqlite.InsufficientUpgradeSpaceError
+	if errors.As(err, &short) {
+		return short.Error() + " (--backend-path starts the daemon on another volume)"
+	}
 	// Runtime state is consumed out of band and must not become a side
 	// channel for SQL text, filesystem paths, DSNs, or credentials embedded in
 	// wrapped errors. The daemon log retains the full structured error.
-	return "startup failed; check the daemon log"
+	return startupFailedMessage
 }
 
 // warmupTimings collects the per-phase costs of one warmupDaemonState run so
@@ -264,6 +370,9 @@ func boundedStartupError(err error) string {
 // already compute — those logs stay untouched; this just also keeps the
 // values around instead of discarding them.
 type warmupTimings struct {
+	// err prevents an incomplete repair from being promoted to enriched by
+	// the outer startup owner even when its context remains live.
+	err               error
 	prelude           time.Duration
 	prepareResolve    time.Duration
 	contractRehydrate time.Duration
@@ -289,19 +398,25 @@ type warmupTimings struct {
 	enrichScheduled int
 }
 
+func (w *warmupTimings) canFinalize(ctx context.Context) bool {
+	return ctx.Err() == nil && w != nil && w.err == nil
+}
+
 // warmupDeltaFrontier carries the exact file/derived frontier out of the
 // parallel reconcile pool. Any incomplete result fails closed to the existing
 // repo/global pipeline; an ordinary warm delta stays file-scoped end to end.
 type warmupDeltaFrontier struct {
-	mu    sync.Mutex
-	exact bool
-	plans map[string]indexer.DerivedInvalidationPlan
+	mu             sync.Mutex
+	exact          bool
+	plans          map[string]indexer.DerivedInvalidationPlan
+	crossRepoFiles map[string]struct{}
 }
 
 func newWarmupDeltaFrontier() *warmupDeltaFrontier {
 	return &warmupDeltaFrontier{
-		exact: true,
-		plans: make(map[string]indexer.DerivedInvalidationPlan),
+		exact:          true,
+		plans:          make(map[string]indexer.DerivedInvalidationPlan),
+		crossRepoFiles: make(map[string]struct{}),
 	}
 }
 
@@ -321,13 +436,21 @@ func (frontier *warmupDeltaFrontier) record(result *indexer.IndexResult) {
 	plan := frontier.plans[result.RepoPrefix]
 	plan.Merge(result.DerivedInvalidation)
 	frontier.plans[result.RepoPrefix] = plan
+	for _, file := range result.CrossRepoResolveFiles {
+		if file != "" {
+			frontier.crossRepoFiles[file] = struct{}{}
+		}
+	}
 }
 
 func (frontier *warmupDeltaFrontier) snapshot(changedRepos int, scopeUnknown bool) (map[string]indexer.DerivedInvalidationPlan, []string, bool) {
 	frontier.mu.Lock()
 	defer frontier.mu.Unlock()
 	plans := make(map[string]indexer.DerivedInvalidationPlan, len(frontier.plans))
-	fileSet := make(map[string]struct{})
+	fileSet := make(map[string]struct{}, len(frontier.crossRepoFiles))
+	for file := range frontier.crossRepoFiles {
+		fileSet[file] = struct{}{}
+	}
 	for prefix, plan := range frontier.plans {
 		plans[prefix] = plan
 		for _, file := range plan.Files {
@@ -424,6 +547,12 @@ func rotateColdInternGeneration(logger *zap.Logger, phase string) int {
 }
 
 func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func()) (*indexer.MultiWatcher, *warmupTimings) {
+	return warmupDaemonStateContext(context.Background(), state, logger, markReady, nil)
+}
+
+// Production supplies its daemon-owned context and watcher handoff. The
+// background wrapper above remains useful to isolated startup fixtures.
+func warmupDaemonStateContext(ctx context.Context, state *daemonState, logger *zap.Logger, markReady func(), startWatcher func(context.Context, *indexer.MultiWatcher) error) (*indexer.MultiWatcher, *warmupTimings) {
 	timings := &warmupTimings{}
 	if state == nil {
 		return nil, timings
@@ -431,9 +560,12 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	if state.multiIndexer == nil || state.configManager == nil {
 		return nil, timings
 	}
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 
 	finishPrelude := startWarmupStep(logger, "prelude")
-	ctx := progress.WithReporter(context.Background(), progress.Nop{})
+	ctx = progress.WithReporter(indexer.WithIndexOrigin(ctx, "daemon_warmup"), progress.Nop{})
 	// BeginParallelBatch / EndBatch tells every per-repo Indexer
 	// constructed inside the loop to skip both the graph-wide
 	// derivation passes (InferImplements / InferOverrides /
@@ -446,7 +578,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// batch wrapper, a 100+ repo warmup is O(R · global_size).
 	finishBatch := startWarmupStep(logger, "begin_parallel_batch")
 	state.multiIndexer.BeginParallelBatch()
+	defer func() {
+		if ctx.Err() != nil || timings.err != nil {
+			// Cancellation or failed repair must release batch mode without launching derived
+			// passes. The topology callback still joins workers and seals its
+			// coordinated bulk connection before returning.
+			state.multiIndexer.ResetBatch()
+		}
+	}()
 	finishBatch()
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 
 	// Heal any duplicate tracked-repo entries that name the same directory
 	// under a different path spelling (case, or Unicode normalisation)
@@ -457,7 +600,14 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	removedDuplicates := healDuplicateRepos(state.configManager.Global(), logger)
 	finishHeal(zap.Int("removed", removedDuplicates))
 
-	repos := state.configManager.Global().Repos
+	configuredRepos := state.configManager.Global().Repos
+	// Every configured entry reads as loading, including one that prefix
+	// resolution below skips; the settle loop after the job loop ends that one
+	// as failed with the prefix's owner. Re-announced after the duplicate heal
+	// above, which can drop a second spelling of one directory the boot-time
+	// announcement still held.
+	state.multiIndexer.ExpectRepos(configuredRepos)
+	repos := state.multiIndexer.ResolveConfiguredRepos(ctx, configuredRepos)
 
 	// Purge orphaned repo prefixes BEFORE the warmup loop re-registers the
 	// tracked repos, while the store still reflects the prior run's state. A
@@ -480,8 +630,11 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		if purger, ok := state.graph.(interface{ PurgeRepo(string) error }); ok {
 			orphanSupported = true
 			finishScan := startWarmupStep(logger, "orphan_prefix_scan", zap.Int("repos", len(repos)))
-			known := make([]string, 0, len(repos))
-			for _, entry := range repos {
+			// A rejected collision still names a configured prefix, not an orphan.
+			knownRepos := append([]config.RepoEntry(nil), state.configManager.Global().Repos...)
+			knownRepos = append(knownRepos, repos...)
+			known := make([]string, 0, len(knownRepos))
+			for _, entry := range knownRepos {
 				p := strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
 				if p != "" {
 					known = append(known, p)
@@ -491,8 +644,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			orphanCount = len(orphans)
 			finishScan(zap.Int("orphans", orphanCount))
 			for _, prefix := range orphans {
+				if ctx.Err() != nil {
+					return nil, timings
+				}
 				finishPurge := startWarmupStep(logger, "orphan_prefix_purge", zap.String("repo", prefix))
-				if err := purger.PurgeRepo(prefix); err != nil {
+				purge := purger.PurgeRepo
+				if scoped, ok := state.graph.(interface {
+					PurgeRepoContext(context.Context, string) error
+				}); ok {
+					purge = func(prefix string) error { return scoped.PurgeRepoContext(ctx, prefix) }
+				}
+				if err := purge(prefix); err != nil {
 					purgeFailures++
 					finishPurge(zap.String("outcome", "error"), zap.Error(err))
 					logger.Warn("daemon: purging orphaned repo prefix failed",
@@ -509,22 +671,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 
 	finishOrphans(zap.Bool("supported", orphanSupported), zap.Int("orphans", orphanCount),
 		zap.Int("purged", purgedCount), zap.Int("failed", purgeFailures))
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 
-	// One-time store compaction, guarded (see daemon_compact.go). Placed HERE
-	// on purpose: after the orphan purge, so the pages it just freed are
-	// measured and reclaimed in the same pass; before the warmup re-index loop
-	// and the resolver/enrichment passes, whose writes would reuse freelist
-	// pages mid-measurement and whose readers would contend with VACUUM's
-	// exclusive lock. The socket is already listening (it opens before this
-	// goroutine by design), but at this point in boot the daemon's own
-	// workload is quiet and a rare early client query either finishes first or
-	// makes the VACUUM fail cleanly at busy_timeout — a skip, not a fault.
-	// Running before the socket opened instead would hold the daemon
-	// unreachable for the whole VACUUM, turning a compacting boot into an
-	// apparent hang.
-	finishCompact := startWarmupStep(logger, "store_compaction_check")
-	maybeCompactStore(state.graph, logger)
-	finishCompact()
+	// Re-index and resolver writes can reuse pages freed by the purge. Boot
+	// compaction measures again only after enrichment and the warmup producer
+	// have finished; a VACUUM must never delay this startup path.
 
 	// Register a per-repo resolver-time LSP helper for every
 	// tracked repo BEFORE the parallel warmup loop fires. The
@@ -536,6 +689,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		poolSize := lsp.ResolverPoolSizeFromEnv(1)
 		registered, skipped, tsRepos, pythonRepos := 0, 0, 0, 0
 		for _, entry := range repos {
+			if ctx.Err() != nil {
+				return nil, timings
+			}
 			finishHelper := startWarmupStep(logger, "resolver_helper", zap.String("path", entry.Path))
 			absRoot, err := filepath.Abs(entry.Path)
 			if err != nil {
@@ -635,12 +791,68 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	var changedPrefixes sync.Map
 	var scopeUnknown atomic.Bool
 	deltaFrontier := newWarmupDeltaFrontier()
+	accounting := warmupRepoAccounting{
+		changed: &changedRepos, files: &filesReindexed, unknown: &scopeUnknown,
+		prefixes: &changedPrefixes, frontier: deltaFrontier,
+	}
+	// walRetries holds repositories whose load was refused by the warmup WAL
+	// boundary. The refusal is transient — the reclaim was blocked by the other
+	// parallel loads — so they stay loading and are retried one at a time once
+	// the parallel phase has drained, instead of ending failed until restart.
+	var walRetries warmupWALRetries
+	// runRepoJob loads one repository and ends its load state, unless
+	// deferrable and the WAL boundary refused it: then the repository stays
+	// loading and is queued on walRetries. The retry (deferrable false)
+	// re-enters the record the first attempt left loading.
+	runRepoJob := func(batchCtx context.Context, entry config.RepoEntry, deferrable bool) {
+		// jobErr is what ended this repository's job, so its load state can
+		// leave "loading" with a reason.
+		var jobErr error
+		deferred := false
+		state.multiIndexer.StartRepoLoad(entry.Path)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("daemon: warmup repo panic recovered",
+					zap.String("path", entry.Path),
+					zap.Any("panic", r))
+				changedRepos.Add(1)
+				scopeUnknown.Store(true)
+				deltaFrontier.invalidate()
+				jobErr = fmt.Errorf("warmup crashed while loading this repository: %v", r)
+			}
+			if !deferred {
+				state.multiIndexer.FinishRepoLoad(entry.Path, jobErr)
+			}
+		}()
+		// Route repos the store already knows through ReconcileRepoCtx — it
+		// calls IncrementalReindexPaths, which evicts files deleted while the
+		// daemon was down and re-indexes only files whose mtime changed. Repos
+		// with no persisted mtimes (newly tracked, or first startup after a
+		// schema bump) fall back to TrackRepoCtx, which does a full walk. Both
+		// paths end with the repo registered on the MultiIndexer; contract
+		// reconciliation is deferred to the single RunGlobalResolve call below.
+		repoStart := time.Now()
+		priorMtimes := warmupPriorMtimes(state, entry, logger)
+		pathFn, loadErr := warmupLoadRepo(batchCtx, accounting, state, entry, priorMtimes, deferrable, logger)
+		jobErr = loadErr
+		if deferrable && warmupWALRetryable(batchCtx, loadErr) {
+			deferred = true
+			walRetries.add(entry, loadErr)
+		}
+		elapsed := time.Since(repoStart)
+		if elapsed > 2*time.Second {
+			logger.Info("daemon: warmup repo elapsed",
+				zap.String("path", entry.Path),
+				zap.String("path_fn", pathFn),
+				zap.Duration("elapsed", elapsed))
+		}
+	}
 	if err := state.multiIndexer.RunRepositoryTopologyBatch(ctx, func(batchCtx context.Context) error {
 		coordinatedBulk, _ := state.graph.(graph.CoordinatedBulkLoader)
 		coordinatedBulkActive := coordinatedBulk != nil && coordinatedBulk.BeginCoordinatedBulkLoad()
 		defer func() {
 			if coordinatedBulkActive {
-				if err := coordinatedBulk.EndCoordinatedBulkLoad(); err != nil {
+				if err := graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk); err != nil {
 					logger.Error("daemon: coordinated cold bulk-load cleanup failed", zap.Error(err))
 				}
 			}
@@ -650,117 +862,34 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			go func() {
 				defer wg.Done()
 				for entry := range jobs {
+					if batchCtx.Err() != nil {
+						return
+					}
 					// Per-entry panic guard so one repo's crash during
 					// reindex doesn't kill the worker — the bad repo logs
 					// and skips, the worker proceeds to the next job, and
 					// warmup completes.
-					func(entry config.RepoEntry) {
-						defer func() {
-							if r := recover(); r != nil {
-								logger.Error("daemon: warmup repo panic recovered",
-									zap.String("path", entry.Path),
-									zap.Any("panic", r))
-								changedRepos.Add(1)
-								scopeUnknown.Store(true)
-								deltaFrontier.invalidate()
-							}
-						}()
-						// Route repos the store already knows through
-						// ReconcileRepoCtx — it calls IncrementalReindexPaths, which
-						// evicts files deleted while the daemon was down and
-						// re-indexes only files whose mtime changed. Repos with no
-						// persisted mtimes (newly tracked, or first startup after a
-						// schema bump) fall back to TrackRepoCtx, which does a
-						// full walk. Both paths end with the repo registered on
-						// the MultiIndexer; contract reconciliation is deferred
-						// to the single RunGlobalResolve call below.
-						repoStart := time.Now()
-						// The backend's FileMtime sidecar table is the sole source
-						// of prior mtimes. An empty result means the store has
-						// never seen this repo, which is a cold index rather than
-						// a reconcile with nothing to do — normalise it to nil so
-						// the full-walk branch below runs.
-						priorMtimes := priorMtimesFromStore(state.graph, state.configManager, entry, logger)
-						if len(priorMtimes) == 0 {
-							priorMtimes = nil
-						}
-						// A backend that crossed a schema-rebuild migration rung
-						// (NeedsRebuild) has on-disk rows in the old shape that an
-						// incremental reconcile cannot fix. Drop prior mtimes so every
-						// file re-indexes into the new schema (the nil branch below
-						// runs a full TrackRepoCtx and marks the repo changed, so the
-						// global resolve/derivation passes re-run too). No-op for
-						// backends without the capability and whenever no rebuild rung
-						// was crossed — the common case.
-						if storeNeedsRebuild(state.graph) {
-							if len(priorMtimes) > 0 {
-								logger.Info("daemon: backend signalled schema rebuild; forcing full re-index",
-									zap.String("path", entry.Path))
-							}
-							priorMtimes = nil
-						}
-						pathFn := "track"
-						if priorMtimes != nil {
-							pathFn = "reconcile"
-							res, err := state.multiIndexer.ReconcileRepoCtx(batchCtx, entry, priorMtimes)
-							switch {
-							case err != nil:
-								logger.Warn("daemon: startup reconcile failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								// Treat a failed reconcile as "changed" so the global
-								// passes still run — degrade toward correctness, not
-								// toward the fast path, when we can't trust the delta.
-								changedRepos.Add(1)
-								scopeUnknown.Store(true)
-								deltaFrontier.invalidate()
-							case res != nil && (res.StaleFileCount > 0 || res.DeletedFileCount > 0 || len(res.FailedFiles) > 0 || res.FullRetrack):
-								changedRepos.Add(1)
-								filesReindexed.Add(int64(reconcileFileCount(res)))
-								deltaFrontier.record(res)
-								if res.RepoPrefix != "" {
-									changedPrefixes.Store(res.RepoPrefix, struct{}{})
-								} else {
-									scopeUnknown.Store(true)
-								}
-							default:
-								// Warm no-op path: the repo re-indexed nothing, so its
-								// graph is served straight from the persisted store and
-								// no global pass has to re-run for it.
-							}
-						} else {
-							// No prior mtimes → full cold (re)index of this repo,
-							// which is "changed" by definition.
-							deltaFrontier.invalidate()
-							changedRepos.Add(1)
-							if res, err := state.multiIndexer.TrackRepoCtx(batchCtx, entry); err != nil {
-								logger.Warn("daemon: startup track failed",
-									zap.String("path", entry.Path), zap.Error(err))
-								scopeUnknown.Store(true)
-							} else if res != nil && res.RepoPrefix != "" {
-								// A cold TrackRepoCtx is itself a full retrack — its
-								// FileCount is the whole repo's file-level work.
-								filesReindexed.Add(int64(res.FileCount))
-								changedPrefixes.Store(res.RepoPrefix, struct{}{})
-							} else {
-								scopeUnknown.Store(true)
-							}
-						}
-						elapsed := time.Since(repoStart)
-						if elapsed > 2*time.Second {
-							logger.Info("daemon: warmup repo elapsed",
-								zap.String("path", entry.Path),
-								zap.String("path_fn", pathFn),
-								zap.Duration("elapsed", elapsed))
-						}
-					}(entry)
+					runRepoJob(batchCtx, entry, true)
 				}
 			}()
 		}
+	feedJobs:
 		for _, entry := range repos {
-			jobs <- entry
+			select {
+			case jobs <- entry:
+			case <-batchCtx.Done():
+				break feedJobs
+			}
 		}
 		close(jobs)
 		wg.Wait()
+		walRetries.run(batchCtx, func(entry config.RepoEntry) {
+			logger.Info("daemon: retrying warmup repository after WAL pressure",
+				zap.String("path", entry.Path))
+			runRepoJob(batchCtx, entry, false)
+		}, func(entry config.RepoEntry, reason error) {
+			state.multiIndexer.FinishRepoLoad(entry.Path, reason)
+		})
 
 		// Materialize go.mod dependency contract nodes while the coordinated
 		// bulk connection is still pinned. The per-indexer drain is idempotent,
@@ -769,12 +898,21 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		// final seal includes them in bulk index creation, checkpointing, and
 		// planner statistics instead of reopening ordinary write transactions
 		// immediately after a large cold load.
+		// The finalize is the window's last call: the deferred end above is
+		// skipped once it has run, and nothing retries a failed seal. So a
+		// failed end is followed by an abort, which closes the window and
+		// leaves the indexes it could not rebuild to the store's repair, rather
+		// than keeping the warmup's relaxed-durability writer until shutdown.
 		var finalizeBulk func() error
 		if coordinatedBulkActive {
-			finalizeBulk = coordinatedBulk.EndCoordinatedBulkLoad
+			finalizeBulk = func() error { return graph.EndOrAbortCoordinatedBulkLoad(coordinatedBulk) }
+		}
+		drain := state.multiIndexer.RunDeferredGoModAll
+		if batchCtx.Err() != nil {
+			drain = nil
 		}
 		goModElapsed, flushElapsed, finalizeErr := drainGoModAndFinalizeWarmupBulk(
-			state.multiIndexer.RunDeferredGoModAll,
+			drain,
 			finalizeBulk,
 		)
 		logger.Info("daemon: warmup pre-bulk go.mod drain complete",
@@ -789,19 +927,39 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			}
 			coordinatedBulkActive = false
 		}
-		return nil
+		return batchCtx.Err()
 	}); err != nil {
-		logger.Error("daemon: repository topology batch failed", zap.Error(err))
+		if ctx.Err() != nil {
+			logger.Info("daemon: warmup canceled", zap.String("phase", "parallel_parse"), zap.Error(ctx.Err()))
+		} else {
+			logger.Error("daemon: repository topology batch failed", zap.Error(err))
+		}
+	}
+	// A batch that failed before its workers drained the queue leaves jobs
+	// that never ran. Settle them, so no configured repository reads as
+	// loading after the work that would have loaded it is gone. A no-op for
+	// every repository a job already settled.
+	for _, entry := range repos {
+		state.multiIndexer.FinishRepoLoad(entry.Path, errors.New("warmup ended before this repository was loaded"))
+	}
+	// A configured entry that prefix resolution skipped had no job. Settling
+	// it with no job error records the prefix's registered owner as the reason.
+	for _, entry := range configuredRepos {
+		state.multiIndexer.FinishRepoLoad(entry.Path, nil)
 	}
 	// RunRepositoryTopologyBatch has joined every parse worker and finalized
 	// the coordinated bulk loader. No producer still needs the canonical
 	// prefixed strings retained by the cold interner generation.
 	rotateColdInternGeneration(logger, "parallel_parse")
 	timings.parse = time.Since(phaseStart)
+	timings.reposChanged = int(changedRepos.Load())
 	timings.filesReindexed = int(filesReindexed.Load())
 	logger.Info("daemon: warmup phase done",
 		zap.String("phase", "parallel_parse"),
 		zap.Duration("elapsed", time.Since(phaseStart)))
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 	parseStats := progress.Stats(string(progress.PhaseParse), phaseStart, len(repos), len(repos))
 	publishReadinessPhase(state, "parallel_parse_done", false, map[string]any{
 		"tracked_repos": len(repos),
@@ -809,6 +967,18 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_human": parseStats.Elapsed,
 		"repos_per_sec": parseStats.ItemsPerSec,
 	})
+
+	// A prior orderly cancellation may have resolved calls but skipped their
+	// test-edge projection. Repair that exact durable frontier before readiness,
+	// even when unchanged file mtimes allow the normal derived-pass fast path.
+	finishTestProjectionResume := startWarmupStep(logger, "test_projection_resume")
+	projectionResumeErr := state.multiIndexer.ResumePendingTestProjectionsContext(ctx)
+	finishTestProjectionResume(zap.Error(projectionResumeErr))
+	if projectionResumeErr != nil {
+		timings.err = projectionResumeErr
+		logger.Error("daemon: pending test projection repair incomplete", zap.Error(projectionResumeErr))
+		return nil, timings
+	}
 
 	prepareStart := time.Now()
 	logger.Info("daemon: warmup step start", zap.String("step", "prepare_resolve"))
@@ -822,7 +992,6 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// The in-memory backend reaches here too, but its snapshot replay
 	// already restored the derived edges, so the skip is equally safe.
 	anyChanged := changedRepos.Load() > 0
-	timings.reposChanged = int(changedRepos.Load())
 	logger.Info("daemon: warmup change detection",
 		zap.Int64("changed_repos", changedRepos.Load()),
 		zap.Int("tracked_repos", len(repos)),
@@ -884,7 +1053,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// a few seconds of useful compute overlap. Operators can explicitly opt in
 	// with GORTEX_ENRICH_OVERLAP=1 while comparing unusual workloads.
 	var deferredRun *indexer.DeferredPassesRun
+	deferredFinished := false
 	openApplyGate := func() {}
+	defer func() {
+		if deferredRun != nil && !deferredFinished {
+			// A previously admitted overlap run still owns semantic lanes and
+			// its receipt. Join it before releasing startup ownership, even
+			// when cancellation skips the remaining warmup.
+			openApplyGate()
+			deferredRun.FinishTailResult()
+		}
+	}()
 	if (anyChanged || enrichPending > 0) && enrichmentOverlapEnabled() {
 		applyGate := make(chan struct{})
 		openApplyGate = sync.OnceFunc(func() {
@@ -968,6 +1147,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// The resolve phase is over: parked enrichment applies may now take the
 	// ResolveMutex without contending the warmup resolver.
 	openApplyGate()
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 
 	// References are resolved (or unchanged and already resolved on the warm
 	// path): the graph is queryable. Flip ready before the multi-minute
@@ -989,9 +1171,13 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Info("daemon: warmup phase start", zap.String("phase", "deferred_passes_all"), zap.Int("pending_repos", enrichPending))
 		publishReadinessPhase(state, "deferred_passes_all", true, nil)
 		if deferredRun != nil {
+			deferredFinished = true
 			deferredResult = deferredRun.FinishTailResult()
 		} else {
 			deferredResult = state.multiIndexer.RunDeferredPassesAllResult(ctx)
+		}
+		if ctx.Err() != nil {
+			return nil, timings
 		}
 		// Deferred module/contract extraction can mint a small second wave of
 		// prefixed strings after the main parse generation was released. Every
@@ -1015,11 +1201,17 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// MergedContractRegistry skips them, so `contracts` returns only
 	// the contracts of repos whose files happened to change since the
 	// last shutdown.
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 	{
 		phaseStart = time.Now()
 		finishContracts := startWarmupStep(logger, "contract_registry_rehydrate")
 		injectedRepos, injectedCount := 0, 0
 		for prefix := range state.multiIndexer.AllMetadata() {
+			if ctx.Err() != nil {
+				return nil, timings
+			}
 			idx := state.multiIndexer.GetIndexer(prefix)
 			if idx == nil || idx.ContractRegistry() != nil {
 				continue
@@ -1048,6 +1240,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 	// the matcher's EffectiveWorkspace falls back to RepoPrefix, so explicit
 	// shared-workspace declarations stop working until every file is
 	// touched. Idempotent — re-running on a stamped graph is a no-op.
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 	phaseStart = time.Now()
 	finishBackfill := startWarmupStep(logger, "workspace_backfill_before_derived")
 	backfillRevisionBefore, backfillRevisionBeforeKnown := state.multiIndexer.GraphMutationRevision()
@@ -1095,7 +1290,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 			logger.Info("daemon: contract-edge catch-up complete; skipped full cross-repo sweep",
 				zap.Int("contract_edges", reconciled))
 		case warmGlobalResolveFull:
-			state.multiIndexer.RunGlobalResolve()
+			if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("daemon: warmup global resolve incomplete", zap.Error(err))
+			}
 		}
 		fullCrossRepo := globalResolveAction == warmGlobalResolveFull
 		timings.globalResolve = time.Since(phaseStart)
@@ -1137,6 +1334,9 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		}
 	}
 
+	if ctx.Err() != nil {
+		return nil, timings
+	}
 	phaseStart = time.Now()
 	logger.Info("daemon: warmup phase start", zap.String("phase", "end_batch"), zap.Bool("changed", anyChanged), zap.Bool("exact", exactWarmDelta))
 	publishReadinessPhase(state, "end_batch", true, nil)
@@ -1150,7 +1350,10 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		report := state.multiIndexer.RunIncrementalDerivedPasses(ctx, deltaPlans)
 		logger.Info("daemon: exact warm derived passes complete", zap.Any("report", report))
 	default:
-		state.multiIndexer.EndBatch()
+		state.multiIndexer.EndBatchContext(ctx)
+	}
+	if ctx.Err() != nil {
+		return nil, timings
 	}
 	finishPostBackfill := startWarmupStep(logger, "workspace_backfill_after_derived")
 	postBatchNodes, postBatchContracts, postBatchResolutionAffected := state.multiIndexer.BackfillWorkspaceSlugsWithImpact()
@@ -1169,7 +1372,12 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		logger.Info("daemon: reconciled post-batch contract edges",
 			zap.Int("contract_edges", reconciled))
 	case warmGlobalResolveFull:
-		state.multiIndexer.RunGlobalResolve()
+		if err := state.multiIndexer.RunGlobalResolveContext(ctx); err != nil {
+			resolveOK = false
+			if ctx.Err() == nil {
+				logger.Warn("daemon: warmup post-batch resolve incomplete", zap.Error(err))
+			}
+		}
 		logger.Info("daemon: post-batch workspace eligibility change forced full cross-repo catch-up")
 	}
 	timings.endBatch = time.Since(phaseStart)
@@ -1180,20 +1388,72 @@ func warmupDaemonState(state *daemonState, logger *zap.Logger, markReady func())
 		"elapsed_ms": time.Since(phaseStart).Milliseconds(),
 	})
 
+	// Seed module-derived edges before releasing base copies so committed
+	// bases include them. This runs after readiness and before watcher startup.
+	finishModuleSeed := startWarmupStep(logger, "go_module_seed")
+	if err := state.multiIndexer.SeedGoModuleDeps(ctx); err != nil {
+		logger.Warn("daemon: seed Go module retries", zap.Error(err))
+	}
+	finishModuleSeed()
+	if ctx.Err() != nil {
+		return nil, timings
+	}
+
+	// Committed-base publication starts HERE, after the readiness flip and
+	// after the batch's derived passes, and not in the dispatch that scheduled
+	// it. The dispatch runs upstream of markReady, so draining there would put
+	// one full index of a committed tree per dedicated repository in front of
+	// the moment the graph becomes queryable. Releasing the queue after the
+	// flip makes "ready, then publish" an ordering the code guarantees rather
+	// than one the scheduler usually wins.
+	//
+	// After end_batch as well: a clean tree's base is a copy of generation 0
+	// (copy_generation_zero), which is the committed tree's index only once
+	// the deferred passes and the batch's derived passes (implements,
+	// capability, framework and cross-repo edges, the references the
+	// deferred tail resolves) have landed in it. Released at the readiness
+	// flip, the copy was taken mid-warmup and the base served none of those
+	// edges: every checkout reading it lost them, and every per-file delta
+	// over it re-derived them as new rows.
+
+	// Unconditional on purpose: a resolve that failed (resolveOK == false) or
+	// a caller that passed no markReady still gets its bases published —
+	// readiness is what publication must not precede, not what it depends on.
+	if ctx.Err() != nil {
+		return nil, timings
+	}
+	if resolveOK {
+		state.multiIndexer.CompleteStartupRelations()
+	}
+	state.basePublisher.BeginDraining()
+
 	finishWatchers := startWarmupStep(logger, "watcher_start")
 	watchCfgs := make(map[string]config.WatchConfig)
 	for prefix := range state.multiIndexer.AllMetadata() {
 		watchCfgs[prefix] = state.configManager.GetRepoConfig(prefix).Watch
 	}
-	mw, err := indexer.NewMultiWatcher(state.multiIndexer, watchCfgs, logger)
+	mw, err := indexer.NewConfigManagedMultiWatcher(state.multiIndexer, watchCfgs, logger)
 	if err != nil {
 		logger.Warn("daemon: multi-watcher init failed", zap.Error(err))
 		timings.watchers = finishWatchers(zap.String("outcome", "init_failed"), zap.Error(err))
 		return nil, timings
 	}
-	if err := mw.Start(); err != nil {
+	if startWatcher == nil {
+		startWatcher = func(ctx context.Context, watcher *indexer.MultiWatcher) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return watcher.Start()
+		}
+	}
+	if err := startWatcher(ctx, mw); err != nil {
+		_ = mw.Stop()
 		logger.Warn("daemon: multi-watcher start failed", zap.Error(err))
 		timings.watchers = finishWatchers(zap.String("outcome", "start_failed"), zap.Error(err))
+		return nil, timings
+	}
+	if ctx.Err() != nil {
+		_ = mw.Stop()
 		return nil, timings
 	}
 	// Attach the live watcher before publishing watcher_started. This makes
@@ -1322,6 +1582,23 @@ func publishReadinessPhase(state *daemonState, phase string, ready bool, extra m
 // mtimes for the repo (fresh cold start). When non-nil it short-
 // circuits the gob-snapshot lookup so the warm path is driven by
 // data the backend persisted itself.
+// warmupRepoPrefix names the repository one warmup dispatch just indexed.
+//
+// The indexer's own result is authoritative when it carries a prefix; a warm
+// no-op reconcile does not always produce one, so the configured entry's
+// effective prefix is the fallback. It is the same derivation the resolver-LSP
+// helper registration above uses, so the two cannot disagree about which
+// repository an entry is.
+func warmupRepoPrefix(state *daemonState, entry config.RepoEntry, reported string) string {
+	if reported != "" {
+		return reported
+	}
+	if state == nil || state.configManager == nil {
+		return ""
+	}
+	return strings.TrimPrefix(indexer.EffectiveRepoPrefix(state.configManager, entry), "/")
+}
+
 func priorMtimesFromStore(g graph.Store, cm *config.ConfigManager, entry config.RepoEntry, logger *zap.Logger) map[string]int64 {
 	reader, ok := g.(graph.FileMtimeReader)
 	if !ok {

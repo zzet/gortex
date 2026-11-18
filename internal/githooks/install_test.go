@@ -382,8 +382,95 @@ func TestHookPathFor_StaysInsideRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HookPathFor: %v", err)
 	}
-	if !strings.HasPrefix(path, repo) {
+	hooksDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("resolve hook directory: %v", err)
+	}
+	repo, err = filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatalf("resolve repo: %v", err)
+	}
+	if !strings.HasPrefix(hooksDir, repo) {
 		t.Errorf("hook path %q escapes the temp repo %q — a machine-global core.hooksPath would make every test write to the real global hooks dir", path, repo)
+	}
+}
+
+func TestHookPathFor_DefaultHooksDirectory(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		name := "main worktree"
+		if linked {
+			name = "linked worktree"
+		}
+		t.Run(name, func(t *testing.T) {
+			// Ignore host config before unsetting the fixture's hooksPath so
+			// the default-path cases can never reach machine-global hooks.
+			t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+			t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+			repo := initRepo(t)
+			cmd := exec.Command("git", "config", "--unset", "core.hooksPath")
+			cmd.Dir = repo
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("unset core.hooksPath: %v: %s", err, out)
+			}
+			root := repo
+			if linked {
+				root = filepath.Join(t.TempDir(), "worktree")
+				for _, args := range [][]string{
+					{"commit", "--quiet", "--allow-empty", "-m", "initial"},
+					{"worktree", "add", "--quiet", "-b", "linked", root},
+				} {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = repo
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("git %v: %v: %s", args, err, out)
+					}
+				}
+			}
+			path, err := HookPathFor(root, "post-commit")
+			if err != nil {
+				t.Fatalf("HookPathFor: %v", err)
+			}
+			assertHookPath(t, path, filepath.Join(repo, ".git", "hooks", "post-commit"))
+		})
+	}
+}
+
+func TestHookPathFor_RelativeHooksPathFromSubdirectory(t *testing.T) {
+	repo := initRepo(t)
+	cmd := exec.Command("git", "config", "core.hooksPath", ".githooks")
+	cmd.Dir = repo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("config core.hooksPath: %v: %s", err, out)
+	}
+	subdir := filepath.Join(repo, "subdir")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(repo, ".githooks"), 0o755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	path, err := HookPathFor(subdir, "post-commit")
+	if err != nil {
+		t.Fatalf("HookPathFor: %v", err)
+	}
+	assertHookPath(t, path, filepath.Join(repo, ".githooks", "post-commit"))
+	if _, err := os.Stat(filepath.Join(subdir, ".githooks")); !os.IsNotExist(err) {
+		t.Errorf("hooks dir created under subdirectory: %v", err)
+	}
+}
+
+func assertHookPath(t *testing.T, got, want string) {
+	t.Helper()
+	gotDir, err := filepath.EvalSymlinks(filepath.Dir(got))
+	if err != nil {
+		t.Fatalf("resolve hook directory: %v", err)
+	}
+	wantDir, err := filepath.EvalSymlinks(filepath.Dir(want))
+	if err != nil {
+		t.Fatalf("resolve expected hook directory: %v", err)
+	}
+	if filepath.Join(gotDir, filepath.Base(got)) != filepath.Join(wantDir, filepath.Base(want)) {
+		t.Errorf("HookPathFor = %q, want %q", got, want)
 	}
 }
 
@@ -402,10 +489,7 @@ func TestHookPathFor_HonoursCoreHooksPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HookPathFor: %v", err)
 	}
-	if filepath.Dir(path) != customHooks {
-		t.Errorf("HookPathFor should honour core.hooksPath, got %q under %q (want %q)",
-			path, filepath.Dir(path), customHooks)
-	}
+	assertHookPath(t, path, filepath.Join(customHooks, "post-commit"))
 }
 
 func TestInstallHook_WatchdogKillsHangingBinary(t *testing.T) {

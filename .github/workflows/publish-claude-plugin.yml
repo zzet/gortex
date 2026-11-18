@@ -1,6 +1,11 @@
 # publish-claude-plugin syncs the generated marketplace bundle from
 # this repo to gortexhq/claude-plugin on every gortex release.
 #
+# release.yml dispatches it after each release: releases are created
+# with GITHUB_TOKEN, which does not fire the `release: published`
+# trigger below. That trigger only covers releases published without
+# GITHUB_TOKEN, such as by hand.
+#
 # How it works:
 #   1. Checkout gortex at the released tag
 #   2. Regenerate the bundle via `make claude-plugin`
@@ -20,6 +25,9 @@
 # gortexhq/claude-plugin with `contents: write`. Mirrors the
 # HOMEBREW_TAP_TOKEN pattern used by .goreleaser.yml's homebrew_casks
 # block — same trust profile.
+# Manual dispatch is a trusted publishing operation: the selected ref's
+# Makefile and Go code execute in this job. Ref validation prevents script
+# injection; it does not make an untrusted source ref safe to publish.
 
 name: publish-claude-plugin
 
@@ -29,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Gortex tag (or branch) to publish from. Required for manual runs."
+        description: "Trusted Gortex tag or branch to publish (letters, digits, _, ., /, +, -)."
         required: true
         type: string
 
@@ -55,24 +63,36 @@ jobs:
     steps:
       - name: Resolve gortex ref
         id: resolve
+        env:
+          DISPATCH_REF: ${{ inputs.ref }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            REF="${{ inputs.ref }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            REF="$DISPATCH_REF"
           else
-            REF="${{ github.ref_name }}"
+            REF="$GITHUB_REF_NAME"
           fi
           if [ -z "$REF" ]; then
             echo "::error::could not resolve gortex ref to publish from"
             exit 1
           fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Publishing from gortex ref: $REF"
+          # Keep expressions out of shell source. Also reject controls/newlines
+          # before writing the single-line output, and limit ref spellings to
+          # a conservative alphabet. Git ref validation alone permits shell
+          # metacharacters such as '$' and backticks.
+          if [[ ! "$REF" =~ ^[A-Za-z0-9_][A-Za-z0-9._/+-]*$ ]] ||
+             ! git check-ref-format "refs/heads/$REF"; then
+            echo "::error::invalid gortex ref; use a tag or branch with letters, digits, _, ., /, +, or -"
+            exit 1
+          fi
+          printf 'ref=%s\n' "$REF" >> "$GITHUB_OUTPUT"
+          printf 'Publishing from gortex ref: %s\n' "$REF"
 
       - name: Checkout gortex
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.resolve.outputs.ref }}
           path: gortex
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -102,9 +122,9 @@ jobs:
           # the freshly-regenerated bundle. --delete removes files that
           # no longer exist in the source (e.g. a removed skill). The
           # --exclude entries protect repo-level files we don't manage
-          # from the gortex side: .git/, .github/ (publish target may
-          # carry its own readme-only CI), and a top-level README/LICENSE
-          # if the publish target maintains its own.
+          # from the gortex side: .git/ and .github/ (publish target may
+          # carry its own readme-only CI). The root README and LICENSE
+          # are generated as part of the marketplace layout.
           rsync -av --delete \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -118,7 +138,7 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No content changes vs ${{ env.PLUGIN_REPO }}@${{ env.PLUGIN_BRANCH }}; nothing to publish"
+            echo "No content changes vs ${PLUGIN_REPO}@${PLUGIN_BRANCH}; nothing to publish"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "Detected content changes:"
@@ -136,7 +156,7 @@ jobs:
           git commit -m "Sync from gortex ${GORTEX_REF}"
           # Fully-qualified refspec — fails loudly on any future name
           # collision instead of pushing the wrong ref ambiguously.
-          git push origin "refs/heads/${{ env.PLUGIN_BRANCH }}:refs/heads/${{ env.PLUGIN_BRANCH }}"
+          git push origin "refs/heads/${PLUGIN_BRANCH}:refs/heads/${PLUGIN_BRANCH}"
 
       - name: Tag publish target with gortex version
         if: steps.diff.outputs.changed == 'true'
@@ -168,7 +188,7 @@ jobs:
             exit 0
           fi
           if git rev-parse --verify "refs/tags/${GORTEX_REF}" >/dev/null 2>&1; then
-            echo "Tag ${GORTEX_REF} already exists in ${{ env.PLUGIN_REPO }}; skipping"
+            echo "Tag ${GORTEX_REF} already exists in ${PLUGIN_REPO}; skipping"
             exit 0
           fi
           git tag -a "${GORTEX_REF}" -m "Plugin bundle from gortex ${GORTEX_REF}"
@@ -176,11 +196,14 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          GORTEX_REF: ${{ steps.resolve.outputs.ref }}
+          CONTENT_CHANGED: ${{ steps.diff.outputs.changed }}
         run: |
           {
             echo "### Publish summary"
             echo ""
-            echo "- Source ref: \`${{ steps.resolve.outputs.ref }}\`"
-            echo "- Target repo: \`${{ env.PLUGIN_REPO }}\`"
-            echo "- Content changed: \`${{ steps.diff.outputs.changed }}\`"
+            printf -- '- Source ref: `%s`\n' "$GORTEX_REF"
+            printf -- '- Target repo: `%s`\n' "$PLUGIN_REPO"
+            printf -- '- Content changed: `%s`\n' "$CONTENT_CHANGED"
           } >> "$GITHUB_STEP_SUMMARY"

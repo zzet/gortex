@@ -74,6 +74,19 @@ type Provider struct {
 
 	client *Client
 
+	// lifetimeMu guards publication, constructor admission and permanent close.
+	// No RPC, subprocess wait or external callback runs under this mutex.
+	lifetimeMu     sync.Mutex
+	lifetimeCtx    context.Context
+	lifetimeCancel context.CancelFunc
+	closed         bool
+	starting       *providerClientStart
+	starts         sync.WaitGroup
+	closeOnce      sync.Once
+	closeDone      chan struct{}
+	closeErr       error
+	closeErrors    map[*Client]error
+
 	// sourceCache holds file contents read by openDocument so the
 	// per-symbol column-resolution lookups don't reread the file for
 	// every hover / references / implementation query. Keyed by
@@ -337,10 +350,8 @@ func (p *Provider) Available() bool {
 }
 
 func (p *Provider) Close() error {
-	if p.client != nil {
-		return p.client.Shutdown()
-	}
-	return nil
+	<-p.BeginClose()
+	return p.closeErr
 }
 
 // nodeRelPath strips a node's own RepoPrefix from its FilePath so the
@@ -542,17 +553,19 @@ func edgeExistsAt(view *lspGraphView, from, to string, kind graph.EdgeKind, line
 
 // definitionNodeAtSite asks the language server which declaration the
 // identifier `name` at (siteRel, siteLine) resolves to, and maps the
-// answer back to a graph node by declaration file + line + name.
+// answer back to a graph node by declaration file + line + name. wantID is
+// the edge's current target (see resolveSiteDefinition for how several
+// occurrences of name on the line are weighed against it).
 //
 // Returns (node, true) when the server answered and the definition
 // landed on a known node; (nil, true) when the server answered but no
-// graph node anchors there (external / builtin / unindexed target);
-// (nil, false) when there is no verdict (identifier not on the line,
-// open/transport failure, empty response) — callers must not draw
-// conclusions from a no-verdict.
+// single graph node anchors there (external / builtin / unindexed target,
+// or uses on the line that disagree); (nil, false) when there is no
+// verdict (identifier not on the line, open/transport failure, empty
+// response) — callers must not draw conclusions from a no-verdict.
 //
-// cache memoises verdicts per (file, line, name) within one enrichment
-// pass; multiple ambiguous edges can share a call site.
+// cache memoises the server's answers per (file, line, name) within one
+// enrichment pass; multiple ambiguous edges can share a call site.
 //
 // content is the site file's bytes, already opened on the server and read
 // from disk by the caller (via the shared document session). A nil content
@@ -565,53 +578,40 @@ func edgeExistsAt(view *lspGraphView, from, to string, kind graph.EdgeKind, line
 // through every sited target at one timeout each. Only transport results
 // feed it — a cache hit or an identifier miss never reaches the server,
 // and an answered-but-empty response counts as success.
-func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name string, content []byte, breaker *phaseBreaker, cache map[string]*graph.Node) (*graph.Node, bool) {
+func (p *Provider) definitionNodeAtSite(view *lspGraphView, repoPrefix, absRoot, siteRel string, siteLine int, name, wantID string, content []byte, breaker *phaseBreaker, cache map[string][]siteDefinitionAnswer) (*graph.Node, bool) {
 	if siteRel == "" || siteLine <= 0 || name == "" {
 		return nil, false
 	}
 	key := siteRel + "\x00" + strconv.Itoa(siteLine) + "\x00" + name
-	if cached, ok := cache[key]; ok {
-		return cached, true
+	answers, cached := cache[key]
+	if !cached {
+		text, _ := sourceLine(content, siteLine)
+		cols := identifierIndices(text, name)
+		if len(cols) == 0 {
+			// The identifier is not on the recorded line — a definition
+			// request would return junk for whatever token sits there.
+			return nil, false
+		}
+		// Every whole-identifier occurrence is asked about: the first one
+		// may be the enclosing declaration's own name rather than the use
+		// the edge records (`serialize() { return this.leaf.serialize(); }`).
+		answers = make([]siteDefinitionAnswer, 0, len(cols))
+		for _, col := range cols {
+			locs, err := p.FindDefinition(absRoot, siteRel, siteLine-1, col, lspCallTimeout())
+			if breaker != nil {
+				breaker.observe(err == nil)
+			}
+			if err != nil {
+				return nil, false
+			}
+			answers = append(answers, siteDefinitionAnswer{col: col, locs: locs})
+		}
+		if len(answers) == 1 && len(answers[0].locs) == 0 {
+			return nil, false
+		}
+		cache[key] = answers
 	}
-	col, found := identifierColumnStrict(content, siteLine, name)
-	if !found {
-		// The identifier is not on the recorded line — a definition
-		// request would return junk for whatever token sits there.
-		return nil, false
-	}
-	locs, err := p.FindDefinition(absRoot, siteRel, siteLine-1, col, lspCallTimeout())
-	if breaker != nil {
-		breaker.observe(err == nil)
-	}
-	if err != nil || len(locs) == 0 {
-		return nil, false
-	}
-	defPath := uriToPath(locs[0].URI, absRoot)
-	if defPath == "" {
-		// Definition outside the workspace (stdlib, site-packages…).
-		cache[key] = nil
-		return nil, true
-	}
-	node := findDeclarationNode(view, scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
-	if node == nil {
-		// A definition can land on a member declaration INSIDE the target
-		// type — `new T(...)` answers the constructor's line, not the type's,
-		// and the ctor node carries its own name. A type declaration named
-		// exactly `name` whose span contains the answered line is the same
-		// verdict: the site binds to that type.
-		node = view.findEnclosingTypeNamed(scopedPath(repoPrefix, defPath), locs[0].Range.Start.Line+1, name)
-	}
-	cache[key] = node
-	return node, true
-}
-
-// findDeclarationNode locates the graph node whose declaration matches
-// (filePath, oneBasedLine, name). Exact StartLine match wins; a ±1
-// slack covers servers that anchor the definition on the identifier
-// line of a multi-line declaration header. The name must match — that
-// is the identity check this lookup exists for.
-func findDeclarationNode(view *lspGraphView, filePath string, oneBasedLine int, name string) *graph.Node {
-	return view.findDeclarationNode(filePath, oneBasedLine, name)
+	return resolveSiteDefinition(view, repoPrefix, absRoot, siteRel, siteLine, name, wantID, answers), true
 }
 
 // Enrich runs the full LSP enrichment pass for a single-repo (un-
@@ -1077,7 +1077,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		if !p.servesFile(rel) {
 			continue // never open a file this server can't compile
 		}
-		content, release, err := session.acquire(p.client, filepath.Join(absRoot, rel))
+		content, release, err := session.acquire(p.Client(), filepath.Join(absRoot, rel))
 		if err != nil {
 			continue
 		}
@@ -1097,7 +1097,11 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			if implPath == "" {
 				continue
 			}
-			implNode := view.matchNodeByFileLine(scopedPath(repoPrefix, implPath), loc.Range.Start.Line+1)
+			implNode := view.matchNodeAt(scopedPath(repoPrefix, implPath), lspSite{
+				line: loc.Range.Start.Line + 1,
+				col:  loc.Range.Start.Character,
+				src:  p.fileSource(absRoot, implPath),
+			})
 			if implNode == nil {
 				continue
 			}
@@ -1191,7 +1195,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// The file is unique to this group, so no two goroutines open
 				// it; the session pins it for the group and leaves it warm for
 				// a later phase that shares the file.
-				content, release, err := session.acquire(p.client, absPath)
+				content, release, err := session.acquire(p.Client(), absPath)
 				if err != nil {
 					return
 				}
@@ -1328,13 +1332,13 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 				// definitionNodeAtSite treats as a no-verdict — the same
 				// outcome the per-site openDocument failure produced before.
 				var content []byte
-				if c, release, err := session.acquire(p.client, filepath.Join(absRoot, grp.rel)); err == nil {
+				if c, release, err := session.acquire(p.Client(), filepath.Join(absRoot, grp.rel)); err == nil {
 					content = c
 					defer release()
 				}
 				// Cache keys carry the site file, so the cache is
 				// group-local by construction — no sharing to guard.
-				cache := map[string]*graph.Node{}
+				cache := map[string][]siteDefinitionAnswer{}
 				for _, t := range grp.targets {
 					if targetedCtx.Err() != nil || targetedBreaker.isTripped() {
 						return
@@ -1343,7 +1347,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 					if toNode == nil {
 						continue
 					}
-					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, content, targetedBreaker, cache)
+					cand, ok := p.definitionNodeAtSite(view, repoPrefix, absRoot, grp.rel, t.edge.Line, toNode.Name, toNode.ID, content, targetedBreaker, cache)
 					// The verdict switch reads the view's edge indexes
 					// (edgeExistsAt, the dispatch-member helpers) that the
 					// staged mutations also update, so the whole switch —
@@ -1485,7 +1489,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 	// dies mid-flight; goroutines load it atomically so the swap never
 	// races an in-flight hover.
 	var activeClient atomic.Pointer[Client]
-	activeClient.Store(p.client)
+	activeClient.Store(p.Client())
 
 	// Abort coordination: if reconnection fails permanently, the first
 	// goroutine to learn it records the error and flips aborted; the rest
@@ -1724,12 +1728,19 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			// keeps prepare* from failing with "non-added document" and
 			// preserves exactly one didOpen per file.
 			if callHierOK || typeHierOK {
+				sharedDecl := sameLineNamesakes(ft.nodes)
 				for _, n := range ft.nodes {
 					if aborted.Load() || ctx.Err() != nil {
 						break
 					}
 					line, ok := lspLine(n)
 					if !ok {
+						continue
+					}
+					if sharedDecl[n.ID] {
+						// The column below is the name's FIRST occurrence on the
+						// line, which may be a namesake's declaration: the
+						// hierarchy would hang that member's calls on n.
 						continue
 					}
 					col := identifierColumn(content, n.StartLine, n.Name)
@@ -2022,9 +2033,14 @@ func (p *Provider) resetForReconnect() {
 	// fresh transport. Close it best-effort first to free any
 	// pending pending-map entries; the dead read loop already closed
 	// `done` so Shutdown() is a no-op past that point.
-	if p.client != nil {
-		_ = p.client.Shutdown()
+	p.lifetimeMu.Lock()
+	client := p.client
+	if !p.closed {
 		p.client = nil
+	}
+	p.lifetimeMu.Unlock()
+	if client != nil {
+		_ = p.closeClient(client)
 	}
 	p.docMu.Lock()
 	p.docVersions = map[string]int{}
@@ -2048,6 +2064,10 @@ func (p *Provider) resetForReconnect() {
 // The dial path retries with exponential backoff capped at
 // maxDialBackoff. Each successful dial resets the backoff window.
 func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
+	ctx := p.providerContext()
+	if ctx.Err() != nil {
+		return nil, errProviderClosed
+	}
 	if p.connect != nil {
 		if err := p.connect.Validate(); err != nil {
 			return nil, fmt.Errorf("lsp passive attach: %w", err)
@@ -2055,6 +2075,7 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 		client, dialErr := NewClientWithTransport(&DialTransport{
 			Network: p.connect.Network,
 			Address: p.connect.Address,
+			ctx:     ctx,
 		}, p.logger)
 		if dialErr == nil {
 			// Reset the backoff so a flap doesn't punish the next
@@ -2091,6 +2112,9 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 				zap.Error(dialErr),
 			)
 		}
+	}
+	if ctx.Err() != nil {
+		return nil, errProviderClosed
 	}
 	if p.command == "" {
 		return nil, fmt.Errorf("lsp: no command configured and no passive attach available")
@@ -2309,7 +2333,7 @@ func (p *Provider) maybeCSharpPreRestore(workspaceRoot string) {
 		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), csharpRestoreTimeout)
+	ctx, cancel := context.WithTimeout(p.providerContext(), csharpRestoreTimeout)
 	defer cancel()
 	// Target the same solution the server will load (when one resolves) — a
 	// bare restore fails with MSB1011 in a multi-solution root, leaving the
@@ -2353,14 +2377,14 @@ func lastBytes(b []byte, n int) []byte {
 // For passive (connect) mode, a dead client triggers a re-dial with
 // exponential backoff, falling back to spawn only if the spec's
 // Connect.FallbackSpawn is true.
-func (p *Provider) ensureClient(workspaceRoot string) error {
+func (p *Provider) initializeClient(workspaceRoot string, start *providerClientStart) error {
 	// Liveness probe — if we have a client but its read loop has
 	// terminated, the server (or socket) is gone. Treat as
 	// disconnected: drop the dead handle and reset per-connection
 	// state so the next branch can build a fresh transport.
-	if p.client != nil {
+	if client := p.Client(); client != nil {
 		select {
-		case <-p.client.Done():
+		case <-client.Done():
 			p.resetForReconnect()
 		default:
 			return nil
@@ -2384,6 +2408,9 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	client, err := p.dialOrSpawn(workspaceRoot)
 	if err != nil {
+		return err
+	}
+	if err := p.captureStartingClient(start, client); err != nil {
 		return err
 	}
 
@@ -2523,7 +2550,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	var initResult InitializeResult
 	if err := client.Call("initialize", initParams, &initResult); err != nil {
-		_ = client.Shutdown()
+		_ = p.closeClient(client)
 		return fmt.Errorf("initialize: %w", err)
 	}
 
@@ -2536,7 +2563,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 	// Send initialized notification.
 	if err := client.Notify("initialized", struct{}{}); err != nil {
-		_ = client.Shutdown()
+		_ = p.closeClient(client)
 		return fmt.Errorf("initialized: %w", err)
 	}
 
@@ -2545,8 +2572,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	// longer block an enrichment Call forever. See lspCallTimeout.
 	client.SetCallTimeout(lspCallTimeout())
 
-	p.client = client
-	return nil
+	return p.publishInitializedClient(client)
 }
 
 // WaitReady implements semantic.ReadinessProber for the Roslyn / MSBuild-class
@@ -2628,7 +2654,7 @@ func (p *Provider) pollWorkspaceReady(ctx context.Context, query string) error {
 // whether the server returned any symbol. A nil client or any error reads as
 // "not ready yet" rather than a hard failure.
 func (p *Provider) workspaceSymbolNonEmpty(query string) bool {
-	client := p.client
+	client := p.Client()
 	if client == nil {
 		return false
 	}
@@ -2803,7 +2829,7 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 
 	langID := p.languageIDFor(absPath)
 
-	if err := p.client.Notify("textDocument/didOpen", DidOpenTextDocumentParams{
+	if err := p.notifyCurrentClient("textDocument/didOpen", DidOpenTextDocumentParams{
 		TextDocument: TextDocumentItem{
 			URI:        pathToURI(absPath),
 			LanguageID: langID,
@@ -2863,7 +2889,7 @@ func (p *Provider) changeDocument(absPath, newText string) error {
 	}
 	p.sourceCache[absPath] = []byte(newText)
 	p.docMu.Unlock()
-	return p.client.Notify("textDocument/didChange", DidChangeTextDocumentParams{
+	return p.notifyCurrentClient("textDocument/didChange", DidChangeTextDocumentParams{
 		TextDocument: VersionedTextDocumentIdentifier{
 			URI:     pathToURI(absPath),
 			Version: v,
@@ -2887,7 +2913,7 @@ func (p *Provider) closeDocument(absPath string) error {
 	// files would pin every one's contents until the daemon exits.
 	delete(p.sourceCache, absPath)
 	p.docMu.Unlock()
-	return p.client.Notify("textDocument/didClose", DidCloseTextDocumentParams{
+	return p.notifyCurrentClient("textDocument/didClose", DidCloseTextDocumentParams{
 		TextDocument: TextDocumentIdentifier{URI: pathToURI(absPath)},
 	})
 }
@@ -2956,7 +2982,11 @@ func (p *Provider) WaitForDiagnostics(absPath string, timeout time.Duration) []D
 
 // Client exposes the underlying LSP client for advanced callers (e.g.
 // the daemon router). Returns nil before ensureClient succeeds.
-func (p *Provider) Client() *Client { return p.client }
+func (p *Provider) Client() *Client {
+	p.lifetimeMu.Lock()
+	defer p.lifetimeMu.Unlock()
+	return p.client
+}
 
 // EnsureClient is the exported form of ensureClient — it spawns the
 // LSP server (idempotent) so callers that want diagnostics or code
@@ -3094,7 +3124,8 @@ func (p *Provider) ConfirmSymbolRefs(g graph.Store, repoRoot string, n *graph.No
 	seenCaller := make(map[string]struct{}, len(hops))
 	for _, h := range hops {
 		otherPath := uriToPath(h.other.URI, absRoot)
-		otherNode := view.matchCallableByFileLine(scopedPath(n.RepoPrefix, otherPath), h.other.SelectionRange.Start.Line+1)
+		otherNode := view.matchCallableAt(scopedPath(n.RepoPrefix, otherPath),
+			p.hierarchyItemSite(absRoot, otherPath, h.other.Name, h.other.SelectionRange))
 		if otherNode == nil {
 			continue
 		}
@@ -3136,7 +3167,7 @@ func (p *Provider) EnrichNode(g graph.Store, repoRoot string, n *graph.Node) (bo
 	if src := p.getSource(repoRoot, rel); src != nil {
 		col = identifierColumn(src, n.StartLine, n.Name)
 	}
-	hr, err := p.hoverWith(p.client, repoRoot, rel, line, col)
+	hr, err := p.hoverWith(p.Client(), repoRoot, rel, line, col)
 	if err != nil {
 		return false, err
 	}
@@ -3171,6 +3202,9 @@ func (p *Provider) getSource(repoRoot, relPath string) []byte {
 // an in-flight hover (the goroutine holds its own pointer value).
 // KEYWORDS — lsp, hover, concurrency, reconnect
 func (p *Provider) hoverWith(c *Client, repoRoot, relPath string, line, col int) (*HoverResult, error) {
+	if c == nil {
+		return nil, errClientNotInitialized
+	}
 	absPath := filepath.Join(repoRoot, relPath)
 	params := HoverParams{
 		TextDocumentPositionParams: TextDocumentPositionParams{
@@ -3265,6 +3299,7 @@ func isServerExitError(err error) bool {
 const maxEnrichReconnectCycles = 5
 
 func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
+	ctx := p.providerContext()
 	const maxReconnectAttempts = 5
 	backoff := p.dialBackoffStart
 	if backoff <= 0 {
@@ -3276,6 +3311,9 @@ func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, errProviderClosed
+		}
 		p.reconnectAttempts.Add(1)
 		p.logger.Warn("LSP enrich: reconnecting after server exit",
 			zap.Int("attempt", attempt),
@@ -3285,14 +3323,20 @@ func (p *Provider) reconnectWithBackoff(absRoot string) (*Client, error) {
 			lastErr = err
 			p.logger.Warn("LSP enrich: reconnect attempt failed",
 				zap.Int("attempt", attempt), zap.Error(err))
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, errProviderClosed
+			case <-timer.C:
+			}
 			if backoff *= 2; backoff > maxBackoff {
 				backoff = maxBackoff
 			}
 			continue
 		}
 		p.logger.Info("LSP enrich: reconnected", zap.Int("attempt", attempt))
-		return p.client, nil
+		return p.requestClient()
 	}
 	return nil, fmt.Errorf("LSP reconnect failed after %d attempts: %w", maxReconnectAttempts, lastErr)
 }
@@ -3309,7 +3353,7 @@ func (p *Provider) findImplementations(repoRoot, relPath string, line, col int) 
 
 	p.reqStats.implementations.Add(1)
 	var locations []Location
-	if err := p.client.Call("textDocument/implementation", params, &locations); err != nil {
+	if err := p.callCurrentClient("textDocument/implementation", params, &locations); err != nil {
 		return nil, err
 	}
 	return locations, nil
@@ -3334,7 +3378,7 @@ type CodeActionsRequest struct {
 // list of CodeActionOrCommand. The provider must already have opened
 // the document via EnsureFileOpen before calling this.
 func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return nil, fmt.Errorf("LSP client not initialized")
 	}
 	params := CodeActionParams{
@@ -3347,7 +3391,7 @@ func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand
 		},
 	}
 	var raw []json.RawMessage
-	if err := p.client.Call("textDocument/codeAction", params, &raw); err != nil {
+	if err := p.callCurrentClient("textDocument/codeAction", params, &raw); err != nil {
 		return nil, err
 	}
 	out := make([]CodeActionOrCommand, 0, len(raw))
@@ -3368,11 +3412,11 @@ func (p *Provider) GetCodeActions(req CodeActionsRequest) ([]CodeActionOrCommand
 // analyzer, jdtls) defer the heavy WorkspaceEdit computation until
 // resolve to keep the initial codeAction call cheap.
 func (p *Provider) ResolveCodeAction(action CodeActionOrCommand) (CodeActionOrCommand, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return action, fmt.Errorf("LSP client not initialized")
 	}
 	var resolved CodeActionOrCommand
-	if err := p.client.Call("codeAction/resolve", action, &resolved); err != nil {
+	if err := p.callCurrentClient("codeAction/resolve", action, &resolved); err != nil {
 		return action, err
 	}
 	return resolved, nil
@@ -3382,12 +3426,12 @@ func (p *Provider) ResolveCodeAction(action CodeActionOrCommand) (CodeActionOrCo
 // apply-code-action path when a CodeAction has only a Command
 // (legacy) form.
 func (p *Provider) ExecuteCommand(cmd Command) (json.RawMessage, error) {
-	if p.client == nil {
+	if p.Client() == nil {
 		return nil, fmt.Errorf("LSP client not initialized")
 	}
 	params := ExecuteCommandParams{Command: cmd.Command, Arguments: cmd.Arguments}
 	var result json.RawMessage
-	if err := p.client.Call("workspace/executeCommand", params, &result); err != nil {
+	if err := p.callCurrentClient("workspace/executeCommand", params, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -3406,7 +3450,7 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 
 	p.reqStats.references.Add(1)
 	var locations []Location
-	if err := p.client.Call("textDocument/references", params, &locations); err != nil {
+	if err := p.callCurrentClient("textDocument/references", params, &locations); err != nil {
 		return nil, err
 	}
 	return locations, nil
@@ -3420,8 +3464,9 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 // repoRoot is the absolute workspace root; relPath is repo-relative.
 // (line, col) are 0-based, matching LSP convention.
 func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeout time.Duration) ([]Location, error) {
-	if p.client == nil {
-		return nil, fmt.Errorf("LSP client not initialised")
+	client, err := p.requestClient()
+	if err != nil {
+		return nil, err
 	}
 	absPath := filepath.Join(repoRoot, relPath)
 	params := TextDocumentPositionParams{
@@ -3441,7 +3486,7 @@ func (p *Provider) FindDefinition(repoRoot, relPath string, line, col int, timeo
 		// (most common), fall back to single Location on unmarshal
 		// error.
 		var raw json.RawMessage
-		if err := p.client.Call("textDocument/definition", params, &raw); err != nil {
+		if err := client.Call("textDocument/definition", params, &raw); err != nil {
 			ch <- result{nil, err}
 			return
 		}
@@ -3509,8 +3554,8 @@ func (p *Provider) recordHierarchyCall(view *lspGraphView, mutations *lspMutatio
 	if otherPath == "" {
 		return
 	}
-	otherNode := view.matchCallableByFileLine(scopedPath(repoPrefix, otherPath),
-		other.SelectionRange.Start.Line+1)
+	otherNode := view.matchCallableAt(scopedPath(repoPrefix, otherPath),
+		p.hierarchyItemSite(absRoot, otherPath, other.Name, other.SelectionRange))
 	if otherNode == nil {
 		return
 	}
@@ -3609,7 +3654,8 @@ func (p *Provider) linkTypeHierarchy(view *lspGraphView, mutations *lspMutationB
 	if otherPath == "" {
 		return
 	}
-	otherNode := view.matchNodeByFileLine(scopedPath(repoPrefix, otherPath), other.SelectionRange.Start.Line+1)
+	otherNode := view.matchNodeAt(scopedPath(repoPrefix, otherPath),
+		p.hierarchyItemSite(absRoot, otherPath, other.Name, other.SelectionRange))
 	if otherNode == nil {
 		return
 	}
@@ -3834,7 +3880,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 	}
 	p.reqStats.prepareCallHierarchy.Add(1)
 	var items []CallHierarchyItem
-	if err := p.client.Call("textDocument/prepareCallHierarchy", params, &items); err != nil {
+	if err := p.callCurrentClient("textDocument/prepareCallHierarchy", params, &items); err != nil {
 		return nil, err
 	}
 	return items, nil
@@ -3844,7 +3890,7 @@ func (p *Provider) prepareCallHierarchy(repoRoot, relPath string, line, col int)
 func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoingCall, error) {
 	p.reqStats.outgoingCalls.Add(1)
 	var calls []CallHierarchyOutgoingCall
-	if err := p.client.Call("callHierarchy/outgoingCalls",
+	if err := p.callCurrentClient("callHierarchy/outgoingCalls",
 		CallHierarchyOutgoingCallsParams{Item: item}, &calls); err != nil {
 		return nil, err
 	}
@@ -3855,7 +3901,7 @@ func (p *Provider) outgoingCalls(item CallHierarchyItem) ([]CallHierarchyOutgoin
 func (p *Provider) incomingCalls(item CallHierarchyItem) ([]CallHierarchyIncomingCall, error) {
 	p.reqStats.incomingCalls.Add(1)
 	var calls []CallHierarchyIncomingCall
-	if err := p.client.Call("callHierarchy/incomingCalls",
+	if err := p.callCurrentClient("callHierarchy/incomingCalls",
 		CallHierarchyIncomingCallsParams{Item: item}, &calls); err != nil {
 		return nil, err
 	}
@@ -3873,7 +3919,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 	}
 	p.reqStats.prepareTypeHierarchy.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("textDocument/prepareTypeHierarchy", params, &items); err != nil {
+	if err := p.callCurrentClient("textDocument/prepareTypeHierarchy", params, &items); err != nil {
 		return nil, err
 	}
 	return items, nil
@@ -3883,7 +3929,7 @@ func (p *Provider) prepareTypeHierarchy(repoRoot, relPath string, line, col int)
 func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
 	p.reqStats.supertypes.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("typeHierarchy/supertypes",
+	if err := p.callCurrentClient("typeHierarchy/supertypes",
 		TypeHierarchySupertypesParams{Item: item}, &items); err != nil {
 		return nil, err
 	}
@@ -3894,7 +3940,7 @@ func (p *Provider) supertypes(item TypeHierarchyItem) ([]TypeHierarchyItem, erro
 func (p *Provider) subtypes(item TypeHierarchyItem) ([]TypeHierarchyItem, error) {
 	p.reqStats.subtypes.Add(1)
 	var items []TypeHierarchyItem
-	if err := p.client.Call("typeHierarchy/subtypes",
+	if err := p.callCurrentClient("typeHierarchy/subtypes",
 		TypeHierarchySubtypesParams{Item: item}, &items); err != nil {
 		return nil, err
 	}
@@ -3974,28 +4020,13 @@ func identifierColumn(src []byte, oneBasedLine int, name string) int {
 // an LSP request at a junk position (column 0 of an unrelated token)
 // can skip the round trip instead.
 func identifierColumnStrict(src []byte, oneBasedLine int, name string) (int, bool) {
-	if name == "" || oneBasedLine <= 0 || len(src) == 0 {
+	if name == "" {
 		return 0, false
 	}
-	// Walk to the start of the requested line.
-	target := oneBasedLine - 1
-	lineStart := 0
-	cur := 0
-	for cur < len(src) && target > 0 {
-		if src[cur] == '\n' {
-			target--
-			lineStart = cur + 1
-		}
-		cur++
-	}
-	if target > 0 {
+	line, ok := sourceLine(src, oneBasedLine)
+	if !ok {
 		return 0, false
 	}
-	lineEnd := lineStart
-	for lineEnd < len(src) && src[lineEnd] != '\n' {
-		lineEnd++
-	}
-	line := string(src[lineStart:lineEnd])
 	idx := identifierIndex(line, name)
 	if idx < 0 {
 		return 0, false

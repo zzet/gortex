@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -112,6 +113,13 @@ func TestLSP_Enrich_DefinitionPassEmptyAnswersDoNotTrip(t *testing.T) {
 func TestLSP_Enrich_DefinitionPassYieldSurvivesProductivityCheckpoint(t *testing.T) {
 	t.Setenv(SweepEnv, "full")
 	t.Setenv("GORTEX_LSP_PRODUCTIVITY_WINDOW", "150ms")
+	// The handler delay and the checkpoint ticker share one fake clock, so
+	// the confirm rate per window is fixed by the test rather than by how
+	// fast the host serves each request.
+	synctest.Test(t, testDefinitionPassYieldSurvivesProductivityCheckpoint)
+}
+
+func testDefinitionPassYieldSurvivesProductivityCheckpoint(t *testing.T) {
 	const nSites = 300
 
 	repoRoot := t.TempDir()

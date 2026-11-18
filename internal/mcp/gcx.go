@@ -771,9 +771,9 @@ func encodeFileSummary(sg *query.SubGraph, etag string) ([]byte, error) {
 func encodeAnalyze(kind string, payload any) ([]byte, error) {
 	var buf bytes.Buffer
 	switch kind {
-	case "dead_code":
+	case "dead_code", "pending_unknown":
 		items, _ := payload.([]deadCodeItem)
-		enc := newGCX(&buf, "analyze.dead_code",
+		enc := newGCX(&buf, "analyze."+kind,
 			[]string{"id", "kind", "name", "path", "line", "reason"},
 			"count", fmt.Sprintf("%d", len(items)),
 		)
@@ -1720,9 +1720,13 @@ func encodeSmartContext(result map[string]any) ([]byte, error) {
 		}
 
 		tests, _ := br["covering_tests"].([]map[string]any)
+		testMeta := []string{"count", fmt.Sprintf("%d", len(tests))}
+		if total, ok := br["covering_tests_total"].(int); ok {
+			testMeta = append(testMeta, "total", fmt.Sprintf("%d", total), "truncated", "true")
+		}
 		testEnc := newGCX(&buf, "smart_context.blast_tests",
 			[]string{"file", "function"},
-			"count", fmt.Sprintf("%d", len(tests)),
+			testMeta...,
 		)
 		for _, tr := range tests {
 			if err := testEnc.WriteRow(str(tr["file"]), str(tr["function"])); err != nil {
@@ -1937,8 +1941,13 @@ func encodeChangeImpact(result map[string]any) ([]byte, error) {
 	communityNote, _ := result["community_note"].(string)
 	contractRiskUpgrade, _ := result["contract_risk_upgrade"].(string)
 
+	var meta []string
+	if waited, ok := result["barrier_wait_ms"].(int64); ok {
+		meta = append(meta, "barrier_wait_ms", strconv.FormatInt(waited, 10))
+	}
 	sumEnc := newGCX(&buf, "explain_change_impact.summary",
 		[]string{"risk", "summary", "total_affected", "cross_repo", "processes", "communities", "test_files", "warning", "note", "risk_upgrade"},
+		meta...,
 	)
 	if err := sumEnc.WriteRow(
 		string(risk),

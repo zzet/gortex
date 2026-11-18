@@ -1,0 +1,4 @@
+GCX1 tool=search_symbols fields=id,kind,name,path,path_abs,line,sig,enclosing,is_test,test_role,test_runner,type_flavor,ui_component total=2 truncated=false
+# 2 result(s)
+server/server.go::Server.HandleRequest	method	Server.HandleRequest	server/server.go	$ROOT/server/server.go	14	func ((s *Server)) HandleRequest(path string) string	Server	false				
+server/server.go::Server.HandleHealth	method	Server.HandleHealth	server/server.go	$ROOT/server/server.go	22	func ((s *Server)) HandleHealth() string	Server	false				

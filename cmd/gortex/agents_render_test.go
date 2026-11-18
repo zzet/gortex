@@ -154,12 +154,14 @@ func TestAgentsRenderIsHermetic(t *testing.T) {
 		}
 	}
 
-	// 2. No manifest may name the developer's real home. A leaked
-	//    absolute path means something resolved a path outside the
-	//    sandbox, whether or not it managed to write there.
 	if realHomeBeforeSandbox != "" {
 		for name, m := range manifests {
-			if strings.Contains(m, realHomeBeforeSandbox) {
+			// Strip the synthetic manifest section headers "=== <mode>/root/"
+			// so that a test running under a user whose home is "/root" does not
+			// collide with the repo-root key prefix.
+			cleaned := strings.ReplaceAll(m, "=== project/root/", "=== project/<repo>/")
+			cleaned = strings.ReplaceAll(cleaned, "=== global/root/", "=== global/<repo>/")
+			if strings.Contains(cleaned, realHomeBeforeSandbox) {
 				t.Errorf("%s manifest references the real home %q", name, realHomeBeforeSandbox)
 			}
 		}

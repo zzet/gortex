@@ -123,12 +123,13 @@ This fix removes request-lifetime cancellation and recovery dead ends from that
 flow. It does not claim that a large dependency closure becomes cheap: background
 build cost and interactive request latency must be measured separately.
 
-## Deliberately unsupported write paths
+## Supported and unsupported write paths
 
-Batch editing/recovery, filesystem lifecycle operations, and LSP refactors have
-separate write and refresh machinery. They remain refused through routed views
-until their checkout ownership and recovery are integrated. The refusal states
-this limitation rather than recommending a CWD change that cannot solve it.
+Atomic batch editing and durable transaction recovery are supported on exact
+live checkouts. A batch can edit files or symbols, move files, and delete files
+within its selected checkout; its journal and graph receipt retain that checkout
+identity. Mixed-checkout batches, LSP refactors, immutable ref views, and inexact
+fallback views remain refused.
 
 Ordinary canonical-checkout editing is unchanged. This change requires no schema
 migration, daemon restart procedure, new tracking intent, or additional database.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -82,10 +83,12 @@ type SharedServerConfig struct {
 	Logger            *zap.Logger
 	Version           string
 	MigrationObserver store_sqlite.MigrationObserver
-	Embedder          EmbedderRequest
-	SideStores        SideStores
-	ScopeWorkspace    string
-	ScopeProject      string
+	// Set only by the acceptance-tagged per-invocation configurator.
+	sqliteUpgradeOption store_sqlite.Option
+	Embedder            EmbedderRequest
+	SideStores          SideStores
+	ScopeWorkspace      string
+	ScopeProject        string
 	// ActiveProject names the project the MCP server should start scoped
 	// to (multi-repo mode hint). Empty leaves it unset.
 	ActiveProject string
@@ -146,6 +149,19 @@ type SharedServer struct {
 	// this stack. Nil in single-repo standalone, where there is no
 	// multi-repo indexer to own a tracked set.
 	CheckoutLifecycle *indexer.CheckoutLifecycle
+	// DedicatedBaseRuntime is the process-wide dedicated-base publisher
+	// runtime this stack constructed and installed on the lifecycle before
+	// any owner could be registered. Every later publication trigger must
+	// use this one value. Nil in single-repo standalone and whenever the
+	// backend is not the sqlite store (nothing publishes there).
+	DedicatedBaseRuntime *indexer.DedicatedBaseRuntime
+	// OutputGenerationAuthority is the process-wide authority every repository
+	// mutation admits through: the generation-zero lanes (owned and orphan),
+	// the multi-repo cold batch, the topology transitions and the checkout
+	// source-edit leases. It is installed on the standalone Indexer AND on the
+	// MultiIndexer, so the standalone Indexer this stack hands to the MCP
+	// server cannot mutate on a lane with no named owner. Never nil.
+	OutputGenerationAuthority *indexer.OutputGenerationAuthority
 	// StorePath is the graph store file this stack actually opened: the
 	// caller's BackendPath expanded to an absolute path, or the platform
 	// default when it was empty. Entry points publish it so out-of-band
@@ -158,11 +174,48 @@ type SharedServer struct {
 	ResolverLSPRegistry *lsp.ResolverHelperRegistry
 	LSPRouter           *lsp.Router
 
-	cleanup []func() // run LIFO by Close (backend close, savings flush).
+	cleanup        []sharedCleanup // run LIFO by Close (backend close, savings flush).
+	closeOnce      sync.Once
+	closeErr       error
+	logger         *zap.Logger
+	semanticOwner  *semantic.Manager     // constructed once, immutable after publication
+	telemetryOwner *telemetrySenderOwner // construction-owned, joined before file-store teardown
 	// sidecarPaths are the sidecar databases this stack caused to be
 	// opened — the side stores and the savings ledger. They are released
 	// after the teardown chain, not inside it.
 	sidecarPaths []string
+	closeSidecar func(string) error // nil selects persistence.CloseSidecar
+}
+
+type sharedCleanup struct {
+	name  string
+	close func() error
+}
+
+// addCleanup is construction-only; Close begins after the stack is published.
+func (s *SharedServer) addCleanup(name string, close func() error) {
+	s.cleanup = append(s.cleanup, sharedCleanup{name: name, close: close})
+}
+
+// BeginSemanticClose interrupts semantic passes and legacy provider calls
+// before warmup/lifecycle joins can wait on them. Actual completion and errors
+// remain the named semantic_manager cleanup step before the backend closes.
+func (s *SharedServer) BeginSemanticClose() {
+	if s != nil && s.semanticOwner != nil {
+		s.semanticOwner.BeginClose()
+	}
+}
+
+// BeginBackgroundClose cancels the MCP notifier before lifecycle's analysis
+// lane is joined. Its actual completion remains the mcp_background step.
+func (s *SharedServer) BeginBackgroundClose() {
+	if s == nil {
+		return
+	}
+	if s.MCP != nil {
+		s.MCP.BeginBackgroundClose()
+	}
+	s.telemetryOwner.Cancel()
 }
 
 // Close runs the teardown chain LIFO, then releases every sidecar database
@@ -176,14 +229,40 @@ type SharedServer struct {
 // teardown. persistence.CloseSidecar is a no-op for a path nothing opened,
 // so listing a store that stayed in memory costs nothing.
 func (s *SharedServer) Close() error {
-	for i := len(s.cleanup) - 1; i >= 0; i-- {
-		s.cleanup[i]()
-	}
-	for _, path := range s.sidecarPaths {
-		_ = persistence.CloseSidecar(path)
-	}
-	s.sidecarPaths = nil
-	return nil
+	s.closeOnce.Do(func() {
+		// Standalone entrypoints share the same cancel-before-join contract.
+		s.BeginSemanticClose()
+		s.BeginBackgroundClose()
+		s.CheckoutLifecycle.Cancel()
+		var errs []error
+		run := func(name string, close func() error) {
+			started := time.Now()
+			if s.logger != nil {
+				s.logger.Info("serverstack: shutdown phase start", zap.String("phase", name))
+			}
+			err := close()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			}
+			if s.logger != nil {
+				s.logger.Info("serverstack: shutdown phase complete", zap.String("phase", name), zap.Duration("elapsed", time.Since(started)), zap.Error(err))
+			}
+		}
+		for i := len(s.cleanup) - 1; i >= 0; i-- {
+			step := s.cleanup[i]
+			run(step.name, step.close)
+		}
+		closeSidecar := s.closeSidecar
+		if closeSidecar == nil {
+			closeSidecar = persistence.CloseSidecar
+		}
+		for _, path := range s.sidecarPaths {
+			run("sidecar "+path, func() error { return closeSidecar(path) })
+		}
+		s.sidecarPaths = nil
+		s.closeErr = errors.Join(errs...)
+	})
+	return s.closeErr
 }
 
 // telemetrySendInterval bounds how often the daemon flushes the in-memory
@@ -200,18 +279,49 @@ const telemetryConsentTTL = 5 * time.Second
 // and returns a stop function for the cleanup chain. It re-resolves consent
 // each tick so `gortex telemetry off` stops transmission within one interval,
 // and is a complete no-op while GORTEX_TELEMETRY_ENDPOINT is unset.
-func startTelemetrySender(srv *gortexmcp.Server, store *telemetry.Store, dir, version string) func() {
+type telemetrySenderOwner struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+func (o *telemetrySenderOwner) Cancel() {
+	if o != nil {
+		o.cancel()
+	}
+}
+func (o *telemetrySenderOwner) Close() {
+	if o != nil {
+		o.Cancel()
+		<-o.done
+	}
+}
+
+func startTelemetrySender(srv *gortexmcp.Server, store *telemetry.Store, dir, version string) *telemetrySenderOwner {
+	return startTelemetrySenderWithInterval(srv, store, dir, version, telemetrySendInterval)
+}
+
+func startTelemetrySenderWithInterval(srv *gortexmcp.Server, store *telemetry.Store, dir, version string, interval time.Duration) *telemetrySenderOwner {
 	sender := telemetry.NewSender(store, dir, version, os.Getenv)
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
-		t := time.NewTicker(telemetrySendInterval)
+		defer close(done)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		flushAndSend := func() {
+			if ctx.Err() != nil {
+				return
+			}
 			srv.FlushTelemetry()
+			// A contextless file flush is still an actual owner. Cancellation
+			// prevents another send, but Close waits for the flush to return.
+			if ctx.Err() != nil {
+				return
+			}
 			consent := telemetry.ResolveConsent(telemetry.LoadConsentConfig(dir), os.Getenv)
 			sender.MaybeSend(ctx, consent)
 		}
-		flushAndSend() // opportunistic send on startup
+		flushAndSend()
 		for {
 			select {
 			case <-ctx.Done():
@@ -221,7 +331,15 @@ func startTelemetrySender(srv *gortexmcp.Server, store *telemetry.Store, dir, ve
 			}
 		}
 	}()
-	return cancel
+	return &telemetrySenderOwner{cancel: cancel, done: done}
+}
+
+// Construction only: install the actual producer and its named completion
+// together before publishing the stack. Shutdown never attaches a replacement.
+func (s *SharedServer) installTelemetrySender(srv *gortexmcp.Server, store *telemetry.Store, dir, version string) {
+	owner := startTelemetrySender(srv, store, dir, version)
+	s.telemetryOwner = owner
+	s.addCleanup("telemetry_sender", func() error { owner.Close(); return nil })
 }
 
 // NewSharedServer builds the whole server stack — graph.Store ->
@@ -274,7 +392,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 	}
 
-	s := &SharedServer{}
+	s := &SharedServer{logger: logger}
 
 	// Resolve the store path once: the lock, the open, and the path published
 	// on SharedServer must all name the same file. The backend name was
@@ -304,17 +422,23 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			}
 			return nil, fmt.Errorf("%s — stop it first (`gortex daemon stop`)", hint)
 		}
-		s.cleanup = append(s.cleanup, func() { _ = lock.Unlock() })
+		s.addCleanup("store_lock", lock.Unlock)
 		storeLockHeld = true
+		// Expired pre-upgrade backups go before the store opens, so the space
+		// they free counts toward an upgrade's free-space check. Only under
+		// the lock: a partial copy can be in progress only while some process
+		// holds it.
+		pruneStoreUpgradeBackups(storePath, logger, time.Now())
 	}
 
 	// allowRebuild is gated on actually holding the store lock: only then may
-	// the sqlite backend drop and recreate an incompatible-schema DB.
-	g, backendCleanup, err := OpenBackend(cfg.Backend, storePath, logger, storeLockHeld, cfg.MigrationObserver)
+	// the sqlite backend rebuild a supported older schema when necessary.
+	g, backendCleanup, err := openBackendWithUpgradeOption(cfg.Backend, storePath, logger, storeLockHeld, cfg.sqliteUpgradeOption, cfg.MigrationObserver)
 	if err != nil {
-		return nil, err
+		// Backend initialization can fail after the store lock was acquired.
+		return nil, errors.Join(err, s.Close())
 	}
-	s.cleanup = append(s.cleanup, backendCleanup)
+	s.addCleanup("backend", backendCleanup)
 	s.Graph = g
 
 	reg := parser.NewRegistry()
@@ -369,6 +493,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			semCfg.Providers = append(semCfg.Providers, out)
 		}
 		semMgr = semantic.NewManager(semCfg, logger)
+		// Own it immediately, including constructor-error cleanup. The stack
+		// is still unpublished: boot registration below cannot race shutdown.
+		s.semanticOwner = semMgr
+		s.addCleanup("semantic_manager", semMgr.Close)
 
 		goMode := goanalysis.ModeTypeCheck
 		if cfg.SemanticMode == "callgraph" {
@@ -452,6 +580,9 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 
 		if !IsFalsyEnv("GORTEX_LSP_RESOLVER") {
 			s.ResolverLSPRegistry = lsp.NewResolverHelperRegistry()
+			// Its registration producers (warmup/lifecycle) join before this
+			// snapshot runs. Beginning semantic close must not snapshot it early.
+			s.addCleanup("resolver_helpers", s.ResolverLSPRegistry.Close)
 			s.LSPRouter = lspRouter
 			idx.SetResolverLSPHelper(s.ResolverLSPRegistry)
 			// Single-repo standalone mode: anchor a "" prefix helper at
@@ -622,6 +753,8 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			Graph:         g,
 			Logger:        logger,
 			LazyWorktrees: conf.Views.LazyWorktreeActivation,
+			// A linked worktree's plain save wakes its coordinator.
+			WatchCheckouts: true,
 			RefViews: indexer.RefViewRetention{
 				RetainInactive:       conf.Views.RetainInactiveDuration(),
 				MaxCachedGenerations: conf.Views.MaxCachedGenerations,
@@ -632,18 +765,92 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 			return nil, fmt.Errorf("build checkout lifecycle: %w", lerr)
 		}
 		s.CheckoutLifecycle = lifecycle
+		// The dedicated-base publisher runtime is installed here — after the
+		// lifecycle exists and before anything can register an owner. Both
+		// halves of that sentence are load-bearing:
+		//
+		//   - it belongs to the stack, not to `cmd/gortex/daemon.go`. The build
+		//     gate is installed from the daemon alone, so the one-shot embedded
+		//     server runs ungated; installing the publisher owner there would
+		//     repeat that asymmetry and leave the embedded path without an
+		//     authority for the publication it is equally able to reach.
+		//   - SetDedicatedBaseCleanupRuntime refuses installation once any owner
+		//     is registered, and Seed registers owners (via bindDedicatedGraph)
+		//     as soon as the daemon warms up — which is after the lifecycle
+		//     reaches the MCP server, the controller and the janitor below. The
+		//     one window that always precedes every owner is this one.
+		//
+		// It is handed the store this stack opened and the lifecycle's OWN lease
+		// manager: a private manager would make advancement invisible to the
+		// retirement sweep that uses the lifecycle's manager as its in-use
+		// predicate. Installing it does not publish anything; it only gives the
+		// publisher/drain half a live owner.
+		if store, ok := g.(*store_sqlite.Store); ok {
+			runtime, rerr := indexer.NewDedicatedBaseRuntime(store, lifecycle.ViewLeases())
+			if rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("build dedicated base publisher runtime: %w", rerr)
+			}
+			if rerr := lifecycle.SetDedicatedBaseCleanupRuntime(runtime); rerr != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("install dedicated base publisher runtime: %w", rerr)
+			}
+			s.DedicatedBaseRuntime = runtime
+		}
+	}
+	// The output-generation authority is installed in the same window and for
+	// the same reason as the publisher runtime above: it belongs to the stack,
+	// so the embedded one-shot path shares it instead of repeating the
+	// SetBuildGate asymmetry.
+	//
+	// It is handed the lifecycle's OWN lease manager when there is a lifecycle,
+	// because that is the manager a routed request's BasePin is taken from: a
+	// generation-zero mutation witnessed through any other manager would be
+	// invisible to the request that needs to hear about it.
+	//
+	// Both the standalone Indexer and the MultiIndexer are installed on. The
+	// standalone Indexer mints an ORPHAN mutation lane (no owner, no prefix),
+	// and it is the Indexer this stack hands straight to the MCP server; with
+	// one shared authority its mutations still name an output generation and
+	// owner rather than running on a lane nothing speaks for.
+	{
+		var authorityLeases *graphview.LeaseManager
+		if s.CheckoutLifecycle != nil {
+			authorityLeases = s.CheckoutLifecycle.ViewLeases()
+		}
+		authority := indexer.NewOutputGenerationAuthority(authorityLeases)
+		idx.SetOutputGenerationAuthority(authority)
+		if mi != nil {
+			mi.SetOutputGenerationAuthority(authority)
+		}
+		s.OutputGenerationAuthority = authority
+		// Admission stops with the stack. Outstanding receipts still settle:
+		// closing must refuse new work, not strand work already on a lane.
+		s.addCleanup("output_authority", func() error {
+			authority.Close()
+			return nil
+		})
 	}
 	// Appended after backendCleanup but before MCP background drain. LIFO
 	// teardown therefore drains background work first, then closes per-repo
 	// parser workers, then the standalone Indexer, and only then the graph and
 	// store lock.
-	s.cleanup = append(s.cleanup, func() {
+	s.addCleanup("indexers", func() error {
+		var err error
 		if mi != nil {
-			if err := mi.Close(context.Background()); err != nil {
-				logger.Warn("serverstack: multi-indexer shutdown failed", zap.Error(err))
-			}
+			err = mi.Close(context.Background())
 		}
 		idx.Close()
+		return err
+	})
+	// LIFO: MCP detached work -> lifecycle admissions/producers/retry joins ->
+	// MI parser workers -> standalone Indexer -> backend and store lock.
+	// This must remain after MI cleanup registration and before MCP drain.
+	s.addCleanup("checkout_lifecycle", func() error {
+		if s.CheckoutLifecycle != nil {
+			return s.CheckoutLifecycle.Close()
+		}
+		return nil
 	})
 
 	toolPolicyCfg := gortexmcp.ToolPolicyConfig{
@@ -655,6 +862,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	}
 	scopeIntentDefaults := conf.Scope.IntentDefaults
 	multiOpts := []gortexmcp.MultiRepoOptions{{
+		EditAckMode:         conf.Edit.Ack,
 		MultiIndexer:        mi,
 		ConfigManager:       cm,
 		CheckoutLifecycle:   s.CheckoutLifecycle,
@@ -675,7 +883,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	// Appended after backendCleanup so LIFO teardown drains the server's
 	// detached store-writing goroutines (analysis-generation prune) before
 	// the backend store closes underneath them.
-	s.cleanup = append(s.cleanup, srv.DrainBackground)
+	s.addCleanup("mcp_background", func() error {
+		srv.DrainBackground()
+		return nil
+	})
 	// The server is the session/analysis fan-out, so it can only be bound
 	// after it exists. Every lifecycle side effect — including the ones the
 	// daemon controller drives — reaches sessions through it from here on.
@@ -713,7 +924,10 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	stopOverlayJanitor := overlays.StartJanitor(0, func(dropped int) {
 		logger.Info("overlay janitor: swept idle sessions", zap.Int("dropped", dropped))
 	})
-	s.cleanup = append(s.cleanup, stopOverlayJanitor)
+	s.addCleanup("overlay_janitor", func() error {
+		stopOverlayJanitor()
+		return nil
+	})
 
 	if semMgr := idx.SemanticManager(); semMgr != nil {
 		srv.SetSemanticManager(semMgr)
@@ -733,14 +947,17 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	teleRec := telemetry.NewRecorderFunc(
 		telemetry.CachedConsentResolver(teleDir, telemetryConsentTTL), teleStore)
 	srv.SetTelemetryRecorder(teleRec)
-	s.cleanup = append(s.cleanup, func() { srv.FlushTelemetry() })
+	s.addCleanup("telemetry_flush", func() error {
+		srv.FlushTelemetry()
+		return nil
+	})
 	if cfg.Lifecycle == LifecycleDaemon {
 		// One daemon-session event per process start, dimensioned by backend
 		// — a constant now that sqlite is the only one, kept as a dimension
 		// so the event shape survives a future second store.
 		// Opt-in + fail-silent: a disabled recorder drops it.
 		telemetry.RecordDaemonSession(teleRec, "sqlite")
-		s.cleanup = append(s.cleanup, startTelemetrySender(srv, teleStore, teleDir, cfg.Version))
+		s.installTelemetrySender(srv, teleStore, teleDir, cfg.Version)
 	}
 
 	// Side-stores. The HTTP path previously wired NONE of these; routing it
@@ -767,6 +984,11 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 	s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(platform.MemoriesDir()))
 	srv.InitMemories(sideCfg.NotesDir, sideCfg.NotesRepo)
 	srv.InitSuppressions(sideCfg.NotesDir, sideCfg.NotesRepo)
+	// The notebook keeps its sidecar below the repository-local .gortex
+	// directory, independently of the other side-store directories above.
+	if sideCfg.NotebookPath != "" {
+		s.sidecarPaths = append(s.sidecarPaths, persistence.DefaultSidecarPath(filepath.Join(sideCfg.NotebookPath, ".gortex")))
+	}
 	srv.InitNotebook(sideCfg.NotebookPath)
 	srv.InitCombo(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
 	srv.InitFrecency(sideCfg.FeedbackDir, sideCfg.FeedbackRepo, gortexmcp.ModeAI)
@@ -789,7 +1011,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		}
 		srv.InitSavings(savingsStore, cfg.SavingsRepo)
 		s.sidecarPaths = append(s.sidecarPaths, savingsPath)
-		s.cleanup = append(s.cleanup, func() { _ = srv.FlushSavings() })
+		s.addCleanup("savings_flush", srv.FlushSavings)
 	} else {
 		logger.Warn("serverstack: savings persistence disabled", zap.Error(err))
 	}
@@ -806,7 +1028,7 @@ func NewSharedServer(cfg SharedServerConfig) (*SharedServer, error) {
 		// its Close in the cleanup chain — the "caller owns Close" contract
 		// SetLLMService documents.
 		if llmSvc := srv.LLMService(); llmSvc != nil {
-			s.cleanup = append(s.cleanup, func() { _ = llmSvc.Close() })
+			s.addCleanup("llm", llmSvc.Close)
 		}
 	}
 

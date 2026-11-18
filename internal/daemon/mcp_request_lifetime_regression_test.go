@@ -389,7 +389,7 @@ func TestMCPDispatchLimitConfiguration(t *testing.T) {
 	}
 }
 
-func TestServeMCPDispatcherSaturationFailsFastAndKeepsReaderResponsive(t *testing.T) {
+func TestServeMCPDispatcherSaturationWithQueueDisabledFailsFastAndKeepsReaderResponsive(t *testing.T) {
 	filled := 0
 	for {
 		select {
@@ -407,10 +407,11 @@ saturated:
 		}
 	}()
 	var dispatches atomic.Int32
-	conn, reader, done := startMCPConnectionTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
+	var zero time.Duration
+	conn, reader, done := startMCPConnectionWithHooksTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
 		dispatches.Add(1)
 		return nil, errors.New("saturated dispatcher unexpectedly ran")
-	})
+	}, &mcpConnectionHooks{dispatchQueueWait: &zero})
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"edit"}}`)
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
 	responses := map[string]testMCPResponse{}
@@ -422,6 +423,15 @@ saturated:
 		response := responses[id]
 		if response.Error == nil || response.Error.Code != -32002 || response.Error.Data["outcome"] != "server_busy" {
 			t.Fatalf("busy response %s = %#v", id, response)
+		}
+		// Lane admission supplies bounded retry guidance even with queueing off;
+		// this remains a not-started refusal and does not relax lifetime safety.
+		retry, ok := response.Error.Data["retry_after_ms"].(float64)
+		if !ok || retry < 100 || retry > 5000 {
+			t.Fatalf("busy response %s retry=%#v", id, response.Error.Data["retry_after_ms"])
+		}
+		if waited, ok := response.Error.Data["queue_wait_ms"].(float64); !ok || waited != 0 {
+			t.Fatalf("queue-off response %s wait=%#v", id, response.Error.Data["queue_wait_ms"])
 		}
 	}
 	if responses["1"].Error.Data["delivery_unknown"] != false || responses["1"].Error.Data["retryable"] != true {
@@ -455,4 +465,49 @@ func startMCPConnectionWithHooksTest(t *testing.T, timeout time.Duration, dispat
 		}
 	})
 	return clientConn, bufio.NewReader(clientConn), done
+}
+
+func TestServeMCPSubscriptionsListenStaysOpenWithoutTimeoutOrSlotConsumption(t *testing.T) {
+	listenStarted := make(chan struct{})
+	slots := make(chan struct{}, 1)
+	hooks := &mcpConnectionHooks{dispatchSlots: slots}
+	conn, reader, done := startMCPConnectionWithHooksTest(t, 20*time.Millisecond, func(ctx context.Context, frame []byte) ([]byte, error) {
+		var envelope mcpRequestEnvelope
+		if err := json.Unmarshal(frame, &envelope); err != nil {
+			return nil, err
+		}
+		if envelope.Method == "subscriptions/listen" {
+			if _, hasDeadline := ctx.Deadline(); hasDeadline {
+				return nil, errors.New("subscriptions/listen must not carry the per-request tool-call deadline")
+			}
+			close(listenStarted)
+			<-ctx.Done()
+			return []byte(`{"jsonrpc":"2.0","id":2,"result":{}}`), nil
+		}
+		return []byte(`{"jsonrpc":"2.0","id":3,"result":{"ok":true}}`), nil
+	}, hooks)
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{}}`)
+	awaitMCPTestSignal(t, listenStarted, "subscriptions/listen did not start")
+
+	// Wait longer than the 20ms per-request timeout and confirm the stream does not
+	// time out or occupy the single bounded dispatch slot.
+	time.Sleep(50 * time.Millisecond)
+	if len(slots) != 0 {
+		t.Fatalf("subscriptions/listen occupied %d bounded dispatch slots, want 0", len(slots))
+	}
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`)
+	response := readMCPTestResponse(t, conn, reader)
+	if string(response.ID) != "3" || response.Error != nil || response.Result["ok"] != true {
+		t.Fatalf("concurrent request while subscriptions/listen active = %#v", response)
+	}
+
+	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`)
+	cancelResp := readMCPTestResponse(t, conn, reader)
+	if string(cancelResp.ID) != "2" || cancelResp.Error != nil {
+		t.Fatalf("subscriptions/listen cancellation response = %#v", cancelResp)
+	}
+	_ = conn.Close()
+	awaitMCPTestSignal(t, done, "connection did not stop")
 }

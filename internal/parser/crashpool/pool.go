@@ -215,11 +215,12 @@ func (p *Pool) SubmitWithOptions(relPath, language string, content []byte, tempo
 			return Result{Panicked: true, Err: resp.Err}
 		}
 		return Result{
-			Nodes:       resp.Nodes,
-			Edges:       resp.Edges,
-			ParseErrors: resp.ParseErrors,
-			HasParseErr: resp.HasParseErr,
-			Err:         resp.Err,
+			Nodes:        resp.Nodes,
+			Edges:        resp.Edges,
+			ParseErrors:  resp.ParseErrors,
+			ParseChecked: resp.Err == "" && resp.ParseChecked && resp.ParseErrors >= 0,
+			HasParseErr:  resp.HasParseErr,
+			Err:          resp.Err,
 		}
 	case <-timer.C:
 		// Worker hung. Killing it unblocks the roundTrip goroutine

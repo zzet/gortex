@@ -1,9 +1,8 @@
 // Package githooks installs local git hooks that re-run gortex
 // commands after specified events. The implementation is read-only on
-// git itself — it shells out only for `git rev-parse` and
-// `git config --get core.hooksPath`. Hook files are managed by
-// markers so we can install and uninstall idempotently without
-// destroying any user-authored content.
+// git itself — it shells out only for `git rev-parse`.
+// Hook files are managed by markers so we can install and uninstall
+// idempotently without destroying any user-authored content.
 package githooks
 
 import (
@@ -216,21 +215,18 @@ func HookPathFor(repoRoot, hook string) (string, error) {
 	if !isSupportedHook(hook) {
 		return "", fmt.Errorf("githooks: unsupported hook %q (supported: %s)", hook, strings.Join(SupportedHooks, ", "))
 	}
-	gitDir, err := runGit(repoRoot, "rev-parse", "--git-dir")
-	if err != nil {
-		return "", fmt.Errorf("githooks: not a git repository at %q: %w", repoRoot, err)
-	}
-	gitDir = strings.TrimSpace(gitDir)
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(repoRoot, gitDir)
-	}
-	customPath, _ := runGit(repoRoot, "config", "--get", "core.hooksPath")
-	hooksDir := filepath.Join(gitDir, "hooks")
-	if cp := strings.TrimSpace(customPath); cp != "" {
-		if !filepath.IsAbs(cp) {
-			cp = filepath.Join(repoRoot, cp)
+	hooksDir, err := runGit(repoRoot, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+	hooksDir = strings.TrimSpace(hooksDir)
+	// Older Git versions may reject or ignore --path-format.
+	if err != nil || !filepath.IsAbs(hooksDir) {
+		hooksDir, err = runGit(repoRoot, "rev-parse", "--git-path", "hooks")
+		if err != nil {
+			return "", fmt.Errorf("githooks: not a git repository at %q: %w", repoRoot, err)
 		}
-		hooksDir = cp
+		hooksDir = strings.TrimSpace(hooksDir)
+		if !filepath.IsAbs(hooksDir) {
+			hooksDir = filepath.Join(repoRoot, hooksDir)
+		}
 	}
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		return "", fmt.Errorf("githooks: create hooks dir %q: %w", hooksDir, err)

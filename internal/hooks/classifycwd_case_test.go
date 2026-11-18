@@ -40,3 +40,27 @@ func TestClassifyCwd_CaseSensitiveNoMatch(t *testing.T) {
 	assert.Nil(t, exact, "case-sensitive: byte-different cwd must not match")
 	assert.Empty(t, contained)
 }
+
+// A cwd inside a tracked repo resolves to that repo (the deepest one when
+// repos nest), matching the daemon's ScopeForCWD. Treating it as uncovered
+// would wrongly scope the MCP-required rule out of a tracked repo (#900).
+func TestClassifyCwd_InsideTrackedRepoResolvesDeepest(t *testing.T) {
+	forceHooksCaseInsensitive(t, false)
+	repos := []daemon.TrackedRepoStatus{
+		{Name: "outer", Path: "/work/outer"},
+		{Name: "inner", Path: "/work/outer/vendor/inner"},
+		{Name: "sibling", Path: "/work/outerx"},
+	}
+	exact, contained := classifyCwd("/work/outer/vendor/inner/pkg", repos)
+	require.NotNil(t, exact)
+	assert.Equal(t, "inner", exact.Name)
+	assert.Empty(t, contained)
+
+	exact, _ = classifyCwd("/work/outer/cmd", repos)
+	require.NotNil(t, exact)
+	assert.Equal(t, "outer", exact.Name)
+
+	exact, contained = classifyCwd("/work/elsewhere", repos)
+	assert.Nil(t, exact)
+	assert.Empty(t, contained)
+}

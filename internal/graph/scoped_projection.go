@@ -14,14 +14,37 @@ type ScopedEdgeRow struct {
 	Target *Node
 }
 
-// ScopedProjectionSequencer streams full rows owned by a repository or file
+// ScopedNodeProjectionSequencer streams nodes owned by a repository or file
 // frontier. When filePaths is non-empty it is the tighter predicate; repository
 // prefixes remain an additional safety filter. Implementations must keep their
 // cursor/page bounded and must not materialise a whole repository.
-type ScopedProjectionSequencer interface {
+type ScopedNodeProjectionSequencer interface {
 	NodesInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
-	EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...EdgeKind) iter.Seq[ScopedEdgeRow]
 	NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[*Node]
+}
+
+// ScopedKindSummarySequencer is an optional kind-filtered identity/location
+// projection. Rows retain ID, kind, name, qualified name, file/location,
+// language, repository, workspace and project, but no retrieval payload or
+// metadata. Scope, kind ordering and bounded paging match NodesInScopeSeq.
+type ScopedKindSummarySequencer interface {
+	NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node]
+}
+
+// ScopedFileLocationSequencer is an optional file inventory narrower than
+// ScopedKindSummarySequencer. It yields exactly the rows of
+// NodesLightByKindsInScopeSeq(repoPrefixes, nil, KindFile), in the same
+// ascending-ID order, but populates only ID, Kind, FilePath, Language,
+// RepoPrefix and WorkspaceID. A reader that masks, replaces or adds rows
+// over a physical store (an overlay or delta layer) must not implement it.
+type ScopedFileLocationSequencer interface {
+	FileLocationsInScopeSeq(repoPrefixes []string) iter.Seq[*Node]
+}
+
+// ScopedProjectionSequencer additionally exposes the selected edge stream.
+type ScopedProjectionSequencer interface {
+	ScopedNodeProjectionSequencer
+	EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...EdgeKind) iter.Seq[ScopedEdgeRow]
 }
 
 // NodesInScopeSeq selects the production streaming capability. The adapter
@@ -78,6 +101,15 @@ func NodesInScopeSeq(s Store, repoPrefixes, filePaths []string, kinds ...NodeKin
 			}
 		}
 	}
+}
+
+// NodesLightByKindsInScopeSeq is an explicit identity/location inventory.
+// Readers without that capability keep the full-row fallback and exact scope.
+func NodesLightByKindsInScopeSeq(s Store, repoPrefixes, filePaths []string, kinds ...NodeKind) iter.Seq[*Node] {
+	if seq, ok := s.(ScopedKindSummarySequencer); ok {
+		return seq.NodesLightByKindsInScopeSeq(repoPrefixes, filePaths, kinds...)
+	}
+	return NodesInScopeSeq(s, repoPrefixes, filePaths, kinds...)
 }
 
 // EdgesInScopeSeq is the edge counterpart of NodesInScopeSeq. Adapter stores
