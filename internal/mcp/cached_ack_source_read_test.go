@@ -130,10 +130,24 @@ func TestSymbolSourceRetriesByteDriftBeforeProjectionSelection(t *testing.T) {
 		default:
 		}
 	})
-	select {
-	case <-extractor.entered:
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
+	// Retain a reply that precedes extractor admission without replacing the
+	// original entry deadline or the later acknowledged-byte oracle.
+	var early *reply
+waitForEntry:
+	for {
+		select {
+		case <-extractor.entered:
+			break waitForEntry
+		case observed := <-responses:
+			early = &observed
+			text := "<nil>"
+			if observed.result != nil {
+				text = resultText(observed.result)
+			}
+			t.Logf("EARLY_SOURCE_REPLY error=%v result=%+v text=%s", observed.err, observed.result, text)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
 	}
 	write := makeReq("edit_file", map[string]any{"path": path, "old_string": "println(1)", "new_string": "println(2)", "format": "json"})
 	ack, err := s.runAcknowledgedEdit(ctx, write, s.handleEditFile)
@@ -142,11 +156,15 @@ func TestSymbolSourceRetriesByteDriftBeforeProjectionSelection(t *testing.T) {
 	require.Equal(t, "committed", extractTextResult(t, ack)["disk_status"])
 	release()
 	var actual reply
-	select {
-	case actual = <-responses:
-	case <-ctx.Done():
-		<-responses
-		t.Fatal(ctx.Err())
+	if early != nil {
+		actual = *early
+	} else {
+		select {
+		case actual = <-responses:
+		case <-ctx.Done():
+			<-responses
+			t.Fatal(ctx.Err())
+		}
 	}
 	require.NoError(t, actual.err)
 	require.NotNil(t, actual.result)

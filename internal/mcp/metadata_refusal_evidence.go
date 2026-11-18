@@ -57,15 +57,18 @@ func (guard projectionLivenessGuard) label() string {
 // revisions require the registry mutex and are deliberately not sampled here.
 // No entry, path, content, clock or additional liveness check is retained.
 type acknowledgementProjectionFailure struct {
-	Guard                string  `json:"guard"`
-	Owner                string  `json:"owner"`
-	OwnerCheck           string  `json:"owner_check"`
-	Suspect              string  `json:"suspect"`
-	SuspectCheck         string  `json:"suspect_check"`
-	EntryCommitSeq       *uint64 `json:"entry_commit_seq,omitempty"`
-	EntrySourceCommitSeq *uint64 `json:"entry_source_commit_seq,omitempty"`
-	OwnerCommitSeq       *uint64 `json:"owner_commit_seq,omitempty"`
-	OwnerSourceCommitSeq *uint64 `json:"owner_source_commit_seq,omitempty"`
+	selectedIdentity, ownerIdentity                                              uintptr
+	selectedSequence, selectedSourceSequence, ownerSequence, ownerSourceSequence uint64
+	observedSuspect                                                              int8
+	Guard                                                                        string  `json:"guard"`
+	Owner                                                                        string  `json:"owner"`
+	OwnerCheck                                                                   string  `json:"owner_check"`
+	Suspect                                                                      string  `json:"suspect"`
+	SuspectCheck                                                                 string  `json:"suspect_check"`
+	EntryCommitSeq                                                               *uint64 `json:"entry_commit_seq,omitempty"`
+	EntrySourceCommitSeq                                                         *uint64 `json:"entry_source_commit_seq,omitempty"`
+	OwnerCommitSeq                                                               *uint64 `json:"owner_commit_seq,omitempty"`
+	OwnerSourceCommitSeq                                                         *uint64 `json:"owner_source_commit_seq,omitempty"`
 }
 
 func acknowledgementProjectionLiveness(entry *projectionEntry) (projectionLivenessGuard, *acknowledgementProjectionFailure) {
@@ -79,6 +82,8 @@ func acknowledgementProjectionLiveness(entry *projectionEntry) (projectionLivene
 	if entry != nil {
 		sequence, sourceSequence := entry.commitSeq, entry.sourceCommitSeq
 		diagnostic.EntryCommitSeq, diagnostic.EntrySourceCommitSeq = &sequence, &sourceSequence
+		diagnostic.selectedIdentity = projectionIdentity(entry)
+		diagnostic.selectedSequence, diagnostic.selectedSourceSequence = sequence, sourceSequence
 	}
 	guard := observeProjectionLiveness(entry, diagnostic)
 	if guard == projectionOwnerLive {
@@ -93,6 +98,7 @@ func (diagnostic *acknowledgementProjectionFailure) observeSuspect(check string,
 		return
 	}
 	diagnostic.SuspectCheck, diagnostic.Suspect = check, "clear"
+	predicateBool(&diagnostic.observedSuspect, suspect)
 	if suspect {
 		diagnostic.Suspect = "suspect"
 	}
@@ -103,6 +109,8 @@ func (diagnostic *acknowledgementProjectionFailure) observeOwner(check string, e
 		return
 	}
 	diagnostic.OwnerCheck, diagnostic.Owner = check, "missing"
+	diagnostic.ownerIdentity = projectionIdentity(owner)
+	diagnostic.ownerSequence, diagnostic.ownerSourceSequence = 0, 0
 	diagnostic.OwnerCommitSeq, diagnostic.OwnerSourceCommitSeq = nil, nil
 	if owner == nil {
 		return
@@ -113,6 +121,7 @@ func (diagnostic *acknowledgementProjectionFailure) observeOwner(check string, e
 	}
 	sequence, sourceSequence := owner.commitSeq, owner.sourceCommitSeq
 	diagnostic.OwnerCommitSeq, diagnostic.OwnerSourceCommitSeq = &sequence, &sourceSequence
+	diagnostic.ownerSequence, diagnostic.ownerSourceSequence = sequence, sourceSequence
 }
 
 type projectionReadStage uint8
@@ -147,9 +156,10 @@ func (stage projectionReadStage) label() string {
 }
 
 type projectionReadDiagnostic struct {
-	cause error
-	stage projectionReadStage
-	guard projectionLivenessGuard
+	cause     error
+	stage     projectionReadStage
+	guard     projectionLivenessGuard
+	predicate *projectionPredicateSample
 }
 
 func (e *projectionReadDiagnostic) Error() string { return e.cause.Error() }
@@ -167,7 +177,7 @@ func annotateProjectionReadRefusal(stage projectionReadStage, guard projectionLi
 		if previous.stage != projectionReadValidation || stage == projectionReadValidation {
 			return err // Keep the first actual refusing site/predicate.
 		}
-		return &projectionReadDiagnostic{cause: err, stage: stage, guard: previous.guard}
+		return &projectionReadDiagnostic{cause: err, stage: stage, guard: previous.guard, predicate: previous.predicate}
 	}
 	return &projectionReadDiagnostic{cause: err, stage: stage, guard: guard}
 }
