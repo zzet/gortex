@@ -93,7 +93,7 @@ A small Linux race smoke uses the existing production wiring tests
 `TestDaemon_EndToEnd_ToolHandlerCanReturnItsDispatchSlot` and
 `TestComposeWiresTheLeaseManagerIntoTheRESTSurface` to supplement imports with
 runtime handler/transport coverage. All-OS default builds remain enabled (Linux
-in the existing `build-onnx` job), along with static/tagged builds, complete lint,
+in the existing `build-gomlx` job), along with static/tagged builds, complete lint,
 module tidiness, CGO flag checks, benchmarks and the separate security workflows.
 
 Only full-suite Linux coverage goes to Codecov. Affected-run coverage is kept in

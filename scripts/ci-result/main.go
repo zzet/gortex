@@ -33,7 +33,7 @@ func checkCIResult(needs map[string]ciNeed, event string) error {
 	}
 	expected := map[string]string{
 		"test": "success", "smoke": "success", "build-native": "success",
-		"lint": "success", "build-linux-static": "success", "build-onnx": "success",
+		"lint": "success", "build-linux-static": "success", "build-gomlx": "success",
 		"benchmark": "skipped", "parser-stress": "skipped",
 	}
 	if hasTests == "false" {
@@ -49,7 +49,7 @@ func checkCIResult(needs map[string]ciNeed, event string) error {
 		expected["parser-stress"] = "success"
 	}
 	// Stable ordering also makes receipts with multiple failures diagnostic.
-	for _, name := range []string{"test", "smoke", "build-native", "lint", "build-linux-static", "build-onnx", "benchmark", "parser-stress"} {
+	for _, name := range []string{"test", "smoke", "build-native", "lint", "build-linux-static", "build-gomlx", "benchmark", "parser-stress"} {
 		if err := require(name, expected[name]); err != nil {
 			return err
 		}

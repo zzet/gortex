@@ -666,7 +666,6 @@ cases:
         - internal/embedding/static.go::StaticProvider
         - internal/embedding/hugot.go::HugotProvider
         - internal/embedding/api.go::APIProvider
-        - internal/embedding/onnx.go::ONNXProvider
         - internal/embedding/nop.go::NopProvider
     - id: mh-search-backends-typo
       tier: multi_hop

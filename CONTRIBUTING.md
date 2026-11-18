@@ -66,7 +66,6 @@ checks and is the right default for most work. Other optional build tags:
 | Tag | Enables |
 |-----|---------|
 | `llama` | In-process llama.cpp provider (`llm.provider: local`) |
-| `embeddings_onnx` | ONNX Runtime embedding backend |
 | `embeddings_gomlx` (+ `XLA`) | GoMLX embedding backend |
 | `netgo,osusergo,static_link` | The fully static Linux release build |
 
@@ -135,7 +134,7 @@ Your PR has to get past all of these
 - a static Linux build (`netgo,osusergo,static_link`) verified to be
   self-contained and smoke-tested inside `debian:11` and `alpine:3`
 - golangci-lint
-- builds with the ONNX and GoMLX embedding tags
+- builds with the GoMLX embedding tag
 - benchmarks for the parser, query, and graph packages
 
 See [CI test selection](docs/ci-testing.md) for full-suite fallbacks, the

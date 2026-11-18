@@ -93,7 +93,7 @@ func TestRenderExploreShapeIsNonTerminal(t *testing.T) {
 
 func TestRenderExploreBroadWeakNeighborhoodReturnsBestSupportedDraft(t *testing.T) {
 	targets := []exploreTarget{
-		{node: &graph.Node{ID: "internal/embedding/onnx.go::current", Name: "current", Kind: graph.KindVariable, FilePath: "internal/embedding/onnx.go"}, score: 0.9},
+		{node: &graph.Node{ID: "internal/embedding/nop.go::current", Name: "current", Kind: graph.KindVariable, FilePath: "internal/embedding/nop.go"}, score: 0.9},
 		{node: &graph.Node{ID: "internal/analyzer/state.go::dirty", Name: "dirty", Kind: graph.KindVariable, FilePath: "internal/analyzer/state.go"}, score: 0.8},
 	}
 	task := "review release blockers across impact reach sqlite races mcp facade routing codex claude guidance explore ranking token cost"

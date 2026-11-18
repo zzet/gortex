@@ -14,10 +14,10 @@ COMMIT    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE      ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 
-.PHONY: build build-onnx build-gomlx build-hugot build-windows \
+.PHONY: build build-gomlx build-hugot build-windows \
        test bench bench-rpi bench-rpi-quick bench-rpi-profile bench-compare \
        lint fmt clean install dev-link tag-release \
-       deps-onnx deps-gomlx deps-hugot deps-vectors \
+       deps-gomlx deps-hugot deps-vectors \
        claude-plugin claude-plugin-check
 
 # ---------------------------------------------------------------------------
@@ -26,9 +26,6 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.d
 
 build:
 	go build -ldflags '$(LDFLAGS)' -tags llama -o $(BINARY) ./cmd/gortex/
-
-build-onnx: deps-onnx
-	go build -tags embeddings_onnx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 build-gomlx: deps-gomlx
 	go build -tags "embeddings_gomlx XLA" -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
@@ -181,20 +178,6 @@ claude-plugin-check: claude-plugin
 # ---------------------------------------------------------------------------
 # Embedding backend dependencies
 # ---------------------------------------------------------------------------
-
-# ONNX Runtime — system library required for -tags embeddings_onnx
-deps-onnx:
-	@echo "=== ONNX Runtime dependency ==="
-ifeq ($(shell uname -s),Darwin)
-	@command -v brew >/dev/null 2>&1 || { echo "Error: Homebrew required. Install from https://brew.sh"; exit 1; }
-	@brew list onnxruntime >/dev/null 2>&1 || brew install onnxruntime
-	@echo "✓ onnxruntime installed (macOS/Homebrew)"
-else ifeq ($(shell uname -s),Linux)
-	@dpkg -s libonnxruntime-dev >/dev/null 2>&1 || { echo "Run: sudo apt install libonnxruntime-dev"; exit 1; }
-	@echo "✓ libonnxruntime-dev installed (Linux/apt)"
-endif
-	go get github.com/yalue/onnxruntime_go@latest
-	@echo "✓ Go ONNX bindings ready"
 
 # GoMLX — XLA/PJRT plugin auto-downloads on first run (~100MB)
 deps-gomlx:

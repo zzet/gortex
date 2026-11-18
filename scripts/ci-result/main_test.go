@@ -24,7 +24,7 @@ func affectedPRNeeds() map[string]ciNeed {
 		"build-native":       {Result: "success"},
 		"lint":               {Result: "success"},
 		"build-linux-static": {Result: "success"},
-		"build-onnx":         {Result: "success"},
+		"build-gomlx":        {Result: "success"},
 		"benchmark":          {Result: "success"},
 		"parser-stress":      {Result: "skipped"},
 	}
@@ -153,7 +153,7 @@ func assertCIWorkflowWiring(t *testing.T, input string) {
 		"CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}",
 		"fetch-depth: 0", "--selection test-selection.json",
 		"needs.plan.outputs.mode == 'full'", "name: affected-coverage-",
-		"  build-native:\n", "  lint:\n", "  build-linux-static:\n", "  build-onnx:\n", "  ci-result:\n",
+		"  build-native:\n", "  lint:\n", "  build-linux-static:\n", "  build-gomlx:\n", "  ci-result:\n",
 		"if: always()", "go test -count=1 ./scripts/ci-result", "run: go run ./scripts/ci-result",
 		"go test -count=1 ./internal/citest", "go run ./scripts/ci-select --output test-selection.json",
 		"go run ./scripts/ci-test --selection test-selection.json",
