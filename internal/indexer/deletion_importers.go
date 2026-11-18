@@ -114,6 +114,9 @@ func (idx *Indexer) forceReparse(filePath string) bool {
 // file, and the unchanged files a per-file delta re-derives because the change
 // can move their rows.
 func (idx *Indexer) forceReparseDropsResolutions(filePath string) bool {
+	if idx.aliasResolutionChanged && closureJSTSPath(filePath) {
+		return true
+	}
 	if len(idx.forcedReparse) == 0 {
 		return false
 	}

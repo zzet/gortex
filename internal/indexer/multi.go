@@ -2612,6 +2612,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 			break
 		}
 	}
+	defer idx.clearAliasPass()
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(meta.RootPath, paths, mode)
 	if err != nil {
 		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
@@ -2665,7 +2666,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	derived.endDerived()
 
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, nil
+	return result, idx.finishAliasPass(result)
 }
 
 // PrefixCollisionError reports a prefix already owned by another repository.
@@ -3306,6 +3307,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
 			zap.Bool("force_full", forceFull), zap.Bool("census_failed", censusErr != nil))
 		defer applyTiming.abort()
+		defer idx.clearAliasPass()
 		switch {
 		case censusErr != nil:
 			// A partial filesystem census cannot safely authorize replacement:
@@ -3317,8 +3319,17 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			route = "full_retrack"
 			result, err = fullRetrack()
 		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0:
-			route = "census_noop"
-			result, err = idx.cleanCensusResult(ctx, detected, start)
+			caller, aliasErr := idx.restoredAliasCaller(absPath, priorMtimes)
+			if aliasErr != nil {
+				return aliasErr
+			}
+			if caller != "" {
+				route = "scoped"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, []string{caller}, false)
+			} else {
+				route = "census_noop"
+				result, err = idx.cleanCensusResult(ctx, detected, start)
+			}
 		case churn == 0:
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
@@ -3419,6 +3430,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// pipeline and only needs the existing cross-repository contract reconcile.
 		if !result.FullRetrack && !batchMode.deferResolve {
 			mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
+			if err := idx.finishAliasPass(result); err != nil {
+				return err
+			}
 			if !batchMode.deferGlobalPasses {
 				idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 				mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{

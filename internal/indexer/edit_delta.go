@@ -130,8 +130,17 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 	if req.importBatch {
 		req.contentProof.disable()
 	}
+	var aliases *aliasSnapshot
 	for _, change := range req.Changes {
-		if dependencyManifestPath(change.Path) {
+		manifest := dependencyManifestPath(change.Path)
+		if !manifest {
+			if aliases == nil {
+				aliases = workingAliases(req.RootPath, req.contentProof, nil)
+			}
+			// An inherited config can have any name or extension.
+			_, manifest = aliases.inputs[filepath.Join(req.RootPath, filepath.FromSlash(change.Path))]
+		}
+		if manifest {
 			req.contentProof.disable()
 			if req.followup && b.Config.Coverage.IsEnabled("clones") {
 				return 0, BuildReport{}, fmt.Errorf("indexer: clone follow-up cannot use the sparse manifest path: %s", change.Path)
@@ -826,6 +835,14 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
+	if base, ok := req.Base.(aliasStateStore); ok {
+		prior, err := base.TSAliasDigest(req.RepoPrefix)
+		if err != nil {
+			idx.Close()
+			return nil, err
+		}
+		idx.appliedAliases = prior
+	}
 	idx.contractGenerationID = handle.ViewGeneration()
 	idx.contractProjectionContext = ctx
 	idx.contractProjectionNeedsWitness = true

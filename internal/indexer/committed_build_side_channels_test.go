@@ -913,12 +913,20 @@ func forgetTSAliasCache(roots ...string) {
 func tsAliasCacheEntry(root string) (*tsalias.Collection, bool) {
 	tsAliasCacheMu.Lock()
 	defer tsAliasCacheMu.Unlock()
-	c, ok := tsAliasCache[root]
-	return c, ok
+	slot := tsAliasCache[root]
+	if slot == nil {
+		return nil, false
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.snapshot == nil {
+		return nil, false
+	}
+	return slot.snapshot.collection, true
 }
 
 // TestSnapshotAliasScopesNeitherReadNorFillTheProcessCache pins the cache
-// keying. tsAliasCache is keyed by repo ROOT and never invalidated, so a
+// keying. tsAliasCache is keyed by working-copy root, so otherwise a
 // committed build and the live index at the same root would share one
 // checkout-derived Collection. A sourced load must ignore a primed entry for
 // its root and must not leave one behind.

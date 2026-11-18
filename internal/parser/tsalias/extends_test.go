@@ -30,6 +30,23 @@ func TestLoad_Extends(t *testing.T) {
 			want: "app/composables/auth",
 		},
 		{
+			name: "dotted stem falls back to json",
+			configs: map[string]string{
+				"tsconfig.json":             `{"extends":"./config/tsconfig.base"}`,
+				"config/tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["../app/*"]}}}`,
+			},
+			want: "app/composables/auth",
+		},
+		{
+			name: "literal parent wins over json fallback",
+			configs: map[string]string{
+				"tsconfig.json": `{"extends":"./base"}`,
+				"base":          `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
+				"base.json":     `{"compilerOptions":{"paths":{"~/*":["wrong/*"]}}}`,
+			},
+			want: "app/composables/auth",
+		},
+		{
 			name: "child baseUrl rebases inherited paths",
 			configs: map[string]string{
 				"tsconfig.json":    `{"extends":"./config/base.json","compilerOptions":{"baseUrl":"app"}}`,
@@ -86,4 +103,13 @@ func TestLoad_ExtendsChildPathsReplaceParent(t *testing.T) {
 	coll := Load(root)
 	require.NotNil(t, coll)
 	require.Empty(t, Resolve(coll.FindForFile("app/page.ts"), "~/composables/auth"))
+}
+
+func TestExactAliasPrecedesWildcardWithSamePrefix(t *testing.T) {
+	coll := LoadTree(memTree{files: map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"paths":{"foo":["exact"],"foo*":["wild/*"]}}}`,
+	}})
+	scope := coll.FindForFile("caller.ts")
+	require.Equal(t, "exact", Resolve(scope, "foo"))
+	require.Equal(t, "wild/bar", Resolve(scope, "foobar"))
 }

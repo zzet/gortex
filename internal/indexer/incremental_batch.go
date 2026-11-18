@@ -367,8 +367,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		// structural stage whatever its fingerprints say
 		// (deletion_importers.go).
 		forced := idx.forceReparse(filePath) || len(legacyIDs) > 0
-		aliasChanged := idx.aliasResolutionChanged && isAliasCallerPath(graphPath)
-		inert := !aliasChanged && probeOK && storedGraph.semantic != "" &&
+		inert := probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata &&
 			unchangedProbeContractInputs(priorNodes, probe)
@@ -461,7 +460,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			legacyIDs: legacyIDs, legacyPath: legacyPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
-			metadataOnly: !aliasChanged && !forced && storedGraph.semantic != "" &&
+			metadataOnly: !forced && storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic &&
 				unchangedProbeContractInputs(priorNodes, probe),
 		}
@@ -767,10 +766,6 @@ func (idx *Indexer) commitIncrementalStages(
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
 			stage.priorNodes, view.outByNode, view.nodesByID,
 		)
-		if idx.aliasResolutionChanged && isAliasCallerPath(stage.graphPath) {
-			stage.reuse, stage.priorPending = nil, nil
-			stage.metadataOnly = false
-		}
 		// A using-stamp change re-prices every visibility-narrowed verdict
 		// in the file: reuse would restore an extension target the new
 		// usings refuse, and the prior-unresolved skip would park a call

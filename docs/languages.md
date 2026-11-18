@@ -119,7 +119,8 @@ config that declares them, while the child config determines the caller scope.
 Generated `.nuxt` configs are read only when explicitly extended; the directory
 is not scanned as an independent scope. Package-specifier `extends` and project
 `references` are not traversed. Cycles and chains deeper than 32 configs stop.
-Repository indexing/reindexing and untracking invalidate the lazy alias cache.
+When an effective alias changes, reindexing rebinds existing JS/TS callers
+even if their source files have not changed.
 
 ### Julia specifics
 

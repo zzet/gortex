@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
@@ -302,24 +301,6 @@ func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache 
 	return out
 }
 
-// tsAliasCache caches the per-repo Collection of tsconfig/jsconfig
-// alias maps. Loaded lazily on first lookup for a repo ROOT PATH and
-// reused within an indexing pass; repository mutations invalidate the entry. A nil
-// entry means "scanned, no usable config" — distinct from "not yet
-// scanned" (missing key).
-//
-// It holds WORKING-COPY answers only. The key is a root, and a root cannot
-// tell two snapshots of one checkout apart, so a build that reads a committed
-// tree neither consults this cache nor fills it: it loads its own scopes out
-// of its own source and memoises them on the Indexer that owns that source
-// (Indexer.tsAliasCollection). Sharing this map between the live index and a
-// committed build is exactly how the checkout's tsconfig would have decided a
-// committed generation's alias edges.
-var (
-	tsAliasCache   = map[string]*tsalias.Collection{}
-	tsAliasCacheMu sync.Mutex
-)
-
 // tsAliasMapFor returns the nearest-ancestor alias map for srcFile
 // (and the repo prefix the resolved path should be prefixed with).
 // srcFile is a repo-prefixed path; we determine the repo by matching
@@ -361,78 +342,16 @@ func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
 // tsAliasCollectionFor returns the tsconfig / jsconfig alias scopes a tracked
 // repository's path-alias lookups must go through.
 //
-// The scopes come from the tracked-repo metadata's root, which is where this
-// scan always read: only a registered indexer that has declared SOURCE
-// authority takes over, and then through that indexer's own memo, because a
-// snapshot's scopes must neither be looked up in nor written to the
-// process-wide root-keyed cache. An indexer with no source installed reads the
-// same working copy the metadata root names, so deferring to it would swap the
-// root for no gain — the same preference readFileFromAnyRepo's manifestTreeFor
-// applies, for the same reason.
+// A sourced indexer owns snapshot resolution. A live mutation pins its
+// checkout scopes until resolver catch-up; other lookups use the root cache.
 func (mi *MultiIndexer) tsAliasCollectionFor(prefix, root string) *tsalias.Collection {
 	// GetIndexer holds mi.mu only for this lookup; no I/O happens under it.
 	if idx := mi.GetIndexer(prefix); idx != nil {
-		if tree := idx.manifestTree(); tree.sourced() {
+		if idx.manifestTree().sourced() || idx.passAliases.Load() != nil {
 			return idx.tsAliasCollection()
 		}
 	}
 	return loadTSAliasCollection(root)
-}
-
-// loadTSAliasCollection returns the WORKING COPY's alias scopes at rootPath,
-// cached process-wide by root. Only an unsourced tree may ask: see the note on
-// tsAliasCache.
-func loadTSAliasCollection(rootPath string) *tsalias.Collection {
-	return loadTSAliasCollectionNoting(rootPath, nil)
-}
-
-// loadTSAliasCollectionNoting is loadTSAliasCollection that calls loading,
-// when set, before it scans the working copy for a root the cache misses.
-func loadTSAliasCollectionNoting(rootPath string, loading func()) *tsalias.Collection {
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
-	if c, ok := tsAliasCache[rootPath]; ok {
-		return c
-	}
-	if loading != nil {
-		loading()
-	}
-	c := tsalias.Load(rootPath)
-	tsAliasCache[rootPath] = c
-	return c
-}
-
-func invalidateTSAliasCollection(rootPath string) {
-	if rootPath == "" {
-		return
-	}
-	tsAliasCacheMu.Lock()
-	delete(tsAliasCache, rootPath)
-	tsAliasCacheMu.Unlock()
-}
-
-// A config edit changes resolution even when callers' source shapes did not.
-// Refresh once per mutation pass and report whether old bindings may be reused.
-func (idx *Indexer) refreshTSAliasCollection(rootPath string) bool {
-	// Immutable builds use their source-keyed scopes, never the checkout cache.
-	if idx.contentSrc.Load() != nil {
-		return false
-	}
-	idx.contentProof.noteUnboundedReader()
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
-	previous, loaded := tsAliasCache[rootPath]
-	current := tsalias.Load(rootPath)
-	tsAliasCache[rootPath] = current
-	return loaded && !previous.Equal(current)
-}
-
-func isAliasCallerPath(filePath string) bool {
-	switch path.Ext(filePath) {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".vue", ".svelte", ".astro":
-		return true
-	}
-	return false
 }
 
 // tsAliasCollectionForTree loads the alias scopes out of one tree.
@@ -447,20 +366,7 @@ func isAliasCallerPath(filePath string) bool {
 func tsAliasCollectionForTree(tree manifestTree) *tsalias.Collection {
 	if !tree.sourced() {
 		if proven, ok := tree.(provenManifestTree); ok {
-			// The scan walks the whole working copy for config files, which
-			// no read set holds: a build that proves its reads and makes it
-			// is fenced by a full sample. A build the cache answers reads no
-			// config itself, but builds on the scopes the configs gave: each
-			// config a cached scope came from is held to its change stamp.
-			scanned := false
-			coll := loadTSAliasCollectionNoting(tree.root(), func() {
-				scanned = true
-				proven.proof.noteUnboundedReader()
-			})
-			if !scanned {
-				proven.proof.holdAliasConfigs(tree.root(), coll)
-			}
-			return coll
+			return workingAliases(tree.root(), proven.proof, nil).collection
 		}
 		return loadTSAliasCollection(tree.root())
 	}

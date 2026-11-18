@@ -440,6 +440,8 @@ type Indexer struct {
 	// Set only while the repository mutation lane is held. Alias changes
 	// invalidate source-shape resolution reuse, including unchanged callers.
 	aliasResolutionChanged bool
+	passAliases            atomic.Pointer[aliasSnapshot]
+	appliedAliases         string // fallback for in-memory stores, under the mutation lane
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -853,6 +855,9 @@ func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
 func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
+		if s := idx.passAliases.Load(); s != nil {
+			return s.collection
+		}
 		return tsAliasCollectionForTree(tree)
 	}
 	idx.tsAliasMu.Lock()
@@ -2848,6 +2853,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 	}
+	defer func() {
+		defer idx.clearAliasPass()
+		if retErr == nil {
+			retErr = idx.finishAliasPass(result)
+		}
+	}()
 	// Registered before the failed-file report below, so it runs after that
 	// report is complete: every failed file of this cold pass is staged as a
 	// failure envelope before the door accepts the namespace.
@@ -2960,8 +2971,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	idx.aliasResolutionChanged = idx.refreshTSAliasCollection(absRoot)
-	defer func() { idx.aliasResolutionChanged = false }()
+	if err := idx.beginAliasPass(absRoot, []string{absRoot}); err != nil {
+		return nil, err
+	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -3125,13 +3137,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 	idx.warnIfWalkAdmittedNothing(absRoot, len(files))
 	reporter.Report("walking files", len(files), len(files))
-	if idx.aliasResolutionChanged {
-		for _, file := range files {
-			if isAliasCallerPath(file.path) {
-				idx.graph.EvictFile(idx.prefixPath(idx.relKey(file.path)))
-			}
-		}
-	}
 	// Capture raw content identities while the parser already owns each source
 	// buffer. A nil collector keeps the disabled path allocation-free.
 	merkleBaseline := newMerkleBaselineCollector(idx.merkleEnabled(), len(files))
@@ -4406,6 +4411,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// AddBatch. Direct SQLite writes enter a bounded cross-file
 					// accumulator, amortising transaction/statement setup without
 					// retaining a repository-sized graph in Go memory.
+					if diskTarget == nil && idx.aliasResolutionChanged && closureJSTSPath(path) && !skipped {
+						idx.removePriorAliasEdges(idx.prefixPath(relPath))
+					}
 					if !contentHandled {
 						batchStart := time.Now()
 						durablePath, durableMtime := path, wf.mtimeNano
@@ -5525,7 +5533,7 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
-	if idx.aliasResolutionChanged && isAliasCallerPath(filePath) {
+	if idx.forceReparseDropsResolutions(absPath) {
 		reuseIdx, priorUnresolved = nil, nil
 	}
 
@@ -7156,8 +7164,8 @@ func (idx *Indexer) SetRootPath(root string) {
 	idx.storeRootPath(abs)
 }
 
-// IncrementalReindexPaths re-indexes only the files reachable from the
-// supplied paths, instead of walking the whole repository root.
+// IncrementalReindexPaths reconciles the supplied paths. An effective alias
+// change also refreshes existing JS/TS callers, without widening deletion scope.
 //
 // Each path may be absolute or relative to root, and may be a file or a
 // directory; directories are walked recursively with the same
@@ -7333,12 +7341,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	idx.aliasResolutionChanged = idx.refreshTSAliasCollection(absRoot)
-	defer func() { idx.aliasResolutionChanged = false }()
-	if idx.aliasResolutionChanged {
-		// Alias scopes may change independently of every source mtime.
-		paths = []string{absRoot}
-		fullRoot = true
+	if err := idx.beginAliasPass(absRoot, paths); err != nil {
+		return nil, err
 	}
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
@@ -7508,9 +7512,28 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 	}
 	if idx.aliasResolutionChanged {
-		for relPath := range diskFiles {
-			if isAliasCallerPath(relPath) {
-				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		// Rebind surviving callers without widening the requested deletion,
+		// mtime, or Merkle scope. In-scope files have already been admitted.
+		for rel := range diskFiles {
+			if closureJSTSPath(rel) {
+				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(rel)))
+			}
+		}
+		if !fullRoot {
+			for _, p := range graph.ReadRepoFilePaths(idx.graph, idx.repoPrefix, "", nil, nil) {
+				rel, owned := idx.graphPathRelKey(p)
+				if !owned || diskFiles[rel] || !closureJSTSPath(rel) {
+					continue
+				}
+				abs := filepath.Join(absRoot, filepath.FromSlash(rel))
+				if idx.shouldExclude(abs, absRoot, false) {
+					continue
+				}
+				if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+					staleFiles = append(staleFiles, abs)
+				} else if err != nil && !os.IsNotExist(err) {
+					return nil, err
+				}
 			}
 		}
 	}

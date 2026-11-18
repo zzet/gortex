@@ -39,13 +39,14 @@
 package tsalias
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 )
@@ -88,8 +89,6 @@ type Map struct {
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
-	// ParentConfigs lists the inherited configs a cached scope depends on.
-	ParentConfigs []string
 	// targetBase can be the declaring parent rather than the child scope.
 	targetBase string
 	// exists reports whether a repo-relative slash path is readable content
@@ -155,16 +154,22 @@ func (c *Collection) Maps() []*Map {
 	return c.scopes
 }
 
-// Equal compares effective scopes, not the tree-specific existence probes.
-func (c *Collection) Equal(other *Collection) bool {
-	return slices.EqualFunc(c.Maps(), other.Maps(), func(a, b *Map) bool {
-		return a.DirPrefix == b.DirPrefix && a.BaseURL == b.BaseURL && a.targetBase == b.targetBase &&
-			slices.EqualFunc(a.Entries, b.Entries, func(a, b Alias) bool {
-				return a.AliasPrefix == b.AliasPrefix && a.AliasSuffix == b.AliasSuffix &&
-					a.TargetPrefix == b.TargetPrefix && a.TargetSuffix == b.TargetSuffix &&
-					a.HasWildcard == b.HasWildcard && slices.Equal(a.Targets, b.Targets)
-			})
-	})
+// Digest identifies the effective scopes and ordered targets, not the
+// filesystem probes or the spelling of the configs they came from.
+func (c *Collection) Digest() string {
+	if c == nil {
+		return "none"
+	}
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	for _, scope := range c.scopes {
+		// Strings and slices of Alias are always JSON-encodable.
+		_ = enc.Encode(scope.DirPrefix)
+		_ = enc.Encode(scope.BaseURL)
+		_ = enc.Encode(scope.targetBase)
+		_ = enc.Encode(scope.Entries)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // FindForFile returns the alias map for the nearest ancestor scope of
@@ -390,6 +395,7 @@ func LoadTree(t Tree) *Collection {
 		return nil
 	}
 	var scopes []*Map
+	configs := configReader{tree: t, docs: make(map[string]*configDocument)}
 	t.Files(func(rel string) {
 		if !IsConfigFileName(path.Base(rel)) || underSkippedDir(rel) {
 			return
@@ -398,7 +404,7 @@ func LoadTree(t Tree) *Collection {
 		if dirRel == "." || dirRel == "/" {
 			dirRel = ""
 		}
-		if m := parseConfig(t, rel, dirRel); m != nil {
+		if m := configs.parseConfig(rel, dirRel); m != nil {
 			scopes = append(scopes, m)
 		}
 	})
@@ -413,14 +419,23 @@ func LoadTree(t Tree) *Collection {
 // The walk respects a small allowlist of skip-dirs (node_modules, .git,
 // vendor, build, dist) to keep cost bounded on large monorepos.
 func Load(repoRoot string) *Collection {
+	return LoadObserved(repoRoot, nil)
+}
+
+// LoadObserved is Load with a callback for each distinct config read,
+// including missing relative parents that can later become resolvable.
+func LoadObserved(repoRoot string, observe func(rel string, data []byte, found bool)) *Collection {
 	if repoRoot == "" {
 		return nil
 	}
-	return LoadTree(dirTree{root: repoRoot})
+	return LoadTree(dirTree{root: repoRoot, observe: observe})
 }
 
 // dirTree is the working copy at a root: the tree Load reads.
-type dirTree struct{ root string }
+type dirTree struct {
+	root    string
+	observe func(string, []byte, bool)
+}
 
 var _ Tree = dirTree{}
 
@@ -455,6 +470,9 @@ func (t dirTree) Files(visit func(rel string)) {
 
 func (t dirTree) Read(rel string) ([]byte, bool) {
 	data, err := os.ReadFile(filepath.Join(t.root, filepath.FromSlash(rel)))
+	if t.observe != nil {
+		t.observe(rel, data, err == nil)
+	}
 	if err != nil {
 		return nil, false
 	}
@@ -466,13 +484,13 @@ func (t dirTree) Exists(rel string) bool {
 }
 
 // parseConfig resolves inherited options and probes targets in the same tree.
-func parseConfig(t Tree, rel, dirPrefix string) *Map {
-	var parents []string
-	co := loadConfigOptions(t, rel, make(map[string]bool), 0, &parents)
+func (r *configReader) parseConfig(rel, dirPrefix string) *Map {
+	var co configOptions
+	r.inherit(rel, 0, make(map[string]int), &co)
 	if co.baseURL == "" && co.paths == nil {
 		return nil
 	}
-	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: t.Exists, ParentConfigs: parents}
+	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: r.tree.Exists}
 	if co.baseURL != "" {
 		m.targetBase = co.baseURL
 		baseURL, relErr := filepath.Rel(filepath.FromSlash(path.Dir(rel)), filepath.FromSlash(co.baseURL))
@@ -498,6 +516,9 @@ func parseConfig(t Tree, rel, dirPrefix string) *Map {
 		if m.Entries[i].AliasPrefix != m.Entries[j].AliasPrefix {
 			return m.Entries[i].AliasPrefix < m.Entries[j].AliasPrefix
 		}
+		if m.Entries[i].HasWildcard != m.Entries[j].HasWildcard {
+			return !m.Entries[i].HasWildcard
+		}
 		return m.Entries[i].AliasSuffix < m.Entries[j].AliasSuffix
 	})
 	return m
@@ -509,29 +530,56 @@ type configOptions struct {
 	pathsDir string
 }
 
-// Each option retains its declaring directory. Inherited paths without a
-// baseUrl must not become relative to the child config's directory.
-func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, parentsRead *[]string) configOptions {
-	const maxExtendsDepth = 32
-	if depth >= maxExtendsDepth || active[rel] {
-		return configOptions{}
+type configDocument struct {
+	Extends         json.RawMessage `json:"extends"`
+	CompilerOptions struct {
+		BaseURL *string             `json:"baseUrl"`
+		Paths   map[string][]string `json:"paths"`
+	} `json:"compilerOptions"`
+}
+
+type configReader struct {
+	tree Tree
+	docs map[string]*configDocument // nil for a missing file
+}
+
+func (r *configReader) read(rel string) *configDocument {
+	if doc, known := r.docs[rel]; known {
+		return doc
 	}
-	data, ok := t.Read(rel)
-	if !ok {
-		return configOptions{}
+	var doc *configDocument
+	if data, ok := r.tree.Read(rel); ok {
+		doc = new(configDocument)
+		if json.Unmarshal(stripJSONC(data), doc) != nil {
+			// Present but unusable: don't try a .json sibling.
+			doc = &configDocument{}
+		}
 	}
-	var raw struct {
-		Extends         json.RawMessage `json:"extends"`
-		CompilerOptions struct {
-			BaseURL *string             `json:"baseUrl"`
-			Paths   map[string][]string `json:"paths"`
-		} `json:"compilerOptions"`
+	r.docs[rel] = doc
+	return doc
+}
+
+// Visit in precedence order: the child first, then parents right to left.
+// A shallower revisit can reach ancestors cut off by the depth limit.
+func (r *configReader) inherit(rel string, depth int, visited map[string]int, effective *configOptions) {
+	if prev, seen := visited[rel]; depth >= 32 || seen && prev <= depth {
+		return
 	}
-	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
-		return configOptions{}
+	visited[rel] = depth
+	raw := r.read(rel)
+	if raw == nil {
+		return
 	}
-	active[rel] = true
-	defer delete(active, rel)
+	if effective.baseURL == "" && raw.CompilerOptions.BaseURL != nil {
+		effective.baseURL = path.Join(path.Dir(rel), filepath.ToSlash(*raw.CompilerOptions.BaseURL))
+	}
+	if effective.paths == nil && raw.CompilerOptions.Paths != nil {
+		effective.paths = raw.CompilerOptions.Paths
+		effective.pathsDir = path.Dir(rel)
+	}
+	if effective.baseURL != "" && effective.paths != nil || len(raw.Extends) == 0 || depth == 31 {
+		return
+	}
 	var parents []string
 	var parent string
 	if json.Unmarshal(raw.Extends, &parent) == nil {
@@ -539,39 +587,23 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 	} else {
 		_ = json.Unmarshal(raw.Extends, &parents)
 	}
-	var effective configOptions
-	for _, parent := range parents {
+	for i := len(parents) - 1; i >= 0; i-- {
+		parent := parents[i]
 		// TS package config resolution is intentionally outside this reader.
 		if !strings.HasPrefix(parent, "./") && !strings.HasPrefix(parent, "../") &&
 			!strings.HasPrefix(parent, `.\`) && !strings.HasPrefix(parent, `..\`) {
 			continue
 		}
 		parent = strings.ReplaceAll(parent, `\`, "/")
-		if path.Ext(parent) == "" {
-			parent += ".json"
-		}
 		parent = path.Join(path.Dir(rel), parent)
 		if !filepath.IsLocal(filepath.FromSlash(parent)) {
 			continue
 		}
-		*parentsRead = append(*parentsRead, parent)
-		inherited := loadConfigOptions(t, parent, active, depth+1, parentsRead)
-		if inherited.baseURL != "" {
-			effective.baseURL = inherited.baseURL
+		if !strings.HasSuffix(parent, ".json") && r.read(parent) == nil {
+			parent += ".json"
 		}
-		if inherited.paths != nil {
-			effective.paths = inherited.paths
-			effective.pathsDir = inherited.pathsDir
-		}
+		r.inherit(parent, depth+1, visited, effective)
 	}
-	if raw.CompilerOptions.BaseURL != nil {
-		effective.baseURL = path.Join(path.Dir(rel), filepath.ToSlash(*raw.CompilerOptions.BaseURL))
-	}
-	if raw.CompilerOptions.Paths != nil {
-		effective.paths = raw.CompilerOptions.Paths
-		effective.pathsDir = path.Dir(rel)
-	}
-	return effective
 }
 
 // splitAlias splits one `paths` entry (pattern → ordered targets) into an

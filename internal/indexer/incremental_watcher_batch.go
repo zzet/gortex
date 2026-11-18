@@ -382,6 +382,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
+	defer idx.clearAliasPass()
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(root, paths, mode)
 	if err != nil {
 		return result, err
@@ -425,7 +426,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		derived.endDerived()
 	}
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, nil
+	return result, idx.finishAliasPass(result)
 }
 
 // resolveReceiptNamePendings rebinds pending references parked under the
