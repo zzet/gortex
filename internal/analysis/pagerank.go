@@ -49,12 +49,17 @@ const (
 // Dangling nodes (no outgoing call/reference edge — leaf utilities)
 // redistribute their mass uniformly each iteration so the scores stay
 // a proper probability distribution.
-func ComputePageRank(g graph.Store) *PageRankResult {
+func ComputePageRank(g graph.Store) *PageRankResult { return ComputePageRankPaced(g, nil) }
+
+// ComputePageRankPaced is ComputePageRank with a cooperative scheduling point
+// in every hot loop (see Pace). A nil Pace never parks.
+func ComputePageRankPaced(g graph.Store, pace *Pace) *PageRankResult {
 	if g == nil {
 		return &PageRankResult{Scores: map[string]float64{}}
 	}
 	ids := make([]string, 0, g.NodeCount())
 	for node := range graph.NodesLightSeq(g) {
+		pace.Tick()
 		if node != nil && node.ID != "" && !graph.IsProxyNode(node) {
 			ids = append(ids, node.ID)
 		}
@@ -78,6 +83,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 	// graph.ProvenanceWeight — never arbitrary Meta — so it must not pay to decode
 	// every edge's meta blob on a warm-restart whole-graph run.
 	for e := range graph.EdgesLightSeq(g, graph.EdgeCalls, graph.EdgeReferences) {
+		pace.Tick()
 		if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeReferences {
 			continue
 		}
@@ -101,6 +107,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 		// and spread it across every node so no mass leaks.
 		var dangling float64
 		for _, id := range ids {
+			pace.Tick()
 			if outWeight[id] == 0 {
 				dangling += score[id]
 			}
@@ -109,6 +116,7 @@ func ComputePageRank(g graph.Store) *PageRankResult {
 
 		next := make(map[string]float64, n)
 		for _, id := range ids {
+			pace.Tick()
 			var sum float64
 			for _, src := range inLinks[id] {
 				if d := outWeight[src.id]; d > 0 {

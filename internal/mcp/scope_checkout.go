@@ -2,11 +2,14 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // scopeForAutomaticCheckout resolves a working directory that lies inside no
@@ -89,4 +92,32 @@ func (s *Server) CheckoutServesCWD(ctx context.Context, cwd string) bool {
 func (s *Server) CheckoutServesCWDChecked(ctx context.Context, cwd string) (bool, error) {
 	_, _, _, ok, err := s.scopeForAutomaticCheckoutChecked(ctx, cwd)
 	return ok, err
+}
+
+// CheckoutAdmissionFailure preserves the dispatcher's existing error
+// classification for both initialize guidance and graph-call refusals.
+func CheckoutAdmissionFailure(err error) (code string, retryable bool) {
+	var committed interface{ Committed() bool }
+	if errors.As(err, &committed) && committed.Committed() {
+		return "checkout_inaccessible", false
+	}
+	if errors.Is(err, indexer.ErrCheckoutMutationBusy) || errors.Is(err, context.DeadlineExceeded) {
+		return "view_building", true
+	}
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 0xff {
+		case 5, 6:
+			return "view_building", true
+		}
+	}
+	return "checkout_inaccessible", false
+}
+
+// CheckoutAdmissionInstructions is shared with the daemon's initialize rewrite
+// so embedded and routed sessions receive the same checked-admission text.
+func CheckoutAdmissionInstructions(cwd string, err error) string {
+	code, retryable := CheckoutAdmissionFailure(err)
+	return fmt.Sprintf("Gortex checkout discovery is unavailable for %s (%s, retryable=%t): %v. "+
+		"No graph access has been granted. Retry after discovery can complete; do not change tracking configuration to resolve this admission error.", cwd, code, retryable, err)
 }

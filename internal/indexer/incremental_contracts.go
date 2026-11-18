@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
@@ -45,7 +46,19 @@ func (result *contractRefreshResult) addFrontier(contractsToAdd ...[]contracts.C
 }
 
 func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResult {
+	if idx.contractCoreInputs != nil {
+		return contractRefreshResult{}
+	}
 	files = appendUniqueSorted(nil, files...)
+	if !idx.contractDependenciesChanged {
+		remaining := files[:0]
+		for _, path := range files {
+			if idx.incrementalUnchangedContracts[path] == nil {
+				remaining = append(remaining, path)
+			}
+		}
+		files = remaining
+	}
 	if len(files) == 0 {
 		return contractRefreshResult{}
 	}
@@ -54,7 +67,7 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 	files = idx.expandIncrementalContractFrontier(files, reg)
 	_, byLang := idx.buildPerFileContractExtractors()
 	result := contractRefreshResult{}
-	var changedFiles []string
+	var changedFiles, restated []string
 	priorIDs := make(map[string]struct{})
 	for start := 0; start < len(files); start += contractFrontierReadBatchSize {
 		end := start + contractFrontierReadBatchSize
@@ -68,6 +81,10 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 			fresh, mtimeNano, exists, preservePrior := idx.extractContractsForGraphFileFromBatch(
 				graphPath, byLang, nodesByFile[graphPath], edgesByNode,
 			)
+			fresh = idx.normalizeFreshContractRecords(fresh)
+			if idx.contractInputError() != nil {
+				return result
+			}
 			if preservePrior {
 				continue
 			}
@@ -81,6 +98,18 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 				reg.ReplaceFile(graphPath, fresh)
 				changedFiles = append(changedFiles, graphPath)
 				result.Changed = true
+			} else if !idx.contractRowsPresent(fresh) {
+				// The records did not change, but the graph no longer holds
+				// them: the file's rows were re-derived (a delta that covers
+				// the path restates all of its rows, and the contract rows
+				// are not part of the parse). They are written again, with
+				// no frontier change: nothing a referrer binds to moved.
+				restated = append(restated, graphPath)
+				for _, contract := range fresh {
+					if contract.ID != "" {
+						priorIDs[contract.ID] = struct{}{}
+					}
+				}
 			}
 
 			idx.contractCacheMu.Lock()
@@ -92,12 +121,64 @@ func (idx *Indexer) refreshContractsForFiles(files []string) contractRefreshResu
 			idx.contractCacheMu.Unlock()
 		}
 	}
+	if idx.contractSharedInputsChanged {
+		// Raw file extraction does not include cross-file mount prefixes.
+		// Shared-input changes already retained the full registry/frontier;
+		// join before persisting owner payloads, as the cold pass does.
+		if scanFiles := idx.routerPrefixScanFiles(reg); len(scanFiles) > 0 {
+			contracts.JoinRouterPrefixes(reg, scanFiles, idx.contractFileSrc)
+			for _, path := range changedFiles {
+				result.addFrontier(reg.ByFile(path))
+			}
+		}
+	}
 	result.Groups = mergeContractGroups(nil, result.Groups...)
 	result.SymbolIDs = appendUniqueSorted(nil, result.SymbolIDs...)
-	if result.Changed {
-		idx.commitIncrementalContractFiles(reg, changedFiles, priorIDs)
+	if result.Changed || len(restated) > 0 {
+		idx.commitIncrementalContractFiles(reg, append(changedFiles, restated...), priorIDs)
 	}
 	return result
+}
+
+// contractRowsPresent reports whether the graph holds every record of list:
+// its contract node and, for a record with a symbol, an owner edge from that
+// symbol into it.
+func (idx *Indexer) contractRowsPresent(list []contracts.Contract) bool {
+	if len(list) == 0 {
+		return true
+	}
+	ids := make([]string, 0, len(list))
+	for _, c := range list {
+		if c.ID != "" {
+			ids = append(ids, c.ID)
+		}
+	}
+	ids = appendUniqueSorted(nil, ids...)
+	nodes := idx.graph.GetNodesByIDs(ids)
+	incoming := idx.graph.GetInEdgesByNodeIDs(ids)
+	for _, c := range list {
+		if c.ID == "" {
+			continue
+		}
+		if n := nodes[c.ID]; n == nil || n.Kind != graph.KindContract {
+			return false
+		}
+		if c.SymbolID == "" {
+			continue
+		}
+		owned := false
+		for _, e := range incoming[c.ID] {
+			if e != nil && e.From == c.SymbolID &&
+				(e.Kind == graph.EdgeProvides || e.Kind == graph.EdgeConsumes || e.Kind == graph.EdgeHandlesRoute) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			return false
+		}
+	}
+	return true
 }
 
 func (idx *Indexer) isIncrementalContractManifest(absPath string) bool {
@@ -140,6 +221,16 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 			failed = append(failed, absPath)
 			continue
 		}
+		if journal := idx.contractCoreInputs; journal != nil {
+			if err := journal.prepare(journal.ctx, idx, graphPath, "manifest", src, nil, false); err != nil {
+				idx.contractRestatementErr = err
+				return plan, append(failed, absPath)
+			}
+			if err := journal.begin([]string{graphPath}); err != nil {
+				idx.contractRestatementErr = err
+				return plan, append(failed, absPath)
+			}
+		}
 		switch filepath.ToSlash(relPath) {
 		case "go.mod":
 			if idx.config.Coverage.IsEnabled("modules") {
@@ -164,17 +255,40 @@ func (idx *Indexer) refreshIncrementalContractManifests(files []string) (Derived
 	return plan, appendUniqueSorted(nil, failed...)
 }
 
+type contractRegistryLoadPhases struct {
+	contracts.RegistryLoadStats
+	CopyMS        float64 `json:"copy_ms"`
+	CopiedRecords int     `json:"copied_records"`
+}
+
 func (idx *Indexer) ensureIncrementalContractRegistry() *contracts.Registry {
 	if idx.contractRegistry != nil {
 		return idx.contractRegistry
 	}
-	reg := contracts.NewRegistry()
-	if restored := contracts.LoadRegistryFromGraphWithScope(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID); restored != nil {
-		for _, c := range restored.ByRepo(idx.repoPrefix) {
-			reg.Add(c)
+	if seed := idx.contractRegistrySeed; seed != nil {
+		idx.contractRegistrySeedCalls++
+		idx.contractRegistrySeed = nil
+		seed()
+		if idx.contractRegistry != nil {
+			return idx.contractRegistry
 		}
 	}
+	started := time.Now()
+	idx.contractRegistryLoads++
+	reg := contracts.NewRegistry()
+	restored, stats := contracts.LoadRegistryFromGraphWithScopeAndStats(idx.graph, idx.repoPrefix, idx.workspaceID, idx.projectID)
+	phases := &contractRegistryLoadPhases{RegistryLoadStats: stats}
+	copyStarted := time.Now()
+	if restored != nil {
+		for _, c := range restored.ByRepo(idx.repoPrefix) {
+			reg.Add(c)
+			phases.CopiedRecords++
+		}
+	}
+	phases.CopyMS = float64(time.Since(copyStarted).Nanoseconds()) / 1e6
+	idx.contractRegistryLoadPhases = phases
 	idx.contractRegistry = reg
+	idx.contractRegistryLoad += time.Since(started)
 	return reg
 }
 
@@ -271,9 +385,9 @@ func contractOwnerEndpoint(c contracts.Contract, files map[contractFileOwnerKey]
 	return files[contractFileOwnerKey{c.RepoPrefix, c.FilePath}]
 }
 
-// contractGraphRows is the common persistence emitter. Full passes leave
-// dependency nodes to their pre-resolution single writer; incremental refresh
-// includes dependencies as before. No extraction/enrichment work moves here.
+// contractGraphRows is the common persistence emitter. Dependency identities
+// are seeded before resolution; completed cold and incremental passes both
+// persist their records and ownership here. No extraction work moves here.
 func contractGraphRows(store graph.Store, all []contracts.Contract, includeDependencies bool) (nodes []*graph.Node, edges []*graph.Edge, missingSourceOwners int) {
 	if !includeDependencies {
 		eligible := make([]contracts.Contract, 0, len(all))
@@ -284,24 +398,37 @@ func contractGraphRows(store graph.Store, all []contracts.Contract, includeDepen
 		}
 		all = eligible
 	}
+	// A contract ID shared by several records (an environment variable read in
+	// two files, a route with a provider and consumers) is ONE node. Its row is
+	// the record that sorts first by contractNodeRecordLess — the smallest file
+	// — so the node a whole index writes
+	// and the one a per-file refresh re-emits (which re-emits every sibling of
+	// a touched ID) are the same whatever order the registry — a map, filled by
+	// parallel extraction — listed the records in. Every record keeps its own
+	// ownership edges.
+	all = append([]contracts.Contract(nil), all...)
+	sort.SliceStable(all, func(i, j int) bool { return contractNodeRecordLess(all[i], all[j]) })
 	fileOwners := contractFileOwners(store, all)
 	symbolOwners := contractSymbolOwners(store, all)
 	nodes = make([]*graph.Node, 0, len(all))
 	edges = make([]*graph.Edge, 0, len(all)*2)
-	for _, c := range all {
+	for i, c := range all {
 		ownerID := contractOwnerEndpoint(c, fileOwners, symbolOwners)
 		if ownerID == "" {
 			missingSourceOwners++
 		}
-		nodes = append(nodes, &graph.Node{
-			ID: c.ID, Kind: graph.KindContract, Name: c.ID, FilePath: c.FilePath, Language: "contract",
-			RepoPrefix: c.RepoPrefix, WorkspaceID: c.EffectiveWorkspace(), ProjectID: c.EffectiveProject(),
-			Meta: map[string]any{
-				"type": string(c.Type), "role": string(c.Role), "symbol_id": c.SymbolID,
-				"line": c.Line, "confidence": c.Confidence, "contract_meta": c.Meta,
-				"contract_owner_record": ownerID != "",
-			},
-		})
+		// Only the ID's first record writes its node.
+		if i == 0 || all[i-1].ID != c.ID {
+			nodes = append(nodes, &graph.Node{
+				ID: c.ID, Kind: graph.KindContract, Name: c.ID, FilePath: c.FilePath, Language: "contract",
+				RepoPrefix: c.RepoPrefix, WorkspaceID: c.EffectiveWorkspace(), ProjectID: c.EffectiveProject(),
+				Meta: map[string]any{
+					"type": string(c.Type), "role": string(c.Role), "symbol_id": c.SymbolID,
+					"line": c.Line, "confidence": c.Confidence, "contract_meta": c.Meta,
+					"contract_owner_record": ownerID != "",
+				},
+			})
+		}
 		if ownerID == "" {
 			continue
 		}
@@ -325,11 +452,11 @@ func contractGraphRows(store graph.Store, all []contracts.Contract, includeDepen
 	return nodes, edges, missingSourceOwners
 }
 
-// expandIncrementalContractFrontier promotes only cross-file contract constructs
-// to the existing contract-file dependency set. It never enumerates every source
-// file in the repository; go.mod/go.work remain exact single-file refreshes.
+// Cross-file constructs promote the existing contract-file dependency set.
+// Changed shared inputs additionally include previous-empty consumers, which
+// have no registry record to discover. Ordinary edits remain file-local.
 func (idx *Indexer) expandIncrementalContractFrontier(files []string, reg *contracts.Registry) []string {
-	needsDependencies := false
+	needsDependencies := idx.contractDependenciesChanged
 	for _, graphPath := range files {
 		base := strings.ToLower(filepath.Base(graphPath))
 		if base == "go.mod" || base == "go.work" {
@@ -360,6 +487,13 @@ func (idx *Indexer) expandIncrementalContractFrontier(files []string, reg *contr
 	for _, contract := range reg.ByRepo(idx.repoPrefix) {
 		files = append(files, contract.FilePath)
 	}
+	if idx.contractSharedInputsChanged {
+		for node := range graph.NodesInScopeSeq(idx.graph, []string{idx.repoPrefix}, nil, graph.KindFile) {
+			if node != nil && node.FilePath != "" {
+				files = append(files, node.FilePath)
+			}
+		}
+	}
 	return appendUniqueSorted(nil, files...)
 }
 
@@ -383,6 +517,24 @@ func (idx *Indexer) commitIncrementalContractFiles(
 	// siblings while replacing only the changed owner files so another file or
 	// repository using the same canonical ID keeps its ownership edges.
 	for _, id := range ids {
+		current = append(current, reg.ByID(id)...)
+	}
+	// The same holds for an ID the changed files introduce: a record another
+	// file already holds for it may be the one that writes its node
+	// (contractGraphRows), so every record of every touched ID is re-emitted.
+	changedIDs := make(map[string]struct{}, len(current))
+	for _, contract := range current {
+		changedIDs[contract.ID] = struct{}{}
+	}
+	for _, id := range ids {
+		delete(changedIDs, id)
+	}
+	newIDs := make([]string, 0, len(changedIDs))
+	for id := range changedIDs {
+		newIDs = append(newIDs, id)
+	}
+	sort.Strings(newIDs)
+	for _, id := range newIDs {
 		current = append(current, reg.ByID(id)...)
 	}
 	seen := make(map[string]struct{}, len(current))
@@ -415,6 +567,24 @@ func (idx *Indexer) commitIncrementalContractFiles(
 		idx.logger.Warn("incremental contract owner replacement failed: " + err.Error())
 	}
 	idx.contractRegistry = reg
+}
+
+// contractNodeRecordLess orders the records of one contract ID for the choice
+// of the record its node carries: by ID, then file, symbol, role and line —
+// the registry key's order, completed by the line.
+func contractNodeRecordLess(a, b contracts.Contract) bool {
+	switch {
+	case a.ID != b.ID:
+		return a.ID < b.ID
+	case a.FilePath != b.FilePath:
+		return a.FilePath < b.FilePath
+	case a.SymbolID != b.SymbolID:
+		return a.SymbolID < b.SymbolID
+	case a.Role != b.Role:
+		return a.Role < b.Role
+	default:
+		return a.Line < b.Line
+	}
 }
 
 func contractRegistryKey(contract contracts.Contract) string {
@@ -563,11 +733,16 @@ func contractSourceNeedsFullRefresh(graphPath, language string, src []byte) bool
 	// These constructs can rewrite contracts owned by sibling files. They are
 	// uncommon, so retain the full pass only when the changed bytes actually
 	// contain a cross-file mount or DI declaration.
-	if language == "python" && strings.Contains(lowerSource, "include_router") {
+	if language == "python" && (strings.Contains(lowerSource, "include_router") ||
+		strings.Contains(lowerSource, "register_blueprint") || strings.Contains(lowerSource, "apirouter") || strings.Contains(lowerSource, "blueprint") || strings.Contains(lowerSource, "include")) {
 		return true
 	}
 	if (language == "typescript" || language == "javascript") &&
-		(strings.Contains(lowerSource, ".use(") || strings.Contains(lowerSource, "@controller(")) {
+		(strings.Contains(lowerSource, ".use") || strings.Contains(lowerSource, "@controller") || strings.Contains(lowerSource, "routermodule")) {
+		return true
+	}
+	if language == "rust" && (strings.Contains(lowerSource, ".nest") || strings.Contains(lowerSource, ".merge") ||
+		strings.Contains(lowerSource, ".configure") || strings.Contains(lowerSource, ".service")) {
 		return true
 	}
 	if language == "java" &&
@@ -602,4 +777,23 @@ func contractSetsEqual(left, right []contracts.Contract) bool {
 		}
 	}
 	return true
+}
+
+// Apply the same record normalization as cold extraction before owner payloads
+// are persisted. A later canonical-node patch cannot repair stale owner Meta.
+func (idx *Indexer) normalizeFreshContractRecords(records []contracts.Contract) []contracts.Contract {
+	if len(records) == 0 {
+		return records
+	}
+	local := contracts.NewRegistry()
+	for _, record := range records {
+		record.WorkspaceID, record.ProjectID = record.EffectiveWorkspace(), record.EffectiveProject()
+		local.Add(record)
+	}
+	idx.upgradeContractBareTypeRefs(local)
+	idx.resolveProviderHandlers(local)
+	idx.resolveCallReturnTypes(local)
+	idx.snapshotContractShapes(local)
+	idx.inlineEnvelopeShapes(local)
+	return local.All()
 }

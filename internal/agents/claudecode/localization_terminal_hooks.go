@@ -10,10 +10,30 @@ const (
 	// Claude Code treats "*" as its native match-all sentinel. Using it keeps
 	// the terminal gate host-wide without paying regex matching cost for ".*".
 	localizationPreToolUseMatcher  = "*"
-	localizationPostToolUseMatcher = "mcp__gortex__explore|mcp__gortex__search|mcp__gortex__read|" +
-		"mcp__gortex__relations|mcp__gortex__trace|mcp__gortex__analyze|" +
-		"mcp__plugin_gortex_gortex__explore|mcp__plugin_gortex_gortex__search|mcp__plugin_gortex_gortex__read|" +
-		"mcp__plugin_gortex_gortex__relations|mcp__plugin_gortex_gortex__trace|mcp__plugin_gortex_gortex__analyze"
+	localizationPostToolUseMatcher = userMCPToolPrefix + "explore|" +
+		userMCPToolPrefix + "search|" +
+		userMCPToolPrefix + "read|" +
+		userMCPToolPrefix + "relations|" +
+		userMCPToolPrefix + "trace|" +
+		userMCPToolPrefix + "analyze|" +
+		pluginMCPToolPrefix + "explore|" +
+		pluginMCPToolPrefix + "search|" +
+		pluginMCPToolPrefix + "read|" +
+		pluginMCPToolPrefix + "relations|" +
+		pluginMCPToolPrefix + "trace|" +
+		pluginMCPToolPrefix + "analyze|" +
+		// The same managed observer also records stale mutation refusals for
+		// older daemons. Keep it installed in every access-policy mode.
+		userMCPToolPrefix + "edit|" +
+		userMCPToolPrefix + "edit_file|" +
+		userMCPToolPrefix + "write_file|" +
+		userMCPToolPrefix + "edit_symbol|" +
+		userMCPToolPrefix + "batch_edit|" +
+		pluginMCPToolPrefix + "edit|" +
+		pluginMCPToolPrefix + "edit_file|" +
+		pluginMCPToolPrefix + "write_file|" +
+		pluginMCPToolPrefix + "edit_symbol|" +
+		pluginMCPToolPrefix + "batch_edit"
 )
 
 func desiredPostToolUseMatcher(mode string) string {
@@ -255,6 +275,7 @@ func pluginHooksWithLocalizationTerminality(data []byte) ([]byte, error) {
 		for _, rawEntry := range group["hooks"].([]any) {
 			if entry, ok := rawEntry.(map[string]any); ok {
 				entry["statusMessage"] = desiredPostToolUseStatus(HookModeDeny)
+				entry["timeout"] = hookTimeoutSeconds
 			}
 		}
 		postGroups = append(postGroups, group)

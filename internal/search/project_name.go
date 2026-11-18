@@ -19,10 +19,17 @@ const projectNameMinLen = 5
 // base name — but only when it is at least projectNameMinLen runes. Returns ""
 // when no name qualifies, which disables de-weighting.
 func DetectProjectName(root string) string {
-	if name := projectNameFromGoMod(root); name != "" {
+	return DetectProjectNameWith(root, os.ReadFile)
+}
+
+// DetectProjectNameWith is DetectProjectName reading the root manifests through
+// readFile, so a caller that accounts for every working-copy read it makes
+// sees these too.
+func DetectProjectNameWith(root string, readFile func(string) ([]byte, error)) string {
+	if name := projectNameFromGoMod(root, readFile); name != "" {
 		return qualifyProjectName(name)
 	}
-	if name := projectNameFromPackageJSON(root); name != "" {
+	if name := projectNameFromPackageJSON(root, readFile); name != "" {
 		return qualifyProjectName(name)
 	}
 	return qualifyProjectName(filepath.Base(root))
@@ -36,8 +43,8 @@ func qualifyProjectName(name string) string {
 	return name
 }
 
-func projectNameFromGoMod(root string) string {
-	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+func projectNameFromGoMod(root string, readFile func(string) ([]byte, error)) string {
+	data, err := readFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		return ""
 	}
@@ -54,8 +61,8 @@ func projectNameFromGoMod(root string) string {
 	return ""
 }
 
-func projectNameFromPackageJSON(root string) string {
-	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+func projectNameFromPackageJSON(root string, readFile func(string) ([]byte, error)) string {
+	data, err := readFile(filepath.Join(root, "package.json"))
 	if err != nil {
 		return ""
 	}

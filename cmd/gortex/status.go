@@ -118,19 +118,7 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 		// A repo whose directory is gone (or that the daemon holds no
 		// index for) gets its state spelled out inline instead of
 		// reading as a legitimate zero-count row — see #312.
-		suffix := fmt.Sprintf("(%d files, %d nodes, %d edges)", r.Files, r.Nodes, r.Edges)
-		switch {
-		case r.Missing:
-			suffix = "MISSING — path no longer exists on disk"
-		case r.Unloaded:
-			suffix = "(not indexed — tracked in config, no index held)"
-		case r.IndexHealthError != "":
-			suffix = "DEGRADED — file indexing health unavailable"
-		case r.FailedFiles > 0:
-			suffix = fmt.Sprintf("DEGRADED — %d failed files (%d unreadable)", r.FailedFiles, r.UnreadableFiles)
-		case repoIndexIsEmpty(r):
-			suffix = "EMPTY — indexed 0 files; no parsable source, or an ignore rule excluded all of it"
-		}
+		suffix := repoStatusSuffix(r)
 		if showWS {
 			ws := r.Workspace
 			if r.WorkspaceProject != "" && r.WorkspaceProject != ws {
@@ -145,6 +133,26 @@ func runStatusViaDaemon(cmd *cobra.Command) error {
 	renderEmptyIndexWarning(w, st.TrackedRepos)
 	renderIndexFailureWarning(w, st.TrackedRepos)
 	return nil
+}
+
+// repoStatusSuffix renders a tracked repo's state or counts for compact status.
+func repoStatusSuffix(r daemon.TrackedRepoStatus) string {
+	suffix := fmt.Sprintf("(%d files, %d nodes, %d edges)", r.Files, r.Nodes, r.Edges)
+	switch {
+	case r.Missing:
+		suffix = "MISSING — path no longer exists on disk"
+	case r.Loading:
+		suffix = "(loading — warmup in progress)"
+	case r.Unloaded:
+		suffix = "(not indexed — tracked in config, no index held)"
+	case r.IndexHealthError != "":
+		suffix = "DEGRADED — file indexing health unavailable"
+	case r.FailedFiles > 0:
+		suffix = fmt.Sprintf("DEGRADED — %d failed files (%d unreadable)", r.FailedFiles, r.UnreadableFiles)
+	case repoIndexIsEmpty(r):
+		suffix = "EMPTY — indexed 0 files; no parsable source, or an ignore rule excluded all of it"
+	}
+	return suffix
 }
 
 // emitStatusBanner prints the shared status banner on stderr (so stdout

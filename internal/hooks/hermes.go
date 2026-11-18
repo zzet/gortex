@@ -189,25 +189,23 @@ func runHermesPreToolCall(data []byte, port int, mode Mode) {
 // terminal reuses enrichBash, whose `command` key Hermes already
 // matches. Any other tool is a no-op.
 //
-// It reaches those enrichments directly rather than through enrich, so it
-// applies the same tracked-repo gate itself — a Hermes session in an unindexed
-// checkout has no more to redirect to than a Claude one.
-func hermesEnrich(input hermesPreToolInput, _ int) enrichResult {
+// Use the shared configured-scope and exact-file recovery decision too. The
+// Hermes pre-tool wire still only supports block/pass, not soft context.
+func hermesEnrich(input hermesPreToolInput, port int) enrichResult {
+	normalized := HookInput{CWD: input.CWD, SessionID: input.SessionID}
 	switch input.ToolName {
 	case hermesReadFileTool:
-		toolInput := hermesNormalizeReadInput(input.ToolInput)
-		if !hookCallTargetsTrackedRepo("Read", toolInput, input.CWD) {
-			return enrichResult{}
-		}
-		return enrichRead(toolInput, input.CWD)
+		normalized.ToolName = "Read"
+		normalized.ToolInput = hermesNormalizeReadInput(input.ToolInput)
 	case hermesTerminalTool:
-		if !hookCallTargetsTrackedRepo("Bash", input.ToolInput, input.CWD) {
-			return enrichResult{}
-		}
-		return enrichBash(input.ToolInput, input.CWD)
+		normalized.ToolName = "Bash"
+		normalized.ToolInput = input.ToolInput
 	default:
 		return enrichResult{}
 	}
+	// Preserve this adapter's existing raw coverage contract. Its hard-only
+	// pre-tool hook has no legacy mutation-response observer of its own.
+	return enrichWithProbe(normalized, port, queryFileIndexScope)
 }
 
 // hermesNormalizeReadInput returns a tool-input map enrichRead

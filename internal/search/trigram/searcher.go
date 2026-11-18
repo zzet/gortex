@@ -35,6 +35,14 @@ type Searcher struct {
 	mu        sync.RWMutex
 	paths     []string          // docID -> forward-slash repo-relative path
 	pathIndex map[string]uint32 // reverse of paths, for Update
+	// pathSorted records that Build was handed its paths in ascending
+	// order, so docID order was path order. outOfOrder records that an
+	// Update since appended a path that sorts before one already held.
+	// Together they decide whether a search must re-order its candidates
+	// by path to keep the file-then-line order a full Build of the same
+	// corpus returns; see orderedDocIDs.
+	pathSorted bool
+	outOfOrder bool
 }
 
 // Build reads every file — forward-slash repo-relative paths under
@@ -64,11 +72,15 @@ func Build(root string, relPaths []string) *Searcher {
 		ix:           New(),
 		paths:        make([]string, len(relPaths)),
 		pathIndex:    make(map[string]uint32, len(relPaths)),
+		pathSorted:   true,
 	}
 	for i, rel := range relPaths {
 		rel = filepath.ToSlash(rel)
 		s.paths[i] = rel
 		s.pathIndex[rel] = uint32(i)
+		if i > 0 && rel < s.paths[i-1] {
+			s.pathSorted = false
+		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if pathguard.EscapesResolvedRoot(abs, s.resolvedRoot) {
 			continue
@@ -108,6 +120,9 @@ func (s *Searcher) Update(rel string) {
 	docID, known := s.pathIndex[rel]
 	if !known {
 		docID = uint32(len(s.paths))
+		if n := len(s.paths); n > 0 && rel < s.paths[n-1] {
+			s.outOfOrder = true
+		}
 		s.paths = append(s.paths, rel)
 		s.pathIndex[rel] = docID
 	}
@@ -137,13 +152,60 @@ func (s *Searcher) dropDoc(docID uint32) {
 	s.ix.Remove(docID)
 }
 
+// Remove drops one repo-relative path from the index whatever is on disk
+// for it, for a caller whose corpus no longer holds the path although
+// the file itself may still exist. A path the searcher has never seen is
+// a no-op; a removed path keeps its docID so a later Update reuses it.
+func (s *Searcher) Remove(rel string) {
+	if s == nil || rel == "" {
+		return
+	}
+	rel = filepath.ToSlash(rel)
+	s.mu.RLock()
+	docID, known := s.pathIndex[rel]
+	s.mu.RUnlock()
+	if known {
+		s.dropDoc(docID)
+	}
+}
+
 // snapshotPaths returns the current docID -> path mapping. The slice is
 // append-only and its existing entries are never rewritten, so the
 // caller may range it after the lock is dropped.
 func (s *Searcher) snapshotPaths() []string {
+	paths, _ := s.snapshotOrder()
+	return paths
+}
+
+// snapshotOrder is snapshotPaths plus whether docID order has stopped
+// being path order: the searcher was built from sorted paths and an
+// Update has since appended one out of place.
+func (s *Searcher) snapshotOrder() ([]string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.paths
+	return s.paths, s.pathSorted && s.outOfOrder
+}
+
+// orderedDocIDs returns docIDs in the order a search visits them. For a
+// searcher built from sorted paths that is path order, which is docID
+// order until an Update appends a new path that sorts before an older
+// one; only then are the candidates re-sorted, so a limited search
+// returns the same prefix a full Build of the same corpus would.
+func orderedDocIDs(docIDs []uint32, paths []string, reorder bool) []uint32 {
+	if !reorder || len(docIDs) < 2 {
+		return docIDs
+	}
+	slices.SortFunc(docIDs, func(a, b uint32) int {
+		var pa, pb string
+		if int(a) < len(paths) {
+			pa = paths[a]
+		}
+		if int(b) < len(paths) {
+			pb = paths[b]
+		}
+		return strings.Compare(pa, pb)
+	})
+	return docIDs
 }
 
 // candidates returns the docIDs to verify for query.
@@ -199,17 +261,23 @@ func (s *Searcher) Grep(query string, limit int) []Match {
 // matches when the path equals it exactly or continues past it at a
 // slash, so "pkg/su" does not match "pkg/sub/x.go" (#845).
 func (s *Searcher) GrepPaths(query string, prefixes []string, limit int) []Match {
+	return s.GrepPathsExcept(query, prefixes, nil, limit)
+}
+
+// GrepPathsExcept removes owned pending files before opening candidates or
+// applying the result limit. Their caller supplies current-byte matches.
+func (s *Searcher) GrepPathsExcept(query string, prefixes []string, excluded map[string]struct{}, limit int) []Match {
 	if query == "" {
 		return nil
 	}
-	paths := s.snapshotPaths()
+	paths, reorder := s.snapshotOrder()
 	var matches []Match
-	for _, docID := range s.candidates(query) {
+	for _, docID := range orderedDocIDs(s.candidates(query), paths, reorder) {
 		if int(docID) >= len(paths) {
 			continue
 		}
 		rel := paths[docID]
-		if !PathUnderAnyPrefix(rel, prefixes) {
+		if _, skip := excluded[rel]; skip || !PathUnderAnyPrefix(rel, prefixes) {
 			continue
 		}
 		f, err := s.openConfined(rel)
@@ -287,6 +355,14 @@ func (s *Searcher) GrepRegexpPaths(re *regexp.Regexp, requiredLiterals []string,
 	})
 }
 
+// GrepRegexpPathsExcept is the regexp counterpart of GrepPathsExcept.
+func (s *Searcher) GrepRegexpPathsExcept(re *regexp.Regexp, requiredLiterals []string, prefixes []string, excluded map[string]struct{}, limit int) []Match {
+	return s.grepRegexpUnder(re, requiredLiterals, limit, func(rel string) bool {
+		_, skip := excluded[rel]
+		return !skip && PathUnderAnyPrefix(rel, prefixes)
+	})
+}
+
 // grepRegexpUnder is the shared body of GrepRegexp and GrepRegexpPaths:
 // the prefix restriction applies before the limit cut; the entry points
 // differ only in how a path qualifies (raw prefix vs segment
@@ -335,9 +411,9 @@ func (s *Searcher) grepRegexpUnder(re *regexp.Regexp, requiredLiterals []string,
 		slices.Sort(docIDs)
 	}
 
-	paths := s.snapshotPaths()
+	paths, reorder := s.snapshotOrder()
 	var matches []Match
-	for _, docID := range docIDs {
+	for _, docID := range orderedDocIDs(docIDs, paths, reorder) {
 		if int(docID) >= len(paths) {
 			continue
 		}

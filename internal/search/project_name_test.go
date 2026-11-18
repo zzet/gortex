@@ -57,3 +57,19 @@ func mustWrite(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// DetectProjectNameWith takes every root manifest it reads through the reader
+// it is given — go.mod, and package.json only when go.mod names nothing — so
+// a caller that accounts for its working-copy reads sees each one.
+func TestDetectProjectNameWithReadsThroughTheReader(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "package.json"), `{"name": "@acme/widgets"}`)
+	var read []string
+	got := DetectProjectNameWith(dir, func(name string) ([]byte, error) {
+		read = append(read, filepath.Base(name))
+		return os.ReadFile(name)
+	})
+	if got != "widgets" || len(read) != 2 || read[0] != "go.mod" || read[1] != "package.json" {
+		t.Fatalf("DetectProjectNameWith = %q reading %v, want widgets reading go.mod then package.json", got, read)
+	}
+}

@@ -152,6 +152,21 @@ var ToolEffects = map[string]ToolEffect{
 	"session":         EffectSessionWrite,
 }
 
+// AdditiveTools lists durable writers whose writes only add to, or bump
+// counters on, Gortex-owned agent-knowledge records (notes, memories,
+// notebook entries, feedback). They are not read-only, but they never
+// overwrite source files, rebuild the index, change configuration, or reach
+// an external system, so tool descriptors advertise them as non-destructive.
+// Every entry must also appear in ToolEffects.
+var AdditiveTools = map[string]bool{
+	"feedback":         true,
+	"notebook_save":    true,
+	"notebook_used":    true,
+	"save_note":        true,
+	"store_memory":     true,
+	"surface_memories": true,
+}
+
 // MutatingTools is the compatibility set used by the planning-mode and
 // federation write gates. It contains durable and external writes, but not
 // session-only effects. New code should prefer EffectOf when it needs the
@@ -184,6 +199,12 @@ func IsEffectful(name string) bool { return EffectOf(name) != EffectNone }
 // IsMutating reports whether a tool can mutate durable local state or an
 // external system. Session-only controls deliberately return false.
 func IsMutating(name string) bool { return EffectOf(name)&durableToolEffects != 0 }
+
+// IsDestructive reports whether a tool may overwrite or remove durable local
+// state or mutate an external system. Session-only controls and the
+// append-style knowledge writers in AdditiveTools return false. It backs the
+// MCP destructiveHint annotation.
+func IsDestructive(name string) bool { return IsMutating(name) && !AdditiveTools[name] }
 
 // SortedMutatingTools returns the canonical mutating-tool names in stable
 // order — used where a deterministic list is surfaced to a client.

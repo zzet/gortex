@@ -55,6 +55,11 @@ type PlannerStatsFreshness struct {
 	Refreshed bool
 	Reason    string
 
+	// DenseIndexesMissing names secondary indexes the backend knows are absent
+	// and owes a rebuild for (an interrupted bulk load), reported with its own
+	// Reason instead of a verdict. Empty in the ordinary case.
+	DenseIndexesMissing []string
+
 	LastRefreshAt     time.Time
 	LastRefreshReason string
 
@@ -118,6 +123,25 @@ type PlannerStatsFreshness struct {
 type PlannerStatsFreshener interface {
 	EnsurePlannerStatsFresh(ctx context.Context) (PlannerStatsFreshness, error)
 	PlannerStatsHealth(ctx context.Context) (PlannerStatsFreshness, error)
+}
+
+type plannerStatsLoadBoundaryKey struct{}
+
+// WithPlannerStatsLoadBoundary marks ctx as the boundary that ends a whole
+// index: its rows have just landed and no edit has been admitted over them
+// yet. There, and only there, a store may run a refresh it owes to the end
+// (statistics absent for an index that holds rows), holding its writer for as
+// long as the ANALYZE takes: nothing waits on the writer yet, and a store
+// without statistics plans its first edits by the default cost model.
+func WithPlannerStatsLoadBoundary(ctx context.Context) context.Context {
+	return context.WithValue(ctx, plannerStatsLoadBoundaryKey{}, true)
+}
+
+// PlannerStatsLoadBoundary reports whether ctx was marked by
+// WithPlannerStatsLoadBoundary.
+func PlannerStatsLoadBoundary(ctx context.Context) bool {
+	v, _ := ctx.Value(plannerStatsLoadBoundaryKey{}).(bool)
+	return v
 }
 
 // MaybeEnsurePlannerStatsFresh gives a store the chance to refresh its planner

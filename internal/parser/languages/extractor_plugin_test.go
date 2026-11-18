@@ -483,3 +483,49 @@ func TestRegisterExtractorPlugins_SkipsInvalidAndCollisions(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "go", e.Language())
 }
+
+// TestStripSecretEnv verifies the plugin subprocess environment drops
+// secret-shaped entries (provider API keys, tokens, AWS secrets, bearer
+// vars) while keeping PATH and other non-secret vars — so an extractor
+// command can't read and exfiltrate them via os.Environ().
+func TestStripSecretEnv(t *testing.T) {
+	in := []string{
+		"PATH=/usr/local/bin:/usr/bin",
+		"OPENAI_API_KEY=sk-abc",
+		"GOOGLE_API_KEY=AIza",
+		"API_KEY=barekey",
+		"GOOGLEAPIKEY=concatkey",
+		"GORTEX_LLM_API_KEY=glp-xyz",
+		"GORTEX_EMBEDDINGS_API_KEY=e-123",
+		"GITHUB_TOKEN=ghp_123",
+		"AUTH_TOKEN=tok",
+		"AWS_SECRET_ACCESS_KEY=wJalr",
+		"MY_SECRET=xyz",
+		"GITHUB_BEARER=b",
+		"HDR_AUTHORIZATION=Bearer abc",
+		"APIKEY=plainkey",
+		"MY_SEGMENTER=split", // not secret-shaped
+		"GORTEX_FILE_PATH=repo/a.go",
+		"GITHUB_ACTIONS", // no '=', kept
+	}
+	got := map[string]bool{}
+	for _, kv := range stripSecretEnv(in) {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		got[key] = true
+	}
+	for _, keep := range []string{"PATH", "MY_SEGMENTER", "GORTEX_FILE_PATH", "GITHUB_ACTIONS"} {
+		assert.True(t, got[keep], "expected %q to be kept", keep)
+	}
+	dropped := []string{
+		"OPENAI_API_KEY", "GOOGLE_API_KEY", "API_KEY", "GOOGLEAPIKEY",
+		"GORTEX_LLM_API_KEY", "GORTEX_EMBEDDINGS_API_KEY",
+		"GITHUB_TOKEN", "AUTH_TOKEN", "AWS_SECRET_ACCESS_KEY", "MY_SECRET",
+		"GITHUB_BEARER", "HDR_AUTHORIZATION", "APIKEY",
+	}
+	for _, name := range dropped {
+		assert.False(t, got[name], "expected %q to be dropped", name)
+	}
+}

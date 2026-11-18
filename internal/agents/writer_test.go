@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // TestWriteIfNotExistsCreatesAndSkips covers both the create and
@@ -290,7 +292,7 @@ func names(as []Adapter) []string {
 // MCP file tool funnels through (write_file, edit_file, move, ...): a
 // fresh write lands the content and a second write atomically replaces it,
 // leaving no stray *.gortex.tmp-* file behind. This is also the
-// no-contention happy path for renameWithRetry — its retry loop must be
+// happy path for platform.ReplaceFile — its retry loop must be
 // transparent when the rename succeeds first try.
 func TestAtomicWriteFileCreatesAndOverwrites(t *testing.T) {
 	dir := t.TempDir()
@@ -317,15 +319,15 @@ func TestAtomicWriteFileCreatesAndOverwrites(t *testing.T) {
 	}
 }
 
-// TestRenameWithRetryReturnsNonRetryableErr checks that a rename failure
+// TestAtomicWriteFileReturnsNonRetryableRenameErr checks that a rename failure
 // which isn't a transient sharing violation (here: a missing source) is
 // surfaced immediately rather than retried — the retry budget is reserved
 // for the Windows lock race, not for masking genuine errors. On every
 // platform ERROR_FILE_NOT_FOUND / ENOENT is non-retryable, so this holds
 // cross-platform.
-func TestRenameWithRetryReturnsNonRetryableErr(t *testing.T) {
+func TestAtomicWriteFileReturnsNonRetryableRenameErr(t *testing.T) {
 	dir := t.TempDir()
-	if err := renameWithRetry(filepath.Join(dir, "does-not-exist"), filepath.Join(dir, "dest")); err == nil {
+	if err := platform.ReplaceFile(filepath.Join(dir, "does-not-exist"), filepath.Join(dir, "dest")); err == nil {
 		t.Fatal("expected an error renaming a missing source, got nil")
 	}
 }

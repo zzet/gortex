@@ -37,6 +37,13 @@ func TestExplicitRetrackDoesNotReelectPrimaryAfterClosure(t *testing.T) {
 	removed, err := f.lc.Untrack(ctx, f.main)
 	require.NoError(t, err)
 	require.Equal(t, UntrackPlanPrimaryClosure, removed.Plan)
+	// Untrack may commit logical withdrawal while its captured cleanup owner
+	// is still draining. Retracking requires that owner to finish first.
+	if removed.Pending {
+		finishRepositoryCleanup(t, f.lc, f.mainPrefix)
+	}
+	require.False(t, f.lc.RepositoryAdmissionClosed(f.mainPrefix),
+		"completed primary cleanup must reopen admission before explicit retrack")
 
 	survivor, found, err := f.catalog.GetDedicatedGraph(ctx, sibling.GraphID)
 	require.NoError(t, err)

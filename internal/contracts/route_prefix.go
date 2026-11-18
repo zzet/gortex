@@ -3,6 +3,7 @@ package contracts
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -226,140 +227,182 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 		return
 	}
 
-	// Per-file router facts, keyed by file path. Parsed once per file.
-	type fileFacts struct {
-		// selfPrefix: router var -> the prefix it declares on itself
-		// (APIRouter(prefix=...)). FastAPI only.
-		selfPrefix map[string]string
-		// mountPrefix: router var -> the prefix it is mounted under at
-		// an include_router / app.use site (may live in another file).
-		mountPrefix map[string]string
-		// mountChild: parent router var -> child router var it mounts,
-		// so nested includes can chain prefixes.
-		mountParent map[string]string
+	paths := make(map[string]bool, len(scanFiles))
+	for _, path := range scanFiles {
+		paths[path] = true
+	}
+	for _, c := range reg.All() {
+		fw, _ := c.Meta["framework"].(string)
+		if c.Type == ContractHTTP && routePrefixFrameworks[fw] {
+			paths[c.FilePath] = true
+		}
+	}
+	facts := make(map[string]RouterFacts, len(paths))
+	for path := range paths {
+		facts[path] = RouterFileFacts(path, srcFor(path))
+	}
+	JoinRouterPrefixFacts(reg, facts)
+}
+
+// RouterFacts contains detached, serializable router inputs for one source file.
+// Callers may retain these values between jobs. Treat their maps and slices as
+// immutable; JoinRouterPrefixFacts only reads them. No source bytes are retained.
+type RouterFacts struct {
+	SelfPrefix       map[string]string
+	MountPrefix      map[string]string
+	MountParent      map[string]string
+	ModulePrefix     map[string]string
+	ControllerModule map[string]string
+	ControllerClass  string
+	LineCount        int
+	Lines            []RouterLineFacts
+}
+
+// RouterLineFacts records source-derived route context at a one-based line.
+// Entries are sparse change points, sorted by their one-based starting Line.
+type RouterLineFacts struct {
+	Line          int
+	Receivers     map[string]string
+	NestPrefix    string
+	SpringPrefix  string
+	RailsPrefix   string
+	LaravelPrefix string
+	VaporPrefix   string
+}
+
+// RouterFileFacts derives pure router facts even when the file has no contracts.
+// Invoke it during extraction for every supported source file, including mount
+// and module files, rather than waiting for an eligible HTTP contract to appear.
+func RouterFileFacts(filePath string, src []byte) RouterFacts {
+	f := RouterFacts{
+		SelfPrefix: map[string]string{}, MountPrefix: map[string]string{}, MountParent: map[string]string{},
+		ModulePrefix: map[string]string{}, ControllerModule: map[string]string{},
+	}
+	if src == nil {
+		return f
+	}
+	text := string(src)
+	// FastAPI: router = APIRouter(prefix="/users")
+	for _, m := range pyRouterDefRE.FindAllStringSubmatch(text, -1) {
+		varName := m[1]
+		if pm := prefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
+			f.SelfPrefix[varName] = cleanPrefix(pm[1])
+		} else {
+			// APIRouter() with no prefix still registers the var so
+			// a later mount join knows it exists (no-op self-prefix).
+			if _, ok := f.SelfPrefix[varName]; !ok {
+				f.SelfPrefix[varName] = ""
+			}
+		}
 	}
 
-	files := make(map[string]*fileFacts)
-	parseFile := func(filePath string) *fileFacts {
-		if f, ok := files[filePath]; ok {
-			return f
+	// FastAPI: app.include_router(router, prefix="/api")
+	for _, m := range pyIncludeRouterRE.FindAllStringSubmatch(text, -1) {
+		child := lastAttr(m[1])
+		prefix := ""
+		if pm := prefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
+			prefix = cleanPrefix(pm[1])
 		}
-		f := &fileFacts{
-			selfPrefix:  map[string]string{},
-			mountPrefix: map[string]string{},
-			mountParent: map[string]string{},
+		// A router can be mounted once; if seen twice keep the
+		// first (deterministic).
+		if _, ok := f.MountPrefix[child]; !ok {
+			f.MountPrefix[child] = prefix
 		}
-		files[filePath] = f
-		src := srcFor(filePath)
-		if src == nil {
-			return f
+		// Record the mount receiver as the parent so nested
+		// includes chain (parent.include_router(child, ...)).
+		parent := receiverOfInclude(text, m[0])
+		if parent != "" && parent != child {
+			f.MountParent[child] = parent
 		}
-		text := string(src)
+	}
 
-		// FastAPI: router = APIRouter(prefix="/users")
-		for _, m := range pyRouterDefRE.FindAllStringSubmatch(text, -1) {
-			varName := m[1]
-			if pm := prefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
-				f.selfPrefix[varName] = cleanPrefix(pm[1])
-			} else {
-				// APIRouter() with no prefix still registers the var so
-				// a later mount join knows it exists (no-op self-prefix).
-				if _, ok := f.selfPrefix[varName]; !ok {
-					f.selfPrefix[varName] = ""
-				}
-			}
+	// Flask: bp = Blueprint('api', __name__, url_prefix='/api')
+	for _, m := range pyBlueprintDefRE.FindAllStringSubmatch(text, -1) {
+		varName := m[1]
+		if pm := urlPrefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
+			f.SelfPrefix[varName] = cleanPrefix(pm[1])
+		} else if _, ok := f.SelfPrefix[varName]; !ok {
+			f.SelfPrefix[varName] = ""
 		}
+	}
 
-		// FastAPI: app.include_router(router, prefix="/api")
-		for _, m := range pyIncludeRouterRE.FindAllStringSubmatch(text, -1) {
-			child := lastAttr(m[1])
-			prefix := ""
-			if pm := prefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
-				prefix = cleanPrefix(pm[1])
-			}
-			// A router can be mounted once; if seen twice keep the
-			// first (deterministic).
-			if _, ok := f.mountPrefix[child]; !ok {
-				f.mountPrefix[child] = prefix
-			}
-			// Record the mount receiver as the parent so nested
-			// includes chain (parent.include_router(child, ...)).
-			parent := receiverOfInclude(text, m[0])
-			if parent != "" && parent != child {
-				f.mountParent[child] = parent
-			}
+	// Flask: app.register_blueprint(bp, url_prefix='/admin')
+	for _, m := range pyRegisterBlueprintRE.FindAllStringSubmatch(text, -1) {
+		child := lastAttr(m[1])
+		prefix := ""
+		if pm := urlPrefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
+			prefix = cleanPrefix(pm[1])
 		}
-
-		// Flask: bp = Blueprint('api', __name__, url_prefix='/api')
-		for _, m := range pyBlueprintDefRE.FindAllStringSubmatch(text, -1) {
-			varName := m[1]
-			if pm := urlPrefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
-				f.selfPrefix[varName] = cleanPrefix(pm[1])
-			} else if _, ok := f.selfPrefix[varName]; !ok {
-				f.selfPrefix[varName] = ""
-			}
+		if _, ok := f.MountPrefix[child]; !ok {
+			f.MountPrefix[child] = prefix
 		}
+	}
 
-		// Flask: app.register_blueprint(bp, url_prefix='/admin')
-		for _, m := range pyRegisterBlueprintRE.FindAllStringSubmatch(text, -1) {
-			child := lastAttr(m[1])
-			prefix := ""
-			if pm := urlPrefixKwargRE.FindStringSubmatch(m[2]); pm != nil {
-				prefix = cleanPrefix(pm[1])
-			}
-			if _, ok := f.mountPrefix[child]; !ok {
-				f.mountPrefix[child] = prefix
-			}
+	// gin: v1 := r.Group("/api/v1"); admin := v1.Group("/admin")
+	for _, m := range ginGroupRE.FindAllStringSubmatch(text, -1) {
+		child, parent, prefix := m[1], m[2], cleanPrefix(m[3])
+		f.SelfPrefix[child] = prefix
+		if parent != "" && parent != child {
+			f.MountParent[child] = parent
 		}
+	}
 
-		// gin: v1 := r.Group("/api/v1"); admin := v1.Group("/admin")
-		for _, m := range ginGroupRE.FindAllStringSubmatch(text, -1) {
-			child, parent, prefix := m[1], m[2], cleanPrefix(m[3])
-			f.selfPrefix[child] = prefix
-			if parent != "" && parent != child {
-				f.mountParent[child] = parent
-			}
+	// axum: app.nest("/api", api_router)
+	for _, m := range axumNestRE.FindAllStringSubmatch(text, -1) {
+		prefix, child := cleanPrefix(m[1]), m[2]
+		if _, ok := f.MountPrefix[child]; !ok {
+			f.MountPrefix[child] = prefix
 		}
+	}
 
-		// axum: app.nest("/api", api_router)
-		for _, m := range axumNestRE.FindAllStringSubmatch(text, -1) {
-			prefix, child := cleanPrefix(m[1]), m[2]
-			if _, ok := f.mountPrefix[child]; !ok {
-				f.mountPrefix[child] = prefix
-			}
+	// Actix: web::scope("/api").configure(api_routes) — the mounted
+	// config function (in this or another file) registers the routes
+	// that inherit the scope prefix.
+	for _, m := range actixScopeConfigRE.FindAllStringSubmatch(text, -1) {
+		prefix, child := cleanPrefix(m[1]), lastPathSeg(m[2])
+		if _, ok := f.MountPrefix[child]; !ok {
+			f.MountPrefix[child] = prefix
 		}
+	}
 
-		// Actix: web::scope("/api").configure(api_routes) — the mounted
-		// config function (in this or another file) registers the routes
-		// that inherit the scope prefix.
-		for _, m := range actixScopeConfigRE.FindAllStringSubmatch(text, -1) {
-			prefix, child := cleanPrefix(m[1]), lastPathSeg(m[2])
-			if _, ok := f.mountPrefix[child]; !ok {
-				f.mountPrefix[child] = prefix
-			}
+	// Express: app.use('/api', router)
+	for _, m := range jsUseMountRE.FindAllStringSubmatch(text, -1) {
+		parent, prefix, child := m[1], cleanPrefix(m[2]), m[3]
+		if _, ok := f.MountPrefix[child]; !ok {
+			f.MountPrefix[child] = prefix
 		}
-
-		// Express: app.use('/api', router)
-		for _, m := range jsUseMountRE.FindAllStringSubmatch(text, -1) {
-			parent, prefix, child := m[1], cleanPrefix(m[2]), m[3]
-			if _, ok := f.mountPrefix[child]; !ok {
-				f.mountPrefix[child] = prefix
-			}
-			if parent != "" && parent != child {
-				f.mountParent[child] = parent
-			}
+		if parent != "" && parent != child {
+			f.MountParent[child] = parent
 		}
+	}
 
-		// Vapor: let api = app.grouped("api"); let v1 = api.grouped("v1")
-		for _, m := range vaporGroupedRE.FindAllStringSubmatch(text, -1) {
-			child, parent, prefix := m[1], lastAttr(m[2]), vaporGroupSegments(m[3])
-			f.selfPrefix[child] = prefix
-			if parent != "" && parent != child {
-				f.mountParent[child] = parent
-			}
+	// Vapor: let api = app.grouped("api"); let v1 = api.grouped("v1")
+	for _, m := range vaporGroupedRE.FindAllStringSubmatch(text, -1) {
+		child, parent, prefix := m[1], lastAttr(m[2]), vaporGroupSegments(m[3])
+		f.SelfPrefix[child] = prefix
+		if parent != "" && parent != child {
+			f.MountParent[child] = parent
 		}
+	}
 
-		return f
+	f.ModulePrefix, f.ControllerModule = nestFileModuleFacts(text)
+	if idx := strings.Index(text, "@Controller"); idx >= 0 {
+		f.ControllerClass = strings.Clone(firstSubmatch(nestControllerClassRE, text[idx:]))
+	}
+	f.SelfPrefix = detachRouterMap(f.SelfPrefix)
+	f.MountPrefix = detachRouterMap(f.MountPrefix)
+	f.MountParent = detachRouterMap(f.MountParent)
+	f.LineCount = strings.Count(text, "\n") + 1
+	f.Lines = routerLineFacts(text)
+	return f
+}
+
+// JoinRouterPrefixFacts rewrites routes using a complete file-facts snapshot.
+// Include contract-free mount/module files. Missing facts act like unreadable
+// files in JoinRouterPrefixes; this function never reads or reparses sources.
+func JoinRouterPrefixFacts(reg *Registry, facts map[string]RouterFacts) {
+	if reg == nil {
+		return
 	}
 
 	// Global maps merged across every contract file. Router var names
@@ -378,23 +421,14 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 	// that only calls include_router) carry no route contracts, so they
 	// must be reached via scanFiles; route-contract files supply the
 	// APIRouter(prefix=...) self-prefixes.
-	factFiles := make(map[string]bool, len(scanFiles))
-	for _, p := range scanFiles {
-		factFiles[p] = true
+	paths := make([]string, 0, len(facts))
+	for path := range facts {
+		paths = append(paths, path)
 	}
-	for _, c := range reg.All() {
-		if c.Type != ContractHTTP {
-			continue
-		}
-		fw, _ := c.Meta["framework"].(string)
-		if !routePrefixFrameworks[fw] {
-			continue
-		}
-		factFiles[c.FilePath] = true
-	}
-	for path := range factFiles {
-		f := parseFile(path)
-		for v, p := range f.selfPrefix {
+	sort.Strings(paths) // deterministic precedence for ambiguous parent/module names
+	for _, path := range paths {
+		f := facts[path]
+		for v, p := range f.SelfPrefix {
 			if existing, ok := globalSelf[v]; ok {
 				if existing != p && existing != "" && p != "" {
 					selfConflict[v] = true
@@ -406,7 +440,7 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 				globalSelf[v] = p
 			}
 		}
-		for v, p := range f.mountPrefix {
+		for v, p := range f.MountPrefix {
 			if existing, ok := globalMount[v]; ok {
 				if existing != p {
 					mountConflict[v] = true
@@ -415,16 +449,14 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 				globalMount[v] = p
 			}
 		}
-		for child, parent := range f.mountParent {
+		for child, parent := range f.MountParent {
 			if _, ok := globalParent[child]; !ok {
 				globalParent[child] = parent
 			}
 		}
 	}
 
-	// NestJS RouterModule cross-module prefixes: controllerClass -> the path
-	// its module is mounted under (walked across module + router-config files).
-	nestModulePrefix := buildNestModulePrefixes(factFiles, srcFor)
+	nestModulePrefix := joinNestModuleFacts(paths, facts)
 
 	// chainPrefix resolves the full mount prefix for a router var,
 	// walking parent includes so a router mounted into a router
@@ -480,7 +512,7 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 			continue
 		}
 
-		prefix := prefixForRoute(c, fw, srcFor, globalSelf, globalMount, selfConflict, mountConflict, chainPrefix, nestModulePrefix)
+		prefix := prefixForRoute(c, fw, facts, globalSelf, globalMount, selfConflict, mountConflict, chainPrefix, nestModulePrefix)
 		if prefix == "" {
 			continue
 		}
@@ -500,7 +532,7 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 			if joined, _ := items[i].Meta[routePrefixJoinedMeta].(bool); joined {
 				continue
 			}
-			rp := prefixForRoute(items[i], ifw, srcFor, globalSelf, globalMount, selfConflict, mountConflict, chainPrefix, nestModulePrefix)
+			rp := prefixForRoute(items[i], ifw, facts, globalSelf, globalMount, selfConflict, mountConflict, chainPrefix, nestModulePrefix)
 			if rp == "" {
 				continue
 			}
@@ -568,15 +600,17 @@ func JoinRouterPrefixes(reg *Registry, scanFiles []string, srcFor func(filePath 
 func prefixForRoute(
 	c Contract,
 	framework string,
-	srcFor func(filePath string) []byte,
+	facts map[string]RouterFacts,
 	globalSelf, globalMount map[string]string,
 	selfConflict, mountConflict map[string]bool,
 	chainPrefix func(string, map[string]bool) string,
 	nestModulePrefix map[string]string,
 ) string {
+	f := facts[c.FilePath]
+	line := f.lineFacts(c.Line)
 	switch framework {
 	case "fastapi/flask", "flask", "express":
-		varName := routeReceiver(c, framework, srcFor)
+		varName := line.Receivers[framework]
 		if varName == "" {
 			return ""
 		}
@@ -592,7 +626,7 @@ func prefixForRoute(
 		// gin RouterGroup / Vapor route-group chain: the route's group var
 		// carries its own .Group / .grouped prefix, parents contribute theirs
 		// via the mount chain.
-		varName := routeReceiver(c, framework, srcFor)
+		varName := line.Receivers[framework]
 		mount, self := "", ""
 		if varName != "" {
 			mount = chainPrefix(varName, map[string]bool{})
@@ -604,7 +638,7 @@ func prefixForRoute(
 			// Vapor's closure-block group form `app.group("api") { ... }`
 			// binds no group var, so its prefix is recovered by balancing
 			// braces upward from the route line over the enclosing blocks.
-			closure := vaporClosureGroupPrefix(c, srcFor)
+			closure := line.VaporPrefix
 			joined := joinPaths(closure, mount, self)
 			if joined != "" {
 				return joined
@@ -616,7 +650,7 @@ func prefixForRoute(
 		return joinPaths(mount, self)
 	case "axum":
 		// axum: the route's router var is mounted under a .nest prefix.
-		varName := routeReceiver(c, framework, srcFor)
+		varName := line.Receivers[framework]
 		if varName == "" {
 			return ""
 		}
@@ -626,7 +660,7 @@ func prefixForRoute(
 		// web::scope(...) prefix (possibly in another file). Single-file
 		// inline scopes are already joined by the extractor, so this only
 		// adds the cross-file scope-config mount prefix.
-		fnName := routeReceiver(c, framework, srcFor)
+		fnName := line.Receivers[framework]
 		if fnName == "" {
 			return ""
 		}
@@ -636,83 +670,19 @@ func prefixForRoute(
 		// upward from the route line for the nearest preceding
 		// decorator in the same file, prefixed by the cross-module
 		// RouterModule mount path of the controller's module (if any).
-		ctrlPrefix := nestControllerPrefix(c, srcFor)
+		ctrlPrefix := line.NestPrefix
 		if len(nestModulePrefix) > 0 {
-			if mp := nestModulePrefix[nestControllerClass(c, srcFor)]; mp != "" {
+			if mp := nestModulePrefix[f.ControllerClass]; mp != "" {
 				return joinPaths(mp, ctrlPrefix)
 			}
 		}
 		return ctrlPrefix
 	case "spring":
-		return springClassPrefix(c, srcFor)
+		return line.SpringPrefix
 	case "rails":
-		return railsNamespacePrefix(c, srcFor)
+		return line.RailsPrefix
 	case "laravel":
-		return laravelGroupPrefix(c, srcFor)
-	}
-	return ""
-}
-
-// routeReceiver recovers the router/app variable a route was declared
-// on, by re-reading the contract's source line. Returns "" when the
-// line can't be read or no receiver is found.
-func routeReceiver(c Contract, framework string, srcFor func(filePath string) []byte) string {
-	// Actix's receiver is the enclosing config function, recovered by
-	// scanning upward over multiple lines rather than from the route line.
-	if framework == "actix" {
-		return actixEnclosingFn(c, srcFor)
-	}
-	line := sourceLine(srcFor(c.FilePath), c.Line)
-	if line == "" {
-		return ""
-	}
-	switch framework {
-	case "fastapi/flask":
-		if m := pyRouteReceiverRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	case "flask":
-		if m := flaskRouteReceiverRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	case "express":
-		if m := jsRouteReceiverRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	case "gin/echo/chi", "fiber":
-		if m := ginRouteReceiverRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	case "axum":
-		if m := axumLetBindingRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	case "vapor":
-		if m := vaporRouteReceiverRE.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	}
-	return ""
-}
-
-// actixEnclosingFn scans upward from an Actix route line for the nearest
-// enclosing `fn <name>(` definition and returns that function name, or "" when
-// the route sits outside any function. The function name is the "router var"
-// the cross-file scope-config mount keys on.
-func actixEnclosingFn(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	for i := idx; i >= 0; i-- {
-		if m := actixFnDefRE.FindStringSubmatch(lines[i]); m != nil {
-			return m[1]
-		}
+		return line.LaravelPrefix
 	}
 	return ""
 }
@@ -726,65 +696,6 @@ func lastPathSeg(ref string) string {
 	return ref
 }
 
-// springClassPrefix scans upward from a Spring route line for the
-// class-level @RequestMapping("/api") prefix (skipping the route's own
-// decorator line), or "" when the controller declares none.
-func springClassPrefix(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	for i := idx - 1; i >= 0; i-- {
-		if m := springClassMappingRE.FindStringSubmatch(lines[i]); m != nil {
-			return cleanPrefix(m[1])
-		}
-	}
-	return ""
-}
-
-// railsNamespacePrefix walks upward from a Rails route line, balancing
-// do/end blocks, and joins the prefixes of every enclosing `namespace :x`.
-func railsNamespacePrefix(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	depth := 0
-	var parts []string
-	for i := idx - 1; i >= 0; i-- {
-		trimmed := strings.TrimSpace(lines[i])
-		if trimmed == "end" || strings.HasPrefix(trimmed, "end ") {
-			depth++
-			continue
-		}
-		if !railsLineOpensBlock(trimmed) {
-			continue
-		}
-		if depth > 0 {
-			depth--
-			continue
-		}
-		// Enclosing block opener at depth 0.
-		if m := railsNamespaceRE.FindStringSubmatch(lines[i]); m != nil {
-			parts = append([]string{m[1]}, parts...)
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "/" + strings.Join(parts, "/")
-}
-
 // railsLineOpensBlock reports whether a Ruby routes line opens a do-block
 // (namespace / resources / scope / draw).
 func railsLineOpensBlock(trimmed string) bool {
@@ -792,119 +703,6 @@ func railsLineOpensBlock(trimmed string) bool {
 		strings.HasSuffix(trimmed, "do") && strings.Contains(trimmed, " do") ||
 		strings.Contains(trimmed, " do |") ||
 		strings.Contains(trimmed, " do;")
-}
-
-// laravelGroupPrefix walks upward from a Laravel route line, balancing
-// braces, and joins the prefixes of every enclosing
-// Route::prefix('x')->group(... { block.
-func laravelGroupPrefix(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	depth := 0
-	var parts []string
-	for i := idx - 1; i >= 0; i-- {
-		line := lines[i]
-		for j := len(line) - 1; j >= 0; j-- {
-			switch line[j] {
-			case '}':
-				depth++
-			case '{':
-				if depth > 0 {
-					depth--
-					continue
-				}
-				// Enclosing open brace: prepend its prefix clause, if any.
-				if m := laravelPrefixRE.FindStringSubmatch(line); m != nil {
-					parts = append([]string{cleanPrefix(m[1])}, parts...)
-				}
-			}
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return joinPaths(parts...)
-}
-
-// vaporClosureGroupPrefix walks upward from a Vapor route line, balancing
-// braces, and joins the prefixes of every enclosing
-// `app.group("api") { ... }` / `routes.group("v1") { g in ... }` closure
-// block. Returns "" when the route sits in no group closure.
-func vaporClosureGroupPrefix(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	depth := 0
-	var parts []string
-	for i := idx - 1; i >= 0; i-- {
-		line := lines[i]
-		for j := len(line) - 1; j >= 0; j-- {
-			switch line[j] {
-			case '}':
-				depth++
-			case '{':
-				if depth > 0 {
-					depth--
-					continue
-				}
-				// Enclosing open brace at depth 0: prepend its group
-				// prefix when the brace opens a `.group(...)` closure.
-				if m := vaporClosureGroupRE.FindStringSubmatch(line); m != nil {
-					parts = append([]string{vaporGroupSegments(m[1])}, parts...)
-				}
-			}
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return joinPaths(parts...)
-}
-
-// nestControllerPrefix scans upward from a NestJS route line for the
-// nearest @Controller('prefix') decorator (its enclosing class) and
-// returns that prefix, or "" when the controller carries none.
-func nestControllerPrefix(c Contract, srcFor func(filePath string) []byte) string {
-	src := srcFor(c.FilePath)
-	if src == nil {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	idx := c.Line - 1 // contract lines are 1-based
-	if idx < 0 || idx >= len(lines) {
-		return ""
-	}
-	for i := idx; i >= 0; i-- {
-		if m := nestControllerRE.FindStringSubmatch(lines[i]); m != nil {
-			return cleanPrefix(m[1])
-		}
-	}
-	return ""
-}
-
-// sourceLine returns the 1-based line `n` from src, or "".
-func sourceLine(src []byte, n int) string {
-	if src == nil || n < 1 {
-		return ""
-	}
-	lines := strings.Split(string(src), "\n")
-	if n > len(lines) {
-		return ""
-	}
-	return lines[n-1]
 }
 
 // receiverOfInclude returns the receiver variable in front of an

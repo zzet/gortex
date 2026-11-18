@@ -30,6 +30,9 @@ const crashWorkerEnv = "GORTEX_INDEXER_TEST_PARSEWORKER"
 // TestMain lets crash-isolation tests use the test binary itself as the
 // parser worker subprocess — no built gortex binary required.
 func TestMain(m *testing.M) {
+	if code, handled := runGoListHoldHelper(); handled {
+		os.Exit(code)
+	}
 	if os.Getenv(crashWorkerEnv) == "1" {
 		_ = crashpool.RunWorker(os.Stdin, os.Stdout)
 		os.Exit(0)

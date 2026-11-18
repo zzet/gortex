@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -350,4 +351,35 @@ func WriteJSON(w http.ResponseWriter, code int, body any) {}
 			t.Errorf("envelope[%s].shape has no fields; got %#v", key, shape)
 		}
 	}
+}
+
+func TestContractsCrossFileHandlerResolvesSiblingResponseShape(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"routes.go":  "package fixture\nimport \"net/http\"\nfunc register(mux *http.ServeMux) { mux.HandleFunc(\"GET /items\", handle) }\n",
+		"handler.go": "package fixture\nimport \"net/http\"\nfunc handle(w http.ResponseWriter, r *http.Request) { response := Reply{Name:\"ok\"}; WriteJSON(w,200,response) }\nfunc WriteJSON(w http.ResponseWriter, code int, body any) {}\n",
+		"types.go":   "package fixture\ntype Reply struct { Name string `json:\"name\"` }\n",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644))
+	}
+	g := graph.New()
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+	idx := New(g, reg, config.Default().Index, zap.NewNop())
+	idx.SetRepoPrefix("fixture")
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+	rows := idx.ContractRegistry().ByID("http::GET::/items")
+	require.Len(t, rows, 1)
+	require.Equal(t, "fixture/handler.go::handle", rows[0].SymbolID)
+	require.Equal(t, "fixture/types.go::Reply", rows[0].Meta["response_type"])
+	encoded, err := json.Marshal(rows[0].Meta["response_shape"])
+	require.NoError(t, err)
+	var shape contracts.Shape
+	require.NoError(t, json.Unmarshal(encoded, &shape))
+	require.Equal(t, "struct", shape.Kind)
+	require.Len(t, shape.Fields, 1)
+	require.Equal(t, "name", shape.Fields[0].Name)
+	require.Equal(t, "string", shape.Fields[0].Type)
+	require.Equal(t, `json:"name"`, shape.Fields[0].JSONTag)
 }

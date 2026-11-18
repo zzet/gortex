@@ -27,8 +27,9 @@ var lastMemoryReleaseAtNanos atomic.Int64
 
 // MCP calls participate in the process-wide activity tracker. The same tracker
 // also covers warmup, reconciliation, snapshots, analysis, and other background
-// work, because debug.FreeOSMemory is process-wide and must not overlap any of
-// them.
+// work: the idle release starts only when none of them is active. Once it has
+// started, a call no longer waits for it (releaseIdleHeapAfterQuiet), so
+// Begin only ever waits for the release's decision, never for the release.
 func beginMCPToolCall() {
 	runtimeactivity.Begin("mcp")
 }
@@ -109,23 +110,35 @@ func releaseIdleMCPHeap(logger *zap.Logger, reason string) (done bool, retryAfte
 	return releaseIdleHeapAfterQuiet(logger, reason, 0)
 }
 
-// releaseIdleHeapAfterQuiet performs one adaptive release attempt. The
-// process-wide tracker closes the check-to-release race: once admitted, no MCP
-// request or tracked background job can begin until the scavenge completes.
+// freeOSMemory is the release itself; a variable so a test can stand in a
+// release that takes a known time.
+var freeOSMemory = debug.FreeOSMemory
+
+// releaseIdleHeapAfterQuiet performs one adaptive release attempt.
+//
+// The decision is taken under the process-wide tracker's exclusive gate: no
+// tracked work is active, the quiet window has passed, the idle heap is worth
+// releasing and the cooldown has run out. The release itself runs after the
+// gate is released. It is best effort: a tool call (or any tracked work) that
+// begins while it runs is admitted at once and runs beside it, instead of
+// waiting for a full collection and scavenge of the whole heap to finish —
+// which, when the gate was held across it, stalled the first call after every
+// quiet window by 100–300 ms at GOMAXPROCS=1.
 func releaseIdleHeapAfterQuiet(logger *zap.Logger, reason string, quiet time.Duration) (done bool, retryAfter time.Duration) {
 	var (
 		attemptDone  bool
 		attemptRetry time.Duration
+		release      bool
+		candidate    uint64
+		before       runtime.MemStats
 	)
 	ran, trackerRetry := runtimeactivity.RunIfQuiet(quiet, func() {
-		var before runtime.MemStats
 		runtime.ReadMemStats(&before)
-		candidate := heapIdleUnreleased(&before)
+		candidate = heapIdleUnreleased(&before)
 		if candidate < idleReleaseMinBytes() {
 			attemptDone = true
 			return
 		}
-
 		if cooldown := idleReleaseCooldown(); cooldown > 0 {
 			last := time.Unix(0, lastMemoryReleaseAtNanos.Load())
 			if remaining := cooldown - time.Since(last); remaining > 0 {
@@ -133,14 +146,24 @@ func releaseIdleHeapAfterQuiet(logger *zap.Logger, reason string, quiet time.Dur
 				return
 			}
 		}
-
-		start := time.Now()
-		debug.FreeOSMemory()
+		// Claimed under the gate, so the cooldown holds even if a second
+		// attempt decided while this release runs.
 		lastMemoryReleaseAtNanos.Store(time.Now().UnixNano())
-
-		var after runtime.MemStats
-		runtime.ReadMemStats(&after)
+		release = true
+	})
+	if !ran {
+		if trackerRetry <= 0 {
+			trackerRetry = defaultIdleReleaseDelay
+		}
+		return false, trackerRetry
+	}
+	if release {
+		start := time.Now()
+		freeOSMemory()
+		lastMemoryReleaseAtNanos.Store(time.Now().UnixNano())
 		if logger != nil {
+			var after runtime.MemStats
+			runtime.ReadMemStats(&after)
 			logger.Debug("daemon: released idle heap to OS",
 				zap.String("reason", reason),
 				zap.Uint64("heap_alloc_bytes", after.HeapAlloc),
@@ -155,12 +178,6 @@ func releaseIdleHeapAfterQuiet(logger *zap.Logger, reason string, quiet time.Dur
 				zap.Duration("elapsed", time.Since(start)))
 		}
 		attemptDone = true
-	})
-	if !ran {
-		if trackerRetry <= 0 {
-			trackerRetry = defaultIdleReleaseDelay
-		}
-		return false, trackerRetry
 	}
 	if attemptRetry > 0 {
 		return false, attemptRetry

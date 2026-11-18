@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
@@ -101,26 +102,57 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		editingContextStarted: make(chan struct{}),
 	}
 	firstServer, firstDone := startProxyRestartDaemon(t, socket, firstDispatcher)
+	var stopFirstOnce sync.Once
+	stopFirst := func() { stopFirstOnce.Do(func() { stopProxyRestartDaemon(t, firstServer, firstDone) }) }
+	t.Cleanup(stopFirst)
 	initial, err := daemon.DialTo(socket, h)
 	if err != nil {
 		t.Fatal(err)
 	}
 	firstInstance := initial.Ack.DaemonInstance
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reconnectReady := make(chan struct{})
+	var reconnectOnce sync.Once
+	allowReconnect := func() { reconnectOnce.Do(func() { close(reconnectReady) }) }
 	dialDaemon = func(handshake daemon.Handshake) (*daemon.Client, error) {
+		select {
+		case <-reconnectReady:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return daemon.DialTo(socket, handshake)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	stdinR, stdinW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
+	stdout := bufio.NewReader(stdoutR) // one reader owns any read-ahead for this stream
 	done := make(chan error, 1)
 	go func() {
 		done <- relayProxySession(ctx, h, initial, stdinR, stdoutW, io.Discard, nil, nil)
 	}()
+	defer func() {
+		// Keep the host transport open until cancellation joins the relay.
+		// Closing it first races a synthetic ErrClosedPipe against ctx.Done.
+		// Still release every endpoint if the bounded join itself fails.
+		defer func() {
+			_ = stdinW.Close()
+			_ = stdinR.Close()
+			_ = stdoutR.Close()
+			_ = stdoutW.Close()
+			_ = initial.Close()
+		}()
+		cancel()
+		allowReconnect()
+		waitRelay(t, done)
+	}()
 
 	initialize := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"restart-test","version":"1"},"capabilities":{}}}` + "\n")
 	mustWriteTestFrame(t, stdinW, initialize)
-	assertTestResponse(t, mustReadTestFrame(t, stdoutR), 1, false)
+	assertTestResponse(t, mustReadTestFrame(t, stdout), 1, false)
 	mustWriteTestFrame(t, stdinW, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`+"\n"))
 	waitForProxyMethods(t, firstDispatcher, 2)
 
@@ -134,17 +166,19 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		t.Fatal("editing_context did not start before daemon restart")
 	}
 
-	stopProxyRestartDaemon(t, firstServer, firstDone)
+	// This case means transport loss before a terminal reply. Close our old
+	// client transport first: a graceful server stop can otherwise race a
+	// cancellation response that legitimately completes the pending request.
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stopFirst()
 	secondDispatcher := &proxyRestartDispatcher{}
 	secondServer, secondDone := startProxyRestartDaemon(t, socket, secondDispatcher)
 	t.Cleanup(func() { stopProxyRestartDaemon(t, secondServer, secondDone) })
+	allowReconnect() // only the real replacement listener may receive redial
 
-	warning := mustReadTestFrame(t, stdoutR)
-	listChanged := mustReadTestFrame(t, stdoutR)
-	resetError := mustReadTestFrame(t, stdoutR)
-	if !jsonFrameMethod(listChanged, "notifications/tools/list_changed") {
-		t.Fatalf("restart tools/list_changed notification missing: %s", listChanged)
-	}
+	warning := mustReadTestFrame(t, stdout)
 	var resetNotification struct {
 		Method string `json:"method"`
 		Params struct {
@@ -163,6 +197,11 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 		resetNotification.Params.Data.CurrentInstance == firstInstance {
 		t.Fatalf("machine-readable daemon instance reset missing: %s (%v)", warning, err)
 	}
+	listChanged := mustReadTestFrame(t, stdout)
+	if !jsonFrameMethod(listChanged, "notifications/tools/list_changed") {
+		t.Fatalf("restart tools/list_changed notification missing: %s", listChanged)
+	}
+	resetError := mustReadTestFrame(t, stdout)
 	assertTestResponse(t, resetError, 2, true)
 	if initial.Ack.DaemonInstance == "" || initial.Ack.DaemonInstance != firstInstance {
 		t.Fatal("initial daemon instance was not stable")
@@ -179,15 +218,11 @@ func TestRelayProxySessionRestoresProtocolAgainstRealRestartedDaemon(t *testing.
 
 	retry := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read","arguments":{"operation":"editing_context","target":{"file":"internal/mcp/tools_explore.go"}}}}` + "\n")
 	mustWriteTestFrame(t, stdinW, retry)
-	assertTestResponse(t, mustReadTestFrame(t, stdoutR), 3, false)
+	assertTestResponse(t, mustReadTestFrame(t, stdout), 3, false)
 	methods = waitForProxyMethods(t, secondDispatcher, 3)
 	if methods[2] != "tools/call" {
 		t.Fatalf("explicit retry was not dispatched: %v", methods)
 	}
-
-	cancel()
-	_ = stdinW.Close()
-	waitRelay(t, done)
 }
 
 func startProxyRestartDaemon(t *testing.T, socket string, dispatcher daemon.MCPDispatcher) (*daemon.Server, <-chan error) {

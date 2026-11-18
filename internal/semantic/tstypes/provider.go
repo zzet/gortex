@@ -19,18 +19,43 @@ import (
 type Provider struct {
 	spec         *LangSpec
 	logger       *zap.Logger
-	observePage  func(factPageStats) // synchronous test/diagnostic hook
-	observeSpool func(string)        // synchronous cleanup test hook
+	observePage  func(factPageStats)       // synchronous test/diagnostic hook
+	observeSpool func(string)              // synchronous cleanup test hook
+	observeFiles func()                    // synchronous test hook: the pass listed its files
+	pageFault    func(factPageStats) error // test hook: fail a page after it applied
+	// resumeVersion identifies this engine build in resume points; empty
+	// means the build cannot be identified and the provider never resumes.
+	resumeVersion string
+	// fullAdjacency restores the legacy all-kinds adjacency preload. Test
+	// hook only: the parity tests run every fixture both ways and require
+	// identical graphs.
+	fullAdjacency bool
+	// observePreload is run by every applier once its page's adjacency is
+	// loaded, before any fact applies (test hook: hot-cache coherence).
+	observePreload func(*applier)
 }
 
-var _ semantic.ContextEnricher = (*Provider)(nil)
+// newApplier builds one pass/page applier for this provider's spec.
+func (p *Provider) newApplier(g graph.Store) *applier {
+	ap := newApplier(g, p.spec, p.Name())
+	if p.fullAdjacency {
+		ap.setAdjacencyKinds(nil, nil)
+	}
+	ap.afterPreload = p.observePreload
+	return ap
+}
+
+var (
+	_ semantic.ContextEnricher            = (*Provider)(nil)
+	_ semantic.QueueWaitExcludingEnricher = (*Provider)(nil)
+)
 
 // NewProvider wraps a LangSpec as a semantic provider.
 func NewProvider(spec *LangSpec, logger *zap.Logger) *Provider {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Provider{spec: spec, logger: logger}
+	return &Provider{spec: spec, logger: logger, resumeVersion: applyResumeVersion()}
 }
 
 // DefaultProviders returns the in-process type resolvers for every
@@ -60,6 +85,16 @@ func (p *Provider) Close() error        { return nil }
 // semantic.SupplementalProvider): the manager runs it for its
 // languages in addition to the arbitration winner.
 func (p *Provider) Supplemental() bool { return true }
+
+// ExcludesQueueWaitFromCeiling implements semantic.QueueWaitExcludingEnricher:
+// a full pass brackets its resolve-mutex wait with semantic.ExcludeQueueWait.
+func (p *Provider) ExcludesQueueWaitFromCeiling() {}
+
+// A suppressed fallback does no parsing or graph work, so it needs no
+// shared admission. Active AST passes keep ordinary build-lane admission.
+func (p *Provider) ConcurrentCheckoutPreparation(ctx context.Context, _, _ string, _ semantic.CheckoutCompilerScope, _ []string) bool {
+	return ctx.Err() == nil && p.spec.Suppressed != nil && p.spec.Suppressed()
+}
 
 // Enrich runs the full-repo pass for a single-repo (un-prefixed) graph.
 // It delegates to EnrichRepo with an empty prefix — the in-memory single
@@ -96,7 +131,18 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		return res, nil
 	}
 
-	files := languageFiles(g, p.spec, repoPrefix, repoRoot)
+	// One read of the file nodes serves both the ledger digest the pass's
+	// points carry and the files it stages, so a point never covers a file
+	// state the pass did not list: a file indexed after the read moves the
+	// digest, and the next pass refuses the point.
+	nodes := repoFileNodes(g, p.spec, repoPrefix)
+	// Decided before any early return, so a point this run must not honour
+	// is discarded even when the pass is cut before it applies anything.
+	resume := p.openApplyResume(ctx, g, repoPrefix, func() string { return digestLedger(nodes, repoRoot) })
+	files := analyzedFiles(nodes, repoRoot)
+	if p.observeFiles != nil {
+		p.observeFiles()
+	}
 	// The budget is charged phase by phase against a movable deadline instead
 	// of arming one context up front: the wait for the graph-wide resolve
 	// mutex below is ANOTHER pass's work, and letting it burn this pass's
@@ -117,7 +163,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		return context.WithDeadline(ctx, deadlineAt)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		markContextPartial(res, err)
 		res.DurationMs = time.Since(start).Milliseconds()
 		return res, nil
@@ -133,7 +179,7 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		}
 		parseCtx, cancelParse := phaseCtx()
 		if err := p.stageRepoFacts(parseCtx, files, spool); err != nil {
-			parseErr := parseCtx.Err()
+			parseErr := context.Cause(parseCtx)
 			cancelParse()
 			if parseErr != nil {
 				markContextPartial(res, parseErr)
@@ -154,11 +200,16 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 		// resolve phase), then the mutex. Both waits are other passes' work,
 		// so both are excluded from this pass's budget below.
 		if err := semantic.ApplyGateWait(ctx); err != nil {
-			markContextPartial(res, err)
+			markContextPartial(res, context.Cause(ctx))
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
+		// The mutex wait cannot be cancelled, so the Manager's outer ceiling
+		// could only expire during it and cut the apply that follows; stop
+		// that clock while queued, as the budget above already does.
+		resumeCeiling := semantic.ExcludeQueueWait(ctx)
 		mu.Lock()
+		resumeCeiling()
 		lockWait := time.Since(lockStart)
 		res.LockWaitMs = lockWait.Milliseconds()
 		if lockWait > 5*time.Second {
@@ -174,16 +225,19 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			deadlineAt = deadlineAt.Add(lockWait)
 		}
 		applyCtx, cancelApply := phaseCtx()
-		if err := applyCtx.Err(); err != nil {
+		if err := context.Cause(applyCtx); err != nil {
 			mu.Unlock()
 			cancelApply()
 			markContextPartial(res, err)
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, nil
 		}
-		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, res)
+		// The resume was decided before staging; a file re-parsed since
+		// shows only in the ledger as it is now.
+		resume.revalidate(func() string { return ledgerDigest(g, p.spec, repoPrefix, repoRoot) })
+		applyErr := p.applyStagedFacts(applyCtx, g, repoPrefix, spool, resume, res)
 		mu.Unlock()
-		applyCtxErr := applyCtx.Err()
+		applyCtxErr := context.Cause(applyCtx)
 		cancelApply()
 		if applyErr != nil {
 			if applyCtxErr != nil {
@@ -194,14 +248,21 @@ func (p *Provider) EnrichRepoContext(ctx context.Context, g graph.Store, repoPre
 			return nil, applyErr
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		markContextPartial(res, err)
+	}
+	if !res.Partial {
+		resume.complete()
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()
 	return res, nil
 }
 
+// markContextPartial records a pass cut by its context. Callers pass
+// context.Cause, read before the phase context is released, so the reason
+// names the bound that ended the pass: the pass's own budget (a deadline), the
+// Manager's outer ceiling, or a shutdown (canceled).
 func markContextPartial(res *semantic.EnrichResult, err error) {
 	res.Partial = true
 	res.AbortReason = err.Error()
@@ -251,7 +312,7 @@ func (p *Provider) EnrichFile(g graph.Store, repoRoot, filePath string) (*semant
 		// race a concurrent watcher / resolver pass on another file.
 		mu := g.ResolveMutex()
 		mu.Lock()
-		ap := newApplier(g, p.spec, p.Name())
+		ap := p.newApplier(g)
 		ap.applyAll([]*fileFacts{facts}, res)
 		ap.flush()
 		p.countCoverage(g, fileNode.RepoPrefix, map[string]bool{facts.file: true}, res)

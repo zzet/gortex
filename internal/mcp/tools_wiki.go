@@ -98,8 +98,10 @@ func (s *Server) handleGenerateWiki(ctx context.Context, req mcp.CallToolRequest
 	cycles := analysis.DetectCycles(g, communities, "")
 
 	var contractList []contracts.Contract
-	if reg := s.effectiveContractRegistry(); reg != nil {
-		contractList = reg.All()
+	if !opts.NoContracts {
+		if reg := s.optionalContractRegistryForContext(ctx); reg != nil {
+			contractList = reg.All()
+		}
 	}
 
 	// Optional docs bundle inside the wiki.

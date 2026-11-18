@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"maps"
 	"sort"
 	"strings"
 
@@ -54,7 +56,10 @@ var providerAddCmd = &cobra.Command{
 	Long: "Register a custom OpenAI-compatible provider. --base-url and " +
 		"--model are required; the base URL should include any version " +
 		"segment (e.g. https://api.groq.com/openai/v1) — gortex appends " +
-		"/chat/completions.",
+		"/chat/completions. --preset <gateway> starts from a built-in " +
+		"gateway preset's values (see `gortex provider list`), and any " +
+		"other flag overrides that field. A provider named like a preset " +
+		"replaces the preset.",
 	Args: cobra.ExactArgs(1),
 	RunE: runProviderAdd,
 }
@@ -65,6 +70,7 @@ var (
 	providerModel       string
 	providerAPIKeyEnv   string
 	providerSchemaMode  string
+	providerProfile     string
 	providerMaxTokensF  string
 	providerReasoning   string
 	providerTemperature float64
@@ -72,6 +78,7 @@ var (
 	providerHeaders     []string
 	providerPriceInput  float64
 	providerPriceOutput float64
+	providerPreset      string
 )
 
 func init() {
@@ -79,12 +86,14 @@ func init() {
 	providerAddCmd.Flags().StringVar(&providerModel, "model", "", "default model identifier (required)")
 	providerAddCmd.Flags().StringVar(&providerAPIKeyEnv, "api-key-env", "", "env var holding the bearer key (omit for keyless local endpoints)")
 	providerAddCmd.Flags().StringVar(&providerSchemaMode, "schema-mode", "", "structured-output mode: json_schema (default) | json_object | prompt")
+	providerAddCmd.Flags().StringVar(&providerProfile, "prompt-profile", "", "search-assist prompt tier: small (default) | frontier — use frontier for hosted frontier models")
 	providerAddCmd.Flags().StringVar(&providerMaxTokensF, "max-tokens-field", "", "override the output-token body key (default max_completion_tokens)")
 	providerAddCmd.Flags().StringVar(&providerReasoning, "reasoning-effort", "", "value sent as reasoning_effort (e.g. low|medium|high)")
 	providerAddCmd.Flags().Float64Var(&providerTemperature, "temperature", 0, "temperature to send (only sent when --temperature is set)")
 	providerAddCmd.Flags().StringArrayVar(&providerHeaders, "header", nil, "extra request header as key=value (repeatable)")
 	providerAddCmd.Flags().Float64Var(&providerPriceInput, "price-input", 0, "informational USD per 1M input tokens")
 	providerAddCmd.Flags().Float64Var(&providerPriceOutput, "price-output", 0, "informational USD per 1M output tokens")
+	providerAddCmd.Flags().StringVar(&providerPreset, "preset", "", "start from a gateway preset's values (e.g. requesty); other flags override")
 
 	providerCmd.AddCommand(providerListCmd)
 	providerCmd.AddCommand(providerShowCmd)
@@ -101,15 +110,38 @@ func runProviderAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cp := llm.CustomProvider{
-		BaseURL:         strings.TrimSpace(providerBaseURL),
-		Model:           strings.TrimSpace(providerModel),
-		APIKeyEnv:       strings.TrimSpace(providerAPIKeyEnv),
-		SchemaMode:      strings.TrimSpace(providerSchemaMode),
-		MaxTokensField:  strings.TrimSpace(providerMaxTokensF),
-		ReasoningEffort: strings.TrimSpace(providerReasoning),
-		Headers:         headers,
-		Pricing:         llm.ProviderPricing{Input: providerPriceInput, Output: providerPriceOutput},
+	var cp llm.CustomProvider
+	if p := strings.TrimSpace(providerPreset); p != "" {
+		preset, ok := llm.Preset(p)
+		if !ok {
+			return fmt.Errorf("provider add %q: unknown preset %q (available: %s)", name, p, strings.Join(llm.PresetNames(), ", "))
+		}
+		cp = preset
+	}
+	// Each flag that was given overrides the (preset or empty) field.
+	setIf := func(dst *string, v string) {
+		if v = strings.TrimSpace(v); v != "" {
+			*dst = v
+		}
+	}
+	setIf(&cp.BaseURL, providerBaseURL)
+	setIf(&cp.Model, providerModel)
+	setIf(&cp.APIKeyEnv, providerAPIKeyEnv)
+	setIf(&cp.SchemaMode, providerSchemaMode)
+	setIf(&cp.PromptProfile, providerProfile)
+	setIf(&cp.MaxTokensField, providerMaxTokensF)
+	setIf(&cp.ReasoningEffort, providerReasoning)
+	if len(headers) > 0 {
+		if cp.Headers == nil {
+			cp.Headers = make(map[string]string, len(headers))
+		}
+		maps.Copy(cp.Headers, headers)
+	}
+	if cmd.Flags().Changed("price-input") {
+		cp.Pricing.Input = providerPriceInput
+	}
+	if cmd.Flags().Changed("price-output") {
+		cp.Pricing.Output = providerPriceOutput
 	}
 	if providerHasTemp {
 		t := providerTemperature
@@ -146,20 +178,41 @@ func runProviderList(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if len(entries) == 0 {
-		fmt.Fprintf(cmd.OutOrStdout(), "No custom providers registered.\nAdd one with: gortex provider add <name> --base-url <url> --model <model>\n")
-		return nil
-	}
 	w := cmd.OutOrStdout()
-	fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", "NAME", "BASE_URL", "MODEL", "SCHEMA")
-	for _, e := range entries {
-		mode := e.Provider.SchemaMode
-		if mode == "" {
-			mode = "json_schema"
+	user := make(map[string]bool, len(entries))
+	if len(entries) == 0 {
+		fmt.Fprintf(w, "No custom providers registered.\nAdd one with: gortex provider add <name> --base-url <url> --model <model>\n")
+	} else {
+		printProviderHeader(w)
+		for _, e := range entries {
+			user[e.Name] = true
+			printProviderRow(w, e.Name, e.Provider)
 		}
-		fmt.Fprintf(w, "%-16s  %-40s  %-24s  %s\n", e.Name, e.Provider.BaseURL, e.Provider.Model, mode)
+	}
+
+	fmt.Fprintf(w, "\nGateway presets (select with llm.provider: <name>; a custom provider of the same name replaces the preset):\n")
+	printProviderHeader(w)
+	for _, name := range llm.PresetNames() {
+		cp, _ := llm.Preset(name)
+		label := name
+		if user[name] {
+			label += " (overridden)"
+		}
+		printProviderRow(w, label, cp)
 	}
 	return nil
+}
+
+func printProviderHeader(w io.Writer) {
+	fmt.Fprintf(w, "%-16s  %-40s  %-24s  %-12s  %s\n", "NAME", "BASE_URL", "MODEL", "SCHEMA", "PROFILE")
+}
+
+func printProviderRow(w io.Writer, name string, cp llm.CustomProvider) {
+	mode := cp.SchemaMode
+	if mode == "" {
+		mode = "json_schema"
+	}
+	fmt.Fprintf(w, "%-16s  %-40s  %-24s  %-12s  %s\n", name, cp.BaseURL, cp.Model, mode, promptProfileLabel(cp.PromptProfile))
 }
 
 func runProviderShow(cmd *cobra.Command, args []string) error {
@@ -168,11 +221,19 @@ func runProviderShow(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return fmt.Errorf("no custom provider named %q", name)
+	source := "custom provider (providers.json)"
+	if ok {
+		if _, preset := llm.Preset(name); preset {
+			source += ", replaces the gateway preset of the same name"
+		}
+	} else if cp, ok = llm.Preset(name); ok {
+		source = "gateway preset (built in; `gortex provider add " + name + " --preset " + name + "` to customise)"
+	} else {
+		return fmt.Errorf("no custom provider or gateway preset named %q", name)
 	}
 	w := cmd.OutOrStdout()
 	fmt.Fprintf(w, "name:             %s\n", name)
+	fmt.Fprintf(w, "source:           %s\n", source)
 	fmt.Fprintf(w, "base_url:         %s\n", cp.BaseURL)
 	fmt.Fprintf(w, "model:            %s\n", cp.Model)
 	if cp.APIKeyEnv != "" {
@@ -183,6 +244,11 @@ func runProviderShow(cmd *cobra.Command, args []string) error {
 		mode = "json_schema (default)"
 	}
 	fmt.Fprintf(w, "schema_mode:      %s\n", mode)
+	profile := promptProfileLabel(cp.PromptProfile)
+	if cp.PromptProfile == "" {
+		profile += " (default)"
+	}
+	fmt.Fprintf(w, "prompt_profile:   %s\n", profile)
 	if cp.MaxTokensField != "" {
 		fmt.Fprintf(w, "max_tokens_field: %s\n", cp.MaxTokensField)
 	}
@@ -206,6 +272,15 @@ func runProviderShow(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "pricing:          $%.4f in / $%.4f out per 1M tokens\n", cp.Pricing.Input, cp.Pricing.Output)
 	}
 	return nil
+}
+
+// promptProfileLabel renders a prompt_profile value, naming the
+// implicit "small" default.
+func promptProfileLabel(p string) string {
+	if p == "" {
+		return "small"
+	}
+	return p
 }
 
 // parseHeaderFlags turns repeated --header key=value flags into a map.

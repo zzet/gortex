@@ -122,14 +122,14 @@ func TestHealStaleHookCommands(t *testing.T) {
 				makeHookEntry("Read", "./gortex hook"),
 				makeHookEntry("Read", "/usr/local/bin/lint --strict"),
 			},
-			"PreCompact": []any{makeHookEntry("", "/tmp/gortex-hook-fix hook")},
-			"Stop":       []any{makeHookEntry("", "/tmp/gortex-hook-fix hook")},
+			"SessionStart": []any{makeHookEntry("", "/tmp/gortex-hook-fix hook")},
+			"Stop":         []any{makeHookEntry("", "/tmp/gortex-hook-fix hook")},
 		}
 		got := healStaleHookCommands(hooks, newCmd)
 		assert.Equal(t, 2, got)
 		assert.Equal(t, "./gortex hook", extractCmd(t, hooks, "PreToolUse", 0))
 		assert.Equal(t, "/usr/local/bin/lint --strict", extractCmd(t, hooks, "PreToolUse", 1))
-		assert.Equal(t, newCmd, extractCmd(t, hooks, "PreCompact", 0))
+		assert.Equal(t, newCmd, extractCmd(t, hooks, "SessionStart", 0))
 		assert.Equal(t, newCmd, extractCmd(t, hooks, "Stop", 0))
 	})
 }
@@ -221,6 +221,8 @@ func TestShellSafeHookBinary(t *testing.T) {
 		{"unixAbsolute", "/opt/homebrew/bin/gortex", "/opt/homebrew/bin/gortex"},
 		{"bareName", "gortex", "gortex"},
 		{"forwardSlashesUnchanged", "C:/Users/me/gortex.exe", "C:/Users/me/gortex.exe"},
+		{"spaceInPath", "/opt/homebrew/bin/gortex beta/gortex.exe", "'/opt/homebrew/bin/gortex beta/gortex.exe'"},
+		{"dollarInPath", "/opt/$(whoami)/gortex", "'/opt/$(whoami)/gortex'"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -560,4 +562,184 @@ func TestInstallHook_DefaultsToDeny(t *testing.T) {
 	require.Contains(t, hooks, "PostToolUse")
 	post := hooks["PostToolUse"].([]any)[0].(map[string]any)
 	assert.Equal(t, localizationPostToolUseMatcher, post["matcher"])
+}
+
+// A fresh install must not wire PreCompact: Claude Code discards its output,
+// and the post-compaction briefing rides on SessionStart(source="compact")
+// instead (#522, #814).
+func TestInstallHook_FreshInstallSkipsPreCompact(t *testing.T) {
+	for _, mode := range []string{HookModeDeny, HookModeEnrich} {
+		t.Run(mode, func(t *testing.T) {
+			settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+			t.Setenv("PATH", t.TempDir())
+
+			_, err := InstallHookWithMode(io.Discard, settingsPath, mode, agentsApplyOptsZero())
+			require.NoError(t, err)
+
+			hooks := readSettingsHooks(t, settingsPath)
+			assert.NotContains(t, hooks, "PreCompact")
+			require.Contains(t, hooks, "SessionStart")
+		})
+	}
+}
+
+// Refreshing an install written before #814 must drop the Gortex PreCompact
+// hook while keeping PreCompact hooks owned by the user, including a user
+// command that shares a group with the Gortex one.
+func TestInstallHook_RefreshRemovesGortexPreCompact(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+	t.Setenv("PATH", t.TempDir())
+
+	_, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal(data, &settings))
+	hooks := settings["hooks"].(map[string]any)
+	hooks["PreCompact"] = []any{
+		makeHookEntry("", "gortex hook"),
+		makeHookEntry("", "/usr/local/bin/notify-compact"),
+		map[string]any{"hooks": []any{
+			map[string]any{"type": "command", "command": "gortex hook", "timeout": 3000},
+			map[string]any{"type": "command", "command": "~/bin/save-transcript", "timeout": 3000},
+		}},
+	}
+	data, err = json.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(settingsPath, data, 0o644))
+
+	action, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assert.Equal(t, agents.ActionMerge, action.Action, "removing the retired hook is a change")
+
+	hooks = readSettingsHooks(t, settingsPath)
+	require.Contains(t, hooks, "PreCompact", "user-owned PreCompact hooks must survive")
+	assert.False(t, hasGortexHookEntry(hooks, "PreCompact"), "Gortex PreCompact hook must be removed")
+	require.Len(t, hooks["PreCompact"].([]any), 2)
+	assert.Equal(t, "/usr/local/bin/notify-compact", extractCmd(t, hooks, "PreCompact", 0))
+	assert.Equal(t, "~/bin/save-transcript", extractCmd(t, hooks, "PreCompact", 1))
+
+	// A second refresh is a no-op.
+	action, err = InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assert.Equal(t, agents.ActionSkip, action.Action)
+}
+
+// When the Gortex hook was the only PreCompact entry, the event key goes away.
+func TestInstallHook_RefreshDropsEmptyPreCompact(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+	t.Setenv("PATH", t.TempDir())
+
+	legacy := map[string]any{"hooks": map[string]any{
+		"PreCompact": []any{makeHookEntry("", "gortex hook --mode=enrich")},
+	}}
+	data, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(settingsPath, data, 0o644))
+
+	_, err = InstallHookWithMode(io.Discard, settingsPath, HookModeEnrich, agentsApplyOptsZero())
+	require.NoError(t, err)
+
+	hooks := readSettingsHooks(t, settingsPath)
+	assert.NotContains(t, hooks, "PreCompact")
+}
+
+// assertHookTimeoutsInSeconds fails when any Gortex hook timeout differs
+// from the installer's value. Claude Code reads timeouts in seconds, so
+// anything above a couple of minutes is a unit bug.
+func assertHookTimeoutsInSeconds(t *testing.T, hooks map[string]any) {
+	t.Helper()
+	checked := 0
+	for event, raw := range hooks {
+		want := float64(gortexHookTimeout(event))
+		groups, _ := raw.([]any)
+		for _, g := range groups {
+			inner, _ := g.(map[string]any)["hooks"].([]any)
+			for _, e := range inner {
+				got, _ := e.(map[string]any)["timeout"].(float64)
+				if got <= 0 || got > 120 {
+					t.Errorf("%s timeout = %v, want seconds in (0, 120]", event, got)
+				} else if got != want {
+					t.Errorf("%s timeout = %v, want %v", event, got, want)
+				}
+				checked++
+			}
+		}
+	}
+	require.NotZero(t, checked, "no hook entries checked")
+}
+
+func TestInstallHook_TimeoutsInSeconds(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+	_, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assertHookTimeoutsInSeconds(t, readSettingsHooks(t, settingsPath))
+}
+
+func TestInstallHook_MigratesMillisecondTimeouts(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+	_, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal(data, &settings))
+	hooks := settings["hooks"].(map[string]any)
+	for event, raw := range hooks {
+		legacy := 3000
+		if event == "Stop" {
+			legacy = 5000
+		}
+		for _, g := range raw.([]any) {
+			for _, e := range g.(map[string]any)["hooks"].([]any) {
+				e.(map[string]any)["timeout"] = legacy
+			}
+		}
+	}
+	hooks["SessionStart"] = append(hooks["SessionStart"].([]any), map[string]any{
+		"hooks": []any{map[string]any{"type": "command", "command": "~/bin/notify", "timeout": 3000}},
+	})
+	data, err = json.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(settingsPath, data, 0o644))
+
+	action, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assert.Equal(t, agents.ActionMerge, action.Action, "converting timeouts is a change")
+
+	hooks = readSettingsHooks(t, settingsPath)
+	user := hooks["SessionStart"].([]any)[1]
+	delete(hooks, "SessionStart")
+	assertHookTimeoutsInSeconds(t, hooks)
+	assert.Equal(t, float64(3000), user.(map[string]any)["hooks"].([]any)[0].(map[string]any)["timeout"],
+		"a user-owned hook keeps its timeout")
+
+	action, err = InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assert.Equal(t, agents.ActionSkip, action.Action)
+}
+
+func TestInstallHook_KeepsCustomGortexTimeout(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.local.json")
+	_, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal(data, &settings))
+	stop := settings["hooks"].(map[string]any)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+	stop["timeout"] = 45
+	data, err = json.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(settingsPath, data, 0o644))
+
+	action, err := InstallHookWithMode(io.Discard, settingsPath, HookModeDeny, agentsApplyOptsZero())
+	require.NoError(t, err)
+	assert.Equal(t, agents.ActionSkip, action.Action)
+	got := readSettingsHooks(t, settingsPath)["Stop"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+	assert.Equal(t, float64(45), got["timeout"])
 }

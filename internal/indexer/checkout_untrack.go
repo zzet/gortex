@@ -355,7 +355,7 @@ func (l *CheckoutLifecycle) demote(
 	if owned != nil {
 		prefix = owned.RepoPrefix
 	}
-	if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
+	if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath, reconcile.CauseDemotion); err != nil {
 		// Publication already committed. Keep the automatic route live and the
 		// transition standing so restart can retry only the external cleanup.
 		l.sweepRetirements(ctx)

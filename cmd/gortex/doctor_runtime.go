@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/zzet/gortex/internal/agents/antigravity"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
@@ -239,6 +240,22 @@ func doctorAgentProbes(home string) []agentProbe {
 				// Gortex can read, so there is no transcript to count tool
 				// calls from. Passing no adoption data is the honest answer;
 				// inventing one would be a fabricated metric.
+			}, activity, now)
+		}},
+		{agent: antigravity.Name, run: func(since time.Time, activity hooks.EffectivenessSummary, now time.Time) doctorAgentRuntime {
+			state := antigravity.Inspect(home)
+			return buildAgentRuntime(agentRuntimeInput{
+				agent:      antigravity.Name,
+				hookEvents: antigravity.HookEvents,
+				install: doctorAgentInstall{
+					ConfigPath: state.ConfigPath, ConfigPresent: state.ConfigPresent,
+					MCPServer: state.MCPServer, Hooks: state.Hooks,
+					HooksDisabled:    state.HooksDisabled,
+					InstructionsPath: state.InstructionsPath, InstructionsWired: state.InstructionsWired,
+				},
+				postToolUseDeny:     state.PostToolUseDenyPosture,
+				hooksDisabledRemedy: antigravity.HooksDisabledRemedy,
+				adoption:            doctor.ScanAntigravitySessions(home, since, 10),
 			}, activity, now)
 		}},
 	}

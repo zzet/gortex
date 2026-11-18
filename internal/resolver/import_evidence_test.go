@@ -262,3 +262,51 @@ func TestPickImportEvidenceCallee_LanguageGate(t *testing.T) {
 		t.Errorf("python caller: pick = %v, want nil (language gate)", pick.ID)
 	}
 }
+
+// TestImportEvidence_SingleCandidateCrossDir pins that import evidence is
+// consulted even when the name has exactly ONE candidate in the repo. A
+// cross-directory call whose caller explicitly imports the candidate's file
+// is structural evidence, not a name-only guess: without this the call fell
+// into the "first same-repo match" fallback, got tagged text_matched, and
+// find_usages hid it behind the import line. Same rule for a .ts caller
+// and for an SFC <script>.
+func TestImportEvidence_SingleCandidateCrossDir(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"composable/useX.ts": `export function useX(): number { return 1; }
+`,
+		"components/a.ts": `import { useX } from '../composable/useX';
+export const x = useX();
+`,
+		"components/B.vue": `<script setup lang="ts">
+import { useX } from '../composable/useX';
+const x = useX();
+</script>
+`,
+	})
+	New(g).ResolveAll()
+
+	for _, tc := range []struct {
+		from string
+		line int
+	}{
+		{"components/a.ts", 2},
+		{"components/B.vue", 3},
+	} {
+		var found bool
+		for _, e := range g.GetOutEdges(tc.from) {
+			if e.Kind != graph.EdgeCalls || e.Line != tc.line {
+				continue
+			}
+			found = true
+			if e.To != "composable/useX.ts::useX" {
+				t.Errorf("%s: call resolved to %q, want composable/useX.ts::useX", tc.from, e.To)
+			}
+			if e.Origin != graph.OriginASTResolved {
+				t.Errorf("%s: origin = %q, want %q", tc.from, e.Origin, graph.OriginASTResolved)
+			}
+		}
+		if !found {
+			t.Errorf("%s: no call edge at line %d", tc.from, tc.line)
+		}
+	}
+}

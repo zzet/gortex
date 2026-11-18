@@ -217,20 +217,30 @@ func SyncSkills(w io.Writer, home string, allowed []string, opts agents.ApplyOpt
 // deletion rule (never remove a customised file) lives in skillpack, not
 // here, so all four skill-aware hosts enforce it identically.
 func syncCuratedSkills(w io.Writer, root string, allowed []string, opts agents.ApplyOpts) ([]agents.FileAction, error) {
-	skills, err := Skills()
+	spec, err := curatedSkillSpec(root)
 	if err != nil {
 		return nil, err
+	}
+	return skillpack.Sync(w, spec, allowed, opts)
+}
+
+// curatedSkillSpec is the curated pack under root, shared by the install,
+// the profile switch and the post-upgrade refresh.
+func curatedSkillSpec(root string) (skillpack.SyncSpec, error) {
+	skills, err := Skills()
+	if err != nil {
+		return skillpack.SyncSpec{}, err
 	}
 	rendered := make(map[string]string, len(skills))
 	for _, s := range skills {
 		rendered[s.ID] = renderSkill(s)
 	}
-	return skillpack.Sync(w, skillpack.SyncSpec{
+	return skillpack.SyncSpec{
 		Dir:         root,
 		FileName:    skillFileName,
 		Rendered:    rendered,
 		KnownHashes: skillpack.AddWorktreeV1Hashes(rendered, profiles.WorktreeBranchRoutingPolicy, skillpack.PreWorktreeAgentSkillHashes()),
-	}, allowed, opts)
+	}, nil
 }
 
 // installGeneratedSkills materialises the per-community skills the skills

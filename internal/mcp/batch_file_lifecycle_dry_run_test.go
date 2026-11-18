@@ -535,7 +535,7 @@ func TestBatchEditDryRunTakesNoMutationPathLock(t *testing.T) {
 	source := writeAtomicBatchFixture(t, repoRoot, "source.txt", "source\n")
 	destination := filepath.Join(repoRoot, "destination.txt")
 
-	release, err := acquireMutationPaths(context.Background(), []string{source, destination})
+	_, release, err := acquireMutationPaths(context.Background(), []string{source, destination})
 	if err != nil {
 		t.Fatal(err)
 	}

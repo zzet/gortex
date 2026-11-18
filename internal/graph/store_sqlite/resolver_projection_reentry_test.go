@@ -8,6 +8,7 @@ import (
 
 func TestResolverScopedProjectionYieldCanReenterStore(t *testing.T) {
 	store := openResolverProjectionTestStore(t)
+	stopStoreBackgroundReaders(store)
 	store.AddBatch([]*graph.Node{
 		{ID: "a-id", Kind: graph.KindFile, FilePath: "a-id", RepoPrefix: "a"},
 		{ID: "b-id", Kind: graph.KindFile, FilePath: "b-id", RepoPrefix: "b"},

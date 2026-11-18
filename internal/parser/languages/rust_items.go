@@ -340,6 +340,42 @@ func emitRustImplBlock(def *sitter.Node, filePath string, src []byte, result *pa
 	emitRustAnnotationEdges(rustCollectAttributes(def), typeID, filePath, src, result, annotationSeen)
 }
 
+// dropRustImplEdgesWithoutSource removes the impl-block edges whose
+// source type has no node in this file. emitRustImplBlock sources them at
+// <file>::<Type> whatever the target is, so `impl From<u32> for Foreign`
+// (Foreign declared in another file or crate) and `impl Ext for u8`
+// produced implements / annotated edges from a node the extraction never
+// emits. Nothing owns such an edge: repository eviction deletes edges by
+// joining on existing nodes, so they outlived their repository.
+func dropRustImplEdgesWithoutSource(result *parser.ExtractionResult, implEdges []*graph.Edge) {
+	if len(implEdges) == 0 {
+		return
+	}
+	nodeIDs := make(map[string]struct{}, len(result.Nodes))
+	for _, n := range result.Nodes {
+		nodeIDs[n.ID] = struct{}{}
+	}
+	dangling := make(map[*graph.Edge]struct{})
+	for _, e := range implEdges {
+		if _, ok := nodeIDs[e.From]; !ok {
+			dangling[e] = struct{}{}
+		}
+	}
+	if len(dangling) == 0 {
+		return
+	}
+	kept := result.Edges[:0]
+	for _, e := range result.Edges {
+		if _, drop := dangling[e]; !drop {
+			kept = append(kept, e)
+		}
+	}
+	for i := len(kept); i < len(result.Edges); i++ {
+		result.Edges[i] = nil
+	}
+	result.Edges = kept
+}
+
 // emitRustTupleFields emits positional fields for a tuple struct or a
 // tuple enum variant. `struct Meters(f64)` and `Msg::Failed(Error)` used
 // to emit no member at all, which also meant the wrapped type was

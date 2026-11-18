@@ -71,7 +71,7 @@ const (
 	// singleton match-all hook.
 	codexLegacyBashPreToolUseMatcher          = "^Bash$"
 	codexLegacyMCPNavigationPreToolUseMatcher = "^(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze)$"
-	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze))$"
+	codexPostToolUseMatcher                   = "^(Bash|apply_patch|(mcp__gortex__|gortex__)(explore|search|read|relations|trace|analyze|edit|edit_file|write_file|edit_symbol|batch_edit))$"
 	codexHookTimeoutSeconds                   = 5
 	codexHookModeEnvVar                       = "GORTEX_CODEX_HOOK_MODE"
 	// Codex merges its home instructions file into every session ahead of
@@ -85,6 +85,20 @@ type Adapter struct{}
 func New() *Adapter                { return &Adapter{} }
 func (a *Adapter) Name() string    { return Name }
 func (a *Adapter) DocsURL() string { return DocsURL }
+
+// WritesSkillFiles reports that this adapter installs the generated
+// community skills as files (~/.codex/skills).
+func (a *Adapter) WritesSkillFiles() bool { return true }
+
+// WritesCommunitiesRouting reports that this adapter merges the
+// communities routing block into its instruction file (project mode).
+func (a *Adapter) WritesCommunitiesRouting() bool { return true }
+
+// CommunitiesRoutingPath reports the instruction file that carries the
+// communities block in project mode.
+func (a *Adapter) CommunitiesRoutingPath(env agents.Env) string {
+	return filepath.Join(env.Root, "AGENTS.md")
+}
 
 // Detect checks for the codex CLI on PATH or ~/.codex/.
 func (a *Adapter) Detect(env agents.Env) (bool, error) {

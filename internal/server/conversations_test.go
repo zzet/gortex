@@ -217,19 +217,21 @@ func TestConversations_GuardIsRouteScoped(t *testing.T) {
 	}
 }
 
-func TestConversations_QueryTokenAuth(t *testing.T) {
-	// A ?token= query param is a valid auth presentation (the EventSource
-	// workaround), so it should let a non-loopback conversation request
-	// pass — same as the Bearer header.
+func TestConversations_BearerTokenAuth(t *testing.T) {
+	// The token is accepted only via the Authorization header (the ?token=
+	// query fallback was dropped because it leaks into logs and Referrer
+	// headers), so a Bearer header should let a non-loopback conversation
+	// request pass.
 	const token = "s3cret-token"
 	h := newConversationHandler(t, t.TempDir())
 	h.SetConversationGuard(nil, func() string { return token })
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/conversations?token="+token, nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/conversations", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Host = "evil.example"
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("query-token auth should pass on a conversation route, got %d", rec.Code)
+		t.Fatalf("bearer-token auth should pass on a conversation route, got %d", rec.Code)
 	}
 }

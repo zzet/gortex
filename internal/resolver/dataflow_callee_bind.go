@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -106,17 +107,45 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 			indexName(idx.byFile, n.FilePath, n.Name, n.ID)
 		}
 	}
-	// Same-package functions: r.dirIndex[dir] carries one KindFile node per
-	// file in the directory, so each package file is visited exactly once.
+	fileEdges := r.fileOutEdges(filePath)
+	// Same-package functions: the package's files are the ones r.dirIndex[dir]
+	// lists. Only a bare-name dataflow edge the file itself cannot bind
+	// consults them, and only under the names such edges carry, so the lookup
+	// is one batched name read filtered to the package's files rather than a
+	// read of every node of every file in the package (hundreds of files for a
+	// large package, on every save).
 	dir := filePathDir(filePath)
-	for _, fileNode := range r.dirIndex[dir] {
-		for _, n := range r.incrementalFileNodes(fileNode.FilePath) {
-			if n != nil && n.Kind == graph.KindFunction && n.Name != "" && n.FilePath != "" {
-				indexName(idx.byDir, dir, n.Name, n.ID)
+	if names := dataflowPackageCalleeNames(fileEdges, idx); len(names) > 0 && len(r.dirIndex[dir]) > 0 {
+		packageFiles := make(map[string]struct{}, len(r.dirIndex[dir]))
+		repos := make(map[string]struct{}, 1)
+		for _, fileNode := range r.dirIndex[dir] {
+			if fileNode.FilePath != "" {
+				packageFiles[fileNode.FilePath] = struct{}{}
+				repos[fileNode.RepoPrefix] = struct{}{}
+			}
+		}
+		// The package's files are one repository's: read the names there
+		// rather than in every tracked repository.
+		var found map[string][]*graph.Node
+		finder, scoped := r.graph.(graph.RepoNamesNodeFinder)
+		if scoped && len(repos) == 1 {
+			for repo := range repos {
+				found = finder.FindNodesByNamesInRepo(names, repo)
+			}
+		} else {
+			found = r.graph.FindNodesByNames(names)
+		}
+		for _, name := range names {
+			for _, n := range found[name] {
+				if n == nil || n.Kind != graph.KindFunction || n.Name != name || n.FilePath == "" {
+					continue
+				}
+				if _, inPackage := packageFiles[n.FilePath]; inPackage {
+					indexName(idx.byDir, dir, n.Name, n.ID)
+				}
 			}
 		}
 	}
-	fileEdges := r.fileOutEdges(filePath)
 	for _, e := range fileEdges {
 		if e != nil && (e.Kind == graph.EdgeCalls || e.Kind == graph.EdgeReferences) {
 			idx.indexCallSite(e)
@@ -130,6 +159,30 @@ func (r *Resolver) bindDataflowCalleeRefsForFile(filePath string) {
 		collector.add(edge, bindDataflowCalleeEdge(edge, idx))
 	}
 	collector.flush()
+}
+
+// dataflowPackageCalleeNames is the sorted set of names a same-package
+// lookup can serve: the bare names of the arg_of /
+// value_flow edges with no same-file candidate, which are the only names
+// bindDataflowCalleeEdge looks up in the same-package index.
+func dataflowPackageCalleeNames(edges []*graph.Edge, idx *calleeIndex) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, e := range edges {
+		if e == nil || (e.Kind != graph.EdgeArgOf && e.Kind != graph.EdgeValueFlow) || !dataflowCalleeTargetShape(e.To) {
+			continue
+		}
+		name := graph.UnresolvedName(e.To)
+		if strings.HasPrefix(name, "*.") || len(idx.byFile[e.FilePath][name]) > 0 {
+			continue
+		}
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // calleeIndex holds the per-pass lookup tables bindDataflowCallee* uses.

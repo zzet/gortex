@@ -45,6 +45,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -87,25 +88,84 @@ type Map struct {
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
-	// targetBase is the repo-relative directory against which effective paths
-	// resolve. Unlike DirPrefix (the child scope), it may belong to a parent
-	// config. "." denotes the root; empty preserves hand-built Map semantics.
+	// ParentConfigs lists the inherited configs a cached scope depends on.
+	ParentConfigs []string
+	// targetBase can be the declaring parent rather than the child scope.
 	targetBase string
-	// repoRoot is the absolute repository root, set by Load, used to
-	// disk-probe multi-target aliases. Empty for hand-built maps, which
-	// then resolve by first-match without touching the filesystem.
-	repoRoot string
+	// exists reports whether a repo-relative slash path is readable content
+	// in the tree this map was loaded from. Set by the loaders, it is what
+	// grounds a multi-target alias in the tree the map came from — the
+	// working copy for Load, the snapshot for LoadTree. Nil for hand-built
+	// maps, which then resolve by first-match without probing anything.
+	exists func(rel string) bool
 }
 
-// Collection aggregates every alias map found by Load, sorted by
+// Collection aggregates every alias map found by a loader, sorted by
 // DirPrefix length descending so nearest-ancestor lookup is a single
 // linear scan.
 type Collection struct {
 	scopes []*Map
 }
 
-// Maps returns the underlying scope slice. Test-visibility only.
-func (c *Collection) Maps() []*Map { return c.scopes }
+// NewCollection returns a Collection over maps, ordered nearest-ancestor
+// first (the order FindForFile scans). It is the constructor a caller that
+// builds its own maps — a snapshot loader, or a test — uses instead of
+// reaching for the unexported field. Returns nil for an empty set, which is
+// the same "no usable config" answer the loaders give.
+func NewCollection(maps []*Map) *Collection {
+	scopes := make([]*Map, 0, len(maps))
+	for _, m := range maps {
+		if m != nil {
+			scopes = append(scopes, m)
+		}
+	}
+	if len(scopes) == 0 {
+		return nil
+	}
+	sort.SliceStable(scopes, func(i, j int) bool {
+		return len(scopes[i].DirPrefix) > len(scopes[j].DirPrefix)
+	})
+	return &Collection{scopes: scopes}
+}
+
+// ObservingProbes returns m with every existence probe Resolve makes on it
+// reported to observe: the repo-relative path probed and whether it held a
+// file. A map with no probe (hand-built), a nil map or a nil observe is
+// returned as is. The copy shares m's entries, which stay read-only.
+func (m *Map) ObservingProbes(observe func(rel string, found bool)) *Map {
+	if m == nil || m.exists == nil || observe == nil {
+		return m
+	}
+	exists := m.exists
+	out := *m
+	out.exists = func(rel string) bool {
+		found := exists(rel)
+		observe(rel, found)
+		return found
+	}
+	return &out
+}
+
+// Maps returns the underlying scope slice, which callers treat as read-only.
+// A nil Collection has none.
+func (c *Collection) Maps() []*Map {
+	if c == nil {
+		return nil
+	}
+	return c.scopes
+}
+
+// Equal compares effective scopes, not the tree-specific existence probes.
+func (c *Collection) Equal(other *Collection) bool {
+	return slices.EqualFunc(c.Maps(), other.Maps(), func(a, b *Map) bool {
+		return a.DirPrefix == b.DirPrefix && a.BaseURL == b.BaseURL && a.targetBase == b.targetBase &&
+			slices.EqualFunc(a.Entries, b.Entries, func(a, b Alias) bool {
+				return a.AliasPrefix == b.AliasPrefix && a.AliasSuffix == b.AliasSuffix &&
+					a.TargetPrefix == b.TargetPrefix && a.TargetSuffix == b.TargetSuffix &&
+					a.HasWildcard == b.HasWildcard && slices.Equal(a.Targets, b.Targets)
+			})
+	})
+}
 
 // FindForFile returns the alias map for the nearest ancestor scope of
 // relPath, or nil when no scope applies.
@@ -150,10 +210,11 @@ func Resolve(m *Map, modulePath string) string {
 			if ti == 0 {
 				first = stripped
 			}
-			// Disk-grounded multi-target: return the first candidate that
-			// actually exists. Skipped for hand-built maps (no repoRoot),
-			// which fall through to the documented primary path.
-			if m.repoRoot != "" && targetExistsOnDisk(m.repoRoot, joined) {
+			// Tree-grounded multi-target: return the first candidate that
+			// actually exists in the tree this map was loaded from. Skipped
+			// for hand-built maps (no exists probe), which fall through to
+			// the documented primary path.
+			if m.exists != nil && targetExistsInTree(m.exists, joined) {
 				return stripped
 			}
 		}
@@ -210,19 +271,23 @@ func (m *Map) joinTarget(matched string) string {
 // matching stripExt's set plus declaration / json / index-file forms.
 var probeExts = []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json"}
 
-// targetExistsOnDisk reports whether the repo-relative joined target resolves
-// to a real file under repoRoot — as an exact path, with any source extension,
-// or as an index file in a directory of that name.
-func targetExistsOnDisk(repoRoot, joined string) bool {
-	base := filepath.Join(repoRoot, filepath.FromSlash(joined))
-	if fileExists(base) {
+// targetExistsInTree reports whether the repo-relative joined target resolves
+// to a real file in the tree exists probes — as an exact path, with any source
+// extension, or as an index file in a directory of that name. The probe set and
+// its order are the tree's only input, so a snapshot answers the same question
+// the working copy does, about its own bytes.
+func targetExistsInTree(exists func(rel string) bool, joined string) bool {
+	if exists == nil || joined == "" {
+		return false
+	}
+	if exists(joined) {
 		return true
 	}
 	for _, ext := range probeExts {
-		if fileExists(base + ext) {
+		if exists(joined + ext) {
 			return true
 		}
-		if fileExists(filepath.Join(base, "index"+ext)) {
+		if exists(path.Join(joined, "index"+ext)) {
 			return true
 		}
 	}
@@ -242,6 +307,104 @@ func stripExt(p string) string {
 	return p
 }
 
+// Tree is the repository view a loader reads its configs out of. A working
+// copy implements it with the os package; a committed snapshot implements it
+// over the content source that serves the tree, so a build that describes a
+// commit never has to reach for the checkout to learn its alias scopes.
+type Tree interface {
+	// Files calls visit with the repo-relative slash path of every file the
+	// tree serves as content, in any order. An implementation with real
+	// directories may skip descending one SkipDirName names — a saving only:
+	// LoadTree applies that rule itself, to every path it is offered. Walk
+	// errors are swallowed, not reported: one unreadable corner of a
+	// repository must not drop every alias in it.
+	Files(visit func(rel string))
+	// Read returns the bytes at a repo-relative slash path.
+	Read(rel string) ([]byte, bool)
+	// Exists reports whether a repo-relative slash path is readable content.
+	Exists(rel string) bool
+}
+
+// configFileNames are the config files a loader reads.
+var configFileNames = [...]string{"tsconfig.json", "jsconfig.json"}
+
+// IsConfigFileName reports whether base — a file's base name — is a config
+// file the loaders parse. Exported so a Tree implementation that must decide
+// what to feed Files (a snapshot enumerating a whole tree, say) applies the
+// loader's own rule rather than a copy of it.
+func IsConfigFileName(base string) bool {
+	for _, name := range configFileNames {
+		if base == name {
+			return true
+		}
+	}
+	return false
+}
+
+// skipDirs is the small allowlist of directory names no walk descends, which
+// keeps the cost bounded on large monorepos.
+var skipDirs = map[string]struct{}{
+	"node_modules": {},
+	".git":         {},
+	".hg":          {},
+	".svn":         {},
+	"vendor":       {},
+	"build":        {},
+	"dist":         {},
+	"target":       {},
+	".next":        {},
+	".nuxt":        {},
+}
+
+// SkipDirName reports whether a directory of this name is skipped by the
+// walk. Exported so a Tree implementation can avoid descending it — a saving
+// only, never the rule: LoadTree applies the same test to every path it is
+// offered, so a Tree that enumerates everything (a snapshot has no directories
+// to prune) still yields exactly the scopes the working-copy walk finds.
+func SkipDirName(name string) bool {
+	_, skip := skipDirs[name]
+	return skip
+}
+
+// underSkippedDir reports whether any ancestor directory of a repo-relative
+// slash path is one the walk does not descend.
+func underSkippedDir(rel string) bool {
+	for dir := path.Dir(rel); dir != "." && dir != "/" && dir != ""; dir = path.Dir(dir) {
+		if SkipDirName(path.Base(dir)) {
+			return true
+		}
+	}
+	return false
+}
+
+// LoadTree reads every tsconfig.json / jsconfig.json the tree holds and
+// returns a Collection ready for FindForFile. Returns nil when the tree holds
+// no usable config. A malformed config is skipped, not fatal.
+//
+// This is the whole loader: Load is LoadTree over the working copy, so a
+// snapshot and a checkout are parsed by the same code, probe their
+// multi-target aliases with the same probe set, and order their scopes the
+// same way.
+func LoadTree(t Tree) *Collection {
+	if t == nil {
+		return nil
+	}
+	var scopes []*Map
+	t.Files(func(rel string) {
+		if !IsConfigFileName(path.Base(rel)) || underSkippedDir(rel) {
+			return
+		}
+		dirRel := path.Dir(rel)
+		if dirRel == "." || dirRel == "/" {
+			dirRel = ""
+		}
+		if m := parseConfig(t, rel, dirRel); m != nil {
+			scopes = append(scopes, m)
+		}
+	})
+	return NewCollection(scopes)
+}
+
 // Load walks repoRoot for tsconfig.json / jsconfig.json files and
 // returns a Collection ready for FindForFile. Returns nil when the
 // walk finds no usable configs. Walk errors on individual files are
@@ -253,21 +416,19 @@ func Load(repoRoot string) *Collection {
 	if repoRoot == "" {
 		return nil
 	}
-	var scopes []*Map
-	skipDirs := map[string]struct{}{
-		"node_modules": {},
-		".git":         {},
-		".hg":          {},
-		".svn":         {},
-		"vendor":       {},
-		"build":        {},
-		"dist":         {},
-		"target":       {},
-		".next":        {},
-		".nuxt":        {},
-	}
+	return LoadTree(dirTree{root: repoRoot})
+}
 
-	err := filepath.WalkDir(repoRoot, func(p string, d fs.DirEntry, err error) error {
+// dirTree is the working copy at a root: the tree Load reads.
+type dirTree struct{ root string }
+
+var _ Tree = dirTree{}
+
+// Files walks the working copy, skipping a directory the walk does not
+// descend and swallowing per-entry errors, which is what keeps one
+// unreadable corner of a repository from dropping every alias in it.
+func (t dirTree) Files(visit func(rel string)) {
+	_ = filepath.WalkDir(t.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) {
 				if d != nil && d.IsDir() {
@@ -278,57 +439,43 @@ func Load(repoRoot string) *Collection {
 			return nil
 		}
 		if d.IsDir() {
-			if _, skip := skipDirs[d.Name()]; skip {
+			if SkipDirName(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		name := d.Name()
-		if name != "tsconfig.json" && name != "jsconfig.json" {
-			return nil
-		}
-		rel, relErr := filepath.Rel(repoRoot, p)
+		rel, relErr := filepath.Rel(t.root, p)
 		if relErr != nil {
 			return nil
 		}
-		dirRel := filepath.ToSlash(filepath.Dir(rel))
-		if dirRel == "." {
-			dirRel = ""
-		}
-		if m := parseConfigFile(p, dirRel, repoRoot); m != nil {
-			scopes = append(scopes, m)
-		}
+		visit(filepath.ToSlash(rel))
 		return nil
 	})
-	if err != nil || len(scopes) == 0 {
-		return nil
-	}
-	sort.SliceStable(scopes, func(i, j int) bool {
-		return len(scopes[i].DirPrefix) > len(scopes[j].DirPrefix)
-	})
-	return &Collection{scopes: scopes}
 }
 
-func parseConfigFile(absPath, dirPrefix, repoRoot string) *Map {
-	co := loadConfigOptions(absPath, make(map[string]bool), 0)
+func (t dirTree) Read(rel string) ([]byte, bool) {
+	data, err := os.ReadFile(filepath.Join(t.root, filepath.FromSlash(rel)))
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func (t dirTree) Exists(rel string) bool {
+	return fileExists(filepath.Join(t.root, filepath.FromSlash(rel)))
+}
+
+// parseConfig resolves inherited options and probes targets in the same tree.
+func parseConfig(t Tree, rel, dirPrefix string) *Map {
+	var parents []string
+	co := loadConfigOptions(t, rel, make(map[string]bool), 0, &parents)
 	if co.baseURL == "" && co.paths == nil {
 		return nil
 	}
-	targetDir := co.pathsDir
+	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: t.Exists, ParentConfigs: parents}
 	if co.baseURL != "" {
-		targetDir = co.baseURL
-	}
-	targetBase, err := filepath.Rel(repoRoot, targetDir)
-	if err != nil {
-		return nil
-	}
-	m := &Map{
-		DirPrefix:  dirPrefix,
-		targetBase: filepath.ToSlash(targetBase),
-		repoRoot:   repoRoot,
-	}
-	if co.baseURL != "" {
-		baseURL, relErr := filepath.Rel(filepath.Dir(absPath), co.baseURL)
+		m.targetBase = co.baseURL
+		baseURL, relErr := filepath.Rel(filepath.FromSlash(path.Dir(rel)), filepath.FromSlash(co.baseURL))
 		if relErr != nil {
 			return nil
 		}
@@ -364,14 +511,13 @@ type configOptions struct {
 
 // Each option retains its declaring directory. Inherited paths without a
 // baseUrl must not become relative to the child config's directory.
-func loadConfigOptions(absPath string, active map[string]bool, depth int) configOptions {
+func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, parentsRead *[]string) configOptions {
 	const maxExtendsDepth = 32
-	absPath = filepath.Clean(absPath)
-	if depth >= maxExtendsDepth || active[absPath] {
+	if depth >= maxExtendsDepth || active[rel] {
 		return configOptions{}
 	}
-	data, err := os.ReadFile(absPath)
-	if err != nil {
+	data, ok := t.Read(rel)
+	if !ok {
 		return configOptions{}
 	}
 	var raw struct {
@@ -384,8 +530,8 @@ func loadConfigOptions(absPath string, active map[string]bool, depth int) config
 	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
 		return configOptions{}
 	}
-	active[absPath] = true
-	defer delete(active, absPath)
+	active[rel] = true
+	defer delete(active, rel)
 	var parents []string
 	var parent string
 	if json.Unmarshal(raw.Extends, &parent) == nil {
@@ -400,10 +546,16 @@ func loadConfigOptions(absPath string, active map[string]bool, depth int) config
 			!strings.HasPrefix(parent, `.\`) && !strings.HasPrefix(parent, `..\`) {
 			continue
 		}
-		if filepath.Ext(parent) == "" {
+		parent = strings.ReplaceAll(parent, `\`, "/")
+		if path.Ext(parent) == "" {
 			parent += ".json"
 		}
-		inherited := loadConfigOptions(filepath.Join(filepath.Dir(absPath), parent), active, depth+1)
+		parent = path.Join(path.Dir(rel), parent)
+		if !filepath.IsLocal(filepath.FromSlash(parent)) {
+			continue
+		}
+		*parentsRead = append(*parentsRead, parent)
+		inherited := loadConfigOptions(t, parent, active, depth+1, parentsRead)
 		if inherited.baseURL != "" {
 			effective.baseURL = inherited.baseURL
 		}
@@ -413,11 +565,11 @@ func loadConfigOptions(absPath string, active map[string]bool, depth int) config
 		}
 	}
 	if raw.CompilerOptions.BaseURL != nil {
-		effective.baseURL = filepath.Join(filepath.Dir(absPath), *raw.CompilerOptions.BaseURL)
+		effective.baseURL = path.Join(path.Dir(rel), filepath.ToSlash(*raw.CompilerOptions.BaseURL))
 	}
 	if raw.CompilerOptions.Paths != nil {
 		effective.paths = raw.CompilerOptions.Paths
-		effective.pathsDir = filepath.Dir(absPath)
+		effective.pathsDir = path.Dir(rel)
 	}
 	return effective
 }

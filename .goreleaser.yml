@@ -71,6 +71,8 @@ builds:
       - -extldflags "-static"
     env:
       - CGO_ENABLED=1
+      - CGO_CFLAGS=-O2 -g -fno-strict-aliasing
+      - CGO_CXXFLAGS=-O2 -g -fno-strict-aliasing
     hooks:
       # Run per built binary, before anything is archived or published, so a
       # link that quietly went dynamic again aborts the release instead of

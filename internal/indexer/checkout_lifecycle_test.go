@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -128,9 +130,10 @@ type lifecycleFixture struct {
 	watcher *fakeWatcher
 	notify  *countingNotifier
 	clock   *manualClock
+	logger  *zap.Logger
 }
 
-func newLifecycleFixture(t *testing.T) *lifecycleFixture {
+func newLifecycleFixture(t *testing.T, loggers ...*zap.Logger) *lifecycleFixture {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not available in PATH")
@@ -150,6 +153,9 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	gc.SetConfigPath(f.cfgPath)
 	require.NoError(t, gc.Save())
 
+	if len(loggers) > 0 {
+		f.logger = loggers[0]
+	}
 	f.open()
 	return f
 }
@@ -159,6 +165,10 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 // dropping the whole stack and building a fresh one over the same files.
 func (f *lifecycleFixture) open() {
 	f.t.Helper()
+	logger := f.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	store, err := store_sqlite.Open(f.dbPath)
 	require.NoError(f.t, err)
 	f.store = store
@@ -168,12 +178,12 @@ func (f *lifecycleFixture) open() {
 	require.NoError(f.t, err)
 	f.cm = cm
 
-	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, zap.NewNop())
+	f.mi = NewMultiIndexer(store, newTestRegistry(), search.NewNull(), cm, logger)
 	lc, err := NewCheckoutLifecycle(CheckoutLifecycleConfig{
 		MultiIndexer:  f.mi,
 		ConfigManager: cm,
 		Graph:         store,
-		Logger:        zap.NewNop(),
+		Logger:        logger,
 		Reconcile:     lifecycleGrace,
 		Clock:         f.clock.Now,
 	})
@@ -350,17 +360,64 @@ func TestCheckoutLifecycleCloseWaitsForAdmittedFamilyRetry(t *testing.T) {
 		t.Fatal("family retry did not finish")
 	}
 
+	// Close is terminal: draining the admitted retry does not reopen the gate.
+	// A retry admitted after Close would reconcile against a Store its owner is
+	// already releasing, which is why the gate stays shut for the life of the
+	// object — see the Close doc comment in checkout_lifecycle.go, and the
+	// coordinator/transition/observation/repository gates, none of which reopen
+	// either. The barrier stays installed as a fired-work detector: from here on
+	// nothing may run it again.
+	var lateAdmissions atomic.Int64
 	fixture.lc.retryMu.Lock()
-	fixture.lc.familyRetryBarrier = nil
+	fixture.lc.familyRetryBarrier = func() { lateAdmissions.Add(1) }
 	fixture.lc.retryMu.Unlock()
+
+	// New admission after Close is refused — on the retry gate, and with the
+	// typed closed error on the repository-admission surface.
 	afterCloseDeadline := fixture.lc.now().Add(time.Hour).Unix()
 	fixture.lc.scheduleFamilyRetryAt("after-close", afterCloseDeadline)
 	fixture.lc.retryMu.Lock()
-	afterClose, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	_, scheduledAfterClose := fixture.lc.familyRetries["after-close"]
+	gateStillClosed := fixture.lc.retryClosing
 	fixture.lc.retryMu.Unlock()
-	require.True(t, scheduledAfterClose, "Close must restore retry admission for lifecycle reuse")
-	require.Equal(t, afterCloseDeadline, afterClose.deadline)
-	require.NoError(t, fixture.lc.Close())
+	require.False(t, scheduledAfterClose, "Close must keep rejecting family retries after the drain")
+	require.True(t, gateStillClosed, "Close must leave retry admission closed")
+	_, readErr := fixture.lc.AcquireRepositoryRead()
+	require.ErrorIs(t, readErr, graphview.ErrRepositoryAdmissionsStopped)
+	require.ErrorIs(t,
+		fixture.lc.RegisterRepositoryOwner(context.Background(), "graph-after-close"),
+		graphview.ErrRepositoryAdmissionsStopped)
+	require.True(t, fixture.lc.RepositoryAdmissionClosed("prefix-after-close"),
+		"every prefix is closed to admission once the lifecycle is closed")
+
+	// A timer callback delayed past Close cannot resurrect the retry it was
+	// scheduled for, in either window: after Close removed the entry, and in the
+	// race where the callback still sees an entry Close has not yet cleared.
+	fixture.lc.runFamilyRetry("admitted-family-retry", deadline)
+	lateTimer := time.NewTimer(time.Hour)
+	defer lateTimer.Stop()
+	fixture.lc.retryMu.Lock()
+	fixture.lc.familyRetries["late-callback"] = familyRetry{deadline: afterCloseDeadline, timer: lateTimer}
+	fixture.lc.retryMu.Unlock()
+	fixture.lc.runFamilyRetry("late-callback", afterCloseDeadline)
+	require.Zero(t, lateAdmissions.Load(), "a callback delayed past Close must not be admitted")
+
+	// Close is idempotent: the second call returns promptly, joins nothing and
+	// re-runs no drained work, and it still clears the entry the late callback
+	// left behind.
+	secondClose := make(chan error, 1)
+	go func() { secondClose <- fixture.lc.Close() }()
+	select {
+	case err := <-secondClose:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a second Close blocked instead of returning")
+	}
+	require.Zero(t, lateAdmissions.Load(), "a second Close must not re-drain admitted work")
+	fixture.lc.retryMu.Lock()
+	remainingRetries := len(fixture.lc.familyRetries)
+	fixture.lc.retryMu.Unlock()
+	require.Zero(t, remainingRetries, "Close must leave no family retry timers behind")
 }
 
 // volumeEvidenceUsable reports whether this platform's path evidence carries
@@ -399,6 +456,109 @@ func (f *lifecycleFixture) gitRepo(name string) string {
 	writeFile(f.t, filepath.Join(root, name+".go"), "package a\n\nfunc A() {}\n")
 	runGit(f.t, root, "add", ".")
 	runGit(f.t, root, "commit", "-q", "-m", "init")
+	return root
+}
+
+// TestADependentCoordinatorAsksTheDaemonForTheCommittedBase is the wiring
+// proof for the on-demand half of the committed-base consumer gate.
+//
+// The primitive works in isolation (TestAnUnpublishedPrimaryAsksTheFamilyForItsCommittedBase
+// drives primaryBase with a stub, TestTheFirstDependentGetsTheCommittedBaseThePublisherDeferred
+// drives RequestBase directly). Neither would catch the state this item's
+// change would otherwise be in: a gate that defers the publication and a
+// coordinator whose RequestBase was never wired, which is a base that is never
+// published at all.
+//
+// So this drives the whole production chain, with nothing stubbed:
+//
+//	InitialBasePublisher.publish declines the owner-only family
+//	  -> a worktree appears on the running daemon
+//	  -> CheckoutLifecycle.Sweep -> applyCoordinators -> ensureCoordinator
+//	  -> buildCoordinator wires RequestBase
+//	  -> the coordinator's cycle -> primaryBase -> demandCommittedBase
+//	  -> CheckoutLifecycle.requestDedicatedBase -> the advance registry
+//	  -> InitialBasePublisher.RequestBase -> publish -> adoption
+//
+// It asserts on the outcome rather than on a count, because the coordinator
+// runs on its own loop: what has to be true is that the base the daemon
+// deferred gets published, that the publication says a CONSUMER asked for it,
+// and that it is adopted.
+func TestADependentCoordinatorAsksTheDaemonForTheCommittedBase(t *testing.T) {
+	f := newLifecycleFixture(t)
+	defer f.close()
+	installStartupPublisherRuntime(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	root := f.gitRepo("coordinator-demand")
+	registered, err := f.lc.Register(ctx, config.RepoEntry{Path: root}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NotEmpty(t, registered.Prefix)
+
+	publisher := startupPublisher(t, f)
+	publisher.Schedule(registered.Prefix)
+	publisher.BeginDraining()
+	require.NoError(t, publisher.Wait(ctx))
+	outcomes := publisher.Outcomes()
+	require.Len(t, outcomes, 1)
+	require.Equal(t, "no dependent checkout", outcomes[0].Skipped,
+		"the premise: the daemon start deferred this family's committed base")
+	require.Zero(t, f.familyOf(registered.Prefix).ActiveGenerationID)
+
+	// The first sweep marks the startup inventory, so the worktree added after
+	// it is a runtime discovery and is served eagerly rather than left dormant.
+	_, err = f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	f.worktreeOf(root, "coordinator-demand-dependent")
+	report, err := f.lc.Sweep(ctx)
+	require.NoError(t, err)
+	require.Positive(t, report.Coordinators,
+		"the runtime-added worktree got no coordinator, so nothing could ask")
+
+	deadline := time.Now().Add(90 * time.Second)
+	var demanded InitialBasePublication
+	for {
+		for _, outcome := range publisher.Outcomes() {
+			if outcome.Demanded {
+				demanded = outcome
+			}
+		}
+		if demanded.RepoPrefix != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no dependent ever asked for the deferred committed base; outcomes=%+v",
+				publisher.Outcomes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NoError(t, demanded.Err)
+	require.Empty(t, demanded.Skipped, "the demanded publication was declined")
+	require.Positive(t, demanded.GenerationID)
+	require.Equal(t, registered.Prefix, demanded.RepoPrefix)
+	require.Equal(t, demanded.GenerationID, f.familyOf(registered.Prefix).ActiveGenerationID,
+		"the on-demand publication was not adopted")
+}
+
+// gitRepoWithDependent is gitRepo plus one linked worktree, so the family the
+// registration creates has a CONSUMER for its committed base.
+//
+// It exists because publication is gated on a reader. A committed base is only
+// ever read by a dependent checkout or a ref view — the owner's own route stays
+// on generation 0 — so InitialBasePublisher.publish declines an owner-only
+// family with "no dependent checkout" (see dedicatedBaseConsumers). A fixture
+// that wants a published base therefore has to be a family that has somewhere
+// to publish one TO, and the cheapest such family is the one the product sees
+// most: a primary plus a linked worktree.
+//
+// The worktree is added BEFORE the caller registers the repository, because the
+// checkout rows are allocated by the family reconciliation Register runs
+// (reconcileFamilyNow), and a worktree created afterwards is not in that
+// family's census until the next sweep.
+func (f *lifecycleFixture) gitRepoWithDependent(name string) string {
+	f.t.Helper()
+	root := f.gitRepo(name)
+	f.worktreeOf(root, name+"-dependent")
 	return root
 }
 
@@ -510,9 +670,12 @@ func TestCheckoutLifecycleTrackSurfaceParity(t *testing.T) {
 	assert.True(t, f.familyOf(cli.Prefix).IsPrimaryBase)
 	assert.True(t, f.familyOf(mcp.Prefix).IsPrimaryBase)
 
+	// The analysis runs on the lifecycle's maintenance lane, coalesced: the
+	// two tracks rerun it at least once, after both, never on the caller.
+	require.True(t, f.lc.waitAnalysisIdle(30*time.Second), "the analysis lane did not settle")
 	invalidated, analysed := f.notify.counts()
 	assert.Equal(t, 2, invalidated, "each track invalidates the session scopes")
-	assert.Equal(t, 2, analysed, "each track reruns the analysis")
+	assert.GreaterOrEqual(t, analysed, 1, "the tracks rerun the analysis")
 
 	// Re-registering is idempotent: the identity is reused, not minted again.
 	again, err := f.lc.Register(ctx, config.RepoEntry{Path: cliRoot}, TrackSourceCLI)
@@ -550,6 +713,9 @@ func TestCheckoutLifecycleUntrackSurfaceParity(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tracked.Prefix, result.Prefix)
 			assert.Equal(t, []string{string(tc.source)}, result.Revoked)
+			if result.Pending {
+				finishRepositoryCleanup(t, f.lc, tracked.Prefix)
+			}
 
 			checkouts, err := f.catalog.ListCheckouts(ctx, familyID)
 			require.NoError(t, err)
@@ -586,32 +752,61 @@ func TestCheckoutLifecycleReloadDiff(t *testing.T) {
 
 	main := f.gitRepo("reload-main")
 	worktree := f.worktreeOf(main, "reload-wt")
+	held := f.worktreeOf(main, "reload-held")
 
 	gc := f.cm.Global()
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: main, Name: "reload-main"}))
 	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: worktree, Name: "reload-wt"}))
+	require.NoError(t, gc.AddRepo(config.RepoEntry{Path: held, Name: "reload-held"}))
 	require.NoError(t, gc.Save())
 
 	added, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 2, added.Added)
+	assert.Equal(t, 3, added.Added)
 	assert.Equal(t, 0, added.Removed)
 	f.assertRegistered("reload-main", main, TrackSourceConfig)
 	f.assertRegistered("reload-wt", worktree, TrackSourceConfig)
+	f.assertRegistered("reload-held", held, TrackSourceConfig)
 	require.True(t, f.familyOf("reload-main").IsPrimaryBase,
 		"the first checkout registered holds the family's primary base")
 	require.False(t, f.familyOf("reload-wt").IsPrimaryBase)
+	require.False(t, f.familyOf("reload-held").IsPrimaryBase)
 
-	// The worktree is a live non-primary checkout of a family that has a
-	// ready primary, so dropping it from the config retires it.
+	// Both worktrees are live non-primary checkouts of a family that has a
+	// ready primary, so dropping them from the config retires them — even one
+	// whose payload a reader still holds. The registration's own producers
+	// can hold a payload the same way on a loaded machine, so either worktree
+	// may have its purge deferred; the pin makes that certain for one of them.
+	pin := f.lc.ViewLeases().AcquireBaseCorpus("reload-held")
+	defer pin.Release() // An early failure must not leave Close waiting on the reader.
+	require.True(t, pin.OwnerPinned(), "the serving pin carries no repository owner")
 	require.NoError(t, gc.RemoveRepo(worktree))
+	require.NoError(t, gc.RemoveRepo(held))
 	require.NoError(t, gc.Save())
 	removed, err := f.lc.ApplyReload(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, removed.Removed)
+	assert.Equal(t, 2, removed.Removed)
 	assert.Equal(t, 0, removed.Pending)
-	assert.Nil(t, f.mi.GetMetadata("reload-wt"))
+	require.NotNil(t, f.mi.GetMetadata("reload-held"),
+		"the purge did not wait for the pinned reader, so this step proves nothing about a deferred cleanup")
+	// A deferred worktree stays listed until its purge lands, but its removal
+	// is already the cleanup's: a reload in between has nothing left to retire.
+	between, err := f.lc.ApplyReload(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, between.Removed+between.Pending,
+		"a reload during a deferred purge retired a worktree a second time")
+	// Nothing but the lifecycle's own cleanup runtime finishes the purge.
+	pin.Release()
+	require.Eventually(t, func() bool {
+		for _, prefix := range []string{"reload-wt", "reload-held"} {
+			if f.mi.GetMetadata(prefix) != nil || f.lc.RepositoryAdmissionClosed(prefix) {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, 10*time.Millisecond, "a removal the reload counted was never purged")
 	assert.False(t, f.watcher.isAttached("reload-wt"))
+	assert.False(t, f.watcher.isAttached("reload-held"))
 
 	// The main checkout owns the family's primary base: nothing is left to
 	// serve it from, so its removal is recorded and NOT applied.
@@ -682,9 +877,15 @@ func TestCheckoutLifecycleSweepReachesAConfiguredButUnindexedRepo(t *testing.T) 
 
 	held := f.checkoutOf("unindexed-repo")
 	assert.Equal(t, tracked.CheckoutID, held.CheckoutID, "the identity survives")
-	assert.Equal(t, store_sqlite.CheckoutStateAvailabilityGrace, held.State,
-		"an unreachable root enters availability handling, indexed or not")
-	assert.Zero(t, held.RemovalDetectedAt, "an outage never starts the removal clock")
+	evidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, held.CheckoutID)
+	require.NoError(t, err)
+	if evidence.CommonDirVolumeToken != "" {
+		assert.Equal(t, store_sqlite.CheckoutStateRemovalGrace, held.State, "mounted-volume common-dir deletion enters removal grace")
+		assert.NotZero(t, held.RemovalDetectedAt)
+	} else {
+		assert.Equal(t, store_sqlite.CheckoutStateReady, held.State, "unknown inventory freezes state without mounted-volume deletion proof")
+		assert.Zero(t, held.RemovalDetectedAt)
+	}
 }
 
 // TestCheckoutLifecycleSeedIsIdempotent runs the startup path twice and
@@ -808,52 +1009,54 @@ func TestCheckoutLifecycleBindDedicatedGraphRejectsOwnerFamilyMismatch(t *testin
 	assert.Len(t, graphs, 1)
 }
 
-// TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace covers a checkout
-// whose root and Git directory disappear together. It receives one
-// availability grace and is then removed completely, including its persisted
-// configuration, rather than surviving as an unavailable shadow graph.
-func TestCheckoutLifecycleInaccessibleRootIsForgottenAfterGrace(t *testing.T) {
+// A deleted intended root keeps its identity/config across grace and restart.
+// An unavailable volume cannot be proved deleted and stays Unknown instead.
+func TestCheckoutLifecycleDeletedPrimaryRemainsTrackedAfterGrace(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
 	ctx := context.Background()
-
 	root := f.gitRepo("offline-repo")
 	tracked, err := f.lc.Register(ctx, config.RepoEntry{Path: root, Name: "offline-repo"}, TrackSourceCLI)
 	require.NoError(t, err)
 	require.NoError(t, tracked.CatalogErr)
+	evidence, _, err := f.catalog.GetCheckoutPathEvidence(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	proven := evidence.CommonDirVolumeToken != ""
 	require.NoError(t, os.RemoveAll(root))
-
 	graced, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 0, graced.Removed)
+	require.Zero(t, graced.Removed)
 	require.Len(t, graced.Reports, 1)
-	assert.False(t, graced.Reports[0].InventoryUsable)
-
-	held := f.checkoutOf("offline-repo")
-	assert.Equal(t, tracked.CheckoutID, held.CheckoutID)
-	assert.Equal(t, store_sqlite.CheckoutStateAvailabilityGrace, held.State)
-	assert.Zero(t, held.RemovalDetectedAt, "inaccessibility uses only one grace clock")
-
+	require.False(t, graced.Reports[0].InventoryUsable)
+	pin := f.lc.ViewLeases().AcquireBaseCorpus("offline-repo")
+	defer pin.Release()
+	require.True(t, pin.OwnerPinned())
 	f.clock.advance(lifecycleGrace.AvailabilityGrace + time.Second)
 	expired, err := f.lc.Sweep(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, expired.Removed)
-	_, checkoutExists, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.Zero(t, expired.Removed)
+	row, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
 	require.NoError(t, err)
-	assert.False(t, checkoutExists, "the checkout catalog row is removed")
-	assert.False(t, f.watcher.isAttached("offline-repo"), "its watcher is detached")
-	assert.Nil(t, f.mi.GetMetadata("offline-repo"), "its corpus is evicted")
-	assert.NotContains(t, f.configPaths(), root, "the removal is persisted")
-
+	require.True(t, found)
+	if proven {
+		require.Equal(t, store_sqlite.CheckoutStateUnavailable, row.State)
+		require.False(t, f.watcher.isAttached("offline-repo"))
+	} else {
+		require.Zero(t, row.UnavailableSince)
+		require.Zero(t, row.RemovalDetectedAt)
+	}
+	require.NotNil(t, f.mi.GetMetadata("offline-repo"))
+	require.False(t, f.lc.RepositoryAdmissionClosed("offline-repo"), "an automatic pass closed intended repository admission")
+	require.Contains(t, f.configPaths(), root)
+	pin.Release()
 	f.restart()
 	require.NoError(t, f.lc.Seed(ctx))
-	assert.Nil(t, f.mi.GetMetadata("offline-repo"), "a restart does not resurrect it")
+	_, found, err = f.catalog.GetCheckout(ctx, tracked.CheckoutID)
+	require.NoError(t, err)
+	require.True(t, found, "restart lost intended checkout identity")
+	require.Contains(t, f.configPaths(), root)
 }
 
-// TestCheckoutLifecycleImplicitRegistrationWritesNoIntent covers the
-// auto-index path: the checkout is recorded and served like any other, but
-// nobody asked for it, so no tracking intent claims otherwise — and nothing
-// is written to the configuration that a later boot could read back as one.
 func TestCheckoutLifecycleImplicitRegistrationWritesNoIntent(t *testing.T) {
 	f := newLifecycleFixture(t)
 	defer f.close()
@@ -872,11 +1075,14 @@ func TestCheckoutLifecycleImplicitRegistrationWritesNoIntent(t *testing.T) {
 	assert.NotContains(t, f.configPaths(), root,
 		"persisting it would make the next boot seed a manual_config intent for it")
 
-	// With no intent to revoke, forgetting it is unobstructed.
+	// With no intent to revoke, forgetting it is unobstructed. The build the
+	// registration started can still hold the corpus when Untrack returns, so
+	// the purge may be the cleanup runtime's to finish.
 	result, err := f.lc.Untrack(ctx, root)
 	require.NoError(t, err)
 	assert.Empty(t, result.Revoked)
-	assert.Nil(t, f.mi.GetMetadata("implicit-repo"))
+	require.Eventually(t, func() bool { return f.mi.GetMetadata("implicit-repo") == nil },
+		30*time.Second, 10*time.Millisecond, "its corpus is never evicted")
 }
 
 // TestCheckoutLifecycleImplicitRegistrationSurvivesRestartWithoutIntent is the
@@ -983,21 +1189,24 @@ func TestCoordinatorLivenessFollowsTheLoopNotTheRegistry(t *testing.T) {
 	defer f.close()
 	ctx := context.Background()
 
-	// Route the automatic checkout before the restart: a served worktree is the
-	// one a restart resumes, and its persisted route is what marks it worth
-	// bringing back rather than leaving dormant.
+	// Route the automatic checkout before the restart.
 	f.runCoordinator(f.automatic.CheckoutID)
 
 	// The daemon's restart path: a fresh stack over the same store, the tracked
 	// set re-registered the way warmup re-tracks it, and the seeding that
-	// reconciles every family it touched — which is what brings a routed
-	// worktree's coordinator back up.
+	// reconciles every family it touched. A routed worktree stays dormant —
+	// its route is a durable overlay — until a selection brings its
+	// coordinator back up.
 	f.restart()
 	_, err := f.mi.TrackRepoCtx(ctx, config.RepoEntry{Path: f.main, Name: f.mainPrefix})
 	require.NoError(t, err)
 	require.NoError(t, f.lc.Seed(ctx))
+	require.False(t, f.coordinatorReported(f.automatic.CheckoutID),
+		"the restart's own reconciliation started a coordinator for an unselected worktree")
+	require.Zero(t, f.lc.liveCoordinators(""))
+	f.activateAndWait(f.automatic.CheckoutID)
 	require.True(t, f.coordinatorReported(f.automatic.CheckoutID),
-		"the restart's own reconciliation brought no coordinator back")
+		"the selection brought no coordinator back")
 	require.Equal(t, 1, f.lc.liveCoordinators(""))
 
 	// The window every transition opens: the registered coordinator is dropped
@@ -1059,4 +1268,63 @@ func TestCheckoutLifecycleAdminNameIdentity(t *testing.T) {
 	}
 	slices.Sort(names)
 	assert.Len(t, names, 2, "two working copies, two identities")
+}
+
+func TestCheckoutLifecycleReloadKeepsImplicitLiveRepo(t *testing.T) {
+	f := newLifecycleFixture(t)
+	t.Cleanup(f.close)
+	root, skipped := f.gitRepo("owner"), f.gitRepo("skipped")
+	_, err := f.mi.TrackRepoCtx(t.Context(), config.RepoEntry{Path: root, Name: "src"})
+	require.NoError(t, err)
+	require.NoError(t, f.lc.RecordImplicit(t.Context(), root))
+	checkout := f.checkoutOf("src")
+	f.cm.Global().Repos = []config.RepoEntry{{Path: skipped, Name: "src"}}
+	require.NoError(t, f.cm.Global().Save())
+	// The CLI fallback removes only the unloaded configured entry, then reloads.
+	require.NoError(t, f.cm.Global().RemoveRepo(skipped))
+	require.NoError(t, f.cm.Global().Save())
+	require.NoError(t, f.cm.Reload())
+	out, err := f.lc.ApplyReload(t.Context())
+	require.NoError(t, err)
+	assert.Zero(t, out.Pending, "config-only removal must not start retiring an implicit live owner")
+	assert.Zero(t, out.Removed)
+	require.NotNil(t, f.mi.GetMetadata("src"))
+	_, pending, err := f.catalog.GetIntentTransition(t.Context(), checkout.CheckoutID)
+	require.NoError(t, err)
+	assert.False(t, pending)
+}
+
+func TestCheckoutLifecycleReloadKeepsNonGitImplicitLiveRepo(t *testing.T) {
+	f := newLifecycleFixture(t)
+	t.Cleanup(f.close)
+	root := filepath.Join(t.TempDir(), "implicit")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	writeFile(t, filepath.Join(root, "lib.go"), "package lib\nfunc Kept() {}\n")
+	_, err := f.mi.TrackRepoCtx(t.Context(), config.RepoEntry{Path: root, Name: "implicit"})
+	require.NoError(t, err)
+	require.NoError(t, f.lc.RecordImplicit(t.Context(), root))
+	before := f.store.GetFileNodes("implicit/lib.go")
+	require.NotEmpty(t, before)
+	f.cm.Global().Repos = nil
+	require.NoError(t, f.cm.Global().Save())
+	require.NoError(t, f.cm.Reload())
+	out, err := f.lc.ApplyReload(t.Context())
+	require.NoError(t, err)
+	require.Zero(t, out.Removed, "an implicit non-Git root is still live")
+	require.Zero(t, out.Pending)
+	require.NotNil(t, f.mi.GetMetadata("implicit"))
+	require.Equal(t, before, f.store.GetFileNodes("implicit/lib.go"))
+	// Explicit tracking supersedes the observation. A later config removal must
+	// still take the normal non-catalog teardown path.
+	require.NoError(t, f.cm.Global().AddRepo(config.RepoEntry{Path: root, Name: "implicit"}))
+	_, err = f.lc.Register(t.Context(), config.RepoEntry{Path: root, Name: "implicit"}, TrackSourceCLI)
+	require.NoError(t, err)
+	require.NoError(t, f.cm.Global().RemoveRepo(root))
+	require.NoError(t, f.cm.Global().Save())
+	require.NoError(t, f.cm.Reload())
+	removed, err := f.lc.ApplyReload(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, removed.Removed)
+	require.Nil(t, f.mi.GetMetadata("implicit"))
+	require.Empty(t, f.store.GetFileNodes("implicit/lib.go"))
 }

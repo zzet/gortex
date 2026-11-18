@@ -596,8 +596,18 @@ func TestLocalizationStateIsBoundedAndResetPerAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) > localizationTerminalPruneLimit {
-		t.Fatalf("snapshot state remained unbounded: %d", len(entries))
+	// Count state files only: the directory also holds the single commit-lock
+	// sidecar, which is fixed overhead rather than accumulating state.
+	stateFiles := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			stateFiles++
+		} else if entry.Name() != localizationStateWriteLockName {
+			t.Fatalf("unexpected snapshot entry %q", entry.Name())
+		}
+	}
+	if stateFiles > localizationTerminalPruneLimit {
+		t.Fatalf("snapshot state remained unbounded: %d", stateFiles)
 	}
 	if _, err := os.Stat(preserved); err != nil {
 		t.Fatalf("current snapshot was not preserved: %v", err)

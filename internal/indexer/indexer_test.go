@@ -212,6 +212,11 @@ func TestIncrementalReindexPaths_MtimeBumpFlagsReparse(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, idx.reparsedThisRun.Load(),
 		"reparsedThisRun is a scoped-path flag; a full Index uses fullReindexed instead")
+	// An index written before whole indexes stamped the extraction
+	// fingerprints: the scoped path cannot prove the file inert and re-parses
+	// it (TestIncrementalReindexPaths_MtimeBumpAfterWholeIndexIsInert is the
+	// stamped case).
+	stripFileFingerprints(t, g)
 
 	// Same bytes, later mtime — a touch / checkout-roundtrip, content unchanged.
 	bumpMtime(t, main, content)
@@ -238,6 +243,7 @@ func TestIncrementalReindexPaths_WholeRootMtimeBumpFlagsReparse(t *testing.T) {
 	_, err := idx.Index(dir)
 	require.NoError(t, err)
 	require.False(t, idx.reparsedThisRun.Load())
+	stripFileFingerprints(t, g)
 
 	bumpMtime(t, main, content)
 	result, err := idx.IncrementalReindexPaths(dir, nil)
@@ -245,6 +251,47 @@ func TestIncrementalReindexPaths_WholeRootMtimeBumpFlagsReparse(t *testing.T) {
 	require.Positive(t, result.StaleFileCount)
 	assert.True(t, idx.reparsedThisRun.Load(),
 		"a whole-root re-parse must force deferred enrichment for the touched file")
+}
+
+// stripFileFingerprints removes the extraction fingerprints from every file
+// node, the shape of an index written before whole indexes stamped them.
+func stripFileFingerprints(t *testing.T, g *graph.Graph) {
+	t.Helper()
+	for _, n := range g.AllNodes() {
+		if n == nil || n.Kind != graph.KindFile || n.Meta == nil {
+			continue
+		}
+		copied := *n
+		copied.Meta = make(map[string]any, len(n.Meta))
+		for k, v := range n.Meta {
+			if !isFingerprintMeta(k) {
+				copied.Meta[k] = v
+			}
+		}
+		g.AddNode(&copied)
+	}
+}
+
+// TestIncrementalReindexPaths_MtimeBumpAfterWholeIndexIsInert: a whole index
+// stamps the extraction fingerprints a per-save compares against, so an
+// mtime-only change after it is recognised as inert — nothing is re-parsed,
+// nothing enrichment-bearing is dropped, and the flag stays clear.
+func TestIncrementalReindexPaths_MtimeBumpAfterWholeIndexIsInert(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.go")
+	const content = "package main\n\nfunc Hello() {}\n"
+	writeFile(t, main, content)
+
+	g := graph.New()
+	idx := newTestIndexer(g)
+	_, err := idx.Index(dir)
+	require.NoError(t, err)
+
+	bumpMtime(t, main, content)
+	_, err = idx.IncrementalReindexPaths(dir, []string{main})
+	require.NoError(t, err)
+	assert.False(t, idx.reparsedThisRun.Load(),
+		"an mtime-only change after a whole index is inert: no re-parse, no dropped enrichment")
 }
 
 // TestIncrementalReindex_NoChangeLeavesReparseClear guards the other side: a

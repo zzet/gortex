@@ -133,7 +133,8 @@ func externalCallers(r graph.Reader, n *graph.Node) int {
 
 // contractsTouched returns the names of API contracts (HTTP routes, topics,
 // …) the symbol participates in, via implements / references edges to
-// KindContract nodes. Reads through the caller's reader.
+// KindContract nodes, including attachment-owned provides/consumes edges.
+// Reads through the caller's bound contract reader.
 func contractsTouched(r graph.Reader, n *graph.Node) []string {
 	if r == nil {
 		return nil
@@ -142,7 +143,8 @@ func contractsTouched(r graph.Reader, n *graph.Node) []string {
 	var names []string
 	visit := func(edges []*graph.Edge, to func(*graph.Edge) string) {
 		for _, e := range edges {
-			if e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeReferences {
+			if e.Kind != graph.EdgeImplements && e.Kind != graph.EdgeReferences &&
+				e.Kind != graph.EdgeProvides && e.Kind != graph.EdgeConsumes && e.Kind != graph.EdgeHandlesRoute {
 				continue
 			}
 			if cn := r.GetNode(to(e)); cn != nil && cn.Kind == graph.KindContract {
@@ -176,7 +178,11 @@ func (s *Server) apiDriftReasons(ctx context.Context, p *prediction) ([]changeRe
 			continue
 		}
 		ext := externalCallers(reader, n)
-		contracts := contractsTouched(reader, n)
+		var contracts []string
+		contractReader, err := s.contractReaderForContext(ctx)
+		if err == nil {
+			contracts = contractsTouched(contractReader, n)
+		}
 		surface = append(surface, apiSurfaceEntry{
 			ID:              n.ID,
 			Name:            n.Name,
@@ -197,6 +203,7 @@ func (s *Server) apiDriftReasons(ctx context.Context, p *prediction) ([]changeRe
 		for _, c := range contracts {
 			reasons = append(reasons, changeReason{
 				Family:     "contract_drift",
+				Stale:      optionalContractWarning(contractConsumerStatusFromContext(ctx)) != "",
 				Severity:   "warn",
 				Message:    fmt.Sprintf("%s implements/serves the API contract %q — verify the contract and its mocks still hold", n.Name, c),
 				Confidence: 0.75,

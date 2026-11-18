@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/zzet/gortex/internal/parser/tsalias"
@@ -13,10 +14,36 @@ import (
 // jsconfig `compilerOptions.paths` alias (or a `baseUrl`-rooted bare
 // specifier) declared in the importing file's nearest-ancestor config to
 // the repo-prefixed, extension-stripped file stem it targets. Returns ""
-// when no alias applies. The tsconfig alias collection is loaded once,
-// lazily, and shared via the package-level cache keyed on repo root path.
+// when no alias applies.
+//
+// The collection comes from the tree this Indexer is indexing — the installed
+// content source when there is one, the working copy otherwise — so a
+// generation built from a committed tree expands its aliases through that
+// tree's tsconfig / jsconfig rather than through whatever the checkout holds.
+// Reading the checkout here would not leave an edge missing: it would land a
+// present, WRONG edge, on the file the checkout's config names. The
+// working-copy collection is still loaded once, lazily, and shared via the
+// package-level cache keyed on repo root path; a snapshot's is memoised on the
+// Indexer that owns the source (see Indexer.tsAliasCollection).
 func (idx *Indexer) resolvePathAliasImport(callerFile, specifier string) string {
-	return resolveTSPathAlias(loadTSAliasCollection(idx.rootPath), idx.repoPrefix, callerFile, specifier)
+	return resolveTSPathAliasObserved(idx.tsAliasCollection(), idx.repoPrefix, callerFile, specifier, idx.tsAliasProbes())
+}
+
+// tsAliasProbes is the observer a build that proves its reads
+// (buildContentProof) puts on the working-copy alias maps it resolves
+// through: a multi-target alias probes the working copy for its targets at
+// resolve time, from a cached collection too, and each probe lands in the
+// proof with its answer. Nil when the build proves nothing, or reads a
+// content source (whose maps probe the snapshot, never the working copy).
+func (idx *Indexer) tsAliasProbes() func(rel string, found bool) {
+	proof := idx.contentProof
+	if !proof.active() || idx.contentSrc.Load() != nil {
+		return nil
+	}
+	root := idx.rootPath
+	return func(rel string, found bool) {
+		proof.probe(filepath.Join(root, filepath.FromSlash(rel)), found, true)
+	}
 }
 
 // pathAliasResolver builds the resolver.PathAliasResolver for the
@@ -38,6 +65,12 @@ func (mi *MultiIndexer) pathAliasResolver() resolver.PathAliasResolver {
 // empty, the caller is outside the prefix, or the specifier matches no
 // alias.
 func resolveTSPathAlias(coll *tsalias.Collection, repoPrefix, callerFile, specifier string) string {
+	return resolveTSPathAliasObserved(coll, repoPrefix, callerFile, specifier, nil)
+}
+
+// resolveTSPathAliasObserved is resolveTSPathAlias reporting each existence
+// probe of the resolution to observe (tsalias.Map.ObservingProbes).
+func resolveTSPathAliasObserved(coll *tsalias.Collection, repoPrefix, callerFile, specifier string, observe func(rel string, found bool)) string {
 	if coll == nil || specifier == "" {
 		return ""
 	}
@@ -48,7 +81,7 @@ func resolveTSPathAlias(coll *tsalias.Collection, repoPrefix, callerFile, specif
 		}
 		rel = strings.TrimPrefix(callerFile, repoPrefix+"/")
 	}
-	return prefixTSAliasTarget(repoPrefix, tsalias.Resolve(coll.FindForFile(path.Dir(rel)), specifier))
+	return prefixTSAliasTarget(repoPrefix, tsalias.Resolve(coll.FindForFile(path.Dir(rel)).ObservingProbes(observe), specifier))
 }
 
 // prefixTSAliasTarget re-attaches repoPrefix to a repo-relative tsalias

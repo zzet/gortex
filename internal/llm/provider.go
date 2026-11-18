@@ -130,10 +130,11 @@ type CompletionResponse struct {
 // Provider is a single-turn LLM completion backend. The agent loop and
 // the search-assist passes are both built on repeated Complete calls.
 type Provider interface {
-	// Name returns the provider's short identifier — one of "local",
-	// "anthropic", "openai", "ollama", "claudecli", "codex", "gemini",
-	// "bedrock", "deepseek", "requesty". Used to pick the prompt tier (see
-	// PromptProfile) and for diagnostics.
+	// Name returns the provider's short identifier — a built-in name
+	// ("local", "anthropic", "openai", "ollama", "claudecli", "codex",
+	// "gemini", "bedrock", "deepseek", ...), "custom" for a user custom
+	// provider, or a gateway preset's name (e.g. "requesty"). Used for
+	// diagnostics; the prompt tier comes from ProfileFor.
 	Name() string
 	// Complete runs one single-turn completion, honouring req.Shape
 	// with whatever structured-output mechanism the provider has.

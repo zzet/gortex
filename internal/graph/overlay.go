@@ -304,6 +304,95 @@ func (l *OverlayLayer) RebuildInEdges() {
 	}
 }
 
+// CarryBaseEdges returns provisional copies of the call edges base recorded in
+// file that layerEdges, the file's re-parse, still make. A layer that covers a
+// file hides every base edge recorded there, while the re-parse holds its calls
+// as unresolved references until relations are rebuilt, so an edited function
+// would otherwise lose its callees and drop out of its callees' callers. A base
+// call is carried when the re-parse has an unresolved call from the same
+// source to the target's name; the copy takes that call's line. Repeated calls
+// pair up in line order, and a call the re-parse no longer makes is dropped.
+func CarryBaseEdges(base Reader, file string, layerEdges []*Edge) []*Edge {
+	type site struct{ from, name string }
+	refs := make(map[site][]*Edge)
+	for _, e := range layerEdges {
+		if e == nil || e.Kind != EdgeCalls || !IsUnresolvedTarget(e.To) || IsFnValuePlaceholder(e.To) {
+			continue
+		}
+		key := site{e.From, unresolvedCallName(e.To)}
+		refs[key] = append(refs[key], e)
+	}
+	if base == nil || len(refs) == 0 {
+		return nil
+	}
+	for _, at := range refs {
+		sortEdgesByLine(at)
+	}
+	var ids []string
+	for _, n := range base.GetFileNodes(file) {
+		ids = append(ids, n.ID)
+	}
+	var recorded []*Edge
+	var targets []string
+	for _, edges := range base.GetOutEdgesByNodeIDs(ids) {
+		for _, e := range edges {
+			if e != nil && e.Kind == EdgeCalls && e.FilePath == file && !IsUnresolvedTarget(e.To) {
+				recorded = append(recorded, e)
+				targets = append(targets, e.To)
+			}
+		}
+	}
+	sortEdgesByLine(recorded)
+	names := base.GetNodesByIDs(targets)
+	used := make(map[site]int, len(refs))
+	var carried []*Edge
+	for _, e := range recorded {
+		target := names[e.To]
+		if target == nil {
+			continue
+		}
+		key := site{e.From, target.Name}
+		at := refs[key]
+		if used[key] >= len(at) {
+			continue
+		}
+		c := *e
+		c.Line = at[used[key]].Line
+		c.Provisional = true
+		used[key]++
+		carried = append(carried, &c)
+	}
+	return carried
+}
+
+// unresolvedCallName is the bare callee name of an unresolved call target:
+// `unresolved::Name`, `unresolved::*.name` and qualified forms all name their
+// last segment.
+func unresolvedCallName(id string) string {
+	name := UnresolvedName(id)
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+// sortEdgesByLine orders edges by source, line and target.
+func sortEdgesByLine(edges []*Edge) {
+	sort.Slice(edges, func(i, j int) bool {
+		a, b := edges[i], edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.To < b.To
+	})
+}
+
 // OverlaidView composes an immutable base Reader with a per-session
 // overlay layer. Every read path consults the layer first for paths
 // the overlay covers; falls through to base otherwise. The base is
@@ -317,12 +406,16 @@ func (l *OverlayLayer) RebuildInEdges() {
 type OverlaidView struct {
 	base  Reader
 	layer OverlayLayerReader
+	// Set only by the request-scoped immutable multi-layer constructor.
+	// All other read surfaces keep the original chain and its capabilities.
+	adjacencyBatch *overlayAdjacencyBatch
 
-	// statsOnce caches the (potentially expensive) Stats walk so
-	// repeated calls within one request don't pay the AllNodes /
-	// AllEdges cost twice.
-	statsOnce sync.Once
-	stats     GraphStats
+	// statsMu guards the first complete statistics result shared by Stats and
+	// StatsContext. Computation stays outside the lock so a canceled caller
+	// never waits behind another first call; concurrent first calls may duplicate
+	// work, and the first complete success becomes the request-local cache.
+	statsMu sync.Mutex
+	stats   *GraphStats
 }
 
 // NewOverlaidView builds a view over the in-memory layer. If layer is
@@ -347,6 +440,10 @@ func NewOverlaidViewWithLayer(base Reader, layer OverlayLayerReader) *OverlaidVi
 // against (view.Base()) and against (view) directly to compute the
 // delta induced by the overlay.
 func (v *OverlaidView) Base() Reader { return v.base }
+
+// LayerReader borrows the immutable physical overlay used by checked
+// composition proofs. It grants no ownership or lifetime beyond this view.
+func (v *OverlaidView) LayerReader() OverlayLayerReader { return v.layer }
 
 // Layer exposes the per-session in-memory overlay layer, nil when the
 // view composes none (or composes a different layer implementation).
@@ -412,6 +509,15 @@ func (v *OverlaidView) baseNodeVisible(n *Node) bool {
 // overlaid file, or one a node tombstone removed without claiming that
 // file. Everything else comes from base.
 func (v *OverlaidView) GetNode(id string) *Node {
+	if v.adjacencyBatch != nil {
+		if layer := v.adjacencyBatch.nodeLayer(id); layer != nil {
+			return layer.NodeByID(id)
+		}
+		if v.adjacencyBatch.base == nil {
+			return nil
+		}
+		return v.adjacencyBatch.base.GetNode(id)
+	}
 	if v.overlayOwnsIdentity(id) {
 		return v.layer.NodeByID(id) // may be nil — the layer hid it
 	}
@@ -493,8 +599,16 @@ func (v *OverlaidView) GetNodesByQualNames(qualNames []string) map[string][]*Nod
 	}
 
 	if v.layer != nil {
-		for n := range v.layer.Nodes() {
-			add(n)
+		if batch, ok := v.layer.(qualifiedNameBatchReader); ok {
+			for _, hits := range batch.GetNodesByQualNames(qualNames) {
+				for _, n := range hits {
+					add(n)
+				}
+			}
+		} else {
+			for n := range v.layer.Nodes() {
+				add(n)
+			}
 		}
 	}
 	if v.base != nil {
@@ -561,15 +675,28 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	}
 	needle := strings.ToLower(substr)
 	var out []*Node
-	// Overlay-side: walk the layer's nodesByName index — the same
-	// bucket FindNodesByName reads from — and accept any name whose
-	// lowercase form contains the needle.
 	if v.layer != nil {
-		for name, bucket := range v.layer.NamedNodes() {
-			if strings.Contains(strings.ToLower(name), needle) {
-				out = append(out, bucket...)
-				if limit > 0 && len(out) >= limit {
-					return out[:limit]
+		if bounded, ok := v.layer.(interface {
+			VisitNodesByNameContainingFolded(string, func(*Node) bool)
+		}); ok {
+			bounded.VisitNodesByNameContainingFolded(substr, func(node *Node) bool {
+				if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
+					return true
+				}
+				out = append(out, node)
+				return limit <= 0 || len(out) < limit
+			})
+			if limit > 0 && len(out) >= limit {
+				return out[:limit]
+			}
+		} else {
+			// In-memory and third-party layers retain the name-bucket fallback.
+			for name, bucket := range v.layer.NamedNodes() {
+				if strings.Contains(strings.ToLower(name), needle) {
+					out = append(out, bucket...)
+					if limit > 0 && len(out) >= limit {
+						return out[:limit]
+					}
 				}
 			}
 		}
@@ -577,33 +704,56 @@ func (v *OverlaidView) FindNodesByNameContaining(substr string, limit int) []*No
 	if v.base == nil {
 		return out
 	}
-	// Base-side: fetch with an inflated limit so overlay-mask drops
-	// don't leave a short page. Then re-apply the same overlaid-file
-	// + name-removed mask FindNodesByName uses.
-	fetch := limit
-	if fetch > 0 {
+	if limit <= 0 {
+		for _, node := range v.base.FindNodesByNameContaining(substr, 0) {
+			if v.baseNodeVisible(node) {
+				out = append(out, node)
+			}
+		}
+		return out
+	}
+
+	// Re-fetch a larger ordered prefix when overlay ownership masks more rows
+	// than the first page allowed for. Each pass rebuilds only the base suffix,
+	// so no candidate is duplicated. Saturating growth prevents integer wrap.
+	overlayLen := len(out)
+	remaining := limit - overlayLen
+	if remaining <= 0 {
+		return out[:limit]
+	}
+	maxInt := int(^uint(0) >> 1)
+	fetch := remaining
+	if fetch <= maxInt/2 {
 		fetch *= 2
+	} else {
+		fetch = maxInt
 	}
-	for _, n := range v.base.FindNodesByNameContaining(substr, fetch) {
-		if !v.baseNodeVisible(n) {
-			continue
+	for {
+		candidates := v.base.FindNodesByNameContaining(substr, fetch)
+		out = out[:overlayLen]
+		for _, node := range candidates {
+			if !v.baseNodeVisible(node) {
+				continue
+			}
+			out = append(out, node)
+			if len(out) >= limit {
+				return out[:limit]
+			}
 		}
-		out = append(out, n)
-		if limit > 0 && len(out) >= limit {
-			return out[:limit]
+		if len(candidates) < fetch || fetch == maxInt {
+			return out
+		}
+		if fetch > maxInt/2 {
+			fetch = maxInt
+		} else {
+			fetch *= 2
 		}
 	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
 }
 
-// GetFileNodes: if the path is overlaid, return overlay's nodes
-// (empty for tombstones). Otherwise base's, minus the rows the layer
-// speaks for anyway — a node tombstone removes one identity without
-// claiming the file it lives in, so an uncovered path can still lose a
-// symbol.
+// GetFileNodes returns a covered path from the layer alone. An uncovered
+// path merges surviving lower identities with any explicit detached rows;
+// row-only replacement neither hides siblings nor claims the whole file.
 func (v *OverlaidView) GetFileNodes(filePath string) []*Node {
 	if v.layer != nil && v.layer.HasFile(filePath) {
 		// The layer owns its slice, so hand callers their own copy.
@@ -626,12 +776,15 @@ func (v *OverlaidView) GetFileNodes(filePath string) []*Node {
 		}
 		out = append(out, n)
 	}
+	if rows, ok := v.layer.(OverlayDetachedNodeReader); ok {
+		out = append(out, rows.DetachedFileNodes(filePath)...)
+	}
 	return out
 }
 
-// GetRepoNodes filters base's per-repo node list by dropping every
-// identity the layer speaks for and appending the overlay's nodes for
-// any overlaid file inside the requested repo prefix.
+// GetRepoNodes filters lower identities, then appends covered-file rows
+// and the optional detached identity rows in this repository. File and
+// node-identity ownership remain independent.
 func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 	if v.base == nil {
 		return nil
@@ -657,6 +810,9 @@ func (v *OverlaidView) GetRepoNodes(repoPrefix string) []*Node {
 			continue
 		}
 		out = append(out, v.layer.FileNodes(path)...)
+	}
+	if rows, ok := v.layer.(OverlayDetachedNodeReader); ok {
+		out = append(out, rows.DetachedRepoNodes(repoPrefix)...)
 	}
 	return out
 }
@@ -687,7 +843,7 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 	if v.layer == nil {
 		return true
 	}
-	if v.overlayOwnsBaseEdge(e.From, e.FilePath) {
+	if v.overlayOwnsBaseEdge(e.From, e.FilePath) || v.overlayClaimsBaseEdge(e) {
 		return false
 	}
 	return v.overlayIdentityVisible(e.From) && v.overlayIdentityVisible(e.To)
@@ -703,6 +859,13 @@ func (v *OverlaidView) baseEdgeVisible(e *Edge) bool {
 // alone is the answer. baseEdgeVisible has already dropped everything
 // the layer speaks for, so nothing surfaces twice.
 func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetOutEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -725,6 +888,13 @@ func (v *OverlaidView) GetOutEdges(nodeID string) []*Edge {
 // originating in overlaid files, since those are replaced by overlay
 // versions) with the overlay's in-edges for the same target.
 func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
+	if v.adjacencyBatch != nil && nodeID != "" {
+		edges := v.GetInEdgesByNodeIDs([]string{nodeID})[nodeID]
+		if len(edges) == 0 {
+			return nil
+		}
+		return edges
+	}
 	if v.layer == nil {
 		if v.base == nil {
 			return nil
@@ -753,6 +923,9 @@ func (v *OverlaidView) GetInEdges(nodeID string) []*Edge {
 // file's symbol can still hold base edges other files recorded out of
 // it — a claim that is per edge and cannot be settled from the id.
 func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, false)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
@@ -771,6 +944,9 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 	}
 	if len(uniq) == 0 {
 		return out
+	}
+	for _, id := range uniq {
+		out[id] = nil
 	}
 	if v.base != nil {
 		base := v.base.GetOutEdgesByNodeIDs(uniq)
@@ -791,9 +967,16 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 		}
 	}
 	if v.layer != nil {
-		for _, id := range uniq {
-			if extras := v.layer.OutEdges(id); len(extras) > 0 {
-				out[id] = append(out[id], extras...)
+		if batch, ok := v.layer.(interface {
+			GetOutEdgesByNodeIDs([]string) map[string][]*Edge
+		}); ok {
+			extras := batch.GetOutEdgesByNodeIDs(uniq)
+			for _, id := range uniq {
+				out[id] = append(out[id], extras[id]...)
+			}
+		} else {
+			for _, id := range uniq {
+				out[id] = append(out[id], v.layer.OutEdges(id)...)
 			}
 		}
 	}
@@ -805,6 +988,9 @@ func (v *OverlaidView) GetOutEdgesByNodeIDs(ids []string) map[string][]*Edge {
 // files) with overlay-introduced in-edges for each input id, all in a
 // single batched base round-trip.
 func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
+	if v.adjacencyBatch != nil {
+		return v.adjacencyBatch.edges(ids, true)
+	}
 	if len(ids) == 0 {
 		return nil
 	}
@@ -843,9 +1029,18 @@ func (v *OverlaidView) GetInEdgesByNodeIDs(ids []string) map[string][]*Edge {
 		}
 	}
 	if v.layer != nil {
-		for _, id := range uniq {
-			if extras := v.layer.InEdges(id); len(extras) > 0 {
-				out[id] = append(out[id], extras...)
+		if batch, ok := v.layer.(OverlayLayerProjectionReader); ok {
+			extras := batch.LayerInEdgesByNodeIDs(uniq)
+			for _, id := range uniq {
+				if len(extras[id]) > 0 {
+					out[id] = append(out[id], extras[id]...)
+				}
+			}
+		} else {
+			for _, id := range uniq {
+				if extras := v.layer.InEdges(id); len(extras) > 0 {
+					out[id] = append(out[id], extras...)
+				}
 			}
 		}
 	}
@@ -962,6 +1157,19 @@ func (v *OverlaidView) NodesByKind(kind NodeKind) iter.Seq[*Node] {
 		if v.layer == nil {
 			return
 		}
+		if byKind, ok := v.layer.(interface {
+			NodesByKind(NodeKind) iter.Seq[*Node]
+		}); ok {
+			for n := range byKind.NodesByKind(kind) {
+				if n == nil || n.Kind != kind {
+					continue
+				}
+				if !yield(n) {
+					return
+				}
+			}
+			return
+		}
 		for n := range v.layer.Nodes() {
 			if n == nil || n.Kind != kind {
 				continue
@@ -1003,16 +1211,19 @@ func (v *OverlaidView) nodeCountDelta() int {
 		}
 		delta += len(v.layer.FileNodes(path)) - baseCount
 	}
+	for range v.detachedNodeSummaries() {
+		delta++
+	}
 	return delta - len(v.detachedBaseNodes())
 }
 
 // detachedBaseNodes resolves the base rows the layer hides from outside
-// every file it covers: an identity it tombstoned, and one it carries at
-// a path other than the ID's own. Neither is priced by a covered file's
-// node trade — that term only sees the paths in the layer's own file
-// list — so the counters resolve them here, in one batched base read
-// over the layer's removal set and its per-file node lists. Both are
-// already in hand: the file lists are what the trade above walks.
+// every file it covers. Covered files already account for their base
+// rows, so only identities removed or re-emitted from an uncovered base
+// path need a separate subtraction. Resolve the layer's candidates in
+// one batched base read and check each row's actual FilePath: canonical
+// IDs need not encode a path, and relocated IDs may encode a different
+// path. The work remains bounded by the layer's own footprint.
 func (v *OverlaidView) detachedBaseNodes() []*Node {
 	if v.base == nil || v.layer == nil {
 		return nil
@@ -1020,7 +1231,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	seen := make(map[string]struct{})
 	var ids []string
 	claim := func(id string) {
-		if id == "" || v.layer.CoversNodeID(id) {
+		if id == "" {
 			return
 		}
 		if _, dup := seen[id]; dup {
@@ -1031,6 +1242,9 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	}
 	for id := range v.layer.RemovedIDs() {
 		claim(id)
+	}
+	for node := range v.detachedNodeSummaries() {
+		claim(node.ID)
 	}
 	for _, path := range v.layer.FilePaths() {
 		for _, n := range v.layer.FileNodes(path) {
@@ -1044,7 +1258,7 @@ func (v *OverlaidView) detachedBaseNodes() []*Node {
 	}
 	out := make([]*Node, 0, len(ids))
 	for _, n := range v.base.GetNodesByIDs(ids) {
-		if n != nil {
+		if n != nil && !v.layer.HasFile(n.FilePath) {
 			out = append(out, n)
 		}
 	}
@@ -1082,21 +1296,10 @@ func (v *OverlaidView) EdgeIdentityRevisions() int {
 //     per-language rollup, and recomputing one means walking every
 //     node in the graph.
 //
-// Caching keeps repeated Stats() calls inside one request to a single
-// base lookup.
+// After the first complete result, caching keeps repeated Stats and
+// StatsContext calls inside one request from repeating the base lookup.
 func (v *OverlaidView) Stats() GraphStats {
-	if v.base == nil {
-		return GraphStats{}
-	}
-	v.statsOnce.Do(func() {
-		v.stats = v.base.Stats()
-		if v.layer == nil {
-			return
-		}
-		v.stats.TotalNodes += v.nodeCountDelta()
-		v.stats.TotalEdges += v.EdgeCount() - v.base.EdgeCount()
-	})
-	return v.stats
+	return v.statsLegacy()
 }
 
 // RepoStats returns base's per-repo rollup with the overlay's node and
@@ -1225,6 +1428,11 @@ func (v *OverlaidView) repoCountDeltas() (map[string]int, map[string]int) {
 			if n != nil && n.RepoPrefix != "" {
 				edges[n.RepoPrefix] -= lostBySource[id]
 			}
+		}
+	}
+	for node := range v.detachedNodeSummaries() {
+		if node.RepoPrefix != "" {
+			nodes[node.RepoPrefix]++
 		}
 	}
 	for _, n := range v.detachedBaseNodes() {

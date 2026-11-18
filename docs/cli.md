@@ -6,7 +6,7 @@ gortex init [path]           Per-repo setup (.mcp.json, hooks, community routing
 gortex init --dry-run-intake Emit a privacy-safe intake manifest and exit before parsing/writes
 gortex doctor                Zero-op state report: adapter drift, hook activity, adoption, savings (human or --json)
 gortex mcp [flags]           Start the MCP stdio proxy (connects to or auto-starts the daemon; embedded fallback requires config opt-in; --server adds HTTP API)
-gortex daemon start [flags]  Start the daemon; --http-addr <addr> serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
+gortex daemon start [flags]  Start the daemon; --http-addr <addr> (or daemon.http_addr in config) serves the HTTP/JSON API under /v1/* plus the MCP /mcp transport (--http-auth-token, --cors-origin)
 gortex daemon <sub>          start / stop / restart / reload / status / logs / install-service / service-status / uninstall-service / server (multi-server roster)
 gortex eval <sub>            Retrieval + coverage benchmarks — recall / embedders / pack / swebench / stdbench / tokens / baselines / quality / parity (substrate; prefer `gortex bench` for the user-facing surface). `parity` measures per-language cross-file coverage against the committed baseline
 gortex eval-server [flags]   HTTP server used by the swebench harness
@@ -60,7 +60,7 @@ gortex daemon status --exact        # recount nodes/edges from the store instead
 gortex daemon stop                  # graceful shutdown; the graph store is already on disk
 gortex daemon restart               # stop + start
 gortex daemon reload                # re-read the global config AND every tracked repo's .gortex.yaml, pick up new/removed repos
-gortex daemon logs -n 50            # tail the log file
+gortex daemon logs -n 50            # tail daemon.log (background/service daemon: rotated; crash and raw stderr in daemon.stderr.log)
 
 # Multi-server roster — let the daemon route to additional Gortex servers (local sockets or remote HTTPS):
 gortex daemon server list                                                  # show ~/.gortex/servers.toml
@@ -79,6 +79,77 @@ gortex untrack backend
 # Per-repo status + daemon-wide status share the same command — it picks:
 gortex status
 ```
+
+Offline `untrack` requires a repository path; a bare prefix is resolved by the
+running daemon. To recover from an unwanted warmup, stop first, then run
+`gortex untrack /absolute/path/to/unwanted-repository`, and start the daemon
+again. See [Recovering from a runaway warmup](onboarding.md#recovering-from-a-runaway-warmup).
+
+## Repository prefix collisions
+
+A repository prefix identifies one indexed root. By default, it is the directory
+basename. Tracking a different root with a prefix taken by another top-level
+entry fails, even without a daemon. Tracking the same top-level root again is a no-op.
+
+Linked worktrees of a registered or configured Git family are served
+automatically. `gortex track <linked-worktree>` warns and returns without a
+config change or track request. If a daemon is running, the warning also shows
+the available `explain-view` state. To intentionally build a separate graph:
+
+```bash
+gortex track --as-worktree ~/projects/feature-checkout
+```
+
+When no checkout of the family is known yet, tracking a linked checkout keeps
+that choice and identifies it as the family's tracked primary; prefer tracking
+the default-branch checkout instead. While automatic checkout discovery is
+pending, retry graph calls on the same session; no reconnect is needed. Inspect
+`gortex repos explain-view <path>` rather than bootstrap-tracking the current
+checkout. An uncovered session can still track an unrelated repository.
+
+For an explicitly requested independent graph, the daemon names the new
+corpus `<family-base>@<admin-name>`. The admin name comes from Git's
+worktree metadata, not its current branch. The CLI uses the same rule offline,
+including families tracked through a linked checkout or a bare repository.
+An explicit `--name` takes precedence.
+
+Give same-named directories distinct prefixes:
+
+```bash
+gortex track ~/projects/one/src
+gortex track --name other-src ~/projects/two/src
+```
+
+The CLI checks top-level configured prefixes before saving a new entry.
+Project-scoped entries are not checked before this save. The daemon checks the
+live registry, which remains authoritative. A live rejection removes
+only the entry the CLI just added. Other daemon failures can leave a config-only
+entry for a later restart.
+
+Older configs can already contain collisions. At startup, Gortex keeps the
+live owner, or a configured catalog owner guarded by a base publication.
+Otherwise config order decides. A legacy catalog row that points at the other
+configured root is repaired without deleting corpus or generation payloads.
+Gortex warns and skips the other entry without replacing the owner's config or corpus.
+Give the skipped entry a unique `name` in the global config, then run
+`gortex daemon reload`. `track --name` refuses a different name for an entry
+already in config; it does not report a temporary rename as a saved change.
+Untracking a configured but unloaded path removes only that config entry and
+reloads the daemon. If it cannot verify which roots are loaded, it refuses
+without changing config. Do not untrack the live owner just to resolve a
+duplicate name. If the owner's path no longer exists, inspect the untrack
+preview before confirming removal of its corpus.
+
+Live collisions return `prefix_collision` and a non-zero exit with or without
+`--wait`, including while another track holds the controller lock. The error
+names the owner. A warmup loser does not change the owner's corpus, workspace
+configuration, watcher or pending base publication. Probes report the collision
+instead of presenting that root as loading or already tracked.
+
+An unresolved configured alias is not proof of a new root. If startup has not
+finished resolving those identities, retry after that resolution completes;
+Gortex leaves the tracking configuration unchanged rather than adding a second
+entry for the same physical directory.
 
 ## Per-repo setup
 
@@ -397,6 +468,21 @@ gortex instructions switch localization   # lean machine: diet body + 10-tool su
 gortex instructions switch core           # back to the balanced default
 ```
 
+
+Generated instruction profiles record the binary version that produced them.
+On daemon startup, an existing managed installation refreshes after an upgrade;
+its saved active selection stays unchanged, even when the daemon process has a
+`GORTEX_INSTRUCTIONS_PROFILE` override. The refresh applies to new sessions.
+A second start leaves already-current files unchanged.
+
+Automatic refresh accepts only recorded generated files or exact known legacy
+profile bodies from v0.64.10 and v0.64.11. It preserves customized, unrecognized or symlinked files and
+logs how to resolve the conflict; the daemon continues serving. Back up and move
+conflicting generated files aside, then run `gortex instructions regen` to
+restore them and record the current version. Keep personal guidance in your
+agent's user-managed instructions rather than editing generated profile files.
+
+
 ### `gortex analyze` — unified analysis dispatcher
 
 `gortex analyze --kind <k>` runs the daemon's `analyze` dispatcher. `gortex analyze kinds` lists the valid kinds (no daemon needed). Universal typed flags (`--limit`, `--compact`, `--path-prefix`, `--format json|gcx|toon|text`) cover the common parameters; kind-specific parameters ride on `--arg key=value` (same coercion as `call`, and a `--arg` pair overrides the matching typed flag).
@@ -449,6 +535,7 @@ gortex savings [--verbose] [--json]      # Today / Last 7 days / All time bar-ch
 gortex bench <sub>                       # user-facing benchmark suite (recall / tokens / tokens-efficiency / perf / daemon-latency / embedders / swebench / all)
 gortex audit [--badge|--format svg|json|text]  # A-F repo health grade + README-ready SVG shield
 gortex gain [--since 7d]                 # forward-looking per-call USD savings + optional history slice
+gortex store cleanup-backup [--backend-path P]  # remove the store backups taken before schema upgrades (the daemon also prunes them after 14 days)
 gortex version
 ```
 

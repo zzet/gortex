@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -199,6 +200,23 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		return emitInitDryRunIntake(cmd, absRoot)
 	}
 
+	// Resolve the adapter set before any stage runs: the skills stage
+	// wording depends on how the selected adapters deliver communities
+	// (skill files vs routing block), and an invalid --agents name
+	// should fail before indexing starts. The wizard above owns the
+	// final value of initAgents, so this stays after it.
+	registry := buildRegistry()
+	selected, err := registry.Filter(initAgents, initAgentsSkip)
+	if err != nil {
+		return err
+	}
+
+	// A repo .gortex.yaml that fails to parse, or carries unknown keys
+	// (at any depth), is silently reduced to defaults — the exact moment
+	// a one-character typo turns into "indexing proceeds on the wrong
+	// file set". Say it out loud before anything else runs.
+	warnIfWorkspaceConfigIgnored(cmd.ErrOrStderr(), absRoot)
+
 	// Bind this directory as a single-project entry point so the MCP
 	// server can resolve it without --hooks-only setups, daemon-less
 	// clients, or future runs needing manual setup. The marker is the
@@ -245,6 +263,12 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		AnalyzeRepo:  initAnalyze,
 		Stderr:       cmd.ErrOrStderr(),
 	}
+	// What will actually run: Apply skips any adapter whose Detect() is
+	// false, so the stage summaries are derived from this filtered set.
+	// Labeling from `selected` alone counted every registered adapter on
+	// a default run (Filter("", "") returns them all), claiming
+	// instruction files for assistants that are not installed.
+	running := runningAdapters(selected, env)
 	defer func() {
 		if err != nil {
 			prog.Fail(err)
@@ -296,7 +320,7 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 				if len(generated) > 0 {
 					env.GeneratedSkills = toEnvSkills(generated)
 					env.SkillsRouting = routing
-					prog.StageDone(stageSkills, fmt.Sprintf("%d community skill(s)", len(generated)))
+					prog.StageDone(stageSkills, skillsStageLabel(len(generated), running, env))
 				} else {
 					prog.StageDone(stageSkills, fmt.Sprintf("no communities large enough (min-size: %d)", initSkillsMinSize))
 				}
@@ -305,11 +329,6 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	prog.Stage(stageAdapters, "")
-	registry := buildRegistry()
-	selected, err := registry.Filter(initAgents, initAgentsSkip)
-	if err != nil {
-		return err
-	}
 
 	opts = agents.ApplyOpts{DryRun: initDryRun, Force: initForce}
 	results = make([]*agents.Result, 0, len(selected))
@@ -326,7 +345,10 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 			results = append(results, r)
 		}
 	}
-	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", len(results)))
+	// "Configured" counts adapters Apply actually ran: an undetected
+	// adapter still returns a Result (Detected: false, nothing written),
+	// and counting it claimed setup that never happened.
+	prog.StageDone(stageAdapters, fmt.Sprintf("%d adapter(s) configured", countConfigured(results)))
 
 	// Always update Gortex's own global config so the daemon picks
 	// up this repo next time it starts (harmless when no daemon).
@@ -349,6 +371,104 @@ func runInit(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 	return nil
+}
+
+// countConfigured reports how many Apply results came from an adapter
+// that actually ran. An undetected adapter still returns a Result
+// (Detected: false, nothing written) — it must not count as configured.
+func countConfigured(results []*agents.Result) int {
+	n := 0
+	for _, r := range results {
+		if r != nil && r.Detected {
+			n++
+		}
+	}
+	return n
+}
+
+// runningAdapters filters selected down to the adapters Apply will not
+// skip: Apply gates on Detect(), and gortex init never sets ForceDetect.
+// Detect errors mirror Apply's own handling — treated as not detected.
+func runningAdapters(selected []agents.Adapter, env agents.Env) []agents.Adapter {
+	running := make([]agents.Adapter, 0, len(selected))
+	for _, a := range selected {
+		if ok, _ := a.Detect(env); ok {
+			running = append(running, a)
+		}
+	}
+	return running
+}
+
+// skillsStageLabel describes what the skills stage delivers, per the
+// mechanisms the adapters that will actually run declare. Both delivery
+// mechanisms are declared capabilities: SkillFilesWriter adapters
+// (Claude Code, Codex, Copilot CLI, opencode) write the generated
+// SKILL.md files, RoutingBlockWriter adapters merge the communities
+// block into their instruction file, and MCP/KI-only adapters (kiro,
+// antigravity, …) consume neither. Inferring routing from the absence
+// of skill files counted the neither-adapter class, and counting from
+// the unfiltered selection counted adapters Apply never runs — a flat
+// or inflated summary sent users hunting for files that are never
+// written. The routing count is over distinct instruction files, not
+// adapters: four adapters (claude-code, codex, opencode, pi) upsert the
+// block into the same repo AGENTS.md and vscode / copilot-cli share
+// .github/copilot-instructions.md, so counting adapters claimed the
+// same file once per writer.
+func skillsStageLabel(n int, running []agents.Adapter, env agents.Env) string {
+	files, routing := 0, 0
+	seenRouting := make(map[string]bool, len(running))
+	for _, a := range running {
+		if w, ok := a.(agents.SkillFilesWriter); ok && w.WritesSkillFiles() {
+			files++
+		}
+		if r, ok := a.(agents.RoutingBlockWriter); ok && r.WritesCommunitiesRouting() {
+			path := r.CommunitiesRoutingPath(env)
+			if !seenRouting[path] {
+				seenRouting[path] = true
+				routing++
+			}
+		}
+	}
+	switch {
+	case files == 0 && routing == 0:
+		return fmt.Sprintf("%d community skill(s) generated (no selected adapter consumes them)", n)
+	case files > 0 && routing > 0:
+		return fmt.Sprintf("%d community skill(s) + communities block(s) in %d instruction file(s)", n, routing)
+	case files > 0:
+		return fmt.Sprintf("%d community skill(s)", n)
+	default:
+		return fmt.Sprintf("communities block(s) in %d instruction file(s) (no skill files)", routing)
+	}
+}
+
+// warnIfWorkspaceConfigIgnored surfaces a repo .gortex.yaml that exists but
+// will not take effect: either it fails to parse (the whole file is ignored
+// and builtins apply) or it contains keys at any depth that gortex does not
+// recognize (those keys are silently dropped by yaml.Unmarshal). Both
+// otherwise surface as "indexing proceeds on the wrong file set" with no
+// hint at the cause.
+//
+// The parse goes through config.ParseWorkspaceFile — the daemon's own
+// acceptance semantics — not config.Load: viper's weak decode and the
+// workspace schema rules accept/reject a different file set than
+// yaml.Unmarshal does, so this warning must not use them. Warn exactly
+// when the daemon would ignore the file, stay silent when the daemon
+// accepts it. Schema-only violations (e.g. both `project` and `projects`
+// set) surface where they are enforced, not as a false "failed to parse"
+// here.
+func warnIfWorkspaceConfigIgnored(w io.Writer, root string) {
+	cfgPath := filepath.Join(root, ".gortex.yaml")
+	if _, err := os.Stat(cfgPath); err != nil {
+		return
+	}
+	if _, err := config.ParseWorkspaceFile(cfgPath); err != nil {
+		fmt.Fprintf(w, "[gortex init] warning: %s failed to parse — its settings are being ignored: %v\n", cfgPath, err)
+		return
+	}
+	if unknown := config.UnknownWorkspaceKeys(cfgPath); len(unknown) > 0 {
+		fmt.Fprintf(w, "[gortex init] warning: %s contains keys gortex does not recognize (they are ignored): %s\n",
+			cfgPath, strings.Join(unknown, ", "))
+	}
 }
 
 func runInitHooksOnly(cmd *cobra.Command, absRoot string) error {

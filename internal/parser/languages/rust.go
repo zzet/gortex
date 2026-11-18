@@ -177,7 +177,8 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	defer tree.Close()
 
 	root := tree.RootNode()
-	result := &parser.ExtractionResult{}
+	checked, parseErrors := parser.ParseErrorVerdict(root)
+	result := &parser.ExtractionResult{ParseChecked: checked, ParseErrors: parseErrors}
 
 	fileNode := &graph.Node{
 		ID: filePath, Kind: graph.KindFile, Name: filePath,
@@ -195,6 +196,7 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 	var calls []rustDeferredCall
 	var lets []rustDeferredLet
 	var funcDefs []rustFuncDef
+	var implBlockEdges []*graph.Edge // edges sourced at an impl block's target type
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
@@ -257,7 +259,9 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			emitRustExternCrate(m.Captures["xcrate.def"].Node, filePath, fileID, src, result)
 
 		case m.Captures["impl.def"] != nil:
+			before := len(result.Edges)
 			emitRustImplBlock(m.Captures["impl.def"].Node, filePath, src, result, annotationSeen)
+			implBlockEdges = append(implBlockEdges, result.Edges[before:]...)
 
 		case m.Captures["tuplefields.def"] != nil:
 			emitRustTupleFields(m.Captures["tuplefields.def"].Node, filePath, src, result, seen, containers)
@@ -536,6 +540,9 @@ func (e *RustExtractor) Extract(filePath string, src []byte) (*parser.Extraction
 			break
 		}
 	}
+	// Runs after the sentinel so `#[wasm_bindgen] impl Foreign` still
+	// stamps the file even though its annotation edge is dropped here.
+	dropRustImplEdgesWithoutSource(result, implBlockEdges)
 
 	// Emit the reference-form edges (construction, trait impls / bounds,
 	// casts, path / static access, derive attributes) the declaration-only

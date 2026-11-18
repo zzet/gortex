@@ -337,8 +337,7 @@ func TestRouter_SetDiagnosticsHook_Nil(t *testing.T) {
 }
 
 // TestProvider_CloseDocument_Idempotent — closeDocument deletes the
-// path from openDocs and is a no-op the second time. Sends nil
-// payload to the LSP client when not initialised (test-only path).
+// path from openDocs and is a no-op the second time.
 func TestProvider_CloseDocument_Idempotent(t *testing.T) {
 	p := NewProvider("noop", nil, []string{"go"}, false, 1, zap.NewNop())
 	// Mark the file as open via the internal state — bypasses the
@@ -347,10 +346,14 @@ func TestProvider_CloseDocument_Idempotent(t *testing.T) {
 	p.openDocs["/abs/main.go"] = true
 	p.docMu.Unlock()
 
-	// First close attempts the LSP notification; client is nil so
-	// it would panic — recover to confirm cleanup happened anyway.
-	defer func() { _ = recover() }()
-	_ = p.closeDocument("/abs/main.go")
+	// First close attempts the LSP notification. A closed client
+	// refuses it with an error; a nil client would fault, and a
+	// recovered nil dereference can corrupt the Go heap on some
+	// Windows runners (golang/go#81238).
+	p.client = &Client{closed: true}
+	if err := p.closeDocument("/abs/main.go"); err == nil {
+		t.Fatal("expected the closed client to refuse didClose")
+	}
 
 	p.docMu.RLock()
 	stillOpen := p.openDocs["/abs/main.go"]

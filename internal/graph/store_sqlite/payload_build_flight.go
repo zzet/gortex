@@ -29,17 +29,37 @@ type PayloadBuildFlight struct {
 	leader       bool
 }
 
+// validatePayloadBuildFlight refuses borrowing stale, foreign, or follower
+// ownership. The caller must keep the leader live until the borrower releases
+// its operation and the caller has installed the resulting generation.
+func (s *Store) validatePayloadBuildFlight(f *PayloadBuildFlight, generationID int64) error {
+	if f == nil || f.core != s.storeCore || f.generationID != generationID || !f.leader || f.state == nil {
+		return fmt.Errorf("%w: invalid borrowed payload build flight", ErrCatalogInvalidValue)
+	}
+	current, ok := s.payloadBuildFlights.Load(generationID)
+	if !ok || current != f.state {
+		return fmt.Errorf("%w: borrowed payload build flight is no longer active", ErrCatalogInvalidValue)
+	}
+	select {
+	case <-f.state.done:
+		return fmt.Errorf("%w: borrowed payload build flight has completed", ErrCatalogInvalidValue)
+	default:
+	}
+	return nil
+}
+
 // JoinPayloadBuildFlight coalesces physical payload construction by catalog
 // generation ID. The returned booleans are mutually exclusive:
 //
 //   - leader means the caller owns the physical build and must call Complete;
-//   - ready means an adopted generation became ready before this caller could
-//     join its former flight and can be reused immediately;
+//   - ready means a generation became ready before this caller could join its
+//     former flight and can be reused immediately;
 //   - otherwise the caller is a follower and must call Wait.
 //
 // If an adopted generation is still building but its former process-local
 // flight is gone, this caller becomes the recovery leader. No lock is persisted,
-// so a process restart naturally takes the same recovery path.
+// so a process restart naturally takes the same recovery path. The adopted
+// hint describes allocation history, never current catalog write authority.
 func (s *Store) JoinPayloadBuildFlight(
 	ctx context.Context,
 	generationID int64,
@@ -67,17 +87,21 @@ func (s *Store) JoinPayloadBuildFlight(
 	if loaded {
 		return flight, false, false, nil
 	}
-	if !adopted {
-		return flight, true, false, nil
-	}
-
+	// Pin before observing catalog state so the collector's post-fence ownership
+	// check cannot miss an already admitted physical leader. A losing leader
+	// completes/removes its flight before returning; loaded followers share that
+	// terminal result through the existing rendezvous.
 	generation, found, readErr := s.Catalog().GetViewGeneration(ctx, generationID)
 	if readErr != nil {
 		flight.Complete(readErr)
 		return nil, false, false, readErr
 	}
+	label := "payload generation"
+	if adopted {
+		label = "adopted payload generation"
+	}
 	if !found {
-		readErr = fmt.Errorf("%w: adopted payload generation %d disappeared", ErrCatalogInvalidValue, generationID)
+		readErr = fmt.Errorf("%w: %s %d disappeared", ErrCatalogInvalidValue, label, generationID)
 		flight.Complete(readErr)
 		return nil, false, false, readErr
 	}
@@ -88,7 +112,7 @@ func (s *Store) JoinPayloadBuildFlight(
 	case ViewGenerationBuilding:
 		return flight, true, false, nil
 	default:
-		readErr = fmt.Errorf("%w: adopted payload generation %d is %q", ErrCatalogInvalidValue, generationID, generation.State)
+		readErr = fmt.Errorf("%w: %s %d is %q", ErrCatalogInvalidValue, label, generationID, generation.State)
 		flight.Complete(readErr)
 		return nil, false, false, readErr
 	}

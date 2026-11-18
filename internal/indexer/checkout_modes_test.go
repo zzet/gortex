@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
@@ -581,7 +583,8 @@ func TestPromotionWorkerCoalescesOneDurableTransition(t *testing.T) {
 	require.NoError(t, outcome.err)
 	assert.Equal(t, first.TransitionID, outcome.promotion.TransitionID)
 
-	require.NoError(t, f.lc.resumeModeTransitions(context.Background()))
+	_, err = f.lc.resumeModeTransitions(context.Background())
+	require.NoError(t, err)
 	f.lc.transitionMu.Lock()
 	_, retained := f.lc.transitionRuns[first.TransitionID]
 	f.lc.transitionMu.Unlock()
@@ -601,10 +604,20 @@ func TestSeedResumesDurablePromotion(t *testing.T) {
 		})
 	require.NoError(t, err)
 	f.restart()
+	core, logs := observer.New(zap.InfoLevel)
+	f.lc.logger = zap.New(core)
+	f.mi.logger = zap.New(core)
 	require.NoError(t, f.lc.Seed(ctx))
+	stages := logs.FilterMessage("checkout lifecycle seed stage completed").FilterField(zap.String("stage", "resume_mode_transitions")).All()
+	require.Len(t, stages, 1)
+	assert.Equal(t, int64(1), stages[0].ContextMap()["resumed_transitions"])
 
 	outcome := awaitModeTransition(t, f.lc, transition.TransitionID)
 	require.NoError(t, outcome.err)
+	indexes := logs.FilterMessage("indexer: full index started").All()
+	require.Len(t, indexes, 1)
+	assert.Equal(t, "checkout_promotion", indexes[0].ContextMap()["origin"])
+	assert.Equal(t, outcome.promotion.Prefix, indexes[0].ContextMap()["repo"])
 	checkout, found, err := f.catalog.GetCheckout(ctx, f.automatic.CheckoutID)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -924,6 +937,11 @@ func TestUntrackAPrimaryRetiresItsClosure(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, UntrackPlanPrimaryClosure, result.Plan)
 	assert.Equal(t, []string{string(TrackSourceCLI)}, result.Revoked)
+
+	// Pending is an admitted cleanup, not its terminal retirement.
+	if result.Pending {
+		finishRepositoryCleanup(t, f.lc, f.mainPrefix)
+	}
 
 	assert.Nil(t, f.mi.GetMetadata(f.mainPrefix), "the primary corpus is gone")
 	_, found, err := f.catalog.GetDedicatedGraph(ctx, f.primaryGraph)

@@ -51,12 +51,7 @@ func selectEdgeOriginsTx(tx *sql.Tx, viewGen int64, updates []graph.EdgeProvenan
 			args = append(args, key.from, key.to, string(key.kind), key.filePath, key.line)
 		}
 		args = append(args, viewGen)
-		rows, err := tx.Query(`WITH wanted(from_id,to_id,kind,file_path,line) AS (VALUES `+values.String()+`)
-SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line, e.origin
-FROM wanted AS w
-JOIN edges AS e
-  ON e.from_id = w.from_id AND e.to_id = w.to_id AND e.kind = w.kind
- AND e.file_path = w.file_path AND e.line = w.line AND e.view_gen = ?`, args...)
+		rows, err := tx.Query(edgeOriginsByIdentitySQL(values.String()), args...)
 		if err != nil {
 			return nil, statements, err
 		}
@@ -82,6 +77,16 @@ JOIN edges AS e
 	return origins, statements, nil
 }
 
+// CROSS JOIN keeps the identity list outer under stale planner statistics.
+func edgeOriginsByIdentitySQL(values string) string {
+	return `WITH wanted(from_id,to_id,kind,file_path,line) AS (VALUES ` + values + `)
+SELECT e.from_id, e.to_id, e.kind, e.file_path, e.line, e.origin
+FROM wanted AS w
+CROSS JOIN edges AS e
+  ON e.from_id = w.from_id AND e.to_id = w.to_id AND e.kind = w.kind
+ AND e.file_path = w.file_path AND e.line = w.line AND e.view_gen = ?`
+}
+
 func updateEdgeProvenanceTx(tx *sql.Tx, viewGen int64, states []provenanceFinalState) (int, error) {
 	statements := 0
 	for start := 0; start < len(states); start += provenanceUpdateChunkSize {
@@ -98,14 +103,14 @@ func updateEdgeProvenanceTx(tx *sql.Tx, viewGen int64, states []provenanceFinalS
 				state.key.from, state.key.to, string(state.key.kind), state.key.filePath, state.key.line)
 		}
 		args = append(args, viewGen)
-		_, err := tx.Exec(`WITH updates(origin,tier,from_id,to_id,kind,file_path,line) AS (VALUES `+values.String()+`)
+		_, err := countEdgeWrite(tx.Exec(`WITH updates(origin,tier,from_id,to_id,kind,file_path,line) AS (VALUES `+values.String()+`)
 UPDATE edges AS e
 SET origin = u.origin, tier = u.tier
 FROM updates AS u
 WHERE e.from_id = u.from_id AND e.to_id = u.to_id AND e.kind = u.kind
   AND e.file_path = u.file_path AND e.line = u.line
   AND e.view_gen = ?
-  AND (e.origin IS NOT u.origin OR e.tier IS NOT u.tier)`, args...)
+  AND (e.origin IS NOT u.origin OR e.tier IS NOT u.tier)`, args...))
 		statements++
 		if err != nil {
 			return statements, err
@@ -183,7 +188,7 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 			}
 			analysisInvalidated := s.analysisGenerationPresent
 			if analysisInvalidated {
-				if invalidateErr := invalidateAnalysisGenerationTx(tx); invalidateErr != nil {
+				if invalidateErr := s.invalidateAnalysisViewTx(tx); invalidateErr != nil {
 					err = invalidateErr
 					return
 				}
@@ -200,9 +205,9 @@ func (s *Store) setEdgeProvenanceBatchSetOriented(batch []graph.EdgeProvenanceUp
 			}
 			committed = true
 			if analysisInvalidated {
-				s.analysisGenerationPresent = false
+				s.analysisGenerationPresent = s.analysisLatchRemaining
 			}
-			s.edgeIdentityRevs.Add(int64(chunkChanged))
+			s.noteEdgeIdentityRevisions(int64(chunkChanged))
 			s.finishAnalysisMutationLocked(true)
 			totalChanged += chunkChanged
 		}()

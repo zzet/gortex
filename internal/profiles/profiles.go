@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/zzet/gortex/internal/platform"
 )
@@ -228,53 +227,21 @@ func ActiveHookTier() HookTier {
 // refreshes ActiveFileName to a byte copy of the active profile.
 // Idempotent: unchanged files are not rewritten (no spurious mtime
 // bumps on re-install).
-func Generate(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	for _, p := range Table() {
-		if err := writeIfChanged(filepath.Join(dir, p.Name+".md"), []byte(p.Body())); err != nil {
-			return fmt.Errorf("profile %s: %w", p.Name, err)
-		}
-	}
-	return refreshActiveCopy(dir, Active(dir))
+func Generate(dir string, binaryVersion ...string) error {
+	_, err := rewriteGeneratedProfiles(dir, "", optionalBinaryVersion(binaryVersion), false)
+	return err
 }
 
-// Switch makes name the active profile: regenerates the profile
-// files, atomically replaces ActiveFileName with a copy of
-// <name>.md, and records the state. It does NOT touch skills or any
-// agent config — the cmd layer orchestrates those so this package
-// stays a leaf. The change applies to NEW sessions only: instructions
-// files, tools/list, and skills are all loaded at session start.
-func Switch(dir, name string) (Profile, error) {
+// Switch changes only generated profiles and the stored selection. Production
+// callers pass their canonical version; unversioned library callers retain the
+// compatibility API without claiming a binary version they do not know.
+func Switch(dir, name string, binaryVersion ...string) (Profile, error) {
 	p, ok := ByName(name)
 	if !ok {
 		return Profile{}, fmt.Errorf("unknown instruction profile %q (known: %s)", name, strings.Join(Names(), ", "))
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return Profile{}, err
-	}
-	for _, q := range Table() {
-		if err := writeIfChanged(filepath.Join(dir, q.Name+".md"), []byte(q.Body())); err != nil {
-			return Profile{}, fmt.Errorf("profile %s: %w", q.Name, err)
-		}
-	}
-	if err := refreshActiveCopy(dir, p); err != nil {
-		return Profile{}, err
-	}
-	st, err := json.Marshal(state{Name: name, SwitchedAt: time.Now().UTC().Format(time.RFC3339)})
-	if err != nil {
-		return Profile{}, err
-	}
-	if err := atomicWrite(filepath.Join(dir, stateFileName), append(st, '\n')); err != nil {
-		return Profile{}, err
-	}
-	return p, nil
-}
-
-// refreshActiveCopy atomically replaces active.md with p's body.
-func refreshActiveCopy(dir string, p Profile) error {
-	return atomicWrite(filepath.Join(dir, ActiveFileName), []byte(p.Body()))
+	_, err := rewriteGeneratedProfiles(dir, name, optionalBinaryVersion(binaryVersion), false)
+	return p, err
 }
 
 // writeIfChanged writes content to path unless it is already
@@ -307,7 +274,7 @@ func atomicWrite(path string, content []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := platform.ReplaceFile(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return err
 	}

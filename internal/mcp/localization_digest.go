@@ -1473,6 +1473,12 @@ func refreshLocalizationDigestResponses(digest *localizationEvidenceDigest, task
 // step, and the refinement contract it carries is byte-budgeted.
 const localizationAnswerClaimDiscipline = "Name only symbols this page lists or a permitted call already returned."
 
+// localizationNewUserTaskRelease names the only exit from a terminal page.
+// Every later navigation call in the session replays this evidence, so a
+// caller whose user has moved on to another request must be told how to
+// start it; without this line the release exists only in code.
+const localizationNewUserTaskRelease = `If the user has since asked something else, start that request with explore(operation:"localize", task:"<request>", options:{new_user_task:true}).`
+
 // The directive is the only instruction the caller sees on a terminal page, so
 // it names the one failure mode measurement keeps finding: an answer that
 // paraphrases the located identifier into a neighbouring one it inferred from
@@ -1487,7 +1493,7 @@ const localizationAnswerClaimDiscipline = "Name only symbols this page lists or 
 // caller's own statements against 2% on pages without it. Ask for the answer,
 // name what the answer should carry, and leave the caller free to disagree —
 // its disagreement is right more often than not.
-const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not. " + localizationAnswerClaimDiscipline
+const localizationAnswerReadyDirective = "Localization for this task is complete. Answer now from this evidence, naming the files and symbols you rely on. If it does not fit the request, say so and name what does — your judgement about the code is welcome, another navigation call is not. " + localizationAnswerClaimDiscipline + " " + localizationNewUserTaskRelease
 
 // The same instruction as a closing line is read after the answer is already
 // shaped, which is why it is obeyed at a rate indistinguishable from absence.
@@ -1501,7 +1507,7 @@ const localizationAnswerShapeDirective = "ANSWER WITH: the 2-3 strongest candida
 // localizationUnconfirmedAnswerDirective closes a page that terminates without
 // corroboration. It must not read as the proven directive: the caller has to
 // know the bounded allowance ran out and the candidates were never confirmed.
-const localizationUnconfirmedAnswerDirective = "The bounded localization allowance is spent and nothing corroborated these candidates. Answer now from them, naming the files and symbols you rely on, and say plainly that the match is unconfirmed. " + localizationAnswerClaimDiscipline
+const localizationUnconfirmedAnswerDirective = "The bounded localization allowance is spent and nothing corroborated these candidates. Answer now from them, naming the files and symbols you rely on, and say plainly that the match is unconfirmed. " + localizationAnswerClaimDiscipline + " " + localizationNewUserTaskRelease
 
 const (
 	localizationAnswerHeading      = "LOCALIZATION:"

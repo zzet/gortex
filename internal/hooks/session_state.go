@@ -23,6 +23,13 @@ type sessionState struct {
 	// Gortex MCP tool this session. ModeConsultUnlock keys the
 	// deny→additionalContext downgrade on it.
 	GraphConsulted bool `json:"graph_consulted,omitempty"`
+	// MutationRefusals is the legacy-daemon fallback, keyed by exact checkout
+	// root. Each timestamp expires after ten minutes; modern ready/read_only
+	// coverage wins without rewriting this record in PreToolUse.
+	MutationRefusals map[string]int64 `json:"mutation_refusals,omitempty"`
+	// Retain the original identity too: filename sanitization may map distinct
+	// host session IDs to one spelling; that must never share an allowance.
+	MutationRefusalSession string `json:"mutation_refusal_session,omitempty"`
 	// NonSymbolicStreak counts consecutive non-symbolic fallback tool
 	// calls (Read / Grep / Glob) since the last symbolic call or nudge.
 	// ModeAdaptiveNudge fires a soft-deny when it crosses the threshold.

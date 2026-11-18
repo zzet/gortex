@@ -24,14 +24,31 @@ import "github.com/zzet/gortex/internal/graph"
 // this file's symbols. The per-file resolve runs single-goroutine under r.mu,
 // so this field needs no extra synchronisation.
 func (r *Resolver) SetIncrementalSkip(priorUnresolved []*graph.Edge) {
+	r.incrementalTerminals = nil
 	if len(priorUnresolved) == 0 {
 		r.incrementalSkip = nil
 		return
 	}
 	skip := make(map[string]struct{}, len(priorUnresolved))
+	terminalOverflow := false
 	for _, e := range priorUnresolved {
 		if e != nil {
 			skip[r.edgeShape(e)] = struct{}{}
+			if !terminalOverflow && edgeTerminalFlag(e) && e.FilePath != "" && e.Line > 0 {
+				if r.incrementalTerminals == nil {
+					r.incrementalTerminals = make(map[graph.EdgeIdentity]*graph.Edge)
+				}
+				prior := *e
+				prior.Meta = make(map[string]any, len(e.Meta))
+				for key, value := range e.Meta {
+					prior.Meta[key] = value
+				}
+				r.incrementalTerminals[graph.EdgeIdentityFor(e)] = &prior
+				if len(r.incrementalTerminals) > attributionReindexBatchSize {
+					r.incrementalTerminals = nil
+					terminalOverflow = true
+				}
+			}
 		}
 	}
 	r.incrementalSkip = skip

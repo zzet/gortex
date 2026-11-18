@@ -66,16 +66,19 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 	// type referenced twice in the same role on the same line emits one edge.
 	seen := map[string]bool{}
 
-	ownerFor := func(line int) string {
-		if owner := findEnclosingFunc(funcRanges, line); owner != "" {
-			return owner
-		}
-		// Fall back to the enclosing class (a class-level attribute /
-		// inheritance clause is not inside any method) then the file node.
+	typeOwnerFor := func(line int) string {
 		if owner := findEnclosingFunc(typeRanges, line); owner != "" {
 			return owner
 		}
 		return fileID
+	}
+	ownerFor := func(line int) string {
+		if owner := findEnclosingFunc(funcRanges, line); owner != "" {
+			return owner
+		}
+		// Fall back to the enclosing class (a class-level attribute is not
+		// inside any method) then the file node.
+		return typeOwnerFor(line)
 	}
 
 	// emit appends one reference-form edge for a single Capitalized,
@@ -144,8 +147,9 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 			// `class X extends Base` / `interface X extends A, B` — emit one
 			// structural inheritance edge per base
 			// name (PHP single inheritance for classes, but interfaces may
-			// extend several). Attributed to the enclosing class node.
-			owner := ownerFor(line)
+			// extend several). Attributed to the enclosing class node, even when
+			// a method shares the declaration's line.
+			owner := typeOwnerFor(line)
 			for _, name := range phpClauseTypeNames(n, src) {
 				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeExtends, graph.RefContextInherit)
 			}
@@ -154,7 +158,7 @@ func emitPHPReferenceForms(root *sitter.Node, src []byte, filePath, fileID strin
 			// `class X implements I, J` / `interface X extends A, B` — one
 			// conformance edge per named interface. tree-sitter-php represents
 			// interface-to-interface extends with base_clause, handled above.
-			owner := ownerFor(line)
+			owner := typeOwnerFor(line)
 			for _, name := range phpClauseTypeNames(n, src) {
 				emit(name, int(n.StartPoint().Row)+1, owner, graph.EdgeImplements, graph.RefContextInherit)
 			}

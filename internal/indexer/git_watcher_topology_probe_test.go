@@ -10,10 +10,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/thirdparty/fsnotify"
 	"go.uber.org/zap"
 )
 
@@ -776,39 +777,41 @@ func TestGitWatcherTopologyProbeStableTickDoesNotReinventory(t *testing.T) {
 }
 
 func TestGitWatcherTopologyProbeDetectsFirstDirectoryTransitionsPromptly(t *testing.T) {
-	if defaultGitTopologyProbeInterval != time.Second {
-		t.Fatalf("default topology probe interval = %s, want 1s", defaultGitTopologyProbeInterval)
-	}
 	fixture := newTopologyWatchFixture(t, 1)
-	watcher := fixture.watcher(0)
-	watcher.topologyOwned = true
-	watcher.topologyOwnerEpoch = 1
-	watcher.topologyProbeInterval = 10 * time.Millisecond
-	watcher.debounce = 5 * time.Millisecond
-	callbacks := make(chan time.Time, 4)
-	watcher.OnWorktreeChange(func(string) { callbacks <- time.Now() })
-	if err := watcher.refreshTopologyWatchesChecked(); err != nil {
-		t.Fatalf("start topology probe: %v", err)
-	}
-	_ = topologyProbeEpochSnapshot(t, watcher)
-	t.Cleanup(watcher.stopTopologyProbe)
+	synctest.Test(t, func(t *testing.T) {
+		if defaultGitTopologyProbeInterval != time.Second {
+			t.Fatalf("default topology probe interval = %s, want 1s", defaultGitTopologyProbeInterval)
+		}
+		watcher := fixture.watcher(0)
+		watcher.topologyOwned = true
+		watcher.topologyOwnerEpoch = 1
+		watcher.topologyProbeInterval = 10 * time.Millisecond
+		watcher.debounce = 5 * time.Millisecond
+		callbacks := make(chan time.Time, 4)
+		watcher.OnWorktreeChange(func(string) { callbacks <- time.Now() })
+		if err := watcher.refreshTopologyWatchesChecked(); err != nil {
+			t.Fatalf("start topology probe: %v", err)
+		}
+		_ = topologyProbeEpochSnapshot(t, watcher)
+		defer watcher.stopTopologyProbe()
 
-	started := time.Now()
-	if err := os.RemoveAll(fixture.worktreesDir); err != nil {
-		t.Fatalf("remove first worktrees directory: %v", err)
-	}
-	waitForPromptTopologyCallback(t, callbacks, started)
-	callsAfterRemoval := fixture.inventoryCalls.Load()
-	time.Sleep(8 * watcher.topologyProbeInterval)
-	if got := fixture.inventoryCalls.Load(); got != callsAfterRemoval {
-		t.Fatalf("stable absent-directory inventories = %d, want %d", got, callsAfterRemoval)
-	}
+		started := time.Now()
+		if err := os.RemoveAll(fixture.worktreesDir); err != nil {
+			t.Fatalf("remove first worktrees directory: %v", err)
+		}
+		waitForPromptTopologyCallback(t, callbacks, started)
+		callsAfterRemoval := fixture.inventoryCalls.Load()
+		time.Sleep(8 * watcher.topologyProbeInterval)
+		if got := fixture.inventoryCalls.Load(); got != callsAfterRemoval {
+			t.Fatalf("stable absent-directory inventories = %d, want %d", got, callsAfterRemoval)
+		}
 
-	started = time.Now()
-	if err := os.MkdirAll(fixture.worktreesDir, 0o755); err != nil {
-		t.Fatalf("recreate first worktrees directory: %v", err)
-	}
-	waitForPromptTopologyCallback(t, callbacks, started)
+		started = time.Now()
+		if err := os.MkdirAll(fixture.worktreesDir, 0o755); err != nil {
+			t.Fatalf("recreate first worktrees directory: %v", err)
+		}
+		waitForPromptTopologyCallback(t, callbacks, started)
+	})
 }
 
 func waitForPromptTopologyCallback(t *testing.T, callbacks <-chan time.Time, started time.Time) {
@@ -816,7 +819,7 @@ func waitForPromptTopologyCallback(t *testing.T, callbacks <-chan time.Time, sta
 	select {
 	case observed := <-callbacks:
 		if elapsed := observed.Sub(started); elapsed > 250*time.Millisecond {
-			t.Fatalf("topology transition latency = %s, want <=250ms with 10ms test cadence", elapsed)
+			t.Fatalf("topology transition latency = %s, want <=%s with 10ms test cadence", elapsed, 250*time.Millisecond)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("topology probe did not publish the transition promptly")

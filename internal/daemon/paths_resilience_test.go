@@ -50,3 +50,22 @@ func TestIdleTimeoutFromEnvParse(t *testing.T) {
 		t.Errorf("parseIdleTimeout(30m) = %v, want 30m", got)
 	}
 }
+
+func TestStderrLogFilePath(t *testing.T) {
+	dir := t.TempDir()
+	for _, tt := range []struct{ log, want string }{
+		{"daemon.log", "daemon.stderr.log"},
+		{"gortex-daemon.log", "gortex-daemon.stderr.log"},
+		{"custom.log", "custom.stderr.log"},
+		{"custom", "custom.stderr"},
+	} {
+		t.Run(tt.log, func(t *testing.T) {
+			logPath := filepath.Join(dir, tt.log)
+			t.Setenv("GORTEX_DAEMON_LOGFILE", logPath)
+			want := filepath.Join(dir, tt.want)
+			if got := StderrLogFilePath(); got != want {
+				t.Fatalf("StderrLogFilePath() = %q, want %q", got, want)
+			}
+		})
+	}
+}

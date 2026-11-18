@@ -53,13 +53,13 @@ func TestAtomicWriteFileRetriesPastSharingViolation(t *testing.T) {
 
 	h := openExclusiveNoDelete(t, path)
 
-	// Release the handle within the retry budget (~225ms) so a rename that
-	// first fails with a sharing violation later succeeds.
+	// Release the handle beyond the old ~225ms retry budget so this pins the
+	// longer deadline used by editor, antivirus and indexer handles.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(350 * time.Millisecond)
 		_ = syscall.CloseHandle(h)
 	}()
 
@@ -85,7 +85,7 @@ func TestAtomicWriteFileFailsWhenHeldThroughout(t *testing.T) {
 	}
 
 	h := openExclusiveNoDelete(t, path)
-	defer syscall.CloseHandle(h)
+	defer func() { _ = syscall.CloseHandle(h) }()
 
 	if err := AtomicWriteFile(path, []byte("new"), 0o644); err == nil {
 		t.Fatal("expected AtomicWriteFile to fail while the file is held open throughout")

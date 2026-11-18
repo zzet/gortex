@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"iter"
 	"math/bits"
 	"os"
@@ -464,10 +465,8 @@ func removeEdgeFromBucket(bucket map[string][]*Edge, keys map[string][]edgeHash,
 // constructed against this Graph. Per-shard locks protect individual
 // node/edge writes, but resolution phases (ResolveAll, ResolveFile)
 // iterate every shard and mutate edge targets in place — two
-// resolvers racing on the same edge produced the data race that
-// MultiIndexer.indexMultiRepo triggered when its per-repo goroutines
-// each created their own Resolver. Routing every resolver through
-// this single mutex serialises those phases without blocking
+// per-repository resolvers can race on the same shared edge. Routing every
+// resolver through this single mutex serialises those phases without blocking
 // ordinary shard-scoped reads and writes.
 type Graph struct {
 	// shards holds the lock-sharded node/edge maps. Its length is
@@ -694,143 +693,267 @@ func (g *Graph) ResolveMutex() *sync.Mutex {
 	return &g.resolveMu
 }
 
-// ReindexEdges is the batched sibling of ReindexEdge. The in-memory
-// store has no per-call commit overhead so the implementation is a
-// straight loop; the value of the batch API lives in the disk
-// backends, where it collapses N transaction commits into one.
+// ReindexEdges frees all old identities before it assigns new ones, so a
+// moving edge cannot converge onto a sibling that is also moving in this batch.
+// A stationary destination keeps its payload unless this batch refreshes it;
+// the first mover in batch order wins a fresh key. Losing rows create no new
+// resolver work. Surviving outgoing slots keep their relative order, but a
+// converged bucket can differ from the old swap-with-last removal order.
+//
+// Every touched shard stays write-locked for the whole batch, including both
+// phases and compaction. Large batches can therefore hold all shards at once.
+// Production callers use private staging graphs, not a shared in-memory store.
+// Payloads are snapshotted before overwriting stored pointers, including live
+// caller edges.
 func (g *Graph) ReindexEdges(batch []EdgeReindex) {
+	receiptActive := g.beginReceiptMutation()
+	if receiptActive {
+		defer g.endReceiptMutation()
+	}
+	for _, r := range batch {
+		if r.Edge != nil && r.RefreshIdentity {
+			g.markMutationReceiptsIncomplete()
+		}
+	}
+	for _, edge := range g.reindexEdges(batch) {
+		g.recordReindexedEdgeForReceipts(edge)
+	}
+}
+
+// reindexEdges chooses payloads before returning the winning rows that create
+// resolver work. DeltaWriter can therefore keep refresh receipts exact without
+// choosing a different convergence rule.
+func (g *Graph) reindexEdges(batch []EdgeReindex) []*Edge {
+	touched := make([]bool, g.shardCount)
 	mutated := false
 	for _, r := range batch {
 		if r.Edge == nil {
 			continue
 		}
 		mutated = true
-		oldKind := r.OldKind
-		if oldKind == "" {
-			oldKind = r.Edge.Kind
-		}
-		if !r.RefreshIdentity {
-			g.reindexEdge(r.Edge, r.OldTo, oldKind)
-			continue
-		}
 		oldFrom := r.OldFrom
-		if oldFrom == "" {
+		if oldFrom == "" || !r.RefreshIdentity {
 			oldFrom = r.Edge.From
 		}
-		g.refreshEdgeIdentity(r.Edge, oldFrom, r.OldTo, oldKind, r.OldFilePath, r.OldLine)
+		for _, id := range []string{oldFrom, r.OldTo, r.Edge.From, r.Edge.To} {
+			touched[g.shardIdx(id)] = true
+		}
+	}
+	for i, lock := range touched {
+		if lock {
+			g.shards[i].mu.Lock()
+		}
+	}
+	defer func() {
+		for i := len(touched) - 1; i >= 0; i-- {
+			if touched[i] {
+				g.shards[i].mu.Unlock()
+			}
+		}
+	}()
+
+	repoOf := func(s *shard, id string) string {
+		if src := s.nodes[id]; src != nil {
+			return src.RepoPrefix
+		}
+		return ""
+	}
+	// oldFrom is the outgoing bucket that held the edge and pos its slot
+	// there; oldFrom is empty for an edge with no outgoing slot. oldKey and
+	// newKey hash the row's identity before and after the move.
+	type pendingEdge struct {
+		stored         *Edge
+		updated        Edge
+		oldFrom        string
+		pos            int
+		oldKey, newKey edgeHash
+	}
+	pending := make([]pendingEdge, 0, len(batch))
+	// created maps a new identity to the first pending row that claims it, and
+	// moving holds the stored identities moved away. Only a row whose old
+	// identity has no outgoing slot reads them, so they are built from pending
+	// at the first such row and kept current after it.
+	var created map[edgeHash]int
+	var moving map[edgeHash]bool
+	buildFoldIndexes := func() {
+		if created != nil {
+			return
+		}
+		created = make(map[edgeHash]int, len(batch))
+		moving = make(map[edgeHash]bool, len(batch))
+		for i := range pending {
+			if pending[i].oldFrom != "" {
+				moving[pending[i].oldKey] = true
+			}
+			if _, ok := created[pending[i].newKey]; !ok {
+				created[pending[i].newKey] = i
+			}
+		}
+	}
+	var receiptRows map[edgeHash]*Edge
+	if g.mutationReceipts.activeCount.Load() != 0 {
+		receiptRows = make(map[edgeHash]*Edge)
+	}
+	for _, r := range batch {
+		if r.Edge == nil {
+			continue
+		}
+		e := r.Edge
+		old := *e
+		old.To = r.OldTo
+		if r.OldKind != "" {
+			old.Kind = r.OldKind
+		}
+		if r.RefreshIdentity {
+			if r.OldFrom != "" {
+				old.From = r.OldFrom
+			}
+			old.FilePath = r.OldFilePath
+			old.Line = r.OldLine
+		}
+		oldKey := hashEdgeKey(keyOf(&old))
+		sFrom := g.shardFor(old.From)
+		pos, exists := sFrom.outEdgeIdx[old.From][oldKey]
+		newKey := hashEdgeKey(keyOf(e))
+		if !exists || pos >= len(sFrom.outEdges[old.From]) {
+			buildFoldIndexes()
+			if moving[oldKey] {
+				continue // A preceding move already consumed this stored identity.
+			}
+			if i, ok := created[oldKey]; ok {
+				// Fold an intermediate identity into its original outgoing slot.
+				delete(created, oldKey)
+				p := pending[i]
+				pending[i].stored = nil
+				p.updated = *e
+				p.newKey = newKey
+				if _, exists := created[newKey]; !exists {
+					created[newKey] = len(pending)
+				}
+				// Choose winners at this row's position in batch order.
+				pending = append(pending, p)
+				continue
+			}
+			if !r.RefreshIdentity {
+				// Preserve the To-only path's incoming update for detached edges.
+				sTo := g.shardFor(old.To)
+				removeEdgeFromBucket(sTo.inEdges, sTo.inEdgeKeys, sTo.inEdgeIdx, old.To, oldKey)
+				pending = append(pending, pendingEdge{stored: e, updated: *e, newKey: newKey})
+			}
+			continue
+		}
+		stored := sFrom.outEdges[old.From][pos]
+		if oldKey == newKey {
+			// A payload-only refresh keeps its identity and both slots.
+			if receiptRows != nil && r.RefreshIdentity && !deltaEdgeContentEqual(stored, e) {
+				receiptRows[oldKey] = stored
+			}
+			sFrom.repoEdgeRemove(repoOf(sFrom, old.From), stored)
+			*stored = *e
+			sFrom.repoEdgeAdd(repoOf(sFrom, e.From), stored)
+			continue
+		}
+		// Free only the old key; the slot stays until the second phase.
+		delete(sFrom.outEdgeIdx[old.From], oldKey)
+		if created != nil {
+			moving[oldKey] = true
+			if _, exists := created[newKey]; !exists {
+				created[newKey] = len(pending)
+			}
+		}
+		pending = append(pending, pendingEdge{stored: stored, updated: *e, oldFrom: old.From, pos: pos, oldKey: oldKey, newKey: newKey})
+		sFrom.repoEdgeRemove(repoOf(sFrom, old.From), &old)
+		sTo := g.shardFor(old.To)
+		removeEdgeFromBucket(sTo.inEdges, sTo.inEdgeKeys, sTo.inEdgeIdx, old.To, oldKey)
+		if r.RefreshIdentity {
+			g.edgeIdentityRevisions.Add(1)
+		}
+	}
+	var dropped map[string]map[int]bool
+	for i := range pending {
+		p := &pending[i]
+		if p.stored == nil {
+			continue // Superseded by a later intermediate-identity move.
+		}
+		e := &p.updated
+		sFrom := g.shardFor(e.From)
+		newKey := p.newKey
+		_, taken := sFrom.outEdgeIdx[e.From][newKey]
+		if p.oldFrom != "" && (p.oldFrom != e.From || taken) {
+			if dropped == nil {
+				dropped = map[string]map[int]bool{}
+			}
+			if dropped[p.oldFrom] == nil {
+				dropped[p.oldFrom] = map[int]bool{}
+			}
+			dropped[p.oldFrom][p.pos] = true
+		}
+		if taken {
+			// A stationary destination (possibly refreshed above) or the
+			// first mover owns this key. Losing rows create no resolver work.
+			continue
+		}
+		*p.stored = p.updated
+		e = p.stored
+		if p.oldFrom != "" {
+			if p.oldFrom == e.From {
+				// Keep the slot so outgoing order does not change.
+				sFrom.outEdgeIdx[e.From][newKey] = p.pos
+				sFrom.outEdgeKeys[e.From][p.pos] = newKey
+			} else {
+				addEdgeToBucket(sFrom.outEdges, sFrom.outEdgeKeys, sFrom.outEdgeIdx, e.From, e)
+			}
+			sFrom.repoEdgeAdd(repoOf(sFrom, e.From), e)
+		}
+		sTo := g.shardFor(e.To)
+		addEdgeToBucket(sTo.inEdges, sTo.inEdgeKeys, sTo.inEdgeIdx, e.To, e)
+		if receiptRows != nil {
+			receiptRows[newKey] = e
+		}
+	}
+	for from, slots := range dropped {
+		g.shardFor(from).dropOutEdgeSlots(from, slots)
 	}
 	if mutated {
-		// ReindexEdges also persists non-key payload changes. The lower-level
-		// helpers already advance edgeMutGen for key moves; this coarse bump
-		// covers same-key metadata/quality updates as a safe invalidation.
 		g.edgeMutGen.Add(1)
 	}
+	var receiptEdges []*Edge
+	for key, edge := range receiptRows {
+		// A later row may have moved a refreshed pointer away from this key.
+		sFrom := g.shardFor(edge.From)
+		pos, exists := sFrom.outEdgeIdx[edge.From][key]
+		if exists && sFrom.outEdges[edge.From][pos] == edge && hashEdgeKey(keyOf(edge)) == key {
+			receiptEdges = append(receiptEdges, edge)
+		}
+	}
+	return receiptEdges
 }
 
-// refreshEdgeIdentity replaces an existing edge in place while repairing the
-// out/in identity sidecars. Keeping the stored pointer preserves AllEdges cache
-// coherence; the watcher uses this for source-span/meta refreshes that must not
-// discard a resolver-selected target.
-func (g *Graph) refreshEdgeIdentity(e *Edge, oldFrom, oldTo string, oldKind EdgeKind, oldFilePath string, oldLine int) {
-	receiptActive := g.beginReceiptMutation()
-	if receiptActive {
-		defer g.endReceiptMutation()
-	}
-	g.markMutationReceiptsIncomplete()
-	if oldFrom != e.From {
-		g.moveEdgeIdentity(e, oldFrom, oldTo, oldKind, oldFilePath, oldLine)
-		return
-	}
-	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
-	defer unlock()
-
-	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: oldKind, FilePath: oldFilePath, Line: oldLine})
-	newKey := hashEdgeKey(keyOf(e))
-	sFrom := g.shardFor(e.From)
-	fromIdx := sFrom.outEdgeIdx[e.From]
-	pos, ok := fromIdx[oldKey]
-	if !ok || pos >= len(sFrom.outEdges[e.From]) {
-		return
-	}
-	stored := sFrom.outEdges[e.From][pos]
-
-	if oldKey != newKey || oldTo != e.To {
-		delete(fromIdx, oldKey)
-		fromIdx[newKey] = pos
-		if keys := sFrom.outEdgeKeys[e.From]; pos < len(keys) {
-			keys[pos] = newKey
+// dropOutEdgeSlots removes the given slots from one outgoing bucket, keeping
+// the order of the rest, and rebuilds the bucket's position index. The index
+// must already hold no key for a dropped slot.
+func (s *shard) dropOutEdgeSlots(from string, slots map[int]bool) {
+	edges, keys := s.outEdges[from], s.outEdgeKeys[from]
+	n := 0
+	for i := range edges {
+		if slots[i] {
+			continue
 		}
-		sOld := g.shardFor(oldTo)
-		removeEdgeFromBucket(sOld.inEdges, sOld.inEdgeKeys, sOld.inEdgeIdx, oldTo, oldKey)
-		*stored = *e
-		sNew := g.shardFor(e.To)
-		addEdgeToBucket(sNew.inEdges, sNew.inEdgeKeys, sNew.inEdgeIdx, e.To, stored)
-		g.edgeIdentityRevisions.Add(1)
+		edges[n], keys[n] = edges[i], keys[i]
+		n++
+	}
+	clear(edges[n:])
+	if n == 0 {
+		delete(s.outEdges, from)
+		delete(s.outEdgeKeys, from)
+		delete(s.outEdgeIdx, from)
 		return
 	}
-	*stored = *e
-}
-
-// moveEdgeIdentity is the source-moving sibling of refreshEdgeIdentity. A
-// returns_to materialization changes From from the enclosing caller to the
-// resolved callee, so both adjacency buckets and the source-repository count
-// must move together. The old identity is removed exactly (including source
-// location) and the new identity keeps AddEdge's collision semantics.
-func (g *Graph) moveEdgeIdentity(e *Edge, oldFrom, oldTo string, oldKind EdgeKind, oldFilePath string, oldLine int) {
-	unlock := g.lockFourWrite(oldFrom, e.From, oldTo, e.To)
-	defer unlock()
-
-	oldKey := hashEdgeKey(edgeKey{
-		From: oldFrom, To: oldTo, Kind: oldKind,
-		FilePath: oldFilePath, Line: oldLine,
-	})
-	sOldFrom := g.shardFor(oldFrom)
-	fromIdx := sOldFrom.outEdgeIdx[oldFrom]
-	pos, ok := fromIdx[oldKey]
-	if !ok || pos >= len(sOldFrom.outEdges[oldFrom]) {
-		return
+	s.outEdges[from], s.outEdgeKeys[from] = edges[:n], keys[:n]
+	idx := s.outEdgeIdx[from]
+	for i, k := range keys[:n] {
+		idx[k] = i
 	}
-	stored := sOldFrom.outEdges[oldFrom][pos]
-	if stored == nil {
-		return
-	}
-	oldStored := *stored
-	oldStored.From = oldFrom
-	oldStored.To = oldTo
-	oldStored.Kind = oldKind
-	oldStored.FilePath = oldFilePath
-	oldStored.Line = oldLine
-	var oldRepo string
-	if src := sOldFrom.nodes[oldFrom]; src != nil {
-		oldRepo = src.RepoPrefix
-	}
-
-	removeEdgeFromBucket(sOldFrom.outEdges, sOldFrom.outEdgeKeys, sOldFrom.outEdgeIdx, oldFrom, oldKey)
-	sOldTo := g.shardFor(oldTo)
-	removeEdgeFromBucket(sOldTo.inEdges, sOldTo.inEdgeKeys, sOldTo.inEdgeIdx, oldTo, oldKey)
-	sOldFrom.repoEdgeRemove(oldRepo, &oldStored)
-
-	*stored = *e
-	sNewFrom := g.shardFor(e.From)
-	inserted, originChanged := addEdgeToBucket(
-		sNewFrom.outEdges, sNewFrom.outEdgeKeys, sNewFrom.outEdgeIdx, e.From, stored,
-	)
-	sNewTo := g.shardFor(e.To)
-	addEdgeToBucket(sNewTo.inEdges, sNewTo.inEdgeKeys, sNewTo.inEdgeIdx, e.To, stored)
-	if inserted {
-		var newRepo string
-		if src := sNewFrom.nodes[e.From]; src != nil {
-			newRepo = src.RepoPrefix
-		}
-		sNewFrom.repoEdgeAdd(newRepo, stored)
-	}
-	if originChanged {
-		g.edgeIdentityRevisions.Add(1)
-	}
-	// Moving source buckets (or collapsing onto an existing identity) changes
-	// the materialized edge set even though the stored pointer is reused.
-	g.edgeMutGen.Add(1)
-	g.edgeIdentityRevisions.Add(1)
 }
 
 // BulkSetCloneShingles is the in-memory implementation of
@@ -1487,7 +1610,7 @@ func (g *Graph) EdgesByKinds(kinds []EdgeKind) iter.Seq[*Edge] {
 // DistinctExternalTargets returns the unique external-shaped destinations for
 // kinds in one shard walk. It keeps only target strings in memory and never
 // materialises the graph's full edge set.
-func (g *Graph) DistinctExternalTargets(kinds []EdgeKind) []string {
+func (g *Graph) DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string {
 	if len(kinds) == 0 {
 		return nil
 	}
@@ -1506,7 +1629,7 @@ func (g *Graph) DistinctExternalTargets(kinds []EdgeKind) []string {
 		s.mu.RLock()
 		for _, edges := range s.outEdges {
 			for _, e := range edges {
-				if e == nil || !isExternalTargetID(e.To) {
+				if e == nil || !isExternalTargetID(e.To) || !strings.HasSuffix(e.FilePath, fileSuffix) {
 					continue
 				}
 				if _, ok := kindSet[e.Kind]; ok {
@@ -1716,6 +1839,10 @@ func (g *Graph) AllEdgesLight(kinds ...EdgeKind) []*Edge {
 // in the disk backend where the equivalent path materialises the full
 // in-edge map.
 func (g *Graph) DeadCodeCandidates(allowedNodeKinds []NodeKind, allowedInEdgeKinds map[NodeKind][]EdgeKind) []*Node {
+	return g.deadCodeCandidates(allowedNodeKinds, allowedInEdgeKinds, nil, OutlineEdgeFilter{})
+}
+
+func (g *Graph) deadCodeCandidates(allowedNodeKinds []NodeKind, allowedInEdgeKinds map[NodeKind][]EdgeKind, prefixes []string, filter OutlineEdgeFilter) []*Node {
 	if len(allowedNodeKinds) == 0 {
 		return nil
 	}
@@ -1731,10 +1858,11 @@ func (g *Graph) DeadCodeCandidates(allowedNodeKinds []NodeKind, allowedInEdgeKin
 	}
 
 	var out []*Node
+	filtering := len(filter.ExcludeKinds)+len(filter.ExcludeNodeKinds)+len(filter.ExcludeNodeIDs) > 0 || filter.ExcludeVia != ""
 	for _, k := range allowedNodeKinds {
 		allowed, hasAllow := allowedSet[k]
 		anyKindCounts := !hasAllow || len(allowed) == 0
-		for n := range g.NodesByKind(k) {
+		for n := range g.NodesByKindInRepos(k, prefixes) {
 			if n == nil {
 				continue
 			}
@@ -1742,6 +1870,9 @@ func (g *Graph) DeadCodeCandidates(allowedNodeKinds []NodeKind, allowedInEdgeKin
 			dead := true
 			for _, e := range incoming {
 				if e == nil {
+					continue
+				}
+				if filtering && !filter.Allows(e, g.GetNode(e.From), n) {
 					continue
 				}
 				if anyKindCounts {
@@ -2379,77 +2510,6 @@ func (g *Graph) lockTwoWrite(idA, idB string) func() {
 	}
 }
 
-// lockThreeWrite locks up to three shards for write in ascending index
-// order, deduplicating any that collide. Used by ReindexEdge, which
-// mutates the From shard's outEdgeIdx plus both in-edge buckets when a
-// resolver step retargets an edge; missing any of the three races with
-// concurrent AddEdge on that shard (bug: "concurrent map read and map
-// write" in addEdgeToBucket).
-func (g *Graph) lockThreeWrite(idA, idB, idC string) func() {
-	a, b, c := g.shardIdx(idA), g.shardIdx(idB), g.shardIdx(idC)
-	// Sort (a, b, c) ascending without allocating a slice.
-	if a > b {
-		a, b = b, a
-	}
-	if b > c {
-		b, c = c, b
-	}
-	if a > b {
-		a, b = b, a
-	}
-	// Dedupe: lock each distinct index once.
-	idxs := [3]int{a, -1, -1}
-	n := 1
-	if b != a {
-		idxs[n] = b
-		n++
-	}
-	if c != b && c != a {
-		idxs[n] = c
-		n++
-	}
-	for i := 0; i < n; i++ {
-		g.shards[idxs[i]].mu.Lock()
-	}
-	return func() {
-		for i := n - 1; i >= 0; i-- {
-			g.shards[idxs[i]].mu.Unlock()
-		}
-	}
-}
-
-// lockFourWrite locks the source and target shards for a complete edge
-// identity move. ReindexEdge only changes To and needs three shards;
-// returns_to materialization can also change From and therefore needs four.
-func (g *Graph) lockFourWrite(idA, idB, idC, idD string) func() {
-	idxs := [4]int{
-		g.shardIdx(idA), g.shardIdx(idB),
-		g.shardIdx(idC), g.shardIdx(idD),
-	}
-	// Four-element insertion sort stays allocation-free and makes lock order
-	// deterministic across every source/target collision shape.
-	for i := 1; i < len(idxs); i++ {
-		for j := i; j > 0 && idxs[j] < idxs[j-1]; j-- {
-			idxs[j], idxs[j-1] = idxs[j-1], idxs[j]
-		}
-	}
-	n := 1
-	for i := 1; i < len(idxs); i++ {
-		if idxs[i] != idxs[n-1] {
-			idxs[n] = idxs[i]
-			n++
-		}
-	}
-	for i := 0; i < n; i++ {
-		g.shards[idxs[i]].mu.Lock()
-	}
-	return func() {
-		for i := n - 1; i >= 0; i-- {
-			g.shards[idxs[i]].mu.Unlock()
-		}
-	}
-}
-
 // lockAllWrite / lockAllRead take every shard's lock in order. Used by
 // operations that have to touch the whole graph (AllNodes, Stats,
 // EvictRepo). Callers must match with unlockAllWrite / unlockAllRead.
@@ -2513,6 +2573,9 @@ func (g *Graph) AddNode(n *Node) {
 // across many node inserts targeting the same shard.
 func (g *Graph) addNodeLocked(s *shard, n *Node) {
 	prev, hadPrev := s.nodes[n.ID]
+	if hadPrev && keepSharedNodeCopy(prev, n) {
+		return
+	}
 	// Subtract the previous size/count before overwriting; the new
 	// node's contribution is re-added after the RepoPrefix-preservation
 	// logic below has settled on the final prefix.
@@ -2572,6 +2635,35 @@ func (g *Graph) addNodeLocked(s *shard, n *Node) {
 		addNodeToBucket(s.byRepo, s.byRepoIdx, n.RepoPrefix, n.ID, n)
 	}
 	s.repoNodeAdd(n)
+}
+
+// keepSharedNodeCopy reports that prev, not n, stays the row of a shared
+// registry node two different files emit: an annotation
+// (`annotation::<lang>::<name>`, Meta["synthetic"]) or a string literal
+// (`string::error_msg::…`, `string::log_message::…`, KindString). A
+// declaration's ID embeds its file, so only such nodes arrive from several
+// files, each copy stamped with its own file and line; parse workers add them
+// in whatever order they finish, so "the last add wins" made the stored copy —
+// and so a whole index — depend on scheduling. The copy from the smallest file
+// path is kept instead, whatever the order. Everything else keeps the
+// last-add-wins upsert: a re-add from the same file (a re-parse), a pathless
+// copy on either side, a copy of another kind (a reconcile pass upgrading a
+// contract to a topic) and any other node.
+func keepSharedNodeCopy(prev, n *Node) bool {
+	if prev == nil || n == nil || prev.FilePath == "" || n.FilePath == "" || prev.FilePath == n.FilePath {
+		return false
+	}
+	if prev.Kind != n.Kind {
+		return false
+	}
+	if n.Kind != KindString {
+		prevSynthetic, _ := prev.Meta["synthetic"].(bool)
+		nSynthetic, _ := n.Meta["synthetic"].(bool)
+		if !prevSynthetic || !nSynthetic {
+			return false
+		}
+	}
+	return prev.FilePath < n.FilePath
 }
 
 // AddBatch inserts a set of nodes and edges in shard-grouped passes,
@@ -2898,75 +2990,16 @@ func (e *edgeIdentityError) Error() string {
 		e.edge.From + " -" + string(e.edge.Kind) + "-> " + e.edge.To
 }
 
-// ReindexEdge updates the inEdges index after an edge's To field has
-// been mutated (e.g., by the resolver changing "unresolved::X" to a
-// real target). oldTo is the previous value of e.To before mutation.
-//
-// Three sidecar entries change: the outEdgeIdx key for From (since the
-// edgeKey depends on To), the inEdgeIdx entry on the old target bucket
-// (removed), and the inEdgeIdx entry on the new target bucket (added).
+// ReindexEdge updates both adjacency indexes after e.To has been mutated.
+// oldTo is the previous value. It uses ReindexEdges' convergence rule: an
+// existing destination keeps its payload and the moving edge's slot is dropped.
+// The batch path locks every touched shard and advances the edge mutation revision.
 func (g *Graph) ReindexEdge(e *Edge, oldTo string) {
 	g.reindexEdge(e, oldTo, e.Kind)
 }
 
 func (g *Graph) reindexEdge(e *Edge, oldTo string, oldKind EdgeKind) {
-	if oldTo == e.To && oldKind == e.Kind {
-		return
-	}
-	receiptActive := g.beginReceiptMutation()
-	if receiptActive {
-		defer g.endReceiptMutation()
-	}
-	if receiptActive {
-		// Mirror the SQLite reindex recorder: only a write that leaves the
-		// edge at an unresolved target creates resolver work; replacing a
-		// stub with a resolved target creates none. The source-node lookup
-		// happens before the shard write locks below.
-		g.recordReindexedEdgeForReceipts(e)
-	}
-	// Must lock the From shard too — we mutate sFrom.outEdgeIdx below,
-	// and without its lock a concurrent AddEdge on From panics the
-	// runtime with "concurrent map read and map write".
-	unlock := g.lockThreeWrite(e.From, oldTo, e.To)
-	defer unlock()
-
-	// Old identity uses oldTo; the current edge struct already has the
-	// new To set, so we reconstruct the key before mutation.
-	oldKey := hashEdgeKey(edgeKey{From: e.From, To: oldTo, Kind: oldKind, FilePath: e.FilePath, Line: e.Line})
-	newKey := hashEdgeKey(keyOf(e))
-
-	sFrom := g.shardFor(e.From)
-	// outEdges slot position doesn't move — only the key under which
-	// the sidecar records it changes. Avoid a churn of slice growth by
-	// swapping the sidecar entry in place.
-	//
-	// The parallel outEdgeKeys slice MUST be updated alongside
-	// outEdgeIdx. removeEdgeFromBucket reads outEdgeKeys[pos] to
-	// learn the swapped slot's insertion-time key during swap-with-
-	// last; leaving outEdgeKeys stale here would re-insert the old
-	// key into outEdgeIdx pointing at a swapped position, and the
-	// next swap on that key would compute a pos past the (now
-	// shorter) slice — the exact index-out-of-range panic that
-	// surfaces during evictEdgesLocked when warmup retargets a lot
-	// of edges via ReindexEdge.
-	if fromIdx, ok := sFrom.outEdgeIdx[e.From]; ok {
-		if pos, exists := fromIdx[oldKey]; exists {
-			delete(fromIdx, oldKey)
-			fromIdx[newKey] = pos
-			if keys, ok := sFrom.outEdgeKeys[e.From]; ok && pos < len(keys) {
-				keys[pos] = newKey
-			}
-		}
-	}
-
-	// Move from the old target's inEdges bucket to the new one.
-	sOld := g.shardFor(oldTo)
-	removeEdgeFromBucket(sOld.inEdges, sOld.inEdgeKeys, sOld.inEdgeIdx, oldTo, oldKey)
-	sNew := g.shardFor(e.To)
-	addEdgeToBucket(sNew.inEdges, sNew.inEdgeKeys, sNew.inEdgeIdx, e.To, e)
-	// No edgeMutGen bump here: outEdges retains the same *Edge slot,
-	// and the cached AllEdges slice holds pointers — readers see the
-	// already-mutated e.To via that pointer. The cache stays valid.
+	g.ReindexEdges([]EdgeReindex{{Edge: e, OldTo: oldTo, OldKind: oldKind}})
 }
 
 // GetNode returns a node by ID, or nil if not found.
@@ -4521,6 +4554,17 @@ func bfsHopLess(a, b BFSHop) bool {
 // semantics. Always returns a nil error (the error in the signature is
 // for the disk implementation's query failures).
 func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, limit int) ([]BFSHop, error) {
+	return BFSOf(context.Background(), g, seeds, dir, kinds, maxDepth, limit)
+}
+
+// BFSOf is the canonical hop-set traversal over a selected reader. Adjacency
+// masks are applied by that reader before discovery; physical BFS is never
+// forwarded through a composed or contract-derived edge mask.
+func BFSOf(ctx context.Context, g Reader, seeds []string, dir Direction, kinds []EdgeKind, maxDepth, limit int) ([]BFSHop, error) {
+	ctx = normalizeNameLookupContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(seeds) == 0 {
 		return nil, nil
 	}
@@ -4557,13 +4601,28 @@ func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, l
 			// — matching the CTE's ROW_NUMBER pick.
 			cand := make(map[string]BFSHop)
 			for _, cur := range frontier {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				var edges []*Edge
-				if forward {
+				if typed, ok := g.(KindAdjacencyReader); ok {
+					rows, err := typed.ReadKindAdjacency(ctx, cur, dir, kinds)
+					if err != nil {
+						return nil, err
+					}
+					edges = rows.Edges
+				} else if forward {
 					edges = g.GetOutEdges(cur)
 				} else {
 					edges = g.GetInEdges(cur)
 				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				for _, e := range edges {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					if e == nil {
 						continue
 					}
@@ -4619,7 +4678,7 @@ func (g *Graph) BFS(seeds []string, dir Direction, kinds []EdgeKind, maxDepth, l
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 
 // ExtractCandidates is the in-memory reference implementation of
@@ -4839,99 +4898,7 @@ func (g *Graph) ClassHierarchyTraverse(
 // returns the same projection. The kinds parameter is the set of
 // kinds treated as call targets (function + method).
 func (g *Graph) FileEditingContext(filePath string, kinds []NodeKind) *FileEditingContextResult {
-	if filePath == "" {
-		return nil
-	}
-	nodes := g.GetFileNodes(filePath)
-	if len(nodes) == 0 {
-		return nil
-	}
-	kset := make(map[NodeKind]struct{}, len(kinds))
-	for _, k := range kinds {
-		if k == "" {
-			continue
-		}
-		kset[k] = struct{}{}
-	}
-	res := &FileEditingContextResult{}
-	var fileNodeID string
-	var defNodeIDs []string
-	for _, n := range nodes {
-		if n == nil {
-			continue
-		}
-		if n.Kind == KindFile {
-			res.FileNode = n
-			fileNodeID = n.ID
-			continue
-		}
-		res.Defines = append(res.Defines, n)
-		if _, ok := kset[n.Kind]; ok {
-			defNodeIDs = append(defNodeIDs, n.ID)
-		}
-	}
-	if fileNodeID != "" {
-		for _, e := range g.GetOutEdges(fileNodeID) {
-			if e == nil {
-				continue
-			}
-			if e.Kind == EdgeImports {
-				res.Imports = append(res.Imports, e)
-			}
-		}
-	}
-	if len(defNodeIDs) == 0 {
-		return res
-	}
-	inEdges := g.GetInEdgesByNodeIDs(defNodeIDs)
-	outEdges := g.GetOutEdgesByNodeIDs(defNodeIDs)
-	callerIDSet := make(map[string]struct{})
-	calleeIDSet := make(map[string]struct{})
-	for _, id := range defNodeIDs {
-		for _, e := range inEdges[id] {
-			if e == nil || e.Kind != EdgeCalls {
-				continue
-			}
-			if e.From == "" {
-				continue
-			}
-			callerIDSet[e.From] = struct{}{}
-		}
-		for _, e := range outEdges[id] {
-			if e == nil || e.Kind != EdgeCalls {
-				continue
-			}
-			if e.To == "" {
-				continue
-			}
-			calleeIDSet[e.To] = struct{}{}
-		}
-	}
-	callerIDs := make([]string, 0, len(callerIDSet))
-	for id := range callerIDSet {
-		callerIDs = append(callerIDs, id)
-	}
-	calleeIDs := make([]string, 0, len(calleeIDSet))
-	for id := range calleeIDSet {
-		calleeIDs = append(calleeIDs, id)
-	}
-	callerNodes := g.GetNodesByIDs(callerIDs)
-	calleeNodes := g.GetNodesByIDs(calleeIDs)
-	for _, id := range callerIDs {
-		n := callerNodes[id]
-		if n == nil || n.FilePath == filePath {
-			continue
-		}
-		res.CalledBy = append(res.CalledBy, n)
-	}
-	for _, id := range calleeIDs {
-		n := calleeNodes[id]
-		if n == nil || n.FilePath == filePath {
-			continue
-		}
-		res.Calls = append(res.Calls, n)
-	}
-	return res
+	return FileEditingContextOf(g, filePath, kinds)
 }
 
 // GetFileSubGraph is the in-memory reference implementation of the

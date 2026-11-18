@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -195,8 +196,25 @@ func TestClaudeCodeGlobalModeWritesUserFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", settingsPath, err)
 	}
-	if !strings.Contains(string(body), "mcp__gortex__read") || strings.Contains(string(body), "mcp__gortex__*") || strings.Contains(string(body), "mcp__gortex__edit") {
-		t.Errorf("expected the safe compact permission set in %s, got:\n%s", settingsPath, body)
+	var settings struct {
+		Permissions struct {
+			Allow []string `json:"allow"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		t.Fatalf("parse %s: %v", settingsPath, err)
+	}
+	// Hook matchers also name mutation tools so they can observe refusals.
+	// Only permissions.allow grants automatic approval.
+	wantAllow := []string{
+		"mcp__gortex__analyze", "mcp__gortex__capabilities", "mcp__gortex__change",
+		"mcp__gortex__explore", "mcp__gortex__read", "mcp__gortex__recall",
+		"mcp__gortex__relations", "mcp__gortex__response", "mcp__gortex__search",
+		"mcp__gortex__trace", "mcp__gortex__workspace",
+	}
+	slices.Sort(settings.Permissions.Allow)
+	if !slices.Equal(settings.Permissions.Allow, wantAllow) {
+		t.Errorf("expected safe compact permissions %v in %s, got %v", wantAllow, settingsPath, settings.Permissions.Allow)
 	}
 
 	// CLAUDE.md must contain the marker-fenced rule block when

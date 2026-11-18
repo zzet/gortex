@@ -220,13 +220,43 @@ func startGitBatch(ctx context.Context, repoDir string) (*gitBatch, error) {
 // The caller must hold the owning source's lock: the pipe carries one
 // request and one response at a time.
 func (b *gitBatch) read(oid string) ([]byte, error) {
+	return b.readWithLimit(oid, -1)
+}
+
+// readBounded checks the actual header before allocating any payload. Rejected
+// framing is broken and must be retired by its owner, never drained.
+func (b *gitBatch) readBounded(oid string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 || maxBytes > maxRegularReadBytes {
+		return nil, errors.New("git cat-file: invalid bounded read limit")
+	}
+	return b.readWithLimit(oid, maxBytes)
+}
+
+// Full SHA-256 OID, object type, decimal int64 size and delimiter fit this bound.
+const maxBoundedGitHeaderBytes = 128
+
+func (b *gitBatch) readBoundedHeader() (string, error) {
+	var header [maxBoundedGitHeaderBytes]byte
+	for i := range header {
+		value, err := b.out.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		header[i] = value
+		if value == b.delim {
+			return string(header[:i+1]), nil
+		}
+	}
+	return "", fmt.Errorf("git cat-file: response header exceeds %d bytes", maxBoundedGitHeaderBytes)
+}
+
+func (b *gitBatch) readWithLimit(oid string, maxBytes int64) ([]byte, error) {
 	if b.broken != nil {
 		return nil, b.broken
 	}
 	if !oidPattern.MatchString(oid) {
 		return nil, fmt.Errorf("git cat-file: refusing to request %q: not an object id", oid)
 	}
-
 	req := make([]byte, 0, len(oid)+16)
 	if b.command {
 		req = append(req, "contents "...)
@@ -237,7 +267,13 @@ func (b *gitBatch) read(oid string) ([]byte, error) {
 		return nil, b.fail(fmt.Errorf("git cat-file: write request: %w%s", err, b.stderrSuffix()))
 	}
 
-	header, err := b.out.ReadString(b.delim)
+	var header string
+	var err error
+	if maxBytes >= 0 {
+		header, err = b.readBoundedHeader()
+	} else {
+		header, err = b.out.ReadString(b.delim)
+	}
 	if err != nil {
 		return nil, b.fail(fmt.Errorf("git cat-file: read response: %w%s", err, b.stderrSuffix()))
 	}
@@ -248,11 +284,16 @@ func (b *gitBatch) read(oid string) ([]byte, error) {
 	case len(fields) != 3:
 		return nil, b.fail(fmt.Errorf("git cat-file: unexpected response header %q", header))
 	}
+	if maxBytes >= 0 && (fields[0] != oid || fields[1] != "blob") {
+		return nil, b.fail(fmt.Errorf("git cat-file: bounded blob request %s got unexpected response %q", oid, header))
+	}
 	size, err := strconv.ParseInt(fields[2], 10, 64)
 	if err != nil || size < 0 {
 		return nil, b.fail(fmt.Errorf("git cat-file: unexpected object size in %q", header))
 	}
-
+	if maxBytes >= 0 && (size > maxBytes || size > maxRegularReadBytes) {
+		return nil, b.fail(fmt.Errorf("git object %s size %d exceeds %d: %w", oid, size, maxBytes, ErrRegularFileTooLarge))
+	}
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(b.out, buf); err != nil {
 		return nil, b.fail(fmt.Errorf("git cat-file: read %d bytes of %s: %w%s", size, oid, err, b.stderrSuffix()))

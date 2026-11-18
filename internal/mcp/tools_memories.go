@@ -31,7 +31,7 @@ import (
 func (s *Server) registerMemoriesTools() {
 	s.addTool(
 		mcp.NewTool("store_memory",
-			mcp.WithDescription("Persist a cross-session development memory: an invariant, gotcha, decision, convention, or reference fact that future agents in this workspace should know. Memories are anchored to symbols and/or files, survive across sessions, and are surfaced automatically when their anchors enter an agent's working set. Pass `id` to update an existing memory."),
+			mcp.WithDescription("Persist a cross-session development memory: an invariant, gotcha, decision, convention, or reference fact. Memories are anchored to symbols and/or files, survive across sessions, and are surfaced automatically when their anchors enter an agent's working set. Pass `id` to update an existing memory."),
 			mcp.WithString("body", mcp.Description("Free-form memory text. Symbol IDs (file/path.go::Name) and bare identifier names are auto-linked when they resolve in the graph.")),
 			mcp.WithString("title", mcp.Description("Short caption (one-liner) used as the headline in surface_memories output.")),
 			mcp.WithString("symbol_ids", mcp.Description("Comma-separated primary symbol anchors (e.g. pkg/foo.go::Bar,pkg/foo.go::Baz). At least one of symbol_ids / file_paths is recommended for high-quality surfacing.")),

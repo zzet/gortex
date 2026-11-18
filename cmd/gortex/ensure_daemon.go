@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,7 +13,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/zzet/gortex/internal/daemon"
-	semver "github.com/zzet/gortex/internal/version"
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // daemonDecision is the resolved auto-start outcome.
@@ -23,16 +25,19 @@ const (
 	daemonUnavailable                       // autostart off, or spawn failed/timed out
 )
 
+// spawnLockInactivityTimeout is deliberately an inactivity budget, not a
+// total startup budget. The lock winner holds the spawn lock until the
+// detached child's socket is live; a schema migration can legitimately keep
+// that socket closed for longer than a minute. Fresh PID-bound startup state
+// extends this deadline in the same way spawnDetachedDaemon extends its own
+// wait, while a missing/stale heartbeat still releases callers promptly.
+// Tests shorten it only in an isolated helper process; there is no user
+// configuration or environment override for this production budget.
+var spawnLockInactivityTimeout = 60 * time.Second
+
 const (
-	// spawnLockInactivityTimeout is deliberately an inactivity budget, not a
-	// total startup budget. The lock winner holds the spawn lock until the
-	// detached child's socket is live; a schema migration can legitimately keep
-	// that socket closed for longer than a minute. Fresh PID-bound startup state
-	// extends this deadline in the same way spawnDetachedDaemon extends its own
-	// wait, while a missing/stale heartbeat still releases callers promptly.
-	spawnLockInactivityTimeout = 60 * time.Second
-	spawnLockPollInterval      = 100 * time.Millisecond
-	spawnProgressFreshness     = 10 * time.Second
+	spawnLockPollInterval  = 100 * time.Millisecond
+	spawnProgressFreshness = 10 * time.Second
 	// spawnFailCooldown bounds serial retries of a broken spawn: within
 	// the window at most one spawn attempt runs across contending callers.
 	spawnFailCooldown = 5 * time.Second
@@ -124,57 +129,77 @@ func waitSpawnLockInterval(ctx context.Context, pause time.Duration) error {
 	}
 }
 
-func daemonStartupHeartbeatFresh(now time.Time) bool {
-	state, ok := daemon.ReadRuntimeState()
-	return ok && state.StartupProgressFresh(now, spawnProgressFreshness)
+// daemonStartupHeartbeatWaiter belongs to one contended spawn-lock wait. A
+// fresh pre-socket record may transition to Serving before endpoint visibility
+// reaches this caller. Honor that same process's handoff for one bounded lease;
+// an already-serving daemon must not keep a replacement wait alive forever.
+func daemonStartupHeartbeatWaiter() func(time.Time) bool {
+	return startupHeartbeatWaiterWithOwnerProof(startupRuntimeOwnerMatches)
+}
+
+func startupRuntimeOwnerMatches(state daemon.RuntimeState) bool {
+	if state.ProcessBirthToken == "" {
+		return false
+	}
+	owner, err := platform.CaptureProcessIdentity(state.PID)
+	if err != nil {
+		return false
+	}
+	token, err := owner.Token()
+	if err != nil || token != state.ProcessBirthToken {
+		return false
+	}
+	running, err := owner.Running()
+	return err == nil && running
+}
+
+func startupHeartbeatWaiterWithOwnerProof(ownerMatches func(daemon.RuntimeState) bool) func(time.Time) bool {
+	return startupHeartbeatWaiterWithRuntimeReader(ownerMatches, daemon.ReadRuntimeState)
+}
+
+// The reader seam lets isolated proxy fixtures record the actual read used by
+// the waiter. A second read cannot explain a failed first observation.
+func startupHeartbeatWaiterWithRuntimeReader(ownerMatches func(daemon.RuntimeState) bool, readState func() (daemon.RuntimeState, bool)) func(time.Time) bool {
+	var ownerPID int
+	var ownerBirth string
+	var handoffUntil time.Time
+	return func(now time.Time) bool {
+		state, ok := readState()
+		if !ok {
+			return false
+		}
+		if state.StartupProgressFresh(now, spawnProgressFreshness) {
+			ownerPID, ownerBirth = 0, ""
+			handoffUntil = time.Time{}
+			// Preserve legacy pre-socket waiting, but grant the new Serving lease
+			// only when the recorded incarnation matches the actual live process.
+			if ownerMatches(state) {
+				ownerPID, ownerBirth = state.PID, state.ProcessBirthToken
+				handoffUntil = now.Add(spawnProgressFreshness)
+			}
+			return true
+		}
+		if state.StartupPhase != daemon.StartupServing || ownerPID <= 0 || state.PID != ownerPID || state.ProcessBirthToken != ownerBirth || !now.Before(handoffUntil) || !ownerMatches(state) {
+			return false
+		}
+		// This is a local copy only: reuse the existing timestamp/skew checks
+		// without broadening pre-socket progress semantics for other callers.
+		state.StartupPhase = daemon.StartupOpeningStore
+		return state.StartupProgressFresh(now, spawnProgressFreshness)
+	}
 }
 
 // Injectable seams so the race/fallback/spawn-failure branches are
 // testable without a real daemon.
 var (
-	isDaemonRunning      = daemon.IsRunning
-	spawnDaemon          = spawnBareDaemon
-	stopIntentActive     = daemon.StopIntentActive
-	runningDaemonVersion = dialRunningDaemonVersion
-	binaryVersion        = canonicalVersion
-	stopStaleDaemon      = func() error { return stopRunningDaemon(io.Discard) }
+	waitForDaemonSpawnLock = waitForSpawnLock
+	isDaemonRunning        = daemon.IsRunning
+	spawnDaemon            = spawnBareDaemon
+	stopIntentActive       = daemon.StopIntentActive
+	runningDaemonInfo      = dialRunningDaemonIdentity
+	binaryVersion          = canonicalVersion
+	stopStaleDaemon        = stopDaemonForHandoff
 )
-
-// dialRunningDaemonVersion reports the build the live daemon announces in its
-// handshake ack. ok is false when the daemon cannot be reached or rejects the
-// handshake (a protocol mismatch carries no version to compare).
-func dialRunningDaemonVersion() (string, bool) {
-	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
-	if err != nil {
-		return "", false
-	}
-	defer c.Close()
-	return c.Ack.DaemonVersion, c.Ack.DaemonVersion != ""
-}
-
-// daemonOlderThanBinary reports whether the running daemon is a strictly
-// older release than this binary — the state a package-manager upgrade leaves
-// behind, since the old process keeps running from the replaced image and
-// keeps holding the store lock. Dev builds and unparseable versions never
-// qualify: there is no direction to trust, and replacing in both directions
-// would let two installs keep bouncing one daemon. Only "older" qualifies, so
-// an older CLI never downgrades a newer daemon.
-func daemonOlderThanBinary() bool {
-	local := binaryVersion()
-	if local == "" || local == "v0.0.0-dev" {
-		return false
-	}
-	running, ok := runningDaemonVersion()
-	if !ok || running == "v0.0.0-dev" {
-		return false
-	}
-	d, dErr := semver.Parse(running)
-	l, lErr := semver.Parse(local)
-	if dErr != nil || lErr != nil {
-		return false
-	}
-	return semver.Compare(d, l) < 0
-}
 
 // spawnBareDaemon is the autostart default for spawnDaemon. Autostart has no
 // `daemon start` flags to forward — it is `gortex mcp` / `gortex track`
@@ -193,56 +218,78 @@ func resolveDaemonDecision() daemonDecision {
 // ensureDaemonReady is the lock-protected single-flight critical section,
 // shared by `gortex mcp` and `gortex track`.
 func ensureDaemonReady(autostart bool) daemonDecision {
+	decision, _, _ := ensureDaemonReadyWithError(autostart)
+	return decision
+}
+
+// MCP must retain a failed mismatch handoff as an error, even if the old
+// daemon disappeared: it must never turn that failure into embedded startup.
+func ensureDaemonReadyWithError(autostart bool) (daemonDecision, daemonIdentity, error) {
 	if isDaemonRunning() {
-		if autostart && daemonOlderThanBinary() {
-			return replaceStaleDaemon()
+		identity := runningDaemonInfo()
+		if autostart && identity.olderThan(binaryVersion()) {
+			decision, observedMismatch, err := replaceStaleDaemon(identity)
+			if observedMismatch.mismatch() {
+				return decision, observedMismatch, err
+			}
+			// Compatible release handoffs retain the existing policy: a
+			// failed stop can continue using the old compatible daemon, and
+			// a failed absent spawn can use the configured fallback. A new
+			// protocol refusal observed during replacement stays terminal.
+			if !errors.Is(err, daemon.ErrProtocolVersionMismatch) {
+				err = nil
+			}
+			return decision, daemonIdentity{}, err
 		}
-		return daemonReady
+		if identity.mismatch() {
+			return daemonReady, identity, daemonMismatchError(identity)
+		}
+		return daemonReady, daemonIdentity{}, nil
 	}
 	if !autostart {
-		return daemonUnavailable
+		return daemonUnavailable, daemonIdentity{}, nil
 	}
 	// Respect an explicit `daemon stop`: do not resurrect a daemon the user
 	// deliberately stopped. The mark is cleared by `daemon start` / `restart`.
 	// A suppressed `gortex mcp` either uses an explicitly allowed embedded
 	// server or exits, so this never overrides the user's stay-down intent.
 	if stopIntentActive() {
-		return daemonUnavailable
+		return daemonUnavailable, daemonIdentity{}, nil
 	}
 
 	lockPath := daemon.SpawnLockPath()
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o700)
 	lock := flock.New(lockPath)
 
-	locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+	locked, err := waitForDaemonSpawnLock(context.Background(), lock, spawnLockWaitOptions{
 		daemonRunning:   isDaemonRunning,
-		startupProgress: daemonStartupHeartbeatFresh,
+		startupProgress: daemonStartupHeartbeatWaiter(),
 	})
 	if err != nil || !locked {
 		// Couldn't acquire the lock in time. The winner may have brought
 		// the socket up while we waited — re-probe before giving up.
 		if isDaemonRunning() {
-			return daemonReady
+			return daemonReady, daemonIdentity{}, nil
 		}
-		return daemonUnavailable
+		return daemonUnavailable, daemonIdentity{}, nil
 	}
 	defer func() { _ = lock.Unlock() }()
 
 	// Re-probe inside the lock: a peer may have won the race while we
 	// blocked on the lock.
 	if isDaemonRunning() {
-		return daemonReady
+		return daemonReady, daemonIdentity{}, nil
 	}
 	// A recent failed spawn within the cooldown — skip our own attempt so
 	// K callers don't serially retry a broken spawn.
 	if spawnFailedRecently() {
-		return daemonUnavailable
+		return daemonUnavailable, daemonIdentity{}, nil
 	}
 	if err := spawnDaemon(); err != nil {
 		stampSpawnFailure()
-		return daemonUnavailable
+		return daemonUnavailable, daemonIdentity{}, nil
 	}
-	return daemonAutostarted
+	return daemonAutostarted, daemonIdentity{}, nil
 }
 
 // replaceStaleDaemon swaps a live daemon that is older than this binary for
@@ -255,43 +302,119 @@ func ensureDaemonReady(autostart bool) daemonDecision {
 // the lock, then re-check and find the new daemon current. Any failure to
 // stop leaves the old daemon serving — the proxy's skew warning still tells
 // the user to restart it.
-func replaceStaleDaemon() daemonDecision {
+func replaceStaleDaemon(observed daemonIdentity) (daemonDecision, daemonIdentity, error) {
+	var observedMismatch daemonIdentity
+	if observed.mismatch() {
+		observedMismatch = observed
+	}
 	lockPath := daemon.SpawnLockPath()
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o700)
 	lock := flock.New(lockPath)
 
-	locked, err := waitForSpawnLock(context.Background(), lock, spawnLockWaitOptions{
-		startupProgress: daemonStartupHeartbeatFresh,
+	locked, err := waitForDaemonSpawnLock(context.Background(), lock, spawnLockWaitOptions{
+		startupProgress: daemonStartupHeartbeatWaiter(),
 	})
 	if err != nil || !locked {
-		if isDaemonRunning() {
-			return daemonReady
+		if err == nil {
+			err = context.DeadlineExceeded
 		}
-		return daemonUnavailable
+		return daemonUnavailable, observedMismatch, daemonHandoffError(observed, "wait for spawn lock", err)
 	}
 	defer func() { _ = lock.Unlock() }()
 
-	if !isDaemonRunning() || !daemonOlderThanBinary() {
+	identity := runningDaemonInfo()
+	if identity.mismatch() {
+		observedMismatch = identity
+	}
+	if !isDaemonRunning() || !identity.olderThan(binaryVersion()) {
 		// A peer replaced it (or it went away) while we waited for the lock.
-		if isDaemonRunning() {
-			return daemonReady
+		if identity.mismatch() {
+			return daemonReady, observedMismatch, daemonMismatchError(identity)
 		}
-		return daemonUnavailable
+		if isDaemonRunning() {
+			return daemonReady, observedMismatch, nil
+		}
+		return daemonUnavailable, observedMismatch, daemonHandoffError(observed, "recheck live daemon", daemon.ErrDaemonUnavailable)
 	}
 	// A supervised daemon is bounced through its supervisor, as `daemon
 	// restart` does; a manual stop+start would orphan it from the unit.
 	if serviceActive() {
-		_ = serviceRestart(io.Discard)
-		return daemonReady
+		// The external supervisor query can outlive a concurrent daemon swap.
+		// Recheck its direction before asking the supervisor to restart it.
+		current := runningDaemonInfo()
+		if current.mismatch() {
+			observedMismatch = current
+		}
+		if current.err != nil && !current.mismatch() {
+			return daemonUnavailable, observedMismatch, daemonHandoffError(identity, "recheck supervised daemon", current.err)
+		}
+		if !current.olderThan(binaryVersion()) {
+			if current.mismatch() {
+				return daemonReady, observedMismatch, daemonMismatchError(current)
+			}
+			return daemonReady, observedMismatch, nil
+		}
+		identity = current
+		if err := serviceRestart(io.Discard); err != nil {
+			return daemonReady, observedMismatch, daemonHandoffError(identity, "supervisor restart", err)
+		}
+		current, duringWait, err := waitForReplacementDaemon()
+		if duringWait.mismatch() {
+			observedMismatch = duringWait
+		}
+		if err != nil {
+			failureIdentity := identity
+			if duringWait.mismatch() {
+				failureIdentity = duringWait
+			}
+			return daemonReady, observedMismatch, daemonHandoffError(failureIdentity, "wait for supervised replacement", err)
+		}
+		logDaemonHandoff(identity, current)
+		return daemonReady, observedMismatch, nil
 	}
-	if err := stopStaleDaemon(); err != nil {
-		return daemonReady
+	if err := stopStaleDaemon(identity); err != nil {
+		if errors.Is(err, daemon.ErrProtocolVersionMismatch) {
+			observedMismatch = daemonIdentityFromMismatch(err)
+			return daemonReady, observedMismatch, daemonHandoffError(observedMismatch, "stop old daemon", err)
+		}
+		return daemonReady, observedMismatch, daemonHandoffError(identity, "stop old daemon", err)
+	}
+	// The store-lock wait may have allowed an independently started daemon
+	// to appear. Revalidate under the spawn lock before starting anything.
+	current := runningDaemonInfo()
+	if current.mismatch() {
+		observedMismatch = current
+	}
+	if current.err == nil {
+		if !current.olderThan(binaryVersion()) {
+			logDaemonHandoff(identity, current)
+			return daemonReady, observedMismatch, nil
+		}
+		return daemonReady, observedMismatch, daemonHandoffError(identity, "old daemon still running", fmt.Errorf("shutdown did not retire the old daemon"))
+	}
+	if !errors.Is(current.err, daemon.ErrDaemonUnavailable) {
+		if current.mismatch() {
+			return daemonReady, observedMismatch, daemonMismatchError(current)
+		}
+		return daemonUnavailable, observedMismatch, daemonHandoffError(identity, "recheck daemon after close", current.err)
 	}
 	if err := spawnDaemon(); err != nil {
 		stampSpawnFailure()
-		return daemonUnavailable
+		return daemonUnavailable, observedMismatch, daemonHandoffError(identity, "start replacement", err)
 	}
-	return daemonAutostarted
+	current, duringWait, err := waitForReplacementDaemon()
+	if duringWait.mismatch() {
+		observedMismatch = duringWait
+	}
+	if err != nil {
+		failureIdentity := identity
+		if duringWait.mismatch() {
+			failureIdentity = duringWait
+		}
+		return daemonUnavailable, observedMismatch, daemonHandoffError(failureIdentity, "wait for replacement", err)
+	}
+	logDaemonHandoff(identity, current)
+	return daemonAutostarted, observedMismatch, nil
 }
 
 func spawnFailedRecently() bool {
@@ -306,4 +429,9 @@ func stampSpawnFailure() {
 	path := daemon.SpawnFailMarkerPath()
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = os.WriteFile(path, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o600)
+}
+
+// Only the spawn-lock winner emits this, after the replacement succeeds.
+func logDaemonHandoff(previous, current daemonIdentity) {
+	fmt.Fprintf(os.Stderr, "[gortex mcp] replaced daemon %s (protocol %s) with %s (protocol %d)\n", daemonVersionLabel(previous.version), previous.protocolLabel(), daemonVersionLabel(current.version), current.protocol)
 }

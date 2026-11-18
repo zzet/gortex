@@ -1,0 +1,148 @@
+{
+  "summary": {
+    "total_nodes": 8,
+    "total_edges": 10,
+    "primary_language": "go",
+    "languages": [
+      {
+        "name": "go",
+        "nodes": 5
+      },
+      {
+        "name": "",
+        "nodes": 1
+      },
+      {
+        "name": "python",
+        "nodes": 1
+      },
+      {
+        "name": "rust",
+        "nodes": 1
+      }
+    ]
+  },
+  "communities": {
+    "count": 4,
+    "modularity": 0.75,
+    "top": [
+      {
+        "id": "a",
+        "label": "A",
+        "size": 3,
+        "cohesion": 0.5
+      },
+      {
+        "id": "b",
+        "label": "B",
+        "size": 2,
+        "cohesion": 0.6
+      },
+      {
+        "id": "global",
+        "label": "Global",
+        "size": 1,
+        "cohesion": 0.7
+      },
+      {
+        "id": "stale",
+        "label": "Stale",
+        "size": 0,
+        "cohesion": 0
+      }
+    ]
+  },
+  "hotspots": [
+    {
+      "id": "outside-main",
+      "name": "main",
+      "kind": "function",
+      "file_path": "c/main.py",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    },
+    {
+      "id": "a-lib",
+      "name": "Library",
+      "kind": "function",
+      "file_path": "a/lib.go",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    },
+    {
+      "id": "b-main",
+      "name": "main",
+      "kind": "function",
+      "file_path": "b/main.rs",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    },
+    {
+      "id": "global-main",
+      "name": "main",
+      "kind": "function",
+      "file_path": "external::go:fmt",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    },
+    {
+      "id": "unowned-main",
+      "name": "main",
+      "kind": "function",
+      "file_path": "source.go",
+      "fan_in": 2,
+      "fan_out": 1,
+      "complexity_score": 3
+    }
+  ],
+  "most_imported_files": [
+    {
+      "path": "a/lib.go",
+      "import_count": 4
+    },
+    {
+      "path": "external::go:fmt",
+      "import_count": 2
+    },
+    {
+      "path": "source.go",
+      "import_count": 1
+    }
+  ],
+  "entry_points": [
+    {
+      "id": "a-main",
+      "name": "main",
+      "file_path": "a/main.go"
+    },
+    {
+      "id": "b-main",
+      "name": "main",
+      "file_path": "b/main.rs"
+    },
+    {
+      "id": "outside-main",
+      "name": "main",
+      "file_path": "c/main.py"
+    },
+    {
+      "id": "global-main",
+      "name": "main",
+      "file_path": "external::go:fmt"
+    },
+    {
+      "id": "legacy-main",
+      "name": "main",
+      "file_path": "legacy/main.go"
+    },
+    {
+      "id": "unowned-main",
+      "name": "main",
+      "file_path": "source.go"
+    }
+  ]
+}

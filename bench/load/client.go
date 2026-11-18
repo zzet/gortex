@@ -1,0 +1,467 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"sync"
+	"time"
+)
+
+const maxWireBytes = 64 << 20
+
+const loadWireTools, loadWireToolsMode = "facade-v1", "hide"
+
+type rpcError struct {
+	Code      int            `json:"code"`
+	Message   string         `json:"message"`
+	Data      map[string]any `json:"data,omitempty"`
+	Retriable bool           `json:"-"` // typed tool-result refusal, not a JSON-RPC top-level field
+}
+
+func (e *rpcError) Error() string { return fmt.Sprintf("RPC %d: %s", e.Code, e.Message) }
+
+func (e *rpcError) retryEditProbe() bool {
+	if unknown, _ := e.Data["delivery_unknown"].(bool); unknown {
+		return false
+	}
+	// These are actual front-door shapes: dispatcher -32002 in
+	// mcp_request_lifetime.go, and repo_loading data in
+	// cmd/gortex/daemon_mcp_repo_loading.go. Unknowns stay terminal.
+	if e.Code == -32002 {
+		return true
+	}
+	return e.Retriable || e.Code == -32000 && e.Data["error_code"] == "repo_loading" && e.Data["retryable"] == true
+}
+
+type wireReply struct {
+	ID       json.Number     `json:"id"`
+	Result   json.RawMessage `json:"result"`
+	Error    *rpcError       `json:"error"`
+	Method   string          `json:"method"`
+	Params   json.RawMessage `json:"params"`
+	err      error
+	rawFrame []byte
+	rawBytes int
+}
+
+type notificationObservation struct {
+	Received time.Time       `json:"received"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+type socketClient struct {
+	conn                      net.Conn
+	reader                    *bufio.Reader
+	writeGate                 chan struct{}
+	mu                        sync.Mutex
+	next                      int64
+	pending                   map[int64]chan wireReply
+	capturePending            map[int64]bool // allocated only for opt-in observed calls
+	closed                    error
+	done                      chan struct{}
+	notifies                  []notificationObservation
+	notifyDropped             int
+	version                   string
+	cwd                       string // immutable checkout supplied by the successful handshake
+	offeredTools, offeredMode string
+}
+
+// Per-call values returned to its caller, never a shared last-ID cache. Times
+// retain monotonic readings until the scenario renders relative nanoseconds.
+type wireCallIdentity struct {
+	ID                                                             int64
+	onWriteStart                                                   func(time.Time)
+	failure                                                        *failureWireCapture
+	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
+}
+
+func readWireLine(reader *bufio.Reader) ([]byte, error) {
+	var data []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(data)+len(part) > maxWireBytes {
+			return nil, errors.New("daemon response exceeds 64 MiB")
+		}
+		data = append(data, part...)
+		if err != bufio.ErrBufferFull {
+			return data, err
+		}
+	}
+}
+
+func dialSocket(ctx context.Context, socket, cwd, mode string) (net.Conn, *bufio.Reader, string, error) {
+	return dialSocketSurface(ctx, socket, cwd, mode, loadWireTools, loadWireToolsMode)
+}
+
+// dialSocketSurface negotiates the session's tool surface in the handshake,
+// as the CLI does per connection; the load workload always uses the facade.
+func dialSocketSurface(ctx context.Context, socket, cwd, mode, tools, toolsMode string) (net.Conn, *bufio.Reader, string, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return nil, nil, "", err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	handshake := map[string]any{"version": 1, "mode": mode, "cwd": cwd, "client": "gortex-load", "tools": tools, "tools_mode": toolsMode}
+	if err := json.NewEncoder(conn).Encode(handshake); err != nil {
+		_ = conn.Close()
+		return nil, nil, "", err
+	}
+	reader := bufio.NewReader(conn)
+	line, err := readWireLine(reader)
+	var ack struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error_msg"`
+		Version string `json:"daemon_version"`
+	}
+	if err == nil {
+		err = json.Unmarshal(line, &ack)
+	}
+	if err == nil && !ack.OK {
+		err = fmt.Errorf("handshake refused: %s", ack.Error)
+	}
+	if err == nil {
+		err = conn.SetDeadline(time.Time{})
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, "", err
+	}
+	return conn, reader, ack.Version, nil
+}
+
+func openMCP(ctx context.Context, socket, cwd string) (*socketClient, error) {
+	conn, reader, version, err := dialSocket(ctx, socket, cwd, "mcp")
+	if err != nil {
+		return nil, err
+	}
+	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, cwd: cwd, writeGate: make(chan struct{}, 1)}
+	c.offeredTools, c.offeredMode = loadWireTools, loadWireToolsMode
+	go c.readLoop()
+	if _, err := c.call(ctx, "initialize", map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "gortex-load", "version": "1"}}); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := c.send(ctx, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"}, false); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *socketClient) readLoop() {
+	defer close(c.done)
+	for {
+		line, err := readWireLine(c.reader)
+		if err != nil {
+			c.fail(err)
+			return
+		}
+		var reply wireReply
+		if err := json.Unmarshal(line, &reply); err != nil {
+			c.fail(fmt.Errorf("invalid daemon JSON: %w", err))
+			return
+		}
+		if reply.Method != "" {
+			c.mu.Lock()
+			// Keep invalidation/publication evidence without retaining unbounded
+			// diagnostic notifications throughout a saturation run.
+			if len(c.notifies) < 1000 {
+				c.notifies = append(c.notifies, notificationObservation{Received: time.Now(), Payload: append(json.RawMessage(nil), line...)})
+			} else {
+				c.notifyDropped++
+			}
+			c.mu.Unlock()
+			continue
+		}
+		id, err := strconv.ParseInt(string(reply.ID), 10, 64)
+		if err != nil {
+			c.fail(errors.New("daemon returned non-integer response ID"))
+			return
+		}
+		if reply.Result == nil && reply.Error == nil {
+			c.fail(errors.New("daemon response has neither result nor error"))
+			return
+		}
+		c.mu.Lock()
+		ch := c.pending[id]
+		capture := c.capturePending[id]
+		delete(c.pending, id)
+		delete(c.capturePending, id)
+		c.mu.Unlock()
+		if capture {
+			reply.rawBytes = len(line)
+			if len(line) <= readSourceFailureBytes {
+				reply.rawFrame = append([]byte(nil), line...)
+			}
+		}
+		if ch != nil {
+			ch <- reply
+		}
+	}
+}
+
+func (c *socketClient) fail(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed != nil {
+		return
+	}
+	c.closed = err
+	for id, ch := range c.pending {
+		ch <- wireReply{err: err}
+		delete(c.pending, id)
+		delete(c.capturePending, id)
+	}
+}
+
+func (c *socketClient) Close() error {
+	err := c.conn.Close()
+	<-c.done
+	return err
+}
+
+func (c *socketClient) send(ctx context.Context, value any, advisory bool) error {
+	return c.sendObserved(ctx, value, advisory, nil)
+}
+
+func (c *socketClient) sendObserved(ctx context.Context, value any, advisory bool, observation *wireCallIdentity) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if advisory {
+		select {
+		case c.writeGate <- struct{}{}:
+		default:
+			return nil // cancellation is advisory; never queue behind a writer
+		}
+	} else {
+		select {
+		case c.writeGate <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { <-c.writeGate }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		c.fail(err)
+		_ = c.conn.Close()
+		return err
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		// A canceled partial frame cannot be reused by another request.
+		c.fail(ctx.Err())
+		_ = c.conn.Close()
+		close(interrupted)
+	})
+	if observation != nil {
+		observation.WriteStarted = time.Now()
+		if observation.onWriteStart != nil {
+			observation.onWriteStart(observation.WriteStarted)
+		}
+	}
+	frame := append(data, '\n')
+	written, writeErr := io.Copy(c.conn, bytes.NewReader(frame))
+	err = writeErr
+	if observation != nil && observation.failure != nil {
+		capture := observation.failure
+		capture.requestBytes = int(written)
+		capture.writeCompleted = writeErr == nil && written == int64(len(frame))
+		switch {
+		case written > readSourceFailureBytes:
+			capture.requestStatus = "oversize"
+		case written > 0:
+			capture.request = append([]byte(nil), frame[:int(written)]...)
+			capture.requestStatus = "partial"
+			if capture.writeCompleted {
+				capture.requestStatus = "complete"
+			}
+		}
+	}
+	if observation != nil {
+		observation.WriteFinished = time.Now()
+	}
+	if !stop() {
+		<-interrupted
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		c.fail(err)
+		_ = c.conn.Close()
+	}
+	return err
+}
+
+func (c *socketClient) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	return c.callObserved(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithFailureCapture(ctx context.Context, method string, params any, capture *failureWireCapture) (json.RawMessage, error) {
+	observation := wireCallIdentity{failure: capture}
+	capture.offeredTools, capture.offeredMode, capture.daemonVersion = c.offeredTools, c.offeredMode, c.version
+	data, err := c.callObserved(ctx, method, params, &observation)
+	capture.id = observation.ID
+	return data, err
+}
+
+func (c *socketClient) callWithIdentity(ctx context.Context, method string, params any) (json.RawMessage, wireCallIdentity, error) {
+	return c.callWithWriteObserver(ctx, method, params, nil)
+}
+
+func (c *socketClient) callWithWriteObserver(ctx context.Context, method string, params any, onWriteStart func(time.Time)) (json.RawMessage, wireCallIdentity, error) {
+	var observation wireCallIdentity
+	observation.onWriteStart = onWriteStart
+	data, err := c.callObserved(ctx, method, params, &observation)
+	observation.onWriteStart = nil
+	return data, observation, err
+}
+
+func (c *socketClient) callObserved(ctx context.Context, method string, params any, observation *wireCallIdentity) (json.RawMessage, error) {
+	if observation != nil {
+		observation.Started = time.Now()
+		defer func() { observation.Finished = time.Now() }()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.closed != nil {
+		err := c.closed
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.next++
+	id := c.next
+	if observation != nil {
+		observation.ID = id
+	}
+	ch := make(chan wireReply, 1)
+	c.pending[id] = ch
+	if observation != nil && observation.failure != nil {
+		if c.capturePending == nil {
+			c.capturePending = make(map[int64]bool)
+		}
+		c.capturePending[id] = true
+	}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		delete(c.capturePending, id)
+		c.mu.Unlock()
+	}()
+	if err := c.sendObserved(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false, observation); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		// This is advisory; closing a shared connection here would censor
+		// unrelated burst calls and distort their latency/error samples.
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		_ = c.send(cancelCtx, map[string]any{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": map[string]any{"requestId": id, "reason": ctx.Err().Error()}}, true)
+		cancel()
+		return nil, ctx.Err()
+	case reply := <-ch:
+		if observation != nil {
+			observation.ReplyDelivered = time.Now()
+			if capture := observation.failure; capture != nil && reply.rawBytes > 0 {
+				capture.responseBytes = reply.rawBytes
+				capture.response = reply.rawFrame
+				capture.responseStatus = "complete"
+				if len(reply.rawFrame) == 0 {
+					capture.responseStatus = "oversize"
+				}
+			}
+		}
+		if ctx.Err() != nil {
+			return reply.Result, ctx.Err()
+		}
+		if reply.err != nil {
+			return nil, reply.err
+		}
+		if reply.Error != nil {
+			return reply.Result, reply.Error
+		}
+		return reply.Result, nil
+	}
+}
+
+func control(ctx context.Context, socket, kind string, params any) (json.RawMessage, error) {
+	conn, reader, _, err := dialSocket(ctx, socket, "", "control")
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	if err := json.NewEncoder(conn).Encode(map[string]any{"kind": kind, "params": params}); err != nil {
+		return nil, err
+	}
+	line, err := readWireLine(reader)
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		OK     bool            `json:"ok"`
+		Error  string          `json:"error_msg"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(line, &response); err != nil {
+		return nil, err
+	}
+	if !response.OK {
+		return response.Result, fmt.Errorf("control %s: %s", kind, response.Error)
+	}
+	return response.Result, nil
+}
+
+// textPayload handles the public MCP content envelope, never daemon internals.
+func textPayload(result json.RawMessage, field string) (json.RawMessage, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(result, &envelope); err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(envelope[field], &rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if json.Valid([]byte(row.Text)) {
+			return json.RawMessage(row.Text), nil
+		}
+	}
+	return nil, io.ErrUnexpectedEOF
+}

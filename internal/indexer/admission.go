@@ -92,7 +92,7 @@ func (idx *Indexer) ScopeIndexability(relDir string, budget time.Duration) (inde
 
 	deadline := time.Now().Add(budget)
 	complete := true
-	_ = filepath.WalkDir(abs, func(path string, d fs.DirEntry, walkErr error) error {
+	_ = idx.walkDisk(root, abs, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// An unread subtree may hold source, so the scope is unsettled.
 			complete = false
@@ -106,15 +106,12 @@ func (idx *Indexer) ScopeIndexability(relDir string, budget time.Duration) (inde
 			return errScopeWalkBudget
 		}
 		if d.IsDir() {
-			if idx.admitWalkEntry(root, path, -1, true).pruneDir {
-				return fs.SkipDir
-			}
 			return nil
 		}
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		if !idx.admitWalkFileKnownType(root, path, -1, d.Type()).admit {
+		if !idx.admitFileInOpenDir(root, path, -1, d.Type()).admit {
 			return nil
 		}
 		indexable = true

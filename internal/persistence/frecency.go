@@ -70,11 +70,11 @@ func SaveFrecency(dir string, store *FrecencyStore) error {
 		trim := len(store.Symbols) - maxFrecencySymbols
 		store.Symbols = store.Symbols[trim:]
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := persistDir(dir); err != nil {
 		return fmt.Errorf("persistence: mkdir frecency: %w", err)
 	}
 	path := filepath.Join(dir, frecencyFile)
-	f, err := os.Create(path)
+	f, err := persistFile(path)
 	if err != nil {
 		return fmt.Errorf("persistence: create frecency: %w", err)
 	}

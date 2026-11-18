@@ -15,12 +15,14 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/profiles"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 // TestInitialize_ReturnsInstructions drives a real `initialize`
@@ -70,6 +72,25 @@ func TestServerInstructions_NonEmpty(t *testing.T) {
 }
 
 func TestStateAwareInstructionsWaitForAutomaticFamilyCheckout(t *testing.T) {
+	for _, routed := range []bool{true, false} {
+		name := "routed"
+		if !routed {
+			name = "ready-without-route"
+		}
+		t.Run(name, func(t *testing.T) {
+			v := newViewStack(t)
+			if !routed {
+				require.NoError(t, v.store.Catalog().DeleteCheckoutRoute(t.Context(), viewTestWorktree))
+			}
+			serves, err := v.srv.CheckoutServesCWDChecked(t.Context(), v.worktreeRoot)
+			require.NoError(t, err)
+			require.True(t, serves)
+			got := v.srv.stateAwareInstructions(v.worktreeRoot)
+			require.NotContains(t, got, "awaiting automatic discovery")
+			require.NotContains(t, got, "checkout discovery is pending")
+			require.Contains(t, got, serverInstructions)
+		})
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -80,14 +101,14 @@ func TestStateAwareInstructionsWaitForAutomaticFamilyCheckout(t *testing.T) {
 
 	srv, _ := newWorktreeMCPServer(t, config.RepoEntry{Path: main, Name: "main"})
 	got := srv.stateAwareInstructions(linked)
-	require.Contains(t, got, "awaiting automatic discovery")
+	require.Contains(t, got, "checkout discovery is pending")
 	require.Contains(t, got, "Do not run `gortex track`")
 	require.NotContains(t, got, "`gortex track "+linked+"`")
 	require.Equal(t, 1, strings.Count(got, profiles.WorktreeBranchRoutingPolicy))
 
 	reverseSrv, _ := newWorktreeMCPServer(t, config.RepoEntry{Path: linked, Name: "linked"})
 	reverse := reverseSrv.stateAwareInstructions(main)
-	require.Contains(t, reverse, "awaiting automatic discovery")
+	require.Contains(t, reverse, "checkout discovery is pending")
 	require.Contains(t, reverse, "Do not run `gortex track`")
 	require.NotContains(t, reverse, "`gortex track "+main+"`")
 
@@ -95,6 +116,40 @@ func TestStateAwareInstructionsWaitForAutomaticFamilyCheckout(t *testing.T) {
 	require.NoError(t, os.MkdirAll(unrelated, 0o755))
 	unrelatedInstructions := srv.stateAwareInstructions(unrelated)
 	require.Contains(t, unrelatedInstructions, "gortex track "+unrelated)
+}
+
+func TestPendingTextNoReconnect(t *testing.T) {
+	for _, text := range []string{ServerInstructionsPendingAutomaticCheckout("/checkout"), ServerInstructionsUntracked("/other")} {
+		withoutException := strings.ReplaceAll(text, "no reconnect is needed", "")
+		require.NotContains(t, strings.ToLower(withoutException), "reconnect")
+		require.NotContains(t, text, "may return repo_not_tracked")
+	}
+}
+
+func TestStateAwareInstructionsChecksAdmissionErrors(t *testing.T) {
+	v := newViewStack(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := v.srv.CheckoutServesCWDChecked(ctx, v.worktreeRoot)
+	require.Error(t, err)
+	got := v.srv.stateAwareInstructionsContext(ctx, v.worktreeRoot, serverInstructions)
+	require.Equal(t, CheckoutAdmissionInstructions(v.worktreeRoot, err), got)
+	require.NotContains(t, got, "gortex track")
+}
+
+func TestStateAwareInstructionsGraceAndTransitionDoNotRecommendTrack(t *testing.T) {
+	for _, state := range []store_sqlite.CheckoutState{store_sqlite.CheckoutStateAvailabilityGrace, store_sqlite.CheckoutStateReconciling} {
+		t.Run(string(state), func(t *testing.T) {
+			v := newViewStack(t)
+			gitInitWorktreeRepo(t, v.repoRoot)
+			gitInit(t, v.repoRoot, "worktree", "add", "-q", "-b", "feature", v.worktreeRoot)
+			v.setWorktreeState(t, state)
+			got := v.srv.stateAwareInstructions(v.worktreeRoot)
+			require.Contains(t, got, "checkout discovery is pending")
+			require.Contains(t, got, "view_building")
+			require.NotContains(t, got, "gortex track "+v.worktreeRoot)
+		})
+	}
 }
 
 // TestStateAwareInstructionsVariants proves the F5 contract: the initialize
@@ -124,8 +179,10 @@ func TestStateAwareInstructionsVariants(t *testing.T) {
 	reg.Register(languages.NewGoExtractor())
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,
@@ -186,4 +243,28 @@ func TestStateAwareInstructionsVariants(t *testing.T) {
 		require.Contains(t, instr, "INACTIVE")
 		require.Contains(t, instr, "gortex track "+stranger)
 	})
+}
+
+func TestInitializeSharedTransientGuidanceAcrossStates(t *testing.T) {
+	require.True(t, strings.HasPrefix(codingAgentInstructions, "When Gortex can serve the step: "), "compact workflow must not negate the degraded exception")
+	loading, _, repo := newLoadingServer(t)
+	main := filepath.Join(t.TempDir(), "main")
+	gitInitWorktreeRepo(t, main)
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitInit(t, main, "worktree", "add", "-q", "-b", "feature", linked)
+	routed, _ := newWorktreeMCPServer(t, config.RepoEntry{Path: main, Name: "main"})
+	for _, base := range []string{serverInstructions, codingAgentInstructions} {
+		for name, instructions := range map[string]string{
+			"ready":             routed.stateAwareInstructionsWithBase(main, base),
+			"repo-loading":      loading.stateAwareInstructionsWithBase(repo, base),
+			"pending-discovery": routed.stateAwareInstructionsWithBase(linked, base),
+		} {
+			for _, sentence := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+				require.Contains(t, instructions, sentence, name)
+			}
+			for _, stop := range []string{"integration failure and stop", "integration failure, stop", "Wait for reconciliation and reconnect", "To activate: run"} {
+				require.NotContains(t, instructions, stop, name)
+			}
+		}
+	}
 }

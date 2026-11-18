@@ -3,11 +3,34 @@ package agents
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 )
+
+// PendingAutomaticCheckoutGuidance is shared by initialize and lifecycle hooks.
+// Family recognition does not grant access, and retrying frames rechecks
+// admission without requiring a new MCP session.
+const PendingAutomaticCheckoutGuidance = "This checkout belongs to an already tracked or configured Git family; Gortex is identifying it. " +
+	"Graph calls return `view_building` until discovery completes; retry them, no reconnect is needed. Do not run `gortex track`. " +
+	"Use `gortex repos explain-view` for discovery details; explicit tracking is only for a user-requested separate graph."
+
+// FamilyRepoRoots unions declarations with the live registry without treating
+// either list as an admission decision. The caller supplies its own config.
+func FamilyRepoRoots(registered, configured []string) []string {
+	roots := make([]string, 0, len(registered)+len(configured))
+	for _, group := range [][]string{registered, configured} {
+		for _, root := range group {
+			if root = strings.TrimSpace(root); root != "" {
+				roots = append(roots, root)
+			}
+		}
+	}
+	slices.Sort(roots)
+	return slices.Compact(roots)
+}
 
 // PendingAutomaticCheckout reports whether cwd is inside a Git checkout whose
 // family is already represented by one of trackedRoots, but the checkout
@@ -27,16 +50,25 @@ import (
 // entry, then reuses the indexer's canonical worktree resolver; it never runs
 // Git, starts a daemon, or mutates configuration.
 func PendingAutomaticCheckout(cwd string, trackedRoots []string) bool {
+	_, represented := AutomaticCheckoutFamily(cwd, trackedRoots)
+	return represented != ""
+}
+
+// AutomaticCheckoutFamily returns the nearest Git checkout and the first
+// configured or registered root representing its family. A nonempty second
+// result proves only family identity; callers still decide admission using
+// the registry/catalog. No Git process or configuration write is involved.
+func AutomaticCheckoutFamily(cwd string, knownRoots []string) (checkout, represented string) {
 	root := nearestGitRoot(cwd)
 	if root == "" {
-		return false
+		return "", ""
 	}
 	candidate := indexer.ResolveWorktree(root)
 	if candidate.GitCommonDir == "" {
-		return false
+		return root, ""
 	}
 	candidateCommon := canonicalFamilyPath(candidate.GitCommonDir)
-	for _, trackedRoot := range trackedRoots {
+	for _, trackedRoot := range knownRoots {
 		trackedRoot = strings.TrimSpace(trackedRoot)
 		if trackedRoot == "" {
 			continue
@@ -46,13 +78,17 @@ func PendingAutomaticCheckout(cwd string, trackedRoots []string) bool {
 			continue
 		}
 		if pathkey.EqualPaths(candidateCommon, canonicalFamilyPath(tracked.GitCommonDir)) {
-			return true
+			return root, trackedRoot
 		}
 	}
-	return false
+	return root, ""
 }
 
 func nearestGitRoot(path string) string {
+	return nearestGitRootWithLstat(path, os.Lstat)
+}
+
+func nearestGitRootWithLstat(path string, lstat func(string) (os.FileInfo, error)) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
@@ -66,8 +102,12 @@ func nearestGitRoot(path string) string {
 		current = filepath.Dir(current)
 	}
 	for {
-		if _, err := os.Lstat(filepath.Join(current, ".git")); err == nil {
+		if _, err := lstat(filepath.Join(current, ".git")); err == nil {
 			return current
+		} else if !os.IsNotExist(err) {
+			// A nearer checkout boundary is unknown, not absent. Never
+			// attribute it to an ancestor family on permission/I/O failure.
+			return ""
 		}
 		parent := filepath.Dir(current)
 		if parent == current {

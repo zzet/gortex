@@ -30,7 +30,7 @@ Homebrew strips the `homebrew-` prefix from tap repositories, so `zzet/homebrew-
 irm https://get.gortex.dev/install.ps1 | iex
 ```
 
-Detects the architecture, downloads the signed `gortex_windows_amd64.zip`, verifies the SHA256 against `checksums.txt`, installs `gortex.exe` to `%LOCALAPPDATA%\Programs\gortex`, and adds that directory to your user `PATH`. Re-runs upgrade in place and back up the previous binary as `gortex.exe.previous`.
+Detects the architecture, downloads the signed `gortex_windows_amd64.zip`, verifies the SHA256 against `checksums.txt`, installs `gortex.exe` to `%LOCALAPPDATA%\Programs\gortex`, and adds that directory to your user `PATH`. Re-runs upgrade in place and back up the previous binary as `gortex.exe.previous`. `gortex upgrade` recognises this install and re-runs the installer (`gortex upgrade --run` executes it through `powershell`; pass a version to pin one).
 
 Override defaults via environment variables: `GORTEX_VERSION=v0.15.0` (pin a version), `GORTEX_INSTALL_DIR` (custom install directory), `GORTEX_NO_PATH=1` (skip the PATH update), `GORTEX_NO_VERIFY=1` (skip checksum verification), `GORTEX_FORCE=1` (overwrite without backup). Source: [`scripts/install.ps1`](../scripts/install.ps1).
 
@@ -96,6 +96,19 @@ xattr -d com.apple.quarantine /usr/local/bin/gortex
 ```bash
 gortex version
 ```
+
+## Claude Code plugin
+
+Gortex also ships as a Claude Code plugin with the MCP server, workflow skills, sub-agents and hooks. With the `gortex` binary installed, add the marketplace and install the plugin:
+
+```bash
+claude plugin marketplace add gortexhq/claude-plugin
+claude plugin install gortex@gortex
+```
+
+The plugin covers Claude Code's MCP server, workflow skills, sub-agents and hooks. Running `gortex install` and `gortex init` for Claude Code as well registers Gortex twice, which duplicates them. To avoid that, pass `--agents-skip claude-code` to both. This also skips the `CLAUDE.md` blocks and the per-repo community skills under `.claude/skills/generated/`, which the plugin does not provide.
+
+The workflows appear as `/gortex:<name>`, for example `/gortex:explore`. The marketplace at [gortexhq/claude-plugin](https://github.com/gortexhq/claude-plugin) is generated from this repository by `gortex plugin emit` on each release.
 
 ## System requirements
 
@@ -175,17 +188,25 @@ Expected output ends with `PASSED: SLSA verification passed`.
 
 Requires Go 1.26+ and a C toolchain (the tree-sitter extractors are CGO — no way around it).
 
+When building with gcc, set both flags below to avoid tree-sitter heap corruption
+from strict aliasing ([#821](https://github.com/zzet/gortex/issues/821)). Keep
+`-O2 -g`, because these variables replace Go's default C/C++ flags. Alternatively,
+use `make build`, which sets the flags automatically, or use clang
+(`CC=clang CXX=clang++`).
+
 ```bash
 git clone https://github.com/zzet/gortex.git
 cd gortex
-go build -o gortex ./cmd/gortex/
+CGO_CFLAGS="-O2 -g -fno-strict-aliasing" CGO_CXXFLAGS="-O2 -g -fno-strict-aliasing" \
+  go build -o gortex ./cmd/gortex/
 sudo mv gortex /usr/local/bin/
 ```
 
 Or without cloning:
 
 ```bash
-go install github.com/zzet/gortex/cmd/gortex@latest
+CGO_CFLAGS="-O2 -g -fno-strict-aliasing" CGO_CXXFLAGS="-O2 -g -fno-strict-aliasing" \
+  go install github.com/zzet/gortex/cmd/gortex@latest
 ```
 
 `go install` drops the binary into `$(go env GOBIN)` (default `~/go/bin`) — make sure that's on your `PATH`.

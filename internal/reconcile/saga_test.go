@@ -131,6 +131,7 @@ func TestForgetCheckoutResumesFromEveryPhase(t *testing.T) {
 			seedForgettableCheckout(f, "co-1", "inc-1", "wt", "graph-1")
 			target := sagaTarget{
 				Kind:        sagaForgetCheckout,
+				Cause:       CauseForget,
 				CheckoutID:  "co-1",
 				Incarnation: "inc-1",
 				FamilyID:    f.familyID,

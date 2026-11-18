@@ -24,6 +24,42 @@ func TestQueryOptions_ScopeAllows(t *testing.T) {
 		want bool
 	}{
 		{
+			name: "repo qualified project in shared workspace",
+			opts: QueryOptions{RepoAllow: map[string]bool{"app": true}, ProjectID: "web"},
+			node: node("shared", "web", "app"),
+			want: true,
+		},
+		{
+			name: "repo qualified project excludes sibling project",
+			opts: QueryOptions{RepoAllow: map[string]bool{"app": true}, ProjectID: "web"},
+			node: node("shared", "worker", "app"),
+			want: false,
+		},
+		{
+			name: "repo qualified project excludes sibling repo",
+			opts: QueryOptions{RepoAllow: map[string]bool{"app": true}, ProjectID: "web"},
+			node: node("shared", "web", "sibling"),
+			want: false,
+		},
+		{
+			name: "repo qualified project keeps legacy project fallback",
+			opts: QueryOptions{RepoAllow: map[string]bool{"app": true}, ProjectID: "app"},
+			node: node("shared", "", "app"),
+			want: true,
+		},
+		{
+			name: "repo qualified project admits global external",
+			opts: QueryOptions{RepoAllow: map[string]bool{"app": true}, ProjectID: "web"},
+			node: &graph.Node{ID: "external::go:fmt::Errorf", Kind: graph.KindFunction, FilePath: "external::go:fmt"},
+			want: true,
+		},
+		{
+			name: "project only remains unqualified",
+			opts: QueryOptions{ProjectID: "web"},
+			node: node("shared", "worker", "app"),
+			want: true,
+		},
+		{
 			name: "empty scope allows everything",
 			opts: QueryOptions{},
 			node: node("vio", "", "rate_checkers_detector"),
@@ -154,6 +190,27 @@ func TestQueryOptions_ScopeAllows(t *testing.T) {
 				RepoAllow:   map[string]bool{"other": true},
 			},
 			node: node("gin", "gin", ""),
+			want: false,
+		},
+		{
+			// A global external (no repository, no workspace) is visible
+			// from every scope: find_usages on ext::go:fmt::Errorf must not
+			// read it as outside the session's workspace.
+			name: "a global external passes a workspace scope",
+			opts: QueryOptions{
+				WorkspaceID: "gin",
+				ProjectID:   "gin",
+				RepoAllow:   map[string]bool{"gin": true},
+			},
+			node: &graph.Node{ID: "ext::go:fmt::Errorf", FilePath: "external::go:fmt"},
+			want: true,
+		},
+		{
+			// Only a synthetic external is global: an unowned node at a
+			// source path is not admitted by the carve-out.
+			name: "an unowned node at a source path is rejected by a workspace scope",
+			opts: QueryOptions{WorkspaceID: "gin"},
+			node: &graph.Node{ID: "svc/unowned.go", FilePath: "svc/unowned.go"},
 			want: false,
 		},
 	}

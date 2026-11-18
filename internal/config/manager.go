@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,9 +13,9 @@ import (
 	"sync/atomic"
 
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/excludes"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // ConfigManager merges GlobalConfig + per-repo WorkspaceConfig.
@@ -38,7 +39,14 @@ type ConfigManager struct {
 	// excludeCache memoizes the per-repo `.gitignore` parse and the layered
 	// exclude list so EffectiveExclude — called on every indexer walk and
 	// per-file reconcile — does not re-read and re-merge on every call.
-	excludeCache *excludeCache
+	excludeCache   *excludeCache
+	lookupMu       sync.Mutex
+	lookupGlobal   *GlobalConfig
+	lookupRevision uint64
+	pathSnapshot   *RepoPathSnapshot
+	trackGlobal    *GlobalConfig
+	trackRevision  uint64
+	trackSnapshot  *RepoTrackSnapshot
 }
 
 // NewConfigManager creates a ConfigManager by loading the GlobalConfig
@@ -63,6 +71,37 @@ func NewConfigManager(globalPath string) (*ConfigManager, error) {
 		logger:         zap.NewNop(),
 		excludeCache:   newExcludeCache(),
 	}, nil
+}
+
+// RepoPathLookup reuses one root lookup until global repository settings change.
+// Workspace publications do not rebuild it: daemon warmup publishes once per repo.
+func (cm *ConfigManager) RepoPathLookup() RepoPathLookup {
+	return cm.repoPathLookup(cm.Global())
+}
+
+func (cm *ConfigManager) repoPathLookup(gc *GlobalConfig) RepoPathLookup {
+	return cm.repoPathSnapshot(gc).Lookup
+}
+
+// RepoPathSnapshot reuses canonical roots until the repository settings change.
+func (cm *ConfigManager) RepoPathSnapshot() *RepoPathSnapshot {
+	return cm.repoPathSnapshot(cm.Global())
+}
+
+func (cm *ConfigManager) repoPathSnapshot(gc *GlobalConfig) *RepoPathSnapshot {
+	cm.lookupMu.Lock()
+	defer cm.lookupMu.Unlock()
+	globalConfigMu.Lock()
+	revision := gc.repoRevision
+	if cm.lookupGlobal == gc && cm.lookupRevision == revision && cm.pathSnapshot != nil {
+		globalConfigMu.Unlock()
+		return cm.pathSnapshot
+	}
+	entries := gc.repoEntriesLocked()
+	globalConfigMu.Unlock()
+	cm.pathSnapshot = gc.repoPathSnapshot(entries, pathkey.CanonicalPath)
+	cm.lookupGlobal, cm.lookupRevision = gc, revision
+	return cm.pathSnapshot
 }
 
 // SetLogger sets the logger for the ConfigManager.
@@ -170,6 +209,23 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 	cm.publishWorkspaceConfig(repoPrefix, repoPath, cfg, authoritative)
 }
 
+// PrepareWorkspaceConfig reads a repository's config and excludes without
+// publishing a prefix binding. The returned commit accepts the final prefix
+// and publishes the prepared snapshot without file I/O. Callers recheck
+// ownership before calling it.
+func (cm *ConfigManager) PrepareWorkspaceConfig(repoPrefix, repoPath string, lookup RepoPathLookup) (*Config, func(string)) {
+	workspace, authoritative := cm.readWorkspaceConfig(repoPrefix, repoPath)
+	if !authoritative {
+		workspace = cm.LastGoodWorkspace(repoPrefix, repoPath)
+	}
+	cm.excludeCache.forgetChain(repoPath)
+	cfg := cm.repoConfig(repoPrefix, workspace, repoPath, lookup)
+	return cfg, func(prefix string) {
+		// Publish the same snapshot used to build cfg, even after a rekey.
+		cm.publishPreparedWorkspaceConfig(prefix, repoPath, workspace, authoritative)
+	}
+}
+
 // readWorkspaceConfig reads and parses a repo's `.gortex.yaml`. The second
 // return reports whether the result reflects what is on disk: it is false
 // only when the file exists but could not be read or parsed, in which case
@@ -178,33 +234,47 @@ func (cm *ConfigManager) LoadWorkspaceConfig(repoPrefix, repoPath string) {
 func (cm *ConfigManager) readWorkspaceConfig(repoPrefix, repoPath string) (*Config, bool) {
 	configPath := filepath.Join(repoPath, ".gortex.yaml")
 
+	// The parse uses the same byte parser as ParseWorkspaceFileInto
+	// (yaml.Unmarshal over the caller's seed): what
+	// the daemon ignores here is exactly what `gortex init` warns about
+	// and what `config exclude list` annotates. The seed is repoConfigSeed
+	// so the daemon's index-workers env override survives.
+	cfg := repoConfigSeed()
 	data, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// No workspace config — global defaults will apply.
-			return nil, true
+	if err == nil {
+		err = parseWorkspaceInto(data, cfg)
+	}
+	switch {
+	case err == nil:
+	case os.IsNotExist(err):
+		// No workspace config — global defaults will apply.
+		return nil, true
+	default:
+		// Malformed or unreadable workspace config — log warning, keep
+		// the last good parse rather than silently downgrading the repo
+		// to global defaults on a transient I/O error or a half-saved
+		// edit.
+		msg := "malformed workspace config, keeping the last good parse"
+		var pe *workspaceParseError
+		if !errors.As(err, &pe) {
+			msg = "failed to read workspace config"
 		}
-		cm.logger.Warn("failed to read workspace config",
+		cm.logger.Warn(msg,
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
 			zap.Error(err))
 		return nil, false
 	}
 
-	// Seed with Default() and unmarshal the file OVER it — the same
-	// overlay semantics config.Load() applies. A zero-value seed turned
-	// the file's mere presence into a wholesale replacement: every field
-	// a partial .gortex.yaml didn't mention lost its documented default
-	// (unset index.workers → parse pool of 1, unset
-	// max_parse_bytes_in_flight → admission semaphore disabled).
-	cfg := repoConfigSeed()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		// Malformed workspace config — log warning, keep the last good parse.
-		cm.logger.Warn("malformed workspace config, keeping the last good parse",
+	// yaml.Unmarshal silently drops keys at any depth that it does not
+	// know — most often a mistyped key such as `index.ignore` (the real
+	// ones are top-level exclude / legacy index.exclude). Surface them so
+	// a one-word typo does not silently change what gets indexed.
+	if unknown := unknownWorkspaceKeys(data); len(unknown) > 0 {
+		cm.logger.Warn("workspace config contains keys gortex does not recognize — they are ignored",
 			zap.String("repo", repoPrefix),
 			zap.String("path", configPath),
-			zap.Error(err))
-		return nil, false
+			zap.Strings("keys", unknown))
 	}
 
 	return cfg, true
@@ -224,7 +294,10 @@ func (cm *ConfigManager) publishWorkspaceConfig(repoPrefix, repoPath string, cfg
 	// reindexed, or refreshed — re-discover where its git root is rather
 	// than trusting a shape memoized before the repo existed in this form.
 	cm.excludeCache.forgetChain(repoPath)
+	cm.publishPreparedWorkspaceConfig(repoPrefix, repoPath, cfg, authoritative)
+}
 
+func (cm *ConfigManager) publishPreparedWorkspaceConfig(repoPrefix, repoPath string, cfg *Config, authoritative bool) {
 	cm.mu.Lock()
 	changed := false
 	if repoPath != "" && cm.workspacePaths[repoPrefix] != repoPath {
@@ -233,7 +306,12 @@ func (cm *ConfigManager) publishWorkspaceConfig(repoPrefix, repoPath string, cfg
 	}
 	switch {
 	case !authoritative:
-		// Keep the last good parse.
+		// Keep the final prefix's last good parse. A newly derived prefix
+		// may inherit the same root's fallback when it has no parse yet.
+		if cm.workspace[repoPrefix] == nil && cfg != nil {
+			cm.workspace[repoPrefix] = cfg
+			changed = true
+		}
 	case cfg == nil:
 		if _, ok := cm.workspace[repoPrefix]; ok {
 			delete(cm.workspace, repoPrefix)
@@ -286,6 +364,44 @@ func repoConfigSeed() *Config {
 	return cfg
 }
 
+// ExtractorPluginsLocalOptInEnv gates extractor plugins declared in a
+// repo-local .gortex.yaml. Those plugins run arbitrary, operator-configured
+// commands over repo file content on the indexer's behalf, so a cloned repo
+// carrying a malicious index.extractor_plugins entry would execute
+// attacker-chosen code when the victim tracks it. The flag — mirroring
+// GORTEX_ALLOW_LOCAL_PROVIDERS — makes execution explicit: operator opt-in.
+const ExtractorPluginsLocalOptInEnv = "GORTEX_ALLOW_LOCAL_EXTRACTOR_PLUGINS"
+
+func repoLocalExtractorPluginsEnabled() bool {
+	return strings.TrimSpace(os.Getenv(ExtractorPluginsLocalOptInEnv)) == "1"
+}
+
+// LocalProvidersOptInEnv gates providers declared in a repo-local
+// .gortex.yaml. Loading an endpoint definition from a cloned repo is a
+// supply-chain risk: an attacker-controlled `llm.custom` base_url makes
+// the daemon send prompts (and any configured API key) to that host. The
+// flag makes it explicit — operator opt-in — and is reused for both
+// repo-local providers.json and inline llm.custom.
+const LocalProvidersOptInEnv = "GORTEX_ALLOW_LOCAL_PROVIDERS"
+
+func repoLocalProvidersEnabled() bool {
+	return strings.TrimSpace(os.Getenv(LocalProvidersOptInEnv)) == "1"
+}
+
+// LastGoodWorkspace returns the workspace config last published for
+// repoPrefix when it was read from the same root as repoPath, or nil.
+// Matching spellings require no filesystem work.
+func (cm *ConfigManager) LastGoodWorkspace(repoPrefix, repoPath string) *Config {
+	cm.mu.RLock()
+	cachedPath, ws := cm.workspacePaths[repoPrefix], cm.workspace[repoPrefix]
+	cm.mu.RUnlock()
+	if cachedPath != repoPath && (cachedPath == "" || repoPath == "" ||
+		!pathkey.SamePathIdentity(pathkey.CanonicalPath(cachedPath), pathkey.CanonicalPath(repoPath))) {
+		return nil
+	}
+	return ws
+}
+
 // getWorkspaceConfig returns the cached workspace config for a repo, or nil.
 func (cm *ConfigManager) getWorkspaceConfig(repoPrefix string) *Config {
 	cm.mu.RLock()
@@ -298,17 +414,26 @@ func (cm *ConfigManager) getWorkspaceConfig(repoPrefix string) *Config {
 // layered exclude list from EffectiveExclude, so callers passing
 // cfg.Index into indexer.New automatically receive the effective patterns.
 func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
+	cm.mu.RLock()
+	ws, repoPath := cm.workspace[repoPrefix], cm.workspacePaths[repoPrefix]
+	cm.mu.RUnlock()
+	return cm.repoConfig(repoPrefix, ws, repoPath, nil)
+}
+
+func (cm *ConfigManager) repoConfig(repoPrefix string, ws *Config, repoPath string, lookup RepoPathLookup) *Config {
 	var out *Config
-	if ws := cm.getWorkspaceConfig(repoPrefix); ws != nil {
+	if ws != nil {
 		dup := *ws
 		out = &dup
 	} else {
 		out = repoConfigSeed()
 	}
-	effective := cm.EffectiveExclude(repoPrefix)
+	effective := cm.effectiveExclude(repoPrefix, cm.Global(), ws, repoPath, "", lookup)
 	out.Exclude = effective
 	out.Index.Exclude = effective
 	out.Watch.Exclude = effective
+	out.Index.Include = out.Include
+	out.Watch.Include = out.Include
 	// Plumb semantic.skip_embed through to the indexer's config so the
 	// embedder can filter without a new setter. Workspace > compiled
 	// defaults.
@@ -331,6 +456,22 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 	// the indexer (which only sees IndexConfig) can honour it.
 	// Defaults to enabled when the key is unset.
 	out.Index.IndexProse = out.Search.IndexProseEnabled()
+	// Repo-local extractor plugins run untrusted commands over indexed
+	// content; drop them unless the operator has explicitly opted in via
+	// GORTEX_ALLOW_LOCAL_EXTRACTOR_PLUGINS. `out` copies the workspace
+	// config only when ws != nil, so this targets repo-local config and
+	// leaves compiled defaults untouched.
+	if ws != nil && !repoLocalExtractorPluginsEnabled() {
+		out.Index.ExtractorPlugins = nil
+	}
+	// Repo-local llm.custom base_urls are uncontrolled egress points (a
+	// cloned repo can point LLM calls and API keys at an arbitrary host).
+	// Drop them unless the operator opts in via GORTEX_ALLOW_LOCAL_PROVIDERS.
+	// `out` copies the workspace config only when ws != nil, so this targets
+	// repo-local config and leaves compiled defaults untouched.
+	if ws != nil && !repoLocalProvidersEnabled() {
+		out.LLM.Custom = nil
+	}
 	return out
 }
 
@@ -343,7 +484,7 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 //     the tracked root (read from disk; opt out with
 //     `respect_gitignore: false` in `.gortex.yaml`)
 //  3. Global Exclude from ~/.gortex/config.yaml
-//  4. Matching RepoEntry.Exclude (first match in Repos, then Projects)
+//  4. Matching root's RepoEntry.Exclude (first match in Repos, then Projects)
 //  5. Workspace .gortex.yaml top-level Exclude
 //  6. Legacy workspace Index.Exclude / Watch.Exclude (deprecated)
 //
@@ -359,19 +500,51 @@ func (cm *ConfigManager) GetRepoConfig(repoPrefix string) *Config {
 // elements. It is clipped (len == cap), so appending to it is safe —
 // append reallocates rather than writing through the shared backing array.
 func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
+	return cm.effectiveExcludeForRoot(repoPrefix, "")
+}
+
+// EffectiveInclude returns the workspace's shared immutable force-includes.
+// Workspace configs are replaced, never mutated in place.
+func (cm *ConfigManager) EffectiveInclude(repoPrefix string) []string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if ws := cm.workspace[repoPrefix]; ws != nil {
+		return ws.Include[:len(ws.Include):len(ws.Include)]
+	}
+	return nil
+}
+
+// EffectiveExcludeForRoot keeps configured repository layers while reading
+// the gitignore layer from a selected checkout's root. This scoped proof path
+// reads ignore bytes afresh, including edits that preserve size and mtime.
+func (cm *ConfigManager) EffectiveExcludeForRoot(repoPrefix, root string) []string {
+	return cm.effectiveExcludeForRoot(repoPrefix, root)
+}
+
+func (cm *ConfigManager) effectiveExcludeForRoot(repoPrefix, root string) []string {
 	cm.mu.RLock()
 	gc := cm.global
 	ws := cm.workspace[repoPrefix]
 	repoPath := cm.workspacePaths[repoPrefix]
 	cm.mu.RUnlock()
 
+	return cm.effectiveExclude(repoPrefix, gc, ws, repoPath, root, nil)
+}
+
+func (cm *ConfigManager) effectiveExclude(repoPrefix string, gc *GlobalConfig, ws *Config, repoPath, root string, lookup RepoPathLookup) []string {
 	respect := shouldRespectGitignore(ws)
 	var chain []gitignoreLayer
 	if respect && repoPath != "" {
-		chain = cm.excludeCache.chain(repoPath)
+		if root != "" {
+			chain = gitignoreChain(root)
+		} else {
+			chain = cm.excludeCache.chain(repoPath)
+		}
 	}
-	if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, chain); ok {
-		return m
+	if root == "" && lookup == nil {
+		if m, ok := cm.excludeCache.lookupMerged(repoPrefix, gc, ws, repoPath, respect, chain); ok {
+			return m
+		}
 	}
 
 	out := make([]string, 0, 32)
@@ -384,12 +557,26 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 	// excludeCache), so a mid-session edit is still picked up on the next
 	// call.
 	for _, layer := range chain {
-		out = append(out, reanchorGitignore(cm.excludeCache.patterns(layer.dir, layer.stat), layer.sub)...)
+		patterns := []string(nil)
+		if root != "" {
+			patterns = loadRepoGitignore(layer.dir)
+		} else {
+			patterns = cm.excludeCache.patterns(layer.dir, layer.stat)
+		}
+		out = append(out, reanchorGitignore(patterns, layer.sub)...)
 	}
 
 	if gc != nil {
 		out = append(out, gc.Exclude...)
-		if entry := gc.FindRepoByPrefix(repoPrefix); entry != nil {
+		var entry *RepoEntry
+		if lookup != nil {
+			entry = lookup(repoPath)
+		} else if repoPath != "" {
+			entry = cm.repoPathLookup(gc)(repoPath)
+		} else {
+			entry = gc.FindRepoByPrefix(repoPrefix)
+		}
+		if entry != nil {
 			out = append(out, entry.Exclude...)
 		}
 	}
@@ -403,28 +590,13 @@ func (cm *ConfigManager) EffectiveExclude(repoPrefix string) []string {
 		}
 	}
 
-	// Force-include last so it wins: each Include entry becomes a gitignore
-	// `!pattern` re-include over every exclude layer above (builtin,
-	// .gitignore, global, repo). This is the readable form of hand-writing
-	// negations, for a vendored/generated tree you want indexed anyway.
-	if ws != nil {
-		for _, inc := range ws.Include {
-			inc = strings.TrimSpace(inc)
-			if inc == "" {
-				continue
-			}
-			if !strings.HasPrefix(inc, "!") {
-				inc = "!" + inc
-			}
-			out = append(out, inc)
-		}
-	}
-
 	// Clip to len == cap so a caller that appends to the returned slice is
 	// forced to reallocate and can never write through the shared backing
 	// array the cache hands to every reader.
 	out = out[:len(out):len(out)]
-	cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, chain, out)
+	if root == "" && lookup == nil {
+		cm.excludeCache.storeMerged(repoPrefix, gc, ws, repoPath, respect, chain, out)
+	}
 	return out
 }
 

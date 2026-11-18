@@ -2,13 +2,17 @@ package indexer
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
 )
@@ -26,24 +30,29 @@ const (
 )
 
 type incrementalBatchStage struct {
-	absPath       string
-	mtimeKey      string
-	readVersion   fileReadVersion
-	relPath       string
-	graphPath     string
-	src           []byte
-	result        *parser.ExtractionResult
-	prepared      *preparedExtraction
-	priorNodes    []*graph.Node
-	storedGraph   fileDeltaFingerprints
-	storedDerived derivedFingerprints
-	probe         fileDeltaProbe
-	metadataOnly  bool
-	edgeRefreshes []graph.EdgeReindex
-	abSnap        *affectedBySnapshot
-	reuse         map[reuseKey]*reuseVal
-	priorPending  []*graph.Edge
-	bytes         int64
+	absPath                string
+	mtimeKey               string
+	readVersion            fileReadVersion
+	rawSHA256              string
+	readRepairBlobSHA      string
+	relPath                string
+	graphPath              string
+	legacyIDs              []string
+	legacyPath             string
+	src                    []byte
+	result                 *parser.ExtractionResult
+	prepared               *preparedExtraction
+	priorNodes             []*graph.Node
+	storedGraph            fileDeltaFingerprints
+	storedDerived          derivedFingerprints
+	probe                  fileDeltaProbe
+	metadataOnly           bool
+	priorRawEdgesCompleted bool
+	edgeRefreshes          []graph.EdgeReindex
+	abSnap                 *affectedBySnapshot
+	reuse                  map[reuseKey]*reuseVal
+	priorPending           []*graph.Edge
+	bytes                  int64
 }
 
 func (stage *incrementalBatchStage) releasePrepared() {
@@ -60,6 +69,13 @@ type fileReadReceipt struct {
 	absPath     string
 	mtimeKey    string
 	readVersion fileReadVersion
+	// rawSHA256 is the content identity of the bytes read, set only for a
+	// build that proves its reads (Indexer.contentProof).
+	rawSHA256         string
+	readRepairBlobSHA string
+	// Only a committed stage can supply publisher proof. Inert validation
+	// receipts deliberately leave this false even for identical fresh bytes.
+	readRepairApplied bool
 }
 
 type incrementalFallback struct {
@@ -83,6 +99,9 @@ type incrementalPriorView struct {
 // reconciliation retries first-pass failures once. A direct IndexFile request
 // can instead stop after a first-pass version race so its historical receipt
 // contract remains observable while watcher storms retain retry behaviour.
+// A sample-pinned working-tree build (Indexer.versionRaceTearsBuild) skips
+// the retry too, for the whole pass, whenever any first-pass path raced a
+// save: the attempt is torn, so retrying its other failures gains nothing.
 func (idx *Indexer) reindexIncrementalFilesBatched(
 	staleFiles, deletedFiles []string,
 	markerBatch *reparsePendingEnrichmentBatch,
@@ -94,14 +113,61 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	// retires its source edges. Later contract refresh uses this registry to
 	// describe removed records and schedule the existing derived frontier.
 	// A true no-op batch must not hydrate any contract state.
-	if len(staleFiles) > 0 || len(deletedFiles) > 0 {
+	if len(deletedFiles) > 0 && idx.contractCoreInputs == nil {
+		// Removed constant/type/mount inputs may have same-package users with
+		// no import edge. Deleted source cannot provide a new trigger stamp.
+		idx.contractDependenciesChanged = true
+		idx.contractSharedInputsChanged = true
 		idx.ensureIncrementalContractRegistry()
 	}
+	if journal := idx.contractCoreInputs; journal != nil && len(deletedFiles) > 0 {
+		for _, path := range deletedFiles {
+			graphPath := idx.prefixPath(idx.relKey(path))
+			if err := journal.prepare(journal.ctx, idx, graphPath, "", nil, nil, true); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}, nil, deletedFiles, nil
+			}
+			if err := journal.begin([]string{graphPath}); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}, nil, deletedFiles, nil
+			}
+		}
+	}
 	var invalidation DerivedInvalidationPlan
-	deleteTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
+	// The surviving importers of a deleted file are re-derived from source in
+	// this batch (deletion_importers.go), read before the eviction removes
+	// the in-edges that name them.
+	if importers := idx.deletionImporterFiles(deletedFiles, staleFiles); len(importers) > 0 {
+		staleFiles = appendUniqueSorted(append([]string(nil), staleFiles...), importers...)
+		// A caller may already force files of its own (the per-file delta
+		// forces its change set); the importers join them for this batch.
+		prior := idx.forcedReparse
+		forced := make(map[string]struct{}, len(prior)+len(importers))
+		for path := range prior {
+			forced[path] = struct{}{}
+		}
+		for _, path := range importers {
+			forced[path] = struct{}{}
+		}
+		idx.forcedReparse = forced
+		defer func() { idx.forcedReparse = prior }()
+	}
+	// A reference recorded in a file this batch re-derives from source is not
+	// parked by the deletion: the reparse re-emits it from the extractor, and
+	// a parked copy under the same key would shadow the fresh row.
+	if len(deletedFiles) > 0 && len(staleFiles) > 0 {
+		idx.deletionReparsePaths = make(map[string]struct{}, len(staleFiles))
+		for _, path := range staleFiles {
+			idx.deletionReparsePaths[idx.prefixPath(idx.relKey(path))] = struct{}{}
+		}
+		defer func() { idx.deletionReparsePaths = nil }()
+	}
+	deleteTiming := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "graph_delete",
 		zap.Int("deleted_files", len(deletedFiles)))
 	defer deleteTiming.abort()
+	deletion := markerBatch.publicationStamps().beginPatchLap(patchApply)
 	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
+	deletion.end()
 	deleteTiming.complete(nil)
 
 	passPlan, reparsed, failed, versionChanged := idx.reindexIncrementalStalePass(
@@ -112,16 +178,28 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.logger.Debug("incremental reindex: failed to index file",
 			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
+	if errors.Is(idx.contractRestatementErr, store_sqlite.ErrWarmupWALPressure) {
+		// The reconcile already fails with this error (its caller returns it
+		// before using the result). A retry pass would only meet the same
+		// refusal after a second full wait. The first pass's file-failure
+		// notes are kept rather than cleared by a retry. Only a warm
+		// reconcile's own indexer has the boundary, and a failed reconcile
+		// never installs it, so leaving its reparsedThisRun unraised loses
+		// nothing. Other restatement errors keep the retry pass and the flag.
+		return invalidation, reparsed, failed, versionChanged
+	}
 	if len(failed) == 0 {
 		if len(reparsed) > 0 {
 			idx.reparsedThisRun.Store(true)
 		}
 		return invalidation, reparsed, nil, nil
 	}
-	if surfaceFirstVersionChange {
+	if surfaceFirstVersionChange || (idx.versionRaceTearsBuild && len(versionChanged) > 0) {
 		// Direct IndexFile is a single accepted-read operation. Do not let a
 		// retry hide any first-pass failure; its caller distinguishes an actual
 		// version race from parse/read failures after the complete mutation tail.
+		// A sample-pinned working-tree build stops on a version race the same
+		// way: the retry would read bytes newer than its sample.
 		if len(reparsed) > 0 || len(invalidation.Files) > 0 {
 			idx.reparsedThisRun.Store(true)
 		}
@@ -164,6 +242,12 @@ func (idx *Indexer) reindexIncrementalStalePass(
 	var plan DerivedInvalidationPlan
 	var reparsed, failed, versionChanged []string
 	for start := 0; start < len(files); {
+		if idx.warmupWriteBoundary != nil {
+			if err := idx.warmupWriteBoundary(); err != nil {
+				idx.contractRestatementErr = err
+				return plan, reparsed, append(failed, files[start:]...), versionChanged
+			}
+		}
 		end := min(start+incrementalBatchFiles, len(files))
 		consumed, chunkPlan, chunkReparsed, chunkFailed, chunkVersionChanged := idx.reindexIncrementalChunk(
 			files[start:end], markerBatch, acceptPreparedSnapshot,
@@ -194,17 +278,19 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 
 	graphPaths := make([]string, len(files))
-	priorTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_prior_graph",
+	priorTiming := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_prior_graph",
 		zap.Int("candidate_files", len(files)))
 	defer priorTiming.abort()
 	for i, filePath := range files {
 		graphPaths[i] = idx.prefixPath(idx.relKey(filePath))
 	}
 	priorByFile := idx.graph.GetFileNodesByPaths(graphPaths)
+	legacyByFile := idx.legacyNodesByPath(graphPaths)
 	priorTiming.complete(nil)
-	parseTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_parse",
+	parseTiming := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_parse",
 		zap.Int("candidate_files", len(files)), zap.Bool("includes_admission_wait", true))
 	defer parseTiming.abort()
+	parse := markerBatch.publicationStamps().beginPatchLap(patchParse)
 
 	stages := make([]*incrementalBatchStage, 0, len(files))
 	// Each staged result carries the tree-sitter tree its extraction
@@ -218,32 +304,118 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}()
 	fallbacks := make([]incrementalFallback, 0)
 	receipts := make([]fileReadReceipt, 0, len(files))
+	// inertMeta holds, by path, the metadata row of an inert file's saved
+	// bytes: its graph rows stand, but the row must describe the new bytes.
+	inertMeta := make(map[string]graph.FileMetaRow)
 	nodeCount, edgeCount := 0, 0
 	var retainedBytes int64
 	var readFailed []string
+	var priorFingerprintTime time.Duration
 	consumed := 0
 	for i, filePath := range files {
 		graphPath := graphPaths[i]
 		priorNodes := priorByFile[graphPath]
+		nativePath := idx.legacyFilePath(graphPath)
+		priorNodes, legacyIDs, legacyPath := mergeLegacyFilePrior(nativePath, priorNodes, legacyByFile[nativePath])
 		storedGraph := storedExtractionGraphFingerprints(priorNodes)
 		storedDerived := storedDerivedFingerprints(priorNodes)
+		// A prior row stamped before derived fingerprints existed is given
+		// its content's fingerprints when a source for them is installed
+		// (edit_delta_prior_fingerprints.go), instead of invalidating every
+		// derived family.
+		fingerprintStarted := time.Now()
+		if idx.priorFingerprints != nil && !storedDerived.complete() && derivedFingerprintSideExists(priorNodes) {
+			if g, d, ok := idx.priorFingerprints(filePath, priorNodes); ok {
+				if storedGraph == (fileDeltaFingerprints{}) {
+					storedGraph = g
+				}
+				storedDerived = d
+			}
+		} else if idx.priorFingerprints != nil && storedDerived.complete() && storedDerived.hierarchy == "" {
+			// A row stamped before the hierarchy fingerprint existed takes
+			// it from the same content source, when that content is the
+			// rows' own parse (priorFingerprints checks it).
+			if _, d, ok := idx.priorFingerprints(filePath, priorNodes); ok && d.declarations == storedDerived.declarations {
+				storedDerived.hierarchy = d.hierarchy
+			}
+		}
+		priorFingerprintTime += time.Since(fingerprintStarted)
 		// Once this chunk retains a prepared result, never block while
 		// asking the shared budget for another. Admission pressure flushes
 		// the partial chunk and retries this file in the next chunk; this
 		// prevents repositories from each holding a partial batch while all
 		// wait for capacity owned by the others.
-		probe, probeOK, admissionBusy := idx.prepareFileDeltaWithAdmission(filePath, len(stages) > 0)
+		var repair *ReadRepairObservation
+		if markerBatch != nil {
+			repair = markerBatch.readRepair
+		}
+		var probe fileDeltaProbe
+		probeOK := false
+		if markerBatch != nil {
+			probe, probeOK = markerBatch.pointPreparation.takeProbe(idx, filePath, markerBatch.relationsReadFrontier())
+		}
+		admissionBusy := false
+		if !probeOK {
+			probe, probeOK, admissionBusy = idx.prepareFileDeltaWithAdmissionObserved(filePath, len(stages) > 0, repair, markerBatch.relationsReadFrontier())
+		}
 		if admissionBusy {
 			break
 		}
 		consumed++
 
-		if !idx.aliasResolutionChanged && probeOK && storedGraph.semantic != "" &&
+		// An importer of a deleted file is re-derived from source as a
+		// structural stage whatever its fingerprints say
+		// (deletion_importers.go).
+		forced := idx.forceReparse(filePath) || len(legacyIDs) > 0
+		aliasChanged := idx.aliasResolutionChanged && isAliasCallerPath(graphPath)
+		inert := !aliasChanged && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
-			probe.fingerprints.metadata == storedGraph.metadata {
+			probe.fingerprints.metadata == storedGraph.metadata &&
+			unchangedProbeContractInputs(priorNodes, probe)
+		if idx.contractCoreInputs == nil && forced && inert && idx.inertReparsed != nil && !idx.forceReparseDropsResolutions(filePath) {
+			// The delta's change set is re-derived whatever its
+			// fingerprints say; an inert one has its prior rows restated
+			// after the passes (edit_delta.go).
+			idx.inertReparsed[graphPath] = struct{}{}
+		}
+		if !forced && inert && idx.contractCoreInputs != nil {
+			prepared, ok := idx.takePreparedSnapshot(filePath)
+			if !ok || prepared == nil || prepared.result == nil {
+				prepared.release()
+				inert = false
+			} else {
+				idx.applyRepoPrefix(prepared.result.Nodes, prepared.result.Edges)
+				inputErr := idx.contractCoreInputs.prepare(idx.contractCoreInputs.ctx, idx, graphPath, prepared.lang, prepared.src, prepared.result, false)
+				if inputErr == nil {
+					inputErr = idx.contractCoreInputs.begin([]string{graphPath})
+				}
+				if row, ok := idx.prepareFileMeta(prepared.relPath, prepared.src, prepared.result); ok && inputErr == nil {
+					inertMeta[filePath] = row
+				}
+				prepared.release()
+				if inputErr != nil {
+					idx.noteFileIndexFailure(filePath, inputErr)
+					readFailed = append(readFailed, filePath)
+					continue
+				}
+			}
+		}
+		if !forced && inert {
+			if _, kept := inertMeta[filePath]; !kept {
+				if prepared, ok := idx.takePreparedSnapshot(filePath); ok {
+					if row, ok := idx.prepareFileMeta(prepared.relPath, prepared.src, prepared.result); ok {
+						inertMeta[filePath] = row
+					}
+					prepared.release()
+				}
+			}
+			// Both branches took the prepared extraction; this only guards a
+			// path that did not.
 			idx.discardPreparedExtraction(filePath)
 			receipts = append(receipts, fileReadReceipt{
 				absPath: filePath, mtimeKey: idx.relKey(filePath), readVersion: probe.readVersion,
+				rawSHA256:         probe.rawSHA256,
+				readRepairBlobSHA: probe.readRepairBlobSHA,
 			})
 			plan.InertFiles++
 			continue
@@ -252,6 +424,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if !probeOK {
 			if probe.readErr != nil {
 				idx.noteFileIndexFailure(filePath, probe.readErr)
+				idx.stageContractFailureEnvelope(filePath, probe.readErr)
 				readFailed = append(readFailed, filePath)
 				continue
 			}
@@ -266,7 +439,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		if acceptPreparedSnapshot {
 			prepared, ok = idx.takePreparedSnapshot(filePath)
 		} else {
-			prepared, ok = idx.takePreparedRefresh(filePath)
+			prepared, ok = idx.takePreparedRefresh(filePath, markerBatch.relationsReadFrontier())
 		}
 		if !ok || prepared == nil || prepared.result == nil {
 			prepared.release()
@@ -281,12 +454,21 @@ func (idx *Indexer) reindexIncrementalChunk(
 		idx.applyRepoPrefix(prepared.result.Nodes, prepared.result.Edges)
 		stage := &incrementalBatchStage{
 			absPath: filePath, mtimeKey: idx.relKey(filePath),
-			readVersion: prepared.readVersion,
-			relPath:     prepared.relPath, graphPath: graphPath,
+			readVersion:       prepared.readVersion,
+			rawSHA256:         prepared.rawSHA256,
+			readRepairBlobSHA: prepared.readRepairBlobSHA,
+			relPath:           prepared.relPath, graphPath: graphPath,
+			legacyIDs: legacyIDs, legacyPath: legacyPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
-			metadataOnly: !idx.aliasResolutionChanged && storedGraph.semantic != "" &&
-				probe.fingerprints.semantic == storedGraph.semantic,
+			metadataOnly: !aliasChanged && !forced && storedGraph.semantic != "" &&
+				probe.fingerprints.semantic == storedGraph.semantic &&
+				unchangedProbeContractInputs(priorNodes, probe),
+		}
+		// Capture completion authority BEFORE commitIncrementalStages opens
+		// the next pending receipt. Absence/errors preserve the old path.
+		if stage.metadataOnly && unchangedRawEdgesAndSpans(priorNodes, stage.result.Nodes) {
+			stage.priorRawEdgesCompleted = idx.rawEdgesPriorCompleted(graphPath, priorNodes)
 		}
 		stage.bytes = estimateParseGraphBytes(stage.result.Nodes, stage.result.Edges) + int64(len(stage.src))
 		stages = append(stages, stage)
@@ -299,14 +481,26 @@ func (idx *Indexer) reindexIncrementalChunk(
 		}
 	}
 
+	parse.end()
 	parseTiming.complete(nil, zap.Int("consumed_files", consumed), zap.Int("staged_files", len(stages)),
 		zap.Int("inert_files", plan.InertFiles), zap.Int("read_failed_files", len(readFailed)),
-		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount))
+		zap.Int("fallback_files", len(fallbacks)), zap.Int("nodes", nodeCount), zap.Int("edges", edgeCount),
+		zap.Duration("prior_fingerprints", priorFingerprintTime))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
+		if idx.contractRestatementErr != nil {
+			for _, stage := range stages {
+				idx.noteFileIndexFailure(stage.absPath, idx.contractRestatementErr)
+				readFailed = append(readFailed, stage.absPath)
+			}
+			return consumed, plan, nil, readFailed, nil
+		}
 		for _, stage := range stages {
 			receipts = append(receipts, fileReadReceipt{
 				absPath: stage.absPath, mtimeKey: stage.mtimeKey, readVersion: stage.readVersion,
+				rawSHA256:         stage.rawSHA256,
+				readRepairBlobSHA: stage.readRepairBlobSHA,
+				readRepairApplied: true,
 			})
 		}
 		// Commit no longer reads the staged source, result, or tree. Return
@@ -316,14 +510,36 @@ func (idx *Indexer) reindexIncrementalChunk(
 			stage.releasePrepared()
 		}
 	}
-	receiptTiming := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_receipts",
+	receiptTiming := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_receipts",
 		zap.Int("receipts", len(receipts)))
 	defer receiptTiming.abort()
+	mtimes := markerBatch.publicationStamps().beginPatchLap(patchMtimes)
+	// As a staged file's row is written before its read is recorded, so is
+	// an inert one's: a read the file has since moved past is not recorded.
+	// Its row then describes bytes no longer on disk, which every reader
+	// that gates on the mtime rejects first, and the next read writes the
+	// row again. A row that could not be written leaves its read unrecorded
+	// and the file failed, so it stays stale and is retried.
+	if unwritten, err := idx.persistInertFileMeta(inertMeta); err != nil {
+		receipts = withoutReceipts(receipts, unwritten)
+		for _, filePath := range unwritten {
+			idx.noteFileIndexFailure(filePath, err)
+			readFailed = append(readFailed, filePath)
+		}
+	}
 	freshPaths, stalePaths := idx.recordFileReadVersionsBatched(receipts)
+	mtimes.end()
 	receiptTiming.complete(nil, zap.Int("fresh_files", len(freshPaths)), zap.Int("stale_files", len(stalePaths)))
 	freshSet := make(map[string]struct{}, len(freshPaths))
 	for _, filePath := range freshPaths {
 		freshSet[filePath] = struct{}{}
+	}
+	if markerBatch != nil && markerBatch.readRepair != nil {
+		for _, receipt := range receipts {
+			if _, fresh := freshSet[receipt.absPath]; fresh && receipt.readRepairBlobSHA != "" {
+				markerBatch.readRepair.acceptFreshBlob(idx.relKey(receipt.absPath), receipt.readRepairBlobSHA, receipt.readRepairApplied)
+			}
+		}
 	}
 
 	var reparsed []string
@@ -336,16 +552,20 @@ func (idx *Indexer) reindexIncrementalChunk(
 	}
 	var fallbackTiming *reconcilePhaseTiming
 	if len(fallbacks) > 0 {
-		// Legacy fallback combines extraction and graph mutation; do not label
-		// this interval as parse-only or silently charge it to graph apply.
-		fallbackTiming = startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_fallback_parse_apply",
+		// indexFile observes successful extraction/commit/search boundaries.
+		// Its unknown, skipped and failed exits retain incomplete evidence.
+		fallbackTiming = idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_fallback_parse_apply",
 			zap.Int("files", len(fallbacks)))
 		defer fallbackTiming.abort()
 	}
 	failedBeforeFallback := len(failed)
 	for _, fallback := range fallbacks {
+		if idx.contractCoreInputs == nil {
+			idx.ensureIncrementalContractRegistry()
+		}
 		if err := idx.reindexIncrementalFallback(fallback, markerBatch, &plan); err != nil {
 			idx.noteFileIndexFailure(fallback.filePath, err)
+			idx.stageContractFailureEnvelope(fallback.filePath, err)
 			idx.discardPreparedExtraction(fallback.filePath)
 			failed = append(failed, fallback.filePath)
 			if errors.Is(err, errFileVersionChanged) {
@@ -377,17 +597,22 @@ func (idx *Indexer) reindexIncrementalFallback(
 		plan.ContractBridgeNodeIDs,
 		contractBridgeNodeIDsForNodes(idx.graph, fallback.priorNodes)...,
 	)
+	// The refresh can reject the prepared snapshot because the source moved
+	// on. The combined fallback has no proof for restating the old graph's
+	// inert rows, including when applying its new read fails.
+	delete(idx.inertReparsed, fallback.graphPath)
+	// Exceptional fallback has no read-bound point coverage; keep the original
+	// ticket cap rather than borrowing a previous prepared receipt.
+	markerBatch.relationsReadFrontier().invalidate(fallback.filePath)
 	resolve := markerBatch == nil || !markerBatch.deferResolverCatchup
 	if err := idx.indexFile(fallback.filePath, resolve, markerBatch); err != nil {
 		return err
 	}
 	freshNodes := idx.graph.GetFileNodesByPaths([]string{fallback.graphPath})[fallback.graphPath]
 	freshDerived := storedDerivedFingerprints(freshNodes)
-	if fallback.probeOK && fallback.probe.derived.complete() {
-		freshDerived = fallback.probe.derived
-	}
-	semanticChanged := !fallback.probeOK || fallback.storedGraph.semantic == "" ||
-		fallback.probe.fingerprints.semantic != fallback.storedGraph.semantic
+	freshGraph := storedExtractionGraphFingerprints(freshNodes)
+	semanticChanged := fallback.storedGraph.semantic == "" || freshGraph.semantic == "" ||
+		freshGraph.semantic != fallback.storedGraph.semantic
 	plan.Merge(derivedPlanForDelta(
 		fallback.storedDerived, freshDerived, semanticChanged,
 		fallback.graphPath, fallback.priorNodes, freshNodes,
@@ -415,8 +640,14 @@ func loadIncrementalPriorView(g graph.Store, stages []*incrementalBatchStage) in
 		}
 	}
 	if len(ids) > 0 {
-		view.inByNode = g.GetInEdgesByNodeIDs(ids)
-		view.outByNode = g.GetOutEdgesByNodeIDs(ids)
+		kept := false
+		if source := priorEdgesSourceOf(g); source != nil {
+			view.inByNode, view.outByNode, kept = source(ids)
+		}
+		if !kept {
+			view.inByNode = g.GetInEdgesByNodeIDs(ids)
+			view.outByNode = g.GetOutEdgesByNodeIDs(ids)
+		}
 	}
 
 	missingTargets := make(map[string]struct{})
@@ -487,11 +718,50 @@ func (idx *Indexer) commitIncrementalStages(
 	stages []*incrementalBatchStage,
 	markerBatch *reparsePendingEnrichmentBatch,
 ) DerivedInvalidationPlan {
-	timing := startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_graph_apply",
+	timing := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "chunk_graph_apply",
 		zap.Int("staged_files", len(stages)))
 	defer timing.abort()
+	apply := markerBatch.publicationStamps().beginPatchLap(patchApply)
 	var plan DerivedInvalidationPlan
+	if journal := idx.contractCoreInputs; journal != nil {
+		paths := make([]string, 0, len(stages))
+		for _, stage := range stages {
+			if err := journal.prepare(journal.ctx, idx, stage.graphPath, stage.prepared.lang, stage.src, stage.result, false); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}
+			}
+			paths = append(paths, stage.graphPath)
+		}
+		if err := journal.begin(paths); err != nil {
+			idx.contractRestatementErr = err
+			return DerivedInvalidationPlan{}
+		}
+	} else {
+		for _, stage := range stages {
+			delete(idx.incrementalUnchangedContracts, stage.graphPath)
+			unchanged := idx.stageUnchangedContracts(stage)
+			if err := idx.contractInputError(); err != nil {
+				idx.contractRestatementErr = err
+				return DerivedInvalidationPlan{}
+			}
+			if !unchanged {
+				idx.ensureIncrementalContractRegistry()
+			}
+		}
+	}
+	idx.startApplyLaps()
 	view := loadIncrementalPriorView(idx.graph, stages)
+	idx.applyLap("prior_view")
+	defer func() {
+		in, out := 0, 0
+		for _, edges := range view.inByNode {
+			in += len(edges)
+		}
+		for _, edges := range view.outByNode {
+			out += len(edges)
+		}
+		idx.finishApplyLaps(len(stages), in, out)
+	}()
 
 	for _, stage := range stages {
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
@@ -510,6 +780,24 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.reuse, stage.priorPending = nil, nil
 			stage.metadataOnly = false
 		}
+		// The importer of a deleted file is re-derived because what its
+		// references bind to changed: neither the prior resolutions nor the
+		// references the deletion just parked may short-cut its resolution.
+		if len(stage.legacyIDs) > 0 {
+			stage.reuse, stage.priorPending = nil, nil
+			stage.metadataOnly = false
+		}
+		if idx.forceReparse(stage.absPath) {
+			if idx.forceReparseDropsResolutions(stage.absPath) {
+				stage.reuse, stage.priorPending = nil, nil
+			} else {
+				// A per-file delta's change set (reparseKeepingResolutions).
+				pruneBuiltinReuse(stage.reuse)
+			}
+			stage.metadataOnly = false
+		} else {
+			stripReuseSemanticMeta(stage.reuse)
+		}
 	}
 
 	// A metadata-only edge refresh cannot safely race a sibling structural
@@ -519,7 +807,7 @@ func (idx *Indexer) commitIncrementalStages(
 		changed = false
 		evicted := structuralPriorIDs(stages)
 		for _, stage := range stages {
-			if !stage.metadataOnly || metadataStageIndependent(stage, view.outByNode, evicted) {
+			if !stage.metadataOnly || metadataStageIndependent(stage, view.outByNode, evicted, view.inByNode) {
 				continue
 			}
 			stage.metadataOnly = false
@@ -559,6 +847,29 @@ func (idx *Indexer) commitIncrementalStages(
 			structural = append(structural, stage)
 		}
 	}
+
+	// Pairing refusal above can introduce new structural siblings after the
+	// first dependency closure. Close that frontier too before preserving raw
+	// edges; a raw-proof success must not retain a dependency just promoted.
+	for changed := true; changed; {
+		changed = false
+		evicted := structuralPriorIDs(stages)
+		for _, stage := range metadata {
+			if stage.metadataOnly && !metadataStageIndependent(stage, view.outByNode, evicted, view.inByNode) {
+				stage.metadataOnly = false
+				changed = true
+			}
+		}
+	}
+	keptMetadata := metadata[:0]
+	for _, stage := range metadata {
+		if stage.metadataOnly {
+			keptMetadata = append(keptMetadata, stage)
+		} else {
+			structural = append(structural, stage)
+		}
+	}
+	metadata = keptMetadata
 
 	// A validation failure above may have promoted another replacement. Rebuild
 	// target existence and apply captured resolutions only after classification
@@ -600,7 +911,12 @@ func (idx *Indexer) commitIncrementalStages(
 		contractBridgeNodeIDsFromPriorView(structural, view)...,
 	)
 
+	idx.applyLap("classify")
+	for _, stage := range stages {
+		idx.invalidateGoModuleSourceStamp(stage.relPath)
+	}
 	idx.replaceIncrementalContentBatch(stages)
+	idx.applyLap("content")
 
 	if len(structural) > 0 {
 		idx.commitStructuralIncrementalBatch(structural, view, markerBatch)
@@ -608,9 +924,16 @@ func (idx *Indexer) commitIncrementalStages(
 	if len(metadata) > 0 {
 		idx.commitMetadataIncrementalBatch(metadata)
 	}
+	idx.applyLap("metadata")
 	idx.persistIncrementalSidecars(stages)
+	idx.applyLap("sidecars")
+	apply.end()
+	search := markerBatch.publicationStamps().beginPatchLap(patchSearch)
 	idx.updateIncrementalSearch(stages)
 	idx.upsertIncrementalFTS(stages)
+	search.end()
+	apply = markerBatch.publicationStamps().beginPatchLap(patchApply)
+	idx.applyLap("search")
 
 	for _, stage := range stages {
 		if stage.metadataOnly {
@@ -629,6 +952,7 @@ func (idx *Indexer) commitIncrementalStages(
 			stage.graphPath, stage.priorNodes, stage.result.Nodes,
 		))
 	}
+	apply.end()
 	timing.complete(nil, zap.Int("structural_files", len(structural)), zap.Int("metadata_files", len(metadata)))
 	return plan
 }
@@ -652,7 +976,30 @@ func metadataStageIndependent(
 	stage *incrementalBatchStage,
 	outByNode map[string][]*graph.Edge,
 	evicted map[string]struct{},
+	incoming ...map[string][]*graph.Edge,
 ) bool {
+	// A preserved raw edge vector may contain pseudo-source IDs absent from
+	// priorNodes. The captured incoming adjacency still sees its dependency on
+	// a structurally replaced sibling; exact recording ownership must block it.
+	for _, byNode := range incoming {
+		for id := range evicted {
+			for _, edge := range byNode[id] {
+				if edge != nil && edge.FilePath == stage.graphPath {
+					return false
+				}
+			}
+		}
+	}
+	// Resolved dataflow can also be recorded in this file FROM a sibling
+	// definition. Evicting that sibling deletes its incident row in either
+	// direction; a preserved-edge stage must not rely on re-extraction here.
+	for id := range evicted {
+		for _, edge := range outByNode[id] {
+			if edge != nil && edge.FilePath == stage.graphPath {
+				return false
+			}
+		}
+	}
 	for _, node := range stage.priorNodes {
 		if node == nil {
 			continue
@@ -684,9 +1031,8 @@ func captureIncrementalStateFromView(
 				continue
 			}
 			if graph.IsUnresolvedTarget(edge.To) {
-				priorPending = append(priorPending, &graph.Edge{
-					From: edge.From, Kind: edge.Kind, To: edge.To, Meta: edge.Meta,
-				})
+				prior := *edge
+				priorPending = append(priorPending, &prior)
 				continue
 			}
 			if !reusableResolvedEdge(edge) {
@@ -706,7 +1052,7 @@ func captureIncrementalStateFromView(
 			reuse[key] = &reuseVal{
 				to: edge.To, confidence: edge.Confidence,
 				confLabel: edge.ConfidenceLabel, origin: edge.Origin, tier: edge.Tier,
-				resolution: reuseResolutionTag(edge),
+				resolution: reuseResolutionTag(edge), semanticMeta: reuseSemanticMeta(edge),
 			}
 		}
 	}
@@ -722,6 +1068,7 @@ func applyResolvedOutEdgesFromView(
 		return 0
 	}
 	reused := 0
+	var retargeted []graph.EdgeReindex
 	for _, edge := range edges {
 		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
 			continue
@@ -739,14 +1086,22 @@ func applyResolvedOutEdgesFromView(
 		if _, ok := existing[value.to]; !ok {
 			continue
 		}
+		oldTo := edge.To
 		edge.To = value.to
 		edge.Confidence = value.confidence
 		edge.ConfidenceLabel = value.confLabel
 		edge.Origin = value.origin
 		edge.Tier = value.tier
 		applyReuseResolutionTag(edge, value.resolution)
+		applyReuseSemanticMeta(edge, value.semanticMeta)
+		retargeted = append(retargeted, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 		reused++
 	}
+	// A re-used reference is bound here, not by a resolution batch, so the
+	// from-side placeholder move a batch triggers has to happen here too: the
+	// dataflow edges the extractor keyed from its placeholder at the same site
+	// take the bound source, as in a whole index.
+	resolver.RepointPlaceholderSourcesInBatch(edges, retargeted)
 	return reused
 }
 
@@ -764,6 +1119,8 @@ func prepareMetadataRefreshFromView(
 	if len(priorByID) != len(stage.result.Nodes) {
 		return false
 	}
+	// Evaluate only the untouched extraction's own proof, not merged metadata.
+	preserveRawEdges := stage.priorRawEdgesCompleted && unchangedRawEdgesAndSpans(stage.priorNodes, stage.result.Nodes)
 	for i, fresh := range stage.result.Nodes {
 		if fresh == nil {
 			return false
@@ -783,61 +1140,25 @@ func prepareMetadataRefreshFromView(
 		stage.result.Nodes[i] = &copyNode
 	}
 
+	// Check before resolution mutates any raw edge. A matching proof preserves
+	// every existing resolved/derived edge and needs no edge refresh rows.
+	if preserveRawEdges {
+		stage.edgeRefreshes = nil
+		return true
+	}
 	applyResolvedOutEdgesFromView(stage.result.Edges, stage.reuse, existing)
-	freshByKey := make(map[edgeRefreshKey][]*graph.Edge)
 	for _, edge := range stage.result.Edges {
-		if edge == nil {
-			continue
-		}
-		if priorByID[edge.From] == nil {
+		if edge != nil && priorByID[edge.From] == nil {
 			return false
 		}
-		key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-		freshByKey[key] = append(freshByKey[key], edge)
 	}
-	oldByKey := make(map[edgeRefreshKey][]*graph.Edge)
+	var oldEdges []*graph.Edge
 	for id := range priorByID {
-		for _, edge := range outByNode[id] {
-			if edge == nil {
-				continue
-			}
-			key := edgeRefreshKey{from: edge.From, kind: edge.Kind, alias: edge.Alias}
-			if _, needed := freshByKey[key]; needed {
-				oldByKey[key] = append(oldByKey[key], edge)
-			}
-		}
+		oldEdges = append(oldEdges, outByNode[id]...)
 	}
-	updates := make([]graph.EdgeReindex, 0, len(stage.result.Edges))
-	for key, fresh := range freshByKey {
-		old := oldByKey[key]
-		if len(old) != len(fresh) {
-			return false
-		}
-		sort.Slice(old, func(i, j int) bool {
-			if old[i].Line != old[j].Line {
-				return old[i].Line < old[j].Line
-			}
-			return old[i].To < old[j].To
-		})
-		sort.Slice(fresh, func(i, j int) bool {
-			if fresh[i].Line != fresh[j].Line {
-				return fresh[i].Line < fresh[j].Line
-			}
-			return fresh[i].To < fresh[j].To
-		})
-		for i := range fresh {
-			before := old[i]
-			after := *before
-			after.FilePath = fresh[i].FilePath
-			after.Line = fresh[i].Line
-			after.Alias = fresh[i].Alias
-			after.Meta = mergeRefreshMeta(before.Meta, fresh[i].Meta)
-			updates = append(updates, graph.EdgeReindex{
-				Edge: &after, OldTo: before.To,
-				OldFilePath: before.FilePath, OldLine: before.Line,
-				RefreshIdentity: true,
-			})
-		}
+	updates, ok := pairMetadataEdgeRefreshes(stage.graphPath, priorByID, oldEdges, stage.result.Edges)
+	if !ok {
+		return false
 	}
 	stage.edgeRefreshes = updates
 	return true
@@ -850,6 +1171,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 ) {
 	deferResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	paths := make([]string, 0, len(stages))
+	var legacyIDs, legacyPaths []string
 	oldFTSNodeIDs := make([]string, 0)
 	oldFuncIDs := make([]string, 0)
 	var nodes []*graph.Node
@@ -857,6 +1179,10 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	var priorPending []*graph.Edge
 	for _, stage := range stages {
 		paths = append(paths, stage.graphPath)
+		legacyIDs = append(legacyIDs, stage.legacyIDs...)
+		if stage.legacyPath != "" {
+			legacyPaths = append(legacyPaths, stage.legacyPath)
+		}
 		nodes = append(nodes, stage.result.Nodes...)
 		edges = append(edges, stage.result.Edges...)
 		priorPending = append(priorPending, stage.priorPending...)
@@ -874,20 +1200,66 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		}
 	}
 
-	restubIncomingRefsFromView(idx.graph, stages, view)
+	idx.applyLap("structural_prepare")
+	// Before the first write below that removes facts.
+	receipts := make(map[string]fileReadVersion, len(stages))
+	for _, stage := range stages {
+		receipts[stage.mtimeKey] = stage.readVersion
+	}
+	idx.retractUnchangedMtimeReceipts(receipts)
+	if deferResolverCatchup && idx.resolver.EvidenceScoping() {
+		// Read before the eviction below: the prior bindings and their
+		// targets are part of what it deletes.
+		markerBatch.recordDeferredPriorBindings(stagePriorBindings(idx.graph, stages, view))
+	}
+	idx.applyLap("prior_bindings")
+	carried, npmConsumers := restubIncomingRefsFromView(idx.graph, stages, view)
+	if markerBatch != nil {
+		markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
+	}
+	idx.applyLap("restub")
+	// The capability state of the files, read before the eviction below
+	// deletes it; the carried set says which incoming accesses_field rows
+	// survive it.
+	idx.noteCapabilityPrior(captureCapabilityPrior(stages, view, carried))
+	idx.applyLap("capability_prior")
 	// Canonical FTS lifetime follows the backend's atomic owner decision.
 	// Retained contracts keep existing rows; actual orphans are deleted there.
 	idx.deleteSymbolFTS(oldFTSNodeIDs)
-	evictFilesBatched(idx.graph, paths)
-	idx.graph.AddBatch(nodes, edges)
+	idx.applyLap("fts_delete")
+	idx.evictFileIdentities(paths, legacyIDs, legacyPaths)
+	idx.applyLap("evict")
+	// The carried in-edges ride the same AddBatch as the fresh payload: the
+	// eviction above deletes every edge incident to a doomed node, including
+	// the ones whose SOURCE survives, so an edge the restub frontier left
+	// alone has to be re-stated here or it is lost. See
+	// restubIncomingRefsFromView.
+	// A function re-derived unchanged keeps its clone rows (clone_carry.go).
+	carried = append(carried, idx.carryCloneRowsOfUnchangedBodies(stages, view, nodes)...)
+	// enrichAndMarkIncrementalStages clears the marker for files it
+	// enriches in place and leaves it on the rest.
+	for _, stage := range stages {
+		if idx.reparseLedgerApplies(stage.result) {
+			stampReparseLedger(stage.result.Nodes)
+		}
+	}
+	idx.graph.AddBatch(nodes, append(edges, carried...))
+	idx.restateUnchangedContracts(stages)
+	idx.applyLap("add_batch")
+	idx.relinkImportNodesToModules(nodes)
+	idx.applyLap("relink")
 
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
+		idx.resolver.SetPriorDeclarations(stagePriorDeclarations(stages))
 		idx.resolver.ResolveFilesAndIncoming(paths)
 		idx.resolver.SetIncrementalSkip(nil)
+		idx.resolver.SetPriorDeclarations(nil)
 		idx.observeIncrementalCatchup("dataflow", paths)
 		idx.materializeDataflowParamsForStages(stages)
+	} else {
+		markerBatch.recordDeferredResolverEvidence(idx.resolver.EvidenceScoping(), paths, stagePriorDeclarations(stages), priorPending)
 	}
 
 	// A global-using edit changes every dependent file's visibility
@@ -928,9 +1300,12 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 			idx.reresolveAffectedByStages(stages)
 		}
 	} else if !idx.deferGlobalPasses.Load() {
+		idx.applyLap("structural_tail")
 		markerBatch.mergeDeferredAffected(idx.planAffectedByStages(stages))
+		idx.applyLap("affected_plan")
 	}
 	idx.enrichAndMarkIncrementalStages(stages, markerBatch)
+	idx.applyLap("enrich_mark")
 }
 
 func (idx *Indexer) commitMetadataIncrementalBatch(stages []*incrementalBatchStage) {
@@ -958,19 +1333,236 @@ func (idx *Indexer) updateIncrementalSearch(stages []*incrementalBatchStage) {
 	}
 }
 
+// restubFrontier is the per-stage answer to "which of this file's prior
+// symbols can a referrer in ANOTHER file still be bound to without the
+// incoming pass re-deciding?". It is the incoming twin of the out-edge reuse
+// captureIncrementalStateFromView/applyResolvedOutEdgesFromView already
+// perform, and it is computed from the same primitives Path B's reverse
+// frontier uses (semanticShapeSet / semanticShapeDelta, keyed on
+// stableSymbolKey) so both paths agree on what a contract change is.
+type restubFrontier struct {
+	// conservative keeps the pre-gate behaviour for the whole stage: every
+	// referenceable prior symbol is restubbed. Mirrors
+	// builderSemanticSeedNodeIDs' fallback — anything the delta cannot be
+	// computed from falls back to the full fanout rather than dropping a
+	// restub that might be needed.
+	conservative bool
+	survivingIDs map[string]struct{}
+	changedNames map[string]struct{}
+}
+
+// requiresRestub reports whether node's surviving in-edges must be parked
+// under an unresolved stub for the incoming pass to re-decide them.
+//
+// Three triggers, each independently sufficient:
+//
+//   - conservative — the frontier could not be computed for this stage.
+//   - the node ID does not survive the reparse. The stable key is
+//     deliberately line-insensitive (affected_by.go), so a body edit ABOVE a
+//     `name@<line>` / `..._L<line>` definition keeps the key while rewriting
+//     the ID; the in-edge still points at the dead ID and must be re-bound.
+//   - some definition of the same NAME changed contract, appeared or
+//     disappeared. Keyed on the name, not the (kind, name) key, because a
+//     referrer parked under `unresolved::<name>` is offered every kind that
+//     answers for that name.
+func (f restubFrontier) requiresRestub(node *graph.Node) bool {
+	if f.conservative || node == nil {
+		return true
+	}
+	if _, survives := f.survivingIDs[node.ID]; !survives {
+		return true
+	}
+	_, changed := f.changedNames[node.Name]
+	return changed
+}
+
+// visibilityByStableKey composes the extractor-stamped visibility of every
+// referenceable definition, per stable key, in node order.
+//
+// The affected-by shape deliberately covers only what a CALL SITE sees
+// (signature, parameters, returns). Whether a referrer in another file may
+// bind here at all is a separate question, and `Meta["visibility"]` is the
+// extraction-time stamp that answers it (Java, Dart, PHP, … ). A
+// public→private edit changes no shape, so without this the frontier would
+// keep a binding a whole index would refuse.
+func visibilityByStableKey(nodes []*graph.Node) map[string]string {
+	out := make(map[string]string, len(nodes))
+	for _, node := range semanticShapeNodes(nodes) {
+		visibility, _ := node.Meta["visibility"].(string)
+		key := stableSymbolKey(node)
+		out[key] = out[key] + visibility + "\n"
+	}
+	return out
+}
+
+// restubFrontierForStage derives the frontier from state already in hand:
+// the pre-evict prior view (prior shapes) and the fresh extraction (current
+// shapes). It issues no graph read of its own.
+func restubFrontierForStage(
+	stage *incrementalBatchStage,
+	view incrementalPriorView,
+) restubFrontier {
+	if stage == nil || stage.result == nil {
+		return restubFrontier{conservative: true}
+	}
+	// reresolveAffectedByStages already built this snapshot for the same
+	// stage; reuse its shapes when it is there. When it is not — the deferred
+	// (deferGlobalPasses / deferResolverCatchup) batches this path exists for
+	// — derive ONLY the shapes. snapshotAffectedByFromView would additionally
+	// walk every in-edge of every prior node to build refSources and record
+	// idsByKey, and the frontier reads neither; on a warm branch switch that
+	// second O(in-edges) pass is pure waste.
+	priorShapes := priorSymbolShapesFromView(stage, view)
+	if len(priorShapes) == 0 {
+		return restubFrontier{conservative: true}
+	}
+	fresh := semanticShapeSet(
+		stage.result.Nodes,
+		symbolShapeAdjacencyFromExtraction(stage.result.Nodes, stage.result.Edges),
+	)
+	priorVisibility := visibilityByStableKey(stage.priorNodes)
+	freshVisibility := visibilityByStableKey(stage.result.Nodes)
+
+	changedNames := make(map[string]struct{})
+	for _, key := range semanticShapeDelta(priorShapes, fresh) {
+		changedNames[stableSymbolKeyName(key)] = struct{}{}
+	}
+	for key := range priorShapes {
+		if priorVisibility[key] != freshVisibility[key] {
+			changedNames[stableSymbolKeyName(key)] = struct{}{}
+		}
+	}
+	// A definition ADDED under a name is not part of the affected-by delta —
+	// nothing can hold a stale reference to a symbol that did not exist — but
+	// it does change the candidate set an existing referrer of that name
+	// should be re-offered, so it is part of this frontier.
+	for key := range fresh {
+		if _, known := priorShapes[key]; !known {
+			changedNames[stableSymbolKeyName(key)] = struct{}{}
+		}
+	}
+
+	survivingIDs := make(map[string]struct{}, len(stage.result.Nodes))
+	for _, node := range stage.result.Nodes {
+		if node != nil && node.ID != "" {
+			survivingIDs[node.ID] = struct{}{}
+		}
+	}
+	return restubFrontier{survivingIDs: survivingIDs, changedNames: changedNames}
+}
+
+// restubIncomingRefsFromView parks the surviving in-edges of the reparsed
+// files under `unresolved::<name>` so the incoming pass re-binds them, and
+// returns the in-edges it deliberately did NOT park.
+//
+// The restub carries two jobs at once, and only the second one is gateable:
+//
+//  1. It rescues the edge from the eviction that follows. Both backends
+//     delete every edge incident to a doomed node — the in-memory graph in
+//     evictEdgesLocked's phase 2, SQLite in the `to_id IN (doomed)` DELETE —
+//     including edges whose source file is untouched. Parking the edge under
+//     a stub moves it off the doomed target first, which is why it survives.
+//  2. It forces the incoming pass to re-decide the binding.
+//
+// For a symbol whose ID survives and whose contract did not change, (2) is
+// pure write amplification: the edge is rewritten to the stub (one durable
+// ReindexEdges row), walked by the incoming pass, and rewritten back to the
+// same target (a second durable row), with StashRestubProvenance /
+// RestoreRestubProvenance round-tripping the tier it never lost. This is the
+// cost the n-th body-only edit of a widely-referenced file pays on every save.
+//
+// So the gate cannot simply skip the write: an unrestubbed edge is DELETED,
+// not left alone. Those edges are returned instead, and
+// commitStructuralIncrementalBatch re-states them in the same AddBatch as the
+// fresh payload — one bulk insert, with the exact target, origin, tier,
+// confidence and Meta the edge already had, and no incoming-pass work.
 func restubIncomingRefsFromView(
 	g graph.Store,
 	stages []*incrementalBatchStage,
 	view incrementalPriorView,
-) {
+) ([]*graph.Edge, []string) {
 	evicted := structuralPriorIDs(stages)
+	reparsed := reparsedPaths(stages)
+	npmConsumers := restubTrackedNpmImportsFromView(g, evicted, view.inByNode)
 	var reindexes []graph.EdgeReindex
+	var carried []*graph.Edge
+	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
+		frontier := restubFrontierForStage(stage, view)
+		// Separator repair changes identity, not the declaration contract.
+		// The normal shape/visibility/parameter gates still decide every carry.
+		if !frontier.conservative {
+			for legacyID := range legacyReplacements(stage) {
+				frontier.survivingIDs[legacyID] = struct{}{}
+			}
+		}
 		for _, node := range stage.priorNodes {
+			if node != nil && node.Kind == graph.KindFile {
+				// Another file's import of this one is recorded in the
+				// importer and names this file node, whose identity (the
+				// path) survives its own reparse. The eviction deletes the
+				// row and no pass of this save re-derives it — the importer
+				// is not reparsed — so re-state it.
+				if _, survives := frontier.survivingIDs[node.ID]; survives || frontier.conservative {
+					for _, edge := range view.inByNode[node.ID] {
+						if edge == nil || edge.Kind != graph.EdgeImports {
+							continue
+						}
+						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+							continue
+						}
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+				}
+				continue
+			}
+			if node != nil && node.Kind == graph.KindParam {
+				// An argument another file passes into this parameter is
+				// recorded in the caller and names the parameter's identity.
+				// While the owner and its contract survive, the dataflow pass
+				// re-derives the parameter under the same identity and the row
+				// the eviction deletes is the one a whole index holds.
+				if carryIntoParam(frontier, stage, node) {
+					for _, edge := range view.inByNode[node.ID] {
+						if edge == nil || !callerOwnedDataflowIn(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
+							continue
+						}
+						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+							continue
+						}
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+				} else {
+					// The owner's contract changed: its callers' arguments
+					// go back to the owner (argOfIntoSurvivingOwner) for the
+					// affected-by pass to re-materialize.
+					for _, edge := range view.inByNode[node.ID] {
+						if _, sourceEvicted := evicted[edge.From]; edge == nil || sourceEvicted {
+							continue
+						}
+						if moved := argOfIntoSurvivingOwner(frontier, node, edge); moved != nil {
+							carried = append(carried, moved)
+						}
+					}
+				}
+				continue
+			}
 			if node == nil || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
 				continue
 			}
+			restub := frontier.requiresRestub(node)
 			stub := graph.UnresolvedMarker + node.Name
+			// The sites (file, line) of the references another file keeps
+			// into this definition, and the repository prefix their
+			// placeholder carries: the dataflow edges keyed FROM the
+			// definition at those sites follow the reference below.
+			var refSites map[dataflowSourceSite]string
 			for _, edge := range view.inByNode[node.ID] {
 				if edge == nil || !graph.IsResolvableRefEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
 					continue
@@ -978,9 +1570,76 @@ func restubIncomingRefsFromView(
 				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
 					continue
 				}
+				if refSites == nil {
+					refSites = make(map[dataflowSourceSite]string)
+				}
+				site := dataflowSourceSite{filePath: edge.FilePath, line: edge.Line}
+				if _, seen := refSites[site]; !seen {
+					refSites[site] = graph.RepoPrefixOfID(edge.From)
+				}
+			}
+			if len(refSites) > 0 || !restub {
+				for _, edge := range dataflowSourcesFollowingReferences(
+					view.outByNode[node.ID], refSites, reparsed, restub, stub) {
+					if _, duplicate := carriedSeen[edge]; !duplicate {
+						carriedSeen[edge] = struct{}{}
+						carried = append(carried, edge)
+					}
+				}
+			}
+			for _, edge := range view.inByNode[node.ID] {
+				if edge != nil && edge.Kind == graph.EdgeAccessesField {
+					// A derived field access into a definition whose ID and
+					// contract survive: its inputs (the source's carried
+					// read/write edge, the field's identity and receiver) are
+					// unchanged, so the row the eviction would delete is the
+					// row the capability pass would derive. Re-state it
+					// instead of losing it; the capability pass re-derives
+					// the rest (captureCapabilityPrior's restoration set).
+					if _, sourceEvicted := evicted[edge.From]; !sourceEvicted && !restub {
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+					continue
+				}
+				if edge != nil && callerOwnedDataflowIn(edge.Kind) {
+					// A dataflow edge another file records into this
+					// definition (an argument it passes, a value a closure
+					// captures) is derived from that file's source and the
+					// target's identity alone. While the identity and the
+					// contract survive, the row the eviction would delete is
+					// the row a whole index of the edited tree holds, and no
+					// pass of this save re-derives it: re-state it.
+					if _, sourceEvicted := evicted[edge.From]; !sourceEvicted && !restub && !graph.IsUnresolvedTarget(edge.To) {
+						if _, duplicate := carriedSeen[edge]; !duplicate {
+							carriedSeen[edge] = struct{}{}
+							carried = append(carried, edge)
+						}
+					}
+					continue
+				}
+				if edge == nil || !graph.IsResolvableRefEdge(edge.Kind) || graph.IsUnresolvedTarget(edge.To) {
+					continue
+				}
+				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
+					continue
+				}
+				if !restub {
+					if _, duplicate := carriedSeen[edge]; duplicate {
+						continue
+					}
+					carriedSeen[edge] = struct{}{}
+					carried = append(carried, edge)
+					continue
+				}
 				oldTo := edge.To
 				graph.StashRestubProvenance(edge)
-				edge.To = stub
+				edge.To = goModuleRestubTarget(edge, stub)
+				if edge.To != stub {
+					edge.CrossRepo, edge.ConfidenceLabel = false, ""
+				}
 				reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 			}
 		}
@@ -988,6 +1647,94 @@ func restubIncomingRefsFromView(
 	if len(reindexes) > 0 {
 		g.ReindexEdges(reindexes)
 	}
+	return canonicalizeLegacyCarried(stages, evicted, carried), npmConsumers
+}
+
+// dataflowSourceSite is a reference's site: the file that records it and its
+// line.
+type dataflowSourceSite struct {
+	filePath string
+	line     int
+}
+
+// reparsedPaths is the set of graph paths the batch re-parses.
+func reparsedPaths(stages []*incrementalBatchStage) map[string]struct{} {
+	out := make(map[string]struct{}, len(stages))
+	for _, stage := range stages {
+		if stage != nil {
+			out[stage.graphPath] = struct{}{}
+		}
+	}
+	return out
+}
+
+// dataflowSourcesFollowingReferences decides the edges another file records
+// FROM a re-parsed definition, and returns the rows to re-state.
+//
+// The eviction of the re-parsed file deletes every edge out of the
+// definition, including rows recorded in files this save does not re-parse
+// (the value a caller's file takes from it: value_flow, returns_to, and
+// arg_of when its result is passed on), and no pass of the save re-derives
+// them. They are derived from the recording file's source and the
+// definition's identity:
+//
+//   - the definition's identity and contract survive (no restub): a whole
+//     index of the edited tree holds exactly these rows, so all of them are
+//     re-stated — the whole set, so a store that composes the re-stated
+//     source over the layer below sees it unchanged;
+//   - the references into it are parked under the name's stub: a whole index
+//     keys a dataflow edge (arg_of, value_flow) from the placeholder of the
+//     reference at its site and moves it to what the reference binds to, so
+//     the dataflow rows at a parked reference's site are re-stated keyed from
+//     the stub's placeholder, and the incoming leg's placeholder move
+//     re-points them to whatever the reference binds to — or leaves them on
+//     the placeholder, as a whole index does, when it stays unresolved.
+//
+// The rows ride the re-stated batch after the eviction (never a reindex of the
+// doomed row, whose identity refresh would void the mutation receipt). Rows
+// recorded in a re-parsed file are left alone: its fresh extraction re-emits
+// them.
+func dataflowSourcesFollowingReferences(
+	out []*graph.Edge,
+	refSites map[dataflowSourceSite]string,
+	reparsed map[string]struct{},
+	restub bool,
+	stub string,
+) []*graph.Edge {
+	var restate []*graph.Edge
+	for _, edge := range out {
+		if edge == nil || edge.FilePath == "" {
+			continue
+		}
+		if _, own := reparsed[edge.FilePath]; own {
+			continue
+		}
+		if !restub {
+			restate = append(restate, edge)
+			continue
+		}
+		if !graph.PlaceholderSourceKind(edge.Kind) {
+			continue
+		}
+		prefix, atReference := refSites[dataflowSourceSite{filePath: edge.FilePath, line: edge.Line}]
+		if !atReference {
+			continue
+		}
+		parked := *edge
+		parked.From = stub
+		if prefix != "" {
+			parked.From = prefix + "/" + stub
+		}
+		restate = append(restate, &parked)
+	}
+	return restate
+}
+
+// callerOwnedDataflowIn reports the dataflow edge kinds a caller's file records
+// into a definition elsewhere, re-stated by the restub step while the
+// definition's identity and contract survive.
+func callerOwnedDataflowIn(kind graph.EdgeKind) bool {
+	return kind == graph.EdgeArgOf || kind == graph.EdgeCaptures
 }
 
 func evictFilesBatched(g graph.Store, paths []string) (int, int) {
@@ -1003,16 +1750,44 @@ func evictFilesBatched(g graph.Store, paths []string) (int, int) {
 	if len(paths) == 0 {
 		return 0, 0
 	}
+	var nodes, edges int
 	if batch, ok := g.(graph.FileBatchEvicter); ok {
-		return batch.EvictFiles(paths)
+		nodes, edges = batch.EvictFiles(paths)
+	} else {
+		for _, path := range paths {
+			n, e := g.EvictFile(path)
+			nodes += n
+			edges += e
+		}
 	}
-	nodes, edges := 0, 0
-	for _, path := range paths {
-		n, e := g.EvictFile(path)
-		nodes += n
-		edges += e
+	return nodes, edges + evictDetachedRecordedEdges(g, paths)
+}
+
+// evictDetachedRecordedEdges removes the edges recorded in paths that the
+// file eviction leaves behind: the ones whose source is no node (a dataflow
+// edge keyed from a call's placeholder, or from the stdlib / dependency stub
+// the placeholder was moved to). The eviction takes every edge touching one
+// of the files' nodes; these touch none, so a re-parse used to keep them next
+// to the fresh extraction's rows — the old site's row survived an edit that
+// moved the call to another line, which a whole index never shows. It runs
+// after the eviction, when the paths are covered, so a writer that tracks
+// ownership by recording file owns these rows. A store that cannot serve rows
+// by recording file keeps the old behaviour.
+func evictDetachedRecordedEdges(g graph.Store, paths []string) int {
+	reader, ok := graph.RecordedEdgesOf(g)
+	if !ok {
+		return 0
 	}
-	return nodes, edges
+	var doomed []*graph.Edge
+	for _, edge := range reader.RecordedEdgesAt(paths) {
+		if edge != nil && (strings.Contains(edge.From, graph.UnresolvedMarker) || graph.IsStub(edge.From)) {
+			doomed = append(doomed, edge)
+		}
+	}
+	if len(doomed) == 0 {
+		return 0
+	}
+	return graph.RemoveEdgesExact(g, doomed)
 }
 
 func (idx *Indexer) deleteSymbolFTS(nodeIDs []string) {
@@ -1101,19 +1876,101 @@ func (idx *Indexer) persistIncrementalSidecars(stages []*incrementalBatchStage) 
 	}
 }
 
+// persistInertFileMeta writes the metadata rows of inert files whose stored
+// row no longer describes their bytes. An inert save restates no graph rows,
+// but the row's content hash and size are what every reader compares with
+// the file to prove its indexed bytes; left behind, the file looks moved to
+// them for good, while its equal mtime keeps the census from reading it.
+// The write is one upsert, so a failure leaves the prior rows in place; it
+// returns the files whose rows were not written with the error.
+func (idx *Indexer) persistInertFileMeta(inertMeta map[string]graph.FileMetaRow) ([]string, error) {
+	fw, ok := idx.graph.(graph.FileMetaWriter)
+	if !ok || len(inertMeta) == 0 {
+		return nil, nil
+	}
+	paths := make([]string, 0, len(inertMeta))
+	for _, row := range inertMeta {
+		paths = append(paths, row.FilePath)
+	}
+	// A failed read leaves stored empty and writes every row, the safe side.
+	var stored map[string]graph.FileMetaRow
+	if reader, ok := idx.graph.(graph.FileMetaPathReader); ok {
+		stored, _ = reader.FileMetasByPaths(idx.repoPrefix, paths)
+	}
+	rows := make([]graph.FileMetaRow, 0, len(inertMeta))
+	files := make([]string, 0, len(inertMeta))
+	for filePath, row := range inertMeta {
+		if prior, found := stored[row.FilePath]; found && prior.ContentHash == row.ContentHash && prior.Size == row.Size {
+			continue
+		}
+		rows = append(rows, row)
+		files = append(files, filePath)
+	}
+	if err := fw.SetFileMetas(idx.repoPrefix, rows); err != nil {
+		return files, fmt.Errorf("persist inert file metadata: %w", err)
+	}
+	return nil, nil
+}
+
+// withoutReceipts drops the receipts of the given files.
+func withoutReceipts(receipts []fileReadReceipt, files []string) []fileReadReceipt {
+	drop := make(map[string]struct{}, len(files))
+	for _, filePath := range files {
+		drop[filePath] = struct{}{}
+	}
+	kept := receipts[:0]
+	for _, receipt := range receipts {
+		if _, dropped := drop[receipt.absPath]; !dropped {
+			kept = append(kept, receipt)
+		}
+	}
+	return kept
+}
+
 // recordFileReadVersionsBatched advances only receipts whose exact parsed
 // version is still on disk after the graph/sidecar commit. One os.Stat per file
 // is required to close the concurrent-write window; persistence remains one
 // set-oriented SQLite write for the whole bounded chunk.
+//
+// A sample-pinned working-tree build (Indexer.contentProof) keeps a receipt a
+// later save made stale when the bytes it parsed are its sample's content for
+// the file: the payload describes the sample, which is the state the build
+// publishes, so the save is the next build's change rather than a tear of this
+// one. Its own version is still the one stamped. A receipt whose bytes are
+// not the sample's content for a file the sample holds tears the build at
+// once, however settled the file looks: the save landed between the sample
+// and the read, so the payload can never pass the fence.
 func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (fresh, stale []string) {
 	if len(receipts) == 0 {
 		return nil, nil
 	}
 	mtimes := make(map[string]int64, len(receipts))
+	keep := func(receipt fileReadReceipt) {
+		idx.contentProof.record(receipt.absPath, receipt.rawSHA256)
+		if receipt.readVersion.valid {
+			mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
+		}
+		fresh = append(fresh, receipt.absPath)
+		idx.noteFileIndexFailure(receipt.absPath, nil)
+	}
+	// A torn read is recorded unproven, except bytes that contradict the
+	// sample, which stay recorded so the fence refuses them too.
+	tear := func(receipt fileReadReceipt, err error) {
+		sum := ""
+		if idx.contentProof.contradicts(receipt.absPath, receipt.rawSHA256) {
+			sum = receipt.rawSHA256
+		}
+		idx.contentProof.record(receipt.absPath, sum)
+		idx.noteFileIndexFailure(receipt.absPath, err)
+		stale = append(stale, receipt.absPath)
+	}
 	for _, receipt := range receipts {
 		if !receipt.readVersion.valid {
-			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
-			stale = append(stale, receipt.absPath)
+			if idx.contentProof.holdsSample(receipt.absPath, receipt.rawSHA256) {
+				keep(receipt)
+				continue
+			}
+			tear(receipt, errFileVersionChanged)
 			continue
 		}
 		if receipt.readVersion.snapshot {
@@ -1125,18 +1982,23 @@ func (idx *Indexer) recordFileReadVersionsBatched(receipts []fileReadReceipt) (f
 		}
 		current, err := os.Stat(receipt.absPath)
 		if err != nil {
-			idx.noteFileIndexFailure(receipt.absPath, err)
-			stale = append(stale, receipt.absPath)
+			tear(receipt, err)
 			continue
 		}
 		if !sameFileVersion(receipt.readVersion.info, current) {
-			idx.noteFileIndexFailure(receipt.absPath, errFileVersionChanged)
-			stale = append(stale, receipt.absPath)
+			if idx.contentProof.holdsSample(receipt.absPath, receipt.rawSHA256) {
+				keep(receipt)
+				continue
+			}
+			tear(receipt, errFileVersionChanged)
 			continue
 		}
-		mtimes[receipt.mtimeKey] = receipt.readVersion.mtime
-		fresh = append(fresh, receipt.absPath)
-		idx.noteFileIndexFailure(receipt.absPath, nil)
+		if idx.contentProof.contradicts(receipt.absPath, receipt.rawSHA256) {
+			tear(receipt, errFileVersionChanged)
+			continue
+		}
+		keep(receipt)
+		receipt.readVersion.relationsRead.accept(receipt.absPath, receipt.readVersion)
 	}
 	if len(mtimes) == 0 {
 		return fresh, stale
@@ -1191,7 +2053,7 @@ func (idx *Indexer) materializeDataflowParamsForStages(stages []*incrementalBatc
 			}
 		}
 	}
-	rewriteDataflowBatch(idx.graph, edges)
+	rewriteDataflowBatchLegs(idx.graph, edges, nil, idx.dataflowParams)
 }
 
 // materializeDataflowParamsForFiles is the receipt-frontier counterpart of the
@@ -1200,10 +2062,22 @@ func (idx *Indexer) materializeDataflowParamsForStages(stages []*incrementalBatc
 // switch does not retain 1,000 parse trees or issue one query per file.
 func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 	graphPaths = appendUniqueSorted(nil, graphPaths...)
+	legs := newRefFactLegs(idx.writeCounterMark)
+	writes := idx.writeCounterMark()
+	defer func() {
+		if idx.logger != nil && len(graphPaths) > 0 {
+			fields := append(legs.fields(len(graphPaths)), writeCounterFields("dataflow_", idx.writeCounterMark().Since(writes))...)
+			if p := idx.dataflowParams; p != nil {
+				fields = append(fields, zap.Int("param_hits", p.hits), zap.Int("param_misses", p.misses))
+			}
+			idx.logger.Info("dataflow: params materialized", fields...)
+		}
+	}()
 	for start := 0; start < len(graphPaths); start += deletedBatchFiles {
 		end := min(start+deletedBatchFiles, len(graphPaths))
 		paths := graphPaths[start:end]
 		nodesByFile := idx.graph.GetFileNodesByPaths(paths)
+		legs.lap("file_nodes")
 		fromSet := make(map[string]struct{})
 		fileSet := make(map[string]struct{}, len(paths))
 		for _, graphPath := range paths {
@@ -1219,8 +2093,10 @@ func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 			froms = append(froms, id)
 		}
 		var edges []*graph.Edge
-		for _, outgoing := range idx.graph.GetOutEdgesByNodeIDs(froms) {
-			for _, edge := range outgoing {
+		outgoing := idx.graph.GetOutEdgesByNodeIDs(froms)
+		legs.lap("out_edges")
+		for _, rows := range outgoing {
+			for _, edge := range rows {
 				if edge == nil || (edge.Kind != graph.EdgeArgOf && edge.Kind != graph.EdgeReturnsTo) {
 					continue
 				}
@@ -1229,7 +2105,7 @@ func (idx *Indexer) materializeDataflowParamsForFiles(graphPaths []string) {
 				}
 			}
 		}
-		rewriteDataflowBatch(idx.graph, edges)
+		rewriteDataflowBatchLegs(idx.graph, edges, legs, idx.dataflowParams)
 	}
 }
 
@@ -1283,6 +2159,9 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 		}
 	}
 	for graphPath, value := range pending {
+		if value {
+			continue // stamped in the structural fact write
+		}
 		if markerBatch == nil {
 			idx.setReparsePendingEnrichment(graphPath, value)
 			continue
@@ -1291,6 +2170,40 @@ func (idx *Indexer) enrichAndMarkIncrementalStages(
 			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 	}
+}
+
+// priorSymbolShapesFromView returns the per-stable-key PRE-EDIT shapes of one
+// stage's referenceable definitions — the only part of the affected-by
+// snapshot the restub frontier reads.
+//
+// It prefers the snapshot the affected-by pass already built for this stage
+// (byte-identical: snapshotAffectedByFromView composes its shapes with the
+// same loop semanticShapeSet runs, over the same adjacency). When there is
+// none, it derives the shapes alone rather than rebuilding the whole snapshot,
+// whose refSources walk is O(in-edges of every prior node) and whose idsByKey
+// the frontier never consults.
+//
+// An empty result means the stage defines no referenceable symbol, which is
+// exactly the condition snapshotAffectedByFromView reports by returning nil.
+func priorSymbolShapesFromView(
+	stage *incrementalBatchStage,
+	view incrementalPriorView,
+) map[string]symbolShape {
+	if stage == nil {
+		return nil
+	}
+	if stage.abSnap != nil {
+		return stage.abSnap.symbols
+	}
+	refNodes := semanticShapeNodes(stage.priorNodes)
+	if len(refNodes) == 0 {
+		return nil
+	}
+	return semanticShapeSet(refNodes, symbolShapeAdjacency{
+		inEdges:  view.inByNode,
+		outEdges: view.outByNode,
+		nodes:    view.nodesByID,
+	})
 }
 
 func snapshotAffectedByFromView(nodes []*graph.Node, view incrementalPriorView) *affectedBySnapshot {
@@ -1391,13 +2304,71 @@ func affectedByDeltaFromExtraction(
 	return delta
 }
 
+// affectedByBatchPlan is the file set one affected-by pass will re-resolve,
+// plus everything needed to bound that set and to say so when the bound bites.
+// They travel together on purpose: a consumer that acts on the files has to be
+// able to tell a complete fan-out from a truncated one.
 type affectedByBatchPlan struct {
 	files []string
+	// maxFiles is the whole-batch bound this plan must be cut to. It rides on
+	// the plan so every site that applies the bound applies the SAME one
+	// without needing the Indexer's config in hand.
+	maxFiles int
+	// notify surfaces a cut. It is stamped by planAffectedByStages — the one
+	// constructor that holds the Indexer — so the fact is reported wherever
+	// the bound is applied, including at call sites that discard the bounded
+	// plan (indexer.go's exceptional-file merge does exactly that).
+	//
+	// "Reported" now means carried, not logged: reportAffectedByTruncation
+	// puts the fact on the MUTATION RECEIPT of the window the pass is running
+	// in (affected_by.go carryAffectedByTruncationOnReceipt) and on the
+	// per-mutation observation the calling watcher is holding
+	// (observeDerivedFanoutPass). Every batch site that applies this bound —
+	// reresolveAffectedByStages and mergeDeferredAffected, both reached from
+	// commitStructuralIncrementalBatch — runs inside both, so a plan built
+	// without this stamp loses the mutation's verdict as well as the log line.
+	notify func(affectedByTruncation)
+	// truncation is the completeness fact for this plan: zero until the bound
+	// has been applied, set once it has.
+	truncation affectedByTruncation
 }
 
-func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBatchPlan) {
+// bounded applies the whole-batch bound, reports a cut exactly once, and
+// returns the plan the pass will actually execute. p.files must already be
+// sorted.
+func (p affectedByBatchPlan) bounded() affectedByBatchPlan {
+	files, truncation := boundAffectedByFiles(p.files, p.maxFiles)
+	// Notify on EVERY application, not only on a cut. reportAffectedByTruncation
+	// still logs and carries the truncated case alone; what the complete case
+	// adds is the fact that this pass ran at all, which is the only thing that
+	// lets a caller tell a finished fan-out from one that was never attempted.
+	if p.notify != nil {
+		p.notify(truncation)
+	}
+	return affectedByBatchPlan{
+		files: files, maxFiles: p.maxFiles, notify: p.notify, truncation: truncation,
+	}
+}
+
+// mergeDeferredAffected folds one structural chunk's affected set into the
+// batch-wide union and re-applies the whole-batch bound to the accumulated
+// result, returning the cumulative plan.
+//
+// Re-applying the bound on every merge is what makes this a bound on the
+// BATCH rather than on the chunk: a deferred reindex commits its stages in
+// chunks, and a per-chunk bound over C chunks re-resolves — and re-persists
+// reference facts for — up to C*cap files. Because the bound keeps the
+// lexicographically smallest cap entries, pruning incrementally lands on
+// exactly the set one bound over the complete union would have kept.
+//
+// The pruned entries leave the carrier too. Leaving them would let a file the
+// bound already rejected re-enter on the next merge and push the union back
+// over the cap.
+func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(
+	plan affectedByBatchPlan,
+) affectedByBatchPlan {
 	if b == nil {
-		return
+		return plan.bounded()
 	}
 	if len(plan.files) > 0 && b.deferredAffectedFiles == nil {
 		b.deferredAffectedFiles = make(map[string]struct{}, len(plan.files))
@@ -1407,9 +2378,21 @@ func (b *reparsePendingEnrichmentBatch) mergeDeferredAffected(plan affectedByBat
 			b.deferredAffectedFiles[filePath] = struct{}{}
 		}
 	}
+	union := b.deferredAffectedUnion()
+	union.maxFiles, union.notify = plan.maxFiles, plan.notify
+	bounded := union.bounded()
+	if bounded.truncation.Truncated {
+		kept := make(map[string]struct{}, len(bounded.files))
+		for _, filePath := range bounded.files {
+			kept[filePath] = struct{}{}
+		}
+		b.deferredAffectedFiles = kept
+	}
+	return bounded
 }
 
-func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPlan {
+// deferredAffectedUnion is the accumulated union in sorted order.
+func (b *reparsePendingEnrichmentBatch) deferredAffectedUnion() affectedByBatchPlan {
 	if b == nil {
 		return affectedByBatchPlan{}
 	}
@@ -1421,12 +2404,24 @@ func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPl
 	return affectedByBatchPlan{files: files}
 }
 
+// deferredAffectedPlan is what the deferred resolution catch-up executes. The
+// union it returns is already bounded and already reported:
+// mergeDeferredAffected re-applies the whole-batch bound on every chunk, so
+// the catch-up — which also persists reference facts for these files — never
+// widens past the cap, and the cut is not reported a second time here.
+func (b *reparsePendingEnrichmentBatch) deferredAffectedPlan() affectedByBatchPlan {
+	return b.deferredAffectedUnion()
+}
+
 func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affectedByBatchPlan {
 	targetOwners := make(map[string]map[string]struct{})
 	sourceOwners := make(map[string]map[string]struct{})
 	filesByChanged := make(map[string]map[string]struct{})
 	for _, stage := range stages {
 		delta := affectedByDeltaFromExtraction(stage.abSnap, stage.result.Nodes, stage.result.Edges)
+		if hook := idx.affectedByDeltaHook; hook != nil {
+			hook(stage.graphPath, delta)
+		}
 		if len(delta) == 0 {
 			continue
 		}
@@ -1447,7 +2442,10 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 		}
 	}
 	if len(filesByChanged) == 0 {
-		return affectedByBatchPlan{}
+		// Still carry the bound and the reporter: an empty chunk merged into
+		// a deferred batch must not hand mergeDeferredAffected a zero cap and
+		// leave the accumulated union unbounded.
+		return idx.emptyAffectedByPlan()
 	}
 
 	if reader, ok := idx.graph.(graph.RefFactsReader); ok && len(targetOwners) > 0 {
@@ -1487,33 +2485,40 @@ func (idx *Indexer) planAffectedByStages(stages []*incrementalBatchStage) affect
 		}
 	}
 
-	plan := affectedByBatchPlan{}
+	// The union is returned UNBOUNDED and carries no completeness fact. The
+	// bound belongs to the batch, not to this stage set: a caller that runs
+	// the pass now bounds it here (reresolveAffectedByStages), and a caller
+	// that defers it merges this union into the batch-wide one and bounds
+	// that (mergeDeferredAffected). Bounding per changed path — which is what
+	// this function used to do — meant a batch of N changed paths re-resolved
+	// up to N*cap files and said nothing about it.
 	union := make(map[string]struct{})
-	for changedPath, fileSet := range filesByChanged {
-		files := make([]string, 0, len(fileSet))
+	for _, fileSet := range filesByChanged {
 		for filePath := range fileSet {
-			files = append(files, filePath)
-		}
-		sort.Strings(files)
-		if maxFiles := idx.affectedByMaxFiles(); len(files) > maxFiles {
-			idx.logger.Debug("affected-by: re-resolve set truncated",
-				zap.String("file", changedPath), zap.Int("affected", len(files)),
-				zap.Int("cap", maxFiles), zap.Int("dropped", len(files)-maxFiles))
-			files = files[:maxFiles]
-		}
-		if len(files) == 0 {
-			continue
-		}
-		for _, filePath := range files {
-			union[filePath] = struct{}{}
+			if filePath != "" {
+				union[filePath] = struct{}{}
+			}
 		}
 	}
-	plan.files = make([]string, 0, len(union))
+	files := make([]string, 0, len(union))
 	for filePath := range union {
-		plan.files = append(plan.files, filePath)
+		files = append(files, filePath)
 	}
-	sort.Strings(plan.files)
+	sort.Strings(files)
+	plan := idx.emptyAffectedByPlan()
+	plan.files = files
 	return plan
+}
+
+// emptyAffectedByPlan is a plan carrying no files but the batch's bound and
+// its reporter, so every plan this Indexer hands out bounds the same way.
+func (idx *Indexer) emptyAffectedByPlan() affectedByBatchPlan {
+	return affectedByBatchPlan{
+		maxFiles: idx.affectedByMaxFiles(),
+		notify: func(fact affectedByTruncation) {
+			idx.reportAffectedByTruncation("incremental_batch", fact)
+		},
+	}
 }
 
 func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
@@ -1521,12 +2526,21 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
 		return
 	}
 	idx.observeIncrementalCatchup("affected_by", plan.files)
-	idx.resolver.ResolveFilesAndIncoming(plan.files)
+	// The affected files are referrers of the changed declarations: their own
+	// references re-bind, while the references parked on the names they
+	// declare did not move (ResolveFilesOutgoing).
+	idx.resolver.ResolveFilesOutgoing(plan.files)
+	// A changed contract moved the referrers' arguments back to the callee
+	// (argOfIntoSurvivingOwner); map them onto its current parameters.
+	idx.materializeDataflowParamsForFiles(plan.files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), plan.files)
 }
 
 func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) {
-	plan := idx.planAffectedByStages(stages)
+	// The plan (the changed declarations' referrers, read from the reference
+	// facts) is its own observed stage.
+	idx.observeIncrementalCatchup("affected_plan", nil)
+	plan := idx.planAffectedByStages(stages).bounded()
 	idx.executeAffectedByPlan(plan)
 	if len(plan.files) > 0 {
 		idx.observeIncrementalCatchup("ref_facts", plan.files)
@@ -1616,6 +2630,14 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		return 0, 0
 	}
 	defer idx.flushFileIndexFailures()
+	idx.goModuleSourceMu.Lock()
+	// A recovery that read one of these files before the eviction must not
+	// store it with stat trust: the file can return with the same stat.
+	idx.goModuleSourceEpoch++
+	for _, path := range deleted {
+		delete(idx.goModuleSourceCache, path)
+	}
+	idx.goModuleSourceMu.Unlock()
 	for _, path := range deleted {
 		idx.noteFileIndexFailure(filepath.Join(idx.rootPath, filepath.FromSlash(path)), nil)
 	}
@@ -1652,18 +2674,37 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 			_ = i
 		}
 		view := loadIncrementalPriorView(idx.graph, stages)
+		view.inByNode = withoutEdgesRecordedAt(view.inByNode, idx.deletionReparsePaths)
 		plan.ContractBridgeNodeIDs = appendUniqueSorted(
 			plan.ContractBridgeNodeIDs,
 			contractBridgeNodeIDsFromPriorView(stages, view)...,
 		)
-		restubIncomingRefsFromView(idx.graph, stages, view)
+		// Deletion stages carry no fresh extraction, so the restub frontier
+		// is conservative for all of them and every surviving in-edge is
+		// parked — the pre-gate behaviour, which is also the only correct one
+		// here: nothing comes back to bind to.
+		//
+		// Nothing on this path re-states a carried edge: the eviction below
+		// deletes it and there is no AddBatch to put it back. A non-empty
+		// carry therefore means a deletion stage stopped being conservative,
+		// which would destroy those edges with no compile error to show for
+		// it — so the assumption is checked, not just documented.
+		if carried, _ := restubIncomingRefsFromView(idx.graph, stages, view); len(carried) > 0 {
+			idx.logger.Error("indexer: deletion restub carried in-edges with no re-state path",
+				zap.String("repo", idx.repoPrefix),
+				zap.Int("carried", len(carried)),
+				zap.Int("files", len(graphPaths)))
+		}
 		idx.deleteEnrichmentByNodeIDs(nodeIDs)
 		// Canonical FTS lifetime is decided with its owners in the backend.
 		idx.deleteSymbolFTS(ftsNodeIDs)
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
-		idx.deleteIncrementalSidecars(graphPaths)
 		idx.clearIncrementalContent(graphPaths)
 		nodes, edges := evictFilesBatched(idx.graph, graphPaths)
+		// This is an authoritative deletion, including legacy files without
+		// accepted inventory. Establish the graph tombstone before sidecar
+		// cleanup so constant ownership cannot restore a live file receipt.
+		idx.deleteIncrementalSidecars(graphPaths)
 		nodesRemoved += nodes
 		edgesRemoved += edges
 	}
@@ -1696,11 +2737,14 @@ func (idx *Indexer) deleteEnrichmentByNodeIDs(nodeIDs []string) {
 }
 
 func (idx *Indexer) deleteIncrementalSidecars(graphPaths []string) {
-	if writer, ok := idx.graph.(graph.FileMetaWriter); ok {
-		_ = writer.DeleteFileMetasByFiles(idx.repoPrefix, graphPaths)
-	}
+	// Delta constant deletion may establish accepted ownership while the
+	// graph file is still live. Retire inventory last so a true file deletion
+	// cannot restore physical metadata underneath the later tombstone.
 	if writer, ok := idx.graph.(graph.ConstantValueWriter); ok {
 		_ = writer.DeleteConstantValuesByFiles(idx.repoPrefix, graphPaths)
+	}
+	if writer, ok := idx.graph.(graph.FileMetaWriter); ok {
+		_ = writer.DeleteFileMetasByFiles(idx.repoPrefix, graphPaths)
 	}
 }
 

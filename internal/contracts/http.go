@@ -767,18 +767,17 @@ func (h *HTTPExtractor) extract(
 				if gStart >= 0 && gEnd > gStart {
 					handlerName := text[gStart:gEnd]
 					handlerIdent = handlerName
-					// Always capture the full call-trail (every
-					// argument between the HandleFunc parens) so a
+					// Capture the trail from the actual handler argument so a
 					// later module-wide pass can enumerate handler
 					// candidates — the narrow `\w+` regex capture
 					// above stops at the first `.` in `h.ServeArchive`
 					// and misses wrappers in `WithAuth(h.Foo)`.
-					// callTrailSlice walks forward from the start of the
-					// HandleFunc match to the matching `)`; passing m[0]
-					// (match start) gets us the full args slice. Passing
-					// m[1] (match end) would search past every paren we
-					// care about and return the empty string.
-					handlerTrail = callTrailSlice(text, m[0])
+					// Balance from the route call's opening paren, but start the
+					// returned text at the captured handler token. The preceding
+					// method/path literal is not a handler reference; treating its
+					// words as names both imports unrelated nodes and can bind a
+					// same-named function when the actual handler is unresolved.
+					handlerTrail = callTrailSliceFrom(text, m[0], gStart)
 					if hID := resolveHandlerIdent(fileNodes, handlerName); hID != "" {
 						symbolID = hID
 					} else if hID := findInnermostResolvableHandler(fileNodes, handlerTrail); hID != "" {
@@ -1115,6 +1114,13 @@ func resolveHandlerIdent(fileNodes []*graph.Node, ident string) string {
 // call can't be balanced (which only happens on truncated or invalid
 // source — production files are fine).
 func callTrailSlice(src string, matchStart int) string {
+	return callTrailSliceFrom(src, matchStart, 0)
+}
+
+// callTrailSliceFrom keeps the complete call boundary while omitting arguments
+// before contentStart. The HTTP extractor supplies its handler capture offset;
+// other callers retain the full argument slice through callTrailSlice.
+func callTrailSliceFrom(src string, matchStart, contentStart int) string {
 	// Seek forward from matchStart to the first '(' — that's the
 	// opening paren of the HandleFunc call. The regex's m[0] lands
 	// at the start of the "HandleFunc" token.
@@ -1141,7 +1147,11 @@ func callTrailSlice(src string, matchStart int) string {
 		case ')':
 			depth--
 			if depth == 0 {
-				return src[openIdx+1 : i]
+				start := max(openIdx+1, contentStart)
+				if start > i {
+					return ""
+				}
+				return src[start:i]
 			}
 			i++
 		case '"', '\'', '`':

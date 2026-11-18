@@ -62,6 +62,9 @@ type enrichResult struct {
 	context string
 	deny    bool
 	reason  string
+	// Explicit checkout refusal must leave the native path open even when
+	// nudge would otherwise turn an advisory into a periodic deny.
+	readOnlyAllowance bool
 }
 
 // gortexMCPToolPrefix is the namespace Claude Code gives Gortex's own
@@ -145,6 +148,11 @@ func runPreToolUseForHost(data []byte, gortexPort int, mode Mode, host preToolUs
 	// switch and the other modes' logic so a gortex tool is never
 	// processed further.
 	if isGortexMCP && isPermissivePermissionMode(input.PermissionMode) {
+		// Returning early skips the consult-unlock branch below, so record
+		// the marker here or fallback reads would stay locked all session.
+		if mode == ModeConsultUnlock {
+			markGraphConsulted(input.SessionID)
+		}
 		hso := &HookSpecificOutput{
 			HookEventName:            "PreToolUse",
 			PermissionDecision:       "allow",
@@ -314,6 +322,9 @@ func hookAlternationSegmentCount(input HookInput) int {
 //   - ModeAdaptiveNudge: per-call denial is replaced with a single
 //     soft-deny per burst of non-symbolic fallback calls.
 func applyMode(input HookInput, isGortexMCP bool, mode Mode, result enrichResult) enrichResult {
+	if result.readOnlyAllowance {
+		return result
+	}
 	switch mode {
 	case ModeEnrich:
 		if result.deny {
@@ -436,13 +447,15 @@ func consultUnlockReason(reason string) string {
 // isPermissivePermissionMode reports whether the host's permission mode
 // is one under which Gortex's own MCP tools should be auto-approved.
 //
-// Implemented as an allowlist — only "acceptEdits" and "auto" return
-// true. Everything else (including "bypassPermissions", "default",
+// Implemented as an allowlist — only "acceptEdits", "auto", and
+// "bypassPermissions" return true. Everything else (including "default",
 // "plan", and the empty string) returns false, so an unknown future
-// permission mode is never auto-approved by default.
+// permission mode is never auto-approved by default. bypassPermissions
+// must be on the list: a rewrite carrying updatedInput (the terminal-auth
+// token) otherwise falls back to "ask", which print-mode runs reject (#841).
 func isPermissivePermissionMode(mode string) bool {
 	switch strings.TrimSpace(mode) {
-	case "acceptEdits", "auto":
+	case "acceptEdits", "auto", "bypassPermissions":
 		return true
 	default:
 		return false
@@ -517,17 +530,21 @@ func nudgeReason(guidance string) string {
 }
 
 func enrich(input HookInput, port int) enrichResult {
-	// A call that touches no tracked repo has no graph to redirect to, so the
-	// access policy has nothing true to say about it. Checked once here rather
-	// than per-enrichment so every host tool the policy covers is gated the
-	// same way, and so a Gortex MCP call — which is not repo-scoped — is not.
+	return enrichWithProbe(input, port, sessionFileScopeProbe(input.SessionID))
+}
+
+func enrichWithProbe(input HookInput, port int, probe fileScopeProbe) enrichResult {
+	// The configured registry bounds normal redirects. It does not enumerate
+	// automatic linked checkouts, so an outside-root candidate may still
+	// establish recovery from its exact file probe, without expanding ordinary
+	// enforcement. Gortex MCP calls are not repo-scoped by this gate.
 	if !isGortexMCPToolName(input.ToolName) &&
 		!hookCallTargetsTrackedRepo(input.ToolName, input.ToolInput, input.CWD) {
-		return enrichResult{}
+		return outsideConfiguredReadOnlyRecovery(input, probe)
 	}
 	switch input.ToolName {
 	case "Read":
-		return enrichRead(input.ToolInput, input.CWD)
+		return enrichReadWithProbe(input.ToolInput, input.CWD, probe)
 	case "Grep":
 		return enrichGrep(input.ToolInput, port, input.CWD)
 	case "Glob":
@@ -535,11 +552,11 @@ func enrich(input HookInput, port int) enrichResult {
 	case "Task":
 		return enrichTask(input.ToolInput, port)
 	case "Bash":
-		return enrichBash(input.ToolInput, input.CWD)
+		return enrichBashWithProbe(input.ToolInput, input.CWD, probe)
 	case "Edit":
-		return enrichEdit(input.ToolInput, input.CWD)
+		return enrichEditWithProbe(input.ToolInput, input.CWD, probe)
 	case "Write":
-		return enrichWrite(input.ToolInput, input.CWD)
+		return enrichWriteWithProbe(input.ToolInput, input.CWD, probe)
 	case gortexReadFileTool, gortexEditingContextTool, gortexCompactReadTool:
 		return enrichGortexRead(input.ToolName, input.ToolInput)
 	default:
@@ -550,6 +567,10 @@ func enrich(input HookInput, port int) enrichResult {
 // enrichRead blocks reads of indexed source files and suggests graph tools.
 // Ranged reads are included: indexed source must stay on the graph-aware read path.
 func enrichRead(toolInput map[string]any, cwd string) enrichResult {
+	return enrichReadWithProbe(toolInput, cwd, queryFileIndexScope)
+}
+
+func enrichReadWithProbe(toolInput map[string]any, cwd string, probe fileScopeProbe) enrichResult {
 	filePath, ok := toolInput["file_path"].(string)
 	if !ok || filePath == "" {
 		return enrichResult{}
@@ -560,10 +581,25 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 		return enrichResult{}
 	}
 
-	st := queryFileIndexScope(cwd, filePath)
+	st := probe(cwd, filePath)
+	if st.ReadOnly {
+		return readOnlyNativeAllowance(false)
+	}
+	if st.Loading {
+		return enrichResult{context: repoLoadingNativeAllowance(st.LoadingRepo)}
+	}
+	// A file in a linked worktree the session is not working in is served by
+	// that worktree's view, not the one graph tools default to (#820).
+	wtRoot := foreignWorktreeRoot(cwd, filePath)
 
 	// If the file is indexed, BLOCK the read and provide graph alternatives.
 	if st.Indexed {
+		if wtRoot != "" {
+			return enrichResult{
+				deny:   true,
+				reason: worktreeReadDeny(filePath, wtRoot, st) + readOutlineEvidence(cwd, filePath),
+			}
+		}
 		var reason strings.Builder
 		fmt.Fprintf(&reason, "[Gortex] BLOCKED: Read of %s (%d symbols indexed). Call `explore` first, then use `read` instead:\n", filePath, st.Count)
 		reason.WriteString("  - `read(target:{symbol:\"<id>\"})` — one symbol\n")
@@ -591,6 +627,9 @@ func enrichRead(toolInput map[string]any, cwd string) enrichResult {
 	}
 
 	// Tracked and indexable, just not indexed yet — allow with advisory.
+	if wtRoot != "" {
+		return enrichResult{context: worktreeReadAdvisory(filePath, wtRoot, st)}
+	}
 	var guidance strings.Builder
 	guidance.WriteString("[Gortex] Use `explore` first, then `read` for indexed source:\n")
 	guidance.WriteString("  - one symbol: `read(target:{symbol:\"<id>\"})`\n")
@@ -689,9 +728,15 @@ func enrichGrep(toolInput map[string]any, _ int, cwdArg ...string) enrichResult 
 		// surface both point at has no answer for it either.
 		return enrichResult{}
 	case searchScopeIndexed:
+		reason := formatTrackedSearchDeny("Grep", pattern)
+		if scope, _ := toolInput["path"].(string); strings.TrimSpace(scope) != "" {
+			if root := foreignWorktreeRoot(cwd, scope); root != "" {
+				reason = worktreeSearchDeny("Grep", pattern, root)
+			}
+		}
 		return enrichResult{
 			deny:   true,
-			reason: formatTrackedSearchDeny("Grep", pattern),
+			reason: reason,
 		}
 	}
 	return probeSymbolPattern("Grep", pattern, cwd, defaultGrepGuidance())
@@ -727,6 +772,9 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 		}
 		st := queryFileIndexScope(cwd, scope)
 		switch {
+		case st.Loading:
+			// Its repository is loading: the graph cannot answer this search.
+			return searchScopeNonSource
 		case st.Indexed:
 			return searchScopeIndexed
 		// Before Symbolless, which it can accompany: a size- or gate-skipped
@@ -761,7 +809,7 @@ func hookSearchScope(cwd string, toolInput map[string]any) searchScopeVerdict {
 // scopeNamesFile reports whether a `path` scope names one file rather than a
 // directory to search under. An existing path answers directly; one that is
 // not on disk (a scope the agent typed from memory) is judged by whether it
-// carries an extension.
+// carries an extension (`.` and `..` are always directories).
 func scopeNamesFile(cwd, scope string) bool {
 	abs := scope
 	if !filepath.IsAbs(abs) && cwd != "" {
@@ -769,6 +817,9 @@ func scopeNamesFile(cwd, scope string) bool {
 	}
 	if info, err := os.Stat(abs); err == nil {
 		return !info.IsDir()
+	}
+	if base := filepath.Base(scope); base == "." || base == ".." {
+		return false
 	}
 	return filepath.Ext(scope) != ""
 }
@@ -1129,6 +1180,38 @@ type fileIndexStatus struct {
 	ProbeOK        bool // the daemon resolved the path to a graph and read it
 	Unreached      bool // the probe never came back
 	Count          int
+	// View is the graph that answered, as the daemon reported it; nil when
+	// it named none. It shapes message text only and decides nothing.
+	View *daemon.ProbeView
+	// Loading reports that the path belongs to a configured repository the
+	// daemon has not registered since it started. Graph tools answer
+	// repo_loading for it, so this is the one decision every door shares:
+	// a loading repository is never denied a native tool, whatever its
+	// persisted rows say, or the agent has no read path at all. The deny
+	// resumes once the repository is ready. LoadingRepo names it.
+	Loading        bool
+	LoadingRepo    string
+	ReadOnly       bool
+	MutationKnown  bool
+	MutationReason string
+}
+
+func readOnlyNativeAllowance(writing bool) enrichResult {
+	context := "[Gortex] Gortex writes are refused for this checkout; native reads and edits are allowed. Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session."
+	if writing {
+		context += " Run git diff and the tests after the native edit."
+	}
+	return enrichResult{context: context + "\n", readOnlyAllowance: true}
+}
+
+// repoLoadingNativeAllowance is the context a native tool carries when the
+// hook lets it through because the path's repository is still loading.
+func repoLoadingNativeAllowance(repo string) string {
+	if repo == "" {
+		return "[Gortex] Graph admission for this path is still resolving and is not yet established (repo_loading, identity_pending). Native tools are allowed while this temporary state resolves. Retry shortly without changing tracking configuration.\n"
+	}
+	return fmt.Sprintf("[Gortex] %s is still loading after a restart; graph tools return repo_loading until it is ready. "+
+		"Native reads are allowed until then.\n", repo)
 }
 
 // noGraphAnswer reports whether a redirect to graph tools has nothing true to
@@ -1136,6 +1219,12 @@ type fileIndexStatus struct {
 // symbol lookups; the search doors answer for symbol-free files too.
 func (st fileIndexStatus) noGraphAnswer() bool {
 	switch {
+	case st.ReadOnly:
+		return true
+	case st.Loading:
+		// The graph has an answer, but not for this session yet: a redirect
+		// to tools that refuse with repo_loading says nothing true.
+		return true
 	case st.Indexed:
 		// Before the Tracked tests below: an older daemon reports coverage
 		// without the tracked flag, and they would silence it.
@@ -1207,6 +1296,12 @@ func fileIndexScopeViaDaemon(cwd, filePath string, timeout time.Duration) fileIn
 		return fileIndexStatus{Unreached: true}
 	}
 	logProbeViewFallback(daemon.ControlFileCoverage, result.View)
+	return fileIndexStatusFromCoverage(result)
+}
+
+// fileIndexStatusFromCoverage turns the daemon's coverage answer into the
+// hook's verdict, split from the transport so it is testable without a daemon.
+func fileIndexStatusFromCoverage(result daemon.FileCoverageResult) fileIndexStatus {
 	// Covered counts as an answer whatever the daemon's vintage. A daemon
 	// predating Answered still reports coverage truthfully, and gating on the
 	// missing field would drop a real deny into silence for the whole life of
@@ -1216,6 +1311,17 @@ func fileIndexScopeViaDaemon(cwd, filePath string, timeout time.Duration) fileIn
 	st := fileIndexStatus{
 		Tracked: result.Tracked,
 		ProbeOK: result.Answered || result.Covered,
+		View:    result.View,
+	}
+	if result.MutationState == "read_only" {
+		st.ProbeOK, st.ReadOnly, st.MutationKnown, st.MutationReason = true, true, true, result.MutationReason
+	}
+	st.MutationKnown = st.MutationKnown || result.MutationState == "ready"
+	if result.RepoState == daemon.RepoStateLoading || result.RepoState == daemon.RepoStateIdentityPending {
+		// Coverage read from a loading repository's persisted rows is not a
+		// reason to deny: report it as loading, never as indexed.
+		st.ProbeOK, st.Loading, st.LoadingRepo = true, true, result.Repo
+		return st
 	}
 	if !st.ProbeOK {
 		return st
@@ -1344,11 +1450,85 @@ func repoRootForFile(abs string) string {
 // disruptive than a miss, so the classifier only flags primary
 // grep/rg/find-name/cat-source invocations and recognised write shapes.
 func enrichBash(toolInput map[string]any, cwd string) enrichResult {
+	return enrichBashWithProbe(toolInput, cwd, queryFileIndexScope)
+}
+
+func enrichBashWithProbe(toolInput map[string]any, cwd string, probe fileScopeProbe) enrichResult {
 	cmd, _ := toolInput["command"].(string)
 	if cmd == "" {
 		return enrichResult{}
 	}
+	return enrichBashCommand(cmd, cwd, probe, 0, time.Time{})
+}
 
+// enrichBashCommand answers one command at the given nesting depth: 0 for
+// the command the agent typed, 1 for a command it runs as text (`bash -c`,
+// a Python os.system), whose own nested commands are not examined.
+//
+// The shapes the hook has always answered come first, exactly as before:
+// their analysis and probes share nothing with what follows. Only a
+// command they do not deny is looked at again for what they cannot see —
+// os.open, scripts behind a wrapper, nested commands — in a second
+// analysis with its own budget, starting when it begins. A zero deadline
+// gives each part its own; a nested command gets the deadline of the
+// command it is nested in.
+func enrichBashCommand(cmd, cwd string, probe fileScopeProbe, depth int, deadline time.Time) enrichResult {
+	r := enrichBashShapes(cmd, cwd, probe, deadline)
+	if r.deny {
+		return r
+	}
+	if deadline.IsZero() {
+		deadline = time.Now().Add(inlineScriptTime)
+	}
+	pyScripts, shells := inlineScriptsAt(cmd, true)
+	if len(pyScripts) == 0 && len(shells) == 0 {
+		return r
+	}
+	scripts := analyzeInlineScripts(pyScripts, deadline, true)
+	dirs := newCommandDirs(cmd)
+	var nested []nestedCommand
+	if depth == 0 {
+		nested = nestedCommands(shells, scripts, dirs, cwd)
+	}
+	r = enrichBashExtra(r, cwd, probe, deadline, scripts, shells, dirs, nested)
+	if depth > 0 {
+		return r
+	}
+	// A walk that reads the files it finds is answered last, after
+	// everything else, nested commands included, and only ever adds a
+	// deny.
+	return enrichBashWalks(r, walkCandidates(pyScripts, dirs, cwd, nested), deadline)
+}
+
+// enrichBashExtra answers what the shapes cannot see: os.open, scripts
+// behind a wrapper and the nested commands.
+func enrichBashExtra(r enrichResult, cwd string, probe fileScopeProbe, deadline time.Time, scripts []analyzedScript, shells []inlineScript, dirs commandDirs, nested []nestedCommand) enrichResult {
+	if len(scripts) == 0 && len(shells) == 0 {
+		return r
+	}
+	if extra, ok := scriptReadAnswer(scripts, true, dirs, cwd, probe, time.Now()); ok {
+		if extra.deny {
+			return extra
+		}
+		if r == (enrichResult{}) {
+			r = extra
+		}
+	}
+	// A Python os.open write is a write shape the patterns cannot see: it
+	// gets the shell-write answer.
+	if writes := scriptWrites(scripts, dirs); len(writes) > 0 {
+		if w, answered := enrichBashWrite(BashClassification{Action: BashActionWriteSource, Writes: writes}, cwd); answered {
+			if w.deny {
+				return w
+			}
+			r = w
+		}
+	}
+	return enrichNestedCommands(r, nested, probe, 0, deadline)
+}
+
+// enrichBashShapes answers the shell shapes and inline Python of a command.
+func enrichBashShapes(cmd, cwd string, probe fileScopeProbe, deadline time.Time) enrichResult {
 	c := classifyBashCommand(cmd)
 	if c.Action == BashActionWriteSource {
 		if result, answered := enrichBashWrite(c, cwd); answered {
@@ -1359,6 +1539,46 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 		// the write pre-pass instead of returning silence.
 		c = classifyBashReadCommand(cmd)
 	}
+	// A grep whose every target lies outside every tracked repo, or is docs or
+	// config inside one, gets the silence `cat` of the same file and Grep with
+	// `path:` already get (#893): the graph the redirect names has nothing for
+	// it. Pass over it rather than stopping, so a source read chained after it
+	// is still answered, unless the operands it read off the command cannot
+	// be trusted (searchOperandsUncertain).
+	trusted := !searchOperandsUncertain(cmd)
+	outsideGraph := func(next BashClassification) bool {
+		return next.Action == BashActionGrepLike && trusted &&
+			(bashSearchOutsideTrackedRepos(next.Paths, cwd) || bashSearchNonSource(next.Paths, cwd))
+	}
+	if outsideGraph(c) {
+		c = classifyBashReadCommandSkipping(cmd, outsideGraph)
+	}
+	// An inline Python one-liner or heredoc that opens indexed source is the
+	// read door agents take once cat and grep are redirected. It is answered
+	// for every command, not only when the shell leaves it passthrough: a
+	// read/grep/find that follows it would otherwise make the command
+	// non-passthrough and skip the Python analysis, so `python3 -c "…"`
+	// chained after a `head` still answers. The analysis is self-limiting and
+	// silent for commands that carry no inline Python.
+	//
+	// A Python deny answers at once. Anything softer (the edit advisory, a
+	// read-only or loading allowance) must not cost the command a deny its
+	// shell read earns on its own, so the shell answer is taken first when
+	// it denies.
+	py, pyAnswered := enrichBashScriptRead(cmd, cwd, probe, deadline)
+	if pyAnswered && (py.deny || c.Action == BashActionPassthrough) {
+		return py
+	}
+	shell := enrichBashShellRead(c, cwd, probe)
+	if shell.deny || !pyAnswered {
+		return shell
+	}
+	return py
+}
+
+// enrichBashShellRead answers the grep, find or source read a classified
+// Bash command leads with.
+func enrichBashShellRead(c BashClassification, cwd string, probe fileScopeProbe) enrichResult {
 	switch c.Action {
 	case BashActionGrepLike:
 		return probeSymbolPattern("Bash", c.Pattern, cwd, defaultGrepGuidance())
@@ -1373,7 +1593,10 @@ func enrichBash(toolInput map[string]any, cwd string) enrichResult {
 	case BashActionReadSource:
 		// Bash is the door an agent falls back to the moment Read denies, so
 		// it has to reach the same verdict Read does — including the silences.
-		st := queryFileIndexScope(cwd, c.Path)
+		st := probe(cwd, c.Path)
+		if st.ReadOnly {
+			return readOnlyNativeAllowance(false)
+		}
 		if st.Indexed {
 			var reason strings.Builder
 			fmt.Fprintf(&reason,
@@ -1494,6 +1717,11 @@ var dirCoverageFn = dirCoverageViaDaemon
 // Only a completed walk that claimed nothing proves a scope holds no source.
 // From the graph alone a scope mid-walk looks exactly like an excluded one.
 func scopeTrackedFromCoverage(result daemon.DirCoverageResult) (hasSource, probeOK bool) {
+	if result.RepoState == daemon.RepoStateLoading || result.RepoState == daemon.RepoStateIdentityPending {
+		// A loading repository's scope holds nothing the graph will answer
+		// for yet, whatever its persisted rows say (see fileIndexStatus).
+		return false, true
+	}
 	if !result.Answered {
 		return false, false
 	}
@@ -1634,8 +1862,15 @@ func envGateEnabled(name string) bool {
 // graph atomically. Advisory by default and a hard block under
 // GORTEX_HOOK_BLOCK_EDIT.
 func enrichEdit(toolInput map[string]any, cwd string) enrichResult {
-	filePath, indexed := indexedSourceTarget(toolInput, cwd)
-	if !indexed {
+	return enrichEditWithProbe(toolInput, cwd, queryFileIndexScope)
+}
+
+func enrichEditWithProbe(toolInput map[string]any, cwd string, probe fileScopeProbe) enrichResult {
+	filePath, st := sourceTargetStatus(toolInput, cwd, probe)
+	if st.ReadOnly {
+		return readOnlyNativeAllowance(true)
+	}
+	if !st.Indexed {
 		return enrichResult{}
 	}
 	return writeRedirect(
@@ -1645,24 +1880,29 @@ func enrichEdit(toolInput map[string]any, cwd string) enrichResult {
 	)
 }
 
-// indexedSourceTarget resolves a tool input's file_path and reports whether
-// the daemon knows it as source. A path outside the graph is a new file, which
-// the graph has no opinion about yet.
-func indexedSourceTarget(toolInput map[string]any, cwd string) (string, bool) {
+// sourceTargetStatus retains refusal state without issuing a second coverage
+// probe. A path outside the graph is a new file with no redirect verdict.
+func sourceTargetStatus(toolInput map[string]any, cwd string, probe fileScopeProbe) (string, fileIndexStatus) {
 	filePath, ok := toolInput["file_path"].(string)
 	if !ok || filePath == "" || !looksLikeSourceFile(filePath) {
-		return "", false
+		return "", fileIndexStatus{}
 	}
-	indexed, _ := queryFileIndexed(cwd, filePath)
-	return filePath, indexed
+	return filePath, probe(cwd, filePath)
 }
 
 // enrichWrite mirrors enrichEdit for whole-file Write. New files
 // (not yet indexed) pass through; rewrites of existing indexed
 // files are redirected to `edit_file` / `write_file`.
 func enrichWrite(toolInput map[string]any, cwd string) enrichResult {
-	filePath, indexed := indexedSourceTarget(toolInput, cwd)
-	if !indexed {
+	return enrichWriteWithProbe(toolInput, cwd, queryFileIndexScope)
+}
+
+func enrichWriteWithProbe(toolInput map[string]any, cwd string, probe fileScopeProbe) enrichResult {
+	filePath, st := sourceTargetStatus(toolInput, cwd, probe)
+	if st.ReadOnly {
+		return readOnlyNativeAllowance(true)
+	}
+	if !st.Indexed {
 		return enrichResult{}
 	}
 	return writeRedirect(

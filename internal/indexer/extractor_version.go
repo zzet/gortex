@@ -38,14 +38,17 @@ var extractorVersions = map[string]int{
 	// Languages default to version 1 (no salt). Raise an entry here in
 	// the same change that alters a language's extraction logic, e.g.
 	//   "go": 2,
-	"c":      generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
-	"php":    2,                                      // class/interface inheritance now emits typed structural edges
-	"csharp": 24,                                     // receiverless calls bound by a local function / delegate parameter / local carry local_shadow (was: partial / conditionally-compiled properties carry their recorded ownership span)
-	"scala":  2,                                      // explicitly instantiated generic calls emit call edges
-	"go":     3,                                      // generic instantiations are marked so indexing a func value cannot bind (was: generic calls emit call edges)
-	"cpp":    2,                                      // templated and namespace-qualified calls emit call edges
-	"swift":  2,                                      // generic calls and ordinary member calls emit call edges
-	"julia":  3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
+	"c":          generatedParserProjectionPolicyVersion, // generated parser projection covers all strictly detected table sizes
+	"php":        2,                                      // class/interface inheritance now emits typed structural edges
+	"csharp":     24,                                     // receiverless calls bound by a local function / delegate parameter / local carry local_shadow (was: partial / conditionally-compiled properties carry their recorded ownership span)
+	"scala":      2,                                      // explicitly instantiated generic calls emit call edges
+	"go":         5,                                      // GraphQL contract operations are limited to string literals
+	"cpp":        2,                                      // templated and namespace-qualified calls emit call edges
+	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
+	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
+	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
+	"javascript": 2,                                      // renamed per-binding imports persist import_alias Meta; older rows keyed a renamed import by its original name
+	"typescript": 3,                                      // gRPC consumer contracts require an actual gRPC import
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -97,6 +100,7 @@ var extractorSaltExtLang = map[string]string{
 	".sh":     "bash",
 	".bash":   "bash",
 	".jl":     "julia",
+	".sql":    "sql",
 }
 
 // ExtractorLangForFile returns the extractor-staleness language key for a

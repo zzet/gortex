@@ -63,7 +63,6 @@ func newBlockedLifecycleFixture(t testing.TB) (*realCheckoutMutationFixture, *li
 	// Unblock before the fixture's lifecycle cleanup waits for its real worker.
 	t.Cleanup(e.unblock)
 	f.srv.mutationReindexWait = 20 * time.Millisecond
-	f.srv.mutationSafetyWait = 20 * time.Millisecond
 	return f, e
 }
 
@@ -283,12 +282,13 @@ func TestWorktreeAgentLifecycleSlowRefreshRemainsRecoverable(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(files), "edit.go")
 
-	// A graph-dependent edit must refuse the pending exact view promptly, not
-	// write through the primary fallback or wait behind the held build lock.
+	// A graph-dependent edit waits only within its caller's short budget and
+	// refuses without writing through the primary or blocking on the build lock.
 	started = time.Now()
 	refused := f.facade(t, f.primary, "edit", map[string]any{
 		"operation": "file", "target": map[string]any{"file": "repo/edit.go"},
 		"match": "LifecycleBlocked", "replacement": "MustNotLand", "view": view, "require_exact": true,
+		"wait_deadline": time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano),
 	})
 	require.True(t, refused.IsError)
 	require.Less(t, time.Since(started), time.Second)

@@ -13,12 +13,12 @@ import (
 // HTTPExtractor.extract can stitch contracts the same way regardless
 // of which detector found the route.
 type goRouteMatch struct {
-	method       string  // "GET" / "ANY" / etc.
-	path         string  // raw path text (with the verb prefix stripped for Go 1.22+ form)
-	handlerIdent string  // first identifier in the handler-arg position, or ""
-	handlerTrail string  // full source span of the call's arguments, or ""
-	line         int     // 1-based line of the call_expression
-	framework    string  // "net/http" / "gin/echo/chi" / "fiber"
+	method       string // "GET" / "ANY" / etc.
+	path         string // raw path text (with the verb prefix stripped for Go 1.22+ form)
+	handlerIdent string // first identifier in the handler-arg position, or ""
+	handlerTrail string // source span from the first handler argument, or ""
+	line         int    // 1-based line of the call_expression
+	framework    string // "net/http" / "gin/echo/chi" / "fiber"
 	confidence   float64
 }
 
@@ -175,12 +175,9 @@ func finishGoRoute(
 		// resolve via the call-trail.
 		handlerArg := argList[1]
 		m.handlerIdent = extractFirstHandlerIdent(handlerArg, src)
-		// handlerTrail is the full source span of the args list,
-		// excluding the leading "(" and trailing ")".
-		argText := args.Content(src)
-		argText = strings.TrimPrefix(argText, "(")
-		argText = strings.TrimSuffix(argText, ")")
-		m.handlerTrail = strings.TrimSpace(argText)
+		// Start at the actual handler expression, retaining later middleware
+		// arguments. Words in the preceding route literal are not references.
+		m.handlerTrail = strings.TrimSpace(string(src[handlerArg.StartByte() : args.EndByte()-1]))
 	}
 	return m
 }

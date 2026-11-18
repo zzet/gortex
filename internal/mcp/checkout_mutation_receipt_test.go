@@ -173,7 +173,7 @@ func TestCheckoutMutationReceiptScopeAndSummary(t *testing.T) {
 	if pending, err := s.mutationFreshnessSummaryForRepos(ctx, "fixture"); pending || !errors.Is(err, failure) {
 		t.Fatalf("summary did not preserve terminal cause: pending=%t err=%v", pending, err)
 	}
-	if err := s.awaitMutationFreshnessForRepos(context.Background(), "fixture"); err != nil {
+	if pending, err := s.mutationFreshnessSummaryForRepos(context.Background(), "fixture"); pending || err != nil {
 		t.Fatalf("sibling checkout failure blocked canonical graph: %v", err)
 	}
 }
@@ -265,9 +265,6 @@ func TestCheckoutMutationReceiptSupersededDoesNotPoisonCurrentView(t *testing.T)
 	if pending, err := s.mutationFreshnessSummaryForRepos(ctx, "fixture"); pending || err != nil {
 		t.Fatalf("historical branch poisoned current-view diagnostics: pending=%t err=%v", pending, err)
 	}
-	if err := s.awaitMutationFreshnessForRepos(ctx, "fixture"); err != nil {
-		t.Fatalf("historical branch poisoned current-view barrier: %v", err)
-	}
 	payload := s.mutationStatusPayload(record)
 	if payload["graph_status"] != mutationGraphFailed || payload["graph_status_terminal"] != true || payload["new_sha"] != "original-bytes-sha" {
 		t.Fatalf("historical receipt was falsely certified by current-view exemption: %#v", payload)
@@ -281,7 +278,7 @@ func TestCheckoutMutationReceiptBindsBytesActuallyCommitted(t *testing.T) {
 			s := &Server{}
 			ctx := withCheckoutMutation(context.Background(), mutation, filepath.Dir(path))
 			data := []byte("package committed\n")
-			record, err := s.commitFileMutation(ctx, "write_file", "", "", "edit.go", path, data, 0o600)
+			record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "", "edit.go", path, data, 0o600)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -399,8 +396,8 @@ func TestCheckoutMutationReceiptRecoveryRetiresOnlyPriorBarrierFailures(t *testi
 						t.Fatalf("unrelated or later failure %q was retired", id)
 					}
 				}
-			} else if err := s.awaitMutationFreshnessForRepos(ctx, "fixture"); err != nil {
-				t.Fatalf("verified root recovery left current-view barrier poisoned: %v", err)
+			} else if pending, err := s.mutationFreshnessSummaryForRepos(ctx, "fixture"); pending || err != nil {
+				t.Fatalf("verified root recovery left current-view summary poisoned: %v", err)
 			}
 		})
 	}

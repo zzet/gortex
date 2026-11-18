@@ -128,6 +128,8 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("SetEdgeProvenanceBatch", func(t *testing.T) { testSetEdgeProvenanceBatch(t, factory) })
 	t.Run("ReindexEdge", func(t *testing.T) { testReindexEdge(t, factory) })
 	t.Run("ReindexEdges", func(t *testing.T) { testReindexEdges(t, factory) })
+	t.Run("ReindexConvergencePayload", func(t *testing.T) { RunReindexConvergencePayload(t, factory) })
+	t.Run("ReindexMovingSiblings", func(t *testing.T) { RunReindexMovingSiblings(t, factory) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
 	t.Run("EdgeIdentityRevisions", func(t *testing.T) { testEdgeIdentityRevisions(t, factory) })
 	t.Run("VerifyEdgeIdentities", func(t *testing.T) { testVerifyEdgeIdentities(t, factory) })
@@ -145,10 +147,13 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("GetNodesByIDs", func(t *testing.T) { testGetNodesByIDs(t, factory) })
 	t.Run("FindNodesByNames", func(t *testing.T) { testFindNodesByNames(t, factory) })
 	t.Run("GetEdgesByNodeIDs", func(t *testing.T) { testGetEdgesByNodeIDs(t, factory) })
+	t.Run("EdgesByNodeIDsKinds", func(t *testing.T) { testEdgesByNodeIDsKinds(t, factory) })
 	t.Run("GetRepoNodesByLanguage", func(t *testing.T) { testGetRepoNodesByLanguage(t, factory) })
 	t.Run("DistinctExternalTargets", func(t *testing.T) { testDistinctExternalTargets(t, factory) })
 	t.Run("SymbolBundleSearcher", func(t *testing.T) { testSymbolBundleSearcher(t, factory) })
 	t.Run("DeadCodeCandidator", func(t *testing.T) { testDeadCodeCandidator(t, factory) })
+	t.Run("ScopedDeadCodeReader", func(t *testing.T) { testScopedDeadCodeReader(t, factory) })
+	t.Run("FilteredScopedDeadCodeReader", func(t *testing.T) { testFilteredScopedDeadCodeReader(t, factory) })
 	t.Run("IfaceImplementsScanner", func(t *testing.T) { testIfaceImplementsScanner(t, factory) })
 	t.Run("NodeDegreeAggregator", func(t *testing.T) { testNodeDegreeAggregator(t, factory) })
 	t.Run("NodeFanAggregator", func(t *testing.T) { testNodeFanAggregator(t, factory) })
@@ -159,6 +164,8 @@ func RunConformance(t *testing.T, factory Factory, semantics Semantics) {
 	t.Run("NodesByKindsScanner", func(t *testing.T) { testNodesByKindsScanner(t, factory) })
 	t.Run("EdgeKindCounter", func(t *testing.T) { testEdgeKindCounter(t, factory) })
 	t.Run("CrossRepoEdgeAggregator", func(t *testing.T) { testCrossRepoEdgeAggregator(t, factory) })
+	t.Run("FilteredScopedOutline", func(t *testing.T) { RunFilteredScopedOutline(t, factory) })
+	t.Run("ScopedOutline", func(t *testing.T) { RunScopedOutline(t, factory) })
 	t.Run("FileImportAggregator", func(t *testing.T) { testFileImportAggregator(t, factory) })
 	t.Run("InDegreeForNodes", func(t *testing.T) { testInDegreeForNodes(t, factory) })
 	t.Run("ReachableForwardByKinds", func(t *testing.T) { testReachableForwardByKinds(t, factory) })
@@ -2473,10 +2480,11 @@ func testDistinctExternalTargets(t *testing.T, factory Factory) {
 	add("external-call::dep::example.com/old", graph.EdgeCalls, 6)
 	add("local.go::resolved", graph.EdgeCalls, 7)
 	add("dep::wrong-kind::Call", graph.EdgeTests, 8)
+	s.AddEdge(&graph.Edge{From: "other", To: "dep::collections.Counter::Counter", Kind: graph.EdgeCalls, FilePath: "worker.py"})
 
 	got := s.DistinctExternalTargets([]graph.EdgeKind{
 		graph.EdgeCalls, graph.EdgeReferences, graph.EdgeReads, graph.EdgeCalls,
-	})
+	}, ".go")
 	want := []string{
 		"dep::example.com/pkg::Call",
 		"external-call::dep::example.com/old",
@@ -2487,7 +2495,7 @@ func testDistinctExternalTargets(t *testing.T, factory Factory) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("DistinctExternalTargets = %v, want %v", got, want)
 	}
-	if got := s.DistinctExternalTargets(nil); len(got) != 0 {
+	if got := s.DistinctExternalTargets(nil, ""); len(got) != 0 {
 		t.Fatalf("DistinctExternalTargets(nil) yielded %d targets, want 0", len(got))
 	}
 }

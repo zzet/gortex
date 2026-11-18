@@ -12,7 +12,7 @@ import (
 
 func openMutationReceiptStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "mutation-receipt.sqlite"))
+	store, err := openPristine(t, filepath.Join(t.TempDir(), "mutation-receipt.sqlite"))
 	if err != nil {
 		t.Fatalf("open SQLite store: %v", err)
 	}
@@ -1040,5 +1040,142 @@ func TestSQLiteMutationReceiptEvictUnmappedImportCandidateKindFailsClosed(t *tes
 
 	if receipt.Complete {
 		t.Fatalf("receipt = %+v, want incomplete: the kind is a qualified-name import candidate without an exact stub mapping", receipt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The bounded-derived-pass (fan-out) axis: attribution
+// ---------------------------------------------------------------------------
+//
+// RecordMutationFanoutTruncation is a BROADCAST: it names a pass and the files
+// it dropped, never the repository or the mutation that ran it. This store is
+// per-daemon and shared by every indexed repository, so several windows are
+// open at once and the broadcast lands on all of them — repository B's cut on
+// repository A's receipt.
+//
+// A window that can attribute its own passes opens with
+// BeginMutationReceiptOwningFanout and hands its own facts back by token. The
+// two tests below pin both halves: the refusal and the keying.
+
+// fanoutFact is one bounded pass's completeness fact.
+func fanoutFact(pass string, capBound, considered int, dropped ...string) graph.ReceiptFanoutTruncation {
+	return graph.ReceiptFanoutTruncation{
+		Pass:         pass,
+		Cap:          capBound,
+		Considered:   considered,
+		Dropped:      len(dropped),
+		DroppedFiles: dropped,
+	}
+}
+
+// Revert-red: drop the fanoutOwned skip from RecordMutationFanoutTruncation and
+// the owning window inherits the sibling repository's two dropped files, so a
+// mutation in repository A tells its caller to re-resolve files that are not
+// A's — and reports a hole twice the size of the one it caused.
+func TestSQLiteOwningFanoutReceiptRefusesAForeignBroadcast(t *testing.T) {
+	store := openMutationReceiptStore(t)
+
+	owned := store.BeginMutationReceiptOwningFanout()
+	shared := store.BeginMutationReceipt()
+
+	// A sibling repository's bounded pass, cut while both windows are open.
+	store.RecordMutationFanoutTruncation(fanoutFact("affected_by", 1, 3, "b/one.go", "b/two.go"))
+	// The owning window's own pass, attributed by its token.
+	store.RecordMutationFanoutTruncationIn(owned, fanoutFact("affected_by", 4, 6, "a/own.go"))
+
+	ownedReceipt := store.EndMutationReceipt(owned)
+	sharedReceipt := store.EndMutationReceipt(shared)
+
+	fact, ok := ownedReceipt.FanoutTruncationFor("affected_by")
+	if !ok {
+		t.Fatalf("the owning window lost its own cut: %+v", ownedReceipt.FanoutTruncations)
+	}
+	if fact.Dropped != 1 || !slices.Equal(fact.DroppedFiles, []string{"a/own.go"}) {
+		t.Fatalf("owning receipt fan-out = %+v, want only its own dropped file", fact)
+	}
+	if fact.Cap != 4 || fact.Considered != 6 {
+		t.Fatalf("owning receipt fan-out = %+v, want the bound its own pass applied", fact)
+	}
+	if ownedReceipt.DroppedFanoutFiles() != 1 {
+		t.Fatalf("owning receipt dropped %d files, want 1", ownedReceipt.DroppedFanoutFiles())
+	}
+
+	// The unattributed window keeps the historical store-wide behaviour: it
+	// cannot attribute anything, so it takes the broadcast and nothing else.
+	// Over-reporting a hole is the safe direction; hiding one is not.
+	sharedFact, ok := sharedReceipt.FanoutTruncationFor("affected_by")
+	if !ok {
+		t.Fatalf("the broadcast reached no unattributed window: %+v", sharedReceipt.FanoutTruncations)
+	}
+	if !slices.Equal(sharedFact.DroppedFiles, []string{"b/one.go", "b/two.go"}) {
+		t.Fatalf("unattributed receipt fan-out = %+v, want the broadcast", sharedFact)
+	}
+
+	// The axis stays additive on both windows: a bounded fan-out never voids
+	// the delta receipt, which would force the whole-graph fallback the bound
+	// exists to avoid.
+	if !ownedReceipt.Complete || !sharedReceipt.Complete {
+		t.Fatalf("a bounded fan-out voided a delta receipt: owned=%+v shared=%+v", ownedReceipt, sharedReceipt)
+	}
+}
+
+// The token IS the attribution. A fact addressed to one window must reach that
+// window and no other, and a token that names no open window is a silent
+// no-op — the same answer a late broadcast gets.
+//
+// Revert-red: make RecordMutationFanoutTruncationIn ignore its token and walk
+// every active accumulator, and the two concurrent mutations below report each
+// other's holes.
+func TestSQLiteMutationFanoutRecordIsKeyedToItsToken(t *testing.T) {
+	store := openMutationReceiptStore(t)
+
+	first := store.BeginMutationReceiptOwningFanout()
+	second := store.BeginMutationReceiptOwningFanout()
+
+	store.RecordMutationFanoutTruncationIn(first, fanoutFact("affected_by", 2, 5, "a/one.go"))
+	store.RecordMutationFanoutTruncationIn(second, fanoutFact("affected_by", 3, 9, "b/one.go", "b/two.go"))
+	// Neither an unknown token nor a closed one may reach anybody.
+	store.RecordMutationFanoutTruncationIn(first+second+1, fanoutFact("affected_by", 1, 2, "ghost.go"))
+
+	firstReceipt := store.EndMutationReceipt(first)
+	store.RecordMutationFanoutTruncationIn(first, fanoutFact("affected_by", 1, 2, "late.go"))
+	secondReceipt := store.EndMutationReceipt(second)
+
+	firstFact, ok := firstReceipt.FanoutTruncationFor("affected_by")
+	if !ok || !slices.Equal(firstFact.DroppedFiles, []string{"a/one.go"}) {
+		t.Fatalf("first receipt fan-out = %+v, want only its own cut", firstReceipt.FanoutTruncations)
+	}
+	secondFact, ok := secondReceipt.FanoutTruncationFor("affected_by")
+	if !ok || !slices.Equal(secondFact.DroppedFiles, []string{"b/one.go", "b/two.go"}) {
+		t.Fatalf("second receipt fan-out = %+v, want only its own cut", secondReceipt.FanoutTruncations)
+	}
+	for _, receipt := range []graph.MutationReceipt{firstReceipt, secondReceipt} {
+		for _, fact := range receipt.FanoutTruncations {
+			if slices.Contains(fact.DroppedFiles, "ghost.go") || slices.Contains(fact.DroppedFiles, "late.go") {
+				t.Fatalf("a fact addressed to no open window landed on %+v", receipt.FanoutTruncations)
+			}
+		}
+	}
+}
+
+// Owning the fan-out axis must cost nothing else: the window still observes the
+// mutation delta exactly, because the two answer different questions ("is the
+// delta exact" vs "did the derived work over it finish").
+func TestSQLiteOwningFanoutReceiptStillObservesTheDelta(t *testing.T) {
+	store := openMutationReceiptStore(t)
+	token := store.BeginMutationReceiptOwningFanout()
+	store.AddBatch([]*graph.Node{{
+		ID: "repo/a.go::A", Kind: graph.KindFunction, Name: "A", FilePath: "a.go", RepoPrefix: "repo",
+	}}, []*graph.Edge{{
+		From: "repo/a.go::A", To: "unresolved::B", Kind: graph.EdgeCalls, FilePath: "a.go",
+	}})
+	receipt := store.EndMutationReceipt(token)
+
+	if !receipt.Complete || !receipt.ResolutionRelevant {
+		t.Fatalf("owning receipt = %+v, want an exact resolution-relevant delta", receipt)
+	}
+	assertSQLiteReceiptContains(t, "owning receipt files", receipt.ResolutionFiles(), "a.go")
+	if !receipt.DerivedFanoutComplete() {
+		t.Fatalf("owning receipt reported a fan-out hole nobody recorded: %+v", receipt.FanoutTruncations)
 	}
 }

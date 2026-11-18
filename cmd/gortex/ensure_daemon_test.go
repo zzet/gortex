@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -57,9 +56,9 @@ func restoreSeams() {
 	isDaemonRunning = daemon.IsRunning
 	spawnDaemon = spawnBareDaemon
 	stopIntentActive = daemon.StopIntentActive
-	runningDaemonVersion = dialRunningDaemonVersion
+	runningDaemonInfo = dialRunningDaemonIdentity
 	binaryVersion = canonicalVersion
-	stopStaleDaemon = func() error { return stopRunningDaemon(io.Discard) }
+	stopStaleDaemon = stopDaemonForHandoff
 	serviceActive = defaultServiceActive
 	serviceRestart = defaultServiceRestart
 }
@@ -79,7 +78,9 @@ func TestEnsureDaemon_AlreadyRunning(t *testing.T) {
 	defer restoreSeams()
 	var spawned int32
 	isDaemonRunning = func() bool { return true }
-	runningDaemonVersion = func() (string, bool) { return "v1.2.0", true }
+	runningDaemonInfo = func() daemonIdentity {
+		return daemonIdentity{version: "v1.2.0", protocol: daemon.ProtocolVersion, protocolKnown: true}
+	}
 	binaryVersion = func() string { return "v1.2.0" }
 	spawnDaemon = func() error { atomic.AddInt32(&spawned, 1); return nil }
 	if d := ensureDaemonReady(true); d != daemonReady {

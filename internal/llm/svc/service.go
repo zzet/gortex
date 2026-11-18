@@ -82,9 +82,10 @@ var errServiceUnavailable = errors.New("llm: service unavailable — no provider
 //     `assist` argument (see assist.go).
 //
 // The active provider is chosen by llm.Config.Provider. The prompt
-// tier (profile) is derived from the provider's Name() so the assist
-// passes prompt small local models and hosted frontier models
-// differently — see llm.ProfileForProvider.
+// tier (profile) is derived from the active provider — a custom
+// provider's prompt_profile, else the built-in's fixed tier — so the
+// assist passes prompt small local models and hosted frontier models
+// differently; see llm.ProfileFor.
 type Service struct {
 	cfg         llm.Config
 	backend     llm.Backend
@@ -144,7 +145,7 @@ func NewService(cfg llm.Config, backend llm.Backend, opts ...ServiceOption) *Ser
 			s.providerErr = err
 		} else {
 			s.provider = p
-			s.profile = llm.ProfileForProvider(p.Name())
+			s.profile = llm.ProfileFor(cfg)
 			s.configureProvider(p)
 		}
 	}

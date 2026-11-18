@@ -1,0 +1,1 @@
+{"query_class":"symbol","results":[{"absolute_file_path":"$ROOT/server/server.go","doc":"HandleRequest serves one request.","enclosing":"Server","enclosing_id":"server/server.go::Server","file_path":"server/server.go","id":"server/server.go::Server.HandleRequest","kind":"method","name":"HandleRequest","start_line":14,"visibility":"public"}],"total":1,"truncated":false}

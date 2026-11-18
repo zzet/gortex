@@ -829,6 +829,138 @@ func TestVBNetExtractor_UnterminatedBlockExtent(t *testing.T) {
 	assert.Equal(t, graph.KindFunction, m.Kind)
 }
 
+// A multiline lambda closes with the same `End Sub` / `End Function` as its
+// enclosing callable; the enclosing extent must run through its own
+// terminator so calls after the lambda stay attributed to it.
+func TestVBNetExtractor_MultilineLambdaExtent(t *testing.T) {
+	src := []byte(`Public Class Worker
+    Public Sub Run()
+        Dim action = Sub()
+                         Work()
+                     End Sub
+
+        client.Save()
+    End Sub
+
+    Public Function Compute() As Integer
+        Dim f = Function(x As Integer) As Integer
+                    Return x + 1
+                End Function
+
+        Return calc.Apply(f)
+    End Function
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("w.vb", src)
+	require.NoError(t, err)
+
+	run := vbFind(res.Nodes, "Run")
+	require.NotNil(t, run)
+	assert.Equal(t, 2, run.StartLine)
+	assert.Equal(t, 8, run.EndLine)
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, run.ID, "unresolved::Save"),
+		"call after a Sub lambda must stay attributed to Run")
+
+	compute := vbFind(res.Nodes, "Compute")
+	require.NotNil(t, compute)
+	assert.Equal(t, 10, compute.StartLine)
+	assert.Equal(t, 16, compute.EndLine)
+	assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, compute.ID, "unresolved::Apply"),
+		"call after a Function lambda must stay attributed to Compute")
+}
+
+// Lambda parameter lists may nest parentheses (array and generic types), and
+// lambda-shaped text in a comment must not open a nested block.
+func TestVBNetExtractor_MultilineLambdaNestedParensAndComments(t *testing.T) {
+	src := []byte(`Public Class Worker
+    Public Sub Run()
+        Dim action = Sub(xs() As Integer)
+                         Work()
+                     End Sub
+        client.Save()
+    End Sub
+
+    Public Function Compute() As Integer
+        Dim f = Function(xs As List(Of Integer)) As List(Of Integer)
+                    Return xs
+                End Function
+        Return calc.Apply(f)
+    End Function
+
+    Public Sub Commented()
+        ' Example: Sub()
+        client.Save()
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("w.vb", src)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name, callee string
+		start, end   int
+	}{
+		{"Run", "Save", 2, 7},
+		{"Compute", "Apply", 9, 14},
+		{"Commented", "Save", 16, 19},
+	} {
+		n := vbFind(res.Nodes, tc.name)
+		require.NotNil(t, n, tc.name)
+		assert.Equal(t, tc.start, n.StartLine, tc.name)
+		assert.Equal(t, tc.end, n.EndLine, tc.name)
+		assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, n.ID, "unresolved::"+tc.callee),
+			"%s must keep its call to %s", tc.name, tc.callee)
+	}
+}
+
+// A multiline lambda passed as an argument closes with `End Function)` or
+// `End Sub, ...)`. Its opener counts as nesting, so its closer must end that
+// nesting too, or the enclosing callable runs past its own End and loses the
+// calls after the lambda.
+func TestVBNetExtractor_ArgumentLambdaClosersEndNesting(t *testing.T) {
+	src := []byte(`Public Class Worker
+    Public Function Find() As Integer
+        Dim x = items.FirstOrDefault(Function(d)
+                                         Return d.Ok()
+                                     End Function)
+        Return client.Save()
+    End Function
+
+    Public Sub Each()
+        items.ForEach(Sub(x)
+                          x.Touch()
+                      End Sub)
+        client.Load()
+    End Sub
+
+    Public Sub Pair()
+        Register(Sub()
+                     client.Open()
+                 End Sub, Nothing)
+        client.Close()
+    End Sub
+End Class
+`)
+	res, err := NewVBNetExtractor().Extract("w.vb", src)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name, callee string
+		start, end   int
+	}{
+		{"Find", "Save", 2, 7},
+		{"Each", "Load", 9, 14},
+		{"Pair", "Close", 16, 21},
+	} {
+		n := vbFind(res.Nodes, tc.name)
+		require.NotNil(t, n, tc.name)
+		assert.Equal(t, tc.start, n.StartLine, tc.name)
+		assert.Equal(t, tc.end, n.EndLine, tc.name)
+		assert.True(t, vbHasEdge(res.Edges, graph.EdgeCalls, n.ID, "unresolved::"+tc.callee),
+			"%s must keep its call to %s", tc.name, tc.callee)
+	}
+}
+
 // Interface method sets feed the resolver's IMPLEMENTS inference, which reads
 // Meta["methods"] rather than member edges. csharp.go stamps this and VB
 // mirrors it, so a VB interface supports the same inference as a C# one.

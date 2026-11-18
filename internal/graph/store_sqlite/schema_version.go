@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -34,7 +35,7 @@ import (
 // index changes in a way an old on-disk DB would not already have, and append a
 // matching schemaMigrations entry describing how to bring an older store
 // forward (in place, or by rebuild).
-const currentSchemaVersion = 21
+const currentSchemaVersion = 44
 
 // schemaMigration is one forward step. Exactly one strategy applies:
 //   - rebuild=true: the change introduces structure/data that can only come
@@ -49,6 +50,9 @@ type schemaMigration struct {
 	name    string
 	inPlace func(tx *sql.Tx) error
 	rebuild bool
+	// Explicit opt-in for a mechanically additive step that cannot change
+	// graph or derived-analysis meaning. Defaults remain conservative.
+	preserveAnalysis bool
 }
 
 // MigrationPhase identifies one observable boundary in an in-place schema
@@ -60,6 +64,14 @@ const (
 	MigrationStarted  MigrationPhase = "started"
 	MigrationFinished MigrationPhase = "finished"
 	MigrationFailed   MigrationPhase = "failed"
+
+	// The backup phases report the pre-upgrade backup Open takes under
+	// WithUpgradeBackup, once, before the first step starts. Version is the
+	// schema version being backed up and Detail carries the backup path
+	// (created, kept) or the reason none was taken (skipped).
+	MigrationBackupCreated MigrationPhase = "backup_created"
+	MigrationBackupKept    MigrationPhase = "backup_kept"
+	MigrationBackupSkipped MigrationPhase = "backup_skipped"
 )
 
 // MigrationProgress describes one schema migration step. Elapsed is measured
@@ -72,6 +84,7 @@ type MigrationProgress struct {
 	Phase   MigrationPhase
 	Elapsed time.Duration
 	Error   error
+	Detail  string
 }
 
 // MigrationObserver receives synchronous migration boundaries. It may be nil.
@@ -118,6 +131,411 @@ var schemaMigrations = []schemaMigration{
 	{version: 19, name: "purge legacy slash-spelled coverage artifacts", inPlace: purgeLegacyCoverageSpellings},
 	{version: 20, name: "purge unresolved derived tests edges", inPlace: purgeUnresolvedTestsEdges},
 	{version: 21, name: "persist per-file indexing failures", inPlace: createFileIndexFailuresTable},
+	{version: 22, name: "add dedicated base publication intent", inPlace: createDedicatedBasePublicationsTable},
+	{version: 23, name: "persist derived dependency revision", inPlace: addDependencyRevisionColumns},
+	{version: 24, name: "separate node identity-only ownership masks", inPlace: addNodeIdentityMaskKinds},
+	{version: 25, name: "key analysis generations by view generation", inPlace: addAnalysisViewGenerationKeys},
+	{version: 26, name: "scope hot graph indexes by view generation", inPlace: scopeHotGraphIndexesByViewGeneration},
+	{version: 27, name: "scope kind and fn-value indexes by view generation", inPlace: scopeKindAndFnValueIndexesByViewGeneration},
+	{version: 28, name: "lead edge candidate indexes with view generation", inPlace: scopeEdgeCandidateIndexesByViewGeneration},
+	{version: 29, name: "persist admitted-input manifests per generation", inPlace: createGenerationInputManifestTables},
+	{version: 30, name: "cover scoped supplementary name candidates", inPlace: createNameCandidateIndex},
+	{version: 31, name: "persist asynchronous contract work tokens", inPlace: createContractWorkTable},
+	{version: 32, name: "persist exact contract input attachments", inPlace: createContractAttachmentTables},
+	{version: 33, name: "persist selected contract input provenance", inPlace: createContractAttachmentInputsTable},
+	{version: 34, name: "preserve inherited contract work actors", inPlace: addContractAttachmentWorkActor},
+	{version: 35, name: "persist indexed contract boundary receipts", inPlace: createContractBoundaryReceiptTables},
+	{version: 36, name: "cover exact selected-generation node histograms", inPlace: createStatsHistogramIndex},
+	{version: 37, name: "cover payload-free contract receipt stamps", inPlace: createContractBoundaryStampIndex},
+	{version: 38, name: "cover exact node declaration reads", inPlace: coverNodeDeclarationIndex},
+	{version: 39, name: "seek supplementary name candidates by name length", inPlace: seekNameCandidatesByLength},
+	{version: 40, name: "reconcile SQLite 3.54 name length keys", inPlace: reconcileNameCandidateLengths},
+	{version: 41, name: "seek exact effective workspace nodes", inPlace: createEffectiveWorkspaceIndex, preserveAnalysis: true},
+	{version: 42, name: "seek eligible workspace dead-code candidates", inPlace: createDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
+	{version: 43, name: "cover workspace dead-code candidate seeks", inPlace: coverDeadCodeEligibleWorkspaceIndex, preserveAnalysis: true},
+	{version: 44, name: "seek registered checkout roots", inPlace: createCheckoutRootIndexes, preserveAnalysis: true},
+}
+
+// An existing v42 key must be replaced: IF NOT EXISTS cannot upgrade its shape.
+func coverDeadCodeEligibleWorkspaceIndex(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_deadcode_eligible_workspace`); err != nil {
+		return err
+	}
+	return createDeadCodeEligibleWorkspaceIndex(tx)
+}
+
+func createDeadCodeEligibleWorkspaceIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesDeadCodeEligibleWorkspaceDDL)
+	return err
+}
+
+func createEffectiveWorkspaceIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesByEffectiveWorkspaceDDL)
+	return err
+}
+
+// Rebuild just the secondary index; graph payload, identity and receipts stay
+// unchanged. The same DDL serves fresh stores and existing bulk sealing. An
+// upgrade from v25 or older already rebuilt nodes_by_name in its current shape
+// at v26, so an index that matches is left alone rather than built twice.
+func coverNodeDeclarationIndex(tx *sql.Tx) error {
+	current, err := indexColumnsMatch(tx, "nodes_by_name", nodesByNameIndexColumns)
+	if err != nil || current {
+		return err
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_by_name`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(nodesByNameIndexDDL)
+	return err
+}
+
+func createStatsHistogramIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesStatsHistogramIndexDDL)
+	return err
+}
+
+func createNameCandidateIndex(tx *sql.Tx) error {
+	_, err := tx.Exec(nodesNameCandidatesIndexDDL)
+	return err
+}
+
+// Rebuild just the candidate index with the name length in its key. An upgrade
+// from v29 or older already built the current shape at v30, so an index that
+// matches is left alone rather than built twice.
+func seekNameCandidatesByLength(tx *sql.Tx) error {
+	current, err := indexColumnsMatch(tx, "nodes_name_candidates", nodesNameCandidatesIndexColumns)
+	if err != nil || current {
+		return err
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS nodes_name_candidates`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(nodesNameCandidatesIndexDDL)
+	return err
+}
+
+// SQLite 3.54 counts runs of orphaned UTF-8 continuation bytes differently.
+// An expression index built by the previous engine retains the old length
+// keys even though its DDL is unchanged. Compare the stored key with a forced
+// recomputation using only the covering index; valid UTF-8 stores pay one
+// narrow scan on upgrade, not an unnecessary index rebuild.
+func reconcileNameCandidateLengths(tx *sql.Tx) error {
+	if err := createNameCandidateIndex(tx); err != nil {
+		return err
+	}
+	var stale bool
+	err := tx.QueryRow(`SELECT EXISTS (
+SELECT 1 FROM nodes INDEXED BY nodes_name_candidates
+WHERE name <> '' AND length(name) <> length(name || '') LIMIT 1
+)`).Scan(&stale)
+	if err != nil || !stale {
+		return err
+	}
+	_, err = tx.Exec(`REINDEX nodes_name_candidates`)
+	return err
+}
+
+// generationFirstEdgeCandidateIndexNames covers precisely the indexes used by
+// endpoint and site candidate reads. The v26 step already rebuilt the endpoint
+// pair with their current registry DDL, so v28 compares every individual
+// column sequence and skips each already-correct index.
+var generationFirstEdgeCandidateIndexNames = [...]string{
+	"edges_by_from",
+	"edges_by_to",
+	"edges_by_from_line",
+	"edges_by_from_line_kind",
+}
+
+func scopeEdgeCandidateIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationFirstEdgeCandidateIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationFirstEdgeCandidateIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-first edge candidate index %q missing from registry", name)
+		}
+	}
+	mismatched := make([]bulkDroppableIndex, 0, len(indexes))
+	for _, idx := range indexes {
+		matched, err := edgeCandidateIndexMatchesGenerationFirst(tx, idx.name)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			mismatched = append(mismatched, idx)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range mismatched {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+func edgeCandidateIndexMatchesGenerationFirst(tx *sql.Tx, name string) (bool, error) {
+	want := map[string][]string{
+		"edges_by_from":           {"view_gen", "from_id", "kind"},
+		"edges_by_to":             {"view_gen", "to_id", "kind"},
+		"edges_by_from_line":      {"view_gen", "from_id", "line"},
+		"edges_by_from_line_kind": {"view_gen", "from_id", "line", "kind"},
+	}
+	columns, ok := want[name]
+	if !ok {
+		return false, fmt.Errorf("generation-first edge candidate index %q has no expected shape", name)
+	}
+	return indexColumnsMatch(tx, name, columns)
+}
+
+// indexColumnsMatch reports whether the installed index name keys exactly
+// columns, in order; an expression key column reads as "". A missing index has
+// no columns and never matches.
+func indexColumnsMatch(tx *sql.Tx, name string, columns []string) (bool, error) {
+	rows, err := tx.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, name)
+	if err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var column sql.NullString
+		if err := rows.Scan(&column); err != nil {
+			return false, fmt.Errorf("scan %s shape: %w", name, err)
+		}
+		got = append(got, column.String)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read %s shape: %w", name, err)
+	}
+	return slices.Equal(got, columns), nil
+}
+
+// generationSelectiveGraphIndexNames is the bounded v27 migration whitelist.
+// Resolve both canonical definitions before dropping either index so a registry
+// drift fails without disturbing a warm store's installed legacy shapes.
+var generationSelectiveGraphIndexNames = [...]string{
+	"nodes_by_kind",
+	"edges_fnvalue_prefixed",
+}
+
+func scopeKindAndFnValueIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationSelectiveGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationSelectiveGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-selective graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+// generationScopedGraphIndexNames is the bounded v26 migration whitelist.
+// Each name resolves back to the same registry DDL used by fresh stores and
+// bulk-index sealing, so initial creation and migration cannot drift.
+var generationScopedGraphIndexNames = [...]string{
+	"nodes_by_name",
+	"nodes_by_file",
+	"nodes_by_repo",
+	"nodes_by_repo_language_name",
+	"edges_by_from",
+	"edges_by_to",
+	nodesByGenerationIndexName,
+	edgesByGenerationIndexName,
+}
+
+// scopeHotGraphIndexesByViewGeneration replaces the eight legacy lookup shapes
+// transactionally. Resolve every definition before the first DROP: a renamed
+// or removed registry entry fails without disturbing any installed index.
+func scopeHotGraphIndexesByViewGeneration(tx *sql.Tx) error {
+	indexes := make([]bulkDroppableIndex, 0, len(generationScopedGraphIndexNames))
+	registries := [][]bulkDroppableIndex{bulkDroppableIndexes, bulkAlwaysLiveIndexes}
+	for _, name := range generationScopedGraphIndexNames {
+		found := false
+		for _, registry := range registries {
+			for _, idx := range registry {
+				if idx.name != name {
+					continue
+				}
+				indexes = append(indexes, idx)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("generation-scoped graph index %q missing from registry", name)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS ` + idx.name); err != nil {
+			return fmt.Errorf("drop %s: %w", idx.name, err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.Exec(idx.ddl); err != nil {
+			return fmt.Errorf("create %s: %w", idx.name, err)
+		}
+	}
+	return nil
+}
+
+// addAnalysisViewGenerationKeys gives the whole-graph analysis cache a real
+// payload-view-generation axis: analysis_generations gains a view_gen column
+// and analysis_active_generation is re-keyed from one global slot to one slot
+// per view generation.
+//
+// Why a column and not the existing CAS: the build_revision the cache already
+// stores is analysisMutationRevision, an atomic.Uint64 on the storeCore every
+// generation handle shares (store.go), bumped only when a graph mutation
+// commits (analysis_generation_state.go) and reset on reopen. Two analyses
+// computed over two payload generations with no intervening mutation carry the
+// identical revision, so it can never identify which view an analysis belongs
+// to. It stays exactly as it is — the concurrency guard it was written to be.
+//
+// Purely additive for the data: every existing row belongs to the single base
+// corpus, generation 0, which is the column default and the value the pointer
+// copy supplies, so nothing is re-derived and no reindex is needed. The
+// pointer's primary key cannot be altered in place, so that one table is
+// rebuilt from the canonical body; analysis_generations only gains a column
+// and takes a plain ALTER. Both run in the caller's single migration
+// transaction, so a failure anywhere leaves the store exactly as it was.
+//
+// Idempotent: each half probes for its own view_gen column first. schemaSQL
+// runs before the migration steps, so on a fresh store both halves are no-ops.
+func addAnalysisViewGenerationKeys(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_generations")
+	if err != nil {
+		return err
+	}
+	if !present {
+		// Nothing to migrate: schemaSQL creates both tables in their current
+		// shape, and a store that reaches here without them has no analysis
+		// cache to re-key.
+		return nil
+	}
+	if err := addAnalysisGenerationsViewGenColumn(tx); err != nil {
+		return fmt.Errorf("analysis_generations: %w", err)
+	}
+	return rebuildAnalysisActiveGenerationAtBase(tx)
+}
+
+// analysisTablePresent reports whether an ordinary table exists. The analysis
+// cache arrived in v4 and schemaSQL recreates it on every Open, but the
+// migration registry is also driven directly by tests and by alternate open
+// paths, and an ALTER against a missing table is a migration failure rather
+// than the no-op it should be.
+func analysisTablePresent(tx *sql.Tx, table string) (bool, error) {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// addAnalysisGenerationsViewGenColumn appends view_gen to the manifest table.
+// Existing rows take the constant default, generation 0 — the base corpus they
+// already describe. The probe reads pragma_table_xinfo for the same reason
+// addEdgeViewGenerationColumn does: one probe shape that lists every column.
+func addAnalysisGenerationsViewGenColumn(tx *sql.Tx) error {
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_generations') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE analysis_generations ADD COLUMN ` +
+		viewGenColumnName + ` INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// rebuildAnalysisActiveGenerationAtBase re-keys the active pointer on
+// (view_gen, slot). A primary key cannot be altered in place, so the table is
+// rebuilt from the canonical body and its single row — if any — is copied at
+// generation 0. The copy names its columns explicitly; the old table's shape
+// is (slot, generation_id) and the new one leads with view_gen, so SELECT *
+// would silently write the slot into the generation column.
+func rebuildAnalysisActiveGenerationAtBase(tx *sql.Tx) error {
+	present, err := analysisTablePresent(tx, "analysis_active_generation")
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_xinfo('analysis_active_generation') WHERE name = ?`,
+		viewGenColumnName,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	const rebuilt = "analysis_active_generation_view_gen_rebuild"
+	if _, err := tx.Exec(`CREATE TABLE ` + rebuilt + analysisActiveGenerationTableBody); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO ` + rebuilt + `(` + viewGenColumnName + `, slot, generation_id)
+SELECT 0, slot, generation_id FROM analysis_active_generation`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE analysis_active_generation`); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`ALTER TABLE ` + rebuilt + ` RENAME TO analysis_active_generation`)
+	return err
 }
 
 // createGenerationMaskTables is the explicit v18 migration. The mask tables are
@@ -129,6 +547,18 @@ var schemaMigrations = []schemaMigration{
 // unversioned side effect of Open.
 func createGenerationMaskTables(tx *sql.Tx) error {
 	_, err := tx.Exec(generationMaskSchemaSQL)
+	return err
+}
+
+// createGenerationInputManifestTables is the explicit v29 migration. Like the
+// v18 masks the manifest tables are purely additive and re-key nothing, so an
+// older store gains them in place with no reindex and no backfill: a
+// generation published before the upgrade simply has no manifest, which a
+// reader reports as absent rather than empty. schemaSQL creates the same
+// objects first on every Open; this step repeats the idempotent DDL so the
+// addition is part of the versioned contract.
+func createGenerationInputManifestTables(tx *sql.Tx) error {
+	_, err := tx.Exec(generationInputManifestSchemaSQL)
 	return err
 }
 
@@ -460,8 +890,8 @@ func createCheckoutCatalogTables(tx *sql.Tx) error {
 // and bounded to the tests kind: pending calls and resolved projections are
 // untouched.
 func purgeUnresolvedTestsEdges(tx *sql.Tx) error {
-	_, err := tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
-		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`)
+	_, err := countEdgeWrite(tx.Exec(`DELETE FROM edges WHERE kind = 'tests'
+		AND (to_id LIKE 'unresolved::%' OR to_id LIKE '%::unresolved::%')`))
 	return err
 }
 
@@ -581,7 +1011,7 @@ func backfillSyntheticNodeRepoPrefixes(tx *sql.Tx) error {
 	if err := ensureCloneCorpusColumns(tx); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`
+	if _, err := countNodeWrite(tx.Exec(`
 UPDATE nodes
 SET repo_prefix = substr(id, 1, instr(id, '::') - 1)
 WHERE repo_prefix = ''
@@ -591,7 +1021,7 @@ WHERE repo_prefix = ''
       OR substr(id, instr(id, '::') + 2) LIKE 'stdlib::%'
       OR substr(id, instr(id, '::') + 2) LIKE 'builtin::%'
       OR substr(id, instr(id, '::') + 2) LIKE 'external_call::%'
-  )`); err != nil {
+  )`)); err != nil {
 		return err
 	}
 	return backfillEdgeSemanticSources(tx)
@@ -813,7 +1243,7 @@ func createAnalysisGenerationTables(tx *sql.Tx) error {
 // shrinks only under a manual VACUUM, deliberately out of scope for a derived
 // cache that reclaims the space on its own.
 func dedupeFnValuePlaceholderEdges(tx *sql.Tx) error {
-	_, err := tx.Exec(`
+	_, err := countEdgeWrite(tx.Exec(`
 WITH ph AS (
     SELECT id, from_id, to_id FROM edges
     WHERE (to_id >= 'unresolved::fnvalue::' AND to_id < 'unresolved::fnvalue:;')
@@ -821,16 +1251,32 @@ WITH ph AS (
 ), keep AS (
     SELECT MIN(id) AS id FROM ph GROUP BY from_id, to_id
 )
-DELETE FROM edges WHERE id IN (SELECT id FROM ph) AND id NOT IN (SELECT id FROM keep)`)
+DELETE FROM edges WHERE id IN (SELECT id FROM ph) AND id NOT IN (SELECT id FROM keep)`))
 	return err
 }
 
 // schemaPlan is the decision planSchemaMigration derives from the stored
 // PRAGMA user_version. It mutates nothing on its own.
 type schemaPlan struct {
-	wipe    bool              // drop the on-disk DB and rebuild from source
+	wipe    bool              // drop an explicitly rebuildable older DB
 	inPlace []schemaMigration // ordered in-place steps to run after schemaSQL
 	stamp   bool              // write currentSchemaVersion once reconciled
+	err     error             // refuse unsupported versions without mutation
+}
+
+// preservesAnalysis requires a known, complete transition consisting solely
+// of explicitly neutral in-place steps. Fresh/pre-versioning stamps, missing
+// registry steps and rebuilds never prove compatibility of existing payloads.
+func (p schemaPlan) preservesAnalysis(stored, current int) bool {
+	if p.err != nil || p.wipe || !p.stamp || stored <= 0 || stored >= current || len(p.inPlace) != current-stored {
+		return false
+	}
+	for i, step := range p.inPlace {
+		if step.version != stored+i+1 || step.inPlace == nil || step.rebuild || !step.preserveAnalysis {
+			return false
+		}
+	}
+	return true
 }
 
 // planSchemaMigrationWith decides how to reconcile a store at the stored
@@ -842,9 +1288,9 @@ func planSchemaMigrationWith(stored, current int, migrations []schemaMigration) 
 	case stored == current:
 		return schemaPlan{} // up to date, nothing to do
 	case stored > current:
-		// Written by a newer build than this binary understands; the shape may
-		// have changed under us. For a cache the safe move is to rebuild.
-		return schemaPlan{wipe: true, stamp: true}
+		// A newer shape is not an authorized rebuild target. In particular,
+		// checkout catalog metadata cannot be reconstructed by reindexing.
+		return schemaPlan{err: &SchemaTooNewError{Stored: stored, Supported: current}}
 	case stored == 0:
 		// Fresh DB, or a pre-versioning store of unknown shape. schemaSQL's
 		// idempotent CREATE ... IF NOT EXISTS plus ensureNodeColumns /
@@ -921,6 +1367,9 @@ func validateSchemaMigrations(current int, migs []schemaMigration) error {
 		if (m.inPlace != nil) == m.rebuild {
 			return fmt.Errorf("migration v%d (%s) must set exactly one of inPlace / rebuild", m.version, m.name)
 		}
+		if m.preserveAnalysis && m.rebuild {
+			return fmt.Errorf("migration v%d (%s) cannot preserve analysis across a rebuild", m.version, m.name)
+		}
 		prev = m.version
 	}
 	if prev != current {
@@ -947,14 +1396,49 @@ func setUserVersion(db *sql.DB, v int) error {
 	return nil
 }
 
+// upgradePoint names a boundary inside a schema transition at which the
+// in-package crash tests stop the process, to prove the next Open completes
+// the transition from whatever a kill there leaves on disk.
+type upgradePoint string
+
+const (
+	// upgradeInStep follows a step body inside the uncommitted migration
+	// transaction; version is that step's.
+	upgradeInStep upgradePoint = "in_step"
+	// upgradeIndexRecreation falls between the core and the sidecar index
+	// rebuilds, after the migration transaction has committed.
+	upgradeIndexRecreation upgradePoint = "index_recreation"
+	// upgradeBeforeStamp is the last moment before user_version is written.
+	upgradeBeforeStamp upgradePoint = "before_stamp"
+	// upgradeBackupCopied follows the pre-upgrade copy into its partial file,
+	// before the copy is folded and renamed into place.
+	upgradeBackupCopied upgradePoint = "backup_copied"
+)
+
+// upgradeHook is called synchronously at each upgradePoint. Only tests set
+// one; a nil hook is a no-op.
+type upgradeHook func(point upgradePoint, version int)
+
+func (h upgradeHook) at(point upgradePoint, version int) {
+	if h != nil {
+		h(point, version)
+	}
+}
+
 // applyInPlaceMigrations runs the in-place steps in a single transaction.
 func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...MigrationObserver) error {
-	if len(steps) == 0 {
-		return nil
-	}
 	var observe MigrationObserver
 	if len(observers) > 0 {
 		observe = observers[0]
+	}
+	return applyInPlaceMigrationsWith(db, steps, observe, nil)
+}
+
+// applyInPlaceMigrationsWith is applyInPlaceMigrations with the crash-test
+// hook threaded through.
+func applyInPlaceMigrationsWith(db *sql.DB, steps []schemaMigration, observe MigrationObserver, hook upgradeHook) error {
+	if len(steps) == 0 {
+		return nil
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -978,6 +1462,7 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...Mi
 			}
 			return fmt.Errorf("schema migration v%d (%s): %w", m.version, m.name, err)
 		}
+		hook.at(upgradeInStep, m.version)
 		if observe != nil {
 			observe(MigrationProgress{
 				Version: m.version,
@@ -997,7 +1482,9 @@ func applyInPlaceMigrations(db *sql.DB, steps []schemaMigration, observers ...Mi
 // -shm) plus the rollback -journal a non-WAL fallback would use; keep it in
 // sync if the journal_mode in Open's DSN ever changes.
 func removeStoreFiles(path string) error {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+	// The close-checkpoint progress and rate sidecars (close_progress.go)
+	// describe the store being removed and go with it.
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal", ".close-progress", ".close-rate"} {
 		if err := os.Remove(path + suffix); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", path+suffix, err)
 		}

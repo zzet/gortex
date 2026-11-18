@@ -31,7 +31,19 @@ VALUES (?, ?, ?, ?, ?)`,
 // bool is false when no row exists yet — the repo's contract pass never
 // completed against this store, or the store predates the marker.
 func (s *Store) GetContractState(repoPrefix string) (graph.ContractState, bool, error) {
-	row := s.db.QueryRow(`
+	return s.GetContractStateContext(context.Background(), repoPrefix)
+}
+
+// GetContractStateContext is the cancellable baseline read used by explicit
+// contract consumers. Core graph materialization does not need this marker.
+func (s *Store) GetContractStateContext(ctx context.Context, repoPrefix string) (graph.ContractState, bool, error) {
+	if ctx == nil {
+		return graph.ContractState{}, false, ErrCatalogInvalidValue
+	}
+	if s.coreless() || s.db == nil {
+		return graph.ContractState{}, false, sql.ErrConnDone
+	}
+	row := s.db.QueryRowContext(ctx, `
 SELECT indexed_sha, completed_at, contract_count
   FROM contract_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix)
 	st := graph.ContractState{RepoPrefix: repoPrefix}

@@ -43,6 +43,23 @@ const lookupNodeColsLight = lookupNodeColsLightPrefix
 // Meta map (or retain docs/signatures) for every node.
 var lookupNodeSummaryCols = strings.SplitN(lookupNodeCols, ", signature", 2)[0]
 
+// nodesPrimaryKeyIndexName is the name SQLite gives the (id, view_gen) primary
+// key of the WITHOUT ROWID nodes table; pragma index_list reports it with
+// origin 'pk'. The key has no sqlite_schema row of its own: SQLite derives the
+// name from the table's declaration on every schema load, so it holds as well
+// for a table rebuilt under another name and renamed to nodes.
+const nodesPrimaryKeyIndexName = "sqlite_autoindex_nodes_1"
+
+// nodesByIDSource is the FROM source of every read that loads node columns for
+// a list of ids on one generation: it pins the primary key, one probe per id.
+// Left to the planner, nodes_by_generation (view_gen, id) keys the same
+// predicate, and SQLite settles the near tie between the two by the believed
+// table size, not by either index's statistics: a 188k-node store took the
+// generation index (an index seek plus a primary-key probe per id), and a
+// truthful statistics row for the key did not move it. Reads that project only
+// id keep nodes_by_generation, which covers them.
+const nodesByIDSource = `nodes INDEXED BY ` + nodesPrimaryKeyIndexName
+
 const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason, semantic_source`
 const lookupQualifiedEdgeCols = `e.from_id, e.to_id, e.kind, e.file_path, e.line, e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source`
 
@@ -142,20 +159,66 @@ func (s *Store) CountNodesByNameClass(names []string, definitionKinds []graph.No
 // FindNodesByNameContaining returns nodes whose Name contains substr,
 // case-insensitively (SQLite's LIKE is ASCII case-insensitive). An empty
 // substring matches nothing (parity with the in-memory store); a limit > 0
-// caps the result set. The leading-wildcard LIKE is a deliberate full scan —
-// no index accelerates an unanchored substring — matching the in-memory
-// strings.Contains fallback. % and _ in substr are escaped so they match
-// literally.
+// caps the result set. Leading-wildcard LIKE scans compact candidate index
+// entries, then hydrates only the selected rows. % and _ in substr are escaped
+// so they match literally.
 func (s *Store) FindNodesByNameContaining(substr string, limit int) []*graph.Node {
 	if substr == "" {
 		return nil
 	}
-	pattern := "%" + escapeLikePattern(substr) + "%"
-	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE name LIKE ? ESCAPE '\' AND view_gen = ? ORDER BY id`
-	if limit > 0 {
-		return s.queryNodesSQL(q+` LIMIT ?`, pattern, s.viewGen, limit)
+	nodes, err := s.FindNodesByNameContainingContext(context.Background(), substr, limit)
+	panicOnFatal(err)
+	return nodes
+}
+
+// VisitNodesByNameContainingFolded streams this generation's nodes whose
+// names contain substr under Go's Unicode lower-case semantics. SQLite LIKE
+// supplies the ASCII candidates; every non-ASCII name remains a candidate so
+// folds such as Kelvin sign to "k" and Greek case pairs cannot be missed.
+// The exact predicate is then applied in Go. Returning false from yield closes
+// the cursor immediately, so a caller can impose its own post-filtered limit
+// without materializing the generation.
+func (s *Store) VisitNodesByNameContainingFolded(substr string, yield func(*graph.Node) bool) {
+	if substr == "" || yield == nil {
+		return
 	}
-	return s.queryNodesSQL(q, pattern, s.viewGen)
+	needle := strings.ToLower(substr)
+	nonASCII := false
+	for i := 0; i < len(needle); i++ {
+		if needle[i] >= 0x80 {
+			nonASCII = true
+			break
+		}
+	}
+
+	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? AND length(name) != length(CAST(name AS BLOB)) ORDER BY id`
+	args := []any{s.viewGen}
+	if !nonASCII {
+		q = `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? AND (name LIKE ? ESCAPE '\' OR length(name) != length(CAST(name AS BLOB))) ORDER BY id`
+		args = append(args, "%"+escapeLikePattern(needle)+"%")
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		panicOnFatal(err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		node, scanErr := scanNodeCursor(rows)
+		if scanErr != nil {
+			panicOnFatal(scanErr)
+			return
+		}
+		if node == nil || node.Name == "" || !strings.Contains(strings.ToLower(node.Name), needle) {
+			continue
+		}
+		if !yield(node) {
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		panicOnFatal(err)
+	}
 }
 
 // GetNodesByQualNames returns every candidate for each requested qualified
@@ -216,7 +279,7 @@ func (s *Store) GetNodesByIDsContext(ctx context.Context, ids []string) (map[str
 		}
 		end := minInt(i+lookupChunkSize, len(uniq))
 		chunk := uniq[i:end]
-		q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
+		q := `SELECT ` + lookupNodeCols + ` FROM ` + nodesByIDSource + ` WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ?`
 		rows, err := s.db.QueryContext(ctx, q, append(toAnyArgs(chunk), s.viewGen)...)
 		if err != nil {
 			return out, fmt.Errorf("get nodes by ids: %w", err)
@@ -309,6 +372,22 @@ func (s *Store) GetOutEdgesByNodeIDsContext(ctx context.Context, ids []string, l
 }
 
 func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+	return s.boundedInEdgesByNodeIDs(ctx, ids, limit, false)
+}
+
+// GetInEdgesByNodeIDsWithMetaContext is GetInEdgesByNodeIDsContext with every
+// edge's metadata decoded, for a caller that filters the rows it reads on that
+// metadata. It costs one metadata decode per row.
+func (s *Store) GetInEdgesByNodeIDsWithMetaContext(ctx context.Context, ids []string, limit int) (map[string][]*graph.Edge, bool, error) {
+	return s.boundedInEdgesByNodeIDs(ctx, ids, limit, true)
+}
+
+func (s *Store) boundedInEdgesByNodeIDs(ctx context.Context, ids []string, limit int, withMeta bool) (map[string][]*graph.Edge, bool, error) {
+	cols, scan := edgeColsLight, s.scanEdgeLight
+	if withMeta {
+		cols = lookupEdgeCols
+		scan = func(rows interface{ Scan(...any) error }) (*graph.Edge, error) { return s.scanEdgeCursor(rows) }
+	}
 	uniq := dedupeNonEmpty(ids)
 	if len(uniq) == 0 {
 		return nil, false, nil
@@ -329,7 +408,7 @@ func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, li
 		// remaining may be zero: fetch one proof row from later chunks so
 		// exactly-limit and greater-than-limit are distinguishable.
 		queryLimit := remaining + 1
-		q := `SELECT ` + edgeColsLight + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? LIMIT ?`
+		q := `SELECT ` + cols + ` FROM edges WHERE to_id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? LIMIT ?`
 		args := toAnyArgs(chunk)
 		args = append(args, s.viewGen, queryLimit)
 		rows, err := s.db.QueryContext(ctx, q, args...)
@@ -337,7 +416,7 @@ func (s *Store) GetInEdgesByNodeIDsContext(ctx context.Context, ids []string, li
 			return out, true, err
 		}
 		for rows.Next() {
-			e, scanErr := s.scanEdgeLight(rows)
+			e, scanErr := scan(rows)
 			if scanErr != nil {
 				_ = rows.Close()
 				return out, true, scanErr
@@ -505,9 +584,12 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 
 // The three candidate-query builders are pure string assembly (no I/O) so
 // the plan-lock test can EXPLAIN the exact SQL GetEdgeCandidates executes
-// (store_bfs.go precedent). Every shape drives the edges side of the VALUES
-// join through edges_by_from(from_id, kind); the wanted CTE is the scanned
-// side by construction.
+// (store_bfs.go precedent). The wanted CTE is the scanned side by construction.
+// Endpoint batches CROSS JOIN to the logical endpoint unique index
+// (from_id,to_id): +view_gen remains a residual filter, so generation-first
+// edges_by_from cannot turn a hot source into the probe's fan-out. Exact and
+// any-site batches use their ordinary view_gen predicates and therefore seek
+// the generation-first (view_gen,from_id,line[,kind]) site prefixes.
 
 func edgeCandidatesValues(rows int, row string) string {
 	return strings.TrimSuffix(strings.Repeat(row+",", rows), ",")
@@ -519,18 +601,24 @@ func edgeCandidatesValues(rows int, row string) string {
 // are still the ones the planner sees first.
 
 func edgeCandidatesEndpointQuery(pairs int) string {
+	// Unary + keeps the generation predicate while preventing SQLite from
+	// preferring a target-only index over the logical endpoint-key index.
+	// view_gen is stored as INTEGER and this path binds Store.viewGen as int64.
+	// The former target index yielded each endpoint bucket by kind then row ID;
+	// preserve that order because EdgeCandidateSet's first-match accessors use it.
 	return `WITH wanted(from_id, to_id) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.to_id = w.to_id
-	       WHERE e.view_gen = ?`
+	        CROSS JOIN edges AS e INDEXED BY sqlite_autoindex_edges_1 ON e.from_id = w.from_id AND e.to_id = w.to_id
+	       WHERE +e.view_gen = ?
+	       ORDER BY e.kind, e.id`
 }
 
 func edgeCandidatesExactSiteQuery(triples int) string {
 	return `WITH wanted(from_id, line, kind) AS (VALUES ` + edgeCandidatesValues(triples, "(?, ?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line
+	        CROSS JOIN edges AS e ON e.from_id = w.from_id AND e.kind = w.kind AND e.line = w.line
 	       WHERE e.view_gen = ?`
 }
 
@@ -538,7 +626,7 @@ func edgeCandidatesAnySiteQuery(pairs int) string {
 	return `WITH wanted(from_id, line) AS (VALUES ` + edgeCandidatesValues(pairs, "(?, ?)") + `)
 	      SELECT DISTINCT ` + lookupQualifiedEdgeCols + `
 	        FROM wanted AS w
-	        JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line
+	        CROSS JOIN edges AS e ON e.from_id = w.from_id AND e.line = w.line
 	       WHERE e.view_gen = ?`
 }
 

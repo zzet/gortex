@@ -11,9 +11,13 @@ import (
 
 type recordingBoundedIncomingReader struct {
 	Reader
-	bounded BoundedIncomingSourceReader
-	calls   int
-	limits  []int
+	bounded     BoundedIncomingSourceReader
+	calls       int
+	limits      []int
+	legacyCalls int
+	scopedCalls int
+	inspections []int
+	budgets     []*IncomingSourceBudget
 }
 
 func (reader *recordingBoundedIncomingReader) FindIncomingSourcesBounded(
@@ -23,8 +27,34 @@ func (reader *recordingBoundedIncomingReader) FindIncomingSourcesBounded(
 	limit int,
 ) (BoundedIncomingSourceProjection, error) {
 	reader.calls++
+	reader.legacyCalls++
 	reader.limits = append(reader.limits, limit)
 	return reader.bounded.FindIncomingSourcesBounded(ctx, targetIDs, kind, limit)
+}
+
+func (reader *recordingBoundedIncomingReader) FindIncomingSourcesScoped(
+	ctx context.Context,
+	targetIDs []string,
+	kind EdgeKind,
+	limit int,
+	scope IncomingSourceScope,
+	budget *IncomingSourceBudget,
+) (BoundedIncomingSourceProjection, error) {
+	reader.calls++
+	reader.scopedCalls++
+	reader.limits = append(reader.limits, limit)
+	reader.budgets = append(reader.budgets, budget)
+	scoped, ok := reader.bounded.(ScopedIncomingSourceReader)
+	if !ok {
+		return BoundedIncomingSourceProjection{}, ErrBoundedLocalizationUnavailable
+	}
+	if budget == nil {
+		return BoundedIncomingSourceProjection{}, errors.New("recording scoped reader requires the query's shared budget")
+	}
+	before := budget.Remaining()
+	page, err := scoped.FindIncomingSourcesScoped(ctx, targetIDs, kind, limit, scope, budget)
+	reader.inspections = append(reader.inspections, before-budget.Remaining())
+	return page, err
 }
 
 func TestGraphFindIncomingSourcesBoundedCountsDistinctRelevantSources(t *testing.T) {
@@ -104,8 +134,14 @@ func TestOverlaidViewFindIncomingSourcesBoundedReappliesLimitAfterCompensation(t
 	if !page.Truncated[targetID] || len(page.Sources[targetID]) != 0 {
 		t.Fatalf("compensation bypassed caller cap: %#v", page)
 	}
-	if !reflect.DeepEqual(recording.limits, []int{308}) {
-		t.Fatalf("base compensation limit = %v, want 308", recording.limits)
+	// Keep the historical test name and result oracle: ownership now reaches
+	// the lower reader before its sentinel, without inflating the caller limit.
+	if recording.calls != 1 || recording.scopedCalls != 1 || recording.legacyCalls != 0 ||
+		!reflect.DeepEqual(recording.limits, []int{8}) ||
+		!reflect.DeepEqual(recording.inspections, []int{9}) ||
+		len(recording.budgets) != 1 || recording.budgets[0].Remaining() != MaxIncomingSourceCandidateRows-9 {
+		t.Fatalf("scoped calls=%d legacy=%d limits=%v inspections=%v; want one limit-8 query inspecting only 9 matching rows",
+			recording.scopedCalls, recording.legacyCalls, recording.limits, recording.inspections)
 	}
 }
 
@@ -135,17 +171,24 @@ func TestOverlaidViewFindIncomingSourcesBoundedSeparatesStandardAndDetachedShado
 	if page.Truncated[targetID] || !reflect.DeepEqual(page.Sources[targetID], []string{currentID}) {
 		t.Fatalf("overlay replacement sources = %#v, want only current %q", page, currentID)
 	}
-	if recording.calls != 1 || len(recording.limits) != 1 || recording.limits[0] != 308 {
-		t.Fatalf("base calls/limits = %d/%v, want one exact compensation call at 308", recording.calls, recording.limits)
+
+	if recording.calls != 1 || recording.scopedCalls != 1 || recording.legacyCalls != 0 ||
+		!reflect.DeepEqual(recording.limits, []int{8}) ||
+		!reflect.DeepEqual(recording.inspections, []int{300}) ||
+		len(recording.budgets) != 1 || recording.budgets[0].Remaining() != MaxIncomingSourceCandidateRows-301 {
+		t.Fatalf("scoped calls=%d legacy=%d limits=%v inspections=%v; want unchanged limit and 300 lower + 1 upper inspections",
+			recording.scopedCalls, recording.legacyCalls, recording.limits, recording.inspections)
 	}
 
+	// These preserve both historical boundary fixtures, but supersede their
+	// global-marker refusal: only rows matching this query consume its budget.
 	for _, test := range []struct {
-		name      string
-		shadows   int
-		wantError bool
+		name    string
+		shadows int
 	}{
-		{name: "exact detached cap", shadows: overlayDetachedShadowLimit},
-		{name: "above detached cap", shadows: overlayDetachedShadowLimit + 1, wantError: true},
+		{name: "historical exact detached cap", shadows: overlayDetachedShadowLimit},
+		{name: "historical above detached cap", shadows: overlayDetachedShadowLimit + 1},
+		{name: "1024 unrelated detached markers", shadows: 1024},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			empty := New()
@@ -157,18 +200,13 @@ func TestOverlaidViewFindIncomingSourcesBoundedSeparatesStandardAndDetachedShado
 			got, gotErr := NewOverlaidView(counted, detached).FindIncomingSourcesBounded(
 				context.Background(), []string{targetID}, EdgeCalls, 8,
 			)
-			if test.wantError {
-				var limitErr *BoundedLocalizationLimitError
-				if !errors.As(gotErr, &limitErr) ||
-					limitErr.Resource != "overlay incoming-source detached shadows" ||
-					limitErr.Limit != overlayDetachedShadowLimit || counted.calls != 0 ||
-					len(got.Sources) != 0 || len(got.Truncated) != 0 {
-					t.Fatalf("overflow = %#v, %v, base calls %d; want exact pre-base detached limit failure", got, gotErr, counted.calls)
-				}
-				return
-			}
-			if gotErr != nil || counted.calls != 1 || counted.limits[0] != 8+overlayDetachedShadowLimit {
-				t.Fatalf("exact-cap projection = %#v, %v, calls/limits %d/%v", got, gotErr, counted.calls, counted.limits)
+			if gotErr != nil || len(got.Sources) != 0 || len(got.Truncated) != 0 ||
+				counted.calls != 1 || counted.scopedCalls != 1 || counted.legacyCalls != 0 ||
+				!reflect.DeepEqual(counted.limits, []int{8}) ||
+				!reflect.DeepEqual(counted.inspections, []int{0}) ||
+				len(counted.budgets) != 1 || counted.budgets[0].Remaining() != MaxIncomingSourceCandidateRows {
+				t.Fatalf("unrelated marker projection = %#v, %v, calls/limits/inspections %d/%v/%v",
+					got, gotErr, counted.calls, counted.limits, counted.inspections)
 			}
 		})
 	}
@@ -258,21 +296,54 @@ func TestBoundedIncomingSourcesCancelsDuringGraphAndOverlayInspection(t *testing
 		t.Fatalf("mid-graph cancellation = %#v, %v", page, err)
 	}
 
+	const matchingRows = 2048
 	base := New()
-	recording := &recordingBoundedIncomingReader{Reader: base, bounded: base}
 	layer := NewOverlayLayer()
 	layer.MarkFile("repo/edited.go", false)
-	for index := 0; index < 512; index++ {
-		layer.MarkRemoved("source", fmt.Sprintf("repo/edited.go::source-%03d", index))
+	for index := 0; index < matchingRows; index++ {
+		id := fmt.Sprintf("repo/edited.go::source-%04d", index)
+		layer.AddNode("repo/edited.go", &Node{ID: id, Name: "source", Kind: KindFunction, FilePath: "repo/edited.go"})
+		layer.AddEdge(&Edge{From: id, To: "target", Kind: EdgeCalls})
 	}
+	healthy := &recordingBoundedIncomingReader{Reader: base, bounded: base}
+	page, err = NewOverlaidView(healthy, layer).FindIncomingSourcesBounded(
+		context.Background(), []string{"target"}, EdgeCalls, 8,
+	)
+	if err != nil || !page.Truncated["target"] || len(page.Sources) != 0 ||
+		len(healthy.budgets) != 1 || healthy.budgets[0].Remaining() != MaxIncomingSourceCandidateRows-matchingRows {
+		t.Fatalf("healthy matching-row cancellation fixture = %#v, %v", page, err)
+	}
+
+	// Unrelated ownership markers must not be used as the inspection/cancel
+	// oracle. The same check allowance completes a query with no matching rows.
+	unrelated := NewOverlayLayer()
+	for index := 0; index < matchingRows; index++ {
+		unrelated.MarkRemoved("source", fmt.Sprintf("legacy-unrelated-%04d", index))
+	}
+	controlContext := &cancelAfterLocalizationChecksContext{
+		Context: context.Background(), remaining: 20, done: make(chan struct{}),
+	}
+	page, err = NewOverlaidView(base, unrelated).FindIncomingSourcesBounded(
+		controlContext, []string{"target"}, EdgeCalls, 8,
+	)
+	if err != nil || len(page.Sources) != 0 || len(page.Truncated) != 0 {
+		t.Fatalf("unrelated-marker cancellation control = %#v, %v", page, err)
+	}
+
+	recording := &recordingBoundedIncomingReader{Reader: base, bounded: base}
 	ctx = &cancelAfterLocalizationChecksContext{
-		Context: context.Background(), remaining: 3, done: make(chan struct{}),
+		Context: context.Background(), remaining: 20, done: make(chan struct{}),
 	}
 	page, err = NewOverlaidView(recording, layer).FindIncomingSourcesBounded(
 		ctx, []string{"target"}, EdgeCalls, 8,
 	)
-	if !errors.Is(err, context.Canceled) || len(page.Sources) != 0 || len(page.Truncated) != 0 || recording.calls != 0 {
-		t.Fatalf("mid-overlay cancellation = %#v, %v, base calls=%d", page, err, recording.calls)
+	if !errors.Is(err, context.Canceled) || len(page.Sources) != 0 || len(page.Truncated) != 0 ||
+		recording.calls != 1 || recording.scopedCalls != 1 || recording.legacyCalls != 0 ||
+		!reflect.DeepEqual(recording.limits, []int{8}) ||
+		!reflect.DeepEqual(recording.inspections, []int{0}) ||
+		len(recording.budgets) != 1 || recording.budgets[0].Remaining() != MaxIncomingSourceCandidateRows {
+		t.Fatalf("mid-overlay physical inspection cancellation = %#v, %v, calls/limits/inspections=%d/%v/%v",
+			page, err, recording.calls, recording.limits, recording.inspections)
 	}
 }
 
@@ -288,7 +359,11 @@ func TestOverlaidViewFindIncomingSourcesBoundedDedupesShadowsAndGuardsCompensati
 	page, err := NewOverlaidView(recording, layer).FindIncomingSourcesBounded(
 		context.Background(), []string{"target"}, EdgeCalls, 8,
 	)
-	if err != nil || len(page.Sources) != 0 || recording.calls != 1 || !reflect.DeepEqual(recording.limits, []int{9}) {
+	if err != nil || len(page.Sources) != 0 || len(page.Truncated) != 0 ||
+		recording.calls != 1 || recording.scopedCalls != 1 || recording.legacyCalls != 0 ||
+		!reflect.DeepEqual(recording.limits, []int{8}) ||
+		!reflect.DeepEqual(recording.inspections, []int{0}) ||
+		len(recording.budgets) != 1 || recording.budgets[0].Remaining() != MaxIncomingSourceCandidateRows {
 		t.Fatalf("deduped shadow projection = %#v, %v, calls/limits=%d/%v", page, err, recording.calls, recording.limits)
 	}
 
@@ -301,10 +376,18 @@ func TestOverlaidViewFindIncomingSourcesBoundedDedupesShadowsAndGuardsCompensati
 	page, err = NewOverlaidView(overflowRecording, overflowLayer).FindIncomingSourcesBounded(
 		context.Background(), []string{"target"}, EdgeCalls, maxInt-1,
 	)
+	if err != nil || overflowRecording.calls != 1 || len(page.Sources) != 0 || len(page.Truncated) != 0 {
+		t.Fatalf("largest valid sentinel limit = %#v, %v, base calls=%d", page, err, overflowRecording.calls)
+	}
+	overflowRecording.calls = 0
+	page, err = NewOverlaidView(overflowRecording, overflowLayer).FindIncomingSourcesBounded(
+		context.Background(), []string{"target"}, EdgeCalls, maxInt,
+	)
 	var limitErr *BoundedLocalizationLimitError
-	if !errors.As(err, &limitErr) || limitErr.Resource != "overlay incoming-source compensation" ||
+	if !errors.As(err, &limitErr) || limitErr.Resource != "overlay incoming-source sentinel" ||
+		limitErr.Limit != maxBoundedIncomingSourceLimit-1 ||
 		overflowRecording.calls != 0 || len(page.Sources) != 0 || len(page.Truncated) != 0 {
-		t.Fatalf("compensation overflow = %#v, %v, base calls=%d", page, err, overflowRecording.calls)
+		t.Fatalf("sentinel overflow = %#v, %v, base calls=%d", page, err, overflowRecording.calls)
 	}
 }
 
@@ -351,4 +434,3 @@ func TestOverlaidViewGetNodesByIDsContextDelegatesContextAndDropsPartialErrors(t
 		t.Fatalf("base error returned partial exact nodes: %#v, %v", nodes, err)
 	}
 }
-

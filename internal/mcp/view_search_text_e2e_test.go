@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
@@ -36,9 +37,51 @@ type worktreeSearchStack struct {
 	primary    string
 	worktree   string
 	checkoutID string
+	familyID   string
 }
 
 func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
+	t.Helper()
+	return newWorktreeSearchStackWithConfig(t, "workspace: main-ws\n")
+}
+
+// newWorktreeSearchStackWithConfig is newWorktreeSearchStack with the primary's
+// .gortex.yaml of the caller's choosing.
+func newWorktreeSearchStackWithConfig(t *testing.T, gortexYAML string) *worktreeSearchStack {
+	t.Helper()
+	stack := buildWorktreeSearchStack(t, gortexYAML)
+	stack.checkoutID = stack.awaitRoutedCheckout(t)
+	return stack
+}
+
+// newDormantWorktreeSearchStack leaves the worktree as the startup inventory
+// does: registered and automatic, with no coordinator and no route.
+func newDormantWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
+	t.Helper()
+	stack := buildWorktreeSearchStack(t, "workspace: main-ws\n")
+	ctx := context.Background()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		checkout, found, err := graphview.CheckoutForPath(ctx, stack.store.Catalog(), stack.srv.viewFamilies(ctx), stack.worktree)
+		if err != nil {
+			t.Fatalf("bind the worktree to a checkout: %v", err)
+		}
+		if found && graphview.ServesAutomaticView(checkout) {
+			stack.checkoutID, stack.familyID = checkout.CheckoutID, checkout.FamilyID
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the worktree at %s was never registered", stack.worktree)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if live := stack.lifecycle.LiveCoordinators(stack.familyID); live != 0 {
+		t.Fatalf("the fixture worktree is not dormant: %d live coordinators", live)
+	}
+	return stack
+}
+
+func buildWorktreeSearchStack(t *testing.T, gortexYAML string) *worktreeSearchStack {
 	t.Helper()
 	refIsolateGit(t)
 
@@ -51,7 +94,7 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 		primary = resolved
 	}
 	refWriteFiles(t, primary, map[string]string{
-		".gortex.yaml": "workspace: main-ws\n",
+		".gortex.yaml": gortexYAML,
 		"keep.go":      "package repo\n\nfunc Keeper() {}\n",
 		"gone.go":      "package repo\n\nfunc Gone() {}\n",
 	})
@@ -131,11 +174,9 @@ func newWorktreeSearchStack(t *testing.T) *worktreeSearchStack {
 	})
 	srv.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases})
 
-	stack := &worktreeSearchStack{
+	return &worktreeSearchStack{
 		srv: srv, store: store, lifecycle: lifecycle, primary: primary, worktree: worktree,
 	}
-	stack.checkoutID = stack.awaitRoutedCheckout(t)
-	return stack
 }
 
 // awaitRoutedCheckout waits for the worktree to become a checkout with a route
@@ -247,4 +288,103 @@ func TestSearchTextRoutedViewSearchesTheCheckoutWorkingCopy(t *testing.T) {
 	if got := stack.search(t, stack.primary, "func Gone"); len(got) != 1 || got[0] != "repo/gone.go" {
 		t.Errorf("the canonical checkout answered %v for the deleted file, want repo/gone.go", got)
 	}
+}
+
+func (w *worktreeSearchStack) searchSymbolsRider(t *testing.T, query string) map[string]any {
+	t.Helper()
+	req := mcplib.CallToolRequest{}
+	req.Params.Name = "search_symbols"
+	req.Params.Arguments = map[string]any{"query": query}
+	ctx := WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), w.worktree)
+	res, err := w.srv.wrapToolHandler(w.srv.handleSearchSymbols)(ctx, req)
+	if err != nil {
+		t.Fatalf("search_symbols %q: %v", query, err)
+	}
+	if res.IsError {
+		t.Fatalf("search_symbols %q was refused: %s", query, viewResultText(t, res))
+	}
+	return resultFreshness(t, res)
+}
+
+// TestSourceReadActivatesDormantWorktree: a worktree that only ever receives
+// source-lane reads must still be selected, or every identifier search keeps
+// scanning its files instead of reaching the routed graph.
+func TestSourceReadActivatesDormantWorktree(t *testing.T) {
+	stack := newDormantWorktreeSearchStack(t)
+	ctx := context.Background()
+
+	if rider := stack.searchSymbolsRider(t, "Keeper"); rider["capability_scope"] != "declarations" {
+		t.Fatalf("the dormant worktree's identifier search was not served by source declarations: %v", rider)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		route, found, err := stack.store.Catalog().GetCheckoutRoute(ctx, stack.checkoutID)
+		if err != nil {
+			t.Fatalf("read the worktree route: %v", err)
+		}
+		if found && route.State == store_sqlite.RouteActive && route.DirtyGenerationID != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a source-lane read never activated the dormant worktree (route found=%v state=%q coordinators=%d)",
+				found, route.State, stack.lifecycle.LiveCoordinators(stack.familyID))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	rider := stack.searchSymbolsRider(t, "Keeper")
+	if _, ok := rider["capability_scope"]; ok {
+		t.Fatalf("the routed worktree's identifier search stayed on the source lane: %v", rider)
+	}
+	if rider["exact"] != true {
+		t.Fatalf("the routed worktree's identifier search was not an exact graph answer: %v", rider)
+	}
+}
+
+// TestSourceReadDoesNotActivateOutOfScopeOrRetiredCheckout: a request the
+// source lane does not prove, or a retired route, never wakes a coordinator.
+func TestSourceReadDoesNotActivateOutOfScopeOrRetiredCheckout(t *testing.T) {
+	resolve := func(stack *worktreeSearchStack, args map[string]any) (*requestView, error) {
+		req := mcplib.CallToolRequest{}
+		req.Params.Name = "search_symbols"
+		req.Params.Arguments = args
+		ctx := WithSessionCWD(WithSessionID(context.Background(), wtSearchSession), stack.worktree)
+		return stack.srv.resolveSourceRequestView(ctx, graphview.Selector{Kind: graphview.SelectorAuto}, &req, "search_symbols", requestFreshness{}, capabilityRequest{})
+	}
+	// Activation installs its coordinator promptly; a quiet window this long
+	// would observe one.
+	assertDormant := func(t *testing.T, stack *worktreeSearchStack) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if live := stack.lifecycle.LiveCoordinators(stack.familyID); live != 0 {
+				t.Fatalf("the checkout was activated: %d live coordinators", live)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	t.Run("out_of_scope", func(t *testing.T) {
+		stack := newDormantWorktreeSearchStack(t)
+		// Refused or declined, the source lane proves nothing for this domain.
+		if view, _ := resolve(stack, map[string]any{"query": "Keeper", "repo": "elsewhere"}); view != nil {
+			t.Fatalf("an uncontained repository domain was served by the source lane")
+		}
+		assertDormant(t, stack)
+	})
+	t.Run("retired", func(t *testing.T) {
+		stack := newDormantWorktreeSearchStack(t)
+		ctx := context.Background()
+		graphs, err := stack.store.Catalog().ListDedicatedGraphs(ctx, stack.familyID)
+		if err != nil || len(graphs) == 0 {
+			t.Fatalf("list the family graphs: %d %v", len(graphs), err)
+		}
+		if err := stack.store.Catalog().UpsertCheckoutRoute(ctx, store_sqlite.CheckoutRoute{
+			CheckoutID: stack.checkoutID, GraphID: graphs[0].GraphID, State: store_sqlite.RouteRetired,
+		}); err != nil {
+			t.Fatalf("retire the route: %v", err)
+		}
+		if view, err := resolve(stack, map[string]any{"query": "Keeper"}); err != nil || view == nil || view.sourceScope != "declarations" {
+			t.Fatalf("the retired route's identifier search was not served by source declarations: %v", err)
+		}
+		assertDormant(t, stack)
+	})
 }

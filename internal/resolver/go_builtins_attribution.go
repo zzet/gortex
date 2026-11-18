@@ -131,7 +131,93 @@ func (r *Resolver) attributeGoBuiltinsForFile(filePath string) {
 	if !r.graphHasLanguage("go") {
 		return
 	}
-	r.attributeGoBuiltinCandidates(r.fileOutEdges(filePath))
+	r.attributeGoBuiltinCandidates(r.goBuiltinFileCandidates([]string{filePath}))
+}
+
+// goBuiltinFileCandidates is shared by the single-file and batched tails.
+// Recording files are authoritative for dataflow sources outside their live
+// node set; the batched path must not silently narrow back to by-node rows.
+func (r *Resolver) goBuiltinFileCandidates(paths []string) []*graph.Edge {
+	allowed := make(map[string]bool, len(paths))
+	var candidates []*graph.Edge
+	for _, path := range paths {
+		if allowed[path] {
+			continue
+		}
+		allowed[path] = true
+		candidates = append(candidates, r.fileOutEdges(path)...)
+	}
+	seen := make(map[graph.EdgeIdentity]struct{}, len(candidates))
+	for _, edge := range candidates {
+		if edge != nil {
+			seen[graph.EdgeIdentityFor(edge)] = struct{}{}
+		}
+	}
+	var recorded []*graph.Edge
+	if reader, ok := graph.RecordedEdgesOf(r.graph); ok {
+		recorded = reader.RecordedEdgesAt(paths)
+	} else {
+		// In-memory/adaptor stores without recording-file reads retain the
+		// finite exact-target discovery used by the whole-graph pass.
+		byTarget := r.graph.GetInEdgesByNodeIDs(goBuiltinUnresolvedTargets)
+		for _, target := range goBuiltinUnresolvedTargets {
+			recorded = append(recorded, byTarget[target]...)
+		}
+	}
+	for _, edge := range recorded {
+		if edge == nil || !allowed[edge.FilePath] || !goBuiltinPendingCandidate(edge) {
+			continue
+		}
+		identity := graph.EdgeIdentityFor(edge)
+		if _, found := seen[identity]; !found {
+			seen[identity] = struct{}{}
+			candidates = append(candidates, edge)
+		}
+	}
+	return candidates
+}
+
+func goBuiltinPendingCandidate(edge *graph.Edge) bool {
+	if edge == nil || !strings.HasPrefix(edge.To, "unresolved::") {
+		return false
+	}
+	if _, allowed := attributeGoBuiltinCandidateKinds[edge.Kind]; !allowed {
+		return false
+	}
+	return isGoBuiltinName(strings.TrimPrefix(edge.To, "unresolved::"))
+}
+
+// A zero pending count can mean every old unresolved shape was skipped, not
+// that attribution has no work. Inspect only the frontier already loaded by
+// the caller: this runs no generic pass/index build or recording-file query.
+func (r *Resolver) attributeFrontierGoBuiltins(frontier incrementalFileFrontier) {
+	allowed := make(map[string]bool, len(frontier.paths))
+	for _, path := range frontier.paths {
+		allowed[path] = true
+	}
+	seen := make(map[graph.EdgeIdentity]struct{})
+	var candidates []*graph.Edge
+	appendCandidate := func(edge *graph.Edge) {
+		if edge == nil || !allowed[edge.FilePath] || !goBuiltinPendingCandidate(edge) {
+			return
+		}
+		key := graph.EdgeIdentityFor(edge)
+		if _, duplicate := seen[key]; !duplicate {
+			seen[key] = struct{}{}
+			candidates = append(candidates, edge)
+		}
+	}
+	for _, edges := range frontier.outByNode {
+		for _, edge := range edges {
+			appendCandidate(edge)
+		}
+	}
+	for _, edge := range frontier.detached {
+		appendCandidate(edge)
+	}
+	if len(candidates) > 0 && r.graphHasLanguage("go") {
+		r.attributeGoBuiltinCandidates(candidates)
+	}
 }
 
 // attributeGoBuiltinCandidates resolves a set of possible builtin edges with
@@ -154,6 +240,9 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 		if owner := enclosingFunctionForBinding(e.From); owner != "" {
 			ids[owner] = struct{}{}
 		}
+		if detachedSource(e.From) && e.FilePath != "" {
+			ids[e.FilePath] = struct{}{}
+		}
 	}
 	idList := make([]string, 0, len(ids))
 	for id := range ids {
@@ -169,11 +258,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 		}
 	}
 	if len(materialised) > 0 {
-		nodes := make([]*graph.Node, 0, len(materialised))
-		for _, n := range materialised {
-			nodes = append(nodes, n)
-		}
-		r.graph.AddBatch(nodes, nil)
+		r.addMissingBuiltinNodes(materialised)
 	}
 	if len(batch) == 0 {
 		return
@@ -182,6 +267,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	targeter, ok := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
 	if !ok {
 		r.graph.ReindexEdges(batch)
+		reconcilePlaceholderSources(r.graph, nil, batch)
 		return
 	}
 
@@ -194,9 +280,11 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	direct, compactOK := compactGoBuiltinTargetReindexes(batch)
 	if !compactOK {
 		r.graph.ReindexEdges(batch)
+		reconcilePlaceholderSources(r.graph, nil, batch)
 		return
 	}
 	targeter.ReindexUnresolvedEdgeTargets(direct)
+	reconcilePlaceholderSources(r.graph, nil, batch)
 }
 
 // attributeGoBuiltinIdentityCandidates evaluates compact logical rows and, when
@@ -224,6 +312,9 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 			}
 			if owner := enclosingFunctionForBinding(identity.From); owner != "" {
 				ids[owner] = struct{}{}
+			}
+			if detachedSource(identity.From) && identity.FilePath != "" {
+				ids[identity.FilePath] = struct{}{}
 			}
 		}
 	}
@@ -265,15 +356,20 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 		return false
 	}
 	if len(materialised) > 0 {
-		nodes := make([]*graph.Node, 0, len(materialised))
-		for _, node := range materialised {
-			nodes = append(nodes, node)
-		}
-		r.graph.AddBatch(nodes, nil)
+		r.addMissingBuiltinNodes(materialised)
 	}
 	if len(direct) > 0 {
 		r.noteImportTargetReindexes(direct)
 		targeter.ReindexUnresolvedEdgeTargets(direct)
+		// The main resolver's placeholder reconciliation has already finished
+		// before this attribution tail. Reconcile these newly bound builtins at
+		// the same exact recording sites as an ordinary resolution batch.
+		resolved := make([]graph.EdgeReindex, 0, len(direct))
+		for _, mutation := range direct {
+			edge := &graph.Edge{From: mutation.Old.From, To: mutation.NewTo, Kind: mutation.Old.Kind, FilePath: mutation.Old.FilePath, Line: mutation.Old.Line}
+			resolved = append(resolved, graph.EdgeReindex{Edge: edge, OldTo: mutation.Old.To})
+		}
+		reconcilePlaceholderSources(r.graph, nil, resolved)
 	}
 	return true
 }
@@ -442,7 +538,17 @@ func tryAttributeGoBuiltin(e *graph.Edge, sourceNodes map[string]*graph.Node, ma
 	if boundarySource == nil {
 		boundarySource = sourceNodes[enclosingFunctionForBinding(e.From)]
 	}
-	repoPrefix := ""
+	if boundarySource == nil && detachedSource(e.From) {
+		if file := sourceNodes[e.FilePath]; file != nil && file.Kind == graph.KindFile && file.FilePath == e.FilePath {
+			// A detached source spelling may name a different repository even
+			// when recorded at this site; never borrow that file's boundary.
+			if repo := sourceSpellingRepoPrefix(e.From); repo != "" && repo != file.RepoPrefix {
+				return ""
+			}
+			boundarySource = file
+		}
+	}
+	repoPrefix := sourceSpellingRepoPrefix(e.From)
 	workspaceID := ""
 	projectID := ""
 	if boundarySource != nil {
@@ -540,4 +646,44 @@ func sourceIsGo(fromID string, sourceNodes map[string]*graph.Node) bool {
 		return true
 	}
 	return false
+}
+
+// addMissingBuiltinNodes writes the builtin sentinel nodes the graph does not
+// already serve as materialised. A sentinel is the same node on every save of
+// every file that uses it; re-adding it through a per-save delta made the
+// delta speak for it again, a composed write per sentinel on every save.
+func (r *Resolver) addMissingBuiltinNodes(materialised map[string]*graph.Node) {
+	ids := make([]string, 0, len(materialised))
+	for id := range materialised {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	existing := r.graph.GetNodesByIDs(ids)
+	nodes := make([]*graph.Node, 0, len(ids))
+	for _, id := range ids {
+		n := materialised[id]
+		if have := existing[id]; have != nil && sameBuiltinSentinel(have, n) {
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) > 0 {
+		r.graph.AddBatch(nodes, nil)
+	}
+}
+
+// sameBuiltinSentinel reports whether a served node is the sentinel a
+// builtin attribution would write.
+func sameBuiltinSentinel(have, want *graph.Node) bool {
+	if have.ID != want.ID || have.Kind != want.Kind || have.Name != want.Name || have.Language != want.Language ||
+		have.RepoPrefix != want.RepoPrefix || have.WorkspaceID != want.WorkspaceID || have.ProjectID != want.ProjectID ||
+		have.FilePath != want.FilePath || len(have.Meta) != len(want.Meta) {
+		return false
+	}
+	for key, value := range want.Meta {
+		if have.Meta[key] != value {
+			return false
+		}
+	}
+	return true
 }

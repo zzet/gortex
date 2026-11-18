@@ -28,6 +28,7 @@ func openNodeSearchKeyTestStore(tb testing.TB) *Store {
 
 func TestScanNodeSearchKeysUsesBoundedOrderedPagesAndClosesRows(t *testing.T) {
 	store := openNodeSearchKeyTestStore(t)
+	stopStoreBackgroundReaders(store)
 	for _, node := range []*graph.Node{
 		{ID: "c.go::Gamma", Kind: graph.KindFunction, Name: "Gamma", FilePath: "c.go"},
 		{ID: "a.go::Alpha", Kind: graph.KindMethod, Name: "Alpha", FilePath: "a.go"},
@@ -64,9 +65,9 @@ func TestScanNodeSearchKeysUsesBoundedOrderedPagesAndClosesRows(t *testing.T) {
 		t.Fatalf("ScanNodeSearchKeys: %v", err)
 	}
 	want := []graph.NodeSearchKey{
-		{ID: "a.go::Alpha", Kind: graph.KindMethod, Name: "Alpha"},
-		{ID: "b.go::Beta", Kind: graph.KindFunction, Name: "Beta"},
-		{ID: "c.go::Gamma", Kind: graph.KindFunction, Name: "Gamma"},
+		{ID: "a.go::Alpha", Kind: graph.KindMethod, Name: "Alpha", FilePath: "a.go"},
+		{ID: "b.go::Beta", Kind: graph.KindFunction, Name: "Beta", FilePath: "b.go"},
+		{ID: "c.go::Gamma", Kind: graph.KindFunction, Name: "Gamma", FilePath: "c.go"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("keys = %#v, want %#v", got, want)
@@ -142,4 +143,59 @@ func BenchmarkScanNodeSearchKeysVsAllNodes(b *testing.B) {
 			nodeSearchKeyBenchmarkCount = count
 		}
 	})
+}
+
+func TestScanNodeSearchKeysClosedStoreCannotProveExhaustion(t *testing.T) {
+	for _, betweenPages := range []bool{false, true} {
+		t.Run(fmt.Sprintf("between_pages_%t", betweenPages), func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "closed-search-keys.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed := false
+			closeStore := func() error {
+				err := store.Close()
+				closed = true
+				return err
+			}
+			t.Cleanup(func() {
+				if !closed {
+					if err := closeStore(); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			store.AddNode(&graph.Node{ID: "a.go::A", Name: "A", Kind: graph.KindFunction, FilePath: "a.go"})
+			store.AddNode(&graph.Node{ID: "b.go::Target", Name: "Target", Kind: graph.KindFunction, FilePath: "b.go"})
+			if !betweenPages {
+				if err := closeStore(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := t.Context()
+			calls := 0
+			var closeErr error
+			err = store.ScanNodeSearchKeys(ctx, 1, func([]graph.NodeSearchKey) bool {
+				calls++
+				closeErr = closeStore()
+				return true
+			})
+			if err == nil {
+				t.Fatal("closed database returned successful empty/partial scan; this cannot prove search exhaustion")
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			wantCalls := 0
+			if betweenPages {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("pages = %d, want %d", calls, wantCalls)
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("fixture caller must remain live: %v", ctx.Err())
+			}
+		})
+	}
 }

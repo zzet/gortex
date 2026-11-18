@@ -86,6 +86,30 @@ func (b *readinessBroadcaster) publish(payload map[string]any) {
 	}
 }
 
+// announce fans an event to every subscriber without making it the
+// last-known state. A per-repository event published through publish would
+// replace the warmup phase every in-band `warming` block and late subscriber
+// reads, so it rides alongside that state instead of over it.
+func (b *readinessBroadcaster) announce(payload map[string]any) {
+	if b == nil || b.server == nil {
+		return
+	}
+	out := copyPayload(payload)
+	out["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
+	b.mu.RLock()
+	subs := make([]string, 0, len(b.subscribers))
+	for id := range b.subscribers {
+		subs = append(subs, id)
+	}
+	b.mu.RUnlock()
+	for _, sid := range subs {
+		if err := b.server.SendNotificationToSpecificClient(sid, "notifications/workspace_readiness", out); err != nil {
+			b.logger.Debug("send workspace_readiness failed",
+				zap.String("session", sid), zap.Error(err))
+		}
+	}
+}
+
 // subscribe records sessionID and immediately delivers the last-known
 // state (if any) as an initial replay. Returns true when a replay
 // payload was sent.

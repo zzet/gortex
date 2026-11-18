@@ -148,8 +148,8 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	// Legacy coverage edges, selected by kind AND their own FilePath
 	// spelling — never by touching an evicted endpoint, which would take
 	// a shared target's other, still-valid edges with it.
-	result, err := tx.Exec(`DELETE FROM edges
-		WHERE kind IN (` + coverageEdgeKinds + `) AND ` + legacyEdgePath)
+	result, err := countEdgeWrite(tx.Exec(`DELETE FROM edges
+		WHERE kind IN (` + coverageEdgeKinds + `) AND ` + legacyEdgePath))
 	if err != nil {
 		return err
 	}
@@ -163,8 +163,8 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	// statements rather than one OR: each side then seeks through its own
 	// endpoint index instead of scanning the edge table.
 	for _, column := range []string{"from_id", "to_id"} {
-		if _, err := tx.Exec(`DELETE FROM edges
-			WHERE ` + column + ` IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
+		if _, err := countEdgeWrite(tx.Exec(`DELETE FROM edges
+			WHERE ` + column + ` IN (SELECT id FROM covdom_doomed_nodes)`)); err != nil {
 			return err
 		}
 	}
@@ -202,9 +202,9 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 	// Symbol FTS rows outlive their node unless deleted explicitly (see
 	// BatchDeleteSymbolFTS, the eviction lane's equivalent) — a purged todo
 	// would otherwise keep answering searches with its stale text.
-	if _, err := tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
+	if _, err := countSymbolFTSWrite(tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
 		SELECT fts_rowid FROM symbol_fts_rowid
-		WHERE node_id IN (SELECT id FROM covdom_doomed_nodes))`); err != nil {
+		WHERE node_id IN (SELECT id FROM covdom_doomed_nodes))`)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid
@@ -225,7 +225,7 @@ func purgeLegacyCoverageSpellings(tx *sql.Tx) error {
 			return fmt.Errorf("delete purged coverage rows from %s: %w", table, err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM nodes WHERE id IN (SELECT id FROM covdom_doomed_nodes)`); err != nil {
+	if _, err := countNodeWrite(tx.Exec(`DELETE FROM nodes WHERE id IN (SELECT id FROM covdom_doomed_nodes)`)); err != nil {
 		return err
 	}
 	// The persisted analysis generation was computed over the rows just

@@ -188,6 +188,39 @@ func TestEvictRepoAllGenerationsRefusesEmptyPrefix(t *testing.T) {
 	}
 }
 
+func TestAllGenerationRemovalThroughPositiveHandleInvalidatesEveryView(t *testing.T) {
+	for _, method := range []string{"purge", "evict"} {
+		t.Run(method, func(t *testing.T) {
+			store := openGenerationEvictionStore(t)
+			generations, handles := generationEvictionHandles(t, store, 3)
+			rows := make([]generationEvictionRows, len(handles))
+			revisions := make([]uint64, len(handles))
+			for i, handle := range handles {
+				rows[i] = seedGenerationEvictionRows(t, handle, generations[i], 2)
+			}
+			for i, handle := range handles {
+				revisions[i] = handle.AnalysisViewRevision()
+			}
+			if method == "purge" {
+				if err := handles[1].PurgeRepo(generationEvictionRepo); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, _, err := handles[1].EvictRepoAllGenerationsChecked(generationEvictionRepo); err != nil {
+				t.Fatal(err)
+			}
+			for i, handle := range handles {
+				requireGenerationEvictionRows(t, handle, rows[i], false)
+				if handle.AnalysisViewRevision() <= revisions[i] {
+					t.Fatalf("generation %d retained its pre-removal revision", generations[i])
+				}
+				if handle.ViewScopedAnalysis().CommitAnalysisSnapshot(revisions[i], func() { t.Error("installed stale snapshot") }) {
+					t.Fatalf("generation %d accepted a pre-removal snapshot", generations[i])
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkRepoEvictionScope(b *testing.B) {
 	const (
 		generationCount = 8

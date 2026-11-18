@@ -30,7 +30,7 @@ func analysisPlaceholders(count int) string {
 func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGenerationHeader, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	tx, err := s.beginWrite()
+	tx, err := s.beginAnalysisWrite()
 	if err != nil {
 		return graph.AnalysisGenerationHeader{}, false, err
 	}
@@ -41,7 +41,10 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 		}
 	}()
 	var generationID int64
-	if err := tx.QueryRow(`SELECT generation_id FROM analysis_active_generation WHERE slot = 1`).Scan(&generationID); err != nil {
+	if err := tx.QueryRow(
+		`SELECT generation_id FROM analysis_active_generation WHERE view_gen = ? AND slot = 1`,
+		s.viewGen,
+	).Scan(&generationID); err != nil {
 		if err == sql.ErrNoRows {
 			return graph.AnalysisGenerationHeader{}, false, nil
 		}
@@ -56,17 +59,27 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 		if reason == nil {
 			reason = fmt.Errorf("state is %d, want ready", state)
 		}
-		if _, clearErr := tx.Exec(`DELETE FROM analysis_active_generation WHERE slot = 1 AND generation_id = ?`, generationID); clearErr != nil {
+		if _, clearErr := tx.Exec(`DELETE FROM analysis_active_generation WHERE view_gen = ? AND slot = 1 AND generation_id = ?`, s.viewGen, generationID); clearErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, clearErr
 		}
 		if _, staleErr := tx.Exec(`UPDATE analysis_generations SET state = ? WHERE generation_id = ?`, analysisGenerationStale, generationID); staleErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, staleErr
 		}
+		// analysisGenerationPresent is the mutation hot path's latch and it
+		// lives on the shared storeCore, so it may only be cleared once NO
+		// view's pointer remains. Dropping it because this view's pointer went
+		// away would let the next graph mutation skip durable invalidation
+		// while another view still has an active analysis — the one way a
+		// restart could resurrect stale analysis.
+		remaining, remainingErr := analysisPointerPresentTx(tx)
+		if remainingErr != nil {
+			return graph.AnalysisGenerationHeader{}, false, remainingErr
+		}
 		if commitErr := tx.Commit(); commitErr != nil {
 			return graph.AnalysisGenerationHeader{}, false, commitErr
 		}
 		committed = true
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = remaining
 		return graph.AnalysisGenerationHeader{}, false, fmt.Errorf("%w: generation %d: %v", graph.ErrAnalysisGenerationCorrupt, generationID, reason)
 	}
 	if header.FormatVersion != formatVersion {
@@ -78,20 +91,37 @@ func (s *Store) LoadActiveAnalysisHeader(formatVersion uint32) (graph.AnalysisGe
 	committed = true
 	// A persisted build revision belongs to the previous process after reopen.
 	// Return the current process revision as the publication receipt instead.
-	header.GraphRevision = s.analysisMutationRevision.Load()
+	header.GraphRevision = s.analysisRevision()
 	return header, true, nil
 }
 
+// ensureAnalysisGenerationReadableLocked is the single gate every bounded
+// analysis query passes. The view_gen predicate is the generation axis on the
+// read side: an analysis built over another payload view is not merely stale
+// for this handle, it describes a different corpus, so it reads as inactive
+// rather than as a hit.
 func (s *Store) ensureAnalysisGenerationReadableLocked(generationID int64) error {
 	var one int
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(s.readContext(), `
 		SELECT 1 FROM analysis_active_generation a
 		JOIN analysis_generations g ON g.generation_id = a.generation_id
-		WHERE a.slot = 1 AND a.generation_id = ? AND g.state = ?`, generationID, analysisGenerationReady).Scan(&one)
+		WHERE a.view_gen = ? AND a.slot = 1 AND a.generation_id = ? AND g.state = ?`,
+		s.viewGen, generationID, analysisGenerationReady).Scan(&one)
 	if err == sql.ErrNoRows {
 		return graph.ErrAnalysisGenerationInactive
 	}
 	return err
+}
+
+// analysisPointerPresentTx reports whether any view generation still has an
+// active analysis pointer. It is the durable half of the shared
+// analysisGenerationPresent latch.
+func analysisPointerPresentTx(tx *sql.Tx) (bool, error) {
+	var present int
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM analysis_active_generation LIMIT 1)`).Scan(&present); err != nil {
+		return false, err
+	}
+	return present != 0, nil
 }
 
 func scanAnalysisNode(scanner interface{ Scan(...any) error }) (graph.AnalysisNodeMetric, error) {
@@ -111,6 +141,24 @@ func (s *Store) AnalysisNodeMetrics(generationID int64, nodeIDs []string) ([]gra
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.analysisNodeMetricsLocked(generationID, ids)
+}
+
+// TryAnalysisNodeMetrics omits this optional ranking signal when a writer is
+// active, rather than queueing a search behind the graph mutation.
+func (s *Store) TryAnalysisNodeMetrics(generationID int64, nodeIDs []string) ([]graph.AnalysisNodeMetric, error) {
+	ids, err := sortedUniqueAnalysisStrings(nodeIDs, "node id")
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	if !s.writeMu.TryLock() {
+		return nil, graph.ErrAnalysisStoreBusy
+	}
+	defer s.writeMu.Unlock()
+	return s.analysisNodeMetricsLocked(generationID, ids)
+}
+
+func (s *Store) analysisNodeMetricsLocked(generationID int64, ids []string) ([]graph.AnalysisNodeMetric, error) {
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, err
 	}
@@ -214,6 +262,31 @@ func (s *Store) TopAnalysisNodeMetrics(generationID int64, metric graph.Analysis
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.topAnalysisNodeMetricsLocked(generationID, metric, column, limit, cursor)
+}
+
+// TryTopAnalysisNodeMetrics is the non-blocking counterpart used to fill a
+// search's normalization cache. Busy reads must be retried by a later search.
+func (s *Store) TryTopAnalysisNodeMetrics(generationID int64, metric graph.AnalysisMetric, limit int, cursor *graph.AnalysisMetricCursor) ([]graph.AnalysisNodeMetric, *graph.AnalysisMetricCursor, error) {
+	column, err := analysisMetricColumn(metric)
+	if err != nil {
+		return nil, nil, err
+	}
+	limit, err = boundedAnalysisLimit(limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cursor != nil && (!validAnalysisFloat(cursor.Score) || cursor.RowID <= 0) {
+		return nil, nil, fmt.Errorf("analysis generation: invalid metric cursor")
+	}
+	if !s.writeMu.TryLock() {
+		return nil, nil, graph.ErrAnalysisStoreBusy
+	}
+	defer s.writeMu.Unlock()
+	return s.topAnalysisNodeMetricsLocked(generationID, metric, column, limit, cursor)
+}
+
+func (s *Store) topAnalysisNodeMetricsLocked(generationID int64, metric graph.AnalysisMetric, column string, limit int, cursor *graph.AnalysisMetricCursor) ([]graph.AnalysisNodeMetric, *graph.AnalysisMetricCursor, error) {
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, nil, err
 	}
@@ -260,7 +333,7 @@ func (s *Store) ListAnalysisCommunitySummaries(generationID int64, limit int, cu
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT community_id, label, hub, parent_id, size, cohesion
 		FROM analysis_communities WHERE generation_id = ? AND community_id > ?
 		ORDER BY community_id LIMIT ?`, generationID, cursorID, limit+1)
@@ -305,7 +378,7 @@ func (s *Store) loadAnalysisCommunityFilesLocked(generationID int64, items []gra
 		args = append(args, items[i].ID)
 		positions[items[i].ID] = i
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT community_id, file_path FROM analysis_community_files
 		WHERE generation_id = ? AND community_id IN (`+analysisPlaceholders(len(items))+`)
 		ORDER BY community_id, ordinal`, args...)
@@ -336,7 +409,7 @@ func (s *Store) AnalysisCommunityMembers(generationID int64, communityID string,
 	if err := s.ensureAnalysisGenerationReadableLocked(generationID); err != nil {
 		return nil, "", err
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(s.readContext(), `
 		SELECT id, node_id, community_id, pagerank, authority, hub
 		FROM analysis_nodes
 		WHERE generation_id = ? AND community_id = ? AND node_id > ?

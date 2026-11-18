@@ -165,7 +165,7 @@ func newLocalizationPlannedRecoveryCompletion(operation, anchor string) localiza
 // completion.instruction carries the same obligation as one that reads the
 // rendered page. required_action stays "respond" — the terminal gate matches
 // that exact value.
-const localizationAnswerReadyInstruction = "Answer now from completion.final_response, naming the files and symbols you rely on. If its evidence does not fit the request, say so and name what does. Either way, do not call another tool."
+const localizationAnswerReadyInstruction = "Answer now from completion.final_response, naming the files and symbols you rely on. If its evidence does not fit the request, say so and name what does. Either way, do not call another tool for this request. " + localizationNewUserTaskRelease
 
 func newLocalizationCompletion(answerReady bool, exactSymbol string) localizationCompletion {
 	if answerReady {
@@ -632,6 +632,9 @@ func (s *localizationTerminalState) interceptAnswerReady(facade, operation strin
 	}
 	switch s.state {
 	case localizationStateAnswerReady:
+		if s.answerReadyTaskMismatchLocked(arguments) {
+			return localizationAnswerReadyTaskMismatchResult(facade, operation), 0
+		}
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	case localizationStateNeedsRecovery:
 		if localizationDirectedRead(facade, operation, arguments) {
@@ -1480,6 +1483,9 @@ func (s *localizationTerminalState) beginLocalize(task string, newUserTask bool)
 		// typed non-retriable signal as every other post-terminal navigation
 		// call. The original successful result already holds the evidence.
 		if s.state == localizationStateAnswerReady {
+			if localizationTaskUnrelated(s.taskFingerprint, task) {
+				return 0, localizationAnswerReadyTaskMismatchResult("explore", "localize")
+			}
 			return 0, localizationTerminalResult(completion, "explore", "localize")
 		}
 		return 0, NewStructuredErrorResult(StructuredError{
@@ -1595,6 +1601,9 @@ func (s *localizationTerminalState) authorizeWithToken(facade, operation string,
 	// before their handlers can run and return a compact typed instruction;
 	// unrelated work remains dispatchable through the early return above.
 	if s.state == localizationStateAnswerReady {
+		if s.answerReadyTaskMismatchLocked(arguments) {
+			return localizationAnswerReadyTaskMismatchResult(facade, operation), 0
+		}
 		return localizationTerminalResult(s.completionLocked(), facade, operation), 0
 	}
 	// A read that names its own target is the agent declaring it no longer needs
@@ -1907,6 +1916,77 @@ func (s *localizationTerminalState) finishReservedReadTokenInternal(
 		return s.releaseLocalizationAdvisoryLocked(nil)
 	}
 	return s.completionLocked()
+}
+
+// answerReadyTaskMismatchLocked reports whether a navigation call names a task
+// other than the one the answer_ready evidence was retained for. Callers hold
+// s.mu.
+func (s *localizationTerminalState) answerReadyTaskMismatchLocked(arguments map[string]any) bool {
+	task, _ := arguments["task"].(string)
+	return localizationTaskUnrelated(s.taskFingerprint, task)
+}
+
+// localizationTaskUnrelated reports whether task is a different request from
+// the retained one. Only explicit task text counts: search, read, relations,
+// and the other operations carry none, so they cannot be told apart from a
+// follow-up of the same request and keep the replay. A paraphrase or repeat
+// of the retained task shares its distinctive terms and keeps the replay too:
+// rewording a request must not reopen localization. Only task text sharing
+// none of the retained task's terms is treated as another request.
+func localizationTaskUnrelated(retainedFingerprint, task string) bool {
+	fingerprint := localizationTaskFingerprint(task)
+	if retainedFingerprint == "" || fingerprint == "" || fingerprint == retainedFingerprint {
+		return false
+	}
+	terms := localizationTaskSubjectTerms(fingerprint)
+	if len(terms) == 0 {
+		return false
+	}
+	retained := localizationTaskSubjectTerms(retainedFingerprint)
+	for term := range terms {
+		if _, shared := retained[term]; shared {
+			return false
+		}
+	}
+	return true
+}
+
+// localizationTaskFramingTerms are the request verbs and fillers that frame a
+// localization task without naming its subject. Two tasks that share only
+// these ("locate Foo", "locate Bar") are different requests.
+var localizationTaskFramingTerms = map[string]struct{}{
+	"again": {}, "code": {}, "codebase": {}, "diagnose": {}, "explain": {},
+	"find": {}, "happen": {}, "implement": {}, "implementation": {},
+	"investigate": {}, "locate": {}, "look": {}, "search": {}, "show": {},
+	"that": {}, "this": {}, "where": {},
+}
+
+func localizationTaskSubjectTerms(task string) map[string]struct{} {
+	terms := exploreTerminalTerms(task)
+	for term := range terms {
+		if _, framing := localizationTaskFramingTerms[term]; framing {
+			delete(terms, term)
+		}
+	}
+	return terms
+}
+
+// localizationAnswerReadyTaskMismatchResult refuses a call whose task differs
+// from the one the answer_ready evidence answers. Task text alone never
+// crosses the terminal boundary, so the contract stays armed; but replaying
+// another task's evidence as this task's answer would be wrong, so the call
+// is refused and pointed at the explicit new-request boundary instead.
+func localizationAnswerReadyTaskMismatchResult(facade, operation string) *mcpgo.CallToolResult {
+	return newStructuredErrorResult(StructuredError{
+		ErrorCode: ErrCodeLocalizationComplete,
+		Message:   "the retained localization evidence answers a different task and is not replayed for this one; if this is a new user request, start it with explore(operation:\"localize\" or \"task\") and options:{new_user_task:true}; otherwise answer the original task from its evidence",
+		Retriable: false,
+		Data: map[string]any{
+			"facade":    facade,
+			"operation": operation,
+			"release":   "options.new_user_task",
+		},
+	}, true)
 }
 
 // localizationTerminalResult is the route-neutral successful replay returned

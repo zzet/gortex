@@ -11,6 +11,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -117,7 +118,25 @@ func TestGetRecentChanges_RepoNarrows(t *testing.T) {
 	assert.Equal(t, "repo:repo-a", applied)
 
 	byPath, _ := runRecentChanges(t, srv, ctx, map[string]any{"repo": paths["repo-a"]})
-	assert.Equal(t, byName, byPath, "the tracked-name and path forms of repo must narrow identically")
+	// Compare the narrowed feed, not the whole response: graph_current_as_of
+	// is the wall-clock read time at RFC3339 second precision, so two calls
+	// straddling a second boundary differ there even when they narrow
+	// identically.
+	assert.Equal(t, recentChangesRows(t, byName), recentChangesRows(t, byPath),
+		"the tracked-name and path forms of repo must narrow identically")
+}
+
+// recentChangesRows decodes a get_recent_changes response and returns its
+// `changes` rows, dropping the per-call graph_current_as_of read stamp.
+func recentChangesRows(t *testing.T, text string) []any {
+	t.Helper()
+	var resp struct {
+		Changes          []any  `json:"changes"`
+		GraphCurrentAsOf string `json:"graph_current_as_of"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(text), &resp), "response: %s", text)
+	require.NotEmpty(t, resp.GraphCurrentAsOf, "every response must carry its read stamp")
+	return resp.Changes
 }
 
 // TestGetRecentChanges_RowsCarryRepoAttribution pins the new field. Without

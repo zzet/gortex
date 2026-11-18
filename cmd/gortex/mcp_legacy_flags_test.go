@@ -42,20 +42,35 @@ func captureLegacyStderr(t *testing.T, fn func()) (stderr, stdout string) {
 	}
 	outR, outW, err := os.Pipe()
 	if err != nil {
+		_ = errR.Close()
+		_ = errW.Close()
 		t.Fatalf("stdout pipe: %v", err)
 	}
+	// Readers must run during fn: a full pipe blocks Write, and on Windows
+	// even a small logger.Sync waits for the pipe reader to consume its bytes.
+	var errBuf, outBuf bytes.Buffer
+	errDone, outDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := errBuf.ReadFrom(errR); errDone <- err }()
+	go func() { _, err := outBuf.ReadFrom(outR); outDone <- err }()
 	origErr, origOut := os.Stderr, os.Stdout
 	os.Stderr, os.Stdout = errW, outW
-	defer func() { os.Stderr, os.Stdout = origErr, origOut }()
+	defer func() {
+		os.Stderr, os.Stdout = origErr, origOut
+		_ = errW.Close()
+		_ = outW.Close()
+		if err := <-errDone; err != nil {
+			t.Errorf("read captured stderr: %v", err)
+		}
+		if err := <-outDone; err != nil {
+			t.Errorf("read captured stdout: %v", err)
+		}
+		_ = errR.Close()
+		_ = outR.Close()
+		stderr, stdout = errBuf.String(), outBuf.String()
+	}()
 
 	fn()
-
-	_ = errW.Close()
-	_ = outW.Close()
-	var errBuf, outBuf bytes.Buffer
-	_, _ = errBuf.ReadFrom(errR)
-	_, _ = outBuf.ReadFrom(outR)
-	return errBuf.String(), outBuf.String()
+	return
 }
 
 // TestLegacyFlags_NoError asserts that the compatibility flags still parse

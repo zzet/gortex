@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"go.uber.org/zap"
 	"sort"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/zzet/gortex/internal/cochange"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
@@ -63,8 +66,14 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	}
 
 	if requestBoolDefault(req, "refresh", true) {
-		s.ensureCoChange()
+		s.ensureCoChangeForRequest(ctx)
 	}
+	// The caches this answer comes from are process-wide and built over the
+	// indexed corpus — from base EdgeCoChange edges, or from a git mine of the
+	// tracked repositories' own worktrees. Neither is the snapshot a routed
+	// request selected, so under a view this answer is about the base and the
+	// rider says so. (No-op on a base request, where the corpus IS the answer.)
+	annotateBaseScoped(ctx, graphview.CapSyntaxGraph)
 	scores := s.coChangeScores(targetFile)
 	counts := s.coChangeCounts(targetFile)
 
@@ -128,8 +137,15 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 	// a fresh daemon on a disk backend takes tens of seconds before the cache is
 	// populated.
 	if len(rows) == 0 && !s.coChangeReady() {
-		result["mining_in_progress"] = true
-		result["note"] = "co-change graph is still being mined; retry shortly"
+		if err := s.coChangeFailure(); err != nil {
+			result["mining_in_progress"] = false
+			result["mining_failed"] = true
+			result["mining_error"] = err.Error()
+			result["note"] = "co-change mining failed; the automatic mine stopped. See mining_error instead of waiting for completion"
+		} else {
+			result["mining_in_progress"] = true
+			result["note"] = "co-change graph is still being mined; retry shortly"
+		}
 	}
 	return s.respondJSONOrTOON(ctx, req, result)
 }
@@ -144,9 +160,11 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 // turned every queued tool call into a blocked-for-60s caller. The
 // async shape keeps the request path off the slow path.
 //
-// PrewarmCoChange (called from RunAnalysis at daemon-ready) is the only normal
-// entrypoint. Read-only query handlers never call ensureCoChange: doing so
-// would make a query causally responsible for durable EdgeCoChange writes.
+// PrewarmCoChange (called from RunAnalysis at daemon-ready) is the normal
+// entrypoint. A query handler reaches the mine only through
+// ensureCoChangeForRequest, which weighs the request's view first: a read that
+// describes one checkout must not be the reason every tracked worktree is
+// swept and the corpus written.
 //
 // Returning immediately means the first user call may see an empty
 // cache when the prewarm goroutine has not yet completed. That is
@@ -156,8 +174,34 @@ func (s *Server) handleFindCoChangingSymbols(ctx context.Context, req mcp.CallTo
 // genuinely uncoupled.
 func (s *Server) ensureCoChange() {
 	s.cochangeOnce.Do(func() {
-		go s.mineCoChange()
+		ctx, done, ok := s.admitBackground()
+		if !ok {
+			return
+		}
+		go func() { defer done(); s.mineCoChangeContext(ctx) }()
 	})
+}
+
+// ensureCoChangeForRequest is the door a REQUEST handler uses, and it is the
+// one place the mine's side effects are weighed against the request's view.
+//
+// The mine is a CORPUS enrichment raised from a read path: it walks the git
+// history of every tracked repository's own live worktree and persists the
+// result as EdgeCoChange edges in generation zero. None of that describes the
+// snapshot a routed request selected, and that request must not be the reason
+// the corpus is swept and written. So a request that reads a checkout of its
+// own starts nothing — and, because the refusal happens before sync.Once is
+// consumed, it also does not burn the one-shot for the base requests that may
+// legitimately trigger it later.
+//
+// Returns whether the mine is now running or already ran, so a caller can tell
+// "no data yet" apart from "no mine was started for you".
+func (s *Server) ensureCoChangeForRequest(ctx context.Context) bool {
+	if requestViewFromContext(ctx).readsOwnCheckout() {
+		return false
+	}
+	s.ensureCoChange()
+	return true
 }
 
 // PrewarmCoChange triggers the co-change mine in the background so a
@@ -168,7 +212,40 @@ func (s *Server) ensureCoChange() {
 // Returns immediately whether mining is in progress, completed, or
 // freshly started.
 func (s *Server) PrewarmCoChange() {
-	go s.cochangeOnce.Do(s.mineCoChange)
+	s.ensureCoChange()
+}
+
+// EnrichCochange is the control socket's explicit corpus mine, owned by the
+// same terminal lifecycle as lazy mining. The caller resolves its target;
+// output admission, every physical write and receipt settlement stay inside
+// this owner's completion. It is not a general background-operation API.
+func (s *Server) EnrichCochange(parent context.Context, prefix, root string) (int, bool, error) {
+	lifetime, done, admitted := s.admitBackground()
+	if !admitted {
+		return 0, false, context.Canceled
+	}
+	defer done()
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(lifetime, cancel)
+	defer stop()
+	defer cancel()
+	if lifetime.Err() != nil {
+		cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	out, err := s.beginEnrichmentOutput(ctx, EnrichProducerCochange, prefix, root)
+	if err != nil {
+		return 0, false, err
+	}
+	defer out.Abandon()
+	count, err := cochange.EnrichGraphContext(ctx, out.Store, out.Root, prefix)
+	if err != nil {
+		return count, false, err
+	}
+	superseded, err := out.Settle()
+	return count, superseded, err
 }
 
 // coChangeReady reports whether the mine has completed and the cache
@@ -178,6 +255,12 @@ func (s *Server) coChangeReady() bool {
 	s.cochangeMu.RLock()
 	defer s.cochangeMu.RUnlock()
 	return s.cochangeByFile != nil
+}
+
+func (s *Server) coChangeFailure() error {
+	s.cochangeMu.RLock()
+	defer s.cochangeMu.RUnlock()
+	return s.cochangeErr
 }
 
 // mineCoChange populates the co-change caches. It prefers EdgeCoChange
@@ -207,6 +290,28 @@ func (s *Server) coChangeReady() bool {
 // `gortex enrich cochange` (or a cold reindex) — the lazy path does not
 // auto-re-mine once edges exist.
 func (s *Server) mineCoChange() {
+	ctx, done, ok := s.admitBackground()
+	if !ok {
+		return
+	}
+	defer done()
+	s.mineCoChangeContext(ctx)
+}
+
+func (s *Server) mineCoChangeContext(ctx context.Context) {
+	var mineErr error
+	defer func() {
+		if err := errors.Join(mineErr, ctx.Err()); err != nil {
+			s.cochangeMu.Lock()
+			if s.cochangeByFile == nil {
+				s.cochangeErr = err
+			}
+			s.cochangeMu.Unlock()
+		}
+	}()
+	if ctx.Err() != nil {
+		return
+	}
 	runtimeactivity.Begin("cochange")
 	defer func() {
 		runtimeactivity.End("cochange")
@@ -216,7 +321,10 @@ func (s *Server) mineCoChange() {
 	scores := map[string]map[string]float64{}
 	counts := map[string]map[string]int{}
 
-	if s.coChangeFromEdges(scores, counts) {
+	if s.coChangeFromEdgesContext(ctx, scores, counts) {
+		if ctx.Err() != nil {
+			return
+		}
 		s.storeCoChange(scores, counts)
 		// The co-change graph COULD be refreshed by re-mining git log,
 		// but was NOT: persisted EdgeCoChange edges already exist, so the
@@ -230,12 +338,55 @@ func (s *Server) mineCoChange() {
 		return
 	}
 
-	for prefix, root := range s.collectRepoRoots("") {
-		res := cochange.Mine(context.Background(), root, cochange.Options{})
+	// The mine outlives the request that triggered it — ensureCoChangeForRequest
+	// hands it to a goroutine — so it runs under its own context and names the
+	// BASE output explicitly, exactly as `gortex enrich cochange` does over the
+	// control socket. Until this it was the last enrichment write in the
+	// package that named no output at all: an un-attributed generation-zero
+	// mutation raised lazily from a read path, which the authority could
+	// neither order against a live index mutation nor supersede with a later
+	// run of the same producer.
+	if ctx.Err() != nil {
+		return
+	}
+	for prefix, root := range s.enrichmentTargets(ctx, "") {
+		if ctx.Err() != nil {
+			return
+		}
+		// Admitted BEFORE the git history is read, for the same reason the
+		// coverage path admits before it resolves the profile: the working copy
+		// the mine reads is the INPUT, and it must be the root of the corpus
+		// this write is named against rather than whatever was swept.
+		out, err := s.beginEnrichmentOutput(ctx, EnrichProducerCochange, prefix, root)
+		if err != nil {
+			mineErr = errors.Join(mineErr, fmt.Errorf("admit cochange %q: %w", prefix, err))
+			if s.logger != nil {
+				s.logger.Debug("co-change mine: no output generation admitted",
+					zap.String("prefix", prefix), zap.Error(err))
+			}
+			continue
+		}
+		res, err := cochange.MineContext(ctx, out.Root, cochange.Options{})
+		if err != nil {
+			out.Abandon()
+			mineErr = errors.Join(mineErr, fmt.Errorf("mine cochange %q: %w", prefix, err))
+			if s.logger != nil && ctx.Err() == nil {
+				s.logger.Warn("co-change mine failed; cache not published", zap.String("prefix", prefix), zap.Error(err))
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
 		if len(res.Pairs) == 0 {
+			out.Abandon()
 			continue
 		}
 		for _, p := range res.Pairs {
+			if ctx.Err() != nil {
+				out.Abandon()
+				return
+			}
 			fa, fb := p.FileA, p.FileB
 			if prefix != "" {
 				fa = prefix + "/" + fa
@@ -250,9 +401,42 @@ func (s *Server) mineCoChange() {
 		// per process (sync.Once) and the fast path above skips the mine
 		// once edges exist, so this persist (and its one clusters-cache
 		// token bump) happens at most once per graph, not per restart.
-		cochange.AddEdges(s.graph, res.Pairs, prefix)
+		//
+		// Through out.Store, the handle the admitted output names — not the
+		// server's un-selected graph field.
+		if ctx.Err() != nil {
+			out.Abandon()
+			return
+		}
+		if _, err := cochange.AddEdgesContext(ctx, out.Store, res.Pairs, prefix); err != nil {
+			out.Abandon()
+			mineErr = errors.Join(mineErr, fmt.Errorf("write cochange %q: %w", prefix, err))
+			if s.logger != nil && ctx.Err() == nil {
+				s.logger.Warn("co-change write failed; cache not published", zap.String("prefix", prefix), zap.Error(err))
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		// A supersession here is an ordering statement, not a failure: the
+		// edges above are already persisted, and a later run of the same
+		// producer over the same corpus is entitled to the authority.
+		if superseded, err := out.Settle(); err != nil {
+			mineErr = errors.Join(mineErr, fmt.Errorf("settle cochange %q: %w", prefix, err))
+			if s.logger != nil {
+				s.logger.Warn("co-change mine: output generation not settled",
+					zap.String("prefix", prefix), zap.Error(err))
+			}
+			continue
+		} else if superseded && s.logger != nil {
+			s.logger.Debug("co-change mine superseded by a newer run; its edges are persisted",
+				zap.String("prefix", prefix))
+		}
 	}
-	s.storeCoChange(scores, counts)
+	if ctx.Err() == nil && mineErr == nil {
+		s.storeCoChange(scores, counts)
+	}
 }
 
 // coChangeFromEdges rebuilds the path-keyed caches from EdgeCoChange
@@ -270,6 +454,14 @@ func (s *Server) mineCoChange() {
 // whole-graph AllEdges materialisation plus the per-edge
 // GetNode trips that loaded the file paths.
 func (s *Server) coChangeFromEdges(scores map[string]map[string]float64, counts map[string]map[string]int) bool {
+	return s.coChangeFromEdgesContext(context.Background(), scores, counts)
+}
+
+func (s *Server) coChangeFromEdgesContext(ctx context.Context, scores map[string]map[string]float64, counts map[string]map[string]int) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	reader := graph.BindReadContext(s.graph, ctx)
 	// First pass: collect CoChange edges + the set of node IDs they
 	// reference. Both can stream from EdgesByKind in one
 	// round-trip on disk backends.
@@ -280,7 +472,10 @@ func (s *Server) coChangeFromEdges(scores map[string]map[string]float64, counts 
 	}
 	var edges []ccEdge
 	idSet := make(map[string]struct{})
-	for e := range s.graph.EdgesByKind(graph.EdgeCoChange) {
+	for e := range reader.EdgesByKind(graph.EdgeCoChange) {
+		if ctx.Err() != nil {
+			return false
+		}
 		if e == nil {
 			continue
 		}
@@ -316,9 +511,18 @@ func (s *Server) coChangeFromEdges(scores map[string]map[string]float64, counts 
 	for id := range idSet {
 		ids = append(ids, id)
 	}
-	nodes := s.graph.GetNodesByIDs(ids)
+	if ctx.Err() != nil {
+		return false
+	}
+	nodes := reader.GetNodesByIDs(ids)
+	if ctx.Err() != nil {
+		return false
+	}
 
 	for _, e := range edges {
+		if ctx.Err() != nil {
+			return false
+		}
 		from, ok := nodes[e.from]
 		if !ok || from == nil {
 			continue
@@ -349,6 +553,7 @@ func (s *Server) storeCoChange(scores map[string]map[string]float64, counts map[
 	s.cochangeMu.Lock()
 	s.cochangeByFile = scores
 	s.cochangeCount = counts
+	s.cochangeErr = nil
 	s.cochangeMu.Unlock()
 }
 

@@ -194,9 +194,10 @@ func (s *Store) reindexUnresolvedEdgeTargetsOriented(
 		}
 		stats.add(txStats)
 		if invalidatedAnalysis {
-			s.analysisGenerationPresent = false
+			s.analysisGenerationPresent = s.analysisLatchRemaining
 		}
 		s.finishAnalysisMutationLocked(changed)
+		s.noteEdgeEndpointRewriteLocked(changed)
 	}
 	return stats, nil
 }
@@ -235,7 +236,7 @@ func (s *Store) reindexUnresolvedEdgeTargetsTransactionLocked(
 	}
 	changed = stats.updatedRows > 0 || stats.deletedRows > 0
 	if changed && s.analysisGenerationPresent {
-		if err := invalidateAnalysisGenerationTx(tx); err != nil {
+		if err := s.invalidateAnalysisViewTx(tx); err != nil {
 			return stats, false, false, err
 		}
 		invalidatedAnalysis = true
@@ -333,7 +334,7 @@ func updateSQLiteUnresolvedTargetsTxLimited(
 			AND e.file_path = p.file_path
 			AND e.line = p.line
 			AND e.view_gen = ?`
-		result, execErr := tx.Exec(query, args...)
+		result, execErr := countEdgeWrite(tx.Exec(query, args...))
 		if tooManySQLVariables(execErr) && rowCount > 1 {
 			rowLimit = lowerBatchVariableLimit(variableLimit, unresolvedTargetUpdateParamsPerRow, rowCount)
 			pos = chunkStart

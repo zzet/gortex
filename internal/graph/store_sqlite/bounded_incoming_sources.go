@@ -12,7 +12,7 @@ import (
 var _ graph.BoundedIncomingSourceReader = (*Store)(nil)
 
 const findIncomingSourcesBoundedSQL = `SELECT DISTINCT from_id
-	FROM edges
+	FROM edges INDEXED BY edges_by_to
 	WHERE to_id = ? AND kind = ? AND from_id <> '' AND view_gen = ?
 	LIMIT ?`
 

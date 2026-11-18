@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,6 +39,11 @@ Targets (in precedence order; later layers override earlier):
   2. Global   - ~/.gortex/config.yaml              (--global)
   3. Repo    - GlobalConfig.repos[].exclude        (--repo <name>)
   4. Workspace - ./.gortex.yaml at the repo root   (default)
+
+The workspace target is the nearest .gortex.yaml between the current
+directory and the enclosing git root; the search never climbs past the
+git root (or past the current directory outside a git repo). When none
+exists there, "add" creates one at the git root (or current directory).
 
 Use "!pattern" in a later layer to re-include something an earlier layer
 excluded.`,
@@ -136,19 +142,14 @@ func newWorkspaceTarget() (*excludeTarget, error) {
 			return patterns, nil
 		},
 		save: func(patterns []string) error {
-			cfg, err := readWorkspaceYAML(path)
+			migrated, err := writeWorkspaceExcludes(path, patterns)
 			if err != nil {
 				return err
 			}
-			if cfg == nil {
-				cfg = &config.Config{}
+			if migrated {
+				fmt.Fprintf(os.Stderr, "[gortex] migrated legacy index.exclude / watch.exclude in %s to top-level exclude:\n", path)
 			}
-			cfg.Exclude = patterns
-			// Scrub legacy keys once the user has written anything to
-			// the new shape — they've been migrated.
-			cfg.Index.Exclude = nil
-			cfg.Watch.Exclude = nil
-			return writeWorkspaceYAML(path, cfg)
+			return nil
 		},
 	}, nil
 }
@@ -268,7 +269,7 @@ func runConfigExcludeRemove(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func runConfigExcludeList(_ *cobra.Command, _ []string) error {
+func runConfigExcludeList(cmd *cobra.Command, _ []string) error {
 	rows := [][2]string{}
 	for _, p := range excludes.Builtin {
 		rows = append(rows, [2]string{"builtin", p})
@@ -285,7 +286,7 @@ func runConfigExcludeList(_ *cobra.Command, _ []string) error {
 	if wsErr == nil && wsRoot != "" {
 		wsPrefix := filepath.Base(wsRoot)
 		if gc != nil {
-			if entry := gc.FindRepoByPrefix(wsPrefix); entry != nil {
+			if entry := gc.FindRepoByPath(wsRoot); entry != nil {
 				for _, p := range entry.Exclude {
 					rows = append(rows, [2]string{"repo:" + wsPrefix, p})
 				}
@@ -295,7 +296,12 @@ func runConfigExcludeList(_ *cobra.Command, _ []string) error {
 		// returns a prospective path for the create case.
 		if _, err := os.Stat(wsPath); err == nil {
 			ws, err := readWorkspaceYAML(wsPath)
-			if err == nil && ws != nil {
+			if err != nil {
+				// A malformed workspace file reduces the layer to zero
+				// patterns — say so instead of just omitting it, so the
+				// user sees why their excludes are not in effect.
+				rows = append(rows, [2]string{"workspace", fmt.Sprintf("0 patterns loaded — file failed to parse: %v", err)})
+			} else if ws != nil {
 				for _, p := range ws.Exclude {
 					rows = append(rows, [2]string{"workspace", p})
 				}
@@ -307,6 +313,13 @@ func runConfigExcludeList(_ *cobra.Command, _ []string) error {
 						rows = append(rows, [2]string{"workspace (legacy watch.exclude)", p})
 					}
 				}
+			}
+			// Unknown keys at any depth are silently dropped by yaml.Unmarshal;
+			// flag them here where a config typo is cheapest to spot.
+			if unknown := config.UnknownWorkspaceKeys(wsPath); len(unknown) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"[gortex] warning: %s contains keys gortex does not recognize (they are ignored): %s\n",
+					wsPath, strings.Join(unknown, ", "))
 			}
 		}
 	}
@@ -377,13 +390,20 @@ func looksLikeGlob(s string) bool {
 }
 
 // findWorkspaceConfigPath walks up from the cwd looking for an existing
-// .gortex.yaml. When one is found, its path and containing dir are
-// returned. Otherwise it returns a prospective path at the nearest
-// git root (or cwd as a last resort) so `add` can create the file.
+// .gortex.yaml, stopping at the enclosing git root: the workspace config
+// is the one the daemon reads at the repo root, so a file above the repo
+// boundary belongs to some other project and must never be adopted.
+// Outside a git repo the search is bounded to the cwd itself. When no
+// file is found within that scope, it returns a prospective path at the
+// git root (or the cwd) so `add` can create the file.
 func findWorkspaceConfigPath() (path, repoRoot string, err error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", "", err
+	}
+	floor := gitToplevel(cwd)
+	if floor == "" {
+		floor = cwd
 	}
 	dir := cwd
 	for {
@@ -392,21 +412,21 @@ func findWorkspaceConfigPath() (path, repoRoot string, err error) {
 			return candidate, dir, nil
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir {
+		if dir == floor || parent == dir {
 			break
 		}
 		dir = parent
 	}
-	if root := gitToplevel(cwd); root != "" {
-		return filepath.Join(root, ".gortex.yaml"), root, nil
-	}
-	return filepath.Join(cwd, ".gortex.yaml"), cwd, nil
+	return filepath.Join(floor, ".gortex.yaml"), floor, nil
 }
 
+// gitToplevel returns the nearest ancestor of start (inclusive) holding a
+// .git entry — a directory for a regular checkout, a file for a linked
+// worktree or submodule — or "" when start is not inside a git repo.
 func gitToplevel(start string) string {
 	dir := start
 	for {
-		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			return dir
 		}
 		parent := filepath.Dir(dir)
@@ -417,32 +437,201 @@ func gitToplevel(start string) string {
 	}
 }
 
-// readWorkspaceYAML loads .gortex.yaml. Returns nil with no error when
-// the file is absent — the workspace target creates it on save.
+// readWorkspaceYAML loads .gortex.yaml into a zero-value Config so callers
+// see only what the file itself sets — seeding it with Default() would mix
+// computed defaults into the layer report. Writes go through
+// writeWorkspaceExcludes, never a Config round trip. Parse acceptance is
+// still the daemon's — it goes through the shared
+// config.ParseWorkspaceFileInto parser, so this surface agrees with the
+// daemon and with `gortex init` on which files are honored. Returns nil
+// with no error when the file is absent — the workspace target creates it
+// on save.
 func readWorkspaceYAML(path string) (*config.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	cfg := &config.Config{}
+	if err := config.ParseWorkspaceFileInto(path, cfg); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var cfg config.Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	return &cfg, nil
+	return cfg, nil
 }
 
-// writeWorkspaceYAML writes .gortex.yaml. The round-trip through the
-// Config struct loses comments, which is an accepted trade-off until
-// someone needs preservation.
-func writeWorkspaceYAML(path string, cfg *config.Config) error {
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return err
+// writeWorkspaceExcludes sets the exclude list of the .gortex.yaml at path
+// to patterns, creating the file when absent. It edits the YAML node tree
+// rather than round-tripping through config.Config, so comments, key
+// order, scalar quoting and keys the Config struct does not model all
+// survive; only the exclude keys are touched.
+//
+// The patterns are written to the top-level `exclude:` key. When that key
+// is absent or empty, the target's load() reported the legacy
+// index.exclude / watch.exclude lists instead, so those (now folded into
+// patterns) are removed from their blocks — siblings such as
+// watch.enabled stay — and migrated reports that this happened. An empty
+// patterns list removes the top-level key.
+func writeWorkspaceExcludes(path string, patterns []string) (migrated bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
 	}
-	return os.WriteFile(path, data, 0644)
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return false, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if doc.Kind == 0 {
+		doc.Kind = yaml.DocumentNode
+	}
+	var buf bytes.Buffer
+	if len(doc.Content) == 0 {
+		// A blank or comment-only file parses to no nodes, so its text
+		// would be lost on encode; carry it over verbatim instead.
+		if len(bytes.TrimSpace(data)) > 0 {
+			buf.Write(data)
+			if !bytes.HasSuffix(data, []byte("\n")) {
+				buf.WriteByte('\n')
+			}
+		}
+		doc.Content = []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return false, fmt.Errorf("%s: top level is not a mapping", path)
+	}
+
+	// Existing scalar nodes are reused for unchanged patterns so their
+	// quoting and line comments are kept.
+	var pool []*yaml.Node
+	seq := yamlMappingValue(root, "exclude")
+	if seq != nil && seq.Kind != yaml.SequenceNode && !isYAMLNull(seq) {
+		return false, fmt.Errorf("%s: exclude is not a list", path)
+	}
+	useLegacy := seq == nil || len(seq.Content) == 0
+	if useLegacy {
+		for _, block := range []string{"index", "watch"} {
+			if legacy := yamlMappingValue(yamlMappingValue(root, block), "exclude"); legacy != nil && legacy.Kind == yaml.SequenceNode {
+				pool = append(pool, legacy.Content...)
+			}
+		}
+	} else {
+		pool = append(pool, seq.Content...)
+	}
+
+	if len(patterns) == 0 {
+		yamlMappingDelete(root, "exclude")
+	} else {
+		// New patterns copy the quoting of the existing entries so they
+		// match their neighbours.
+		var style yaml.Style
+		for _, n := range pool {
+			if n.Kind == yaml.ScalarNode {
+				style = n.Style & (yaml.DoubleQuotedStyle | yaml.SingleQuotedStyle)
+			}
+		}
+		items := make([]*yaml.Node, 0, len(patterns))
+		for _, p := range patterns {
+			items = append(items, takeYAMLScalar(&pool, p, style))
+		}
+		switch {
+		case seq != nil && seq.Kind == yaml.SequenceNode:
+			seq.Content = items
+		case seq != nil: // `exclude:` with a null value
+			*seq = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Content: items,
+				HeadComment: seq.HeadComment, LineComment: seq.LineComment, FootComment: seq.FootComment}
+		default:
+			root.Content = append(root.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "exclude"},
+				&yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Content: items})
+		}
+	}
+
+	if useLegacy {
+		for _, block := range []string{"index", "watch"} {
+			m := yamlMappingValue(root, block)
+			if m == nil || m.Kind != yaml.MappingNode || !yamlMappingDelete(m, "exclude") {
+				continue
+			}
+			migrated = true
+			if len(m.Content) == 0 {
+				yamlMappingDelete(root, block)
+			}
+		}
+	}
+
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(yamlIndent(data))
+	if err := enc.Encode(&doc); err != nil {
+		return false, err
+	}
+	if err := enc.Close(); err != nil {
+		return false, err
+	}
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	return migrated, os.WriteFile(path, buf.Bytes(), mode)
+}
+
+// yamlMappingValue returns the value node for key in mapping m, or nil
+// when m is not a mapping or has no such key.
+func yamlMappingValue(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// yamlMappingDelete removes key (and its value) from mapping m and
+// reports whether it was present.
+func yamlMappingDelete(m *yaml.Node, key string) bool {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func isYAMLNull(n *yaml.Node) bool {
+	return n.Kind == yaml.ScalarNode && n.Tag == "!!null"
+}
+
+// takeYAMLScalar returns the first node in pool whose value is v, removing
+// it from the pool, or a fresh scalar with the given style.
+func takeYAMLScalar(pool *[]*yaml.Node, v string, style yaml.Style) *yaml.Node {
+	for i, n := range *pool {
+		if n.Kind == yaml.ScalarNode && n.Value == v {
+			*pool = append((*pool)[:i], (*pool)[i+1:]...)
+			return n
+		}
+	}
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v, Style: style}
+}
+
+// yamlIndent guesses the indentation width of an existing YAML document
+// from its shallowest indented content line, defaulting to 2.
+func yamlIndent(data []byte) int {
+	indent := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimLeft(line, " ")
+		n := len(line) - len(trimmed)
+		if n == 0 || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if indent == 0 || n < indent {
+			indent = n
+		}
+	}
+	if indent < 2 || indent > 8 {
+		return 2
+	}
+	return indent
 }
 
 // notifyDaemonReload sends a Reload RPC when a daemon is running so

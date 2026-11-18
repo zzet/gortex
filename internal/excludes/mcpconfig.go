@@ -3,6 +3,7 @@ package excludes
 import (
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -37,6 +38,43 @@ func InAgentConfigDir(relPath string) bool {
 		}
 	}
 	return false
+}
+
+// IsAgentConfigMCPDir reports whether a repo-root-relative folder inside an
+// agent-config root is one where an agent keeps its MCP config: the root
+// itself or its settings/ folder (.kiro/settings/mcp.json). Every other
+// folder under an agent-config root holds agent state only, such as the
+// checkouts under .claude/worktrees/.
+func IsAgentConfigMCPDir(relDir string) bool {
+	rel := strings.TrimPrefix(filepath.ToSlash(relDir), "./")
+	for _, root := range agentConfigRoots {
+		if rel == root || rel == root+"/settings" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAgentConfigMCPFile reports whether a repo-root-relative path is an MCP
+// config file in one of the folders IsAgentConfigMCPDir accepts.
+func IsAgentConfigMCPFile(relPath string) bool {
+	rel := strings.TrimPrefix(filepath.ToSlash(relPath), "./")
+	return IsMCPConfigFile(rel) && IsAgentConfigMCPDir(path.Dir(rel))
+}
+
+// ExcludesAgentConfigPath reports whether m excludes an MCP config file or
+// an open agent-config folder once the Builtin lines that exclude the
+// agent-config roots wholesale are lifted. The user's own excludes still
+// apply, even one spelled like the Builtin line.
+func ExcludesAgentConfigPath(m *Matcher, absPath, root string, isDir bool) bool {
+	if m == nil {
+		return false
+	}
+	return m.withoutBuiltinAgentRoots().MatchAbsDir(absPath, root, isDir)
+}
+
+func isAgentConfigRootPattern(pattern string) bool {
+	return slices.ContainsFunc(agentConfigRoots, func(root string) bool { return pattern == root+"/" })
 }
 
 // IsMCPConfigFile reports whether a path's basename is a recognised MCP

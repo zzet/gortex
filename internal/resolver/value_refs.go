@@ -49,6 +49,23 @@ func ResolveValueRefsScoped(g graph.Store, scope map[string]bool) int {
 	return resolveValueRefs(g, scope)
 }
 
+// ResolveValueRefsForFilesWithSelection restores reads after a structural
+// reparse whose unchanged framework inputs do not schedule the registry. The
+// declared seed bounds candidates to these files; same-file binding retains
+// the normal shadowing, generated-source and conditional-definition rules.
+func ResolveValueRefsForFilesWithSelection(
+	g graph.Store,
+	scope map[string]bool,
+	files []string,
+	selection FrameworkSynthesizerSelection,
+) int {
+	if g == nil || len(files) == 0 || !selection.allows(SynthValueRefName) {
+		return 0
+	}
+	seed := newFrameworkDeclaredSeed(g, frameworkScopeForFiles(g, scope, files), files)
+	return runLegacyFrameworkSynth(seed.passStore(SynthValueRefName), ResolveValueRefs)
+}
+
 func resolveValueRefs(g graph.Store, scope map[string]bool) int {
 	if g == nil {
 		return 0
@@ -144,10 +161,20 @@ func resolveValueRefs(g graph.Store, scope map[string]bool) int {
 			continue
 		}
 		if e.To == target.ID {
+			// A file-scoped replay may see an already-bound candidate. Its
+			// certified same-file target also invalidates any old failure stamp;
+			// persist the metadata even though the edge identity stays put.
+			_, hadTerminal := e.Meta[metaResolveTerminal]
+			_, hadReason := e.Meta[metaResolveTerminalReason]
+			if hadTerminal || hadReason {
+				clearEdgeTerminal(e)
+				reindex = append(reindex, graph.EdgeReindex{Edge: e, OldTo: e.To})
+			}
 			resolved++
 			continue
 		}
 		oldTo := e.To
+		clearEdgeTerminal(e)
 		e.To = target.ID
 		e.Origin = graph.OriginASTResolved
 		e.Confidence = 0.7

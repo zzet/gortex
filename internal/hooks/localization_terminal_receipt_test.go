@@ -303,6 +303,7 @@ func TestLocalizationAuthPreservesPreToolUsePolicyBranches(t *testing.T) {
 	}{
 		{name: "permissive auto approve", mode: ModeDeny, permissionMode: "auto", wantDecision: "allow"},
 		{name: "accept edits auto approve", mode: ModeDeny, permissionMode: "acceptEdits", wantDecision: "allow"},
+		{name: "bypass permissions auto approve", mode: ModeDeny, permissionMode: "bypassPermissions", wantDecision: "allow"},
 		{name: "default preserves prompt", mode: ModeDeny, permissionMode: "default", wantDecision: "ask"},
 		{name: "plan preserves prompt", mode: ModeDeny, permissionMode: "plan", wantDecision: "ask"},
 		{name: "consult unlock marker", mode: ModeConsultUnlock, wantDecision: "ask", wantConsulted: true},

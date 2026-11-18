@@ -10,7 +10,6 @@ func TestProfileForProvider(t *testing.T) {
 		"gemini":    ProfileFrontier,
 		"bedrock":   ProfileFrontier,
 		"deepseek":  ProfileFrontier,
-		"requesty":  ProfileFrontier,
 		"local":     ProfileSmall,
 		"ollama":    ProfileSmall,
 		"":          ProfileSmall,
@@ -87,5 +86,43 @@ func TestJSONSchemaFor_ToolCallEnumeratesNames(t *testing.T) {
 	}
 	if _, ok := props["args"]; !ok {
 		t.Error("tool-call schema missing args property")
+	}
+}
+
+func TestProfileFor_CustomProviderPromptProfile(t *testing.T) {
+	custom := func(profile string) Config {
+		return Config{Provider: "mygw", Custom: map[string]CustomProvider{
+			"mygw": {BaseURL: "https://x/v1", Model: "m", PromptProfile: profile},
+		}}
+	}
+	cases := map[string]struct {
+		cfg  Config
+		want PromptProfile
+	}{
+		"custom frontier":         {custom("frontier"), ProfileFrontier},
+		"custom frontier mixed":   {custom(" Frontier "), ProfileFrontier},
+		"custom small":            {custom("small"), ProfileSmall},
+		"custom default is small": {custom(""), ProfileSmall},
+		"custom invalid is small": {custom("huge"), ProfileSmall},
+		"builtin anthropic":       {Config{Provider: "anthropic"}, ProfileFrontier},
+		"builtin local":           {Config{}, ProfileSmall},
+		"requesty preset":         {Config{Provider: "requesty"}, ProfileFrontier},
+		"unregistered name":       {Config{Provider: "nope"}, ProfileSmall},
+	}
+	for name, tc := range cases {
+		if got := ProfileFor(tc.cfg); got != tc.want {
+			t.Errorf("%s: ProfileFor=%v want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestParsePromptProfile(t *testing.T) {
+	for _, ok := range []string{"", "small", "frontier", "FRONTIER"} {
+		if _, err := ParsePromptProfile(ok); err != nil {
+			t.Errorf("ParsePromptProfile(%q) err=%v", ok, err)
+		}
+	}
+	if _, err := ParsePromptProfile("large"); err == nil {
+		t.Error("ParsePromptProfile(large) should fail")
 	}
 }

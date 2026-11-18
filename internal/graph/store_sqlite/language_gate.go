@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"iter"
+	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -21,7 +22,7 @@ import (
 // Measured on a 5.3 GB, 34-prefix store: 8ms on a miss and ~1ms on a hit,
 // against 2.5s for the equivalent `WHERE language = ? LIMIT 1`.
 //
-// `name <> ''` is therefore load-bearing for the plan, and it narrows the
+// The non-empty-name predicate is load-bearing for the plan and narrows the
 // question to "are there NAMED nodes in this language" — a language
 // present only as unnamed nodes answers false. That is the right question
 // for every caller today (each gates a pass over symbols), and no such
@@ -34,20 +35,13 @@ func (s *Store) HasLanguage(lang string) bool {
 		return false
 	}
 	var one int
-	err := s.db.QueryRow(`
-WITH RECURSIVE repo_prefixes(rp) AS (
-    SELECT MIN(repo_prefix) FROM nodes
-    UNION ALL
-    SELECT (SELECT MIN(repo_prefix) FROM nodes WHERE repo_prefix > rp)
-    FROM repo_prefixes WHERE rp IS NOT NULL
-)
-SELECT 1 FROM repo_prefixes
-WHERE rp IS NOT NULL
-  AND EXISTS (
-      SELECT 1 FROM nodes
-      WHERE repo_prefix = rp AND language = ? AND name <> '' AND view_gen = ?
-  )
-LIMIT 1`, lang, s.viewGen).Scan(&one)
+	err := s.db.QueryRow(hasLanguageSQL, lang, s.viewGen).Scan(&one)
+	// Bulk ingestion can defer this dense index. Preserve the previous read
+	// behavior in that state rather than making an index hint a new fatal error.
+	if err != nil && strings.Contains(err.Error(), "no such index: nodes_by_repo_language_name") {
+		fallback := strings.Replace(hasLanguageSQL, " INDEXED BY nodes_by_repo_language_name", "", 1)
+		err = s.db.QueryRow(fallback, lang, s.viewGen).Scan(&one)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return false
 	}
@@ -57,6 +51,25 @@ LIMIT 1`, lang, s.viewGen).Scan(&one)
 	}
 	return true
 }
+
+// Pin the covering probe: nodes_name_candidates can otherwise win costing
+// despite having no language key, turning an absent-language check into a
+// scan of every named node in each repository. The missing-index fallback above
+// retains compatibility with bulk ingestion's deferred-index window.
+const hasLanguageSQL = `
+WITH RECURSIVE repo_prefixes(rp) AS (
+    SELECT MIN(repo_prefix) FROM nodes
+    UNION ALL
+    SELECT (SELECT MIN(repo_prefix) FROM nodes WHERE repo_prefix > rp)
+    FROM repo_prefixes WHERE rp IS NOT NULL
+)
+SELECT 1 FROM repo_prefixes
+WHERE rp IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM nodes INDEXED BY nodes_by_repo_language_name
+      WHERE repo_prefix = rp AND language = ? AND name <> '' AND view_gen = ?
+  )
+LIMIT 1`
 
 // NodesByKindLang is NodesByKind with the language predicate pushed into
 // SQL, so only the matching language's rows are decoded and cross the

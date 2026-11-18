@@ -198,7 +198,9 @@ func providerWithInstrumentedServer(t *testing.T, server *instrumentedServer, la
 	c, serverIn, serverOut, cleanup := newPipedClient(t)
 	go server.run(serverIn, serverOut)
 	p := NewProvider("fake-lsp", nil, languages, false, maxParallel, zap.NewNop())
+	p.lifetimeMu.Lock()
 	p.client = c
+	p.lifetimeMu.Unlock()
 	return p, cleanup
 }
 
@@ -420,7 +422,9 @@ func TestLSP_Enrich_ReconnectsOnServerExit(t *testing.T) {
 		c2, in2, out2, cl2 := newPipedClient(t)
 		go server2.run(in2, out2)
 		t.Cleanup(cl2)
+		p.lifetimeMu.Lock()
 		p.client = c2
+		p.lifetimeMu.Unlock()
 		return nil
 	}
 	// Pin backoff small so the test is fast.
@@ -477,7 +481,9 @@ func TestLSP_Enrich_UsesRetriedHoverResult(t *testing.T) {
 		c2, in2, out2, cl2 := newPipedClient(t)
 		go server2.run(in2, out2)
 		t.Cleanup(cl2)
+		p.lifetimeMu.Lock()
 		p.client = c2
+		p.lifetimeMu.Unlock()
 		return nil
 	}
 	p.dialBackoffStart = 1 * time.Millisecond
@@ -547,7 +553,9 @@ func TestLSP_Enrich_SingleReconnectUnderConcurrency(t *testing.T) {
 		c2, in2, out2, cl2 := newPipedClient(t)
 		go server2.run(in2, out2)
 		t.Cleanup(cl2)
+		p.lifetimeMu.Lock()
 		p.client = c2
+		p.lifetimeMu.Unlock()
 		mu.Unlock()
 		return nil
 	}
@@ -635,7 +643,9 @@ func TestLSP_Enrich_ReopensDocsOnNewServerAfterReconnect(t *testing.T) {
 		c2, in2, out2, cl2 := newPipedClient(t)
 		go server2.run(in2, out2)
 		t.Cleanup(cl2)
+		p.lifetimeMu.Lock()
 		p.client = c2
+		p.lifetimeMu.Unlock()
 		return nil
 	}
 	p.dialBackoffStart = 1 * time.Millisecond

@@ -15,7 +15,14 @@ import (
 // done) get no stamp — absence of the meta key means "unknown", not
 // "clean".
 func stampParseErrors(result *parser.ExtractionResult) {
-	if result == nil || result.Tree == nil {
+	if result == nil {
+		return
+	}
+	if result.ParseChecked && result.ParseErrors >= 0 {
+		stampParseErrorCount(result.Nodes, result.ParseErrors)
+		return
+	}
+	if result.Tree == nil {
 		return
 	}
 	if !result.Tree.HasParseErrors() {

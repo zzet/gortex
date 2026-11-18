@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -172,7 +173,7 @@ WHERE view_gen = ? AND repo_prefix = ? AND node_id IN (` + placeholders + `)`
 SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
 WHERE id IN (` + placeholders + `) AND repo_prefix = ? AND view_gen = ?
   AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
-		if _, err := tx.Exec(updateNodes, nodeArgs...); err != nil {
+		if _, err := countNodeWrite(tx.Exec(updateNodes, nodeArgs...)); err != nil {
 			return err
 		}
 	}
@@ -193,7 +194,7 @@ func (s *Store) ReplaceCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 	if _, err := tx.Exec(`DELETE FROM clone_shingles WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND view_gen = ? AND clone_sig IS NOT NULL`, repoPrefix, s.viewGen); err != nil {
+	if _, err := countNodeWrite(tx.Exec(`UPDATE nodes SET clone_sig = NULL WHERE repo_prefix = ? AND view_gen = ? AND clone_sig IS NOT NULL`, repoPrefix, s.viewGen)); err != nil {
 		return err
 	}
 	if err := upsertCloneCorpusTx(tx, s.viewGen, repoPrefix, rows); err != nil {
@@ -206,7 +207,14 @@ func (s *Store) ReplaceCloneCorpus(repoPrefix string, rows []graph.CloneCorpusRo
 }
 
 func upsertCloneCorpusTx(tx *sql.Tx, viewGen int64, repoPrefix string, rows []graph.CloneCorpusRow) error {
+	return upsertCloneCorpusTxContext(context.Background(), tx, viewGen, repoPrefix, rows)
+}
+
+func upsertCloneCorpusTxContext(ctx context.Context, tx *sql.Tx, viewGen int64, repoPrefix string, rows []graph.CloneCorpusRow) error {
 	for start := 0; start < len(rows); start += shingleChunk {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := start + shingleChunk
 		if end > len(rows) {
 			end = len(rows)
@@ -251,7 +259,7 @@ WHERE clone_shingles.repo_prefix IS NOT excluded.repo_prefix
    OR clone_shingles.shingles IS NOT excluded.shingles
    OR clone_shingles.token_count IS NOT excluded.token_count
    OR (excluded.signature IS NOT NULL AND clone_shingles.signature IS NOT excluded.signature)`
-		if _, err := tx.Exec(query, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 
@@ -275,7 +283,7 @@ WHERE clone_shingles.repo_prefix IS NOT excluded.repo_prefix
 SET clone_sig = NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')
 WHERE id IN (` + placeholders + `) AND view_gen = ?
   AND clone_sig IS NOT NULLIF((SELECT signature FROM clone_shingles WHERE node_id = nodes.id AND view_gen = ?), '')`
-		if _, err := tx.Exec(update, updateArgs...); err != nil {
+		if _, err := countNodeWrite(tx.ExecContext(ctx, update, updateArgs...)); err != nil {
 			return err
 		}
 	}

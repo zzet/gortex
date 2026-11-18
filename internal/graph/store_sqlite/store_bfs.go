@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"sort"
 	"strings"
 
@@ -29,6 +30,19 @@ var _ graph.BFSCapable = (*Store)(nil)
 // Reads run lock-free, like the store's other read paths (SQLite WAL
 // serves readers concurrently with the single serialized writer).
 func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error) {
+	return s.BFSContext(context.Background(), seeds, dir, kinds, maxDepth, limit)
+}
+
+// BFSContext is BFS bound to a request: the recursive CTE runs under ctx, so
+// SQLite interrupts it when the request ends, and a cancelled walk returns
+// ctx's error instead of a partial hop set.
+func (s *Store) BFSContext(ctx context.Context, seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	seen := make(map[string]struct{}, len(seeds))
 	uniqSeeds := make([]string, 0, len(seeds))
 	for _, sd := range seeds {
@@ -78,7 +92,7 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 		args = append(args, limit)
 	}
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +115,9 @@ func (s *Store) BFS(seeds []string, dir graph.Direction, kinds []graph.EdgeKind,
 		})
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -144,7 +161,10 @@ func buildBFSQuery(dir graph.Direction, nSeeds, nKinds int, withLimit bool) stri
 	// which on a hot kind would scan every edge of that kind per frontier
 	// node. If the index is ever absent (a bulk-load window drops it) the
 	// query errors and the engine falls back to the in-memory walk.
-	b.WriteString("  JOIN edges e INDEXED BY " + edgeIdx + " ON " + joinCol + " = b.node_id\n")
+	// CROSS JOIN keeps bfs as the outer loop. With a plain JOIN the planner
+	// may put edges outside, which matches the index on view_gen alone and
+	// reads the whole generation for every BFS call.
+	b.WriteString("  CROSS JOIN edges e INDEXED BY " + edgeIdx + " ON " + joinCol + " = b.node_id\n")
 	// The node-backed gate pairs generations: a target that exists only in
 	// another generation must read as absent, not as a followable hop.
 	b.WriteString("  JOIN nodes n ON n.id = " + nextCol + " AND n.view_gen = e.view_gen\n")

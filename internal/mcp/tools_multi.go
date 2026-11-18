@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +14,8 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
 // trackAcceptedHeadroom is how long before the MCP request deadline the
@@ -89,15 +90,6 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("path is required"), nil
 	}
 
-	// Validate path exists and is a directory.
-	info, statErr := os.Stat(path)
-	if statErr != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("invalid path: %s", path)), nil
-	}
-	if !info.IsDir() {
-		return mcp.NewToolResultError(fmt.Sprintf("invalid path: %s (not a directory)", path)), nil
-	}
-
 	if s.multiIndexer == nil {
 		return mcp.NewToolResultError("multi-repo indexing is not enabled"), nil
 	}
@@ -132,29 +124,52 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 	// cycle (#326). Run the index on a context detached from the request and
 	// answer `accepted` before the deadline, so the work continues
 	// server-side the way boot indexing does.
-	absPath, absErr := filepath.Abs(path)
-	if absErr != nil {
-		absPath = path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid path: %s", path)), nil
 	}
-	if _, busy := s.trackInFlight.LoadOrStore(absPath, struct{}{}); busy {
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
-			"status": "accepted",
-			"path":   path,
-			"detail": "an initial index for this path is already running; call track again later to read its result",
-		})
+	absPath = pathkey.NormalizeVolume(absPath) // lexical only; no serving-path EvalSymlinks
+	key := trackRequestKey(absPath, entry)
+	if result, err, found := s.storedTrackOutcome(ctx, req, path, entry, key); found {
+		return result, err
 	}
-
 	if s.lifecycle == nil {
 		return mcp.NewToolResultError("checkout lifecycle is not wired"), nil
 	}
-
-	type trackOutcome struct {
-		result indexer.RegisterResult
-		err    error
+	// Cancellation stops advisory preflight, but does not cancel the detached
+	// registration contract (#326). That producer performs authoritative
+	// admission even when this request already spent its deadline.
+	canonical, preflightErr := s.lifecycle.PreflightTrackRoot(ctx, entry)
+	if canonical != "" {
+		key = trackRequestKey(pathkey.NormalizeVolume(canonical), entry)
+		if result, err, found := s.storedTrackOutcome(ctx, req, path, entry, key); found {
+			return result, err
+		}
 	}
-	done := make(chan trackOutcome, 1)
+	canceledPreflight := ctx.Err() != nil && errors.Is(preflightErr, ctx.Err())
+	if preflightErr != nil && !canceledPreflight {
+		return s.trackRepositoryOutcome(ctx, req, path, entry, repositoryTrackOutcome{err: preflightErr}, false)
+	}
+	if answer, loading := s.configuredRepoStillLoading(ctx, req, path); loading {
+		return answer, nil
+	}
+	s.expireTrackOutcomes(time.Now())
+	job := &repositoryTrackJob{done: make(chan struct{})}
+	if _, busy := s.trackInFlight.LoadOrStore(key, job); busy {
+		return s.trackRepositoryAccepted(ctx, req, path)
+	}
+	// Remember the lexical spelling too: the next retry can read its result
+	// before touching the filesystem. Canonical aliases share producer admission.
+	s.trackInFlight.Store(trackRequestKey(absPath, entry), job)
+
+	// The index below outlives this request by design, so it must not outlive
+	// the payload the request was reading: join the view's lease before the
+	// goroutine starts and release it when the goroutine actually exits,
+	// cancellation tail included. Nil when this request read the base corpus,
+	// which is the common case for a track call — nothing to pin.
+	pin := handoffRequestView(ctx, viewmetrics.HandoffRepositoryIndex)
 	go func() {
-		defer s.trackInFlight.Delete(absPath)
+		defer pin.release()
 		// WithoutCancel keeps the request's values (progress token, session)
 		// while dropping its cancellation, so the daemon's request lifetime
 		// can no longer kill a half-written first index.
@@ -171,7 +186,16 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 			s.logger.Warn("track: recording the checkout identity failed",
 				zap.String("path", path), zap.Error(res.CatalogErr))
 		}
-		done <- trackOutcome{result: res, err: trackErr}
+		job.outcome = snapshotTrackOutcome(res, trackErr)
+		prefix, collisionOwner := res.Prefix, ""
+		var collision *indexer.PrefixCollisionError
+		if errors.As(trackErr, &collision) {
+			prefix, collisionOwner = collision.Prefix, collision.ExistingPath
+		}
+		job.witness = s.multiIndexer.CaptureTrackOutcome(prefix, collisionOwner)
+		job.completed = time.Now()
+		pin.release() // done publishes a physically joined handoff tail
+		close(job.done)
 	}()
 
 	// A nil channel blocks forever, so a request with no deadline (CLI, tests)
@@ -185,27 +209,8 @@ func (s *Server) handleTrackRepository(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	select {
-	case out := <-done:
-		if out.err != nil {
-			return mcp.NewToolResultError(out.err.Error()), nil
-		}
-		// Already tracked — the corpus held the repo, so only its identity
-		// and side effects were brought up to date.
-		if out.result.AlreadyTracked {
-			return mcp.NewToolResultText("repository already tracked"), nil
-		}
-		prefix := out.result.Prefix
-		if prefix == "" {
-			prefix = config.ResolvePrefix(entry)
-		}
-		return s.respondJSONOrTOON(ctx, req, map[string]any{
-			"status":     "tracked",
-			"path":       path,
-			"prefix":     prefix,
-			"file_count": out.result.Index.FileCount,
-			"node_count": out.result.Index.NodeCount,
-			"edge_count": out.result.Index.EdgeCount,
-		})
+	case <-job.done:
+		return s.trackRepositoryOutcome(ctx, req, path, entry, job.outcome, false)
 	case <-answerBy:
 		return s.respondJSONOrTOON(ctx, req, map[string]any{
 			"status": "accepted",
@@ -415,7 +420,21 @@ func (s *Server) diffJoinPrefix(repoRoot string) string {
 // repo. With no selector the lone tracked repo wins, then the session's
 // cwd-bound repo (clients dial the daemon with their working directory).
 // Both empty means no resolvable working tree.
+//
+// A request routed to a worktree view reads that view's working copy, so the
+// diff runs there too; the prefix stays the tracked repository's, which is how
+// the graph keys the view's files. A view of another repository, or one that
+// reads a committed tree (a ref view, or a routed checkout whose working-tree
+// layer was withdrawn), keeps the tracked root.
 func (s *Server) diffRepoScope(ctx context.Context, repo string) (repoRoot, repoPrefix string) {
+	repoRoot, repoPrefix = s.trackedDiffRepoScope(ctx, repo)
+	if view := requestViewPathRoot(ctx); repoRoot != "" && view.serves(repoPrefix) && !requestReadsCommittedTree(ctx) {
+		repoRoot = view.root
+	}
+	return repoRoot, repoPrefix
+}
+
+func (s *Server) trackedDiffRepoScope(ctx context.Context, repo string) (repoRoot, repoPrefix string) {
 	if repo != "" {
 		if p := s.resolveRepoPrefix(repo); p != "" {
 			repo = p
@@ -529,7 +548,7 @@ func (s *Server) resolveRepoPrefixOrReconcile(ctx context.Context, pathOrPrefix 
 			config.ResolvePrefix(entry) != pathOrPrefix {
 			continue
 		}
-		if _, err := s.multiIndexer.TrackRepoCtx(ctx, entry); err != nil {
+		if _, err := s.multiIndexer.TrackRepoCtx(indexer.WithIndexOrigin(ctx, "mcp_auto_track"), entry); err != nil {
 			s.logger.Warn("auto-track from config failed",
 				zap.String("path", entry.Path), zap.Error(err))
 			return ""

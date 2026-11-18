@@ -2,12 +2,14 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/runtimeactivity"
 	"github.com/zzet/gortex/internal/search"
 	"go.uber.org/zap"
@@ -21,8 +23,90 @@ const (
 	analysisGenerationPruneKeep  = 2
 )
 
-func (s *Server) analysisGenerationBackends() (graph.AnalysisGenerationStore, graph.AnalysisQueryStore) {
+const analysisGenerationPruneMaxIdlePasses = 3
+
+// viewGenerationScoped is the store-side generation axis, narrowed to the one
+// method this package needs. Declared here rather than imported so a graph
+// that is not a SQLite store (the in-memory fixtures) simply fails the type
+// assertion and keeps the base-generation behaviour it always had.
+type viewGenerationScoped interface {
+	ViewGeneration() int64
+}
+
+// analysisViewGeneration reports the payload view generation the analysis
+// passes actually read. populateAnalysisLocked walks s.graph
+// (analysis_persistence.go: `analysisGraph := s.graph`), so that handle — not
+// the indexer's base handle — names the corpus a cached analysis describes.
+// A graph with no generation axis reads as the base corpus, generation 0.
+func (s *Server) analysisViewGeneration() int64 {
+	if scoped, ok := s.graph.(viewGenerationScoped); ok {
+		return scoped.ViewGeneration()
+	}
+	return 0
+}
+
+// analysisGenerationStore returns the backend handle pinned to the generation
+// the analysis is computed over.
+//
+// backendStore() hands back the indexer's own handle, which is the base corpus.
+// When the server is serving a routed view, s.graph is a different generation,
+// and persisting through the base handle stamps the cache with a generation
+// the analysis was never computed over — a collision the mutation revision
+// cannot catch, because it is one coarse process-local counter shared by every
+// generation handle (store_sqlite/analysis_generation_state.go).
+//
+// When the two already agree — every non-routed deployment and every test
+// fixture — the backend is returned unchanged, so this is a no-op there.
+//
+// WIRING STATUS: seam only. No production path can currently make the two
+// disagree. serverstack.NewSharedServer opens ONE backend handle and hands the
+// same object to indexer.New and to gortexmcp.NewServer, so s.graph,
+// s.indexer.Graph() and the base store are one and the same and viewGen is 0 on
+// all three; the other NewServer callers (cmd/gortex/eval_server.go,
+// cmd/gortex/eval_recall.go, bench/daemon-latency) pass the same pair. Every
+// analysis is therefore still written and read at view_gen 0 in production
+// today, and this selector short-circuits on the equality below. The divergence
+// it corrects is constructed by hand in analysis_generation_test.go via
+// store.AtGeneration. Routing a request view onto a non-base payload
+// generation is not implemented yet; until it is, "routed analysis caching
+// works end to end" would be an over-read of this function.
+func (s *Server) analysisGenerationStore() graph.Store {
 	backend := s.backendStore()
+	scoped, ok := backend.(*store_sqlite.Store)
+	if !ok {
+		return backend
+	}
+	target := scoped
+	if viewGen := s.analysisViewGeneration(); viewGen != scoped.ViewGeneration() {
+		if pinned := scoped.AtGeneration(viewGen); pinned != nil {
+			target = pinned
+		}
+	}
+	return s.viewScopedAnalysisHandle(target)
+}
+
+// viewScopedAnalysisHandle is target's view-scoped analysis handle
+// (store_sqlite.ViewScopedAnalysis): its analysis revision, the gate every
+// publication and the no-op rule check, moves only on writes to the analysed
+// view and to the base it composes over. A worktree edit writes its own
+// derived generation, so it neither stales the installed snapshot nor
+// supersedes a pass in flight. The handle is kept for the last target, so the
+// per-request answer path does not copy the store handle each time.
+func (s *Server) viewScopedAnalysisHandle(target *store_sqlite.Store) *store_sqlite.Store {
+	if memo := s.analysisScopedHandle.Load(); memo != nil && memo.source == target {
+		return memo.scoped
+	}
+	scoped := target.ViewScopedAnalysis()
+	s.analysisScopedHandle.Store(&analysisScopedHandleMemo{source: target, scoped: scoped})
+	return scoped
+}
+
+type analysisScopedHandleMemo struct {
+	source, scoped *store_sqlite.Store
+}
+
+func (s *Server) analysisGenerationBackends() (graph.AnalysisGenerationStore, graph.AnalysisQueryStore) {
+	backend := s.analysisGenerationStore()
 	writer, _ := backend.(graph.AnalysisGenerationStore)
 	query, _ := backend.(graph.AnalysisQueryStore)
 	return writer, query
@@ -189,13 +273,22 @@ func prepareAnalysisGeneration(candidate persistedAnalysis, revision uint64) (an
 	}, nil
 }
 
-func persistAnalysisGeneration(
-	writer graph.AnalysisGenerationStore,
-	expectedRevision uint64,
-	candidate persistedAnalysis,
-) (graph.AnalysisGenerationHeader, bool, error) {
+// Context checks prevent new chunks/publication after cancellation. An
+// already-admitted physical legacy write still runs to completion and remains
+// owned; this is not a claim of a context-bounded SQLite transaction.
+func persistAnalysisGenerationContext(
+	ctx context.Context, writer graph.AnalysisGenerationStore,
+	expectedRevision uint64, candidate persistedAnalysis,
+) (header graph.AnalysisGenerationHeader, accepted bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return header, false, err
+	}
+	writer = bindAnalysisWriteContext(writer, ctx)
 	input, err := prepareAnalysisGeneration(candidate, expectedRevision)
 	if err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
 		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	generationID, accepted, err := writer.BeginAnalysisGeneration(expectedRevision, input.header)
@@ -205,7 +298,9 @@ func persistAnalysisGeneration(
 	activated := false
 	defer func() {
 		if !activated {
-			_ = writer.AbortAnalysisGeneration(generationID)
+			if abortErr := abortAnalysisGeneration(ctx, writer, generationID); abortErr != nil {
+				err = errors.Join(err, fmt.Errorf("abort analysis generation: %w", abortErr))
+			}
 		}
 	}()
 
@@ -213,10 +308,16 @@ func persistAnalysisGeneration(
 	// an immediate foreign key to the immutable generation's community row.
 	for start := 0; start < len(input.communities); start += analysisGenerationWriteChunk {
 		end := min(start+analysisGenerationWriteChunk, len(input.communities))
+		if err := ctx.Err(); err != nil {
+			return graph.AnalysisGenerationHeader{}, false, err
+		}
 		accepted, err = writer.AppendAnalysisCommunities(expectedRevision, generationID, input.communities[start:end])
 		if err != nil || !accepted {
 			return graph.AnalysisGenerationHeader{}, accepted, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentCommunities, input.header.CommunityCount); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
@@ -232,10 +333,16 @@ func persistAnalysisGeneration(
 				Hub: candidate.hits.Hubs[nodeID],
 			})
 		}
+		if err := ctx.Err(); err != nil {
+			return graph.AnalysisGenerationHeader{}, false, err
+		}
 		accepted, err = writer.AppendAnalysisNodes(expectedRevision, generationID, rows)
 		if err != nil || !accepted {
 			return graph.AnalysisGenerationHeader{}, accepted, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentNodes, input.header.NodeCount); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
@@ -243,6 +350,9 @@ func persistAnalysisGeneration(
 
 	for start := 0; start < len(input.processes); start += analysisGenerationWriteChunk {
 		end := min(start+analysisGenerationWriteChunk, len(input.processes))
+		if err := ctx.Err(); err != nil {
+			return graph.AnalysisGenerationHeader{}, false, err
+		}
 		accepted, err = writer.AppendAnalysisProcesses(expectedRevision, generationID, input.processes[start:end], nil)
 		if err != nil || !accepted {
 			return graph.AnalysisGenerationHeader{}, accepted, err
@@ -252,11 +362,17 @@ func persistAnalysisGeneration(
 		steps := input.processSteps[process.ID]
 		for start := 0; start < len(steps); start += analysisGenerationWriteChunk {
 			end := min(start+analysisGenerationWriteChunk, len(steps))
+			if err := ctx.Err(); err != nil {
+				return graph.AnalysisGenerationHeader{}, false, err
+			}
 			accepted, err = writer.AppendAnalysisProcesses(expectedRevision, generationID, nil, steps[start:end])
 			if err != nil || !accepted {
 				return graph.AnalysisGenerationHeader{}, accepted, err
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentProcesses, input.header.ProcessCount); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
@@ -264,6 +380,9 @@ func persistAnalysisGeneration(
 
 	for start := 0; start < len(input.concepts); start += analysisGenerationWriteChunk {
 		end := min(start+analysisGenerationWriteChunk, len(input.concepts))
+		if err := ctx.Err(); err != nil {
+			return graph.AnalysisGenerationHeader{}, false, err
+		}
 		accepted, err = writer.AppendAnalysisConcepts(expectedRevision, generationID, input.concepts[start:end], nil)
 		if err != nil || !accepted {
 			return graph.AnalysisGenerationHeader{}, accepted, err
@@ -278,6 +397,9 @@ func persistAnalysisGeneration(
 	flushRelations := func() (bool, error) {
 		if len(relations) == 0 {
 			return true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
 		ok, flushErr := writer.AppendAnalysisConcepts(expectedRevision, generationID, nil, relations)
 		relations = relations[:0]
@@ -297,6 +419,9 @@ func persistAnalysisGeneration(
 	if accepted, err = flushRelations(); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
 	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
+	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentConcepts, input.header.ConceptCount); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
 	}
@@ -305,8 +430,14 @@ func persistAnalysisGeneration(
 	if err != nil {
 		return graph.AnalysisGenerationHeader{}, false, fmt.Errorf("encode adjacency: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
+	}
 	if accepted, err = writer.PutAnalysisBlob(expectedRevision, generationID, graph.AnalysisBlob{Component: graph.AnalysisBlobAdjacency, Payload: adjacencyPayload}); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentAdjacency, 1); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
@@ -316,13 +447,22 @@ func persistAnalysisGeneration(
 	if err != nil {
 		return graph.AnalysisGenerationHeader{}, false, fmt.Errorf("encode Leiden state: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
+	}
 	if accepted, err = writer.PutAnalysisBlob(expectedRevision, generationID, graph.AnalysisBlob{Component: graph.AnalysisBlobLeiden, Payload: leidenPayload}); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
 	}
 	if accepted, err = writer.SealAnalysisComponent(expectedRevision, generationID, graph.AnalysisComponentLeiden, 1); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return graph.AnalysisGenerationHeader{}, false, err
+	}
 	if accepted, err = writer.ActivateAnalysisGeneration(expectedRevision, generationID); err != nil || !accepted {
 		return graph.AnalysisGenerationHeader{}, accepted, err
 	}
@@ -332,49 +472,114 @@ func persistAnalysisGeneration(
 }
 
 func (s *Server) scheduleAnalysisGenerationPrune(writer graph.AnalysisGenerationStore) {
-	if writer == nil || !s.analysisPruneScheduled.CompareAndSwap(false, true) {
+	if writer == nil {
 		return
 	}
-	// Add under the gate so it cannot start at counter zero concurrently
-	// with DrainBackground's Wait (a WaitGroup misuse panic), and so a
-	// prune requested after the drain is refused instead of escaping it
-	// to write through a store that is about to close.
-	s.backgroundMaintenanceMu.Lock()
-	if s.backgroundMaintenanceDrained {
-		s.backgroundMaintenanceMu.Unlock()
+	// Record the request before trying the slot, so an owner that is
+	// already past its last pass sees it on release and replays it.
+	s.analysisPruneRequested.Store(true)
+	s.startAnalysisGenerationPrune(writer)
+}
+
+// startAnalysisGenerationPrune takes the prune slot and starts its owner.
+// It does not record a request: a replay must not mark a replacement owner
+// as owing another pass.
+func (s *Server) startAnalysisGenerationPrune(writer graph.AnalysisGenerationStore) {
+	if !s.analysisPruneScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	maintenanceCtx, done, admitted := s.admitBackground()
+	if !admitted {
 		s.analysisPruneScheduled.Store(false)
 		return
 	}
-	s.backgroundMaintenance.Add(1)
-	s.backgroundMaintenanceMu.Unlock()
 	go func() {
-		defer s.backgroundMaintenance.Done()
-		defer s.analysisPruneScheduled.Store(false)
-		runtimeactivity.Begin("analysis_generation_gc")
-		defer runtimeactivity.End("analysis_generation_gc")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := writer.PruneAnalysisGenerations(ctx, analysisGenerationPruneKeep, analysisGenerationPruneBatch); err != nil && s.logger != nil {
-			s.logger.Warn("mcp: analysis generation prune failed", zap.Error(err))
+		defer func() {
+			s.analysisPruneScheduled.Store(false)
+			// A request that arrived after the last pass started found the
+			// slot taken. Replay it, or the generation it reported waits for
+			// the next analysis run. Scheduling here, before Done, keeps the
+			// WaitGroup above zero; a drained server refuses the replay.
+			if s.analysisPruneRequested.Load() {
+				s.startAnalysisGenerationPrune(writer)
+			}
+			done()
+		}()
+		// One owner retains the slot through backoff. Retry timed-out passes
+		// while they make progress; after consecutive idle passes, stop until
+		// another RunAnalysis schedules a new prune.
+		idlePasses := 0
+		// Each pass waits for the edit lane and stops if an edit cycle starts.
+		for backoff := 30 * time.Second; maintenanceCtx.Err() == nil; backoff = min(backoff*2, 5*time.Minute) {
+			// This pass covers every generation reported so far.
+			s.analysisPruneRequested.Store(false)
+			if !s.waitForQuietEditLaneContext(maintenanceCtx, analysisPruneLaneWait) {
+				analysisPruneStoodDown.Add(1)
+				return
+			}
+			ctx, cancel := context.WithTimeout(maintenanceCtx, 30*time.Second)
+			stop := s.cancelWhenEditCycleStartsContext(ctx, cancel)
+			runtimeactivity.Begin("analysis_generation_gc")
+			removed, err := writer.PruneAnalysisGenerations(ctx, analysisGenerationPruneKeep, analysisGenerationPruneBatch)
+			runtimeactivity.End("analysis_generation_gc")
+			stop()
+			timedOut := ctx.Err() == context.DeadlineExceeded
+			cancelled := ctx.Err() == context.Canceled
+			cancel()
+			progressed := timedOut && errors.Is(err, context.DeadlineExceeded) && removed > 0
+			if err != nil && s.logger != nil && !cancelled {
+				if progressed {
+					// A deadline-limited pass that committed rows is the
+					// expected shape on a large backlog, not a failure.
+					s.logger.Info("mcp: analysis generation prune pass reached its deadline; retrying",
+						zap.Int64("removed", removed), zap.Duration("retry_in", backoff))
+				} else {
+					s.logger.Warn("mcp: analysis generation prune failed", zap.Error(err))
+				}
+			}
+			if !timedOut || !errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			if removed > 0 {
+				idlePasses = 0
+			} else {
+				idlePasses++
+			}
+			if idlePasses >= analysisGenerationPruneMaxIdlePasses {
+				if s.logger != nil {
+					s.logger.Warn("mcp: analysis generation prune made no progress; stopping until the next analysis run", zap.Int("idle_passes", idlePasses))
+				}
+				return
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-maintenanceCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}()
 }
 
-// DrainBackground waits for any in-flight analysis-generation prune and
-// permanently refuses to schedule new ones. Call it before closing the backend
-// store: the prune keeps writing on its already-acquired connection after
-// sql.DB.Close, and a commit there recreates WAL files under a directory being
-// torn down (a test TempDir, an uninstall). The wait ends once the prune's
-// 30s context expires between chunks, though an in-flight chunk can first
-// queue behind the store's writer gate. It does not quiesce RunAnalysis
-// itself: a pass still running on a detached caller (on-demand ensureAnalysis,
-// the track_repository worker) keeps writing generations through the store,
-// and stopping those is the caller's lifecycle problem, not this drain's.
+// DrainBackground permanently closes admission, then joins every admitted
+// analysis, mine, prune, FTS reader and cursor call before backend teardown.
+// Cancellation is not physical completion: an already running legacy SQL or
+// CPU operation remains owned until it returns. An expired deadline is never proof of quiescence.
 func (s *Server) DrainBackground() {
-	s.backgroundMaintenanceMu.Lock()
-	s.backgroundMaintenanceDrained = true
-	s.backgroundMaintenanceMu.Unlock()
-	s.backgroundMaintenance.Wait()
+	s.BeginBackgroundClose()
+	s.backgroundDrainOnce.Do(func() {
+		s.retireSymbolPages()
+		s.backgroundMaintenance.Wait()
+		started := time.Now()
+		if s.logger != nil {
+			s.logger.Info("mcp: shutdown phase start", zap.String("phase", "health_broadcaster"))
+		}
+		s.StopHealthBroadcaster()
+		if s.logger != nil {
+			s.logger.Info("mcp: shutdown phase complete", zap.String("phase", "health_broadcaster"), zap.Duration("elapsed", time.Since(started)))
+		}
+	})
 }
 
 func restoreAdjacencyBlob(payload []byte) (*analysis.AdjacencySnapshot, error) {

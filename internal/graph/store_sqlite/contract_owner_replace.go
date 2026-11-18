@@ -57,7 +57,7 @@ func (s *Store) ReplaceContractOwners(replacement graph.ContractOwnerReplacement
 		result.NodesChanged = invalidated
 	}
 	if hasFiles {
-		removed, execErr := tx.Exec(`
+		removed, execErr := countEdgeWrite(tx.Exec(`
 WITH owner_files(file_path) AS (
     SELECT CAST(value AS TEXT) FROM json_each(?)
 )
@@ -75,7 +75,7 @@ WHERE kind IN (?, ?, ?)
   )`, filesJSON,
 			string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute),
 			s.viewGen,
-			replacement.RepoPrefix, s.viewGen, string(graph.KindContract), s.viewGen)
+			replacement.RepoPrefix, s.viewGen, string(graph.KindContract), s.viewGen))
 		if execErr != nil {
 			return graph.ContractOwnerReplaceResult{}, execErr
 		}
@@ -119,14 +119,14 @@ WITH touched(id) AS (
             AND owner.view_gen = ?
       )
 )`
-		removed, execErr := tx.Exec(orphanContractIDs+`
+		removed, execErr := countEdgeWrite(tx.Exec(orphanContractIDs+`
 DELETE FROM edges
 WHERE (from_id IN (SELECT id FROM orphan)
     OR to_id IN (SELECT id FROM orphan))
   AND view_gen = ?`,
 			prunableJSON, s.viewGen, string(graph.KindContract),
 			string(graph.EdgeProvides), string(graph.EdgeConsumes), string(graph.EdgeHandlesRoute),
-			s.viewGen, s.viewGen)
+			s.viewGen, s.viewGen))
 		if execErr != nil {
 			return graph.ContractOwnerReplaceResult{}, execErr
 		}
@@ -169,8 +169,8 @@ WHERE (from_id IN (SELECT id FROM orphan)
 		if frozenJSON == "" {
 			frozenJSON = "[]"
 		}
-		removed, execErr = tx.Exec(`DELETE FROM nodes
-WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?`, frozenJSON, s.viewGen)
+		removed, execErr = countNodeWrite(tx.Exec(`DELETE FROM nodes
+WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND view_gen = ?`, frozenJSON, s.viewGen))
 		if execErr != nil {
 			return graph.ContractOwnerReplaceResult{}, execErr
 		}

@@ -47,7 +47,7 @@ func seedPythonExternGraph(t *testing.T, defs []*graph.Node, edges ...*graph.Edg
 		g.AddNode(d)
 	}
 	r := New(g)
-	r.warmLookupCache(edges)
+	require.NoError(t, r.warmLookupCache(edges))
 	return r
 }
 
@@ -175,7 +175,7 @@ func TestResolveExtern_PythonPrefersCallerRepo(t *testing.T) {
 	e := &graph.Edge{From: "app/tests/test_pricing.py::test_it", To: "unresolved::extern::shop.pricing.apply_discount::apply_discount",
 		Kind: graph.EdgeCalls, FilePath: "app/tests/test_pricing.py", Line: 5}
 	r := New(g)
-	r.warmLookupCache([]*graph.Edge{e})
+	require.NoError(t, r.warmLookupCache([]*graph.Edge{e}))
 
 	resolvePyExtern(r, e)
 	assert.Equal(t, "app/src/shop/pricing.py::apply_discount", e.To)
@@ -190,7 +190,7 @@ func TestResolveExtern_PythonStepSkipsOtherLanguages(t *testing.T) {
 	e := &graph.Edge{From: "cmd/main.go::main", To: "unresolved::extern::example.com/app/shop::ApplyDiscount",
 		Kind: graph.EdgeCalls, FilePath: "cmd/main.go", Line: 3}
 	r := New(g)
-	r.warmLookupCache([]*graph.Edge{e})
+	require.NoError(t, r.warmLookupCache([]*graph.Edge{e}))
 
 	resolvePyExtern(r, e)
 	require.Equal(t, "internal/shop/pricing.go::ApplyDiscount", e.To)

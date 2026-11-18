@@ -22,6 +22,7 @@ func TestEmitPreToolUseNormalizesUpdatedInputByHost(t *testing.T) {
 		{name: "Claude plan asks", host: preToolUseClaude, permissionMode: "plan", updatedInput: rewrite, wantDecision: "ask", wantUpdated: true},
 		{name: "Claude acceptEdits allows", host: preToolUseClaude, permissionMode: "acceptEdits", updatedInput: rewrite, wantDecision: "allow", wantUpdated: true},
 		{name: "Claude auto allows", host: preToolUseClaude, permissionMode: "auto", updatedInput: rewrite, wantDecision: "allow", wantUpdated: true},
+		{name: "Claude bypassPermissions allows", host: preToolUseClaude, permissionMode: "bypassPermissions", updatedInput: rewrite, wantDecision: "allow", wantUpdated: true},
 		{name: "Claude explicit ask", host: preToolUseClaude, decision: "ask", updatedInput: rewrite, wantDecision: "ask", wantUpdated: true},
 		{name: "Codex decision-less rewrite allows", host: preToolUseCodex, updatedInput: rewrite, wantDecision: "allow", wantUpdated: true},
 		{name: "Codex explicit allow", host: preToolUseCodex, decision: "allow", updatedInput: rewrite, wantDecision: "allow", wantUpdated: true},

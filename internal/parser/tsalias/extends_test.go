@@ -68,12 +68,13 @@ func TestLoad_Extends(t *testing.T) {
 			for name, contents := range tc.configs {
 				tsaliasWrite(t, filepath.Join(root, filepath.FromSlash(name)), contents)
 			}
-			coll := Load(root)
-			require.NotNil(t, coll)
-			m := coll.FindForFile("app/pages/index.vue")
-			require.NotNil(t, m)
-			require.Equal(t, tc.want, Resolve(m, "~/composables/auth"))
-			require.Empty(t, Resolve(m, "first/only"), "inherited paths are replaced, not merged")
+			for _, coll := range []*Collection{Load(root), LoadTree(memTree{files: tc.configs})} {
+				require.NotNil(t, coll)
+				m := coll.FindForFile("app/pages/index.vue")
+				require.NotNil(t, m)
+				require.Equal(t, tc.want, Resolve(m, "~/composables/auth"))
+				require.Empty(t, Resolve(m, "first/only"), "inherited paths are replaced, not merged")
+			}
 		})
 	}
 }

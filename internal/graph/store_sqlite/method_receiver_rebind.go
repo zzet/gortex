@@ -180,7 +180,7 @@ func (s *Store) RebindGoMethodReceivers(filePath string) (changed int, err error
 	// hanging when the SQLite pool is intentionally limited to one connection.
 	analysisInvalidated := s.analysisGenerationPresent
 	if analysisInvalidated {
-		if err = invalidateAnalysisGenerationTx(tx); err != nil {
+		if err = s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, fmt.Errorf("sqlite receiver rebind invalidate analysis: %w", err)
 		}
 	}
@@ -188,7 +188,7 @@ func (s *Store) RebindGoMethodReceivers(filePath string) (changed int, err error
 	// ReindexEdges deletes an old identity and INSERT OR IGNOREs the new one.
 	// If that new identity already exists, its row/payload survives and the old
 	// row disappears. Reproduce that behavior before the in-place UPDATE.
-	if _, err = tx.ExecContext(ctx, `
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, `
 DELETE FROM edges
 WHERE id IN (
     SELECT old.id
@@ -205,14 +205,14 @@ WHERE id IN (
           AND existing.line = old.line
           AND existing.view_gen = old.view_gen
     )
-)`); err != nil {
+)`)); err != nil {
 		return 0, fmt.Errorf("sqlite receiver rebind remove existing-key conflicts: %w", err)
 	}
 
 	// Multiple phantom targets can collapse onto the same logical edge. Keep
 	// the lowest row id deterministically, matching SQLite's kind-index scan
 	// order used by the previous ReindexEdges implementation.
-	if _, err = tx.ExecContext(ctx, `
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, `
 DELETE FROM edges
 WHERE id IN (
     SELECT edge_id
@@ -226,18 +226,18 @@ WHERE id IN (
         JOIN temp.go_receiver_rebind_candidates AS r ON r.edge_id = old.id
     )
     WHERE duplicate_rank > 1
-)`); err != nil {
+)`)); err != nil {
 		return 0, fmt.Errorf("sqlite receiver rebind deduplicate canonical keys: %w", err)
 	}
 
-	if _, err = tx.ExecContext(ctx, `
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, `
 UPDATE edges
 SET to_id = (
     SELECT r.new_to
     FROM temp.go_receiver_rebind_candidates AS r
     WHERE r.edge_id = edges.id
 )
-WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != nil {
+WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`)); err != nil {
 		return 0, fmt.Errorf("sqlite receiver rebind update targets: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
@@ -245,9 +245,10 @@ WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != n
 	}
 	committed = true
 	if analysisInvalidated {
-		s.analysisGenerationPresent = false
+		s.analysisGenerationPresent = s.analysisLatchRemaining
 	}
 
 	s.finishAnalysisMutationLocked(true)
+	s.noteEdgeEndpointRewriteLocked(true)
 	return int(candidates), nil
 }

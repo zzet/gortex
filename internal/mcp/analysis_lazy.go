@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -168,8 +169,20 @@ func (s *Server) releaseTransientAnalysisIfIdle() bool {
 	s.adjacency = nil
 	s.autoConcepts = nil
 	s.hits = nil
-	s.hotspots = nil
-	s.hotspotsReady = false
+	// Retain the complete default ranking only within a fixed memory budget.
+	// A truncated prefix could hide a workspace's first visible result. This
+	// keeps no partition/member maps; epoch/token checks still govern hits.
+	if !s.hotspotsReady || !hotspotResultRetainable(s.hotspots) {
+		s.hotspots = nil
+		s.hotspotsReady = false
+		s.hotspotsOwned = false
+	} else if !s.hotspotsOwned {
+		// Own only the bounded result bytes, never a substring's source or
+		// a leading/trailing slice allocation. Existing callers retain their
+		// immutable result; later callers share this independent compact copy.
+		s.hotspots = compactHotspotResult(s.hotspots)
+		s.hotspotsOwned = true
+	}
 	return true
 }
 
@@ -241,6 +254,13 @@ func (s *Server) ensureNodeMetricsMaterialized() bool {
 }
 
 func (s *Server) ensureCommunitiesMaterialized() bool {
+	return s.ensureCommunitiesMaterializedContext(context.Background())
+}
+
+func (s *Server) ensureCommunitiesMaterializedContext(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	s.analysisMu.RLock()
 	ready := s.analysisSnapshotCurrentLocked() && s.communities != nil
 	s.analysisMu.RUnlock()
@@ -248,7 +268,9 @@ func (s *Server) ensureCommunitiesMaterialized() bool {
 		return true
 	}
 
-	s.analysisMaterializeMu.Lock()
+	if !lockAnalysisPreparation(ctx, &s.analysisMaterializeMu) {
+		return false
+	}
 	defer s.analysisMaterializeMu.Unlock()
 	s.analysisMu.RLock()
 	ready = s.analysisSnapshotCurrentLocked() && s.communities != nil
@@ -260,6 +282,13 @@ func (s *Server) ensureCommunitiesMaterialized() bool {
 	if !ok {
 		return false
 	}
+	if ctx.Done() != nil {
+		if reader, ok := query.(graph.Reader); ok {
+			if bound, ok := graph.BindReadContext(reader, ctx).(graph.AnalysisQueryStore); ok {
+				query = bound
+			}
+		}
+	}
 
 	result := &analysis.CommunityResult{
 		Communities: make([]analysis.Community, 0, header.CommunityCount),
@@ -268,9 +297,14 @@ func (s *Server) ensureCommunitiesMaterialized() bool {
 	}
 	cursor := ""
 	for {
+		if ctx.Err() != nil {
+			return false
+		}
 		summaries, next, err := query.ListAnalysisCommunitySummaries(header.GenerationID, analysisGenerationQueryPage, cursor)
 		if err != nil {
-			s.logAnalysisMaterializationError("communities", err)
+			if ctx.Err() == nil {
+				s.logAnalysisMaterializationError("communities", err)
+			}
 			return false
 		}
 		for _, summary := range summaries {
@@ -281,9 +315,14 @@ func (s *Server) ensureCommunitiesMaterialized() bool {
 			}
 			memberCursor := ""
 			for {
+				if ctx.Err() != nil {
+					return false
+				}
 				members, memberNext, memberErr := query.AnalysisCommunityMembers(header.GenerationID, summary.ID, analysisGenerationQueryPage, memberCursor)
 				if memberErr != nil {
-					s.logAnalysisMaterializationError("community_members", memberErr)
+					if ctx.Err() == nil {
+						s.logAnalysisMaterializationError("community_members", memberErr)
+					}
 					return false
 				}
 				for _, member := range members {
@@ -302,7 +341,15 @@ func (s *Server) ensureCommunitiesMaterialized() bool {
 		}
 		cursor = next
 	}
-	return s.installMaterializedGeneration(header, func() { s.communities = result })
+	if ctx.Err() != nil {
+		return false
+	}
+	installed := s.installMaterializedGeneration(header, func() {
+		if ctx.Err() == nil {
+			s.communities = result
+		}
+	})
+	return installed && ctx.Err() == nil
 }
 
 func (s *Server) ensureProcessesMaterialized() bool {

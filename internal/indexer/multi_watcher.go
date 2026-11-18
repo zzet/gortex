@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"weak"
 
 	"go.uber.org/zap"
 
@@ -121,6 +122,9 @@ type MultiWatcher struct {
 	stopDone             chan struct{}
 	stopErr              error
 
+	// Immutable after construction; inherited by later AddRepo watchers.
+	configManagedExcludes bool
+
 	// symbolChangeCb is the OnSymbolChange callback registered by the
 	// MCP server (or any other consumer). It's fanned out to every
 	// per-repo Watcher and re-applied at AddRepo time so newly-tracked
@@ -130,6 +134,7 @@ type MultiWatcher struct {
 	// atomically with an ownership-epoch dispatch admission.
 	callbackMu     sync.Mutex
 	symbolChangeCb SymbolChangeCallback
+	sourceEventCb  func(string)
 	// degradedCb is fanned out to every per-repo Watcher (and re-applied at
 	// AddRepo) so a watcher entering a degraded state — inotify / FD
 	// exhaustion — pushes a single health notice through the daemon.
@@ -175,6 +180,39 @@ func NewMultiWatcher(
 	return mw, nil
 }
 
+// NewConfigManagedMultiWatcher opts the daemon's MultiIndexer into live
+// ConfigManager exclusion policy for that MultiIndexer's lifetime. Stopping a
+// watcher does not revert producer policy. NewMultiWatcher retains its existing
+// caller-supplied exclusion semantics and does not enable this behavior.
+func NewConfigManagedMultiWatcher(mi *MultiIndexer, configs map[string]config.WatchConfig, logger *zap.Logger) (*MultiWatcher, error) {
+	if mi == nil || mi.configMgr == nil {
+		return nil, fmt.Errorf("config-managed watcher requires a ConfigManager")
+	}
+	mw, err := NewMultiWatcher(mi, configs, logger)
+	if err != nil {
+		return nil, err
+	}
+	mw.configManagedExcludes = true
+	for prefix, w := range mw.watchers {
+		mw.configureManagedExcludes(prefix, w)
+	}
+	mi.configManagedExcludes.Store(true)
+	return mw, nil
+}
+
+// configureManagedExcludes runs only before a watcher is published or started.
+func (mw *MultiWatcher) configureManagedExcludes(prefix string, w *Watcher) {
+	w.currentExcludePatterns = func() []string {
+		return mw.multi.configMgr.EffectiveExclude(prefix)
+	}
+	w.currentIncludePatterns = func() []string {
+		return mw.multi.configMgr.EffectiveInclude(prefix)
+	}
+	w.excludePolicyIncludes = w.config.Include
+	w.excludePolicyPatterns = w.config.Exclude
+	w.excludePolicyMatcher = w.excludes
+}
+
 // createWatcher creates a per-repo Watcher for the given prefix.
 func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) error {
 	meta := mw.multi.GetMetadata(prefix)
@@ -197,6 +235,12 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	if err != nil {
 		return fmt.Errorf("creating watcher for %s: %w", prefix, err)
 	}
+	// Resolve the current callback at delivery time: replacements and future
+	// watchers share registration without a stale fanout snapshot.
+	w.OnSourceEvent(mw.notifySourceEvent)
+	if mw.configManagedExcludes {
+		mw.configureManagedExcludes(prefix, w)
+	}
 	// The watcher outlives an IndexRepo replacement. Its construction-time
 	// Indexer remains the stable lane carrier; graph work selects the current
 	// registry entry only after that lane admits it.
@@ -208,9 +252,6 @@ func (mw *MultiWatcher) createWatcher(prefix string, cfg config.WatchConfig) err
 	}
 	w.discoverReindex = func(paths []string) (*IndexResult, error) {
 		return mw.multi.incrementalDiscoverRepo(prefix, paths)
-	}
-	w.pointReindexRaw = func(filePath string) (*IndexResult, error) {
-		return mw.multi.incrementalPointRepoRaw(prefix, filePath)
 	}
 
 	mw.watchers[prefix] = w
@@ -985,6 +1026,23 @@ func (mw *MultiWatcher) HistorySince(since time.Time) []GraphChangeEvent {
 	return out
 }
 
+// OnSourceEvent replaces the synchronous source-path callback for every
+// current and future per-repo watcher. The callback must return promptly.
+func (mw *MultiWatcher) OnSourceEvent(cb func(string)) {
+	mw.callbackMu.Lock()
+	mw.sourceEventCb = cb
+	mw.callbackMu.Unlock()
+}
+
+func (mw *MultiWatcher) notifySourceEvent(path string) {
+	mw.callbackMu.Lock()
+	cb := mw.sourceEventCb
+	mw.callbackMu.Unlock()
+	if cb != nil {
+		cb(path)
+	}
+}
+
 // OnSymbolChange registers the callback against every current per-repo
 // Watcher and stores it so AddRepo applies it to future watchers too.
 // Replaces any previously registered callback (matches Watcher.OnSymbolChange
@@ -1070,6 +1128,17 @@ func (mw *MultiWatcher) OnWorktreeChangeContext(cb WorktreeChangeCallback) {
 // cannot force a synchronous fallback, and a watcher that failed to start is
 // never reported as accepting work.
 func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	return mw.enqueueFileMutation(ctx, filePath, false)
+}
+
+// EnqueueToolMutation routes committed tool writes through the same owner and
+// startup checks, without native debounce once the owner accepts them.
+func (mw *MultiWatcher) EnqueueToolMutation(ctx context.Context, filePath string) (*MutationTicket, error) {
+	return mw.enqueueFileMutation(ctx, filePath, true)
+}
+
+func (mw *MultiWatcher) enqueueFileMutation(ctx context.Context, filePath string, tool bool) (*MutationTicket, error) {
+	ctx, _ = canonicalSchedulingEntry(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1090,7 +1159,56 @@ func (mw *MultiWatcher) EnqueueFileMutation(ctx context.Context, filePath string
 	if w == nil || !started {
 		return nil, nil
 	}
+	if tool {
+		return w.EnqueueToolMutation(ctx, filePath)
+	}
 	return w.EnqueueFileMutation(ctx, filePath)
+}
+
+// EnqueueFileMutations keeps a single owner's complete frontier together.
+// Mixed owners retain the existing point admission path in the caller.
+func (mw *MultiWatcher) EnqueueFileMutations(ctx context.Context, paths []string) (map[string]*MutationTicket, error) {
+	originalEntry := time.Now()
+	ctx, _ = canonicalSchedulingEntry(ctx)
+	if len(paths) == 1 {
+		ticket, err := mw.EnqueueToolMutation(ctx, paths[0])
+		if ticket == nil {
+			return nil, err
+		}
+		return map[string]*MutationTicket{ticket.Path: ticket}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var owner *Watcher
+	prefixes := make([]string, len(paths))
+	for i, path := range paths {
+		prefixes[i] = mw.multi.RepoForFile(path)
+	}
+	mw.mu.Lock()
+	for _, prefix := range prefixes {
+		candidate := mw.watchers[prefix]
+		started := mw.started[prefix]
+		if candidate == nil && prefix == "" && len(mw.watchers) == 1 {
+			for key, value := range mw.watchers {
+				candidate = value
+				started = mw.started[key]
+			}
+		}
+		if candidate == nil || !started || (owner != nil && owner != candidate) {
+			mw.mu.Unlock()
+			return nil, nil
+		}
+		owner = candidate
+	}
+	mw.mu.Unlock()
+	if owner == nil {
+		return nil, nil
+	}
+	call := newSharedSetInvocation(originalEntry, len(paths))
+	call.forward = weak.Make(owner)
+	ctx = context.WithValue(ctx, sharedSetInvocationKey{}, call)
+	return owner.EnqueueFileMutations(ctx, paths)
 }
 
 // DegradedReason returns the first non-empty per-repo degraded reason, prefixed

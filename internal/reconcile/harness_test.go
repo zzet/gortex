@@ -22,6 +22,10 @@ const testCommonDir = "/repo/.git"
 // saga stops exactly where a crashed process would have.
 var errHookFailed = errors.New("hook refused on purpose")
 
+// errReleaseDeferred is what a fake release returns while a test holds the
+// graph, standing in for a reader the real owner waits out.
+var errReleaseDeferred = errors.New("release deferred on purpose")
+
 // The fakes have to keep matching the extension points they stand in for. A
 // signature drift shows up here as one compile error rather than as a
 // confusing argument mismatch at every wiring site.
@@ -38,8 +42,11 @@ var (
 type recordingHooks struct {
 	mu          sync.Mutex
 	calls       []string
+	causes      []string
 	failPurge   int
 	failRelease int
+	// deferRelease names a graph whose release is deferred until it is reset.
+	deferRelease string
 	// onPurge runs inside the purge, which is where the layer owner stops the
 	// builder that has been routing for this checkout. The cycle that builder
 	// was already running finishes during the stop, so this is the one place a
@@ -61,15 +68,30 @@ func (h *recordingHooks) PurgeCheckoutLayers(_ context.Context, checkoutID, inca
 	return nil
 }
 
-func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID string) error {
+func (h *recordingHooks) ReleaseGraph(_ context.Context, graphID, cause string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls = append(h.calls, "release:"+graphID)
+	h.causes = append(h.causes, cause)
 	if h.failRelease > 0 {
 		h.failRelease--
 		return errHookFailed
 	}
+	if graphID == h.deferRelease {
+		return errReleaseDeferred
+	}
 	return nil
+}
+
+func (h *recordingHooks) CleanupDeferred(err error) bool {
+	return errors.Is(err, errReleaseDeferred)
+}
+
+// setDeferRelease defers graphID's release, or stops deferring with "".
+func (h *recordingHooks) setDeferRelease(graphID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.deferRelease = graphID
 }
 
 // snapshot returns the calls recorded so far.
@@ -172,6 +194,7 @@ func gitSampleExisting(token string) gitstate.PathEvidence {
 // present on token.
 func gitSampleAbsent(token string) gitstate.PathEvidence {
 	return gitstate.PathEvidence{
+		RootMissing:         true,
 		AncestorPath:        "/repo",
 		AncestorVolumeKind:  gitstate.VolumeKindUnixDev,
 		AncestorVolumeToken: token,
@@ -182,6 +205,7 @@ func gitSampleAbsent(token string) gitstate.PathEvidence {
 type fixture struct {
 	t        *testing.T
 	store    *store_sqlite.Store
+	dbPath   string
 	catalog  *store_sqlite.Catalog
 	hooks    *recordingHooks
 	git      *fakeGit
@@ -195,7 +219,8 @@ type fixture struct {
 // against this package's own idea of them.
 func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 	t.Helper()
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "catalog.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store, err := store_sqlite.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -204,6 +229,7 @@ func newFixture(t *testing.T, cfg Config, opts ...Option) *fixture {
 	f := &fixture{
 		t:        t,
 		store:    store,
+		dbPath:   dbPath,
 		catalog:  store.Catalog(),
 		hooks:    &recordingHooks{},
 		git:      newFakeGit(),

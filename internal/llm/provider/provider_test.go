@@ -1,6 +1,11 @@
 package provider
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
@@ -192,5 +197,53 @@ func TestNew_ClaudeCLIOK(t *testing.T) {
 	defer p.Close()
 	if p.Name() != "claudecli" {
 		t.Errorf("Name()=%q want claudecli", p.Name())
+	}
+}
+
+// TestNew_RequestyLegacyConfigWire pins the wire behaviour of a config
+// written for the former requesty built-in: path, Bearer key, model,
+// reasoning_effort and strict json_schema structured output.
+func TestNew_RequestyLegacyConfigWire(t *testing.T) {
+	for _, suffix := range []string{"", "/v1", "/v1/"} {
+		t.Run("base"+suffix, func(t *testing.T) {
+			var gotPath, gotAuth string
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotAuth = r.URL.Path, r.Header.Get("authorization")
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &body)
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"terms\":[\"jwt\"]}"}}]}`)
+			}))
+			defer srv.Close()
+
+			t.Setenv("REQUESTY_API_KEY", "test-key")
+			cfg := llm.Config{Provider: "requesty", Requesty: llm.RemoteConfig{ //nolint:staticcheck // pins the deprecated block
+
+				Model: "openai/o4-mini", BaseURL: srv.URL + suffix, Effort: "high",
+			}}.ApplyDefaults()
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			if p.Name() != "requesty" {
+				t.Errorf("Name()=%q want requesty", p.Name())
+			}
+			if _, err := p.Complete(context.Background(), llm.CompletionRequest{
+				Messages: []llm.Message{{Role: llm.RoleUser, Content: "Query: auth"}},
+				Shape:    llm.ShapeExpandTerms,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if gotPath != "/v1/chat/completions" || gotAuth != "Bearer test-key" {
+				t.Errorf("path=%q auth=%q", gotPath, gotAuth)
+			}
+			if body["model"] != "openai/o4-mini" || body["reasoning_effort"] != "high" {
+				t.Errorf("model=%v reasoning_effort=%v", body["model"], body["reasoning_effort"])
+			}
+			if rf, _ := body["response_format"].(map[string]any); rf["type"] != "json_schema" {
+				t.Errorf("response_format=%v want json_schema", body["response_format"])
+			}
+		})
 	}
 }

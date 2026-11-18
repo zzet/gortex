@@ -10,6 +10,7 @@ import (
 // does not expose generations has only one logical generation, so its ordinary
 // Store eviction is the compatible fallback.
 func evictRepoCurrentGeneration(target graph.Store, repoPrefix string) (nodesRemoved, edgesRemoved int) {
+	restubTrackedNpmRepoIncoming(target, repoPrefix)
 	if scoped, ok := target.(graph.CurrentGenerationRepoEvicter); ok {
 		return scoped.EvictRepoCurrentGeneration(repoPrefix)
 	}

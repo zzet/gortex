@@ -70,11 +70,11 @@ func (s *Store) EvictEdgesFromSourcesByKinds(
 		panicOnFatal(err)
 		return 0, err
 	}
-	res, err := tx.ExecContext(ctx, `
+	res, err := countEdgeWrite(tx.ExecContext(ctx, `
 DELETE FROM edges
 WHERE from_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
   AND kind IN (SELECT CAST(value AS TEXT) FROM json_each(?))
-  AND view_gen = ?`, sourcesJSON, kindsJSON, s.viewGen)
+  AND view_gen = ?`, sourcesJSON, kindsJSON, s.viewGen))
 	if err != nil {
 		_ = tx.Rollback()
 		if ctxErr := ctx.Err(); ctxErr != nil {

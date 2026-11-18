@@ -96,19 +96,27 @@ func (b *parseSidecarBatch) persist(payload compactSidecarPayload) {
 	persistConstantValueRows(b.target, b.idx.repoPrefix, payload.constFiles, payload.constRows)
 }
 
-// persistShadowCompactSidecars transfers authoritative compact projections in
-// bounded batches after the graph is durable. The repo-wide empty replacement
-// happens once; subsequent writes append chunks and never replay per file.
-func persistShadowCompactSidecars(
-	shadow *graph.Graph,
-	disk graph.Store,
-	repoPrefix string,
-) error {
+// resetShadowCloneCorpus runs before the first node-drain write. SQLite's
+// AddBatch extracts pending raw clone rows from those nodes; resetting after
+// that drain would delete them when the shadow deferred clone finalization.
+func resetShadowCloneCorpus(disk graph.Store, repoPrefix string) error {
 	if writer, ok := disk.(graph.CloneCorpusRepoReplacer); ok {
 		if err := writer.ReplaceCloneCorpus(repoPrefix, nil); err != nil {
 			return fmt.Errorf("reset clone corpus: %w", err)
 		}
 	}
+	return nil
+}
+
+// persistShadowCompactSidecars transfers authoritative compact projections in
+// bounded batches after the graph is durable. The caller has already reset
+// clone rows before the node drain; append finalized shadow rows without
+// removing pending rows that the node writer just installed.
+func persistShadowCompactSidecars(
+	shadow *graph.Graph,
+	disk graph.Store,
+	repoPrefix string,
+) error {
 	if writer, ok := disk.(graph.FileMetaRepoReplacer); ok {
 		if err := writer.ReplaceFileMetas(repoPrefix, nil); err != nil {
 			return fmt.Errorf("reset file metadata: %w", err)

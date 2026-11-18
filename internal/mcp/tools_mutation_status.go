@@ -2,10 +2,16 @@ package mcp
 
 import (
 	"context"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/zzet/gortex/internal/indexer"
 )
+
+var graphFreshnessReceiptID = regexp.MustCompile(`^mutation-\d+$`)
 
 // handleMutationStatus answers "what actually happened to my edit?" after a
 // response was lost — the recovery path for a tool call the deadline wrapper
@@ -23,21 +29,41 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	case receipt != "":
 		record, ok := s.mutationCommits.byReceipt(receipt)
 		if !ok {
+			if payload, handled := s.moveFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+			if payload, handled := s.batchAcknowledgementReceiptPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+			if payload, handled := s.batchFileObservationPayload(ctx, receipt); handled {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
 			if payload, found := s.graphRefreshReceiptPayload(ctx, receipt); found {
 				return s.respondJSONOrTOON(ctx, req, payload)
 			}
 		}
-		if !ok || !mutationCommitInScope(ctx, record) {
-			return mcp.NewToolResultError(
-				"no mutation receipt " + receipt + " — receipts are kept for " + mutationCommitRetention.String() +
-					"; query by path instead, or read the file to see its current state"), nil
+		if ok && !mutationCommitInScope(ctx, record) {
+			return mcp.NewToolResultError("no mutation receipt " + receipt), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("receipt", receipt))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
 	case mutationID != "":
 		record, ok := s.mutationCommits.byMutationID(mutationID)
-		if !ok || !mutationCommitInScope(ctx, record) {
+		if !ok && graphFreshnessReceiptID.MatchString(mutationID) {
+			if payload, found := s.graphRefreshReceiptPayload(ctx, mutationID); found {
+				payload["note"] = "this is a graph freshness receipt id, not a caller mutation_id"
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
+		}
+		if ok && !mutationCommitInScope(ctx, record) {
 			return mcp.NewToolResultError("no mutation recorded for mutation_id " + mutationID), nil
+		}
+		if !ok {
+			return s.respondJSONOrTOON(ctx, req, lostMutationPayload("mutation_id", mutationID))
 		}
 		return s.respondJSONOrTOON(ctx, req, s.mutationStatusPayload(record))
 
@@ -68,6 +94,7 @@ func (s *Server) handleMutationStatus(ctx context.Context, req mcp.CallToolReque
 	var records []*mutationCommitRecord
 	for _, record := range s.mutationCommits.recent(maxMutationCommits) {
 		if mutationCommitInScope(ctx, record) {
+			s.refreshPendingSourceRecord(record)
 			records = append(records, record)
 			if len(records) == maxMutationCommitListing {
 				break
@@ -123,10 +150,30 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	if outcome.Err != nil {
 		payload["error"] = outcome.Err.Error()
 	}
+	var retained *indexer.PublicationPhaseRecord
+	var acknowledgement *editAcknowledgementSnapshot
+	acknowledgementState := "not_applicable"
+	if commit, found := s.mutationCommits.byFreshnessReceipt(receipt.id); found && mutationCommitInScope(ctx, commit) {
+		acknowledgementState = "unavailable_recording_or_evicted"
+		retained, _ = retainedMutationPublication(commit)
+		if ack := retainedMutationAcknowledgement(commit); ack != nil {
+			snapshot := ack.snapshot()
+			acknowledgement = &snapshot
+		}
+		if retained != nil && retained.Key() != receipt.id {
+			retained = nil
+		}
+	}
+	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
+	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
+	attachReceiptTiers(payload, receipt)
 	return payload, true
 }
 
 func mutationCommitInScope(ctx context.Context, record *mutationCommitRecord) bool {
+	if !record.isPhysicalCommit() {
+		return false
+	}
 	checkoutID, incarnation := mutationCheckoutScope(ctx)
 	record.mu.RLock()
 	defer record.mu.RUnlock()
@@ -153,13 +200,13 @@ func (s *Server) recentMutationCommitInScope(ctx context.Context, path string) (
 // pending receipt would read as pending forever, which is precisely the stale
 // answer this tool exists to avoid.
 func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]any {
-	if pending := record.pendingReindexReceipt(); pending != "" {
-		if outcome, ok := s.mutationReceiptState(pending); ok {
-			record.recordGraph(outcome)
-		}
+	if !record.isPhysicalCommit() {
+		return map[string]any{"found": false, "reason": "not_physical_commit"}
 	}
+	s.refreshPendingSourceRecord(record)
 	snap := record.snapshot()
 	payload := map[string]any{
+		"ack_mode":     snap.AckMode,
 		"found":        true,
 		"receipt":      snap.Receipt,
 		"tool":         snap.Tool,
@@ -168,8 +215,14 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 		"graph_status": snap.GraphStatus,
 	}
 	attachMutationRefreshSnapshot(payload, snap)
+	if snap.readRepair != nil {
+		payload["read_assisted_publication"] = snap.readRepair.payload()
+	}
 	if snap.MutationID != "" {
 		payload["mutation_id"] = snap.MutationID
+	}
+	if snap.ContentSHA256 != "" {
+		payload["content_sha256"] = snap.ContentSHA256
 	}
 	if snap.NewSHA != "" {
 		payload["new_sha"] = snap.NewSHA
@@ -188,11 +241,67 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	}
 	payload["retry_safe"] = snap.DiskStatus == mutationDiskNotApplied || snap.DiskStatus == mutationDiskFailed
 	payload["graph_status_terminal"] = graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded)
-	if note := mutationGraphStatusNote(snap.GraphStatus, snap.GraphRecorded, snap.CheckoutID); note != "" {
+	s.attachRecordDerivedFanout(payload, record, snap)
+	if snap.Reason == "receipt_lost" {
+		payload["graph_note"] = "publication outcome is unavailable because its freshness receipt was lost; this does not establish graph freshness"
+	} else if note := mutationGraphStatusNote(snap.GraphStatus, snap.GraphRecorded, snap.CheckoutID); note != "" {
 		payload["graph_note"] = note
 	}
 	payload["guidance"] = mutationStatusGuidance(snap.DiskStatus)
+	retained, committedAt := retainedMutationPublication(record)
+	attachMutationPhaseTimings(payload, snap.ReindexReceipt, committedAt, indexer.PublicationSourceMCPEdit, retained)
+	var acknowledgement *editAcknowledgementSnapshot
+	if ack := retainedMutationAcknowledgement(record); ack != nil {
+		snapshot := ack.snapshot()
+		acknowledgement = &snapshot
+	}
+	attachAcknowledgementPayload(payload, acknowledgement, "unavailable_recording_or_evicted")
+	publicationReceipt := snap.ReindexReceipt
+	if publicationReceipt == "" {
+		publicationReceipt = snap.publicationReceipt
+	}
+	if value, found := s.mutationReceipts.Load(publicationReceipt); found {
+		if receipt, ok := value.(*mutationReceipt); ok {
+			attachReceiptTiers(payload, receipt)
+		}
+	}
+	record.attachFileProjection(payload)
+	s.attachSharedOwnerAccounting(payload, record, retained)
 	return payload
+}
+
+// attachRecordDerivedFanout publishes the bounded-derived-pass completeness
+// fact beside graph_status_terminal.
+//
+// It is the answer to the question graph_status cannot answer. A caller whose
+// edit response was lost comes here to learn two things — did the bytes land,
+// and has the graph caught up — and "caught up" has always silently meant "the
+// file was re-parsed", never "its dependants were rebound". When the
+// affected-by bound fires, graph_status reads "fresh" over a graph that is
+// knowingly incoherent for the files the pass dropped, and until now nothing
+// on this payload said so.
+//
+// The fact is read from the freshness receipt rather than from the ledger
+// record: the record keeps the generation the reindex ran under, which is the
+// handle that finds it (see derivedFanoutForMutation). A record whose receipt
+// has aged out, or one from a path the watcher never measured, renders
+// nothing — an absent verdict, never an invented one.
+func (s *Server) attachRecordDerivedFanout(
+	payload map[string]any,
+	record *mutationCommitRecord,
+	snap mutationCommitSnapshot,
+) {
+	if payload == nil || record == nil || !snap.GraphRecorded {
+		return
+	}
+	record.mu.RLock()
+	absPath := record.absPath
+	record.mu.RUnlock()
+	fanout, ok := s.derivedFanoutForMutation(absPath, snap.ReindexGeneration)
+	if !ok {
+		return
+	}
+	attachDerivedFanout(payload, fanout)
 }
 
 func mutationGraphStatusNote(graph string, recorded bool, checkoutID string) string {
@@ -203,6 +312,9 @@ func mutationGraphStatusNote(graph string, recorded bool, checkoutID string) str
 }
 
 func attachMutationRefreshSnapshot(payload map[string]any, snap mutationCommitSnapshot) {
+	if snap.Reason != "" {
+		payload["reason"] = snap.Reason
+	}
 	if snap.ReindexReceipt != "" {
 		payload["reindex_receipt"] = snap.ReindexReceipt
 	}
@@ -222,9 +334,8 @@ func attachMutationRefreshSnapshot(payload map[string]any, snap mutationCommitSn
 
 // graphStatusTerminal answers the only question a caller actually has about
 // the graph half: is it still worth waiting? Once an outcome is recorded only
-// "pending" resolves on its own — mutationStatusPayload refreshes a record
-// through pendingReindexReceipt, which returns nothing once the record left
-// that state, so every other value is frozen for the life of the entry.
+// "pending" can resolve on its own. A lost pending receipt settles as failed;
+// an explicitly recorded terminal stale outcome remains historical evidence.
 // Rendering the four values without this flag makes a terminal one look like a
 // stage in a progression, and a caller that waits on it waits forever.
 //
@@ -277,19 +388,8 @@ func mutationStatusGuidance(disk string) string {
 }
 
 // mutationCommitListingPayload renders the listing with the same graph
-// terminality the single-record payload carries. It deliberately does not
-// refresh pending records the way mutationStatusPayload does: a listing is a
-// survey, and a caller acting on one entry selects it by receipt, which takes
-// the refreshing path.
-//
-// Worth naming because it is surprising: a frozen graph_status is
-// observer-dependent. mutationStatusPayload only refreshes while the record is
-// pending, so if someone calls change.receipt in the window between an ingest
-// failure and a later mutation that supersedes it, the ledger reads "failed"
-// for the life of the entry; if nobody looks in that window, the same history
-// renders "fresh". The notes handle the consequence by pointing at the
-// freshness receipt rather than this ledger, which is the structure that
-// actually gates change.detect.
+// terminality the single-record payload carries. The listing handler refreshes
+// selected records first; this renderer only formats their current snapshots.
 func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]any {
 	snaps := mutationCommitListing(records)
 	out := make([]map[string]any, 0, len(snaps))
@@ -301,6 +401,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 			"graph_status_terminal": graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded),
 		}
 		attachMutationRefreshSnapshot(entry, snap)
+		if snap.AckMode != "" {
+			entry["ack_mode"] = snap.AckMode
+		}
 		// Every remaining field mirrors mutationCommitSnapshot's omitempty
 		// exactly. Rendering by hand is what dropped new_sha and
 		// bytes_written the first time, so the parity is asserted against the
@@ -314,6 +417,9 @@ func mutationCommitListingPayload(records []*mutationCommitRecord) []map[string]
 		}
 		if snap.MutationID != "" {
 			entry["mutation_id"] = snap.MutationID
+		}
+		if snap.ContentSHA256 != "" {
+			entry["content_sha256"] = snap.ContentSHA256
 		}
 		if snap.NewSHA != "" {
 			entry["new_sha"] = snap.NewSHA

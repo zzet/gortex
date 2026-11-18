@@ -159,7 +159,8 @@ func compareEdgeIdentityLookupKey(left, right graph.EdgeIdentity) int {
 // The generation is the sixth column of the edges UNIQUE key, so binding it in
 // the inner probe lengthens that seek instead of filtering after it. The outer
 // walk needs no filter of its own: edge ids are unique across generations, so
-// the inner match already decided which rows it may fetch.
+// the inner match already decided which rows it may fetch. CROSS JOIN keeps
+// the identity list outer under stale planner statistics.
 func exactEdgeIdentityQuery(rows int) string {
 	return `WITH wanted(from_id, to_id, kind, file_path, line) AS (VALUES ` +
 		multiValues(rows, exactEdgeIdentityParamsPerRow) + `)
@@ -168,7 +169,7 @@ FROM edges AS e
 WHERE e.id IN (
       SELECT matched.id
       FROM wanted AS w
-      JOIN edges AS matched
+      CROSS JOIN edges AS matched
         ON matched.from_id = w.from_id
        AND matched.to_id = w.to_id
        AND matched.kind = w.kind

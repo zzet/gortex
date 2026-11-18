@@ -76,25 +76,25 @@ func TestClassifyEvidenceMatrix(t *testing.T) {
 			name:         "inventory unavailable with a listed accessible record",
 			inventoryErr: inventoryDown, record: accessible,
 			persisted: persistedOnA, fresh: sampleOnVolume(volumeA),
-			want: DispositionInaccessible, wantEvidence: EvidenceNone,
+			want: DispositionUnknown, wantEvidence: EvidenceNone,
 		},
 		{
 			name:         "inventory unavailable with no record at all",
 			inventoryErr: inventoryDown, record: nil,
 			persisted: persistedOnA, fresh: sampleAbsentAncestorOn(volumeA),
-			want: DispositionInaccessible, wantEvidence: EvidenceNone,
+			want: DispositionUnknown, wantEvidence: EvidenceNone,
 		},
 		{
 			name:         "inventory unavailable outranks a fully confirmed prune",
 			inventoryErr: inventoryDown, record: listedRecord(true, fs.ErrNotExist),
 			persisted: persistedOnA, fresh: sampleAbsentAncestorOn(volumeA),
-			want: DispositionInaccessible, wantEvidence: EvidenceNone,
+			want: DispositionUnknown, wantEvidence: EvidenceNone,
 		},
 		{
 			name:         "inventory came from another family's common dir",
 			inventoryErr: mismatch, record: nil,
 			persisted: persistedOnA, fresh: sampleAbsentAncestorOn(volumeA),
-			want: DispositionInaccessible, wantEvidence: EvidenceNone,
+			want: DispositionUnknown, wantEvidence: EvidenceNone,
 		},
 		{
 			name:      "trustworthy inventory omits a known admin name",
@@ -215,6 +215,9 @@ func TestClassifyEvidenceMatrix(t *testing.T) {
 			wantCode := ""
 			if tc.want == DispositionInaccessible {
 				wantCode = graphview.CodeCheckoutInaccessible
+			}
+			if tc.want == DispositionUnknown {
+				wantCode = "inventory_unavailable"
 			}
 			if got.Code != wantCode {
 				t.Errorf("Code = %q, want %q", got.Code, wantCode)

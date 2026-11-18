@@ -19,6 +19,7 @@ import (
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/telemetry"
+	"github.com/zzet/gortex/internal/toolref"
 	"go.uber.org/zap"
 )
 
@@ -224,8 +225,10 @@ func TestIdentifiedClientsShareDefaultSurface(t *testing.T) {
 	require.Equal(t, "", srv.resolveSessionFormat(unknownCtx),
 		"unknown clients keep the JSON-safe wire format")
 
-	// Until initialize provides a non-empty clientInfo.name, preserve the
-	// server's global compatibility policy and instructions.
+	// A bare session id with no client connection behind it is an internal
+	// caller and keeps the server's global policy and instructions. An
+	// unnamed client connection gets the facade surface (see
+	// TestUnnamedClientGetsNamedClientSurface, #661).
 	anonymousTools := listToolNamesForSession(t, srv, "anonymous_client")
 	require.True(t, anonymousTools["read_file"])
 	require.False(t, anonymousTools["read"])
@@ -539,10 +542,16 @@ func TestCodingAgentInstructionsStayTerseAndDirective(t *testing.T) {
 	srv := &Server{}
 	got := srv.stateAwareInstructionsForClient("", "generic-harness")
 	require.Equal(t, codingAgentInstructions, got)
-	// The workflow directive stays compact; the shared safety policy deliberately
-	// raises the complete initialize envelope while keeping it below one 2 KiB
-	// prompt block.
-	require.Less(t, len(got), 2_048)
+	// #1030 requires the canonical transient/transport suffix in initialize.
+	// Preserve the original 2 KiB workflow/routing budget and add only the
+	// separately bounded suffix; this changes no instruction-profile ceiling.
+	suffix := "\n" + toolref.TransportClause() + " " + toolref.DegradedModeLine()
+	require.True(t, strings.HasSuffix(got, suffix))
+	require.Equal(t, 1, strings.Count(got, suffix))
+	require.Less(t, len(strings.TrimSuffix(got, suffix)), 2_048)
+	const maxSharedSuffixBytes = 1 + 80 + 1 + 240 // newline + transport + space + degraded
+	require.LessOrEqual(t, len(suffix), maxSharedSuffixBytes)
+	require.Less(t, len(got), 2_048+maxSharedSuffixBytes)
 	for _, implementationTerm := range []string{"codex", "facade", "version", "preset", "tools/list", "tools_search"} {
 		require.NotContains(t, strings.ToLower(got), implementationTerm)
 	}

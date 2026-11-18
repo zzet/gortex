@@ -54,6 +54,30 @@ func TestImportAdjacencyProjectionUsesCoveringFileIndexes(t *testing.T) {
 	}
 }
 
+// The malformed-provenance sentinel must probe edges_by_from per node of the
+// requested file, never range over the generation prefix of edges_by_from.
+// The latter reads every edge of the generation once per requested file.
+func TestImportAdjacencyProjectionSentinelProbesEdgesPerNode(t *testing.T) {
+	store := openImportProjectionTestStore(t)
+	plan := explainQueryPlanArgs(t, store, importAdjacencyProjectionSQL,
+		`["pkg/caller.go"]`, string(graph.EdgeImports), baseViewGeneration,
+		string(graph.EdgeImports), baseViewGeneration)
+	var sawSentinelProbe bool
+	for _, line := range plan {
+		if !strings.Contains(line, "edges_by_from") {
+			continue
+		}
+		if !strings.Contains(line, "from_id=?") {
+			t.Fatalf("edges_by_from is searched without from_id (a generation-wide range):\n%s",
+				strings.Join(plan, "\n"))
+		}
+		sawSentinelProbe = true
+	}
+	if !sawSentinelProbe {
+		t.Fatalf("query plan never probes edges_by_from:\n%s", strings.Join(plan, "\n"))
+	}
+}
+
 func TestImportAdjacencyProjectionSkipsUnrelatedOutgoingRows(t *testing.T) {
 	store := openImportProjectionTestStore(t)
 	const callerPath = "pkg/caller.go"

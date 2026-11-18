@@ -33,9 +33,11 @@ type probeView struct {
 	// repoPrefix is the corpus the path's content lives under. It keys the
 	// file lookup and filters the nodes a coverage answer counts.
 	repoPrefix string
-	// searchScope narrows a symbol probe to one repo prefix. It is empty for
-	// a dedicated checkout and for an untracked path, because narrowing them
-	// would change the answer those callers already get.
+	// searchScope narrows a symbol probe to the repo prefix the probed path
+	// belongs to. It is empty only when no corpus claims the path, because
+	// there is then no repo to clamp to. A hook deny must cite evidence the
+	// tools it redirects to could see: an unclamped probe would deny on
+	// sibling-repo symbols that search and relations refuse to answer about.
 	searchScope string
 	// root is the working copy the path is relative to, empty when no
 	// checkout owns it.
@@ -163,11 +165,16 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 
 	if !binding.Matched || binding.EffectiveMode != string(store_sqlite.CheckoutModeAutomatic) {
-		// A live dedicated checkout, the family primary, and every untracked
-		// path are read from the indexed corpus directly, unscoped, exactly as
-		// they were before routed views existed.
+		// A live dedicated checkout, the family primary, and every tracked
+		// path no checkout owns read the indexed corpus directly, exactly as
+		// they were before routed views existed. The corpus the binding named
+		// is the path's own repo, so a symbol probe is clamped to it: the
+		// coverage and file lookups below already filter by repoPrefix, and
+		// an unclamped probe would cite sibling-repo symbols in a multi-repo
+		// daemon — evidence a deny's own redirect targets cannot answer for.
 		base.answer = exactProbeView(daemon.ProbeViewBase, binding.CheckoutID, binding.RepoPrefix)
 		base.repoPrefix = binding.RepoPrefix
+		base.searchScope = binding.RepoPrefix
 		base.root = binding.RootPath
 		return base
 	}
@@ -228,6 +235,49 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	}
 }
 
+// probeViewServesAutomaticLane is the wire-side spelling of
+// graphview.ServesAutomaticView — the predicate the MCP dispatcher's admission
+// gate answers with (CheckoutServesCWDChecked → scopeForAutomaticCheckoutChecked
+// → graphview.ServesAutomaticView, internal/mcp/scope_checkout.go:37-56).
+//
+// It exists because the CLI pre-flight and the dispatcher ask the same question
+// through different doors: the CLI has only the control surface's ProbeView, the
+// dispatcher has the catalog row. A ProbeView answers it exactly, because
+// selectProbeView above derives its kind from the same two catalog columns
+// ServesAutomaticView reads:
+//
+//   - ProbeViewWorktree and ProbeViewUnrouted are produced only past the two
+//     guards at the top of selectProbeView, i.e. only for a checkout whose state
+//     is CheckoutStateReady AND whose effective mode is CheckoutModeAutomatic —
+//     which is ServesAutomaticView's whole definition.
+//   - ProbeViewBase is produced for everything else: an untracked path, a live
+//     dedicated checkout, the family primary, and every checkout in a grace or
+//     transition state. A dedicated checkout and a primary carry a CheckoutID on
+//     that answer, so "the answer named a checkout" is NOT the same question and
+//     admits paths the dispatcher refuses.
+//
+// The difference is user-visible: a CLI pre-flight that admits a path the
+// dispatcher then refuses spends a full MCP round trip to come back with
+// repo_not_tracked, which query.go re-routes into the worktree remedy anyway.
+// Answering it here gives the same remedy without the round trip.
+//
+// Residual, declared: the dispatcher additionally requires the family primary to
+// be a tracked repository with a resolvable scope
+// (scope_checkout.go:57-69). ProbeView carries no field that reports it, so a
+// checkout whose primary was forgotten is still admitted here and refused there
+// — degrading, as before, to repo_not_tracked → worktreeCWDErr.
+func probeViewServesAutomaticLane(answer *daemon.ProbeView) bool {
+	if answer == nil {
+		return false
+	}
+	switch answer.Kind {
+	case daemon.ProbeViewWorktree, daemon.ProbeViewUnrouted:
+		return true
+	default:
+		return false
+	}
+}
+
 // exactProbeView names a graph that is the path's own.
 func exactProbeView(kind, checkoutID, repoPrefix string) *daemon.ProbeView {
 	return &daemon.ProbeView{
@@ -260,6 +310,10 @@ func fallbackProbeView(kind, checkoutID, repoPrefix, reason string) *daemon.Prob
 // and one whose view is not built yet is answered as uncovered so the hook
 // allows the native tool through.
 func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverageParams) (daemon.FileCoverageResult, error) {
+	return c.fileCoverageWithProbe(ctx, p, c.resolveProbeView)
+}
+
+func (c *realController) fileCoverageWithProbe(ctx context.Context, p daemon.FileCoverageParams, resolve func(context.Context, string) probeView) (daemon.FileCoverageResult, error) {
 	if c == nil || p.Path == "" {
 		return daemon.FileCoverageResult{}, nil
 	}
@@ -268,10 +322,29 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		abs = resolved
 	}
 
-	view := c.resolveProbeView(ctx, abs)
+	mutationProbe := c.lifecycle.CaptureCheckoutMutationProbe()
+	view := resolve(ctx, abs)
 	defer view.release()
 
 	out := daemon.FileCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
+
+	// On a warm restart the persisted catalog binds a configured repository
+	// before warmup registers it, so the coverage below reads its persisted
+	// rows and reports the file covered while every graph call refuses with
+	// repo_loading. The state rides on the reply so the hook can let the
+	// native tool through instead of denying the only read path left.
+	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.ErrorCode == daemon.ErrPrefixCollision {
+			out.RepoState, out.Repo, out.Tracked = daemon.RepoStatePrefixCollision, rec.Label(), false
+			return out, nil
+		}
+		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
+			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
+		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {
+			out.RepoState = daemon.RepoStateIdentityPending
+			return out, nil // unknown or newly ready needs a fresh authoritative probe
+		}
+	}
 	if !view.servable {
 		return out, nil
 	}
@@ -291,6 +364,12 @@ func (c *realController) FileCoverage(ctx context.Context, p daemon.FileCoverage
 		return out, nil
 	}
 	out.Answered = true
+	if c.lifecycle != nil && view.answer != nil && view.root != "" {
+		state, reason := c.lifecycle.CheckoutMutationStateForProbe(ctx, view.answer.CheckoutID, view.root, mutationProbe, view.servable && view.answer.Exact)
+		if state == "read_only" || (state == "ready" && view.servable && view.answer.Exact) {
+			out.MutationState, out.MutationReason = state, reason
+		}
+	}
 	// Newer graph writers use slash keys; retained graphs can still hold
 	// repo-prefixed native keys. Prefer the canonical spelling without
 	// counting both copies when a graph contains both generations of keys.
@@ -348,6 +427,10 @@ const dirCoverageWalkBudget = 500 * time.Millisecond
 // there. It is the scope verdict a PreToolUse hook turns into a Grep/Glob
 // deny; both halves are exact rather than sampled.
 func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoverageParams) (daemon.DirCoverageResult, error) {
+	return c.dirCoverageWithProbe(ctx, p, c.resolveProbeView)
+}
+
+func (c *realController) dirCoverageWithProbe(ctx context.Context, p daemon.DirCoverageParams, resolve func(context.Context, string) probeView) (daemon.DirCoverageResult, error) {
 	if c == nil || p.Path == "" {
 		return daemon.DirCoverageResult{}, nil
 	}
@@ -356,10 +439,23 @@ func (c *realController) DirCoverage(ctx context.Context, p daemon.DirCoveragePa
 		abs = resolved
 	}
 
-	view := c.resolveProbeView(ctx, abs)
+	view := resolve(ctx, abs)
 	defer view.release()
 
 	out := daemon.DirCoverageResult{View: view.answer, Tracked: c.pathTracked(abs, view)}
+	// See FileCoverage: a loading repository's scope must not deny Grep.
+	if rec, classified := c.pendingRepoLoadForPath(abs); classified {
+		if rec.ErrorCode == daemon.ErrPrefixCollision {
+			out.RepoState, out.Repo, out.Tracked = daemon.RepoStatePrefixCollision, rec.Label(), false
+			return out, nil
+		}
+		if rec.State.Loading() && rec.State != indexer.RepoLoadIdentityPending {
+			out.RepoState, out.Repo = daemon.RepoStateLoading, rec.Label()
+		} else if !out.Tracked && (rec.State == indexer.RepoLoadIdentityPending || rec.State.Ready()) {
+			out.RepoState = daemon.RepoStateIdentityPending
+			return out, nil // unknown or newly ready needs a fresh authoritative probe
+		}
+	}
 	if !view.servable {
 		return out, nil
 	}
@@ -720,7 +816,7 @@ func (c *realController) reconcileFamilyForProbeContext(ctx context.Context, fam
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, err := c.lifecycle.ReconcileFamily(ctx, familyID); err != nil && c.logger != nil {
+	if _, err := c.lifecycle.ReconcileFamilyDeferredRetirement(ctx, familyID); err != nil && c.logger != nil {
 		c.logger.Debug("probe view: reconciling the family failed",
 			zap.String("family", familyID), zap.Error(err))
 	}

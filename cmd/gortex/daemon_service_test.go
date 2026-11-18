@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/xml"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/daemon"
 )
 
 // assertWellFormedXML fails if s is not parseable XML — a stronger
@@ -36,7 +39,7 @@ func TestRenderLaunchdPlist_NoXDG(t *testing.T) {
 	out, err := renderLaunchdPlist(
 		"com.zzet.gortex",
 		"/usr/local/bin/gortex",
-		"/Users/testuser/.gortex/cache/daemon.log",
+		"/Users/testuser/.gortex/cache/daemon.stderr.log",
 		nil,
 	)
 	require.NoError(t, err)
@@ -47,7 +50,8 @@ func TestRenderLaunchdPlist_NoXDG(t *testing.T) {
 	assert.Contains(t, out, "<string>start</string>")
 	assert.Contains(t, out, "<key>RunAtLoad</key>")
 	assert.Contains(t, out, "<key>KeepAlive</key>")
-	assert.Contains(t, out, "/Users/testuser/.gortex/cache/daemon.log")
+	assert.Contains(t, out, "<key>StandardOutPath</key>\n    <string>/Users/testuser/.gortex/cache/daemon.stderr.log</string>")
+	assert.Contains(t, out, "<key>StandardErrorPath</key>\n    <string>/Users/testuser/.gortex/cache/daemon.stderr.log</string>")
 	// Homebrew paths must be on PATH so launchd can find a Homebrew-
 	// installed gortex binary even when the LaunchAgent env is minimal.
 	assert.Contains(t, out, "/opt/homebrew/bin")
@@ -68,7 +72,7 @@ func TestRenderLaunchdPlist_PropagatesXDG(t *testing.T) {
 	out, err := renderLaunchdPlist(
 		"com.zzet.gortex",
 		"/usr/local/bin/gortex",
-		"/Users/testuser/.config/gortex/daemon.log",
+		"/Users/testuser/.config/gortex/daemon.stderr.log",
 		env,
 	)
 	require.NoError(t, err)
@@ -100,7 +104,7 @@ func TestRenderSystemdUnit_NoXDG(t *testing.T) {
 	t.Setenv("PATH", "")
 	out, err := renderSystemdUnit(
 		"/home/u/.local/bin/gortex",
-		"/home/u/.gortex/cache/daemon.log",
+		"/home/u/.gortex/cache/daemon.stderr.log",
 		nil,
 	)
 	require.NoError(t, err)
@@ -108,7 +112,8 @@ func TestRenderSystemdUnit_NoXDG(t *testing.T) {
 	assert.Contains(t, out, "ExecStart=/home/u/.local/bin/gortex daemon start")
 	assert.Contains(t, out, "Type=simple")
 	assert.Contains(t, out, "Restart=on-failure")
-	assert.Contains(t, out, "StandardOutput=append:/home/u/.gortex/cache/daemon.log")
+	assert.Contains(t, out, "StandardOutput=append:/home/u/.gortex/cache/daemon.stderr.log")
+	assert.Contains(t, out, "StandardError=append:/home/u/.gortex/cache/daemon.stderr.log")
 	assert.Contains(t, out, "WantedBy=default.target")
 	assert.NotContains(t, out, "Environment=", "no env line when none captured")
 }
@@ -123,7 +128,7 @@ func TestRenderSystemdUnit_PropagatesXDG(t *testing.T) {
 	}
 	out, err := renderSystemdUnit(
 		"/home/u/.local/bin/gortex",
-		"/home/u/.cache/gortex/daemon.log",
+		"/home/u/.cache/gortex/daemon.stderr.log",
 		env,
 	)
 	require.NoError(t, err)
@@ -155,7 +160,7 @@ func TestXDGServiceEnv_OnlyAbsoluteSet(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", "")                               // ignored — empty/unset
 
 	got := map[string]string{}
-	for _, e := range xdgServiceEnv() {
+	for _, e := range xdgServiceEnv(daemon.LogFilePath()) {
 		got[e.Key] = e.Value
 	}
 
@@ -348,5 +353,85 @@ func TestWindowsTaskCreateArgs(t *testing.T) {
 	assert.Contains(t, joined, "/F")
 	// The run action quotes the exe (so a Program Files path with spaces is one
 	// token) and appends the daemon subcommand.
-	assert.Contains(t, joined, `"C:\Users\x\scoop\apps\gortex\current\gortex.exe" daemon start`)
+	assert.Contains(t, joined, `"C:\Users\x\scoop\apps\gortex\current\gortex.exe" daemon start --service-log`)
+}
+
+func TestWindowsTaskInstallLogs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	t.Setenv("GORTEX_DAEMON_LOGFILE", path)
+	for _, tt := range []struct {
+		name string
+		size *int
+		logs string
+	}{
+		{"default", nil, path + " (rotating JSON; raw output: " + daemon.StderrLogPath(path) + "; per current config)"},
+		{"disabled", new(0), daemon.StderrLogPath(path) + " (JSON and raw output; rotation disabled per current config)"},
+		{"negative", new(-1), path + " (rotating JSON; raw output: " + daemon.StderrLogPath(path) + "; per current config)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			var calls [][]string
+			run := func(_ io.Writer, name string, args ...string) error {
+				calls = append(calls, append([]string{name}, args...))
+				return nil
+			}
+			exe := `C:\Program Files\gortex\gortex.exe`
+			require.NoError(t, installWindowsTask(&output, exe, config.DaemonConfig{LogMaxSize: tt.size}, run))
+			assert.Equal(t, [][]string{
+				{"schtasks", "/Create", "/TN", "GortexDaemon", "/TR", `"C:\Program Files\gortex\gortex.exe" daemon start --service-log`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"},
+				{"schtasks", "/Run", "/TN", "GortexDaemon"},
+			}, calls)
+			assert.Equal(t, "[gortex daemon] logon task installed (GortexDaemon)\n"+
+				"  logs: "+tt.logs+"\n"+
+				"  check: gortex daemon service-status\n", output.String())
+		})
+	}
+}
+
+func TestRenderLaunchdPlist_DaemonLogOverride(t *testing.T) {
+	for _, value := range []string{"", "/custom/a&b/daemon.log"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("GORTEX_DAEMON_LOGFILE", value)
+			out, err := renderLaunchdPlist("com.zzet.gortex", "/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
+			require.NoError(t, err)
+			assertWellFormedXML(t, out)
+			if value == "" {
+				assert.NotContains(t, out, "GORTEX_DAEMON_LOGFILE")
+			} else {
+				assert.Contains(t, out, "<key>GORTEX_DAEMON_LOGFILE</key>\n        <string>/custom/a&amp;b/daemon.log</string>")
+				assert.Contains(t, out, "<key>StandardErrorPath</key>\n    <string>/custom/a&amp;b/daemon.stderr.log</string>")
+			}
+		})
+	}
+}
+
+func TestRenderSystemdUnit_DaemonLogOverride(t *testing.T) {
+	for _, value := range []string{"", "/custom/100% logs/daemon.log"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("GORTEX_DAEMON_LOGFILE", value)
+			out, err := renderSystemdUnit("/bin/gortex", daemon.StderrLogFilePath(), xdgServiceEnv(daemon.LogFilePath()))
+			require.NoError(t, err)
+			if value == "" {
+				assert.NotContains(t, out, "GORTEX_DAEMON_LOGFILE")
+			} else {
+				assert.Contains(t, out, "\nEnvironment=\"GORTEX_DAEMON_LOGFILE=/custom/100%% logs/daemon.log\"\n")
+				assert.Contains(t, out, "\nStandardOutput=append:/custom/100%% logs/daemon.stderr.log\n")
+				assert.Contains(t, out, "\nStandardError=append:/custom/100%% logs/daemon.stderr.log\n")
+			}
+		})
+	}
+}
+
+func TestServiceLogFileAnchorsRelativeOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("GORTEX_DAEMON_LOGFILE", filepath.Join("logs", "daemon.log"))
+	got, err := serviceLogFile()
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(got), got)
+	want, err := filepath.Abs(filepath.Join("logs", "daemon.log"))
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	env := xdgServiceEnv(got)
+	assert.Contains(t, env, serviceEnvVar{Key: "GORTEX_DAEMON_LOGFILE", Value: got})
 }

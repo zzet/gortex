@@ -621,6 +621,13 @@ type Edge struct {
 	// only on the in-memory projection under min_tier:"text_matched";
 	// never persisted, never part of the edge identity / dedup key.
 	NameOnly bool `json:"name_only,omitempty"`
+	// Provisional marks a stored relation carried onto an overlay that
+	// re-parsed its file before relations were rebuilt: the new content
+	// still references the same target from the same source, so the edge
+	// is served at the reference's new line until the reindex confirms
+	// it. Set only on the in-memory overlay; never persisted, never part
+	// of the edge identity / dedup key.
+	Provisional bool `json:"provisional,omitempty"`
 	// Meta is intentionally excluded from JSON. It holds internal
 	// instrumentation (semantic_source, provider hints, etc.) that agents
 	// don't consume but that adds measurable bytes to every edge in
@@ -754,6 +761,14 @@ const (
 // to flag their default text_matched suppression as re-verification-pending,
 // making a hidden-but-real usage diagnosable instead of silently dropped.
 const MetaReparsePendingEnrichment = "reparse_pending_enrichment"
+
+// MetaReparseEpoch is a KindFile-node Meta key the indexer writes, with a
+// new value, every time it sets or clears MetaReparsePendingEnrichment. It
+// names the re-parse rather than the file's bytes, so a type pass sees every
+// re-parse since its resume point, including one with no write to the file
+// (the importer of a deleted file) and one enriched in place since, and
+// does not resume over it.
+const MetaReparseEpoch = "reparse_epoch"
 
 // OriginRank returns a numeric rank for origin comparison. Higher = more
 // confident. Unknown or empty origin returns 0 so it sorts below all known
