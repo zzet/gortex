@@ -40,13 +40,15 @@ type Tracker struct {
 
 	kindsMu sync.Mutex
 	byKind  map[string]int64
+	// kindEpoch counts each kind's Begin and End calls (KindEpoch).
+	kindEpoch map[string]uint64
 }
 
 // NewTracker returns an independent tracker. Most production code uses the
 // process-wide package functions below; the constructor exists for isolated
 // policy and race tests.
 func NewTracker() *Tracker {
-	t := &Tracker{byKind: make(map[string]int64)}
+	t := &Tracker{byKind: make(map[string]int64), kindEpoch: make(map[string]uint64)}
 	t.lastNano.Store(time.Now().UnixNano())
 	return t
 }
@@ -67,6 +69,7 @@ func (t *Tracker) Begin(kind string) {
 		t.byKind = make(map[string]int64)
 	}
 	t.byKind[kind]++
+	t.noteKindLocked(kind)
 	t.kindsMu.Unlock()
 	t.gate.RUnlock()
 }
@@ -90,8 +93,29 @@ func (t *Tracker) End(kind string) {
 	} else {
 		delete(t.byKind, kind)
 	}
+	t.noteKindLocked(kind)
 	t.kindsMu.Unlock()
 	t.gate.RUnlock()
+}
+
+func (t *Tracker) noteKindLocked(kind string) {
+	if t.kindEpoch == nil {
+		t.kindEpoch = make(map[string]uint64)
+	}
+	t.kindEpoch[kind]++
+}
+
+// KindEpoch counts kind's Begin and End calls. It moves whenever work of that
+// kind starts or ends, so a caller that reads it now and then still sees work
+// that started and ended between two reads, which ByKind cannot show.
+func (t *Tracker) KindEpoch(kind string) uint64 {
+	if t == nil {
+		return 0
+	}
+	kind = normalizeKind(kind)
+	t.kindsMu.Lock()
+	defer t.kindsMu.Unlock()
+	return t.kindEpoch[kind]
 }
 
 // Snapshot returns process activity without blocking a running maintenance
@@ -162,6 +186,9 @@ func End(kind string) { process.End(kind) }
 
 // Current returns a process-wide activity snapshot.
 func Current() Snapshot { return process.Snapshot() }
+
+// KindEpoch returns the process-wide KindEpoch of kind.
+func KindEpoch(kind string) uint64 { return process.KindEpoch(kind) }
 
 // RunIfQuiet executes fn behind the process-wide exclusive gate.
 func RunIfQuiet(quiet time.Duration, fn func()) (bool, time.Duration) {

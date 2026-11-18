@@ -149,8 +149,8 @@ func TestMatcher_EscapesAndGlobstarSurvive(t *testing.T) {
 	if m.MatchRel("other/a/build") {
 		t.Error(`"docs/**/build" must not exclude "other/a/build"`)
 	}
-	if n := New([]string{"!keep$"}); !n.HasNegatedDescendant("build") {
-		t.Error("a negation must still register after the rewrite")
+	if New([]string{"*", "!keep$"}).MatchRel("keep$") {
+		t.Error("a negation must still apply after the rewrite")
 	}
 }
 

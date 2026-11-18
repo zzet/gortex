@@ -22,7 +22,11 @@ func (e *SQLExtractor) Language() string     { return "sql" }
 func (e *SQLExtractor) Extensions() []string { return []string{".sql"} }
 
 func (e *SQLExtractor) Extract(filePath string, src []byte) (*parser.ExtractionResult, error) {
-	tree, err := parser.ParseFile(src, e.lang)
+	// Parse with dollar-quoted bodies blanked so a PL/pgSQL body the
+	// grammar cannot read never takes its CREATE FUNCTION header down
+	// with it. The mask keeps byte offsets and lines, so the tree is
+	// read against the original src below.
+	tree, err := parser.ParseFile(maskSQLDollarQuotedBodies(src), e.lang)
 	if err != nil {
 		return nil, err
 	}
@@ -70,14 +74,15 @@ const maxDDLWalkDepth = 64
 // walkDDL descends the whole tree looking for CREATE statements rather
 // than only visiting `statement` children of the root.
 //
-// The recursion is load-bearing, not defensive. tree-sitter-sql has no
-// grammar for dollar-quoted PL/pgSQL bodies, so a `CREATE FUNCTION … $$
-// BEGIN … END $$` — routine in Postgres migrations — parses as an ERROR
-// node that swallows the rest of the file. Under a top-level-only walk
-// every table declared after the first trigger function silently
-// disappeared, which is most of a real migration set. Descending through
-// ERROR recovers those statements: the sub-nodes are still parsed
-// correctly, they are just re-parented under the error.
+// The recursion is load-bearing, not defensive. tree-sitter-sql's error
+// recovery can re-parent well-formed statements under an ERROR node that
+// swallows the rest of the file — historically a `CREATE FUNCTION … $$
+// BEGIN … END $$` body it could not read, routine in Postgres
+// migrations (Extract now blanks those bodies before parsing, see
+// maskSQLDollarQuotedBodies). Under a top-level-only walk every table
+// declared after the first such error silently disappeared. Descending
+// through ERROR recovers those statements: the sub-nodes are still
+// parsed correctly, they are just re-parented under the error.
 func (e *SQLExtractor) walkDDL(node *sitter.Node, src []byte, filePath, fileID string, seen map[string]bool, result *parser.ExtractionResult, depth int) {
 	if depth > maxDDLWalkDepth {
 		return
@@ -89,7 +94,7 @@ func (e *SQLExtractor) walkDDL(node *sitter.Node, src []byte, filePath, fileID s
 			e.extractCreateTable(child, src, filePath, fileID, seen, result)
 		case "create_view":
 			e.extractCreateView(child, src, filePath, fileID, seen, result)
-		case "create_function":
+		case "create_function", "create_procedure":
 			e.extractCreateFunction(child, src, filePath, fileID, seen, result)
 		case "create_index":
 			e.extractCreateIndex(child, src, filePath, fileID, seen, result)
@@ -172,11 +177,18 @@ func (e *SQLExtractor) extractCreateFunction(node *sitter.Node, src []byte, file
 		return
 	}
 	seen[obj.key("function")] = true
+	// Postgres keeps functions and procedures in one namespace, so a
+	// procedure shares the function dedupe key and node kind; the
+	// sql_type marker tells the two apart.
+	var base map[string]any
+	if node.Type() == "create_procedure" {
+		base = map[string]any{"sql_type": "procedure"}
+	}
 	id := filePath + "::" + obj.qualified()
 	result.Nodes = append(result.Nodes, &graph.Node{
 		ID: id, Kind: graph.KindFunction, Name: obj.Name,
 		FilePath: filePath, StartLine: int(node.StartPoint().Row) + 1, EndLine: int(node.EndPoint().Row) + 1,
-		Language: "sql", Meta: obj.meta(nil),
+		Language: "sql", Meta: obj.meta(base),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,

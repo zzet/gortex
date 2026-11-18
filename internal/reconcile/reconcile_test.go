@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -207,11 +206,11 @@ func TestReconcileFamilyInventoryFailureNeverRemoves(t *testing.T) {
 		t.Fatal("report claims a usable inventory")
 	}
 	entry := f.entry(report, "wt")
-	if entry.Classification.Disposition != DispositionInaccessible {
+	if entry.Classification.Disposition != DispositionUnknown {
 		t.Fatalf("classified %q, want inaccessible", entry.Classification.Disposition)
 	}
-	if entry.Action != ActionAvailabilityGraceStarted {
-		t.Fatalf("action = %q, want the availability clock started", entry.Action)
+	if entry.Action != ActionInventoryUnknown {
+		t.Fatalf("action = %q, want clocks frozen", entry.Action)
 	}
 	row := f.checkout(allocated.CheckoutID)
 	if row.RemovalDetectedAt != 0 || row.RemovalDeadline != 0 || row.RemovalEvidence != "" {
@@ -223,7 +222,7 @@ func TestReconcileFamilyInventoryFailureNeverRemoves(t *testing.T) {
 	f.git.commonDir = "/somewhere/else/.git"
 	f.git.setRecords()
 	entry = f.entry(f.reconcile(), "wt")
-	if entry.Classification.Disposition != DispositionInaccessible {
+	if entry.Classification.Disposition != DispositionUnknown {
 		t.Fatalf("mismatched common dir classified %q", entry.Classification.Disposition)
 	}
 	if row := f.checkout(allocated.CheckoutID); row.RemovalDetectedAt != 0 {
@@ -324,7 +323,7 @@ func TestAvailabilityRecoveryKeepsIdentity(t *testing.T) {
 		f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
 
 		entry := f.entry(f.reconcile(), "wt")
-		if entry.Action != ActionAvailabilityRecovered || entry.State != store_sqlite.CheckoutStateReady {
+		if entry.Action != ActionAvailabilityRecovered || entry.State != store_sqlite.CheckoutStateReconciling {
 			t.Fatalf("recovery = %+v", entry)
 		}
 		if entry.CheckoutID != allocated.CheckoutID || entry.Incarnation != allocated.Incarnation {
@@ -443,7 +442,7 @@ func TestRemovalCancelledBySameIncarnation(t *testing.T) {
 		synctest.Sleep(cfg.RemovalGrace - time.Second)
 		f.git.setRecords(presentRecord("wt", "/repo/wt"))
 		entry := f.entry(f.reconcile(), "wt")
-		if entry.Action != ActionRemovalCancelled || entry.State != store_sqlite.CheckoutStateReady {
+		if entry.Action != ActionRemovalCancelled || entry.State != store_sqlite.CheckoutStateReconciling {
 			t.Fatalf("reappearance = %+v", entry)
 		}
 		if entry.CheckoutID != allocated.CheckoutID || entry.Incarnation != allocated.Incarnation {
@@ -454,6 +453,9 @@ func TestRemovalCancelledBySameIncarnation(t *testing.T) {
 			t.Fatalf("removal clock survived the reappearance: %+v", row)
 		}
 
+		if err := f.catalog.UpdateCheckoutRecoveryState(context.Background(), entry.CheckoutID, entry.Incarnation, store_sqlite.CheckoutStateReconciling, store_sqlite.CheckoutStateReady, "", time.Now().Unix()); err != nil {
+			t.Fatal(err)
+		}
 		// Well past the original deadline, nothing is deleted.
 		synctest.Sleep(2 * cfg.RemovalGrace)
 		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionReadyConfirmed {
@@ -719,52 +721,151 @@ func TestRemovalGuardLossKeepsThePassGoing(t *testing.T) {
 	})
 }
 
+// TestDeferredReleaseKeepsThePassGoing covers a forget saga whose graph
+// release is deferred because a reader still holds the graph. The checkout is
+// withdrawn and its saga journaled, so the pass reports it forgotten and still
+// reconciles the rest of the family. A later pass drives the same saga again,
+// and reports it neither while the holder stays nor when the saga finishes.
+func TestDeferredReleaseKeepsThePassGoing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := Config{AvailabilityGrace: time.Minute, RemovalGrace: time.Minute}
+		f := newFixture(t, cfg)
+		f.seedPrimaryGraph("graph-primary")
+		// The admin names order the pass: the held one is reconciled first, so
+		// a pass that aborted on its deferral would never reach the other.
+		f.git.setRecords(presentRecord("wt-a", "/repo/wt-a"), presentRecord("wt-b", "/repo/wt-b"))
+		f.git.samples["/repo/wt-a"] = gitSampleExisting(volumeA)
+		f.git.samples["/repo/wt-b"] = gitSampleExisting(volumeA)
+		first := f.reconcile()
+		held := f.entry(first, "wt-a")
+		calm := f.entry(first, "wt-b")
+		f.seedOwnedGraph("graph-held", held.CheckoutID)
+		f.hooks.setDeferRelease("graph-held")
+
+		f.git.setRecords()
+		f.reconcile()
+		synctest.Sleep(cfg.RemovalGrace)
+		if err := f.rec.ForgetCheckout(context.Background(), held.CheckoutID, held.Incarnation); !errors.Is(err, errReleaseDeferred) {
+			t.Fatalf("explicit forget=%v, want deferred", err)
+		}
+		report := f.reconcile()
+
+		if entry := f.entry(report, "wt-a"); entry.Action != ActionGuardLost {
+			t.Fatalf("deferred checkout = %+v, want authorized cleanup guard_lost", entry)
+		}
+		if entry := f.entry(report, "wt-b"); entry.Action != ActionForgotten {
+			t.Fatalf("the pass stopped at the deferred release: wt-b = %q", entry.Action)
+		}
+		f.checkout(held.CheckoutID) // The saga has not deleted the row before its release.
+		f.assertNoCheckoutRows(calm.CheckoutID)
+
+		if entry := f.entry(f.reconcile(), "wt-a"); entry.Action != ActionGuardLost {
+			t.Fatalf("a pass during the deferral = %q, want guard_lost", entry.Action)
+		}
+		f.hooks.failRelease = 1
+		if _, err := f.rec.ReconcileFamily(context.Background(), f.familyID, "/repo"); !errors.Is(err, errHookFailed) {
+			t.Fatalf("a release that failed rather than deferred = %v, want the failure", err)
+		}
+
+		f.hooks.setDeferRelease("")
+		if entry := f.entry(f.reconcile(), "wt-a"); entry.Action != ActionGuardLost {
+			t.Fatalf("the pass that finished the deferred saga = %q, want guard_lost", entry.Action)
+		}
+		f.assertNoCheckoutRows(held.CheckoutID)
+		if entries := f.journal(); len(entries) != 0 {
+			t.Fatalf("the finished saga left journal entries: %+v", entries)
+		}
+	})
+}
+
+// TestDeferredPrimaryClosureMintsNothingUnderIt covers a primary closure whose
+// release is deferred while git still lists a worktree the closure forgot. A
+// second dedicated graph keeps the family alive, so nothing but the journaled
+// closure says the primary is going: a pass during the deferral must not mint
+// the forgotten worktree a new identity under it.
+func TestDeferredPrimaryClosureMintsNothingUnderIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		cfg := Config{AvailabilityGrace: time.Minute, RemovalGrace: time.Minute}
+		f := newFixture(t, cfg)
+		f.seedPrimaryGraph("graph-primary")
+		f.git.setRecords(presentRecord("dep", "/repo/dep"), presentRecord("ded", "/repo/ded"), presentRecord("wt", "/repo/wt"))
+		for _, root := range []string{"/repo/dep", "/repo/ded", "/repo/wt"} {
+			f.git.samples[root] = gitSampleExisting(volumeA)
+		}
+		first := f.reconcile()
+		owner := f.entry(first, "wt")
+		ded := f.entry(first, "ded")
+		if err := f.catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
+			GraphID: "graph-primary", OwnerCheckoutID: owner.CheckoutID, RepoPrefix: "prefix-graph-primary",
+			FamilyID: f.familyID, IsPrimaryBase: true, State: "graph_ready",
+		}); err != nil {
+			t.Fatalf("give the primary an owner: %v", err)
+		}
+		row := f.checkout(ded.CheckoutID)
+		row.DesiredMode, row.EffectiveMode = store_sqlite.CheckoutModeDedicated, store_sqlite.CheckoutModeDedicated
+		if err := f.catalog.UpsertCheckout(ctx, row); err != nil {
+			t.Fatalf("make ded dedicated: %v", err)
+		}
+		f.seedOwnedGraph("graph-ded", ded.CheckoutID)
+		f.hooks.setDeferRelease("graph-primary")
+
+		f.git.setRecords(presentRecord("dep", "/repo/dep"), presentRecord("ded", "/repo/ded"))
+		f.reconcile()
+		synctest.Sleep(cfg.RemovalGrace)
+		family, _, err := f.catalog.GetRepositoryFamily(ctx, f.familyID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.rec.RetirePrimaryClosure(ctx, "graph-primary", family.PrimaryEpoch); !errors.Is(err, errReleaseDeferred) {
+			t.Fatalf("explicit closure=%v, want deferred", err)
+		}
+		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionGuardLost {
+			t.Fatalf("deferred owner = %q, want primary_closure_retired", entry.Action)
+		}
+
+		during := f.reconcile()
+		if during.PrimaryGraphID != "" || during.Code != graphview.CodeNoPrimary {
+			t.Fatalf("a pass during the deferral serves primary %q (code %q)", during.PrimaryGraphID, during.Code)
+		}
+		if entry := f.entry(during, "dep"); entry.Action != ActionObserved {
+			t.Fatalf("forgotten dependent = %q, want observed", entry.Action)
+		}
+
+		f.hooks.setDeferRelease("")
+		f.reconcile()
+		for _, checkout := range f.checkouts() {
+			if checkout.CheckoutID != ded.CheckoutID {
+				t.Fatalf("the finished closure left %s (%s) behind", checkout.AdminName, checkout.EffectiveMode)
+			}
+		}
+	})
+}
+
 // TestPrimaryClosureGuardLossIsReported covers the other saga entry point a
 // removal can reach. The family's primary epoch moves after the pass read it,
 // which is the catalog telling the pass that the primary it was about to
 // retire is not the one that is current.
 func TestPrimaryClosureGuardLossIsReported(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cfg := Config{AvailabilityGrace: time.Minute, RemovalGrace: time.Minute}
-		f := newFixture(t, cfg)
-		seedForgettableCheckout(f, "co-primary", "inc-p", "wt", "graph-primary")
-		f.promoteToPrimary("graph-primary")
-
-		// git never lists it, so the removal is evidenced on the first pass.
-		f.git.samples["/repo/wt"] = gitSampleAbsent(volumeA)
-		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionRemovalGraceStarted {
-			t.Fatalf("removal detection = %q", entry.Action)
-		}
-		synctest.Sleep(cfg.RemovalGrace)
-
-		racing := &racingSampler{root: "/repo/wt", sample: f.git.sample, race: func() {
-			// Re-installing the same primary is the cheapest way to move the
-			// epoch the pass is holding without changing anything else.
-			f.promoteToPrimary("graph-primary")
-		}}
-		WithPathSampler(racing.sampleAndRace)(f.rec)
-
-		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionGuardLost {
-			t.Fatalf("stale primary epoch = %q, want guard_lost", entry.Action)
-		}
-		f.checkout("co-primary")
-		if !f.graphExists("graph-primary") {
-			t.Error("a refused retirement still released the primary graph")
-		}
-		if !f.familyExists() {
-			t.Error("a refused retirement still forgot the family")
-		}
-		if entries := f.journal(); len(entries) != 0 {
-			t.Fatalf("a refused retirement wrote journal entries: %+v", entries)
-		}
-
-		// The next pass, holding the current epoch, retires it for real.
-		WithPathSampler(f.git.sample)(f.rec)
-		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionPrimaryClosureRetired {
-			t.Fatalf("retry after the guard loss = %q", entry.Action)
-		}
-		f.assertNoCheckoutRows("co-primary")
-	})
+	f := newFixture(t, Default())
+	seedForgettableCheckout(f, "co-primary", "inc-p", "wt", "graph-primary")
+	stale := f.promoteToPrimary("graph-primary")
+	f.promoteToPrimary("graph-primary")
+	if err := f.rec.RetirePrimaryClosure(context.Background(), "graph-primary", stale); !errors.Is(err, store_sqlite.ErrCatalogStaleGuard) {
+		t.Fatalf("stale explicit primary epoch=%v", err)
+	}
+	f.checkout("co-primary")
+	if !f.graphExists("graph-primary") || !f.familyExists() || len(f.journal()) != 0 {
+		t.Fatal("stale retirement changed primary identity")
+	}
+	family, _, err := f.catalog.GetRepositoryFamily(context.Background(), f.familyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.rec.RetirePrimaryClosure(context.Background(), "graph-primary", family.PrimaryEpoch); err != nil {
+		t.Fatal(err)
+	}
+	f.assertNoCheckoutRows("co-primary")
 }
 
 // TestReconcileRecordsHeadAndPathEvidence proves the pass writes back what it
@@ -811,11 +912,16 @@ func TestReconcileRecordsHeadAndPathEvidence(t *testing.T) {
 	}
 
 	// A HEAD the sampler cannot read falls back to what the inventory said,
-	// and never invents a tree.
+	// and never invents a tree: the inventory carries ref and commit, so those
+	// are restated, and the tree it does not carry is left at the last one that
+	// was actually observed rather than being blanked. Blanking it was a pass
+	// erasing the base identity every dependent worktree keys on — and, since
+	// the committed-base publisher now writes the same column, erasing a base
+	// that had just been published. See TestReconcileKeepsTheRecordedHeadTree.
 	delete(f.git.heads, "/repo/wt")
 	f.reconcile()
 	row = f.checkout(allocated.CheckoutID)
-	if row.HeadCommit != strings.Repeat("a", 40) || row.HeadTree != "" {
+	if row.HeadCommit != strings.Repeat("a", 40) || row.HeadTree != "t1" {
 		t.Fatalf("head fallback = %q/%q", row.HeadCommit, row.HeadTree)
 	}
 
@@ -885,57 +991,72 @@ func TestWithClockDrivesEveryTimestamp(t *testing.T) {
 // TestRemovalOfThePrimaryOwnerRetiresTheClosure proves the expiry branch picks
 // the closure teardown, not the plain forget, when the checkout that went away
 // is the one its family's primary graph hangs off.
-func TestRemovalOfThePrimaryOwnerRetiresTheClosure(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx := context.Background()
-		cfg := Config{AvailabilityGrace: time.Minute, RemovalGrace: time.Minute}
-		f := newFixture(t, cfg)
-		f.seedPrimaryGraph("graph-primary")
-		f.git.setRecords(presentRecord("wt", "/repo/wt"))
-		f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
-		allocated := f.entry(f.reconcile(), "wt")
+func TestRemovalOfThePrimaryOwnerKeepsClosureUnavailable(t *testing.T) {
+	clock := &steppedClock{now: time.Unix(1900000000, 0)}
+	f := newFixture(t, Default(), WithClock(clock.Now))
+	f.seedCheckout("primary", "inc", "main", store_sqlite.CheckoutModeDedicated)
+	f.seedOwnedGraph("graph-primary", "primary")
+	f.promoteToPrimary("graph-primary")
+	f.seedRefView("graph-primary-main", "graph-primary")
+	f.git.samples["/repo/main"] = gitSampleAbsent(volumeA)
+	f.reconcile()
+	clock.advance(31 * time.Second)
+	entry := f.entry(f.reconcile(), "main")
+	if entry.Action != ActionPrimaryRetirementRefused || entry.State != store_sqlite.CheckoutStateUnavailable {
+		t.Fatalf("primary expiry=%+v", entry)
+	}
+	if !f.graphExists("graph-primary") || !f.refViewExists("graph-primary-main") || !f.familyExists() {
+		t.Fatal("automatic pass retired primary closure")
+	}
+	f.checkout("primary")
+	if calls := f.hooks.snapshot(); len(calls) != 1 || calls[0] != "purge:primary:inc" {
+		t.Fatalf("primary expiry cleanup=%v", calls)
+	}
+}
 
-		// The allocated checkout takes ownership of the family's primary.
-		err := f.catalog.UpsertDedicatedGraph(ctx, store_sqlite.DedicatedGraph{
-			GraphID:         "graph-primary",
-			OwnerCheckoutID: allocated.CheckoutID,
-			RepoPrefix:      "prefix-graph-primary",
-			FamilyID:        f.familyID,
-			IsPrimaryBase:   true,
-			State:           "graph_ready",
-		})
-		if err != nil {
-			t.Fatalf("attach the primary to its owner: %v", err)
-		}
-		f.seedRefView("graph-primary-main", "graph-primary")
+// TestReconcileKeepsTheRecordedHeadTree separates a tree the pass learned is
+// gone from one it simply could not read.
+//
+// checkouts.head_tree is the committed identity a dependent worktree's layers
+// are keyed on, and — since AdoptDedicatedBaseGeneration advances the same
+// column — the identity a just-published committed base wrote there. The tree
+// reaches this pass only through a live `git` sample of the working copy, so a
+// sample that fails says nothing about the checkout's committed state; writing
+// its empty answer back would erase a published base identity for the length of
+// an hourly janitor interval, and leave graphBase's unpublished fallback with
+// no tree to build over at all.
+//
+// The second half is what keeps that from becoming a write-once column: a
+// working copy that ANSWERS with no tree is an unborn branch, which is a fact,
+// and the pass states it.
+func TestReconcileKeepsTheRecordedHeadTree(t *testing.T) {
+	f := newFixture(t, Default())
+	f.seedPrimaryGraph("graph-primary")
+	f.git.setRecords(presentRecord("wt", "/repo/wt"))
+	f.git.samples["/repo/wt"] = gitSampleExisting(volumeA)
+	f.git.heads["/repo/wt"] = gitstate.HEADState{Ref: "refs/heads/wt", CommitOID: "b1", TreeOID: "t1"}
 
-		f.git.setRecords()
-		if entry := f.entry(f.reconcile(), "wt"); entry.Action != ActionRemovalGraceStarted {
-			t.Fatalf("removal detection = %q", entry.Action)
-		}
-		synctest.Sleep(cfg.RemovalGrace)
-		entry := f.entry(f.reconcile(), "wt")
-		if entry.Action != ActionPrimaryClosureRetired {
-			t.Fatalf("expiry of the primary's owner = %q, want the closure retired", entry.Action)
-		}
+	allocated := f.entry(f.reconcile(), "wt")
+	if row := f.checkout(allocated.CheckoutID); row.HeadTree != "t1" {
+		t.Fatalf("first sighting recorded head_tree %q, want t1", row.HeadTree)
+	}
 
-		f.assertNoCheckoutRows(allocated.CheckoutID)
-		if f.graphExists("graph-primary") || f.refViewExists("graph-primary-main") {
-			t.Error("the primary graph or its views survived the closure")
-		}
-		if f.primaryGraphID() != "" {
-			t.Errorf("the family still has primary %q", f.primaryGraphID())
-		}
-		// Nothing is left to serve the family from, so it goes too.
-		if f.familyExists() {
-			t.Error("the family survived a closure that emptied it")
-		}
-		if entries := f.journal(); len(entries) != 0 {
-			t.Fatalf("the closure left journal entries: %+v", entries)
-		}
-		want := []string{"purge:" + allocated.CheckoutID + ":" + allocated.Incarnation, "release:graph-primary"}
-		if got := f.hooks.snapshot(); !slices.Equal(got, want) {
-			t.Fatalf("hook calls = %v, want %v", got, want)
-		}
-	})
+	// The sampler cannot answer. Ref and commit still come from the inventory;
+	// the tree stays at the last one anybody actually observed.
+	delete(f.git.heads, "/repo/wt")
+	f.reconcile()
+	row := f.checkout(allocated.CheckoutID)
+	if row.HeadTree != "t1" {
+		t.Fatalf("an unsampled pass rewrote head_tree to %q, want t1 preserved", row.HeadTree)
+	}
+	if row.State != store_sqlite.CheckoutStateReady {
+		t.Fatalf("state = %q, want the checkout still ready", row.State)
+	}
+
+	// The sampler answers, and what it says is that there is no tree.
+	f.git.heads["/repo/wt"] = gitstate.HEADState{Ref: "refs/heads/unborn"}
+	f.reconcile()
+	if row := f.checkout(allocated.CheckoutID); row.HeadTree != "" {
+		t.Fatalf("an unborn branch left head_tree at %q, want it stated as empty", row.HeadTree)
+	}
 }

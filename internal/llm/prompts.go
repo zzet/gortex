@@ -8,8 +8,13 @@
 //
 // Rather than carry a prompt set per provider, prompts are keyed by a
 // capability *tier* (PromptProfile): two sets to maintain, not four.
-// The svc layer maps a provider to its tier via ProfileForProvider.
+// The svc layer maps the active provider to its tier via ProfileFor.
 package llm
+
+import (
+	"fmt"
+	"strings"
+)
 
 // PromptProfile selects a prompt tier.
 type PromptProfile int
@@ -33,10 +38,37 @@ const (
 // tier).
 func ProfileForProvider(name string) PromptProfile {
 	switch name {
-	case "anthropic", "openai", "azure", "claudecli", "codex", "copilot", "cursor", "opencode", "gemini", "bedrock", "deepseek", "requesty":
+	case "anthropic", "openai", "azure", "claudecli", "codex", "copilot", "cursor", "opencode", "gemini", "bedrock", "deepseek":
 		return ProfileFrontier
 	default:
 		return ProfileSmall
+	}
+}
+
+// ProfileFor returns the prompt tier for cfg's active provider. A
+// custom provider declares its tier with prompt_profile (default
+// "small"); a built-in is mapped by ProfileForProvider.
+func ProfileFor(cfg Config) PromptProfile {
+	if cp, ok := cfg.ActiveCustom(); ok {
+		p, err := ParsePromptProfile(cp.PromptProfile)
+		if err != nil {
+			return ProfileSmall
+		}
+		return p
+	}
+	return ProfileForProvider(cfg.ProviderName())
+}
+
+// ParsePromptProfile parses a custom provider's prompt_profile value:
+// "small" or "frontier", case-insensitive; empty means "small".
+func ParsePromptProfile(s string) (PromptProfile, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "small":
+		return ProfileSmall, nil
+	case "frontier":
+		return ProfileFrontier, nil
+	default:
+		return ProfileSmall, fmt.Errorf("unknown prompt_profile %q (want small|frontier)", s)
 	}
 }
 

@@ -433,13 +433,15 @@ type Config struct {
 	// re-include something an outer layer excluded.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
 
-	// Include force-indexes paths an outer layer (notably the repo
-	// .gitignore) excludes — the dedicated, readable counterpart to
-	// hand-writing `!pattern` negations in Exclude. Each entry is appended
-	// last as a gitignore `!pattern` re-include, so it wins over the
-	// builtin / .gitignore / global / repo exclude layers. Use it for a
-	// vendored or generated tree you nonetheless want in the graph
-	// (e.g. Pods/, a per-customer customer/ directory).
+	// Include force-indexes paths over the builtin / .gitignore / global /
+	// repo exclude layers. A leading or inner slash anchors at the repo root;
+	// other entries match at any depth. Anchored literal paths also keep
+	// their parents open, for example vendor/acme/lib/. Wildcard and
+	// unanchored literals reopen their target only when its parents are open.
+	// Wildcards can reopen a matching folder, but not its excluded parents.
+	// A contents glob (vendor/**) does not reopen vendor/ itself.
+	// Per-directory ignore files still apply. Git metadata, non-MCP agent
+	// state and escaping symlinks remain excluded.
 	Include []string `mapstructure:"include" yaml:"include,omitempty"`
 
 	// RuleFiles are paths (or globs) to TOML files of user-defined
@@ -480,6 +482,7 @@ type Config struct {
 	// workspaces. Only `mode: read-only` is accepted in iteration 1.
 	CrossWorkspaceDeps []CrossWorkspaceDep `mapstructure:"cross_workspace_deps" yaml:"cross_workspace_deps,omitempty"`
 
+	Edit   EditConfig   `mapstructure:"edit" yaml:"edit,omitempty"`
 	Index  IndexConfig  `mapstructure:"index"    yaml:"index,omitempty"`
 	Watch  WatchConfig  `mapstructure:"watch"    yaml:"watch,omitempty"`
 	Query  QueryConfig  `mapstructure:"query"    yaml:"query,omitempty"`
@@ -526,6 +529,34 @@ type Config struct {
 	// — branches, tags and commits nobody has checked out. Empty takes
 	// the shipped retention bounds.
 	Views ViewsConfig `mapstructure:"views" yaml:"views,omitempty"`
+	// ContractAnalysis schedules the background contract analysis of
+	// linked git worktrees. Empty takes the shipped policy. The daemon
+	// reads it from its own config file (Load), never from a tracked
+	// repository's .gortex.yaml. It is kept out of IndexConfig on
+	// purpose: IndexConfig is part of every published contract cohort's
+	// identity, and a scheduling choice must not invalidate what was
+	// published under another.
+	ContractAnalysis ContractAnalysisConfig `mapstructure:"contract_analysis" yaml:"contract_analysis,omitempty"`
+}
+
+// ContractAnalysisConfig is the `contract_analysis:` block. It decides when
+// the daemon spends CPU on a linked worktree's contract analysis; primary
+// checkouts and requests that wait for fresh results are not affected.
+type ContractAnalysisConfig struct {
+	// LinkedPolicy is idle (the default: a linked worktree's job starts
+	// only after the daemon had no foreground work for LinkedIdleWindow),
+	// throttled (one linked job at a time, each worktree at most once per
+	// LinkedThrottleInterval) or eager (as soon as it is asked for). The
+	// GORTEX_CONTRACT_LINKED_POLICY env var overrides it.
+	LinkedPolicy string `mapstructure:"linked_policy" yaml:"linked_policy,omitempty"`
+	// LinkedIdleWindow is how long the daemon must have been idle before
+	// the idle policy starts a linked job, as a Go duration ("5s"). Empty
+	// takes the shipped window.
+	LinkedIdleWindow string `mapstructure:"linked_idle_window" yaml:"linked_idle_window,omitempty"`
+	// LinkedThrottleInterval is the least time between two job starts of
+	// one linked worktree under the throttled policy, as a Go duration
+	// ("30s"). Empty takes the shipped interval.
+	LinkedThrottleInterval string `mapstructure:"linked_throttle_interval" yaml:"linked_throttle_interval,omitempty"`
 }
 
 // ViewsConfig is the `views:` block. It bounds how much payload the
@@ -626,12 +657,56 @@ type ReviewRule struct {
 	Disabled bool `mapstructure:"disabled" yaml:"disabled,omitempty"`
 }
 
+// DirtyChainConfig is `index.dirty_chain`.
+//
+// A working-tree layer is always built as a per-file delta chained over the
+// checkout's previous working-tree layer, and its go/types pass is always
+// rooted at the packages the delta carries, with sibling bodies stripped and
+// the checkout's type-check state retained and warmed. What remains
+// configurable is the budget of that retained state and the resolver's
+// evidence scoping.
+type DirtyChainConfig struct {
+	// SemanticTypecheckCacheMB caps the retained type-check state across
+	// checkouts, in MiB of estimated heap. The least recently used checkout's
+	// state is dropped first. Zero means the provider default (256).
+	SemanticTypecheckCacheMB int `mapstructure:"semantic_typecheck_cache_mb" yaml:"semantic_typecheck_cache_mb,omitempty"`
+	// ResolverEvidenceScope lets an incremental resolve of an edited file
+	// skip re-attempting parked references whose candidate declarations the
+	// edit left unchanged (the incoming leg's declaration carry, and the
+	// deferred catch-up's prior-unresolved skip). It is not row-identical to
+	// the exhaustive legs, but measured against a clean index of the edited
+	// tree it differs only where the exhaustive legs differ too (they re-stamp
+	// and re-bind edges a whole index leaves alone). On when unset; false
+	// turns it off. GORTEX_RESOLVER_EVIDENCE_SCOPE=on|off overrides it.
+	ResolverEvidenceScope *bool `mapstructure:"resolver_evidence_scope" yaml:"resolver_evidence_scope,omitempty"`
+}
+
+// ResolverEvidenceScopeEnabled reports
+// index.dirty_chain.resolver_evidence_scope; unset is true.
+func (c IndexConfig) ResolverEvidenceScopeEnabled() bool {
+	if c.DirtyChain == nil || c.DirtyChain.ResolverEvidenceScope == nil {
+		return true
+	}
+	return *c.DirtyChain.ResolverEvidenceScope
+}
+
+// SemanticTypecheckCacheBytes reports index.dirty_chain.semantic_typecheck_cache_mb
+// in bytes; zero (unset or non-positive) means the provider default.
+func (c IndexConfig) SemanticTypecheckCacheBytes() int64 {
+	if c.DirtyChain == nil || c.DirtyChain.SemanticTypecheckCacheMB <= 0 {
+		return 0
+	}
+	return int64(c.DirtyChain.SemanticTypecheckCacheMB) << 20
+}
+
 type IndexConfig struct {
 	Languages []string `mapstructure:"languages" yaml:"languages,omitempty"`
 	// Exclude is deprecated — use top-level Config.Exclude instead.
 	// Still read for one release so existing .gortex.yaml files don't
 	// silently stop working; merged into the unified list by ConfigManager.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
+	// Include carries top-level force-includes, separate from gitignore rules.
+	Include []string `mapstructure:"-" yaml:"-"`
 	Workers int      `mapstructure:"workers" yaml:"workers,omitempty"`
 	// SkipEmbed is the effective skip-embedding rules resolved from
 	// Semantic.SkipEmbed. Not part of the on-disk YAML schema — it's
@@ -767,6 +842,13 @@ type IndexConfig struct {
 	// default) uses the built-in cap of 200 files. Configured under
 	// `index.affected_by_reresolve_max` in .gortex.yaml.
 	AffectedByReresolveMax int `mapstructure:"affected_by_reresolve_max" yaml:"affected_by_reresolve_max,omitempty"`
+	// DirtyChain holds the remaining knobs of an automatic checkout's
+	// working-tree build (DirtyChainConfig). Configured under
+	// `index.dirty_chain` in .gortex.yaml; nil takes every default. It is
+	// exempt from the configuration digest (it decides how a layer is built,
+	// not what it contains), so no value of it changes a stored generation's
+	// configuration identity.
+	DirtyChain *DirtyChainConfig `mapstructure:"dirty_chain" yaml:"dirty_chain,omitempty" json:",omitempty"`
 	// Transforms are pluggable pre-ingestion content processors. Each
 	// rewrites a matching file's bytes before the parser sees them —
 	// expanding minified bundles, normalising SVG/TOON, converting a
@@ -1333,6 +1415,8 @@ type WatchConfig struct {
 	// Exclude is deprecated — use top-level Config.Exclude instead.
 	// Kept for one release as a fallback merged into the unified list.
 	Exclude []string `mapstructure:"exclude" yaml:"exclude,omitempty"`
+	// Include carries top-level force-includes, separate from gitignore rules.
+	Include []string `mapstructure:"-" yaml:"-"`
 
 	// StormThreshold — when more than this many events arrive within
 	// StormWindowMs, the watcher switches from per-file debounced
@@ -1910,6 +1994,9 @@ func Load(configPath string) (*Config, error) {
 // in one pass rather than one round-trip per fix.
 func (c *Config) validateWorkspaceSchema() error {
 	var errs []string
+	if _, err := c.Edit.AckMode(); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if c.Project != "" && len(c.Projects) > 0 {
 		errs = append(errs, "config: 'project' and 'projects' are mutually exclusive — pick one")
 	}

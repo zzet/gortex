@@ -49,6 +49,21 @@ func editFileRequest(args map[string]any) mcp.CallToolRequest {
 	return req
 }
 
+// commitHeldFileMutationForTest supplies the real path lock now required by
+// the primitive. Keep the original request context (including cancellation and
+// checkout refusal evidence) so these existing deeper-boundary tests still
+// exercise their intended guard rather than a lock-admission refusal.
+func (s *Server) commitHeldFileMutationForTest(t *testing.T, ctx context.Context,
+	tool, mutationID, fingerprint, relPath, absPath string, data []byte, perm os.FileMode,
+) (*mutationCommitRecord, error) {
+	t.Helper()
+	held, release, err := acquireMutationPath(context.Background(), absPath)
+	require.NoError(t, err)
+	defer release()
+	ctx = context.WithValue(ctx, mutationPathAdmissionKey{}, held.Value(mutationPathAdmissionKey{}))
+	return s.commitFileMutation(ctx, tool, mutationID, fingerprint, relPath, absPath, data, perm)
+}
+
 // --- Criterion: timeout BEFORE the write applies nothing -------------------
 
 // A cancelled request must not reach the disk. The handler takes its
@@ -144,11 +159,18 @@ func TestAbandonedCallReportsCommittedDiskWrite(t *testing.T) {
 	target := filepath.Join(dir, "landed.go")
 
 	s := newMutationServer()
-	s.ToolCallTimeout = 150 * time.Millisecond
+	// The deadline must fire after the commit, and it starts before the
+	// handler runs, so the budget has to cover the atomic write. A 150ms
+	// budget lost that race on a slow Windows runner and the answer correctly
+	// said the write was still in flight. Two seconds is a wide margin over one
+	// small write.
+	s.ToolCallTimeout = 2 * time.Second
 
 	committed := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
 	handler := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		record, err := s.commitFileMutation(ctx, "write_file", "", "fp", "landed.go", target,
+		record, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "fp", "landed.go", target,
 			[]byte("package p\n"), 0o644)
 		require.NoError(t, err)
 		require.Equal(t, mutationDiskCommitted, record.diskStatus())
@@ -156,7 +178,9 @@ func TestAbandonedCallReportsCommittedDiskWrite(t *testing.T) {
 		// Stand in for the post-commit graph refresh that outran the budget:
 		// mutationReindexState can fall through to a synchronous, contextless
 		// IncrementalReindexRepo, which is where the reporter's 59s went.
-		time.Sleep(500 * time.Millisecond)
+		// Holding until the test has its answer keeps the handler running
+		// past the deadline however fast or slow the runner is.
+		<-release
 		return mcp.NewToolResultText("applied"), nil
 	}
 
@@ -199,7 +223,7 @@ func TestAbandonedCallReportsNotAppliedWrite(t *testing.T) {
 
 	handler := func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		<-ctx.Done() // the deadline fires first
-		_, err := s.commitFileMutation(ctx, "write_file", "", "fp", "refused.go", target,
+		_, err := s.commitHeldFileMutationForTest(t, ctx, "write_file", "", "fp", "refused.go", target,
 			[]byte("package p\n"), 0o644)
 		require.Error(t, err)
 		return mcp.NewToolResultText("unreachable"), nil
@@ -303,15 +327,14 @@ func TestMutationStatusResolvesReceiptPathAndListing(t *testing.T) {
 	require.Equal(t, "unrecorded", unknown["disk_status"])
 }
 
-func TestMutationStatusUnknownReceiptIsAnError(t *testing.T) {
+func TestMutationStatusUnknownReceiptIsLost(t *testing.T) {
 	s := newMutationServer()
 	req := mcp.CallToolRequest{}
 	req.Params.Name = "mutation_status"
 	req.Params.Arguments = map[string]any{"receipt": "commit-does-not-exist"}
 	res, err := s.handleMutationStatus(context.Background(), req)
 	require.NoError(t, err)
-	require.True(t, res.IsError)
-	require.Contains(t, resultText(res), "no mutation receipt")
+	require.Equal(t, "lost", resultJSON(t, res)["state"])
 }
 
 // --- Criterion: retrying after a timeout is idempotent ---------------------
@@ -628,6 +651,9 @@ func TestMutationStatusMarksTerminalGraphStatus(t *testing.T) {
 			s := newMutationServer()
 			record := s.beginMutationCommit(context.Background(), "edit_file", "", "fp", "pkg/a.go", "/abs/pkg/a.go")
 			record.markCommitted("sha", 10)
+			if tc.outcome.Pending {
+				pendingFreshnessReceipt(s, tc.outcome.Receipt, "", record.absPath, tc.outcome.Generation)
+			}
 			if !tc.unrecorded {
 				record.recordGraph(tc.outcome)
 			}
@@ -707,7 +733,14 @@ func TestRenameStopsWritingOnceCancelled(t *testing.T) {
 		}
 	}
 
-	results := s.commitRenameWrites(ctx, writes)
+	paths := make([]string, len(writes))
+	for i, w := range writes {
+		paths[i] = w.AbsPath
+	}
+	heldCtx, releasePaths, err := acquireMutationPaths(ctx, paths)
+	require.NoError(t, err)
+	defer releasePaths()
+	results := s.commitRenameWrites(heldCtx, writes, releasePaths)
 	require.Len(t, results, 2, "the rename must stop instead of attempting every remaining file")
 	require.Equal(t, "applied", results[0]["status"])
 	require.Equal(t, mutationDiskCommitted, results[0]["disk_status"])

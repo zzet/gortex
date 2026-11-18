@@ -235,8 +235,7 @@ func setupMultiRepoRenameRecoveryServer(
 	registry := testRegistry()
 	store := graph.New()
 	multi := indexer.NewMultiIndexer(store, registry, search.NewNull(), manager, zap.NewNop())
-	_, err = multi.IndexAll()
-	require.NoError(t, err)
+	registerMCPFixtureRepos(t, multi, manager)
 
 	var base *indexer.Indexer
 	if baseCfg != nil {

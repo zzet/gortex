@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"sort"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/zzet/gortex/internal/analysis"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
 )
 
 // handleGetRepoOutline returns a single-call narrative overview of the
@@ -23,51 +25,146 @@ import (
 // follows up with smart_context, find_usages, etc. on specific symbols
 // surfaced here.
 func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	const (
-		topCommunitiesN  = 5
-		topHotspotsN     = 5
-		topMostImportedN = 10
-		topEntryPointsN  = 10
-		topLanguagesN    = 5
-	)
 
-	// scopedNodes confines the whole-repo overview to the session's
-	// workspace — for an unbound session it returns every node, so the
-	// outline is byte-identical to the legacy global view. inScope is
-	// the node-ID set used to bound the edge-driven and analyzer-driven
-	// sections; nil for an unbound session means "no filter".
-	_, _, bound := s.sessionScope(ctx)
+	// Bound sessions aggregate the request reader's scope in the backend.
+	// Keep unbound sessions on the cached Stats / EdgeCount path.
+	opts, bound := s.sessionScopeOptions(ctx)
+	if bound {
+		opts, _ = s.scopeOptionsWithRepoNarrow(ctx, repoAllowFromContext(ctx))
+	}
 
 	// Every node / edge read below goes through the request's reader, so
 	// an overlay-active caller sees its own buffers. Hoisted once: the
 	// outline touches the reader from several sections.
 	reader := s.readerFor(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key, cacheable := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound)
+	if cacheable {
+		if payload, ok := s.outlineResponses.get(key); ok {
+			if after, valid := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound); valid && after == key && ctx.Err() == nil {
+				return s.respondJSONOrTOON(ctx, req, payload)
+			}
+		}
+	}
+	payload, err := s.buildRepoOutline(ctx, reader, opts, bound)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		if after, valid := s.outlineCacheKey(reader, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}, bound); valid && after == key && ctx.Err() == nil && contractCoreReadError(ctx) == nil {
+			s.outlineResponses.put(key, payload)
+		}
+	}
+	return s.respondJSONOrTOON(ctx, req, payload)
+}
 
-	// Pull the full scoped node slice only when the session is bound
-	// — the lang count, total-node count, and edge filter need it then.
-	// Unbound sessions get the same numbers from the backend's cached
-	// Stats() (one indexed groupby on disk backends) and the
-	// callable-only entry-point pass, neither of which materialises
-	// the whole node table over cgo.
+const outlineMostImportedLimit = 10
+
+type outlineLanguage struct {
+	Name  string `json:"name"`
+	Nodes int    `json:"nodes"`
+}
+
+func (s *Server) buildRepoOutline(ctx context.Context, reader graph.Reader, opts query.QueryOptions, bound bool) (map[string]any, error) {
+	const (
+		topHotspotsN    = 5
+		topEntryPointsN = 10
+		topLanguagesN   = 5
+	)
+
+	scope := graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}
+	var prepared *outlinePreparedSummary
+	if key, ok := s.outlineCacheKey(reader, scope, bound); ok {
+		if counts, ready := s.outlineResponses.getSummary(key); ready {
+			if after, valid := s.outlineCacheKey(reader, scope, bound); valid && after == key {
+				prepared = &counts
+			}
+		}
+	}
+	reader = graph.BindReadContext(reader, ctx)
+
+	scopedNodes, _ := graph.BindReadContext(reader, ctx).(graph.ScopedOutlineNodeReader)
+	var candidateErr error
+
 	var scoped []*graph.Node
 	var inScope map[string]bool
+	var aggregated *graph.OutlineCounts
 	if bound {
-		scoped = s.scopedNodesLight(ctx)
-		inScope = make(map[string]bool, len(scoped))
-		for _, n := range scoped {
-			inScope[n.ID] = true
+		if prepared != nil {
+			aggregated = &prepared.counts
+		} else if counts, ok, err := scopedOutlineCountsFor(reader, graph.NodeScope{
+			WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow,
+		}); err != nil {
+			return nil, err
+		} else if ok {
+			aggregated = &counts
+		} else {
+			// Overlays deliberately take the existing reader-based path.
+			scoped = s.scopedNodesLight(ctx)
+			inScope = make(map[string]bool, len(scoped))
+			for _, n := range scoped {
+				inScope[n.ID] = true
+			}
 		}
+	}
+	// The aggregate path resolves only analyzer and entry-point candidates.
+	// Cache negative lookups as well, and stop community lookups as soon as
+	// one member matches instead of fetching every member of large groups.
+	checked := make(map[string]bool)
+	candidateScope := make(map[string]bool)
+	loadCandidates := func(ids []string) {
+		for start := 0; start < len(ids); start += outlineCandidateBatchSize {
+			chunk := ids[start:min(start+outlineCandidateBatchSize, len(ids))]
+			var missing []string
+			for _, id := range chunk {
+				if !checked[id] {
+					missing = append(missing, id)
+					checked[id] = true
+				}
+			}
+			if len(missing) > 0 {
+				if scopedNodes != nil {
+					ids, err := scopedNodes.OutlineNodeIDsInScope(scope, missing)
+					candidateErr = errors.Join(candidateErr, err)
+					for _, id := range ids {
+						candidateScope[id] = true
+					}
+				} else {
+					for id, n := range reader.GetNodesByIDs(missing) {
+						candidateScope[id] = n != nil && opts.ScopeAllows(n)
+					}
+				}
+			}
+		}
+	}
+	allowsAny := func(ids []string) bool {
+		if !bound {
+			return true
+		}
+		allowed := inScope
+		if aggregated != nil {
+			loadCandidates(ids)
+			allowed = candidateScope
+		}
+		for _, id := range ids {
+			if allowed[id] {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Language breakdown — computed from the scoped node set so the
 	// counts reflect only the session's workspace.
-	type langEntry struct {
-		Name  string `json:"name"`
-		Nodes int    `json:"nodes"`
-	}
+
 	langCounts := make(map[string]int)
 	totalScopedNodes := 0
-	if bound {
+	if aggregated != nil {
+		maps.Copy(langCounts, aggregated.ByLanguage)
+		totalScopedNodes = aggregated.TotalNodes
+	} else if bound {
 		for _, n := range scoped {
 			if n.Language != "" {
 				langCounts[n.Language]++
@@ -81,9 +178,9 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 		maps.Copy(langCounts, stats.ByLanguage)
 		totalScopedNodes = stats.TotalNodes
 	}
-	var languages []langEntry
+	var languages []outlineLanguage
 	for name, n := range langCounts {
-		languages = append(languages, langEntry{Name: name, Nodes: n})
+		languages = append(languages, outlineLanguage{Name: name, Nodes: n})
 	}
 	sort.Slice(languages, func(i, j int) bool {
 		if languages[i].Nodes != languages[j].Nodes {
@@ -104,9 +201,13 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// the backend's EdgeCount() — an O(1) lookup that skips
 	// materialising every edge over cgo.
 	totalEdges := 0
-	if inScope == nil {
+	if aggregated != nil {
+		totalEdges = aggregated.TotalEdges
+	} else if inScope == nil {
 		totalEdges = reader.EdgeCount()
 	} else {
+		// Repository scoping for outline is tracked separately from the
+		// read-tool work; until then a bound session counts from the full scan.
 		for _, e := range reader.AllEdges() {
 			if !inScope[e.From] || !inScope[e.To] {
 				continue
@@ -125,44 +226,61 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 	// Communities — top N by member count, filtered to communities
 	// with at least one member inside the session's workspace.
 	communitiesSection := map[string]any{"count": 0}
-	if comms := s.getCommunities(); comms != nil && len(comms.Communities) > 0 {
-		sorted := make([]analysis.Community, 0, len(comms.Communities))
-		for _, c := range comms.Communities {
-			if inScope == nil {
-				sorted = append(sorted, c)
-				continue
+	if prepared != nil && prepared.communities != nil {
+		communitiesSection = prepared.communities
+	} else {
+		var comms *analysis.CommunityResult
+		generationCommunities := false
+		if aggregated != nil {
+			var err error
+			comms, generationCommunities, err = s.outlineGenerationCommunities(ctx, reader, graph.NodeScope{
+				WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow,
+			})
+			if err != nil {
+				return nil, err
 			}
-			for _, m := range c.Members {
-				if inScope[m] {
-					sorted = append(sorted, c)
-					break
+		}
+		if !generationCommunities {
+			comms = s.getCommunities()
+		}
+		if comms != nil && (generationCommunities || len(comms.Communities) > 0) {
+			sorted := make([]analysis.Community, 0, len(comms.Communities))
+			if generationCommunities {
+				sorted = append(sorted, comms.Communities...)
+			} else if aggregated != nil {
+				sorted = outlineCommunitiesInScope(comms.Communities, loadCandidates, candidateScope)
+			} else {
+				for _, c := range comms.Communities {
+					if allowsAny(c.Members) {
+						sorted = append(sorted, c)
+					}
 				}
 			}
+			communitiesSection = outlineCommunitySection(sorted, comms.Modularity)
 		}
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i].Size > sorted[j].Size
-		})
-		top := sorted
-		if len(top) > topCommunitiesN {
-			top = top[:topCommunitiesN]
-		}
-		communitiesSection = map[string]any{
-			"count":      len(sorted),
-			"modularity": comms.Modularity,
-			"top":        topCommunitiesSummary(top),
-		}
+
 	}
 
 	// Hotspots — load-bearing symbols by fan-in/out/crossings. Use a low
 	// threshold to ensure we get the top N regardless of repo size.
 	// Post-filtered to the session's workspace.
 	hotspotsSection := []map[string]any{}
-	hs := s.getHotspots()
-	for _, h := range hs {
+	hs := s.outlineHotspots()
+	for i, h := range hs {
 		if len(hotspotsSection) >= topHotspotsN {
 			break
 		}
-		if inScope != nil && !inScope[h.ID] {
+		if aggregated != nil && i%outlineCandidateBatchSize == 0 {
+			// Resolve one ranked head at a time; stop once the outline has
+			// enough visible hotspots rather than hydrating the entire list.
+			end := min(i+outlineCandidateBatchSize, len(hs))
+			ids := make([]string, 0, end-i)
+			for _, candidate := range hs[i:end] {
+				ids = append(ids, candidate.ID)
+			}
+			loadCandidates(ids)
+		}
+		if bound && !allowsAny([]string{h.ID}) {
 			continue
 		}
 		hotspotsSection = append(hotspotsSection, map[string]any{
@@ -176,13 +294,65 @@ func (s *Server) handleGetRepoOutline(ctx context.Context, req mcp.CallToolReque
 		})
 	}
 
-	return s.respondJSONOrTOON(ctx, req, map[string]any{
+	imported := []map[string]any(nil)
+	var entries []map[string]any
+	if aggregated != nil {
+		counts := make(map[string]int, len(aggregated.FileImports))
+		for _, row := range aggregated.FileImports {
+			counts[row.FilePath] = row.Count
+		}
+		if prepared != nil {
+			imported = prepared.imports
+		} else {
+			imported = rankImportedFiles(counts, outlineMostImportedLimit)
+		}
+		if scopedNodes != nil {
+			mains, err := scopedNodes.OutlineNodesByName(scope, "main")
+			if err != nil {
+				return nil, err
+			}
+			entries = entryPointsForNodes(mains, nil, topEntryPointsN)
+		} else {
+			mains := reader.FindNodesByName("main")
+			ids := make([]string, 0, len(mains))
+			for _, n := range mains {
+				if n != nil {
+					ids = append(ids, n.ID)
+				}
+			}
+			for id, n := range reader.GetNodesByIDs(ids) {
+				candidateScope[id] = opts.ScopeAllows(n)
+			}
+			entries = entryPointsForNodes(mains, candidateScope, topEntryPointsN)
+		}
+	} else {
+		imported = mostImportedFiles(reader, inScope, outlineMostImportedLimit)
+		entries = entryPoints(reader, inScope, topEntryPointsN)
+	}
+	if candidateErr != nil {
+		return nil, candidateErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{
 		"summary":             summary,
 		"communities":         communitiesSection,
 		"hotspots":            hotspotsSection,
-		"most_imported_files": mostImportedFiles(reader, inScope, topMostImportedN),
-		"entry_points":        entryPoints(reader, inScope, topEntryPointsN),
-	})
+		"most_imported_files": imported,
+		"entry_points":        entries,
+	}, nil
+}
+
+// outlineCommunitySection shares the exact legacy ranking/tie behavior with
+// explicit summary preparation; only the small final section is retained.
+func outlineCommunitySection(sorted []analysis.Community, modularity float64) map[string]any {
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Size > sorted[j].Size })
+	top := sorted
+	if len(top) > 5 {
+		top = top[:5]
+	}
+	return map[string]any{"count": len(sorted), "modularity": modularity, "top": topCommunitiesSummary(top)}
 }
 
 // topCommunitiesSummary shapes a subset of communities for the outline.
@@ -214,10 +384,6 @@ func topCommunitiesSummary(comms []analysis.Community) []map[string]any {
 // Falls back to the AllEdges-driven loop on backends that don't — which
 // is what an overlay view takes, since it implements no aggregate.
 func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[string]any {
-	type fileCount struct {
-		path  string
-		count int
-	}
 	counts := make(map[string]int)
 	if ag, ok := g.(graph.FileImportAggregator); ok {
 		var scope []string
@@ -237,6 +403,8 @@ func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[
 			counts[r.FilePath] = r.Count
 		}
 	} else {
+		// Fallback for readers without the import aggregate; outline scoping is
+		// tracked separately from the read-tool work.
 		for _, e := range g.AllEdges() {
 			if e.Kind != graph.EdgeImports {
 				continue
@@ -259,6 +427,14 @@ func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[
 		}
 	}
 
+	return rankImportedFiles(counts, topN)
+}
+
+func rankImportedFiles(counts map[string]int, topN int) []map[string]any {
+	type fileCount struct {
+		path  string
+		count int
+	}
 	var ranked []fileCount
 	for p, c := range counts {
 		ranked = append(ranked, fileCount{path: p, count: c})
@@ -295,13 +471,17 @@ func mostImportedFiles(g graph.Reader, inScope map[string]bool, topN int) []map[
 // the name lookup so a bound session never sees mains from other
 // workspaces.
 func entryPoints(g graph.Reader, inScope map[string]bool, topN int) []map[string]any {
+	return entryPointsForNodes(g.FindNodesByName("main"), inScope, topN)
+}
+
+func entryPointsForNodes(nodes []*graph.Node, inScope map[string]bool, topN int) []map[string]any {
 	type ep struct {
 		id       string
 		name     string
 		filePath string
 	}
 	var out []ep
-	for _, n := range g.FindNodesByName("main") {
+	for _, n := range nodes {
 		if n == nil {
 			continue
 		}

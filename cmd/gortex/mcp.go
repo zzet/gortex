@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,7 +17,9 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/llm/conversationlog"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/platform"
+	"github.com/zzet/gortex/internal/savings"
 	"github.com/zzet/gortex/internal/server"
 	"github.com/zzet/gortex/internal/server/hub"
 	"github.com/zzet/gortex/internal/serverstack"
@@ -63,7 +66,7 @@ func init() {
 	mcpCmd.Flags().BoolVar(&mcpServerAPI, "server", false, "start HTTP server API alongside MCP stdio")
 	mcpCmd.Flags().StringVar(&mcpBind, "bind", "127.0.0.1", "bind address for --server; requires --auth-token when not localhost")
 	mcpCmd.Flags().StringVar(&mcpAuthToken, "auth-token", "", "bearer token for --server's /v1/* requests (fallback: $GORTEX_SERVER_TOKEN)")
-	mcpCmd.Flags().StringVar(&mcpCORSOrigin, "cors-origin", "*", "allowed CORS origin for server API")
+	mcpCmd.Flags().StringVar(&mcpCORSOrigin, "cors-origin", "", "trusted web origin allowed to call the server API (default: refuse browser origins; '*' does not grant browser access)")
 	mcpCmd.Flags().StringSliceVar(&mcpTrack, "track", nil, "additional repository paths to track")
 	mcpCmd.Flags().StringVar(&mcpProject, "project", "", "active project name")
 	mcpCmd.Flags().StringVar(&mcpCacheDir, "cache-dir", "", "directory for the side stores — notes, feedback, server id (default ~/.gortex/cache/)")
@@ -242,8 +245,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// permission or broken-socket failure. Preserve that distinction before
 	// startup selection so even an opted-in embedded server cannot mask a live
 	// daemon or a system error.
-	if err := probeDaemonAvailability(); err != nil && !daemon.ShouldFallBackToEmbedded(err) {
-		return fmt.Errorf("check gortex daemon availability: %w", err)
+	availabilityErr := probeDaemonAvailability()
+	if availabilityErr != nil && !daemon.ShouldFallBackToEmbedded(availabilityErr) && !errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return fmt.Errorf("check gortex daemon availability: %w", availabilityErr)
 	}
 
 	// Daemon-first: ensure a daemon is up (auto-starting it under a
@@ -252,7 +256,13 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// identical from a terminal or a pipe given the same daemon state. The
 	// legacy --no-daemon flag is an inert no-op (warned above); embedded mode
 	// is available only through the machine-global opt-in checked below.
-	decision := resolveDaemonDecision()
+	decision, observedMismatch, startupErr := ensureDaemonReadyWithError(daemon.ParseAutostart())
+	if startupErr != nil {
+		return startupErr
+	}
+	if decision == daemonUnavailable && errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return daemonMismatchError(daemonIdentityFromMismatch(availabilityErr))
+	}
 	switch decision {
 	case daemonReady, daemonAutostarted:
 		ran, proxyErr := runProxy(cmd.Context(), proxyToolSurface())
@@ -278,6 +288,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			if ran {
 				return nil
 			}
+		} else if errors.Is(probeErr, daemon.ErrProtocolVersionMismatch) {
+			return daemonMismatchError(daemonIdentityFromMismatch(probeErr))
 		} else if !daemon.ShouldFallBackToEmbedded(probeErr) {
 			return fmt.Errorf("check gortex daemon availability: %w", probeErr)
 		}
@@ -287,6 +299,15 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+	// A mismatch observed earlier in this invocation is not erased if the
+	// daemon vanishes between ensure and the proxy dial. Handoff/proxy failure
+	// must not turn a live-daemon protocol refusal into embedded startup.
+	if errors.Is(availabilityErr, daemon.ErrProtocolVersionMismatch) {
+		return daemonMismatchError(daemonIdentityFromMismatch(availabilityErr))
+	}
+	if observedMismatch.mismatch() {
+		return daemonMismatchError(observedMismatch)
 	}
 	if mcpForceProxy {
 		return fmt.Errorf("gortex daemon is unavailable and --proxy requires it; start the daemon with `gortex daemon start`")
@@ -403,6 +424,14 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	mi := ss.MultiIndexer
 	srv := ss.MCP
 
+	// Bound this process's savings window and commit it on the way out.
+	// Registered AFTER `defer ss.Close()`, so LIFO runs it BEFORE the stack
+	// teardown — covering every exit path from here on: the errCh return,
+	// the SIGINT/SIGTERM return, and any error return in between. A SIGKILL
+	// still loses whatever is buffered, which is why the bound is seconds
+	// and a handful of events rather than the daemon's minute.
+	defer installOneshotSavingsFlush(srv)()
+
 	// Announce the degraded mode to the CLIENT, not just to stderr. An
 	// MCP host that discards stderr — most of them — otherwise cannot
 	// tell an embedded single-tree answer from a daemon-backed one, and
@@ -463,9 +492,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		serverHandler.SetConversationDir(conversationlog.DirFromEnv())
 		authTokenForGuard := authToken
 		serverHandler.SetConversationGuard(nil, func() string { return authTokenForGuard })
-		handler := server.WithAuth(serverHandler, authToken)
-		corsOpts := server.CORSOptions{AllowOrigins: []string{mcpCORSOrigin}}
-		handler = server.WithCORS(handler, corsOpts)
+		handler := composeMCPServerHandler(serverHandler, authToken, mcpCORSOrigin)
 		go func() {
 			serverAddr := fmt.Sprintf("%s:%d", mcpBind, mcpPort)
 			fmt.Fprintf(os.Stderr, "[gortex] server API at http://%s\n", serverAddr)
@@ -554,4 +581,28 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n[gortex] received %s, shutting down\n", sig)
 		return nil
 	}
+}
+
+// installOneshotSavingsFlush tightens the token-savings ledger's coalescing
+// window for a one-shot stdio server and returns the flush to defer.
+//
+// The coalescing that makes an idle agent session cheap was built for the
+// daemon: a long-lived process where losing the last minute of accounting on
+// a crash is nothing against the ~37 KB sidecar transaction every read-only
+// tool call used to pay. A `gortex mcp` / `gortex server` process is the
+// other shape — MCP hosts SIGKILL their stdio servers, and a whole session
+// can be shorter than the default window, which is the flat-file era's
+// "permanently empty under SIGKILLing MCP clients" bug all over again. So the
+// window here is savings.OneshotFlushInterval / savings.OneshotFlushMax, and
+// every graceful exit commits explicitly rather than relying on the stack's
+// teardown chain reaching its savings step.
+//
+// Returns a no-op closure when the server has no ledger wired (embedded
+// fixtures, persistence disabled), so the call site can defer it blind.
+func installOneshotSavingsFlush(srv *gortexmcp.Server) func() {
+	if srv == nil {
+		return func() {}
+	}
+	srv.SetSavingsFlushBounds(savings.OneshotFlushInterval, savings.OneshotFlushMax)
+	return func() { _ = srv.FlushSavings() }
 }

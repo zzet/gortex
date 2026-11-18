@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -853,12 +854,48 @@ func writeLocalizationState(path string, value any) bool {
 	// A concurrent reader of the very state file being replaced makes the
 	// commit fail with a sharing violation on Windows, and the hook would drop
 	// a terminal marker it believed it had written; platform.ReplaceFile
-	// retries that refusal briefly.
-	if err := platform.ReplaceFile(tmpPath, path); err != nil {
+	// retries that refusal briefly. Concurrent writers are serialized first:
+	// on Windows every in-flight replace of the destination (and the scanner
+	// handles each fresh replacement attracts) refuses all the others, so
+	// unserialized writers keep invalidating one another's retries and a
+	// backed-off writer can lose every attempt until its budget runs out.
+	release := lockLocalizationStateDir(dir)
+	err = platform.ReplaceFile(tmpPath, path)
+	release()
+	if err != nil {
 		return false
 	}
 	committed = true
 	return true
+}
+
+// localizationStateWriteLockName is the per-directory sidecar that serializes
+// state commits. It is not a .json file, so trimStateDir never prunes it, and
+// lifecycle rotation removes it with its namespace.
+const localizationStateWriteLockName = ".state-write.lock"
+
+const (
+	// The wait outlasts platform.ReplaceFile's own retry budget, so a writer
+	// queued behind one slow commit still gets its turn.
+	localizationStateWriteLockWait  = 5 * time.Second
+	localizationStateWriteLockDelay = 2 * time.Millisecond
+)
+
+// lockLocalizationStateDir takes the cross-process commit lock for dir and
+// returns its release. The lock only orders writers; it is not needed for
+// correctness, because each commit is an atomic replace. When the lock cannot
+// be taken in time (or at all) the commit proceeds unserialized rather than
+// dropping state.
+func lockLocalizationStateDir(dir string) func() {
+	lock := flock.New(filepath.Join(dir, localizationStateWriteLockName))
+	ctx, cancel := context.WithTimeout(context.Background(), localizationStateWriteLockWait)
+	defer cancel()
+	locked, err := lock.TryLockContext(ctx, localizationStateWriteLockDelay)
+	if err != nil || !locked {
+		_ = lock.Close()
+		return func() {}
+	}
+	return func() { _ = lock.Close() }
 }
 
 // writeBoundedLocalizationState keeps transient marker/snapshot storage

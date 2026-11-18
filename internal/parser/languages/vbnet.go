@@ -60,7 +60,14 @@ var (
 	// to sit directly after the modifier run.
 	vbSubRe      = regexp.MustCompile(`(?im)^[ \t]*(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|MustOverride|NotOverridable|Shadows|Partial|Async|Iterator)[ \t]+)*Sub[ \t]+([A-Za-z_]\w*)`)
 	vbFunctionRe = regexp.MustCompile(`(?im)^[ \t]*(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|MustOverride|NotOverridable|Shadows|Partial|Async|Iterator)[ \t]+)*Function[ \t]+([A-Za-z_]\w*)`)
-	vbPropertyRe = regexp.MustCompile(`(?im)^[ \t]*(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|MustOverride|NotOverridable|Shadows|ReadOnly|WriteOnly|Default|Iterator)[ \t]+)*Property[ \t]+([A-Za-z_]\w*)`)
+	// A multiline lambda opener — `Sub(...)` / `Function(...) [As T]` ending
+	// its line — closes with the same `End Sub` / `End Function` as the
+	// enclosing callable, so it counts as a nested block for extent depth.
+	// These locate the keyword; vbLambdaOpener checks the rest of the line.
+	vbSubLambdaRe      = regexp.MustCompile(`(?i)\bSub[ \t]*\(`)
+	vbFunctionLambdaRe = regexp.MustCompile(`(?i)\bFunction[ \t]*\(`)
+	vbTypeNameRe       = regexp.MustCompile(`^[A-Za-z_][\w.]*\??`)
+	vbPropertyRe       = regexp.MustCompile(`(?im)^[ \t]*(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|MustOverride|NotOverridable|Shadows|ReadOnly|WriteOnly|Default|Iterator)[ \t]+)*Property[ \t]+([A-Za-z_]\w*)`)
 
 	vbImportsRe    = regexp.MustCompile(`(?im)^[ \t]*Imports[ \t]+(?:[A-Za-z_]\w*[ \t]*=[ \t]*)?([A-Za-z_][\w.]*)`)
 	vbInheritsRe   = regexp.MustCompile(`(?im)^[ \t]*Inherits[ \t]+([A-Za-z_][\w.]*)`)
@@ -141,7 +148,7 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	for _, m := range vbNamespaceRe.FindAllSubmatchIndex(src, -1) {
 		name := string(src[m[2]:m[3]])
 		line := lineAt(src, m[0])
-		end := vbContainerEnd(lines, line, vbNamespaceRe, "end namespace")
+		end := vbContainerEnd(lines, line, vbNamespaceRe.MatchString, hasPrefixWord, "end namespace")
 		id := add(filePath+"::"+name, name, graph.KindPackage, line, end, nil)
 		if id != "" {
 			namespaces = append(namespaces, vbRange{name: name, id: id, start: line, end: end})
@@ -178,7 +185,7 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		for _, m := range spec.re.FindAllSubmatchIndex(src, -1) {
 			name := string(src[m[2]:m[3]])
 			line := lineAt(src, m[0])
-			end := vbContainerEnd(lines, line, spec.re, spec.endKw)
+			end := vbContainerEnd(lines, line, spec.re.MatchString, hasPrefixWord, spec.endKw)
 			meta := map[string]any{"type_flavor": spec.flavor}
 			if ns := enclosingNS(line); ns != "" {
 				meta["scope_ns"] = ns
@@ -270,17 +277,25 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 		}
 	}
 
+	// Comments and string literals are blanked first so call- and
+	// lambda-shaped text in them (`' obj.Delete()`, `"x.Drop("`) is not
+	// scanned. The masked copy keeps every byte offset, so names and lines
+	// are still read from src.
+	code := vbMaskCommentsAndStrings(src)
+	codeLines := strings.Split(string(code), "\n")
+
 	for _, spec := range []struct {
 		re         *regexp.Regexp
 		endKw      string
 		freeKind   graph.NodeKind
 		memberKind graph.NodeKind
 		skip       *regexp.Regexp
+		nests      func(string) bool
 	}{
-		{vbSubRe, "end sub", graph.KindFunction, graph.KindMethod, vbDeclareRe},
-		{vbFunctionRe, "end function", graph.KindFunction, graph.KindMethod, vbDeclareRe},
-		{vbPropertyRe, "end property", graph.KindField, graph.KindField, nil},
-		{vbEventRe, "end event", graph.KindEvent, graph.KindEvent, nil},
+		{vbSubRe, "end sub", graph.KindFunction, graph.KindMethod, vbDeclareRe, vbLambdaOpener(vbSubLambdaRe, false)},
+		{vbFunctionRe, "end function", graph.KindFunction, graph.KindMethod, vbDeclareRe, vbLambdaOpener(vbFunctionLambdaRe, true)},
+		{vbPropertyRe, "end property", graph.KindField, graph.KindField, nil, nil},
+		{vbEventRe, "end event", graph.KindEvent, graph.KindEvent, nil, nil},
 	} {
 		for _, m := range spec.re.FindAllSubmatchIndex(src, -1) {
 			line := lineAt(src, m[0])
@@ -291,9 +306,17 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 			}
 			name := string(src[m[2]:m[3]])
 			// Interface members, MustOverride members and auto-properties have
-			// no terminator; findKeywordBlockEnd returns the start line, which
+			// no terminator; both block-end helpers return the start line, which
 			// is the correct single-line extent.
-			end := findKeywordBlockEnd(lines, line, spec.endKw)
+			var end int
+			if spec.nests != nil {
+				// Sub/Function count same-kind multiline lambdas as nesting;
+				// masked lines keep `' Example: Sub()` from opening one, and
+				// vbEndsBlock closes a lambda passed as an argument.
+				end = vbContainerEnd(codeLines, line, spec.nests, vbEndsBlock, spec.endKw)
+			} else {
+				end = findKeywordBlockEnd(lines, line, spec.endKw)
+			}
 			emitCallable(name, line, end, spec.freeKind, spec.memberKind, nil)
 		}
 	}
@@ -368,10 +391,6 @@ func (e *VBNetExtractor) Extract(filePath string, src []byte) (*parser.Extractio
 	// the call scan below can skip it, and emitted as a type reference.
 	type vbSpan struct{ start, end int }
 	var newSpans []vbSpan
-	// Comments and string literals are blanked first so call-shaped text in
-	// them (`' obj.Delete()`, `"x.Drop("`) is not scanned. The masked copy
-	// keeps every byte offset, so names and lines are still read from src.
-	code := vbMaskCommentsAndStrings(src)
 	for _, m := range vbNewRe.FindAllSubmatchIndex(code, -1) {
 		newSpans = append(newSpans, vbSpan{start: m[2], end: m[3]})
 		if n := vbSimpleName(string(src[m[2]:m[3]])); n != "" {
@@ -535,7 +554,7 @@ func vbIsRem(src []byte, i int) bool {
 //
 // Returns startLine when no terminator is found, matching
 // findKeywordBlockEnd's degradation for an unterminated block.
-func vbContainerEnd(lines []string, startLine int, openRe *regexp.Regexp, endKw string) int {
+func vbContainerEnd(lines []string, startLine int, opens func(string) bool, ends func(line, endKw string) bool, endKw string) int {
 	if startLine < 1 || startLine > len(lines) {
 		return startLine
 	}
@@ -548,18 +567,90 @@ func vbContainerEnd(lines []string, startLine int, openRe *regexp.Regexp, endKw 
 		// Terminator first: "End Class" never satisfies the opening pattern
 		// (End is not a modifier), but checking it first keeps that
 		// independent of the pattern's exact shape.
-		if hasPrefixWord(toLower(trimmedLine), endKw) {
+		if ends(toLower(trimmedLine), endKw) {
 			depth--
 			if depth == 0 {
 				return i + 1
 			}
 			continue
 		}
-		if openRe.MatchString(lines[i]) {
+		if opens(lines[i]) {
 			depth++
 		}
 	}
 	return startLine
+}
+
+// vbEndsBlock reports whether a lowercased, trimmed, comment-masked line
+// starts with endKw as a whole word. Unlike hasPrefixWord it accepts any
+// character that cannot continue an identifier, so a multiline lambda passed
+// as an argument (`End Function)`, `End Sub, Nothing)`) closes the nesting
+// its opener counted. Namespaces and types keep hasPrefixWord: they scan
+// unmasked lines, where `End Namespace"` can sit inside a string literal.
+func vbEndsBlock(line, endKw string) bool {
+	if !strings.HasPrefix(line, endKw) {
+		return false
+	}
+	if len(line) == len(endKw) {
+		return true
+	}
+	c := line[len(endKw)]
+	return c != '_' && (c < 'a' || c > 'z') && (c < '0' || c > '9')
+}
+
+// vbLambdaOpener returns a predicate reporting whether a comment-masked line
+// ends with a multiline lambda header: the keyword located by kwRe, a
+// balanced parameter list (`xs() As Integer`, `xs As List(Of Integer)`),
+// and, when allowAs is set, an optional `As T` return clause.
+func vbLambdaOpener(kwRe *regexp.Regexp, allowAs bool) func(string) bool {
+	return func(line string) bool {
+		for _, m := range kwRe.FindAllStringIndex(line, -1) {
+			rest, ok := vbSkipParens(line[m[1]-1:])
+			if !ok {
+				continue
+			}
+			rest = strings.TrimSpace(rest)
+			if allowAs && len(rest) > 3 && strings.EqualFold(rest[:2], "as") && (rest[2] == ' ' || rest[2] == '\t') {
+				rest = strings.TrimSpace(rest[3:])
+				n := vbTypeNameRe.FindStringIndex(rest)
+				if n == nil {
+					continue
+				}
+				rest = rest[n[1]:]
+				// Generic `(Of T)` and array `()` suffixes, each balanced.
+				for ok && strings.HasPrefix(rest, "(") {
+					rest, ok = vbSkipParens(rest)
+					rest = strings.TrimPrefix(rest, "?")
+				}
+				if !ok {
+					continue
+				}
+				rest = strings.TrimSpace(rest)
+			}
+			if rest == "" {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// vbSkipParens returns what follows the parenthesis matching the `(` at
+// s[0], or false when it is unbalanced on this line.
+func vbSkipParens(s string) (string, bool) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[i+1:], true
+			}
+		}
+	}
+	return "", false
 }
 
 // vbVisibility reads the access modifier off a declaration line. VB defaults

@@ -3,6 +3,7 @@ package indexer
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"go.uber.org/zap"
@@ -124,6 +125,63 @@ func TestResolveProviderHandlersUsesOneNameAndFileBatch(t *testing.T) {
 		if _, ok := items[0].Meta["handler_ident"]; ok {
 			t.Fatalf("contract %s retained internal handler hint", id)
 		}
+	}
+}
+
+func TestResolveProviderHandlersKeepsDistinctRegistrationRecords(t *testing.T) {
+	root := t.TempDir()
+	base := graph.New()
+	for _, repo := range []string{"repo", "other"} {
+		requireDir := filepath.Join(root, repo)
+		if err := os.MkdirAll(requireDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		source := "package handlers\n\nfunc First() {}\nfunc Second() {}\n"
+		if err := os.WriteFile(filepath.Join(requireDir, "handlers.go"), []byte(source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path := repo + "/handlers.go"
+		base.AddBatch([]*graph.Node{
+			{ID: path, Kind: graph.KindFile, Name: "handlers.go", FilePath: path, Language: "go", RepoPrefix: repo},
+			{ID: path + "::First", Kind: graph.KindFunction, Name: "First", FilePath: path, StartLine: 3, EndLine: 3, Language: "go", RepoPrefix: repo},
+			{ID: path + "::Second", Kind: graph.KindFunction, Name: "Second", FilePath: path, StartLine: 4, EndLine: 4, Language: "go", RepoPrefix: repo},
+		}, nil)
+	}
+	idx := &Indexer{graph: base, rootPath: root, logger: zap.NewNop()}
+	reg := contracts.NewRegistry()
+	expected := map[string]string{}
+	for _, row := range []struct {
+		repo, registration, handler string
+		line                        int
+	}{
+		{"repo", "registerFirst", "First", 10},
+		{"repo", "registerSecond", "Second", 20},
+		{"other", "registerFirst", "First", 10},
+	} {
+		path := row.repo + "/router.go"
+		reg.Add(contracts.Contract{ID: "http::GET::/items", Type: contracts.ContractHTTP, Role: contracts.RoleProvider,
+			FilePath: path, Line: row.line, SymbolID: path + "::" + row.registration, RepoPrefix: row.repo,
+			Meta: map[string]any{"handler_ident": row.handler}})
+		expected[path+"|"+strconv.Itoa(row.line)] = row.repo + "/handlers.go::" + row.handler
+	}
+	idx.resolveProviderHandlers(reg)
+	rows := reg.All()
+	if len(rows) != len(expected) {
+		t.Fatalf("distinct registration records collapsed: got %d want %d: %#v", len(rows), len(expected), rows)
+	}
+	for _, row := range rows {
+		key := row.FilePath + "|" + strconv.Itoa(row.Line)
+		want, ok := expected[key]
+		if !ok || row.SymbolID != want {
+			t.Fatalf("registration %s resolved to %q, want %q", key, row.SymbolID, want)
+		}
+		delete(expected, key)
+		if _, ok := row.Meta["handler_ident"]; ok {
+			t.Fatalf("registration %s retained internal handler hint", key)
+		}
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing registration records: %#v", expected)
 	}
 }
 

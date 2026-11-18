@@ -139,16 +139,52 @@ func (s *Store) RebindGoMethodReceiversForFiles(filePaths []string) (changed int
 
 	analysisInvalidated := s.analysisGenerationPresent
 	if analysisInvalidated {
-		if err = invalidateAnalysisGenerationTx(tx); err != nil {
+		if err = s.invalidateAnalysisViewTx(tx); err != nil {
 			return 0, fmt.Errorf("sqlite receiver batch invalidate analysis: %w", err)
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, goMethodReceiverBatchConflictDeleteSQL)); err != nil {
+		return 0, fmt.Errorf("sqlite receiver batch remove existing-key conflicts: %w", err)
+	}
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, goMethodReceiverBatchDuplicateDeleteSQL)); err != nil {
+		return 0, fmt.Errorf("sqlite receiver batch deduplicate canonical keys: %w", err)
+	}
+	if _, err = countEdgeWrite(tx.ExecContext(ctx, `
+UPDATE edges
+SET to_id = (
+    SELECT r.new_to
+    FROM temp.go_receiver_rebind_candidates AS r
+    WHERE r.edge_id = edges.id
+)
+WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`)); err != nil {
+		return 0, fmt.Errorf("sqlite receiver batch update targets: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sqlite receiver batch commit: %w", err)
+	}
+	committed = true
+	if analysisInvalidated {
+		s.analysisGenerationPresent = s.analysisLatchRemaining
+	}
+	s.finishAnalysisMutationLocked(true)
+	s.noteEdgeEndpointRewriteLocked(true)
+	return int(candidates), nil
+}
+
+// The two cleanup DELETEs of the batched rebind are driven from the candidate
+// table: each candidate row probes its edge by rowid. With edges as the outer
+// loop, SQLite scanned every edge of the store (the covering autoindex) and
+// probed the candidate table per edge — twice per save on a large store.
+// CROSS JOIN pins that loop order.
+
+// goMethodReceiverBatchConflictDeleteSQL removes candidates whose rebound key
+// already exists as another edge.
+const goMethodReceiverBatchConflictDeleteSQL = `
 DELETE FROM edges
 WHERE id IN (
     SELECT old.id
-    FROM edges AS old
-    JOIN temp.go_receiver_rebind_candidates AS r ON r.edge_id = old.id
+    FROM temp.go_receiver_rebind_candidates AS r
+    CROSS JOIN edges AS old ON old.id = r.edge_id
     WHERE EXISTS (
         SELECT 1
         FROM edges AS existing
@@ -160,10 +196,10 @@ WHERE id IN (
           AND existing.line = old.line
           AND existing.view_gen = old.view_gen
     )
-)`); err != nil {
-		return 0, fmt.Errorf("sqlite receiver batch remove existing-key conflicts: %w", err)
-	}
-	if _, err = tx.ExecContext(ctx, `
+)`
+
+// goMethodReceiverBatchDuplicateDeleteSQL keeps one candidate per rebound key.
+const goMethodReceiverBatchDuplicateDeleteSQL = `
 DELETE FROM edges
 WHERE id IN (
     SELECT edge_id
@@ -173,30 +209,8 @@ WHERE id IN (
                    PARTITION BY old.from_id, r.new_to, old.kind, old.file_path, old.line
                    ORDER BY old.id
                ) AS duplicate_rank
-        FROM edges AS old
-        JOIN temp.go_receiver_rebind_candidates AS r ON r.edge_id = old.id
+        FROM temp.go_receiver_rebind_candidates AS r
+        CROSS JOIN edges AS old ON old.id = r.edge_id
     )
     WHERE duplicate_rank > 1
-)`); err != nil {
-		return 0, fmt.Errorf("sqlite receiver batch deduplicate canonical keys: %w", err)
-	}
-	if _, err = tx.ExecContext(ctx, `
-UPDATE edges
-SET to_id = (
-    SELECT r.new_to
-    FROM temp.go_receiver_rebind_candidates AS r
-    WHERE r.edge_id = edges.id
-)
-WHERE id IN (SELECT edge_id FROM temp.go_receiver_rebind_candidates)`); err != nil {
-		return 0, fmt.Errorf("sqlite receiver batch update targets: %w", err)
-	}
-	if err = tx.Commit(); err != nil {
-		return 0, fmt.Errorf("sqlite receiver batch commit: %w", err)
-	}
-	committed = true
-	if analysisInvalidated {
-		s.analysisGenerationPresent = false
-	}
-	s.finishAnalysisMutationLocked(true)
-	return int(candidates), nil
-}
+)`

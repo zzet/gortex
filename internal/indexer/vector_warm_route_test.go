@@ -11,7 +11,6 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
-	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/search"
 )
 
@@ -30,15 +29,14 @@ func TestWarmScopedReconcileRestoresDurableVectorCorpus(t *testing.T) {
 	cm := newTestConfigManager(t)
 	cm.Global().Repos = []config.RepoEntry{entry}
 
-	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite"))
-	require.NoError(t, err)
+	store := builderOpenStoreAt(t, filepath.Join(t.TempDir(), "store.sqlite"))
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
 	seedSw := search.NewSwappable(initialSearchBackend(store))
 	seed := NewMultiIndexer(graph.Store(store), newTestRegistry(), seedSw, cm, zap.NewNop())
 	seedEmb := &poolEmbedder{}
 	seed.SetEmbedder(seedEmb)
-	results, err := seed.indexMultiRepo([]config.RepoEntry{entry})
+	results, err := seed.indexFixtureRepos([]config.RepoEntry{entry})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.Greater(t, seedEmb.calls, int32(0))

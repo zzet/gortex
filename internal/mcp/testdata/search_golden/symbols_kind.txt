@@ -1,0 +1,1 @@
+{"query_class":"symbol","results":[{"absolute_file_path":"$ROOT/config/config.go","doc":"Config holds the server settings.","file_path":"config/config.go","id":"config/config.go::Config","kind":"type","name":"Config","start_line":4,"type_flavor":"struct","visibility":"public"}],"total":1,"truncated":false}

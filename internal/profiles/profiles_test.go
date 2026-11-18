@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 // Per-profile instruction-body byte ceilings. The body is re-read into
@@ -50,8 +52,9 @@ var positioningCues = []string{
 	"MUST prefer graph queries",
 	"Hook posture is configurable",
 	"explore",
-	"Gortex MCP integration failure",
-	"Do not start a daemon",
+	toolref.TransportClause(),
+	toolref.DegradedModeLine(),
+	"Never start a daemon",
 	"automatic overlay",
 	"explicit user request to track",
 	"selected overlay plus exactly one designated primary",
@@ -107,6 +110,22 @@ func TestEveryProfileKeepsPositioningCues(t *testing.T) {
 		for _, cue := range positioningCues {
 			if !strings.Contains(body, cue) {
 				t.Errorf("profile %q body lost the positioning cue %q", p.Name, cue)
+			}
+		}
+	}
+}
+
+func TestEveryProfileKeepsSharedDegradedGuidance(t *testing.T) {
+	for _, p := range Table() {
+		body := p.Body()
+		for _, sentence := range []string{toolref.TransportClause(), toolref.DegradedModeLine()} {
+			if !strings.Contains(body, sentence) {
+				t.Errorf("profile %q lost shared sentence %q", p.Name, sentence)
+			}
+		}
+		for _, stop := range []string{"integration failure and stop", "integration failure, stop", "stop indexed code operations"} {
+			if strings.Contains(body, stop) {
+				t.Errorf("profile %q still abandons a transient step: %q", p.Name, stop)
 			}
 		}
 	}

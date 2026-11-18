@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync"
 )
@@ -164,12 +165,16 @@ type Store interface {
 	// ReindexEdge is the legacy To-only mutation. Callers that change Kind
 	// must use ReindexEdges and provide EdgeReindex.OldKind.
 	ReindexEdge(e *Edge, oldTo string)
-	// Batched siblings of the per-edge mutators. Same semantics, but
-	// disk backends amortise the per-call transaction overhead by
-	// committing in implementation-chosen chunks (the in-memory
-	// backend just loops). The resolver fans out per-edge mutations
-	// across thousands of edges in a single ResolveAll pass, so the
-	// per-call form was unusable on disk backends without these.
+	// ReindexEdges frees moving stored identities before assigning destinations.
+	// A stationary destination keeps its payload, including a same-batch refresh;
+	// the first mover wins a fresh key. Repeated stationary updates apply in order.
+	// Simple intermediate chains are supported. Cross-store convergence is not
+	// guaranteed for distinct copied rows that converge at a fresh key and then
+	// move it again, or reuse an identity an earlier row already moved, whether
+	// that identity was stored or created earlier in the batch.
+	// Losing candidates create no resolver receipt work. Disk backends may commit
+	// bounded chunks independently; the two-phase guarantee is per chunk, not
+	// across chunk boundaries. A loop of per-edge calls is not equivalent.
 	// Callers MUST first mutate the *Edge fields they want persisted
 	// (To / Kind / Origin / …) before handing the entry over — these
 	// methods read the post-mutation Edge state and update the
@@ -258,10 +263,11 @@ type Store interface {
 	GetEdgeCandidates(endpoints []EdgeEndpoint, sites []EdgeSite) EdgeCandidateSet
 
 	// DistinctExternalTargets returns the unique external-shaped destination
-	// IDs used by the supplied edge kinds. Backends must push both the kind and
-	// target predicates down and project only the destination ID; no per-kind
+	// IDs used by the supplied edge kinds. A non-empty fileSuffix restricts
+	// the recording file. Backends must push the predicates down and
+	// project only the destination ID; no per-kind
 	// queries or full Edge materialisation are permitted.
-	DistinctExternalTargets(kinds []EdgeKind) []string
+	DistinctExternalTargets(kinds []EdgeKind, fileSuffix string) []string
 
 	// GetRepoEdges returns every edge whose source node has the given
 	// RepoPrefix. Equivalent to GetRepoNodes(r) followed by
@@ -521,9 +527,27 @@ type BulkLoader interface {
 // multi-repository cold load. Implementations engage only on an empty store;
 // nested per-repository BulkLoader calls must leave the outer window open so
 // secondary indexes are rebuilt once after every repository drains.
+//
+// A failed EndCoordinatedBulkLoad may leave the window open so its owner can
+// retry it. AbortCoordinatedBulkLoad is how an owner that will not retry gives
+// it up: the window closes unfinished, ordinary durability comes back, and
+// whatever the end could not rebuild is left to the backend to repair.
 type CoordinatedBulkLoader interface {
 	BeginCoordinatedBulkLoad() bool
 	EndCoordinatedBulkLoad() error
+	AbortCoordinatedBulkLoad() error
+}
+
+// EndOrAbortCoordinatedBulkLoad ends l's coordinated window and, when the end
+// fails, aborts it. It is for an owner's last call on the window: an end that
+// fails with the window still open would otherwise leave it open until the
+// store closes, with every later write at the window's relaxed durability.
+func EndOrAbortCoordinatedBulkLoad(l CoordinatedBulkLoader) error {
+	err := l.EndCoordinatedBulkLoad()
+	if err == nil {
+		return nil
+	}
+	return errors.Join(err, l.AbortCoordinatedBulkLoad())
 }
 
 // SymbolHit is a single full-text-search result: the matched node ID
@@ -675,6 +699,15 @@ type SymbolFTSRepoReplacer interface {
 // fallback; SQLite implements it natively.
 type FileBatchEvicter interface {
 	EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int)
+}
+
+// FileIdentityBatchEvicter replaces the same bounded file frontier while also
+// removing explicitly identified legacy file-owned nodes. Callers include those
+// identities in their prior-state/restub frontier first. Their native path may
+// also anchor shared targets, so evicting that whole spelling is not equivalent.
+// Additional IDs never widen the operation to another payload generation.
+type FileIdentityBatchEvicter interface {
+	EvictFilesWithNodeIDs(filePaths, nodeIDs []string) (nodesRemoved, edgesRemoved int)
 }
 
 // ContentHit is one result from a ContentSearcher query: the content
@@ -1409,6 +1442,44 @@ type EnrichmentStateStore interface {
 	SetEnrichmentState(state EnrichmentState) error
 }
 
+// EnrichmentResumePoint is how far a cut whole-repo enrichment apply pass got
+// for one (repo, provider): every page of Phase up to and including the file
+// path After was committed against the graph at IndexedSHA by an engine
+// identified by Version. Covered carries the symbols-covered count the pass
+// measured before applying anything, so a pass that resumes past that walk
+// can still report the coverage of a full pass. A provider that applies in
+// deterministic pages records it after each committed page so the next pass
+// starts where the last one was cut instead of replaying from page one.
+type EnrichmentResumePoint struct {
+	RepoPrefix string
+	Provider   string
+	IndexedSHA string
+	Version    string
+	Phase      int
+	After      string
+	Covered    int
+	// LedgerDigest names the provider's files, their re-parse epochs and
+	// the on-disk versions of the re-parse-pending ones, as the pass that
+	// recorded the pages saw them when it started.
+	LedgerDigest string
+	UpdatedAt    int64 // unix seconds
+}
+
+// EnrichmentResumeStore is an optional capability for backends that persist
+// enrichment resume points. A backend without durable state does not
+// implement it, and a provider then never resumes — every pass starts from
+// the first page, which is always correct.
+//
+// GetEnrichmentResume's bool is false when no point is recorded.
+// ClearRepoEnrichmentResume deletes the repository's points for every
+// provider.
+type EnrichmentResumeStore interface {
+	GetEnrichmentResume(repoPrefix, provider string) (EnrichmentResumePoint, bool, error)
+	SetEnrichmentResume(point EnrichmentResumePoint) error
+	ClearEnrichmentResume(repoPrefix, provider string) error
+	ClearRepoEnrichmentResume(repoPrefix string) error
+}
+
 // ContractState is the per-repo completion marker for the contract tier: the
 // git revision the whole-repo contract pass last committed at, when it
 // finished, and how many contracts it wrote.
@@ -2033,6 +2104,12 @@ type ExternalCallCandidates interface {
 	ExternalCallCandidateEdges() []*Edge
 }
 
+// ExternalCallCandidateIterator is the bounded, early-stoppable form of
+// ExternalCallCandidates. Callbacks may mutate the store between pages.
+type ExternalCallCandidateIterator interface {
+	ExternalCallCandidateEdgesSeq() iter.Seq[*Edge]
+}
+
 // CommunityCrossingsByKind is an optional capability backends MAY
 // implement to return per-source crossing counts for edges whose
 // Kind is in the supplied set, given a node→community membership
@@ -2583,8 +2660,9 @@ type ClassHierarchyTraverser interface {
 // any defines node, filtered to symbols outside the file). All five
 // projections are scoped to the input file in one round-trip each.
 //
-// Optional capability — handleGetEditingContext falls back to the
-// per-symbol loop when the backend doesn't implement it.
+// Legacy synchronous capability. The MCP handler uses FileEditingContextReadScope
+// so cancellation, incomplete reads and selected-layer revisions are checked
+// before accepting a bundle; it never falls back to this errorless interface.
 type FileEditingContextResult struct {
 	FileNode *Node
 	Defines  []*Node

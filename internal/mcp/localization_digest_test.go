@@ -150,6 +150,29 @@ func TestRepeatLocalizeAgainstTerminalContractReturnsCompactStop(t *testing.T) {
 	requireLocalizationTerminalReplay(t, blocked, "explore", "localize")
 }
 
+// The terminal page and completion.instruction are the only text a caller sees
+// once localization is answer_ready, so they must name the one release.
+func TestAnswerReadyReplayNamesNewUserTaskRelease(t *testing.T) {
+	state := &localizationTerminalState{}
+	completion := newLocalizationCompletion(true, "")
+	completion.digest = testEvidenceDigest()
+	state.armForTask(completion, "find the storage load implementations")
+
+	const release = "options:{new_user_task:true}"
+	replay := state.block("search", "text", map[string]any{"query": "certificate rotation"})
+	contract := requireLocalizationTerminalReplay(t, replay, "search", "text")
+	text, _ := singleTextContent(replay)
+	if !strings.Contains(text, release) {
+		t.Fatalf("answer_ready replay does not name %s: %q", release, text)
+	}
+	if !strings.Contains(contract.Completion.Instruction, release) {
+		t.Fatalf("answer_ready instruction does not name %s: %q", release, contract.Completion.Instruction)
+	}
+	if !strings.Contains(localizationUnconfirmedAnswerDirective, release) {
+		t.Fatalf("unconfirmed directive does not name %s: %q", release, localizationUnconfirmedAnswerDirective)
+	}
+}
+
 func TestRefinementPromotionRetainsDigestForReplay(t *testing.T) {
 	state := &localizationTerminalState{}
 	candidate := "repo/storage/disk.go::DiskStorage.Load"

@@ -242,9 +242,9 @@ func TestSQLiteBoundedAdjacencyPlansUsePredicateIndexes(t *testing.T) {
 		index       string
 		constraints string
 	}{
-		{name: "outgoing", query: boundedOutgoingAdjacencySQL(1), args: []any{"source", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM", constraints: "(FROM_ID=? AND KIND=?)"},
-		{name: "incoming", query: boundedIncomingAdjacencySQL(1), args: []any{"target", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_TO", constraints: "(TO_ID=? AND KIND=?)"},
-		{name: "site", query: boundedOutgoingSiteAdjacencySQL(1), args: []any{"source", 10, string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM_LINE_KIND", constraints: "(FROM_ID=? AND LINE=? AND KIND=?)"},
+		{name: "outgoing", query: boundedOutgoingAdjacencySQL(1), args: []any{"source", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM", constraints: "(VIEW_GEN=? AND FROM_ID=? AND KIND=?)"},
+		{name: "incoming", query: boundedIncomingAdjacencySQL(1), args: []any{"target", string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_TO", constraints: "(VIEW_GEN=? AND TO_ID=? AND KIND=?)"},
+		{name: "site", query: boundedOutgoingSiteAdjacencySQL(1), args: []any{"source", 10, string(graph.EdgeCalls), baseViewGeneration, 2}, index: "EDGES_BY_FROM_LINE_KIND", constraints: "(VIEW_GEN=? AND FROM_ID=? AND LINE=? AND KIND=?)"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			rows, err := store.db.Query("EXPLAIN QUERY PLAN "+test.query, test.args...)
@@ -284,8 +284,10 @@ func TestSQLiteEdgesByFromLineIndexesCoexistAndOpenIdempotently(t *testing.T) {
 	if _, err := store.writerDB.Exec(`DROP INDEX edges_by_from_line_kind`); err != nil {
 		t.Fatalf("drop bounded-site index: %v", err)
 	}
-	if _, err := store.writerDB.Exec(`CREATE INDEX IF NOT EXISTS edges_by_from_line ON edges(from_id, line)`); err != nil {
-		t.Fatalf("create historical index: %v", err)
+	// The ordered-outgoing sibling keeps its registry shape; only the
+	// bounded-site index is missing when the store is reopened.
+	if _, err := store.writerDB.Exec(edgesByFromLineIndexDDL); err != nil {
+		t.Fatalf("ensure ordered-outgoing sibling index: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store without bounded-site index: %v", err)
@@ -313,8 +315,8 @@ func TestSQLiteEdgesByFromLineIndexesCoexistAndOpenIdempotently(t *testing.T) {
 			t.Fatalf("index info rows: %v", err)
 		}
 		_ = rows.Close()
-		if !reflect.DeepEqual(columns, []string{"from_id", "line"}) {
-			t.Fatalf("reopen %d legacy columns = %#v", reopen, columns)
+		if !reflect.DeepEqual(columns, []string{"view_gen", "from_id", "line"}) {
+			t.Fatalf("reopen %d ordered-outgoing sibling columns = %#v", reopen, columns)
 		}
 		rows, err = store.db.Query(`PRAGMA index_info('edges_by_from_line_kind')`)
 		if err != nil {
@@ -333,7 +335,7 @@ func TestSQLiteEdgesByFromLineIndexesCoexistAndOpenIdempotently(t *testing.T) {
 			t.Fatalf("bounded-site index rows: %v", err)
 		}
 		_ = rows.Close()
-		if !reflect.DeepEqual(columns, []string{"from_id", "line", "kind"}) {
+		if !reflect.DeepEqual(columns, []string{"view_gen", "from_id", "line", "kind"}) {
 			t.Fatalf("reopen %d bounded-site columns = %#v", reopen, columns)
 		}
 		var schemaBefore, schemaAfter int

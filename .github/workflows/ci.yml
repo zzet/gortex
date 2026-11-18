@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  # Run on the merged commit to verify the extended parser regression gate (#991).
+  workflow_dispatch:
 
 # One run per PR: a new push cancels the PR's older run. Every other event
 # (pushes to main, schedules) gets its own group from the run ID, so none of
@@ -13,17 +15,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# Match the release builds, including dependency grammars and C++ scanners (#821).
+env:
+  CGO_CFLAGS: -O2 -g -fno-strict-aliasing
+  CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
+
+# Keep Linux compiler/header behavior stable while forest/perl v1.9.9
+# still declares bsearch, which collides with the C23 glibc macro (#1114).
+# Upstream tree-sitter-perl PR220 fixes the name; forest has no fixed release yet.
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    # The suite runs ~30m on the ubuntu runners and slower on macos, so the
-    # per-step budget needs headroom; this job-level cap still bounds a hang.
+  parser-stress:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        go-version: ['1.27']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -31,34 +35,121 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
-        run: go build -o gortex ./cmd/gortex/
+      - name: Stress parser with release cgo flags
+        run: go test -race -count=50 -timeout=50m ./internal/parser/...
 
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      mode: ${{ steps.select.outputs.mode }}
+      has_tests: ${{ steps.select.outputs.has_tests }}
+      empty_ok: ${{ steps.select.outputs.empty_ok }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test selection and runner fixtures
+        run: go test -count=1 ./internal/citest
+      - name: Test workflow policy through the production gate
+        run: go test -count=1 ./scripts/ci-result
+      - name: Select complete packages or fall back to full
+        id: select
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_FULL_TESTS: ${{ vars.CI_FULL_TESTS }}
+        run: go run ./scripts/ci-select --output test-selection.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-selection
+          path: test-selection.json
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.has_tests == 'true'
+    runs-on: ${{ matrix.os }}
+    # Whole selected packages retain the existing census, batching, failure
+    # evidence and platform behavior. Full mode includes sixteen rows, including the independent macOS watcher race job.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-selection
       - name: Test
-        if: matrix.os != 'windows-latest'
-        run: go test -race -timeout=45m -coverprofile=coverage.out ./...
-
-      # The Windows shard checks the platform contract, not the race
-      # contract: the race detector multiplies runtime several times over and
-      # the windows runners are already the slowest of the three, so the two
-      # together overran the job cap before the suite finished. Linux and
-      # macOS keep -race, which is where a data race would surface anyway.
-      # -v is temporary: per-test timings are how we find which packages hang
-      # here, and it comes out once the shard is reliably green.
-      # It writes no coverage profile either: nothing uploads one from this
-      # shard, and the runner's default PowerShell tokenises
-      # -coverprofile=coverage.out into an extra ".out" package argument, so
-      # the job failed on an unresolvable package before any test ran.
-      - name: Test (windows, no race detector)
-        if: matrix.os == 'windows-latest'
-        run: go test -v -timeout=45m ./...
-
-      - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27'
+        shell: bash
+        env:
+          TEST_PARTITION: ${{ matrix.partition }}
+          TEST_TARGET: ${{ matrix.os }}
+          TEST_RACE: ${{ matrix.os == 'ubuntu-24.04' }}
+          TEST_WINDOWS: ${{ matrix.os == 'windows-latest' }}
+        run: go run ./scripts/ci-test --selection test-selection.json
+      - name: Upload full-suite coverage
+        if: matrix.os == 'ubuntu-24.04' && needs.plan.outputs.mode == 'full'
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage.out
         continue-on-error: true
+      - name: Preserve partial coverage separately
+        if: matrix.os == 'ubuntu-24.04' && needs.plan.outputs.mode == 'affected'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: affected-coverage-${{ strategy.job-index }}
+          path: coverage.out
+      - name: Upload test logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/gt/*/logs/
+          retention-days: 7
+
+  build-native:
+    # build-onnx already builds default Linux; always build the other OSes.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build -o gortex ./cmd/gortex/
+
+  smoke:
+    needs: plan
+    if: needs.plan.outputs.mode == 'affected'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Runtime handler/transport wiring is not fully described by imports.
+      # These existing integration tests supplement complete selected packages.
+      - name: Runtime integration smoke with race detection
+        run: >-
+          go test -race -count=1 -timeout=10m
+          -gcflags=modernc.org/sqlite/lib=-race=false
+          -gcflags=modernc.org/libc/...=-race=false
+          ./cmd/gortex/
+          -run '^(TestDaemon_EndToEnd_ToolHandlerCanReturnItsDispatchSlot|TestComposeWiresTheLeaseManagerIntoTheRESTSurface)$'
 
   build-linux-static:
     # The linux release ships a statically linked binary so it runs on any
@@ -67,10 +158,10 @@ jobs:
     # dep that needs a runtime dlopen, breaks it. The release-time build hook
     # catches that at tag time; this catches it on the PR that introduces it.
     #
-    # ubuntu-latest is the same Ubuntu 24.04 / GCC 13 generation as the
-    # goreleaser-cross image, so it reproduces the same GLIBCXX floor the
+    # Ubuntu 24.04 uses the same GCC 13 generation as goreleaser-cross,
+    # so it reproduces the same GLIBCXX floor the
     # dynamic build used to inherit — without pulling that multi-GB image.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -111,7 +202,7 @@ jobs:
           done
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -119,10 +210,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Cgo aliasing flags
+        run: sh scripts/check-cgo-flags.sh
+
+      - name: CI test layout
+        run: go run ./scripts/ci-test --check-workflow .github/workflows/ci.yml
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.13.1
+          version: v2.14.0
           args: --timeout=10m
 
       # goreleaser used to run `go mod tidy` as a release before-hook, which
@@ -141,7 +238,7 @@ jobs:
           fi
 
   build-onnx:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -151,9 +248,16 @@ jobs:
 
       - name: Install ONNX Runtime
         run: |
-          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz
-          tar xzf onnxruntime-linux-x64-1.24.4.tgz
-          sudo cp onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so* /usr/local/lib/
+          # The official ONNX Runtime CPU package matches the C API 31 used by onnxruntime_go v1.38.0.
+          version=1.31.0
+          package="$RUNNER_TEMP/microsoft.ml.onnxruntime.$version.nupkg"
+          library="libonnxruntime.so.$version"
+          curl -fsSL --retry 3 -o "$package" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$version/microsoft.ml.onnxruntime.$version.nupkg"
+          echo "7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b  $package" | sha256sum --check
+          unzip -p "$package" runtimes/linux-x64/native/libonnxruntime.so > "$RUNNER_TEMP/$library"
+          sudo install -m 0644 "$RUNNER_TEMP/$library" /usr/local/lib/
+          sudo ln -sfn "$library" /usr/local/lib/libonnxruntime.so
           sudo ldconfig
 
       - name: Build with ONNX tag
@@ -178,7 +282,7 @@ jobs:
         run: go build -tags embeddings_gomlx -o gortex-gomlx-noxla ./cmd/gortex/
 
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -188,4 +292,20 @@ jobs:
           go-version-file: go.mod
 
       - name: Run benchmarks
-        run: go test -bench=. -benchmem -count=1 -benchtime=1x -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/
+        run: go test -run '^$' -bench=. -benchmem -count=1 -benchtime=1x -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/
+
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [plan, test, smoke, build-native, lint, build-linux-static, build-onnx, benchmark, parser-stress]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # This small tool needs only the standard library.
+      - name: Require the planned tests and all unchanged CI gates
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: go run ./scripts/ci-result

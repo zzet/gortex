@@ -291,13 +291,13 @@ type csExtractor struct{ countingExtractor }
 
 func (e *csExtractor) Extensions() []string { return []string{".cs"} }
 
-// TestIndexFile_UTF16SkipLabel pins the label users see for a UTF-16
-// source (#812): since #834's admission check runs before the parser,
-// an ordinary UTF-16LE file never reaches ErrUTF16Source — the BOM-strip
-// leaves its mark in place, the admission sniff classifies it as a UTF-16
-// text source (not "binary"), and the extractor never runs on it. The
-// skip is a successful read: no failure-ledger row, no reconcile retry.
-func TestIndexFile_UTF16SkipLabel(t *testing.T) {
+// TestIndexFile_UTF16DecodedIndexed pins the decoded behaviour (#812,
+// rebase over #839): an ordinary UTF-16LE file no longer skips — the
+// always-on utf16-decode transform transcodes it to UTF-8 ahead of the
+// admission sniff, so the extractor runs on the decoded bytes and the
+// symbols land in the graph. No skip node, and — because the decode
+// succeeds — no failure-ledger row and no silent-zero diagnostic.
+func TestIndexFile_UTF16DecodedIndexed(t *testing.T) {
 	ext := &csExtractor{}
 	reg := parser.NewRegistry()
 	reg.Register(ext)
@@ -318,19 +318,25 @@ func TestIndexFile_UTF16SkipLabel(t *testing.T) {
 
 	result, err := idx.Index(dir)
 	require.NoError(t, err)
-	require.Equal(t, 1, result.SkippedFiles, "the UTF-16 file must skip, the text file must index")
+	require.Zero(t, result.SkippedFiles, "nothing may skip: the UTF-16 file is decoded, the text file indexes")
 	n := idx.graph.GetNode("legacy.cs")
-	require.NotNil(t, n, "a UTF-16 skip must leave a visible node")
-	require.Equal(t, true, n.Meta["skipped_due_to_binary"])
-	require.Equal(t, "utf-16 text source (NUL-interleaved; nothing a text grammar can extract)",
-		n.Meta["binary_reason"], "a text file must not be mislabelled as binary")
-	// The extractor ran once — for the text file; never on the
-	// NUL-interleaved bytes.
-	require.Equal(t, int32(1), ext.calls.Load())
-	// The skip is a successful read: no failure-ledger row to retry.
+	require.NotNil(t, n, "the decoded file must leave a node")
+	require.NotEqual(t, true, n.Meta["skipped_due_to_binary"],
+		"a decoded UTF-16 source must not carry the binary-skip mark")
+	// The extractor ran on BOTH files — the decoded legacy.cs reached it
+	// as clean UTF-8.
+	require.Equal(t, int32(2), ext.calls.Load())
+	var legacySymbols int
+	for _, node := range idx.graph.AllNodes() {
+		if node != nil && strings.HasSuffix(node.ID, "legacy.cs") {
+			legacySymbols++
+		}
+	}
+	require.Positive(t, legacySymbols, "the decoded source must yield symbols")
+	// A successful decode is a successful read: no failure-ledger row.
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		require.NotEqual(t, "legacy.cs", graphPath,
-			"a UTF-16 skip must not land in the failure ledger")
+			"a decoded UTF-16 index must not land in the failure ledger")
 	}
 }
 

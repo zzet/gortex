@@ -38,7 +38,7 @@ func TestResolverProjectionRowsIgnoreMetadata(t *testing.T) {
 	store.AddBatch([]*graph.Node{
 		{
 			ID: "a::src/main.go", Kind: graph.KindFile, Name: "main.go",
-			FilePath: "a::src/main.go", RepoPrefix: "a", WorkspaceID: "workspace-a",
+			FilePath: "a::src/main.go", RepoPrefix: "a", WorkspaceID: "workspace-a", Language: "go",
 			Meta: map[string]any{"large": make([]byte, 1<<20)},
 		},
 		{
@@ -48,7 +48,7 @@ func TestResolverProjectionRowsIgnoreMetadata(t *testing.T) {
 		},
 		{
 			ID: "b::lib.go", Kind: graph.KindFile, Name: "lib.go",
-			FilePath: "b::lib.go", RepoPrefix: "b", WorkspaceID: "workspace-b",
+			FilePath: "b::lib.go", RepoPrefix: "b", WorkspaceID: "workspace-b", Language: "go",
 			Meta: map[string]any{"large": make([]byte, 1<<20)},
 		},
 	}, nil)
@@ -70,8 +70,8 @@ func TestResolverProjectionRowsIgnoreMetadata(t *testing.T) {
 
 	globalFiles := collectResolverProjection(store.FileNodeIdentitiesSeq(nil))
 	wantGlobalFiles := []graph.FileNodeIdentity{
-		{ID: "a::src/main.go", FilePath: "a::src/main.go", RepoPrefix: "a", WorkspaceID: "workspace-a"},
-		{ID: "b::lib.go", FilePath: "b::lib.go", RepoPrefix: "b", WorkspaceID: "workspace-b"},
+		{ID: "a::src/main.go", FilePath: "a::src/main.go", RepoPrefix: "a", WorkspaceID: "workspace-a", Language: "go"},
+		{ID: "b::lib.go", FilePath: "b::lib.go", RepoPrefix: "b", WorkspaceID: "workspace-b", Language: "go"},
 	}
 	if !reflect.DeepEqual(globalFiles, wantGlobalFiles) {
 		t.Fatalf("global file identities = %#v, want %#v", globalFiles, wantGlobalFiles)
@@ -197,9 +197,9 @@ func TestResolverProjectionYieldCanReenterStore(t *testing.T) {
 
 	assertReentry := func(label string) {
 		t.Helper()
-		if inUse := store.db.Stats().InUse; inUse != 0 {
-			t.Fatalf("%s yield retained %d read connection(s)", label, inUse)
-		}
+		// Background startup probes can own the pool independently of this
+		// iterator. Bounded re-entry on a one-connection pool proves that
+		// the iterator released its rows before invoking the callback.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		var one int

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 // batchDurabilityOps is a narrow test seam around the filesystem operations
@@ -22,7 +24,7 @@ func (s *Server) batchDurability() batchDurabilityOps {
 	ops := batchDurabilityOps{
 		writeFile:     durableAtomicWriteFile,
 		syncDirectory: syncBatchDirectory,
-		removeFile:    os.Remove,
+		removeFile:    platform.RemoveFile,
 	}
 	if s == nil || s.batchDurabilityOverride == nil {
 		return ops
@@ -76,7 +78,7 @@ func durableAtomicWriteFile(path string, content []byte, mode os.FileMode) error
 		return fmt.Errorf("close temporary file: %w", err)
 	}
 	closed = true
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := platform.ReplaceFile(tmpPath, path); err != nil {
 		return fmt.Errorf("replace target file: %w", err)
 	}
 	return nil

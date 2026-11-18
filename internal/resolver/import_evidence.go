@@ -87,16 +87,20 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	}
 	// A candidate defined in the caller's own file is (or may be) module-
 	// local — the import pick must stand down and let the locality/scope
-	// cascade bind it. Local classes, consts and nested helpers all shadow
-	// imports. Import nodes only describe statements; they declare no local
-	// implementation and must not stand down their own import evidence.
+	// cascade bind it. Any kind blocks: a local class, const, or nested
+	// helper of the same name all shadow an import at some scope, and
+	// falling through only preserves today's behaviour. The one exception
+	// is the caller's own import-statement node: its display name is the
+	// imported module's basename, so `import { useX } from './useX'` puts a
+	// same-named KindImport node in the caller file. That node is the
+	// import evidence itself, not a shadow.
 	for _, c := range candidates {
 		if c.FilePath == callerFile && c.Kind != graph.KindImport {
 			return nil
 		}
 	}
 	var symbolPick *graph.Node
-	for _, e := range r.importEvidenceEdges(callerFile) {
+	for _, e := range r.callerOutEdges(callerFile) {
 		if e.Kind != graph.EdgeImports || e.Alias != "" {
 			continue
 		}
@@ -191,7 +195,7 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 		pendingBarrels = append(pendingBarrels, f)
 	}
 
-	for _, e := range r.importEvidenceEdges(callerFile) {
+	for _, e := range r.callerOutEdges(callerFile) {
 		if e.Kind != graph.EdgeImports {
 			continue
 		}
@@ -208,7 +212,7 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 			continue
 		}
 		seen[f] = true
-		for _, e := range r.importEvidenceEdges(f) {
+		for _, e := range r.callerOutEdges(f) {
 			if e.Kind != graph.EdgeReExports {
 				continue
 			}
@@ -280,64 +284,72 @@ func (r *Resolver) nodeFilePath(id string) string {
 	return ""
 }
 
-// Import statements are page-scoped structural evidence. Hydrate callers in
-// one batch before worker fan-out, including known-empty files, rather than
-// querying the store once per call. The ordinary cache clear also drops them
-// after an interleaved mutation.
-func (r *Resolver) warmImportEvidenceEdges(pending []*graph.Edge) {
-	files := make(map[string]struct{})
-	for _, edge := range pending {
-		if edge == nil || edge.Kind != graph.EdgeCalls || !isBareNameCallTarget(edge.To) {
-			continue
-		}
-		file := r.edgeCallerFile(edge)
-		if isJSTSPath(file) {
-			files[file] = struct{}{}
-		}
+// callerOutEdges returns a caller file's outgoing edges from the pass
+// prefetch when prefetchImportEdges loaded them, else from the store.
+func (r *Resolver) callerOutEdges(callerFile string) []*graph.Edge {
+	r.importFilesMu.RLock()
+	edges, ok := r.importOutByFile[callerFile]
+	r.importFilesMu.RUnlock()
+	if ok {
+		return edges
 	}
-	if len(files) == 0 {
-		return
-	}
-	ids := make([]string, 0, len(files))
-	for file := range files {
-		ids = append(ids, file)
-	}
-	byFile := r.graph.GetOutEdgesByNodeIDs(ids)
-	r.importEdgesByFile = make(map[string][]*graph.Edge, len(ids))
-	for _, file := range ids {
-		for _, edge := range byFile[file] {
-			if edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports {
-				r.importEdgesByFile[file] = append(r.importEdgesByFile[file], edge)
-			}
+	// A re-export hop can reach a file outside the prefetched frontier.
+	r.importFilesMu.Lock()
+	defer r.importFilesMu.Unlock()
+	if edges, ok = r.importOutByFile[callerFile]; !ok {
+		edges = r.graph.GetOutEdges(callerFile)
+		if r.importOutByFile == nil {
+			r.importOutByFile = make(map[string][]*graph.Edge)
 		}
-		if _, present := r.importEdgesByFile[file]; !present {
-			r.importEdgesByFile[file] = nil
-		}
+		r.importOutByFile[callerFile] = edges
 	}
+	return edges
 }
 
-// Barrel files reached after the caller batch are memoised once per page too.
-func (r *Resolver) importEvidenceEdges(file string) []*graph.Edge {
-	r.importFilesMu.RLock()
-	edges, loaded := r.importEdgesByFile[file]
-	r.importFilesMu.RUnlock()
-	if loaded {
-		return edges
+// prefetchImportEdges loads, in one batched read, the outgoing edges of
+// every JS/TS caller file behind edges — the import statements
+// importedFilesFor walks for every bare call. known is an optional
+// already-loaded out-edge map (the incremental page frontier) consumed
+// before asking the store. Without this every JS/TS call edge cost one
+// point GetOutEdges on the caller file, which on a disk backend is one
+// round-trip per call.
+func (r *Resolver) prefetchImportEdges(edges []*graph.Edge, known map[string][]*graph.Edge) {
+	if len(edges) == 0 {
+		return
 	}
 	r.importFilesMu.Lock()
 	defer r.importFilesMu.Unlock()
-	if edges, loaded = r.importEdgesByFile[file]; loaded {
-		return edges
+	if r.importOutByFile == nil {
+		r.importOutByFile = make(map[string][]*graph.Edge)
 	}
-	byFile := r.graph.GetOutEdgesByNodeIDs([]string{file})
-	for _, edge := range byFile[file] {
-		if edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports {
-			edges = append(edges, edge)
+	var missing []string
+	seen := make(map[string]struct{})
+	for _, e := range edges {
+		if e == nil {
+			continue
 		}
+		caller := e.FilePath
+		if caller == "" || !isJSTSPath(caller) {
+			continue
+		}
+		if _, dup := seen[caller]; dup {
+			continue
+		}
+		seen[caller] = struct{}{}
+		if _, ok := r.importOutByFile[caller]; ok {
+			continue
+		}
+		if out, ok := known[caller]; ok {
+			r.importOutByFile[caller] = out
+			continue
+		}
+		missing = append(missing, caller)
 	}
-	if r.importEdgesByFile == nil {
-		r.importEdgesByFile = make(map[string][]*graph.Edge)
+	if len(missing) == 0 {
+		return
 	}
-	r.importEdgesByFile[file] = edges
-	return edges
+	byFile := r.graph.GetOutEdgesByNodeIDs(missing)
+	for _, caller := range missing {
+		r.importOutByFile[caller] = byFile[caller]
+	}
 }

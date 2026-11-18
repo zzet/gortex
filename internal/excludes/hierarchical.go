@@ -2,6 +2,7 @@ package excludes
 
 import (
 	"bufio"
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,24 @@ type Hierarchical struct {
 
 	mu    sync.RWMutex
 	cache map[string]*Matcher // abs dir -> compiled matcher; nil value = directory has no ignore files
+	// forgets counts Forget calls. A read that started before one does not
+	// store its result, which may predate the change Forget reports.
+	forgets  uint64
+	diagnose func(string, *Matcher)
+
+	// observe, when set (ObserveReads), is handed every ignore file read.
+	observe func(path string, data []byte, err error)
+}
+
+// ObserveReads installs fn, which is handed every ignore file the matcher
+// reads: the bytes it read, or the error that ended the read (a missing
+// file's fs.ErrNotExist among them). A caller that must account for every
+// working-copy read it makes (a build proving its reads) installs it before
+// the matcher's first use; it is not safe to install concurrently with one.
+func (h *Hierarchical) ObserveReads(fn func(path string, data []byte, err error)) {
+	if h != nil {
+		h.observe = fn
+	}
 }
 
 // NewHierarchical builds a per-directory ignore matcher rooted at root.
@@ -32,6 +51,12 @@ type Hierarchical struct {
 // (e.g. ".gortexignore"). An empty filename list yields a matcher that
 // excludes nothing.
 func NewHierarchical(root string, filenames ...string) *Hierarchical {
+	return NewHierarchicalWithDiagnostics(root, filenames, nil)
+}
+
+// NewHierarchicalWithDiagnostics reports each loaded list once, when cached.
+// diagnose must not call back into the hierarchical matcher.
+func NewHierarchicalWithDiagnostics(root string, filenames []string, diagnose func(string, *Matcher)) *Hierarchical {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -39,6 +64,39 @@ func NewHierarchical(root string, filenames ...string) *Hierarchical {
 		root:      filepath.Clean(root),
 		filenames: filenames,
 		cache:     make(map[string]*Matcher),
+		diagnose:  diagnose,
+	}
+}
+
+// Forget drops the cached rules of absDir and of every folder beneath it,
+// so the next check reads their ignore files again. Call it when an ignore
+// file in absDir is created, changed or deleted, or when absDir is removed
+// or renamed: a folder moved away and replaced by another tree may bring
+// different ignore files at any depth.
+//
+// A folder is cached only after its parent (see dirMatcher), so when absDir
+// is not cached nothing beneath it is either, and Forget costs one map
+// lookup. That keeps file removals, which also call Forget, cheap.
+func (h *Hierarchical) Forget(absDir string) {
+	if h == nil {
+		return
+	}
+	dir := filepath.Clean(absDir)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.forgets++
+	if _, ok := h.cache[dir]; !ok {
+		return
+	}
+	prefix := dir + string(filepath.Separator)
+	if dir == h.root {
+		clear(h.cache)
+		return
+	}
+	for key := range h.cache {
+		if key == dir || strings.HasPrefix(key, prefix) {
+			delete(h.cache, key)
+		}
 	}
 }
 
@@ -57,6 +115,16 @@ func (h *Hierarchical) Match(absPath string, isDir bool) bool {
 // nothing matched. Used to name the culprit when an over-broad ignore
 // leaves a repo with nothing to index.
 func (h *Hierarchical) Explain(absPath string, isDir bool) (bool, string, string) {
+	return h.explain(absPath, isDir, (*Matcher).ExplainAbsDir)
+}
+
+// MatchInOpenDir omits parent checks already proved by a pruned disk walk.
+func (h *Hierarchical) MatchInOpenDir(absPath string, isDir bool) bool {
+	matched, _, _ := h.explain(absPath, isDir, (*Matcher).ExplainAbsDirInOpenDir)
+	return matched
+}
+
+func (h *Hierarchical) explain(absPath string, isDir bool, match func(*Matcher, string, string, bool) (bool, string)) (bool, string, string) {
 	if h == nil || len(h.filenames) == 0 {
 		return false, "", ""
 	}
@@ -75,72 +143,17 @@ func (h *Hierarchical) Explain(absPath string, isDir bool) (bool, string, string
 	// level that excludes the path wins; a file's own directory cannot
 	// exclude the file from itself.
 	dir := h.root
-	if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+	if matched, pat := match(h.dirMatcher(dir), absPath, dir, isDir); matched {
 		return true, dir, pat
 	}
 	segs := strings.Split(rel, "/")
 	for _, seg := range segs[:len(segs)-1] {
 		dir = filepath.Join(dir, seg)
-		if matched, pat := h.dirMatcher(dir).ExplainAbsDir(absPath, dir, isDir); matched {
+		if matched, pat := match(h.dirMatcher(dir), absPath, dir, isDir); matched {
 			return true, dir, pat
 		}
 	}
 	return false, "", ""
-}
-
-// HasNegatedDescendant reports whether any per-directory ignore file
-// along the chain from the root down to absDir carries a re-include
-// ("!") pattern that could match a path strictly beneath absDir. The
-// index walk uses it to keep descending an excluded directory whose
-// subtree a negation could resurrect, instead of pruning it outright —
-// the per-directory counterpart of Matcher.HasNegatedDescendant. absDir
-// is an absolute directory path; a path outside the root never matches.
-func (h *Hierarchical) HasNegatedDescendant(absDir string) bool {
-	if h == nil || len(h.filenames) == 0 {
-		return false
-	}
-	absDir = filepath.Clean(absDir)
-	rel, err := filepath.Rel(h.root, absDir)
-	if err != nil {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return false
-	}
-
-	// Each directory's ignore patterns are anchored at that directory, so
-	// the question "is there a negated descendant of absDir?" is asked of
-	// every ancestor matcher (and absDir's own) with absDir expressed
-	// relative to that ancestor.
-	dir := h.root
-	if h.dirMatcher(dir).HasNegatedDescendant(relUnder(dir, absDir)) {
-		return true
-	}
-	if rel == "." || rel == "" {
-		return false
-	}
-	for _, seg := range strings.Split(rel, "/") {
-		dir = filepath.Join(dir, seg)
-		if h.dirMatcher(dir).HasNegatedDescendant(relUnder(dir, absDir)) {
-			return true
-		}
-	}
-	return false
-}
-
-// relUnder returns child expressed relative to dir, in forward-slash
-// form. It returns "" when child is dir itself.
-func relUnder(dir, child string) string {
-	rel, err := filepath.Rel(dir, child)
-	if err != nil {
-		return ""
-	}
-	rel = filepath.ToSlash(rel)
-	if rel == "." {
-		return ""
-	}
-	return rel
 }
 
 // dirMatcher returns the compiled ignore matcher for one directory,
@@ -150,6 +163,7 @@ func relUnder(dir, child string) string {
 func (h *Hierarchical) dirMatcher(dir string) *Matcher {
 	h.mu.RLock()
 	m, ok := h.cache[dir]
+	forgets := h.forgets
 	h.mu.RUnlock()
 	if ok {
 		return m
@@ -157,32 +171,50 @@ func (h *Hierarchical) dirMatcher(dir string) *Matcher {
 
 	var patterns []string
 	for _, name := range h.filenames {
-		patterns = append(patterns, readIgnoreFile(filepath.Join(dir, name))...)
+		patterns = append(patterns, readIgnoreFile(filepath.Join(dir, name), h.observe)...)
 	}
 	if len(patterns) > 0 {
 		m = New(patterns)
 	}
 
 	h.mu.Lock()
-	h.cache[dir] = m
+	// Store only when no Forget ran since the read and the parent is
+	// cached, so a cached folder always has cached ancestors and Forget
+	// can skip folders that are not cached.
+	if cached, ok := h.cache[dir]; ok {
+		m = cached
+	} else if h.forgets == forgets && (dir == h.root || h.cached(filepath.Dir(dir))) {
+		h.cache[dir] = m
+		if m != nil && h.diagnose != nil {
+			h.diagnose(dir, m)
+		}
+	}
 	h.mu.Unlock()
 	return m
+}
+
+// cached reports whether dir has an entry. The caller holds h.mu.
+func (h *Hierarchical) cached(dir string) bool {
+	_, ok := h.cache[dir]
+	return ok
 }
 
 // readIgnoreFile reads one ignore file and returns its non-blank,
 // non-comment lines as gitignore-syntax patterns. A missing or
 // unreadable file yields nil — honoring ignore files is a convenience,
 // never a hard requirement, so a missing or permission-denied file
-// silently no-ops.
-func readIgnoreFile(path string) []string {
-	f, err := os.Open(path)
+// silently no-ops. observe, when set, is handed what the read found.
+func readIgnoreFile(path string, observe func(string, []byte, error)) []string {
+	data, err := os.ReadFile(path)
+	if observe != nil {
+		observe(path, data, err)
+	}
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 
 	var patterns []string
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {

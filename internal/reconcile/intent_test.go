@@ -100,7 +100,7 @@ func TestRetireCheckoutForgetsWhatTheFamilyCanStillServe(t *testing.T) {
 	f.seedOwnedGraph("graph-wt", "co-wt")
 	f.seedIntent("co-wt")
 
-	outcome, err := f.rec.RetireCheckout(context.Background(), "co-wt", "inc-wt", "reload")
+	outcome, err := f.rec.RetireCheckout(context.Background(), "co-wt", "inc-wt", CauseReloadRemoved)
 	if err != nil {
 		t.Fatalf("RetireCheckout: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRetireCheckoutRecordsWhatItMayNotDelete(t *testing.T) {
 		f.seedOwnedGraph("graph-main", "co-main")
 		f.promoteToPrimary("graph-main")
 
-		outcome, err := f.rec.RetireCheckout(context.Background(), "co-main", "inc-main", "reload")
+		outcome, err := f.rec.RetireCheckout(context.Background(), "co-main", "inc-main", CauseReloadRemoved)
 		if err != nil {
 			t.Fatalf("RetireCheckout: %v", err)
 		}
@@ -152,7 +152,7 @@ func TestRetireCheckoutRecordsWhatItMayNotDelete(t *testing.T) {
 
 		// Asking again does not stack a second transition — the slot is
 		// unique and the standing one already says what was asked.
-		repeat, err := f.rec.RetireCheckout(context.Background(), "co-main", "inc-main", "reload")
+		repeat, err := f.rec.RetireCheckout(context.Background(), "co-main", "inc-main", CauseReloadRemoved)
 		if err != nil || repeat != OutcomeTransitionPending {
 			t.Fatalf("second RetireCheckout = %q, %v", repeat, err)
 		}
@@ -169,7 +169,7 @@ func TestRetireCheckoutGuardsOnIncarnation(t *testing.T) {
 	f.seedCheckout("co-wt", "inc-wt", "wt", store_sqlite.CheckoutModeDedicated)
 	f.rekey("co-wt", "inc-wt-2")
 
-	if _, err := f.rec.RetireCheckout(context.Background(), "co-wt", "inc-wt", "reload"); !errors.Is(
+	if _, err := f.rec.RetireCheckout(context.Background(), "co-wt", "inc-wt", CauseReloadRemoved); !errors.Is(
 		err, store_sqlite.ErrCatalogStaleGuard) {
 		t.Fatalf("RetireCheckout error = %v, want a stale guard", err)
 	}
@@ -179,7 +179,7 @@ func TestRetireCheckoutGuardsOnIncarnation(t *testing.T) {
 
 	// A checkout the catalog never held is not an error — there is simply
 	// nothing to retire.
-	outcome, err := f.rec.RetireCheckout(context.Background(), "co-gone", "inc-gone", "reload")
+	outcome, err := f.rec.RetireCheckout(context.Background(), "co-gone", "inc-gone", CauseReloadRemoved)
 	if err != nil || outcome != OutcomeNoIdentity {
 		t.Fatalf("RetireCheckout on a missing checkout = %q, %v", outcome, err)
 	}

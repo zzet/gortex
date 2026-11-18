@@ -110,14 +110,12 @@ export class UsersController {
 		}
 		reg := NewRegistry()
 		h := &HTTPExtractor{}
-		var scan []string
 		for fp, src := range files {
 			for _, c := range h.Extract(fp, []byte(src), nil, nil) {
 				reg.Add(c)
 			}
-			scan = append(scan, fp)
 		}
-		JoinRouterPrefixes(reg, scan, func(fp string) []byte { return []byte(files[fp]) })
+		joinRouterFixtureFacts(t, reg, srcMap(files))
 
 		got := map[string]bool{}
 		for _, c := range reg.All() {

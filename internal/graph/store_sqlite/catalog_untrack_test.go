@@ -2,6 +2,7 @@ package store_sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 )
@@ -425,4 +426,26 @@ func TestCommitAuthorizedDemotionRevalidatesBeforePublication(t *testing.T) {
 			t.Fatalf("cleanup collision moved checkout = %+v", checkout)
 		}
 	})
+}
+
+func TestAuthorizeUntrackPersistsCauseWithoutTrackingIntent(t *testing.T) {
+	f := newCatalogUntrackFixture(t)
+	request := f.forgetAuthorization(pendingCleanup("cleanup-without-intent", "forget_checkout", 0))
+	first, err := f.catalog.AuthorizeUntrack(context.Background(), request)
+	if err != nil || first.Cleanup == nil {
+		t.Fatalf("explicit authorization=%+v err=%v", first, err)
+	}
+	var target struct {
+		Cause string `json:"cause"`
+	}
+	if err := json.Unmarshal([]byte(first.Cleanup.OpaqueTargetIDs), &target); err != nil {
+		t.Fatal(err)
+	}
+	if target.Cause != CleanupCauseUntrack {
+		t.Fatalf("explicit journal cause=%q", target.Cause)
+	}
+	again, err := f.catalog.AuthorizeUntrack(context.Background(), request)
+	if err != nil || !again.Existing || again.Cleanup == nil || again.Cleanup.OpaqueTargetIDs != first.Cleanup.OpaqueTargetIDs || again.Cleanup.Phase != first.Cleanup.Phase {
+		t.Fatalf("idempotent explicit authorization=%+v err=%v", again, err)
+	}
 }

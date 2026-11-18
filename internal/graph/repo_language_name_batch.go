@@ -33,7 +33,12 @@ func FindNodesByResolverNameScopes(store Store, scopes []ResolverNameScope) ([]m
 	if finder, ok := store.(ResolverNameScopeFinder); ok {
 		return finder.FindNodesByResolverNameScopes(scopes)
 	}
+	return resolverNameScopesFromNames(store, scopes)
+}
 
+// resolverNameScopesFromNames answers the scopes from one unscoped batched
+// name lookup, filtering each scope in Go.
+func resolverNameScopesFromNames(store batchedNamesReader, scopes []ResolverNameScope) ([]map[string][]*Node, error) {
 	nameSet := make(map[string]struct{})
 	for _, scope := range scopes {
 		for _, name := range scope.Names {

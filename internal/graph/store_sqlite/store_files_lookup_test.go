@@ -1,6 +1,7 @@
 package store_sqlite
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,14 @@ func TestFileMetasByPathsReturnsOnlyRequestedPrimaryKeys(t *testing.T) {
 	got, err := store.FileMetasByPaths("repo", requested)
 	require.NoError(t, err)
 	require.Equal(t, expected, got)
+	contextual, err := store.FileMetasByPathsContext(t.Context(), "repo", requested)
+	require.NoError(t, err)
+	require.Equal(t, expected, contextual, "context propagation preserves chunked requested-key and repository isolation semantics")
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	unavailable, err := store.FileMetasByPathsContext(cancelled, "repo", requested)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, unavailable, "cancellation never returns a partial metadata map")
 	for _, row := range got {
 		require.True(t, strings.HasPrefix(row.ContentHash, "repo-"))
 	}

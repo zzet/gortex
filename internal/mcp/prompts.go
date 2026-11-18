@@ -176,13 +176,7 @@ func (s *Server) handlePromptOrientation(ctx context.Context, _ mcp.GetPromptReq
 		}
 		byKind[n.Kind]++
 	}
-	totalEdges := 0
-	for _, e := range s.readerFor(ctx).AllEdges() {
-		if inScope != nil && (!inScope[e.From] || !inScope[e.To]) {
-			continue
-		}
-		totalEdges++
-	}
+	totalEdges := countEdgesWithin(s.readerFor(ctx), inScope)
 
 	var b strings.Builder
 	b.WriteString("## Codebase Orientation\n\n")

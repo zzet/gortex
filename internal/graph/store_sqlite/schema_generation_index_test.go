@@ -2,16 +2,15 @@ package store_sqlite
 
 import (
 	"database/sql"
-	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
-// The v17 step adds the two sparse view-generation indexes. They are the only
-// keys in the package that lead with view_gen, and they exist for the two
-// operations that ask about a generation rather than about a symbol:
-// enumerating a derived generation's rows and dropping them again.
+// The current dense view-generation indexes lead with view_gen then id. They
+// serve the two operations that ask about one generation rather than about a
+// symbol: enumerating that generation's rows and dropping them again.
 
 func generationIndexDDLByName(t *testing.T, db *sql.DB, name string) (string, bool) {
 	t.Helper()
@@ -28,10 +27,9 @@ func generationIndexDDLByName(t *testing.T, db *sql.DB, name string) (string, bo
 	return ddl.String, true
 }
 
-// TestGenerationIndexesExistOnFreshStore pins the shape a fresh store gets:
-// both indexes present, both leading with view_gen, both partial on
-// view_gen > 0 so a store that has only ever been plainly indexed maintains
-// nothing.
+// TestGenerationIndexesExistOnFreshStore pins the dense shape a fresh store
+// gets: both indexes lead with view_gen then id and cover generation zero as
+// well as derived generations.
 func TestGenerationIndexesExistOnFreshStore(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "generation-index-fresh.sqlite"))
 	if err != nil {
@@ -48,18 +46,18 @@ func TestGenerationIndexesExistOnFreshStore(t *testing.T) {
 			t.Fatalf("fresh store is missing %s", tc.name)
 		}
 		if !strings.Contains(ddl, "ON "+tc.table+"(view_gen, id)") {
-			t.Fatalf("%s must lead with view_gen: %s", tc.name, ddl)
+			t.Fatalf("%s must lead with view_gen then id: %s", tc.name, ddl)
 		}
-		if !strings.Contains(ddl, "WHERE view_gen > 0") {
-			t.Fatalf("%s must stay partial so generation 0 pays nothing: %s", tc.name, ddl)
+		if strings.Contains(ddl, "WHERE view_gen > 0") {
+			t.Fatalf("%s must remain dense for generation 0: %s", tc.name, ddl)
 		}
 	}
 }
 
-// TestGenerationIndexMigrationBringsForwardAnOlderStore drops both indexes to
-// reproduce a store stamped at v16, runs the step, and checks the result
-// matches a fresh store's. A second run must be a no-op.
-func TestGenerationIndexMigrationBringsForwardAnOlderStore(t *testing.T) {
+// TestGenerationIndexInstallerIsIdempotent drops the current indexes then
+// invokes their direct installer twice. Historical schema transitions belong
+// to the migration tests; this fixture checks only current installer behavior.
+func TestGenerationIndexInstallerIsIdempotent(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "generation-index-migrate.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -78,10 +76,6 @@ func TestGenerationIndexMigrationBringsForwardAnOlderStore(t *testing.T) {
 			t.Fatalf("drop %s: %v", name, err)
 		}
 	}
-	if _, err := store.writerDB.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, currentSchemaVersion-1)); err != nil {
-		t.Fatalf("stamp pre-v17 version: %v", err)
-	}
-
 	for run := 0; run < 2; run++ {
 		tx, err := store.writerDB.Begin()
 		if err != nil {
@@ -112,48 +106,77 @@ func TestGenerationIndexMigrationBringsForwardAnOlderStore(t *testing.T) {
 	}
 }
 
-// TestGenerationIndexesStayEmptyAtGenerationZero is the cost argument as an
-// assertion: a plainly indexed store writes no entry into either index, so the
-// addition is free until a derived generation exists.
-func TestGenerationIndexesStayEmptyAtGenerationZero(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "generation-index-empty.sqlite"))
+// TestGenerationIndexesServeGenerationZeroAndDerivedRows proves that both
+// populated generations return the same ordered IDs as a table scan and that
+// the production-shaped query takes the bounded, order-preserving index path.
+func TestGenerationIndexesServeGenerationZeroAndDerivedRows(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "generation-index-dense.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	seedCoreRows(t, store)
+	store.AtGeneration(1).AddBatch(genReadNodes(genOneMark), genReadEdges(genOneMark))
 
-	// The partial predicate has to be restated literally for SQLite to admit
-	// the index — a bound parameter cannot be proven greater than zero.
 	for _, tc := range []struct{ table, index string }{
 		{"nodes", nodesByGenerationIndexName},
 		{"edges", edgesByGenerationIndexName},
 	} {
-		if got := scalarInt(t, store.writerDB,
-			`SELECT COUNT(*) FROM `+tc.table+` WHERE view_gen > 0`); got != 0 {
-			t.Fatalf("%s holds %d rows above generation 0 before any derived write", tc.table, got)
-		}
-		plan := generationIndexPlan(t, store, tc.table)
-		if !strings.Contains(plan, tc.index) {
-			t.Fatalf("the sparse-generation enumeration of %s must ride %s:\n%s", tc.table, tc.index, plan)
-		}
-	}
-
-	store.AtGeneration(1).AddBatch(genReadNodes(genOneMark), genReadEdges(genOneMark))
-	for _, table := range []string{"nodes", "edges"} {
-		if got := scalarInt(t, store.writerDB,
-			`SELECT COUNT(*) FROM `+table+` WHERE view_gen > 0`); got == 0 {
-			t.Fatalf("%s recorded no rows above generation 0 after a derived write", table)
+		for _, generation := range []int64{0, 1} {
+			want := generationTableIDs(t, store, tc.table, generation, true)
+			if len(want) == 0 {
+				t.Fatalf("%s has no rows at generation %d", tc.table, generation)
+			}
+			got := generationTableIDs(t, store, tc.table, generation, false)
+			if !slices.Equal(got, want) {
+				t.Fatalf("%s generation %d IDs=%v, want %v", tc.table, generation, got, want)
+			}
+			plan := generationEqualityPlan(t, store, tc.table, generation)
+			if !strings.Contains(plan, "SEARCH "+tc.table) || !strings.Contains(plan, "view_gen=?") {
+				t.Fatalf("generation %d enumeration of %s must be bounded by view_gen:\n%s", generation, tc.table, plan)
+			}
+			if !strings.Contains(plan, tc.index) {
+				t.Fatalf("the bounded generation %d enumeration of %s must use %s:\n%s", generation, tc.table, tc.index, plan)
+			}
+			if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
+				t.Fatalf("generation %d enumeration of %s sorted outside %s:\n%s", generation, tc.table, tc.index, plan)
+			}
 		}
 	}
 }
 
-func generationIndexPlan(t *testing.T, store *Store, table string) string {
+func generationTableIDs(t *testing.T, store *Store, table string, generation int64, notIndexed bool) []string {
+	t.Helper()
+	from := table
+	if notIndexed {
+		from += " NOT INDEXED"
+	}
+	rows, err := store.db.Query(
+		`SELECT id FROM `+from+` WHERE view_gen = ? ORDER BY id`, generation)
+	if err != nil {
+		t.Fatalf("read %s generation %d: %v", table, generation, err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan %s generation %d: %v", table, generation, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %s generation %d: %v", table, generation, err)
+	}
+	return ids
+}
+
+func generationEqualityPlan(t *testing.T, store *Store, table string, generation int64) string {
 	t.Helper()
 	rows, err := store.db.Query(
-		`EXPLAIN QUERY PLAN SELECT id FROM ` + table + ` WHERE view_gen > 0 ORDER BY view_gen, id`)
+		`EXPLAIN QUERY PLAN SELECT id FROM `+table+` WHERE view_gen = ? ORDER BY id`, generation)
 	if err != nil {
-		t.Fatalf("explain %s enumeration: %v", table, err)
+		t.Fatalf("explain %s generation %d enumeration: %v", table, generation, err)
 	}
 	defer rows.Close()
 	var lines []string

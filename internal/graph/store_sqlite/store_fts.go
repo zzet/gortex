@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/search"
@@ -113,6 +114,7 @@ type symbolFTSBatchStats struct {
 // appending bounded BatchUpsertSymbolFTS chunks, so no chunk can erase an
 // earlier one and no whole-repository token slice is retained in Go.
 func (s *Store) ResetSymbolFTS(repoPrefix string) error {
+	s.markFreshFTSIncomplete(s.viewGen) // a wipe the fresh-rows buffer does not follow
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.beginWrite()
@@ -120,7 +122,7 @@ func (s *Store) ResetSymbolFTS(repoPrefix string) error {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck // rollback after Commit is a no-op
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
+	if _, err := countSymbolFTSWrite(tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
@@ -170,7 +172,11 @@ func (s *Store) BatchDeleteSymbolFTS(nodeIDs []string) error {
 	if err := s.deleteSymbolFTSTx(tx, ids); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.forgetFreshFTSNodes(s.viewGen, ids)
+	return nil
 }
 
 // deleteSymbolFTSTx deletes only the supplied IDs in the caller's existing
@@ -186,9 +192,9 @@ func (s *Store) deleteSymbolFTSTx(tx *sql.Tx, ids []string) error {
 		for _, nodeID := range chunk {
 			args = append(args, nodeID)
 		}
-		if _, err := tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
+		if _, err := countSymbolFTSWrite(tx.Exec(`DELETE FROM symbol_fts WHERE rowid IN (
 SELECT fts_rowid FROM symbol_fts_rowid WHERE view_gen = ? AND node_id IN (`+placeholders+`)
-)`, args...); err != nil {
+)`, args...)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND node_id IN (`+placeholders+`)`, args...); err != nil {
@@ -221,36 +227,43 @@ func dedupeSymbolFTSItems(items []graph.SymbolFTSItem) []graph.SymbolFTSItem {
 // open write transaction, advancing *nextRowid over the docids it allocates.
 // Shared by the incremental batch path and the whole-repository replacement so
 // the two cannot drift in how they derive ownership or reuse docids.
-func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats) error {
+func upsertSymbolFTSChunkTx(tx *sql.Tx, viewGen int64, chunk []graph.SymbolFTSItem, nextRowid *int64, stats *symbolFTSBatchStats, collect *[]SymbolFTSRow) error {
 	type rowState struct {
 		repoPrefix string
 		rowid      int64
 		exists     bool
+		unchanged  bool
 	}
 
 	// Fetch owning repo prefixes and prior FTS docids with one indexed
 	// VALUES join for the whole chunk. This replaces the old two SELECTs
 	// per symbol while retaining the exact old rowid when one exists.
 	var lookup strings.Builder
-	lookup.WriteString(`WITH wanted(ord, node_id) AS (VALUES `)
-	lookupArgs := make([]any, 0, len(chunk)*2)
+	lookup.WriteString(`WITH wanted(ord, node_id, tokens) AS (VALUES `)
+	lookupArgs := make([]any, 0, len(chunk)*3+2)
 	for i, item := range chunk {
 		if i > 0 {
 			lookup.WriteByte(',')
 		}
-		lookup.WriteString(`(?, ?)`)
-		lookupArgs = append(lookupArgs, i, item.NodeID)
+		lookup.WriteString(`(?, ?, ?)`)
+		lookupArgs = append(lookupArgs, i, item.NodeID, item.Tokens)
 	}
 	// Both LEFT JOINs bind the same generation: the owning repo prefix must be
 	// read from the node this generation carries, not a same-id node another
 	// generation happens to hold, or the row would be filed under the wrong
 	// repository in this generation's index.
 	lookup.WriteString(`)
-SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid
+SELECT wanted.ord, COALESCE(nodes.repo_prefix, ''), symbol_fts_rowid.fts_rowid,
+       CASE WHEN symbol_fts_rowid.repo_prefix = COALESCE(nodes.repo_prefix, '') COLLATE BINARY
+                  AND f.node_id = wanted.node_id COLLATE BINARY
+                  AND f.repo_prefix = COALESCE(nodes.repo_prefix, '') COLLATE BINARY
+                  AND typeof(f.tokens) = 'text' AND f.tokens = wanted.tokens COLLATE BINARY
+            THEN 1 ELSE 0 END
 FROM wanted
 LEFT JOIN nodes ON nodes.id = wanted.node_id AND nodes.view_gen = ?
 LEFT JOIN symbol_fts_rowid
        ON symbol_fts_rowid.view_gen = ? AND symbol_fts_rowid.node_id = wanted.node_id
+LEFT JOIN symbol_fts f ON f.rowid = symbol_fts_rowid.fts_rowid
 ORDER BY wanted.ord`)
 	lookupArgs = append(lookupArgs, viewGen, viewGen)
 	rows, err := tx.Query(lookup.String(), lookupArgs...)
@@ -263,7 +276,8 @@ ORDER BY wanted.ord`)
 		var ord int
 		var repoPrefix string
 		var oldRowid sql.NullInt64
-		if err := rows.Scan(&ord, &repoPrefix, &oldRowid); err != nil {
+		var unchanged bool
+		if err := rows.Scan(&ord, &repoPrefix, &oldRowid, &unchanged); err != nil {
 			_ = rows.Close()
 			return err
 		}
@@ -272,6 +286,7 @@ ORDER BY wanted.ord`)
 			return fmt.Errorf("symbol FTS batch lookup returned invalid ordinal %d", ord)
 		}
 		states[ord].repoPrefix = repoPrefix
+		states[ord].unchanged = unchanged
 		if oldRowid.Valid {
 			states[ord].rowid = oldRowid.Int64
 			states[ord].exists = true
@@ -289,7 +304,15 @@ ORDER BY wanted.ord`)
 	}
 
 	oldRowids := make([]any, 0, len(chunk))
+	changed := make([]int, 0, len(chunk))
 	for i := range states {
+		// Only the actual FTS document and its same-generation ownership row
+		// can prove a no-op. In particular, identical ownership alone cannot:
+		// changed tokens must still replace the document and bump revisions.
+		if states[i].unchanged {
+			continue
+		}
+		changed = append(changed, i)
 		if states[i].exists {
 			oldRowids = append(oldRowids, states[i].rowid)
 			continue
@@ -307,41 +330,50 @@ ORDER BY wanted.ord`)
 			wipe.WriteByte('?')
 		}
 		wipe.WriteByte(')')
-		if _, err := tx.Exec(wipe.String(), oldRowids...); err != nil {
+		if _, err := countSymbolFTSWrite(tx.Exec(wipe.String(), oldRowids...)); err != nil {
 			return err
 		}
 		stats.deleteStatements++
 	}
 
-	var insert strings.Builder
-	insert.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
-	insertArgs := make([]any, 0, len(chunk)*4)
-	for i, item := range chunk {
-		if i > 0 {
-			insert.WriteByte(',')
+	if len(changed) > 0 {
+		var insert strings.Builder
+		insert.WriteString(`INSERT INTO symbol_fts (rowid, node_id, repo_prefix, tokens) VALUES `)
+		insertArgs := make([]any, 0, len(chunk)*4)
+		for pos, i := range changed {
+			item := chunk[i]
+			if pos > 0 {
+				insert.WriteByte(',')
+			}
+			insert.WriteString(`(?, ?, ?, ?)`)
+			insertArgs = append(insertArgs, states[i].rowid, item.NodeID, states[i].repoPrefix, item.Tokens)
 		}
-		insert.WriteString(`(?, ?, ?, ?)`)
-		insertArgs = append(insertArgs, states[i].rowid, item.NodeID, states[i].repoPrefix, item.Tokens)
-	}
-	if _, err := tx.Exec(insert.String(), insertArgs...); err != nil {
-		return err
-	}
-	stats.insertStatements++
+		if _, err := countSymbolFTSWrite(tx.Exec(insert.String(), insertArgs...)); err != nil {
+			return err
+		}
+		stats.insertStatements++
 
-	var ownership strings.Builder
-	ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (view_gen, node_id, repo_prefix, fts_rowid) VALUES `)
-	ownershipArgs := make([]any, 0, len(chunk)*4)
-	for i, item := range chunk {
-		if i > 0 {
-			ownership.WriteByte(',')
+		var ownership strings.Builder
+		ownership.WriteString(`INSERT OR REPLACE INTO symbol_fts_rowid (view_gen, node_id, repo_prefix, fts_rowid) VALUES `)
+		ownershipArgs := make([]any, 0, len(chunk)*4)
+		for pos, i := range changed {
+			item := chunk[i]
+			if pos > 0 {
+				ownership.WriteByte(',')
+			}
+			ownership.WriteString(`(?, ?, ?, ?)`)
+			ownershipArgs = append(ownershipArgs, viewGen, item.NodeID, states[i].repoPrefix, states[i].rowid)
 		}
-		ownership.WriteString(`(?, ?, ?, ?)`)
-		ownershipArgs = append(ownershipArgs, viewGen, item.NodeID, states[i].repoPrefix, states[i].rowid)
+		if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
+			return err
+		}
+		stats.ownershipStatements++
 	}
-	if _, err := tx.Exec(ownership.String(), ownershipArgs...); err != nil {
-		return err
+	if collect != nil {
+		for i, item := range chunk {
+			*collect = append(*collect, SymbolFTSRow{RowID: states[i].rowid, NodeID: item.NodeID, RepoPrefix: states[i].repoPrefix, Tokens: item.Tokens})
+		}
 	}
-	stats.ownershipStatements++
 	return nil
 }
 
@@ -369,9 +401,14 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 	}
 	stats.allocatorQueries++
 
+	var fresh *[]SymbolFTSRow
+	if s.viewGen > baseViewGeneration && !freshFTSOff.Load() {
+		collected := make([]SymbolFTSRow, 0, len(items))
+		fresh = &collected
+	}
 	for start := 0; start < len(items); start += ftsInsertChunkRows {
 		end := minInt(start+ftsInsertChunkRows, len(items))
-		if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
+		if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats, fresh); err != nil {
 			return stats, err
 		}
 	}
@@ -380,6 +417,9 @@ func (s *Store) batchUpsertSymbolFTS(items []graph.SymbolFTSItem) (symbolFTSBatc
 		return stats, err
 	}
 	stats.commits++
+	if fresh != nil {
+		s.recordFreshFTS(s.viewGen, *fresh)
+	}
 	return stats, nil
 }
 
@@ -400,6 +440,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 	if produce == nil {
 		return nil
 	}
+	s.markFreshFTSIncomplete(s.viewGen) // a replacement the fresh-rows buffer does not follow
 	if s.db == s.writerDB {
 		return fmt.Errorf("store_sqlite: ReplaceSymbolFTS needs independent read and write pools; %q shares one handle", s.dbPath)
 	}
@@ -419,7 +460,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 
 	// Drive the wipe through the indexed rowid sidecar, and drop the sidecar
 	// rows in lockstep so the two can never diverge.
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
+	if _, err := countSymbolFTSWrite(tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM symbol_fts_rowid WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repoPrefix); err != nil {
@@ -438,7 +479,7 @@ func (s *Store) ReplaceSymbolFTS(repoPrefix string, produce func(emit func([]gra
 		items = dedupeSymbolFTSItems(items)
 		for start := 0; start < len(items); start += ftsInsertChunkRows {
 			end := minInt(start+ftsInsertChunkRows, len(items))
-			if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats); err != nil {
+			if err := upsertSymbolFTSChunkTx(tx, s.viewGen, items[start:end], &nextRowid, &stats, nil); err != nil {
 				return err
 			}
 		}
@@ -469,6 +510,7 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 	if len(items) == 0 {
 		return nil
 	}
+	s.markFreshFTSIncomplete(s.viewGen) // a bulk write the fresh-rows buffer does not follow
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -507,7 +549,7 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 	// Drive the wipe through the indexed rowid sidecar. Filtering the FTS5
 	// table's UNINDEXED repo_prefix column here used to rescan the growing
 	// corpus once per repository during a cold multi-repo build.
-	if _, err := tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix); err != nil {
+	if _, err := countSymbolFTSWrite(tx.Exec(deleteSymbolFTSForRepoSQL, s.viewGen, repoPrefix)); err != nil {
 		return err
 	}
 	// Drop this repo's rowid-map entries in lockstep with the symbol_fts
@@ -535,7 +577,7 @@ func (s *Store) BulkUpsertSymbolFTS(repoPrefix string, items []graph.SymbolFTSIt
 			b.WriteString(`(?,?,?,?)`)
 			args = append(args, nextRowid+int64(start+i), it.NodeID, repoPrefix, it.Tokens)
 		}
-		if _, err := tx.Exec(b.String(), args...); err != nil {
+		if _, err := countSymbolFTSWrite(tx.Exec(b.String(), args...)); err != nil {
 			return err
 		}
 
@@ -595,19 +637,26 @@ func backfillSymbolFTSRowidMap(db *sql.DB) error {
 
 // BuildSymbolIndex is a no-op for FTS5: the index is maintained
 // incrementally on every insert, so there is nothing to build after the
-// bulk parse phase. We opportunistically run the FTS5 'optimize'
-// command to merge segments (purely a read-latency improvement); any
-// error is ignored because the index is already correct without it.
+// bulk parse phase. One bounded FTS5 merge improves read latency without a
+// whole-corpus optimize. Maintenance errors are logged through fts_merge but
+// do not fail the build: the transactional index is already query-correct.
 // Idempotent — safe to call any number of times.
 func (s *Store) BuildSymbolIndex() error {
 	// A generation's rows are correct as soon as its bounded inserts commit.
-	// FTS5 optimize is global maintenance, so running it for every unpublished
-	// generation turns a view burst into repeated whole-table writer holds.
+	// FTS maintenance targets the global table, so unpublished view bursts
+	// must not schedule repeated writer holds for already query-correct rows.
 	if s.viewGen > 0 {
 		return nil
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	var event bulkFinalizeEvent
+	merged := false
+	defer func() {
+		s.writeMu.Unlock()
+		if merged {
+			s.emitBulkFinalizeEvent(event)
+		}
+	}()
 	if s.coordinatedBulkLoad {
 		// Multi-repository cold indexing calls this once per repository. A
 		// full optimize of the growing corpus after every repo is quadratic;
@@ -615,7 +664,8 @@ func (s *Store) BuildSymbolIndex() error {
 		s.deferredFTSOptimize = true
 		return nil
 	}
-	_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO symbol_fts(symbol_fts) VALUES('optimize')`)
+	event = s.mergeLiveFTSLocked("symbol_fts", `INSERT INTO symbol_fts(symbol_fts, rank) VALUES('merge', ?)`)
+	merged = true
 	return nil
 }
 
@@ -634,7 +684,13 @@ func (s *Store) BuildSymbolIndex() error {
 // SQLite's bm25() returns lower-is-better, so the stored Score is its
 // negation (higher-is-better, matching the SymbolHit contract).
 func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error) {
-	return s.SearchSymbolsRepoScoped(query, nil, limit)
+	return s.SearchSymbolsContext(context.Background(), query, limit)
+}
+
+// SearchSymbolsContext is SearchSymbols with request cancellation propagated
+// through both the exact-name and FTS queries.
+func (s *Store) SearchSymbolsContext(ctx context.Context, query string, limit int) ([]graph.SymbolHit, error) {
+	return s.SearchSymbolsRepoScopedContext(ctx, query, nil, limit)
 }
 
 // SearchSymbolsRepoScoped is SearchSymbols narrowed to the repoAllow
@@ -646,6 +702,23 @@ func (s *Store) SearchSymbols(query string, limit int) ([]graph.SymbolHit, error
 // without the IN). A nil / empty repoAllow is the exact unscoped
 // behaviour.
 func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
+	return s.SearchSymbolsRepoScopedContext(context.Background(), query, repoAllow, limit)
+}
+
+// SearchSymbolsRepoScopedContext is SearchSymbolsRepoScoped with request
+// cancellation propagated to SQLite. Legacy callers retain their original
+// background-context behavior through SearchSymbolsRepoScoped.
+func (s *Store) SearchSymbolsRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolHit, error) {
+	return s.searchSymbolsPathScopedContext(ctx, query, repoAllow, nil, limit)
+}
+
+func (s *Store) searchSymbolsPathScopedContext(ctx context.Context, query string, repoAllow, pathPrefixes []string, limit int) ([]graph.SymbolHit, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if query == "" {
 		return nil, nil
 	}
@@ -669,11 +742,14 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 	// module named "Extensions" would otherwise eclipse every
 	// `*Extensions` class the FTS ranks first.
 	if isIdentifierQuery(query) {
-		ns := s.FindNodesByName(query)
+		ns, err := s.symbolExactNodesContext(ctx, query)
+		if err != nil {
+			return nil, err
+		}
 		if len(ns) > 0 {
 			out := make([]graph.SymbolHit, 0, minInt(len(ns), limit))
 			for _, n := range ns {
-				if n == nil || n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
+				if n.ID == "" || !tier0ShortCircuitKind(n.Kind) {
 					continue
 				}
 				// Unowned nodes (empty prefix) pass every repo narrow —
@@ -682,6 +758,9 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 					if _, ok := allowed[n.RepoPrefix]; !ok {
 						continue
 					}
+				}
+				if !symbolPathAllowed(n.FilePath, n.RepoPrefix, pathPrefixes) {
+					continue
 				}
 				out = append(out, graph.SymbolHit{NodeID: n.ID, Score: 100.0})
 				if len(out) >= limit {
@@ -699,6 +778,39 @@ func (s *Store) SearchSymbolsRepoScoped(query string, repoAllow []string, limit 
 		return nil, nil
 	}
 
+	if len(pathPrefixes) > 0 {
+		if hits, handled, err := s.searchSymbolPathPointPlan(ctx, match, repoAllow, pathPrefixes, limit); handled {
+			return hits, err
+		}
+	}
+
+	// A derived generation with a dense rowid run is ranked inside it; see
+	// symbolFTSSpanFraction. The page is the one the unbounded query returns.
+	if len(pathPrefixes) == 0 {
+		if span, measured, err := s.symbolFTSGenerationSpan(ctx, s.viewGen); err != nil {
+			return nil, err
+		} else if measured && span.empty() {
+			return nil, nil
+		} else if measured && span.dense() {
+			return s.searchSymbolFTSSpan(ctx, match, span, repoAllow, limit, true)
+		}
+	}
+
+	if s.viewGen == baseViewGeneration && len(pathPrefixes) == 0 && len(repoAllow) == 1 {
+		if hits, handled, err := s.searchSymbolRepoSpanPlan(ctx, match, repoAllow[0], limit); handled {
+			return hits, err
+		}
+	}
+
+	// A generation that is not one narrow run, the base corpus above all, is
+	// ranked in its span with the other generations' runs cut out when that
+	// skips enough of the table; see symbolFTSHoleShare.
+	if len(pathPrefixes) == 0 {
+		if hits, handled, err := s.searchSymbolFTSRangePlan(ctx, match, s.viewGen, repoAllow, limit); handled {
+			return hits, err
+		}
+	}
+
 	// symbol_fts is one shared virtual table across every generation, so the
 	// MATCH alone would rank rows this handle cannot see. The rowid map carries
 	// the generation and its symbol_fts_rowid_by_rowid index is UNIQUE on
@@ -709,7 +821,19 @@ FROM symbol_fts
 JOIN symbol_fts_rowid
   ON symbol_fts_rowid.fts_rowid = symbol_fts.rowid AND symbol_fts_rowid.view_gen = ?
 WHERE symbol_fts MATCH ?`
+	if len(pathPrefixes) > 0 {
+		q = `SELECT symbol_fts.node_id, bm25(symbol_fts)
+FROM symbol_fts
+JOIN symbol_fts_rowid ON symbol_fts_rowid.fts_rowid = symbol_fts.rowid AND symbol_fts_rowid.view_gen = ?
+JOIN nodes AS path_node ON path_node.view_gen = symbol_fts_rowid.view_gen AND path_node.id = symbol_fts.node_id
+WHERE symbol_fts MATCH ?`
+	}
 	args := []any{s.viewGen, match}
+	if len(pathPrefixes) > 0 {
+		predicate, pathArgs := symbolPathPredicate(pathPrefixes)
+		q += " AND (" + predicate + ")"
+		args = append(args, pathArgs...)
+	}
 	if len(repoAllow) > 0 {
 		// The empty prefix always passes: unowned rows (synthetic
 		// externals) are admitted by every repo-narrow predicate — see
@@ -719,9 +843,12 @@ WHERE symbol_fts MATCH ?`
 			args = append(args, r)
 		}
 	}
-	q += ` ORDER BY bm25(symbol_fts) LIMIT ?`
+	// FTS5's rank ordering can stop after the requested in-scope hits without
+	// an external sort of every match. Pin the mapping per query so a stored
+	// custom rank configuration cannot change the existing BM25 scores.
+	q += ` AND symbol_fts.rank MATCH 'bm25()' ORDER BY symbol_fts.rank LIMIT ?`
 	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -748,6 +875,45 @@ WHERE symbol_fts MATCH ?`
 		return nil, err
 	}
 	return hits, nil
+}
+
+type symbolExactNode struct {
+	FilePath   string
+	ID         string
+	Kind       graph.NodeKind
+	RepoPrefix string
+}
+
+// symbolExactNodesContext reads only the fields the tier-0 short circuit uses.
+// Keeping this query local ensures a canceled request never falls back to the
+// legacy background-context node lookup.
+func (s *Store) symbolExactNodesContext(ctx context.Context, name string) ([]symbolExactNode, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, kind, repo_prefix, file_path
+FROM nodes
+WHERE name = ? AND view_gen = ?
+ORDER BY id`, name, s.viewGen)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []symbolExactNode
+	for rows.Next() {
+		var (
+			n    symbolExactNode
+			kind string
+		)
+		if err := rows.Scan(&n.ID, &kind, &n.RepoPrefix, &n.FilePath); err != nil {
+			return nil, err
+		}
+		n.Kind = graph.NodeKind(kind)
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // tier0ShortCircuitKind reports whether an exact-name hit may
@@ -812,27 +978,64 @@ func escapeFTSQuote(t string) string {
 // through this when the backend implements SymbolBundleSearcher,
 // pre-seeding rerank.Context's edge caches.
 func (s *Store) SearchSymbolBundles(query string, limit int) ([]graph.SymbolBundle, error) {
-	hits, err := s.SearchSymbols(query, limit)
+	return s.SearchSymbolBundlesContext(context.Background(), query, limit)
+}
+
+// SearchSymbolBundlesContext is SearchSymbolBundles with request cancellation
+// propagated through the ranked symbol query. Bundle hydration retains its
+// existing batched-read contract and starts only while the request is live.
+func (s *Store) SearchSymbolBundlesContext(ctx context.Context, query string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
+	hits, err := s.SearchSymbolsContext(ctx, query, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return s.bundlesForHits(hits)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.bundlesForHits(hits, stats)
 }
 
 // SearchSymbolBundlesRepoScoped is SearchSymbolBundles over the
 // repo-scoped hit query — see SearchSymbolsRepoScoped for why the
 // narrowing must happen inside the FTS query.
 func (s *Store) SearchSymbolBundlesRepoScoped(query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
-	hits, err := s.SearchSymbolsRepoScoped(query, repoAllow, limit)
+	return s.SearchSymbolBundlesRepoScopedContext(context.Background(), query, repoAllow, limit)
+}
+
+// SearchSymbolBundlesRepoScopedContext is SearchSymbolBundlesRepoScoped with
+// request cancellation propagated through the repository-scoped FTS query.
+func (s *Store) SearchSymbolBundlesRepoScopedContext(ctx context.Context, query string, repoAllow []string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
+	hits, err := s.SearchSymbolsRepoScopedContext(ctx, query, repoAllow, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return s.bundlesForHits(hits)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.bundlesForHits(hits, stats)
 }
 
 // bundlesForHits materialises ranked hits into SymbolBundles through
 // the content-addressed cache + batched node/edge fetches.
-func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, error) {
+func (s *Store) bundlesForHits(hits []graph.SymbolHit, stats *search.SymbolBundleTimings) ([]graph.SymbolBundle, error) {
 	if len(hits) == 0 {
 		return nil, nil
 	}
@@ -872,14 +1075,39 @@ func (s *Store) bundlesForHits(hits []graph.SymbolHit) ([]graph.SymbolBundle, er
 		}
 	}
 
+	if stats != nil {
+		stats.UniqueIDs = len(ids)
+		stats.CacheHits = len(cached)
+		stats.CacheMisses = len(missIDs)
+	}
+
 	// Fetch the misses' nodes + in/out edges in one batched round-trip
 	// each. A full cache hit skips all three fetches entirely.
 	var nodes map[string]*graph.Node
 	var out, in map[string][]*graph.Edge
 	if len(missIDs) > 0 {
+		legStart := bundleLegStart(stats)
 		nodes = s.GetNodesByIDs(missIDs)
+		if stats != nil {
+			stats.NodeMS = bundleLegMS(legStart)
+			stats.NodeRows = len(nodes)
+		}
+		legStart = bundleLegStart(stats)
 		out = s.GetOutEdgesByNodeIDs(missIDs)
+		if stats != nil {
+			stats.OutMS = bundleLegMS(legStart)
+			for _, rows := range out {
+				stats.OutRows += len(rows)
+			}
+		}
+		legStart = bundleLegStart(stats)
 		in = s.GetInEdgesByNodeIDs(missIDs)
+		if stats != nil {
+			stats.InMS = bundleLegMS(legStart)
+			for _, rows := range in {
+				stats.InRows += len(rows)
+			}
+		}
 	}
 
 	bundles := make([]graph.SymbolBundle, 0, len(ids))
@@ -928,4 +1156,75 @@ func isIdentifierQuery(q string) bool {
 		}
 	}
 	return true
+}
+
+// SearchSymbolBundlesPathScopedContext narrows the ranked text candidates before
+// LIMIT and bundle hydration. Prefixes use literal, case-sensitive slash-boundary
+// matching, exactly as the MCP repo-relative path predicate does.
+func (s *Store) SearchSymbolBundlesPathScopedContext(ctx context.Context, query string, repos, paths []string, limit int) ([]graph.SymbolBundle, error) {
+	stats, observe := bundleTimingsForContext(ctx)
+	if observe != nil {
+		defer func() { observe(*stats) }()
+	}
+	rankStart := bundleLegStart(stats)
+	hits, err := s.searchSymbolsPathScopedContext(ctx, query, repos, paths, limit)
+	if stats != nil {
+		stats.RankMS = bundleLegMS(rankStart)
+		stats.RankedHits = len(hits)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return s.bundlesForHits(hits, stats)
+}
+
+func symbolPathAllowed(filePath, repo string, paths []string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	rel := strings.ReplaceAll(filePath, "\\", "/")
+	if repo != "" {
+		rel = strings.TrimPrefix(rel, repo+"/")
+	}
+	for _, path := range paths {
+		if rel == path || strings.HasPrefix(rel, path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func symbolPathPredicate(paths []string) (string, []any) {
+	// substr equality avoids LIKE wildcards and case folding, including prefixes
+	// containing %, _, [, and Unicode. length/substr both count Unicode characters.
+	normalized := `replace(path_node.file_path, '\', '/')`
+	relative := `(CASE WHEN path_node.repo_prefix <> '' AND substr(` + normalized + `,1,length(path_node.repo_prefix)+1) = path_node.repo_prefix || '/' THEN substr(` + normalized + `,length(path_node.repo_prefix)+2) ELSE ` + normalized + ` END)`
+	clauses := make([]string, 0, len(paths))
+	args := make([]any, 0, len(paths)*3)
+	for _, path := range paths {
+		clauses = append(clauses, relative+` = ? OR substr(`+relative+`,1,length(?)+1) = ? || '/'`)
+		args = append(args, path, path, path)
+	}
+	return strings.Join(clauses, " OR "), args
+}
+
+// Observers are installed only for the engine's existing request timing record.
+func bundleTimingsForContext(ctx context.Context) (*search.SymbolBundleTimings, func(search.SymbolBundleTimings)) {
+	observe := search.SymbolBundleTimingsObserver(ctx)
+	if observe == nil {
+		return nil, nil
+	}
+	return &search.SymbolBundleTimings{Calls: 1}, observe
+}
+func bundleLegStart(stats *search.SymbolBundleTimings) time.Time {
+	if stats == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+func bundleLegMS(start time.Time) float64 {
+	return float64(time.Since(start)) / float64(time.Millisecond)
 }

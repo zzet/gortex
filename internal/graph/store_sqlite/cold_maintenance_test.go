@@ -250,32 +250,87 @@ func TestColdMaintenanceRepoIndexAvailableDuringBulk(t *testing.T) {
 	}
 	coldMaintenanceCorpus(t, s, 1000, 5000)
 	coldMaintenanceNode(t, s, "target", "target::a", 0)
-	coldMaintenanceEdge(t, s, "target::a", "large::0", 0)
-	for _, query := range []string{
-		`SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? AND repo_prefix <> '' AND view_gen = ? LIMIT 1)`,
-		`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`,
-		`SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen WHERE n.repo_prefix = ? AND e.view_gen = ?`,
+	coldMaintenanceNode(t, s, "foreign", "shared", 0)
+	coldMaintenanceNode(t, s, "foreign", "target::a", 17)
+	coldMaintenanceNode(t, s, "target", "shared", 17)
+	// The same node IDs deliberately change repository ownership across
+	// generations. Edges belong to the source; a missing target is valid,
+	// but an absent source cannot establish repository membership.
+	for _, edge := range []struct {
+		from, to   string
+		generation int64
+	}{
+		{"target::a", "large::0", 0},
+		{"target::a", "missing-target", 0},
+		{"shared", "missing-target", 0},
+		{"missing-source", "target::a", 0},
+		{"shared", "large::0", 17},
+		{"shared", "missing-target", 17},
+		{"target::a", "missing-target", 17},
+		{"missing-source", "shared", 17},
 	} {
-		plan := coldMaintenancePlan(t, s, query, "target", 0)
-		repoSeek := false
-		for _, line := range strings.Split(plan, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			isNode := fields[1] == "n" || fields[1] == "nodes"
-			isEdge := fields[1] == "e" || fields[1] == "edges"
-			if fields[0] == "SEARCH" && isNode && strings.Contains(line, "nodes_by_repo_kind") {
-				repoSeek = true
-			}
-			if fields[0] == "SCAN" && (isNode || isEdge) {
-				t.Fatalf("unexpected whole-graph-table scan for %s; plan:\n%s", query, plan)
-			}
-		}
-		if !repoSeek {
-			t.Fatalf("expected repository-indexed node seek for %s; plan:\n%s", query, plan)
+		coldMaintenanceExec(t, s, `INSERT INTO edges (from_id, to_id, kind, view_gen) VALUES (?, ?, 'calls', ?)`, edge.from, edge.to, edge.generation)
+	}
+	const edgeCountSQL = `SELECT COUNT(*) FROM edges
+	 WHERE view_gen = ?2 AND from_id IN (
+	     SELECT id FROM nodes WHERE repo_prefix = ?1 AND view_gen = ?2
+	 )`
+	prepared := false
+	for _, query := range s.preparedSQL {
+		if strings.Join(strings.Fields(query), " ") == strings.Join(strings.Fields(edgeCountSQL), " ") {
+			prepared = true
+			break
 		}
 	}
+	if !prepared {
+		t.Fatal("edge-count plan fixture diverged from the production prepared SQL")
+	}
+	assertRepoQueries := func(phase string) {
+		for _, generation := range []int64{0, 17} {
+			for _, query := range []string{
+				`SELECT EXISTS(SELECT 1 FROM nodes WHERE repo_prefix = ? AND repo_prefix <> '' AND view_gen = ? LIMIT 1)`,
+				`SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`,
+				edgeCountSQL,
+			} {
+				if query == edgeCountSQL {
+					coldMaintenanceCount(t, s, 2, query, "target", generation)
+				} else {
+					coldMaintenanceCount(t, s, 1, query, "target", generation)
+				}
+				plan := coldMaintenancePlan(t, s, query, "target", generation)
+				repoSeek := false
+				for _, line := range strings.Split(plan, "\n") {
+					fields := strings.Fields(line)
+					if len(fields) < 2 {
+						continue
+					}
+					isNode := fields[1] == "n" || fields[1] == "nodes"
+					isEdge := fields[1] == "e" || fields[1] == "edges"
+					repoIndex := strings.Contains(line, "nodes_by_repo_kind (")
+					if phase != "during bulk" {
+						repoIndex = repoIndex || (strings.Contains(line, "nodes_by_repo (") && strings.Contains(line, "view_gen=?"))
+					}
+					if fields[0] == "SEARCH" && isNode && repoIndex && strings.Contains(line, "(repo_prefix=?") {
+						repoSeek = true
+					}
+					if fields[0] == "SCAN" && (isNode || isEdge) {
+						t.Fatalf("%s generation=%d: unexpected whole-graph-table scan for %s; plan:\n%s", phase, generation, query, plan)
+					}
+				}
+				if !repoSeek {
+					t.Fatalf("%s generation=%d: expected repository-indexed node seek for %s; plan:\n%s", phase, generation, query, plan)
+				}
+			}
+			var actual int
+			if err := s.stmtRepoEdgeCount.QueryRow("target", generation).Scan(&actual); err != nil {
+				t.Fatalf("%s generation=%d: production edge count: %v", phase, generation, err)
+			}
+			if actual != 2 {
+				t.Fatalf("%s generation=%d: production edge count=%d, want 2", phase, generation, actual)
+			}
+		}
+	}
+	assertRepoQueries("during bulk")
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +339,7 @@ func TestColdMaintenanceRepoIndexAvailableDuringBulk(t *testing.T) {
 	for _, index := range bulkDroppableIndexes {
 		coldMaintenanceCount(t, s, 1, `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?`, index.name)
 	}
+	assertRepoQueries("after bulk")
 	if err := s.EndCoordinatedBulkLoad(); err != nil {
 		t.Fatalf("idempotent bulk completion: %v", err)
 	}
@@ -298,6 +354,7 @@ func TestColdMaintenanceRepoIndexAvailableDuringBulk(t *testing.T) {
 	coldMaintenanceCount(t, s, 1, `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'nodes_by_repo_kind'`)
 	coldMaintenanceCount(t, s, 1, `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'nodes_missing_workspace_slugs'`)
 	coldMaintenanceCount(t, s, 1, `SELECT COUNT(*) FROM nodes WHERE repo_prefix = 'target' AND view_gen = 0`)
+	assertRepoQueries("after reopen")
 }
 
 func coldMaintenanceBenchmarkStore(b *testing.B, indexes string) *Store {
@@ -361,7 +418,10 @@ func BenchmarkColdBulkRepoMaintenance(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					coldMaintenanceCount(b, s, 1, `SELECT COUNT(*) FROM nodes WHERE repo_prefix = ? AND view_gen = ?`, "target", 0)
-					coldMaintenanceCount(b, s, 1, `SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.from_id AND n.view_gen = e.view_gen WHERE n.repo_prefix = ? AND e.view_gen = ?`, "target", 0)
+					coldMaintenanceCount(b, s, 1, `SELECT COUNT(*) FROM edges
+						WHERE view_gen = ?2 AND from_id IN (
+							SELECT id FROM nodes WHERE repo_prefix = ?1 AND view_gen = ?2
+						)`, "target", 0)
 				}
 				b.StopTimer()
 			})

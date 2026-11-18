@@ -100,6 +100,7 @@ func runCall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	argObj = applyCLIRequireFresh(argObj)
 
 	compactCall := gortexmcp.IsFacadeToolName(tool) && !callLegacy
 	formatExplicit := callFormat != "json"
@@ -144,6 +145,9 @@ func runCall(cmd *cobra.Command, args []string) error {
 		relay = callFacadeDaemonTool
 	}
 	raw, err := relay(callIndex, tool, argObj)
+	if cliRequireFresh {
+		err = checkCLIFreshness(cmd, raw, err)
+	}
 	if err != nil {
 		return err
 	}

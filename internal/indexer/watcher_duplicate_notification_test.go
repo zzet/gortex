@@ -62,7 +62,7 @@ func Original() {}
 	// is never written while a patch goroutine reads it.
 	var armed atomic.Bool
 	var once sync.Once
-	w.pointReindexRaw = func(p string) (*IndexResult, error) {
+	w.pointReindexRaw = func(p string, _ *PublicationStamps) (*IndexResult, error) {
 		result, err := idx.incrementalPointWatcherPath(idx.rootPath, p)
 		if armed.Load() {
 			// The window between "graph mutated" and "is my generation

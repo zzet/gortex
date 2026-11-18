@@ -24,6 +24,8 @@ func openEdgeKindBatchTestStore(t *testing.T) *Store {
 
 func TestScanEdgesByKindsBatchedBoundsRewritesAndFreezesHighWater(t *testing.T) {
 	store := openEdgeKindBatchTestStore(t)
+	// Pool-wide InUse can otherwise count unrelated maintenance readers.
+	stopStoreBackgroundReaders(store)
 	store.db.SetMaxOpenConns(1)
 	store.db.SetMaxIdleConns(1)
 

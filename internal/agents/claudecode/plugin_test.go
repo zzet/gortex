@@ -23,8 +23,9 @@ func TestEmitPluginBundle_Layout(t *testing.T) {
 	}
 
 	// The emitter should write exactly: 1 plugin.json + 1 README +
-	// 1 LICENSE + 1 .mcp.json + N commands + N skills + 1 hooks.json
-	// + 1 hook handler script.
+	// 1 LICENSE + 1 .mcp.json + N skills + N sub-agents + 1 hooks.json
+	// + 1 hook handler script. No commands/: plugin skills are already
+	// slash commands.
 	wantPaths := []string{
 		".claude-plugin/plugin.json",
 		".mcp.json",
@@ -33,11 +34,8 @@ func TestEmitPluginBundle_Layout(t *testing.T) {
 		"hooks-handlers/gortex-hook.sh",
 		"hooks/hooks.json",
 	}
-	for _, name := range sortedKeys(SlashCommands) {
-		wantPaths = append(wantPaths, filepath.Join("commands", name))
-	}
-	for _, name := range sortedKeys(GlobalSkills) {
-		wantPaths = append(wantPaths, filepath.Join("skills", name, "SKILL.md"))
+	for _, id := range sortedKeys(GlobalSkills) {
+		wantPaths = append(wantPaths, filepath.Join("skills", pluginSkillName(id), "SKILL.md"))
 	}
 	for _, name := range sortedKeys(SubAgents) {
 		wantPaths = append(wantPaths, filepath.Join("agents", name))
@@ -138,6 +136,7 @@ func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
 		"`edit` / `refactor`",
 		"`capabilities`",
 		"`gortex call`",
+		"`/gortex:explore`",
 	} {
 		if !strings.Contains(pluginReadmeBody, want) {
 			t.Errorf("plugin README must contain %q", want)
@@ -147,6 +146,7 @@ func TestPluginReadme_DescribesPublicAgentSurface(t *testing.T) {
 		"52 tools", "search_symbols", "find_usages", "get_call_chain",
 		"rename_symbol", "preview_edit", "simulate_chain", "facade-v1",
 		"gortex daemon start",
+		"`/gortex-",
 	} {
 		if strings.Contains(pluginReadmeBody, forbidden) {
 			t.Errorf("plugin README must not expose %q", forbidden)
@@ -176,9 +176,9 @@ func TestEmitPluginBundle_HooksShape(t *testing.T) {
 		t.Fatalf("hooks.json: missing top-level 'hooks' object: %v", doc)
 	}
 
-	// All seven lifecycle/tool event kinds must be present; each must reference the
+	// All six lifecycle/tool event kinds must be present; each must reference the
 	// hooks-handlers script via ${CLAUDE_PLUGIN_ROOT}.
-	for _, event := range []string{"PreToolUse", "UserPromptSubmit", "SubagentStart", "SubagentStop", "PreCompact", "Stop", "SessionStart"} {
+	for _, event := range []string{"PreToolUse", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "SessionStart"} {
 		entries, ok := hooks[event].([]any)
 		if !ok || len(entries) == 0 {
 			t.Errorf("hooks.json: event %s missing or empty", event)
@@ -198,6 +198,14 @@ func TestEmitPluginBundle_HooksShape(t *testing.T) {
 		if !strings.Contains(cmd, "gortex-hook.sh") {
 			t.Errorf("hooks.json: %s command does not invoke gortex-hook.sh: %q", event, cmd)
 		}
+	}
+
+	assertHookTimeoutsInSeconds(t, hooks)
+
+	// PreCompact output is discarded by Claude Code; the post-compaction
+	// briefing rides on SessionStart(source="compact") instead (#814).
+	if _, ok := hooks["PreCompact"]; ok {
+		t.Error("hooks.json: PreCompact must not be bound")
 	}
 
 	// PreToolUse should carry the canonical matcher.
@@ -249,23 +257,29 @@ func TestEmitPluginBundle_SkillBodiesMatchSource(t *testing.T) {
 	}
 
 	// Single-source-of-truth check: the bytes written under
-	// skills/<name>/SKILL.md must equal GlobalSkills[<name>] exactly.
-	// Drift means content.go was edited without re-running the
-	// emitter; the CI guard catches that case but we double-check
-	// here in unit tests.
-	for name, want := range GlobalSkills {
+	// skills/<name>/SKILL.md must equal GlobalSkills[<id>] except for
+	// the frontmatter name line. Drift means content.go was edited
+	// without re-running the emitter; the CI guard catches that case
+	// but we double-check here in unit tests.
+	for id, source := range GlobalSkills {
+		name := pluginSkillName(id)
 		got, err := os.ReadFile(filepath.Join(dir, "skills", name, "SKILL.md"))
 		if err != nil {
 			t.Errorf("read skill %s: %v", name, err)
 			continue
 		}
+		want := strings.Replace(source, "\nname: "+id+"\n", "\nname: "+name+"\n", 1)
 		if string(got) != want {
-			t.Errorf("skill %s body drift: bytes do not match GlobalSkills[%q]", name, name)
+			t.Errorf("skill %s body drift: bytes do not match GlobalSkills[%q] with the plugin name", name, id)
 		}
 	}
 }
 
-func TestEmitPluginBundle_CommandBodiesMatchSource(t *testing.T) {
+// Claude Code namespaces plugin skills as "gortex:", so a skill's
+// directory and frontmatter name must both drop the "gortex-" prefix.
+// The frontmatter name wins over the directory, so checking only one
+// would let /gortex:gortex-<name> slip back in.
+func TestEmitPluginBundle_SkillNamesDropPrefix(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := EmitPluginBundle(PluginBundleSpec{
 		TargetDir: dir,
@@ -274,14 +288,54 @@ func TestEmitPluginBundle_CommandBodiesMatchSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for name, want := range SlashCommands {
-		got, err := os.ReadFile(filepath.Join(dir, "commands", name))
+	entries, err := os.ReadDir(filepath.Join(dir, "skills"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(GlobalSkills) {
+		t.Fatalf("skills/ has %d entries, want %d (one per workflow)", len(entries), len(GlobalSkills))
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "gortex-") {
+			t.Errorf("skill directory %q keeps the gortex- prefix", e.Name())
+		}
+		body, err := os.ReadFile(filepath.Join(dir, "skills", e.Name(), "SKILL.md"))
 		if err != nil {
-			t.Errorf("read command %s: %v", name, err)
+			t.Errorf("read skill %s: %v", e.Name(), err)
 			continue
 		}
-		if string(got) != want {
-			t.Errorf("command %s body drift", name)
+		if !strings.Contains(string(body), "\nname: "+e.Name()+"\n") {
+			t.Errorf("skill %s: frontmatter name does not match its directory", e.Name())
+		}
+	}
+}
+
+// A plugin skill is already a slash command, so a commands/ directory
+// would list every workflow twice. The bodies there also had no
+// frontmatter, which fails `claude plugin validate --strict`.
+func TestEmitPluginBundle_NoCommandsDir(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EmitPluginBundle(PluginBundleSpec{
+		TargetDir: dir,
+		Version:   "0.18.2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "commands")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("plugin bundle must not contain commands/ (stat err = %v)", err)
+	}
+}
+
+func TestPluginSkillBody_OnlyRewritesLeadingFrontmatter(t *testing.T) {
+	cases := map[string]string{
+		"---\nname: gortex-x\ndescription: d\n---\nbody\n": "---\nname: x\ndescription: d\n---\nbody\n",
+		"# Skill\n---\nname: body\n":                       "# Skill\n---\nname: body\n",
+		"---\nmeta:\n  name: nested\n---\nname: after\n":   "---\nmeta:\n  name: nested\n---\nname: after\n",
+	}
+	for in, want := range cases {
+		if got := pluginSkillBody(in, "x"); got != want {
+			t.Errorf("pluginSkillBody(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -378,10 +432,6 @@ func TestPluginPathHelpers(t *testing.T) {
 		t.Errorf("PluginHooksPath wrong: %s", PluginHooksPath())
 	}
 
-	cmds := PluginCommandPaths()
-	if len(cmds) != len(SlashCommands) {
-		t.Errorf("PluginCommandPaths count: got %d, want %d", len(cmds), len(SlashCommands))
-	}
 	skills := PluginSkillPaths()
 	if len(skills) != len(GlobalSkills) {
 		t.Errorf("PluginSkillPaths count: got %d, want %d", len(skills), len(GlobalSkills))
@@ -401,14 +451,53 @@ func TestEmitPluginBundle_SubAgentBodiesMatchSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for name, want := range SubAgents {
+	for name, source := range SubAgents {
 		got, err := os.ReadFile(filepath.Join(dir, "agents", name))
 		if err != nil {
 			t.Errorf("read sub-agent %s: %v", name, err)
 			continue
 		}
+		want := pluginSubAgentBody(source)
 		if string(got) != want {
-			t.Errorf("sub-agent %s body drift: bytes do not match SubAgents[%q]", name, name)
+			t.Errorf("sub-agent %s body drift: bytes do not match the plugin-transformed SubAgents[%q]", name, name)
+		}
+	}
+}
+
+func TestEmitPluginBundle_SubAgentToolNamespaces(t *testing.T) {
+	// Pin Claude Code's external names independently of the emitter constants:
+	// a misspelled plugin namespace must fail even if every tool uses it.
+	const wantUserPrefix = "mcp__gortex__"
+	const wantPluginPrefix = "mcp__plugin_gortex_gortex__"
+	dir := t.TempDir()
+	if _, err := EmitPluginBundle(PluginBundleSpec{TargetDir: dir, Version: "0.18.2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, source := range SubAgents {
+		userTools := SubAgentTools(source)
+		if len(userTools) == 0 {
+			t.Fatalf("user sub-agent %s has no tools", name)
+		}
+		for _, tool := range userTools {
+			if !strings.HasPrefix(tool, wantUserPrefix) {
+				t.Errorf("user sub-agent %s tool %q does not use %q", name, tool, wantUserPrefix)
+			}
+		}
+
+		body, err := os.ReadFile(filepath.Join(dir, "agents", name))
+		if err != nil {
+			t.Fatalf("read plugin sub-agent %s: %v", name, err)
+		}
+		pluginTools := SubAgentTools(string(body))
+		if len(pluginTools) != len(userTools) {
+			t.Fatalf("plugin sub-agent %s tool count = %d, want %d", name, len(pluginTools), len(userTools))
+		}
+		for i, tool := range pluginTools {
+			want := wantPluginPrefix + strings.TrimPrefix(userTools[i], wantUserPrefix)
+			if tool != want {
+				t.Errorf("plugin sub-agent %s tool[%d] = %q, want %q", name, i, tool, want)
+			}
 		}
 	}
 }

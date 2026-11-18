@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,8 +47,15 @@ type Client struct {
 	// loop and concurrent Call goroutines.
 	callTimeout atomic.Int64 // time.Duration nanoseconds
 
-	mu     sync.Mutex
-	closed bool
+	mu      sync.Mutex // state only; never held across pipe writes
+	writeMu sync.Mutex // serializes complete wire frames
+	closing bool
+	closed  bool
+
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
+	readerDone   chan struct{}
 
 	// notifHandlers route server → client notifications. Keyed by
 	// LSP method name. Each handler receives the raw params and
@@ -102,15 +110,24 @@ type SpawnTransport struct {
 	// stderr silently (no log spam, but also no visibility).
 	Logger *zap.Logger
 
-	cmd *exec.Cmd
+	started  atomic.Bool // transport is single-use, including a failed Start
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stopOnce sync.Once
+	stopDone chan struct{}
+	stopErr  error
 }
 
 // Start spawns the subprocess and returns its stdin / stdout. Errors
-// from pipe construction or exec.Start are returned verbatim. stderr is
-// not inherited: a per-process scanner goroutine routes it through
+// from pipe construction or exec.Start are returned verbatim. Start is single-use
+// even on failure; reconnect constructs a fresh transport. It must return before
+// Stop is called. Stderr is not inherited: a per-process scanner routes it through
 // Logger as structured, rate-limited Warn entries so a disconnect spam
 // or crash backtrace can't flood the daemon's log with raw text.
 func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
+	if !s.started.CompareAndSwap(false, true) {
+		return nil, nil, fmt.Errorf("LSP spawn transport is single-use")
+	}
 	cmd := exec.Command(s.Command, s.Args...)
 	platform.ConfigureBackgroundCommand(cmd)
 	cmd.Dir = s.WorkspaceRoot
@@ -133,16 +150,16 @@ func (s *SpawnTransport) Start() (io.WriteCloser, io.Reader, error) {
 		return nil, nil, fmt.Errorf("start %s: %w", s.Command, err)
 	}
 	s.cmd = cmd
+	s.stdin = stdin
 	procio.StderrWatcher{Logger: s.Logger, Tag: s.Description()}.Watch(stderr)
 	return stdin, stdout, nil
 }
 
-// Stop closes stdin and waits for the subprocess to exit.
+// Stop closes owned stdin, gives the child a bounded exit opportunity, then
+// kills only this exact child if necessary and joins its actual Wait result.
+// It does not claim ownership of arbitrary descendant processes.
 func (s *SpawnTransport) Stop() error {
-	if s.cmd == nil || s.cmd.Process == nil {
-		return nil
-	}
-	return s.cmd.Wait()
+	return s.stopBefore(time.Now().Add(lspShutdownBudget))
 }
 
 // SendsShutdown returns true: gortex owns the subprocess, so it must
@@ -156,8 +173,9 @@ func (s *SpawnTransport) Description() string { return s.Command }
 // already-running LSP server (e.g. one started by the user's IDE) and
 // uses the resulting net.Conn as the JSON-RPC carrier.
 type DialTransport struct {
-	Network string // "tcp" or "unix"
-	Address string // host:port (tcp) or socket path (unix)
+	ctx     context.Context // optional owner cancellation while dialing
+	Network string          // "tcp" or "unix"
+	Address string          // host:port (tcp) or socket path (unix)
 
 	conn net.Conn
 	// connWriter wraps conn so closing the write half does not also
@@ -172,7 +190,11 @@ type DialTransport struct {
 // Start dials the configured network/address and returns paired
 // read/write halves of the connection.
 func (d *DialTransport) Start() (io.WriteCloser, io.Reader, error) {
-	conn, err := net.Dial(d.Network, d.Address)
+	ctx := d.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, d.Network, d.Address)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial %s %s: %w", d.Network, d.Address, err)
 	}
@@ -286,6 +308,7 @@ func NewClientWithTransport(t Transport, logger *zap.Logger) (*Client, error) {
 		stdout:        bufio.NewReader(stdout),
 		logger:        logger,
 		done:          make(chan struct{}),
+		readerDone:    make(chan struct{}),
 		notifHandlers: make(map[string]NotificationHandler),
 		reqHandlers:   make(map[string]RequestHandler),
 	}
@@ -313,8 +336,8 @@ func (c *Client) OnRequest(method string, h RequestHandler) {
 	c.reqHandlers[method] = h
 }
 
-// Done returns a channel that closes when the client's read loop
-// terminates (server exited or stdin/stdout error).
+// Done closes when the connection becomes unavailable (EOF, error or shutdown).
+// Shutdown additionally joins the actual response-reader and owned transport.
 func (c *Client) Done() <-chan struct{} { return c.done }
 
 // SetCallTimeout bounds how long subsequent Call invocations wait for a
@@ -325,6 +348,10 @@ func (c *Client) SetCallTimeout(d time.Duration) { c.callTimeout.Store(int64(d))
 
 // Call sends a request and waits for the response.
 func (c *Client) Call(method string, params any, result any) error {
+	return c.call(method, params, result, false, time.Duration(c.callTimeout.Load()))
+}
+
+func (c *Client) call(method string, params any, result any, shutdown bool, timeoutBudget time.Duration) error {
 	id := c.reqID.Add(1)
 
 	req := jsonRPCRequest{
@@ -338,7 +365,7 @@ func (c *Client) Call(method string, params any, result any) error {
 	c.pending.Store(id, respCh)
 	defer c.pending.Delete(id)
 
-	if err := c.send(req); err != nil {
+	if err := c.sendFrame(req, shutdown); err != nil {
 		return fmt.Errorf("send %s: %w", method, err)
 	}
 
@@ -348,8 +375,8 @@ func (c *Client) Call(method string, params any, result any) error {
 	// forever in the select, preserving the historical unbounded
 	// behaviour for callers that never set a timeout.
 	var timeout <-chan time.Time
-	if d := time.Duration(c.callTimeout.Load()); d > 0 {
-		t := time.NewTimer(d)
+	if timeoutBudget > 0 {
+		t := time.NewTimer(timeoutBudget)
 		defer t.Stop()
 		timeout = t.C
 	}
@@ -365,7 +392,7 @@ func (c *Client) Call(method string, params any, result any) error {
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
 	case <-timeout:
-		return fmt.Errorf("LSP call %s: timeout after %s", method, time.Duration(c.callTimeout.Load()))
+		return fmt.Errorf("LSP call %s: timeout after %s", method, timeoutBudget)
 	}
 }
 
@@ -379,54 +406,31 @@ func (c *Client) Notify(method string, params any) error {
 	return c.send(notif)
 }
 
-// Shutdown closes the client. The transport decides whether the LSP
-// shutdown/exit handshake is sent first — spawned subprocesses get the
-// full sequence (we own their lifetime); dialed servers do not (the
-// IDE owns the server; we just disconnect).
-func (c *Client) Shutdown() error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		// The read loop already closed `done`; ensure the transport
-		// has finished tearing down (e.g. subprocess Wait) so we
-		// don't leak resources.
-		if c.transport != nil {
-			_ = c.transport.Stop()
-		}
-		return nil
-	}
-	c.closed = true
-	close(c.done)
-	sendsShutdown := c.transport != nil && c.transport.SendsShutdown()
-	c.mu.Unlock()
-
-	if sendsShutdown {
-		// Best-effort handshake — the server may already be gone.
-		// The shutdown/exit pair tells a server we own ("we spawned
-		// it") to free per-workspace state and exit cleanly.
-		_ = c.Call("shutdown", nil, nil)
-		_ = c.Notify("exit", nil)
-		_ = c.stdin.Close()
-	}
-
-	if c.transport == nil {
-		return nil
-	}
-	return c.transport.Stop()
-}
-
 // send writes a JSON-RPC message using the LSP content-length framing.
 func (c *Client) send(msg any) error {
+	return c.sendFrame(msg, false)
+}
+
+func (c *Client) sendFrame(msg any, shutdown bool) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
+	// Refuse new work before queuing behind a possibly blocked old writer.
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return fmt.Errorf("client is closed")
+	refused := c.closed || c.closing && !shutdown
+	c.mu.Unlock()
+	if refused {
+		return fmt.Errorf("client is closed or shutting down")
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	refused = c.closed || c.closing && !shutdown
+	c.mu.Unlock()
+	if refused {
+		return fmt.Errorf("client is closed or shutting down")
 	}
 
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
@@ -450,21 +454,10 @@ func (c *Client) send(msg any) error {
 //     in OnRequest returns a result that we frame and send back.
 func (c *Client) readResponses() {
 	defer func() {
-		// On EOF / read error, signal done so pending Call() return
-		// promptly instead of blocking forever. The select probe
-		// covers the case where someone (typically a test) closed
-		// c.done directly — close-of-closed-channel would panic.
-		select {
-		case <-c.done:
-			return
-		default:
+		c.markClosed()
+		if c.readerDone != nil {
+			close(c.readerDone)
 		}
-		c.mu.Lock()
-		if !c.closed {
-			c.closed = true
-			close(c.done)
-		}
-		c.mu.Unlock()
 	}()
 
 	// malformedFrames counts consecutive header blocks that yielded no

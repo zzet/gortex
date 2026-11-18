@@ -74,3 +74,58 @@ impl Dto { pub fn go(&self) {} }
 		}
 	}
 }
+
+// An impl for a type this file does not declare (another file, another
+// crate, a primitive) has no node to source the implements edge at.
+// Emitting <file>::<Type> anyway left edges no node owns, which outlived
+// their repository on eviction (#1120).
+func TestRsExtractor_ImplForForeignTypeEmitsNoDanglingEdge(t *testing.T) {
+	e := NewRustExtractor()
+	result, err := e.Extract("probe.rs", []byte(`use other::Strictness;
+impl From<u32> for Strictness { fn from(_: u32) -> Self { todo!() } }
+impl MyExt for u8 {}
+#[wasm_bindgen]
+impl Strictness { pub fn go(&self) {} }
+struct Local;
+impl Send for Local {}
+`))
+	require.NoError(t, err)
+
+	nodes := make(map[string]bool, len(result.Nodes))
+	for _, n := range result.Nodes {
+		nodes[n.ID] = true
+	}
+	for _, ed := range result.Edges {
+		if ed.Kind != graph.EdgeImplements && ed.Kind != graph.EdgeAnnotated {
+			continue
+		}
+		assert.True(t, nodes[ed.From], "%s edge %s -> %s has no source node", ed.Kind, ed.From, ed.To)
+	}
+
+	impls := rustImplementsEdges(t, `use other::Strictness;
+impl From<u32> for Strictness {}
+impl MyExt for u8 {}
+struct Local;
+impl Send for Local {}
+`)
+	assert.NotContains(t, impls, "probe.rs::Strictness -> unresolved::From")
+	assert.NotContains(t, impls, "probe.rs::u8 -> unresolved::MyExt")
+	require.Contains(t, impls, "probe.rs::Local -> unresolved::Send",
+		"an impl for a type declared in the file keeps its edge")
+
+	for _, n := range result.Nodes {
+		if n.Kind == graph.KindFile {
+			assert.Equal(t, true, n.Meta["uses_wasm_bindgen"],
+				"the interop sentinel still fires for #[wasm_bindgen] on an impl of a foreign type")
+		}
+	}
+}
+
+// The type may be declared after the impl that names it; the edge must
+// survive regardless of order.
+func TestRsExtractor_ImplBeforeTypeDeclarationKeepsEdge(t *testing.T) {
+	impls := rustImplementsEdges(t, `impl Send for Later {}
+struct Later;
+`)
+	require.Contains(t, impls, "probe.rs::Later -> unresolved::Send")
+}

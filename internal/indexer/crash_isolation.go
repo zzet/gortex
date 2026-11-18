@@ -261,6 +261,18 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 			return binarySkipResult(relPath, lang, reason), true, nil
 		}
 	}
+	// #812 defense in depth: an extraction that reports success but
+	// minted zero symbols from a partial parse used to vanish from the
+	// graph with no diagnostic. The UTF-16 decode transform removes the
+	// known cause; this catches every remaining silent-zero shape. The
+	// note goes through the pending set, not the ledger directly — the
+	// version receipt this file's caller records afterwards would clear
+	// a direct entry before any flush persisted it.
+	defer func() {
+		if err == nil && !skipped && silentZeroExtraction(result) {
+			idx.noteSilentZeroExtraction(relPath)
+		}
+	}()
 	// Bundled / minified build artifacts are synthetic source — a
 	// minified bundle or a sourcemap has no meaningful symbols and
 	// only pollutes the graph. Detect by content and skip with
@@ -301,7 +313,7 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 			idx.logger.Warn("indexer: file extraction exceeded budget; skipped",
 				zap.String("file", relPath), zap.Int("budget_ms", budget))
 			return timeoutSkipResult(relPath, lang, budget), true,
-				fmt.Errorf("extraction exceeded %dms budget: %s", budget, relPath)
+				&extractBudgetError{budgetMS: budget, path: relPath}
 		}
 		// An extractor panic was recovered in-process: isolate the file
 		// like the subprocess pool does — emit a quarantine node so it
@@ -315,7 +327,7 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 				true, eerr
 		}
 		if eerr != nil {
-			return nil, false, eerr
+			return nil, false, contractContentFailure(eerr)
 		}
 		stampParseErrors(r)
 		normalizeExtractionMetadata(r, src)
@@ -348,13 +360,16 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 		return quarantineResult(relPath, lang, res.Err), true,
 			fmt.Errorf("parser crash isolated on %s: %s", relPath, res.Err)
 	case res.Err != "":
-		return nil, false, errors.New(res.Err)
+		return nil, false, contractContentFailure(errors.New(res.Err))
 	}
 
 	// Clean parse: if the file was quarantined under an older revision
 	// and has since been fixed, drop the stale entry.
 	q.Forget(relPath)
 	result = &parser.ExtractionResult{Nodes: res.Nodes, Edges: res.Edges}
+	if res.ParseChecked && res.ParseErrors >= 0 {
+		result.ParseChecked, result.ParseErrors = true, res.ParseErrors
+	}
 	if res.HasParseErr {
 		stampParseErrorCount(result.Nodes, res.ParseErrors)
 	}

@@ -86,6 +86,16 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 	if err := validateAuthorizeUntrackRequest(req); err != nil {
 		return AuthorizeUntrackResult{}, err
 	}
+	// The explicit catalog authorization also covers direct callers: a newly
+	// proposed journal always records its cause in the same transaction. Existing
+	// journal token, phase and cause remain immutable and must pass the proof below.
+	if req.Cleanup != nil {
+		entry, err := explicitCleanupEntry(*req.Cleanup)
+		if err != nil {
+			return AuthorizeUntrackResult{}, err
+		}
+		req.Cleanup = &entry
+	}
 	var out AuthorizeUntrackResult
 	err := c.withTx(ctx, func(tx *sql.Tx) error {
 		if req.Cleanup != nil {
@@ -94,6 +104,9 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 				return err
 			}
 			if found {
+				if err := requireExplicitCleanupCauseTx(ctx, tx, entry, req.CheckoutID); err != nil {
+					return err
+				}
 				if entry.Reason != req.Cleanup.Reason {
 					return fmt.Errorf("%w: cleanup %s is %q, not %q", ErrCatalogStaleGuard,
 						req.Cleanup.CleanupID, entry.Reason, req.Cleanup.Reason)
@@ -104,8 +117,12 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 						ErrCatalogStaleGuard, req.Cleanup.CleanupID,
 						entry.PrimaryEpoch, req.ExpectedPrimaryEpoch)
 				}
+				entry, err = authorizeCleanupAttemptTx(ctx, tx, entry, *req.Cleanup)
+				if err != nil {
+					return err
+				}
 				out.Cleanup, out.Existing = &entry, true
-				return nil
+				return closeAuthorizedUntrackGraphTx(ctx, tx, req)
 			}
 		}
 
@@ -177,6 +194,9 @@ func (c *Catalog) AuthorizeUntrack(ctx context.Context, req AuthorizeUntrackRequ
 		out.Revoked = candidates
 
 		if req.Cleanup != nil {
+			if err := closeAuthorizedUntrackGraphTx(ctx, tx, req); err != nil {
+				return err
+			}
 			if err := insertCleanupEntryTx(ctx, tx, *req.Cleanup); err != nil {
 				return err
 			}
@@ -246,6 +266,9 @@ func (c *Catalog) CommitAuthorizedDemotion(ctx context.Context, req CommitAuthor
 				ErrCatalogStaleGuard, req.CheckoutID, active)
 		}
 		if req.Cleanup != nil {
+			if err := closeDedicatedGraphAdmissionTx(ctx, tx, req.OwnedGraphID); err != nil {
+				return err
+			}
 			entry, exists, err := cleanupEntryTx(ctx, tx, req.Cleanup.CleanupID)
 			if err != nil {
 				return err

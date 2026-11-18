@@ -63,9 +63,9 @@ import (
 const externalCallPrefix = "external-call::"
 
 // externalCallMutationChunk caps every point-lookup map and write batch in
-// this optional pass. The SQLite scoped projection pages independently; this
-// smaller boundary also keeps the in-memory fallback from retaining an entire
-// changed repository's candidates while it synthesizes terminals.
+// this optional pass (a chunk is extended only to keep one converging group
+// whole). The candidate list itself is held for the pass so it can be put in
+// a total order first: one compact entry per external-terminal edge.
 const externalCallMutationChunk = 512
 
 type externalCallCandidate struct {
@@ -104,6 +104,65 @@ func SynthesizeExternalCallsForFiles(g graph.Store, enabled bool, files []string
 	return synthesizeExternalCalls(g, externalCallCandidateEdgesForFiles(g, files))
 }
 
+// SynthesizeDemotedGoCallsForFiles is SynthesizeExternalCallsForFiles for Go
+// calls that a module change just demoted. A demoted call can land on a site
+// whose package terminal another call already holds. That row first goes back
+// to its own symbol, so the site converges in the cold order (the smallest
+// original terminal keeps the row) instead of keeping whichever call reached
+// the terminal first.
+func SynthesizeDemotedGoCallsForFiles(g graph.Store, enabled bool, files []string) int {
+	if g == nil || !enabled || len(files) == 0 {
+		return 0
+	}
+	reopenSharedGoTerminals(g, files)
+	return SynthesizeExternalCallsForFiles(g, enabled, files)
+}
+
+// reopenSharedGoTerminals moves each landed Go terminal row that shares its
+// site and package with a pending dep:: call back to the symbol it recorded.
+func reopenSharedGoTerminals(g graph.Store, files []string) {
+	mu := g.ResolveMutex()
+	mu.Lock()
+	defer mu.Unlock()
+	type destination struct {
+		site graph.EdgeSite
+		file string
+		node string
+	}
+	pending := make(map[destination]struct{})
+	var landed []*graph.Edge
+	externalCallCandidateEdgesForFiles(g, files)(func(row externalCallCandidate) bool {
+		e := row.edge
+		if e == nil {
+			return true
+		}
+		if strings.HasPrefix(e.To, externalCallPrefix) {
+			if target, _ := e.Meta["go_extern_target"].(string); strings.HasPrefix(target, "dep::") {
+				landed = append(landed, e)
+			}
+			return true
+		}
+		if ecosystem, importPath, ok := parseExternalCallTarget(e.To); ok && ecosystem == "dep" {
+			pending[destination{graph.EdgeSite{From: e.From, Line: e.Line, Kind: e.Kind}, e.FilePath, externalCallNodeID(ecosystem, importPath)}] = struct{}{}
+		}
+		return true
+	})
+	var reopened []graph.EdgeReindex
+	for _, e := range landed {
+		if _, shared := pending[destination{graph.EdgeSite{From: e.From, Line: e.Line, Kind: e.Kind}, e.FilePath, e.To}]; !shared {
+			continue
+		}
+		oldTo := e.To
+		e.To, _ = e.Meta["go_extern_target"].(string)
+		delete(e.Meta, "go_extern_target")
+		delete(e.Meta, "external_call")
+		reopened = append(reopened, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+	}
+	if len(reopened) > 0 {
+		g.ReindexEdges(reopened)
+	}
+}
+
 // SynthesizeExternalCallsForRepos is the repo-scoped counterpart used by the
 // end-of-batch global passes when only some repos re-indexed: it materialises
 // external-call nodes for the out-edges of the changed repos' symbols only, so
@@ -137,12 +196,12 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 	defer mu.Unlock()
 
 	synthesized := 0
-	type parsedCandidate struct {
-		externalCallCandidate
-		ecosystem, importPath, nodeID string
-	}
-	pending := make([]parsedCandidate, 0, externalCallMutationChunk)
-	flush := func() {
+	// A store that cannot remove one exact edge identity keeps the legacy
+	// behaviour for converging candidates (every member is moved and the
+	// store's key-collision rule decides).
+	remover, canDrop := g.(graph.ExactEdgeBatchRemover)
+	var pending []externalCallParsedCandidate
+	flush := func(pending []externalCallParsedCandidate) {
 		if len(pending) == 0 {
 			return
 		}
@@ -173,7 +232,16 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 		nodeSeen := make(map[string]struct{}, len(pending))
 		nodes := make([]*graph.Node, 0, len(pending))
 		reindexes := make([]graph.EdgeReindex, 0, len(pending))
-		for _, c := range pending {
+		// converged collects the later members of a converging group: their
+		// retargeted key is already taken by the group's first member, so
+		// they are removed rather than moved onto it. The SQLite store would
+		// drop them on the key collision anyway; the in-memory graph would
+		// keep them side by side under one key, and which of them the drain
+		// to disk kept first depended on its iteration order.
+		var converged []*graph.Edge
+		var last *externalCallParsedCandidate
+		for i := range pending {
+			c := pending[i]
 			e := c.edge
 			caller := c.source
 			if caller == nil {
@@ -190,6 +258,11 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 				// edge on its bookkeeping-string terminal.
 				continue
 			}
+			if canDrop && last != nil && sameExternalCallDestination(*last, c) {
+				converged = append(converged, e)
+				continue
+			}
+			last = &pending[i]
 
 			if knownNodes[c.nodeID] == nil {
 				if _, seen := nodeSeen[c.nodeID]; !seen {
@@ -214,16 +287,26 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 				e.Meta = map[string]any{}
 			}
 			e.Meta["external_call"] = true
+			// Keep Go's symbol-bearing identity for a module tracked later.
+			// Older package-only synthetic targets still need re-extraction.
+			if callerLang == "go" && strings.HasPrefix(oldTo, "dep::") {
+				e.Meta["go_extern_target"] = oldTo
+			}
+			graph.RestoreRestubProvenance(e)
+			delete(e.Meta, "go_import")
+			delete(e.Meta, "npm_import")
 			reindexes = append(reindexes, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
 		if len(nodes) > 0 {
 			g.AddBatch(nodes, nil)
 		}
+		if len(converged) > 0 {
+			remover.RemoveEdgesExact(converged)
+		}
 		if len(reindexes) > 0 {
 			g.ReindexEdges(reindexes)
 			synthesized += len(reindexes)
 		}
-		pending = pending[:0]
 	}
 
 	collect(func(row externalCallCandidate) bool {
@@ -241,19 +324,70 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 		if !ok {
 			return true
 		}
-		pending = append(pending, parsedCandidate{
+		pending = append(pending, externalCallParsedCandidate{
 			externalCallCandidate: row,
 			ecosystem:             ecosystem,
 			importPath:            importPath,
 			nodeID:                externalCallNodeID(ecosystem, importPath),
 		})
-		if len(pending) == externalCallMutationChunk {
-			flush()
-		}
 		return true
 	})
-	flush()
+	// Two calls into one package at one site (`zap.String(...)` and
+	// `zap.Error(...)` on one line) retarget to the same edge key, and the
+	// store keeps the first converging payload (ReindexEdges' contract). The
+	// candidates therefore run in a total order and a chunk never splits a
+	// converging group, so the surviving payload is always the one of the
+	// smallest original terminal: independent of the order the store listed
+	// the candidates in, of where a chunk boundary fell, and of whether the
+	// whole graph or one edited file is being synthesized.
+	sortExternalCallCandidates(pending)
+	for start := 0; start < len(pending); {
+		end := min(start+externalCallMutationChunk, len(pending))
+		for end < len(pending) && sameExternalCallDestination(pending[end-1], pending[end]) {
+			end++
+		}
+		flush(pending[start:end])
+		start = end
+	}
 	return synthesized
+}
+
+// externalCallParsedCandidate is one candidate with its synthetic target.
+type externalCallParsedCandidate struct {
+	externalCallCandidate
+	ecosystem, importPath, nodeID string
+}
+
+// sortExternalCallCandidates orders candidates by the retargeted edge key
+// (source, kind, file, line, synthetic target) and, inside one key, by the
+// original terminal, so every group of converging candidates is contiguous and
+// its first member is the same whatever order the candidates arrived in.
+func sortExternalCallCandidates(pending []externalCallParsedCandidate) {
+	sort.SliceStable(pending, func(i, j int) bool {
+		a, b := pending[i].edge, pending[j].edge
+		switch {
+		case a.From != b.From:
+			return a.From < b.From
+		case a.Kind != b.Kind:
+			return a.Kind < b.Kind
+		case a.FilePath != b.FilePath:
+			return a.FilePath < b.FilePath
+		case a.Line != b.Line:
+			return a.Line < b.Line
+		case pending[i].nodeID != pending[j].nodeID:
+			return pending[i].nodeID < pending[j].nodeID
+		default:
+			return a.To < b.To
+		}
+	})
+}
+
+// sameExternalCallDestination reports that two sorted candidates retarget to
+// one edge key.
+func sameExternalCallDestination(a, b externalCallParsedCandidate) bool {
+	return a.edge.From == b.edge.From && a.edge.Kind == b.edge.Kind &&
+		a.edge.FilePath == b.edge.FilePath && a.edge.Line == b.edge.Line &&
+		a.nodeID == b.nodeID
 }
 
 // externalCallCandidateEdges returns the call / reference edges whose
@@ -266,6 +400,14 @@ func synthesizeExternalCalls(g graph.Store, collect externalCallCandidateSeq) in
 // falls back to the EdgesByKinds scan + prefix filter otherwise.
 func externalCallCandidateEdges(g graph.Store) externalCallCandidateSeq {
 	return func(yield func(externalCallCandidate) bool) {
+		if cap, ok := g.(graph.ExternalCallCandidateIterator); ok {
+			for e := range cap.ExternalCallCandidateEdgesSeq() {
+				if e != nil && isExternalCandidateTarget(e.To) && !yield(externalCallCandidate{edge: e}) {
+					return
+				}
+			}
+			return
+		}
 		if cap, ok := g.(graph.ExternalCallCandidates); ok {
 			for _, e := range cap.ExternalCallCandidateEdges() {
 				if e != nil && isExternalCandidateTarget(e.To) &&

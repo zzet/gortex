@@ -33,12 +33,9 @@ func statsRepoNodes(repo string, n int) []*graph.Node {
 	return out
 }
 
-// Stats totals are summed from the persisted repo_index_state counters, not a
-// scan of the nodes/edges tables. Seeding a counter that disagrees with the
-// stored corpus is the only way to tell the two sources apart from outside:
-// the counter sum (7+11=18 nodes, 2+4=6 edges) differs from the 10 stored
-// nodes and 0 stored edges.
-func TestStatsTotalsComeFromIndexStateCounters(t *testing.T) {
+// Index-state counters can predate derived writes. Global statistics must
+// describe the physical corpus, including when those index counters drift.
+func TestStatsTotalsIgnoreStaleIndexStateCounters(t *testing.T) {
 	s := openStatsStore(t)
 	s.AddBatch(statsRepoNodes("r1", 5), nil)
 	s.AddBatch(statsRepoNodes("r2", 5), nil)
@@ -51,8 +48,8 @@ func TestStatsTotalsComeFromIndexStateCounters(t *testing.T) {
 	}))
 
 	st := s.Stats()
-	require.Equal(t, 18, st.TotalNodes, "totals must be the counter sum, not a node recount")
-	require.Equal(t, 6, st.TotalEdges, "totals must be the counter sum, not an edge recount")
+	require.Equal(t, 10, st.TotalNodes, "stale repo counters must not replace physical totals")
+	require.Zero(t, st.TotalEdges, "stale repo counters must not invent edges")
 }
 
 // When the counters match the corpus, the counter sum equals what the exact
@@ -87,19 +84,16 @@ func TestStatsFallsBackToExactScanWithoutCounters(t *testing.T) {
 	require.Equal(t, 6, st.TotalNodes, "fallback must not report a counter-absent zero")
 }
 
-// OverlaidView.Stats composes the counter-sourced base totals with the
-// overlay's own node/edge delta — base + delta, not the layer's bare count and
-// not a recount of the overlay generation. The base counter is seeded larger
-// than the stored corpus so the composed total can only be right if the base
-// half came from the counter.
-func TestOverlaidViewStatsComposesOverCounterBase(t *testing.T) {
+// OverlaidView composes over the physical base, even when the base has stale
+// index-state metadata. No underlying generation can bypass overlay scope.
+func TestOverlaidViewStatsComposesOverPhysicalBase(t *testing.T) {
 	base := openStatsStore(t)
 	base.AddBatch(statsRepoNodes("repo", 4), nil)
 	require.NoError(t, base.SetRepoIndexState(graph.RepoIndexState{
 		RepoPrefix: "repo", NodeCount: 100, EdgeCount: 50,
 	}))
-	require.Equal(t, 100, base.Stats().TotalNodes)
-	require.Equal(t, 50, base.Stats().TotalEdges)
+	require.Equal(t, 4, base.Stats().TotalNodes)
+	require.Zero(t, base.Stats().TotalEdges)
 
 	layer := graph.NewOverlayLayer()
 	layer.MarkFile("repo/new.go", false)
@@ -118,8 +112,8 @@ func TestOverlaidViewStatsComposesOverCounterBase(t *testing.T) {
 
 	got := view.Stats()
 	require.Equal(t, base.Stats().TotalNodes+nodeDelta, got.TotalNodes,
-		"overlay Stats must be base counter total plus the overlay node delta")
+		"overlay Stats must be physical base total plus the overlay node delta")
 	require.Equal(t, base.Stats().TotalEdges+edgeDelta, got.TotalEdges)
-	require.Equal(t, 101, got.TotalNodes,
-		"composition is base counter (100) + 1, not the overlay's bare node count")
+	require.Equal(t, 5, got.TotalNodes,
+		"composition is physical base (4) + 1, not stale metadata or the layer count")
 }

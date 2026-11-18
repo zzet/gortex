@@ -15,7 +15,8 @@ import (
 //   - ModeDeny (default, "deny"): the PreToolUse hook actively denies
 //     whole-file Grep / Glob / Read of indexed source and points the
 //     agent at the equivalent Gortex graph tools. The agent learns by
-//     friction. No PostToolUse hook is registered.
+//     friction. PostToolUse observes Gortex terminal and mutation results;
+//     it does not augment native read output in this mode.
 //
 //   - ModeEnrich ("enrich"): the PreToolUse hook never denies — it only
 //     emits soft `additionalContext` guidance — and a PostToolUse hook
@@ -42,7 +43,7 @@ import (
 // The modes co-exist by selection — a user picks one per install via
 // `gortex install --hook-mode=<mode>`. Switching modes is a single
 // re-install; the Claude Code adapter rewrites the hook command and
-// adds / removes the PostToolUse entry to match.
+// keeps the terminal/mutation observer and selects native output enrichment.
 type Mode int
 
 const (

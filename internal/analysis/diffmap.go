@@ -113,6 +113,13 @@ func MapGitDiffContext(ctx context.Context, g graph.Reader, repoRoot, repoPrefix
 	return joinHunksToSymbolsContext(ctx, g, repoPrefix, hunks, files)
 }
 
+// JoinDiffSymbolsContext maps a file-only diff (MapGitDiffContext with a nil
+// reader) to the symbols g indexes, without running git again. A caller that
+// needs the changed files before it can pick its reader diffs once this way.
+func JoinDiffSymbolsContext(ctx context.Context, g graph.Reader, repoPrefix string, diff *DiffResult) (*DiffResult, error) {
+	return joinHunksToSymbolsContext(ctx, g, repoPrefix, diff.Hunks, diff.FileChanges)
+}
+
 // PathDomain names the vocabulary a file path is spelled in. The two overlap,
 // so the domain has to travel with the path rather than be recovered from it:
 // in a repo whose tree carries a top-level directory named like the repo

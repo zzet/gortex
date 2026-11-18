@@ -244,7 +244,7 @@ func runEvalRecall(_ *cobra.Command, _ []string) error {
 	if selected["winnow"] {
 		eng := query.NewEngine(g)
 		eng.SetSearch(textBackend)
-		srv := gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), cfg.Guards.Rules)
+		srv := gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), cfg.Guards.Rules, gortexmcp.MultiRepoOptions{EditAckMode: cfg.Edit.Ack})
 		srv.SetArchitecture(cfg.Architecture)
 		srv.SetEventRules(cfg.Events.Rules)
 		srv.SetArtifacts(cfg.Artifacts)

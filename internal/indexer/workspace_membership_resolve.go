@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -110,8 +111,25 @@ func (x *workspaceMembershipIndex) Lookup(filePath string) string {
 // and prefix are not final until after New().
 func (idx *Indexer) indexerWorkspaceMembership(filePath string) string {
 	idx.workspaceMembersOnce.Do(func() {
+		if proof := idx.contentProof; proof.active() && idx.rootPath != "" {
+			// Detection reads the root's workspace manifests off the
+			// working copy, and a workspace root's member globs read
+			// directories no read set holds: a build that proves its reads
+			// claims the manifests, and is fenced by a full sample when the
+			// root is a workspace.
+			for _, name := range workspaceRootManifests {
+				proof.record(filepath.Join(idx.rootPath, name), "")
+			}
+			if modules.DetectWorkspace(idx.rootPath) != nil {
+				proof.noteUnboundedReader()
+			}
+		}
 		idx.workspaceMembers = newWorkspaceMembershipIndex(
 			map[string]string{idx.repoPrefix: idx.rootPath})
 	})
 	return idx.workspaceMembers.Lookup(filePath)
 }
+
+// workspaceRootManifests are the root manifests modules.DetectWorkspace reads
+// to decide whether a repository is a package-manager workspace root.
+var workspaceRootManifests = []string{"package.json", "pnpm-workspace.yaml", "Cargo.toml"}

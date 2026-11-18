@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/zzet/gortex/internal/agents"
+	"github.com/zzet/gortex/internal/agents/antigravity"
 	"github.com/zzet/gortex/internal/agents/claudecode"
 	"github.com/zzet/gortex/internal/agents/codex"
 	"github.com/zzet/gortex/internal/agents/copilotcli"
@@ -50,7 +51,7 @@ var uninstallCmd = &cobra.Command{
 Counterpart to ` + "`gortex init`" + `. For machine-wide setup (user MCP config,
 rule blocks, user hooks) installed by ` + "`gortex install`" + `, pass --global
 to also strip the user-level footprint of every host Gortex configures —
-Claude Code, Codex, GitHub Copilot CLI, OpenCode and Pi: MCP entries,
+Claude Code, Codex, GitHub Copilot CLI, OpenCode, Pi and Antigravity: MCP entries,
 permission allowlists, hooks, the rule blocks, and the gortex skills /
 commands / sub-agents / bridge plugin / Pi sidecar. Merged files keep
 everything that is not ours, and a gortex skill you have edited is kept
@@ -78,7 +79,7 @@ docs / scripts / muscle memory still work.`,
 
 func init() {
 	uninstallCmd.Flags().BoolVarP(&uninstallYes, "yes", "y", false, "skip the confirmation prompt (required when stdin is not a TTY)")
-	uninstallCmd.Flags().BoolVar(&uninstallGlobal, "global", false, "also remove the machine-level footprint of every configured host (Claude Code, Codex, Copilot CLI, OpenCode): user MCP entries, settings, rule blocks, hooks, skills/commands/agents/plugin, as installed by `gortex install`")
+	uninstallCmd.Flags().BoolVar(&uninstallGlobal, "global", false, "also remove the machine-level footprint of every configured host (Claude Code, Codex, Copilot CLI, OpenCode, Pi, Antigravity): user MCP entries, settings, rule blocks, hooks, skills/commands/agents/plugin, as installed by `gortex install`")
 	uninstallCmd.Flags().BoolVar(&uninstallPurge, "purge", false, "also tear down the machine-level runtime: stop the daemon, remove its OS service unit, and delete the ~/.gortex data/cache/config tree (and the binary, for an installer-script install)")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "claude-config-dir", "", "Claude Code config root to clean (implies --global); overrides $CLAUDE_CONFIG_DIR, defaults to ~/.claude")
 	uninstallCmd.Flags().StringVar(&uninstallClaudeConfigDir, "config-root", "", "alias for --claude-config-dir")
@@ -324,6 +325,7 @@ func globalHosts() []globalHost {
 		{artifacts: copilotcli.GlobalArtifacts, remove: copilotcli.New().RemoveGlobal},
 		{artifacts: opencode.GlobalArtifacts, remove: opencode.New().RemoveGlobal},
 		{artifacts: pi.GlobalArtifacts, remove: pi.New().RemoveGlobal},
+		{artifacts: antigravity.GlobalArtifacts, remove: antigravity.New().RemoveGlobal},
 	}
 }
 
@@ -458,13 +460,13 @@ func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPres
 		}
 		fmt.Fprintf(w, "[gortex uninstall] done (%d/%d items removed)\n", removed, totalPresent)
 		if globalCleaned {
-			fmt.Fprintln(w, "Note: the user-level footprint was removed for Claude Code, Codex, Copilot CLI, OpenCode and Pi (rule blocks, MCP entries, hooks, skills/commands/agents/plugin, Pi sidecar). Other content in those files was preserved, and any gortex skill you had edited was kept. Pi's `packages` entry stays: run `pi remove npm:pi-gortex` to drop it.")
+			fmt.Fprintln(w, "Note: the user-level footprint was removed for Claude Code, Codex, Copilot CLI, OpenCode, Pi and Antigravity (rule blocks, MCP entries, hooks, skills/commands/agents/plugin, Pi sidecar, Antigravity KI). Other content in those files was preserved, and any gortex skill you had edited was kept. Pi's `packages` entry stays: run `pi remove npm:pi-gortex` to drop it.")
 		} else {
 			fmt.Fprintln(w, "Note: CLAUDE.md was not modified — remove the Gortex block manually if needed (or re-run with --global).")
+			fmt.Fprintln(w, "Note: Antigravity KIs are global and were not removed. Manually delete ~/.gemini/antigravity/knowledge/gortex-workflow if desired (or re-run with --global).")
 		}
 		fmt.Fprintln(w, "Note: .kiro/steering/ files with 'gortex-' prefix were removed. Other .kiro/ files were preserved.")
 		fmt.Fprintln(w, "Note: only 'gortex-' skills were removed from .agents/skills/, .opencode/skills/ and .github/skills/ — those trees are shared, so your own skills were preserved.")
-		fmt.Fprintln(w, "Note: Antigravity KIs are global and were not removed. Manually delete ~/.gemini/antigravity/knowledge/gortex-workflow if desired.")
 		fmt.Fprintln(w, "Note: Hermes config is global and was not removed. Manually delete the gortex entry in ~/.hermes/config.yaml (+ profiles), the gortex pre_tool_call / pre_llm_call entries under its `hooks:` block, and the gortex / gortex-* skill directories under ~/.hermes/skills/ if desired.")
 		return
 	}
@@ -495,7 +497,9 @@ func emitUninstallSummary(w io.Writer, removed int, failures []string, totalPres
 	}
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render(".kiro/ files without the 'gortex-' prefix"))
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("your own skills in .agents/skills/, .opencode/skills/ and .github/skills/"))
-	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.gemini/antigravity/knowledge/gortex-workflow (global)"))
+	if !globalCleaned {
+		fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.gemini/antigravity/knowledge/gortex-workflow (global)"))
+	}
 	fmt.Fprintln(w, "       "+progress.StyleHint.Render("·")+"  "+progress.StyleVal.Render("~/.hermes/config.yaml + skills (global)"))
 	fmt.Fprintln(w)
 }

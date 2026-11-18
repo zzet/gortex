@@ -3,6 +3,7 @@ package query
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,11 +48,74 @@ type Engine struct {
 	// pre-materialised (the bundle fast path) predates the overlay and
 	// has to be re-read through the reader before it can be trusted.
 	overlay *graph.OverlayLayer
+	layers  []graph.OverlayLayerReader
 	// viewLayers are the persisted generations stacked in the reader,
 	// bottom first, empty for a plain base reader. Each carries its own
 	// text corpus, so candidate enumeration queries them alongside the
 	// backend's — see viewTextCandidates.
 	viewLayers []ViewLayerSource
+	// requestCtx is the lifetime of the request this engine clone serves,
+	// nil for the shared engine. Graph walks that can run long (bfs and the
+	// backend BFS capability) stop when it ends, so a handler whose caller
+	// hung up or whose deadline fired stops consuming the daemon's CPU. See
+	// WithRequestContext.
+	requestCtx context.Context
+	// viewExcludesBase says the composed view's stack does not include the
+	// indexed corpus (generation zero): its bottom is a dedicated full root.
+	// Candidate enumeration then asks only the stack's own corpora — a
+	// generation-zero hit could only name a row the view does not read, or
+	// re-rank a row the stack's own corpus already answers for.
+	viewExcludesBase bool
+}
+
+// WithRequestContext returns a shallow clone of the engine whose long graph
+// walks stop when ctx ends. A walk cut short answers what it had gathered (or
+// nothing), never a fallback walk that repeats the cancelled work.
+func (e *Engine) WithRequestContext(ctx context.Context) *Engine {
+	if e == nil {
+		return nil
+	}
+	clone := *e
+	clone.requestCtx = ctx
+	return &clone
+}
+
+// WithViewLayersContext is WithViewLayers and WithRequestContext in one
+// clone, so binding a routed request's lifetime costs no second copy.
+func (e *Engine) WithViewLayersContext(r graph.Reader, layers []ViewLayerSource, ctx context.Context) *Engine {
+	return e.WithComposedView(r, layers, ctx, false)
+}
+
+// WithComposedView is WithViewLayersContext for a view that may not compose
+// the indexed corpus: excludesBase=true (a stack rooted in a dedicated full
+// root) makes candidate enumeration skip generation zero entirely. It only
+// takes effect when layers are bound.
+func (e *Engine) WithComposedView(r graph.Reader, layers []ViewLayerSource, ctx context.Context, excludesBase bool) *Engine {
+	clone := e.WithViewLayers(r, layers)
+	if clone != nil {
+		clone.requestCtx = ctx
+		clone.viewExcludesBase = excludesBase && len(clone.viewLayers) > 0
+	}
+	return clone
+}
+
+// walkContext is the request lifetime a walk honours: the caller's
+// QueryOptions.Context first, then the engine clone's own.
+func (e *Engine) walkContext(opts QueryOptions) context.Context {
+	if opts.Context != nil {
+		return opts.Context
+	}
+	return e.requestCtx
+}
+
+// walkDone reports whether the request a walk serves has ended.
+func walkDone(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+// bfsContextCapable is the request-aware form of graph.BFSCapable.
+type bfsContextCapable interface {
+	BFSContext(ctx context.Context, seeds []string, dir graph.Direction, kinds []graph.EdgeKind, maxDepth, limit int) ([]graph.BFSHop, error)
 }
 
 // overlayLayered is the view side of the reader swap: a reader that
@@ -72,12 +136,17 @@ func (e *Engine) WithReader(r graph.Reader) *Engine {
 	clone := *e
 	clone.g = r
 	clone.overlay = nil
+	clone.layers = nil
 	// A reader swap re-decides which corpora answer, so the stack the
 	// previous reader named never carries over — WithViewLayers is the
 	// only way one is bound.
 	clone.viewLayers = nil
+	clone.viewExcludesBase = false
 	if view, ok := r.(overlayLayered); ok {
 		clone.overlay = view.Layer()
+		if clone.overlay != nil {
+			clone.layers = []graph.OverlayLayerReader{clone.overlay}
+		}
 	}
 	return &clone
 }
@@ -530,24 +599,23 @@ func (e *Engine) SearchSymbols(query string, limit int) []*graph.Node {
 // Fan-out callers merge multiple retrieval channels through this method and run
 // one final session-aware rerank over the combined slice.
 func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	return e.GatherSymbolCandidatesContext(context.Background(), query, limit, opts, rctx)
+}
+
+// GatherSymbolCandidatesContext is the request-aware candidate retrieval path.
+// A canceled request never starts another backend, vector, refill, or fallback
+// operation. Legacy callers retain the background-context behavior above.
+func (e *Engine) GatherSymbolCandidatesContext(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	if limit <= 0 {
 		limit = 20
 	}
-	fetchLimit := limit
-	if opts.hasScopeFilter() {
-		// Over-fetch so the post-fetch scope filter still fills the
-		// page, but never clamp below the caller's own ask — an
-		// explicit deep limit (the wipeout-escalation refetch) exists
-		// precisely to dig past this cap, and flattening it turns the
-		// deeper iterations into byte-identical re-queries.
-		fetchLimit = limit * 4
-		if fetchLimit > 200 {
-			fetchLimit = 200
-		}
-		if fetchLimit < limit {
-			fetchLimit = limit
-		}
-	}
+	fetchLimit := scopeFetchLimit(limit, opts)
 
 	gatherCtx := rctx
 	if gatherCtx == nil {
@@ -556,10 +624,18 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 
 	var cands []*rerank.Candidate
 	if s := e.getSearch(); s != nil && e.backendHasCorpus(s) {
-		cands = e.gatherBackendCandidates(query, fetchLimit, opts, gatherCtx)
+		// The backend lanes size themselves: a lane that applies the scope in
+		// its own query needs no post-filter slack.
+		cands = e.gatherBackendCandidates(ctx, query, limit, opts, gatherCtx)
 	} else {
+		if ctx.Err() != nil {
+			return nil
+		}
 		start := time.Now()
-		nodes := e.searchSubstring(query, fetchLimit)
+		nodes := e.searchSubstringScoped(ctx, query, fetchLimit, opts)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if opts.SearchTimings != nil {
 			opts.SearchTimings.FallbackMS += time.Since(start).Milliseconds()
 		}
@@ -569,10 +645,10 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 		}
 	}
 
-	if opts.hasScopeFilter() {
+	if opts.hasScopeFilter() || opts.SearchNodeFilter != nil {
 		kept := cands[:0]
 		for _, c := range cands {
-			if !opts.ScopeAllows(c.Node) {
+			if !opts.searchAllows(c.Node) {
 				continue
 			}
 			kept = append(kept, c)
@@ -584,6 +660,23 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 	return cands
 }
 
+// scopeFetchLimit over-fetches a lane whose results are filtered to the
+// request scope after the lane's own limit, so that filter still leaves about
+// limit survivors.
+func scopeFetchLimit(limit int, opts QueryOptions) int {
+	if !opts.hasScopeFilter() {
+		return limit
+	}
+	fetchLimit := limit * 4
+	if fetchLimit > 200 {
+		fetchLimit = 200
+	}
+	if fetchLimit < limit {
+		fetchLimit = limit
+	}
+	return fetchLimit
+}
+
 // SearchSymbolsRanked is SearchSymbolsScoped that returns the full
 // rerank.Candidate slice instead of just the nodes — callers can read
 // the per-signal contributions and the final score off each candidate.
@@ -591,17 +684,33 @@ func (e *Engine) GatherSymbolCandidates(query string, limit int, opts QueryOptio
 // repo + project locality); pass nil to score with structural signals
 // only.
 func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	return e.SearchSymbolsRankedContext(context.Background(), query, limit, opts, rctx)
+}
+
+// SearchSymbolsRankedContext is SearchSymbolsRanked with request cancellation
+// propagated through candidate gathering and each post-gather ranking stage.
+func (e *Engine) SearchSymbolsRankedContext(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	ctx = liveRequestContext(ctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if limit <= 0 {
 		limit = 20
 	}
-	cands := e.GatherSymbolCandidates(query, limit, opts, rctx)
+	cands := e.GatherSymbolCandidatesContext(ctx, query, limit, opts, rctx)
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	if e.rerank != nil && !opts.SkipInnerRerank {
-		ctx := rctx
-		if ctx == nil {
-			ctx = &rerank.Context{}
+		if ctx.Err() != nil {
+			return nil
 		}
-		ctx.Graph = e.g
+		rerankCtx := rctx
+		if rerankCtx == nil {
+			rerankCtx = &rerank.Context{}
+		}
+		rerankCtx.Graph = e.g
 		// When the caller supplied opts.RerankContext (the bundle-
 		// seeding handler), inherit its cached edges so this per-call
 		// rerank's prepare can read them — saves the 2 batched edge
@@ -610,10 +719,20 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		// runs against the merged candidate set); the inner rerank
 		// gets a structural-only context plus the bundle-cached edges.
 		if rctx == nil && opts.RerankContext != nil {
-			ctx.InheritEdgeCacheFrom(opts.RerankContext)
+			rerankCtx.InheritEdgeCacheFrom(opts.RerankContext)
+		}
+		if observer := rerankCtx.ObserveTiming; observer != nil {
+			rerankCtx.ObserveTiming = func(timing rerank.Timing) {
+				timing.Stage = rerank.TimingInner
+				observer(timing)
+			}
+			defer func() { rerankCtx.ObserveTiming = observer }()
 		}
 		rerankStart := time.Now()
-		e.rerank.Rerank(query, cands, ctx)
+		e.rerank.Rerank(query, cands, rerankCtx)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if opts.SearchTimings != nil {
 			opts.SearchTimings.EngineRerankMS += time.Since(rerankStart).Milliseconds()
 		}
@@ -626,10 +745,19 @@ func (e *Engine) SearchSymbolsRanked(query string, limit int, opts QueryOptions,
 		// best-effort: refineByCosine is a no-op whenever the vector
 		// channel is inactive, so a text-only search is unaffected.
 		if opts.CosineRerank {
+			if ctx.Err() != nil {
+				return nil
+			}
 			cands = e.RefineByCosine(query, cands, opts.CosineTopN)
+			if ctx.Err() != nil {
+				return nil
+			}
 		}
 	}
 
+	if ctx.Err() != nil {
+		return nil
+	}
 	if len(cands) > limit {
 		cands = cands[:limit]
 	}
@@ -650,9 +778,22 @@ func (e *Engine) RefineByCosine(query string, cands []*rerank.Candidate, topN in
 	}
 	vectors, ok := e.g.(graph.VectorSearcher)
 	if !ok {
+		if selected, isSelected := e.g.(selectedVectorReader); isSelected {
+			vectors = selected.SelectedVectorSearcher()
+			ok = vectors != nil
+		}
+	}
+	if !ok {
 		return cands
 	}
 	return refineByCosine(query, cands, embedder, vectors, topN)
+}
+
+// selectedVectorReader is a reader that filters adjacency in front of another
+// reader. Stored vectors are keyed by node id and read no edges, so it names
+// the vectors of the reader it selected, or nil when that reader has none.
+type selectedVectorReader interface {
+	SelectedVectorSearcher() graph.VectorSearcher
 }
 
 // SearchSymbolsScoped is SearchSymbols with the optional
@@ -729,7 +870,13 @@ func repoAllowList(allow map[string]bool) []string {
 // the rerank's 2 edge fetches) into 4 server-side queries with no
 // engine→rerank boundary crossings; the GetNodesByIDs cost goes
 // away entirely for the BM25 hits.
-func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+func (e *Engine) gatherBackendCandidates(ctx context.Context, query string, limit int, opts QueryOptions, rctx *rerank.Context) []*rerank.Candidate {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	backend := e.getSearch()
 	timings := opts.SearchTimings
 
@@ -756,6 +903,18 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	viewLayered := e.viewLayersActive()
 	skipVectorChannel := opts.SkipVectorChannel || viewLayered
 
+	// Every lane is filtered to the request scope after its own limit, so it
+	// over-fetches. A repo-scoped bundle query applies RepoAllow itself: when
+	// that is the whole scope, its answer is sized and saturates at the
+	// caller's limit like an unscoped query. laneLimit is the limit of the lane
+	// that answered the text query.
+	fetchLimit := scopeFetchLimit(limit, opts)
+	scopedLimit := fetchLimit
+	if opts.WorkspaceID == "" && opts.ProjectID == "" && opts.SearchNodeFilter == nil && !viewLayered {
+		scopedLimit = limit
+	}
+	laneLimit := fetchLimit
+
 	// Bundle fast path. The SymbolBundleSearcherBackend assertion
 	// chains through Swappable → HybridBackend → SymbolSearcherBackend
 	// in production; both Swappable and HybridBackend forward when
@@ -767,61 +926,57 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		bundleHandled  bool
 		bundleNodeByID = make(map[string]*graph.Node)
 	)
-	if bsb, ok := backend.(search.SymbolBundleSearcherBackend); ok {
-		// Pull the vector channel separately when present. Bundles
-		// cover BM25 only; the engine merges vector hits below.
-		// VectorChannelOnly avoids re-running the text BM25 path —
-		// the bundle already returned the BM25 hits and their full
-		// node + edge payload. Falling back to SearchChannels here
-		// would double-pay the FTS query cost per BM25 fan-out.
-		type vectorOnly interface {
-			VectorChannelOnly(query string, limit int) ([]string, search.ChannelTimings)
-		}
-		vectorOnlyBackend, vectorOnlyOK := backend.(vectorOnly)
+	bundleCapable := false
+	if _, ok := backend.(search.SymbolBundleSearcherBackend); ok {
+		bundleCapable = true
+	}
+	if _, ok := backend.(search.ContextSymbolBundleSearcherBackend); ok {
+		bundleCapable = true
+	}
+	// A stack that does not compose the indexed corpus is enumerated from its
+	// own generations alone: skip every base-corpus lane (bundles, channels,
+	// the base refill below).
+	skipBase := viewLayered && e.viewExcludesBase
+	if skipBase {
+		bundleCapable = false
+		bundleHandled = true
+	}
+	if bundleCapable {
 		bundleStart := time.Now()
-		// Repo-narrowed sessions take the scoped bundle path when the
-		// backend can filter inside the FTS query. The post-fetch
-		// ScopeAllows pass below starves whenever another repo owns the
-		// whole BM25 head deeper than this fetch — only the backend can
-		// narrow without a depth limit.
-		var bundles []search.SymbolBundle
-		// Gate on the flattened list, not the map: an all-false map is
-		// "deny everything" under ScopeAllows and must not select the
-		// scoped path with an empty (= unscoped!) allow list.
-		scopedAnswered := false
-		if allow := repoAllowList(opts.RepoAllow); len(allow) > 0 {
-			if sb, ok := backend.(search.ScopedSymbolBundleSearcherBackend); ok {
-				bundles = sb.SearchSymbolBundlesScoped(query, allow, limit*2)
-				// nil = no scoped support (or error); anything non-nil —
-				// an empty slice included — is the scoped path's answer.
-				scopedAnswered = bundles != nil
+		bundleCtx := ctx
+		if timings != nil {
+			bundleCtx = search.WithSymbolBundleTimingsObserver(ctx, timings.BundleLegs.Add)
+		}
+		var answer requestBundleAnswer
+		if len(opts.SearchPathPrefixes) > 0 && !viewLayered && e.overlay == nil && len(e.layers) == 0 {
+			answer = requestPathScopedSymbolBundles(bundleCtx, backend, query, repoAllowList(opts.RepoAllow), opts.SearchPathPrefixes, fetchLimit*2)
+		}
+		if allow := repoAllowList(opts.RepoAllow); !answer.authoritative && len(allow) > 0 {
+			answer = requestScopedSymbolBundles(bundleCtx, backend, query, allow, scopedLimit*2)
+			if answer.authoritative {
+				laneLimit = scopedLimit
 			}
 		}
-		// nil = no scoped support (or error); a non-nil empty slice is
-		// the scoped path's real answer and must NOT trigger the
-		// unscoped flood fetch its emptiness proves useless.
-		if bundles == nil {
-			bundles = bsb.SearchSymbolBundles(query, limit*2)
+		if !answer.authoritative {
+			answer = requestSymbolBundles(bundleCtx, backend, query, fetchLimit*2)
+		}
+		bundles := answer.bundles
+		scopedAnswered := answer.authoritative && len(repoAllowList(opts.RepoAllow)) > 0
+		bundleHandled = answer.authoritative
+		if answer.failed || ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.BundleMS += time.Since(bundleStart).Milliseconds()
 		}
-		// A per-request overlay reader invalidates the bundle payload:
-		// the backend indexes the base graph, so a symbol the buffer
-		// replaced arrives carrying its pre-edit node, and a symbol the
-		// buffer deleted arrives at all. Keep the BM25 ranking — the
-		// scores are still the corpus's answer — and drop the payload:
-		// every hit falls through to the view-aware batched lookup
-		// below, which substitutes the overlay's node and omits the IDs
-		// the view no longer exposes.
-		//
-		// A composed view invalidates it for the same reason one level
-		// down: the bundle's payload is the indexed corpus's row, and a
-		// generation in the stack may have replaced or deleted it.
-		rehydrateThroughReader := e.overlay != nil || viewLayered
+		// Ownership is explicit even when the runtime wraps the view reader.
+		// Keep each safe base payload and adjacency; only affected hits fall back
+		// to the composed reader. Partial adjacency seeds remain partial.
+
 		if len(bundles) > 0 {
 			bundleHandled = true
 			textResults = make([]search.SearchResult, 0, len(bundles))
+			allEdgesSeeded := true
 			outSeed := make(map[string][]*graph.Edge, len(bundles))
 			inSeed := make(map[string][]*graph.Edge, len(bundles))
 			for _, b := range bundles {
@@ -829,31 +984,20 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 					continue
 				}
 				textResults = append(textResults, search.SearchResult{ID: b.Node.ID, Score: b.Score})
-				if rehydrateThroughReader {
+				if !e.bundleNodeNeedsReader(b.Node) {
+					bundleNodeByID[b.Node.ID] = b.Node
+				}
+				if e.bundleEdgesNeedReader(b) {
+					allEdgesSeeded = false
 					continue
 				}
-				bundleNodeByID[b.Node.ID] = b.Node
 				outSeed[b.Node.ID] = b.OutEdges
 				inSeed[b.Node.ID] = b.InEdges
 			}
-			// Seed the rerank context's edge caches so prepare() can
-			// skip its own batched fetch for the bundle-covered IDs.
-			// preSeeded=true is the contract that prepare's batched
-			// edge fetch is now redundant — see rerank.Context for the
-			// invariant the engine relies on (the next caller's
-			// candidate set is fully covered by these maps for the
-			// BM25 hits; vector / substring fallback hits are still
-			// served by the per-candidate accessor fallback).
-			//
-			// Under an overlay the seed is skipped entirely rather than
-			// filtered down to the uncovered files: the layer also
-			// *introduces* edges no base bundle carries, so no subset of
-			// base edges can honour the pre-seed contract. Dropping it
-			// hands the fetch back to the rerank pass, which reads
-			// through the same overlay-aware reader.
-			if rctx != nil && !rehydrateThroughReader {
-				rctx.SeedEdgeCaches(inSeed, outSeed, true)
+			if rctx != nil && len(outSeed) > 0 {
+				rctx.SeedEdgeCaches(inSeed, outSeed, allEdgesSeeded)
 			}
+
 		} else if scopedAnswered {
 			// A scoped query that answered zero IS the answer. Leaving
 			// bundleHandled false here would send the miss down the
@@ -873,9 +1017,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		// classWeightTable already proves semantic contributes near-
 		// zero signal vs the BM25 channel — see classWeightTable in
 		// internal/search/rerank/query_kind.go.
-		if vectorOnlyOK && !skipVectorChannel {
-			vecIDs, stats := vectorOnlyBackend.VectorChannelOnly(query, limit*2)
-			vectorIDs = vecIDs
+		if bundleHandled && !skipVectorChannel {
+			var stats search.ChannelTimings
+			vectorIDs, stats = requestVectorChannel(ctx, backend, query, fetchLimit*2)
+			if ctx.Err() != nil {
+				return nil
+			}
 			if timings != nil {
 				timings.EmbedMS += stats.EmbedMS
 				timings.VectorSearchMS += stats.VectorSearchMS
@@ -883,53 +1030,25 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 		}
 	}
 
-	// Legacy / fallback path: bundle backend absent OR returned no
-	// hits. Pull text + vector channels separately when the backend
-	// exposes them (HybridBackend). Otherwise treat plain Search()
-	// output as text-only. The wall-clock for the backend search
-	// call lands on the outer caller's BM25*MS bucket — measuring
-	// around the engine boundary captures the full per-call cost
-	// without double-counting against the post-call GetNodesByIDs /
-	// FindNodesByName / Fallback phases that this function
-	// instruments individually below.
 	if !bundleHandled {
-		type timedChan interface {
-			SearchChannelsTimed(query string, limit int) ([]search.SearchResult, []string, search.ChannelTimings)
-		}
 		switch {
 		case skipVectorChannel:
-			// Identifier-shape fast path: skip the vector channel
-			// (no embed, no ANN) and run text-only Search. The cost
-			// saved is the per-call embedder + vector index hit; the
-			// rerank's classWeightTable proves it's not earning its
-			// keep for these query classes.
 			textStart := time.Now()
-			textResults = backend.Search(query, limit*2)
+			textResults = requestTextSearch(ctx, backend, query, fetchLimit*2)
 			if timings != nil {
 				timings.TextBackendMS += time.Since(textStart).Milliseconds()
 			}
 		default:
-			if tc, ok := backend.(timedChan); ok {
-				var stats search.ChannelTimings
-				textResults, vectorIDs, stats = tc.SearchChannelsTimed(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += stats.TextMS
-					timings.EmbedMS += stats.EmbedMS
-					timings.VectorSearchMS += stats.VectorSearchMS
-				}
-			} else if cs, ok := backend.(search.ChannelSearcher); ok {
-				textStart := time.Now()
-				textResults, vectorIDs = cs.SearchChannels(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += time.Since(textStart).Milliseconds()
-				}
-			} else {
-				textStart := time.Now()
-				textResults = backend.Search(query, limit*2)
-				if timings != nil {
-					timings.TextBackendMS += time.Since(textStart).Milliseconds()
-				}
+			var stats search.ChannelTimings
+			textResults, vectorIDs, stats = requestSearchChannels(ctx, backend, query, fetchLimit*2)
+			if timings != nil {
+				timings.TextBackendMS += stats.TextMS
+				timings.EmbedMS += stats.EmbedMS
+				timings.VectorSearchMS += stats.VectorSearchMS
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 	}
 
@@ -939,12 +1058,24 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// where every surviving candidate is resolved through the composed
 	// reader and anything the view hides falls out.
 	if viewLayered {
-		textResults = e.viewTextCandidates(
+		refillBase := viewBaseTextRefillContext(ctx, backend, query, repoAllowList(opts.RepoAllow))
+		if skipBase {
+			refillBase = nil
+		}
+		textResults = e.viewTextCandidatesContext(
+			ctx,
 			query,
-			limit*2,
+			fetchLimit*2,
 			textResults,
-			viewBaseTextRefill(backend, query, repoAllowList(opts.RepoAllow)),
+			refillBase,
 		)
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
+
+	if opts.SymbolSearchStats != nil && len(textResults) >= laneLimit*2 {
+		opts.SymbolSearchStats.TextSaturated = true
 	}
 
 	// Collect every ID NOT covered by the bundle path (vector hits +
@@ -968,8 +1099,14 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			idBatch = append(idBatch, id)
 		}
 	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	getNodesStart := time.Now()
 	nodeByID := e.g.GetNodesByIDs(idBatch)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if timings != nil {
 		timings.GetNodesMS += time.Since(getNodesStart).Milliseconds()
 	}
@@ -992,7 +1129,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			return
 		}
 		node := nodeByID[id]
-		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport {
+		if node == nil || node.Kind == graph.KindFile || node.Kind == graph.KindImport || !opts.searchAllows(node) {
 			return
 		}
 		if pos, ok := idx[id]; ok {
@@ -1021,7 +1158,7 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// Stop early when the native text + vector union has already exceeded the
 	// requested width; the supplementary tiers below are a fill, not a
 	// boost.
-	if len(cands) >= limit*2 {
+	if len(cands) >= laneLimit*2 {
 		return cands
 	}
 
@@ -1032,9 +1169,16 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// of expansion terms, for example) — saves the query round-trip
 	// that would unconditionally return zero rows.
 	if !opts.SkipExactNameSplice {
+		if ctx.Err() != nil {
+			return nil
+		}
 		findNameStart := time.Now()
-		for _, n := range e.g.FindNodesByName(query) {
-			if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
+		nameMatches, err := graph.FindNodesByNameScopedContext(ctx, e.g, query, graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow})
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		for _, n := range nameMatches {
+			if n.Kind == graph.KindFile || n.Kind == graph.KindImport || !opts.searchAllows(n) {
 				continue
 			}
 			if _, seen := idx[n.ID]; seen {
@@ -1042,6 +1186,9 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			}
 			idx[n.ID] = len(cands)
 			cands = append(cands, &rerank.Candidate{Node: n, TextRank: len(textResults), VectorRank: -1})
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.FindNameMS += time.Since(findNameStart).Milliseconds()
@@ -1056,14 +1203,28 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 	// in Go — the old AllNodes loop is broken at Linux-kernel scale
 	// (10M+ symbols, hundreds of MB of nodes per query). We over-fetch
 	// by a small slack factor so dedup against existing cands still
-	// leaves room to fill `limit`.
-	if len(cands) < limit {
-		fallbackStart := time.Now()
-		fetch := (limit - len(cands)) * 2
-		if fetch < limit {
-			fetch = limit
+	// leaves room to fill `laneLimit`.
+	if len(cands) < laneLimit {
+		if ctx.Err() != nil {
+			return nil
 		}
-		subMatches := e.g.FindNodesByNameContaining(query, fetch)
+		fallbackStart := time.Now()
+		fetch := (laneLimit - len(cands)) * 2
+		if fetch < laneLimit {
+			fetch = laneLimit
+		}
+		subMatches, err := graph.FindNodesByNameContainingFilteredContext(ctx, e.g, query, fetch, graph.NameSearchFilter{
+			RepoAllow: opts.RepoAllow,
+			Accept: func(n *graph.Node) bool {
+				return n.Kind != graph.KindFile && n.Kind != graph.KindImport && opts.searchAllows(n)
+			},
+		})
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
 		// Stable ordering — backends may return in catalog order, which
 		// is not a meaningful relevance signal here.
 		sort.Slice(subMatches, func(i, j int) bool { return subMatches[i].ID < subMatches[j].ID })
@@ -1076,9 +1237,12 @@ func (e *Engine) gatherBackendCandidates(query string, limit int, opts QueryOpti
 			}
 			idx[n.ID] = len(cands)
 			cands = append(cands, &rerank.Candidate{Node: n, TextRank: -1, VectorRank: -1})
-			if len(cands) >= limit {
+			if len(cands) >= laneLimit {
 				break
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		if timings != nil {
 			timings.FallbackMS += time.Since(fallbackStart).Milliseconds()
@@ -1169,10 +1333,17 @@ func substringScore(id, name string, kind graph.NodeKind, query, lower string) (
 	}
 }
 
-func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]substringCandidate, error) {
+func (e *Engine) scanSubstringCandidatesScoped(ctx context.Context, query, lower string, limit int, opts QueryOptions) ([]substringCandidate, error) {
 	top := make(substringCandidateHeap, 0, limit)
-	err := graph.ScanNodeSearchKeys(context.Background(), e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
+	err := graph.ScanNodeSearchKeys(ctx, e.g, substringSearchPageSize, func(page []graph.NodeSearchKey) bool {
 		for _, key := range page {
+			if ctx.Err() != nil {
+				return false
+			}
+			if !opts.searchAllows(&graph.Node{ID: key.ID, Kind: key.Kind, Name: key.Name, FilePath: key.FilePath,
+				RepoPrefix: key.RepoPrefix, WorkspaceID: key.WorkspaceID, ProjectID: key.ProjectID}) {
+				continue
+			}
 			score, ok := substringScore(key.ID, key.Name, key.Kind, query, lower)
 			if !ok {
 				continue
@@ -1200,7 +1371,7 @@ func (e *Engine) scanSubstringCandidates(query, lower string, limit int) ([]subs
 	return top, nil
 }
 
-func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, query, lower string, limit int) []*graph.Node {
+func (e *Engine) hydrateSubstringCandidatesScoped(candidates []substringCandidate, query, lower string, limit int, opts QueryOptions) []*graph.Node {
 	ids := make([]string, len(candidates))
 	for i := range candidates {
 		ids[i] = candidates[i].id
@@ -1214,7 +1385,7 @@ func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, que
 	hydrated := make([]hydratedCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		node := nodeByID[candidate.id]
-		if node == nil {
+		if node == nil || !opts.searchAllows(node) {
 			continue
 		}
 		score, ok := substringScore(node.ID, node.Name, node.Kind, query, lower)
@@ -1243,13 +1414,20 @@ func (e *Engine) hydrateSubstringCandidates(candidates []substringCandidate, que
 }
 
 func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
+	return e.searchSubstringScoped(context.Background(), query, limit, QueryOptions{})
+}
+
+func (e *Engine) searchSubstringScoped(ctx context.Context, query string, limit int, opts QueryOptions) []*graph.Node {
 	if limit <= 0 {
 		return nil
 	}
 	lower := strings.ToLower(query)
 	for attempt := 0; attempt < 2; attempt++ {
 		before, revisionKnown := nodeMutationRevision(e.g)
-		candidates, err := e.scanSubstringCandidates(query, lower, limit)
+		candidates, err := e.scanSubstringCandidatesScoped(ctx, query, lower, limit, opts)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if err != nil {
 			// SearchSymbols cannot return an error. Preserve the Reader contract:
 			// unexpected storage failures must remain visible, not look like an
@@ -1259,7 +1437,10 @@ func (e *Engine) searchSubstring(query string, limit int) []*graph.Node {
 		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
 			continue
 		}
-		out := e.hydrateSubstringCandidates(candidates, query, lower, limit)
+		out := e.hydrateSubstringCandidatesScoped(candidates, query, lower, limit, opts)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if attempt == 0 && nodeMutationChanged(e.g, before, revisionKnown) {
 			continue
 		}
@@ -1330,6 +1511,12 @@ func (e *Engine) Stats() *graph.GraphStats {
 // with hundreds of implementors cannot blow up a call-chain walk.
 const defaultDispatchFanout = 24
 
+// bfsAdmissionMinFanout is the seed fan-out from which a scoped walk reads its
+// neighborhood in one admission statement. That statement costs about as much
+// as six indexed adjacency reads even for an empty neighborhood, so a seed with
+// fewer matching edges than this finishes sooner hop by hop.
+const bfsAdmissionMinFanout = 4
+
 // bfs performs breadth-first traversal from nodeID.
 // If forward is true, follows outgoing edges; if false, follows incoming.
 // If edgeKinds is nil, follows all edge kinds bidirectionally (for cluster).
@@ -1339,6 +1526,10 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	}
 	if opts.Limit <= 0 {
 		opts.Limit = 50
+	}
+	walkCtx := e.walkContext(opts)
+	if walkDone(walkCtx) {
+		return &SubGraph{}
 	}
 	seed := e.g.GetNode(nodeID)
 	if opts.hasScopeFilter() && (seed == nil || !opts.ScopeAllows(seed)) {
@@ -1351,6 +1542,41 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		kindSet[k] = true
 	}
 
+	// A selected adjacency wrapper has always used the Go admission shape:
+	// backedges, evidence order, caps and unresolved boundaries are observable.
+	// Read its scoped neighborhood in one statement where available, then run
+	// that same admission against the detached rows. Bare unscoped stores keep
+	// their established canonical BFSCapable hop-set path below.
+	//
+	// The statement costs several indexed adjacency reads, so it pays off only
+	// for a wide neighborhood. The seed's own adjacency, which the walk reads
+	// first anyway, decides: a narrow seed walks hop by hop from that read.
+	_, selectedAdmission := e.g.(graph.BFSAdmissionReader)
+	var seedAdjacency *graph.KindAdjacency
+	if !bidir && len(edgeKinds) > 0 && opts.Limit > 1 && !opts.ExcludeTests && !opts.IncludeDispatch && (opts.hasScopeFilter() || selectedAdmission) {
+		request := graph.BFSAdmissionRequest{Seed: nodeID, Direction: graph.DirectionForward, Kinds: edgeKinds, Depth: opts.Depth, Limit: opts.Limit,
+			Scope: graph.NodeScope{WorkspaceID: opts.WorkspaceID, ProjectID: opts.ProjectID, RepoAllow: opts.RepoAllow}}
+		if !forward {
+			request.Direction = graph.DirectionBackward
+		}
+		first, err := graph.ReadKindAdjacency(walkCtx, e.g, nodeID, request.Direction, edgeKinds)
+		if walkDone(walkCtx) {
+			return &SubGraph{}
+		}
+		if err == nil {
+			seedAdjacency = &first
+		}
+		if err != nil || len(first.Edges) >= bfsAdmissionMinFanout {
+			snapshot, handled, err := graph.ReadBFSAdmissionContext(walkCtx, e.g, request)
+			if walkDone(walkCtx) {
+				return &SubGraph{}
+			}
+			if err == nil && handled {
+				return e.WithReader(graph.NewBFSAdmissionReader(snapshot, seed, request.Direction)).bfs(nodeID, opts, forward, edgeKinds)
+			}
+		}
+	}
+
 	// Prefer a single-round-trip BFS capability (the disk backend lowers it
 	// to one recursive CTE) over the layer-by-layer GetOutEdges / GetInEdges
 	// walk below, when the walk needs none of the per-layer hooks the flat
@@ -1359,7 +1585,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 	// implements the same capability, so both backends take this path and
 	// agree by construction; a backend without it (or a capability error)
 	// falls through to the Go walk, which stays the correctness oracle.
-	if capStore, ok := e.g.(graph.BFSCapable); ok && !bidir && len(edgeKinds) > 0 &&
+	if capStore, ok := e.g.(graph.BFSCapable); ok && !selectedAdmission && !bidir && len(edgeKinds) > 0 &&
 		!opts.hasScopeFilter() && !opts.ExcludeTests && !opts.IncludeDispatch {
 		if sg, ok := e.bfsViaCapability(capStore, nodeID, opts, forward, edgeKinds, kindSet); ok {
 			return sg
@@ -1464,7 +1690,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		!opts.ExcludeTests && !opts.hasScopeFilter()
 
 	frontier := []string{nodeID}
-	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit; depth++ {
+	for depth := 0; depth < opts.Depth && len(frontier) > 0 && len(allNodes) < opts.Limit && !walkDone(walkCtx); depth++ {
 		var next []string
 		if batched {
 			for _, h := range expander.ExpandFrontier(frontier, forward, edgeKinds, opts.Limit) {
@@ -1486,13 +1712,37 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 		} else {
 			for _, cur := range frontier {
 				var edges []*graph.Edge
-				switch {
-				case bidir:
+				edgeTotal := 0
+				if bidir {
 					edges = append(e.g.GetOutEdges(cur), e.g.GetInEdges(cur)...)
-				case forward:
-					edges = e.g.GetOutEdges(cur)
-				default:
-					edges = e.g.GetInEdges(cur)
+					edgeTotal = len(edges)
+				} else {
+					dir := graph.DirectionForward
+					if !forward {
+						dir = graph.DirectionBackward
+					}
+					var adjacency graph.KindAdjacency
+					var err error
+					if seedAdjacency != nil && cur == nodeID {
+						adjacency, seedAdjacency = *seedAdjacency, nil
+					} else {
+						adjacency, err = graph.ReadKindAdjacency(walkCtx, e.g, cur, dir, edgeKinds)
+					}
+					if walkDone(walkCtx) {
+						return &SubGraph{}
+					}
+					if err != nil {
+						// An unavailable optional read retains the ordinary selected
+						// reader's oracle; never fall through after cancellation.
+						if forward {
+							edges = e.g.GetOutEdges(cur)
+						} else {
+							edges = e.g.GetInEdges(cur)
+						}
+						edgeTotal = len(edges)
+					} else {
+						edges, edgeTotal = adjacency.Edges, adjacency.Total
+					}
 				}
 				// One deterministic admission order before the cap: the
 				// backends hand back raw edges in storage order (insertion
@@ -1508,7 +1758,7 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 				// the batched expander and BFSCapable fast paths keep
 				// their own store order. The backends return fresh
 				// slices, so the in-place sort is safe.
-				if opts.Limit > 0 && len(allNodes)+len(edges) >= opts.Limit {
+				if opts.Limit > 0 && len(allNodes)+edgeTotal >= opts.Limit {
 					SortEdgesForPage(edges)
 				}
 				for _, edge := range edges {
@@ -1638,9 +1888,21 @@ func (e *Engine) bfs(nodeID string, opts QueryOptions, forward bool, edgeKinds [
 }
 
 func stripMeta(sg *SubGraph) {
-	for _, n := range sg.Nodes {
-		n.Meta = nil
+	if sg.Nodes == nil {
+		return
 	}
+	// Readers may lend immutable nodes and their slice to multiple requests.
+	// Brief rendering owns only these response copies, never the reader's full
+	// metadata or another concurrent response's selection.
+	nodes := make([]*graph.Node, len(sg.Nodes))
+	for i, n := range sg.Nodes {
+		if n != nil {
+			cp := *n
+			cp.Meta = nil
+			nodes[i] = &cp
+		}
+	}
+	sg.Nodes = nodes
 }
 
 // bfsViaCapability builds the same SubGraph the layer walk would, but
@@ -1667,7 +1929,21 @@ func (e *Engine) bfsViaCapability(
 	if !forward {
 		dir = graph.DirectionBackward
 	}
-	hops, err := capStore.BFS([]string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	var (
+		hops []graph.BFSHop
+		err  error
+	)
+	walkCtx := e.walkContext(opts)
+	if contextual, ok := capStore.(bfsContextCapable); ok && walkCtx != nil {
+		hops, err = contextual.BFSContext(walkCtx, []string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	} else {
+		hops, err = capStore.BFS([]string{nodeID}, dir, edgeKinds, opts.Depth, opts.Limit)
+	}
+	if walkDone(walkCtx) {
+		// The request ended: answer nothing rather than letting the caller
+		// fall back to the layer walk, which would redo the abandoned work.
+		return &SubGraph{}, true
+	}
 	if err != nil {
 		return nil, false
 	}

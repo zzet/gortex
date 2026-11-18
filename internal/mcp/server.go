@@ -41,6 +41,7 @@ import (
 	"github.com/zzet/gortex/internal/semantic"
 	"github.com/zzet/gortex/internal/telemetry"
 	"github.com/zzet/gortex/internal/tokens"
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 // Version is set at build time.
@@ -130,7 +131,15 @@ func (sh *symbolHistory) All() map[string][]SymbolModification {
 
 // Server wraps the MCP server with Gortex-specific tools.
 type Server struct {
-	mcpServer *server.MCPServer
+	sharedIdentity   sharedServerIdentity
+	editAckMode      config.EditAckMode
+	editAckConfigErr error
+	// editOperations covers actual source-edit handler completions across this
+	// Server's sessions/views, including handlers that outlive their caller.
+	// Native filesystem stimuli remain harness-owned, not inferred from events.
+	editOperations editOperationCounters
+	editCPU        *editCPUObservation
+	mcpServer      *server.MCPServer
 	// connSessions tracks daemon-socket connections registered as live
 	// mcp-go client sessions so server-initiated notifications reach
 	// them (ConnectSession / DisconnectSession / WithClientSession in
@@ -144,8 +153,13 @@ type Server struct {
 	multiIndexer  *indexer.MultiIndexer
 	configManager *config.ConfigManager
 	// lifecycle is the shared owner of checkout track / forget side effects.
-	lifecycle     *indexer.CheckoutLifecycle
-	activeProject string
+	lifecycle *indexer.CheckoutLifecycle
+	// freshnessWaiter overrides the checkout settle signal a require_fresh
+	// request waits on. Nil in production, where the lifecycle above is the
+	// waiter; a test installs one to drive the wait's outcomes without a live
+	// coordinator. See checkoutFreshnessWaiter.
+	freshnessWaiter checkoutFreshnessWaiter
+	activeProject   string
 	// testIndexProbe caches, per repo prefix, which language families the
 	// graph carries test symbols for (see testLangsIndexed). The answer
 	// changes with a reindex — and with the test-edge pass that stamps those
@@ -153,7 +167,9 @@ type Server struct {
 	// resetTestIndexProbe clears it on every analysis pass rather than
 	// pinning the first (possibly mid-warmup) answer for the daemon's life.
 	testIndexProbe sync.Map
-	// trackInFlight guards first-index runs by absolute repo path.
+	// trackInFlight guards first-index runs by canonical root and request
+	// options, retaining final outcomes for ten minutes while owner/config
+	// witnesses remain current. Lexical aliases share the same job pointer.
 	// track answers before the index finishes (#326), so without this a
 	// second call for the same path would start a duplicate full index:
 	// TrackRepoCtx's already-tracked check only sees repos that finished.
@@ -202,15 +218,18 @@ type Server struct {
 	communitiesToken communityCacheToken
 	// hotspots is the lazily-built default-threshold (mean + 2*stddev)
 	// ranking. FindHotspots' inner ComputeBetweenness pass is too expensive
-	// to put on every daemon cold-start path; RunAnalysis invalidates this
-	// cache and the first hotspot-consuming request rebuilds it once for that
-	// analysis epoch. Reads/cache state are guarded by analysisMu; the separate
+	// to repeat per request; a successful explicit RunAnalysis warms the same
+	// default ranking once for its published epoch. Legacy/lazy callers can
+	// still rebuild it on first demand. Reads/cache state are guarded by
+	// analysisMu; the separate
 	// build mutex coalesces concurrent first requests without blocking unrelated
 	// analysis snapshots while betweenness runs.
-	hotspots        []analysis.HotspotEntry
-	hotspotsReady   bool
-	hotspotsBuildMu sync.Mutex
-	analysisEpoch   uint64
+	hotspots         []analysis.HotspotEntry
+	hotspotsReady    bool
+	hotspotsOwned    bool // compact slice and cloned strings, guarded by analysisMu
+	hotspotsBuildMu  sync.Mutex
+	outlineResponses outlineResponseCache
+	analysisEpoch    uint64
 	// analysisRun tracks the background on-demand analysis pass so a tool
 	// call can report "running, retry in Ns" instead of blocking for
 	// minutes on a whole-graph computation.
@@ -236,18 +255,46 @@ type Server struct {
 	analysisGeneration      graph.AnalysisGenerationHeader
 	analysisGenerationReady bool
 	analysisPruneScheduled  atomic.Bool
-	// backgroundMaintenance joins the detached analysis-generation prune
-	// goroutine. Anyone closing the backend store must DrainBackground
-	// first: an in-flight prune batch survives sql.DB.Close on its pinned
-	// connection and its next WAL commit recreates store files
-	// mid-teardown. Add is gated by the mutex + drained flag so it never
-	// races DrainBackground's Wait, and a prune requested after the drain
-	// is dropped rather than run against a closing store.
+	analysisPruneRequested  atomic.Bool
+	// backgroundMaintenance owns analysis, cochange, prune and route-reader
+	// work through actual completion. Add is serialized with permanent close;
+	// cancellation is published before joins, never treated as quiescence.
 	backgroundMaintenance        sync.WaitGroup
 	backgroundMaintenanceMu      sync.Mutex
 	backgroundMaintenanceDrained bool
+	backgroundContext            context.Context    // initialized under backgroundMaintenanceMu
+	backgroundCancel             context.CancelFunc // guarded by backgroundMaintenanceMu
+	backgroundDrainOnce          sync.Once
 	analysisMaterializeMu        sync.Mutex
 	analysisMu                   sync.RWMutex
+	// answerAnalysis is the analysis receipt the answer path last observed
+	// with analysisMu free, and answerAnalysisValues the per-generation values
+	// it memoizes; see analysis_answer.go. The answer path never waits for a
+	// running analysis pass.
+	// analysisRunMu serializes analysis passes (and the clusters tool's
+	// recompute, which shares the Leiden cache); analysisPassActive reports a
+	// pass in flight now that a pass no longer holds analysisMu. See
+	// analysis_pass.go.
+	analysisRunMu      sync.Mutex
+	analysisPassActive atomic.Bool
+	analysisPassSkips  atomic.Int64
+	// analysisScopedHandle memoizes the view-scoped analysis handle
+	// (analysis_generation.go).
+	analysisScopedHandle atomic.Pointer[analysisScopedHandleMemo]
+	// analysisYield, when set, reports that an edit cycle holds the build
+	// lane; a background pass waits it out between sub-analyses.
+	analysisYield func() bool
+	// routeFTSWarm is the background warm of routes' base generations for
+	// the full-text ranker (warmRouteFTS): the route pre-warm only queues a
+	// route here, and one worker reads, outside every publication.
+	routeFTSWarm         routeFTSWarmQueue
+	answerAnalysis       atomic.Pointer[answerAnalysisSnapshot]
+	answerAnalysisValues answerAnalysisCache
+	answerToken          atomic.Pointer[answerTokenMemo]
+	// stackAdjacency memoizes the rerank's bounded-centrality reads per
+	// composed level of a routed stack; see centrality_stack_memo.go.
+	stackAdjacency     *stackAdjacencyMemo
+	stackAdjacencyOnce sync.Once
 
 	// cochange caches the git-history co-change graph. cochangeByFile
 	// maps a file path to its co-changing file paths and association
@@ -261,6 +308,7 @@ type Server struct {
 	cochangeMu     sync.RWMutex
 	cochangeByFile map[string]map[string]float64
 	cochangeCount  map[string]map[string]int
+	cochangeErr    error // terminal mine failure, guarded by cochangeMu
 
 	// autoIndexOnce guards the opt-in (GORTEX_AUTOINDEX=1) zero-config
 	// background index of an untracked cwd, fired at most once per session
@@ -329,12 +377,10 @@ type Server struct {
 	equivalence      *search.EquivalenceTable
 	contractRegistry *contracts.Registry
 	semanticMgr      *semantic.Manager
-	// refsConfirmed is the lazy-enrichment ledger: symbol IDs whose incoming
-	// references have been confirmed on demand (via ConfirmSymbolRefs) this
-	// daemon session, so a repeat usages query serves from the confirmed graph
-	// instead of re-spawning the language server. An entry is recorded after
-	// the first attempt (success or empty) to bound per-query LSP work.
-	refsConfirmed sync.Map // symbolID → struct{}
+	// refsConfirmed bounds on-demand incoming-reference work per symbol. Entries
+	// hold an active claim, a retry deadline, or an accepted positive result for
+	// this analysis epoch. Failed/empty attempts never permanently suppress retry.
+	refsConfirmed sync.Map // symbolID → *referenceConfirmation
 	feedback      *feedbackManager
 	notes         *notesManager
 	memories      *memoryManager
@@ -368,14 +414,22 @@ type Server struct {
 	// defaults. sync.Map keeps directly-constructed servers usable.
 	mutationReceipts    sync.Map
 	mutationReindexWait time.Duration
-	mutationSafetyWait  time.Duration
+	// mutationReceiptAfterFunc replaces retention scheduling in deterministic
+	// tests. Nil uses time.AfterFunc with the unchanged retention windows.
+	mutationReceiptAfterFunc func(time.Duration, func())
+	// mutationRouteWaitEntered observes a real pending source-mutation route
+	// after selection and before polling. Nil outside deterministic tests.
+	mutationRouteWaitEntered func(context.Context)
+	// releaseDispatchSlot replaces daemon.MoveMCPDispatchToSlowLane in tests.
+	releaseDispatchSlot func(context.Context, <-chan struct{}) bool
 
 	// mutationCommits is the durable disk-commit ledger for the single-file
 	// mutating tools (mutation_commit.go). It answers the question the
 	// transport cannot: when a tool call is abandoned at its deadline, did the
 	// bytes actually land? The zero value is usable, so directly-constructed
 	// test and embedded servers need no constructor wiring.
-	mutationCommits mutationCommitLedger
+	mutationCommits    mutationCommitLedger
+	pendingSourceFiles pendingSourceRegistry
 
 	// mutationPreCommitHook is a fault-injection seam, nil in production. It
 	// fires between registering a commit and the cancellation gate that guards
@@ -596,6 +650,18 @@ type Server struct {
 	// that legacy tool.
 	facades *facadeRegistry
 
+	// Installed only with an independently owned contract producer. Ordinary
+	// source operations do not capture inputs or call this runtime.
+	contractAnalysisRuntime *ContractAnalysisRuntime
+	contractAnalysisWaiters atomic.Int64
+	// contractRegistries carries repository registries between bound
+	// requests while their projection inputs stay unchanged.
+	contractRegistries contractRegistryCache
+	// contractCoreExclusions is the identity-set cache readerFor's
+	// contract-core readers share; nil shares the process-wide
+	// defaultContractCoreExclusions.
+	contractCoreExclusions *contractCoreExclusionCache
+
 	// toolPolicy restricts the published tool surface to a named preset
 	// / allow-deny set (see tool_presets.go). Resolved at construction
 	// from MultiRepoOptions.ToolPolicy (the mcp.tools config block) plus
@@ -630,6 +696,13 @@ type Server struct {
 // Never returns nil — callers can chain `.recordFile(...)` etc.
 // unconditionally.
 func (s *Server) sessionFor(ctx context.Context) *sessionState {
+	// A cursor call pins its owner before retrieval; release must not let
+	// an active call lazily recreate a disconnected session.
+	if ctx != nil {
+		if owner, ok := ctx.Value(symbolPageOwnerKey{}).(*sessionState); ok {
+			return owner
+		}
+	}
 	id := SessionIDFromContext(ctx)
 	if id == "" || s.sessions == nil {
 		return s.session
@@ -681,11 +754,12 @@ func (s *Server) ReleaseSession(id string) {
 
 // sessionState tracks recent agent activity for context recovery after compaction.
 type sessionState struct {
-	mu             sync.Mutex
-	viewedSymbols  []string // recently viewed symbol IDs (most recent first)
-	viewedFiles    []string // recently viewed file paths
-	modifiedFiles  []string // files modified via edit_symbol
-	recentSearches []string // recent search queries
+	mu                     sync.Mutex
+	viewedSymbols          []string                // recently viewed symbol IDs (most recent first)
+	viewedFiles            []string                // recently viewed file paths
+	modifiedFiles          []string                // files modified via edit_symbol
+	interactiveEditedFiles []interactiveEditedFile // bounded physical identities, no in-flight store marker
+	recentSearches         []string                // recent search queries
 	// clientName is the MCP client identifier (claude-code / cursor / vscode /
 	// zed / …) captured from the protocol's `initialize.clientInfo.name`
 	// field by the daemon dispatcher. Drives the per-session default
@@ -709,7 +783,8 @@ type sessionState struct {
 	// subsequent get_symbol_source / get_editing_context on one of its
 	// results can be attributed back to the query — this is the raw input
 	// to the combo tracker. Reset on every search.
-	lastSearch lastSearchState
+	lastSearch  lastSearchState
+	symbolPages *symbolPageCache
 
 	// Workspace scope for this session, resolved lazily from the
 	// session cwd on first query and cached here. scopeResolved
@@ -815,9 +890,11 @@ type lastSearchState struct {
 }
 
 // tokenStats tracks estimated token savings for the current session. When a
-// savings.Store is attached, each record() call also increments the persistent
-// cumulative totals so "Gortex saved $X this month"-style narratives survive
-// server restarts.
+// savings.Store is attached, each record() call also books the observation
+// into the persistent cumulative totals so "Gortex saved $X this month"-style
+// narratives survive server restarts. That booking is a buffered enqueue, not
+// a database transaction: a read-only tool call must not pay a durable
+// sidecar commit to record its own accounting (see internal/savings).
 //
 // parent, when non-nil, is the process-wide aggregate (s.tokenStats) that
 // every per-session counter feeds. Without the fan-out, a fresh session's
@@ -961,7 +1038,8 @@ func (ts *tokenStats) record(node *graph.Node, tool string, returned, fullFile i
 
 	// Forward to the persistent store outside our lock — its own
 	// synchronization guards concurrent writers, and the ledger write
-	// shouldn't block new record() calls on the hot path.
+	// shouldn't block new record() calls on the hot path. Sidecar-backed
+	// stores buffer here and commit one transaction per flush window.
 	if store != nil {
 		store.AddObservation(savings.Observation{
 			Repo:      repo,
@@ -1413,6 +1491,8 @@ func prependUnique(slice []string, item string, maxLen int) []string {
 // MultiRepoOptions holds optional multi-repo components for the Server.
 // When nil or zero-valued, the server operates in single-repo mode.
 type MultiRepoOptions struct {
+	// EditAckMode is startup policy; empty inherits global config, then full.
+	EditAckMode   config.EditAckMode
 	MultiIndexer  *indexer.MultiIndexer
 	ConfigManager *config.ConfigManager
 	// CheckoutLifecycle owns every side effect of tracking and forgetting a
@@ -1452,16 +1532,16 @@ Worktree and branch routing:
 
 ` + profiles.WorktreeBranchRoutingPolicy + `
 
-` + sharedParamLegend
+` + sharedParamLegend + "\n\n" + toolref.TransportText + " " + toolref.DegradedModeText
 
 // codingAgentInstructions is intentionally terse because some MCP hosts repeat
 // initialize instructions beside every rendered tool. It describes what to do,
 // not how the server versions or implements its tool surface.
-const codingAgentInstructions = `MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.
+const codingAgentInstructions = `When Gortex can serve the step: MUST use Gortex MCP. First explicit-file read per new user request: read(operation:"file", target:{file:"<path>"}, options:{new_user_task:true}); do not localize. Unknown file/symbol/evidence: explore(operation:"localize"); obey completion.required_action; stop at answer_ready. Diagnosis/change: explore(operation:"task"); 1 follow-up. Pre-edit: change(operation:"impact"); signature: change(operation:"verify"). Mutate only via edit/refactor. Post-edit: change(operation:"detect"), tests/guards/contract. capabilities only if fields unknown.
 
 Worktree and branch routing:
 
-` + profiles.WorktreeBranchRoutingPolicy
+` + profiles.WorktreeBranchRoutingPolicy + "\n" + toolref.TransportText + " " + toolref.DegradedModeText
 
 // ServerInstructionsUntracked is the inactive-state `instructions` variant
 // returned when a session's cwd is not covered by any tracked repo. Rather than
@@ -1475,8 +1555,7 @@ func ServerInstructionsUntracked(cwd string, roots ...string) string {
 	}
 	msg := fmt.Sprintf("Gortex is connected but INACTIVE for this directory: %q is not covered by any tracked repository, "+
 		"so the graph tools have nothing to answer with yet.\n\n"+
-		"To activate: run `gortex track %s`, then reconnect — the full tool catalogue and the "+
-		"graph become available.\n\n"+
+		"To activate: run `gortex track %s`, then retry graph calls; no reconnect is needed.\n\n"+
 		"Until then only capabilities and workspace_admin(operation:\"track\") will answer; every other call "+
 		"returns repo_not_tracked, so fall back to your own file reads and text search.", target, target)
 	// Append the tracked roots so the mismatch is self-diagnosing: a
@@ -1502,11 +1581,28 @@ func ServerInstructionsPendingAutomaticCheckout(cwd string, roots ...string) str
 	if target == "" {
 		target = "."
 	}
-	msg := fmt.Sprintf("Gortex is connected but this Git checkout is still awaiting automatic discovery: %q belongs to an already tracked Git family, but its overlay route is not published yet.\n\n"+
-		"Do not run `gortex track` for this state: implicit/session checkouts are automatic overlays. Wait for reconciliation and reconnect; if it remains unavailable, report the discovery lag. Explicit tracking is only for a user-requested dedicated graph.\n\n"+
-		"Until its route is published, graph calls may return repo_not_tracked rather than silently reading another checkout.\n\n"+
-		"Worktree and branch routing:\n\n%s", target, profiles.WorktreeBranchRoutingPolicy)
-	return appendTrackedRootsDiagnostic(msg, roots)
+	msg := fmt.Sprintf("Gortex is connected; checkout discovery is pending for %q.\n\n%s\n\n"+
+		"Retry after other work; if discovery is still pending after a few attempts, continue natively for this step and report the discovery lag.\n\n"+
+		"Worktree and branch routing:\n\n%s", target, agents.PendingAutomaticCheckoutGuidance, profiles.WorktreeBranchRoutingPolicy)
+	return appendTrackedRootsDiagnostic(msg+"\n\n"+toolref.TransportClause()+" "+toolref.DegradedModeLine(), roots)
+}
+
+// PendingAutomaticCheckoutInstructions captures the verified family verdict
+// with its canonical rendered guidance. A later reader must not re-probe the
+// filesystem and accidentally turn this pending result into untracked advice.
+func PendingAutomaticCheckoutInstructions(cwd string, roots ...string) (string, bool) {
+	if !agents.PendingAutomaticCheckout(cwd, roots) {
+		return "", false
+	}
+	return ServerInstructionsPendingAutomaticCheckout(cwd, roots...), true
+}
+
+// ServerInstructionsPendingFamilyLoad retains the terminal load failure as
+// context, without suggesting a second track operation for a declared family.
+func ServerInstructionsPendingFamilyLoad(cwd string, load indexer.RepoLoad, roots ...string) string {
+	return ServerInstructionsPendingAutomaticCheckout(cwd, roots...) + fmt.Sprintf(
+		"\n\nConfigured repository %q finished loading without registration (state=%s). Load diagnostic: %s",
+		load.Root, load.State, load.Reason)
 }
 
 func appendTrackedRootsDiagnostic(msg string, roots []string) string {
@@ -1517,7 +1613,7 @@ func appendTrackedRootsDiagnostic(msg string, roots []string) string {
 	for i, root := range roots {
 		quoted[i] = fmt.Sprintf("%q", root)
 	}
-	return msg + fmt.Sprintf("\n\nTracked repository roots: [%s]. The worktree shares a Git common directory with one of these roots.",
+	return msg + fmt.Sprintf("\n\nKnown repository roots (registered or configured): [%s]. The checkout shares a Git common directory with one of these roots.",
 		strings.Join(quoted, ", "))
 }
 
@@ -1537,7 +1633,21 @@ func (s *Server) afterInitializeInstructions(ctx context.Context, _ any, req *mc
 		return
 	}
 	result.Instructions = s.stateAwareInstructionsForPolicy(
-		SessionCWDFromContext(ctx), s.effectiveSessionPolicy(ctx))
+		ctx, SessionCWDFromContext(ctx), s.effectiveSessionPolicy(ctx))
+}
+
+// Modern clients discover the server without an initialize handshake. Apply
+// the same per-session instructions, including loading and pending-checkout
+// guidance, and read their identity from the SDK's parsed request metadata.
+func (s *Server) afterDiscoverInstructions(ctx context.Context, _ any, _ *mcp.DiscoverRequest, result *mcp.DiscoverResult) {
+	if s == nil || result == nil {
+		return
+	}
+	if info := server.RequestProtocolInfoFromContext(ctx); info != nil && info.Modern && info.ClientInfo != nil {
+		s.sessionFor(ctx).recordClientName(info.ClientInfo.Name)
+	}
+	result.Instructions = s.stateAwareInstructionsForPolicy(
+		ctx, SessionCWDFromContext(ctx), s.effectiveSessionPolicy(ctx))
 }
 
 // stateAwareInstructions chooses the initialize `instructions` text for a
@@ -1566,18 +1676,28 @@ func (s *Server) stateAwareInstructions(cwd string) string {
 }
 
 func (s *Server) stateAwareInstructionsForClient(cwd, client string) string {
-	return s.stateAwareInstructionsForPolicy(cwd, s.clientDefaultPolicy(client))
+	return s.stateAwareInstructionsForPolicy(context.Background(), cwd, s.clientDefaultPolicy(client))
 }
 
-func (s *Server) stateAwareInstructionsForPolicy(cwd string, policy *toolPolicy) string {
+func (s *Server) stateAwareInstructionsForPolicy(ctx context.Context, cwd string, policy *toolPolicy) string {
 	base := serverInstructions
 	if policy != nil && policy.preset == FacadeSurfaceVersion {
 		base = codingAgentInstructions
 	}
-	return s.stateAwareInstructionsWithBase(cwd, base)
+	return s.stateAwareInstructionsContext(ctx, cwd, base)
 }
 
 func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
+	return s.stateAwareInstructionsContext(context.Background(), cwd, base)
+}
+
+func (s *Server) stateAwareInstructionsContext(ctx context.Context, cwd, base string) string {
+	return s.stateAwareInstructionsWithCheckout(ctx, cwd, base, s.CheckoutServesCWDChecked)
+}
+
+// Keep the existing checkout lookup explicit so publication during that
+// lookup can be exercised without a global hook or changing the transport.
+func (s *Server) stateAwareInstructionsWithCheckout(ctx context.Context, cwd, base string, lookup func(context.Context, string) (bool, error)) string {
 	// The reachability test must match the dispatcher's gate exactly.
 	// Telling a session it is INACTIVE while every call succeeds is the
 	// same divergence as the reverse, just quieter.
@@ -1585,13 +1705,66 @@ func (s *Server) stateAwareInstructionsWithBase(cwd, base string) string {
 		_, _, _, inside := s.multiIndexer.ScopeForCWD(cwd)
 		_, _, contains := s.multiIndexer.ContainedReposScope(cwd)
 		if !inside && !contains {
-			roots := s.trackedRepoRoots()
+			// A configured repository the registry does not hold yet is not
+			// untracked: telling it to track itself and reconnect is the
+			// advice that made agents re-track or stop on every restart.
+			if rec, pending := s.multiIndexer.PendingRepoForPath(cwd); pending {
+				return s.instructionsForRepoLoad(cwd, base, rec)
+			}
+			if serves, err := lookup(ctx, cwd); err != nil {
+				return CheckoutAdmissionInstructions(cwd, err)
+			} else if serves {
+				return s.appendLiveInstructions(cwd, base)
+			}
+			if rec, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+				if rec.State.Ready() {
+					_, _, _, inside = s.multiIndexer.ScopeForCWD(cwd)
+					_, _, contains = s.multiIndexer.ContainedReposScope(cwd)
+					if inside || contains {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					if serves, err := lookup(ctx, cwd); err != nil {
+						return CheckoutAdmissionInstructions(cwd, err)
+					} else if serves {
+						return s.appendLiveInstructions(cwd, base)
+					}
+					roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+					if instructions, known := PendingAutomaticCheckoutInstructions(cwd, roots...); known {
+						return instructions
+					}
+					return ServerInstructionsScopeBindingPending() + "\n\n" + base
+				}
+				return s.instructionsForRepoLoad(cwd, base, rec)
+			}
+			roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
 			if agents.PendingAutomaticCheckout(cwd, roots) {
 				return ServerInstructionsPendingAutomaticCheckout(cwd, roots...)
 			}
 			return ServerInstructionsUntracked(cwd, roots...)
 		}
 	}
+	return s.appendLiveInstructions(cwd, base)
+}
+
+func (s *Server) instructionsForRepoLoad(cwd, base string, rec indexer.RepoLoad) string {
+	if rec.ErrorCode == string(ErrCodePrefixCollision) {
+		return ServerInstructionsPrefixCollision(rec)
+	}
+	if rec.State == indexer.RepoLoadIdentityPending {
+		return ServerInstructionsIdentityPending() + "\n\n" + base
+	}
+	if !rec.State.Loading() {
+		roots := agents.FamilyRepoRoots(s.trackedRepoRoots(), s.multiIndexer.ConfiguredRepoRoots())
+		if agents.PendingAutomaticCheckout(cwd, roots) {
+			return ServerInstructionsPendingFamilyLoad(cwd, rec, roots...)
+		}
+		return ServerInstructionsUnavailable(rec.Root, rec.Reason)
+	}
+	phase, percent := s.WarmupProgress()
+	return ServerInstructionsLoading(rec.Label(), phase, percent) + "\n\n" + base
+}
+
+func (s *Server) appendLiveInstructions(cwd, base string) string {
 	if facts := s.liveInstructionFacts(cwd); facts != "" {
 		base = base + "\n\n" + facts
 	}
@@ -1738,11 +1911,12 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		prCache:    newPRCache(prCacheTTL),
 		facades:    newFacadeRegistry(),
 	}
+	s.initializeSharedIdentity()
 	// Wire the process-wide tokenStats as the parent of every
 	// per-session counter so record() fanout aggregates daemon-wide.
 	s.sessions.setParentTokenStats(s.tokenStats)
-	// Per-connection state-aware initialize instructions: the after-init
-	// hook rewrites result.Instructions for THIS session's cwd — the terse
+	// Per-connection state-aware instructions: initialize and discovery
+	// hooks rewrite result.Instructions for THIS session's cwd — the terse
 	// activation affordance for an uncovered cwd, or the base guidance plus
 	// live workspace + warmup facts for a covered one. It fires for every
 	// MCP client straight from the handshake, including non-Claude-Code
@@ -1750,6 +1924,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 	// rewrite for the proxy path would not reach the embedded stdio server).
 	initHooks := &server.Hooks{}
 	initHooks.AddAfterInitialize(s.afterInitializeInstructions)
+	initHooks.AddAfterDiscover(s.afterDiscoverInstructions)
 
 	// mcpServer is constructed after s exists so the per-session tool
 	// filter can close over s — toolSurfaceFilter varies the tools/list
@@ -1784,6 +1959,17 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 		s.watcher = watcher
 	}
 
+	ackConfig := config.EditConfig{}
+	if len(opts) > 0 {
+		if opts[0].ConfigManager != nil {
+			ackConfig = opts[0].ConfigManager.Global().Edit
+		}
+		if opts[0].EditAckMode != "" {
+			ackConfig.Ack = opts[0].EditAckMode
+		}
+	}
+	s.editAckMode, s.editAckConfigErr = ackConfig.AckMode()
+
 	// Apply multi-repo options if provided.
 	if len(opts) > 0 {
 		o := opts[0]
@@ -1817,6 +2003,7 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 			}
 		}
 		s.lifecycle.SetNotifier(s)
+		s.wireRoutePrewarm()
 	}
 
 	// Proactive-notification broadcasters. Constructed up-front so
@@ -1943,6 +2130,9 @@ func NewServer(engine *query.Engine, g graph.Store, idx *indexer.Indexer, watche
 
 	s.applyDefaultToolScopes()
 
+	// Capture process CPU/count0 together, after construction and before this
+	// Server's registered handlers can be called. Never reset on stats reads.
+	s.initializeEditCPUObservation(platform.ProcessCPUTime)
 	return s
 }
 
@@ -2301,9 +2491,22 @@ func (s *Server) sessionScope(ctx context.Context) (workspaceID, projectID strin
 	}
 
 	// cwd neither lives inside nor contains a tracked repo. The daemon
-	// dispatcher rejects unreachable cwds before dispatch, so this is
-	// defensive: the sentinel matches no node, so the session sees
-	// nothing rather than the whole global graph.
+	// dispatcher (cmd/gortex/daemon_mcp.go) rejects ordinary tools/call
+	// frames from such a cwd with notTrackedError, but that guard does not
+	// cover every request: the untrackedBootstrapCall tools, non-tools/call
+	// methods, a router-reachable cwd whose proxy attempt falls back to
+	// local dispatch, and any other entrypoint that reaches sessionScope
+	// with an uncovered cwd all still land here. So this must fail closed:
+	// the sentinel matches no node, so the session sees nothing rather
+	// than the whole global graph.
+	//
+	// A cwd in a configured repository that is still loading resolves here
+	// too, but only for now. Caching the sentinel would leave the session
+	// blind after the repository registers, so it is not cached: the next
+	// call resolves again.
+	if _, classified := s.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+		ss.scopeResolved = false
+	}
 	ss.scopeWorkspaceID = unresolvedWorkspacePrefix + cwd
 	return ss.scopeWorkspaceID, ss.scopeProjectID, true
 }
@@ -2404,6 +2607,8 @@ func (s *Server) InvalidateSessionScopes() {
 		ss.resetScopeLocked()
 		ss.mu.Unlock()
 	}
+	s.outlineResponses.clear()
+	s.retireDeadPendingSourceIncarnations()
 }
 
 // sessionLocality returns the session's home repo prefix and project
@@ -2574,9 +2779,11 @@ func (s *Server) scopedNodesByKinds(ctx context.Context, kinds []graph.NodeKind)
 	if len(kinds) == 0 {
 		return nil
 	}
-	reader := s.readerFor(ctx)
+	// Bound to the request: an abandoned call stops reading within one page
+	// of its deadline instead of pinning the store's WAL snapshot.
+	reader := graph.BindReadContext(s.readerFor(ctx), ctx)
 	var nodes []*graph.Node
-	if scan, ok := reader.(graph.NodesByKindsScanner); ok {
+	if scan, ok := contractCoreSelectedReader(reader).(graph.NodesByKindsScanner); ok {
 		nodes = scan.NodesByKinds(kinds)
 	} else {
 		// Fallback: same behaviour as scopedNodes, kind-filtered Go-side.
@@ -2669,15 +2876,32 @@ func (s *Server) tokenStatsFor(ctx context.Context) *tokenStats {
 	return s.sessions.get(id).tokenStats
 }
 
-// FlushSavings is kept for shutdown-path compatibility. The sidecar-backed
-// ledger commits every observation as it is recorded, so there is nothing
-// buffered to write.
+// FlushSavings commits any buffered savings observations. The sidecar-backed
+// ledger coalesces observations into one transaction per flush window, so
+// this is the shutdown path's job: the daemon's teardown chain calls it
+// (serverstack registers it as a cleanup step) before the sidecar handle is
+// released, and without it the last window of accounting is lost. Reads of
+// the ledger flush on their own, so no reader needs to call this first.
 func (s *Server) FlushSavings() error {
 	store := s.savingsStore()
 	if store == nil {
 		return nil
 	}
 	return store.Flush()
+}
+
+// SetSavingsFlushBounds narrows (or widens) the ledger's coalescing window
+// for this server. The daemon keeps the package default; the one-shot stdio
+// server — which its host SIGKILLs rather than shuts down — tightens it at
+// its entry point so a killed session loses seconds of accounting, not a
+// whole minute. No-op when persistence isn't wired, and an operator's
+// GORTEX_SAVINGS_FLUSH_INTERVAL is never overridden (see savings.Store).
+func (s *Server) SetSavingsFlushBounds(interval time.Duration, max int) {
+	store := s.savingsStore()
+	if store == nil {
+		return
+	}
+	store.SetFlushBounds(interval, max)
 }
 
 // savingsStore extracts the persistent savings store via tokenStats. Returns
@@ -2819,10 +3043,22 @@ func (s *Server) ResolveToolScope(toolName string, repo any) (*ScopedRepos, *mcp
 	return ResolveScopedRepos(scope, repo)
 }
 
-// communityCacheToken is the per-graph identity tuple
-// handleAnalyzeClusters checks before re-running the incremental
-// detector. EdgeIdentity moves on provenance churn; NodeCount and EdgeCount
-// cover additions/removals. analysisRevision closes the remaining same-count
+// communityCacheToken is the identity of the INDEXED CORPUS — s.graph,
+// generation zero — at one moment. It is not the identity of a request's view:
+// every per-server analysis it keys (the Leiden partition and the process
+// discovery beneath it) is computed over the corpus and not over whatever view
+// a request selected, which is why the consumers that serve one under a routed
+// view say base_scoped on the rider rather than pretending the answer describes
+// the view (view_capabilities.go, annotateBaseScoped).
+//
+// Reading it is NOT free and it must never be put on a liveness path: on the
+// SQL backend NodeCount and EdgeCount are whole-generation COUNT(*) scans
+// (store_sqlite/store.go, stmtNodeCount / stmtEdgeCount — the O(repos) counter
+// path countsFromIndexState is reachable only through Stats()). It is read once
+// per analysis run, which is what it is priced for.
+//
+// EdgeIdentity moves on provenance churn; NodeCount and EdgeCount cover
+// additions/removals. analysisRevision closes the remaining same-count
 // mutation gap on durable stores (for example a rebind or source-location
 // shift). A zero token is "never populated".
 type communityCacheToken struct {
@@ -2848,7 +3084,50 @@ func (s *Server) currentCommunityToken() communityCacheToken {
 // the current graph, then pushes a `notifications/resources/updated`
 // for every bootstrap resource so subscribed clients can refresh
 // without polling.
-func (s *Server) RunAnalysis() {
+func (s *Server) RunAnalysis() { s.runAnalysis(true) }
+
+// runAnalysis is RunAnalysis. A background pass (the lifecycle's lane, the
+// on-demand starter) yields between its sub-analyses to edit cycles and to
+// tool calls in flight; a pass a tool call runs itself (index_repository,
+// reindex) does not, since it would only be waiting for itself.
+//
+// The pass never holds analysisMu while it computes: every reader keeps
+// answering from the installed snapshot (or without analysis signals once
+// that snapshot no longer matches the graph) and only the install itself
+// takes the lock. Passes are serialized by analysisRunMu, and a graph whose
+// installed snapshot still matches makes the pass a no-op.
+func (s *Server) runAnalysis(background bool) {
+	ctx, done, ok := s.admitBackground()
+	if !ok {
+		return
+	}
+	defer done()
+	s.runAnalysisOwned(ctx, background)
+}
+
+// runAnalysisOwned is called only by an admitted owner, including while it
+// waits for the serial pass lock. Cancellation never certifies completion.
+func (s *Server) runAnalysisOwned(ctx context.Context, background bool) {
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	s.analysisPassActive.Store(true)
+	defer s.analysisPassActive.Store(false)
+	if s.analysisSnapshotStillCurrent() {
+		s.analysisPassSkips.Add(1)
+		if s.logger != nil {
+			s.logger.Info("mcp: analysis pass skipped: the installed snapshot matches the graph")
+		}
+		// Subscribers are still told, as after every pass: the call is the
+		// "rollups are settled" signal they wait for. Nothing was rebuilt, so
+		// the graph-invalidated broadcast and the per-graph resets stay out.
+		if ctx.Err() == nil {
+			s.notifyBootstrapResourcesUpdated()
+		}
+		return
+	}
 	runtimeactivity.Begin("analysis")
 	analysisStarted := time.Now()
 	var memoryBefore runtime.MemStats
@@ -2861,9 +3140,18 @@ func (s *Server) RunAnalysis() {
 		scheduleOSMemoryReleaseAfterBurst(s.logger, "mcp_analysis")
 	}()
 
-	s.analysisMu.Lock()
-	analysisMetrics := s.populateAnalysisLocked()
-	s.analysisMu.Unlock()
+	analysisMetrics := s.populateAnalysisContext(ctx, true, background)
+	if ctx.Err() != nil {
+		return // An interrupted attempt is not a settled bootstrap receipt.
+	}
+	hotspotsWarmup := s.warmOutlineHotspotsContext(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	outlineWarmup := s.warmOutlineSummaries(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 
 	// The graph was just rebuilt, so the lazy-enrichment ledger — symbol
 	// IDs whose incoming refs were confirmed against the *previous* graph
@@ -2908,6 +3196,19 @@ func (s *Server) RunAnalysis() {
 			zap.Duration("adjacency", analysisMetrics.adjacency),
 			zap.Duration("auto_concepts", analysisMetrics.autoConcepts),
 			zap.Duration("hits", analysisMetrics.hits),
+			zap.Duration("hotspots_warmup", hotspotsWarmup),
+			zap.Duration("outline_summary_warmup", outlineWarmup.elapsed),
+			zap.Int("outline_summary_scopes", outlineWarmup.scopes),
+			zap.Int("outline_summary_ready", outlineWarmup.ready),
+			zap.Int("outline_summary_owned_estimate_bytes", outlineWarmup.bytes),
+			zap.Int("attempts", analysisMetrics.attempts),
+			zap.Int("superseded", analysisMetrics.superseded),
+			zap.String("superseded_at", analysisMetrics.supersededAt),
+			zap.Int("yields", analysisMetrics.yields),
+			zap.Int("pace_parks", analysisMetrics.paceParks),
+			zap.Duration("pace_parked", analysisMetrics.paceParked),
+			zap.Int("projection_edge_scans", analysisMetrics.projectionEdgeScans),
+			zap.Duration("yielded", analysisMetrics.yielded),
 			zap.Duration("total", time.Since(analysisStarted)),
 			zap.Uint64("heap_alloc_before_bytes", memoryBefore.HeapAlloc),
 			zap.Uint64("heap_alloc_after_bytes", memoryAfter.HeapAlloc),
@@ -2948,22 +3249,16 @@ func ScheduleMemoryReleaseAfterBurst(logger *zap.Logger, reason string) {
 	go runScheduledMCPMemoryRelease(logger, reason)
 }
 
-// resetConfirmedRefs clears the lazy-enrichment ledger (see the
-// refsConfirmed field). sync.Map has no clear-all, so this ranges and
-// deletes; it is safe against concurrent confirmSymbolRefsOnDemand
-// readers because a racing miss just re-confirms the symbol, which is
-// idempotent — it re-lands the same lsp_resolved edges.
+// resetConfirmedRefs starts a new reference-confirmation epoch. Finishers use
+// pointer CAS, so an attempt admitted before Clear cannot revive its old entry.
 func (s *Server) resetConfirmedRefs() {
-	s.refsConfirmed.Range(func(k, _ any) bool {
-		s.refsConfirmed.Delete(k)
-		return true
-	})
+	s.refsConfirmed.Clear()
 }
 
 // resetTestIndexProbe clears the per-repo-prefix test-symbol probe (see the
-// testIndexProbe field) so the next review re-scans the rebuilt graph. Like
-// resetConfirmedRefs it ranges-and-deletes because sync.Map has no clear-all,
-// and it is safe against a concurrent testLangsIndexed reader: a racing miss
+// testIndexProbe field) so the next review re-scans the rebuilt graph.
+// Ranging and deleting is safe against a concurrent testLangsIndexed reader:
+// a racing miss
 // just re-scans, which is idempotent.
 func (s *Server) resetTestIndexProbe() {
 	s.testIndexProbe.Range(func(k, _ any) bool {
@@ -3005,9 +3300,60 @@ func (s *Server) getCommunities() *analysis.CommunityResult {
 func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats) {
 	_ = s.ensureCommunitiesMaterialized()
 	_ = s.ensureLeidenMaterialized()
+	// The fast path reads under the read lock; the recompute runs outside
+	// analysisMu, serialized with the analysis pass by analysisRunMu, and
+	// only its install takes the lock — a reader never waits for a Leiden
+	// run (analysis_pass.go).
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisRunMu.Lock()
+	defer s.analysisRunMu.Unlock()
+	if result, stats, ok := s.cachedIncrementalCommunities(); ok {
+		return result, stats
+	}
+	s.analysisMu.RLock()
+	cur := s.currentCommunityToken()
+	communitiesNil, cachedToken, leidenInput := s.communities == nil, s.communitiesToken, s.leidenCache
+	s.analysisMu.RUnlock()
+	if s.logger != nil {
+		s.logger.Info("incrementalCommunities cache miss",
+			zap.Bool("communities_nil", communitiesNil),
+			zap.Int("cached_nodes", cachedToken.nodeCount),
+			zap.Int("cur_nodes", cur.nodeCount),
+			zap.Int("cached_edges", cachedToken.edgeCount),
+			zap.Int("cur_edges", cur.edgeCount),
+			zap.Int("cached_edge_rev", cachedToken.edgeIdentity),
+			zap.Int("cur_edge_rev", cur.edgeIdentity))
+	}
+	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, leidenInput)
+	// Capture the token AFTER the algo finishes — if the graph mutated
+	// during the (potentially slow) detector run, the token reflects
+	// the state the result was actually computed against, and the next
+	// call's token comparison stays meaningful.
+	token := s.currentCommunityToken()
 	s.analysisMu.Lock()
 	defer s.analysisMu.Unlock()
+	s.communities = result
+	s.leidenCache = cache
+	s.communitiesToken = token
+	// A cache miss ran a real community recompute. Invalidate the dependent
+	// hotspot ranking and advance its epoch while holding analysisMu: an
+	// in-flight getHotspots build that captured the old communities will see
+	// the epoch change, discard its result, and rebuild before publishing.
+	s.hotspots = nil
+	s.hotspotsReady = false
+	s.hotspotsOwned = false
+	s.analysisEpoch++
+	return result, stats
+}
+
+// cachedIncrementalCommunities is incrementalCommunities' cache hit: the
+// communities installed for the graph as it is now.
+func (s *Server) cachedIncrementalCommunities() (*analysis.CommunityResult, analysis.IncrementalCommunityStats, bool) {
 	cur := s.currentCommunityToken()
+	s.analysisMu.RLock()
+	defer s.analysisMu.RUnlock()
 	if s.communities != nil && s.communitiesToken == cur {
 		stats := analysis.IncrementalCommunityStats{
 			Incremental: true,
@@ -3021,40 +3367,9 @@ func (s *Server) incrementalCommunities() (*analysis.CommunityResult, analysis.I
 				zap.Int("edges", cur.edgeCount),
 				zap.Int("edge_identity_rev", cur.edgeIdentity))
 		}
-		return s.communities, stats
+		return s.communities, stats, true
 	}
-	if s.logger != nil {
-		// INFO-level on the miss path so a regression that re-introduces
-		// a steady-state cache miss is visible without flipping the
-		// daemon to debug. The full token diff is here precisely to
-		// catch background-mutation regressions (some pass keeps drifting
-		// the edge count under the cache and the Leiden walk runs every
-		// call). A real first-call miss is a single line in the log.
-		s.logger.Info("incrementalCommunities cache miss",
-			zap.Bool("communities_nil", s.communities == nil),
-			zap.Int("cached_nodes", s.communitiesToken.nodeCount),
-			zap.Int("cur_nodes", cur.nodeCount),
-			zap.Int("cached_edges", s.communitiesToken.edgeCount),
-			zap.Int("cur_edges", cur.edgeCount),
-			zap.Int("cached_edge_rev", s.communitiesToken.edgeIdentity),
-			zap.Int("cur_edge_rev", cur.edgeIdentity))
-	}
-	result, cache, stats := analysis.DetectCommunitiesLeidenIncremental(s.graph, s.leidenCache)
-	s.communities = result
-	s.leidenCache = cache
-	// Capture the token AFTER the algo finishes — if the graph mutated
-	// during the (potentially slow) detector run, the token reflects
-	// the state the result was actually computed against, and the next
-	// call's token comparison stays meaningful.
-	s.communitiesToken = s.currentCommunityToken()
-	// A cache miss ran a real community recompute. Invalidate the dependent
-	// hotspot ranking and advance its epoch while holding analysisMu: an
-	// in-flight getHotspots build that captured the old communities will see
-	// the epoch change, discard its result, and rebuild before publishing.
-	s.hotspots = nil
-	s.hotspotsReady = false
-	s.analysisEpoch++
-	return result, stats
+	return nil, analysis.IncrementalCommunityStats{}, false
 }
 
 func (s *Server) getProcesses() *analysis.ProcessResult {
@@ -3123,7 +3438,11 @@ func (s *Server) getHITS() *analysis.HITSResult {
 // the stale result is discarded and rebuilt against the new communities.
 // The returned slice is shared and must not be mutated by the caller.
 func (s *Server) getHotspots() []analysis.HotspotEntry {
-	if !s.ensureCommunitiesMaterialized() && s.hotspotsFn == nil {
+	return s.getHotspotsContext(context.Background())
+}
+
+func (s *Server) getHotspotsContext(ctx context.Context) []analysis.HotspotEntry {
+	if ctx.Err() != nil {
 		return nil
 	}
 	s.analysisMu.RLock()
@@ -3138,9 +3457,14 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 	}
 	s.analysisMu.RUnlock()
 
-	s.hotspotsBuildMu.Lock()
+	if !lockAnalysisPreparation(ctx, &s.hotspotsBuildMu) {
+		return nil
+	}
 	defer s.hotspotsBuildMu.Unlock()
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		s.analysisMu.RLock()
 		if !s.analysisSnapshotCurrentLocked() {
 			s.analysisMu.RUnlock()
@@ -3151,21 +3475,54 @@ func (s *Server) getHotspots() []analysis.HotspotEntry {
 			s.analysisMu.RUnlock()
 			return hotspots
 		}
+		s.analysisMu.RUnlock()
+		// Coalesced waiters recheck the ranking before hydrating a partition.
+		// A retained result therefore needs no full community map at all.
+		materialized := s.ensureCommunitiesMaterializedContext(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !materialized && s.hotspotsFn == nil {
+			return nil
+		}
+		s.analysisMu.RLock()
+		if !s.analysisSnapshotCurrentLocked() {
+			s.analysisMu.RUnlock()
+			return nil
+		}
 		epoch := s.analysisEpoch
 		token := s.communitiesToken
 		communities := s.communities
 		s.analysisMu.RUnlock()
-
-		build := analysis.FindHotspots
-		if s.hotspotsFn != nil {
-			build = s.hotspotsFn
+		if materialized && communities == nil {
+			// Another request released compatibility views between hydration
+			// and this snapshot. Retry rather than rank without crossings.
+			continue
 		}
-		hotspots := build(s.graph, communities, 0)
+
+		var reader graph.Reader = s.graph
+		if ctx.Done() != nil {
+			reader = graph.BindReadContext(reader, ctx)
+		}
+		var hotspots []analysis.HotspotEntry
+		if s.hotspotsFn != nil {
+			hotspots = s.hotspotsFn(reader, communities, 0)
+		} else {
+			var err error
+			hotspots, err = analysis.FindHotspotsContext(ctx, reader, communities, 0)
+			if err != nil {
+				return nil
+			}
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
 
 		s.analysisMu.Lock()
-		if s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
+		if ctx.Err() == nil && s.analysisEpoch == epoch && s.communitiesToken == token && s.analysisSnapshotCurrentLocked() {
 			s.hotspots = hotspots
 			s.hotspotsReady = true
+			s.hotspotsOwned = false
 			s.analysisMu.Unlock()
 			scheduleOSMemoryReleaseAfterBurst(s.logger, "lazy_hotspots")
 			return hotspots
@@ -3207,6 +3564,7 @@ func (s *Server) SetEventRules(rules []config.EventRule) {
 
 // ServeStdio starts the MCP server on stdin/stdout.
 func (s *Server) ServeStdio() error {
+	defer s.retireSymbolPages()
 	return server.ServeStdio(s.mcpServer)
 }
 
@@ -3284,6 +3642,13 @@ func (s *Server) prepareTool(tool *mcp.Tool, handler server.ToolHandlerFunc) ser
 	guarded := !isFacadeToolName(tool.Name)
 	if guarded && tool.RawInputSchema == nil && tool.InputSchema.AdditionalProperties == nil {
 		tool.InputSchema.AdditionalProperties = false
+	}
+	// #883: mcp.NewTool defaults every tool to readOnlyHint:false /
+	// destructiveHint:true, so clients that gate on the hints (Claude Code
+	// plan mode) prompted on every pure read. Derive them from the canonical
+	// effect registry instead. Facades carry their own facadeAnnotation.
+	if guarded {
+		applyEffectAnnotation(tool)
 	}
 	// Capture the finished schema plus the unwrapped legacy implementation
 	// before lazy routing. Reused facade names receive a compatibility wrapper
@@ -3430,6 +3795,11 @@ func (s *Server) SetWatcher(w watcherHistory) {
 	s.watcherMu.Lock()
 	s.watcher = w
 	s.watcherMu.Unlock()
+	if sourceEvents, ok := w.(interface{ OnSourceEvent(func(string)) }); ok {
+		sourceEvents.OnSourceEvent(func(path string) {
+			pendingFileProjections.markSuspect(path)
+		})
+	}
 
 	// Register callback to track symbol modifications for
 	// get_symbol_history AND fan stale_refs notifications to any

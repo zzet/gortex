@@ -13,7 +13,7 @@ After `gortex install` (once per machine) and `gortex init` (once per repo), Cla
   - `gortex-search` — locate code, trace call paths, explore architecture
   - `gortex-impact` — assess blast radius before editing (`verify_change`, `simulate_chain`, `check_guards`, `get_test_targets`)
 - **PreToolUse hook:** automatic graph context + graph-tool suggestions on Read/Grep/Glob. The posture is selectable via `gortex install --hook-mode` — `deny` (default), `enrich`, `consult-unlock` (deny fallback reads only until the graph has been queried once this session), or `nudge` (a rate-limited soft reminder instead of a hard deny). Gortex's own MCP tools are auto-approved under the host's permissive permission modes
-- **PreCompact hook:** condensed orientation snapshot injected before context compaction so the agent resumes without re-exploring
+- **SessionStart hook:** orientation snapshot at session start; after a compaction (`source="compact"`) it also carries the condensed post-compaction briefing so the agent resumes without re-exploring. Claude Code discards PreCompact output, so no PreCompact hook is installed
 - **Stop hook:** post-task diagnostics — tests to run, guard violations, dead code, and contract issues on the changed symbols — injected as context before the agent hands off
 - **AGENTS.md + CLAUDE.md:** `gortex init --skills` writes the marker-guarded community routing once to canonical `AGENTS.md`; Claude Code consumes it through one `@AGENTS.md` import in `CLAUDE.md`, whose managed block remains reserved for the per-repo `--analyze` overview
 

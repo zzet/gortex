@@ -12,7 +12,7 @@ package graph
 // bumpDeletedNodeRevision preserves the existing public-path distinction:
 // EvictFile bumps nodeMutGen for deletion; EvictFiles currently does not. A new
 // legacy scalar mutation always bumps it, independently of that old difference.
-func (g *Graph) evictFileNodesLocked(paths map[string]struct{}, bumpDeletedNodeRevision bool) (nodesRemoved, edgesRemoved int, scalarInvalidated bool) {
+func (g *Graph) evictFileNodesLocked(paths map[string]struct{}, bumpDeletedNodeRevision bool, extraNodeIDs ...string) (nodesRemoved, edgesRemoved int, scalarInvalidated bool) {
 	original := make(map[string]*Node)
 	for path := range paths {
 		for _, shard := range g.shards {
@@ -22,6 +22,26 @@ func (g *Graph) evictFileNodesLocked(paths map[string]struct{}, bumpDeletedNodeR
 				}
 			}
 		}
+	}
+	if len(extraNodeIDs) > 0 {
+		// Ownership recorded under a retired spelling also leaves, but its
+		// shared nodes are not added to the ordinary file eviction frontier.
+		ownerPaths := make(map[string]struct{}, len(paths)+len(extraNodeIDs))
+		for path := range paths {
+			ownerPaths[path] = struct{}{}
+		}
+		for _, id := range extraNodeIDs {
+			if id == "" {
+				continue
+			}
+			if node := g.shardFor(id).nodes[id]; node != nil {
+				original[id] = node
+				if node.FilePath != "" {
+					ownerPaths[node.FilePath] = struct{}{}
+				}
+			}
+		}
+		paths = ownerPaths
 	}
 	if len(original) == 0 {
 		return 0, 0, false

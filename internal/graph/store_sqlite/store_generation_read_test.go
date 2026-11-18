@@ -91,6 +91,7 @@ func oppositeMark(mark string) string {
 // pair, an extra unresolved call site, and a third indexed symbol.
 func genReadNodes(mark string) []*graph.Node {
 	nodes := []*graph.Node{
+		{ID: "env::generation_contract_" + mark, Kind: graph.KindContract, Name: "Contract" + mark, FilePath: genReadFileA, RepoPrefix: genReadRepo, Meta: map[string]any{"type": "env", "role": "provider", "contract_meta": map[string]any{"marker": mark}}},
 		{ID: genReadFileA, Kind: graph.KindFile, Name: "a.go", FilePath: genReadFileA, RepoPrefix: genReadRepo, Language: "go"},
 		{ID: genImportFile(mark), Kind: graph.KindFile, Name: "b" + mark + ".go", FilePath: genImportFile(mark), RepoPrefix: genReadRepo, Language: "go"},
 		{
@@ -219,7 +220,7 @@ func genReadEdges(mark string) []*graph.Edge {
 // returns the base handle plus a handle pinned to generation 1.
 func openGenerationReadPair(t *testing.T) (base, derived *Store) {
 	t.Helper()
-	base, err := Open(filepath.Join(t.TempDir(), "generation_read.sqlite"))
+	base, err := openPristine(t, filepath.Join(t.TempDir(), "generation_read.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -342,6 +343,45 @@ func genReadProbeIDs() []string {
 	}
 }
 
+// genIncomingSourceTargets is the incoming-source frontier shared by the three
+// probes below: one call target each generation exclusively owns, one
+// unresolved target each generation exclusively owns, and the shared identity
+// that gains incoming callers only in generation 1. Every row a handle can
+// legitimately return therefore names the generation it was read from, in the
+// target key, in the source id, or in the edge file path.
+func genIncomingSourceTargets() []string {
+	return []string{
+		genOnlyID(genZeroMark), genOnlyID(genOneMark),
+		genUnresolved(genZeroMark), genUnresolved(genOneMark),
+		genReadShared,
+	}
+}
+
+// genIncomingSourceNodeIDs mixes the shared row, one row each generation owns
+// alone, two rows only generation 1 has, and one identity neither generation
+// ever indexed. Both directions of the presence check are therefore exercised:
+// a row visible in the derived generation and not the base, and vice versa.
+func genIncomingSourceNodeIDs() []string {
+	return []string{
+		genReadShared,
+		genOnlyID(genZeroMark), genOnlyID(genOneMark),
+		genExtraID(genOneMark), genSecondNodeID(genOneMark),
+		"repo::pkg/a.go::NeverIndexed",
+	}
+}
+
+const (
+	// genIncomingSourceLimit is a real distinct-source sentinel: above the
+	// fixture's per-target source count so nothing truncates by accident, and
+	// far below the unbounded maximum ValidateScopedIncomingSources rejects.
+	genIncomingSourceLimit = 8
+	// genIncomingSourceBudgetRows is the inspection remainder the scoped probe
+	// leaves on the shared budget after pre-charging it. A read that ignores
+	// the budget it was handed cannot be told from one that honours an
+	// unbounded default, so the probe never passes the zero value.
+	genIncomingSourceBudgetRows = 64
+)
+
 func genReadProbeNames() []string {
 	return []string{
 		"Shared" + genZeroMark, "Shared" + genOneMark,
@@ -411,8 +451,69 @@ func generationReadProbes() []genProbe {
 		{name: "FindNodesByNameContaining", run: func(t *testing.T, s *Store) []string {
 			return nodeTokens(s.FindNodesByNameContaining("Gen", 0))
 		}},
+		{name: "FindNodesByNameContainingFilteredContext", run: func(t *testing.T, s *Store) []string {
+			nodes, err := s.FindNodesByNameContainingFilteredContext(context.Background(), "Gen", 0, graph.NameSearchFilter{RepoAllow: map[string]bool{genReadRepo: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(nodes)
+		}},
+		{name: "FindFoldedNameCandidatesContext", run: func(t *testing.T, s *Store) []string {
+			nodes, more, err := s.FindFoldedNameCandidatesContext(t.Context(), "Gen", 1000, graph.NameSearchFilter{RepoAllow: map[string]bool{genReadRepo: true}})
+			if err != nil || more {
+				t.Fatalf("folded generation head: more=%v err=%v", more, err)
+			}
+			return nodeTokens(nodes)
+		}},
 		{name: "FindNodesByNames", run: func(t *testing.T, s *Store) []string {
 			return nodeSliceMapTokens(s.FindNodesByNames(genReadProbeNames()))
+		}},
+
+		{name: "ContractRepoProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LoadContractRepoProjectionContext(context.Background(), genReadRepo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(p.ScalarNodes)
+		}},
+		{name: "LayerContractRepoProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LayerContractRepoProjectionContext(context.Background(), genReadRepo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(p.ScalarNodes)
+		}},
+		{name: "LayerContractRepoOwnerProjectionContext", run: func(t *testing.T, s *Store) []string {
+			if s.ContractRepoOwnerProjectionSource() != s {
+				t.Fatal("thin projection must certify this exact generation handle")
+			}
+			p, err := s.LayerContractRepoOwnerProjectionContext(context.Background(), genReadRepo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return nodeTokens(p.ScalarNodes)
+		}},
+		{name: "ContractFileProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.LoadContractFileProjectionContext(context.Background(), genReadRepo, []string{genReadFileA})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var nodes []*graph.Node
+			for _, rows := range p.FileNodes {
+				nodes = append(nodes, rows...)
+			}
+			return nodeTokens(nodes)
+		}},
+		{name: "ConstantValueProjectionContext", run: func(t *testing.T, s *Store) []string {
+			p, err := s.ReadConstantValueProjectionContext(context.Background(), genReadProbeIDs(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for id, path := range p.Nodes {
+				out = append(out, id+" "+path)
+			}
+			return out
 		}},
 		{name: "GetFileNodes", run: func(t *testing.T, s *Store) []string {
 			return nodeTokens(s.GetFileNodes(genReadFileA))
@@ -469,6 +570,50 @@ func generationReadProbes() []genProbe {
 				t.Fatalf("GetNodesByIDsContext: %v", err)
 			}
 			return nodeMapTokens(m)
+		}},
+		{name: "GetNodeKindsByIDsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.GetNodeKindsByIDsContext(context.Background(), genReadProbeIDs())
+			if err != nil {
+				t.Fatalf("GetNodeKindsByIDsContext: %v", err)
+			}
+			out := make([]string, 0, len(rows))
+			for id, row := range rows {
+				out = append(out, fmt.Sprintf("kind %s %s %s %s", id, row.Kind, row.FilePath, row.RepoPrefix))
+			}
+			return out
+		}},
+		{name: "GetNodePresenceByIDsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.GetNodePresenceByIDsContext(context.Background(), genReadProbeIDs())
+			if err != nil {
+				t.Fatalf("GetNodePresenceByIDsContext: %v", err)
+			}
+			out := make([]string, 0, len(rows))
+			for id := range rows {
+				out = append(out, "id "+id)
+			}
+			return out
+		}},
+		{name: "GetNodeIDsByKindsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.GetNodeIDsByKindsContext(context.Background(), genReadProbeIDs(), []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType})
+			if err != nil {
+				t.Fatalf("GetNodeIDsByKindsContext: %v", err)
+			}
+			out := make([]string, 0, len(rows))
+			for id := range rows {
+				out = append(out, "id "+id)
+			}
+			return out
+		}},
+		{name: "NodeIDsByKindsBoundedContext", run: func(t *testing.T, s *Store) []string {
+			ids, complete, err := s.NodeIDsByKindsBoundedContext(context.Background(), []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType}, 1000)
+			if err != nil || !complete {
+				t.Fatalf("NodeIDsByKindsBoundedContext: complete=%v err=%v", complete, err)
+			}
+			out := make([]string, 0, len(ids))
+			for _, id := range ids {
+				out = append(out, "id "+id)
+			}
+			return out
 		}},
 		{name: "ExistingNodeIDs", run: func(t *testing.T, s *Store) []string {
 			out := make([]string, 0)
@@ -589,6 +734,47 @@ func generationReadProbes() []genProbe {
 			return nodeTokens(got.Nodes)
 		}},
 
+		{name: "BFSAdmissionFilteredContext", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for _, dir := range []graph.Direction{graph.DirectionForward, graph.DirectionBackward} {
+				request := graph.BFSAdmissionRequest{Seed: genReadShared, Direction: dir, Kinds: []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeImports}, Depth: 3, Limit: 64}
+				rows, handled, err := s.BFSAdmissionFilteredContext(t.Context(), request, graph.OutlineEdgeFilter{ExcludeVia: "spring.Bean"})
+				if err != nil || !handled {
+					t.Fatalf("scoped BFS snapshot declined: handled=%v error=%v", handled, err)
+				}
+				for _, node := range rows.Nodes {
+					out = append(out, nodeTokens([]*graph.Node{node})...)
+				}
+				for _, adjacency := range rows.Adjacency {
+					out = append(out, edgeTokens(adjacency.Edges)...)
+				}
+			}
+			return out
+		}},
+
+		{name: "CallAncestorsContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.CallAncestorsContext(t.Context(), genReadProbeIDs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, row := range rows {
+				out = append(out, fmt.Sprintf("%s/%s/%s/%s", row.From, row.To, row.FromKind, row.FromFile))
+			}
+			return out
+		}},
+		{name: "CallAncestorsFilteredContext", run: func(t *testing.T, s *Store) []string {
+			rows, err := s.CallAncestorsFilteredContext(t.Context(), genReadProbeIDs(), graph.OutlineEdgeFilter{ExcludeVia: "spring.Bean"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, row := range rows {
+				out = append(out, fmt.Sprintf("%s/%s/%s/%s", row.From, row.To, row.FromKind, row.FromFile))
+			}
+			return out
+		}},
+
 		{name: "GetOutEdges", run: func(t *testing.T, s *Store) []string {
 			return edgeTokens(s.GetOutEdges(genReadShared))
 		}},
@@ -605,8 +791,20 @@ func generationReadProbes() []genProbe {
 		{name: "GetOutEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetOutEdgesByNodeIDs(genReadProbeIDs()))
 		}},
+		{name: "GetCallReferenceOutEdgesContext", run: func(t *testing.T, s *Store) []string {
+			m, err := s.GetCallReferenceOutEdgesContext(context.Background(), genReadProbeIDs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return edgeSliceMapTokens(m)
+		}},
 		{name: "GetInEdgesByNodeIDs", run: func(t *testing.T, s *Store) []string {
 			return edgeSliceMapTokens(s.GetInEdgesByNodeIDs(genReadProbeIDs()))
+		}},
+		{name: "EdgesByNodeIDsKinds", run: func(t *testing.T, s *Store) []string {
+			kinds := []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences, graph.EdgeMemberOf}
+			out := edgeSliceMapTokens(s.GetOutEdgesByNodeIDsKinds(genReadProbeIDs(), kinds))
+			return append(out, edgeSliceMapTokens(s.GetInEdgesByNodeIDsKinds(genReadProbeIDs(), kinds))...)
 		}},
 		{name: "GetOutEdgesByNodeIDsContext", run: func(t *testing.T, s *Store) []string {
 			m, _, err := s.GetOutEdgesByNodeIDsContext(context.Background(), genReadProbeIDs(), 64)
@@ -619,6 +817,20 @@ func generationReadProbes() []genProbe {
 			m, _, err := s.GetInEdgesByNodeIDsContext(context.Background(), genReadProbeIDs(), 64)
 			if err != nil {
 				t.Fatalf("GetInEdgesByNodeIDsContext: %v", err)
+			}
+			return edgeSliceMapTokens(m)
+		}},
+		{name: "GetInEdgesByNodeIDsWithMetaContext", run: func(t *testing.T, s *Store) []string {
+			m, _, err := s.GetInEdgesByNodeIDsWithMetaContext(context.Background(), genReadProbeIDs(), 64)
+			if err != nil {
+				t.Fatalf("GetInEdgesByNodeIDsWithMetaContext: %v", err)
+			}
+			return edgeSliceMapTokens(m)
+		}},
+		{name: "GetInEdgesByNodeIDsFromRepos", run: func(t *testing.T, s *Store) []string {
+			m, handled, err := s.GetInEdgesByNodeIDsFromRepos(genReadProbeIDs(), []string{"", genReadRepo, genReadOtherRepo, "extra"})
+			if err != nil || !handled {
+				t.Fatalf("GetInEdgesByNodeIDsFromRepos: handled=%v err=%v", handled, err)
 			}
 			return edgeSliceMapTokens(m)
 		}},
@@ -687,6 +899,62 @@ func generationReadProbes() []genProbe {
 			out = append(out, edgeTokens([]*graph.Edge{set.Endpoint(genReadShared, genReadType)})...)
 			out = append(out, edgeTokens(set.Site(genReadShared, 12, graph.EdgeReferences))...)
 			return out
+		}},
+		{name: "EdgeEndpointProjections", run: func(t *testing.T, s *Store) []string {
+			// All four endpoint projections in one probe: each must answer from
+			// the handle's own generation only.
+			var out []string
+			render := func(label string, rows []graph.EdgeEndpointRow) {
+				for _, r := range rows {
+					out = append(out, fmt.Sprintf("%s %s->%s|%s|%s", label, r.From, r.To, r.Kind, r.FilePath))
+				}
+			}
+			render("recorded", s.EdgeEndpointsRecordedAt([]string{genReadFileA, genImportFile(genZeroMark), genImportFile(genOneMark)}))
+			render("from", s.EdgeEndpointsFrom(genReadProbeIDs(), nil))
+			render("from-calls", s.EdgeEndpointsFrom(genReadProbeIDs(), []graph.EdgeKind{graph.EdgeCalls}))
+			for id, name := range s.NodeNamesByIDs(genReadProbeIDs()) {
+				out = append(out, fmt.Sprintf("name %s=%s", id, name))
+			}
+			for from, paths := range s.OutEdgePathsFrom(genReadProbeIDs()) {
+				out = append(out, fmt.Sprintf("paths %s=%s", from, strings.Join(paths, ",")))
+			}
+			return out
+		}},
+		// The analysis binding borrows the selected generation. Exercise both
+		// paged projections against the fence's distinct node/edge fixtures.
+		{name: "BindAnalysisPages", run: func(t *testing.T, s *Store) []string {
+			bound, ok := s.BindAnalysisPages().(*Store)
+			if !ok || bound.ViewGeneration() != s.ViewGeneration() {
+				t.Fatalf("BindAnalysisPages left generation %d", s.ViewGeneration())
+			}
+			var nodes []*graph.Node
+			for n := range bound.NodesLightSeq() {
+				nodes = append(nodes, n)
+			}
+			var edges []*graph.Edge
+			for e := range bound.EdgesLightSeq(graph.EdgeCalls, graph.EdgeReferences) {
+				edges = append(edges, e)
+			}
+			return append(nodeTokens(nodes), edgeTokens(edges)...)
+		}},
+		// A handle bound to a request context reads its own generation:
+		// binding changes only when a paged read stops, never what it serves.
+		{name: "BindReadContext", run: func(t *testing.T, s *Store) []string {
+			bound, ok := s.BindReadContext(context.Background()).(*Store)
+			if !ok || bound.ViewGeneration() != s.ViewGeneration() {
+				t.Fatalf("BindReadContext left generation %d", s.ViewGeneration())
+			}
+			kinds := []graph.NodeKind{graph.KindFunction, graph.KindMethod, graph.KindType, graph.KindInterface, graph.KindVariable}
+			out := nodeTokens(bound.NodesByKinds(kinds))
+			out = append(out, nodeTokens(bound.DeadCodeCandidates(kinds, nil))...)
+			var probes []*graph.Node
+			for _, id := range genReadProbeIDs() {
+				probes = append(probes, bound.GetNode(id))
+			}
+			return append(out, nodeTokens(probes)...)
+		}},
+		{name: "RecordedEdgesAt", run: func(t *testing.T, s *Store) []string {
+			return edgeTokens(s.RecordedEdgesAt([]string{genReadFileA, genImportFile(genZeroMark), genImportFile(genOneMark)}))
 		}},
 		{name: "FindEdgesByIdentities", run: func(t *testing.T, s *Store) []string {
 			ids := []graph.EdgeIdentity{
@@ -776,6 +1044,85 @@ func generationReadProbes() []genProbe {
 			}
 			return out
 		}},
+		{name: "ReadIncomingSourceCandidates", run: func(t *testing.T, s *Store) []string {
+			// Raw candidate rows, before any overlay dedup: the projection
+			// carries source identity AND edge-file provenance, so a row read
+			// from the wrong generation shows up in either column.
+			byTarget, err := s.ReadIncomingSourceCandidates(context.Background(), genIncomingSourceTargets(), graph.EdgeCalls)
+			if err != nil {
+				t.Fatalf("ReadIncomingSourceCandidates: %v", err)
+			}
+			var out []string
+			for target, rows := range byTarget {
+				for _, row := range rows {
+					out = append(out, fmt.Sprintf("cand %s<-%s|%s", target, row.From, row.FilePath))
+				}
+			}
+			if len(out) == 0 {
+				t.Fatal("no candidate rows for this handle; the probe would prove nothing")
+			}
+			return out
+		}},
+		{name: "FindIncomingSourcesScoped", run: func(t *testing.T, s *Store) []string {
+			// The budget is the shared inspection allowance of one public
+			// query. Pre-charging it leaves a real, bounded remainder, so the
+			// read runs against a genuine limit; a spend of zero would mean the
+			// raw rows were never charged and is failed here rather than
+			// rendered.
+			budget := &graph.IncomingSourceBudget{}
+			if err := budget.Charge(graph.MaxIncomingSourceCandidateRows - genIncomingSourceBudgetRows); err != nil {
+				t.Fatalf("pre-charge incoming-source budget: %v", err)
+			}
+			before := budget.Remaining()
+			if before != genIncomingSourceBudgetRows {
+				t.Fatalf("budget remaining after pre-charge = %d, want %d", before, genIncomingSourceBudgetRows)
+			}
+			p, err := s.FindIncomingSourcesScoped(context.Background(), genIncomingSourceTargets(),
+				graph.EdgeCalls, genIncomingSourceLimit, graph.IncomingSourceScope{}, budget)
+			if err != nil {
+				t.Fatalf("FindIncomingSourcesScoped: %v", err)
+			}
+			spent := before - budget.Remaining()
+			if spent <= 0 {
+				t.Fatal("scoped read charged no raw rows to the budget it was handed")
+			}
+			out := []string{fmt.Sprintf("scoped budget spent=%d", spent)}
+			for target, sources := range p.Sources {
+				for _, src := range sources {
+					out = append(out, "scoped "+target+"<-"+src)
+				}
+			}
+			for target, truncated := range p.Truncated {
+				out = append(out, fmt.Sprintf("scoped truncated %s=%v", target, truncated))
+			}
+			if len(out) == 1 {
+				t.Fatal("scoped read produced no sources for this handle")
+			}
+			return out
+		}},
+		{name: "IncomingSourceNodeExists", run: func(t *testing.T, s *Store) []string {
+			// Only positive results may be named. Rendering a miss would print
+			// the other generation's marker through this handle, and the leak
+			// assertion could no longer tell a leaked row from a probe
+			// artifact; the miss count keeps the negative half observable.
+			var out []string
+			misses := 0
+			for _, id := range genIncomingSourceNodeIDs() {
+				exists, err := s.IncomingSourceNodeExists(context.Background(), id, nil)
+				if err != nil {
+					t.Fatalf("IncomingSourceNodeExists(%s): %v", id, err)
+				}
+				if !exists {
+					misses++
+					continue
+				}
+				out = append(out, "nodeexists "+id)
+			}
+			if len(out) == 0 || misses == 0 {
+				t.Fatalf("presence probe needs a hit and a miss through this handle: hits=%d misses=%d", len(out), misses)
+			}
+			return append(out, fmt.Sprintf("nodeexists misses=%d", misses))
+		}},
 		{name: "EdgesWithUnresolvedTarget", run: func(t *testing.T, s *Store) []string {
 			var out []*graph.Edge
 			for e := range s.EdgesWithUnresolvedTarget() {
@@ -834,7 +1181,7 @@ func generationReadProbes() []genProbe {
 			return edgeTokens(s.ExternalCallCandidateEdges())
 		}},
 		{name: "DistinctExternalTargets", run: func(t *testing.T, s *Store) []string {
-			return prefixed("external ", s.DistinctExternalTargets([]graph.EdgeKind{graph.EdgeCalls}))
+			return prefixed("external ", s.DistinctExternalTargets([]graph.EdgeKind{graph.EdgeCalls}, ""))
 		}},
 
 		{name: "NodeCount", run: func(t *testing.T, s *Store) []string {
@@ -935,6 +1282,41 @@ func generationReadProbes() []genProbe {
 			sort.Strings(out)
 			return out
 		}},
+		{name: "ScopedOutlineCounts", run: func(t *testing.T, s *Store) []string {
+			counts, err := s.ScopedOutlineCounts(graph.NodeScope{WorkspaceID: genReadRepo, RepoAllow: map[string]bool{genReadRepo: true}})
+			if err != nil {
+				t.Fatalf("ScopedOutlineCounts: %v", err)
+			}
+			return outlineCountTokens(counts)
+		}},
+		{name: "ScopedAnalysisCommunitySummaries", run: func(t *testing.T, s *Store) []string {
+			mark := genZeroMark
+			if s.ViewGeneration() != 0 {
+				mark = genOneMark
+			}
+			community := "community-" + mark
+			id := publishOutlineCommunities(t, s,
+				[]graph.AnalysisCommunitySummary{{ID: community, Label: mark, Size: 1}},
+				[]graph.AnalysisNodeMetric{{NodeID: genOnlyID(mark), CommunityID: community}})
+			rows, _, err := s.ScopedAnalysisCommunitySummaries(id, graph.NodeScope{RepoAllow: map[string]bool{genReadRepo: true}}, 1, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, row := range rows {
+				out = append(out, row.ID+" "+row.Label)
+			}
+			return out
+		}},
+		{name: "ScopedOutlineCountsFiltered", run: func(t *testing.T, s *Store) []string {
+			counts, err := s.ScopedOutlineCountsFiltered(graph.NodeScope{WorkspaceID: genReadRepo, RepoAllow: map[string]bool{genReadRepo: true}}, graph.OutlineEdgeFilter{
+				ExcludeKinds: []graph.EdgeKind{graph.EdgeReferences}, ExcludeNodeKinds: []graph.NodeKind{graph.KindContract}, ExcludeVia: "spring.Bean",
+			})
+			if err != nil {
+				t.Fatalf("ScopedOutlineCountsFiltered: %v", err)
+			}
+			return outlineCountTokens(counts)
+		}},
 		{name: "FileImporters", run: func(t *testing.T, s *Store) []string {
 			var out []string
 			for _, mark := range []string{genZeroMark, genOneMark} {
@@ -966,6 +1348,70 @@ func generationReadProbes() []genProbe {
 			return crossRepoTokens(s.CrossRepoCandidatesForMutation([]graph.EdgeKind{graph.EdgeCalls}, []string{genReadFileA}, []string{genReadFileA}))
 		}},
 
+		{name: "ScopedDeadCodeReads", run: func(t *testing.T, s *Store) []string {
+			repos := []string{genReadRepo}
+			out := nodeTokens(s.DeadCodeCandidatesInRepos([]graph.NodeKind{graph.KindFunction}, map[graph.NodeKind][]graph.EdgeKind{graph.KindFunction: {graph.EdgeCalls}}, repos))
+			for n := range s.NodesByKindInRepos(graph.KindFile, repos) {
+				out = append(out, nodeTokens([]*graph.Node{n})...)
+			}
+			for _, row := range s.IfaceImplementsRowsInRepos(repos) {
+				out = append(out, fmt.Sprintf("scoped impl %s->%s methods=%v", row.TypeID, row.IfaceID, row.IfaceMeta["methods"]))
+			}
+			return out
+		}},
+		{name: "FilteredScopedDeadCodeReads", run: func(t *testing.T, s *Store) []string {
+			filter := graph.OutlineEdgeFilter{ExcludeKinds: []graph.EdgeKind{graph.EdgeMatches}, ExcludeVia: "spring.Bean"}
+			nodes, err := s.DeadCodeCandidatesInReposFiltered([]graph.NodeKind{graph.KindFunction}, map[graph.NodeKind][]graph.EdgeKind{graph.KindFunction: {graph.EdgeCalls}}, []string{genReadRepo}, filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := nodeTokens(nodes)
+			rows, err := s.IfaceImplementsRowsInReposFiltered([]string{genReadRepo}, filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				out = append(out, fmt.Sprintf("filtered impl %s->%s methods=%v", row.TypeID, row.IfaceID, row.IfaceMeta["methods"]))
+			}
+			return out
+		}},
+		{name: "NodeScopedDeadCodeReads", run: func(t *testing.T, s *Store) []string {
+			scope := graph.NodeScope{WorkspaceID: genReadRepo}
+			out := nodeTokens(s.DeadCodeCandidatesInScope([]graph.NodeKind{graph.KindFunction}, map[graph.NodeKind][]graph.EdgeKind{graph.KindFunction: {graph.EdgeCalls}}, nil, scope, graph.DeadCodeCandidateExclusions{Stubs: true, External: true}))
+			for n := range s.NodesByKindInScope(graph.KindFile, nil, scope) {
+				out = append(out, nodeTokens([]*graph.Node{n})...)
+			}
+			return out
+		}},
+		{name: "FilteredNodeScopedDeadCodeReads", run: func(t *testing.T, s *Store) []string {
+			scope := graph.NodeScope{WorkspaceID: genReadRepo}
+			filter := graph.OutlineEdgeFilter{ExcludeKinds: []graph.EdgeKind{graph.EdgeMatches}, ExcludeVia: "spring.Bean"}
+			nodes, err := s.DeadCodeCandidatesInScopeFiltered([]graph.NodeKind{graph.KindFunction}, map[graph.NodeKind][]graph.EdgeKind{graph.KindFunction: {graph.EdgeCalls}}, nil, scope, filter, graph.DeadCodeCandidateExclusions{Stubs: true, External: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := nodeTokens(nodes)
+			return out
+		}},
+		{name: "ScopedOutlineNodes", run: func(t *testing.T, s *Store) []string {
+			scope := graph.NodeScope{RepoAllow: map[string]bool{genReadRepo: true}}
+			ids, err := s.OutlineNodeIDsInScope(scope, genReadProbeIDs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, id := range ids {
+				out = append(out, "outline id "+id)
+			}
+			for _, name := range genReadProbeNames() {
+				nodes, err := s.OutlineNodesByName(scope, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out = append(out, nodeTokens(nodes)...)
+			}
+			return out
+		}},
 		{name: "DeadCodeCandidates", run: func(t *testing.T, s *Store) []string {
 			return nodeTokens(s.DeadCodeCandidates(
 				[]graph.NodeKind{graph.KindFunction},
@@ -1080,6 +1526,20 @@ func generationReadProbes() []genProbe {
 				out = append(out, n)
 			}
 			return nodeTokens(out)
+		}},
+		{name: "NodesLightByKindsInScopeSeq", run: func(t *testing.T, s *Store) []string {
+			var out []*graph.Node
+			for n := range s.NodesLightByKindsInScopeSeq([]string{genReadRepo}, nil, graph.KindFunction) {
+				out = append(out, n)
+			}
+			return nodeTokens(out)
+		}},
+		{name: "FileLocationsInScopeSeq", run: func(t *testing.T, s *Store) []string {
+			var out []string
+			for n := range s.FileLocationsInScopeSeq([]string{"", genReadRepo}) {
+				out = append(out, fmt.Sprintf("file %s|%s|%s|%s|%s", n.ID, n.FilePath, n.Language, n.RepoPrefix, n.WorkspaceID))
+			}
+			return out
 		}},
 		{name: "EdgesInScopeSeq", run: func(t *testing.T, s *Store) []string {
 			var out []string
@@ -1320,6 +1780,17 @@ func crossRepoTokens(rows []graph.CrossRepoCandidateRow) []string {
 		out = append(out, fmt.Sprintf("xcand %s->%s|%s|%s|%s", r.Edge.From, r.Edge.To, r.Edge.Kind, r.Edge.Origin, r.FromRepo+"/"+r.ToRepo))
 	}
 	sort.Strings(out)
+	return out
+}
+
+// Include both scalar aggregates and marked import targets: a generation-
+// blind outline must fail even when an aggregate happens to have equal counts.
+func outlineCountTokens(counts graph.OutlineCounts) []string {
+	out := []string{fmt.Sprintf("outline nodes=%d edges=%d", counts.TotalNodes, counts.TotalEdges)}
+	out = append(out, sortedCountTokens("language", counts.ByLanguage)...)
+	for _, row := range counts.FileImports {
+		out = append(out, fmt.Sprintf("outline import %s=%d", row.FilePath, row.Count))
+	}
 	return out
 }
 
@@ -1683,21 +2154,30 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.AllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.CheckedAllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.AnalysisGenerationStore)(nil), skip: skipSidecar},
+		{iface: (*graph.AnalysisPageBinder)(nil), probe: "BindAnalysisPages"},
 		{iface: (*graph.AnalysisQueryStore)(nil), skip: skipSidecar},
+		{iface: (*graph.ScopedAnalysisCommunityReader)(nil), probe: "ScopedAnalysisCommunitySummaries"},
 		{iface: (*graph.AtomicVectorCorpusInstaller)(nil), skip: skipSidecar},
 		{iface: (*graph.BFSCapable)(nil), probe: "BFS"},
+		{iface: (*graph.FilteredBFSAdmissionReader)(nil), probe: "BFSAdmissionFilteredContext"},
 		{iface: (*graph.BlameEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.BlameEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.BoundedEdgeExistenceReader)(nil), probe: "FindExistingEdgeEndpoints"},
 		{iface: (*graph.BoundedExactNameReader)(nil), probe: "FindNodesByNameBounded"},
 		{iface: (*graph.BoundedFileNodeReader)(nil), probe: "FindFileNodesBounded"},
 		{iface: (*graph.BoundedIncomingEdgeIdentityReader)(nil), probe: "FindIncomingEdgeIdentitiesBounded"},
+		{iface: (*graph.BoundedIncomingSourceCandidateReader)(nil), probe: "ReadIncomingSourceCandidates"},
 		{iface: (*graph.BoundedIncomingSourceReader)(nil), probe: "FindIncomingSourcesBounded"},
 		{iface: (*graph.BoundedOutgoingEdgeIdentityReader)(nil), probe: "FindOutgoingEdgeIdentitiesBounded"},
 		{iface: (*graph.BoundedOutgoingSiteEdgeIdentityReader)(nil), probe: "FindOutgoingSiteEdgeIdentitiesBounded"},
 		{iface: (*graph.BulkLoader)(nil), skip: "the cold-load bracket engages only on a provably empty store; its generation-0 emptiness gate is asserted by TestColdGraphStoreEmptyIgnoresDerivedGenerations"},
 		{iface: (*graph.BundleFingerprintSink)(nil), skip: skipInMemory},
 		{iface: (*graph.CallableBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
+		{iface: (*graph.CallAncestorReader)(nil), probe: "CallAncestorsContext"},
+		{iface: (*graph.FilteredCallAncestorReader)(nil), probe: "CallAncestorsFilteredContext"},
+		{iface: (*graph.CallReferenceOutgoingReader)(nil), probe: "GetCallReferenceOutEdgesContext"},
+		{iface: (*graph.ScopedKindSummarySequencer)(nil), probe: "NodesLightByKindsInScopeSeq"},
+		{iface: (*graph.ScopedFileLocationSequencer)(nil), probe: "FileLocationsInScopeSeq"},
 		{iface: (*graph.ChurnEnrichmentReader)(nil), skip: skipSidecar},
 		{iface: (*graph.ChurnEnrichmentWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ClassHierarchyTraverser)(nil), probe: "ClassHierarchyTraverse"},
@@ -1710,6 +2190,22 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.CloneShingleWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ConfigNodeBatchEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("config_node_evict")},
 		{iface: (*graph.ConstantValueReader)(nil), skip: skipSidecar},
+		{iface: (*graph.ConstantValueContextReader)(nil), skip: skipSidecar},
+		{iface: (*graph.ConstantValueProjectionReader)(nil), probe: "ConstantValueProjectionContext"},
+		{iface: (*graph.ContractAttachmentWorkReader)(nil), skip: "exact selected attachment completion; sibling/historical isolation tested by TestContractAttachmentCopiedActorAndInheritedDebt"},
+		{iface: (*graph.PendingContractWorkReader)(nil), skip: "generation-keyed pending contract debt; bounded exact acknowledgments tested by TestContractAttachmentAtomicExactWorkAndHistoricalIsolation"},
+		{iface: (*graph.ContractWorkReader)(nil), skip: "generation-keyed work sidecar; isolation and fold covered by TestContractWorkFoldPreservesDeletionAndExactAcknowledgments"},
+		{iface: (*graph.ContractInputStateCohortReader)(nil), skip: "checked own-generation actor cohort; copy isolation tested by TestContractAttachmentCopiedActorAndInheritedDebt"},
+		{iface: (*graph.ContractBoundaryReceiptReader)(nil), skip: "checked generation-keyed parser receipts; indexed owner/matcher/negative membership tested by TestContractBoundaryReceiptIndexedNegativeOwnersAndPendingUnion"},
+		{iface: (*graph.ContractInputStateReader)(nil), skip: "generation-keyed input state; exact isolation and fold tested by TestContractInputFoldAndPreviousSnapshot"},
+		{iface: (*graph.ContractAttachmentReader)(nil), skip: "exact historical identity catalog lookup; isolation and lifecycle tested by TestContractAttachmentAtomicExactWorkAndHistoricalIsolation"},
+		{iface: (*graph.ContractRepoProjectionReader)(nil), probe: "ContractRepoProjectionContext"},
+		{iface: (*graph.OverlayLayerContractRepoProjectionReader)(nil), probe: "LayerContractRepoProjectionContext"},
+		{iface: (*graph.OverlayLayerContractRepoOwnerProjectionReader)(nil), probe: "LayerContractRepoOwnerProjectionContext"},
+		{iface: (*graph.ContractFileProjectionReader)(nil), probe: "ContractFileProjectionContext"},
+		{iface: (*graph.NodePresenceByIDsReader)(nil), probe: "GetNodePresenceByIDsContext"},
+		{iface: (*graph.NodeKindsByIDsReader)(nil), probe: "GetNodeKindsByIDsContext"},
+		{iface: (*graph.NodeKindMembershipReader)(nil), probe: "GetNodeIDsByKindsContext"},
 		{iface: (*graph.ConstantValueRepoReplacer)(nil), skip: skipSidecar},
 		{iface: (*graph.ConstantValueWriter)(nil), skip: skipSidecar},
 		{iface: (*graph.ContentFTSBatchReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("content_fts_replace")},
@@ -1727,6 +2223,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.DeadCodeCandidator)(nil), probe: "DeadCodeCandidates"},
 		{iface: (*graph.DerivedContractReplacer)(nil), skip: skipWrite, writeFence: writerFamilyFence("derived_contract_replace")},
 		{iface: (*graph.EdgeAdjacencyForKinds)(nil), probe: "EdgeAdjacencyForKinds"},
+		{iface: (*graph.EdgesByNodeIDsKindsReader)(nil), probe: "EdgesByNodeIDsKinds"},
+		{iface: (*graph.EdgeEndpointReader)(nil), probe: "EdgeEndpointProjections"},
 		{iface: (*graph.EdgeIdentityBatchFinder)(nil), probe: "FindEdgesByIdentities"},
 		{iface: (*graph.EdgeKindCounter)(nil), probe: "EdgeKindCounts"},
 		{iface: (*graph.EdgeKindEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("edge_kind_evict")},
@@ -1734,13 +2232,22 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.EdgesByKindsBatchScanner)(nil), probe: "ScanEdgesByKindsBatched"},
 		{iface: (*graph.EdgesByKindsScanner)(nil), probe: "EdgesByKinds"},
 		{iface: (*graph.EdgeTerminalStampPersister)(nil), skip: skipWrite, writeFence: writerFamilyFence("edge_terminal_stamps")},
+		{iface: (*graph.EnrichmentResumeStore)(nil), skip: skipSidecar},
 		{iface: (*graph.EnrichmentStateStore)(nil), skip: skipSidecar},
 		{iface: (*graph.ExactEdgeBatchRemover)(nil), skip: skipWrite, writeFence: "TestGenerationScopedExactEdgeDelete"},
 		{iface: (*graph.ExistingNodeIDFinder)(nil), probe: "ExistingNodeIDs"},
 		{iface: (*graph.ExtractCandidatesScanner)(nil), probe: "ExtractCandidates"},
 		{iface: (*graph.FileBatchEvicter)(nil), skip: skipWrite, writeFence: "TestGenerationScopedFileEvict"},
+		{iface: (*graph.FileIdentityBatchEvicter)(nil), skip: skipWrite, writeFence: "TestFileIdentityEvictionIsGenerationScoped"},
 		{iface: (*graph.FileEditingContext)(nil), probe: "FileEditingContext"},
 		{iface: (*graph.FileImportAggregator)(nil), probe: "FileImportCounts"},
+		{iface: (*graph.ScopedDeadCodeReader)(nil), probe: "ScopedDeadCodeReads"},
+		{iface: (*graph.FilteredScopedDeadCodeReader)(nil), probe: "FilteredScopedDeadCodeReads"},
+		{iface: (*graph.NodeScopedDeadCodeReader)(nil), probe: "NodeScopedDeadCodeReads"},
+		{iface: (*graph.FilteredNodeScopedDeadCodeReader)(nil), probe: "FilteredNodeScopedDeadCodeReads"},
+		{iface: (*graph.ScopedOutlineNodeReader)(nil), probe: "ScopedOutlineNodes"},
+		{iface: (*graph.ScopedOutlineAggregator)(nil), probe: "ScopedOutlineCounts"},
+		{iface: (*graph.FilteredScopedOutlineAggregator)(nil), probe: "ScopedOutlineCountsFiltered"},
 		{iface: (*graph.FileImporters)(nil), probe: "FileImporters"},
 		{iface: (*graph.FileIndexFailureReader)(nil), skip: "v21 generation-keyed sidecar; read/write isolation and recovery covered by TestFileIndexFailuresPersistAndScope"},
 		{iface: (*graph.FileIndexFailureWriter)(nil), skip: "v21 generation-keyed sidecar; read/write isolation and recovery covered by TestFileIndexFailuresPersistAndScope"},
@@ -1765,12 +2272,18 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.GoMethodReceiverRebinder)(nil), skip: skipWrite, writeFence: "TestGenerationScopedReceiverRebind"},
 		{iface: (*graph.IfaceImplementsScanner)(nil), probe: "IfaceImplementsRows"},
 		{iface: (*graph.ImportAdjacencyProjector)(nil), probe: "ProjectImportAdjacency"},
+		{iface: (*graph.IncomingSourceNodeChecker)(nil), probe: "IncomingSourceNodeExists"},
 		{iface: (*graph.InDegreeForNodes)(nil), probe: "InDegreeForNodes"},
 		{iface: (*graph.InEdgeCounter)(nil), probe: "InEdgeCountsByKind"},
 		{iface: (*graph.InEdgeIdentityBatchReader)(nil), probe: "GetInEdgeIdentitiesByNodeIDs"},
 		{iface: (*graph.LightEdgeScanner)(nil), probe: "AllEdgesLight"},
 		{iface: (*graph.LightEdgeSequencer)(nil), probe: "EdgesLightSeq"},
 		{iface: (*graph.MemberMethodsByType)(nil), probe: "MemberMethodsByType"},
+		// Annotates the in-process receipt accumulators with a bounded derived
+		// pass's completeness fact. It reads no row and writes none — the
+		// fact describes work a pass did NOT do — so it has nothing to scope
+		// to a generation, exactly like the receipt store it annotates.
+		{iface: (*graph.MutationFanoutRecorder)(nil), skip: skipInMemory},
 		{iface: (*graph.MutationReceiptStore)(nil), skip: skipInMemory},
 		{iface: (*graph.MutationScopedCrossRepoCandidates)(nil), probe: "CrossRepoCandidatesForMutation"},
 		{iface: (*graph.NamedLanguageNodeSequencer)(nil), probe: "NodesInScopeSeq"},
@@ -1783,12 +2296,17 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.NodeNameClassCounter)(nil), probe: "CountNodesByNameClass"},
 		{iface: (*graph.NodePlacementBatchReader)(nil), probe: "NodePlacementsByIDs"},
 		{iface: (*graph.NodeSearchKeyScanner)(nil), probe: "ScanNodeSearchKeys"},
+		{iface: (*graph.FilteredContainingNameReader)(nil), probe: "FindNodesByNameContainingFilteredContext"},
+		{iface: (*graph.FoldedNameCandidateReader)(nil), probe: "FindFoldedNameCandidatesContext"},
 		{iface: (*graph.NodesByKindsScanner)(nil), probe: "NodesByKinds"},
 		{iface: (*graph.NodesByKindsSequencer)(nil), probe: "NodesByKindsSeq"},
 		{iface: (*graph.NodesInFilesByKindFinder)(nil), probe: "NodesInFilesByKind"},
 		{iface: (*graph.OverrideDispatchCallBatchScanner)(nil), probe: "ScanOverrideDispatchCalls"},
+		{iface: (*graph.PathlessNodeBatchEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("pathless_node_evict")},
 		{iface: (*graph.PlannerStatsFreshener)(nil), skip: skipPhysical},
 		{iface: (*graph.QualifiedNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
+		{iface: (*graph.RecordedEdgeReader)(nil), probe: "RecordedEdgesAt"},
+		{iface: (*graph.ReadContextBinder)(nil), probe: "BindReadContext"},
 		{iface: (*graph.ReachableForwardByKinds)(nil), probe: "ReachableForwardByKinds"},
 		{iface: (*graph.ReceiverMutationScanner)(nil), probe: "ScanReceiverMutation"},
 		{iface: (*graph.RefFactsReader)(nil), skip: skipSidecar},
@@ -1809,10 +2327,12 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.RepoNamesNodeFinder)(nil), probe: "FindNodesByNamesInRepo"},
 		{iface: (*graph.RepoNodeIdentitySequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.RepoNodeKindIDReader)(nil), probe: "RepoProjections"},
+		{iface: (*graph.RepoScopedInEdgeReader)(nil), probe: "GetInEdgesByNodeIDsFromRepos"},
 		{iface: (*graph.ResolverNameScopeFinder)(nil), probe: "FindNodesByResolverNameScopes"},
 		{iface: (*graph.ScopeBindingNodeSequencer)(nil), probe: "NodesInScopeSeq"},
 		{iface: (*graph.ScopedCrossRepoCandidates)(nil), probe: "CrossRepoCandidatesForRepos"},
 		{iface: (*graph.ScopedEdgeKindEvicter)(nil), skip: skipWrite, writeFence: writerFamilyFence("scoped_edge_kind_evict")},
+		{iface: (*graph.ScopedIncomingSourceReader)(nil), probe: "FindIncomingSourcesScoped"},
 		{iface: (*graph.ScopedProjectionSequencer)(nil), probe: "EdgesInScopeSeq"},
 		{iface: (*graph.ScopedSymbolBundleSearcher)(nil), probe: "SearchSymbolBundles"},
 		{iface: (*graph.SemanticBindingTypeStore)(nil), skip: skipSidecar},
@@ -1982,7 +2502,7 @@ func isStoreNilConversion(expr ast.Expr) bool {
 // generation 0. The cold path rebuilds the base corpus; a derived generation's
 // rows are not what it is deciding about.
 func TestColdGraphStoreEmptyIgnoresDerivedGenerations(t *testing.T) {
-	base, err := Open(filepath.Join(t.TempDir(), "cold_gate.sqlite"))
+	base, err := openPristine(t, filepath.Join(t.TempDir(), "cold_gate.sqlite"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

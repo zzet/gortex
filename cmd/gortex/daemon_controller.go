@@ -21,8 +21,10 @@ import (
 	"github.com/zzet/gortex/internal/coverage"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/indexer"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/reconcile"
 	"github.com/zzet/gortex/internal/releases"
@@ -67,6 +69,10 @@ type realController struct {
 	// and could have its generations deleted mid-read. Nil leaves every probe
 	// on the base corpus.
 	viewMaterializer *graphview.Materializer
+	// buildGate is the daemon-wide view-build lane the lifecycle was given
+	// (SetBuildGate). Status reads its holder and queues; nil leaves the
+	// build-lane block out.
+	buildGate *indexer.ViewBuildGate
 
 	// probeNudgeMu guards probeNudgedAt alone. It is deliberately not mu: the
 	// whole point of the nudge is to be raised from the probe path, which
@@ -89,11 +95,11 @@ type realController struct {
 	// selects a ready, automatic, unrouted working copy. nil in production →
 	// the real lifecycle call; a test substitutes it to observe the nudge.
 	probeActivateCheckout func(string) bool
-	// multiWatcher is an atomic pointer, not a mu-guarded field: the daemon's
-	// teardown hook reads it, and reading it under mu is what kept `daemon
-	// stop` queued behind a running track / reload / enrichment. One writer
-	// (AttachWatcher, during warmup); read via watcher().
-	multiWatcher atomic.Pointer[indexer.MultiWatcher]
+	// A slot owns the watcher before Start, but readers see it only after
+	// publication. A non-nil slot with no watcher is the terminal stopped
+	// state. Stop can revoke an in-flight start without taking mu or holding
+	// a handoff mutex across watcher I/O or callbacks.
+	multiWatcher atomic.Pointer[daemonWatcherSlot]
 	logger       *zap.Logger
 
 	// liveRouter is the multi-server Router currently wired into the
@@ -122,6 +128,9 @@ type realController struct {
 	// per-workspace learned-promotion count for `gortex daemon status`.
 	// Nil when the MCP server isn't wired (control-only daemon).
 	toolSurface func() (preset, mode string, learned int)
+	// Immutable before publication; production explicit cochange writes share
+	// MCP's cancellation/admission and actual terminal-write ownership.
+	maintenance *gortexmcp.Server
 
 	// ready flips to true once references are resolved and the graph is
 	// queryable — find_usages / get_callers return complete results from
@@ -149,12 +158,25 @@ type realController struct {
 	lastAggregate atomic.Pointer[statusAggregate]
 }
 
+type daemonWatcherSlot struct {
+	watcher *indexer.MultiWatcher
+	ready   bool
+}
+
+// PreflightTrack checks authoritative ownership without indexing, persisting,
+// or taking the controller mutation lock. A clear answer grants no registration.
+func (c *realController) PreflightTrack(ctx context.Context, p daemon.TrackParams) error {
+	if c.multiIndexer == nil || c.lifecycle == nil {
+		return fmt.Errorf("checkout lifecycle not initialized")
+	}
+	return c.lifecycle.PreflightTrack(ctx, config.RepoEntry{
+		Path: p.Path, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree,
+	})
+}
+
 // Track indexes a new repository and persists it to the global config.
 // Path is resolved to an absolute form before the MultiIndexer sees it.
 func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.RawMessage, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.multiIndexer == nil {
 		return nil, fmt.Errorf("multi-repo indexer not initialized")
 	}
@@ -166,6 +188,11 @@ func (c *realController) Track(ctx context.Context, p daemon.TrackParams) (json.
 		return nil, fmt.Errorf("checkout lifecycle not initialized")
 	}
 	entry := config.RepoEntry{Path: absPath, Name: p.Name, Ref: p.Ref, AsWorktree: p.AsWorktree}
+	if err := c.lifecycle.PreflightTrack(ctx, entry); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Project association from TrackParams.Project isn't wired yet — the
 	// config package doesn't expose an AddRepoToProject helper. Callers
@@ -247,10 +274,21 @@ func (c *realController) EnrichChurn(ctx context.Context, p daemon.EnrichChurnPa
 				zap.String("prefix", t.prefix), zap.String("root", t.root))
 			continue
 		}
-		res, err := churn.EnrichGraph(ctx, c.graph, t.root, churn.Options{Branch: branch})
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerChurn, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		res, err := churn.EnrichGraph(ctx, out.Store, out.Root, churn.Options{Branch: branch})
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichChurnResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerChurn, t.prefix, superseded)
 		combined.Files += res.Files
 		combined.Symbols += res.Symbols
 		combined.Branch = res.Branch
@@ -291,7 +329,6 @@ func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichRele
 	if len(targets) == 0 {
 		return daemon.EnrichReleasesResult{}, fmt.Errorf("no tracked repo matches %q", p.Path)
 	}
-	_ = ctx // graph mutation is synchronous; no cancellation surface today
 
 	started := time.Now()
 	var combined daemon.EnrichReleasesResult
@@ -304,10 +341,21 @@ func (c *realController) EnrichReleases(ctx context.Context, p daemon.EnrichRele
 			// no default branch can be resolved (e.g. a clone without
 			// origin/HEAD set yet).
 		}
-		count, err := releases.EnrichGraphForBranch(c.graph, t.root, t.prefix, branch)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerReleases, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		count, err := releases.EnrichGraphForBranch(out.Store, out.Root, t.prefix, branch)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichReleasesResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerReleases, t.prefix, superseded)
 		combined.Files += count
 		combined.Branch = branch
 	}
@@ -351,10 +399,59 @@ func (c *realController) resolveEnrichTargets(path string) ([]enrichTarget, erro
 	return targets, nil
 }
 
+// enrichmentAuthority is the one output-generation authority every mutation in
+// this process admits through — the same one the MCP tool surface and the
+// indexer lanes resolve to.
+func (c *realController) enrichmentAuthority() *indexer.OutputGenerationAuthority {
+	if c == nil || c.multiIndexer == nil {
+		return nil
+	}
+	return c.multiIndexer.ResolvedOutputGenerationAuthority()
+}
+
+// beginBaseEnrichment names this control-socket enrichment's output generation.
+//
+// The control socket has no request view: `gortex enrich` runs against the
+// indexed CORPUS, so it declares generation zero explicitly rather than writing
+// base because nothing selected anything else. That declaration is the whole
+// point — the write is the same write it always was, but it is now a named
+// output with an owner the authority can order and supersede, instead of an
+// unattributed mutation of whatever `c.graph` happened to be.
+func (c *realController) beginBaseEnrichment(
+	ctx context.Context, producer, repoPrefix, root string,
+) (*gortexmcp.EnrichmentOutput, error) {
+	return gortexmcp.BeginBaseEnrichment(ctx, c.enrichmentAuthority(), c.graph, producer, repoPrefix, root)
+}
+
+// logSupersededEnrichment records the one settled outcome that is neither a
+// success to count nor a failure to report: the producer wrote everything it
+// was going to write, and a newer run of the same producer over the same corpus
+// took the authority before this one settled.
+//
+// It exists so the control socket says exactly what the tool surface says. Both
+// doors admit through one authority with one owner key per (producer, corpus),
+// BY DESIGN — that is why the producer names are shared constants — so an agent
+// running `analyze kind=blame` while a hook runs `gortex enrich blame`
+// supersedes one of them every time. The tool surface reports that as
+// `superseded: true` beside the counts; this door used to turn it into a hard
+// error AND discard the repositories it had already enriched, which is a
+// failure mode the pre-item code could not produce.
+func (c *realController) logSupersededEnrichment(producer, prefix string, superseded bool) {
+	if !superseded || c == nil || c.logger == nil {
+		return
+	}
+	c.logger.Debug("daemon: enrichment superseded by a newer run; its stamps are written",
+		zap.String("producer", producer), zap.String("repo", prefix))
+}
+
 // EnrichBlame runs the git-blame authorship enricher against the
 // daemon's graph. Mirrors EnrichChurn — c.mu is held for the duration
 // and targets resolve via the multi-indexer.
-func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
+//
+// Output generation: BASE (generation zero), declared explicitly. The control
+// socket serves the corpus; a routed checkout generation is enriched through
+// the MCP tool surface, which is where a request view exists.
+func (c *realController) EnrichBlame(ctx context.Context, p daemon.EnrichBlameParams) (daemon.EnrichBlameResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -366,10 +463,23 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 	started := time.Now()
 	var combined daemon.EnrichBlameResult
 	for _, t := range targets {
-		count, err := blame.EnrichGraph(c.graph, t.root, t.prefix)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerBlame, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		// t.prefix scopes the pass: without it the walk over one repo's root
+		// can stamp another repo's identically-pathed nodes.
+		count, err := blame.EnrichGraph(out.Store, out.Root, t.prefix)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichBlameResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerBlame, t.prefix, superseded)
 		combined.Nodes += count
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
@@ -380,7 +490,7 @@ func (c *realController) EnrichBlame(_ context.Context, p daemon.EnrichBlamePara
 // the daemon's graph. The CLI parses the profile (the path is relative
 // to the caller's cwd, not the daemon's), so the daemon only needs the
 // segments and resolves each repo's module path from its working tree.
-func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
+func (c *realController) EnrichCoverage(ctx context.Context, p daemon.EnrichCoverageParams) (daemon.EnrichCoverageResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -404,8 +514,18 @@ func (c *realController) EnrichCoverage(_ context.Context, p daemon.EnrichCovera
 	var combined daemon.EnrichCoverageResult
 	combined.Segments = len(segments)
 	for _, t := range targets {
-		modulePath := coverage.ReadModulePath(t.root)
-		combined.Symbols += coverage.EnrichGraph(c.graph, segments, modulePath)
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerCoverage, t.prefix, t.root)
+		if err != nil {
+			return daemon.EnrichCoverageResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		modulePath := coverage.ReadModulePath(out.Root)
+		combined.Symbols += coverage.EnrichGraph(out.Store, segments, modulePath)
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichCoverageResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerCoverage, t.prefix, superseded)
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
 	return combined, nil
@@ -423,15 +543,35 @@ func (c *realController) EnrichCochange(ctx context.Context, p daemon.EnrichCoch
 	if err != nil {
 		return daemon.EnrichCochangeResult{}, err
 	}
-	_ = ctx // mining is synchronous; no cancellation surface today
-
 	started := time.Now()
 	var combined daemon.EnrichCochangeResult
 	for _, t := range targets {
-		count, err := cochange.EnrichGraph(c.graph, t.root, t.prefix)
+		if c.maintenance != nil {
+			count, superseded, err := c.maintenance.EnrichCochange(ctx, t.prefix, t.root)
+			if err != nil {
+				return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+			}
+			combined.Edges += count
+			combined.Superseded = combined.Superseded || superseded
+			c.logSupersededEnrichment(gortexmcp.EnrichProducerCochange, t.prefix, superseded)
+			continue
+		}
+		// A control-only caller still propagates cancellation through the producer.
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerCochange, t.prefix, t.root)
 		if err != nil {
 			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
 		}
+		count, err := cochange.EnrichGraphContext(ctx, out.Store, out.Root, t.prefix)
+		if err != nil {
+			out.Abandon()
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.EnrichCochangeResult{}, fmt.Errorf("enrich %s: %w", t.prefix, err)
+		}
+		combined.Superseded = combined.Superseded || superseded
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerCochange, t.prefix, superseded)
 		combined.Edges += count
 	}
 	combined.DurationMS = time.Since(started).Milliseconds()
@@ -755,8 +895,9 @@ func resolveSearchBackend(b search.Backend) searchBackendInfo {
 // status row for a repo the daemon holds no index for is itself synthesised
 // from it.
 //
-// Anything added here that reads the store or takes a lock reintroduces
-// exactly the stall this exists to avoid; TestProbeAnswersDuringLongMutation
+// The loaded-root snapshot takes only the registry's short read lock, not
+// the controller's mutation mutex. Store reads or c.mu would reintroduce
+// the stall this exists to avoid; TestProbeAnswersDuringLongMutation
 // pins that.
 func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error) {
 	if err := ctx.Err(); err != nil {
@@ -766,6 +907,18 @@ func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error
 	resp := daemon.ProbeResponse{
 		Ready:    c.ready.Load(),
 		Enriched: c.enriched.Load(),
+	}
+	if policy, ok := c.graph.(interface{ CloseCheckpointPolicy() string }); ok {
+		resp.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
+	}
+	if c.multiIndexer != nil {
+		roots := make([]string, 0)
+		for _, meta := range c.multiIndexer.AllMetadata() {
+			if meta != nil {
+				roots = append(roots, meta.RootPath)
+			}
+		}
+		resp.LoadedRoots = &roots
 	}
 	if c.configManager == nil {
 		return resp, nil
@@ -782,13 +935,25 @@ func (c *realController) Probe(ctx context.Context) (daemon.ProbeResponse, error
 			return
 		}
 		seen[path] = true
-		resp.TrackedRepos = append(resp.TrackedRepos, daemon.ProbeRepo{
+		repo := daemon.ProbeRepo{
 			Path:      path,
 			Prefix:    config.ResolvePrefix(e),
 			Name:      e.Name,
 			Workspace: e.Workspace,
 			Project:   e.Project,
-		})
+		}
+		// The load state is a lock-free snapshot, so it keeps this call's
+		// no-mutex, no-store contract; it is never read from the registry,
+		// whose lock topology mutations hold.
+		if rec, ok := c.multiIndexer.RepoLoadFor(path); ok {
+			repo.State = publicRepoState(rec.State)
+			repo.StateReason = rec.Reason
+			if rec.ErrorCode == daemon.ErrPrefixCollision {
+				repo.State = daemon.RepoStatePrefixCollision
+				repo.ErrorCode, repo.OwnerPath, repo.OwnerState = rec.ErrorCode, rec.OwnerPath, rec.OwnerState
+			}
+		}
+		resp.TrackedRepos = append(resp.TrackedRepos, repo)
 	}
 	for _, e := range gc.Repos {
 		add(e)
@@ -840,11 +1005,41 @@ func (c *realController) StatusExact(ctx context.Context) (daemon.StatusResponse
 	if reconciler, ok := graph.Store(g).(interface {
 		ReconcileRepoCounters(map[string]graph.RepoMemoryEstimate) error
 	}); ok {
-		if err := reconciler.ReconcileRepoCounters(scanned); err != nil {
+		// Writing the recounted per-repo estimates back is a mutation of the
+		// corpus, so it names generation zero through the same authority every
+		// other write does rather than being the one unattributed write left.
+		out, err := c.beginBaseEnrichment(ctx, gortexmcp.EnrichProducerRepoCounters, "", "")
+		if err != nil {
 			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
 		}
+		if err := reconciler.ReconcileRepoCounters(scanned); err != nil {
+			out.Abandon()
+			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
+		}
+		// A supersession is NOT a failure here, and must not be turned into
+		// one: this method does not hold c.mu, so two concurrent
+		// `gortex status --exact` calls supersede each other by construction,
+		// and the loser's counters are already written (and are the same
+		// measured numbers the winner wrote). Naming the output is how the two
+		// runs are ordered; failing the later-admitted-then-overtaken one
+		// would invent an error the pre-item code could never return.
+		//
+		// Settle is the SAME settlement the enrich doors and the tool surface
+		// use, for the same reason: one spelling of "landed, superseded" across
+		// every door that names this corpus.
+		superseded, err := out.Settle()
+		if err != nil {
+			return daemon.StatusResponse{}, fmt.Errorf("reconcile repo counters: %w", err)
+		}
+		c.logSupersededEnrichment(gortexmcp.EnrichProducerRepoCounters, "", superseded)
 	}
-	return c.status(ctx, true)
+	resp, err := c.status(ctx, true)
+	if err == nil && resp.Storage != nil {
+		if check := checkRowCounters(ctx, graph.Store(g)); check != nil {
+			resp.Storage.RowCounters = check
+		}
+	}
+	return resp, err
 }
 
 // Status answers within the caller's budget even while the controller mutex
@@ -905,12 +1100,29 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// every queued control request wait out the pause as well.
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
+	// The operating system's and SQLite's figures are read in the same breath,
+	// so the runtime block describes one moment. Read after the view census
+	// and the aggregate, which can wait seconds for the mutex, they would
+	// describe a later process than the Go heap beside them.
+	runtimeStats := withProcessGauges(daemon.RuntimeStats{
+		Alloc:        mem.Alloc,
+		Sys:          mem.Sys,
+		HeapInuse:    mem.HeapInuse,
+		HeapIdle:     mem.HeapIdle,
+		HeapReleased: mem.HeapReleased,
+		StackInuse:   mem.StackInuse,
+		NumGC:        mem.NumGC,
+		NumGoroutine: runtime.NumGoroutine(),
+	})
 
 	// Stat every configured repo path before taking c.mu. A stat is cheap
 	// on a live path and on a deleted one, but an unresponsive network
 	// mount can block for seconds, and no status caller should be able to
 	// wedge track / untrack / reload behind a dead NFS handle.
 	configRepos, repoMissing := c.trackedRepoLiveness()
+	// Sample readiness before the aggregate so warmup cannot finish between
+	// its inventory snapshot and this flag, making unloaded rows look final.
+	ready := c.ready.Load()
 
 	// The view census is catalog listings bounded by the number of families,
 	// graphs and generations, so it belongs in the slow half rather than
@@ -950,29 +1162,26 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 	// The copy keeps the cached slice immutable — it is shared by every
 	// subsequent busy pass.
 	tracked := append([]daemon.TrackedRepoStatus(nil), agg.tracked...)
-	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked)...)
+	tracked = append(tracked, reconcileUnloadedRepos(configRepos, repoMissing, agg.tracked, ready)...)
+	for i := range tracked {
+		if rec, ok := c.multiIndexer.RepoLoadFor(tracked[i].Path); ok && rec.ErrorCode == daemon.ErrPrefixCollision {
+			tracked[i].Unloaded, tracked[i].Loading = true, false
+			tracked[i].ErrorCode, tracked[i].OwnerPath, tracked[i].OwnerState = rec.ErrorCode, rec.OwnerPath, rec.OwnerState
+		}
+	}
 
-	// mem was sampled before the mutex was taken — see the note at the top
-	// of status.
+	// mem and the runtime block were sampled before the mutex was taken —
+	// see the note at the top of status.
 
 	resp := daemon.StatusResponse{
-		TrackedRepos:   tracked,
-		MemoryBytes:    mem.Alloc,
-		SearchBackend:  agg.searchBackend,
-		TrigramCache:   trigramCacheForResponse(),
-		GraphIntegrity: daemon.GraphIntegrityStatusFor(g),
-		Runtime: daemon.RuntimeStats{
-			Alloc:        mem.Alloc,
-			Sys:          mem.Sys,
-			HeapInuse:    mem.HeapInuse,
-			HeapIdle:     mem.HeapIdle,
-			HeapReleased: mem.HeapReleased,
-			StackInuse:   mem.StackInuse,
-			NumGC:        mem.NumGC,
-			NumGoroutine: runtime.NumGoroutine(),
-		},
+		TrackedRepos:       tracked,
+		MemoryBytes:        mem.Alloc,
+		SearchBackend:      agg.searchBackend,
+		TrigramCache:       trigramCacheForResponse(),
+		GraphIntegrity:     daemon.GraphIntegrityStatusFor(g),
+		Runtime:            runtimeStats,
 		PProfAddr:          daemonPProfAddr(),
-		Ready:              c.ready.Load(),
+		Ready:              ready,
 		WarmupSeconds:      c.warmupSeconds.Load(),
 		EnrichmentComplete: enriched,
 		EnrichSeconds:      c.enrichSeconds.Load(),
@@ -982,6 +1191,9 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		LSPRouter:          agg.lspRouter,
 		Enrichment:         agg.enrichment,
 		Views:              views,
+		PublicationPhases:  publicationPhasesStatus(indexer.DefaultPublicationPhases()),
+		Storage:            storageStatusFor(g),
+		BuildLane:          buildLaneStatusFor(c.buildGate, time.Now()),
 		ToolPreset:         agg.toolPreset,
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
@@ -1415,10 +1627,9 @@ func lookupRepoMissing(missing map[string]bool, root string) bool {
 
 // reconcileUnloadedRepos returns a synthetic row for every configured
 // repo the daemon holds no index for. Matching is by path first (what
-// track resolves and persists) and by resolved prefix second, so a repo
-// registered under a derived worktree-instance prefix still matches its
-// config entry.
-func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus) []daemon.TrackedRepoStatus {
+// track resolves and persists). Prefix-only matching is reserved for entries
+// without a path: another root under the same prefix is not a loaded entry.
+func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool, loaded []daemon.TrackedRepoStatus, ready bool) []daemon.TrackedRepoStatus {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1427,7 +1638,7 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 		prefix := config.ResolvePrefix(e)
 		isLoaded := false
 		for _, r := range loaded {
-			if (e.Path != "" && pathkey.EqualPaths(r.Path, e.Path)) || (prefix != "" && r.Prefix == prefix) {
+			if e.Path != "" && pathkey.EqualPaths(r.Path, e.Path) || e.Path == "" && prefix != "" && r.Prefix == prefix {
 				isLoaded = true
 				break
 			}
@@ -1435,6 +1646,7 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 		if isLoaded {
 			continue
 		}
+		isMissing := lookupRepoMissing(missing, e.Path)
 		out = append(out, daemon.TrackedRepoStatus{
 			Prefix:           prefix,
 			Path:             e.Path,
@@ -1443,7 +1655,8 @@ func reconcileUnloadedRepos(entries []config.RepoEntry, missing map[string]bool,
 			WorkspaceProject: prefix,
 			Ref:              e.Ref,
 			Unloaded:         true,
-			Missing:          lookupRepoMissing(missing, e.Path),
+			Missing:          isMissing,
+			Loading:          !ready && !isMissing,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
@@ -1522,6 +1735,170 @@ func (c *realController) collectLSPRouterStatus() *daemon.LSPRouterStatus {
 	return out
 }
 
+// publicationPhasesStatus renders the recorder's per-checkout publication
+// records for daemon status, checkouts sorted and records oldest first. It is
+// its own block beside the view census, which carries no identities.
+func publicationPhasesStatus(recorder *indexer.PublicationPhaseRecorder) []daemon.PublicationPhaseStatus {
+	var out []daemon.PublicationPhaseStatus
+	for _, checkoutID := range recorder.Checkouts() {
+		for _, record := range recorder.Snapshot(checkoutID) {
+			status := daemon.PublicationPhaseStatus{
+				Key:               record.Key,
+				CheckoutID:        record.CheckoutID,
+				Source:            record.Source,
+				Ticket:            record.Ticket,
+				DirtyGenerationID: record.DirtyGenerationID,
+				OriginWall:        record.OriginWall,
+				Clock:             record.Clock,
+				Terminal:          record.Terminal,
+				Phases:            make([]daemon.PublicationPhaseOffset, 0, len(record.Phases)),
+			}
+			for _, phase := range record.Phases {
+				status.Phases = append(status.Phases, daemon.PublicationPhaseOffset{
+					Phase: string(phase.Phase), OffsetNS: phase.OffsetNS, OffsetMS: phase.OffsetMS,
+				})
+			}
+			out = append(out, status)
+		}
+	}
+	return out
+}
+
+// storeWALReporter is the part of the SQLite store the storage block reads.
+// Every method is cheap: file stats, a read of the wal-index header, and a
+// counter snapshot under a short mutex — nothing that waits on the writer or
+// the read pool, so it is safe on the status path of a busy daemon.
+type storeWALReporter interface {
+	DBStats() (dbBytes, walBytes int64)
+	CloseCheckpointEstimate() (time.Duration, int64)
+	WALReclaimStats() store_sqlite.WALReclaimStats
+}
+
+// storageStatusFor renders the store's write-ahead-log state, nil for a store
+// that is not SQLite (or none).
+func storageStatusFor(g graph.Store) *daemon.StorageStatus {
+	if g == nil {
+		return nil
+	}
+	reporter, ok := g.(storeWALReporter)
+	if !ok {
+		return nil
+	}
+	dbBytes, walBytes := reporter.DBStats()
+	estimate, pending := reporter.CloseCheckpointEstimate()
+	out := &daemon.StorageStatus{
+		DBBytes:                   dbBytes,
+		WALBytes:                  walBytes,
+		WALPendingFrames:          pending,
+		CloseCheckpointEstimateMS: estimate.Milliseconds(),
+		WALReclaim:                walReclaimStatus(reporter.WALReclaimStats()),
+	}
+	if reporter, ok := g.(interface{ DenseIndexesMissing() []string }); ok {
+		out.DenseIndexesMissing = reporter.DenseIndexesMissing()
+	}
+	if reporter, ok := g.(interface {
+		LastFirstIndexDrains() map[string]graph.FirstIndexDrain
+	}); ok {
+		out.LastFirstIndexDrain = reporter.LastFirstIndexDrains()
+	}
+	if passive, ok := g.(interface {
+		WALPassiveStats() store_sqlite.WALPassiveStats
+	}); ok {
+		out.WALCheckpoint = daemon.WALCheckpointStatusFrom(passive.WALPassiveStats())
+	}
+	if policy, ok := g.(interface{ CloseCheckpointPolicy() string }); ok {
+		out.CloseCheckpointPolicy = policy.CloseCheckpointPolicy()
+	}
+	if counters, ok := g.(storeRowCounterReporter); ok {
+		out.RowCounters = &daemon.RowCounterStatus{Ready: counters.RowCountersReady()}
+	}
+	return out
+}
+
+// storeRowCounterReporter is the store's writer-maintained row counters.
+type storeRowCounterReporter interface {
+	RowCountersReady() bool
+	CheckRowCounters(ctx context.Context, repair bool) (store_sqlite.RowCounterCheck, error)
+}
+
+// checkRowCounters runs the exact status's drift check of the row counters:
+// a recount of every generation in one snapshot, compared with the counters
+// of that snapshot, and a repair of any drift. Nil for a store without them.
+func checkRowCounters(ctx context.Context, g graph.Store) *daemon.RowCounterStatus {
+	counters, ok := g.(storeRowCounterReporter)
+	if !ok {
+		return nil
+	}
+	check, err := counters.CheckRowCounters(ctx, true)
+	out := &daemon.RowCounterStatus{Ready: check.Ready, Checked: err == nil && check.Ready,
+		Generations: check.Generations, Drifted: len(check.Drift), Repaired: check.Repaired,
+		CheckMS: durationMS(check.Elapsed)}
+	if err != nil {
+		out.FirstDrift = "check failed: " + err.Error()
+	} else if len(check.Drift) > 0 {
+		d := check.Drift[0]
+		out.FirstDrift = fmt.Sprintf("generation %d: nodes %d (counted %d), edges %d (counted %d)",
+			d.GenerationID, d.CounterNodes, d.ExactNodes, d.CounterEdges, d.ExactEdges)
+	}
+	return out
+}
+
+func walReclaimStatus(st store_sqlite.WALReclaimStats) *daemon.WALReclaimStatus {
+	return daemon.WALReclaimStatusFrom(st)
+}
+
+// buildLaneStatusFor renders the view-build lane: its holder (kind, checkout,
+// generation, how long it has held the lane) and the queues behind it. nil
+// when the daemon has no gate.
+func buildLaneStatusFor(gate *indexer.ViewBuildGate, now time.Time) *daemon.BuildLaneStatus {
+	if gate == nil {
+		return nil
+	}
+	st := gate.Stats()
+	out := &daemon.BuildLaneStatus{
+		Open:                 st.Open,
+		Active:               st.Active,
+		InteractiveQueued:    st.InteractiveQueued,
+		BackgroundQueued:     st.BackgroundQueued,
+		InteractiveHighWater: st.InteractiveHighWater,
+		BackgroundHighWater:  st.BackgroundHighWater,
+		AdmittedInteractive:  st.AdmittedInteractive,
+		AdmittedBackground:   st.AdmittedBackground,
+		WaitSamples:          st.WaitSamples,
+		WaitMaxMS:            durationMS(st.MaxWait),
+	}
+	if st.WaitSamples > 0 {
+		out.WaitAvgMS = durationMS(st.TotalWait / time.Duration(st.WaitSamples))
+	}
+	if st.Active {
+		holder := &daemon.BuildLaneHolderStatus{Kind: "undeclared"}
+		since := st.ActiveSince
+		if h := st.Holder; h != nil {
+			holder.Kind = h.Kind
+			holder.CheckoutID = h.CheckoutID
+			holder.Priority = h.Priority
+			holder.Generation = h.Generation
+			if !h.Since.IsZero() {
+				since = h.Since
+			}
+		}
+		if !since.IsZero() {
+			holder.SinceUnixMS = since.UnixMilli()
+			if held := now.Sub(since); held > 0 {
+				holder.HeldForMS = durationMS(held)
+			}
+		}
+		out.Holder = holder
+	}
+	return out
+}
+
+// durationMS renders a duration as fractional milliseconds, rounded to the
+// microsecond so the JSON stays readable.
+func durationMS(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000
+}
+
 // collectViewsStatus reflects the checkout-view lifecycle census into the
 // status payload.
 //
@@ -1543,6 +1920,13 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		}
 		return nil
 	}
+	return viewsStatusFromHealth(health)
+}
+
+// viewsStatusFromHealth is the census → payload projection, split out so the
+// one thing that can go wrong with it is checkable: a field the census carries
+// and the payload silently drops.
+func viewsStatusFromHealth(health indexer.ViewsHealth) *daemon.ViewsStatus {
 	return &daemon.ViewsStatus{
 		Families:     health.Families,
 		Checkouts:    health.Checkouts,
@@ -1550,8 +1934,105 @@ func (c *realController) collectViewsStatus(ctx context.Context) *daemon.ViewsSt
 		Generations:  health.Generations,
 		Leases:       health.Leases,
 		RefViews:     health.RefViews,
-		Counters:     health.Counters,
+		// The counts beside this are unreadable without it: Coordinators says
+		// how many build loops run, and the checkouts that have none are
+		// explained nowhere else. The census already carried the reasons
+		// (indexer.ViewsHealth.CoordinatorStartFailures) and this literal used
+		// to drop them on the floor, which left them with no reader at all — a
+		// background reconciliation has no caller to fail, so the status
+		// payload is the only surface the reason can reach.
+		CoordinatorStartFailures: viewsStartFailures(health.CoordinatorStartFailures),
+		// The same defect one field down, and the one the census itself names:
+		// the lifecycle collects the storage layer's refusals
+		// (indexer.ViewsHealth.StorageFailures) and this literal dropped them,
+		// so a retirement blocked by a full volume reached no reader at all.
+		// Retirement is a background pass with no caller to fail, so — exactly
+		// like the start failures above — the status payload is the only
+		// surface the reason can come out of.
+		StorageFailures:   viewsStorageFailures(health.StorageFailures),
+		PublicationStalls: viewsPublicationStalls(health.PublicationStalls),
+		RetirementBacklog: viewsRetirementBacklog(health.RetirementBacklog),
+		Counters:          health.Counters,
 	}
+}
+
+// viewsRetirementBacklog translates the deferred retirement backlog onto the
+// wire; a nil backlog stays nil so an idle status omits the field.
+func viewsRetirementBacklog(backlog *indexer.RetirementBacklog) *daemon.RetirementBacklog {
+	if backlog == nil {
+		return nil
+	}
+	return &daemon.RetirementBacklog{
+		Generations:    backlog.Generations,
+		Retiring:       backlog.Retiring,
+		Parked:         backlog.Parked,
+		BytesEstimate:  backlog.BytesEstimate,
+		DebtAgeSeconds: backlog.DebtAgeSeconds,
+		LastRemovedAt:  backlog.LastRemovedAt,
+	}
+}
+
+// viewsPublicationStalls translates the coordinators' non-publishing runs onto
+// the wire; a nil list stays nil so a healthy status omits the field.
+func viewsPublicationStalls(stalls []indexer.CheckoutPublicationStall) []daemon.PublicationStall {
+	if len(stalls) == 0 {
+		return nil
+	}
+	out := make([]daemon.PublicationStall, 0, len(stalls))
+	for _, s := range stalls {
+		out = append(out, daemon.PublicationStall{
+			CheckoutID:                     s.CheckoutID,
+			ConsecutiveNonpublishingCycles: s.ConsecutiveNonpublishingCycles,
+			Since:                          s.Since,
+			LastPublicationAgeSeconds:      s.LastPublicationAgeSeconds,
+			StallReason:                    s.StallReason,
+			ChangeSetSize:                  s.ChangeSetSize,
+		})
+	}
+	return out
+}
+
+// viewsStorageFailures translates the store's maintenance-failure register onto
+// the wire. Like viewsStartFailures it is a translation rather than an alias —
+// internal/daemon is the protocol package — and a nil register stays nil so the
+// field is omitted: "nothing is stuck" must render as absence, not as an empty
+// list that reads like a section someone forgot to fill in.
+func viewsStorageFailures(failures []store_sqlite.StorageFailure) []daemon.StorageFailure {
+	if len(failures) == 0 {
+		return nil
+	}
+	out := make([]daemon.StorageFailure, 0, len(failures))
+	for _, f := range failures {
+		out = append(out, daemon.StorageFailure{
+			GenerationID: f.GenerationID,
+			Reason:       f.Reason,
+		})
+	}
+	return out
+}
+
+// viewsStartFailures translates the lifecycle's start-failure ledger onto the
+// wire. It is a translation rather than an alias because internal/daemon is the
+// protocol package: its payloads are plain structs a client decodes without
+// linking the indexer.
+//
+// A nil ledger stays nil so the field is omitted — "every checkout that wanted
+// a loop has one" must render as absence, not as an empty list that reads like
+// a section someone forgot to fill in.
+func viewsStartFailures(failures []indexer.CoordinatorStartFailure) []daemon.CoordinatorStartFailure {
+	if len(failures) == 0 {
+		return nil
+	}
+	out := make([]daemon.CoordinatorStartFailure, 0, len(failures))
+	for _, f := range failures {
+		out = append(out, daemon.CoordinatorStartFailure{
+			CheckoutID: f.CheckoutID,
+			RootPath:   f.RootPath,
+			Reason:     f.Reason,
+			At:         f.At,
+		})
+	}
+	return out
 }
 
 // collectEnrichmentProgress reflects the semantic manager's per-(repo,
@@ -1646,6 +2127,10 @@ const (
 // base corpus answers and the response carries no view block at all, which is
 // what every client that predates routed views sends and still receives.
 func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbolsParams) (daemon.SearchSymbolsResult, error) {
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
+
 	// No mu: graph is write-once at construction (see the field comment), and
 	// this is the probe path a hook calls on a sub-second budget. Taking mu
 	// here is what made it wait out an in-flight reindex.
@@ -1660,6 +2145,9 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 	// receives outlives the generations that produced it.
 	view := c.resolveProbeView(ctx, p.Path)
 	defer view.release()
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
 	if !view.servable {
 		// A registered working copy with no composed view. Reporting the
 		// primary's symbols would cite another working copy's code as
@@ -1685,7 +2173,11 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 	// a hash bucket per shard, so this is a handful of map lookups rather
 	// than a walk over every name in the graph — the difference between
 	// microseconds and blowing the hook's probe budget on a large graph.
-	for _, n := range g.FindNodesByName(p.Query) {
+	candidates, err := graph.FindNodesByNameContext(ctx, g, p.Query)
+	if err != nil {
+		return daemon.SearchSymbolsResult{}, err
+	}
+	for _, n := range candidates {
 		if !probeSymbolCandidate(n, p.Repo) {
 			continue
 		}
@@ -1693,6 +2185,9 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 		if len(hits) >= limit {
 			break
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
 	}
 	if len(hits) > 0 {
 		return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
@@ -1714,10 +2209,16 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 		fetch = limit * searchSymbolsRepoFetchFactor
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		if fetch > searchSymbolsMaxFetch {
 			fetch = searchSymbolsMaxFetch
 		}
-		candidates := g.FindNodesByNameContaining(p.Query, fetch)
+		candidates, err = graph.FindNodesByNameContainingContext(ctx, g, p.Query, fetch)
+		if err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		hits = hits[:0]
 		for _, n := range candidates {
 			if !probeSymbolCandidate(n, p.Repo) {
@@ -1731,11 +2232,17 @@ func (c *realController) SearchSymbols(ctx context.Context, p daemon.SearchSymbo
 				break
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return daemon.SearchSymbolsResult{}, err
+		}
 		// Enough hits, the index is exhausted, or the bound is reached.
 		if len(hits) >= limit || len(candidates) < fetch || fetch >= searchSymbolsMaxFetch {
 			break
 		}
 		fetch *= 4
+	}
+	if err := ctx.Err(); err != nil {
+		return daemon.SearchSymbolsResult{}, err
 	}
 	return daemon.SearchSymbolsResult{Hits: hits, View: view.answer}, nil
 }
@@ -1774,7 +2281,70 @@ func probeSymbolHit(n *graph.Node) daemon.SymbolHit {
 // The lifecycle reads the watcher through this same pointer, so every
 // surface's attach and detach hit the one live watcher.
 func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
-	c.multiWatcher.Store(mw)
+	if mw == nil {
+		for {
+			previous := c.multiWatcher.Load()
+			if previous == nil || previous.watcher == nil || c.multiWatcher.CompareAndSwap(previous, nil) {
+				return
+			}
+		}
+	}
+	slot := &daemonWatcherSlot{watcher: mw}
+	if !c.multiWatcher.CompareAndSwap(nil, slot) {
+		_ = mw.Stop()
+		return
+	}
+	c.configureWatcher(mw)
+	if !c.multiWatcher.CompareAndSwap(slot, &daemonWatcherSlot{watcher: mw, ready: true}) {
+		_ = mw.Stop()
+	}
+}
+
+// startAndAttachWatcher reserves ownership before touching the filesystem.
+// Stop either stops that exact watcher or wins before the reservation, in which
+// case no Start is admitted. MultiWatcher's own Start/Stop boundary serializes
+// an already-admitted physical start. Callbacks run outside any handoff lock.
+func (c *realController) startAndAttachWatcher(ctx context.Context, mw *indexer.MultiWatcher) error {
+	return c.startAndAttachWatcherWith(ctx, mw, mw.Start)
+}
+
+// The explicit start operation gives deterministic tests a scheduling barrier;
+// production always supplies this exact watcher's physical Start method.
+func (c *realController) startAndAttachWatcherWith(ctx context.Context, mw *indexer.MultiWatcher, start func() error) error {
+	if err := ctx.Err(); err != nil {
+		_ = mw.Stop()
+		return err
+	}
+	slot := &daemonWatcherSlot{watcher: mw}
+	if !c.multiWatcher.CompareAndSwap(nil, slot) {
+		_ = mw.Stop()
+		return context.Canceled
+	}
+	reject := func(err error) error {
+		c.multiWatcher.CompareAndSwap(slot, nil)
+		_ = mw.Stop()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return reject(err)
+	}
+	if err := start(); err != nil {
+		return reject(err)
+	}
+	c.configureWatcher(mw)
+	if err := ctx.Err(); err != nil {
+		return reject(err)
+	}
+	if !c.multiWatcher.CompareAndSwap(slot, &daemonWatcherSlot{watcher: mw, ready: true}) {
+		return reject(context.Canceled)
+	}
+	return nil
+}
+
+func (c *realController) configureWatcher(mw *indexer.MultiWatcher) {
+	if c.lifecycle == nil {
+		return
+	}
 	c.lifecycle.SetWatcherSource(func() indexer.RepoWatcher {
 		// A typed nil in an interface is not nil; return the untyped one so
 		// the lifecycle's "is there a watcher yet" test stays honest.
@@ -1783,9 +2353,6 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 		}
 		return nil
 	})
-	if mw == nil {
-		return
-	}
 	mw.OnWorktreeChangeContext(func(dispatchCtx context.Context, repoPrefix, _ string) {
 		resolveCtx, cancel := context.WithTimeout(dispatchCtx, 10*time.Second)
 		familyID, err := c.lifecycle.ResolveFamilyID(resolveCtx, repoPrefix)
@@ -1804,7 +2371,10 @@ func (c *realController) AttachWatcher(mw *indexer.MultiWatcher) {
 // The teardown path needs it, and taking mu there would put the stop request
 // back behind the minutes-long track / reload / enrichment it is trying to end.
 func (c *realController) watcher() *indexer.MultiWatcher {
-	return c.multiWatcher.Load()
+	if slot := c.multiWatcher.Load(); slot != nil && slot.ready {
+		return slot.watcher
+	}
+	return nil
 }
 
 // StopWatcher halts filesystem watching. Called first during teardown so no
@@ -1816,8 +2386,8 @@ func (c *realController) watcher() *indexer.MultiWatcher {
 // watcher pointer, which meant `gortex daemon stop` queued behind whatever
 // long operation was holding it.
 func (c *realController) StopWatcher() {
-	if mw := c.watcher(); mw != nil {
-		_ = mw.Stop()
+	if slot := c.multiWatcher.Swap(&daemonWatcherSlot{}); slot != nil && slot.watcher != nil {
+		_ = slot.watcher.Stop()
 	}
 }
 

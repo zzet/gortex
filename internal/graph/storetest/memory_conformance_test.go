@@ -30,3 +30,11 @@ func TestMemoryStoreConformance(t *testing.T) {
 		AdjacencyLineOrdered: false,
 	})
 }
+
+func TestDeltaWriterReindexConvergenceConformance(t *testing.T) {
+	factory := func(t *testing.T) graph.Store {
+		return graph.NewDeltaWriter(graph.New(), nil)
+	}
+	t.Run("ReindexConvergencePayload", func(t *testing.T) { storetest.RunReindexConvergencePayload(t, factory) })
+	t.Run("ReindexMovingSiblings", func(t *testing.T) { storetest.RunReindexMovingSiblings(t, factory) })
+}

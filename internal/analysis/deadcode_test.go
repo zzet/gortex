@@ -3,6 +3,7 @@ package analysis
 import (
 	"fmt"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -254,9 +255,9 @@ func TestPropertyDeadCode_Completeness(t *testing.T) {
 		// For every node in the graph, if it meets all dead code criteria,
 		// it must be in the result.
 		for _, node := range tc.Graph.AllNodes() {
-			// Never-reported kinds (file/package/import + the broader
-			// noise set: param/closure/module/string/etc).
-			if neverDeadCodeKinds[node.Kind] {
+			// Completeness applies only to the declared candidate kinds;
+			// structural and future kinds are not unreported dead code.
+			if !slices.Contains(candidateNodeKinds, node.Kind) {
 				continue
 			}
 
@@ -931,9 +932,9 @@ func TestDeadCode_ExportedInsideInternalIsSurfaced(t *testing.T) {
 	// gortex/internal/parser/tsitter/tsitter.go — used by the user as a
 	// dead-code-detection probe and expected to show up.
 	g.AddNode(&graph.Node{
-		ID: "gortex/internal/parser/tsitter/tsitter.go::Node.Test",
+		ID:   "gortex/internal/parser/tsitter/tsitter.go::Node.Test",
 		Kind: graph.KindMethod, Name: "Test",
-		FilePath: "gortex/internal/parser/tsitter/tsitter.go",
+		FilePath:  "gortex/internal/parser/tsitter/tsitter.go",
 		StartLine: 85, EndLine: 85, Language: "go",
 		Meta: map[string]any{"receiver": "Node"},
 	})

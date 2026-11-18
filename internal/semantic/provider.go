@@ -101,6 +101,16 @@ type PreselectionDeadlineEnricher interface {
 	UsePreselectionDeadline()
 }
 
+// QueueWaitExcludingEnricher marks a ContextEnricher that brackets its
+// uncancellable queue waits (acquiring the graph-wide resolve mutex) with
+// ExcludeQueueWait. The Manager arms a pausable outer ceiling for it, so a
+// pass queued behind another pass's apply keeps its time for its own work.
+// Other providers keep the plain timeout.
+type QueueWaitExcludingEnricher interface {
+	ContextEnricher
+	ExcludesQueueWaitFromCeiling()
+}
+
 // ReadinessProber is an optional interface a Provider MAY implement when its
 // server answers `initialize` quickly but is not ready to serve semantic
 // queries until a slower background load finishes — the Roslyn / MSBuild
@@ -185,6 +195,10 @@ type EnrichResult struct {
 	// hover types and hierarchy edges are absent. DegradedReason carries why.
 	Degraded       bool   `json:"degraded,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// Compiler is the compiler-context work of a go/packages-backed pass:
+	// loads, type-checked packages and compiled files, and the load scope.
+	// nil when the provider reports none.
+	Compiler *CompilerLoadStats `json:"compiler,omitempty"`
 }
 
 // Bounding reasons for the enrichment add-phase (EnrichResult.BoundReason /

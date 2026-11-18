@@ -28,8 +28,8 @@ func TestAgentPreset_Membership(t *testing.T) {
 }
 
 // TestClientAwareDefault: every identified client gets the same compact closed
-// surface; a pre-initialize session keeps the compatibility default; and an
-// explicit forwarded preset still wins.
+// surface; a bare session id with no client connection (an internal caller)
+// keeps the compatibility default; and an explicit forwarded preset still wins.
 func TestClientAwareDefault(t *testing.T) {
 	srv := setupPresetServer(t, ToolPolicyConfig{Preset: "core", Mode: "defer"})
 

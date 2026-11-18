@@ -1,0 +1,95 @@
+{
+  "provenance": "Transport-identity subset of actual one-off native81ca report0ef347b7900b194c53c49f5ddc00e92809504aed8d0826390f2a3566af57e723; no reference or acceptance evidence. CWD and response bodies omitted.",
+  "records": [
+    {
+      "ordinal": 0,
+      "editor": 0,
+      "connection_identity": "fixed-editor-0",
+      "requested_connection_surface": "all/defer",
+      "due_ns": 0,
+      "probe_origin": "2026-11-02T21:34:37.43789+01:00",
+      "ack": {
+        "request_params": {
+          "arguments": {
+            "dry_run": false,
+            "id": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go::GortexReadback000",
+            "mutation_id": "readback-modify_body-000",
+            "new_source": "func GortexReadback000() int {\n\tvalue := 7\n\treturn value\n}",
+            "old_source": "func GortexReadback000() int { return 7 }"
+          },
+          "name": "edit_symbol"
+        },
+        "rpc_id": 11,
+        "write_started": "2026-11-02T21:34:37.435678+01:00",
+        "write_finished": "2026-11-02T21:34:37.435685+01:00"
+      },
+      "probes": {
+        "editing_context": {
+          "request_params": {
+            "arguments": {
+              "format": "json",
+              "path": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go"
+            },
+            "name": "get_editing_context"
+          },
+          "rpc_id": 14,
+          "write_started": "2026-11-02T21:34:37.437962+01:00",
+          "write_finished": "2026-11-02T21:34:37.437962+01:00"
+        },
+        "file": {
+          "request_params": {
+            "arguments": {
+              "format": "json",
+              "path": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go"
+            },
+            "name": "read_file"
+          },
+          "rpc_id": 15,
+          "write_started": "2026-11-02T21:34:37.437968+01:00",
+          "write_finished": "2026-11-02T21:34:37.437969+01:00"
+        },
+        "source": {
+          "request_params": {
+            "arguments": {
+              "compress_bodies": false,
+              "context_lines": 0,
+              "format": "json",
+              "id": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go::GortexReadback000"
+            },
+            "name": "get_symbol_source"
+          },
+          "rpc_id": 16,
+          "write_started": "2026-11-02T21:34:37.438048+01:00",
+          "write_finished": "2026-11-02T21:34:37.438051+01:00"
+        },
+        "summary": {
+          "request_params": {
+            "arguments": {
+              "format": "json",
+              "path": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go"
+            },
+            "name": "get_file_summary"
+          },
+          "rpc_id": 13,
+          "write_started": "2026-11-02T21:34:37.437956+01:00",
+          "write_finished": "2026-11-02T21:34:37.437959+01:00"
+        },
+        "symbol": {
+          "request_params": {
+            "arguments": {
+              "detail": "full",
+              "format": "json",
+              "id": "tiny_readback_protocol/zz_gortex_readback_probe/modify_body/p000.go::GortexReadback000"
+            },
+            "name": "get_symbol"
+          },
+          "rpc_id": 12,
+          "write_started": "2026-11-02T21:34:37.437947+01:00",
+          "write_finished": "2026-11-02T21:34:37.437951+01:00"
+        }
+      },
+      "start_lateness_ns": 80459
+    }
+  ],
+  "started": "2026-11-02T21:34:37.43551+01:00"
+}

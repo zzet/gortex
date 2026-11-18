@@ -28,10 +28,10 @@ func TestHandleFacadeRejectsLocalizationBypassesWithoutClearingState(t *testing.
 		name string
 		args map[string]any
 	}{
-		{name: "task top-level override", args: map[string]any{"operation": "task", "task": "Locate Bar", "localize": true}},
-		{name: "task nested override", args: map[string]any{"operation": "task", "task": "Locate Bar", "options": map[string]any{"localize": true}}},
+		{name: "task top-level override", args: map[string]any{"operation": "task", "task": "Locate Foo again", "localize": true}},
+		{name: "task nested override", args: map[string]any{"operation": "task", "task": "Locate Foo again", "options": map[string]any{"localize": true}}},
 		{name: "empty localize", args: map[string]any{"operation": "localize", "task": ""}},
-		{name: "nested localize task", args: map[string]any{"operation": "localize", "options": map[string]any{"task": "Locate Bar"}}},
+		{name: "nested localize task", args: map[string]any{"operation": "localize", "options": map[string]any{"task": "Locate Foo again"}}},
 	}
 	for _, request := range requests {
 		t.Run(request.name, func(t *testing.T) {
@@ -563,6 +563,89 @@ func TestHandleFacadeTaskCannotEscapeTerminalState(t *testing.T) {
 	}
 }
 
+// An answer_ready contract retains evidence for one task. A later call naming
+// an unrelated task must not receive that evidence as its answer, and must not
+// escape the contract either: it is refused and pointed at new_user_task.
+func TestHandleFacadeUnrelatedTaskIsNotAnsweredWithRetainedEvidence(t *testing.T) {
+	registry := newFacadeRegistry()
+	calls := 0
+	registry.capture(mcpgo.NewTool("explore", mcpgo.WithString("task", mcpgo.Required())), func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		calls++
+		return mcpgo.NewToolResultText("unexpected"), nil
+	})
+	server := &Server{facades: registry, localization: newLocalizationTerminalState(), sessions: newSessionMap()}
+	ctx := WithSessionID(context.Background(), "unrelated-task")
+	terminal := server.localizationFor(ctx)
+	retained := newLocalizationCompletion(true, "")
+	retained.digest = testEvidenceDigest()
+	const retainedTask = "find the payment retry scheduler implementation in this codebase"
+	terminal.armForTask(retained, retainedTask)
+
+	for _, operation := range []string{"localize", "task"} {
+		req := mcpgo.CallToolRequest{}
+		req.Params.Name = "explore"
+		req.Params.Arguments = map[string]any{"operation": operation, "task": "find where TLS certificate rotation happens"}
+		result, err := server.handleFacade(ctx, "explore", req)
+		if err != nil || result == nil || !result.IsError {
+			t.Fatalf("unrelated explore(%s) = (%#v, %v), want refusal", operation, result, err)
+		}
+		text, _ := singleTextContent(result)
+		if strings.Contains(text, localizationAnswerHeading) || strings.Contains(text, localizationAnswerReadyDirective) {
+			t.Fatalf("unrelated explore(%s) replayed retained evidence: %q", operation, text)
+		}
+		if !strings.Contains(text, "new_user_task:true") {
+			t.Fatalf("unrelated explore(%s) refusal does not name new_user_task: %q", operation, text)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("unrelated task dispatched %d legacy call(s)", calls)
+	}
+	if token, blocked := terminal.beginLocalize("find where TLS certificate rotation happens", false); token != 0 || blocked == nil || !blocked.IsError {
+		t.Fatalf("unrelated beginLocalize = (%d, %#v), want refusal without reservation", token, blocked)
+	}
+
+	// The contract is still armed: task-less navigation and a rewording of the
+	// retained task keep the replay.
+	requireLocalizationTerminalReplay(t, terminal.block("search", "text", map[string]any{"query": "TLS certificate rotation"}), "search", "text")
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = "explore"
+	req.Params.Arguments = map[string]any{"operation": "localize", "task": "where is the payment retry scheduler"}
+	result, err := server.handleFacade(ctx, "explore", req)
+	if err != nil {
+		t.Fatalf("same-task localize transport error = %v", err)
+	}
+	requireLocalizationTerminalReplay(t, result, "explore", "localize")
+	terminal.mu.Lock()
+	fingerprint := terminal.taskFingerprint
+	state := terminal.state
+	terminal.mu.Unlock()
+	if fingerprint != retainedTask || state != localizationStateAnswerReady {
+		t.Fatalf("refused unrelated task changed the contract: fingerprint %q, state %q", fingerprint, state)
+	}
+}
+
+func TestLocalizationTaskUnrelated(t *testing.T) {
+	const retained = "find the payment retry scheduler implementation in this codebase"
+	for _, tc := range []struct {
+		retained, task string
+		want           bool
+	}{
+		{retained, "", false},
+		{retained, "   ", false},
+		{retained, retained, false},
+		{retained, "  find the payment   retry scheduler implementation in this codebase ", false},
+		{retained, "where does the retry scheduler run", false},
+		{retained, "find it again", false},
+		{retained, "find where TLS certificate rotation happens", true},
+		{"Locate Foo", "Locate Bar", true},
+		{"", "find where TLS certificate rotation happens", false},
+	} {
+		if got := localizationTaskUnrelated(localizationTaskFingerprint(tc.retained), tc.task); got != tc.want {
+			t.Errorf("localizationTaskUnrelated(%q, %q) = %v, want %v", tc.retained, tc.task, got, tc.want)
+		}
+	}
+}
+
 func TestHandleFacadeTaskRunsWhenTerminalInactive(t *testing.T) {
 	registry := newFacadeRegistry()
 	called := false
@@ -992,7 +1075,7 @@ func TestHandleFacadeExplicitNewUserTaskCommitsOnSuccess(t *testing.T) {
 		t.Fatalf("successful boundary committed fingerprint %q", fingerprint)
 	}
 
-	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate Baz"}
+	req.Params.Arguments = map[string]any{"operation": "localize", "task": "Locate Bar again"}
 	blocked, err := server.handleFacade(ctx, "explore", req)
 	if err != nil || calls != 1 {
 		t.Fatalf("later localize without boundary escaped: result=%#v err=%v calls=%d", blocked, err, calls)

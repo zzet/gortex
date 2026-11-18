@@ -12,6 +12,7 @@ package store_sqlite
 // created in schema.go (edges_by_from / edges_by_to / nodes_by_kind).
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -59,49 +60,154 @@ func anaDedupeEdgeKinds(in []graph.EdgeKind) []graph.EdgeKind {
 // node-id exclusion happens here. The NOT-EXISTS filter runs server-side
 // per node kind.
 func (s *Store) DeadCodeCandidates(allowedNodeKinds []graph.NodeKind, allowedInEdgeKinds map[graph.NodeKind][]graph.EdgeKind) []*graph.Node {
+	out, _ := s.DeadCodeCandidatesContext(s.readContext(), allowedNodeKinds, allowedInEdgeKinds)
+	return out
+}
+
+// deadCodePageSize bounds one DeadCodeCandidates page: how many nodes of a
+// kind one short read transaction examines.
+var deadCodePageSize = 4096
+
+// DeadCodeCandidatesContext is DeadCodeCandidates in keyset pages, stopping
+// within one page once ctx ends (returning the candidates found so far and
+// ctx's error). Per kind, each page is two short read transactions: the
+// next deadCodePageSize node ids of the kind in id order, each with its
+// "no counting incoming edge" verdict (nodes_by_generation seek plus one
+// NOT EXISTS probe per id), then the full rows of the candidates among them.
+// The former single statement per kind scanned the whole generation inside
+// one read transaction — minutes on a large store, pinning the WAL snapshot
+// the whole time. Rows and their order equal the single statement's on an
+// unchanging generation.
+func (s *Store) DeadCodeCandidatesContext(ctx context.Context, allowedNodeKinds []graph.NodeKind, allowedInEdgeKinds map[graph.NodeKind][]graph.EdgeKind) ([]*graph.Node, error) {
 	if len(allowedNodeKinds) == 0 {
-		return nil
+		return nil, nil
 	}
 	var out []*graph.Node
 	for _, nk := range allowedNodeKinds {
 		allowed := anaDedupeEdgeKinds(allowedInEdgeKinds[nk])
-		anyKindCounts := len(allowed) == 0
-
-		var q string
-		var args []any
-		// The reachability probe pairs generations with the node it is
-		// testing. Without the pairing an incoming edge from any other
-		// generation answers "used", and every node reads as reachable.
-		if anyKindCounts {
-			// Any incoming edge disqualifies the node.
-			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
-WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)
-  AND n.view_gen = ?
-ORDER BY n.id`
-			args = []any{string(nk), s.viewGen}
-		} else {
-			// Only an incoming edge of one of the allowed kinds counts.
-			q = `SELECT ` + lookupNodeCols + ` FROM nodes n
-WHERE n.kind = ?
-  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(len(allowed)) + `) AND e.view_gen = n.view_gen)
-  AND n.view_gen = ?
-ORDER BY n.id`
-			args = make([]any, 0, 2+len(allowed))
-			args = append(args, string(nk))
+		q := deadCodeVerdictPageSQL(len(allowed))
+		after := ""
+		for {
+			if err := ctx.Err(); err != nil {
+				return out, err
+			}
+			args := make([]any, 0, 4+len(allowed))
+			args = append(args, s.viewGen, after, string(nk))
 			for _, ek := range allowed {
 				args = append(args, string(ek))
 			}
-			args = append(args, s.viewGen)
-		}
-
-		for _, n := range s.queryNodesSQL(q, args...) {
-			if n != nil {
-				out = append(out, n)
+			args = append(args, deadCodePageSize)
+			dead, scanned, lastID, err := s.deadCodeVerdictPage(ctx, q, args...)
+			if err != nil {
+				return out, err
 			}
+			if len(dead) > 0 {
+				nodes, err := s.nodesByIDsOrdered(ctx, dead)
+				out = append(out, nodes...)
+				if err != nil {
+					return out, err
+				}
+			}
+			if scanned < deadCodePageSize {
+				break
+			}
+			after = lastID
 		}
 	}
-	return out
+	return out, nil
+}
+
+// deadCodeVerdictPageSQL is one page of a kind's ids with their verdict. The
+// reachability probe pairs generations with the node it is testing: without
+// the pairing an incoming edge from any other generation answers "used".
+// With no allowed edge kinds, any incoming edge counts as usage.
+func deadCodeVerdictPageSQL(allowedEdgeKinds int) string {
+	return `SELECT n.id, ` + deadCodeIncomingProbeSQL(allowedEdgeKinds) + ` FROM nodes n WHERE n.view_gen = ? AND n.id > ? AND n.kind = ? ORDER BY n.id LIMIT ?`
+}
+
+func deadCodeIncomingProbeSQL(allowedEdgeKinds int) string {
+	probe := `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.view_gen = n.view_gen)`
+	if allowedEdgeKinds > 0 {
+		probe = `NOT EXISTS (SELECT 1 FROM edges e WHERE e.to_id = n.id AND e.kind IN (` + inPlaceholders(allowedEdgeKinds) + `) AND e.view_gen = n.view_gen)`
+	}
+	return probe
+}
+
+// deadCodeVerdictPage runs one verdict page: the dead ids (in id order), how
+// many ids it examined, and the last one.
+func (s *Store) deadCodeVerdictPage(ctx context.Context, q string, args ...any) ([]string, int, string, error) {
+	// The probe's edge-kind placeholders sit in the SELECT list, before the
+	// WHERE clause's; reorder the arguments to match.
+	ordered := reorderDeadCodeArgs(args)
+	return s.scanDeadCodeVerdictPage(ctx, q, ordered...)
+}
+
+func (s *Store) scanDeadCodeVerdictPage(ctx context.Context, q string, args ...any) ([]string, int, string, error) {
+	rows, err := outlineRows(ctx, s.db, outlineQuery{sql: q, args: args})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, 0, "", ctx.Err()
+		}
+		panicOnFatal(err)
+		return nil, 0, "", err
+	}
+	defer rows.Close()
+	var dead []string
+	scanned := 0
+	var lastID string
+	for rows.Next() {
+		var id string
+		var isDead bool
+		if err := rows.Scan(&id, &isDead); err != nil {
+			if ctx.Err() != nil {
+				return dead, scanned, lastID, ctx.Err()
+			}
+			panicOnFatal(err)
+			return dead, scanned, lastID, err
+		}
+		scanned++
+		lastID = id
+		if isDead {
+			dead = append(dead, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return dead, scanned, lastID, ctx.Err()
+		}
+		panicOnFatal(err)
+		return dead, scanned, lastID, err
+	}
+	return dead, scanned, lastID, nil
+}
+
+// reorderDeadCodeArgs maps (viewGen, after, kind, edgeKinds..., limit) onto
+// the SQL's placeholder order: the probe's edge kinds (in the SELECT list),
+// then viewGen, after, kind, limit.
+func reorderDeadCodeArgs(args []any) []any {
+	viewGen, after, kind := args[0], args[1], args[2]
+	edgeKinds := args[3 : len(args)-1]
+	limit := args[len(args)-1]
+	out := make([]any, 0, len(args))
+	out = append(out, edgeKinds...)
+	return append(out, viewGen, after, kind, limit)
+}
+
+// nodesByIDsOrdered reads the full rows of ids (sorted) on this handle's
+// generation, in id order, in one short read.
+func (s *Store) nodesByIDsOrdered(ctx context.Context, ids []string) ([]*graph.Node, error) {
+	var out []*graph.Node
+	for i := 0; i < len(ids); i += lookupChunkSize {
+		end := minInt(i+lookupChunkSize, len(ids))
+		chunk := ids[i:end]
+		q := `SELECT ` + lookupNodeCols + ` FROM ` + nodesByIDSource + ` WHERE id IN (` + inPlaceholders(len(chunk)) + `) AND view_gen = ? ORDER BY id`
+		page, _, _, err := s.scanNodePage(ctx, q, append(toAnyArgs(chunk), s.viewGen)...)
+		out = append(out, page...)
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // --- IfaceImplementsScanner ---------------------------------------------
@@ -120,6 +226,11 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
 	if err != nil {
 		return nil
 	}
+	out, _ := scanIfaceImplementsRows(rows)
+	return out
+}
+
+func scanIfaceImplementsRows(rows *sql.Rows) ([]graph.IfaceImplementsRow, error) {
 	defer rows.Close()
 
 	var out []graph.IfaceImplementsRow
@@ -146,9 +257,9 @@ WHERE e.kind = ? AND n.kind = ? AND n.meta IS NOT NULL AND e.view_gen = ?`
 	// iteration is different in kind — it truncates the projection — so it
 	// fails the whole call the way a failed Query does.
 	if rows.Err() != nil {
-		return nil
+		return nil, rows.Err()
 	}
-	return out
+	return out, nil
 }
 
 // --- MemberMethodsByType ------------------------------------------------
@@ -395,10 +506,12 @@ func (s *Store) CrossRepoCandidatesForMutation(baseKinds []graph.EdgeKind, edgeS
 	return s.crossRepoCandidates(baseKinds, nil, edgeFiles, incidentFiles)
 }
 
-func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
+// crossRepoCandidatesQuery builds the candidate query of crossRepoCandidates;
+// ok is false when the scope is empty or cannot be encoded.
+func (s *Store) crossRepoCandidatesQuery(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) (string, []any, bool) {
 	uniq := anaDedupeEdgeKinds(baseKinds)
 	if len(uniq) == 0 {
-		return nil
+		return "", nil, false
 	}
 	// The projection is the authoritative generation filter: both endpoint
 	// joins pair with the edge's generation and the edge itself is bound, so
@@ -426,7 +539,7 @@ JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 	if len(repoPrefixes) > 0 {
 		scopeJSON, ok := projectionJSON(repoPrefixes)
 		if !ok {
-			return nil
+			return "", nil, false
 		}
 		q = `WITH candidate_edges(id) AS (
   SELECT e.id
@@ -452,7 +565,7 @@ JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 		if len(edgeSourceFiles) > 0 {
 			scopeJSON, ok := projectionJSON(edgeSourceFiles)
 			if !ok {
-				return nil
+				return "", nil, false
 			}
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM edges e
@@ -464,33 +577,52 @@ JOIN nodes nt ON nt.id = e.to_id AND nt.view_gen = e.view_gen
 		if len(incidentNodeFiles) > 0 {
 			scopeJSON, ok := projectionJSON(incidentNodeFiles)
 			if !ok {
-				return nil
+				return "", nil, false
 			}
+			// CROSS JOIN pins the frontier files' nodes as the driving loop of
+			// both incident arms. With a plain JOIN the planner drove the
+			// incoming arm from edges_by_kind and probed nodes_by_file for
+			// every edge of the four base kinds. It planned it that way with
+			// no statistics, and also on a 6M-edge store whose sqlite_stat1
+			// estimated 667 rows per kind: 1m50s for a 5-file frontier there,
+			// 11ms pinned.
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
+  CROSS JOIN edges e ON e.from_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
 			args = appendKinds(args)
 			candidateQueries = append(candidateQueries, `SELECT e.id
   FROM nodes n
-  JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
+  CROSS JOIN edges e ON e.to_id = n.id AND e.view_gen = n.view_gen
   WHERE n.file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))
     AND e.kind IN (`+inPlaceholders(len(uniq))+`)`)
 			args = append(args, scopeJSON)
 			args = appendKinds(args)
 		}
+		// CROSS JOIN pins the frontier CTE as the driving loop. With a plain
+		// JOIN the planner drove from edges_by_to on view_gen alone (every
+		// edge of the generation) and probed the CTE per edge: 13-21 s per
+		// save on a 946k-edge store for a candidate set of a few hundred ids.
 		q = `WITH candidate_edges(id) AS (
 ` + strings.Join(candidateQueries, "\n  UNION\n  ") + `
 )
-` + fmt.Sprintf(projection, `candidate_edges ce JOIN edges e ON e.id = ce.id`)
+` + fmt.Sprintf(projection, `candidate_edges ce CROSS JOIN edges e ON e.id = ce.id`)
 		args = append(args, s.viewGen)
 	} else {
 		q = fmt.Sprintf(projection, `edges e`) + ` AND e.kind IN (` + inPlaceholders(len(uniq)) + `)`
 		// The projection's generation bind precedes the kind list in the text.
 		args = append(args, s.viewGen)
 		args = appendKinds(args)
+	}
+	return q, args, true
+}
+
+func (s *Store) crossRepoCandidates(baseKinds []graph.EdgeKind, repoPrefixes, edgeSourceFiles, incidentNodeFiles []string) []graph.CrossRepoCandidateRow {
+	q, args, ok := s.crossRepoCandidatesQuery(baseKinds, repoPrefixes, edgeSourceFiles, incidentNodeFiles)
+	if !ok {
+		return nil
 	}
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

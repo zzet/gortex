@@ -67,17 +67,19 @@ func TestWithAuth_BypassesOptionsForCORSPreflight(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestWithAuth_AcceptsQueryStringToken(t *testing.T) {
+func TestWithAuth_AcceptsBearerToken(t *testing.T) {
 	h := WithAuth(okHandler(), "secret-token")
-	req := httptest.NewRequest(http.MethodGet, "/v1/events?token=secret-token", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestWithAuth_RejectsWrongQueryStringToken(t *testing.T) {
+func TestWithAuth_RejectsWrongBearerToken(t *testing.T) {
 	h := WithAuth(okHandler(), "secret-token")
-	req := httptest.NewRequest(http.MethodGet, "/v1/events?token=wrong", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)

@@ -1,12 +1,14 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
 
@@ -147,9 +149,9 @@ type QueryOptions struct {
 	// don't care about the workspace boundary.
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	// ProjectID applies the same scoping for the soft sub-boundary.
-	// Honoured only when WorkspaceID is also set; on its own it would
-	// be ambiguous (two workspaces could declare a project with the
-	// same name).
+	// Honoured when WorkspaceID or an explicit RepoAllow is also set;
+	// on its own it would be ambiguous (two workspaces could declare
+	// a project with the same name).
 	ProjectID string `json:"project_id,omitempty"`
 	// RepoAllow, when non-empty, restricts traversal to nodes whose
 	// RepoPrefix is present in the allow-set. Nil or empty preserves
@@ -157,6 +159,18 @@ type QueryOptions struct {
 	// soft breadth control inside any workspace boundary, not a
 	// replacement for caller-side workspace isolation.
 	RepoAllow map[string]bool `json:"repo_allow,omitempty"`
+	// SearchNodeFilter restricts symbol-search candidates before bounded ranking
+	// and supplementary fills. It sees compact scope fields only and must be a
+	// pure predicate. Traversal and by-ID scope policy remain in ScopeAllows.
+	SearchNodeFilter func(*graph.Node) bool `json:"-"`
+	// SearchPathPrefixes are normalized, repo-relative slash-boundary prefixes.
+	// Capable base backends apply them before candidate limits and hydration;
+	// SearchNodeFilter remains the authoritative filter for every channel.
+	SearchPathPrefixes []string `json:"-"`
+	// SymbolSearchStats, used by path-scoped searches, retains raw text-channel
+	// saturation across a fan-out. A filtered short page alone cannot prove
+	// that the backend is exhausted. The caller resets it before a deeper pass.
+	SymbolSearchStats *SymbolSearchStats `json:"-"`
 	// ExcludeTests, when true, drops edges originating in test code —
 	// nodes flagged by the indexer's test-edge pass (Node.Meta["is_test"]
 	// = true) plus unflagged node kinds whose file path matches the
@@ -211,6 +225,12 @@ type QueryOptions struct {
 	// engine-side rerank invocations to zero. The merge-side rerank
 	// is the source of truth either way.
 	SkipInnerRerank bool `json:"-"`
+
+	// Context is the lifetime of the request this walk serves. When it ends,
+	// long graph walks (bfs and the backend BFS capability) stop and answer
+	// nothing rather than running on as abandoned work. nil falls back to the
+	// engine's own request context, if any. Never serialised.
+	Context context.Context `json:"-"`
 
 	// SkipVectorChannel, when true, makes gatherBackendCandidates skip
 	// the vector channel entirely — no embedder call, no ANN search.
@@ -268,6 +288,8 @@ type SearchTimings struct {
 	TextBackendMS  int64 // strictly inside Backend.Search / text channel
 	EmbedMS        int64 // inside embedder.Embed (vector path only)
 	VectorSearchMS int64 // inside vector.Search ANN call (vector path only)
+	RerankInner    rerank.Timing
+	RerankOuter    rerank.Timing
 	EngineRerankMS int64 // inside rerank.Pipeline.Rerank in SearchSymbolsRanked
 	// BundleMS accumulates the wall-clock spent inside
 	// SymbolBundleSearcherBackend.SearchSymbolBundles (one query per
@@ -277,6 +299,8 @@ type SearchTimings struct {
 	// derivation in the handler subtracts BundleMS so the existing
 	// fields stay meaningful.
 	BundleMS int64
+	// BundleLegs accumulates observed SQLite bundle legs across this request.
+	BundleLegs search.SymbolBundleTimings
 	// CacheHitRate is the fraction of post-merge candidates whose
 	// in/out edges were already in the rerank Context cache when the
 	// handler-side prepare() ran. 1.0 means every candidate was
@@ -296,50 +320,19 @@ type SearchTimings struct {
 // boundary on by-id and whole-graph handlers that don't route through
 // the engine's scoped traversal.
 func (o QueryOptions) ScopeAllows(n *graph.Node) bool {
-	if n == nil {
-		return true
-	}
-	if o.WorkspaceID != "" {
-		ws := n.WorkspaceID
-		if ws == "" {
-			ws = n.RepoPrefix
-		}
-		if ws != o.WorkspaceID {
-			return false
-		}
-		if o.ProjectID != "" {
-			proj := n.ProjectID
-			if proj == "" {
-				proj = n.RepoPrefix
-			}
-			if proj != o.ProjectID {
-				return false
-			}
-		}
-	}
-	// A node with an empty RepoPrefix is not owned by any repository, so a
-	// repo narrow can only ever be satisfied vacuously — the RepoAllow keys
-	// are registry prefixes, which such nodes never carry. Admit it: the
-	// workspace / project checks above still bound it for scoped sessions.
-	//
-	// Two populations land here. Synthetic global externals (dep::,
-	// external::, non-Go module::) model third-party symbols owned by no
-	// repo and are visible from every scope by construction — that is the
-	// durable reason. Nodes minted in single-repo (unprefixed) mode are the
-	// historical one, and go away once prefixing is unconditional.
-	//
-	// This is the same carve-out the MCP layer's filterNodes / field-query /
-	// API-impact filters apply. Every repo-narrow predicate in the codebase
-	// must agree on it: one that rejects instead of admitting turns a scoped
-	// query into an empty result rather than a narrower one.
-	if len(o.RepoAllow) > 0 && n.RepoPrefix != "" && !o.RepoAllow[n.RepoPrefix] {
-		return false
-	}
-	return true
+	return (graph.NodeScope{WorkspaceID: o.WorkspaceID, ProjectID: o.ProjectID, RepoAllow: o.RepoAllow}).Allows(n)
 }
 
 func (o QueryOptions) hasScopeFilter() bool {
 	return o.WorkspaceID != "" || len(o.RepoAllow) > 0
+}
+
+func (o QueryOptions) searchAllows(n *graph.Node) bool {
+	return n != nil && o.ScopeAllows(n) && (o.SearchNodeFilter == nil || o.SearchNodeFilter(n))
+}
+
+type SymbolSearchStats struct {
+	TextSaturated bool
 }
 
 // FilterByMinTier drops edges whose Origin rank is below minTier.

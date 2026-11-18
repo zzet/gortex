@@ -283,7 +283,7 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 	runGit(t, repo, "worktree", "add", "-q", "--", worktree, "feature")
 	report = pass()
 	revived := find(report, adminName)
-	if revived.Action != ActionRemovalCancelled || revived.State != store_sqlite.CheckoutStateReady {
+	if revived.Action != ActionRemovalCancelled || revived.State != store_sqlite.CheckoutStateReconciling {
 		t.Fatalf("recreated worktree = %+v", revived)
 	}
 	if revived.CheckoutID != linked.CheckoutID || revived.Incarnation != linked.Incarnation {
@@ -304,8 +304,13 @@ func TestReconcileFamilyAgainstRealGit(t *testing.T) {
 		t.Fatal("an inventory of a different repository was accepted")
 	}
 	for _, entry := range report.Checkouts {
-		if entry.Classification.Disposition != DispositionInaccessible {
-			t.Fatalf("%s classified %q against a foreign inventory", entry.AdminName, entry.Classification.Disposition)
+		fresh := gitstate.SamplePathEvidence(entry.RootPath)
+		want := DispositionUnknown
+		if fresh.RootExists && fresh.GitMarkerExists {
+			want = DispositionPresent
+		}
+		if entry.Classification.Disposition != want {
+			t.Fatalf("%s classified %q against a foreign inventory, want %s", entry.AdminName, entry.Classification.Disposition, want)
 		}
 	}
 }

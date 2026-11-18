@@ -193,3 +193,32 @@ func TestLoad_PlaintextHTTPWarning(t *testing.T) {
 		t.Error("expected a cleartext-http warning for a non-loopback host")
 	}
 }
+
+func TestAdd_PromptProfile(t *testing.T) {
+	isolate(t)
+	if err := Add("gw", llm.CustomProvider{BaseURL: "https://x/v1", Model: "m", PromptProfile: "huge"}); err == nil {
+		t.Error("an unknown prompt_profile must be rejected")
+	}
+	if err := Add("gw", llm.CustomProvider{BaseURL: "https://x/v1", Model: "m", PromptProfile: "frontier"}); err != nil {
+		t.Fatal(err)
+	}
+	cp, ok, err := Get("gw")
+	if err != nil || !ok || cp.PromptProfile != "frontier" {
+		t.Errorf("Get gw: %+v ok=%v err=%v, want prompt_profile frontier", cp, ok, err)
+	}
+}
+
+// TestAdd_PresetNameAllowedAndWins pins that a preset name is not
+// reserved: the user may register "requesty", and the merged entry
+// replaces the gateway preset.
+func TestAdd_PresetNameAllowedAndWins(t *testing.T) {
+	isolate(t)
+	if err := Add("requesty", llm.CustomProvider{BaseURL: "https://proxy.internal/v1", Model: "my-model"}); err != nil {
+		t.Fatalf("a preset name must be registrable: %v", err)
+	}
+	cfg, _ := Augment(llm.Config{Provider: "requesty"}.MergeEnv())
+	cp, ok := cfg.ActiveCustom()
+	if !ok || cp.BaseURL != "https://proxy.internal/v1" || cp.Model != "my-model" {
+		t.Errorf("providers.json entry must win over the preset: %+v ok=%v", cp, ok)
+	}
+}

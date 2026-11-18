@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -63,22 +64,20 @@ func TestFreshnessRider_ExtractorStalenessIsScopedToTheFilesLanguage(t *testing.
 	reg.Register(languages.NewJuliaExtractor())
 	g := graph.New()
 	store := &riderIndexStateStore{Store: g}
-	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
-
-	// A snapshot at the current global post-extraction policy epoch, with
-	// every language it tracked except julia. Keeping the policy epoch
-	// current isolates the per-language Julia bump; without it, the global
-	// policy upgrade intentionally makes every real language stale.
-	previous := map[string]int{"_post_extraction_policy": 2}
-	for _, lang := range []string{"go", "python", "java", "ruby", "rust", "c", "cpp",
-		"csharp", "php", "swift", "kotlin", "scala", "objc", "objcpp", "lua",
-		"dart", "elixir", "bash", "javascript", "typescript"} {
-		previous[lang] = 1
+	mi := indexer.NewMultiIndexer(store, reg, search.NewNull(), cm, zap.NewNop())
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
 	}
-	previous["c"], previous["cpp"], previous["csharp"] = 3, 2, 12
-	previous["go"], previous["php"], previous["scala"], previous["swift"] = 3, 2, 2, 2
+
+	// Use the actual policy snapshot persisted by this index, so unrelated
+	// extractor or global policy bumps cannot accidentally stale the Go file.
+	require.NotEmpty(t, store.st.ExtractorVersions)
+	require.Empty(t, indexer.ExtractorVersionStaleLangs(store.st.ExtractorVersions))
+	var previous map[string]int
+	require.NoError(t, json.Unmarshal([]byte(store.st.ExtractorVersions), &previous))
+	require.Greater(t, previous["julia"], 1, "the fixture needs a prior Julia extractor version")
+	previous["julia"]--
 	encoded, err := json.Marshal(previous)
 	require.NoError(t, err)
 	store.st = graph.RepoIndexState{RepoPrefix: "repo-a", ExtractorVersions: string(encoded)}
@@ -92,7 +91,7 @@ func TestFreshnessRider_ExtractorStalenessIsScopedToTheFilesLanguage(t *testing.
 	}
 
 	// julia IS stale against that snapshot...
-	require.Contains(t, indexer.ExtractorVersionStaleLangs(string(encoded)), "julia")
+	require.Equal(t, []string{"julia"}, indexer.ExtractorVersionStaleLangs(string(encoded)))
 
 	// ...but a fresh Go file must draw no rider at all. Before the
 	// narrowing this returned {"extractor_stale_langs":["julia"], ...} on

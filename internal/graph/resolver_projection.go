@@ -91,6 +91,7 @@ type FileNodeIdentity struct {
 	FilePath    string
 	RepoPrefix  string
 	WorkspaceID string
+	Language    string
 }
 
 // FileNodeIdentitySequencer streams file identities. A nil repository slice
@@ -455,6 +456,7 @@ func fileNodeIdentity(node *Node) FileNodeIdentity {
 	return FileNodeIdentity{
 		ID: node.ID, FilePath: node.FilePath,
 		RepoPrefix: node.RepoPrefix, WorkspaceID: node.WorkspaceID,
+		Language: node.Language,
 	}
 }
 

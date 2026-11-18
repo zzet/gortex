@@ -48,6 +48,7 @@ var rootCmd = &cobra.Command{
 		platform.MigrateToUnifiedHome(func(format string, a ...any) {
 			fmt.Fprintf(os.Stderr, format+"\n", a...)
 		})
+		refreshAgentFilesFromCLI(cmd)
 	},
 	// Runs after every subcommand (no subcommand defines its own
 	// PersistentPostRun, so cobra falls through to the root's). Records the
@@ -55,9 +56,35 @@ var rootCmd = &cobra.Command{
 	// and consent-gated, so a default run touches no disk and never affects
 	// the command's exit.
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		recordCLIUsage(cmd, telemetry.NewStore(platform.TelemetryDir()), os.Getenv)
-		recordCLIEvent(cmd, os.Getenv)
+		recordCLIInvocationAfterRun(cmd)
 	},
+}
+
+const foregroundDaemonRecorded = "gortex.foreground-daemon-recorded"
+
+// A foreground daemon cannot open the CLI sidecar after its shared stack has
+// closed. Record its invocation on actual foreground entry instead. The detach
+// parent still uses the ordinary post-run path; the child exclusions below are
+// unchanged. An annotation belongs to this invocation, not a process registry.
+func recordForegroundDaemonInvocation(cmd *cobra.Command) {
+	recordCLIInvocation(cmd)
+	if cmd.Annotations == nil {
+		cmd.Annotations = make(map[string]string)
+	}
+	cmd.Annotations[foregroundDaemonRecorded] = "true"
+}
+
+func recordCLIInvocationAfterRun(cmd *cobra.Command) {
+	if cmd.Annotations[foregroundDaemonRecorded] == "true" {
+		delete(cmd.Annotations, foregroundDaemonRecorded)
+		return
+	}
+	recordCLIInvocation(cmd)
+}
+
+func recordCLIInvocation(cmd *cobra.Command) {
+	recordCLIUsage(cmd, telemetry.NewStore(platform.TelemetryDir()), os.Getenv)
+	recordCLIEvent(cmd, os.Getenv)
 }
 
 // cliEventSidecarPath resolves the sidecar database the consent-free CLI-verb
@@ -141,9 +168,10 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default .gortex.yaml)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	rootCmd.PersistentFlags().BoolVar(&noProgress, "no-progress", false, "disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)")
+	rootCmd.PersistentFlags().BoolVar(&cliRequireFresh, "require-fresh", false, "wait for graph freshness; exit 4 if the requested tier remains pending or failed")
 }
 
-func newLogger() *zap.Logger {
+func newLoggerConfig() zap.Config {
 	level := zapcore.InfoLevel
 	switch logLevel {
 	case "debug":
@@ -157,7 +185,11 @@ func newLogger() *zap.Logger {
 	cfg.Level = zap.NewAtomicLevelAt(level)
 	cfg.OutputPaths = []string{"stderr"}
 	cfg.ErrorOutputPaths = []string{"stderr"}
-	logger, err := cfg.Build()
+	return cfg
+}
+
+func newLogger() *zap.Logger {
+	logger, err := newLoggerConfig().Build()
 	if err != nil {
 		// Fallback.
 		logger = zap.NewNop()
@@ -187,6 +219,12 @@ func execute() {
 			}
 			os.Exit(ec.code)
 		}
+		// Any other error that names its exit code (repoLoadingError's 75)
+		// was already printed by cobra; only the code is left to honour.
+		var coded interface{ ExitCode() int }
+		if errors.As(err, &coded) {
+			os.Exit(coded.ExitCode())
+		}
 		os.Exit(1)
 	}
 }
@@ -214,6 +252,7 @@ func assignCommandGroups() {
 		"mcp":    "serve",
 		"daemon": "engine", "track": "engine", "untrack": "engine",
 		"repos": "engine", "status": "engine", "proxy": "engine", "workspace": "engine",
+		"store": "engine",
 		"query": "query", "context": "query", "audit": "query", "wiki": "query",
 		"docs": "query", "export": "query", "wakeup": "query", "prs": "query",
 		"review": "query", "call": "query", "tools": "query",

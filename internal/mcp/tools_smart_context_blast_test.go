@@ -1,7 +1,12 @@
 package mcp
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"testing"
+
+	"github.com/zzet/gortex/internal/graph"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,4 +79,55 @@ func TestSmartContext_WorkingSetClustered(t *testing.T) {
 		require.True(t, ok, "each cluster carries a symbols list")
 		assert.NotEmpty(t, syms, "a cluster must carry at least one symbol id")
 	}
+}
+
+// TestBuildBlastRadiusCapsCoveringTests verifies a symbol covered by more
+// tests than the cap keeps the first blastRadiusTestLimit of the sorted list,
+// reports the full count, and marks the gcx header as truncated.
+func TestBuildBlastRadiusCapsCoveringTests(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	const helperID = "pkg/helper.go::Helper"
+	helper := &graph.Node{ID: helperID, Name: "Helper", Kind: graph.KindFunction, FilePath: "pkg/helper.go", StartLine: 1}
+	srv.graph.AddNode(helper)
+	total := blastRadiusTestLimit + 5
+	for i := 0; i < total; i++ {
+		testID := fmt.Sprintf("pkg/helper_test.go::TestHelper%02d", i)
+		srv.graph.AddNode(&graph.Node{ID: testID, Name: fmt.Sprintf("TestHelper%02d", i), Kind: graph.KindFunction, FilePath: "pkg/helper_test.go", StartLine: 10 + i})
+		srv.graph.AddEdge(&graph.Edge{From: testID, To: helperID, Kind: graph.EdgeTests, FilePath: "pkg/helper_test.go", Line: 11 + i})
+	}
+
+	br := srv.buildBlastRadius(context.Background(), []*graph.Node{helper})
+	require.NotNil(t, br)
+	tests, _ := br["covering_tests"].([]map[string]any)
+	require.Len(t, tests, blastRadiusTestLimit)
+	assert.Equal(t, "TestHelper00", tests[0]["function"])
+	assert.Equal(t, total, br["covering_tests_total"])
+	assert.Equal(t, true, br["covering_tests_truncated"])
+
+	encoded, err := encodeSmartContext(map[string]any{"blast_radius": br})
+	require.NoError(t, err)
+	assert.True(t, bytes.Contains(encoded, []byte(fmt.Sprintf("total=%d", total))), "gcx header must carry the full count: %s", encoded)
+}
+
+// TestPackRootTracksCoveringTestsTotal guards if_none_match: when a new
+// covering test sorts after the capped prefix, the visible list is
+// unchanged but the total is not, so the pack root must change.
+func TestPackRootTracksCoveringTestsTotal(t *testing.T) {
+	rootWith := func(n int) string {
+		srv, _ := setupTestServer(t)
+		const helperID = "pkg/helper.go::Helper"
+		helper := &graph.Node{ID: helperID, Name: "Helper", Kind: graph.KindFunction, FilePath: "pkg/helper.go", StartLine: 1}
+		srv.graph.AddNode(helper)
+		for i := 0; i < n; i++ {
+			testID := fmt.Sprintf("pkg/helper_test.go::TestHelper%02d", i)
+			srv.graph.AddNode(&graph.Node{ID: testID, Name: fmt.Sprintf("TestHelper%02d", i), Kind: graph.KindFunction, FilePath: "pkg/helper_test.go", StartLine: 10 + i})
+			srv.graph.AddEdge(&graph.Edge{From: testID, To: helperID, Kind: graph.EdgeTests, FilePath: "pkg/helper_test.go", Line: 11 + i})
+		}
+		br := srv.buildBlastRadius(context.Background(), []*graph.Node{helper})
+		return computePackRoot(map[string]any{"blast_radius": br})
+	}
+
+	assert.NotEqual(t, rootWith(blastRadiusTestLimit), rootWith(blastRadiusTestLimit+1), "crossing the cap must change the pack root")
+	assert.NotEqual(t, rootWith(blastRadiusTestLimit+5), rootWith(blastRadiusTestLimit+6), "a new total above the cap must change the pack root")
+	assert.Equal(t, rootWith(blastRadiusTestLimit+5), rootWith(blastRadiusTestLimit+5))
 }

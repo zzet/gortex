@@ -63,6 +63,22 @@ func TestScopeIndexability_ExcludedTreeIsSourceFree(t *testing.T) {
 	}
 }
 
+// A re-include under .git once let the walk claim Git's own files. Every
+// .git folder is closed now, whether the scope starts above it or inside
+// it, and in any letter case.
+func TestScopeIndexability_GitFoldersHoldNoSource(t *testing.T) {
+	root := t.TempDir()
+	idx := newAdmissionTestIndexer(t, root, "!.git/hooks/")
+	writeExcludeFixture(t, filepath.Join(root, ".git", "hooks", "pre-commit.go"), "package hooks\n")
+	writeExcludeFixture(t, filepath.Join(root, "sub", ".GIT", "hooks", "pre-commit.go"), "package hooks\n")
+
+	for _, rel := range []string{"", ".git", ".git/hooks", "sub", "sub/.GIT/hooks"} {
+		if mustScope(t, idx, rel) {
+			t.Errorf("ScopeIndexability(%q) claimed a file inside a .git folder", rel)
+		}
+	}
+}
+
 func TestScopeIndexability_UnclaimedNamesAreSourceFree(t *testing.T) {
 	root := t.TempDir()
 	idx := newAdmissionTestIndexer(t, root)

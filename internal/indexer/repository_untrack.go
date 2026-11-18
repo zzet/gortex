@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/search"
+	"go.uber.org/zap"
 )
 
 // UntrackRepoChecked hides and removes one live repository without changing
@@ -36,6 +38,41 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	force bool,
 	finalize func(*RepoMetadata) error,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	return mi.untrackRepoCheckedRetainingAdmission(ctx, repoPrefix, force, finalize, false)
+}
+
+// untrackRepoCheckedRetainingAdmission is the lifecycle-only continuation path.
+// Legacy callers keep the four-argument wrapper and release admission normally.
+func (mi *MultiIndexer) untrackRepoCheckedRetainingAdmission(
+	ctx context.Context,
+	repoPrefix string,
+	force bool,
+	finalize func(*RepoMetadata) error,
+	retainAdmission bool,
+) (nodesRemoved, edgesRemoved int, err error) {
+	return mi.untrackRepoWithOwner(ctx, repoPrefix, force, finalize, retainAdmission, nil, nil)
+}
+
+// purgeRepoOwnedChecked is promotion rollback, not authoritative untrack. It
+// may remove only the registration that attempt actually observed. The witness
+// is checked again after the existing stable lane drains and before payload or
+// registry teardown; a replacement owner is never selected by prefix alone.
+func (mi *MultiIndexer) purgeRepoOwnedChecked(ctx context.Context, expected prefixOwnerWitness, stopWatcher func()) (int, int, error) {
+	if expected.meta == nil || expected.prefix == "" {
+		return 0, 0, errPrefixIdentityUnknown
+	}
+	return mi.untrackRepoWithOwner(ctx, expected.prefix, true, nil, false, &expected, stopWatcher)
+}
+
+func (mi *MultiIndexer) untrackRepoWithOwner(
+	ctx context.Context,
+	repoPrefix string,
+	force bool,
+	finalize func(*RepoMetadata) error,
+	retainAdmission bool,
+	expected *prefixOwnerWitness,
+	stopOwnedWatcher func(),
+) (nodesRemoved, edgesRemoved int, err error) {
 	if repoPrefix == "" {
 		return 0, 0, fmt.Errorf("indexer: repository teardown refuses an empty prefix")
 	}
@@ -53,7 +90,11 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	state := mi.pendingRepositoryUntracks[repoPrefix]
 	metaSnapshot, tracked := mi.repos[repoPrefix]
 	idxSnapshot := mi.indexers[repoPrefix]
+	ownerErr := mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected)
 	mi.mu.RUnlock()
+	if ownerErr != nil {
+		return 0, 0, ownerErr
+	}
 
 	var coordinator *repositoryMutationCoordinator
 	if state != nil {
@@ -87,6 +128,12 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	if err := coordinator.closeAndWait(ctx); err != nil {
 		return 0, 0, fmt.Errorf("indexer: drain repository %s before teardown: %w", repoPrefix, err)
 	}
+	mi.mu.RLock()
+	ownerErr = mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected)
+	mi.mu.RUnlock()
+	if ownerErr != nil {
+		return 0, 0, ownerErr
+	}
 
 	mi.batchMutationGate.RLock()
 	defer mi.batchMutationGate.RUnlock()
@@ -94,7 +141,17 @@ func (mi *MultiIndexer) untrackRepoChecked(
 	topologyChanged := false
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
+	mi.goModuleMu.Lock()
+	stamp := mi.goModuleFiles[repoPrefix]
+	hadGoModule := mi.goModuleCache[repoPrefix] != "" || stamp.modified != 0
+	mi.goModuleMu.Unlock()
+	hadRules := mi.configMgr != nil && len(mi.configMgr.GetRepoConfig(repoPrefix).CrossWorkspaceDeps) > 0
+	goModuleAffected := hadGoModule || hadRules || len(graph.ReadRepoFilePaths(mi.graph, repoPrefix, "", []string{"go"}, nil)) > 0
 	mi.mu.Lock()
+	if err := mi.validatePrefixCleanupOwnerLocked(repoPrefix, expected); err != nil {
+		mi.mu.Unlock()
+		return 0, 0, err
+	}
 	state = mi.pendingRepositoryUntracks[repoPrefix]
 	if state == nil {
 		meta := mi.repos[repoPrefix]
@@ -109,11 +166,12 @@ func (mi *MultiIndexer) untrackRepoChecked(
 			return 0, 0, fmt.Errorf("indexer: repository teardown for %s lost its mutation lane", repoPrefix)
 		}
 		state = &repositoryUntrackState{
-			metadata:    meta,
-			indexer:     idx,
-			coordinator: coordinator,
-			contract:    mi.contractInvalidationPlanForRepo(idx),
-			finalize:    finalize,
+			metadata:         meta,
+			indexer:          idx,
+			coordinator:      coordinator,
+			contract:         mi.contractInvalidationPlanForRepo(idx),
+			finalize:         finalize,
+			goModuleAffected: goModuleAffected,
 		}
 		if mi.pendingRepositoryUntracks == nil {
 			mi.pendingRepositoryUntracks = make(map[string]*repositoryUntrackState)
@@ -126,13 +184,36 @@ func (mi *MultiIndexer) untrackRepoChecked(
 		}
 	}
 	mi.mu.Unlock()
+	if state.metadata != nil {
+		mi.forgetRepoLoad(state.metadata.RootPath)
+	}
+	if expected != nil && stopOwnedWatcher != nil {
+		// The witness was accepted inside the drained stable lane and the
+		// registry is hidden. Stop only that owner's watcher, outside mi.mu
+		// and the cleanup continuation lock, before any payload is removed.
+		stopOwnedWatcher()
+	}
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	state.retainAdmission = state.retainAdmission || retainAdmission
 	if state.finalize == nil && finalize != nil {
 		state.finalize = finalize
 	}
+	finalizeConfig := func() error {
+		if state.configFinalized || state.finalize == nil {
+			return nil
+		}
+		if err := state.finalize(state.metadata); err != nil {
+			return fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
+		}
+		state.configFinalized = true
+		return nil
+	}
 	if state.completed {
+		if err := mi.finalizeCompletedRepositoryUntrackConfig(repoPrefix, state, coordinator); err != nil {
+			return state.nodesRemoved, state.edgesRemoved, err
+		}
 		return state.nodesRemoved, state.edgesRemoved, nil
 	}
 
@@ -178,41 +259,109 @@ func (mi *MultiIndexer) untrackRepoChecked(
 			fmt.Errorf("indexer: authoritative cleanup for %s: %w", repoPrefix, err)
 	}
 
-	if !state.configFinalized && state.finalize != nil {
-		if err := state.finalize(state.metadata); err != nil {
-			return state.nodesRemoved, state.edgesRemoved,
-				fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
-		}
-		state.configFinalized = true
+	if err := finalizeConfig(); err != nil {
+		return state.nodesRemoved, state.edgesRemoved, err
 	}
 	if !state.contract.Empty() {
 		mi.ReconcileContractEdgesForFrontier(state.contract)
 	}
-
-	// Delete the continuation before opening admission. A caller that already
-	// holds its pointer observes completed=true; a fresh track cannot enter
-	// until the exact closed coordinator is detached immediately afterwards.
-	state.completed = true
-	mi.mu.Lock()
-	if mi.pendingRepositoryUntracks[repoPrefix] == state {
-		delete(mi.pendingRepositoryUntracks, repoPrefix)
+	if state.goModuleAffected {
+		mi.goModuleRetry.Invalidate()
+		cr := mi.newCrossRepoResolver()
+		if err := cr.RetryGoModuleDeps(ctx); err != nil {
+			// Removal and config finalization already committed. The invalidated
+			// retry state lets the next module pass finish this optional tail.
+			mi.logger.Warn("settle Go module callers after untrack deferred", zap.String("repo", repoPrefix), zap.Error(err))
+		}
+		// A canceled sweep can already have changed a bounded batch. Finish
+		// the source/parallel tails it recorded before dropping this pass.
+		mi.finishGoModuleCalls(cr)
+		mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 	}
-	mi.mu.Unlock()
-	mi.detachRepositoryMutationCoordinator(repoPrefix, coordinator)
+
+	// A cleanup reservation wins atomically over continuation deletion and
+	// keeps this exact closed lane for lifecycle finalization.
+	state.completed = true
+	if state.retainAdmission {
+		return state.nodesRemoved, state.edgesRemoved, nil
+	}
+	retained, detached := mi.detachRepositoryUntrackContinuation(repoPrefix, state, coordinator, nil)
+	if retained {
+		state.retainAdmission = true
+		return state.nodesRemoved, state.edgesRemoved, nil
+	}
+	if !detached {
+		return state.nodesRemoved, state.edgesRemoved,
+			fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
 	return state.nodesRemoved, state.edgesRemoved, nil
+}
+
+var errRepositoryUntrackContinuationChanged = fmt.Errorf("indexer: repository teardown continuation changed")
+
+// finalizeCompletedRepositoryUntrackConfig runs a callback supplied after the
+// payload phases completed only while the same continuation and mutation lane
+// still own the prefix. The caller owns state.mu through the callback.
+func (mi *MultiIndexer) finalizeCompletedRepositoryUntrackConfig(
+	repoPrefix string,
+	state *repositoryUntrackState,
+	coordinator *repositoryMutationCoordinator,
+) error {
+	if state == nil || coordinator == nil || state.coordinator != coordinator {
+		return fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
+	if state.configFinalized || state.finalize == nil {
+		return nil
+	}
+	mi.mu.RLock()
+	mi.repositoryMutationMu.Lock()
+	current := mi.pendingRepositoryUntracks[repoPrefix] == state &&
+		mi.repositoryMutations[repoPrefix] == coordinator
+	mi.repositoryMutationMu.Unlock()
+	mi.mu.RUnlock()
+	if !current {
+		return fmt.Errorf("%w for %s", errRepositoryUntrackContinuationChanged, repoPrefix)
+	}
+	if err := state.finalize(state.metadata); err != nil {
+		return fmt.Errorf("indexer: finalize repository cleanup for %s: %w", repoPrefix, err)
+	}
+	state.configFinalized = true
+	return nil
 }
 
 func (mi *MultiIndexer) purgeRepositoryPayload(
 	repoPrefix string, meta *RepoMetadata,
 ) (nodesRemoved, edgesRemoved int, err error) {
+	restubTrackedNpmRepoIncoming(mi.graph, repoPrefix)
+	parked := restubGoModuleRepoIncoming(mi.graph, repoPrefix)
 	if purger, ok := mi.graph.(interface{ PurgeRepo(string) error }); ok {
 		if err := purger.PurgeRepo(repoPrefix); err != nil {
 			return 0, 0, fmt.Errorf("purge repository payload: %w", err)
+		}
+		if err := mi.finalizeUntrackedGoModuleCalls(parked); err != nil {
+			return 0, 0, err
 		}
 		if meta != nil {
 			return meta.NodeCount, meta.EdgeCount, nil
 		}
 		return 0, 0, nil
 	}
-	return evictRepoAllGenerations(mi.graph, repoPrefix)
+	nodesRemoved, edgesRemoved, err = evictRepoAllGenerations(mi.graph, repoPrefix)
+	if err == nil {
+		err = mi.finalizeUntrackedGoModuleCalls(parked)
+	}
+	return nodesRemoved, edgesRemoved, err
+}
+
+func (mi *MultiIndexer) finalizeUntrackedGoModuleCalls(parked []graph.EdgeIdentity) error {
+	if len(parked) == 0 {
+		return nil
+	}
+	cr := mi.newCrossRepoResolver()
+	if err := cr.ResolveDeferredGoModuleEdgeIdentities(parked); err != nil {
+		return err
+	}
+	mi.finishGoModuleCalls(cr)
+	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return nil
 }

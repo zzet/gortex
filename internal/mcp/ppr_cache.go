@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"container/list"
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -175,4 +176,89 @@ func (c *pprWalkCache) stats() (hits, misses int64, size, capacity int, enabled 
 	size = c.ll.Len()
 	c.mu.Unlock()
 	return c.hits.Load(), c.misses.Load(), size, c.cap, c.enabled
+}
+
+// Snapshot-identity scoping for the walk cache.
+//
+// The walk key content-addresses the seeds, the restart probability and the
+// per-package roots of the seed packages plus their 1-hop out-neighbours. It
+// is a statement about the packages nearest the seeds, not about the whole
+// subgraph a walk traverses — so two snapshots whose seed neighbourhoods are
+// byte-identical produce the same key even when they differ further out, and
+// two snapshots built over different corpora (the shared analysis pass's
+// whole-graph CSR, and a bounded CSR a request built from its own selected
+// reader) can collide on it as well.
+//
+// The cache is process-global and every request shares it, so the key alone
+// would let one snapshot's walk answer another's: a selected graph ranked by
+// scores computed over the shared corpus, which is a mixed view even when the
+// graph the request read was correct. A scope therefore namespaces every
+// entry by which snapshot produced it — the provenance of the CSR plus the
+// identity of the view the request selected — and refuses to cache at all
+// when that identity is not stable across requests.
+
+const (
+	// pprWalkSourceSharedAnalysis marks walks over the whole-graph CSR the
+	// shared analysis pass publishes (Server.getAdjacency).
+	pprWalkSourceSharedAnalysis = "analysis"
+	// pprWalkSourceSelectedReader marks walks over a bounded CSR the request
+	// built from the reader it actually reads through.
+	pprWalkSourceSelectedReader = "selected"
+)
+
+// pprCacheScope namespaces walk-cache entries by the snapshot that produced
+// them. The zero value is uncacheable, which is the right default for any
+// request whose snapshot identity cannot be named.
+type pprCacheScope struct {
+	// source is the provenance of the adjacency snapshot the walk ran over.
+	source string
+	// view is the identity of the selected snapshot the request reads —
+	// empty for the shared base corpus, which is the identity every unrouted
+	// request has always cached under.
+	view string
+	// roots names the exact node set a BOUNDED snapshot was built from, and
+	// is empty for a whole-graph snapshot (which has no root set to name).
+	// The walk key is content-addressed on the seed neighbourhood alone, so
+	// two requests over one view that bound their CSR differently — a wider
+	// max_depth, a larger max_nodes, another edge-kind set — produce the same
+	// walk key over materially different graphs. Without the root set in the
+	// namespace the narrower request's scores would answer the wider one.
+	roots string
+	// cacheable is false when entries must not be shared across requests at
+	// all (an editor-buffer overlay: per-session, mutable, and named by no
+	// durable identity).
+	cacheable bool
+}
+
+// withRoots returns the scope namespaced by the root set a bounded snapshot
+// was built from. A whole-graph snapshot leaves it empty.
+func (sc pprCacheScope) withRoots(digest string) pprCacheScope {
+	sc.roots = digest
+	return sc
+}
+
+// key namespaces a content-addressed walk key with the scope. It returns ""
+// — the cache's "do not store, never hit" key — for an uncacheable scope or
+// an empty walk key.
+func (sc pprCacheScope) key(walkKey string) string {
+	if !sc.cacheable || walkKey == "" {
+		return ""
+	}
+	return sc.source + "\x00" + sc.view + "\x00" + sc.roots + "\x00" + walkKey
+}
+
+// walkCacheScope is the scope a request's seeded walks over a snapshot of the
+// given provenance must carry. A request composing editor buffers is not
+// cacheable: the buffers are session-local mutable state that no durable view
+// identity names. Everything else is keyed by the identity of the view the
+// request selected, which is "" exactly when the shared corpus answers.
+func walkCacheScope(ctx context.Context, source string) pprCacheScope {
+	if OverlayViewFromContext(ctx) != nil {
+		return pprCacheScope{}
+	}
+	return pprCacheScope{
+		source:    source,
+		view:      requestOverlayViewCacheKey(ctx),
+		cacheable: true,
+	}
 }

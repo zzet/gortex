@@ -11,6 +11,8 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // TestTrackRepositoryDetachesFirstIndexFromRequestLifetime pins #326.
@@ -119,4 +121,56 @@ func TestTrackRepositoryAnswersBeforeTheRequestDeadline(t *testing.T) {
 	}, 30*time.Second, 25*time.Millisecond,
 		"the detached first index must register the repo and finish cleanly")
 	require.Len(t, mi.AllMetadata(), 1)
+}
+
+func TestTrackRepositoryPrefixCollisionNamesMCPParameter(t *testing.T) {
+	srv, mi := newWorktreeMCPServer(t)
+	first, second := filepath.Join(t.TempDir(), "src"), filepath.Join(t.TempDir(), "src")
+	for _, path := range []string{first, second} {
+		require.NoError(t, os.MkdirAll(path, 0o755))
+	}
+	_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Path: first})
+	require.NoError(t, err)
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": second}
+	res, err := srv.handleTrackRepository(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	text := extractTextFromContent(t, res.Content)
+	require.True(t, res.IsError, "expected prefix collision, got: %s", text)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(text), &payload))
+	require.Contains(t, payload["message"], "name parameter")
+	require.NotContains(t, payload["message"], "gortex track --name")
+	require.Equal(t, "prefix_collision", payload["error_code"])
+	require.Equal(t, first, payload["owner_path"], "compare decoded paths, including Windows JSON escapes")
+	// Preflight rejects the collision before a track job exists, so there is
+	// no worker to retire before the missing-owner retry below.
+	absSecond, err := filepath.Abs(second)
+	require.NoError(t, err)
+	_, stored := srv.trackInFlight.Load(trackRequestKey(pathkey.NormalizeVolume(absSecond), config.RepoEntry{Path: second}))
+	require.False(t, stored, "a preflight collision must not store a track job")
+	require.NoError(t, os.RemoveAll(first))
+	res, err = srv.handleTrackRepository(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	text = extractTextFromContent(t, res.Content)
+	require.True(t, res.IsError, "expected missing-owner collision, got: %s", text)
+	require.Contains(t, text, "no longer exists")
+	require.Contains(t, text, "untrack_repository")
+}
+
+func TestTrackRepositoryConfiguredNameChangeRequiresConfigEdit(t *testing.T) {
+	srv, mi := newWorktreeMCPServer(t)
+	root := t.TempDir()
+	require.NoError(t, srv.configManager.Global().AddRepo(config.RepoEntry{Path: root, Name: "src"}))
+	require.NoError(t, srv.configManager.Global().Save())
+	req := mcplib.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"path": root, "name": "other-src"}
+	res, err := srv.handleTrackRepository(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, res.IsError, "%+v", res.Content)
+	require.Contains(t, extractTextFromContent(t, res.Content), "already configured; set name: other-src")
+	require.Empty(t, mi.AllMetadata(), "refusal must precede indexing")
+	require.Equal(t, "src", srv.configManager.Global().FindRepoByPath(root).Name)
 }

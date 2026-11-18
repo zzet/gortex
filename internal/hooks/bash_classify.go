@@ -44,6 +44,13 @@ type BashClassification struct {
 	Path    string      // for ReadSource / ReadRange / WriteSource
 	Writes  []BashWrite // every recognised write target, for WriteSource
 	Primary string      // the primary command token (grep, rg, cat, …) — for messages
+	// Paths are the files and directories a GrepLike command searches, each
+	// joined onto the directory a leading `cd <dir> &&` chain moved into and
+	// with a leading `~` expanded; relative entries stay relative to the
+	// hook's cwd. Nil when the command names no path (stdin, or recursion from
+	// the working directory) or when any operand, or the directory the
+	// command runs in, cannot be read off the command line.
+	Paths []string
 }
 
 // classifyBashCommand inspects a Bash tool_input.command and returns the first
@@ -79,7 +86,18 @@ func classifyBashCommand(cmd string) BashClassification {
 // breath has to be able to come back here for the read answer rather than
 // losing it to a write classification that turned out not to apply.
 func classifyBashReadCommand(cmd string) BashClassification {
-	for _, seg := range primarySegments(cmd) {
+	return classifyBashReadCommandSkipping(cmd, nil)
+}
+
+// classifyBashReadCommandSkipping is classifyBashReadCommand with a veto: a
+// segment classification skip rejects is passed over and the search goes on
+// with the next primary segment. enrichBash uses it to look past a grep whose
+// every target lies outside the graph, so a source read chained after it is
+// still answered.
+func classifyBashReadCommandSkipping(cmd string, skip func(BashClassification) bool) BashClassification {
+	segments := primarySegments(cmd)
+	cdDir, cdSegments := leadingCdChain(cmd)
+	for idx, seg := range segments {
 		// A redirect names where output goes, not what the command reads:
 		// without removing it, `cat internal/x.go > /tmp/out.go` reports
 		// /tmp/out.go as the file being read and the indexed read is lost.
@@ -89,10 +107,33 @@ func classifyBashReadCommand(cmd string) BashClassification {
 			continue
 		}
 
-		switch tokens[0] {
+		// Command names are matched case-insensitively: PowerShell, which the
+		// Copilot and Pi adapters route through this classifier, accepts
+		// `Cat` and `GREP` as readily as `cat` and `grep`.
+		name := strings.ToLower(tokens[0])
+		if c, ok := classifyPowerShellRead(name, tokens, "", false); ok {
+			if c.Action == BashActionGrepLike {
+				if dir, known := segmentWorkingDir(segments, idx, cdDir, cdSegments); known {
+					c, _ = classifyPowerShellRead(name, tokens, dir, true)
+				}
+				if skip != nil && skip(c) {
+					continue
+				}
+			}
+			return c
+		}
+		tokens = append([]string{name}, tokens[1:]...)
+
+		switch name {
 		case "grep", "rg", "ag", "egrep", "fgrep":
 			if p, ok := extractGrepPattern(tokens); ok {
-				return BashClassification{Action: BashActionGrepLike, Pattern: p, Primary: tokens[0]}
+				c := BashClassification{Action: BashActionGrepLike, Pattern: p, Primary: tokens[0]}
+				if dir, known := segmentWorkingDir(segments, idx, cdDir, cdSegments); known {
+					c.Paths = grepSearchPaths(tokens, dir)
+				}
+				if skip == nil || !skip(c) {
+					return c
+				}
 			}
 		case "find":
 			if p, ok := extractFindName(tokens); ok {

@@ -16,7 +16,8 @@ import (
 )
 
 // preparedVectorPlan is the immutable hand-off between embedding and vector
-// publication. It owns only IDs and copied vectors: graph nodes and source
+// publication. It owns only IDs and the vectors the provider returned (each
+// vector has exactly one owner, the plan item): graph nodes and source
 // buffers are deliberately not retained across a cold-shadow drain.
 type preparedVectorPlan struct {
 	repoPrefix   string
@@ -160,7 +161,12 @@ func (idx *Indexer) prepareVectorPlan(ctx context.Context, nodes []*graph.Node) 
 		items:        make([]graph.VectorCorpusItem, 0, len(vectors)),
 		embeddedText: len(texts),
 	}
+	// The provider returns freshly allocated vectors and keeps no reference
+	// to them (see embedding.Provider.EmbedBatch), so each valid vector moves
+	// into its plan item instead of being copied. Clearing the source entry
+	// leaves the item as the vector's only owner.
 	for i, vec := range vectors {
+		vectors[i] = nil
 		valid := len(vec) == dims
 		if valid {
 			for _, value := range vec {
@@ -182,7 +188,7 @@ func (idx *Indexer) prepareVectorPlan(ctx context.Context, nodes []*graph.Node) 
 		plan.items = append(plan.items, graph.VectorCorpusItem{
 			NodeID:   ids[i],
 			ParentID: parentID,
-			Vec:      append([]float32(nil), vec...),
+			Vec:      vec,
 		})
 		if parentID != "" {
 			if plan.chunkMap == nil {

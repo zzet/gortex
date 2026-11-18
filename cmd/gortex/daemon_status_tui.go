@@ -50,6 +50,7 @@ type repoItem struct {
 	// "not indexed" — and replaces the counts cell when set. A repo
 	// whose directory is gone renders as a row of zeros otherwise,
 	// which reads as an empty repo rather than an absent one (#312).
+	// "loading (warmup)" also replaces the counts while warmup is pending.
 	state string
 }
 
@@ -111,12 +112,14 @@ func (d repoDelegate) Render(w io.Writer, m list.Model, index int, listItem list
 	fmt.Fprint(w, cursor+style.Render(row))
 }
 
-// repoItemState renders a tracked repo's inventory problem for the watch
-// TUI, or "" for a healthy repo (which shows its counts instead).
+// repoItemState renders a tracked repo's pending or problem state for the
+// watch TUI, or "" for a healthy repo (which shows its counts instead).
 func repoItemState(r daemon.TrackedRepoStatus) string {
 	switch {
 	case r.Missing:
 		return "MISSING — path deleted"
+	case r.Loading:
+		return "loading (warmup)"
 	case r.Unloaded:
 		return "not indexed"
 	case r.IndexHealthError != "":

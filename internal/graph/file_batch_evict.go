@@ -5,6 +5,12 @@ package graph
 // EvictFile's exact indexes/counters/receipt semantics while amortising the
 // lock and edge cleanup across a partial-reconcile chunk.
 func (g *Graph) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) {
+	return g.EvictFilesWithNodeIDs(filePaths, nil)
+}
+
+// EvictFilesWithNodeIDs keeps shared nodes at a legacy spelling outside the
+// replacement unless the caller explicitly identified them as file-owned.
+func (g *Graph) EvictFilesWithNodeIDs(filePaths, nodeIDs []string) (nodesRemoved, edgesRemoved int) {
 	pathSet := make(map[string]struct{}, len(filePaths))
 	for _, filePath := range filePaths {
 		if filePath != "" {
@@ -26,8 +32,10 @@ func (g *Graph) EvictFiles(filePaths []string) (nodesRemoved, edgesRemoved int) 
 			g.markMutationReceiptsIncomplete()
 		}
 	}()
-	nodesRemoved, edgesRemoved, scalarInvalidated = g.evictFileNodesLocked(pathSet, false)
+	nodesRemoved, edgesRemoved, scalarInvalidated = g.evictFileNodesLocked(pathSet, false, nodeIDs...)
 	return nodesRemoved, edgesRemoved
 }
 
 var _ FileBatchEvicter = (*Graph)(nil)
+
+var _ FileIdentityBatchEvicter = (*Graph)(nil)

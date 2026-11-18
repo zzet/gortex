@@ -138,6 +138,9 @@ func TestViewBuildGateCancellationFreesCapacity(t *testing.T) {
 
 func TestViewBuildGateBoundedQueuesPreserveFairness(t *testing.T) {
 	gate := newViewBuildGateWithLimits(8, 8)
+	// The burst mechanics alone: the background waiter counts as starved at
+	// once (the age bound is TestViewBuildGateStarvedBackgroundStillRuns).
+	gate.backgroundStarvation = 0
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	results := make(chan boundedGateAcquireResult, 6)

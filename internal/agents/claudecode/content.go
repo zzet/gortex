@@ -4,7 +4,7 @@
 //   - .mcp.json                   (project-level MCP stanza, shared)
 //   - .claude/commands/gortex-*.md (slash commands)
 //   - .claude/settings.json        (MCP tool permissions, shared)
-//   - .claude/settings.local.json  (PreToolUse/PreCompact/Stop hooks)
+//   - .claude/settings.local.json  (PreToolUse/Stop/SessionStart/... hooks)
 //   - CLAUDE.md                    (appended instructions block)
 //   - ~/.claude/skills/gortex-*    (user-level skills)
 //

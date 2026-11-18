@@ -12,6 +12,10 @@ import (
 // Keeping the check in Go rather than in a CHECK constraint means extending a
 // vocabulary is a code change, not a migration of every installed database.
 
+// DedicatedGraphReady is a dedicated graph that can serve queries. This is
+// distinct from ViewGenerationReady, which describes a published generation.
+const DedicatedGraphReady = "graph_ready"
+
 // CheckoutState is the lifecycle state of one working copy.
 type CheckoutState string
 
@@ -25,9 +29,8 @@ const (
 	// checkout but its removal deadline has not expired. Queries fall back to
 	// the family primary while the identity remains recoverable.
 	CheckoutStateRemovalGrace CheckoutState = "removal_grace"
-	// CheckoutStateUnavailable is a legacy persisted value from releases that
-	// retained an inaccessible checkout after grace. Current reconciliation
-	// retires it at the deadline; accepting the value keeps upgrades readable.
+	// CheckoutStateUnavailable retains an intended checkout after serving
+	// layers expire. Its identity and tracking configuration survive recovery.
 	CheckoutStateUnavailable CheckoutState = "checkout_unavailable"
 	// CheckoutStateReconciling means a reconciler is bringing the checkout's
 	// effective mode in line with its desired mode.
@@ -370,15 +373,17 @@ type ViewGeneration struct {
 	ConfigHash           string
 	ExtractorVersions    string
 	ResolverVersion      string
-	State                ViewGenerationState
-	CoveredFiles         int64
-	AffectedFiles        int64
-	StorageBytes         int64
-	Completeness         string
-	CreatedAt            int64 // unix seconds
-	PublishedAt          int64 // unix seconds
-	LastSelected         int64 // unix seconds
-	Error                string
+	// Empty denotes legacy/unproven derived dependency provenance.
+	DependencyRevision string
+	State              ViewGenerationState
+	CoveredFiles       int64
+	AffectedFiles      int64
+	StorageBytes       int64
+	Completeness       string
+	CreatedAt          int64 // unix seconds
+	PublishedAt        int64 // unix seconds
+	LastSelected       int64 // unix seconds
+	Error              string
 }
 
 // ViewGenerationFilter narrows a ListViewGenerations scan. Every field is

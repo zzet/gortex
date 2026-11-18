@@ -21,7 +21,7 @@ import (
 //
 // This interface avoids a circular dependency with the indexer package.
 type SourceReader interface {
-	Graph() graph.Store
+	Graph() graph.Reader
 	ResolveFilePath(graphPath string) string
 }
 
@@ -62,7 +62,7 @@ func GenerateScaffold(engine *query.Engine, reader SourceReader, exampleID, newN
 	if absPath == "" {
 		return nil, fmt.Errorf("could not resolve abs path for %s", node.FilePath)
 	}
-	source, err := readSourceLines(absPath, node.StartLine, node.EndLine)
+	source, _, endLine, err := scaffoldSource(reader, node, absPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read source for %s: %w", exampleID, err)
 	}
@@ -75,7 +75,7 @@ func GenerateScaffold(engine *query.Engine, reader SourceReader, exampleID, newN
 	// Add the new symbol edit — insert after the example symbol
 	result.Edits = append(result.Edits, ScaffoldEdit{
 		FilePath:      node.FilePath,
-		InsertionLine: node.EndLine + 1,
+		InsertionLine: endLine + 1,
 		Code:          substituted,
 		Reason:        "new_symbol",
 	})
@@ -85,7 +85,7 @@ func GenerateScaffold(engine *query.Engine, reader SourceReader, exampleID, newN
 	callerNodes := filterCallerNodes(callerSG, exampleID)
 
 	if len(callerNodes) > 0 {
-		regEdit := generateRegistrationCode(g, callerNodes, node, newName)
+		regEdit := generateRegistrationCode(g, reader, callerNodes, node, newName)
 		if regEdit != nil {
 			result.Edits = append(result.Edits, *regEdit)
 		}
@@ -102,6 +102,18 @@ func GenerateScaffold(engine *query.Engine, reader SourceReader, exampleID, newN
 	}
 
 	return result, nil
+}
+
+// A live caller can resolve declarations against the exact current bytes.
+// Static analysis fixtures retain the ordinary source-reader contract.
+func scaffoldSource(reader SourceReader, node *graph.Node, path string) (string, int, int, error) {
+	if live, ok := reader.(interface {
+		ScaffoldNodeSource(*graph.Node) (string, int, int, error)
+	}); ok {
+		return live.ScaffoldNodeSource(node)
+	}
+	text, err := readSourceLines(path, node.StartLine, node.EndLine)
+	return text, node.StartLine, node.EndLine, err
 }
 
 // readSourceLines reads lines [startLine, endLine] (1-indexed) from an
@@ -153,7 +165,7 @@ func filterCallerNodes(sg *query.SubGraph, exampleID string) []*graph.Node {
 
 // generateRegistrationCode creates a registration/wiring edit by analyzing how
 // the example symbol is called by its depth-1 callers.
-func generateRegistrationCode(g graph.Store, callers []*graph.Node, example *graph.Node, newName string) *ScaffoldEdit {
+func generateRegistrationCode(g graph.Reader, reader SourceReader, callers []*graph.Node, example *graph.Node, newName string) *ScaffoldEdit {
 	if len(callers) == 0 {
 		return nil
 	}
@@ -176,10 +188,13 @@ func generateRegistrationCode(g graph.Store, callers []*graph.Node, example *gra
 	regCode := fmt.Sprintf("// TODO: Register %s following the pattern of %s\n// See %s at line %d for the registration pattern",
 		newName, example.Name, caller.FilePath, callLine)
 
-	insertionLine := caller.EndLine
-	if callLine > 0 {
-		insertionLine = callLine + 1
+	// The generated wiring is a comment, so insert outside the current
+	// declaration rather than applying an old edge line inside changed text.
+	_, _, end, err := scaffoldSource(reader, caller, reader.ResolveFilePath(caller.FilePath))
+	if err != nil {
+		return nil
 	}
+	insertionLine := end + 1
 
 	return &ScaffoldEdit{
 		FilePath:      caller.FilePath,
@@ -191,7 +206,7 @@ func generateRegistrationCode(g graph.Store, callers []*graph.Node, example *gra
 
 // generateTestStub creates a test stub edit by finding the test file and test
 // functions associated with the example symbol.
-func generateTestStub(g graph.Store, reader SourceReader, example *graph.Node, newName string) *ScaffoldEdit {
+func generateTestStub(g graph.Reader, reader SourceReader, example *graph.Node, newName string) *ScaffoldEdit {
 	testFilePath := deriveTestFilePath(example.FilePath)
 
 	// Check if the test file exists on disk. Resolve abs path through
@@ -223,7 +238,7 @@ func generateTestStub(g graph.Store, reader SourceReader, example *graph.Node, n
 	}
 
 	// Read the test function source and substitute the name
-	testSource, err := readSourceLines(absTestPath, testExample.StartLine, testExample.EndLine)
+	testSource, _, end, err := scaffoldSource(reader, testExample, absTestPath)
 	if err != nil {
 		return nil
 	}
@@ -232,7 +247,7 @@ func generateTestStub(g graph.Store, reader SourceReader, example *graph.Node, n
 
 	return &ScaffoldEdit{
 		FilePath:      testFilePath,
-		InsertionLine: testExample.EndLine + 1,
+		InsertionLine: end + 1,
 		Code:          substituted,
 		Reason:        "test_stub",
 	}

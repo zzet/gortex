@@ -51,8 +51,10 @@ func prefixedServerOver(t *testing.T, dir, name string) (*Server, string) {
 
 	g := graph.New()
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, err = mi.IndexAll()
-	require.NoError(t, err)
+	for _, entry := range cm.Global().ReposSnapshot() {
+		_, err := mi.TrackRepoCtx(context.Background(), entry)
+		require.NoError(t, err)
+	}
 
 	srv := NewServer(query.NewEngine(g), g, nil, nil, zap.NewNop(), nil, MultiRepoOptions{
 		ConfigManager: cm,

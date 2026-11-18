@@ -117,7 +117,14 @@ func newInventoryController(t *testing.T, repos []config.RepoEntry) *realControl
 	reg := parser.NewRegistry()
 	languages.RegisterAll(reg)
 	mi := indexer.NewMultiIndexer(g, reg, search.NewNull(), cm, zap.NewNop())
-	_, _ = mi.IndexAll()
+	mi.ExpectRepos(repos)
+	for _, entry := range repos {
+		mi.StartRepoLoad(entry.Path)
+		_, trackErr := mi.TrackRepoCtx(context.Background(), entry)
+		// Missing entries deliberately remain configured but unavailable;
+		// inventory/status assertions below must still report those entries.
+		mi.FinishRepoLoad(entry.Path, trackErr)
+	}
 
 	return &realController{graph: g, multiIndexer: mi, configManager: cm, logger: zap.NewNop()}
 }

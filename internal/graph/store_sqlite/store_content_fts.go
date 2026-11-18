@@ -1,7 +1,6 @@
 package store_sqlite
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -64,10 +63,10 @@ const (
 // indexed sidecar, then deletes FTS rows by docid. Filtering the FTS5 table's
 // UNINDEXED repo/file columns directly would scan the entire virtual table.
 func deleteContentFTSByOwnershipTx(tx *sql.Tx, predicate string, args ...any) (int64, error) {
-	result, err := tx.Exec(`DELETE FROM content_fts
+	result, err := countContentFTSWrite(tx.Exec(`DELETE FROM content_fts
 WHERE rowid IN (
     SELECT fts_rowid FROM content_fts_rowid WHERE `+predicate+`
-)`, args...)
+)`, args...))
 	if err != nil {
 		return 0, err
 	}
@@ -360,7 +359,7 @@ AND file_path IN (SELECT CAST(value AS TEXT) FROM json_each(?))`
 				args = append(args, rowid, item.NodeID, repoPrefix, item.FilePath, item.Ordinal, item.Body)
 				ownerArgs = append(ownerArgs, s.viewGen, rowid, repoPrefix, item.FilePath)
 			}
-			if _, err := tx.Exec(insert.String(), args...); err != nil {
+			if _, err := countContentFTSWrite(tx.Exec(insert.String(), args...)); err != nil {
 				return err
 			}
 			stats.insertStatements++
@@ -437,7 +436,7 @@ func (s *Store) AppendContent(repoPrefix string, items []graph.ContentFTSItem) e
 		if len(args) == 0 {
 			continue
 		}
-		if _, err := tx.Exec(b.String(), args...); err != nil {
+		if _, err := countContentFTSWrite(tx.Exec(b.String(), args...)); err != nil {
 			return err
 		}
 		var owners strings.Builder
@@ -486,23 +485,32 @@ SELECT rowid, repo_prefix, file_path FROM content_fts`)
 	return err
 }
 
-// BuildContentIndex opportunistically merges FTS5 segments (a read-latency
-// improvement). Like BuildSymbolIndex it is a no-op for correctness — the
-// FTS index is maintained incrementally on every insert — and idempotent.
+// BuildContentIndex performs one bounded FTS5 segment merge for read latency.
+// Like BuildSymbolIndex it is a no-op for correctness: transactional inserts
+// maintain the index. fts_merge reports errors without failing the build.
+// Derived views and coordinated cold loads retain their existing deferral.
 func (s *Store) BuildContentIndex() error {
 	// Derived generations are immutable and invisible until publication. Their
-	// incremental FTS writes are already query-correct; optimizing the global
+	// incremental FTS writes are already query-correct; merging the global
 	// virtual table once per generation only multiplies writer hold time.
 	if s.viewGen > 0 {
 		return nil
 	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	var event bulkFinalizeEvent
+	merged := false
+	defer func() {
+		s.writeMu.Unlock()
+		if merged {
+			s.emitBulkFinalizeEvent(event)
+		}
+	}()
 	if s.coordinatedBulkLoad {
 		s.deferredContentFTS = true
 		return nil
 	}
-	_, _ = s.execActiveWriteLocked(context.Background(), `INSERT INTO content_fts(content_fts) VALUES('optimize')`)
+	event = s.mergeLiveFTSLocked("content_fts", `INSERT INTO content_fts(content_fts, rank) VALUES('merge', ?)`)
+	merged = true
 	return nil
 }
 

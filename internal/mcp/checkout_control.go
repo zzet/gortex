@@ -112,15 +112,33 @@ func viewlessCatalogTool(name string) bool {
 // Catalog lookup must not depend on a ready corpus listing its repository:
 // that is precisely the missing state a recovery request is meant to repair.
 func (s *Server) registeredCheckoutForPath(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
-	families, err := s.materializer.Catalog.ListRepositoryFamilies(ctx)
+	return graphview.RegisteredCheckoutForPath(ctx, s.materializer.Catalog, path)
+}
+
+// routedCheckoutForPath reports whether path resolves inside a *routed* linked
+// checkout — a registered worktree whose composed-view route is ready to serve —
+// rather than merely one that happens to be registered. A routed checkout is a
+// working copy of a tracked repository the request can genuinely serve, so an
+// absolute path into it stays inside the indexed corpus even without a view
+// selector. It reuses registeredCheckoutForPath for the canonical-path
+// resolution (including the macOS /var -> /private alias normalization) and
+// additionally requires a ready route, so an unrouted or mid-build checkout is
+// still refused rather than silently served out of an incomplete state. A nil
+// materializer or a catalog read failure fail closed: they report "not routed",
+// so the guard refuses rather than admits.
+func (s *Server) routedCheckoutForPath(ctx context.Context, path string) (store_sqlite.Checkout, bool, error) {
+	if s.materializer == nil || s.materializer.Catalog == nil {
+		return store_sqlite.Checkout{}, false, nil
+	}
+	checkout, found, err := s.registeredCheckoutForPath(ctx, path)
+	if err != nil || !found {
+		return checkout, false, err
+	}
+	route, ready, err := s.materializer.Catalog.GetCheckoutRoute(ctx, checkout.CheckoutID)
 	if err != nil {
-		return store_sqlite.Checkout{}, false, err
+		return checkout, false, err
 	}
-	ids := make([]string, len(families))
-	for i, family := range families {
-		ids[i] = family.FamilyID
-	}
-	return graphview.CheckoutForPath(ctx, s.materializer.Catalog, ids, path)
+	return checkout, ready && graphview.RouteReady(route), nil
 }
 
 // registeredWorktreeSelector shares exact-root matching between control and

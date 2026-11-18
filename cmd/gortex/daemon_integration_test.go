@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -34,14 +35,14 @@ import (
 // dispatch goes through the real production code paths.
 func spinUpDaemon(t *testing.T) (socket, trackedRoot string) {
 	t.Helper()
-	_, socket, trackedRoot = spinUpDaemonWithConfig(t)
+	_, socket, trackedRoot, _ = spinUpDaemonWithConfig(t)
 	return socket, trackedRoot
 }
 
 // spinUpDaemonWithConfig is spinUpDaemon plus the test-scoped global
 // config path, which tests that assert persistence side effects need
-// to read back.
-func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot string) {
+// to read back, and the MCP server the daemon dispatches to.
+func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot string, srv *gortexmcp.Server) {
 	t.Helper()
 
 	// Short base dir so the unix socket stays under the 104-char limit
@@ -76,7 +77,7 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 	require.NoError(t, err)
 
 	eng := query.NewEngine(g)
-	srv := gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), nil, gortexmcp.MultiRepoOptions{
+	srv = gortexmcp.NewServer(eng, g, idx, nil, zap.NewNop(), nil, gortexmcp.MultiRepoOptions{
 		MultiIndexer:  mi,
 		ConfigManager: cm,
 	})
@@ -120,7 +121,7 @@ func spinUpDaemonWithConfig(t *testing.T) (configPath, socket, trackedRoot strin
 
 	require.Eventually(t, func() bool { return daemon.IsRunningAt(socket) },
 		2*time.Second, 10*time.Millisecond)
-	return configPath, socket, trackedRoot
+	return configPath, socket, trackedRoot, srv
 }
 
 // TestDaemon_EndToEnd_GraphStatsOverMCPProxy confirms that the whole
@@ -180,6 +181,52 @@ func TestDaemon_EndToEnd_GraphStatsOverMCPProxy(t *testing.T) {
 		"indexed repo should contribute nodes: %v", stats)
 }
 
+// TestDaemon_EndToEnd_ToolHandlerCanReturnItsDispatchSlot pins that the
+// request context a tool handler receives over the daemon socket still
+// carries that request's dispatch slot. An edit relies on it to give the
+// slot back while it waits for its graph refresh; a context dropped anywhere
+// between the socket and the handler would silently turn that into a no-op.
+func TestDaemon_EndToEnd_ToolHandlerCanReturnItsDispatchSlot(t *testing.T) {
+	_, socket, trackedRoot, srv := spinUpDaemonWithConfig(t)
+	srv.MCPServer().AddTool(mcp.NewTool("dispatch_slot_probe"), func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		first := daemon.ReleaseMCPDispatchSlot(ctx)
+		second := daemon.ReleaseMCPDispatchSlot(ctx)
+		return mcp.NewToolResultText(fmt.Sprintf("%t,%t", first, second)), nil
+	})
+
+	client, err := daemon.DialTo(socket, daemon.Handshake{
+		Mode:       daemon.ModeMCP,
+		CWD:        trackedRoot,
+		ClientName: "integration-test",
+		Tools:      cliLegacyToolSurface,
+		ToolsMode:  cliLegacyToolMode,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.WriteMCPFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"integration","version":"0"}}}`)))
+	initReply, err := client.ReadMCPFrame()
+	require.NoError(t, err)
+	require.Contains(t, string(initReply), `"result"`, "initialize must succeed: %s", string(initReply))
+
+	require.NoError(t, client.WriteMCPFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dispatch_slot_probe","arguments":{}}}`)))
+	reply, err := client.ReadMCPFrame()
+	require.NoError(t, err)
+	var resp struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+		Error map[string]any `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(reply, &resp))
+	require.Nil(t, resp.Error, "probe call failed: %s", string(reply))
+	require.Len(t, resp.Result.Content, 1, "probe reply: %s", string(reply))
+	require.Equal(t, "true,false", resp.Result.Content[0].Text,
+		"the first release returns the request's slot and the second finds none")
+}
+
 // TestDaemon_EndToEnd_UntrackedCWDRejectedViaProxy verifies the
 // structured error reaches the client end-to-end, not just the unit
 // dispatcher. An agent opening in an untracked directory must see a
@@ -226,9 +273,13 @@ func TestDaemon_EndToEnd_WorkspaceRootCWDServed(t *testing.T) {
 	socket, trackedRoot := spinUpDaemon(t)
 	wsRoot := filepath.Dir(trackedRoot)
 
+	// The test drives legacy tool names, so it pins the legacy surface the
+	// way the CLI and hooks do: an MCP client connection otherwise gets the
+	// compact facade surface (#661).
 	client, err := daemon.DialTo(socket, daemon.Handshake{
-		Mode: daemon.ModeMCP,
-		CWD:  wsRoot,
+		Mode:  daemon.ModeMCP,
+		CWD:   wsRoot,
+		Tools: "core",
 	})
 	require.NoError(t, err)
 	defer client.Close()
@@ -312,7 +363,7 @@ func TestDaemon_EndToEnd_TrackAddsRepoLive(t *testing.T) {
 // in-memory GlobalConfig via AddRepo but never flushed to disk, so the
 // repo vanished on the next start.
 func TestDaemon_EndToEnd_TrackPersistsToConfig(t *testing.T) {
-	configPath, socket, _ := spinUpDaemonWithConfig(t)
+	configPath, socket, _, _ := spinUpDaemonWithConfig(t)
 
 	second := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(second, "lib.go"),

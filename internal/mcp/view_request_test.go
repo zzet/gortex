@@ -47,6 +47,7 @@ type viewStack struct {
 	dbPath       string
 	repoRoot     string
 	otherRoot    string
+	siblingRoot  string
 	worktreeRoot string
 	graphID      string
 	commit       int64
@@ -114,6 +115,18 @@ func newViewStack(t *testing.T) *viewStack {
 // bare path gets no shortcut past it.
 func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 	t.Helper()
+	return buildViewStack(t, includeOther, false)
+}
+
+// newViewStackWithSibling adds a "sibling" repo in the worktree family's own
+// workspace, so a worktree session has a second repository it may read.
+func newViewStackWithSibling(t *testing.T) *viewStack {
+	t.Helper()
+	return buildViewStack(t, true, true)
+}
+
+func buildViewStack(t *testing.T, includeOther, includeSibling bool) *viewStack {
+	t.Helper()
 	base := t.TempDir()
 	repoRoot := writeViewRepo(t, filepath.Join(base, "repo"), "main-ws", map[string]string{
 		"edit.go": "package repo\n\nfunc Old() {}\n",
@@ -126,6 +139,13 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 			"other.go": "package other\n\nfunc Other() {}\n",
 		})
 		repos = append(repos, config.RepoEntry{Path: otherRoot, Name: "other"})
+	}
+	var siblingRoot string
+	if includeSibling {
+		siblingRoot = writeViewRepo(t, filepath.Join(base, "sibling"), "main-ws", map[string]string{
+			"sibling.go": "package sibling\n\nfunc Sibling() {}\n",
+		})
+		repos = append(repos, config.RepoEntry{Path: siblingRoot, Name: "sibling"})
 	}
 	worktreeRoot := filepath.Join(base, "wt")
 	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
@@ -154,9 +174,7 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 	languages.RegisterAll(reg)
 	bm := search.NewNull()
 	mi := indexer.NewMultiIndexer(store, reg, bm, cm, zap.NewNop())
-	if _, err := mi.IndexScoped("", ""); err != nil {
-		t.Fatalf("index fixture repos: %v", err)
-	}
+	registerMCPFixtureRepos(t, mi, cm)
 
 	graphID := indexer.GraphIDFor("repo")
 	stack := &viewStack{
@@ -165,6 +183,7 @@ func newViewStackWithRepos(t *testing.T, includeOther bool) *viewStack {
 		dbPath:       dbPath,
 		repoRoot:     repoRoot,
 		otherRoot:    otherRoot,
+		siblingRoot:  siblingRoot,
 		worktreeRoot: worktreeRoot,
 		graphID:      graphID,
 	}
@@ -581,6 +600,46 @@ func TestPrimaryCWDReadsTheBaseCorpus(t *testing.T) {
 	}
 	if rider := resultFreshness(t, res); rider != nil {
 		t.Errorf("a base answer carries a view rider: %v", rider)
+	}
+}
+
+func TestDedicatedWorktreeSelectorWithoutRouteIsUnsupported(t *testing.T) {
+	stack := newViewStack(t)
+	for _, field := range []string{"checkout_id", "path"} {
+		for _, strictFresh := range []bool{false, true} {
+			selector := map[string]any{"kind": "worktree", field: viewTestPrimary}
+			if field == "path" {
+				selector[field] = stack.repoRoot
+			}
+			args := map[string]any{"view": selector}
+			if strictFresh {
+				args = freshArgs(args, time.Minute)
+				args[requireExactArgName] = true
+			}
+			var reader graph.Reader
+			res, err := stack.callWithView(t, stack.repoRoot, "get_symbol", args, captureReader(stack.srv, &reader))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertToolError(t, res, graphview.CodeCapabilityUnavailable)
+			text := viewResultText(t, res)
+			if reader != nil || !strings.Contains(text, "base") || !strings.Contains(text, "graph_id") ||
+				strings.Contains(text, "build_token") || strings.Contains(text, "retry_after") {
+				t.Fatalf("unsupported dedicated selector served a fallback or lacks permanent selector guidance: %s", text)
+			}
+			// The middleware consumes request metadata; restore it for the
+			// out-of-scope control.
+			args["view"] = selector
+			if strictFresh {
+				args = freshArgs(args, time.Minute)
+				args[requireExactArgName] = true
+			}
+			res, err = stack.callWithView(t, stack.otherRoot, "get_symbol", args, captureReader(stack.srv, &reader))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertToolError(t, res, graphview.CodeSelectorOutOfScope)
+		}
 	}
 }
 

@@ -20,6 +20,7 @@ func installCommunitiesForTest(s *Server, communities *analysis.CommunityResult)
 	s.analysisEpoch++
 	s.hotspots = nil
 	s.hotspotsReady = false
+	s.hotspotsOwned = false
 }
 
 func TestInstallCommunitiesForTestRespectsGraphFreshness(t *testing.T) {

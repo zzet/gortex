@@ -1,6 +1,8 @@
 package store_sqlite
 
 import (
+	"context"
+	"database/sql"
 	"iter"
 	"sort"
 	"strings"
@@ -109,13 +111,14 @@ func (s *Store) InEdgeCountsByKind(kinds []graph.EdgeKind) map[string]int {
 // NodeIDsByKinds returns the deduplicated IDs of every node whose kind
 // is in the supplied set.
 func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
+	ctx := s.readContext()
 	_, args := aggDedupeNodeKinds(kinds)
 	if len(args) == 0 {
 		return nil
 	}
 	q := `SELECT id FROM nodes WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
-	panicOnFatal(err)
+	rows, err := s.db.QueryContext(ctx, q, append(args, s.viewGen)...)
+	analysisProjectionReadError(ctx, err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
 		return nil
@@ -124,10 +127,10 @@ func (s *Store) NodeIDsByKinds(kinds []graph.NodeKind) []string {
 	var out []string
 	for rows.Next() {
 		var id string
-		panicOnFatal(rows.Scan(&id))
+		analysisProjectionReadError(ctx, rows.Scan(&id))
 		out = append(out, id)
 	}
-	panicOnFatal(rows.Err())
+	analysisProjectionReadError(ctx, rows.Err())
 	return out
 }
 
@@ -452,10 +455,23 @@ func (s *Store) FileSymbolNamesByPaths(paths []string, kinds []graph.NodeKind) [
 	for i := 0; i < len(uniqPaths); i += lookupChunkSize {
 		end := minInt(i+lookupChunkSize, len(uniqPaths))
 		chunk := uniqPaths[i:end]
-		args := append(toAnyArgs(chunk), kindArgs...)
-		args = append(args, s.viewGen)
-		q := `SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (` +
-			inPlaceholders(len(chunk)) + `) AND kind IN (` + inPlaceholders(len(kindArgs)) + `) AND view_gen = ?`
+		pathsJSON, ok := projectionJSON(chunk)
+		if !ok {
+			continue
+		}
+		args := append([]any{pathsJSON, s.viewGen}, kindArgs...)
+		// Driven from the paths: one (file_path, view_gen) seek each. The
+		// IN-list form let the planner, under the store's sampled
+		// statistics, range over (kind, view_gen) from about 30 paths: every
+		// node of those kinds in the generation, 8 s on the base generation.
+		// The kind is written +n.kind so the choice does not rest on the
+		// statistics: without any, nodes_by_kind (kind, view_gen) keys as many
+		// columns as nodes_by_file and was taken, a range per path.
+		q := `SELECT DISTINCT n.file_path, n.name FROM json_each(?) AS p CROSS JOIN nodes AS n
+ WHERE n.file_path = p.value AND n.view_gen = ? AND +n.kind IN (` + inPlaceholders(len(kindArgs)) + `)`
+		if observe := nameLookupSQLObserver; observe != nil {
+			observe(q)
+		}
 		rows, err := s.db.Query(q, args...)
 		panicOnFatal(err)
 		if rows == nil {
@@ -521,19 +537,85 @@ func (s *Store) ExternalCallCandidateEdges() []*graph.Edge {
 	return s.queryEdgesSQL(q, s.viewGen)
 }
 
+// ExternalCallCandidateEdgesSeq uses the same partial-index predicate as the
+// slice projection, with a stable rowid window and bounded decoded pages.
+func (s *Store) ExternalCallCandidateEdgesSeq() iter.Seq[*graph.Edge] {
+	return func(yield func(*graph.Edge) bool) {
+		var highWater int64
+		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges`).Scan(&highWater); err != nil {
+			panicOnFatal(err)
+			return
+		}
+		// A single kind lets the partial index stream rowids without sorting
+		// the remaining range on every page. Keep one window across both kinds
+		// so callback mutations cannot enter the second stream.
+		for _, kind := range []graph.EdgeKind{graph.EdgeCalls, graph.EdgeReferences} {
+			var after int64
+			for after < highWater {
+				page, err := s.externalCallCandidatePage(kind, after, highWater)
+				if err != nil {
+					panicOnFatal(err)
+					return
+				}
+				if len(page.Edges) == 0 {
+					break
+				}
+				for _, edge := range page.Edges {
+					if !yield(edge) {
+						return
+					}
+				}
+				after = page.NextID
+			}
+		}
+	}
+}
+
+func (s *Store) externalCallCandidatePage(kind graph.EdgeKind, after, highWater int64) (graph.UnresolvedEdgePage, error) {
+	page := graph.UnresolvedEdgePage{NextID: after}
+	// With LIMIT, SQLite can prefer the full rowid range even after ANALYZE.
+	// Pin the existing partial index so sparse external terminals stay cheap.
+	rows, err := s.db.Query(`SELECT id, `+lookupEdgeCols+` FROM edges INDEXED BY edges_external
+		WHERE view_gen = ? AND id > ? AND id <= ?
+		AND kind = ? AND `+externalCallTargetPredicate+`
+		ORDER BY id LIMIT 512`, s.viewGen, after, highWater, kind)
+	if err != nil {
+		return page, err
+	}
+	defer rows.Close()
+	bytesUsed := 0
+	for rows.Next() {
+		id, edge, size, err := scanUnresolvedEdge(rows)
+		if err != nil {
+			return page, err
+		}
+		page.NextID = id
+		page.Edges = append(page.Edges, edge)
+		bytesUsed += size
+		if bytesUsed >= 4<<20 {
+			break
+		}
+	}
+	return page, rows.Err()
+}
+
 // DistinctExternalTargets performs the Go external-attribution discovery as
 // one SQLite aggregate. Only distinct destination IDs cross the driver; full
 // edge payloads (especially Meta) stay disk-resident.
-func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
+func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind, fileSuffix string) []string {
 	_, args := aggDedupeEdgeKinds(kinds)
 	if len(args) == 0 {
 		return nil
 	}
 	q := `SELECT DISTINCT to_id FROM edges
 		WHERE kind IN (` + inPlaceholders(len(args)) + `) AND ` + externalCallTargetPredicate + `
-		  AND view_gen = ?
-		ORDER BY to_id`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
+		  AND view_gen = ?`
+	args = append(args, s.viewGen)
+	if fileSuffix != "" {
+		q += ` AND substr(file_path, -length(?)) = ?`
+		args = append(args, fileSuffix, fileSuffix)
+	}
+	rows, err := s.db.Query(q+` ORDER BY to_id`, args...)
 	panicOnFatal(err)
 	if rows == nil {
 		return nil
@@ -550,21 +632,110 @@ func (s *Store) DistinctExternalTargets(kinds []graph.EdgeKind) []string {
 	return targets
 }
 
-// NodesByKinds returns every node whose kind is in the supplied set.
+// NodesByKinds returns every node whose kind is in the supplied set, in id
+// order. It is NodesByKindsContext under the handle's bound read context (see
+// WithReadContext); a read cut short by that context returns what it read.
 func (s *Store) NodesByKinds(kinds []graph.NodeKind) []*graph.Node {
+	out, _ := s.NodesByKindsContext(s.readContext(), kinds)
+	return out
+}
+
+// NodesByKindsContext returns every node whose kind is in the supplied set,
+// in id order, and stops within one page once ctx ends (returning the rows
+// read so far and ctx's error).
+//
+// It reads in keyset pages of nodesByKindsPageSize ids, each page its own
+// short read transaction, instead of one statement over the whole
+// generation. A whole-generation read of a large store runs for minutes, and
+// one read transaction held that long pins its WAL snapshot: the log cannot be
+// backfilled past it or reset while it lives. On the live store an abandoned
+// analysis call (its MCP deadline long past, its query uncancellable) held
+// one for over 20 minutes and kept a 22 GB WAL from resetting. Paged, the
+// reader's snapshot advances every page. Each page walks nodes_by_generation
+// (view_gen, id) from the last id; the rows and their order are the
+// single-statement answer's on an unchanging generation.
+func (s *Store) NodesByKindsContext(ctx context.Context, kinds []graph.NodeKind) ([]*graph.Node, error) {
 	_, args := aggDedupeNodeKinds(kinds)
 	if len(args) == 0 {
-		return nil
+		return nil, nil
 	}
-	q := `SELECT ` + lookupNodeCols + ` FROM nodes WHERE kind IN (` +
-		inPlaceholders(len(args)) + `) AND view_gen = ? ORDER BY id`
-	return s.queryNodesSQL(q, append(args, s.viewGen)...)
+	q := nodesByKindsPageSQL(len(args))
+	var out []*graph.Node
+	after := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		page, scanned, lastID, err := s.scanNodePage(ctx, q, append(append([]any{s.viewGen, after}, args...), nodesByKindsPageSize)...)
+		out = append(out, page...)
+		if err != nil {
+			return out, err
+		}
+		if scanned < nodesByKindsPageSize {
+			return out, nil
+		}
+		after = lastID
+	}
+}
+
+// scanNodePage runs one node page and reports its nodes, how many rows it
+// scanned (including rows the scanner filters out) and the last row's id. A
+// cancelled ctx is returned as an error, never a panic; other failures go
+// through panicOnFatal like every node reader.
+func (s *Store) scanNodePage(ctx context.Context, q string, args ...any) ([]*graph.Node, int, string, error) {
+	rows, err := outlineRows(ctx, s.db, outlineQuery{sql: q, args: args})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, 0, "", ctx.Err()
+		}
+		panicOnFatal(err)
+		return nil, 0, "", err
+	}
+	defer rows.Close()
+	var out []*graph.Node
+	scanned := 0
+	var lastID string
+	for rows.Next() {
+		var id string
+		n, err := scanNodeCursorID(rows, &id)
+		if err != nil {
+			if ctx.Err() != nil {
+				return out, scanned, lastID, ctx.Err()
+			}
+			panicOnFatal(err)
+			return out, scanned, lastID, err
+		}
+		scanned++
+		lastID = id
+		if n != nil {
+			out = append(out, n)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return out, scanned, lastID, ctx.Err()
+		}
+		panicOnFatal(err)
+		return out, scanned, lastID, err
+	}
+	return out, scanned, lastID, nil
+}
+
+// nodesByKindsPageSize bounds one NodesByKinds page (one read transaction).
+var nodesByKindsPageSize = 4096
+
+// nodesByKindsPageSQL is one keyset page: the generation's ids after the last
+// one read, filtered to the kinds, in id order.
+func nodesByKindsPageSQL(kinds int) string {
+	return `SELECT ` + lookupNodeCols + ` FROM nodes WHERE view_gen = ? AND id > ? AND kind IN (` +
+		inPlaceholders(kinds) + `) ORDER BY id LIMIT ?`
 }
 
 // EdgeAdjacencyForKinds streams (from, to) id pairs for edges whose
 // kind is in edgeKinds and whose endpoints both have a kind in
 // nodeKinds; honours early-stop. Empty kinds yields nothing.
 func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []graph.NodeKind) iter.Seq[[2]string] {
+	ctx := s.readContext()
 	_, eArgs := aggDedupeEdgeKinds(edgeKinds)
 	_, nArgs := aggDedupeNodeKinds(nodeKinds)
 	return func(yield func([2]string) bool) {
@@ -583,8 +754,8 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 			AND nf.kind IN (` + inPlaceholders(len(nArgs)) + `)
 			AND nt.kind IN (` + inPlaceholders(len(nArgs)) + `)
 			AND e.view_gen = ?`
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		analysisProjectionReadError(ctx, err)
 		if rows == nil {
 			// swallowed teardown-race error: read returns empty (see panicOnFatal)
 			return
@@ -592,12 +763,12 @@ func (s *Store) EdgeAdjacencyForKinds(edgeKinds []graph.EdgeKind, nodeKinds []gr
 		defer rows.Close()
 		for rows.Next() {
 			var from, to string
-			panicOnFatal(rows.Scan(&from, &to))
+			analysisProjectionReadError(ctx, rows.Scan(&from, &to))
 			if !yield([2]string{from, to}) {
 				return
 			}
 		}
-		panicOnFatal(rows.Err())
+		analysisProjectionReadError(ctx, rows.Err())
 	}
 }
 
@@ -654,6 +825,7 @@ func (s *Store) NodeDegreeCounts(ids []string, usageKinds []graph.EdgeKind) []gr
 // and fan-out (outgoing edges in fanOutKinds) for the supplied id set.
 // Unknown ids produce no row; duplicates collapse.
 func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.EdgeKind) []graph.NodeFanRow {
+	ctx := s.readContext()
 	uniq := dedupeNonEmpty(ids)
 	if len(uniq) == 0 {
 		return nil
@@ -688,18 +860,18 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 		args = append(args, outInline...)
 		args = append(args, toAnyArgs(chunk)...)
 		args = append(args, s.viewGen)
-		rows, err := s.db.Query(q, args...)
-		panicOnFatal(err)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		analysisProjectionReadError(ctx, err)
 		if rows == nil {
 			// swallowed teardown-race error: read returns empty (see panicOnFatal)
 			return out
 		}
 		for rows.Next() {
 			var r graph.NodeFanRow
-			panicOnFatal(rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
+			analysisProjectionReadError(ctx, rows.Scan(&r.NodeID, &r.FanIn, &r.FanOut))
 			out = append(out, r)
 		}
-		panicOnFatal(rows.Err())
+		analysisProjectionReadError(ctx, rows.Err())
 		_ = rows.Close()
 	}
 	return out
@@ -712,13 +884,14 @@ func (s *Store) NodeFanCounts(ids []string, fanInKinds, fanOutKinds []graph.Edge
 // community map returns nil. The community comparison runs Go-side
 // because community membership is not a node column.
 func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[string]string) map[string]int {
+	ctx := s.readContext()
 	_, args := aggDedupeEdgeKinds(kinds)
 	if len(args) == 0 || len(nodeToComm) == 0 {
 		return nil
 	}
 	q := `SELECT from_id, to_id FROM edges WHERE kind IN (` + inPlaceholders(len(args)) + `) AND view_gen = ?`
-	rows, err := s.db.Query(q, append(args, s.viewGen)...)
-	panicOnFatal(err)
+	rows, err := s.db.QueryContext(ctx, q, append(args, s.viewGen)...)
+	analysisProjectionReadError(ctx, err)
 	if rows == nil {
 		// swallowed teardown-race error: read returns empty (see panicOnFatal)
 		return nil
@@ -727,7 +900,7 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 	out := make(map[string]int)
 	for rows.Next() {
 		var from, to string
-		panicOnFatal(rows.Scan(&from, &to))
+		analysisProjectionReadError(ctx, rows.Scan(&from, &to))
 		fromComm, ok := nodeToComm[from]
 		if !ok {
 			continue
@@ -740,9 +913,32 @@ func (s *Store) CommunityCrossingsByKind(kinds []graph.EdgeKind, nodeToComm map[
 			out[from]++
 		}
 	}
-	panicOnFatal(rows.Err())
+	analysisProjectionReadError(ctx, rows.Err())
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// scanNodeCursorID is scanNodeCursor that also reports the row's id, which a
+// keyset page needs even for a row the scanner filters out (nil node).
+func scanNodeCursorID(rows *sql.Rows, id *string) (*graph.Node, error) {
+	return scanNodeCursor(idCapturingScanner{rows: rows, id: id})
+}
+
+type idCapturingScanner struct {
+	rows *sql.Rows
+	id   *string
+}
+
+func (c idCapturingScanner) Scan(dest ...any) error {
+	if err := c.rows.Scan(dest...); err != nil {
+		return err
+	}
+	if len(dest) > 0 {
+		if p, ok := dest[0].(*string); ok {
+			*c.id = *p
+		}
+	}
+	return nil
 }

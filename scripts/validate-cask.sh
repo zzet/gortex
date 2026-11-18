@@ -41,12 +41,31 @@ rendered="$("$repo_root/scripts/render-cask.sh" 0.0.0 \
 # untouched, and the trap removes it even when brew fails.
 tap_user="gortexcaskcheck"
 tap_dir="$(brew --repository)/Library/Taps/$tap_user/homebrew-tap"
-cleanup() { rm -rf "$(brew --repository)/Library/Taps/$tap_user"; }
+trust_home=""
+cleanup() {
+	rm -rf "$(brew --repository)/Library/Taps/$tap_user"
+	if [ -n "$trust_home" ]; then rm -rf "$trust_home"; fi
+}
 trap cleanup EXIT
 
 cleanup
 mkdir -p "$tap_dir/Casks"
 printf '%s\n' "$rendered" >"$tap_dir/Casks/gortex.rb"
+
+# Current Homebrew refuses to load casks from a tap nobody has trusted, and
+# `brew info` does not trust it on the way like `brew install user/tap/x`
+# does. Trust the scratch tap in a throwaway trust store (brew keeps it under
+# $XDG_CONFIG_HOME/homebrew when that is set), so the developer's own trust
+# store and brew.env are neither read nor changed. HOMEBREW_NO_REQUIRE_TAP_TRUST
+# is deprecated, and its warning would trip the check below, so it is unset
+# too in case a developer exported it to get past this same error. Older brew
+# has no `trust` command and needs none.
+trust_home="$(mktemp -d)"
+export XDG_CONFIG_HOME="$trust_home"
+unset HOMEBREW_NO_REQUIRE_TAP_TRUST HOMEBREW_REQUIRE_TAP_TRUST
+if brew trust --help >/dev/null 2>&1; then
+	brew trust --tap "$tap_user/tap"
+fi
 
 echo "==> loading the rendered cask through brew"
 # `brew info --cask` evaluates every stanza, so an unknown one (the #639 bug)

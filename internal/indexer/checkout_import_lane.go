@@ -1,0 +1,358 @@
+package indexer
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/semantic"
+)
+
+type importBuildLaneKey struct{}
+
+// Private stepped folds reenter immediately before publishing their payload.
+type importFoldPublicationKey struct{}
+type importFoldPublication struct {
+	beforePublish func(context.Context) error
+	afterPublish  func(int64)
+}
+
+// A stale detached import starts a new admission cycle rather than retrying
+// beneath the context whose interactive yield was already withdrawn.
+var errImportPreparationChanged = errors.New("indexer: import preparation needs a new cycle")
+
+// importBuildLane transfers only unpublished one-file delta preparation out
+// of the build lane. The cycle still owns its checkout lock and ancestry lease;
+// publication reenters the lane before checking the working-copy inputs.
+type importBuildLane struct {
+	gate               *ViewBuildGate
+	detach             func() bool
+	resume             func(context.Context, bool) (context.Context, error)
+	arm                func(context.Context) error
+	detached           bool
+	preparationRelease func()
+	preambleFence      func(context.Context) error
+}
+
+func (l *importBuildLane) begin(ctx context.Context) (func(), error) {
+	if !l.detached {
+		if !l.detach() {
+			return nil, ctx.Err()
+		}
+		l.detached = true
+	}
+	if l.preparationRelease == nil {
+		release, err := l.gate.acquireImportPreparation(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var once sync.Once
+		l.preparationRelease = func() {
+			once.Do(func() { release(); l.preparationRelease = nil })
+		}
+	}
+	return l.preparationRelease, nil
+}
+
+func (l *importBuildLane) reenter(ctx context.Context, yieldable bool) (context.Context, error) {
+	if l.detached {
+		var err error
+		ctx, err = l.resume(ctx, yieldable)
+		if err != nil {
+			return ctx, err
+		}
+		l.detached = false
+	}
+	if l.preambleFence != nil {
+		fence := l.preambleFence
+		l.preambleFence = nil
+		if err := fence(ctx); err != nil {
+			return ctx, err
+		}
+	}
+	if yieldable && l.arm != nil {
+		if err := l.arm(ctx); err != nil {
+			return ctx, err
+		}
+	}
+	return ctx, nil
+}
+
+func (l *importBuildLane) leave() {
+	if !l.detached {
+		l.detach()
+		l.detached = true
+	}
+}
+
+func resumeImportBuildLane(ctx context.Context, yieldable bool) (context.Context, error) {
+	if lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane); lane != nil {
+		return lane.reenter(ctx, yieldable)
+	}
+	return ctx, nil
+}
+
+// The catalog pin/recomposition decisions precede dirty-slot planning and can
+// themselves outlast foreground demand. Start their read-only handoff once the
+// routed commit names an immutable base and the sample can be confirmed. Open
+// and retain that complete positive ancestry before making those decisions;
+// the first mutation reentry checks the route, correction epochs and source.
+func (c *CheckoutCoordinator) prepareImportPreamble(ctx context.Context, sample gitstate.DirtySnapshot, route store_sqlite.CheckoutRoute) (func(), error) {
+	noop := func() {}
+	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+	if lane == nil {
+		return noop, nil
+	}
+	if route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		// A read-only early hint is not authority to continue after a route
+		// moved. Restore ordinary admission before any live fallback.
+		_, err := lane.reenter(ctx, true)
+		return noop, err
+	}
+	finishPlan, err := c.prepareImportPlan(ctx, route.CommitGenerationID, sample, route)
+	if err != nil || !lane.detached {
+		return finishPlan, err
+	}
+	base, closeBase, err := c.generationLayerReader(ctx, route.CommitGenerationID)
+	if err != nil {
+		finishPlan()
+		return noop, err
+	}
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			lane.preambleFence = nil
+			closeBase()
+			finishPlan()
+		})
+	}
+	ancestry, ok := base.(commitLayerBase)
+	if !ok {
+		finish()
+		_, err := lane.reenter(ctx, true)
+		return noop, err
+	}
+	epochs, eligible, err := c.builder.immutableImportEpochs(ctx, ancestry.stack)
+	if err != nil || !eligible {
+		finish()
+		if err == nil {
+			_, err = lane.reenter(ctx, true)
+		}
+		return noop, err
+	}
+	lane.preambleFence = func(ctx context.Context) error {
+		current, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+		if err != nil {
+			return err
+		}
+		if !found || current.RouteEpoch != route.RouteEpoch || current.GraphID != route.GraphID || current.State != route.State || current.CommitGenerationID != route.CommitGenerationID || current.DirtyGenerationID != route.DirtyGenerationID {
+			return fmt.Errorf("%w: route changed during import preamble", errRouteMoved)
+		}
+		if err := c.builder.checkImportPreparationEpochs(epochs); err != nil {
+			return err
+		}
+		proof, err := c.sampler.ConfirmReadSet(ctx, sample, nil, nil)
+		if err != nil {
+			return err
+		}
+		if !proof.Confirmed {
+			return fmt.Errorf("%w: import preamble source could not be confirmed: %s", ErrDirtySnapshotChanged, proof.Reason)
+		}
+		return nil
+	}
+	return finish, nil
+}
+
+// Planning may be slower than the interactive request interval too. It writes
+// no payload, and each mutation/full-build boundary reenters the lane. Only an
+// ordinary imported delta passing the stricter ancestry checks below remains
+// outside it for physical preparation.
+func (c *CheckoutCoordinator) prepareImportPlan(ctx context.Context, commit int64, sample gitstate.DirtySnapshot, route store_sqlite.CheckoutRoute) (func(), error) {
+	noop := func() {}
+	lane, _ := ctx.Value(importBuildLaneKey{}).(*importBuildLane)
+	if lane == nil || lane.gate == nil || c.builder == nil {
+		return noop, nil
+	}
+	decline := func() (func(), error) {
+		if lane.detached {
+			_, err := lane.reenter(ctx, true)
+			return noop, err
+		}
+		return noop, nil
+	}
+	if len(sample.Entries) <= importInteractivePaths && !c.importInProgress(ctx, route.DirtyGenerationID) {
+		return decline()
+	}
+	row, found, err := c.catalog.GetViewGeneration(ctx, commit)
+	if err != nil {
+		return noop, err
+	}
+	if !found || row.BaseGenerationID <= 0 {
+		return decline()
+	}
+	verdict, err := c.sampler.ConfirmReadSet(ctx, sample, nil, nil)
+	if err != nil {
+		return noop, err
+	}
+	if !verdict.Confirmed {
+		return decline()
+	}
+	return lane.begin(ctx)
+}
+
+func (g *ViewBuildGate) acquireImportPreparation(ctx context.Context) (func(), error) {
+	g.mu.Lock()
+	if g.importPreparation == nil {
+		g.importPreparation = make(chan struct{}, 1)
+	}
+	slot := g.importPreparation
+	g.mu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-slot }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// importPreparationEpochs excludes the mutable corpus and generations the
+// startup correction still needs to modify. A lease alone prevents retirement,
+// not writes to generation zero or correction of old derivation versions.
+func (b *SparseGenerationBuilder) importPreparationEpochs(ctx context.Context, req BuildRequest) (map[int64]uint64, bool, error) {
+	if !req.importBatch || req.followup || len(req.Changes) != 1 || !b.canPrepareImportEnrichment(ctx, req) {
+		return nil, false, nil
+	}
+	if req.importReadSetReady == nil || !req.importReadSetReady(ctx) {
+		return nil, false, nil
+	}
+	base, ok := req.Base.(commitLayerBase)
+	if !ok {
+		return nil, false, nil
+	}
+	return b.immutableImportEpochs(ctx, base.stack)
+}
+
+func (b *SparseGenerationBuilder) immutableImportEpochs(ctx context.Context, stack []int64) (map[int64]uint64, bool, error) {
+	if len(stack) == 0 {
+		return nil, false, nil
+	}
+	epochs := make(map[int64]uint64, len(stack))
+	for _, generation := range stack {
+		if generation <= 0 {
+			return nil, false, nil
+		}
+		stamps, err := b.Store.AtGeneration(generation).DerivationStamps(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		for pass, version := range currentDerivationStamps() {
+			if stamps[pass] < version {
+				return nil, false, nil
+			}
+		}
+		epochs[generation] = b.Store.GenerationCorrectionEpoch(generation)
+	}
+	return epochs, true, nil
+}
+
+func (b *SparseGenerationBuilder) checkImportPreparationEpochs(epochs map[int64]uint64) error {
+	for generation, epoch := range epochs {
+		if b.Store.GenerationCorrectionEpoch(generation) != epoch {
+			return fmt.Errorf("%w: import ancestor %d was corrected during preparation", ErrDirtySnapshotChanged, generation)
+		}
+	}
+	return nil
+}
+
+// A manager without a provider for this file does no semantic work. An actual
+// provider must advertise independent admission for this exact checkout scope;
+// manager presence alone does not establish that foreground work can proceed.
+func (b *SparseGenerationBuilder) canPrepareImportEnrichment(ctx context.Context, req BuildRequest) bool {
+	if req.Enrich == nil || b.Semantic == nil {
+		return true
+	}
+	languages := map[string][]string{}
+	for _, change := range req.Changes {
+		language, known := b.Registry.DetectLanguage(change.Path)
+		if !known {
+			return !b.Semantic.HasProviders()
+		}
+		languages[language] = append(languages[language], builderGraphPath(req.RepoPrefix, change.Path))
+	}
+	return b.importEnrichmentProvidersReady(ctx, req, languages)
+}
+
+func (b *SparseGenerationBuilder) importEnrichmentProvidersReady(ctx context.Context, req BuildRequest, languages map[string][]string) bool {
+	if req.Enrich == nil || b.Semantic == nil {
+		return true
+	}
+	for language, files := range languages {
+		providers, known := b.Semantic.CheckoutPreparationProviders(language)
+		if !known {
+			return false
+		}
+		for _, provider := range providers {
+			parallel, ok := provider.(interface {
+				ConcurrentCheckoutPreparation(context.Context, string, string, semantic.CheckoutCompilerScope, []string) bool
+			})
+			if !ok || !parallel.ConcurrentCheckoutPreparation(ctx, req.RootPath, req.RepoPrefix, b.checkoutCompilerScope(req.Changes), files) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// The resolver can materialize dependents/shared emitters beyond Changes.
+// Check that actual payload before allowing any provider to execute off lane.
+func (b *SparseGenerationBuilder) importHandleEnrichmentReady(ctx context.Context, req BuildRequest, handle *store_sqlite.Store) bool {
+	languages := map[string][]string{}
+	for _, node := range handle.AllNodes() {
+		if node != nil && node.RepoPrefix == req.RepoPrefix && node.Language != "" {
+			if node.FilePath != "" {
+				languages[node.Language] = append(languages[node.Language], node.FilePath)
+			} else if _, ok := languages[node.Language]; !ok {
+				languages[node.Language] = nil
+			}
+		}
+	}
+	return b.importEnrichmentProvidersReady(ctx, req, languages)
+}
+
+// importPreparationHint is sampled outside the physical lane under cycleMu.
+// It recognizes both the first large dirty set and a partial import. It grants
+// no mutation authority: prepareImportPreamble retains/validates the complete
+// ancestry and its live reentry fence confirms route, correction epochs and
+// source; every fallback or route mutation reacquires ordinary admission.
+func (c *CheckoutCoordinator) importPreparationHint(ctx context.Context) bool {
+	if c.builder == nil || c.gate == nil || ctx.Err() != nil {
+		return false
+	}
+	sample, err := c.cycleSample(ctx)
+	if err != nil || sample.HeadTree == "" {
+		return false
+	}
+	route, found, err := c.catalog.GetCheckoutRoute(ctx, c.checkoutID)
+	if err != nil || !found || route.State != store_sqlite.RouteActive || route.CommitGenerationID <= 0 || route.DirtyGenerationID <= 0 {
+		return false
+	}
+	commit, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil || !found || !servableGeneration(commit.State) || commit.OwnerKind != checkoutLayerOwnerKind || commit.GenerationKind != CommitLayerGenerationKind || commit.BaseGenerationID <= 0 || commit.TreeOID != sample.HeadTree {
+		return false
+	}
+	return ctx.Err() == nil && (len(sample.Entries) > importInteractivePaths || c.importInProgress(ctx, route.DirtyGenerationID))
+}
+
+// privateImportLaneContext starts the same cancellable cycle lineage without
+// arming a physical-lane yield. begin releases its brief initial grant before
+// private checks. rearmBackgroundLaneYield adds ordinary preemption if a live
+// fallback needs the lane; no canceled context is revived.
+func privateImportLaneContext(ctx context.Context) (context.Context, *backgroundLaneYield) {
+	ctx, cancel := context.WithCancel(ctx)
+	y := &backgroundLaneYield{cancel: cancel, withdraw: func() {}, committed: true, stop: make(chan struct{})}
+	return context.WithValue(ctx, buildCommitPointKey{}, y), y
+}

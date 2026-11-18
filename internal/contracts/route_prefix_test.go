@@ -85,7 +85,7 @@ app.include_router(router, prefix="/api")
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users/{p1}"] {
@@ -114,8 +114,8 @@ def get_user(id): return id
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users/{p1}"] {
@@ -147,7 +147,7 @@ parent.include_router(child, prefix="/admin")
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/api/admin/users/{p1}"] {
@@ -169,7 +169,7 @@ def get_user(id): return id
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/users/{p1}"] {
@@ -192,7 +192,7 @@ def get_user(id): return id
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/users/{p1}"] {
@@ -230,7 +230,7 @@ def get_user(id): return id
 		reg.Add(c)
 	}
 
-	JoinRouterPrefixes(reg, providerFiles.paths(), providerFiles.reader())
+	joinRouterFixtureFacts(t, reg, providerFiles)
 
 	result := Match(reg)
 	var paired *CrossLink
@@ -269,7 +269,7 @@ app.use('/api', router);
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users/{p1}"] {
@@ -299,7 +299,7 @@ export class CatsController {
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/cats/{p1}"] {
@@ -335,7 +335,7 @@ def list_users():
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
@@ -365,7 +365,7 @@ app.register_blueprint(admin, url_prefix='/admin')
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
 
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 
 	ids := idSet(reg)
 	if !ids["http::GET::/admin/dashboard"] {
@@ -386,7 +386,7 @@ func setup(r *gin.Engine) {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/v1/users"] {
 		t.Errorf("expected gin-joined http::GET::/api/v1/users; got %v", keysOfBool(ids))
@@ -409,7 +409,7 @@ public class UserController {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
 		t.Errorf("expected spring-joined http::GET::/api/users; got %v", keysOfBool(ids))
@@ -428,7 +428,7 @@ end
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/admin/users"] {
 		t.Errorf("expected rails-joined http::GET::/admin/users; got %v", keysOfBool(ids))
@@ -445,7 +445,7 @@ Route::prefix('admin')->group(function () {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/admin/users"] {
 		t.Errorf("expected laravel-joined http::GET::/admin/users; got %v", keysOfBool(ids))
@@ -465,7 +465,7 @@ func routes(_ app: Application) throws {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
 		t.Errorf("expected vapor-joined http::GET::/api/users; got %v", keysOfBool(ids))
@@ -486,7 +486,7 @@ func routes(_ app: Application) throws {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
 		t.Errorf("expected vapor closure-joined http::GET::/api/users; got %v", keysOfBool(ids))
@@ -510,7 +510,7 @@ func routes(_ app: Application) throws {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::POST::/v1/admin/ban"] {
 		t.Errorf("expected nested vapor closure-joined http::POST::/v1/admin/ban; got %v", keysOfBool(ids))
@@ -539,7 +539,7 @@ async fn list() {}
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
 		t.Errorf("expected actix cross-file-scope-joined http::GET::/api/users; got %v", keysOfBool(ids))
@@ -565,7 +565,7 @@ async fn me() {}
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/v2/me"] {
 		t.Errorf("expected actix cross-file-scope-joined http::GET::/v2/me; got %v", keysOfBool(ids))
@@ -583,7 +583,7 @@ fn app() -> Router {
 	}
 	reg := NewRegistry()
 	extractInto(t, reg, files, "svc", "svc")
-	JoinRouterPrefixes(reg, files.paths(), files.reader())
+	joinRouterFixtureFacts(t, reg, files)
 	ids := idSet(reg)
 	if !ids["http::GET::/api/users"] {
 		t.Errorf("expected axum-joined http::GET::/api/users; got %v", keysOfBool(ids))

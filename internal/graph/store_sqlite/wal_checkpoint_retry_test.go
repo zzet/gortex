@@ -39,6 +39,13 @@ func TestPassiveCheckpointTransientDeferralsRequestRetry(t *testing.T) {
 
 	t.Run("complete", func(t *testing.T) {
 		s, _ := openTempStore(t)
+		// Nothing contends here, so the only thing the default one-second
+		// window can measure is the back-fill and fsync of the schema's WAL
+		// frames — milliseconds on a warm local disk, past a second on a
+		// contended Windows CI disk, where the expired window is reported
+		// (correctly) as a retryable timeout. This case is about classifying a
+		// completed checkpoint, so it is given room to complete.
+		s.passiveCheckpointTimeout = 30 * time.Second
 		if retry := s.checkpointWALPassive(); retry {
 			t.Fatal("complete passive checkpoint requested retry")
 		}

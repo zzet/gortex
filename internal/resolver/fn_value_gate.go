@@ -61,6 +61,13 @@ func ResolveFnValueCallbacksScoped(g graph.Store, scope map[string]bool) int {
 }
 
 func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
+	return resolveFnValueCallbacksWithPrior(g, scope, nil)
+}
+
+// resolveFnValueCallbacksWithPrior is resolveFnValueCallbacks that republishes
+// the prior registrations of every candidate a save cannot have moved
+// (FnValuePrior) instead of resolving it again.
+func resolveFnValueCallbacksWithPrior(g graph.Store, scope map[string]bool, prior *FnValuePrior) int {
 	if g == nil {
 		return 0
 	}
@@ -106,9 +113,40 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 			}
 		}
 	}
+	return resolveFnValueCandidates(g, candidates, prior)
+}
+
+// resolveFnValueCandidates gates the collected candidates and lands their
+// registrations, republishing from prior what the save cannot have moved.
+func resolveFnValueCandidates(g graph.Store, candidates []*graph.Edge, prior *FnValuePrior) int {
 	if len(candidates) == 0 {
 		return 0
 	}
+
+	var landed []*graph.Edge
+	if prior != nil {
+		changed := prior.changedNames(g)
+		resolve := candidates[:0:0]
+		for _, edge := range candidates {
+			name, _ := edge.Meta[metaFnValueName].(string)
+			regs, ok := prior.reusable(edge, name, changed)
+			if !ok {
+				resolve = append(resolve, edge)
+				continue
+			}
+			seenTarget := make(map[string]struct{}, len(regs))
+			for _, reg := range regs {
+				if _, dup := seenTarget[reg.To]; dup || reg.To == edge.From {
+					continue
+				}
+				seenTarget[reg.To] = struct{}{}
+				landed = append(landed, republishFnValueRegistration(reg, edge))
+			}
+		}
+		fnValueReused.Add(int64(len(candidates) - len(resolve)))
+		candidates = resolve
+	}
+	fnValueResolved.Add(int64(len(candidates)))
 
 	sameFileTarget := newFnValueSameFileTargetLookup(g, candidates)
 	// Resolve global names lazily. Most candidates bind within their file, so a
@@ -116,7 +154,7 @@ func resolveFnValueCallbacks(g graph.Store, scope map[string]bool) int {
 	// set than the gate uses. The memo still collapses repeated positive and
 	// negative lookups to one bounded store query per distinct global name.
 	nameMemo := make(map[string][]*graph.Node)
-	var landed []*graph.Edge
+	prefetchCertainFnValueNames(g, candidates, nameMemo)
 	for _, edge := range candidates {
 		name, _ := edge.Meta[metaFnValueName].(string)
 		// Resolution scope depends on the captured form. A special form's
@@ -510,4 +548,38 @@ func isFnValueNonTarget(name string) bool {
 		return true
 	}
 	return false
+}
+
+// prefetchCertainFnValueNames reads, in one batch, the names the gate is
+// certain to look up across the repository: a gate-skipping value and a
+// member of a named receiver type. Every other candidate binds in its own
+// file first and reads its name lazily only if that fails (an ungated
+// fallback, a self member), so the batch holds exactly the rows the per-name
+// reads would have decoded, in one round trip instead of one per name.
+func prefetchCertainFnValueNames(g graph.Store, candidates []*graph.Edge, memo map[string][]*graph.Node) {
+	var names []string
+	seen := make(map[string]struct{})
+	for _, edge := range candidates {
+		name, _ := edge.Meta[metaFnValueName].(string)
+		if name == "" {
+			continue
+		}
+		recvHint, _ := edge.Meta["fn_ref_recv_hint"].(string)
+		skipGate, _ := edge.Meta["skip_gate"].(bool)
+		if !skipGate && (recvHint == "" || recvHint == "<self>") {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return
+	}
+	found := g.FindNodesByNames(names)
+	for _, name := range names {
+		memo[name] = found[name]
+	}
 }

@@ -69,6 +69,11 @@ type WorkspaceStopper interface {
 type CheckoutWorkspaceRef struct {
 	Language string
 	Root     string
+	// Committed marks the entry of a pass over a committed tree (a dedicated
+	// base, its advance, a commit layer), admitted by AcquireCommitted. It is
+	// its own entry beside the checkout's, so it never pins the checkout's
+	// pair, and an admission for an edit takes its slot even while it is held.
+	Committed bool
 }
 
 // CheckoutWorkspaces admits (language, checkout root) pairs against a global
@@ -106,6 +111,10 @@ type checkoutWorkspace struct {
 	// weight is the slots this pair charged when it was admitted, remembered
 	// here so eviction gives back exactly what admission took.
 	weight int
+	// preempts end the committed passes holding a committed entry, keyed by
+	// the hold. Eviction runs them instead of stopping a server: a committed
+	// pass holds no server of its own.
+	preempts map[uint64]func()
 }
 
 // NewCheckoutWorkspaces builds the registry. A non-positive cap takes
@@ -219,6 +228,61 @@ func (w *CheckoutWorkspaces) admit(ref CheckoutWorkspaceRef) (func(), []func(), 
 	return w.releaseFor(ref), stops, true
 }
 
+// AcquireCommitted admits a committed tree's pass at one checkout root. The
+// entry is its own, beside the checkout's pair, and it yields: it takes only
+// slots nobody holds or wants (it never evicts a pair to make room), and an
+// admission for an edit that needs its slot takes it while it is held, calling
+// preempt to end the pass. The second return is false when no slot is free.
+func (w *CheckoutWorkspaces) AcquireCommitted(language, root string, preempt func()) (func(), bool) {
+	if w == nil || language == "" || root == "" {
+		return nil, false
+	}
+	ref := CheckoutWorkspaceRef{Language: language, Root: cleanCheckoutRoot(root), Committed: true}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entry, live := w.live[ref]
+	if !live {
+		weight := w.weightFor(language)
+		if w.charged+weight > w.cap {
+			viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceStarved)
+			return nil, false
+		}
+		entry = &checkoutWorkspace{weight: weight}
+		w.live[ref] = entry
+		w.charged += weight
+		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceAcquired)
+	}
+	w.clock++
+	hold := w.clock
+	entry.held++
+	entry.used = hold
+	if entry.preempts == nil {
+		entry.preempts = map[uint64]func(){}
+	}
+	entry.preempts[hold] = preempt
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			current, still := w.live[ref]
+			if !still || current != entry {
+				return
+			}
+			delete(entry.preempts, hold)
+			if entry.held > 0 {
+				entry.held--
+			}
+			if entry.held == 0 {
+				// A committed entry keeps nothing warm, so it gives its slot
+				// back as soon as no pass holds it.
+				delete(w.live, ref)
+				w.charged -= entry.weight
+			}
+		})
+	}, true
+}
+
 // weightFor is the slots one workspace in this language charges. A language no
 // server declared a weight for spends one, which is the unit the cap counts.
 func (w *CheckoutWorkspaces) weightFor(language string) int {
@@ -245,12 +309,12 @@ func (w *CheckoutWorkspaces) EvictRoot(root string) int {
 	w.mu.Lock()
 	var stops []func()
 	for ref, entry := range w.live {
-		if ref.Root != target || entry.held > 0 {
+		if ref.Root != target || (entry.held > 0 && !ref.Committed) {
 			continue
 		}
 		delete(w.live, ref)
 		w.charged -= entry.weight
-		stops = append(stops, w.stopLocked(ref, entry.weight, "the checkout it served went away"))
+		stops = append(stops, w.stopLocked(ref, entry, "the checkout it served went away"))
 	}
 	w.mu.Unlock()
 	viewmetrics.Add(viewmetrics.LSPWorkspaceTotal, int64(len(stops)), viewmetrics.WorkspaceEvicted)
@@ -313,7 +377,7 @@ func (w *CheckoutWorkspaces) makeRoomLocked(weight int) ([]func(), bool) {
 		delete(w.live, ref)
 		w.charged -= entry.weight
 		viewmetrics.Count(viewmetrics.LSPWorkspaceTotal, viewmetrics.WorkspaceEvicted)
-		stops = append(stops, w.stopLocked(ref, entry.weight, "the workspace cap admitted another checkout"))
+		stops = append(stops, w.stopLocked(ref, entry, "the workspace cap admitted another checkout"))
 	}
 	return stops, true
 }
@@ -324,19 +388,46 @@ func (w *CheckoutWorkspaces) makeRoomLocked(weight int) ([]func(), bool) {
 func (w *CheckoutWorkspaces) evictionOrderLocked() []CheckoutWorkspaceRef {
 	out := make([]CheckoutWorkspaceRef, 0, len(w.live))
 	for ref, entry := range w.live {
-		if entry.held == 0 {
+		if entry.held == 0 || ref.Committed {
 			out = append(out, ref)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return w.live[out[i]].used < w.live[out[j]].used })
+	// A committed tree's pass yields to an edit: its entry goes first, held
+	// or not, and only then the unheld pairs by recency.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Committed != out[j].Committed {
+			return out[i].Committed
+		}
+		return w.live[out[i]].used < w.live[out[j]].used
+	})
 	return out
 }
 
 // stopLocked builds the stop for a pair the registry has already dropped. The
 // collaborators it needs are read here, under the mutex that guards them, so
 // the returned closure can run without one.
-func (w *CheckoutWorkspaces) stopLocked(ref CheckoutWorkspaceRef, weight int, why string) func() {
-	stopper, logger := w.stopper, w.logger
+func (w *CheckoutWorkspaces) stopLocked(ref CheckoutWorkspaceRef, entry *checkoutWorkspace, why string) func() {
+	stopper, logger, weight := w.stopper, w.logger, entry.weight
+	if ref.Committed {
+		preempts := make([]func(), 0, len(entry.preempts))
+		for _, preempt := range entry.preempts {
+			preempts = append(preempts, preempt)
+		}
+		return func() {
+			for _, preempt := range preempts {
+				if preempt != nil {
+					preempt()
+				}
+			}
+			logger.Info("committed tree's pass gave its workspace slot up",
+				zap.String("language", ref.Language),
+				zap.String("root", ref.Root),
+				zap.String("reason", why),
+				zap.Int("passes_preempted", len(preempts)),
+				zap.Int("slots_freed", weight),
+			)
+		}
+	}
 	return func() {
 		stopped := 0
 		if stopper != nil {

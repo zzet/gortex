@@ -225,7 +225,19 @@ func (w *goFlowWalker) handleAssignment(n *sitter.Node) {
 func (w *goFlowWalker) handleVarSpec(n *sitter.Node) {
 	nameNode := n.ChildByFieldName("name")
 	value := n.ChildByFieldName("value")
-	if nameNode == nil || value == nil {
+	if nameNode == nil {
+		return
+	}
+	if value == nil {
+		// A zero-initialized declaration still introduces bindings. Without
+		// these, reads before the first assignment point at phantom sources
+		// and a later assignment can appear to be the declaration instead.
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			name := n.NamedChild(i)
+			if name != nil && name.Type() == "identifier" {
+				w.declareTarget(name, true, int(n.StartPoint().Row)+1)
+			}
+		}
 		return
 	}
 	w.bindAssignment(nameNode, value, true, int(n.StartPoint().Row)+1)

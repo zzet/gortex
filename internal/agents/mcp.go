@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -271,8 +272,9 @@ func sameFile(a, b string) bool {
 // MCPEntriesEqual compares two MCP stanzas by their JSON-marshaled
 // form. Round-tripping is the simplest way to handle the []string vs
 // []any drift between freshly-built entries and entries decoded from
-// an existing mcp.json on disk. Exported so the doctor can compare an
-// on-disk stanza against DefaultGortexMCPEntry() to flag a stale entry.
+// an existing mcp.json on disk. Installers use it to decide whether an
+// on-disk stanza needs rewriting; doctor uses GortexMCPEntryCurrent,
+// which ignores keys Gortex does not own.
 func MCPEntriesEqual(a, b any) bool {
 	aj, err := json.Marshal(a)
 	if err != nil {
@@ -316,6 +318,50 @@ func DefaultGortexMCPEntry() map[string]any {
 		"command": "gortex",
 		"args":    gortexMCPArgs(),
 	}
+}
+
+// GortexMCPEntryCurrent reports whether an MCP stanza still launches
+// Gortex the current way: a command whose base name is gortex (bare,
+// .exe, or an absolute path in either separator form) and args exactly
+// equal to gortexMCPArgs(). Every other key is ignored. Adapters add
+// their own (Cline's alwaysAllow, Kiro's disabled/autoApprove, Copilot
+// CLI's type, Claude Code's env) and users add theirs (env, cwd,
+// timeout), so comparing the whole entry would call a working stanza
+// stale. Only command and args change when Gortex changes how the
+// server is launched, so only they can make a stanza outdated.
+func GortexMCPEntryCurrent(entry any) bool {
+	m, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	cmd, _ := m["command"].(string)
+	if !commandIsGortex(cmd) {
+		return false
+	}
+	return mcpArgsEqual(m["args"], gortexMCPArgs())
+}
+
+// mcpArgsEqual compares an args value against want, accepting both the
+// []string of a freshly built entry and the []any of one decoded from
+// disk. Any non-string element makes the args unequal.
+func mcpArgsEqual(raw any, want []string) bool {
+	var got []string
+	switch v := raw.(type) {
+	case []string:
+		got = v
+	case []any:
+		got = make([]string, 0, len(v))
+		for _, a := range v {
+			s, ok := a.(string)
+			if !ok {
+				return false
+			}
+			got = append(got, s)
+		}
+	default:
+		return false
+	}
+	return slices.Equal(got, want)
 }
 
 // GlobalGortexMCPEntry returns the daemon-proxy MCP entry suitable

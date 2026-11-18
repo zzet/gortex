@@ -85,3 +85,54 @@ Route::resource('items', ItemController::class)->except(['destroy', 'edit', 'cre
 		t.Errorf("except(destroy,edit,create) should leave 4 routes, got %d: %v", len(byID), keysOf(byID))
 	}
 }
+
+func TestLaravelResource_Options(t *testing.T) {
+	for _, tc := range []struct {
+		name, route string
+		want        []string
+	}{
+		{"resource", `Route::resource("orders", ShopController::class, ["names" => "orders"])->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"api_resource", `Route::apiResource("orders", ShopController::class, ["names" => ["show" => "orders.show"]])->except(["destroy", "update"]);`, []string{"http::GET::/orders", "http::POST::/orders", "http::GET::/orders/{p1}"}},
+		{"nested_options", `Route::resource("orders", ShopController::class, ["names" => array("index" => "orders.index)"), "parameters" => ["orders" => "order"]])->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"options_only", `Route::resource("orders", ShopController::class, ["only" => ["index"], "names" => ["show" => "orders.show"]]);`, []string{"http::GET::/orders"}},
+		{"options_except", `Route::apiResource("orders", ShopController::class, ["except" => ["destroy", "update"]])->only(["index", "destroy"]);`, []string{"http::GET::/orders"}},
+		{"nested_filter_name", `Route::resource("orders", ShopController::class, ["names" => ["only" => "ignored"]])->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"trailing_comma", `Route::resource("orders", ShopController::class, ["names" => "orders"],)->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"dynamic_options", `Route::resource("orders", ShopController::class, $options);`, nil},
+		{"dynamic_filter", `Route::resource("orders", ShopController::class, ["except" => $actions]);`, nil},
+		{"spread_options", `Route::resource("orders", ShopController::class, [...$options]);`, nil},
+		{"multiline_filter", `Route::resource("orders", ShopController::class, ["only" => [
+    "index",
+  ]]);`, []string{"http::GET::/orders"}},
+		{"empty_options", `Route::resource("orders", ShopController::class, [  ])->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"multiline_chain", `Route::resource("orders", ShopController::class, ["names" => "orders"])
+    ->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"dynamic_chain", `Route::resource("orders", ShopController::class, ["names" => "orders"])->only($actions);`, nil},
+		{"chain_override", `Route::resource("orders", ShopController::class, ["only" => ["show"]])->only(["show"])->only(["index"]);`, []string{"http::GET::/orders"}},
+		{"no_import", `Route::resource("orders", ShopController::class)->only(["index"]);`, []string{"http::GET::/orders"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte("<?php\n" + tc.route + "\nRoute::resource('other', CatalogController::class)->only(['show']);\n")
+			got := laravelContractIDs((&HTTPExtractor{}).Extract("routes/api.php", src, nil, nil))
+			if len(got) != len(tc.want)+1 {
+				t.Fatalf("want %d routes including the independent registration, got %d: %v", len(tc.want)+1, len(got), keysOf(got))
+			}
+			for _, id := range tc.want {
+				c, ok := got[id]
+				if !ok {
+					t.Errorf("missing %s", id)
+					continue
+				}
+				if c.SymbolID != "" || c.Meta["handler_class"] != "ShopController" {
+					t.Errorf("unexpected handler for %s: %+v", id, c)
+				}
+				if c.Line != 2 {
+					t.Errorf("line = %d, want 2", c.Line)
+				}
+			}
+			if c := got["http::GET::/other/{p1}"]; c.Meta["handler_class"] != "CatalogController" {
+				t.Errorf("independent registration changed: %+v", c)
+			}
+		})
+	}
+}

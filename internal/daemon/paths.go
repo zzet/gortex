@@ -114,8 +114,8 @@ func PIDFilePath() string {
 	return filepath.Join(os.TempDir(), "gortex-daemon.pid")
 }
 
-// LogFilePath returns the path the daemon writes logs to when running in
-// --detach mode. In foreground mode stderr is used instead.
+// LogFilePath returns the daemon's rotating JSON log path.
+// Interactive foreground mode uses stderr instead.
 func LogFilePath() string {
 	if override := os.Getenv("GORTEX_DAEMON_LOGFILE"); override != "" {
 		return override
@@ -124,6 +124,18 @@ func LogFilePath() string {
 		return filepath.Join(dir, "daemon.log")
 	}
 	return filepath.Join(os.TempDir(), "gortex-daemon.log")
+}
+
+// StderrLogFilePath holds crashes and other output outside the daemon logger.
+// Keeping inherited descriptors separate lets the daemon rotate LogFilePath.
+func StderrLogFilePath() string {
+	return StderrLogPath(LogFilePath())
+}
+
+// StderrLogPath derives the raw stderr file beside a daemon's JSON log.
+func StderrLogPath(logPath string) string {
+	ext := filepath.Ext(logPath)
+	return logPath[:len(logPath)-len(ext)] + ".stderr" + ext
 }
 
 // StateDir returns the directory the daemon keeps its runtime state in —

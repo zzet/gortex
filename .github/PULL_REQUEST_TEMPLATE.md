@@ -8,7 +8,7 @@ Brief description of what this PR does.
 
 ## Testing
 
-- [ ] All tests pass (`go test -race ./...`)
+- [ ] Tests for the touched packages pass (`make test PKGS=./internal/<pkg>/...`); CI runs the full suite
 - [ ] New tests added for new functionality
 - [ ] Benchmarks run if performance-relevant
 

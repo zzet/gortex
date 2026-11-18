@@ -78,7 +78,7 @@ func TestStatusAnswersWhileTheControllerMutexIsHeld(t *testing.T) {
 // truth is "the daemon is working on it". The tracked-repo registry is read
 // lock-free, so the configured rows still render.
 func TestStatusBeforeAnySuccessfulPassDegradesInsteadOfFailing(t *testing.T) {
-	c := probeController(t, "repos:\n  - path: /work/alpha\n")
+	c := probeController(t, "repos:\n  - path: "+t.TempDir()+"\n")
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -101,6 +101,7 @@ func TestStatusBeforeAnySuccessfulPassDegradesInsteadOfFailing(t *testing.T) {
 		assert.Empty(t, got.st.Workspaces, "the mutex-guarded rollup is genuinely unknown")
 		require.Len(t, got.st.TrackedRepos, 1, "the config registry is lock-free and still answers")
 		assert.True(t, got.st.TrackedRepos[0].Unloaded)
+		assert.True(t, got.st.TrackedRepos[0].Loading)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Status blocked behind the controller mutex on its very first pass")
 	}

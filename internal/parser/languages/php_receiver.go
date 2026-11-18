@@ -35,12 +35,13 @@ import (
 // only recorded from a declaration the source states outright, so a stamped
 // receiver_type is evidence the resolver can bind at the ast_resolved tier.
 type phpReceiverEnv struct {
+	fn *sitter.Node // preserves parameter spellings for graph-aware property lookup
 	// class is the simple name of the enclosing class, or "" inside a free
 	// function or a `static` closure (which does not bind $this).
 	class string
-	// vars maps a bare variable name (no leading `$`) to its simple type name.
+	// vars maps a bare variable name (no leading `$`) to its written type name.
 	vars typeEnv
-	// props maps a bare property name to its declared simple type name.
+	// props maps a bare property name to its declared type spelling.
 	props map[string]string
 }
 
@@ -49,7 +50,13 @@ func (env phpReceiverEnv) lookupVar(name string) string {
 	if env.vars == nil {
 		return ""
 	}
-	return env.vars[name]
+	typ := env.vars[name]
+	// A local assigned new self/static names the enclosing declaration,
+	// not a class literally named "self" or "static" in its namespace.
+	if strings.EqualFold(typ, "self") || strings.EqualFold(typ, "static") {
+		return env.class
+	}
+	return typ
 }
 
 // lookupProp returns the recorded type of $this->name, or "".
@@ -65,7 +72,7 @@ func (env phpReceiverEnv) lookupProp(name string) string {
 // imports outer variables), extended with the closure's own parameters and
 // local `new` assignments. A `static` closure drops $this.
 func (env phpReceiverEnv) childScope(fn *sitter.Node, src []byte) phpReceiverEnv {
-	child := phpReceiverEnv{class: env.class, props: env.props, vars: typeEnv{}}
+	child := phpReceiverEnv{fn: fn, class: env.class, props: env.props, vars: typeEnv{}}
 	for k, v := range env.vars {
 		child.vars[k] = v
 	}
@@ -81,7 +88,7 @@ func (env phpReceiverEnv) childScope(fn *sitter.Node, src []byte) phpReceiverEnv
 // class is the enclosing class simple name ("" for a free function) and props
 // its declared property types (nil for a free function).
 func newPHPReceiverEnv(fn *sitter.Node, src []byte, class string, props map[string]string) phpReceiverEnv {
-	env := phpReceiverEnv{class: class, props: props, vars: typeEnv{}}
+	env := phpReceiverEnv{fn: fn, class: class, props: props, vars: typeEnv{}}
 	collectPHPParamTypes(fn, src, env.vars)
 	collectPHPLocalTypes(phpFunctionBody(fn), src, env.vars)
 	return env
@@ -223,7 +230,7 @@ func phpNewExpressionClass(expr *sitter.Node, src []byte) string {
 		c := expr.NamedChild(i)
 		switch c.Type() {
 		case "name", "qualified_name":
-			return canonicalizePHPTypeRef(c.Content(src))
+			return strings.TrimSpace(c.Content(src))
 		case "arguments", "attribute_list":
 			continue
 		default:
@@ -259,13 +266,14 @@ func phpSoleTypeAtom(decl string) string {
 		if t == "" || phpBuiltinType(t) {
 			continue
 		}
-		return t
+		// Keep the written qualifier until the namespace pass resolves imports.
+		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(branch), "?"))
 	}
 	return ""
 }
 
 // phpClassPropertyTypes maps each declared property of a class / trait / enum
-// body to its simple type name — both classic typed properties and PHP 8
+// body to its written type name — both classic typed properties and PHP 8
 // constructor-promoted ones, which are declared in the constructor's parameter
 // list and have no property_declaration of their own.
 func phpClassPropertyTypes(body *sitter.Node, src []byte) map[string]string {
@@ -389,7 +397,6 @@ func (env phpReceiverEnv) phpScopeReceiverType(scope *sitter.Node, src []byte) s
 	return ""
 }
 
-
 // collectPHPAssignedPropertyTypes types a property that carries no type
 // DECLARATION from `$this->prop = new Foo()` in the class body. PHP only got
 // typed properties in 7.4, so a large body of code declares `private $handler;`
@@ -451,4 +458,41 @@ func phpThisPropertyName(access *sitter.Node, src []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(nameNode.Content(src))
+}
+
+// phpPropertyReceiver preserves a property path whose declarations may live in
+// another file. Parameter spellings must survive until namespace resolution.
+func (env phpReceiverEnv) phpPropertyReceiver(obj *sitter.Node, src []byte) map[string]any {
+	var path []string
+	for obj != nil && (obj.Type() == "member_access_expression" || obj.Type() == "nullsafe_member_access_expression") {
+		name := obj.ChildByFieldName("name")
+		if name == nil || name.Type() != "name" {
+			return nil
+		}
+		path = append([]string{name.Content(src)}, path...)
+		obj = obj.ChildByFieldName("object")
+	}
+	if len(path) == 0 || obj == nil || obj.Type() != "variable_name" {
+		return nil
+	}
+	root := ""
+	ambiguous := false
+	variable := strings.TrimPrefix(obj.Content(src), "$")
+	if variable == "this" {
+		root = env.class
+	} else if env.fn != nil {
+		if params := env.fn.ChildByFieldName("parameters"); params != nil {
+			for i := 0; i < int(params.NamedChildCount()); i++ {
+				p := params.NamedChild(i)
+				raw := phpParameterType(p, src)
+				if phpParamVarName(p, src) == variable && strings.ContainsAny(raw, "|&") {
+					ambiguous = true
+				}
+				if phpParamVarName(p, src) == variable && p.Type() != "variadic_parameter" && !strings.ContainsAny(raw, "|&") && env.lookupVar(variable) != "" && env.lookupVar(variable) == phpSoleTypeAtom(raw) {
+					root = strings.TrimPrefix(strings.TrimSpace(raw), "?")
+				}
+			}
+		}
+	}
+	return map[string]any{"php_property_root": root, "php_property_path": strings.Join(path, "."), "php_property_ambiguous": ambiguous}
 }

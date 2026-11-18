@@ -19,6 +19,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/platform"
 )
 
@@ -28,6 +29,10 @@ import (
 // construction time — the daemon package deliberately doesn't depend
 // on internal/mcp to keep the direction of imports clean.
 type Server struct {
+	runtimeMu       sync.RWMutex
+	runtimeClosing  bool
+	startupMetadata bool
+
 	SocketPath string
 	Version    string
 	Logger     *zap.Logger
@@ -69,6 +74,17 @@ type Server struct {
 	HTTPHandler http.Handler
 	HTTPAddr    string
 
+	// Configure before Listen. CancelShutdownOwners must be nonjoining;
+	// JoinRuntimeWriter retains actual startup-state publication completion.
+	// RuntimeStateFile is explicit because control-only library servers do
+	// not own the process-global daemon state file.
+	CancelShutdownOwners func()
+	JoinRuntimeWriter    func()
+	RuntimeStateFile     string
+	// OnShutdownComplete observes the actual cached result outside sync.Once.
+	// It runs once, after owned descriptors/files have physically completed.
+	OnShutdownComplete func(error)
+
 	sessions     *SessionRegistry
 	listener     net.Listener
 	httpListener net.Listener
@@ -89,10 +105,21 @@ type Server struct {
 	binaryStatFn      func(path string) (int64, int64, error) // size, mtime unix seconds, err
 	binaryLoggedStale bool
 
-	shutdown chan struct{}
-	doneOnce sync.Once
-	conns    map[net.Conn]struct{}
-	connsMu  sync.Mutex
+	shutdown          chan struct{}
+	shutdownDone      chan struct{}
+	doneOnce          sync.Once
+	shutdownErr       error
+	pidPath           string
+	statePath         string
+	ownedPID          ownedRuntimeFile
+	ownedSocket       ownedRuntimeFile
+	serveStarted      bool // protected by connsMu with connection admission
+	serveDone         chan struct{}
+	connsClosing      bool
+	lateConnCloseErrs []error // rejected accepted descriptors, joined by serveDone
+	socketChmod       func(string, os.FileMode) error
+	conns             map[net.Conn]struct{}
+	connsMu           sync.Mutex
 }
 
 // MCPDispatcher is implemented by whichever layer runs the MCP tool
@@ -193,8 +220,11 @@ func New(socketPath, version string, logger *zap.Logger) *Server {
 		instanceID:   newSessionID(),
 		sessions:     NewSessionRegistry(),
 		shutdown:     make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		serveDone:    make(chan struct{}),
 		conns:        make(map[net.Conn]struct{}),
 		binaryStatFn: osStatIdentity,
+		socketChmod:  os.Chmod,
 	}
 	// Capture the running image's identity so status requests can detect
 	// a later on-disk replace. Best-effort: a failure here leaves
@@ -272,33 +302,46 @@ func (s *Server) populateBinaryStatus(st *StatusResponse) {
 // machine should reach it; on Windows, %USERPROFILE% ACLs scope it to
 // the user instead.
 func (s *Server) Listen() error {
+	s.pidPath, s.statePath = PIDFilePath(), s.RuntimeStateFile
 	if err := EnsureParentDir(s.SocketPath); err != nil {
 		return fmt.Errorf("ensure socket dir: %w", err)
 	}
-	// Remove stale socket file from a crashed previous run. If the daemon
-	// is actually running, the PID check below will catch it and abort.
-	_ = os.Remove(s.SocketPath)
-
-	if err := s.writePIDFile(); err != nil {
+	// Check the PID before touching a potentially live existing endpoint.
+	if err := s.writePIDFileAt(s.pidPath); err != nil {
 		return fmt.Errorf("pid file: %w", err)
+	}
+	var err error
+	s.ownedPID, err = captureOwnedRuntimeFile(s.pidPath, true)
+	if err != nil {
+		return err
+	}
+	if err := removeStaleDaemonEndpoint(s.SocketPath); err != nil {
+		return errors.Join(err, s.ownedPID.remove())
 	}
 
 	lc := &net.ListenConfig{}
 	l, err := lc.Listen(context.Background(), "unix", s.SocketPath)
 	if err != nil {
-		_ = os.Remove(PIDFilePath())
-		return fmt.Errorf("listen: %w", err)
+		return errors.Join(fmt.Errorf("listen: %w", err), s.ownedPID.remove())
+	}
+	if listener, ok := l.(*net.UnixListener); ok {
+		// Automatic unlink ignores path replacement. Only the captured file
+		// identity may authorize removing this endpoint during Shutdown.
+		listener.SetUnlinkOnClose(false)
+	}
+	s.listener = l
+	s.ownedSocket, err = captureOwnedRuntimeFile(s.SocketPath, false)
+	if err != nil {
+		return s.failListen(err)
 	}
 	// chmod the socket to user-only on Unix. Windows has no POSIX mode
 	// bits — the socket inherits the ACLs of %USERPROFILE%, which is
 	// already user-scoped — so skip it there.
 	if runtime.GOOS != "windows" {
-		if err := os.Chmod(s.SocketPath, 0o600); err != nil {
-			_ = l.Close()
-			return fmt.Errorf("chmod socket: %w", err)
+		if err := s.socketChmod(s.SocketPath, 0o600); err != nil {
+			return s.failListen(fmt.Errorf("chmod socket: %w", err))
 		}
 	}
-	s.listener = l
 	s.started = time.Now()
 
 	// Optional HTTP listener for the MCP 2026 Streamable transport.
@@ -311,9 +354,7 @@ func (s *Server) Listen() error {
 	if s.HTTPHandler != nil && s.HTTPAddr != "" {
 		httpLn, herr := net.Listen("tcp", s.HTTPAddr)
 		if herr != nil {
-			_ = l.Close()
-			_ = os.Remove(PIDFilePath())
-			return fmt.Errorf("listen http: %w", herr)
+			return s.failListen(fmt.Errorf("listen http: %w", herr))
 		}
 		s.httpListener = httpLn
 		s.httpServer = &http.Server{
@@ -326,9 +367,13 @@ func (s *Server) Listen() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, platform.ShutdownSignals()...)
 	go func() {
-		<-sigCh
-		s.Logger.Info("daemon: received signal, shutting down")
-		_ = s.Shutdown()
+		defer signal.Stop(sigCh)
+		select {
+		case <-sigCh:
+			s.Logger.Info("daemon: received signal, shutting down")
+			_ = s.Shutdown()
+		case <-s.shutdown:
+		}
 	}()
 	return nil
 }
@@ -342,6 +387,14 @@ func (s *Server) Serve() error {
 	if s.listener == nil {
 		return errors.New("daemon: Listen must be called before Serve")
 	}
+	s.connsMu.Lock()
+	if s.connsClosing || s.serveStarted {
+		s.connsMu.Unlock()
+		return errors.New("daemon: serve lifetime is already started or closed")
+	}
+	s.serveStarted = true
+	s.connsMu.Unlock()
+	defer close(s.serveDone)
 	if s.httpListener != nil && s.httpServer != nil {
 		go func() {
 			if err := s.httpServer.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -392,7 +445,9 @@ func (s *Server) Serve() error {
 			continue
 		}
 		emfileBackoff = 0
-		s.trackConn(conn)
+		if !s.trackConn(conn) {
+			continue
+		}
 		go s.handle(conn)
 	}
 }
@@ -403,7 +458,7 @@ var deadPeerSweepInterval = 30 * time.Second
 
 // runMaintenance is the daemon's background hygiene loop: every
 // deadPeerSweepInterval it sweeps sessions whose originating client process has
-// died (platform.ProcessAlive), and — when GORTEX_DAEMON_IDLE_TIMEOUT is set —
+// died (platform.ProcessExists, so a client running as another user counts), and — when GORTEX_DAEMON_IDLE_TIMEOUT is set —
 // it shuts the daemon down after that long with no live sessions. Exits on the
 // shutdown signal.
 func (s *Server) runMaintenance() {
@@ -424,8 +479,8 @@ func (s *Server) runMaintenance() {
 		case <-s.shutdown:
 			return
 		case <-t.C:
-			for _, sd := range s.sessions.SweepDead(platform.ProcessAlive) {
-				if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+			for _, sd := range s.sessions.SweepDead(platform.ProcessExists) {
+				if hook, ok := s.currentDispatcher().(SessionEndedHook); ok && hook != nil {
 					hook.SessionEnded(sd)
 				}
 				s.Logger.Info("daemon: swept dead session",
@@ -483,7 +538,7 @@ func (s *Server) handle(conn net.Conn) {
 		if sess := s.sessions.Remove(conn); sess != nil {
 			// Fire the optional disconnect hook so implementations can
 			// release per-session resources keyed by this ID.
-			if hook, ok := s.MCPDispatcher.(SessionEndedHook); ok && hook != nil {
+			if hook, ok := s.currentDispatcher().(SessionEndedHook); ok && hook != nil {
 				hook.SessionEnded(sess)
 			}
 			s.Logger.Debug("daemon: session closed",
@@ -536,9 +591,13 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 		})
 		return nil, fmt.Errorf("parse handshake: %w", err)
 	}
+	protocol := ProtocolVersion
 	if h.Version != ProtocolVersion {
 		_ = WriteJSONLine(conn, HandshakeAck{
-			ErrorCode: ErrProtocolMismatch,
+			ErrorCode:      ErrProtocolMismatch,
+			DaemonVersion:  s.Version,
+			DaemonProtocol: &protocol,
+			DaemonInstance: s.instanceID,
 			ErrorMsg: fmt.Sprintf("daemon expects protocol %d, client sent %d",
 				ProtocolVersion, h.Version),
 		})
@@ -559,11 +618,12 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 		SessionID:      sess.ID,
 		DaemonVersion:  s.Version,
 		DaemonInstance: s.instanceID,
+		DaemonProtocol: &protocol,
 	}
 	// Stamp warmup state so the client can tell a still-warming daemon from a
 	// ready one. The session is established either way — Warming is advisory.
-	if s.Ready != nil {
-		ready, phase := s.Ready()
+	if readyFn := s.currentReadiness(); readyFn != nil {
+		ready, phase := readyFn()
 		ack.Warming = !ready
 		ack.WarmupPhase = phase
 	}
@@ -584,7 +644,7 @@ func (s *Server) handshake(conn net.Conn, reader *bufio.Reader) (*Session, error
 // returns the raw reply to write back. Nil reply = no response (the
 // client sent a notification).
 func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
-	if s.MCPDispatcher == nil {
+	if s.currentDispatcher() == nil {
 		_ = WriteJSONLine(conn, map[string]any{
 			"jsonrpc": "2.0",
 			"error": map[string]any{
@@ -596,21 +656,18 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 		return
 	}
 
+	classifier, _ := s.currentDispatcher().(MCPDispatchClassifier)
 	hooks := &mcpConnectionHooks{
+		sessionID: sess.ID,
+		classify:  classifier,
 		onReady: func(write func([]byte) error) {
-			if hook, ok := s.MCPDispatcher.(SessionStartedHook); ok && hook != nil {
+			if hook, ok := s.currentDispatcher().(SessionStartedHook); ok && hook != nil {
 				hook.SessionStarted(sess, write)
 			}
 		},
 	}
 	serveMCPConnectionWithHooks(conn, reader, s.mcpToolCallTimeout(), func(ctx context.Context, line []byte) ([]byte, error) {
-		reply, _, err := sess.dispatchMCPOnceContext(ctx, line, func() ([]byte, error) {
-			reply, err := s.MCPDispatcher.Dispatch(ctx, sess, line)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			return reply, err
-		})
+		reply, err := DispatchMCPFrame(ctx, sess, line, s.currentDispatcher())
 		if err != nil && s.Logger != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				outcome := "cancelled"
@@ -622,6 +679,14 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 					zap.String("outcome", outcome),
 					zap.Duration("deadline", s.mcpToolCallTimeout()),
 					zap.Error(ctxErr))
+			} else if errors.Is(err, errMCPDispatchSaturated) {
+				// Busy refusals are expected under bursts; keep them out of Warn.
+				fields := []zap.Field{zap.String("session_id", sess.ID)}
+				var busy *mcpDispatchBusyError
+				if errors.As(err, &busy) {
+					fields = append(fields, zap.Int64("queue_wait_ms", busy.waited.Milliseconds()))
+				}
+				s.Logger.Debug("daemon: mcp dispatcher busy", fields...)
 			} else {
 				s.Logger.Warn("daemon: dispatch error",
 					zap.String("session_id", sess.ID), zap.Error(err))
@@ -634,7 +699,7 @@ func (s *Server) serveMCP(conn net.Conn, reader *bufio.Reader, sess *Session) {
 // serveControl drains ControlRequest messages, invokes the Controller,
 // and writes paired ControlResponse messages.
 func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session) {
-	if s.Controller == nil {
+	if controller, startup := s.currentController(); controller == nil && !startup {
 		_ = WriteJSONLine(conn, ControlResponse{
 			ErrorCode: ErrInternal,
 			ErrorMsg:  "daemon started without controller",
@@ -656,18 +721,19 @@ func (s *Server) serveControl(conn net.Conn, reader *bufio.Reader, sess *Session
 		}
 		resp := s.handleControlBounded(sess, req)
 		writeErr := WriteJSONLine(conn, resp)
-		if req.Kind == ControlShutdown && resp.OK {
+		if req.Kind == ControlShutdown {
 			// Scheduled regardless of whether the ack reached the client. The
-			// controller flushes and closes the store before answering, so a
+			// controller attempts the teardown before answering, so a
 			// client that gave up waiting (or died) has already left by the
 			// time we get here — and skipping the teardown on a failed write
-			// would leave a daemon that flushed its store and then kept
-			// running, holding the on-disk lock the next start needs.
+			// would strand the listener/runtime after an accepted shutdown.
+			// Cleanup errors remain warnings, never proof of store-close success.
 			//
-			// The short delay gives a client that IS still listening a moment
-			// to read the ack before the listener goes away.
+			// WriteJSONLine writes directly to the connection, without a
+			// userspace buffer. A successful write has submitted the whole
+			// response; closing the stream does not require a fixed delay for
+			// the peer to consume it. Failed writes still schedule shutdown.
 			go func() {
-				time.Sleep(100 * time.Millisecond)
 				_ = s.Shutdown()
 			}()
 			return
@@ -714,14 +780,53 @@ func (s *Server) handleControlBounded(sess *Session, req ControlRequest) Control
 }
 
 func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlRequest) ControlResponse {
+	controller, startup := s.currentController()
+	if controller == nil && startup {
+		if req.Kind == ControlShutdown {
+			return ControlResponse{OK: true}
+		}
+		return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: "store is opening or migrating; retry", Retryable: true}
+	}
 	switch req.Kind {
+	case ControlTrackPreflight:
+		// Separate from Track so an unsupported/older controller cannot
+		// accidentally register a root for a read-only ownership observation.
+		preflight, ok := s.Controller.(interface {
+			PreflightTrack(context.Context, TrackParams) error
+		})
+		if !ok {
+			return controlErr(ErrInternal, "track preflight is not supported")
+		}
+		var p TrackParams
+		if err := unmarshalParams(req.Params, &p); err != nil {
+			return controlErr(ErrInternal, err.Error())
+		}
+		if err := preflight.PreflightTrack(ctx, p); err != nil {
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return controlErr(ErrPrefixCollision, err.Error())
+			}
+			if errors.Is(err, indexer.ErrRepoIdentityPending) {
+				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
+			}
+			return controlErr(ErrInternal, err.Error())
+		}
+		return ControlResponse{OK: true}
+
 	case ControlTrack:
 		var p TrackParams
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.Track(ctx, p)
+		result, err := controller.Track(ctx, p)
 		if err != nil {
+			if errors.Is(err, indexer.ErrRepoIdentityPending) {
+				return ControlResponse{ErrorCode: ErrRepoLoading, ErrorMsg: err.Error(), Retryable: true}
+			}
+			var collision *indexer.PrefixCollisionError
+			if errors.As(err, &collision) {
+				return controlErr(ErrPrefixCollision, err.Error())
+			}
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
@@ -731,28 +836,28 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.Untrack(ctx, p)
+		result, err := controller.Untrack(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlProxy:
-		result, err := s.Controller.ReloadServers(ctx)
+		result, err := controller.ReloadServers(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlReload:
-		result, err := s.Controller.Reload(ctx)
+		result, err := controller.Reload(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
 		return ControlResponse{OK: true, Result: result}
 
 	case ControlProbe:
-		pr, err := s.Controller.Probe(ctx)
+		pr, err := controller.Probe(ctx)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -771,12 +876,12 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 			// something else entirely, gets the routine counter-backed poll.
 			_ = json.Unmarshal(req.Params, &sp)
 		}
-		statusFn := s.Controller.Status
+		statusFn := controller.Status
 		if sp.Exact {
 			// Optional: a controller whose backend cannot recount simply does
 			// not implement this, and --exact degrades to the ordinary answer
 			// rather than failing.
-			if exact, ok := s.Controller.(StatusExactController); ok {
+			if exact, ok := controller.(StatusExactController); ok {
 				statusFn = exact.StatusExact
 			}
 		}
@@ -805,7 +910,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 				name, version := sess.SnapshotClientInfo()
 				row := MCPSessionStatus{
 					ID:            sess.ID,
-					Cwd:           sess.CWD,
+					Cwd:           sess.EffectiveCWD(),
 					ClientName:    name,
 					ClientVersion: version,
 				}
@@ -818,6 +923,8 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		}
 		// Binary-drift self-report: did the on-disk daemon image get
 		// replaced under this running process? See populateBinaryStatus.
+		dispatch := MCPDispatchSnapshot()
+		st.MCPDispatch = &dispatch
 		s.populateBinaryStatus(&st)
 		buf, _ := json.Marshal(st)
 		return ControlResponse{OK: true, Result: buf}
@@ -827,7 +934,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.SearchSymbols(ctx, p)
+		result, err := controller.SearchSymbols(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -838,7 +945,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlFileCoverage:
-		coverage, ok := s.Controller.(FileCoverageController)
+		coverage, ok := controller.(FileCoverageController)
 		if !ok {
 			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
 		}
@@ -857,7 +964,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlDirCoverage:
-		coverage, ok := s.Controller.(DirCoverageController)
+		coverage, ok := controller.(DirCoverageController)
 		if !ok {
 			return controlErr(ErrInternal, "this daemon cannot resolve a path to the view that serves it")
 		}
@@ -876,17 +983,18 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		return ControlResponse{OK: true, Result: buf}
 
 	case ControlShutdown:
-		if err := s.Controller.Shutdown(ctx); err != nil {
-			return controlErr(ErrInternal, err.Error())
+		resp := ControlResponse{OK: true}
+		if err := controller.Shutdown(ctx); err != nil {
+			resp.Warnings = []string{err.Error()}
 		}
-		return ControlResponse{OK: true}
+		return resp
 
 	case ControlEnrichChurn:
 		var p EnrichChurnParams
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichChurn(ctx, p)
+		result, err := controller.EnrichChurn(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -901,7 +1009,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichReleases(ctx, p)
+		result, err := controller.EnrichReleases(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -916,7 +1024,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichBlame(ctx, p)
+		result, err := controller.EnrichBlame(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -931,7 +1039,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichCoverage(ctx, p)
+		result, err := controller.EnrichCoverage(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -946,7 +1054,7 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 		if err := unmarshalParams(req.Params, &p); err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
-		result, err := s.Controller.EnrichCochange(ctx, p)
+		result, err := controller.EnrichCochange(ctx, p)
 		if err != nil {
 			return controlErr(ErrInternal, err.Error())
 		}
@@ -962,44 +1070,86 @@ func (s *Server) handleControl(ctx context.Context, _ *Session, req ControlReque
 // Shutdown stops the accept loop, closes outstanding connections, and
 // removes the socket and PID files. Safe to call multiple times.
 func (s *Server) Shutdown() error {
-	var first error
+	started := time.Now()
+	select {
+	case <-s.shutdownDone:
+		return s.shutdownErr
+	default:
+	}
+	// No producer callback runs under the once/admission mutex. Repeated
+	// callers cancel and join the same immutable writer lifetime.
+	cancelOwners, joinWriter := s.closeRuntimeAdmission()
+	if cancelOwners != nil {
+		cancelOwners()
+	}
+	if joinWriter != nil {
+		joinWriter()
+	}
+	ran := false
 	s.doneOnce.Do(func() {
+		ran = true
+		var errs []error
+		s.connsMu.Lock()
+		s.connsClosing = true
+		serveStarted := s.serveStarted
+		conns := make([]net.Conn, 0, len(s.conns))
+		for conn := range s.conns {
+			conns = append(conns, conn)
+		}
+		s.connsMu.Unlock()
 		close(s.shutdown)
 		if s.listener != nil {
-			first = s.listener.Close()
+			if err := s.listener.Close(); err != nil && !runtimeAlreadyClosed(err) {
+				errs = append(errs, fmt.Errorf("close daemon listener: %w", err))
+			}
 		}
-		// Tear down the HTTP listener with a short grace window so
-		// in-flight Streamable responses can finish flushing. We
-		// don't propagate the http error unless the unix-socket
-		// listener succeeded — the operator already sees a
-		// unix-socket close error in the same path.
+		// Allow in-flight Streamable responses their existing short grace;
+		// retain every actual failure alongside other cleanup errors.
 		if s.httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if herr := s.httpServer.Shutdown(ctx); herr != nil && first == nil {
-				first = herr
+			if err := s.httpServer.Shutdown(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown daemon HTTP server: %w", err))
 			}
 			cancel()
 		}
-		// Close all live conns so per-conn goroutines exit their read loops.
-		s.connsMu.Lock()
-		for c := range s.conns {
-			_ = c.Close()
+		// HTTP may not have entered Serve yet; retain its physical listener
+		// too, rather than assuming http.Server already registered it.
+		if s.httpListener != nil {
+			if err := s.httpListener.Close(); err != nil && !runtimeAlreadyClosed(err) {
+				errs = append(errs, fmt.Errorf("close daemon HTTP listener: %w", err))
+			}
 		}
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil && !runtimeAlreadyClosed(err) {
+				errs = append(errs, fmt.Errorf("close daemon connection: %w", err))
+			}
+		}
+		if serveStarted {
+			<-s.serveDone // Joins an accepted-but-not-yet-tracked descriptor.
+		}
+		s.connsMu.Lock()
+		errs = append(errs, s.lateConnCloseErrs...)
 		s.connsMu.Unlock()
-		_ = os.Remove(s.SocketPath)
-		_ = os.Remove(PIDFilePath())
-		// The runtime record describes THIS daemon's resolved choices, so it
-		// shares the PID file's lifetime — a survivor would point readers at
-		// a store no daemon has open.
-		RemoveRuntimeState()
+		errs = append(errs, s.removeRuntimeFiles())
+		s.shutdownErr = errors.Join(errs...)
+		close(s.shutdownDone)
 	})
-	return first
+	if ran && s.OnShutdownComplete != nil {
+		s.OnShutdownComplete(s.shutdownErr)
+	}
+	if ran {
+		s.Logger.Info("daemon: runtime teardown complete", zap.Duration("elapsed", time.Since(started)), zap.Error(s.shutdownErr))
+	}
+	return s.shutdownErr
 }
 
 // writePIDFile fails if a live daemon is already running, so starting
 // twice is a loud "already running" error rather than a silent overwrite.
 func (s *Server) writePIDFile() error {
-	path := PIDFilePath()
+	return s.writePIDFileAt(PIDFilePath())
+}
+
+func (s *Server) writePIDFileAt(path string) error {
 	if err := EnsureParentDir(path); err != nil {
 		return err
 	}
@@ -1018,7 +1168,7 @@ func (s *Server) writePIDFile() error {
 // RunningPID reports the PID of a live daemon recorded in the PID file, or
 // (0, false) when none is. Unlike IsRunning — which only probes the control
 // socket — this still reports a daemon that is *mid-shutdown*: the
-// ControlShutdown handler tears the listener down ~100ms after acking, but
+// ControlShutdown handler tears the listener down after writing its ack, but
 // the process stays alive while it flushes and closes the store, and it
 // holds the store's on-disk lock until it exits. That window is exactly what
 // turned a quick restart into a "failed to open database" lock conflict, so
@@ -1048,10 +1198,20 @@ func RunningPID() (int, bool) {
 	return pid, true
 }
 
-func (s *Server) trackConn(c net.Conn) {
+func (s *Server) trackConn(c net.Conn) bool {
 	s.connsMu.Lock()
+	if s.connsClosing {
+		s.connsMu.Unlock()
+		if err := c.Close(); err != nil && !runtimeAlreadyClosed(err) {
+			s.connsMu.Lock()
+			s.lateConnCloseErrs = append(s.lateConnCloseErrs, fmt.Errorf("close late accepted daemon connection: %w", err))
+			s.connsMu.Unlock()
+		}
+		return false
+	}
 	s.conns[c] = struct{}{}
 	s.connsMu.Unlock()
+	return true
 }
 
 func (s *Server) untrackConn(c net.Conn) {
