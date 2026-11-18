@@ -80,11 +80,8 @@ The combo store now keys symbol associations both on the whole query and per key
 Opt-in faster local backends via build tags:
 
 ```bash
-go build -tags embeddings_onnx ./cmd/gortex/          # needs: brew install onnxruntime
 go build -tags "embeddings_gomlx XLA" ./cmd/gortex/   # needs libtokenizers.a on the linker path — use `make build-gomlx` (see below)
 ```
-
-The `embeddings_onnx` backend (GTE-small) **never auto-downloads**: place `model.onnx` and `vocab.txt` in `~/.gortex/models/gte-small/` yourself and install the ONNX Runtime native library (`brew install onnxruntime`, or the distro equivalent). Without both, the backend reports "ONNX model not found" and the local chain falls through to the pure-Go Hugot backend.
 
 The GoMLX/XLA backend requires **both** tags — `embeddings_gomlx` alone links a disabled XLA stub and always falls through to the pure-Go backend; the `XLA` tag is what compiles the real XLA session. It also statically links the rust tokenizer, so the build needs `libtokenizers.a` on the linker path (a prebuilt archive from [daulet/tokenizers](https://github.com/daulet/tokenizers) releases, at `/usr/lib` or `/usr/local/lib`); `make build-gomlx` downloads it for you. At runtime the XLA/PJRT plugin auto-downloads (~100 MB). XLA/PJRT runtime viability is platform-dependent and still experimental — if the plugin fails to load, the local chain degrades to the pure-Go Hugot backend and the startup log names the failed backend (see Troubleshooting). The default pure-Go backend needs no tags and no native libraries, and is the reliable path.
 
@@ -92,7 +89,6 @@ The GoMLX/XLA backend requires **both** tags — `embeddings_gomlx` alone links 
 |---|---|---|---|---|
 | _(none)_ | Hugot pure-Go | MiniLM-L6-v2 (auto-download) | none | **default — reliable path** |
 | `embeddings_gomlx XLA` | Hugot + XLA/GoMLX | MiniLM-L6-v2 (auto-download) | libtokenizers.a (build) + PJRT plugin (runtime download) | experimental — XLA/PJRT runtime is platform-dependent |
-| `embeddings_onnx` | ONNX Runtime | GTE-small (manual placement) | libonnxruntime + hand-placed model | manual setup — never auto-downloads |
 
 The legacy `--embeddings` / `--embeddings-url` / `--embeddings-model` CLI flags and the `GORTEX_EMBEDDINGS*` env vars still take precedence over the config block — useful for one-shot overrides without editing `.gortex.yaml`.
 
@@ -101,7 +97,7 @@ The legacy `--embeddings` / `--embeddings-url` / `--embeddings-model` CLI flags 
 Semantic search degrading to text-only (BM25 / FTS5) is always logged — match the daemon log line to the cause:
 
 - **`embeddings enabled ... provider: local (hugot/fp32), dim: 384`** — working as intended: the transformer backend is active at its true width.
-- **`embeddings enabled ... provider: local → static fallback, dim: 50`** — a `local` config could not construct any transformer backend and fell back to static GloVe. The preceding `embedding backend unavailable — degraded to static fallback` warnings name each backend and why (an uncached model with downloads disabled, a missing `embeddings_onnx` model, …). Fix the named backend or accept static; the width and provider name now tell the truth rather than echoing the configured name.
+- **`embeddings enabled ... provider: local → static fallback, dim: 50`** — a `local` config could not construct any transformer backend and fell back to static GloVe. The preceding `embedding backend unavailable — degraded to static fallback` warnings name each backend and why (an uncached model with downloads disabled, …). Fix the named backend or accept static; the width and provider name now tell the truth rather than echoing the configured name.
 - **`vector index aborted on chunk failure`** — an embedding call failed (API timeout / auth, or an over-long input on a build without truncation) and the whole vector index was dropped to avoid a half-embedded, mis-scoring index. Text search stays live. `gortex eval embedders` reports the concrete cause as `vector build failed: …` instead of a bare "no vector data".
 - **`vector index built ... dropped: N`** (N > 0) — N malformed vectors (nil / wrong width) were skipped; the `sample_ids` warning names the first few. A non-zero `dropped` from a healthy provider is worth investigating.
 - **`vector index disabled — embedding text count exceeds threshold`** — the corpus is larger than `embedding.max_symbols`; raise it if you have the memory headroom.

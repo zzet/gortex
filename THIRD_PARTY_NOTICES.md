@@ -404,7 +404,6 @@ For an automated license-aware report, run a tool such as
 - `github.com/viterin/partial` @ v1.1.0
 - `github.com/viterin/vek` @ v0.4.3
 - `github.com/xo/terminfo` @ v0.0.0-20220910002029-abceb7e1c41e
-- `github.com/yalue/onnxruntime_go` @ v1.32.0
 - `github.com/yosida95/uritemplate/v3` @ v3.0.2
 - `github.com/yuin/goldmark` @ v1.4.13
 - `github.com/zeebo/assert` @ v1.3.0

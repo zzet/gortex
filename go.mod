@@ -275,7 +275,6 @@ require (
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
 	github.com/tree-sitter/tree-sitter-scala v0.26.12
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
-	github.com/yalue/onnxruntime_go v1.38.0
 	github.com/zeebo/blake3 v0.2.4
 	go.uber.org/zap v1.28.0
 	golang.org/x/image v0.48.0

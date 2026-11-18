@@ -8,7 +8,6 @@
 //
 // Opt-in build tags enable faster transformer backends for users who are
 // willing to manage native dependencies:
-//   - embeddings_onnx  — yalue/onnxruntime_go with libonnxruntime on PATH
 //   - embeddings_gomlx — hugot with XLA/PJRT plugin (~100MB auto-download)
 package embedding
 
@@ -19,9 +18,9 @@ import (
 )
 
 // ErrBackendNotCompiled marks a local-backend factory that failed only because
-// its build tag was not set (the onnx/gomlx stubs). Such a failure is benign
-// noise in a default build — callers use errors.Is to log it at debug rather
-// than warn even when the chain degrades to the static fallback.
+// its build tag was not set (the gomlx stub). Such a failure is benign noise
+// in a default build — callers use errors.Is to log it at debug rather than
+// warn even when the chain degrades to the static fallback.
 var ErrBackendNotCompiled = errors.New("embedding backend not compiled in")
 
 // Provider generates embedding vectors from text.
@@ -162,16 +161,15 @@ type SelectionReport struct {
 }
 
 // NewLocalProviderWithReport returns the best available local embedding provider
-// along with a report of every backend it tried. Preference order: ONNX
-// (fastest, requires libonnxruntime) → GoMLX (XLA) → Hugot (pure Go, always
-// compiled in) → Static (GloVe word vectors fallback). A nil provider means even
-// the static fallback failed to construct (its error is the last attempt).
+// along with a report of every backend it tried. Preference order:
+// GoMLX (XLA, fastest) → Hugot (pure Go, always compiled in) → Static
+// (GloVe word vectors fallback). A nil provider means even the static
+// fallback failed to construct (its error is the last attempt).
 func NewLocalProviderWithReport() (Provider, SelectionReport) {
 	factories := []struct {
 		name    string
 		factory func() (Provider, error)
 	}{
-		{"onnx", newONNXProvider},
 		{"gomlx", newGoMLXProvider},
 		{"hugot", newHugotProvider},
 	}

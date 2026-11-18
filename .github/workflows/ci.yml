@@ -118,7 +118,7 @@ jobs:
           retention-days: 7
 
   build-native:
-    # build-onnx already builds default Linux; always build the other OSes.
+    # build-gomlx already builds default Linux; always build the other OSes.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -237,7 +237,7 @@ jobs:
             exit 1
           fi
 
-  build-onnx:
+  build-gomlx:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -246,23 +246,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install ONNX Runtime
-        run: |
-          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz
-          tar xzf onnxruntime-linux-x64-1.24.4.tgz
-          sudo cp onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so* /usr/local/lib/
-          sudo ldconfig
-
-      - name: Build with ONNX tag
-        run: go build -tags embeddings_onnx -o gortex-onnx ./cmd/gortex/
-
       - name: Build default (Hugot bundled — no tag)
         run: go build -o gortex-default ./cmd/gortex/
 
       - name: Install rust tokenizers library
         # hugot's XLA session uses the rust tokenizer, statically linked as
         # -ltokenizers, so the embeddings_gomlx XLA build needs libtokenizers.a
-        # on the linker path. (The pure-Go default and the ONNX build do not.)
+        # on the linker path. (The pure-Go default and the GoMLX build do not.)
         run: |
           curl -fsSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar -xz
           sudo cp libtokenizers.a /usr/lib/
@@ -290,7 +280,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [plan, test, smoke, build-native, lint, build-linux-static, build-onnx, benchmark, parser-stress]
+    needs: [plan, test, smoke, build-native, lint, build-linux-static, build-gomlx, benchmark, parser-stress]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
