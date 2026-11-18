@@ -248,13 +248,14 @@ jobs:
 
       - name: Install ONNX Runtime
         run: |
-          # ONNX Runtime's official CPU wheel matches the C API 31 used by onnxruntime_go v1.38.0.
-          wheel="$RUNNER_TEMP/onnxruntime-1.31.0.whl"
-          library=libonnxruntime.so.1.31.0
-          curl -fsSL --retry 3 -o "$wheel" \
-            https://files.pythonhosted.org/packages/6c/44/1e9e762b95b7da0a8424913a1ed7c38cdaf88624a3c41ddba24ebac88bc9/onnxruntime-1.31.0-cp312-cp312-manylinux_2_28_x86_64.whl
-          echo "5e129d6c56abd53e659cb70f00a108d6824086470ff99c2e47a82e5786563db3  $wheel" | sha256sum --check
-          unzip -p "$wheel" "onnxruntime/capi/$library" > "$RUNNER_TEMP/$library"
+          # The official ONNX Runtime CPU package matches the C API 31 used by onnxruntime_go v1.38.0.
+          version=1.31.0
+          package="$RUNNER_TEMP/microsoft.ml.onnxruntime.$version.nupkg"
+          library="libonnxruntime.so.$version"
+          curl -fsSL --retry 3 -o "$package" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$version/microsoft.ml.onnxruntime.$version.nupkg"
+          echo "7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b  $package" | sha256sum --check
+          unzip -p "$package" runtimes/linux-x64/native/libonnxruntime.so > "$RUNNER_TEMP/$library"
           sudo install -m 0644 "$RUNNER_TEMP/$library" /usr/local/lib/
           sudo ln -sfn "$library" /usr/local/lib/libonnxruntime.so
           sudo ldconfig
