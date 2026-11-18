@@ -349,12 +349,32 @@ func (p *pendingProjections) publishReadExpected(e *projectionEntry, observed pr
 	if !p.enabled {
 		return projectionDisabled
 	}
+	diagnosticEnabled := os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") == "1"
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e.commitSeq != 0 || e == observed.entry || e.suspect.Load() || p.snap.Load().entries[e.key] != observed.entry ||
-		(observed.entry != nil && observed.entry.sourceEvents != observed.sourceEvents) {
+	sample := predicateSample("publish.expected_owner", observed.entry, nil)
+	sample.selectedSeen = true
+	var current *projectionEntry
+	ownerChanged := func() bool {
+		current = p.snap.Load().entries[e.key]
+		sample.currentSeen = true
+		sample.current = projectionIdentity(current)
+		if current != nil {
+			sample.currentSeq, sample.currentSourceSeq = current.commitSeq, current.sourceCommitSeq
+		}
+		return predicateReason(sample, "owner_changed", current != observed.entry)
+	}
+	if predicateReason(sample, "candidate_physical_seq", e.commitSeq != 0) || predicateReason(sample, "candidate_is_expected", e == observed.entry) || predicateReason(sample, "candidate_suspect", predicateBool(&sample.candidateSuspect, e.suspect.Load())) || ownerChanged() ||
+		(observed.entry != nil && predicateEvents(sample, observed.sourceEvents, observed.entry.sourceEvents)) {
 		p.refused[projectionSuperseded]++
-		return projectionSuperseded
+		return predicateErrorEnabled(diagnosticEnabled, "publish.expected_owner", observed.entry, current, func(out *projectionPredicateSample) {
+			out.decision = sample.decision
+			out.selectedSeen = true
+			out.currentSeen = sample.currentSeen
+			out.candidateSuspect = sample.candidateSuspect
+			out.eventSeen = sample.eventSeen
+			out.expectedEvent, out.currentEvent = sample.expectedEvent, sample.currentEvent
+		})
 	}
 	next, err := p.projectionReplacementLocked(e)
 	if err != nil {
