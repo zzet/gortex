@@ -24,27 +24,38 @@ LDFLAGS   := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.d
 # Build variants
 # ---------------------------------------------------------------------------
 
+# -trimpath on the host build, test, bench and install recipes: Go keys a
+# module's own packages by their absolute source directory, so without it each
+# worktree caches a private copy of all ~7.7k packages in every variant. The
+# cross-compile recipes and `claude-plugin` are deliberately left untrimmed —
+# `claude-plugin` is also a CI target, where checkout paths are stable and a
+# second variant is pure cost. Do not hoist this into `export GOFLAGS`:
+# internal/citest refuses to run with GOFLAGS set, so that breaks `make test`.
+#
+# Trimmed binaries report module-relative paths, so panics and stack traces
+# lose IDE click-through and a debugger needs a source-path substitution.
+
 build:
-	go build -ldflags '$(LDFLAGS)' -tags llama -o $(BINARY) ./cmd/gortex/
+	go build -trimpath -ldflags '$(LDFLAGS)' -tags llama -o $(BINARY) ./cmd/gortex/
 
 build-onnx: deps-onnx
-	go build -tags embeddings_onnx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+	go build -trimpath -tags embeddings_onnx -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 build-gomlx: deps-gomlx
-	go build -tags "embeddings_gomlx XLA" -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+	go build -trimpath -tags "embeddings_gomlx XLA" -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 # Hugot is bundled by default now — this target is kept as a compatibility
 # alias and also ensures the dep is explicitly recorded in go.mod.
 build-hugot: deps-hugot
-	go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
+	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/gortex/
 
 PKGS ?= ./...
 
 test:
-	go test -race -gcflags=modernc.org/sqlite/lib=-race=false -gcflags=modernc.org/libc/...=-race=false $(PKGS)
+	go test -trimpath -race -gcflags=modernc.org/sqlite/lib=-race=false -gcflags=modernc.org/libc/...=-race=false $(PKGS)
 
 bench:
-	go test -bench=. -benchmem -count=1 -benchtime=1s \
+	go test -trimpath -bench=. -benchmem -count=1 -benchtime=1s \
 		./internal/parser/languages/ \
 		./internal/graph/ \
 		./internal/search/ \
@@ -83,7 +94,7 @@ clean:
 	rm -f $(BINARY) gortex.exe gortex-linux gortex-rpi gortex-rpi32
 
 install:
-	go install -ldflags '$(LDFLAGS)' ./cmd/gortex/
+	go install -trimpath -ldflags '$(LDFLAGS)' ./cmd/gortex/
 
 # dev-link builds the working tree and points the Homebrew shim at it so
 # `gortex` on $PATH runs the dev binary. Restarts the daemon so the new
