@@ -23,6 +23,9 @@ func TestCommitTargetCheckReusesEvidenceAndRechecksRefChanges(t *testing.T) {
 	target := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
 	trace := filepath.Join(t.TempDir(), "git-trace.json")
 	t.Setenv("GIT_TRACE2_EVENT", trace)
+	// Some platforms and Git layouts cannot provide stable file evidence.
+	// They must keep asking Git rather than taking the metadata fast path.
+	metadataUsable := c.sampler.CaptureHeadEvidence().Usable()
 	check := c.commitTargetCheck(target)
 	if err := check(ctx); err != nil {
 		t.Fatal(err)
@@ -37,13 +40,35 @@ func TestCommitTargetCheckReusesEvidenceAndRechecksRefChanges(t *testing.T) {
 		}
 	}
 	after, err := os.ReadFile(trace)
-	if err != nil || !bytes.Equal(before, after) {
-		t.Fatalf("unchanged checks spawned Git subprocesses: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadataUsable && !bytes.Equal(before, after) {
+		t.Fatal("unchanged checks spawned Git subprocesses despite usable evidence")
+	}
+	if !metadataUsable && bytes.Equal(before, after) {
+		t.Fatal("unsupported metadata evidence did not fall back to Git")
 	}
 	for _, args := range [][]string{{"pack-refs", "--all"}, {"commit", "--allow-empty", "-m", "same tree"}} {
 		builderGit(t, f.worktree, args...)
 		if err := check(ctx); err != nil {
 			t.Fatalf("same-tree metadata change aborted build: %v", err)
+		}
+		// After revalidation, supported evidence must regain the fast path.
+		// Unsupported evidence must still take the authoritative Git path.
+		before, err = os.ReadFile(trace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := check(ctx); err != nil {
+			t.Fatal(err)
+		}
+		after, err = os.ReadFile(trace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metadataUsable != bytes.Equal(before, after) {
+			t.Fatalf("ref revalidation did not preserve evidence behavior (usable=%v)", metadataUsable)
 		}
 	}
 	// An unavailable metadata source must ask Git on every call, rather
