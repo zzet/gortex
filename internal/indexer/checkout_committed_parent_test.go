@@ -110,6 +110,11 @@ func TestCommittedParentReuseBuildsOnlyTheNewBranchDelta(t *testing.T) {
 func committedParentReuseFixture(t *testing.T) (*committedBaseFixture, string, store_sqlite.ViewGeneration) {
 	t.Helper()
 	f := newCommittedBaseFixture(t)
+	return committedParentReuseFixtureOver(t, f)
+}
+
+func committedParentReuseFixtureOver(t *testing.T, f *committedBaseFixture) (*committedBaseFixture, string, store_sqlite.ViewGeneration) {
+	t.Helper()
 	parent, root := f.pinDependent(t, "parent")
 	for i := range 20 {
 		builderWriteFile(t, root, fmt.Sprintf("branch%d.go", i), fmt.Sprintf("package fixture\nfunc Branch%d() { Helper() }\n", i))
@@ -134,6 +139,85 @@ func committedParentChild(t *testing.T, f *committedBaseFixture, parentRoot, nam
 	builderGit(t, root, "add", "-A")
 	builderGit(t, root, "commit", "-m", "one new branch change")
 	return c, root
+}
+
+func TestCommittedParentReuseReturnsToPrimaryAfterHEADMoves(t *testing.T) {
+	for _, modified := range []bool{false, true} {
+		t.Run(fmt.Sprintf("modified=%t", modified), func(t *testing.T) {
+			f, parentRoot, parent := committedParentReuseFixture(t)
+			c, root := committedParentChild(t, f, parentRoot, "child")
+			ctx := context.Background()
+			if out := c.reconcile(ctx); out.Err != nil {
+				t.Fatal(out.Err)
+			}
+			row, _ := f.generation(f.routeOf(t, c.checkoutID).CommitGenerationID)
+			if row.BaseGenerationID != parent.GenerationID {
+				t.Fatal("fixture did not borrow the committed parent")
+			}
+			builderWriteFile(t, root, "child_only.go", "package fixture\nfunc childOnly() { Branch1() }\n")
+			builderGit(t, root, "add", "-A")
+			builderGit(t, root, "commit", "-m", "stay near the borrowed branch")
+			if out := c.reconcile(ctx); out.Err != nil {
+				t.Fatal(out.Err)
+			}
+			row, _ = f.generation(f.routeOf(t, c.checkoutID).CommitGenerationID)
+			if row.BaseGenerationID != parent.GenerationID {
+				t.Fatal("nearby HEAD move lost the useful committed parent")
+			}
+			builderGit(t, root, "reset", "--hard", builderGit(t, f.primary, "rev-parse", "HEAD"))
+			if modified {
+				builderWriteFile(t, root, "helper.go", "package fixture\nfunc Helper() { Updated() }\nfunc Updated() {}\n")
+				builderGit(t, root, "add", "-A")
+				builderGit(t, root, "commit", "-m", "one change on primary")
+			}
+			if out := c.reconcile(ctx); out.Err != nil {
+				t.Fatal(out.Err)
+			}
+			row, _ = f.generation(f.routeOf(t, c.checkoutID).CommitGenerationID)
+			if row.BaseGenerationID != parent.BaseGenerationID || c.PinnedBaseGeneration() != 0 {
+				t.Fatalf("moved checkout retained an unnecessarily distant parent: %+v pin=%d", row, c.PinnedBaseGeneration())
+			}
+			assertViewIsItsOwnTree(t, f, c.checkoutID, root)
+		})
+	}
+}
+
+func TestCommittedParentReusePreservesSemanticQuality(t *testing.T) {
+	t.Setenv("GORTEX_ENRICH_MIN_NODES", "1")
+	for _, baselineComplete := range []bool{false, true} {
+		t.Run(fmt.Sprintf("baseline_complete=%t", baselineComplete), func(t *testing.T) {
+			f := newUnpublishedCommittedBaseFixture(t)
+			if baselineComplete {
+				manager := goTypesManager(t)
+				f.newBuilder = func(store *store_sqlite.Store) *SparseGenerationBuilder {
+					b := builderNewBuilder(store)
+					b.Semantic = manager
+					return b
+				}
+			}
+			builderWriteFile(t, f.primary, "go.mod", "module example.invalid/semanticquality\n\ngo 1.24\n")
+			builderGit(t, f.primary, "add", "-A")
+			builderGit(t, f.primary, "commit", "-m", "module base")
+			f.publishBase(t)
+			// The parent cannot finish its compiler pass. With no manager in
+			// either build, this must still permit ordinary structural reuse.
+			f.newBuilder = nil
+			_, parentRoot, _ := committedParentReuseFixtureOver(t, f)
+			c, root := committedParentChild(t, f, parentRoot, "child")
+			ctx := context.Background()
+			base, err := c.primaryBase(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, release, ok := c.chooseCommittedParent(ctx, base, builderGit(t, root, "rev-parse", "HEAD^{tree}"))
+			if ok {
+				release()
+			}
+			if ok == baselineComplete {
+				t.Fatalf("semantic quality admission=%t with complete baseline=%t", ok, baselineComplete)
+			}
+		})
+	}
 }
 
 func TestCommittedParentReuseRefusesChangedInputs(t *testing.T) {

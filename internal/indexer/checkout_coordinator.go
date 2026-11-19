@@ -1943,7 +1943,12 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	//
 	// pinRoutedBase refuses in the legacy regime and whenever anything but the
 	// base moved, so both fall through to the paths they always took.
+	primary := base
 	base, pinned := c.pinRoutedBase(ctx, base, route)
+	if pinned && c.preferPrimaryAfterCommitMove(ctx, primary, base, route, head.HeadTree) {
+		base, pinned = primary, false
+		c.notePinnedBase(0)
+	}
 	out.BasePinned = pinned
 	if !pinned && route.CommitGenerationID == 0 {
 		if parent, release, ok := c.chooseCommittedParent(ctx, base, head.HeadTree); ok {

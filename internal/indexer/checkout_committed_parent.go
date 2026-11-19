@@ -13,6 +13,31 @@ import (
 // Git subprocesses on the admission path.
 const maxCommittedParentDiffs = 8
 
+// Borrowing a sibling's branch is a startup optimization, not a reason to
+// keep undoing that branch after this checkout switches back to main. Only
+// reconsider borrowed parents when this checkout's own committed tree moves;
+// the existing dedicated-base pins keep their retention policy unchanged.
+func (c *CheckoutCoordinator) preferPrimaryAfterCommitMove(
+	ctx context.Context, primary, parent primaryBase, route store_sqlite.CheckoutRoute, targetTree string,
+) bool {
+	if parent.pinAnchor <= 0 {
+		return false
+	}
+	row, found, err := c.catalog.GetViewGeneration(ctx, route.CommitGenerationID)
+	if err != nil || !found || row.TreeOID == targetTree {
+		return false
+	}
+	if primary.treeOID == targetTree {
+		return true
+	}
+	direct, err := diffTreeChanges(ctx, c.root, primary.treeOID, targetTree)
+	if err != nil {
+		return false
+	}
+	borrowed, err := diffTreeChanges(ctx, c.root, parent.treeOID, targetTree)
+	return err == nil && len(direct) <= len(borrowed)
+}
+
 // chooseCommittedParent substitutes a substantially closer immutable tree for
 // a fresh checkout's physical build base. The returned release keeps its whole
 // ancestry leased until the caller has published and routed the child.
@@ -127,12 +152,30 @@ func (c *CheckoutCoordinator) openCommittedParent(
 		view.Close()
 		return empty, nil, false
 	}
+	var parentSemantic, anchorSemantic store_sqlite.ProducerState
 	for _, source := range view.GenerationSources() {
 		states, err := source.Handle.ProducerStates()
 		if err != nil || !completeCommittedParentProducers(states) {
 			view.Close()
 			return empty, nil, false
 		}
+		for _, state := range states {
+			if state.Producer != string(graphview.CapSemantic) {
+				continue
+			}
+			if source.Handle.ViewGeneration() == row.GenerationID {
+				parentSemantic = state.State
+			} else if source.Handle.ViewGeneration() == anchor.GenerationID {
+				anchorSemantic = state.State
+			}
+		}
+	}
+	// Do not replace a usable compiler baseline with an interrupted pass.
+	// Equal non-complete states remain eligible: without a semantic manager
+	// both generations honestly declare the same structural-only capability.
+	if parentSemantic != store_sqlite.ProducerStateComplete && parentSemantic != anchorSemantic {
+		view.Close()
+		return empty, nil, false
 	}
 	return primaryBase{
 		graphID: graphID, generationID: row.GenerationID, treeOID: row.TreeOID,
