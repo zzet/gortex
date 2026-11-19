@@ -311,70 +311,36 @@ func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache 
 // config exists — callers must handle that as "no alias resolution
 // available, fall through to bare-name behaviour."
 func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
-	if srcFile == "" {
-		return nil, ""
+	in, prefix, idx := mi.resolutionInputsForFile(srcFile)
+	if in == nil || in.aliases == nil {
+		return nil, prefix
 	}
-	for _, m := range mi.AllMetadata() {
-		prefix := m.RepoPrefix
-		// A tracked repo always carries a prefix; a metadata entry without
-		// one is malformed rather than a lone-repo special case, so it
-		// cannot claim srcFile. Nor can a repo whose prefix does not lead
-		// the path.
-		if prefix == "" || !strings.HasPrefix(srcFile, prefix+"/") {
-			continue
-		}
-		rel := strings.TrimPrefix(srcFile, prefix+"/")
-		coll := mi.tsAliasCollectionFor(prefix, m.RootPath)
-		if coll == nil {
-			return nil, prefix
-		}
-		scope := coll.FindForFile(path.Dir(rel))
-		if idx := mi.GetIndexer(prefix); idx != nil {
-			// The repository's own build, when it proves its reads, records
-			// the working-copy probes this map makes (tsAliasProbes).
-			scope = scope.ObservingProbes(idx.tsAliasProbes())
-		}
-		return scope, prefix
+	scope := in.aliases.FindForFile(path.Dir(strings.TrimPrefix(srcFile, prefix+"/")))
+	if idx != nil {
+		scope = scope.ObservingProbes(idx.tsAliasProbes())
 	}
-	return nil, ""
+	return scope, prefix
 }
 
-// tsAliasCollectionFor returns the tsconfig / jsconfig alias scopes a tracked
-// repository's path-alias lookups must go through.
-//
-// The scopes come from the tracked-repo metadata's root, which is where this
-// scan always read: only a registered indexer that has declared SOURCE
-// authority takes over, and then through that indexer's own memo, because a
-// snapshot's scopes must neither be looked up in nor written to the
-// process-wide root-keyed cache. An indexer with no source installed reads the
-// same working copy the metadata root names, so deferring to it would swap the
-// root for no gain — the same preference readFileFromAnyRepo's manifestTreeFor
-// applies, for the same reason.
-func (mi *MultiIndexer) tsAliasCollectionFor(prefix, root string) *tsalias.Collection {
-	// GetIndexer holds mi.mu only for this lookup; no I/O happens under it.
-	if idx := mi.GetIndexer(prefix); idx != nil {
-		if tree := idx.manifestTree(); tree.sourced() {
-			return idx.tsAliasCollection()
+// Resolution uses the registered snapshot or pinned pass before the shared
+// checkout cache. Never hold the metadata lock during discovery.
+func (mi *MultiIndexer) resolutionInputsForFile(file string) (*resolutionInputs, string, *Indexer) {
+	mi.mu.RLock()
+	prefix, meta := mi.graphFileRepoLocked(file)
+	idx := mi.indexers[prefix]
+	mi.mu.RUnlock()
+	if meta == nil {
+		return nil, "", nil
+	}
+	if idx != nil {
+		if idx.manifestTree().sourced() {
+			return idx.lookupResolutionInputs(), prefix, idx
+		}
+		if pinned := idx.activeResolution.Load(); pinned != nil {
+			return pinned, prefix, idx
 		}
 	}
-	return loadTSAliasCollection(root)
-}
-
-func loadTSAliasCollection(root string) *tsalias.Collection {
-	return workingResolutionInputs(root, nil).aliases
-}
-
-// tsAliasCollectionForTree loads the alias scopes out of one tree.
-//
-// A working-copy tree keeps the process-wide root-keyed cache it has always
-// used. A sourced tree is loaded through tsalias.LoadTree over the snapshot
-// itself — every config file it holds, read out of it, with its multi-target
-// aliases grounded in its own bytes — and never touches that cache. A sourced
-// tree that cannot enumerate answers "no scopes" rather than falling back to
-// the checkout: a build that declared source authority must not read the
-// working copy, and a wrong alias scope is a wrong EDGE, not a missing one.
-func tsAliasCollectionForTree(tree manifestTree) *tsalias.Collection {
-	return resolutionInputsForTree(tree).aliases
+	return workingResolutionInputs(meta.RootPath, nil), prefix, idx
 }
 
 // readFileFromAnyRepo finds the bytes for a repo-prefixed file path by

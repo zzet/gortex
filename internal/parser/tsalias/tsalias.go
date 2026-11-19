@@ -81,15 +81,12 @@ type AliasTarget struct {
 // Map is the alias set declared by one tsconfig/jsconfig file.
 type Map struct {
 	Entries []Alias
-	// BaseURL is the relative path the targets resolve against. Empty
-	// when the config didn't declare one — callers should treat
-	// targets as repo-relative in that case.
-	BaseURL string
+	// TargetBase is the effective repo-relative base of replacement paths.
+	// It may belong to a parent config outside this map's lookup scope.
+	TargetBase string
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
-	// targetBase can be the declaring parent rather than the child scope.
-	targetBase string
 	// exists reports whether a repo-relative slash path is readable content
 	// in the tree this map was loaded from. Set by the loaders, it is what
 	// grounds a multi-target alias in the tree the map came from — the
@@ -156,7 +153,7 @@ func (c *Collection) Maps() []*Map {
 // Equal compares effective scopes, not the tree-specific existence probes.
 func (c *Collection) Equal(other *Collection) bool {
 	return slices.EqualFunc(c.Maps(), other.Maps(), func(a, b *Map) bool {
-		return a.DirPrefix == b.DirPrefix && a.BaseURL == b.BaseURL && a.targetBase == b.targetBase &&
+		return a.DirPrefix == b.DirPrefix && a.TargetBase == b.TargetBase &&
 			slices.EqualFunc(a.Entries, b.Entries, func(a, b Alias) bool {
 				return a.AliasPrefix == b.AliasPrefix && a.AliasSuffix == b.AliasSuffix &&
 					a.TargetPrefix == b.TargetPrefix && a.TargetSuffix == b.TargetSuffix &&
@@ -242,27 +239,13 @@ func matchAlias(a *Alias, modulePath string) (string, bool) {
 	return "", true
 }
 
-// joinTarget resolves a filled-in target against the config's BaseURL and
-// DirPrefix, returning a forward-slashed repo-relative path. The result is
+// joinTarget returns a forward-slashed repo-relative path. The result is
 // always path-cleaned: a tsconfig written without a baseUrl (legal since
 // TS 4.1) keeps its targets verbatim (`"zustand": ["./src/index.ts"]`),
 // and an uncleaned `./` prefix would never match a graph file node, so
 // every paths-alias import in such a repo silently failed to resolve.
 func (m *Map) joinTarget(matched string) string {
-	if m.targetBase != "" {
-		return path.Clean(path.Join(m.targetBase, filepath.ToSlash(matched)))
-	}
-	joined := matched
-	if m.BaseURL != "" {
-		joined = filepath.ToSlash(filepath.Join(m.BaseURL, matched))
-	}
-	if m.DirPrefix != "" {
-		joined = filepath.ToSlash(filepath.Join(m.DirPrefix, joined))
-	}
-	if joined == "" {
-		return ""
-	}
-	return path.Clean(joined)
+	return path.Join(m.TargetBase, filepath.ToSlash(matched))
 }
 
 // probeExts are the source extensions a path-alias target may resolve to,
@@ -292,11 +275,6 @@ func targetExistsInTree(exists func(rel string) bool, joined string) bool {
 	return false
 }
 
-func fileExists(p string) bool {
-	info, err := os.Stat(p)
-	return err == nil && !info.IsDir()
-}
-
 func stripExt(p string) string {
 	switch ext := filepath.Ext(p); ext {
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
@@ -321,6 +299,9 @@ type Tree interface {
 
 // configFileNames are the config files a loader reads.
 var configFileNames = [...]string{"tsconfig.json", "jsconfig.json"}
+
+// ConfigFileNames returns the filenames that can introduce an alias scope.
+func ConfigFileNames() [len(configFileNames)]string { return configFileNames }
 
 // IsConfigFileName reports whether base — a file's base name — is a config
 // file the loaders parse. Exported so a Tree implementation that must decide
@@ -383,8 +364,13 @@ func LoadTree(t Tree) *Collection {
 	if t == nil {
 		return nil
 	}
+	return LoadScopes(t.Files, t.Read, t.Exists)
+}
+
+// LoadScopes retains only exists; discovery and config reads are load-time inputs.
+func LoadScopes(files func(func(string)), read func(string) ([]byte, bool), exists func(string) bool) *Collection {
 	var scopes []*Map
-	t.Files(func(rel string) {
+	files(func(rel string) {
 		if !IsConfigFileName(path.Base(rel)) || underSkippedDir(rel) {
 			return
 		}
@@ -392,7 +378,7 @@ func LoadTree(t Tree) *Collection {
 		if dirRel == "." || dirRel == "/" {
 			dirRel = ""
 		}
-		if m := parseConfig(t, rel, dirRel); m != nil {
+		if m := parseConfig(read, exists, rel, dirRel); m != nil {
 			scopes = append(scopes, m)
 		}
 	})
@@ -415,13 +401,16 @@ func Load(repoRoot string) *Collection {
 
 // WorkingTree visits config candidates plus an optional file in a pruned
 // directory (for example, a generated list supplied by another loader).
-func WorkingTree(root, extra string) Tree {
+func WorkingTree(root, extra string, scopeFiles ...string) Tree {
 	dir, file := path.Split(extra)
-	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file}
+	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file, scopeFiles: scopeFiles}
 }
 
 // dirTree is the working copy at a root: the tree Load reads.
-type dirTree struct{ root, extraDir, extraFile string }
+type dirTree struct {
+	root, extraDir, extraFile string
+	scopeFiles                []string
+}
 
 var _ Tree = dirTree{}
 
@@ -450,7 +439,7 @@ func (t dirTree) Files(visit func(rel string)) {
 			}
 			return nil
 		}
-		if !IsConfigFileName(d.Name()) {
+		if !IsConfigFileName(d.Name()) && !slices.Contains(t.scopeFiles, d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(t.root, p)
@@ -463,28 +452,36 @@ func (t dirTree) Files(visit func(rel string)) {
 }
 
 func (t dirTree) Read(rel string) ([]byte, bool) {
-	data, err := os.ReadFile(filepath.Join(t.root, filepath.FromSlash(rel)))
+	root, err := os.OpenRoot(t.root)
 	if err != nil {
 		return nil, false
 	}
-	return data, true
+	defer root.Close()
+	data, err := root.ReadFile(filepath.FromSlash(rel))
+	return data, err == nil
 }
 
 func (t dirTree) Exists(rel string) bool {
-	return fileExists(filepath.Join(t.root, filepath.FromSlash(rel)))
+	root, err := os.OpenRoot(t.root)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	info, err := root.Stat(filepath.FromSlash(rel))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // parseConfig resolves inherited options and probes targets in the same tree.
-func parseConfig(t Tree, rel, dirPrefix string) *Map {
-	load := configLoad{tree: t, visited: make(map[string]int)}
+func parseConfig(read func(string) ([]byte, bool), exists func(string) bool, rel, dirPrefix string) *Map {
+	load := configLoad{read: read, visited: make(map[string]int)}
 	load.visit(rel, 0)
 	co := load.options
 	if co.baseURL == "" && co.paths == nil {
 		return nil
 	}
-	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: t.Exists}
+	m := &Map{DirPrefix: dirPrefix, TargetBase: co.pathsDir, exists: exists}
 	if co.baseURL != "" {
-		m.targetBase = co.baseURL
+		m.TargetBase = co.baseURL
 	}
 	for pattern, targets := range co.paths {
 		if len(targets) == 0 {
@@ -518,7 +515,7 @@ type configOptions struct {
 // left. A shared ancestor can only supply an option not yet chosen. Revisit
 // it only if the shorter path leaves more of the depth budget for its parents.
 type configLoad struct {
-	tree    Tree
+	read    func(string) ([]byte, bool)
 	options configOptions
 	visited map[string]int
 }
@@ -528,7 +525,7 @@ func (l *configLoad) visit(rel string, depth int) {
 		return
 	}
 	l.visited[rel] = depth
-	data, ok := l.tree.Read(rel)
+	data, ok := l.read(rel)
 	if !ok {
 		if depth > 0 && !strings.HasSuffix(rel, ".json") {
 			l.visit(rel+".json", depth)

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
@@ -135,4 +136,146 @@ func TestNuxtRestoreAndBindingEdits(t *testing.T) {
 	reindex(page, "old.ts::useAuth")
 	bumpMtime(t, page, body)
 	reindex(page, "lib/impl.ts::second")
+}
+
+func TestNuxtAliasedImplementationArrives(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, ".nuxt/imports.d.ts"), "export { later as useLater } from '../lib'")
+	writeFileMk(t, filepath.Join(root, "page.ts"), "export function run() { return useLater() }")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::useLater", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+	module := filepath.Join(root, "lib/index.ts")
+	writeFileMk(t, module, "export function later() { return 1 }")
+	_, err = idx.incrementalPointWatcherPath(root, module)
+	require.NoError(t, err)
+	require.Equal(t, "lib/index.ts::later", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+}
+
+func TestNuxtWatcherDigestUsesResolvedSnapshot(t *testing.T) {
+	root := t.TempDir()
+	list := filepath.Join(root, ".nuxt/imports.d.ts")
+	set := func(module string) { writeFileMk(t, list, "export { useAuth } from '../"+module+"'") }
+	for _, mod := range []string{"old", "new"} {
+		writeFileMk(t, filepath.Join(root, mod+".ts"), "export function useAuth() {}")
+	}
+	page := filepath.Join(root, "app/page.ts")
+	writeFileMk(t, page, "export function run() { return useAuth() }")
+	set("old")
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	other, _ := newSQLiteIndexer(t)
+	other.SetRootPath(root)
+	set("new")
+	caughtUp := false
+	idx.incrementalResolveFilesHook = func(files []string) {
+		digest, err := store.ResolutionInputDigest("")
+		require.NoError(t, err)
+		require.Empty(t, digest, "a restart here must not trust the parsed but unresolved graph")
+		set("old")
+		_, err = other.refreshResolutionInputs(root, "")
+		require.NoError(t, err)
+		idx.resolver.ResolveFilesAndIncoming(files)
+		caughtUp = true
+	}
+	_, err = idx.incrementalPointWatcherPath(root, page)
+	require.NoError(t, err)
+	require.True(t, caughtUp)
+	require.Equal(t, "new.ts::useAuth", callTargetForName(t, idx.Graph(), "app/page.ts", "run"))
+	require.False(t, idx.censusResolutionCurrent(root))
+	set("new")
+	require.True(t, idx.censusResolutionCurrent(root))
+
+	// A source-only edit also replaces call rows before resolver catch-up.
+	caughtUp = false
+	idx.incrementalResolveFilesHook = func(files []string) {
+		require.False(t, idx.censusResolutionCurrent(root), "unchanged inputs cannot certify unfinished rows")
+		idx.resolver.ResolveFilesAndIncoming(files)
+		caughtUp = true
+	}
+	bumpMtime(t, page, "export function secondCaller() { return useAuth() }")
+	_, err = idx.incrementalPointWatcherPath(root, page)
+	require.NoError(t, err)
+	require.True(t, caughtUp)
+	require.Equal(t, "new.ts::useAuth", callTargetForName(t, idx.Graph(), "app/page.ts", "secondCaller"))
+	require.True(t, idx.censusResolutionCurrent(root))
+}
+
+func TestNuxtNestedRepositoryUsesOwningList(t *testing.T) {
+	outer, inner := t.TempDir(), t.TempDir()
+	writeFileMk(t, filepath.Join(outer, ".nuxt/imports.d.ts"), "export { useAuth } from '../outer'")
+	writeFileMk(t, filepath.Join(inner, ".nuxt/imports.d.ts"), "export { useAuth } from '../inner'")
+	mi := &MultiIndexer{repos: map[string]*RepoMetadata{
+		"team": {RepoPrefix: "team", RootPath: outer}, "team/store": {RepoPrefix: "team/store", RootPath: inner},
+	}}
+	for file, want := range map[string]string{"team/store/page.ts": "team/store/inner", "team/storefront/page.ts": "team/outer"} {
+		got, _ := mi.nuxtAutoImportResolver()(file, "useAuth")
+		require.Equal(t, want, got)
+	}
+}
+
+// Cause the real read-version fence to reject this file on every attempt.
+type movingNuxtFile struct {
+	bomStripTransform
+	file string
+}
+
+func (m movingNuxtFile) matches(path string) bool {
+	return filepath.Base(path) == filepath.Base(m.file)
+}
+func (m movingNuxtFile) apply(_ string, src []byte) ([]byte, error) {
+	st, err := os.Stat(m.file)
+	if err != nil {
+		return nil, err
+	}
+	next := st.ModTime().Add(time.Second)
+	return src, os.Chtimes(m.file, next, next)
+}
+
+func TestNuxtResolutionRetryOnlyRestagesFailedFile(t *testing.T) {
+	root := t.TempDir()
+	page := filepath.Join(root, "page.ts")
+	writeFileMk(t, page, "export function run() { return useAuth() }")
+	for _, mod := range []string{"old", "new"} {
+		writeFileMk(t, filepath.Join(root, mod+".ts"), "export function useAuth() {}")
+	}
+	list := filepath.Join(root, ".nuxt/imports.d.ts")
+	writeFileMk(t, list, "export { useAuth } from '../old'")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	original := idx.transforms.transforms
+	idx.transforms.transforms = append(original[:len(original):len(original)], movingNuxtFile{file: page})
+	writeFileMk(t, list, "export { useAuth } from '../new'")
+	for pass := range 2 {
+		res, err := idx.IncrementalReindexPaths(root, []string{list})
+		require.NoError(t, err)
+		require.Contains(t, res.FailedFiles, page)
+		if pass == 1 {
+			require.Equal(t, 1, res.StaleFileCount)
+		}
+	}
+	idx.transforms.transforms = original
+	res, err := idx.IncrementalReindexPaths(root, []string{list})
+	require.NoError(t, err)
+	require.Empty(t, res.FailedFiles)
+	require.Equal(t, 1, res.StaleFileCount)
+	require.Equal(t, "new.ts::useAuth", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+}
+
+func TestNuxtResolutionRejectsEscapingExtends(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"extends":"./link/base.json"}`)
+	writeFileMk(t, filepath.Join(outside, "base.json"), `{"compilerOptions":{"paths":{"@secret":["private"]}}}`)
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	idx, _ := newSQLiteIndexer(t)
+	idx.SetRootPath(root)
+	in, err := idx.refreshResolutionInputs(root, "")
+	require.NoError(t, err)
+	require.Empty(t, idx.resolvePathAliasImport("page.ts", "@secret"))
+	require.Empty(t, in.reads["link/base.json"], "an out-of-root read cannot supply a content hash")
 }

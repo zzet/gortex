@@ -307,6 +307,14 @@ var validNodeKinds = map[NodeKind]bool{
 	KindMacro:     true, KindAgent: true, KindContractBridge: true,
 }
 
+// Persisted JS/TS binding evidence shared by extraction, resolution and restubbing.
+const (
+	DefaultExportMeta  = "default_export"
+	ImportBindingsMeta = "import_bindings"
+	StarReExportMeta   = "star_reexport"
+	NuxtImportNameMeta = "nuxt_import_name"
+)
+
 type Node struct {
 	ID        string   `json:"id"`
 	Kind      NodeKind `json:"kind"`
@@ -322,8 +330,8 @@ type Node struct {
 	StartColumn int            `json:"start_column,omitempty"`
 	EndColumn   int            `json:"end_column,omitempty"`
 	Language    string         `json:"language"`
-	Meta       map[string]any `json:"meta,omitempty"`
-	RepoPrefix string         `json:"repo_prefix,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+	RepoPrefix  string         `json:"repo_prefix,omitempty"`
 	// WorkspaceID is the hard graph boundary slug. Two nodes with
 	// different WorkspaceIDs are not allowed to be matched as contract
 	// provider/consumer pairs and queries scope by it by default.

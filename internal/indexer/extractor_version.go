@@ -47,12 +47,12 @@ var extractorVersions = map[string]int{
 	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
 	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
 	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
-	"javascript": 3,                                      // module imports retain their local value bindings
-	"typescript": 4,                                      // same import binding metadata as JavaScript
-	"vue":        2,                                      // embedded scripts retain their local import bindings
-	"svelte":     2,                                      // embedded scripts retain their local import bindings
-	"astro":      2,                                      // embedded scripts retain their local import bindings
-	"html":       2,                                      // inline module scripts use the JS import extractor
+	"javascript": 4,                                      // module imports retain local-to-export mappings
+	"typescript": 5,
+	"vue":        3, // embedded scripts share JS/TS binding evidence
+	"svelte":     3,
+	"astro":      3,
+	"html":       3,
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

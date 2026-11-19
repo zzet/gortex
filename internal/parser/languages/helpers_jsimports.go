@@ -79,24 +79,28 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		return
 	}
 	var locals strings.Builder
-	addLocal := func(name string) {
+	addLocal := func(name, exported string) {
 		if locals.Len() != 0 {
 			locals.WriteByte(' ')
 		}
 		locals.WriteString(name)
+		if name != exported {
+			locals.WriteByte(':')
+			locals.WriteString(exported)
+		}
 	}
 	typeOnly := tsImportStatementTypeOnly(importNode, src)
 	if clause := findChildByType(importNode, "import_clause"); clause != nil && !typeOnly {
 		if id := findChildByType(clause, "identifier"); id != nil {
 			name := id.Content(src)
-			addLocal(name)
+			addLocal(name, "default")
 			if strings.Contains(filePath, ".vue#script:") {
 				module.Meta = map[string]any{"vue_default_import": name}
 			}
 		}
 		if ns := findChildByType(clause, "namespace_import"); ns != nil {
 			if id := findChildByType(ns, "identifier"); id != nil {
-				addLocal(id.Content(src))
+				addLocal(id.Content(src), "*")
 			}
 		}
 	}
@@ -111,9 +115,9 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		}
 		if !typeOnly && !tsSpecifierTypeOnly(sp, src) {
 			if alias == "" {
-				addLocal(orig)
+				addLocal(orig, orig)
 			} else {
-				addLocal(alias)
+				addLocal(alias, orig)
 			}
 		}
 		if len(specs) > jsImportBindingCap {
@@ -133,7 +137,7 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		if module.Meta == nil {
 			module.Meta = map[string]any{}
 		}
-		module.Meta["import_bindings"] = locals.String()
+		module.Meta[graph.ImportBindingsMeta] = locals.String()
 	}
 }
 
@@ -247,6 +251,8 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 		if id := findChildByType(ns, "identifier"); id != nil {
 			edge.Alias = id.Content(src)
 		}
+	} else if !tsExportStatementTypeOnly(exportNode, src) {
+		edge.Meta = map[string]any{graph.StarReExportMeta: true}
 	}
 	result.Edges = append(result.Edges, edge)
 }

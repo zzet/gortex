@@ -45,7 +45,8 @@ import (
 // cascade, changing import edges for an unchanged corpus.
 // Nuxt app bindings, exact named imports and inherited TS aliases change JS/TS call targets.
 // Named forwarding edges and caller-owned shadow checks change JS/TS call bindings.
-const ResolutionSemanticsVersion = 9
+// Exact module bindings follow renamed exports and stop at Nuxt app boundaries.
+const ResolutionSemanticsVersion = 10
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

@@ -369,9 +369,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 		// structural stage whatever its fingerprints say
 		// (deletion_importers.go).
 		forced := idx.forceReparse(filePath) || len(legacyIDs) > 0
-		aliasChanged := idx.mustReresolve(graphPath) || closureJSTSPath(graphPath) && probeOK &&
-			(storedDerived.imports == "" || storedDerived.imports != probe.derived.imports)
-		inert := !aliasChanged && probeOK && storedGraph.semantic != "" &&
+		resolutionStale := idx.inputsStaleForFile(idx.relKey(filePath)) || closureJSTSPath(graphPath) && probeOK && importSurfaceChanged(storedDerived, probe.derived)
+		inert := !resolutionStale && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata &&
 			unchangedProbeContractInputs(priorNodes, probe)
@@ -464,8 +463,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 			legacyIDs: legacyIDs, legacyPath: legacyPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
-			resolutionStale: aliasChanged,
-			metadataOnly: !aliasChanged && !forced && storedGraph.semantic != "" &&
+			resolutionStale: resolutionStale,
+			metadataOnly: !resolutionStale && !forced && storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic &&
 				unchangedProbeContractInputs(priorNodes, probe),
 		}
@@ -1257,9 +1256,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	for _, stage := range stages {
 		nuxtCallers = append(nuxtCallers, stage.nuxtCallers...)
 	}
-	if len(nuxtCallers) > 0 {
-		idx.resolver.ResolveFilesOutgoing(nuxtCallers)
-	}
+	idx.rebindParkedNuxtCalls(nuxtCallers, markerBatch)
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
@@ -1638,20 +1635,17 @@ func restubIncomingRefsFromView(
 				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
 					continue
 				}
-				local, _ := edge.Meta["nuxt_import_name"].(string)
-				if !restub && !(defaultChanged && local != "") {
+				oldTo := edge.To
+				if parkNuxtCall(edge, restub || defaultChanged, &stage.nuxtCallers) {
+					reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+					continue
+				}
+				if !restub {
 					if _, duplicate := carriedSeen[edge]; duplicate {
 						continue
 					}
 					carriedSeen[edge] = struct{}{}
 					carried = append(carried, edge)
-					continue
-				}
-				oldTo := edge.To
-				if local != "" {
-					parkNuxtCall(edge, local)
-					stage.nuxtCallers = append(stage.nuxtCallers, edge.FilePath)
-					reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 					continue
 				}
 				graph.StashRestubProvenance(edge)

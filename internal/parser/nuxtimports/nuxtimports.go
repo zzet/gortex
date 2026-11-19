@@ -5,6 +5,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -23,16 +24,27 @@ type scope struct {
 }
 
 // Collection keeps generated lists scoped to their Nuxt project roots.
-type Collection struct{ scopes []scope }
+type Collection struct {
+	scopes       []scope
+	localsByStem map[string][]string
+}
 
 var exportRE = regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
 const GeneratedList = ".nuxt/imports.d.ts"
 
+var configFiles = [...]string{"nuxt.config.ts", "nuxt.config.js", "nuxt.config.mts", "nuxt.config.mjs", "nuxt.config.cts", "nuxt.config.cjs"}
+
+func ConfigFileNames() [len(configFiles)]string { return configFiles }
+
+func WorkingTree(root string) tsalias.Tree {
+	return tsalias.WorkingTree(root, GeneratedList, configFiles[:]...)
+}
+
 // Load ignores unprepared projects, packages and files outside the repository.
 func Load(repoRoot string) *Collection {
-	return LoadTree(tsalias.WorkingTree(repoRoot, GeneratedList))
+	return LoadTree(WorkingTree(repoRoot))
 }
 
 // LoadTree reads only generated lists present in the snapshot, never the checkout.
@@ -40,27 +52,38 @@ func LoadTree(tree tsalias.Tree) *Collection {
 	if tree == nil {
 		return nil
 	}
-	var scopes []scope
+	roots := make(map[string]map[string]Binding)
 	tree.Files(func(rel string) {
 		dir := path.Dir(rel)
-		if rel != GeneratedList && !strings.HasSuffix(rel, "/"+GeneratedList) {
+		generated := rel == GeneratedList || strings.HasSuffix(rel, "/"+GeneratedList)
+		root := dir
+		if generated {
+			root = path.Dir(dir)
+		} else if !slices.Contains(configFiles[:], path.Base(rel)) {
 			return
 		}
-		root := path.Dir(dir)
 		for ancestor := root; ancestor != "." && ancestor != "/"; ancestor = path.Dir(ancestor) {
 			if tsalias.SkipDirName(path.Base(ancestor)) {
 				return
 			}
 		}
 		data, ok := tree.Read(rel)
-		if !ok {
+		if generated && !ok {
 			return
 		}
 		if root == "." {
 			root = ""
 		}
-		scopes = append(scopes, scope{Root: root, Bindings: parse(".", dir, string(data))})
+		if generated {
+			roots[root] = parse(".", dir, string(data))
+		} else if _, exists := roots[root]; !exists {
+			roots[root] = nil
+		}
 	})
+	scopes := make([]scope, 0, len(roots))
+	for root, bindings := range roots {
+		scopes = append(scopes, scope{Root: root, Bindings: bindings})
+	}
 	return collection(scopes)
 }
 
@@ -74,7 +97,14 @@ func collection(scopes []scope) *Collection {
 		}
 		return scopes[i].Root < scopes[j].Root
 	})
-	return &Collection{scopes: scopes}
+	c := &Collection{scopes: scopes, localsByStem: make(map[string][]string)}
+	for _, scope := range scopes {
+		for local, binding := range scope.Bindings {
+			stem := moduleStem(binding.File)
+			c.localsByStem[stem] = append(c.localsByStem[stem], local)
+		}
+	}
+	return c
 }
 
 func parse(repoRoot, generatedDir, source string) map[string]Binding {
@@ -112,6 +142,34 @@ func parse(repoRoot, generatedDir, source string) map[string]Binding {
 	return bindings
 }
 
+// VisitLocals reports candidate caller spellings for the incoming stub frontier.
+// Forward resolution still checks the exact extension, caller scope and export.
+func (c *Collection) VisitLocals(file string, visit func(string)) {
+	if c == nil {
+		return
+	}
+	stem := moduleStem(file)
+	for _, name := range c.localsByStem[stem] {
+		visit(name)
+	}
+	if path.Base(stem) == "index" {
+		for _, name := range c.localsByStem[path.Dir(stem)] {
+			visit(name)
+		}
+	}
+}
+
+func moduleStem(file string) string {
+	if strings.HasSuffix(file, ".d.ts") {
+		return strings.TrimSuffix(file, ".d.ts")
+	}
+	switch ext := path.Ext(file); ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
+		return strings.TrimSuffix(file, ext)
+	}
+	return file
+}
+
 // Resolve never applies app imports to Nitro server files or generated files.
 func (c *Collection) Resolve(callerFile, name string) Binding {
 	if c == nil {
@@ -130,8 +188,13 @@ func (c *Collection) Resolve(callerFile, name string) Binding {
 		if strings.TrimSuffix(base, path.Ext(base)) == "nuxt.config" {
 			return Binding{}
 		}
+		layer, isLayer := strings.CutPrefix(rel, "layers/")
+		_, inLayer, _ := strings.Cut(layer, "/")
+		if strings.HasPrefix(rel, "server/") || isLayer && strings.HasPrefix(inLayer, "server/") {
+			return Binding{}
+		}
 		for part := range strings.SplitSeq(rel, "/") {
-			if part == "server" || part == ".nuxt" {
+			if part == ".nuxt" {
 				return Binding{}
 			}
 		}

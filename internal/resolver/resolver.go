@@ -665,7 +665,8 @@ type Resolver struct {
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
 
-	nuxtAutoImport NuxtAutoImportResolver
+	nuxtAutoImport    NuxtAutoImportResolver
+	nuxtIncomingNames func(string, func(string))
 
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
@@ -2855,7 +2856,7 @@ func (f incrementalFileFrontier) incomingKeys() []string {
 // TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
 	return collectIncrementalFileFrontierKeys(
-		r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor, r.vanishedDeclarationKeys)
+		r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor, r.extraIncomingKeys)
 }
 
 func collectIncrementalFileFrontier(
@@ -3757,6 +3758,7 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 		seen[n.Name] = struct{}{}
 		stubKeys = append(stubKeys, graph.UnresolvedNameCandidateIDs(n)...)
 	}
+	stubKeys = r.appendNuxtIncomingKeys(stubKeys, filePath, defNodes)
 	if len(stubKeys) == 0 {
 		return
 	}
@@ -3993,6 +3995,10 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if resolutionExempt(e) {
 		return oldTo, false
 	}
+	priorBinding, _ := e.Meta[pendingJSBinding].(string)
+	if priorBinding != "" {
+		delete(e.Meta, pendingJSBinding)
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every
@@ -4152,7 +4158,8 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		}
 	}
 
-	return oldTo, e.To != oldTo
+	binding, _ := e.Meta[pendingJSBinding].(string)
+	return oldTo, e.To != oldTo || binding != priorBinding
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -4657,15 +4664,16 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 			if c.Kind == graph.KindParam && strings.HasPrefix(c.ID, e.From+"#param:") {
 				// Calling a parameter gives no evidence for an implementation
 				// of that name in the module or its imports.
-				stats.Unresolved++
+				parkJSBinding(e, "parameter", stats)
 				return
 			}
 		}
-	}
-	if len(candidates) == 0 {
-		if r.tryResolveNuxtAutoImport(e, funcName, nil, stats) {
+		if !strings.Contains(funcName, ".") && !hasLocalValue(e.FilePath, candidates) &&
+			(r.tryResolveExplicitImport(e, funcName, stats) || r.tryResolveNuxtAutoImport(e, funcName, stats)) {
 			return
 		}
+	}
+	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
 		// import-reachability + workspace-boundary evidence — to lift.
@@ -4783,21 +4791,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Explicit local bindings and declarations shadow Nuxt; a generated
-	// binding in turn outranks merely importing some other name from a file.
-	if r.tryResolveNuxtAutoImport(e, funcName, candidates, stats) {
-		return
-	}
-	// Exact symbol import, then unique imported file (including barrels).
+	// Only file-level evidence remains after the explicit and generated binding tiers.
 	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
-		e.To = pick.ID
-		e.Origin = graph.OriginASTResolved
-		e.Confidence = 0.9
-		if e.Meta == nil {
-			e.Meta = map[string]any{}
-		}
-		e.Meta["resolution"] = "import_closure"
-		stats.Resolved++
+		bindImportCall(e, pick, "import_closure", stats)
 		return
 	}
 

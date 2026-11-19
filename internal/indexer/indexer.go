@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -437,11 +438,13 @@ type Indexer struct {
 	// writes.
 	passCorpusFilter func(*graph.Graph) error
 
-	// Set only while the repository mutation lane is held. Alias changes
-	// invalidate source-shape resolution reuse, including unchanged callers.
-	aliasResolutionChanged bool
-	appliedResolution      atomic.Pointer[resolutionInputs]
-	resolutionRetry        bool
+	// The mutation lane owns retry state. Both local and master resolvers can
+	// read the immutable snapshot without looking it up again by checkout root.
+	activeResolution        atomic.Pointer[resolutionInputs]
+	appliedResolution       atomic.Pointer[resolutionInputs]
+	resolutionInputsChanged bool
+	resolutionRetry         *resolutionRetry
+	warmResolution          *resolutionCompletion // guarded by resolutionMu
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -789,6 +792,7 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	// to their real file. Same lazy-build rationale.
 	idx.resolver.SetPathAliasResolver(idx.resolvePathAliasImport)
 	idx.resolver.SetNuxtAutoImportResolver(idx.resolveNuxtAutoImport)
+	idx.resolver.SetNuxtIncomingNames(idx.visitNuxtIncomingNames)
 	// Break same-named import collisions in favour of the importer's
 	// own package-manager workspace member. Same lazy-build rationale.
 	idx.resolver.SetWorkspaceMembership(idx.indexerWorkspaceMembership)
@@ -845,6 +849,9 @@ func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
 func (idx *Indexer) lookupResolutionInputs() *resolutionInputs {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
+		if pinned := idx.activeResolution.Load(); pinned != nil {
+			return pinned
+		}
 		return resolutionInputsForTree(tree)
 	}
 	idx.resolutionMu.Lock()
@@ -2827,7 +2834,11 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	var inputs *resolutionInputs
 	defer func() {
-		if err := idx.finishResolutionInputs(inputs, retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0); err != nil {
+		work := resolutionCompletion{inputs: inputs, success: retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0, warm: idx.deferResolve.Load()}
+		if retErr == nil && result != nil && len(result.Errors) == 0 {
+			work.failed = result.FailedFiles
+		}
+		if err := idx.finishResolutionPass(work); err != nil {
 			retErr = err
 		}
 	}()
@@ -2959,6 +2970,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	inputs, err = idx.refreshResolutionInputs(absRoot, "")
 	if err != nil {
 		return nil, err
+	}
+	if idx.resolutionInputsChanged || idx.deferResolve.Load() && inputs != nil && len(inputs.reads) != 0 {
+		if err := idx.fenceResolutionWrites(inputs); err != nil {
+			return nil, err
+		}
 	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
@@ -4401,7 +4417,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						batchStart := time.Now()
 						// A full direct build adds batches; it does not use indexFile.
 						// Drop old bindings only once their replacement is ready.
-						if !shadowTaken && !skipped && err == nil && idx.mustReresolve(relPath) {
+						if !shadowTaken && !skipped && err == nil && idx.inputsStaleForFile(relPath) {
 							idx.graph.EvictFile(idx.prefixPath(relPath))
 						}
 						durablePath, durableMtime := path, wf.mtimeNano
@@ -5523,9 +5539,6 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
-	if idx.mustReresolve(filePath) {
-		reuseIdx, priorUnresolved = nil, nil
-	}
 
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
@@ -5574,8 +5587,8 @@ func (idx *Indexer) indexFile(
 	// the file — the reuse key carries no visibility evidence, so both the
 	// captured resolutions and the prior-unresolved skip are stale.
 	freshVis := csharpVisibilityStampForNodes(result.Nodes)
-	changedImports := visCaptured && closureJSTSPath(graphPath) &&
-		storedDerivedFingerprints(priorNodes).imports != storedDerivedFingerprints(result.Nodes).imports
+	changedImports := visCaptured && closureJSTSPath(relPath) && (idx.inputsStaleForFile(relPath) ||
+		importSurfaceChanged(storedDerivedFingerprints(priorNodes), storedDerivedFingerprints(result.Nodes)))
 	if visCaptured && priorVis != freshVis || changedImports {
 		reuseIdx, priorUnresolved, priorDeclarations = nil, nil, nil
 	}
@@ -5602,9 +5615,7 @@ func (idx *Indexer) indexFile(
 	idx.graph.AddBatch(result.Nodes, append(result.Edges, legacyCarried...))
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
-	if len(nuxtCallers) > 0 {
-		idx.resolver.ResolveFilesOutgoing(nuxtCallers)
-	}
+	idx.rebindParkedNuxtCalls(nuxtCallers, markerBatch)
 	// No subsequent stage reads source bytes or the parse tree. Release both
 	// here instead of retaining them through resolver/enrichment work; the
 	// deferred calls above remain as idempotent guards for every early return.
@@ -6177,11 +6188,7 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, nuxtCalle
 				continue // already a pending stub
 			}
 			oldTo := e.To
-			if local, _ := e.Meta["nuxt_import_name"].(string); local != "" {
-				parkNuxtCall(e, local)
-				if nuxtCallers != nil {
-					*nuxtCallers = append(*nuxtCallers, e.FilePath)
-				}
+			if parkNuxtCall(e, true, nuxtCallers) {
 				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 				continue
 			}
@@ -7357,10 +7364,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if err != nil {
 		return nil, err
 	}
-	// A failed or partial rebuild must retry even if the lookup cache is warm.
-	applied := false
+	var completion resolutionCompletion
+	completion.inputs = inputs
 	defer func() {
-		if err := idx.finishResolutionInputs(inputs, applied); err != nil {
+		if retErr == nil && len(markerBatches) != 0 && markerBatches[0] != nil && markerBatches[0].deferResolverCatchup {
+			markerBatches[0].resolution = completion
+			return
+		}
+		if err := idx.finishResolutionPass(completion); err != nil {
 			retErr = err
 		}
 	}()
@@ -7405,99 +7416,110 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		extractorStaleLangs = idx.extractorVersionStaleLangSet()
 	}
 
-	// A config change can name a newly created implementation as well as
-	// existing callers. Discover both without widening deletion authority.
-	requested := len(paths)
-	if idx.aliasResolutionChanged && !fullRoot {
-		paths = append(paths[:requested:requested], absRoot)
+	// Added discovery roots find implementations without acquiring deletion
+	// authority outside the caller's request. A partial pass instead revisits
+	// only its failed files under the same inputs.
+	var extra []string
+	if idx.resolutionInputsChanged && !fullRoot {
+		extra = []string{absRoot}
+	} else if idx.resolutionRetry != nil && !fullRoot {
+		paths = slices.Clip(paths)
+		for rel := range idx.resolutionRetry.files {
+			paths = append(paths, rel)
+		}
 	}
-	for i, p := range paths {
-		absPath := p
-		if !filepath.IsAbs(absPath) {
-			absPath = filepath.Join(absRoot, filepath.FromSlash(p))
-		}
-		absPath = filepath.Clean(absPath)
+	for _, discovery := range []struct {
+		paths     []string
+		requested bool
+	}{{paths, true}, {extra, false}} {
+		for _, p := range discovery.paths {
+			absPath := p
+			if !filepath.IsAbs(absPath) {
+				absPath = filepath.Join(absRoot, filepath.FromSlash(p))
+			}
+			absPath = filepath.Clean(absPath)
 
-		// A path outside the repo root is rejected: scoping is a
-		// narrowing operation, never an escape hatch to index files
-		// the repo doesn't own.
-		rel, relErr := filepath.Rel(absRoot, absPath)
-		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("incremental reindex: path %q is outside repository root %q", p, absRoot)
-		}
-		// Canonical key (slash + NFC) so scopeRels matches fileMtimes
-		// keys when deletion detection intersects the two below.
-		if i < requested {
-			scopeRels[idx.relKey(absPath)] = true
-		}
+			// A path outside the repo root is rejected: scoping is a
+			// narrowing operation, never an escape hatch to index files
+			// the repo doesn't own.
+			rel, relErr := filepath.Rel(absRoot, absPath)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("incremental reindex: path %q is outside repository root %q", p, absRoot)
+			}
+			// Canonical key (slash + NFC) so scopeRels matches fileMtimes
+			// keys when deletion detection intersects the two below.
+			if discovery.requested {
+				scopeRels[idx.relKey(absPath)] = true
+			}
 
-		info, statErr := os.Stat(absPath)
-		if statErr != nil {
-			// A path that no longer exists is not an error: it may be
-			// a deleted file the caller still wants evicted. Deletion
-			// detection below handles it via scopeRels.
-			if errors.Is(statErr, os.ErrNotExist) {
-				// A build that proves its reads records the absence: the
-				// path's rows leave the payload on it.
-				idx.contentProof.recordRead(absPath, nil, statErr)
-				if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
-					forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
+			info, statErr := os.Stat(absPath)
+			if statErr != nil {
+				// A path that no longer exists is not an error: it may be
+				// a deleted file the caller still wants evicted. Deletion
+				// detection below handles it via scopeRels.
+				if errors.Is(statErr, os.ErrNotExist) {
+					// A build that proves its reads records the absence: the
+					// path's rows leave the payload on it.
+					idx.contentProof.recordRead(absPath, nil, statErr)
+					if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
+						forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
+					}
+					continue
+				}
+				idx.noteFileIndexFailure(absPath, statErr)
+				return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
+			}
+
+			if info.IsDir() {
+				walkErr := idx.walkDisk(absRoot, absPath, func(path string, d os.DirEntry, err error) error {
+					if err != nil {
+						if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+							idx.noteFileIndexFailure(path, err)
+							discoveryFailed = append(discoveryFailed, path)
+						}
+						return nil
+					}
+					if d.IsDir() {
+						idx.noteFileIndexFailure(path, nil)
+						walkedDirs = append(walkedDirs, path)
+						return nil
+					}
+					if !discovery.requested && !closureJSTSPath(path) {
+						return nil
+					}
+					adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
+					if !adm.admit && !adm.manifest {
+						return nil
+					}
+					// relKey (slash + NFC) keeps the disk set keyed
+					// consistently with fileMtimes for non-ASCII names.
+					relPath := idx.relKey(path)
+					diskFiles[relPath] = true
+					if !merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath)) {
+						staleFiles = append(staleFiles, path)
+					}
+					return nil
+				})
+				if walkErr != nil {
+					return nil, walkErr
 				}
 				continue
 			}
-			idx.noteFileIndexFailure(absPath, statErr)
-			return nil, fmt.Errorf("incremental reindex: stat %q: %w", p, statErr)
-		}
 
-		if info.IsDir() {
-			walkErr := idx.walkDisk(absRoot, absPath, func(path string, d os.DirEntry, err error) error {
-				if err != nil {
-					if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
-						idx.noteFileIndexFailure(path, err)
-						discoveryFailed = append(discoveryFailed, path)
-					}
-					return nil
-				}
-				if d.IsDir() {
-					idx.noteFileIndexFailure(path, nil)
-					walkedDirs = append(walkedDirs, path)
-					return nil
-				}
-				if i == requested && !closureJSTSPath(path) {
-					return nil
-				}
-				adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
-				if !adm.admit && !adm.manifest {
-					return nil
-				}
-				// relKey (slash + NFC) keeps the disk set keyed
-				// consistently with fileMtimes for non-ASCII names.
-				relPath := idx.relKey(path)
-				diskFiles[relPath] = true
-				if !merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath)) {
-					staleFiles = append(staleFiles, path)
-				}
-				return nil
-			})
-			if walkErr != nil {
-				return nil, walkErr
+			// Single file. Apply the same language / exclude gate so a
+			// caller can't force a non-source or excluded file in.
+			if !idx.admitScopedWalkFile(absRoot, absPath) {
+				continue
 			}
-			continue
-		}
-
-		// Single file. Apply the same language / exclude gate so a
-		// caller can't force a non-source or excluded file in.
-		if !idx.admitScopedWalkFile(absRoot, absPath) {
-			continue
-		}
-		// relKey (slash + NFC) — same canonical key the graph and
-		// fileMtimes use, so a non-ASCII path passed in here matches
-		// regardless of the Unicode form the caller supplied.
-		relPath := idx.relKey(absPath)
-		diskFiles[relPath] = true
-		if mode.forceExplicitFiles ||
-			(!merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath))) {
-			staleFiles = append(staleFiles, absPath)
+			// relKey (slash + NFC) — same canonical key the graph and
+			// fileMtimes use, so a non-ASCII path passed in here matches
+			// regardless of the Unicode form the caller supplied.
+			relPath := idx.relKey(absPath)
+			diskFiles[relPath] = true
+			if mode.forceExplicitFiles ||
+				(!merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath))) {
+				staleFiles = append(staleFiles, absPath)
+			}
 		}
 	}
 
@@ -7542,9 +7564,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
 		}
 	}
-	if idx.aliasResolutionChanged {
+	if idx.resolutionInputsChanged || idx.resolutionRetry != nil {
 		for relPath := range diskFiles {
-			if closureJSTSPath(relPath) {
+			if idx.inputsStaleForFile(relPath) {
 				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
 			}
 		}
@@ -7667,6 +7689,12 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
 	}
+	if idx.resolutionInputsChanged || markerBatch.deferResolverCatchup && inputs != nil && len(inputs.reads) != 0 &&
+		(slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath)) {
+		if err := idx.fenceResolutionWrites(inputs); err != nil {
+			return nil, err
+		}
+	}
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
@@ -7680,6 +7708,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation.Merge(manifestPlan)
 	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
 	failedFiles = appendUniqueSorted(failedFiles, discoveryFailed...)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, markerBatch.nuxtCallers...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.structuralFiles = appendUniqueSorted(invalidation.structuralFiles, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
@@ -7809,7 +7838,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
 		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount),
 		zap.Bool("counts_cached", countsCached))
-	applied = len(failedFiles) == 0 && len(versionChangedFiles) == 0 && result.mutationErr == nil
+	completion.success = len(failedFiles) == 0 && len(versionChangedFiles) == 0 && result.mutationErr == nil
+	if !completion.success && len(discoveryFailed) == 0 {
+		completion.failed = appendUniqueSorted(nil, failedFiles...)
+		completion.failed = appendUniqueSorted(completion.failed, versionChangedFiles...)
+	}
+	if idx.deferResolve.Load() {
+		completion.frontier = appendUniqueSorted(invalidation.Files, markerBatch.nuxtCallers...)
+	}
 	return result, nil
 }
 

@@ -130,7 +130,7 @@ func (idx *Indexer) fileMtimeMatches(filePath string) bool {
 	if !idx.indexedFileReceiptMatches(filePath) {
 		return false
 	}
-	return !closureJSTSPath(filePath) || idx.contentSrc.Load() != nil ||
+	return !closureJSTSPath(filePath) || idx.manifestTree().sourced() ||
 		idx.appliedResolution.Load().unchangedForPoint(idx.RootPath(), filePath, nil)
 }
 
@@ -211,6 +211,8 @@ type reparsePendingEnrichmentBatch struct {
 	relationsRead    *relationsReadFrontier
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
+	nuxtCallers           []string
+	resolution            resolutionCompletion
 	byFile                map[string]bool
 	deferResolverCatchup  bool
 	deferredAffectedFiles map[string]struct{}

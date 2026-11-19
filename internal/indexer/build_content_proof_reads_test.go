@@ -465,7 +465,7 @@ func TestTheManifestTreeOfAProvenBuildRecordsItsReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	invalidateResolutionInputs(root)
-	tsAliasCollectionForTree(tree)
+	resolutionInputsForTree(tree)
 	if !proof.isUnbounded() || proof.proven() != nil {
 		t.Fatal("a whole-tree config scan left the proof bounded")
 	}
@@ -498,12 +498,12 @@ func TestCachedAliasScopeProvesOriginalConfigBytes(t *testing.T) {
 	t.Cleanup(func() {
 		invalidateResolutionInputs(root)
 	})
-	if loadTSAliasCollection(root) == nil { // an earlier build's scan
+	if workingResolutionInputs(root, nil).aliases == nil { // an earlier build's scan
 		t.Fatal("the fixture's configs gave no alias scopes")
 	}
 	proof := newBuildContentProof(root, before)
 	tree := provenManifestTree{diskManifestTree: newDiskManifestTree(root), proof: proof}
-	if tsAliasCollectionForTree(tree) == nil {
+	if resolutionInputsForTree(tree).aliases == nil {
 		t.Fatal("the cache answered no alias scopes")
 	}
 	if proof.isUnbounded() {
@@ -525,7 +525,7 @@ func TestCachedAliasScopeProvesOriginalConfigBytes(t *testing.T) {
 	}
 	builderWriteFile(t, root, rel, "{}\n")
 	later := newBuildContentProof(root, before)
-	tsAliasCollectionForTree(provenManifestTree{diskManifestTree: newDiskManifestTree(root), proof: later})
+	resolutionInputsForTree(provenManifestTree{diskManifestTree: newDiskManifestTree(root), proof: later})
 	if got := later.parsed[rel].sha256; got != gitstate.BlobSHA256(original) {
 		t.Fatalf("cache hit after an unprocessed config edit recorded %q, want the prior input digest", got)
 	}

@@ -33,17 +33,9 @@ import (
 //
 //  1. preferScopeCandidate — per-language static scope rules stay first;
 //     they carry stronger, language-specific evidence.
-//  2. Module-local definition — a same-file function/method candidate is
-//     bound directly by the file-local tier in resolveFunctionCall, and
-//     any same-file declaration blocks the import pick (import nodes are
-//     statement metadata, not implementations). A
-//     top-level local definition cannot legally coexist with an imported
-//     binding of the same name (redeclaration), and a function-scoped
-//     shadow may be the true callee; in both cases the local symbol wins
-//     or the cascade safely refuses. Blocking only ever preserves the
-//     pre-import-evidence behaviour — it can never mint a new edge.
-//  3. A generated Nuxt binding not shadowed by an explicit import, then
-//     exact symbol and file-closure evidence, before same-dir neighbours.
+//  2. A parameter of the caller or a module-local value shadows imports.
+//  3. An explicit value import, then a generated Nuxt binding, then
+//     unique imported-file evidence. A known but unresolved binding stops here.
 //  4. The existing cascade — same-dir, first-same-repo, JS/TS top-level
 //     value callee — untouched.
 //
@@ -71,40 +63,13 @@ import (
 // an import edge has already been resolved by this pass or not — the pick
 // is order-independent inside the parallel worker phase.
 
-// pickImportEvidenceCallee returns the uniquely imported callable. A named
-// binding to the symbol outranks file-level import closure evidence. Candidate
-// count does not weaken an explicit import; absent or ambiguous evidence
-// leaves the existing cascade unchanged. Only JS/TS callers are eligible.
+// pickImportEvidenceCallee is the file-closure fallback, not an explicit binding.
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
 	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil
 	}
-	if hasLocalDeclaration(callerFile, "", candidates) {
+	if hasLocalValue(callerFile, candidates) {
 		return nil
-	}
-	var symbolPick *graph.Node
-	for _, e := range r.callerOutEdges(callerFile) {
-		if e.Kind != graph.EdgeImports || importBindingAlias(e) != "" {
-			continue
-		}
-		target := r.importedTargetOf(e)
-		if strings.HasSuffix(target, "::"+funcName) {
-			if n := r.cachedGetNode(target); n != nil && graph.IsReExportNode(n) {
-				target = r.canonicalForwardedTarget(n)
-			}
-		}
-		for _, c := range candidates {
-			if c.ID != target || !isImportableCallee(c, funcName) {
-				continue
-			}
-			if symbolPick != nil && symbolPick.ID != c.ID {
-				return nil
-			}
-			symbolPick = c
-		}
-	}
-	if symbolPick != nil {
-		return symbolPick
 	}
 	imported := r.importedFilesFor(callerFile)
 	if len(imported) == 0 {
@@ -130,30 +95,111 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	return pick
 }
 
-// Follow only this named export's forwarding edges, never its barrel's imports.
-func (r *Resolver) canonicalForwardedTarget(n *graph.Node) string {
-	seen := make(map[string]bool)
-	for graph.IsReExportNode(n) && !seen[n.ID] {
-		seen[n.ID] = true
-		var next string
-		for _, edge := range r.callerOutEdges(n.ID) {
-			if edge.Kind == graph.EdgeReExports {
-				target := r.importedTargetOf(edge)
-				if target == "" || next != "" && next != target {
-					return ""
-				}
-				next = target
+// The module edge retains local:export pairs even for statements too large
+// to emit a symbol edge per specifier. Bare entries have identical names.
+func (r *Resolver) tryResolveExplicitImport(e *graph.Edge, name string, stats *ResolveStats) bool {
+	for _, imp := range r.callerOutEdges(e.FilePath) {
+		if imp.Kind != graph.EdgeImports {
+			continue
+		}
+		bindings, _ := imp.Meta[graph.ImportBindingsMeta].(string)
+		for item := range strings.FieldsSeq(bindings) {
+			local, exported, renamed := strings.Cut(item, ":")
+			if local != name {
+				continue
+			}
+			if !renamed {
+				exported = local
+			}
+			if target := r.exportedCallee(r.importedFileOf(imp), exported); target != nil {
+				bindImportCall(e, target, "import_closure", stats)
+			} else {
+				parkJSBinding(e, "import", stats)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// A known binding without an indexed implementation is not a candidate for
+// later name-only passes (notably React's useX convention). Keep the ordinary
+// unresolved target so a newly indexed declaration still wakes the caller.
+const pendingJSBinding = "pending_js_binding"
+
+func parkJSBinding(e *graph.Edge, binding string, stats *ResolveStats) {
+	if e.Meta == nil {
+		e.Meta = make(map[string]any)
+	}
+	e.Meta[pendingJSBinding] = binding
+	stats.Unresolved++
+}
+
+func bindImportCall(e *graph.Edge, target *graph.Node, evidence string, stats *ResolveStats) {
+	e.To, e.Origin, e.Confidence = target.ID, graph.OriginASTResolved, 0.9
+	if e.Meta == nil {
+		e.Meta = make(map[string]any)
+	}
+	e.Meta["resolution"] = evidence
+	stats.Resolved++
+}
+
+// Follow the export's own forwarding edge, or value-star exports if the
+// module has no declaration of that name. Never search its ordinary imports.
+func (r *Resolver) exportedCallee(file, name string) *graph.Node {
+	if file == "" || name == "*" {
+		return nil
+	}
+	type binding struct{ file, name string }
+	pending := []binding{{file, name}}
+	var seen map[binding]bool
+	var pick *graph.Node
+	for len(pending) > 0 {
+		b := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if b.file == "" || seen[b] {
+			continue
+		}
+		id := b.file + "::" + b.name
+		n := r.cachedGetNode(id)
+		if n == nil && b.name == "default" {
+			f := r.cachedGetNode(b.file)
+			if f == nil {
+				continue
+			}
+			local, _ := f.Meta[graph.DefaultExportMeta].(string)
+			if local == "" {
+				continue
+			} // export * never forwards default
+			n = r.cachedGetNode(b.file + "::" + local)
+		}
+		owner, nextName := b.file, b.name
+		named := graph.IsReExportNode(n)
+		if named {
+			owner = n.ID
+			if orig, _ := n.Meta["reexport_original"].(string); orig != "" {
+				nextName = orig
+			}
+		} else if n != nil {
+			if isImportableCallee(n, n.Name) {
+				if pick != nil && pick.ID != n.ID {
+					return nil
+				} // ambiguous star
+				pick = n
+			}
+			continue
+		}
+		if seen == nil {
+			seen = make(map[binding]bool)
+		}
+		seen[b] = true
+		for _, edge := range r.callerOutEdges(owner) {
+			if edge.Kind == graph.EdgeReExports && (named || edge.Meta[graph.StarReExportMeta] == true) {
+				pending = append(pending, binding{r.importedFileOf(edge), nextName})
 			}
 		}
-		n = r.cachedGetNode(next)
-		if n == nil {
-			return ""
-		}
 	}
-	if graph.IsReExportNode(n) {
-		return ""
-	}
-	return n.ID
+	return pick
 }
 
 func importBindingAlias(e *graph.Edge) string {
@@ -163,11 +209,10 @@ func importBindingAlias(e *graph.Edge) string {
 	return e.Alias
 }
 
-// An import statement can share its module's basename; it isn't a local definition.
-func hasLocalDeclaration(file, owner string, candidates []*graph.Node) bool {
+// Methods and type-only declarations do not introduce a module-local callable.
+func hasLocalValue(file string, candidates []*graph.Node) bool {
 	for _, c := range candidates {
-		if c.FilePath == file && c.Kind != graph.KindImport &&
-			(c.ID == file+"::"+c.Name || owner != "" && strings.HasPrefix(c.ID, owner+"#")) {
+		if c.FilePath == file && isImportableCallee(c, c.Name) {
 			return true
 		}
 	}

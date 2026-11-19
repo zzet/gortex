@@ -250,7 +250,10 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	parser.EachMatch(qAll, root, src, func(m parser.QueryResult) {
 		switch {
 		case m.Captures["default.name"] != nil:
-			fileNode.Meta = map[string]any{"default_export": m.Captures["default.name"].Text}
+			if fileNode.Meta == nil {
+				fileNode.Meta = make(map[string]any)
+			}
+			fileNode.Meta[graph.DefaultExportMeta] = m.Captures["default.name"].Text
 
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seenIDs)

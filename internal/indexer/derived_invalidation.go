@@ -165,6 +165,10 @@ type derivedFingerprints struct {
 	hierarchy string
 }
 
+func importSurfaceChanged(prior, fresh derivedFingerprints) bool {
+	return prior.imports == "" || prior.imports != fresh.imports
+}
+
 // isHierarchyNodeKind reports the declaration kinds the hierarchy passes read:
 // types and their methods, not free functions or fields.
 func isHierarchyNodeKind(kind graph.NodeKind) bool {

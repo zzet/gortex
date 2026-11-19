@@ -32,6 +32,7 @@ type resolutionInputs struct {
 type resolutionTree struct {
 	tsalias.Tree
 	root  string
+	dir   *os.Root
 	paths []string
 	reads map[string]string
 	proof *buildContentProof
@@ -44,14 +45,18 @@ func (t *resolutionTree) Files(visit func(string)) {
 }
 
 func (t *resolutionTree) Read(rel string) ([]byte, bool) {
-	data, sum := readResolutionInput(t.root, rel, t.proof)
+	data, sum := readResolutionInput(t.dir, t.root, rel, t.proof)
 	t.reads[rel] = sum
 	return data, sum != "" && sum != absentContent
 }
 
-func readResolutionInput(root, rel string, proof *buildContentProof) ([]byte, string) {
+func readResolutionInput(dir *os.Root, root, rel string, proof *buildContentProof) ([]byte, string) {
 	abs := filepath.Join(root, filepath.FromSlash(rel))
-	data, err := os.ReadFile(abs)
+	if dir == nil {
+		proof.record(abs, "")
+		return nil, ""
+	}
+	data, err := dir.ReadFile(filepath.FromSlash(rel))
 	var sum string
 	switch {
 	case err == nil:
@@ -80,19 +85,26 @@ func (in *resolutionInputs) unchangedForPoint(root, point string, proof *buildCo
 	if info, err := os.Stat(point); err != nil || !info.Mode().IsRegular() {
 		return false
 	}
+	confined, err := os.OpenRoot(root)
+	if err != nil {
+		return false
+	}
+	defer confined.Close()
 	for input, prior := range in.reads {
-		if _, sum := readResolutionInput(root, input, proof); sum == "" || prior != sum {
+		if _, sum := readResolutionInput(confined, root, input, proof); sum == "" || prior != sum {
 			return false
 		}
 	}
+	tsNames, nuxtNames := tsalias.ConfigFileNames(), nuxtimports.ConfigFileNames()
+	names := append(append(tsNames[:], nuxtNames[:]...), nuxtimports.GeneratedList)
 	for dir := path.Dir(filepath.ToSlash(rel)); ; dir = path.Dir(dir) {
-		for _, name := range [...]string{"tsconfig.json", "jsconfig.json", nuxtimports.GeneratedList} {
+		for _, name := range names {
 			candidate := path.Join(dir, name)
 			if _, known := in.reads[candidate]; known {
 				continue
 			}
 			abs := filepath.Join(root, filepath.FromSlash(candidate))
-			_, err := os.Stat(abs)
+			_, err := confined.Stat(filepath.FromSlash(candidate))
 			if !errors.Is(err, os.ErrNotExist) {
 				return false
 			}
@@ -111,10 +123,13 @@ type resolutionInputStore interface {
 
 func discoverResolutionInputs(root string, proof *buildContentProof) *resolutionInputs {
 	proof.noteUnboundedReader()
-	t := &resolutionTree{Tree: tsalias.WorkingTree(root, nuxtimports.GeneratedList), root: root, reads: make(map[string]string), proof: proof}
+	dir, _ := os.OpenRoot(root)
+	if dir != nil {
+		defer dir.Close()
+	}
+	t := &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir, reads: make(map[string]string), proof: proof}
 	t.Tree.Files(func(rel string) { t.paths = append(t.paths, rel) })
-	current := &resolutionInputs{aliases: tsalias.LoadTree(t), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
-	t.proof, t.paths, t.reads = nil, nil, nil
+	current := &resolutionInputs{aliases: tsalias.LoadScopes(t.Files, t.Read, t.Tree.Exists), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
 	h := sha256.New()
 	for _, rel := range slices.Sorted(maps.Keys(current.reads)) {
 		writeFingerprintString(h, rel)
@@ -124,14 +139,32 @@ func discoverResolutionInputs(root string, proof *buildContentProof) *resolution
 	return current
 }
 
+type resolutionCompletion struct {
+	inputs   *resolutionInputs
+	success  bool
+	failed   []string // absolute paths; empty on a failure of unknown extent
+	warm     bool
+	frontier []string // nil means a deferred full build
+}
+
+type resolutionRetry struct {
+	inputs *resolutionInputs
+	files  map[string]bool // relative paths; nil means the pass did not complete discovery
+}
+
+func (idx *Indexer) resolutionStore() resolutionInputStore {
+	s, _ := idx.graph.(resolutionInputStore)
+	return s
+}
+
 // A clean source census does not cover ignored generator outputs.
 func (idx *Indexer) censusResolutionCurrent(root string) bool {
-	if idx.contentSrc.Load() != nil {
+	if idx.manifestTree().sourced() {
 		return true
 	}
 	current := discoverResolutionInputs(root, nil)
-	store, ok := idx.graph.(resolutionInputStore)
-	if !ok {
+	store := idx.resolutionStore()
+	if store == nil {
 		prior := idx.appliedResolution.Load()
 		return prior != nil && prior.digest == current.digest
 	}
@@ -145,37 +178,59 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 }
 
 func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInputs, error) {
-	if idx.contentSrc.Load() != nil {
+	if idx.manifestTree().sourced() {
 		return nil, nil
 	}
+	idx.resolutionMu.Lock()
+	if pending := idx.warmResolution; pending != nil {
+		// A new mutation overtook deferred warmup. Its incomplete pass cannot
+		// certify this graph; recover exactly as after a restart.
+		idx.resolutionRetry = &resolutionRetry{inputs: pending.inputs}
+		idx.warmResolution = nil
+	}
+	idx.resolutionMu.Unlock()
 	prior := idx.appliedResolution.Load()
-	idx.aliasResolutionChanged = idx.resolutionRetry
+	retry := idx.resolutionRetry
+	if retry != nil {
+		prior = retry.inputs
+	}
+	idx.resolutionInputsChanged = retry != nil && retry.files == nil
 	current := prior
 	if !prior.unchangedForPoint(root, point, idx.contentProof) {
 		current = discoverResolutionInputs(root, idx.contentProof)
 		if prior != nil {
-			idx.aliasResolutionChanged = idx.aliasResolutionChanged || !prior.aliases.Equal(current.aliases) || !prior.nuxt.Equal(current.nuxt)
+			idx.resolutionInputsChanged = idx.resolutionInputsChanged || !prior.aliases.Equal(current.aliases) || !prior.nuxt.Equal(current.nuxt)
 		}
 	}
-	if store, ok := idx.graph.(resolutionInputStore); ok && (prior == nil || prior.digest != current.digest || idx.resolutionRetry) {
+	if store := idx.resolutionStore(); store != nil && prior == nil {
 		stored, err := store.ResolutionInputDigest(idx.repoPrefix)
 		if err != nil {
 			return nil, err
 		}
-		if prior == nil && stored != current.digest {
+		if stored != current.digest {
 			// A brand new scoped index has no callers to repair. Only
 			// widen the request when this graph already owns JS/TS files.
-			idx.aliasResolutionChanged = stored != "" || idx.resolutionRetry || idx.hasResolutionCallers()
-		}
-		if stored != "" && stored != current.digest && idx.aliasResolutionChanged {
-			// Fence before the first graph write, not after a partial rebuild.
-			if err := store.SetResolutionInputDigest(idx.repoPrefix, ""); err != nil {
-				return nil, err
-			}
+			idx.resolutionInputsChanged = stored != "" || idx.hasResolutionCallers()
 		}
 	}
 	cacheResolutionInputs(root, current)
+	idx.activeResolution.Store(current)
 	return current, nil
+}
+
+// Invalidate the certificate before binding rows can be replaced. A deferred
+// resolver can leave a gap even when the input bytes themselves did not change.
+func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs) error {
+	if inputs == nil {
+		return nil
+	}
+	if store := idx.resolutionStore(); store != nil {
+		if err := store.SetResolutionInputDigest(idx.repoPrefix, ""); err != nil {
+			return err
+		}
+	}
+	idx.appliedResolution.Store(nil)
+	return nil
 }
 
 func (idx *Indexer) hasResolutionCallers() bool {
@@ -235,26 +290,102 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 	resolutionCache.Unlock()
 }
 
-func (idx *Indexer) finishResolutionInputs(inputs *resolutionInputs, success bool) error {
-	if inputs != nil {
-		idx.resolutionRetry = !success && idx.aliasResolutionChanged
-		if success {
-			prior := idx.appliedResolution.Load()
-			if store, ok := idx.graph.(resolutionInputStore); ok && (prior == nil || prior.digest != inputs.digest || idx.aliasResolutionChanged) {
-				if err := store.SetResolutionInputDigest(idx.repoPrefix, inputs.digest); err != nil {
-					idx.resolutionRetry = true
-					return err
-				}
-			}
-			idx.appliedResolution.Store(inputs)
-		} else if idx.resolutionRetry {
-			idx.appliedResolution.Store(nil)
-		}
+func (idx *Indexer) finishResolutionPass(work resolutionCompletion) error {
+	if work.inputs == nil {
+		return nil
 	}
-	idx.aliasResolutionChanged = false
+	prior := idx.appliedResolution.Load()
+	needsStamp := prior == nil || prior.digest != work.inputs.digest || idx.resolutionRetry != nil || idx.resolutionInputsChanged
+	idx.resolutionInputsChanged = false
+	if !work.warm {
+		defer idx.activeResolution.Store(nil)
+	}
+	if !needsStamp && !work.warm {
+		return nil
+	}
+	if !work.success {
+		retry := &resolutionRetry{inputs: work.inputs}
+		if len(work.failed) != 0 {
+			retry.files = make(map[string]bool, len(work.failed))
+			for _, file := range work.failed {
+				retry.files[idx.relKey(file)] = true
+			}
+		}
+		idx.resolutionRetry = retry
+		idx.appliedResolution.Store(nil)
+	} else {
+		idx.resolutionRetry = nil
+	}
+	if work.warm {
+		idx.resolutionMu.Lock()
+		idx.warmResolution = &work
+		idx.resolutionMu.Unlock()
+		return nil
+	}
+	if !work.success {
+		return nil
+	}
+	if err := idx.stampResolution(work.inputs); err != nil {
+		idx.resolutionRetry = &resolutionRetry{inputs: work.inputs}
+		return err
+	}
 	return nil
 }
 
-func (idx *Indexer) mustReresolve(file string) bool {
-	return idx.aliasResolutionChanged && closureJSTSPath(file)
+func (idx *Indexer) stampResolution(inputs *resolutionInputs) error {
+	if store := idx.resolutionStore(); store != nil {
+		if err := store.SetResolutionInputDigest(idx.repoPrefix, inputs.digest); err != nil {
+			return err
+		}
+	}
+	idx.appliedResolution.Store(inputs)
+	return nil
+}
+
+func (idx *Indexer) inputsStaleForFile(rel string) bool {
+	return closureJSTSPath(rel) && (idx.resolutionInputsChanged || idx.resolutionRetry != nil && idx.resolutionRetry.files[rel])
+}
+
+// Capture the passes before the warm resolver starts. A repository mutated in
+// the meantime cancels its old completion in refreshResolutionInputs.
+func (mi *MultiIndexer) warmResolutionPasses(scope map[string]struct{}) map[*Indexer]*resolutionCompletion {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	var pending map[*Indexer]*resolutionCompletion
+	for prefix, idx := range mi.indexers {
+		if _, ok := scope[prefix]; len(scope) > 0 && !ok {
+			continue
+		}
+		idx.resolutionMu.Lock()
+		work := idx.warmResolution
+		idx.resolutionMu.Unlock()
+		if work != nil {
+			if pending == nil {
+				pending = make(map[*Indexer]*resolutionCompletion)
+			}
+			pending[idx] = work
+		}
+	}
+	return pending
+}
+
+func finishWarmResolutions(pending map[*Indexer]*resolutionCompletion) error {
+	for idx, work := range pending {
+		idx.resolutionMu.Lock()
+		var err error
+		if idx.warmResolution == work {
+			if work.success {
+				err = idx.stampResolution(work.inputs)
+			}
+			if err == nil {
+				idx.warmResolution = nil
+				idx.activeResolution.Store(nil)
+			}
+		}
+		idx.resolutionMu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

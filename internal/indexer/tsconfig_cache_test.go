@@ -39,7 +39,7 @@ func TestTSConfigPathAlias_NewIndexerSeesPreviouslyAbsentConfig(t *testing.T) {
 	idx, _ := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
-	require.Nil(t, loadTSAliasCollection(root), "absence of configs is cached too")
+	require.Nil(t, workingResolutionInputs(root, nil).aliases, "absence of configs is cached too")
 	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{"~/*":["lib/*"]}}}`)
 	idx, _ = newSQLiteIndexer(t)
 	_, err = idx.Index(root)
@@ -81,4 +81,3 @@ func TestTSConfigPathAlias_ConfigOnlyIncrementalReindex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 }
-

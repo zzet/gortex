@@ -1,8 +1,6 @@
 package resolver
 
 import (
-	"strings"
-
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -13,59 +11,44 @@ type NuxtAutoImportResolver func(callerFile, name string) (stem, exportedName st
 // SetNuxtAutoImportResolver installs generated bindings before a resolve pass.
 func (r *Resolver) SetNuxtAutoImportResolver(fn NuxtAutoImportResolver) { r.nuxtAutoImport = fn }
 
-func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidates []*graph.Node, stats *ResolveStats) bool {
-	if e.Kind != graph.EdgeCalls || !isJSTSPath(e.FilePath) || strings.Contains(name, ".") {
-		return false
+// SetNuxtIncomingNames installs the reverse side of the generated bindings.
+func (r *Resolver) SetNuxtIncomingNames(visit func(string, func(string))) {
+	r.nuxtIncomingNames = visit
+}
+
+func (r *Resolver) appendNuxtIncomingKeys(keys []string, file string, nodes []*graph.Node) []string {
+	if r.nuxtIncomingNames == nil || !isJSTSPath(file) || len(nodes) == 0 {
+		return keys
 	}
-	if hasLocalDeclaration(e.FilePath, e.From, candidates) {
-		return false
+	r.nuxtIncomingNames(file, func(name string) {
+		keys = append(keys, graph.UnresolvedNameCandidateIDsForName(name, nodes[0].RepoPrefix)...)
+	})
+	return keys
+}
+
+func (r *Resolver) extraIncomingKeys(paths []string, nodes map[string][]*graph.Node) []string {
+	keys := r.vanishedDeclarationKeys(paths, nodes)
+	for _, file := range paths {
+		keys = r.appendNuxtIncomingKeys(keys, file, nodes[file])
 	}
-	// Even an unresolved explicit binding shadows a generated global.
-	for _, edge := range r.callerOutEdges(e.FilePath) {
-		if edge.Kind != graph.EdgeImports {
-			continue
-		}
-		locals, _ := edge.Meta["import_bindings"].(string)
-		for local := range strings.FieldsSeq(locals) {
-			if local == name {
-				// An external package binding cannot name a local neighbour
-				// either. Leave it for external resolution, not name heuristics.
-				if r.importedTargetOf(edge) == "" {
-					stats.Unresolved++
-					return true
-				}
-				return false
-			}
-		}
-	}
+	return keys
+}
+
+// A known binding consumes the call even if its implementation isn't indexed.
+func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, stats *ResolveStats) bool {
 	if r.nuxtAutoImport == nil {
 		return false
 	}
 	stem, exported := r.nuxtAutoImport(e.FilePath, name)
-	if stem == "" || exported == "" {
+	if stem == "" {
 		return false
 	}
-	file := probeJSTSFile(r.cachedGetNode, stem)
-	if file == "" {
-		return false
+	target := r.exportedCallee(probeJSTSFile(r.cachedGetNode, stem), exported)
+	if target == nil {
+		parkJSBinding(e, "nuxt", stats)
+		return true
 	}
-	if exported == "default" {
-		if local, _ := r.cachedGetNode(file).Meta["default_export"].(string); local != "" {
-			exported = local
-		}
-	}
-	candidate := r.cachedGetNode(file + "::" + exported)
-	if candidate == nil || !isImportableCallee(candidate, exported) {
-		return false
-	}
-	e.To = candidate.ID
-	e.Origin = graph.OriginASTResolved
-	e.Confidence = 0.9
-	if e.Meta == nil {
-		e.Meta = make(map[string]any)
-	}
-	e.Meta["nuxt_import_name"] = name
-	e.Meta["resolution"] = "nuxt_auto_import"
-	stats.Resolved++
+	bindImportCall(e, target, "nuxt_auto_import", stats)
+	e.Meta[graph.NuxtImportNameMeta] = name
 	return true
 }

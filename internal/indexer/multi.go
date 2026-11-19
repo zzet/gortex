@@ -1005,6 +1005,7 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetNpmDependencyLookup(mi.npmDependencyLookup())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetNuxtAutoImportResolver(mi.nuxtAutoImportResolver())
+	master.SetNuxtIncomingNames(mi.visitNuxtIncomingNames)
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	master.SetGoPackageOwnershipInventoryFactory(mi.prepareGoPackageOwnership)
 	master.SetGoModules(mi.trackedGoModules())
@@ -1197,6 +1198,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	pending := mi.warmResolutionPasses(scope)
 	mi.runDeferredGoModAll()
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
@@ -1207,13 +1209,23 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	return mi.runCrossRepoResolveContext(ctx, false)
+	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+		return err
+	}
+	return finishWarmResolutions(pending)
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
 // same-repository and cross-repository resolution. A restart that reparsed one
 // file must not promote that delta to every unresolved edge in its repository.
 func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
+	pending := mi.warmResolutionPasses(nil)
+	for _, work := range pending {
+		if work.frontier == nil {
+			return mi.RunPreEnrichResolve(ctx, nil, onComputeDone)
+		}
+		files = appendUniqueSorted(files, work.frontier...)
+	}
 	mi.runDeferredGoModAll()
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -1237,10 +1249,16 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		return err
 	}
 	if resolutionAffected > 0 {
-		return mi.runCrossRepoResolveContext(ctx, false)
+		if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+			return err
+		}
+	} else {
+		mi.runCrossRepoResolveFiles(files)
 	}
-	mi.runCrossRepoResolveFiles(files)
-	return context.Cause(ctx)
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return finishWarmResolutions(pending)
 }
 
 func (mi *MultiIndexer) runDeferredGoModAll() {
@@ -2626,6 +2644,9 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	frontier := mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
+	if err := idx.finishResolutionPass(batch.resolution); err != nil {
+		return result, err
+	}
 	// Module changes and full retracks may rebind edges outside the frontier.
 	if !goModChanged && !result.FullRetrack {
 		topologyFrontier = frontier
@@ -3437,6 +3458,12 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 				mi.ReconcileContractEdges()
 			}
 		}
+		if batch != nil {
+			batch.resolution.warm = batchMode.deferResolve && (result.StaleFileCount > 0 || result.DeletedFileCount > 0)
+			if err := idx.finishResolutionPass(batch.resolution); err != nil {
+				return err
+			}
+		}
 
 		publishTiming.complete(nil)
 		// Total includes nested phase timings: do not sum it with them.
@@ -3942,21 +3969,7 @@ func (mi *MultiIndexer) ResolveFilePath(prefixedPath string) string {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 
-	// Longest matching prefix wins. With worktree instances two prefixes
-	// can share a leading segment (`oas-orm` vs `oas-orm@task-ws`); map
-	// iteration order is random, so a plain first-match could resolve a
-	// `oas-orm@task-ws/...` path against the shorter `oas-orm` root. The
-	// "/"-boundary check already keeps the two disjoint, but ranking by
-	// length makes that robust regardless of any future prefix shapes.
-	var bestPrefix, bestRoot string
-	for prefix, meta := range mi.repos {
-		if meta == nil {
-			continue
-		}
-		if strings.HasPrefix(prefixedPath, prefix+"/") && len(prefix) > len(bestPrefix) {
-			bestPrefix, bestRoot = prefix, meta.RootPath
-		}
-	}
+	bestPrefix, meta := mi.graphFileRepoLocked(prefixedPath)
 	if bestPrefix == "" {
 		// No known prefix leads this path. Graph paths are always prefixed,
 		// so this is a caller-supplied repo-relative path — an agent naming
@@ -3968,7 +3981,22 @@ func (mi *MultiIndexer) ResolveFilePath(prefixedPath string) string {
 		}
 		return ""
 	}
-	return filepath.Join(bestRoot, strings.TrimPrefix(prefixedPath, bestPrefix+"/"))
+	return filepath.Join(meta.RootPath, strings.TrimPrefix(prefixedPath, bestPrefix+"/"))
+}
+
+// Walk whole graph-path segments from the innermost repository out. The caller
+// holds mi.mu; no metadata copy or filesystem lookup is needed.
+func (mi *MultiIndexer) graphFileRepoLocked(file string) (string, *RepoMetadata) {
+	for {
+		i := strings.LastIndexByte(file, '/')
+		if i <= 0 {
+			return "", nil
+		}
+		file = file[:i]
+		if meta := mi.repos[file]; meta != nil {
+			return file, meta
+		}
+	}
 }
 
 // RepoPrefixes returns the set of registered repo prefixes. The returned

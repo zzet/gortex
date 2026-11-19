@@ -138,16 +138,19 @@ Relative named exports into the repository, including `original as local`
 renames, resolve bare JS/TS and SFC calls at `ast_resolved` with
 `resolution: nuxt_auto_import`. A generated binding beats an unrelated import
 from a file with a same-named export, but never an explicit local value binding
-or a visible local declaration. Explicit module extensions are tried verbatim;
+or a visible local value. Named barrel exports resolve to their implementation,
+including renamed exports. Explicit module extensions are tried verbatim;
 `default as local` can target a named default function or a default-exported
-local identifier.
+local identifier. A known binding with no indexed implementation stays unresolved;
+creating its implementation can repair callers without a caller edit.
+
 Package imports, `#app` specifiers, conflicting generated names, and paths
-outside the repository are ignored. Missing generated lists disable this path;
-no composable-directory guessing is performed. Nested Nuxt roots stay scoped.
-The app list is not applied to `nuxt.config.*`, generated files, or `server/`
-directories (including layers); Nitro imports are not handled. SQLite records
-the applied resolution inputs so a changed list is reconciled after restart,
-even when all indexed source files have unchanged mtimes.
+outside the repository are ignored. The nearest Nuxt config or generated list
+bounds the project: an unprepared nested app does not inherit outer globals.
+The app list excludes config and generated files and the project's or a layer's
+Nitro `server/`, not ordinary app paths such as `app/pages/server/`. SQLite records
+the applied input digest after resolver catch-up, so changed lists reconcile
+after restart even when all indexed source files have unchanged mtimes.
 
 ### Julia specifics
 
