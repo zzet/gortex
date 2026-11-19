@@ -598,13 +598,13 @@ func TestLegacyStateCollectorRedactsRoots(t *testing.T) {
 			"state":          "ready",
 			"graphs": []any{map[string]any{
 				"graph_id": "g1", "repo_prefix": "acme/private-prefix", "state": "ready",
+			}},
+			"checkouts": []any{
+				map[string]any{"checkout_id": "c1", "root_path": siblingHome, "admin_name": "wt1", "effective_mode": "dedicated", "graph_id": "g1"},
+				map[string]any{"checkout_id": "c2", "root_path": outsideHome, "admin_name": "wt2", "effective_mode": "dedicated", "graph_id": "g1"},
 			},
-				"checkouts": []any{
-					map[string]any{"checkout_id": "c1", "root_path": siblingHome, "admin_name": "wt1", "effective_mode": "dedicated", "graph_id": "g1"},
-					map[string]any{"checkout_id": "c2", "root_path": outsideHome, "admin_name": "wt2", "effective_mode": "dedicated", "graph_id": "g1"},
-				},
-			},
-		}}})
+		}},
+	})
 	if err != nil {
 		t.Fatalf("census marshal: %v", err)
 	}
@@ -622,9 +622,16 @@ func TestLegacyStateCollectorRedactsRoots(t *testing.T) {
 	if len(state.DedicatedCorpora) != 2 {
 		t.Fatalf("corpora = %d, want 2", len(state.DedicatedCorpora))
 	}
-	if len(state.Unattributed) != 2 && len(state.Intentless) != 2 {
-		t.Fatalf("configured roots not classified: unattributed=%d intentless=%d",
-			len(state.Unattributed), len(state.Intentless))
+	// Both roots are configured and both are always-intentless, so the
+	// count that matters is the intentless list. This used to be a single
+	// `&&` assertion over two different lists, which passes while either one
+	// is wrong: a census that lost the checkouts would report
+	// unattributed=0 intentless=2 and stay green.
+	if len(state.Intentless) != 2 {
+		t.Fatalf("intentless = %d, want 2", len(state.Intentless))
+	}
+	if got := len(state.Unattributed); got > 2 {
+		t.Fatalf("unattributed = %d, want at most 2", got)
 	}
 
 	// JSON: marshal the section exactly as doctor does.

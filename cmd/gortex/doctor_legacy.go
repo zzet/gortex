@@ -379,28 +379,36 @@ func isManualConfigOnly(kinds []string) bool {
 }
 
 // intentCheckoutGap is how long after its checkout an entry's manual_config
-// intent was created, decoded from the two UUIDv7 ids. ok is false when either
-// id is not a decodable v7 (an old row, a hand-written id).
+// intent was created. ok is false when the gap cannot be measured: an old row
+// with no intent details, or a checkout id that is not a decodable UUIDv7.
+//
+// The checkout side still comes from the id, because the catalog stores no
+// created_at for the checkout row itself. The intent side reads
+// IntentOverview.CreatedAt, which the catalog populates from the intent row --
+// the same value its UUIDv7 encodes, but authoritative and already marshaled.
+// Decoding the intent id as well would keep two sources for one timestamp, and
+// a row whose id and column disagreed would silently use the wrong one.
 func intentCheckoutGap(co indexer.CheckoutOverview) (time.Duration, bool) {
 	checkoutAt, ok := uuidV7Time(co.CheckoutID)
 	if !ok {
 		return 0, false
 	}
-	var intentAt time.Time
 	for _, d := range co.IntentDetails {
-		if d.SourceKind == "manual_config" {
+		if d.SourceKind != "manual_config" {
+			continue
+		}
+		if d.CreatedAt <= 0 {
+			// Recorded before the column existed: fall back to the id, which
+			// is what the heuristic read before CreatedAt was carried at all.
 			at, ok := uuidV7Time(d.IntentID)
 			if !ok {
 				return 0, false
 			}
-			intentAt = at
-			break
+			return at.Sub(checkoutAt), true
 		}
+		return time.Unix(d.CreatedAt, 0).Sub(checkoutAt), true
 	}
-	if intentAt.IsZero() {
-		return 0, false
-	}
-	return intentAt.Sub(checkoutAt), true
+	return 0, false
 }
 
 // uuidV7Time decodes the millisecond timestamp a UUIDv7 carries in its first
