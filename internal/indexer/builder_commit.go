@@ -25,6 +25,11 @@ var ErrInvalidTreeOID = errors.New("indexer: not a git object id")
 // CommitLayerRequest is one commit-layer build: the two committed trees the
 // layer spans, plus the identity and repository scoping the generation carries.
 type CommitLayerRequest struct {
+	// checkNeeded is set only by a checkout coordinator. An immutable ref
+	// build remains valid even when nobody has its tree checked out; a
+	// coordinator can instead abandon work its checkout no longer needs.
+	checkNeeded func(context.Context) error
+
 	// Identity names the generation. GenerationKind and TreeOID are stamped by
 	// the builder from the request's own fields, so a caller cannot name one
 	// tree and build another.
@@ -81,6 +86,7 @@ func (b *SparseGenerationBuilder) BuildCommitLayer(
 	identity.TreeOID = req.TargetTreeOID
 
 	build := BuildRequest{
+		checkNeeded: req.checkNeeded,
 		Identity:    identity,
 		Base:        req.Base,
 		Target:      target,

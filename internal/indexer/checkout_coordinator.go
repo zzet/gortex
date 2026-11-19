@@ -177,6 +177,8 @@ func initialCheckoutPollDelay(checkoutID string, interval time.Duration) time.Du
 // flips again, because that would be forcing its answer over the winner's.
 var errRouteMoved = errors.New("indexer: the checkout route moved under this coordinator")
 
+var errCommitTargetMoved = errors.New("indexer: the checkout no longer needs the commit build")
+
 // errCheckoutUnsettled reports that two working-tree builds in a row were torn
 // by edits landing under them. A cycle answers it by rescheduling; a caller
 // driving a transition has to decide whether to wait for the checkout to go
@@ -1965,6 +1967,9 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.HeadTree, &route, &out)
 	lap("commit_slot")
 	if err != nil {
+		if c.rescheduleObsoleteCommit(err, &out) {
+			return out
+		}
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 			c.rescheduleOnLostRoute("route moved under the commit flip")
@@ -2141,6 +2146,9 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	previousCommit, previousDirty := commitRow.GenerationID, dirtyRow.GenerationID
 	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.HeadTree)
 	if err != nil {
+		if c.rescheduleObsoleteCommit(err, out) {
+			return true, nil
+		}
 		return true, err
 	}
 	// The checkout is free to commit while the delta over the new base is
@@ -3119,6 +3127,16 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		baseReader = c.ancestryLayerBase(view)
 	}
 	generationID, report, err := c.builder.BuildCommitLayer(WithIndexOrigin(ctx, "checkout_coordinator"), CommitLayerRequest{
+		checkNeeded: func(ctx context.Context) error {
+			head, err := gitstate.SampleHEAD(ctx, c.root)
+			if err != nil {
+				return err
+			}
+			if head.TreeOID != targetTree {
+				return fmt.Errorf("%w: built for %s, now at %s", errCommitTargetMoved, targetTree, head.TreeOID)
+			}
+			return nil
+		},
 		Identity:      identity,
 		Base:          baseReader,
 		RepoDir:       c.root,
@@ -3139,6 +3157,21 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 			zap.Int("cap", report.ClosureCap))
 	}
 	return generationID, false, nil
+}
+
+// The builder has already abandoned its unpublished generation. Preserve the
+// existing route and retry the current tree without a failure backoff. The
+// later HEAD guard remains necessary for moves after the last early check.
+func (c *CheckoutCoordinator) rescheduleObsoleteCommit(err error, out *CheckoutCycle) bool {
+	if !errors.Is(err, errCommitTargetMoved) {
+		return false
+	}
+	out.Rescheduled, out.rescheduledBy = true, stallReasonHeadMoved
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
+	c.logger.Debug("checkout coordinator: skipped obsolete commit build",
+		zap.String("checkout", c.checkoutID), zap.Error(err))
+	c.Signal("the checkout moved to another commit under the cycle")
+	return true
 }
 
 // moveCommitSlot points the commit slot at a different generation, dropping

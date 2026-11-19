@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,10 +12,12 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/graphpath"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/viewmetrics"
 )
 
@@ -147,6 +150,30 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		// passing for the path's own view.
 		base.answer = fallbackProbeView(daemon.ProbeViewBase, "", "", daemon.FallbackCheckoutInaccessible)
 		return base
+	}
+	// A control probe can be a new worktree's first request, just like an MCP
+	// call. Observe only that path in an already known family rather than wait
+	// for the topology sweep. The lifecycle bounds and coalesces the metadata
+	// work; it never tracks an unknown family or waits for graph construction.
+	root, _, gitPath := gitstate.MarkerCommonDir(path)
+	nested := binding.Matched && gitPath && !pathkey.EqualPaths(root, binding.RootPath)
+	if (!binding.Matched || nested) && (c.multiIndexer == nil || !c.multiIndexer.RepoIdentityPending()) {
+		_, found, observeErr := c.lifecycle.ObserveCheckoutPath(ctx, path)
+		if observeErr != nil || (!found && nested) {
+			reason := daemon.FallbackCheckoutInaccessible
+			if errors.Is(observeErr, indexer.ErrCheckoutMutationBusy) {
+				reason = daemon.FallbackViewBuilding
+			}
+			return probeView{answer: fallbackProbeView(daemon.ProbeViewUnrouted, "", "", reason),
+				root: root, servable: false, release: noopRelease}
+		}
+		if found {
+			binding, err = c.lifecycle.ExplainView(ctx, path)
+			if err != nil || !binding.Matched {
+				return probeView{answer: fallbackProbeView(daemon.ProbeViewUnrouted, "", "", daemon.FallbackCheckoutInaccessible),
+					root: root, servable: false, release: noopRelease}
+			}
+		}
 	}
 
 	if binding.Matched && binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {

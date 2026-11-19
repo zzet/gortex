@@ -420,6 +420,11 @@ type Indexer struct {
 	// shelling out to git (see headAndDirty).
 	headProvenance *repoHeadProvenance
 
+	// passCheckNeeded lets a private sparse pass stop dispatching obsolete
+	// checkout work. Sample on the dispatch goroutine, at most once per 64
+	// files, and after joining workers; ordinary full indexes leave it nil.
+	passCheckNeeded func(context.Context) error
+
 	// passCorpusFilter is the read-only-context mode. When a caller installs
 	// one, the pass corpus it produces is held in memory for the whole
 	// pipeline — parse, resolve, every subpass — and this hook is handed that
@@ -4112,7 +4117,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	// times — once for the non-streaming path, repeatedly for the
 	// streaming-flush large-repo path where each call processes a
 	// bounded slice into a per-chunk in-memory shadow.
-	parseChunk := func(chunkFiles []walkedFile) {
+	parseChunk := func(chunkFiles []walkedFile) error {
 		sidecars := newParseSidecarBatch(idx)
 		contentBatch := newParseContentBatch(idx)
 		graphBatch := newParseGraphBatch(idx.graph)
@@ -4459,8 +4464,14 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}()
 		}
 
+		var neededErr error
 	dispatch:
-		for _, f := range chunkFiles {
+		for i, f := range chunkFiles {
+			if idx.passCheckNeeded != nil && i%64 == 0 {
+				if neededErr = idx.passCheckNeeded(ctx); neededErr != nil {
+					break dispatch
+				}
+			}
 			select {
 			case fileCh <- f:
 			case <-ctx.Done():
@@ -4496,6 +4507,13 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		maybeReleaseHeapAfterLargeDirectParse(
 			graphBatch != nil, idx.repoPrefix, len(chunkFiles), chunkInputBytes, idx.logger,
 		)
+		if neededErr != nil {
+			return neededErr
+		}
+		if idx.passCheckNeeded != nil {
+			return idx.passCheckNeeded(ctx)
+		}
+		return nil
 	}
 
 	// Dispatch the largest files first. Both dispatch paths below
@@ -4530,7 +4548,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			chunkEnd := min(chunkStart+chunkSize, len(files))
 			chunkShadow := idx.newStructuralIntegrityShadow(streamingDisk, graph.StructuralPathShadowStreaming)
 			idx.graph = chunkShadow
-			parseChunk(files[chunkStart:chunkEnd])
+			if err := parseChunk(files[chunkStart:chunkEnd]); err != nil {
+				idx.graph = streamingDisk
+				return nil, err
+			}
 			if err := ctx.Err(); err != nil {
 				// This chunk has not crossed the durable boundary yet. Drop it
 				// and retain only prior fully-flushed chunks; never stamp mtimes
@@ -4587,7 +4608,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// the resolver and subpasses read/mutate the merged state.
 		idx.graph = streamingDisk
 	} else {
-		parseChunk(files)
+		if err := parseChunk(files); err != nil {
+			flushStreamedMtimes()
+			return nil, err
+		}
 		if err := ctx.Err(); err != nil {
 			// Direct SQLite batches have committed all completed files at this
 			// point. Persist their under-threshold mtime tail before returning;

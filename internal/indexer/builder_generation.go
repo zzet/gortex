@@ -176,6 +176,11 @@ type LayerBase interface {
 
 // BuildRequest is one sparse generation build.
 type BuildRequest struct {
+	// checkNeeded avoids expensive work for obsolete checkout demand. It is
+	// an optimization, not a replacement for the publication/route fences.
+	// Immutable ref builds leave it nil.
+	checkNeeded func(context.Context) error
+
 	// contractFullCensus is set only by the claimed complete-snapshot producer.
 	contractFullCensus bool
 	// importBatch marks the one-file quantum of a large working-tree import.
@@ -797,6 +802,14 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 			}
 		}()
 		var separation contextSeparation
+		// An empty delta has no expensive pass/enrichment to avoid. Its
+		// coordinator's existing post-build HEAD guard is enough; avoid adding
+		// Git probes to the common equal-HEAD startup path.
+		if req.checkNeeded != nil && len(plan.indexed) > 0 {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
+		}
 		if adopted || len(plan.indexed) > 0 {
 			var err error
 			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
@@ -818,6 +831,11 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		// so a cancel during the go/types load ends the build too.
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if req.checkNeeded != nil && len(plan.indexed) > 0 {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
 		}
 		if !report.committedTypecheckInMemory {
 			b.runEnrichment(ctx, req, handle, &report)
@@ -1146,6 +1164,7 @@ func (b *SparseGenerationBuilder) runPass(
 	}
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
+	idx.passCheckNeeded = req.checkNeeded
 
 	// The read-only-context mode. Installing the filter is what lets a pass
 	// writing through a derived generation handle hold its corpus in memory at
@@ -1172,6 +1191,11 @@ func (b *SparseGenerationBuilder) runPass(
 	idx.setPassCorpusFilter(func(corpus *graph.Graph) error {
 		canSeparate := true
 		var payload contextCorpus = corpus
+		if req.checkNeeded != nil {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
+		}
 		// Compare typed context with typed context, and persist the compiler's
 		// changes once. Previously the untyped pass could not equal an enriched
 		// base, so unchanged context was drained and then updated by the compiler.
@@ -1195,6 +1219,13 @@ func (b *SparseGenerationBuilder) runPass(
 		if canSeparate {
 			separation, err = b.separateAndPrune(ctx, req, plan, payload)
 			if err != nil {
+				return err
+			}
+		}
+		// Base comparison can itself take time. Recheck immediately before
+		// allowing the pass to drain, including a move during comparison.
+		if req.checkNeeded != nil {
+			if err := req.checkNeeded(ctx); err != nil {
 				return err
 			}
 		}
