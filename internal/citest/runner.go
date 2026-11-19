@@ -558,9 +558,11 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 		return report, fmt.Errorf("package census must be nonempty and unique")
 	}
 	large := map[string]string{}
+	largePackages := set{}
 	all := newSet(packages)
 	for group, suffix := range policy.Groups {
 		large[group] = module + suffix
+		largePackages.add(large[group])
 		if !all.has(large[group]) {
 			return report, fmt.Errorf("missing large package %s", large[group])
 		}
@@ -615,12 +617,20 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 		if part.Group == "rest" {
 			rest := []string{}
 			for _, pkg := range packages {
-				if !slices.ContainsFunc([]string{"indexer", "mcp", "store"}, func(group string) bool { return large[group] == pkg }) && (selected == nil || selected.has(pkg)) {
+				if !largePackages.has(pkg) && (selected == nil || selected.has(pkg)) {
 					rest = append(rest, pkg)
 				}
 			}
 			if len(rest) > 0 {
 				if err := j.runRest(rest); err != nil {
+					return report, err
+				}
+			}
+		} else if part.Group == "cli" {
+			// Keep the whole-package CLI invocation and isolated home, but give
+			// it its own job budget instead of the remainder of the rest job.
+			if selected == nil || selected.has(large["cli"]) {
+				if err := j.runRest([]string{large["cli"]}); err != nil {
 					return report, err
 				}
 			}

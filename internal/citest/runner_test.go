@@ -237,7 +237,7 @@ func TestRunnerRealFullVersusAffectedExecutionAndCoverage(t *testing.T) {
 			t.Fatalf("planned test not executed: %s %v", name, executed)
 		}
 	}
-	for _, name := range []string{"TestIndexer", "TestOtherIndexer", "TestStore"} {
+	for _, name := range []string{"TestIndexer", "TestOtherIndexer", "TestStore", "TestCLI"} {
 		if executed["affected"].has(name) || !executed["full"].has(name) {
 			t.Fatalf("wrong package filtering for %s", name)
 		}
@@ -362,7 +362,7 @@ func TestRunnerWorkflowRowsSupportDynamicAndLegacyLayouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"rest\"]\n    include: [{os: macos-latest, partition: indexer-race}]\n"} {
+	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"cli\", \"rest\"]\n    include: [{os: macos-latest, partition: indexer-race}]\n"} {
 		rows, err := WorkflowRows(text, p)
 		if err != nil {
 			t.Fatal(err)

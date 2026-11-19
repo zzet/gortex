@@ -91,6 +91,10 @@ To run a package the way CI does, one worker process per CPU:
 TEST_RACE=true go run ./scripts/ci-test --partition mcp+store
 ```
 
+The CLI package has its own `--partition cli` job on each platform. It runs
+the whole package with an isolated home and a separate 35-minute budget;
+`--partition rest` excludes it so other packages cannot consume its test time.
+
 ### Linting
 
 ```bash

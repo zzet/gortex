@@ -39,7 +39,7 @@ func LoadPolicy() (Policy, error) {
 	if err := json.Unmarshal(policyJSON, &p); err != nil {
 		return p, err
 	}
-	if len(p.Targets) != 3 || !slices.Equal(p.Partitions, []string{"indexer:1/2", "indexer:2/2", "mcp", "store", "rest"}) || len(p.Groups) != 3 {
+	if len(p.Targets) != 3 || !slices.Equal(p.Partitions, []string{"indexer:1/2", "indexer:2/2", "mcp", "store", "cli", "rest"}) || len(p.Groups) != 4 {
 		return p, fmt.Errorf("invalid CI policy")
 	}
 	seen := set{}
@@ -49,7 +49,7 @@ func LoadPolicy() (Policy, error) {
 		}
 		seen.add(t.Runner)
 	}
-	for _, g := range []string{"indexer", "mcp", "store"} {
+	for _, g := range []string{"indexer", "mcp", "store", "cli"} {
 		if p.Groups[g] == "" {
 			return p, fmt.Errorf("missing CI group %s", g)
 		}
@@ -119,7 +119,7 @@ func ParsePartition(spec string, p Policy) ([]Partition, error) {
 	for _, text := range strings.Split(spec, "+") {
 		group, tail, sharded := strings.Cut(text, ":")
 		item := Partition{Group: group, Count: 1}
-		if group != "rest" && p.Groups[group] == "" || seen.has(group) {
+		if group != "rest" && p.Groups[group] == "" || seen.has(group) || group == "cli" && spec != "cli" {
 			return nil, fmt.Errorf("bad partition group %q", group)
 		}
 		if sharded {
