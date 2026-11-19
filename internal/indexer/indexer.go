@@ -441,7 +441,8 @@ type Indexer struct {
 	// invalidate source-shape resolution reuse, including unchanged callers.
 	aliasResolutionChanged bool
 	passAliases            atomic.Pointer[aliasSnapshot]
-	appliedAliases         string // fallback for in-memory stores, under the mutation lane
+	deltaAliases           *aliasSnapshot // private to a single edit-delta builder
+	appliedAliases         string         // fallback for in-memory stores, under the mutation lane
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to

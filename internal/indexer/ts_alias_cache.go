@@ -107,8 +107,11 @@ func (idx *Indexer) beginAliasPass(root string, paths []string) error {
 	if idx.contentSource() != nil {
 		return nil // immutable source uses its own memo, never the checkout
 	}
-	s := workingAliases(root, idx.contentProof, paths)
 	if _, delta := idx.graph.(*graph.DeltaWriter); delta {
+		s := idx.deltaAliases
+		if s == nil {
+			return nil
+		}
 		// The delta planner owns its frontier. It does not adopt the live
 		// graph's receipt or certify a rebind for the checkout.
 		if prior := idx.appliedAliases; prior != "" && prior != s.digest {
@@ -118,6 +121,7 @@ func (idx *Indexer) beginAliasPass(root string, paths []string) error {
 		idx.passAliases.Store(s)
 		return nil
 	}
+	s := workingAliases(root, idx.contentProof, paths)
 	prior := idx.appliedAliases
 	store, durable := idx.graph.(aliasStateStore)
 	if durable && prior == "" {

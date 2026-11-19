@@ -67,6 +67,29 @@ const (
 	editDeltaFallbackRefused  = "delta_refused"
 )
 
+// A cold lookup walks the checkout and forces a full publication sample.
+// Avoid it when neither the edit nor any stored caller could consume an alias.
+func deltaMayUseAliases(ctx context.Context, req *BuildRequest) (bool, error) {
+	if len(req.Changes) == 0 {
+		return false, nil
+	}
+	for _, change := range req.Changes {
+		if closureJSTSPath(change.Path) {
+			return true, nil
+		}
+	}
+	switch base := req.Base.(type) {
+	case *store_sqlite.Store:
+		return base.MayHaveTSAliasCallers(ctx, req.RepoPrefix)
+	case commitLayerBase:
+		// The coordinator's materialized ancestry shares one database.
+		if len(base.facts.handles) != 0 {
+			return base.facts.handles[0].MayHaveTSAliasCallers(ctx, req.RepoPrefix)
+		}
+	}
+	return true, nil // no complete inventory for this reader
+}
+
 // buildWorkingTreeLayer builds one working-tree generation through the delta
 // path, falling back to the sparse closure builder for a manifest change and
 // for a delta the DeltaWriter refused.
@@ -130,15 +153,22 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 	if req.importBatch {
 		req.contentProof.disable()
 	}
-	var aliases *aliasSnapshot
+	mayUseAliases, err := deltaMayUseAliases(ctx, &req)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
 	for _, change := range req.Changes {
 		manifest := dependencyManifestPath(change.Path)
-		if !manifest {
-			if aliases == nil {
-				aliases = workingAliases(req.RootPath, req.contentProof, nil)
+		if !manifest && mayUseAliases {
+			if req.deltaAliases == nil {
+				paths := make([]string, len(req.Changes))
+				for i, c := range req.Changes {
+					paths[i] = c.Path
+				}
+				req.deltaAliases = workingAliases(req.RootPath, req.contentProof, paths)
 			}
 			// An inherited config can have any name or extension.
-			_, manifest = aliases.inputs[filepath.Join(req.RootPath, filepath.FromSlash(change.Path))]
+			_, manifest = req.deltaAliases.inputs[filepath.Join(req.RootPath, filepath.FromSlash(change.Path))]
 		}
 		if manifest {
 			req.contentProof.disable()
@@ -835,7 +865,8 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
-	if base, ok := req.Base.(aliasStateStore); ok {
+	idx.deltaAliases = req.deltaAliases
+	if base, ok := req.Base.(aliasStateStore); ok && idx.deltaAliases != nil {
 		prior, err := base.TSAliasDigest(req.RepoPrefix)
 		if err != nil {
 			idx.Close()
