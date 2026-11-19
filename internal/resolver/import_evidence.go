@@ -79,15 +79,20 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil
 	}
-	if hasLocalDeclaration(callerFile, candidates) {
+	if hasLocalDeclaration(callerFile, "", candidates) {
 		return nil
 	}
 	var symbolPick *graph.Node
 	for _, e := range r.callerOutEdges(callerFile) {
-		if e.Kind != graph.EdgeImports || e.Alias != "" {
+		if e.Kind != graph.EdgeImports || importBindingAlias(e) != "" {
 			continue
 		}
 		target := r.importedTargetOf(e)
+		if strings.HasSuffix(target, "::"+funcName) {
+			if n := r.cachedGetNode(target); n != nil && graph.IsReExportNode(n) {
+				target = r.canonicalForwardedTarget(n)
+			}
+		}
 		for _, c := range candidates {
 			if c.ID != target || !isImportableCallee(c, funcName) {
 				continue
@@ -125,10 +130,44 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	return pick
 }
 
+// Follow only this named export's forwarding edges, never its barrel's imports.
+func (r *Resolver) canonicalForwardedTarget(n *graph.Node) string {
+	seen := make(map[string]bool)
+	for graph.IsReExportNode(n) && !seen[n.ID] {
+		seen[n.ID] = true
+		var next string
+		for _, edge := range r.callerOutEdges(n.ID) {
+			if edge.Kind == graph.EdgeReExports {
+				target := r.importedTargetOf(edge)
+				if target == "" || next != "" && next != target {
+					return ""
+				}
+				next = target
+			}
+		}
+		n = r.cachedGetNode(next)
+		if n == nil {
+			return ""
+		}
+	}
+	if graph.IsReExportNode(n) {
+		return ""
+	}
+	return n.ID
+}
+
+func importBindingAlias(e *graph.Edge) string {
+	if alias, _ := e.Meta["import_alias"].(string); alias != "" {
+		return alias
+	}
+	return e.Alias
+}
+
 // An import statement can share its module's basename; it isn't a local definition.
-func hasLocalDeclaration(file string, candidates []*graph.Node) bool {
+func hasLocalDeclaration(file, owner string, candidates []*graph.Node) bool {
 	for _, c := range candidates {
-		if c.FilePath == file && c.Kind != graph.KindImport {
+		if c.FilePath == file && c.Kind != graph.KindImport &&
+			(c.ID == file+"::"+c.Name || owner != "" && strings.HasPrefix(c.ID, owner+"#")) {
 			return true
 		}
 	}

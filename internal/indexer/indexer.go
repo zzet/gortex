@@ -36,7 +36,6 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/crashpool"
 	"github.com/zzet/gortex/internal/parser/languages"
-	"github.com/zzet/gortex/internal/parser/nuxtimports"
 	"github.com/zzet/gortex/internal/parser/tsalias"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -441,7 +440,7 @@ type Indexer struct {
 	// Set only while the repository mutation lane is held. Alias changes
 	// invalidate source-shape resolution reuse, including unchanged callers.
 	aliasResolutionChanged bool
-	appliedResolution      *resolutionInputs
+	appliedResolution      atomic.Pointer[resolutionInputs]
 	resolutionRetry        bool
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
@@ -478,23 +477,11 @@ type Indexer struct {
 	npmAliasOnce sync.Once
 	npmAlias     *npmAliasIndex
 
-	// tsAliasMu guards this Indexer's own tsconfig / jsconfig alias scopes.
-	// They are memoised HERE, not in the process-wide tsAliasCache, whenever a
-	// content source is installed: that cache is keyed by repo root, and a
-	// root cannot tell two snapshots of one checkout apart, so a committed
-	// build sharing it would resolve its path aliases through the live
-	// checkout's tsconfig. tsAliasRef is the source ref the scopes were loaded
-	// from, so swapping the installed source reloads them; tsAliasLoaded
-	// distinguishes "scanned, no usable config" from "not yet scanned".
-	tsAliasMu     sync.Mutex
-	tsAliasRef    *contentSourceRef
-	tsAliasColl   *tsalias.Collection
-	tsAliasLoaded bool
-
-	// Immutable Nuxt metadata is keyed by source, not checkout root.
-	nuxtMu   sync.Mutex
-	nuxtRef  *contentSourceRef
-	nuxtColl *nuxtimports.Collection
+	// Immutable aliases and generated bindings belong to the installed source,
+	// never to another snapshot of the same checkout.
+	resolutionMu     sync.Mutex
+	resolutionRef    *contentSourceRef
+	sourceResolution *resolutionInputs
 
 	// workspaceMembersOnce builds workspaceMembers lazily on the first
 	// resolve-time package-manager-workspace lookup. Lazy for the same
@@ -850,29 +837,23 @@ func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
 	return newDiskManifestTree(idx.rootPath), nil
 }
 
-// tsAliasCollection returns the tsconfig / jsconfig alias scopes this
-// Indexer's path-alias resolution reads.
-//
-// With no source installed that is the process-wide, root-keyed cache the live
-// index has always used. With a source installed the scopes are loaded out of
-// THAT SNAPSHOT and memoised on this Indexer, keyed on the installed ref: the
-// scan costs one walk of the source, the shared cache cannot tell two
-// snapshots of one root apart, and an alias scope read from the wrong tree
-// produces a wrong import edge rather than a missing one.
+// tsAliasCollection shares its source boundary with generated app bindings.
 func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
+	return idx.lookupResolutionInputs().aliases
+}
+
+func (idx *Indexer) lookupResolutionInputs() *resolutionInputs {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
-		return tsAliasCollectionForTree(tree)
+		return resolutionInputsForTree(tree)
 	}
-	idx.tsAliasMu.Lock()
-	defer idx.tsAliasMu.Unlock()
-	if idx.tsAliasLoaded && idx.tsAliasRef == ref {
-		return idx.tsAliasColl
+	idx.resolutionMu.Lock()
+	defer idx.resolutionMu.Unlock()
+	if idx.resolutionRef != ref {
+		idx.sourceResolution = resolutionInputsForTree(tree)
+		idx.resolutionRef = ref
 	}
-	idx.tsAliasColl = tsAliasCollectionForTree(tree)
-	idx.tsAliasRef = ref
-	idx.tsAliasLoaded = true
-	return idx.tsAliasColl
+	return idx.sourceResolution
 }
 
 // graphHasCFamilyFiles reports whether this pass's graph carries any C, C++ or
@@ -2846,7 +2827,9 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	var inputs *resolutionInputs
 	defer func() {
-		idx.finishResolutionInputs(inputs, retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0)
+		if err := idx.finishResolutionInputs(inputs, retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0); err != nil {
+			retErr = err
+		}
 	}()
 	if idx.contractCoreRuntime.Load() != nil && idx.contractCoreInputs == nil {
 		// Raw MI doors retain this journal until their OUTER source receipt settles.
@@ -2973,7 +2956,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	inputs = idx.refreshResolutionInputs(absRoot, "")
+	inputs, err = idx.refreshResolutionInputs(absRoot, "")
+	if err != nil {
+		return nil, err
+	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -5288,6 +5274,7 @@ func (idx *Indexer) indexFile(
 	// so it must be captured before evictExisting runs.
 	priorNodes, legacyIDs, legacyPath := idx.filePriorWithLegacy(graphPath, idx.graph.GetFileNodes(graphPath))
 	var legacyCarried []*graph.Edge
+	var nuxtCallers []string
 	var oldFuncIDs []string
 	evictExisting := func(result *parser.ExtractionResult) {
 		idx.invalidateGoModuleSourceStamp(relPath)
@@ -5310,7 +5297,7 @@ func (idx *Indexer) indexFile(
 		idx.deleteSymbolFTS(oldFTSNodeIDs)
 		var npmConsumers []string
 		if len(legacyIDs) == 0 {
-			npmConsumers = idx.restubIncomingRefs(graphPath)
+			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &nuxtCallers)
 		} else {
 			// Extraction is still unprefixed here. Build only the identity surface
 			// needed by the same incoming frontier used by the structural batch.
@@ -5326,6 +5313,7 @@ func (idx *Indexer) indexFile(
 			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
 			stages := []*incrementalBatchStage{stage}
 			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages))
+			nuxtCallers = stage.nuxtCallers
 		}
 		if markerBatch != nil {
 			markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
@@ -5586,7 +5574,9 @@ func (idx *Indexer) indexFile(
 	// the file — the reuse key carries no visibility evidence, so both the
 	// captured resolutions and the prior-unresolved skip are stale.
 	freshVis := csharpVisibilityStampForNodes(result.Nodes)
-	if visCaptured && priorVis != freshVis {
+	changedImports := visCaptured && closureJSTSPath(graphPath) &&
+		storedDerivedFingerprints(priorNodes).imports != storedDerivedFingerprints(result.Nodes).imports
+	if visCaptured && priorVis != freshVis || changedImports {
 		reuseIdx, priorUnresolved, priorDeclarations = nil, nil, nil
 	}
 	if len(legacyIDs) > 0 {
@@ -5612,6 +5602,9 @@ func (idx *Indexer) indexFile(
 	idx.graph.AddBatch(result.Nodes, append(result.Edges, legacyCarried...))
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
+	if len(nuxtCallers) > 0 {
+		idx.resolver.ResolveFilesOutgoing(nuxtCallers)
+	}
 	// No subsequent stage reads source bytes or the parse tree. Release both
 	// here instead of retaining them through resolver/enrichment work; the
 	// deferred calls above remain as idempotent guards for every early return.
@@ -6140,6 +6133,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
 func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
+	return idx.restubIncomingRefsForReplacement(graphPath, nil)
+}
+
+func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, nuxtCallers *[]string) []string {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
 		return nil
@@ -6180,6 +6177,14 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
 				continue // already a pending stub
 			}
 			oldTo := e.To
+			if local, _ := e.Meta["nuxt_import_name"].(string); local != "" {
+				parkNuxtCall(e, local)
+				if nuxtCallers != nil {
+					*nuxtCallers = append(*nuxtCallers, e.FilePath)
+				}
+				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+				continue
+			}
 			// Stash + clear the edge's resolved provenance before restubbing:
 			// an `unresolved::` stub must not keep advertising a resolved
 			// tier. The incoming-resolve pass restores it verbatim if the stub
@@ -7299,7 +7304,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	paths []string,
 	mode incrementalPathMode,
 	markerBatches ...*reparsePendingEnrichmentBatch,
-) (*IndexResult, error) {
+) (_ *IndexResult, retErr error) {
 	idx.incrementalUnchangedContracts = make(map[string]*unchangedFileContracts)
 	idx.contractDependenciesChanged = false
 	idx.contractSharedInputsChanged = false
@@ -7348,10 +7353,17 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if mode.forceExplicitFiles && len(paths) == 1 {
 		point = paths[0]
 	}
-	inputs := idx.refreshResolutionInputs(absRoot, point)
+	inputs, err := idx.refreshResolutionInputs(absRoot, point)
+	if err != nil {
+		return nil, err
+	}
 	// A failed or partial rebuild must retry even if the lookup cache is warm.
 	applied := false
-	defer func() { idx.finishResolutionInputs(inputs, applied) }()
+	defer func() {
+		if err := idx.finishResolutionInputs(inputs, applied); err != nil {
+			retErr = err
+		}
+	}()
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial

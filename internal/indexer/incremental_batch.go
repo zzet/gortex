@@ -46,6 +46,8 @@ type incrementalBatchStage struct {
 	storedGraph            fileDeltaFingerprints
 	storedDerived          derivedFingerprints
 	probe                  fileDeltaProbe
+	resolutionStale        bool
+	nuxtCallers            []string
 	metadataOnly           bool
 	priorRawEdgesCompleted bool
 	edgeRefreshes          []graph.EdgeReindex
@@ -367,7 +369,8 @@ func (idx *Indexer) reindexIncrementalChunk(
 		// structural stage whatever its fingerprints say
 		// (deletion_importers.go).
 		forced := idx.forceReparse(filePath) || len(legacyIDs) > 0
-		aliasChanged := idx.mustReresolve(graphPath)
+		aliasChanged := idx.mustReresolve(graphPath) || closureJSTSPath(graphPath) && probeOK &&
+			(storedDerived.imports == "" || storedDerived.imports != probe.derived.imports)
 		inert := !aliasChanged && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata &&
@@ -461,6 +464,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 			legacyIDs: legacyIDs, legacyPath: legacyPath,
 			src: prepared.src, result: prepared.result, prepared: prepared, priorNodes: priorNodes,
 			storedGraph: storedGraph, storedDerived: storedDerived, probe: probe,
+			resolutionStale: aliasChanged,
 			metadataOnly: !aliasChanged && !forced && storedGraph.semantic != "" &&
 				probe.fingerprints.semantic == storedGraph.semantic &&
 				unchangedProbeContractInputs(priorNodes, probe),
@@ -767,7 +771,7 @@ func (idx *Indexer) commitIncrementalStages(
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
 			stage.priorNodes, view.outByNode, view.nodesByID,
 		)
-		if idx.mustReresolve(stage.graphPath) {
+		if stage.resolutionStale {
 			stage.reuse, stage.priorPending = nil, nil
 			stage.metadataOnly = false
 		}
@@ -1249,6 +1253,13 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	idx.relinkImportNodesToModules(nodes)
 	idx.applyLap("relink")
 
+	var nuxtCallers []string
+	for _, stage := range stages {
+		nuxtCallers = append(nuxtCallers, stage.nuxtCallers...)
+	}
+	if len(nuxtCallers) > 0 {
+		idx.resolver.ResolveFilesOutgoing(nuxtCallers)
+	}
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
@@ -1489,6 +1500,7 @@ func restubIncomingRefsFromView(
 	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
 		frontier := restubFrontierForStage(stage, view)
+		defaultChanged := closureJSTSPath(stage.graphPath) && fileDefaultExport(stage.priorNodes) != fileDefaultExport(extractionNodes(stage.result))
 		// Separator repair changes identity, not the declaration contract.
 		// The normal shape/visibility/parameter gates still decide every carry.
 		if !frontier.conservative {
@@ -1626,7 +1638,8 @@ func restubIncomingRefsFromView(
 				if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
 					continue
 				}
-				if !restub {
+				local, _ := edge.Meta["nuxt_import_name"].(string)
+				if !restub && !(defaultChanged && local != "") {
 					if _, duplicate := carriedSeen[edge]; duplicate {
 						continue
 					}
@@ -1635,6 +1648,12 @@ func restubIncomingRefsFromView(
 					continue
 				}
 				oldTo := edge.To
+				if local != "" {
+					parkNuxtCall(edge, local)
+					stage.nuxtCallers = append(stage.nuxtCallers, edge.FilePath)
+					reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+					continue
+				}
 				graph.StashRestubProvenance(edge)
 				edge.To = goModuleRestubTarget(edge, stub)
 				if edge.To != stub {

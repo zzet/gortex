@@ -28,18 +28,11 @@ type Collection struct{ scopes []scope }
 var exportRE = regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
+const GeneratedList = ".nuxt/imports.d.ts"
+
 // Load ignores unprepared projects, packages and files outside the repository.
 func Load(repoRoot string) *Collection {
-	return LoadTree(tsalias.WorkingTree(repoRoot))
-}
-
-// ListPaths visits the generated files whose bytes supplied these scopes.
-func (c *Collection) ListPaths(visit func(string)) {
-	if c != nil {
-		for _, scope := range c.scopes {
-			visit(path.Join(scope.Root, ".nuxt/imports.d.ts"))
-		}
-	}
+	return LoadTree(tsalias.WorkingTree(repoRoot, GeneratedList))
 }
 
 // LoadTree reads only generated lists present in the snapshot, never the checkout.
@@ -50,7 +43,7 @@ func LoadTree(tree tsalias.Tree) *Collection {
 	var scopes []scope
 	tree.Files(func(rel string) {
 		dir := path.Dir(rel)
-		if path.Base(dir) != ".nuxt" || path.Base(rel) != "imports.d.ts" {
+		if rel != GeneratedList && !strings.HasSuffix(rel, "/"+GeneratedList) {
 			return
 		}
 		root := path.Dir(dir)
@@ -133,8 +126,14 @@ func (c *Collection) Resolve(callerFile, name string) Binding {
 			}
 			rel = strings.TrimPrefix(callerFile, scope.Root+"/")
 		}
-		if rel == "server" || strings.HasPrefix(rel, "server/") || strings.HasPrefix(rel, ".nuxt/") {
+		base := path.Base(rel)
+		if strings.TrimSuffix(base, path.Ext(base)) == "nuxt.config" {
 			return Binding{}
+		}
+		for part := range strings.SplitSeq(rel, "/") {
+			if part == "server" || part == ".nuxt" {
+				return Binding{}
+			}
 		}
 		return scope.Bindings[name]
 	}

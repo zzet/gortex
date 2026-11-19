@@ -14,11 +14,10 @@ type NuxtAutoImportResolver func(callerFile, name string) (stem, exportedName st
 func (r *Resolver) SetNuxtAutoImportResolver(fn NuxtAutoImportResolver) { r.nuxtAutoImport = fn }
 
 func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidates []*graph.Node, stats *ResolveStats) bool {
-	if r.nuxtAutoImport == nil || e.Kind != graph.EdgeCalls || !isJSTSPath(e.FilePath) || strings.Contains(name, ".") {
+	if e.Kind != graph.EdgeCalls || !isJSTSPath(e.FilePath) || strings.Contains(name, ".") {
 		return false
 	}
-	stem, exported := r.nuxtAutoImport(e.FilePath, name)
-	if stem == "" || exported == "" || hasLocalDeclaration(e.FilePath, candidates) {
+	if hasLocalDeclaration(e.FilePath, e.From, candidates) {
 		return false
 	}
 	// Even an unresolved explicit binding shadows a generated global.
@@ -39,6 +38,13 @@ func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidat
 			}
 		}
 	}
+	if r.nuxtAutoImport == nil {
+		return false
+	}
+	stem, exported := r.nuxtAutoImport(e.FilePath, name)
+	if stem == "" || exported == "" {
+		return false
+	}
 	file := probeJSTSFile(r.cachedGetNode, stem)
 	if file == "" {
 		return false
@@ -58,6 +64,7 @@ func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidat
 	if e.Meta == nil {
 		e.Meta = make(map[string]any)
 	}
+	e.Meta["nuxt_import_name"] = name
 	e.Meta["resolution"] = "nuxt_auto_import"
 	stats.Resolved++
 	return true

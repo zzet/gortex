@@ -16,6 +16,9 @@ func TestNuxtAutoImportPrecedence(t *testing.T) {
 		"app/explicit.ts":         "import { useRedirect } from '../other/auth'\nexport function run() { return useRedirect() }",
 		"app/unresolved.ts":       "import { useRedirect } from 'missing-package'\nexport function run() { return useRedirect() }",
 		"app/local.ts":            "export function useRedirect() { return 3 }\nexport function run() { return useRedirect() }",
+		"app/scopes.ts":           "function sibling(useRedirect: Function) { return useRedirect() }\nexport function run() { return useRedirect() }",
+		"barrel/index.ts":         "export { useRedirect } from '../other/auth'",
+		"app/barrel.ts":           "import { useRedirect } from '../barrel/index'\nimport { other } from '../app/composables/auth'\nexport function run() { return useRedirect() }",
 	}
 	g := buildGraphFromSources(t, files)
 	r := New(g)
@@ -25,6 +28,9 @@ func TestNuxtAutoImportPrecedence(t *testing.T) {
 	require.Equal(t, "app/local.ts::useRedirect", callEdgeTo(g, "app/local.ts::run", 2))
 	for range 2 {
 		require.Equal(t, "app/composables/auth.ts::useRedirect", callEdgeTo(g, "app/unrelated.ts::run", 2))
+		require.Equal(t, "app/composables/auth.ts::useRedirect", callEdgeTo(g, "app/scopes.ts::run", 2))
+		require.Equal(t, "unresolved::useRedirect", callEdgeTo(g, "app/scopes.ts::sibling", 1))
+		require.Equal(t, "other/auth.ts::useRedirect", callEdgeTo(g, "app/barrel.ts::run", 3))
 		require.Equal(t, "app/composables/auth.ts::useRedirect", callEdgeTo(g, "app/type.ts::run", 2))
 		for _, caller := range []string{"app/unresolved.ts::run", "app/default.js::run"} {
 			require.Equal(t, "unresolved::useRedirect", callEdgeTo(g, caller, 2), caller)

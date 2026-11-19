@@ -877,10 +877,7 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 			}
 			marked, _ := e.Meta[NpmImportSpecifierMeta].(string)
 			npmLinked := marked != "" && e.CrossRepo
-			alias, _ := e.Meta["import_alias"].(string)
-			if alias == "" {
-				alias = e.Alias
-			}
+			alias := importBindingAlias(e)
 			if e.CrossRepo && isJSTSPath(e.From) {
 				// JS/TS imports name bindings, not every symbol in the provider.
 				if _, name, ok := strings.Cut(e.To, "::"); ok {

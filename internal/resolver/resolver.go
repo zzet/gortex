@@ -4652,6 +4652,16 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
+	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
+		for _, c := range candidates {
+			if c.Kind == graph.KindParam && strings.HasPrefix(c.ID, e.From+"#param:") {
+				// Calling a parameter gives no evidence for an implementation
+				// of that name in the module or its imports.
+				stats.Unresolved++
+				return
+			}
+		}
+	}
 	if len(candidates) == 0 {
 		if r.tryResolveNuxtAutoImport(e, funcName, nil, stats) {
 			return

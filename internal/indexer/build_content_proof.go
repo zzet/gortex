@@ -14,7 +14,6 @@ import (
 	"sync"
 
 	"github.com/zzet/gortex/internal/gitstate"
-	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
 // buildContentProof is what a sample-pinned working-tree build proves about
@@ -56,9 +55,8 @@ import (
 //     handler-source reads, the scoped walk's finding
 //     that an explicit path is gone, and every change the plan demoted to a
 //     deletion because the working copy no longer held it;
-//   - recorded as a read of unknown bytes, held to its change stamp: each
-//     tsconfig / jsconfig a cached alias scope came from (holdAliasConfigs),
-//     when the process-wide alias cache answered the build;
+//   - recorded by content identity: config and generated-list reads during
+//     discovery, bounded point refresh, and replay from workingResolutionInputs;
 //   - recorded as an existence probe with its answer (probe): the deletion
 //     walk's checks of the files it plans and of the root manifests, the
 //     importer scan's check of a deleted file's importers, and a tsconfig
@@ -662,30 +660,6 @@ func (p *buildContentProof) proven() map[string]string {
 		}
 	}
 	return out
-}
-
-// holdAliasConfigs records, for a build whose tsconfig / jsconfig alias scopes
-// came from the process-wide cache (tsAliasCollectionForTree), every config
-// file a cached scope was parsed from as a read of unknown bytes: the build
-// read none of them, but its payload is built on what they said, so each is
-// held to its change stamp (unrecordedMoved, and the read set's own
-// confirmation). Only a config present now is held: an absent one is
-// decided by its directory's stamp, which every save beside it moves.
-func (p *buildContentProof) holdAliasConfigs(root string, coll *tsalias.Collection) {
-	if !p.active() {
-		return
-	}
-	for _, scope := range coll.Maps() {
-		for _, parent := range scope.ParentConfigs {
-			p.record(filepath.Join(root, filepath.FromSlash(parent)), "")
-		}
-		for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
-			abs := filepath.Join(root, filepath.FromSlash(scope.DirPrefix), name)
-			if info, err := os.Lstat(abs); err == nil && !info.IsDir() {
-				p.record(abs, "")
-			}
-		}
-	}
 }
 
 // claimedByName reports whether rel is a file the read set claims by name at

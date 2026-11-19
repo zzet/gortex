@@ -3317,7 +3317,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		case forceFull:
 			route = "full_retrack"
 			result, err = fullRetrack()
-		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0:
+		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0 && idx.censusResolutionCurrent(absPath):
 			route = "census_noop"
 			result, err = idx.cleanCensusResult(ctx, detected, start)
 		case churn == 0:

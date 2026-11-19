@@ -44,7 +44,8 @@ import (
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
 // Nuxt app bindings, exact named imports and inherited TS aliases change JS/TS call targets.
-const ResolutionSemanticsVersion = 8
+// Named forwarding edges and caller-owned shadow checks change JS/TS call bindings.
+const ResolutionSemanticsVersion = 9
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

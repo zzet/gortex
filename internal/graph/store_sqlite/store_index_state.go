@@ -44,3 +44,24 @@ SELECT indexed_sha, dirty, indexed_at, workspace_fp, node_count, edge_count, ext
 	st.Dirty = dirty != 0
 	return st, true, nil
 }
+
+// ResolutionInputDigest returns the last complete working-copy resolution pass.
+// An empty digest is unknown (legacy graph or interrupted replacement).
+func (s *Store) ResolutionInputDigest(repo string) (string, error) {
+	var digest string
+	err := s.db.QueryRow(`SELECT digest FROM resolution_input_state WHERE view_gen=? AND repo_prefix=?`,
+		s.viewGen, repo).Scan(&digest)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return digest, err
+}
+
+func (s *Store) SetResolutionInputDigest(repo, digest string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.execActiveWriteLocked(context.Background(),
+		`INSERT OR REPLACE INTO resolution_input_state (view_gen,repo_prefix,digest) VALUES (?,?,?)`,
+		s.viewGen, repo, digest)
+	return err
+}

@@ -88,8 +88,6 @@ type Map struct {
 	// DirPrefix is the repo-relative path of the config file's
 	// directory. Used by Collection to pick the nearest ancestor scope.
 	DirPrefix string
-	// ParentConfigs lists the inherited configs a cached scope depends on.
-	ParentConfigs []string
 	// targetBase can be the declaring parent rather than the child scope.
 	targetBase string
 	// exists reports whether a repo-relative slash path is readable content
@@ -412,15 +410,18 @@ func Load(repoRoot string) *Collection {
 	if repoRoot == "" {
 		return nil
 	}
-	return LoadTree(WorkingTree(repoRoot))
+	return LoadTree(WorkingTree(repoRoot, ""))
 }
 
-// WorkingTree enumerates project config candidates in a checkout. Generated
-// Nuxt directories contribute only their import list, not another alias scope.
-func WorkingTree(root string) Tree { return dirTree{root: root} }
+// WorkingTree visits config candidates plus an optional file in a pruned
+// directory (for example, a generated list supplied by another loader).
+func WorkingTree(root, extra string) Tree {
+	dir, file := path.Split(extra)
+	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file}
+}
 
 // dirTree is the working copy at a root: the tree Load reads.
-type dirTree struct{ root string }
+type dirTree struct{ root, extraDir, extraFile string }
 
 var _ Tree = dirTree{}
 
@@ -440,9 +441,9 @@ func (t dirTree) Files(visit func(rel string)) {
 		}
 		if d.IsDir() {
 			if p != t.root && SkipDirName(d.Name()) {
-				if d.Name() == ".nuxt" {
+				if d.Name() == t.extraDir {
 					if rel, err := filepath.Rel(t.root, p); err == nil {
-						visit(path.Join(filepath.ToSlash(rel), "imports.d.ts"))
+						visit(path.Join(filepath.ToSlash(rel), t.extraFile))
 					}
 				}
 				return filepath.SkipDir
@@ -475,19 +476,15 @@ func (t dirTree) Exists(rel string) bool {
 
 // parseConfig resolves inherited options and probes targets in the same tree.
 func parseConfig(t Tree, rel, dirPrefix string) *Map {
-	var parents []string
-	co := loadConfigOptions(t, rel, make(map[string]bool), 0, &parents)
+	load := configLoad{tree: t, visited: make(map[string]int)}
+	load.visit(rel, 0)
+	co := load.options
 	if co.baseURL == "" && co.paths == nil {
 		return nil
 	}
-	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: t.Exists, ParentConfigs: parents}
+	m := &Map{DirPrefix: dirPrefix, targetBase: co.pathsDir, exists: t.Exists}
 	if co.baseURL != "" {
 		m.targetBase = co.baseURL
-		baseURL, relErr := filepath.Rel(filepath.FromSlash(path.Dir(rel)), filepath.FromSlash(co.baseURL))
-		if relErr != nil {
-			return nil
-		}
-		m.BaseURL = filepath.ToSlash(baseURL)
 	}
 	for pattern, targets := range co.paths {
 		if len(targets) == 0 {
@@ -517,27 +514,26 @@ type configOptions struct {
 	pathsDir string
 }
 
-// Each option retains its declaring directory. Inherited paths without a
-// baseUrl must not become relative to the child config's directory.
-func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, parentsRead *[]string) configOptions {
-	const maxExtendsDepth = 32
-	if depth >= maxExtendsDepth || active[rel] {
-		return configOptions{}
+// Visit strongest options first: the child, then its extends array right to
+// left. A shared ancestor can only supply an option not yet chosen. Revisit
+// it only if the shorter path leaves more of the depth budget for its parents.
+type configLoad struct {
+	tree    Tree
+	options configOptions
+	visited map[string]int
+}
+
+func (l *configLoad) visit(rel string, depth int) {
+	if prior, seen := l.visited[rel]; depth >= 32 || seen && prior <= depth {
+		return
 	}
-	data, ok := t.Read(rel)
-	if depth > 0 {
-		*parentsRead = append(*parentsRead, rel)
-		if !ok && !strings.HasSuffix(rel, ".json") {
-			rel += ".json"
-			*parentsRead = append(*parentsRead, rel)
-			if active[rel] {
-				return configOptions{}
-			}
-			data, ok = t.Read(rel)
-		}
-	}
+	l.visited[rel] = depth
+	data, ok := l.tree.Read(rel)
 	if !ok {
-		return configOptions{}
+		if depth > 0 && !strings.HasSuffix(rel, ".json") {
+			l.visit(rel+".json", depth)
+		}
+		return
 	}
 	var raw struct {
 		Extends         json.RawMessage `json:"extends"`
@@ -547,10 +543,15 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 		} `json:"compilerOptions"`
 	}
 	if err := json.Unmarshal(stripJSONC(data), &raw); err != nil {
-		return configOptions{}
+		return
 	}
-	active[rel] = true
-	defer delete(active, rel)
+	if l.options.baseURL == "" && raw.CompilerOptions.BaseURL != nil {
+		l.options.baseURL = path.Join(path.Dir(rel), filepath.ToSlash(*raw.CompilerOptions.BaseURL))
+	}
+	if l.options.paths == nil && raw.CompilerOptions.Paths != nil {
+		l.options.paths = raw.CompilerOptions.Paths
+		l.options.pathsDir = path.Dir(rel)
+	}
 	var parents []string
 	var parent string
 	if json.Unmarshal(raw.Extends, &parent) == nil {
@@ -558,8 +559,8 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 	} else {
 		_ = json.Unmarshal(raw.Extends, &parents)
 	}
-	var effective configOptions
-	for _, parent := range parents {
+	for i := len(parents) - 1; i >= 0; i-- {
+		parent := parents[i]
 		// TS package config resolution is intentionally outside this reader.
 		if !strings.HasPrefix(parent, "./") && !strings.HasPrefix(parent, "../") &&
 			!strings.HasPrefix(parent, `.\`) && !strings.HasPrefix(parent, `..\`) {
@@ -570,23 +571,8 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 		if !filepath.IsLocal(filepath.FromSlash(parent)) {
 			continue
 		}
-		inherited := loadConfigOptions(t, parent, active, depth+1, parentsRead)
-		if inherited.baseURL != "" {
-			effective.baseURL = inherited.baseURL
-		}
-		if inherited.paths != nil {
-			effective.paths = inherited.paths
-			effective.pathsDir = inherited.pathsDir
-		}
+		l.visit(parent, depth+1)
 	}
-	if raw.CompilerOptions.BaseURL != nil {
-		effective.baseURL = path.Join(path.Dir(rel), filepath.ToSlash(*raw.CompilerOptions.BaseURL))
-	}
-	if raw.CompilerOptions.Paths != nil {
-		effective.paths = raw.CompilerOptions.Paths
-		effective.pathsDir = path.Dir(rel)
-	}
-	return effective
 }
 
 // splitAlias splits one `paths` entry (pattern → ordered targets) into an

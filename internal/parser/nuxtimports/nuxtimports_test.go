@@ -27,6 +27,8 @@ export { type TypeOnly } from '../app/types';
 		require.Empty(t, coll.Resolve("app/page.ts", name))
 	}
 	require.Empty(t, coll.Resolve("server/api/redirect.ts", "useRedirect"))
+	require.Empty(t, coll.Resolve("layers/shop/server/api/items.ts", "useRedirect"))
+	require.Empty(t, coll.Resolve("layers/shop/nuxt.config.ts", "useRedirect"))
 	require.Empty(t, coll.Resolve(".nuxt/imports.d.ts", "useRedirect"))
 }
 

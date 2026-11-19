@@ -52,6 +52,7 @@ var extractorVersions = map[string]int{
 	"vue":        2,                                      // embedded scripts retain their local import bindings
 	"svelte":     2,                                      // embedded scripts retain their local import bindings
 	"astro":      2,                                      // embedded scripts retain their local import bindings
+	"html":       2,                                      // inline module scripts use the JS import extractor
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -74,6 +75,8 @@ var extractorSaltExtLang = map[string]string{
 	".vue":    "vue",
 	".svelte": "svelte",
 	".astro":  "astro",
+	".html":   "html",
+	".htm":    "html",
 	".java":   "java",
 	".rb":     "ruby",
 	".rs":     "rust",

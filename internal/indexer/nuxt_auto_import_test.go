@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
 )
 
@@ -61,7 +62,9 @@ func TestNuxtPointSaveMetadataProof(t *testing.T) {
 	list := filepath.Join(root, ".nuxt/imports.d.ts")
 	writeFileMk(t, list, "export { useAuth } from '../lib/auth'")
 	writeFileMk(t, filepath.Join(root, "lib/auth.ts"), "export function useAuth() { return 1 }")
-	_, err = idx.incrementalPointWatcherPath(root, caller)
+	w, err := NewWatcher(idx, config.WatchConfig{Enabled: true}, idx.logger)
+	require.NoError(t, err)
+	err = w.patchGraph(caller, ChangeModified)
 	require.NoError(t, err)
 	require.Equal(t, "lib/auth.ts::useAuth", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 
@@ -84,4 +87,52 @@ func TestNuxtAutoImports_UseOnlyInstalledSnapshot(t *testing.T) {
 	idx.SetContentSource(snapshotOf(t, t.TempDir()))
 	stem, _ = idx.resolveNuxtAutoImport("pages/index.ts", "useAuth")
 	require.Empty(t, stem, "missing generated metadata must not fall back to the working copy or previous snapshot")
+}
+
+func TestNuxtRestoreAndBindingEdits(t *testing.T) {
+	root := t.TempDir()
+	list := filepath.Join(root, ".nuxt/imports.d.ts")
+	page := filepath.Join(root, "app/page.ts")
+	impl := filepath.Join(root, "lib/impl.ts")
+	body := "export function run() { return useAuth() }"
+	decls := "function first() { return 1 }\nfunction second() { return 2 }\nexport default "
+	writeFileMk(t, list, "export { useAuth } from '../old'")
+	writeFileMk(t, filepath.Join(root, "old.ts"), "export function useAuth() { return 3 }")
+	writeFileMk(t, filepath.Join(root, "other.ts"), "export function useAuth() { return 4 }")
+	writeFileMk(t, impl, decls+"first")
+	writeFileMk(t, page, body)
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "old.ts::useAuth", callTargetForName(t, idx.Graph(), "app/page.ts", "run"))
+	// Neither the bare call nor its target name changes: only its binding does.
+	bumpMtime(t, page, "import { useAuth } from '../other'\n"+body)
+	_, err = idx.IncrementalReindexPaths(root, []string{page})
+	require.NoError(t, err)
+	require.Equal(t, "other.ts::useAuth", callTargetForName(t, idx.Graph(), "app/page.ts", "run"))
+	bumpMtime(t, page, body)
+	_, err = idx.IncrementalReindexPaths(root, []string{page})
+	require.NoError(t, err)
+	require.Equal(t, "old.ts::useAuth", callTargetForName(t, idx.Graph(), "app/page.ts", "run"))
+	idx = New(store, idx.registry, idx.config, idx.logger)
+	idx.SetRootPath(root)
+	idx.SetFileMtimes(store.LoadFileMtimes(""))
+	require.True(t, idx.censusResolutionCurrent(root))
+	writeFileMk(t, list, "export { default as useAuth } from '../lib/impl'")
+	idx = New(store, idx.registry, idx.config, idx.logger)
+	idx.SetFileMtimes(store.LoadFileMtimes(""))
+	require.False(t, idx.censusResolutionCurrent(root))
+	reindex := func(path, want string) {
+		t.Helper()
+		_, err := idx.IncrementalReindexPaths(root, []string{path})
+		require.NoError(t, err)
+		require.Equal(t, want, callTargetForName(t, idx.Graph(), "app/page.ts", "run"))
+	}
+	reindex(list, "lib/impl.ts::first")
+	bumpMtime(t, impl, decls+"second")
+	reindex(impl, "lib/impl.ts::second")
+	bumpMtime(t, page, "import { useAuth } from '../old'\n"+body)
+	reindex(page, "old.ts::useAuth")
+	bumpMtime(t, page, body)
+	reindex(page, "lib/impl.ts::second")
 }

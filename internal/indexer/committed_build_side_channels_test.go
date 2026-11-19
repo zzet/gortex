@@ -902,19 +902,20 @@ func TestCommittedBuildPathAliasComesFromTheSnapshotConfig(t *testing.T) {
 // forgetTSAliasCache drops the process-wide working-copy entries a test
 // planted, so one test's temp root cannot answer another's.
 func forgetTSAliasCache(roots ...string) {
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
 	for _, root := range roots {
-		delete(tsAliasCache, root)
+		invalidateResolutionInputs(root)
 	}
 }
 
 // tsAliasCacheEntry reports what the process-wide cache holds for a root.
 func tsAliasCacheEntry(root string) (*tsalias.Collection, bool) {
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
-	c, ok := tsAliasCache[root]
-	return c, ok
+	resolutionCache.Lock()
+	defer resolutionCache.Unlock()
+	inputs, ok := resolutionCache.byRoot[root]
+	if !ok {
+		return nil, false
+	}
+	return inputs.aliases, true
 }
 
 // TestSnapshotAliasScopesNeitherReadNorFillTheProcessCache pins the cache

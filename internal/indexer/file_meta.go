@@ -127,7 +127,11 @@ func (idx *Indexer) indexedFileReceiptMatches(filePath string) bool {
 // name, equal mtime alone never returns true — indexedFileReceiptMatches also
 // confirms the persisted content identity.
 func (idx *Indexer) fileMtimeMatches(filePath string) bool {
-	return idx.indexedFileReceiptMatches(filePath)
+	if !idx.indexedFileReceiptMatches(filePath) {
+		return false
+	}
+	return !closureJSTSPath(filePath) || idx.contentSrc.Load() != nil ||
+		idx.appliedResolution.Load().unchangedForPoint(idx.RootPath(), filePath, nil)
 }
 
 // persistFileMeta records one file's per-file metadata row — the BLAKE3
