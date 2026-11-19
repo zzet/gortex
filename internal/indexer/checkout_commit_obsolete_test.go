@@ -1,7 +1,11 @@
 package indexer
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -11,6 +15,64 @@ import (
 
 	"github.com/zzet/gortex/internal/graphview"
 )
+
+func TestCommitTargetCheckReusesEvidenceAndRechecksRefChanges(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	ctx := context.Background()
+	target := builderGit(t, f.worktree, "rev-parse", "HEAD^{tree}")
+	trace := filepath.Join(t.TempDir(), "git-trace.json")
+	t.Setenv("GIT_TRACE2_EVENT", trace)
+	check := c.commitTargetCheck(target)
+	if err := check(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(trace)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("initial check did not run Git: %v", err)
+	}
+	for range 64 {
+		if err := check(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := os.ReadFile(trace)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("unchanged checks spawned Git subprocesses: %v", err)
+	}
+	for _, args := range [][]string{{"pack-refs", "--all"}, {"commit", "--allow-empty", "-m", "same tree"}} {
+		builderGit(t, f.worktree, args...)
+		if err := check(ctx); err != nil {
+			t.Fatalf("same-tree metadata change aborted build: %v", err)
+		}
+	}
+	// An unavailable metadata source must ask Git on every call, rather
+	// than turning the first successful read into unconditional permission.
+	c.sampler = nil
+	uncached := c.commitTargetCheck(target)
+	if err := uncached(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, _ = os.ReadFile(trace)
+	if err := uncached(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, err = os.ReadFile(trace)
+	if err != nil || bytes.Equal(before, after) {
+		t.Fatalf("unusable evidence did not fall back to Git: %v", err)
+	}
+	builderWriteFile(t, f.worktree, "new.go", "package fixture\nfunc NewTree() {}\n")
+	builderGit(t, f.worktree, "add", "-A")
+	builderGit(t, f.worktree, "commit", "-m", "new tree")
+	if err := check(ctx); !errors.Is(err, errCommitTargetMoved) {
+		t.Fatalf("changed tree was not detected: %v", err)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := c.commitTargetCheck(target)(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("check ignored cancellation: %v", err)
+	}
+}
 
 // Switch a real checkout at the first index-start boundary. The obsolete
 // committed source remains readable, but it must not drain an entire payload

@@ -3158,16 +3158,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		baseReader = c.ancestryLayerBase(view)
 	}
 	generationID, report, err := c.builder.BuildCommitLayer(WithIndexOrigin(ctx, "checkout_coordinator"), CommitLayerRequest{
-		checkNeeded: func(ctx context.Context) error {
-			head, err := gitstate.SampleHEAD(ctx, c.root)
-			if err != nil {
-				return err
-			}
-			if head.TreeOID != targetTree {
-				return fmt.Errorf("%w: built for %s, now at %s", errCommitTargetMoved, targetTree, head.TreeOID)
-			}
-			return nil
-		},
+		checkNeeded:   c.commitTargetCheck(targetTree),
 		Identity:      identity,
 		Base:          baseReader,
 		RepoDir:       c.root,
@@ -3188,6 +3179,35 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 			zap.Int("cap", report.ClosureCap))
 	}
 	return generationID, false, nil
+}
+
+// Each build calls this check serially at dispatch and phase boundaries.
+// Metadata only confirms an authoritative Git sample captured inside the
+// same unchanged interval. An unreadable layout or any ref-file change asks
+// Git again; a same-tree commit or pack-refs need not abandon the build.
+// Publication retains its independent, authoritative post-build HEAD guard.
+func (c *CheckoutCoordinator) commitTargetCheck(targetTree string) func(context.Context) error {
+	var confirmed gitstate.HeadEvidence
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if confirmed.Unchanged() {
+			return nil
+		}
+		evidence := c.sampler.CaptureHeadEvidence()
+		head, err := gitstate.SampleHEAD(ctx, c.root)
+		if err != nil {
+			return err
+		}
+		if head.TreeOID != targetTree {
+			return fmt.Errorf("%w: built for %s, now at %s", errCommitTargetMoved, targetTree, head.TreeOID)
+		}
+		if evidence.Unchanged() {
+			confirmed = evidence
+		}
+		return nil
+	}
 }
 
 // The builder has already abandoned its unpublished generation. Preserve the
