@@ -167,6 +167,13 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		// static, runtime, and the paths quoted inside findings — agrees on
 		// what a given repo is called.
 		doctorPath = newDoctorPathRedactor(home, root)
+		// Family remotes and repo prefixes are identity too, and they are not
+		// paths, so the path rewriter never touched them.
+		doctorLabel = newDoctorLabelRedactor()
+		// The legacy-state census is daemon-wide: it can name a checkout root
+		// in a sibling home, or outside home entirely. doctorPath leaves
+		// those alone, so the census gets its own root alias.
+		doctorRoot = newDoctorRootRedactor()
 	}
 
 	doctorEnv := doctorEnvironment()
@@ -179,6 +186,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 
 	runtime := collectRuntime(home, doctorDays)
 	generated := doctorGeneratedFiles()
+	legacy := collectLegacyState(home)
 
 	if doctorJSON {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -188,6 +196,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 			"agents":          reports,
 			"generated_files": generated,
 			"runtime":         runtime,
+			"legacy_state":    legacy,
 		}); err != nil {
 			return err
 		}
@@ -197,6 +206,7 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 	printDoctorHuman(cmd.OutOrStdout(), reports)
 	printDoctorGeneratedFiles(cmd.OutOrStdout(), generated)
 	printDoctorRuntime(cmd.OutOrStdout(), runtime)
+	printDoctorLegacy(cmd.OutOrStdout(), legacy)
 	return doctorExit(runtime)
 }
 
