@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
 
 func TestNuxtAutoImports_ConfigOnlyIncrementalReindex(t *testing.T) {
@@ -144,6 +146,11 @@ func TestNuxtAliasedImplementationArrives(t *testing.T) {
 	writeFileMk(t, filepath.Join(root, "page.ts"), "export function run() { return useLater() }")
 	idx, _ := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::useLater", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+	caller := filepath.Join(root, "page.ts")
+	bumpMtime(t, caller, "export const unrelated = 1\nexport function run() { return useLater() }")
+	_, err = idx.incrementalPointWatcherPath(root, caller)
 	require.NoError(t, err)
 	require.Equal(t, "unresolved::useLater", callTargetForName(t, idx.Graph(), "page.ts", "run"))
 	module := filepath.Join(root, "lib/index.ts")
@@ -341,4 +348,97 @@ func TestNuxtResolutionRetryCannotDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, result.DeletedFileCount)
 	require.NotNil(t, idx.Graph().GetNode("page.ts::run"))
+}
+
+func TestNuxtRemovedShadowRebinds(t *testing.T) {
+	root := t.TempDir()
+	page := filepath.Join(root, "page.ts")
+	writeFileMk(t, filepath.Join(root, ".nuxt/imports.d.ts"), "export {real as useIt} from '../lib'")
+	writeFileMk(t, filepath.Join(root, "lib.ts"), "export function real(){}")
+	writeFileMk(t, page, "export function run(useIt: Function){return useIt()}")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::useIt", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+	bumpMtime(t, page, "export function run(){return useIt()}")
+	_, err = idx.incrementalPointWatcherPath(root, page)
+	require.NoError(t, err)
+	require.Equal(t, "lib.ts::real", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+}
+
+func TestAliasPreferredModuleArrives(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{"@impl/*":["src/*","fallback/*"]}}}`)
+	writeFileMk(t, filepath.Join(root, "fallback/lib.ts"), "export function impl(){}")
+	writeFileMk(t, filepath.Join(root, "page.ts"), "import {impl} from '@impl/lib'; export function run(){impl()}")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "fallback/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+	preferred := filepath.Join(root, "src/lib.ts")
+	writeFileMk(t, preferred, "export function impl(){}")
+	_, err = idx.incrementalPointWatcherPath(root, preferred)
+	require.NoError(t, err)
+	require.Equal(t, "src/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+	var imports []string
+	for _, e := range idx.Graph().GetOutEdges("page.ts") {
+		if e.Kind == graph.EdgeImports {
+			imports = append(imports, e.To)
+		}
+	}
+	require.ElementsMatch(t, []string{"src/lib.ts", "src/lib.ts::impl"}, imports)
+}
+
+func TestConfiglessBindingFence(t *testing.T) {
+	root := t.TempDir()
+	page := filepath.Join(root, "page.js")
+	writeFileMk(t, filepath.Join(root, "lib.js"), "export function impl(){}")
+	writeFileMk(t, page, "import {impl} from './lib'; export function run(){impl()}")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.True(t, idx.censusResolutionCurrent(root))
+	var catchups int
+	idx.incrementalResolveFilesHook = func(files []string) {
+		require.False(t, idx.censusResolutionCurrent(root), "restart must not certify incomplete bindings")
+		idx.resolver.ResolveFilesAndIncoming(files)
+		catchups++
+	}
+	bumpMtime(t, page, "import {impl} from './lib'; export function changed(){impl()}")
+	_, err = idx.incrementalPointWatcherPath(root, page)
+	require.NoError(t, err)
+	require.Equal(t, "lib.js::impl", callTargetForName(t, idx.Graph(), "page.js", "changed"))
+	require.True(t, idx.censusResolutionCurrent(root))
+	require.NoError(t, os.Remove(filepath.Join(root, "lib.js")))
+	_, _, err = idx.incrementalEvictWatcherPath("lib.js")
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::impl", callTargetForName(t, idx.Graph(), "page.js", "changed"))
+	require.Equal(t, 2, catchups)
+	require.True(t, idx.censusResolutionCurrent(root))
+}
+
+type refuseBindingInvalidation struct{ *store_sqlite.Store }
+
+func (s refuseBindingInvalidation) ReindexEdgesApplied([]graph.EdgeReindex) bool { return false }
+
+func TestDroppedBindingInvalidationRetriesCaller(t *testing.T) {
+	root := t.TempDir()
+	barrel := filepath.Join(root, "barrel.ts")
+	writeFileMk(t, filepath.Join(root, "lib.ts"), "export function old(){}; export function fresh(){}")
+	writeFileMk(t, barrel, "export {old as impl} from './lib'")
+	writeFileMk(t, filepath.Join(root, "page.ts"), "import {impl} from './barrel'; export function run(){impl()}")
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "lib.ts::old", callTargetForName(t, store, "page.ts", "run"))
+	bumpMtime(t, barrel, "export {fresh as impl} from './lib'")
+	idx.graph = refuseBindingInvalidation{store}
+	_, err = idx.incrementalPointWatcherPath(root, barrel)
+	require.ErrorContains(t, err, "invalidation did not apply")
+	require.False(t, idx.censusResolutionCurrent(root))
+	idx.graph = store
+	_, err = idx.incrementalPointWatcherPath(root, barrel)
+	require.NoError(t, err)
+	require.Equal(t, "lib.ts::fresh", callTargetForName(t, store, "page.ts", "run"))
+	require.True(t, idx.censusResolutionCurrent(root))
 }

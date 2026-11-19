@@ -23,7 +23,7 @@ import (
 // and say which in the commit message. A diff that changes this line and
 // nothing else in internal/resolver is the signal that something re-keyed
 // every cached generation by accident.
-const resolverVersionGolden = "resolver-11:65f9dca1aae044899832c2f57ac427fd"
+const resolverVersionGolden = "resolver-12:a85fdb8eba24f3d711800d241ccf7b7d"
 
 func TestResolverVersionIsPinned(t *testing.T) {
 	if got := Version(); got != resolverVersionGolden {

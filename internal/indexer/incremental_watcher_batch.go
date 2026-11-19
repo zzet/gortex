@@ -339,6 +339,9 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
+	if result.mutationErr != nil {
+		return 0, 0, result.mutationErr
+	}
 	files, needed, exact := incrementalResolutionFrontier(result, nil)
 	if needed && len(files) > 0 {
 		idx.runIncrementalResolutionCatchup(files, eviction.batch, func(frontier []string) {
@@ -351,6 +354,9 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
 		idx.ResolveAll()
+	}
+	if err := idx.finishResolutionPass(eviction.batch.resolution); err != nil {
+		return eviction.nodesRemoved, eviction.edgesRemoved, err
 	}
 	if evictedGlobals {
 		idx.reresolveCSharpGlobalUsingDependents(

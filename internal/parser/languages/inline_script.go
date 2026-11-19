@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 )
 
@@ -58,17 +59,22 @@ func carveAndDelegateScripts(src []byte, filePath, fileID, language string, ts, 
 // It is the shared spine behind every markup extractor that embeds another
 // language (HTML/Vue/Svelte/Astro <script>, Razor @code), so the error-prone
 // offset-rebase math lives — and is tested — in exactly one place.
-func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOffset int, filePath, fileID, language string, result *parser.ExtractionResult) {
+func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOffset int, filePath, fileID, language string, result *parser.ExtractionResult) *graph.Node {
 	if delegate == nil || result == nil || strings.TrimSpace(string(content)) == "" {
-		return
+		return nil
 	}
 	virtual := filePath + "#script:" + strconv.Itoa(lineOffset+1)
 	sub, err := delegate.Extract(virtual, content)
 	if err != nil || sub == nil {
-		return
+		return nil
 	}
+	var file *graph.Node
 	for _, n := range sub.Nodes {
-		if n == nil || n.ID == virtual { // drop the synthetic file node
+		if n == nil {
+			continue
+		}
+		if n.ID == virtual {
+			file = n
 			continue
 		}
 		n.FilePath = filePath
@@ -100,4 +106,5 @@ func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOf
 		}
 		result.Edges = append(result.Edges, ed)
 	}
+	return file
 }

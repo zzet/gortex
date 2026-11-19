@@ -58,6 +58,7 @@ var plannerStatsIndexesOutside = map[string]string{
 	"nodes_by_effective_workspace":      "raw effective-workspace reads pin this index explicitly and must retain external declarations excluded by the eligible-candidate partial key",
 	"nodes_deadcode_eligible_workspace": "partial, external IS NOT 1: only explicitly eligible workspace dead-code reads imply this predicate and pin this key",
 	"edges_by_unresolved":               "partial, is_unresolved = 1: the resolver's unresolved scan only",
+	"edges_by_js_module":                "partial expression, non-null JS module stem: only reverse module dependency reads use this key",
 	"edges_fnvalue_prefixed":            "partial, to_id LIKE '%::unresolved::fnvalue::%': the fnvalue pass only",
 	"edges_external":                    "partial, the external-call target predicate: the external-call synthesizer only",
 }

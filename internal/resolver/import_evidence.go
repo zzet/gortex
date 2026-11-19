@@ -29,16 +29,6 @@ import (
 // name. Without one, a unique callable in the import closure (directly or
 // through re-export hops) supplies the evidence; ambiguity is not a pick.
 //
-// Precedence (documented here because it is the load-bearing design):
-//
-//  1. preferScopeCandidate — per-language static scope rules stay first;
-//     they carry stronger, language-specific evidence.
-//  2. A parameter of the caller or a module-local value shadows imports.
-//  3. An explicit value import, then a generated Nuxt binding, then
-//     unique imported-file evidence. A known but unresolved binding stops here.
-//  4. The existing cascade — same-dir, first-same-repo, JS/TS top-level
-//     value callee — untouched.
-//
 // Language gate: the pick only runs for JS/TS caller files. This is a
 // correctness requirement, not caution. In Go a bare call can never name a
 // symbol from another package (that call is selector-shaped and resolved
@@ -187,7 +177,8 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 			local, _ = f.Meta[graph.DefaultExportMeta].(string)
 		}
 		if local != "" {
-			if n := r.cachedGetNode(b.file + "::" + local); n != nil && !graph.IsReExportNode(n) && isImportableCallee(n, local) {
+			scope, _ := f.Meta[graph.JSExportScopeMeta].(string)
+			if n := r.cachedGetNode(b.file + scope + "::" + local); n != nil && !graph.IsReExportNode(n) && importableValueKind(n.Kind) {
 				if pick != nil && pick.ID != n.ID {
 					return nil
 				}
@@ -275,9 +266,13 @@ func hasLocalValue(file string, candidates []*graph.Node) bool {
 // exact value-callee shape whose repo-wide ambiguity refuses call edges
 // today (see pickTopLevelValueCallee).
 func isImportableCallee(c *graph.Node, funcName string) bool {
-	switch c.Kind {
+	return c.FilePath != "" && c.ID == c.FilePath+"::"+funcName && importableValueKind(c.Kind)
+}
+
+func importableValueKind(kind graph.NodeKind) bool {
+	switch kind {
 	case graph.KindFunction, graph.KindVariable, graph.KindConstant:
-		return c.FilePath != "" && c.ID == c.FilePath+"::"+funcName
+		return true
 	}
 	return false
 }

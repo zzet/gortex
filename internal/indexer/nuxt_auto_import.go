@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -50,26 +51,30 @@ func parkExactCall(e *graph.Edge) bool {
 // owned by the consumer. Preserve its raw specifier for resolution after the edit.
 func restubJSImports(edges []*graph.Edge, evicted map[string]struct{}, moves []graph.EdgeReindex, callers []string) ([]graph.EdgeReindex, []string) {
 	for _, e := range edges {
-		if e == nil || (e.Kind != graph.EdgeImports && e.Kind != graph.EdgeReExports) || graph.IsUnresolvedTarget(e.To) {
+		if e == nil || (e.Kind != graph.EdgeImports && e.Kind != graph.EdgeReExports) || graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 			continue
 		}
 		spec, _ := e.Meta[graph.JSImportSourceMeta].(string)
 		if _, gone := evicted[e.From]; gone || spec == "" {
 			continue
 		}
-		old := e.To
-		graph.StashRestubProvenance(e)
-		e.To = graph.UnresolvedMarker + "import::" + spec
-		moves = append(moves, graph.EdgeReindex{Edge: e, OldTo: old})
+		moves = append(moves, parkJSImport(e, spec))
 		callers = append(callers, e.FilePath)
 	}
 	return moves, callers
 }
 
+func parkJSImport(e *graph.Edge, spec string) graph.EdgeReindex {
+	old := e.To
+	graph.StashRestubProvenance(e)
+	e.To = graph.UnresolvedMarker + "import::" + spec
+	return graph.EdgeReindex{Edge: e, OldTo: old}
+}
+
 // Walk reverse module dependencies, not a name-only call graph. Two unrelated
 // modules may expose the same export. Only forwarding imports propagate edits.
-func parkModuleDependents(g graph.Store, files []string) []string {
-	if len(files) == 0 {
+func (idx *Indexer) parkModuleDependents(files []string) []string {
+	if !slices.ContainsFunc(files, closureJSTSPath) {
 		return nil
 	}
 	var queue []string
@@ -80,30 +85,51 @@ func parkModuleDependents(g graph.Store, files []string) []string {
 			queue = append(queue, stem)
 		}
 	}
+	aliases := idx.tsAliasCollection()
+	var aliasChoices map[string]bool
+	addStem := func(stem string) {
+		push(stem)
+		rel := strings.TrimPrefix(stem, idx.repoPrefix+"/")
+		aliases.VisitAlternateStems(rel, func(alt string) {
+			alt = prefixTSAliasTarget(idx.repoPrefix, alt)
+			if aliasChoices == nil {
+				aliasChoices = make(map[string]bool)
+			}
+			aliasChoices[stem], aliasChoices[alt] = true, true
+			push(alt)
+		})
+	}
 	addFile := func(file string) {
 		if closureJSTSPath(file) {
 			stem := graph.JSModuleStem(file)
-			push(stem)
+			addStem(stem)
 			if path.Base(stem) == "index" {
-				push(path.Dir(stem))
+				addStem(path.Dir(stem))
 			}
 		}
 	}
 	for _, file := range files {
 		addFile(file)
 	}
-	if len(queue) == 0 {
-		return nil
-	}
 	var callers []string
 	var moves []graph.EdgeReindex
-	lookup := graph.JSModuleDependencyLookup(g)
+	lookup := graph.JSModuleDependencyLookup(idx.graph)
 	for len(queue) > 0 {
 		stem := queue[0]
 		queue = queue[1:]
 		for _, e := range lookup(stem) {
 			if e.Kind != graph.EdgeCalls {
-				addFile(e.FilePath)
+				if e.Kind == graph.EdgeReExports || e.Meta[graph.JSForwardsImportMeta] == true {
+					addFile(e.FilePath)
+				}
+				raw, _ := e.Meta[graph.JSImportSourceMeta].(string)
+				if (aliasChoices[stem] || strings.HasPrefix(e.To, "external::")) &&
+					raw != "" && !strings.HasPrefix(raw, "./") && !strings.HasPrefix(raw, "../") && e.Meta[resolver.NpmImportSpecifierMeta] == nil {
+					callers = append(callers, e.FilePath)
+					if !graph.IsUnresolvedTarget(e.To) {
+						moves = append(moves, parkJSImport(e, raw))
+					}
+				}
 				continue
 			}
 			callers = append(callers, e.FilePath)
@@ -116,7 +142,19 @@ func parkModuleDependents(g graph.Store, files []string) []string {
 		}
 	}
 	if len(moves) > 0 {
-		g.ReindexEdges(moves)
+		if w, ok := idx.graph.(interface {
+			ReindexEdgesApplied([]graph.EdgeReindex) bool
+		}); ok {
+			if !w.ReindexEdgesApplied(moves) {
+				// The batch can be partially applied. Re-extract its callers
+				// from source rather than replaying superseded edge identities.
+				for _, m := range moves {
+					idx.failedBindingWrites = append(idx.failedBindingWrites, m.Edge.FilePath)
+				}
+			}
+		} else {
+			idx.graph.ReindexEdges(moves)
+		}
 	}
 	return appendUniqueSorted(nil, callers...)
 }

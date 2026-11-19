@@ -43,11 +43,9 @@ import (
 // Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
-// Nuxt app bindings, exact named imports and inherited TS aliases change JS/TS call targets.
-// Named forwarding edges and caller-owned shadow checks change JS/TS call bindings.
-// Exact module bindings follow renamed exports and stop at Nuxt app boundaries.
-// Lexical bindings and module export surfaces decide exact JS/TS calls.
-const ResolutionSemanticsVersion = 11
+// Exact JS/TS and Nuxt calls follow module exports, aliases and lexical scope,
+// including CommonJS assignments and the normal script of a Vue component.
+const ResolutionSemanticsVersion = 12
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

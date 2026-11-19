@@ -2557,8 +2557,14 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 			"evicting %s from %s returned a nil result", path, repoPrefix,
 		)
 	}
+	if result.mutationErr != nil {
+		return 0, 0, result.mutationErr
+	}
 	if result.DeletedFileCount > 0 {
 		topologyFrontier = mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
+	}
+	if err := idx.finishResolutionPass(eviction.batch.resolution); err != nil {
+		return eviction.nodesRemoved, eviction.edgesRemoved, err
 	}
 
 	fileMtimes := idx.publishFileMtimes()

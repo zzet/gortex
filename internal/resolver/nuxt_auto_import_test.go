@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/graph"
 )
 
 func TestNuxtAutoImportPrecedence(t *testing.T) {
@@ -120,4 +121,50 @@ func TestNuxtLexicalClosure(t *testing.T) {
 	r.ResolveAll()
 	require.Equal(t, "unresolved::useIt", callEdgeTo(g, "page.ts::inner", 2))
 	require.Equal(t, "lib.ts::useIt", callEdgeTo(g, "page.ts::run", 5))
+}
+
+func TestExactModuleScriptExports(t *testing.T) {
+	for _, tc := range []struct{ module, body, binding, want string }{
+		{"lib.cjs", "function run(){}; module.exports = run", "default", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports.publicRun = run", "publicRun", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports.old = run; module.exports = run", "old", "unresolved::local"},
+		{"lib.vue", "<script lang='ts'>export function run(){}</script>\n<script setup>function hidden(){}</script>", "run", "lib.vue#script:1::run"},
+		{"lib.vue", "<script setup>function hidden(){}</script>", "hidden", "unresolved::local"},
+	} {
+		t.Run(tc.module+"/"+tc.binding, func(t *testing.T) {
+			g := buildGraphFromSources(t, map[string]string{tc.module: tc.body, "page.ts": "import {" + tc.binding + " as local} from './" + tc.module + "'\nexport function go(){local()}"})
+			New(g).ResolveAll()
+			require.Equal(t, tc.want, callEdgeTo(g, "page.ts::go", 2))
+		})
+	}
+}
+
+func TestNuxtShadowingBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		line       int
+	}{
+		{"hoisted var", "export function go(x){if(x){var useIt=x}\nuseIt()}", 2},
+		{"switch", "export function go(x){switch(x){case 0: const useIt=x;break;default:\nuseIt()}}", 2},
+		{"named expression", "const other=function useIt(x){\nreturn useIt(x-1)}", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := buildGraphFromSources(t, map[string]string{"lib.ts": "export function useIt(){}", "page.js": tc.body + "\nexport function outside(){useIt()}"})
+			r := New(g)
+			r.SetNuxtAutoImportResolver(func(_, name string) (string, string) { return "lib", name })
+			r.ResolveAll()
+			var inner string
+			for edge := range g.EdgesByKind(graph.EdgeCalls) {
+				if edge.FilePath == "page.js" && edge.Line == tc.line {
+					inner = edge.To
+				}
+			}
+			require.NotEmpty(t, inner)
+			require.NotEqual(t, "lib.ts::useIt", inner)
+			if tc.name == "named expression" {
+				require.Equal(t, "page.js::useIt", inner)
+			}
+			require.Equal(t, "lib.ts::useIt", callEdgeTo(g, "page.js::outside", tc.line+1))
+		})
+	}
 }

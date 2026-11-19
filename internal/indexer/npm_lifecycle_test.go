@@ -31,7 +31,7 @@ func TestTrackedNpmImportsSurviveEviction(t *testing.T) {
 					{ID: "lib/index.ts::f", Kind: graph.KindFunction, Name: "f", FilePath: "lib/index.ts", RepoPrefix: "lib"},
 				}
 				g.AddBatch(nodes, []*graph.Edge{
-					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p"}},
+					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p", graph.JSImportSourceMeta: "p"}},
 					{From: "app/a.ts", To: "lib/index.ts::f", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p::f"}},
 					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 2},
 				})

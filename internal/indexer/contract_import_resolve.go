@@ -333,12 +333,7 @@ func (mi *MultiIndexer) resolutionInputsForFile(file string) (*resolutionInputs,
 		return nil, "", nil
 	}
 	if idx != nil {
-		if idx.manifestTree().sourced() {
-			return idx.lookupResolutionInputs(), prefix, idx
-		}
-		if pinned := idx.activeResolution.Load(); pinned != nil {
-			return pinned, prefix, idx
-		}
+		return idx.lookupResolutionInputs(), prefix, idx
 	}
 	return workingResolutionInputs(meta.RootPath, nil), prefix, idx
 }

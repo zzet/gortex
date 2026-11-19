@@ -97,24 +97,32 @@ func EmittedJSSourceExts(ext string) []string { return jsTSEmittedSourceExts[ext
 // stops reverting its callers to `unresolved::*` (issue #136). Shared by
 // Resolver.resolveImport and CrossRepoResolver.resolveImport.
 func resolveJSTSImportTarget(getNode func(string) *graph.Node, pathAlias PathAliasResolver, callerFile, importPath string) string {
+	target, _ := jstsImportTargetAndAliasStem(getNode, pathAlias, callerFile, importPath)
+	return target
+}
+
+func jstsImportTargetAndAliasStem(getNode func(string) *graph.Node, pathAlias PathAliasResolver, callerFile, importPath string) (target, alias string) {
 	if !isJSTSPath(callerFile) {
-		return ""
+		return "", ""
 	}
 	spec, symbol := splitImportSpecSymbol(importPath)
 	stem := expandJSTSSpecifier(pathAlias, callerFile, spec)
 	if stem == "" {
-		return ""
+		return "", ""
+	}
+	if !strings.HasPrefix(spec, "./") && !strings.HasPrefix(spec, "../") {
+		alias = graph.JSModuleStem(stem)
 	}
 	file := probeJSTSFile(getNode, stem)
 	if file == "" {
-		return ""
+		return "", alias
 	}
 	if symbol != "" {
 		if symID := file + "::" + symbol; getNode(symID) != nil {
-			return symID
+			return symID, alias
 		}
 	}
-	return file
+	return file, alias
 }
 
 // jsTSImportCallerFile returns the importing file's graph path for an

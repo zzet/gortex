@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	vueScriptRe   = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	vueLangAttrRe = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
+	vueScriptRe    = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
+	vueLangAttrRe  = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
+	vueSetupAttrRe = regexp.MustCompile(`(?i)(?:^|\s)setup(?:\s|=|$)`)
 )
 
 // VueExtractor extracts Vue single-file components. Each .vue file becomes a
@@ -70,7 +71,15 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		if vueScriptIsTypeScript(attrs) {
 			delegate = e.ts
 		}
-		delegateInlineScriptSlice(delegate, content, lineOffset, filePath, fileNode.ID, "vue", result)
+		script := delegateInlineScriptSlice(delegate, content, lineOffset, filePath, fileNode.ID, "vue", result)
+		if script != nil && !vueSetupAttrRe.Match(attrs) && (script.Meta[graph.JSLocalExportsMeta] != nil || script.Meta[graph.DefaultExportMeta] != nil) {
+			fileNode.Meta = map[string]any{graph.JSExportScopeMeta: strings.TrimPrefix(script.ID, filePath)}
+			for _, key := range [...]string{graph.JSLocalExportsMeta, graph.DefaultExportMeta} {
+				if value := script.Meta[key]; value != nil {
+					fileNode.Meta[key] = value
+				}
+			}
+		}
 	}
 	mineTemplateComponentUsages(src, filePath, componentID, "vue", result)
 	applyFrameworkTemplatePasses(src, filePath, componentID, "vue", result)

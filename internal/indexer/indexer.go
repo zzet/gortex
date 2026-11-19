@@ -444,6 +444,7 @@ type Indexer struct {
 	appliedResolution       atomic.Pointer[resolutionInputs]
 	resolutionInputsChanged bool
 	resolutionRetry         *resolutionRetry
+	failedBindingWrites     []string // caller graph paths; drained at pass completion
 	warmResolution          *resolutionCompletion // guarded by resolutionMu
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
@@ -2970,7 +2971,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if err != nil {
 		return nil, err
 	}
-	if err := idx.fenceResolutionWrites(inputs, idx.deferResolve.Load()); err != nil {
+	if err := idx.fenceResolutionWrites(inputs, true); err != nil {
 		return nil, err
 	}
 	idx.projectName = search.DetectProjectName(absRoot)
@@ -5613,7 +5614,7 @@ func (idx *Indexer) indexFile(
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
 	if jsModuleSurfaceChanged(graphPath, priorNodes, result.Nodes) {
-		bindingCallers = append(bindingCallers, parkModuleDependents(idx.graph, []string{graphPath})...)
+		bindingCallers = append(bindingCallers, idx.parkModuleDependents([]string{graphPath})...)
 	}
 	idx.rebindParkedCalls(bindingCallers, markerBatch)
 	// No subsequent stage reads source bytes or the parse tree. Release both
@@ -7704,8 +7705,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
 	}
-	deferredJS := markerBatch.deferResolverCatchup && (slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath))
-	if err := idx.fenceResolutionWrites(inputs, deferredJS); err != nil {
+	bindingWrites := slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath)
+	if err := idx.fenceResolutionWrites(inputs, bindingWrites); err != nil {
 		return nil, err
 	}
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(

@@ -317,8 +317,10 @@ const (
 	JSBindingModuleMeta  = "js_binding_module" // reverse lookup key for calls and forwarding modules
 	JSImportSourceMeta   = "js_import_source"
 	JSLocalExportsMeta   = "js_local_exports"
+	JSExportScopeMeta    = "js_export_scope" // virtual ID suffix of a Vue normal script
 	JSForwardsImportMeta = "js_forwards_import"
 	JSLexicalBindingMeta = "js_lexical_binding"
+	JSLexicalLocal       = "local"
 	JSPendingBindingMeta = "pending_js_binding"
 	JSPendingImport      = "import"
 	JSPendingGenerated   = "nuxt"

@@ -4388,7 +4388,15 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+	to, aliasStem := jstsImportTargetAndAliasStem(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath)
+	if aliasStem != "" {
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		e.Meta[graph.JSImportSourceMeta] = importPath
+		e.Meta[graph.JSBindingModuleMeta] = aliasStem
+	}
+	if to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -4671,7 +4679,7 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		if lexical == "" && !strings.Contains(funcName, ".") && (r.tryResolveExplicitImport(e, funcName, stats) || r.tryResolveNuxtAutoImport(e, funcName, stats)) {
 			return
 		}
-		if lexical == "local" && !hasLocalValue(e.FilePath, candidates) {
+		if lexical == graph.JSLexicalLocal && !hasLocalValue(e.FilePath, candidates) {
 			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
 		}

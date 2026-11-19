@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path"
@@ -228,8 +229,8 @@ func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInpu
 
 // Invalidate the certificate before binding rows can be replaced. A deferred
 // resolver can leave a gap even when the input bytes themselves did not change.
-func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs, deferredWrites bool) error {
-	if inputs == nil || (!idx.resolutionInputsChanged && !(deferredWrites && len(inputs.reads) != 0)) {
+func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs, bindingWrites bool) error {
+	if inputs == nil || (!idx.resolutionInputsChanged && !bindingWrites) {
 		return nil
 	}
 	if store := idx.resolutionStore(); store != nil {
@@ -303,9 +304,23 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 	resolutionCache.Unlock()
 }
 
-func (idx *Indexer) finishResolutionPass(work resolutionCompletion) error {
+func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr error) {
+	if dropped := idx.failedBindingWrites; len(dropped) > 0 {
+		idx.failedBindingWrites = nil
+		// Preserve a failure of unknown extent. Otherwise retry only callers
+		// whose invalidation might have been dropped. Restart sees the fence.
+		if work.success || len(work.failed) > 0 {
+			for _, file := range dropped {
+				if rel, owned := idx.graphPathRelKey(file); owned {
+					work.failed = append(work.failed, filepath.Join(idx.rootPath, filepath.FromSlash(rel)))
+				}
+			}
+		}
+		work.success, work.warm = false, false
+		passErr = fmt.Errorf("module invalidation did not apply; %d caller edges need retry", len(dropped))
+	}
 	if work.inputs == nil {
-		return nil
+		return passErr
 	}
 	prior := idx.appliedResolution.Load()
 	needsStamp := prior == nil || prior.digest != work.inputs.digest || idx.resolutionRetry != nil || idx.resolutionInputsChanged
@@ -313,7 +328,7 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) error {
 	if !work.warm {
 		defer idx.activeResolution.Store(nil)
 	}
-	if !needsStamp && !work.warm {
+	if !needsStamp && !work.warm && passErr == nil {
 		return nil
 	}
 	if !work.success {
@@ -336,7 +351,7 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) error {
 		return nil
 	}
 	if !work.success {
-		return nil
+		return passErr
 	}
 	if err := idx.stampResolution(work.inputs); err != nil {
 		idx.resolutionRetry = &resolutionRetry{inputs: work.inputs}

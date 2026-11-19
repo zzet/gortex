@@ -1260,7 +1260,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 			changedModules = append(changedModules, stage.graphPath)
 		}
 	}
-	bindingCallers = append(bindingCallers, parkModuleDependents(idx.graph, changedModules)...)
+	bindingCallers = append(bindingCallers, idx.parkModuleDependents(changedModules)...)
 	idx.rebindParkedCalls(bindingCallers, markerBatch)
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
@@ -1522,7 +1522,7 @@ func restubIncomingRefsFromView(
 				// is not reparsed — so re-state it.
 				if _, survives := frontier.survivingIDs[node.ID]; survives || frontier.conservative {
 					for _, edge := range view.inByNode[node.ID] {
-						if edge == nil || graph.IsUnresolvedTarget(edge.To) || (edge.Kind != graph.EdgeImports && edge.Kind != graph.EdgeReExports) {
+						if edge == nil || edge.To != node.ID || (edge.Kind != graph.EdgeImports && edge.Kind != graph.EdgeReExports) {
 							continue
 						}
 						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
@@ -2588,6 +2588,19 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	if idx == nil || relPath == "" {
 		return forcedFileEviction{result: result, batch: batch}
 	}
+	if closureJSTSPath(relPath) {
+		inputs, err := idx.refreshResolutionInputs(idx.rootPath, relPath)
+		if err == nil {
+			err = idx.fenceResolutionWrites(inputs, true)
+		}
+		if err != nil {
+			idx.activeResolution.Store(nil)
+			result.mutationErr = err
+			return forcedFileEviction{result: result, batch: batch}
+		}
+		// Eviction catches up its own frontier, not a pending config edit.
+		batch.resolution = resolutionCompletion{inputs: inputs, success: !idx.resolutionInputsChanged && idx.resolutionRetry == nil}
+	}
 	// Explicit eviction is intentionally unconditional. Ownership sidecars may
 	// be partially missing after an interrupted or older indexing pass; the
 	// bounded deletion core is idempotent and must still clear orphan mtimes,
@@ -2724,7 +2737,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
 		idx.clearIncrementalContent(graphPaths)
 		nodes, edges := evictFilesBatched(idx.graph, graphPaths)
-		parked = append(parked, parkModuleDependents(idx.graph, graphPaths)...)
+		parked = append(parked, idx.parkModuleDependents(graphPaths)...)
 		for _, stage := range stages {
 			parked = append(parked, stage.bindingCallers...)
 		}

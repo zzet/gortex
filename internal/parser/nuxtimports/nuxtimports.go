@@ -148,8 +148,7 @@ func (c *Collection) Resolve(callerFile, name string) Binding {
 			}
 			rel = strings.TrimPrefix(callerFile, scope.Root+"/")
 		}
-		base := path.Base(rel)
-		if strings.TrimSuffix(base, path.Ext(base)) == "nuxt.config" {
+		if slices.Contains(configFiles[:], path.Base(rel)) {
 			return Binding{}
 		}
 		layer, isLayer := strings.CutPrefix(rel, "layers/")

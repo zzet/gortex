@@ -419,6 +419,9 @@ func reusableResolvedEdge(e *graph.Edge) bool {
 	if _, exact := e.Meta[graph.JSBindingNameMeta]; exact {
 		return false // the reuse key names the implementation, not the caller's binding
 	}
+	if e.Meta[graph.JSBindingModuleMeta] != nil {
+		return false // recompute an import's reverse module key along with its target
+	}
 	if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 		return false
 	}

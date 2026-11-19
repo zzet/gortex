@@ -130,6 +130,11 @@ barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
+Exact imports also follow top-level `module.exports = local`, `exports.name = local`
+and `module.exports.name = local` assignments, and named exports from a Vue
+component's normal `<script>`. `<script setup>` locals are not module exports.
+When a higher-priority tsconfig path target appears, a watcher edit rechecks
+calls that had selected a fallback target.
 
 ### Nuxt app auto-imports
 

@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -98,11 +100,69 @@ func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
-// Only the program's export statements define the module's value surface.
+// Only direct assignments to the CommonJS export object are module evidence.
+// A replacement drops its old properties and detaches the original exports alias.
+type jsCommonExports struct {
+	named    map[string]string
+	def      string
+	replaced bool
+}
+
+func (c *jsCommonExports) assign(stmt *sitter.Node, src []byte) {
+	n := stmt.NamedChild(0)
+	if n == nil || n.Type() != "assignment_expression" {
+		return
+	}
+	left, value := n.ChildByFieldName("left"), n.ChildByFieldName("right")
+	if left == nil || value == nil || left.Type() != "member_expression" {
+		return
+	}
+	obj, prop := left.ChildByFieldName("object"), left.ChildByFieldName("property")
+	if obj == nil || prop == nil || prop.Type() != "property_identifier" {
+		return
+	}
+	var local string
+	switch value.Type() {
+	case "identifier":
+		local = value.Content(src)
+	case "function_expression", "generator_function":
+		if name := value.ChildByFieldName("name"); name != nil {
+			local = name.Content(src)
+		}
+	}
+	name := prop.Content(src)
+	if obj.Type() == "identifier" && obj.Content(src) == "module" && name == "exports" {
+		c.def, c.named, c.replaced = local, nil, true
+		return
+	}
+	if obj.Type() == "member_expression" {
+		base, field := obj.ChildByFieldName("object"), obj.ChildByFieldName("property")
+		if base == nil || base.Type() != "identifier" || base.Content(src) != "module" || field == nil || field.Content(src) != "exports" {
+			return
+		}
+	} else if c.replaced || obj.Type() != "identifier" || obj.Content(src) != "exports" {
+		return
+	}
+	if local == "" {
+		delete(c.named, name)
+		return
+	}
+	if c.named == nil {
+		c.named = make(map[string]string)
+	}
+	c.named[name] = local
+}
+
+// Nested declarations and assignments do not define the module's value surface.
 func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 	var bindings strings.Builder
+	var common jsCommonExports
 	for i := 0; i < int(root.NamedChildCount()); i++ {
 		s := root.NamedChild(i)
+		if s.Type() == "expression_statement" {
+			common.assign(s, src)
+			continue
+		}
 		if s.Type() != "export_statement" || s.ChildByFieldName("source") != nil || tsExportStatementTypeOnly(s, src) {
 			continue
 		}
@@ -135,11 +195,43 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 			}
 		}
 	}
+	for _, name := range slices.Sorted(maps.Keys(common.named)) {
+		graph.AppendJSBinding(&bindings, name, common.named[name])
+	}
+	if common.def != "" {
+		graph.AppendJSBinding(&bindings, graph.JSDefaultBinding, common.def)
+	}
 	if bindings.Len() != 0 {
 		if file.Meta == nil {
 			file.Meta = map[string]any{}
 		}
 		file.Meta[graph.JSLocalExportsMeta] = bindings.String()
+	}
+}
+
+// var crosses statement-block boundaries but not function or class boundaries.
+// Only descend through statement containers: expressions cannot introduce a
+// var in this scope, even when they contain an entire function expression.
+func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "variable_declaration":
+		visitJSDeclaration(n, src, visit)
+		return
+	case "for_in_statement":
+		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
+			visitJSPattern(n.ChildByFieldName("left"), src, visit)
+		}
+	case "program", "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
+		"switch_case", "switch_default", "for_statement", "while_statement", "do_statement",
+		"try_statement", "catch_clause", "finally_clause", "with_statement", "labeled_statement", "export_statement":
+	default:
+		return
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		visitJSHoistedVars(n.NamedChild(i), src, visit)
 	}
 }
 
@@ -155,7 +247,7 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 	for n := expr.Parent(); n != nil; n = n.Parent() {
 		kind := n.Type()
 		switch kind {
-		case "program", "statement_block", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		case "program", "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
 		default:
 			continue
 		}
@@ -168,22 +260,39 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				}
 				names[name] = value
 			}
+			local := func(id string) { add(id, graph.JSLexicalLocal) }
 			switch kind {
 			case "program", "statement_block":
+				if kind == "program" {
+					visitJSHoistedVars(n, src, local)
+				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
 					s := n.NamedChild(i)
 					if s.Type() == "export_statement" {
 						s = s.ChildByFieldName("declaration")
 					}
-					visitJSDeclaration(s, src, func(id string) { add(id, "local") })
+					visitJSDeclaration(s, src, local)
+				}
+			case "switch_body":
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					clause := n.NamedChild(i)
+					for j := 0; j < int(clause.NamedChildCount()); j++ {
+						visitJSDeclaration(clause.NamedChild(j), src, local)
+					}
 				}
 			case "for_statement", "for_in_statement":
-				visitJSDeclaration(n.ChildByFieldName("initializer"), src, func(id string) { add(id, "local") })
+				visitJSDeclaration(n.ChildByFieldName("initializer"), src, local)
 				if n.ChildByFieldName("kind") != nil {
-					visitJSPattern(n.ChildByFieldName("left"), src, func(id string) { add(id, "local") })
+					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
 			default:
 				param := func(id string) { add(id, graph.JSPendingParameter) }
+				if kind != "catch_clause" {
+					visitJSHoistedVars(n.ChildByFieldName("body"), src, local)
+				}
+				if kind == "function_expression" || kind == "generator_function" {
+					visitJSPattern(n.ChildByFieldName("name"), src, local)
+				}
 				visitJSPattern(n.ChildByFieldName("parameters"), src, param)
 				visitJSPattern(n.ChildByFieldName("parameter"), src, param)
 			}

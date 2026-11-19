@@ -99,7 +99,8 @@ type Map struct {
 // DirPrefix length descending so nearest-ancestor lookup is a single
 // linear scan.
 type Collection struct {
-	scopes []*Map
+	scopes           []*Map
+	alternateTargets [][]string // normalized target patterns, only for multi-target aliases
 }
 
 // NewCollection returns a Collection over maps, ordered nearest-ancestor
@@ -120,7 +121,24 @@ func NewCollection(maps []*Map) *Collection {
 	sort.SliceStable(scopes, func(i, j int) bool {
 		return len(scopes[i].DirPrefix) > len(scopes[j].DirPrefix)
 	})
-	return &Collection{scopes: scopes}
+	c := &Collection{scopes: scopes}
+	for _, m := range scopes {
+		for _, a := range m.Entries {
+			if len(a.Targets) < 2 {
+				continue
+			}
+			var capture string
+			if a.HasWildcard {
+				capture = "*"
+			}
+			targets := make([]string, len(a.Targets))
+			for i, t := range a.Targets {
+				targets[i] = stripExt(m.joinTarget(t.Prefix + capture + t.Suffix))
+			}
+			c.alternateTargets = append(c.alternateTargets, targets)
+		}
+	}
+	return c
 }
 
 // ObservingProbes returns m with every existence probe Resolve makes on it
@@ -216,6 +234,34 @@ func Resolve(m *Map, modulePath string) string {
 		return first
 	}
 	return ""
+}
+
+// VisitAlternateStems reports the other possible selections of a multi-target
+// alias when one of its target stems changes. Invert the target's wildcard,
+// not the importer's path: an inherited map may have a different TargetBase.
+func (c *Collection) VisitAlternateStems(stem string, visit func(string)) {
+	if c == nil {
+		return
+	}
+	for _, targets := range c.alternateTargets {
+		for i, target := range targets {
+			prefix, suffix, wildcard := strings.Cut(target, "*")
+			var star string
+			if wildcard {
+				if len(stem) < len(prefix)+len(suffix) || !strings.HasPrefix(stem, prefix) || !strings.HasSuffix(stem, suffix) {
+					continue
+				}
+				star = stem[len(prefix) : len(stem)-len(suffix)]
+			} else if target != stem {
+				continue
+			}
+			for j, alt := range targets {
+				if j != i {
+					visit(strings.Replace(alt, "*", star, 1))
+				}
+			}
+		}
+	}
 }
 
 // matchAlias reports whether modulePath matches a and, when it does, returns
