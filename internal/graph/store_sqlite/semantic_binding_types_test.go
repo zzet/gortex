@@ -35,6 +35,17 @@ func TestSemanticBindingTypesAreRepoIsolatedBatchedAndReplaceable(t *testing.T) 
 		bSame: "TypeB",
 		empty: "TypeEmpty",
 	}, got)
+	files := make([]string, semanticBindingChunk+1)
+	for i := range files {
+		files[i] = aOne.FilePath
+	}
+	files = append(files, aTwo.FilePath, bSame.FilePath)
+	projection, err := store.SemanticBindingTypesForFiles("a", files)
+	require.NoError(t, err)
+	assert.Equal(t, map[graph.SemanticBindingSite]string{aOne: "TypeA", aTwo: "TypeA2"}, projection)
+	otherGeneration, err := store.AtGeneration(99).SemanticBindingTypesForFiles("a", files)
+	require.NoError(t, err)
+	assert.Empty(t, otherGeneration, "file projection must not borrow another generation's bindings")
 
 	require.NoError(t, store.ReplaceSemanticBindingTypesForFiles("a", []string{aOne.FilePath}, []graph.SemanticBindingType{{Site: aOne, TypeName: "TypeANew"}}))
 	got, err = store.SemanticBindingTypes([]graph.SemanticBindingSite{aOne, aTwo, bSame})

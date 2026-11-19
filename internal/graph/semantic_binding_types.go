@@ -35,6 +35,12 @@ type SemanticBindingTypeReader interface {
 	SemanticBindingTypes(sites []SemanticBindingSite) (map[SemanticBindingSite]string, error)
 }
 
+// SemanticBindingFileReader returns the complete binding projection for the
+// requested files, including the absence of sites removed by a new compile.
+type SemanticBindingFileReader interface {
+	SemanticBindingTypesForFiles(repoPrefix string, files []string) (map[SemanticBindingSite]string, error)
+}
+
 // SemanticBindingTypeStore is the full optional side-table capability.
 type SemanticBindingTypeStore interface {
 	SemanticBindingTypeWriter
