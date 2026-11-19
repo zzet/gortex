@@ -590,6 +590,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				}
 			}
 		}
+		node.Meta = jsNamedExportMeta(v.defNode, node.Meta)
 		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -721,7 +722,7 @@ func (e *TypeScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNod
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "typescript",
-		Meta:     meta,
+		Meta:     jsNamedExportMeta(def.Node, meta),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -774,7 +775,7 @@ func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "typescript",
-		Meta:     meta,
+		Meta:     jsNamedExportMeta(def.Node, meta),
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,

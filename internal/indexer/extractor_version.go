@@ -47,8 +47,8 @@ var extractorVersions = map[string]int{
 	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
 	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
 	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
-	"javascript": 2,                                      // renamed per-binding imports persist import_alias Meta; older rows keyed a renamed import by its original name
-	"typescript": 3,                                      // gRPC consumer contracts require an actual gRPC import
+	"javascript": 3,                                      // directly named exports carry declaration evidence for bare calls
+	"typescript": 4,                                      // same named-export evidence as JavaScript
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

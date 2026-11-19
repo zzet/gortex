@@ -8,6 +8,23 @@ import (
 	sitter "github.com/zzet/gortex/internal/parser/tsitter"
 )
 
+// A same-named declaration is not necessarily the value imported by name:
+// `export { other as work }` can coexist with a private `work`.
+func jsNamedExportMeta(decl *sitter.Node, meta map[string]any) map[string]any {
+	parent := decl.Parent()
+	if parent == nil || parent.Type() != "export_statement" || findChildByType(parent, "default") != nil {
+		return meta
+	}
+	if scope := parent.Parent(); scope == nil || scope.Type() != "program" {
+		return meta
+	}
+	if meta == nil {
+		meta = make(map[string]any)
+	}
+	meta["js_named_export"] = true
+	return meta
+}
+
 // jsImportBindingCap bounds how many per-binding import / re-export edges a
 // single statement may emit. Barrel files (`export { ... } from`) routinely
 // re-export hundreds of names; without a cap one statement could add hundreds

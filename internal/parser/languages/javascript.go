@@ -302,6 +302,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				}
 			}
 		}
+		node.Meta = jsNamedExportMeta(v.defNode, node.Meta)
 		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.line,
@@ -530,6 +531,7 @@ func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNod
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("function %s()", name)},
 	}
+	node.Meta = jsNamedExportMeta(def.Node, node.Meta)
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -554,6 +556,7 @@ func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
 	}
+	node.Meta = jsNamedExportMeta(def.Node, node.Meta)
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,

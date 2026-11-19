@@ -214,7 +214,8 @@ func TestImportEvidence_ResolvedEdgeStampsProvenance(t *testing.T) {
 `,
 		"tests/util.ts": `export function createStore(): unknown { return { helper: true }; }
 `,
-		"tests/a.test.ts": `import { createStore } from '../src/vanilla';
+		"src/index.ts": `export * from './vanilla'`,
+		"tests/a.test.ts": `import { createStore } from '../src/index';
 function setup(): unknown {
   return createStore({});
 }
@@ -252,10 +253,10 @@ func TestPickImportEvidenceCallee_LanguageGate(t *testing.T) {
 		{ID: "pkgA/b.go::helper", Kind: graph.KindFunction, FilePath: "pkgA/b.go", Name: "helper"},
 		{ID: "pkgB/c.go::helper", Kind: graph.KindFunction, FilePath: "pkgB/c.go", Name: "helper"},
 	}
-	if pick := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
+	if pick, _ := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
 		t.Errorf("go caller: pick = %v, want nil (language gate)", pick.ID)
 	}
-	if pick := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
+	if pick, _ := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
 		t.Errorf("python caller: pick = %v, want nil (language gate)", pick.ID)
 	}
 }

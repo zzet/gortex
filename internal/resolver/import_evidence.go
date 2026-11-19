@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -25,65 +26,16 @@ import (
 //     widely-used export (zustand's `createStore`: 20 refused call edges,
 //     ~120 line-level false negatives).
 //
-// pickImportEvidenceCallee closes both holes with structural evidence the
-// cascade never consulted: the caller file's import closure. When the
-// caller imports exactly one candidate's file — directly, or transitively
-// through re-export (barrel) hops — that import statement is AST-grade
-// proof of which module the name comes from, so the pick is stamped
-// OriginASTResolved (the same tier resolveRendersChild's import-binding
-// path uses). When the caller imports none of the candidates' files, or
-// several, no evidence exists and the cascade proceeds unchanged.
-//
-// Precedence (documented here because it is the load-bearing design):
-//
-//  1. preferScopeCandidate — per-language static scope rules stay first;
-//     they carry stronger, language-specific evidence.
-//  2. Module-local definition — a same-file function/method candidate is
-//     bound directly by the file-local tier in resolveFunctionCall, and
-//     any same-file declaration blocks the import pick (import nodes are
-//     statement metadata, not implementations). A
-//     top-level local definition cannot legally coexist with an imported
-//     binding of the same name (redeclaration), and a function-scoped
-//     shadow may be the true callee; in both cases the local symbol wins
-//     or the cascade safely refuses. Blocking only ever preserves the
-//     pre-import-evidence behaviour — it can never mint a new edge.
-//  3. Import evidence (this pass) — a unique imported candidate wins,
-//     BEFORE the same-directory loop, so an explicit import beats a
-//     same-dir-different-file shadow.
-//  4. The existing cascade — same-dir, first-same-repo, JS/TS top-level
-//     value callee — untouched.
-//
-// Language gate: the pick only runs for JS/TS caller files. This is a
-// correctness requirement, not caution. In Go a bare call can never name a
-// symbol from another package (that call is selector-shaped and resolved
-// elsewhere), so letting an imported package's file outrank the caller's
-// own directory would manufacture impossible edges. In Python a plain
-// `import x` puts x's file in the closure without bringing `foo` into
-// scope, so file-granularity closure membership is not scope evidence
-// there. For the ES module system it is: every import form that binds a
-// bare name (named, default, aliased) makes the target module's file the
-// only place the name can come from. Go and Python resolution paths are
-// bit-for-bit unchanged.
-//
-// Granularity: the closure is FILE-level, not the directory-level closure
-// guardCrossPackageCallEdges uses. The guard's map is seeded with each
-// file's own directory (so same-package calls survive the guard), which
-// would make every same-dir shadow "import-reachable" and defeat point 3;
-// and dir granularity cannot separate two same-named candidates living in
-// one imported directory. The expansion machinery is shared, not
-// duplicated: raw specifiers go through the exact resolveJSTSImportTarget
-// helper resolveImport uses (relative join, tsconfig paths/baseUrl, npm
-// alias, extension + index probing), so the closure is identical whether
-// an import edge has already been resolved by this pass or not — the pick
-// is order-independent inside the parallel worker phase.
+// After language-specific scope and same-file resolution, an unrenamed import
+// of a directly named export beats file-level evidence. Without a symbol pick,
+// exactly one candidate in the caller's imported files (including transitive
+// barrel re-exports) wins. Otherwise leave the locality cascade unchanged.
+// Same-file declarations block both import tiers. Restrict these rules to
+// JS/TS: importing a package does not put its bare names in scope in Go.
 
-// pickImportEvidenceCallee returns the uniquely imported callable. A named
-// binding to the symbol outranks file-level import closure evidence. Candidate
-// count does not weaken an explicit import; absent or ambiguous evidence
-// leaves the existing cascade unchanged. Only JS/TS callers are eligible.
-func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
+func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) (*graph.Node, string) {
 	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
-		return nil
+		return nil, ""
 	}
 	// A candidate defined in the caller's own file is (or may be) module-
 	// local — the import pick must stand down and let the locality/scope
@@ -96,38 +48,30 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	// import evidence itself, not a shadow.
 	for _, c := range candidates {
 		if c.FilePath == callerFile && c.Kind != graph.KindImport {
-			return nil
+			return nil, ""
 		}
 	}
+	imports := r.importEvidenceFor(callerFile)
 	var symbolPick *graph.Node
-	for _, e := range r.callerOutEdges(callerFile) {
-		if e.Kind != graph.EdgeImports || e.Alias != "" {
+	for _, c := range candidates {
+		if !imports.direct[c.ID] || c.Meta["js_named_export"] != true || !isImportableCallee(c, funcName) {
 			continue
 		}
-		target := r.importedTargetOf(e)
-		for _, c := range candidates {
-			if c.ID != target || !isImportableCallee(c, funcName) {
-				continue
-			}
-			if symbolPick != nil && symbolPick.ID != c.ID {
-				return nil
-			}
-			symbolPick = c
+		if symbolPick != nil && symbolPick.ID != c.ID {
+			return nil, ""
 		}
+		symbolPick = c
 	}
 	if symbolPick != nil {
-		return symbolPick
+		return symbolPick, "import_binding"
 	}
-	imported := r.importedFilesFor(callerFile)
-	if len(imported) == 0 {
-		return nil
-	}
+	imports.closureOnce.Do(func() { imports.files = r.importClosureFiles(callerFile, imports.direct) })
 	var pick *graph.Node
 	for _, c := range candidates {
 		if !isImportableCallee(c, funcName) {
 			continue
 		}
-		if _, ok := imported[c.FilePath]; !ok {
+		if _, ok := imports.files[c.FilePath]; !ok {
 			continue
 		}
 		if pick != nil {
@@ -135,11 +79,14 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 			// top-level symbols) both define the name — the import
 			// statement alone cannot arbitrate. Refuse, exactly like
 			// the no-import case.
-			return nil
+			return nil, ""
 		}
 		pick = c
 	}
-	return pick
+	if pick == nil {
+		return nil, ""
+	}
+	return pick, "import_closure"
 }
 
 // isImportableCallee reports whether a candidate is a symbol an ES import
@@ -161,28 +108,63 @@ func isImportableCallee(c *graph.Node, funcName string) bool {
 	return false
 }
 
-// importedFilesFor returns the set of file paths the caller file imports —
-// directly, plus every file reachable from an imported barrel through
-// transitive EdgeReExports hops. Memoised per caller file for the duration
-// of a resolve pass (r.importFilesMu guards the map because the resolver's
-// worker phase is parallel); cleared with the per-pass lookup caches.
-//
-// The set is built from the import edges' CURRENT state, whichever that
-// is: a resolved edge contributes its target node's file, an unresolved
-// one has its raw `import::` specifier expanded exactly the way
-// resolveImport will expand it. Both states yield the same file, so a call
-// edge resolved before its file's import edge sees the same closure as one
-// resolved after.
-func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
-	r.importFilesMu.RLock()
-	files, ok := r.importFilesByCaller[callerFile]
-	r.importFilesMu.RUnlock()
-	if ok {
-		return files
-	}
+// direct maps expanded target IDs to whether any import of that target was
+// unrenamed. Module IDs also seed the file tier but cannot match a callee ID.
+// Walk barrels only if a call actually needs the weaker file-level evidence.
+type callerImportEvidence struct {
+	directOnce  sync.Once
+	direct      map[string]bool
+	closureOnce sync.Once
+	files       map[string]struct{}
+}
 
-	files = make(map[string]struct{})
-	seen := map[string]bool{callerFile: true}
+func (r *Resolver) clearImportEvidence() {
+	r.importFilesMu.Lock()
+	r.importsByCaller = nil
+	r.importOutByFile = nil
+	r.importFilesMu.Unlock()
+}
+
+func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
+	r.importFilesMu.RLock()
+	imports := r.importsByCaller[callerFile]
+	r.importFilesMu.RUnlock()
+	if imports == nil {
+		r.importFilesMu.Lock()
+		if imports = r.importsByCaller[callerFile]; imports == nil {
+			if r.importsByCaller == nil {
+				r.importsByCaller = make(map[string]*callerImportEvidence)
+			}
+			imports = new(callerImportEvidence)
+			r.importsByCaller[callerFile] = imports
+		}
+		r.importFilesMu.Unlock()
+	}
+	imports.directOnce.Do(func() {
+		for _, e := range r.callerOutEdges(callerFile) {
+			if e.Kind != graph.EdgeImports {
+				continue
+			}
+			target := r.importedTargetOf(e)
+			if target == "" {
+				continue
+			}
+			if imports.direct == nil {
+				imports.direct = make(map[string]bool)
+			}
+			// SQLite retains import_alias even when Alias is not projected.
+			alias, _ := e.Meta["import_alias"].(string)
+			imports.direct[target] = imports.direct[target] || (e.Alias == "" && alias == "")
+		}
+	})
+	return imports
+}
+
+func (r *Resolver) importClosureFiles(callerFile string, direct map[string]bool) map[string]struct{} {
+	if len(direct) == 0 {
+		return nil
+	}
+	files := make(map[string]struct{})
 	var pendingBarrels []string
 	addTarget := func(f string) {
 		if f == "" || f == callerFile {
@@ -195,11 +177,8 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 		pendingBarrels = append(pendingBarrels, f)
 	}
 
-	for _, e := range r.callerOutEdges(callerFile) {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
-		addTarget(r.importedFileOf(e))
+	for target := range direct {
+		addTarget(r.nodeFilePath(target))
 	}
 	// Barrel hops: an import that lands on a re-exporting module makes the
 	// re-exported modules visible too (`import { createStore } from
@@ -208,32 +187,15 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 	for len(pendingBarrels) > 0 {
 		f := pendingBarrels[len(pendingBarrels)-1]
 		pendingBarrels = pendingBarrels[:len(pendingBarrels)-1]
-		if seen[f] {
-			continue
-		}
-		seen[f] = true
 		for _, e := range r.callerOutEdges(f) {
 			if e.Kind != graph.EdgeReExports {
 				continue
 			}
-			addTarget(r.importedFileOf(e))
+			addTarget(r.nodeFilePath(r.importedTargetOf(e)))
 		}
 	}
 
-	r.importFilesMu.Lock()
-	if r.importFilesByCaller == nil {
-		r.importFilesByCaller = make(map[string]map[string]struct{})
-	}
-	r.importFilesByCaller[callerFile] = files
-	r.importFilesMu.Unlock()
 	return files
-}
-
-// importedFileOf maps an EdgeImports / EdgeReExports edge to the file path
-// of the module it names, or "" when the edge targets nothing indexable
-// (third-party package, stdlib stub, dep contract, unexpandable specifier).
-func (r *Resolver) importedFileOf(e *graph.Edge) string {
-	return r.nodeFilePath(r.importedTargetOf(e))
 }
 
 // importedTargetOf shares symbol/file expansion across both evidence tiers.
@@ -308,7 +270,7 @@ func (r *Resolver) callerOutEdges(callerFile string) []*graph.Edge {
 
 // prefetchImportEdges loads, in one batched read, the outgoing edges of
 // every JS/TS caller file behind edges — the import statements
-// importedFilesFor walks for every bare call. known is an optional
+// importEvidenceFor reads for bare calls. known is an optional
 // already-loaded out-edge map (the incremental page frontier) consumed
 // before asking the store. Without this every JS/TS call edge cost one
 // point GetOutEdges on the caller file, which on a disk backend is one

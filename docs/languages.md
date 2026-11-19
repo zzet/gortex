@@ -112,13 +112,12 @@ Recent extraction refinements (each covered by a per-feature CI golden): Java `@
 
 ### JS/TS import evidence
 
-Bare JS/TS calls with import evidence resolve at `ast_resolved`, including when
-the repository has only one definition. A named import of the defining symbol
-outranks file-level closure evidence; otherwise a unique directly imported or
-barrel-re-exported defining file supplies the binding. Same-file declarations
-still win, and ambiguous import evidence does not promote a guessed target.
-Import statement evidence is batch-loaded per resolver page and cleared after
-interleaved mutations, so promotion does not add per-call adjacency queries.
+Bare JS/TS calls can resolve at `ast_resolved` even when the repository has
+only one candidate. An unrenamed named import that matches a directly exported
+declaration takes precedence (`import_binding`). Otherwise, a unique candidate
+in a directly imported file or its barrel re-exports can supply file-level
+evidence (`import_closure`). A same-file declaration blocks import promotion;
+when imports don't settle the call, the usual resolution rules still apply.
 
 ### Julia specifics
 
