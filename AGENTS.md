@@ -6,12 +6,16 @@ Code intelligence engine written in Go. Indexes repositories into a knowledge gr
 
 ```bash
 CGO_CFLAGS="-O2 -g -fno-strict-aliasing" CGO_CXXFLAGS="-O2 -g -fno-strict-aliasing" \
-  go build -o gortex ./cmd/gortex/   # requires CGO (tree-sitter C bindings)
+  go build -trimpath -o gortex ./cmd/gortex/   # requires CGO (tree-sitter C bindings)
 make test PKGS=./internal/<pkg>/... # packages you touched; CI runs the full suite
 ```
 
-`make test` (all packages when `PKGS` is unset) runs `go test -race` with SQLite's transpiled C and libc left out of
-race instrumentation, as CI does. Plain `go test -race ./...` instruments them
+`-trimpath` keeps the Go build cache shared across worktrees — without it every checkout caches its own copy of
+every package. It costs IDE click-through on stack traces, and a debugger needs a source-path substitution. CI builds
+untrimmed (stable checkout paths), so the two configurations do not share cache entries.
+
+`make test` (all packages when `PKGS` is unset) runs `go test -trimpath -race` with SQLite's transpiled C and libc left
+out of race instrumentation, as CI does (CI omits `-trimpath`). Plain `go test -race ./...` instruments them
 too, which makes `store_sqlite`, `indexer` and `mcp` several times slower and
 can trip package timeouts. To run a heavy package with one worker per CPU like
 CI: `TEST_RACE=true go run ./scripts/ci-test --partition indexer:1/2`.

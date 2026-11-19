@@ -8,10 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/testutil/reporoot"
 )
 
 // Schema-vs-extractor parity audit.
@@ -40,10 +41,7 @@ import (
 // allowlist with a documented reason — that turns "we forgot" into
 // "we deliberately deferred."
 func TestSchemaParityAudit(t *testing.T) {
-	repoRoot, err := findRepoRoot()
-	if err != nil {
-		t.Fatalf("locate repo root: %v", err)
-	}
+	repoRoot := reporoot.Path(t)
 
 	declared, err := extractKindDeclarations(filepath.Join(repoRoot, "internal", "graph"))
 	if err != nil {
@@ -70,7 +68,7 @@ func TestSchemaParityAudit(t *testing.T) {
 		// production query paths — the actual emit site can then sit
 		// in a resolver or enricher that calls the mapping fn.
 		if usage[d.Name] == 0 {
-			orphans = append(orphans, formatOrphan(d))
+			orphans = append(orphans, formatOrphan(repoRoot, d))
 		}
 	}
 	if len(orphans) > 0 {
@@ -266,64 +264,10 @@ func scanKindUsage(repoRoot string, declared []kindDecl) (map[string]int, error)
 	return usage, nil
 }
 
-// findRepoRoot first preserves the package-CWD lookup. An isolated test
-// process can instead audit the actual checkout that supplied this source
-// file to its binary; no process-CWD or configuration change is needed.
-func findRepoRoot() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	if root, err := findRepoRootFromDir(dir); err == nil {
-		return root, nil
-	}
-	_, source, _, ok := runtime.Caller(0)
-	if !ok || !filepath.IsAbs(source) {
-		return "", os.ErrNotExist
-	}
-	info, err := os.Stat(source)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", os.ErrNotExist
-	}
-	return findRepoRootFromDir(filepath.Dir(source))
-}
-
-// findRepoRootFromDir retains the original go.mod predicate and upward walk.
-func findRepoRootFromDir(dir string) (string, error) {
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", os.ErrNotExist
-		}
-		dir = parent
-	}
-}
-
-func TestFindRepoRootFromDirUsesActualAuditDirectory(t *testing.T) {
-	root, err := findRepoRoot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := filepath.Join(root, "internal", "graph", "parity_audit_test.go")
-	info, err := os.Stat(source)
-	if err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("actual audit source is not a real file: %v", err)
-	}
-	fromSource, err := findRepoRootFromDir(filepath.Dir(source))
-	if err != nil || fromSource != root {
-		t.Fatalf("source-directory lookup returned %q, want %q: %v", fromSource, root, err)
-	}
-}
-
-func formatOrphan(d kindDecl) string {
+func formatOrphan(repoRoot string, d kindDecl) string {
 	rel := d.Path
-	if root, err := findRepoRoot(); err == nil {
-		if r, err := filepath.Rel(root, d.Path); err == nil {
-			rel = r
-		}
+	if r, err := filepath.Rel(repoRoot, d.Path); err == nil {
+		rel = r
 	}
 	return "  " + d.Kind + "." + d.Name + " (declared at " + rel + ":" + itoa(d.Line) + ")"
 }
