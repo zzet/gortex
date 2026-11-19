@@ -847,6 +847,9 @@ type primaryBase struct {
 	// was would have to be guessed at. graphBase never sets it, so every
 	// unpinned path keeps the exact comparison it always had.
 	pinned bool
+	// pinAnchor is the dedicated ancestor retained by a reused committed
+	// parent. Zero keeps the ordinary dedicated-base pin representation.
+	pinAnchor int64
 }
 
 // NewCheckoutCoordinator builds a coordinator and starts its loop. The caller
@@ -1942,6 +1945,14 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	// base moved, so both fall through to the paths they always took.
 	base, pinned := c.pinRoutedBase(ctx, base, route)
 	out.BasePinned = pinned
+	if !pinned && route.CommitGenerationID == 0 {
+		if parent, release, ok := c.chooseCommittedParent(ctx, base, head.HeadTree); ok {
+			defer release()
+			base = parent
+			c.notePinnedBase(base.retirementAnchor())
+			out.BasePinned = true
+		}
+	}
 
 	// A committed base that advanced under a checkout whose own tree did not
 	// move is recomposed, not torn down: both layers are rebuilt off-route and
@@ -2745,7 +2756,7 @@ func (c *CheckoutCoordinator) pinRoutedBase(
 		c.notePinnedBase(0)
 		return base, false
 	}
-	c.notePinnedBase(pinned.generationID)
+	c.notePinnedBase(pinned.retirementAnchor())
 	return pinned, true
 }
 
@@ -2818,6 +2829,14 @@ func (c *CheckoutCoordinator) validatedPinnedCommitBaseFor(
 	baseRow, found, err := c.catalog.GetViewGeneration(ctx, commitRow.BaseGenerationID)
 	if err != nil {
 		return out, false, err
+	}
+	if found && baseRow.TreeOID == commitRow.LowerViewFingerprint && baseRow.GenerationKind == CommitLayerGenerationKind {
+		parent, view, ok := c.openCommittedParent(ctx, base.graphID, baseRow)
+		if !ok {
+			return out, false, nil
+		}
+		view.Close()
+		return parent, true, nil
 	}
 	if !found || !servableGeneration(baseRow.State) ||
 		baseRow.GenerationKind != DedicatedBaseGenerationKind ||
@@ -3078,12 +3097,19 @@ func (c *CheckoutCoordinator) baseMovedUnderCycle(ctx context.Context, base prim
 		if base.generationID <= 0 || base.treeOID == "" {
 			return true, nil
 		}
-		if base.generationID == c.releaseRequestedBasePin() {
+		if base.generationID == c.releaseRequestedBasePin() || base.retirementAnchor() == c.releaseRequestedBasePin() {
 			return true, nil
 		}
 		row, found, err := c.catalog.GetViewGeneration(ctx, base.generationID)
 		if err != nil {
 			return false, err
+		}
+		if base.pinAnchor > 0 {
+			parent, view, ok := c.openCommittedParent(ctx, base.graphID, row)
+			if ok {
+				view.Close()
+			}
+			return !found || !ok || parent != base, nil
 		}
 		return !found || !servableGeneration(row.State) || row.TreeOID != base.treeOID, nil
 	}
@@ -3978,21 +4004,7 @@ func (c *CheckoutCoordinator) adoptedCommitRowFor(row store_sqlite.ViewGeneratio
 // evicting one and attributes every write to the generation the cache gave up.
 func (c *CheckoutCoordinator) storedCommit(ctx context.Context, identity GenerationIdentity) (int64, bool) {
 	key := generationIdentityKey(identity)
-	rows, err := c.catalog.FindReusableViewGenerations(ctx, store_sqlite.ViewGeneration{
-		OwnerKind:            identity.OwnerKind,
-		GraphID:              identity.GraphID,
-		LayerID:              identity.LayerID,
-		CheckoutID:           identity.CheckoutID,
-		GenerationKind:       identity.GenerationKind,
-		BaseGenerationID:     identity.BaseGenerationID,
-		LowerViewFingerprint: identity.LowerViewFingerprint,
-		TreeOID:              identity.TreeOID,
-		ProvenanceCommitOID:  identity.ProvenanceCommitOID,
-		ConfigHash:           identity.ConfigHash,
-		ExtractorVersions:    identity.ExtractorVersions,
-		ResolverVersion:      identity.ResolverVersion,
-		DependencyRevision:   identity.DependencyRevision,
-	}, maxStoredCommitLayerCandidates)
+	rows, err := c.catalog.FindReusableViewGenerations(ctx, commitGenerationLookup(identity), maxStoredCommitLayerCandidates)
 	if err != nil {
 		// A reuse lookup that cannot be answered is not a failed cycle: the
 		// build below produces the same payload, at the price this item exists
