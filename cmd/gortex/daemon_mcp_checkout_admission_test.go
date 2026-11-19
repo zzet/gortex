@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
+	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/toolref"
 )
 
 func TestDispatcher_CheckoutAdmissionFailurePreservesClassification(t *testing.T) {
@@ -58,6 +61,20 @@ func TestDispatcher_CheckoutAdmissionFailurePreservesClassification(t *testing.T
 				assert.Contains(t, failure["message"], tc.err.Error(), "preserve the cause")
 				assert.NotContains(t, string(reply), "gortex track")
 				assert.NotContains(t, string(reply), "repo_not_tracked")
+			}
+			reply, err := d.Dispatch(context.Background(), sess, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`))
+			require.NoError(t, err)
+			var init struct {
+				Result struct {
+					Instructions string `json:"instructions"`
+				} `json:"result"`
+			}
+			require.NoError(t, json.Unmarshal(reply, &init))
+			if tc.retryable {
+				assert.True(t, strings.HasPrefix(init.Result.Instructions, "Gortex is LOADING checkout "), init.Result.Instructions)
+			} else {
+				assert.True(t, strings.HasPrefix(init.Result.Instructions, "Gortex checkout discovery is unavailable"), init.Result.Instructions)
+				assert.Contains(t, init.Result.Instructions, "No graph access has been granted")
 			}
 			_, logged := d.loggedUntracked.Load(sess.ID)
 			assert.False(t, logged, "transient discovery is not an untracked session")
@@ -115,8 +132,11 @@ func TestDispatcher_CheckoutAdmissionBusyHandshakeAndSameSessionRetry(t *testing
 	require.True(t, ok)
 	instructions, ok := result["instructions"].(string)
 	require.True(t, ok)
-	assert.Contains(t, instructions, "view_building")
-	assert.Contains(t, instructions, "No graph access has been granted")
+	// The session reads these once and keeps them after admission, so they
+	// must carry the ordinary instructions, not a "no access" verdict.
+	assert.True(t, strings.HasPrefix(instructions, gortexmcp.ServerInstructionsCheckoutLoading(sess.CWD, "view_building")), instructions)
+	assert.Contains(t, instructions, toolref.TransportClause(), "ordinary instructions follow the preamble")
+	assert.NotContains(t, instructions, "No graph access")
 	assert.NotContains(t, instructions, "gortex track")
 
 	listed := dispatch(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
@@ -144,5 +164,38 @@ func BenchmarkCheckoutAdmissionError(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = checkoutAdmissionError("/checkout", frame, indexer.ErrCheckoutMutationBusy)
+	}
+}
+
+// The daemon rewrite must keep the base the session's own initialize chose:
+// a legacy client told the facade workflow names tools it does not have.
+func TestDispatcher_CheckoutAdmissionBusyKeepsSessionBase(t *testing.T) {
+	d, _ := trackedPathMCPSetup(t, t.TempDir())
+	d.checkoutCWDProbe = func(context.Context, string) (bool, error) { return false, indexer.ErrCheckoutMutationBusy }
+	frames := map[string]string{
+		"initialize":      `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`,
+		"server/discover": `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"antigravity-client","version":"v1.0.0"}}}}`,
+	}
+	for _, surface := range []struct{ spec, base string }{
+		{"", "When Gortex can serve the step"},
+		{"core", "Gortex is a code-intelligence graph server"},
+	} {
+		for method, frame := range frames {
+			t.Run(surface.spec+"/"+method, func(t *testing.T) {
+				sess := &daemon.Session{ID: "busy-base-" + surface.spec + method, CWD: t.TempDir(), ToolSpec: surface.spec}
+				d.SessionStarted(sess, func([]byte) error { return nil })
+				t.Cleanup(func() { d.SessionEnded(sess) })
+				reply, err := d.Dispatch(context.Background(), sess, []byte(frame))
+				require.NoError(t, err)
+				var parsed struct {
+					Result struct {
+						Instructions string `json:"instructions"`
+					} `json:"result"`
+				}
+				require.NoError(t, json.Unmarshal(reply, &parsed), "%s", reply)
+				want := gortexmcp.ServerInstructionsCheckoutLoading(sess.CWD, "view_building") + "\n\n" + surface.base
+				assert.True(t, strings.HasPrefix(parsed.Result.Instructions, want), "%s", parsed.Result.Instructions)
+			})
+		}
 	}
 }

@@ -444,6 +444,7 @@ func decodeProbeFrame(frame []byte) probeSample {
 func instructionsVariant(text string) string {
 	for _, variant := range []struct{ prefix, name string }{
 		{"Gortex is LOADING graph admission", "admission_pending"},
+		{"Gortex is LOADING checkout ", "checkout_loading"},
 		{"Gortex is LOADING ", "loading"},
 		{"Gortex is connected but could not load", "unavailable"},
 		{"Gortex is connected but INACTIVE", "untracked"},

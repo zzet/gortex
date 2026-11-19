@@ -250,7 +250,7 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, cwd, d.familyRoots(), terminalFamilyLoad...)
 	}
 	if admissionErr != nil {
-		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, cwd, admissionErr)
+		out = rewriteMCPAdmissionInstructions(peekFrameMethod(frame), out, d.srv.CheckoutAdmissionInstructionsFor(ctx, cwd, admissionErr))
 	}
 	if pending != nil && pending.familyInstructions != "" {
 		out = rewriteMCPAdmissionInstructions(peekFrameMethod(frame), out, pending.familyInstructions)
@@ -479,10 +479,6 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 		},
 	})
 	return out
-}
-
-func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err error) []byte {
-	return rewriteMCPAdmissionInstructions(method, out, gortexmcp.CheckoutAdmissionInstructions(cwd, err))
 }
 
 func rewriteMCPAdmissionInstructions(method string, out []byte, instructions string) []byte {
