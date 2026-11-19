@@ -441,6 +441,8 @@ type Indexer struct {
 	// Set only while the repository mutation lane is held. Alias changes
 	// invalidate source-shape resolution reuse, including unchanged callers.
 	aliasResolutionChanged bool
+	appliedResolution      *resolutionInputs
+	resolutionRetry        bool
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -2842,6 +2844,10 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // indexCtxRaw performs full-tree indexing while the caller holds the
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
+	var inputs *resolutionInputs
+	defer func() {
+		idx.finishResolutionInputs(inputs, retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0)
+	}()
 	if idx.contractCoreRuntime.Load() != nil && idx.contractCoreInputs == nil {
 		// Raw MI doors retain this journal until their OUTER source receipt settles.
 		if _, err := idx.beginInstalledContractCoreInputs(ctx); err != nil {
@@ -2967,8 +2973,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	idx.aliasResolutionChanged = idx.refreshTSAliasCollection(absRoot)
-	defer func() { idx.aliasResolutionChanged = false }()
+	inputs = idx.refreshResolutionInputs(absRoot, "")
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -3132,13 +3137,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 	idx.warnIfWalkAdmittedNothing(absRoot, len(files))
 	reporter.Report("walking files", len(files), len(files))
-	if idx.aliasResolutionChanged {
-		for _, file := range files {
-			if isAliasCallerPath(file.path) {
-				idx.graph.EvictFile(idx.prefixPath(idx.relKey(file.path)))
-			}
-		}
-	}
 	// Capture raw content identities while the parser already owns each source
 	// buffer. A nil collector keeps the disabled path allocation-free.
 	merkleBaseline := newMerkleBaselineCollector(idx.merkleEnabled(), len(files))
@@ -4415,6 +4413,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// retaining a repository-sized graph in Go memory.
 					if !contentHandled {
 						batchStart := time.Now()
+						// A full direct build adds batches; it does not use indexFile.
+						// Drop old bindings only once their replacement is ready.
+						if !shadowTaken && !skipped && err == nil && idx.mustReresolve(relPath) {
+							idx.graph.EvictFile(idx.prefixPath(relPath))
+						}
 						durablePath, durableMtime := path, wf.mtimeNano
 						if !graphBatch.add(result.Nodes, result.Edges, func() {
 							recordStreamedMtime(durablePath, durableMtime)
@@ -5532,7 +5535,7 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
-	if idx.aliasResolutionChanged && isAliasCallerPath(filePath) {
+	if idx.mustReresolve(filePath) {
 		reuseIdx, priorUnresolved = nil, nil
 	}
 
@@ -7163,8 +7166,9 @@ func (idx *Indexer) SetRootPath(root string) {
 	idx.storeRootPath(abs)
 }
 
-// IncrementalReindexPaths re-indexes only the files reachable from the
-// supplied paths, instead of walking the whole repository root.
+// IncrementalReindexPaths re-indexes the supplied scope. A changed JS/TS
+// resolution config also restages JS/TS dependents across the repository,
+// but deletion detection stays within the requested paths.
 //
 // Each path may be absolute or relative to root, and may be a file or a
 // directory; directories are walked recursively with the same
@@ -7340,13 +7344,14 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	idx.aliasResolutionChanged = idx.refreshTSAliasCollection(absRoot)
-	defer func() { idx.aliasResolutionChanged = false }()
-	if idx.aliasResolutionChanged {
-		// Alias scopes may change independently of every source mtime.
-		paths = []string{absRoot}
-		fullRoot = true
+	var point string
+	if mode.forceExplicitFiles && len(paths) == 1 {
+		point = paths[0]
 	}
+	inputs := idx.refreshResolutionInputs(absRoot, point)
+	// A failed or partial rebuild must retry even if the lookup cache is warm.
+	applied := false
+	defer func() { idx.finishResolutionInputs(inputs, applied) }()
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
@@ -7388,7 +7393,13 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		extractorStaleLangs = idx.extractorVersionStaleLangSet()
 	}
 
-	for _, p := range paths {
+	// A config change can name a newly created implementation as well as
+	// existing callers. Discover both without widening deletion authority.
+	requested := len(paths)
+	if idx.aliasResolutionChanged && !fullRoot {
+		paths = append(paths[:requested:requested], absRoot)
+	}
+	for i, p := range paths {
 		absPath := p
 		if !filepath.IsAbs(absPath) {
 			absPath = filepath.Join(absRoot, filepath.FromSlash(p))
@@ -7404,7 +7415,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		}
 		// Canonical key (slash + NFC) so scopeRels matches fileMtimes
 		// keys when deletion detection intersects the two below.
-		scopeRels[idx.relKey(absPath)] = true
+		if i < requested {
+			scopeRels[idx.relKey(absPath)] = true
+		}
 
 		info, statErr := os.Stat(absPath)
 		if statErr != nil {
@@ -7436,6 +7449,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 				if d.IsDir() {
 					idx.noteFileIndexFailure(path, nil)
 					walkedDirs = append(walkedDirs, path)
+					return nil
+				}
+				if i == requested && !closureJSTSPath(path) {
 					return nil
 				}
 				adm := idx.admitFileInOpenDir(absRoot, path, -1, d.Type())
@@ -7516,7 +7532,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	}
 	if idx.aliasResolutionChanged {
 		for relPath := range diskFiles {
-			if isAliasCallerPath(relPath) {
+			if closureJSTSPath(relPath) {
 				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
 			}
 		}
@@ -7781,6 +7797,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
 		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount),
 		zap.Bool("counts_cached", countsCached))
+	applied = len(failedFiles) == 0 && len(versionChangedFiles) == 0 && result.mutationErr == nil
 	return result, nil
 }
 

@@ -25,14 +25,9 @@ import (
 //     widely-used export (zustand's `createStore`: 20 refused call edges,
 //     ~120 line-level false negatives).
 //
-// pickImportEvidenceCallee closes both holes with structural evidence the
-// cascade never consulted: the caller file's import closure. When the
-// caller imports exactly one candidate's file — directly, or transitively
-// through re-export (barrel) hops — that import statement is AST-grade
-// proof of which module the name comes from, so the pick is stamped
-// OriginASTResolved (the same tier resolveRendersChild's import-binding
-// path uses). When the caller imports none of the candidates' files, or
-// several, no evidence exists and the cascade proceeds unchanged.
+// An exact symbol binding wins even if several imported files define the
+// name. Without one, a unique callable in the import closure (directly or
+// through re-export hops) supplies the evidence; ambiguity is not a pick.
 //
 // Precedence (documented here because it is the load-bearing design):
 //
@@ -47,9 +42,8 @@ import (
 //     shadow may be the true callee; in both cases the local symbol wins
 //     or the cascade safely refuses. Blocking only ever preserves the
 //     pre-import-evidence behaviour — it can never mint a new edge.
-//  3. Import evidence (this pass) — a unique imported candidate wins,
-//     BEFORE the same-directory loop, so an explicit import beats a
-//     same-dir-different-file shadow.
+//  3. A generated Nuxt binding not shadowed by an explicit import, then
+//     exact symbol and file-closure evidence, before same-dir neighbours.
 //  4. The existing cascade — same-dir, first-same-repo, JS/TS top-level
 //     value callee — untouched.
 //
@@ -85,19 +79,8 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil
 	}
-	// A candidate defined in the caller's own file is (or may be) module-
-	// local — the import pick must stand down and let the locality/scope
-	// cascade bind it. Any kind blocks: a local class, const, or nested
-	// helper of the same name all shadow an import at some scope, and
-	// falling through only preserves today's behaviour. The one exception
-	// is the caller's own import-statement node: its display name is the
-	// imported module's basename, so `import { useX } from './useX'` puts a
-	// same-named KindImport node in the caller file. That node is the
-	// import evidence itself, not a shadow.
-	for _, c := range candidates {
-		if c.FilePath == callerFile && c.Kind != graph.KindImport {
-			return nil
-		}
+	if hasLocalDeclaration(callerFile, candidates) {
+		return nil
 	}
 	var symbolPick *graph.Node
 	for _, e := range r.callerOutEdges(callerFile) {
@@ -140,6 +123,16 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 		pick = c
 	}
 	return pick
+}
+
+// An import statement can share its module's basename; it isn't a local definition.
+func hasLocalDeclaration(file string, candidates []*graph.Node) bool {
+	for _, c := range candidates {
+		if c.FilePath == file && c.Kind != graph.KindImport {
+			return true
+		}
+	}
+	return false
 }
 
 // isImportableCallee reports whether a candidate is a symbol an ES import

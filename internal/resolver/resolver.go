@@ -4773,17 +4773,12 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Import-evidence disambiguation (JS/TS only; see import_evidence.go
-	// for the full precedence design). The ES module system has no ambient
-	// directory scope, so before the locality cascade below can bind a
-	// same-dir shadow — and before cross-dir ambiguity guesses or refuses —
-	// ask the caller file's import closure. When the caller imports exactly
-	// one candidate's file (directly or through re-export/barrel hops) that
-	// import statement is structural, AST-grade evidence of the binding:
-	// resolve to it at OriginASTResolved, the tier resolveRendersChild's
-	// import-binding path already uses. A module-local candidate blocks the
-	// pick; no import or several imported candidates fall through to the
-	// existing cascade unchanged.
+	// Explicit local bindings and declarations shadow Nuxt; a generated
+	// binding in turn outranks merely importing some other name from a file.
+	if r.tryResolveNuxtAutoImport(e, funcName, candidates, stats) {
+		return
+	}
+	// Exact symbol import, then unique imported file (including barrels).
 	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
 		e.To = pick.ID
 		e.Origin = graph.OriginASTResolved
@@ -4793,9 +4788,6 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		}
 		e.Meta["resolution"] = "import_closure"
 		stats.Resolved++
-		return
-	}
-	if r.tryResolveNuxtAutoImport(e, funcName, candidates, stats) {
 		return
 	}
 

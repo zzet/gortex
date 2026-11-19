@@ -22,6 +22,7 @@ import (
 // walks up from the matched node to find the enclosing class.
 const tsQAll = `
 [
+` + jsDefaultExportQuery + `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
@@ -248,6 +249,9 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	parser.EachMatch(qAll, root, src, func(m parser.QueryResult) {
 		switch {
+		case m.Captures["default.name"] != nil:
+			fileNode.Meta = map[string]any{"default_export": m.Captures["default.name"].Text}
+
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
 
@@ -1246,18 +1250,16 @@ func (e *TypeScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 		From: fileID, To: importNodeID,
 		Kind: graph.EdgeContains, FilePath: filePath, Line: line,
 	})
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + importPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-	})
-	defCap, ok := m.Captures["import.def"]
-	if !ok || defCap.Node == nil {
+	var importNode *sitter.Node
+	if def := m.Captures["import.def"]; def != nil {
+		importNode = def.Node
+	}
+	emitJSImports(importNode, importPath, fileID, filePath, line, src, result)
+	if importNode == nil {
 		return
 	}
-	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
-	emitJSPerBindingImports(defCap.Node, importPath, fileID, filePath, src, result)
-	for i, _nc := 0, int(defCap.Node.NamedChildCount()); i < _nc; i++ {
-		child := defCap.Node.NamedChild(i)
+	for i, _nc := 0, int(importNode.NamedChildCount()); i < _nc; i++ {
+		child := importNode.NamedChild(i)
 		if child.Type() != "import_clause" {
 			continue
 		}

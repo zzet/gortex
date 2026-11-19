@@ -1,36 +1,42 @@
 package indexer
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/zzet/gortex/internal/parser/nuxtimports"
+	"github.com/zzet/gortex/internal/parser/tsalias"
 	"github.com/zzet/gortex/internal/resolver"
 )
 
-var nuxtImportCache = struct {
-	sync.Mutex
-	byRoot map[string]*nuxtimports.Collection
-}{byRoot: make(map[string]*nuxtimports.Collection)}
-
-func loadNuxtImports(root string) *nuxtimports.Collection {
-	nuxtImportCache.Lock()
-	defer nuxtImportCache.Unlock()
-	if coll, exists := nuxtImportCache.byRoot[root]; exists {
-		return coll
-	}
-	coll := nuxtimports.Load(root)
-	nuxtImportCache.byRoot[root] = coll
-	return coll
+type cachedNuxtImports struct {
+	collection *nuxtimports.Collection
+	reads      map[string]string // nil for a lazy load outside a mutation pass
 }
 
-func refreshNuxtImports(root string) bool {
+var nuxtImportCache = struct {
+	sync.Mutex
+	byRoot map[string]cachedNuxtImports
+}{byRoot: make(map[string]cachedNuxtImports)}
+
+func loadNuxtImports(root string, proof *buildContentProof) *nuxtimports.Collection {
 	nuxtImportCache.Lock()
+	entry, exists := nuxtImportCache.byRoot[root]
+	if exists {
+		nuxtImportCache.Unlock()
+		if proof.active() {
+			entry.collection.ListPaths(func(rel string) {
+				proof.record(filepath.Join(root, filepath.FromSlash(rel)), entry.reads[rel])
+			})
+		}
+		return entry.collection
+	}
 	defer nuxtImportCache.Unlock()
-	previous, loaded := nuxtImportCache.byRoot[root]
-	current := nuxtimports.Load(root)
-	nuxtImportCache.byRoot[root] = current
-	return loaded && !previous.Equal(current)
+	proof.noteUnboundedReader()
+	coll := nuxtimports.Load(root)
+	nuxtImportCache.byRoot[root] = cachedNuxtImports{collection: coll}
+	return coll
 }
 
 func invalidateNuxtImports(root string) {
@@ -50,18 +56,18 @@ func resolveNuxtBinding(coll *nuxtimports.Collection, prefix, caller, name strin
 	if binding.File == "" {
 		return "", ""
 	}
-	return prefixTSAliasTarget(prefix, binding.Stem()), binding.Name
+	return prefixTSAliasTarget(prefix, binding.File), binding.Name
 }
 
 func (idx *Indexer) resolveNuxtAutoImport(caller, name string) (string, string) {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
-		idx.contentProof.noteUnboundedReader()
-		return resolveNuxtBinding(loadNuxtImports(tree.root()), idx.repoPrefix, caller, name)
+		return resolveNuxtBinding(loadNuxtImports(tree.root(), idx.contentProof), idx.repoPrefix, caller, name)
 	}
 	idx.nuxtMu.Lock()
 	if idx.nuxtRef != ref {
-		idx.nuxtColl = nuxtimports.LoadTree(tree.(sourceManifestTree))
+		src, _ := tree.(tsalias.Tree)
+		idx.nuxtColl = nuxtimports.LoadTree(src)
 		idx.nuxtRef = ref
 	}
 	coll := idx.nuxtColl
@@ -76,7 +82,7 @@ func (mi *MultiIndexer) nuxtAutoImportResolver() resolver.NuxtAutoImportResolver
 				if idx := mi.GetIndexer(meta.RepoPrefix); idx != nil && idx.contentSrc.Load() != nil {
 					return idx.resolveNuxtAutoImport(caller, name)
 				}
-				return resolveNuxtBinding(loadNuxtImports(meta.RootPath), meta.RepoPrefix, caller, name)
+				return resolveNuxtBinding(loadNuxtImports(meta.RootPath, nil), meta.RepoPrefix, caller, name)
 			}
 		}
 		return "", ""

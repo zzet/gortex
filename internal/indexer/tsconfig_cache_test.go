@@ -1,10 +1,12 @@
 package indexer
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zzet/gortex/internal/progress"
 )
 
 func TestTSConfigPathAlias_ConfigChangeOnFullReindex(t *testing.T) {
@@ -19,12 +21,18 @@ func TestTSConfigPathAlias_ConfigChangeOnFullReindex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = idx.IndexCtx(progress.WithReporter(ctx, firstIndexCancelReporter{cancel: cancel}), root)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotNil(t, idx.Graph().GetNode("old/auth.ts::useRedirect"))
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"), "same-root reindex must not keep the old config")
 }
 
-func TestTSConfigPathAlias_NegativeCacheOnRetrack(t *testing.T) {
+func TestTSConfigPathAlias_NewIndexerSeesPreviouslyAbsentConfig(t *testing.T) {
 	root := t.TempDir()
 	writeFileMk(t, filepath.Join(root, "lib/auth.ts"), "export function useRedirect() { return 1 }\n")
 	writeFileMk(t, filepath.Join(root, "pages/index.ts"), "import { useRedirect } from '~/auth'\nexport function run() { return useRedirect() }\n")

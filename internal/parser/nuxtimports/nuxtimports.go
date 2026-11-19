@@ -2,16 +2,16 @@
 package nuxtimports
 
 import (
-	"io/fs"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
-// Binding names the repository-relative source stem and its original export.
+// Binding names the repository-relative module path and its original export.
 type Binding struct {
 	File string
 	Name string
@@ -30,51 +30,23 @@ var identifierRE = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
 // Load ignores unprepared projects, packages and files outside the repository.
 func Load(repoRoot string) *Collection {
-	var scopes []scope
-	_ = filepath.WalkDir(repoRoot, func(p string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !entry.IsDir() {
-			return nil
-		}
-		if skipDir(entry.Name()) {
-			return filepath.SkipDir
-		}
-		if entry.Name() == ".nuxt" {
-			data, readErr := os.ReadFile(filepath.Join(p, "imports.d.ts"))
-			if readErr != nil {
-				return filepath.SkipDir
-			}
-			rel, relErr := filepath.Rel(repoRoot, filepath.Dir(p))
-			if relErr != nil {
-				return filepath.SkipDir
-			}
-			if rel == "." {
-				rel = ""
-			}
-			bindings := parse(repoRoot, p, string(data))
-			scopes = append(scopes, scope{Root: filepath.ToSlash(rel), Bindings: bindings})
-			return filepath.SkipDir
-		}
-		return nil
-	})
-	return collection(scopes)
+	return LoadTree(tsalias.WorkingTree(repoRoot))
 }
 
-func skipDir(name string) bool {
-	switch name {
-	case "node_modules", ".git", ".hg", ".svn", "vendor", "build", "dist", "target", ".next":
-		return true
+// ListPaths visits the generated files whose bytes supplied these scopes.
+func (c *Collection) ListPaths(visit func(string)) {
+	if c != nil {
+		for _, scope := range c.scopes {
+			visit(path.Join(scope.Root, ".nuxt/imports.d.ts"))
+		}
 	}
-	return false
 }
 
 // LoadTree reads only generated lists present in the snapshot, never the checkout.
-func LoadTree(tree interface {
-	Files(func(string))
-	Read(string) ([]byte, bool)
-}) *Collection {
+func LoadTree(tree tsalias.Tree) *Collection {
+	if tree == nil {
+		return nil
+	}
 	var scopes []scope
 	tree.Files(func(rel string) {
 		dir := path.Dir(rel)
@@ -83,7 +55,7 @@ func LoadTree(tree interface {
 		}
 		root := path.Dir(dir)
 		for ancestor := root; ancestor != "." && ancestor != "/"; ancestor = path.Dir(ancestor) {
-			if name := path.Base(ancestor); skipDir(name) || name == ".nuxt" {
+			if tsalias.SkipDirName(path.Base(ancestor)) {
 				return
 			}
 		}
@@ -189,13 +161,4 @@ func (c *Collection) Equal(other *Collection) bool {
 		}
 	}
 	return true
-}
-
-// Stem allows extension and index probing through the ordinary JS/TS resolver.
-func (b Binding) Stem() string {
-	switch path.Ext(b.File) {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		return strings.TrimSuffix(b.File, path.Ext(b.File))
-	}
-	return b.File
 }

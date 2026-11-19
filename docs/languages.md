@@ -118,8 +118,10 @@ replace (not merge) `paths`. Targets without a `baseUrl` remain relative to the
 config that declares them, while the child config determines the caller scope.
 Generated `.nuxt` configs are read only when explicitly extended; the directory
 is not scanned as an independent scope. Package-specifier `extends` and project
-`references` are not traversed. Cycles and chains deeper than 32 configs stop.
-Repository indexing/reindexing and untracking invalidate the lazy alias cache.
+`references` are not traversed. Cycles and excessively deep chains stop.
+Relative parents are tried as written before the `.json` fallback.
+
+### JS/TS call resolution
 
 Bare JS/TS calls with import evidence resolve at `ast_resolved`, including when
 the repository has only one definition. A named import of the defining symbol
@@ -134,7 +136,11 @@ interleaved mutations, so promotion does not add per-call adjacency queries.
 Prepared Nuxt projects supply their own binding evidence in `.nuxt/imports.d.ts`.
 Relative named exports into the repository, including `original as local`
 renames, resolve bare JS/TS and SFC calls at `ast_resolved` with
-`resolution: nuxt_auto_import`. Explicit imports and same-file definitions win.
+`resolution: nuxt_auto_import`. A generated binding beats an unrelated import
+from a file with a same-named export, but never an explicit local value binding
+or a same-file declaration. Explicit module extensions are tried verbatim;
+`default as local` can target a named default function or a default-exported
+local identifier.
 Package imports, `#app` specifiers, conflicting generated names, and paths
 outside the repository are ignored. Missing generated lists disable this path;
 no composable-directory guessing is performed. Nested Nuxt roots stay scoped.

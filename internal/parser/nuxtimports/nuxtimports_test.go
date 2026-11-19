@@ -9,7 +9,7 @@ import (
 )
 
 func TestGeneratedAppBindings(t *testing.T) {
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "build") // skip rules apply below, not to the checkout itself
 	generated := filepath.Join(root, ".nuxt")
 	require.NoError(t, os.MkdirAll(generated, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(generated, "imports.d.ts"), []byte(`export { useRedirect, original as renamed } from '../app/composables/auth';

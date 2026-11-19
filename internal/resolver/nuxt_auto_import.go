@@ -17,35 +17,37 @@ func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, candidat
 	if r.nuxtAutoImport == nil || e.Kind != graph.EdgeCalls || !isJSTSPath(e.FilePath) || strings.Contains(name, ".") {
 		return false
 	}
-	for _, candidate := range candidates {
-		if candidate.FilePath == e.FilePath && candidate.Kind != graph.KindImport {
-			return false
-		}
+	stem, exported := r.nuxtAutoImport(e.FilePath, name)
+	if stem == "" || exported == "" || hasLocalDeclaration(e.FilePath, candidates) {
+		return false
 	}
 	// Even an unresolved explicit binding shadows a generated global.
 	for _, edge := range r.callerOutEdges(e.FilePath) {
 		if edge.Kind != graph.EdgeImports {
 			continue
 		}
-		if edge.Alias == name {
-			return false
-		}
-		target := r.importedTargetOf(edge)
-		if n := r.cachedGetNode(target); n != nil && n.Kind != graph.KindFile && n.Name == name && edge.Alias == "" {
-			return false
-		}
-		if graph.IsUnresolvedTarget(edge.To) {
-			_, exported := splitImportSpecSymbol(strings.TrimPrefix(graph.UnresolvedName(edge.To), "import::"))
-			if exported == name && edge.Alias == "" {
+		locals, _ := edge.Meta["import_bindings"].(string)
+		for local := range strings.FieldsSeq(locals) {
+			if local == name {
+				// An external package binding cannot name a local neighbour
+				// either. Leave it for external resolution, not name heuristics.
+				if r.importedTargetOf(edge) == "" {
+					stats.Unresolved++
+					return true
+				}
 				return false
 			}
 		}
 	}
-	stem, exported := r.nuxtAutoImport(e.FilePath, name)
-	if stem == "" || exported == "" {
+	file := probeJSTSFile(r.cachedGetNode, stem)
+	if file == "" {
 		return false
 	}
-	file := probeJSTSFile(r.cachedGetNode, stem)
+	if exported == "default" {
+		if local, _ := r.cachedGetNode(file).Meta["default_export"].(string); local != "" {
+			exported = local
+		}
+	}
 	candidate := r.cachedGetNode(file + "::" + exported)
 	if candidate == nil || !isImportableCallee(candidate, exported) {
 		return false

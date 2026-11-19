@@ -22,8 +22,8 @@ import (
 // tree's tsconfig / jsconfig rather than through whatever the checkout holds.
 // Reading the checkout here would not leave an edge missing: it would land a
 // present, WRONG edge, on the file the checkout's config names. The
-// working-copy collection is still loaded once, lazily, and shared via the
-// package-level cache keyed on repo root path; a snapshot's is memoised on the
+// working-copy collection is shared by repo root and refreshed on reindex;
+// a snapshot's is memoised on the
 // Indexer that owns the source (see Indexer.tsAliasCollection).
 func (idx *Indexer) resolvePathAliasImport(callerFile, specifier string) string {
 	return resolveTSPathAliasObserved(idx.tsAliasCollection(), idx.repoPrefix, callerFile, specifier, idx.tsAliasProbes())

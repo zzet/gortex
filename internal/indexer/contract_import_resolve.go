@@ -412,31 +412,6 @@ func invalidateTSAliasCollection(rootPath string) {
 	tsAliasCacheMu.Unlock()
 }
 
-// A config edit changes resolution even when callers' source shapes did not.
-// Refresh once per mutation pass and report whether old bindings may be reused.
-func (idx *Indexer) refreshTSAliasCollection(rootPath string) bool {
-	// Immutable builds use their source-keyed scopes, never the checkout cache.
-	if idx.contentSrc.Load() != nil {
-		return false
-	}
-	idx.contentProof.noteUnboundedReader()
-	nuxtChanged := refreshNuxtImports(rootPath)
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
-	previous, loaded := tsAliasCache[rootPath]
-	current := tsalias.Load(rootPath)
-	tsAliasCache[rootPath] = current
-	return nuxtChanged || (loaded && !previous.Equal(current))
-}
-
-func isAliasCallerPath(filePath string) bool {
-	switch path.Ext(filePath) {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".vue", ".svelte", ".astro":
-		return true
-	}
-	return false
-}
-
 // tsAliasCollectionForTree loads the alias scopes out of one tree.
 //
 // A working-copy tree keeps the process-wide root-keyed cache it has always

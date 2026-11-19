@@ -60,44 +60,63 @@ func jsNamedImportsNode(importNode *sitter.Node) *sitter.Node {
 	return nil
 }
 
-// emitJSPerBindingImports emits one EdgeImports per named binding of an import
-// statement — `import { foo, bar as baz } from "mod"` yields an edge to
-// unresolved::import::mod::foo and one to unresolved::import::mod::bar with
-// Alias "baz". The module-level import edge is emitted separately by the
-// caller and left untouched; these per-binding edges let find_usages and
-// dependency analysis answer "who imports `foo` from mod" instead of only
-// "who imports mod". Over jsImportBindingCap bindings the per-binding edges are
-// skipped (the module edge still records the dependency).
-func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePath string, src []byte, result *parser.ExtractionResult) {
-	// Vue template tags refer to the local default binding, which need not
-	// match the component filename. Retain it on the module edge through resolve.
-	if strings.Contains(filePath, ".vue#script:") {
-		if clause := findChildByType(importNode, "import_clause"); clause != nil {
-			for _, id := range jsCollectChildren(clause, "identifier") {
-				for i := len(result.Edges) - 1; i >= 0; i-- {
-					edge := result.Edges[i]
-					if edge.Kind == graph.EdgeImports && edge.From == fileID && edge.To == "unresolved::import::"+importPath {
-						if edge.Meta == nil {
-							edge.Meta = map[string]any{}
-						}
-						edge.Meta["vue_default_import"] = id.Content(src)
-						break
-					}
-				}
+// Match only a named implementation or a local identifier, not an arbitrary
+// expression containing an identifier. Anonymous exports have no symbol ID.
+const jsDefaultExportQuery = `
+  (program (export_statement "default" declaration: (function_declaration name: (identifier) @default.name)))
+  (program (export_statement "default" value: (identifier) @default.name))
+`
+
+// emitJSImports retains value bindings on the module edge: a per-symbol edge
+// can converge onto that edge when resolution finds the file but not the export.
+func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string, line int, src []byte, result *parser.ExtractionResult) {
+	module := &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	}
+	result.Edges = append(result.Edges, module)
+	if importNode == nil {
+		return
+	}
+	var locals strings.Builder
+	addLocal := func(name string) {
+		if locals.Len() != 0 {
+			locals.WriteByte(' ')
+		}
+		locals.WriteString(name)
+	}
+	typeOnly := tsImportStatementTypeOnly(importNode, src)
+	if clause := findChildByType(importNode, "import_clause"); clause != nil && !typeOnly {
+		if id := findChildByType(clause, "identifier"); id != nil {
+			name := id.Content(src)
+			addLocal(name)
+			if strings.Contains(filePath, ".vue#script:") {
+				module.Meta = map[string]any{"vue_default_import": name}
+			}
+		}
+		if ns := findChildByType(clause, "namespace_import"); ns != nil {
+			if id := findChildByType(ns, "identifier"); id != nil {
+				addLocal(id.Content(src))
 			}
 		}
 	}
-	named := jsNamedImportsNode(importNode)
-	if named == nil {
-		return
-	}
-	specs := jsCollectChildren(named, "import_specifier")
-	if len(specs) == 0 || len(specs) > jsImportBindingCap {
-		return
+	var specs []*sitter.Node
+	if named := jsNamedImportsNode(importNode); named != nil {
+		specs = jsCollectChildren(named, "import_specifier")
 	}
 	for _, sp := range specs {
 		orig, alias := jsSpecifierNames(sp, src)
 		if orig == "" {
+			continue
+		}
+		if !typeOnly && !tsSpecifierTypeOnly(sp, src) {
+			if alias == "" {
+				addLocal(orig)
+			} else {
+				addLocal(alias)
+			}
+		}
+		if len(specs) > jsImportBindingCap {
 			continue
 		}
 		edge := &graph.Edge{
@@ -109,6 +128,12 @@ func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePa
 			edge.Meta = map[string]any{"import_alias": alias}
 		}
 		result.Edges = append(result.Edges, edge)
+	}
+	if locals.Len() != 0 {
+		if module.Meta == nil {
+			module.Meta = map[string]any{}
+		}
+		module.Meta["import_bindings"] = locals.String()
 	}
 }
 

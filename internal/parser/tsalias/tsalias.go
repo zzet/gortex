@@ -312,12 +312,8 @@ func stripExt(p string) string {
 // over the content source that serves the tree, so a build that describes a
 // commit never has to reach for the checkout to learn its alias scopes.
 type Tree interface {
-	// Files calls visit with the repo-relative slash path of every file the
-	// tree serves as content, in any order. An implementation with real
-	// directories may skip descending one SkipDirName names — a saving only:
-	// LoadTree applies that rule itself, to every path it is offered. Walk
-	// errors are swallowed, not reported: one unreadable corner of a
-	// repository must not drop every alias in it.
+	// Files enumerates repo-relative candidates. A snapshot can offer every
+	// path; a checkout can prune irrelevant directories and filenames.
 	Files(visit func(rel string))
 	// Read returns the bytes at a repo-relative slash path.
 	Read(rel string) ([]byte, bool)
@@ -416,8 +412,12 @@ func Load(repoRoot string) *Collection {
 	if repoRoot == "" {
 		return nil
 	}
-	return LoadTree(dirTree{root: repoRoot})
+	return LoadTree(WorkingTree(repoRoot))
 }
+
+// WorkingTree enumerates project config candidates in a checkout. Generated
+// Nuxt directories contribute only their import list, not another alias scope.
+func WorkingTree(root string) Tree { return dirTree{root: root} }
 
 // dirTree is the working copy at a root: the tree Load reads.
 type dirTree struct{ root string }
@@ -439,9 +439,17 @@ func (t dirTree) Files(visit func(rel string)) {
 			return nil
 		}
 		if d.IsDir() {
-			if SkipDirName(d.Name()) {
+			if p != t.root && SkipDirName(d.Name()) {
+				if d.Name() == ".nuxt" {
+					if rel, err := filepath.Rel(t.root, p); err == nil {
+						visit(path.Join(filepath.ToSlash(rel), "imports.d.ts"))
+					}
+				}
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if !IsConfigFileName(d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(t.root, p)
@@ -517,6 +525,17 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 		return configOptions{}
 	}
 	data, ok := t.Read(rel)
+	if depth > 0 {
+		*parentsRead = append(*parentsRead, rel)
+		if !ok && !strings.HasSuffix(rel, ".json") {
+			rel += ".json"
+			*parentsRead = append(*parentsRead, rel)
+			if active[rel] {
+				return configOptions{}
+			}
+			data, ok = t.Read(rel)
+		}
+	}
 	if !ok {
 		return configOptions{}
 	}
@@ -547,14 +566,10 @@ func loadConfigOptions(t Tree, rel string, active map[string]bool, depth int, pa
 			continue
 		}
 		parent = strings.ReplaceAll(parent, `\`, "/")
-		if path.Ext(parent) == "" {
-			parent += ".json"
-		}
 		parent = path.Join(path.Dir(rel), parent)
 		if !filepath.IsLocal(filepath.FromSlash(parent)) {
 			continue
 		}
-		*parentsRead = append(*parentsRead, parent)
 		inherited := loadConfigOptions(t, parent, active, depth+1, parentsRead)
 		if inherited.baseURL != "" {
 			effective.baseURL = inherited.baseURL

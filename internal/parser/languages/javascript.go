@@ -20,6 +20,7 @@ import (
 // the name is already owned by an arrow.
 const qJSAll = `
 [
+` + jsDefaultExportQuery + `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
@@ -175,6 +176,9 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	parser.EachMatch(e.qAll, root, src, func(m parser.QueryResult) {
 		switch {
+
+		case m.Captures["default.name"] != nil:
+			fileNode.Meta = map[string]any{"default_export": m.Captures["default.name"].Text}
 
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
@@ -851,14 +855,7 @@ func (e *JavaScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 	importPath := m.Captures["import.path"].Text
 	def := m.Captures["import.def"]
 	line := def.StartLine + 1
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + importPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-	})
-	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
-	if def.Node != nil {
-		emitJSPerBindingImports(def.Node, importPath, fileID, filePath, src, result)
-	}
+	emitJSImports(def.Node, importPath, fileID, filePath, line, src, result)
 }
 
 // emitReExport records the alias-aware re-export edges for an

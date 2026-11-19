@@ -30,6 +30,23 @@ func TestLoad_Extends(t *testing.T) {
 			want: "app/composables/auth",
 		},
 		{
+			name: "dotted relative parent with implicit json extension",
+			configs: map[string]string{
+				"tsconfig.json":      `{"extends":"./tsconfig.base"}`,
+				"tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
+			},
+			want: "app/composables/auth",
+		},
+		{
+			name: "exact parent takes precedence over json fallback",
+			configs: map[string]string{
+				"tsconfig.json":      `{"extends":"./tsconfig.base"}`,
+				"tsconfig.base":      `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
+				"tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["wrong/*"]}}}`,
+			},
+			want: "app/composables/auth",
+		},
+		{
 			name: "child baseUrl rebases inherited paths",
 			configs: map[string]string{
 				"tsconfig.json":    `{"extends":"./config/base.json","compilerOptions":{"baseUrl":"app"}}`,

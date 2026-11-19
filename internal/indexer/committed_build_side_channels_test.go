@@ -918,7 +918,7 @@ func tsAliasCacheEntry(root string) (*tsalias.Collection, bool) {
 }
 
 // TestSnapshotAliasScopesNeitherReadNorFillTheProcessCache pins the cache
-// keying. tsAliasCache is keyed by repo ROOT and never invalidated, so a
+// keying. tsAliasCache is keyed by repo ROOT, so without source isolation a
 // committed build and the live index at the same root would share one
 // checkout-derived Collection. A sourced load must ignore a primed entry for
 // its root and must not leave one behind.

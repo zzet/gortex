@@ -367,7 +367,7 @@ func (idx *Indexer) reindexIncrementalChunk(
 		// structural stage whatever its fingerprints say
 		// (deletion_importers.go).
 		forced := idx.forceReparse(filePath) || len(legacyIDs) > 0
-		aliasChanged := idx.aliasResolutionChanged && isAliasCallerPath(graphPath)
+		aliasChanged := idx.mustReresolve(graphPath)
 		inert := !aliasChanged && probeOK && storedGraph.semantic != "" &&
 			probe.fingerprints.semantic == storedGraph.semantic &&
 			probe.fingerprints.metadata == storedGraph.metadata &&
@@ -767,7 +767,7 @@ func (idx *Indexer) commitIncrementalStages(
 		stage.reuse, stage.priorPending = captureIncrementalStateFromView(
 			stage.priorNodes, view.outByNode, view.nodesByID,
 		)
-		if idx.aliasResolutionChanged && isAliasCallerPath(stage.graphPath) {
+		if idx.mustReresolve(stage.graphPath) {
 			stage.reuse, stage.priorPending = nil, nil
 			stage.metadataOnly = false
 		}
