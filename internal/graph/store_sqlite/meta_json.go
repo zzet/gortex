@@ -336,6 +336,11 @@ func encodeMeta(m map[string]any) ([]byte, error) {
 	if len(m) == 0 {
 		return nil, nil
 	}
+	// Exact JS module dependencies have a partial expression index. Keep just
+	// those rows in the existing JSON wire format so SQLite can seek the key.
+	if _, indexed := m[graph.JSBindingModuleMeta]; indexed {
+		return json.Marshal(m)
+	}
 	if b, ok := encodeMetaFast(m); ok {
 		return b, nil
 	}

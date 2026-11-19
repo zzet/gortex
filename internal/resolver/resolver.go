@@ -665,8 +665,7 @@ type Resolver struct {
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
 
-	nuxtAutoImport    NuxtAutoImportResolver
-	nuxtIncomingNames func(string, func(string))
+	nuxtAutoImport NuxtAutoImportResolver
 
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
@@ -2856,7 +2855,7 @@ func (f incrementalFileFrontier) incomingKeys() []string {
 // TestIncrementalFrontierKeepsOneIncomingReadPastTheScopedKeyCap.
 func (r *Resolver) collectIncrementalFileFrontier(filePaths []string) incrementalFileFrontier {
 	return collectIncrementalFileFrontierKeys(
-		r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor, r.extraIncomingKeys)
+		r.graph, filePaths, r.incrementalSkipped, true, r.incomingCarryFor, r.vanishedDeclarationKeys)
 }
 
 func collectIncrementalFileFrontier(
@@ -3758,7 +3757,6 @@ func (r *Resolver) resolveIncomingLocked(filePath string, stats *ResolveStats) {
 		seen[n.Name] = struct{}{}
 		stubKeys = append(stubKeys, graph.UnresolvedNameCandidateIDs(n)...)
 	}
-	stubKeys = r.appendNuxtIncomingKeys(stubKeys, filePath, defNodes)
 	if len(stubKeys) == 0 {
 		return
 	}
@@ -3995,9 +3993,13 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if resolutionExempt(e) {
 		return oldTo, false
 	}
-	priorBinding, _ := e.Meta[pendingJSBinding].(string)
-	if priorBinding != "" {
-		delete(e.Meta, pendingJSBinding)
+	priorBinding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	delete(e.Meta, graph.JSPendingBindingMeta)
+	priorModule, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	if e.Meta[graph.JSImportSourceMeta] != nil && (e.Kind == graph.EdgeReExports || e.Meta[graph.JSForwardsImportMeta] == true) {
+		if stem, _ := r.jsBindingSource(e); stem != "" {
+			e.Meta[graph.JSBindingModuleMeta] = graph.JSModuleStem(stem)
+		}
 	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
@@ -4158,8 +4160,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		}
 	}
 
-	binding, _ := e.Meta[pendingJSBinding].(string)
-	return oldTo, e.To != oldTo || binding != priorBinding
+	binding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	module, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	return oldTo, e.To != oldTo || binding != priorBinding || module != priorModule
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -4660,16 +4663,16 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
-		for _, c := range candidates {
-			if c.Kind == graph.KindParam && strings.HasPrefix(c.ID, e.From+"#param:") {
-				// Calling a parameter gives no evidence for an implementation
-				// of that name in the module or its imports.
-				parkJSBinding(e, "parameter", stats)
-				return
-			}
+		lexical, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
+		if lexical == graph.JSPendingParameter {
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return
 		}
-		if !strings.Contains(funcName, ".") && !hasLocalValue(e.FilePath, candidates) &&
-			(r.tryResolveExplicitImport(e, funcName, stats) || r.tryResolveNuxtAutoImport(e, funcName, stats)) {
+		if lexical == "" && !strings.Contains(funcName, ".") && (r.tryResolveExplicitImport(e, funcName, stats) || r.tryResolveNuxtAutoImport(e, funcName, stats)) {
+			return
+		}
+		if lexical == "local" && !hasLocalValue(e.FilePath, candidates) {
+			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
 		}
 	}

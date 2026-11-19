@@ -404,6 +404,50 @@ func (dw *DeltaWriter) composeEdgesByKindOver(s deltaStack, kind EdgeKind) ([]*E
 	return out, true
 }
 
+// JSModuleDependencyLookup returns a reverse lookup for one mutation. The
+// production store seeks its partial index. On a sparse view, project only the
+// small overlay layers; never enumerate the bottom store's entire call graph.
+func JSModuleDependencyLookup(r Reader) func(string) []*Edge {
+	if indexed, ok := r.(interface{ JSModuleDependents(string) []*Edge }); ok {
+		return indexed.JSModuleDependents
+	}
+	kinds := []EdgeKind{EdgeCalls, EdgeImports, EdgeReExports}
+	byKey := map[string][]*Edge{}
+	add := func(e *Edge) {
+		if key, _ := e.Meta[JSBindingModuleMeta].(string); key != "" {
+			byKey[key] = append(byKey[key], e)
+		}
+	}
+	if dw, ok := r.(*DeltaWriter); ok {
+		s := dw.stack()
+		if s.base != nil {
+			base := JSModuleDependencyLookup(s.base)
+			for i, l := range s.layers {
+				for _, e := range dw.layerEdgesOfKinds(l, kinds) {
+					if e != nil && s.edgeVisibleFrom(e, i+1) {
+						add(e)
+					}
+				}
+			}
+			return func(key string) []*Edge {
+				out := cloneDeltaEdges(byKey[key])
+				for _, e := range base(key) {
+					if s.edgeVisibleFrom(e, 0) {
+						out = append(out, cloneDeltaEdge(e))
+					}
+				}
+				return out
+			}
+		}
+	}
+	for _, kind := range kinds {
+		for e := range r.EdgesByKind(kind) {
+			add(e)
+		}
+	}
+	return func(key string) []*Edge { return byKey[key] }
+}
+
 // composedNodesByKind answers NodesByKind through the stack, like
 // composedEdgesByKind.
 func (dw *DeltaWriter) composedNodesByKind(kind NodeKind) ([]*Node, bool) {

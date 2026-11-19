@@ -47,7 +47,7 @@ type incrementalBatchStage struct {
 	storedDerived          derivedFingerprints
 	probe                  fileDeltaProbe
 	resolutionStale        bool
-	nuxtCallers            []string
+	bindingCallers         []string
 	metadataOnly           bool
 	priorRawEdgesCompleted bool
 	edgeRefreshes          []graph.EdgeReindex
@@ -168,7 +168,8 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		zap.Int("deleted_files", len(deletedFiles)))
 	defer deleteTiming.abort()
 	deletion := markerBatch.publicationStamps().beginPatchLap(patchApply)
-	idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
+	_, _, parked := idx.evictDeletedFilesBatched(deletedFiles, &invalidation)
+	idx.rebindParkedCalls(parked, markerBatch)
 	deletion.end()
 	deleteTiming.complete(nil)
 
@@ -1252,11 +1253,15 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	idx.relinkImportNodesToModules(nodes)
 	idx.applyLap("relink")
 
-	var nuxtCallers []string
+	var bindingCallers, changedModules []string
 	for _, stage := range stages {
-		nuxtCallers = append(nuxtCallers, stage.nuxtCallers...)
+		bindingCallers = append(bindingCallers, stage.bindingCallers...)
+		if jsModuleSurfaceChanged(stage.graphPath, stage.priorNodes, stage.result.Nodes) {
+			changedModules = append(changedModules, stage.graphPath)
+		}
 	}
-	idx.rebindParkedNuxtCalls(nuxtCallers, markerBatch)
+	bindingCallers = append(bindingCallers, parkModuleDependents(idx.graph, changedModules)...)
+	idx.rebindParkedCalls(bindingCallers, markerBatch)
 	if !deferResolverCatchup {
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
@@ -1497,7 +1502,7 @@ func restubIncomingRefsFromView(
 	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
 		frontier := restubFrontierForStage(stage, view)
-		defaultChanged := closureJSTSPath(stage.graphPath) && fileDefaultExport(stage.priorNodes) != fileDefaultExport(extractionNodes(stage.result))
+		jsModule := closureJSTSPath(stage.graphPath)
 		// Separator repair changes identity, not the declaration contract.
 		// The normal shape/visibility/parameter gates still decide every carry.
 		if !frontier.conservative {
@@ -1506,6 +1511,9 @@ func restubIncomingRefsFromView(
 			}
 		}
 		for _, node := range stage.priorNodes {
+			if jsModule && node != nil && (stage.result == nil || node.Kind != graph.KindFile) {
+				reindexes, stage.bindingCallers = restubJSImports(view.inByNode[node.ID], evicted, reindexes, stage.bindingCallers)
+			}
 			if node != nil && node.Kind == graph.KindFile {
 				// Another file's import of this one is recorded in the
 				// importer and names this file node, whose identity (the
@@ -1514,7 +1522,7 @@ func restubIncomingRefsFromView(
 				// is not reparsed — so re-state it.
 				if _, survives := frontier.survivingIDs[node.ID]; survives || frontier.conservative {
 					for _, edge := range view.inByNode[node.ID] {
-						if edge == nil || edge.Kind != graph.EdgeImports {
+						if edge == nil || graph.IsUnresolvedTarget(edge.To) || (edge.Kind != graph.EdgeImports && edge.Kind != graph.EdgeReExports) {
 							continue
 						}
 						if _, sourceEvicted := evicted[edge.From]; sourceEvicted {
@@ -1636,7 +1644,8 @@ func restubIncomingRefsFromView(
 					continue
 				}
 				oldTo := edge.To
-				if parkNuxtCall(edge, restub || defaultChanged, &stage.nuxtCallers) {
+				if restub && parkExactCall(edge) {
+					stage.bindingCallers = append(stage.bindingCallers, edge.FilePath)
 					reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 					continue
 				}
@@ -2588,7 +2597,8 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	// recover this file's records from a sibling's canonical scalar payload.
 	idx.ensureIncrementalContractRegistry()
 	var invalidation DerivedInvalidationPlan
-	nodesRemoved, edgesRemoved := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
+	nodesRemoved, edgesRemoved, parked := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, parked...)
 	graphPath := idx.prefixPath(relPath)
 	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, dependencyFiles...)
@@ -2638,9 +2648,9 @@ func (idx *Indexer) removeIncrementalContractsForFile(graphPath string, plan *De
 	plan.ContractSymbolIDs = appendUniqueSorted(plan.ContractSymbolIDs, refresh.SymbolIDs...)
 }
 
-func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan) (nodesRemoved, edgesRemoved int) {
+func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan) (nodesRemoved, edgesRemoved int, parked []string) {
 	if len(deleted) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 	defer idx.flushFileIndexFailures()
 	idx.goModuleSourceMu.Lock()
@@ -2714,6 +2724,10 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		idx.deleteRefFactsForFiles(idx.repoPrefix, graphPaths)
 		idx.clearIncrementalContent(graphPaths)
 		nodes, edges := evictFilesBatched(idx.graph, graphPaths)
+		parked = append(parked, parkModuleDependents(idx.graph, graphPaths)...)
+		for _, stage := range stages {
+			parked = append(parked, stage.bindingCallers...)
+		}
 		// This is an authoritative deletion, including legacy files without
 		// accepted inventory. Establish the graph tombstone before sidecar
 		// cleanup so constant ownership cannot restore a live file receipt.
@@ -2728,7 +2742,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 	}
 	idx.mtimeMu.Unlock()
 	idx.clearRecoveredParseErrors(nil, nil, deleted)
-	return nodesRemoved, edgesRemoved
+	return nodesRemoved, edgesRemoved, appendUniqueSorted(nil, parked...)
 }
 
 func (idx *Indexer) deleteEnrichmentByNodeIDs(nodeIDs []string) {

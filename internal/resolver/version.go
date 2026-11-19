@@ -46,7 +46,8 @@ import (
 // Nuxt app bindings, exact named imports and inherited TS aliases change JS/TS call targets.
 // Named forwarding edges and caller-owned shadow checks change JS/TS call bindings.
 // Exact module bindings follow renamed exports and stop at Nuxt app boundaries.
-const ResolutionSemanticsVersion = 10
+// Lexical bindings and module export surfaces decide exact JS/TS calls.
+const ResolutionSemanticsVersion = 11
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

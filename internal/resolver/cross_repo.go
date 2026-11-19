@@ -1386,14 +1386,14 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
 	file := cr.callerFileID(e)
-	pending, _ := e.Meta[pendingJSBinding].(string)
-	if pending != "" && pending != "import" {
+	pending, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	if pending != "" && pending != graph.JSPendingImport {
 		stats.Unresolved++
 		return
 	}
 	if target := cr.jsTSBindingsByFile[file][funcName]; target != "" {
 		if imported := cr.cachedGetNode(target); imported != nil && (imported.Kind == graph.KindFunction || imported.Kind == graph.KindMethod) {
-			delete(e.Meta, pendingJSBinding)
+			delete(e.Meta, graph.JSPendingBindingMeta)
 			e.To = imported.ID
 			stats.Resolved++
 			if isCrossRepoHop(cr.callerRepoPrefix(e), imported.RepoPrefix) {

@@ -400,7 +400,7 @@ func Load(repoRoot string) *Collection {
 }
 
 // WorkingTree visits config candidates plus an optional file in a pruned
-// directory (for example, a generated list supplied by another loader).
+// directory. The optional extra has exactly the form "directory/file".
 func WorkingTree(root, extra string, scopeFiles ...string) Tree {
 	dir, file := path.Split(extra)
 	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file, scopeFiles: scopeFiles}

@@ -103,35 +103,55 @@ func (r *Resolver) tryResolveExplicitImport(e *graph.Edge, name string, stats *R
 			continue
 		}
 		bindings, _ := imp.Meta[graph.ImportBindingsMeta].(string)
-		for item := range strings.FieldsSeq(bindings) {
-			local, exported, renamed := strings.Cut(item, ":")
-			if local != name {
-				continue
-			}
-			if !renamed {
-				exported = local
-			}
-			if target := r.exportedCallee(r.importedFileOf(imp), exported); target != nil {
-				bindImportCall(e, target, "import_closure", stats)
-			} else {
-				parkJSBinding(e, "import", stats)
-			}
+		if exported := graph.JSBinding(bindings, name); exported != "" {
+			stem, file := r.jsBindingSource(imp)
+			r.resolveExactCall(e, name, stem, file, exported, graph.JSPendingImport, "import_closure", stats)
 			return true
 		}
 	}
 	return false
 }
 
-// A known binding without an indexed implementation is not a candidate for
-// later name-only passes (notably React's useX convention). Keep the ordinary
-// unresolved target so a newly indexed declaration still wakes the caller.
-const pendingJSBinding = "pending_js_binding"
+// Expand the source spelling even if the old import row was parked on an
+// external stub, or resolved before a higher priority module existed.
+func (r *Resolver) jsBindingSource(e *graph.Edge) (stem, file string) {
+	spec, _ := e.Meta[graph.JSImportSourceMeta].(string)
+	spec, _ = splitImportSpecSymbol(spec)
+	stem = expandJSTSSpecifier(r.pathAlias, e.FilePath, spec)
+	if stem == "" {
+		if rewritten, ok := rewriteNpmAliasImport(r.npmAlias, e.FilePath, spec); ok {
+			stem = expandJSTSSpecifier(r.pathAlias, e.FilePath, rewritten)
+		}
+	}
+	if stem != "" {
+		return stem, probeJSTSFile(r.cachedGetNode, stem)
+	}
+	file = r.importedFileOf(e)
+	return file, file
+}
+
+func (r *Resolver) resolveExactCall(e *graph.Edge, local, stem, file, exported, kind, evidence string, stats *ResolveStats) {
+	if e.Meta == nil {
+		e.Meta = make(map[string]any)
+	}
+	e.Meta[graph.JSBindingNameMeta] = local
+	if stem != "" {
+		e.Meta[graph.JSBindingModuleMeta] = graph.JSModuleStem(stem)
+	} else {
+		delete(e.Meta, graph.JSBindingModuleMeta)
+	}
+	if target := r.exportedCallee(file, exported); target != nil {
+		bindImportCall(e, target, evidence, stats)
+	} else {
+		parkJSBinding(e, kind, stats)
+	}
+}
 
 func parkJSBinding(e *graph.Edge, binding string, stats *ResolveStats) {
 	if e.Meta == nil {
 		e.Meta = make(map[string]any)
 	}
-	e.Meta[pendingJSBinding] = binding
+	e.Meta[graph.JSPendingBindingMeta] = binding
 	stats.Unresolved++
 }
 
@@ -144,12 +164,9 @@ func bindImportCall(e *graph.Edge, target *graph.Node, evidence string, stats *R
 	stats.Resolved++
 }
 
-// Follow the export's own forwarding edge, or value-star exports if the
-// module has no declaration of that name. Never search its ordinary imports.
+// A named export (including a local alias or an imported value) wins over
+// stars. Stars never forward default and two distinct implementations conflict.
 func (r *Resolver) exportedCallee(file, name string) *graph.Node {
-	if file == "" || name == "*" {
-		return nil
-	}
 	type binding struct{ file, name string }
 	pending := []binding{{file, name}}
 	var seen map[binding]bool
@@ -157,45 +174,72 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 	for len(pending) > 0 {
 		b := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		if b.file == "" || seen[b] {
+		if b.file == "" || b.name == graph.JSNamespaceBinding || seen[b] {
 			continue
 		}
-		id := b.file + "::" + b.name
-		n := r.cachedGetNode(id)
-		if n == nil && b.name == "default" {
-			f := r.cachedGetNode(b.file)
-			if f == nil {
-				continue
-			}
-			local, _ := f.Meta[graph.DefaultExportMeta].(string)
-			if local == "" {
-				continue
-			} // export * never forwards default
-			n = r.cachedGetNode(b.file + "::" + local)
+		f := r.cachedGetNode(b.file)
+		if f == nil {
+			continue
 		}
-		owner, nextName := b.file, b.name
-		named := graph.IsReExportNode(n)
-		if named {
-			owner = n.ID
-			if orig, _ := n.Meta["reexport_original"].(string); orig != "" {
-				nextName = orig
-			}
-		} else if n != nil {
-			if isImportableCallee(n, n.Name) {
+		locals, _ := f.Meta[graph.JSLocalExportsMeta].(string)
+		local := graph.JSBinding(locals, b.name)
+		if local == "" && b.name == graph.JSDefaultBinding {
+			local, _ = f.Meta[graph.DefaultExportMeta].(string)
+		}
+		if local != "" {
+			if n := r.cachedGetNode(b.file + "::" + local); n != nil && !graph.IsReExportNode(n) && isImportableCallee(n, local) {
 				if pick != nil && pick.ID != n.ID {
 					return nil
-				} // ambiguous star
+				}
 				pick = n
+				continue
 			}
-			continue
 		}
 		if seen == nil {
-			seen = make(map[binding]bool)
+			seen = map[binding]bool{}
 		}
 		seen[b] = true
-		for _, edge := range r.callerOutEdges(owner) {
-			if edge.Kind == graph.EdgeReExports && (named || edge.Meta[graph.StarReExportMeta] == true) {
-				pending = append(pending, binding{r.importedFileOf(edge), nextName})
+		if local == "" {
+			if n := r.cachedGetNode(b.file + "::" + b.name); graph.IsReExportNode(n) {
+				orig, _ := n.Meta["reexport_original"].(string)
+				if orig == "" {
+					orig = b.name
+				}
+				for _, edge := range r.callerOutEdges(n.ID) {
+					if edge.Kind == graph.EdgeReExports {
+						_, file := r.jsBindingSource(edge)
+						pending = append(pending, binding{file, orig})
+					}
+				}
+				continue
+			}
+		}
+		edges := r.callerOutEdges(b.file)
+		explicit := false
+		for _, edge := range edges {
+			bindings, _ := edge.Meta[graph.ImportBindingsMeta].(string)
+			var forwarded string
+			switch {
+			case local != "" && edge.Kind == graph.EdgeImports:
+				forwarded = graph.JSBinding(bindings, local)
+			case local == "" && edge.Kind == graph.EdgeReExports:
+				forwarded = graph.JSBinding(bindings, b.name)
+			default:
+				continue
+			}
+			if forwarded != "" {
+				explicit = true
+				_, file := r.jsBindingSource(edge)
+				pending = append(pending, binding{file, forwarded})
+			}
+		}
+		if local != "" || explicit || b.name == graph.JSDefaultBinding {
+			continue
+		}
+		for _, edge := range edges {
+			if edge.Kind == graph.EdgeReExports && edge.Meta[graph.StarReExportMeta] == true {
+				_, file := r.jsBindingSource(edge)
+				pending = append(pending, binding{file, b.name})
 			}
 		}
 	}

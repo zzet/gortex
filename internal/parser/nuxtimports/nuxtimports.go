@@ -25,8 +25,7 @@ type scope struct {
 
 // Collection keeps generated lists scoped to their Nuxt project roots.
 type Collection struct {
-	scopes       []scope
-	localsByStem map[string][]string
+	scopes []scope
 }
 
 var exportRE = regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
@@ -76,7 +75,7 @@ func LoadTree(tree tsalias.Tree) *Collection {
 		}
 		if generated {
 			roots[root] = parse(".", dir, string(data))
-		} else if _, exists := roots[root]; !exists {
+		} else if _, exists := roots[root]; !exists && path.Base(path.Dir(root)) != "layers" {
 			roots[root] = nil
 		}
 	})
@@ -97,14 +96,7 @@ func collection(scopes []scope) *Collection {
 		}
 		return scopes[i].Root < scopes[j].Root
 	})
-	c := &Collection{scopes: scopes, localsByStem: make(map[string][]string)}
-	for _, scope := range scopes {
-		for local, binding := range scope.Bindings {
-			stem := moduleStem(binding.File)
-			c.localsByStem[stem] = append(c.localsByStem[stem], local)
-		}
-	}
-	return c
+	return &Collection{scopes: scopes}
 }
 
 func parse(repoRoot, generatedDir, source string) map[string]Binding {
@@ -140,34 +132,6 @@ func parse(repoRoot, generatedDir, source string) map[string]Binding {
 		delete(bindings, name)
 	}
 	return bindings
-}
-
-// VisitLocals reports candidate caller spellings for the incoming stub frontier.
-// Forward resolution still checks the exact extension, caller scope and export.
-func (c *Collection) VisitLocals(file string, visit func(string)) {
-	if c == nil {
-		return
-	}
-	stem := moduleStem(file)
-	for _, name := range c.localsByStem[stem] {
-		visit(name)
-	}
-	if path.Base(stem) == "index" {
-		for _, name := range c.localsByStem[path.Dir(stem)] {
-			visit(name)
-		}
-	}
-}
-
-func moduleStem(file string) string {
-	if strings.HasSuffix(file, ".d.ts") {
-		return strings.TrimSuffix(file, ".d.ts")
-	}
-	switch ext := path.Ext(file); ext {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		return strings.TrimSuffix(file, ext)
-	}
-	return file
 }
 
 // Resolve never applies app imports to Nitro server files or generated files.

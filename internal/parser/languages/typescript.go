@@ -22,7 +22,6 @@ import (
 // walks up from the matched node to find the enclosing class.
 const tsQAll = `
 [
-` + jsDefaultExportQuery + `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
@@ -153,8 +152,7 @@ type deferredCall struct {
 	receiver string // receiver text for member calls
 	line     int    // 1-based line of the call_expression
 	isMember bool
-	// expr is the call_expression node, kept for member calls so the
-	// post-pass can inspect arguments for pub/sub topic detection.
+	// Used for bare-call scope and member-call pub/sub evidence.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -200,6 +198,8 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	recordJSExports(root, src, fileNode)
+	var scopes jsScopeCache
 
 	imports := map[string]string{}
 	arrowNames := map[string]bool{}
@@ -249,11 +249,6 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	parser.EachMatch(qAll, root, src, func(m parser.QueryResult) {
 		switch {
-		case m.Captures["default.name"] != nil:
-			if fileNode.Meta == nil {
-				fileNode.Meta = make(map[string]any)
-			}
-			fileNode.Meta[graph.DefaultExportMeta] = m.Captures["default.name"].Text
 
 		case m.Captures["func.def"] != nil:
 			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
@@ -306,6 +301,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			calls = append(calls, deferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
+				expr:        expr.Node,
 				returnUsage: classifyReturnUsage(expr.Node, src, jsTSReturnUsageSpec),
 			})
 
@@ -501,6 +497,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
 			stampReturnUsage(edge, c.returnUsage)
+			scopes.stamp(edge, c.expr, c.name, src)
 			result.Edges = append(result.Edges, edge)
 			continue
 		}

@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"path"
 	"strings"
 	"time"
 )
@@ -309,11 +310,79 @@ var validNodeKinds = map[NodeKind]bool{
 
 // Persisted JS/TS binding evidence shared by extraction, resolution and restubbing.
 const (
-	DefaultExportMeta  = "default_export"
-	ImportBindingsMeta = "import_bindings"
-	StarReExportMeta   = "star_reexport"
-	NuxtImportNameMeta = "nuxt_import_name"
+	DefaultExportMeta    = "default_export"
+	ImportBindingsMeta   = "import_bindings"
+	StarReExportMeta     = "star_reexport"
+	JSBindingNameMeta    = "js_binding_name"   // caller spelling on exact calls only
+	JSBindingModuleMeta  = "js_binding_module" // reverse lookup key for calls and forwarding modules
+	JSImportSourceMeta   = "js_import_source"
+	JSLocalExportsMeta   = "js_local_exports"
+	JSForwardsImportMeta = "js_forwards_import"
+	JSLexicalBindingMeta = "js_lexical_binding"
+	JSPendingBindingMeta = "pending_js_binding"
+	JSPendingImport      = "import"
+	JSPendingGenerated   = "nuxt"
+	JSPendingParameter   = "parameter"
+	JSDefaultBinding     = "default"
+	JSNamespaceBinding   = "*"
 )
+
+// AppendJSBinding encodes one identifier pair. Unrenamed bindings need only
+// one identifier; JS identifiers cannot contain whitespace or a colon.
+func AppendJSBinding(b *strings.Builder, local, original string) {
+	if b.Len() != 0 {
+		b.WriteByte(' ')
+	}
+	b.WriteString(local)
+	if local != original {
+		b.WriteByte(':')
+		b.WriteString(original)
+	}
+}
+
+func JSBinding(bindings, local string) string {
+	for pair := range strings.FieldsSeq(bindings) {
+		name, orig, renamed := strings.Cut(pair, ":")
+		if name == local {
+			if renamed {
+				return orig
+			}
+			return name
+		}
+	}
+	return ""
+}
+
+// JSExportsImport reports whether a local export names a value in this import.
+func JSExportsImport(exports, defaultLocal, imports string) bool {
+	if defaultLocal != "" && JSBinding(imports, defaultLocal) != "" {
+		return true
+	}
+	for pair := range strings.FieldsSeq(exports) {
+		_, local, renamed := strings.Cut(pair, ":")
+		if !renamed {
+			local = pair
+		}
+		if JSBinding(imports, local) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// JSModuleStem is a conservative reverse-lookup key, not a forward resolver.
+func JSModuleStem(file string) string {
+	for _, ext := range [...]string{".d.ts", ".d.cts", ".d.mts"} {
+		if strings.HasSuffix(file, ext) {
+			return strings.TrimSuffix(file, ext)
+		}
+	}
+	switch ext := path.Ext(file); ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
+		return strings.TrimSuffix(file, ext)
+	}
+	return file
+}
 
 type Node struct {
 	ID        string   `json:"id"`

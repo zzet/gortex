@@ -792,7 +792,6 @@ func New(g graph.Store, reg *parser.Registry, cfg config.IndexConfig, logger *za
 	// to their real file. Same lazy-build rationale.
 	idx.resolver.SetPathAliasResolver(idx.resolvePathAliasImport)
 	idx.resolver.SetNuxtAutoImportResolver(idx.resolveNuxtAutoImport)
-	idx.resolver.SetNuxtIncomingNames(idx.visitNuxtIncomingNames)
 	// Break same-named import collisions in favour of the importer's
 	// own package-manager workspace member. Same lazy-build rationale.
 	idx.resolver.SetWorkspaceMembership(idx.indexerWorkspaceMembership)
@@ -2971,10 +2970,8 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if err != nil {
 		return nil, err
 	}
-	if idx.resolutionInputsChanged || idx.deferResolve.Load() && inputs != nil && len(inputs.reads) != 0 {
-		if err := idx.fenceResolutionWrites(inputs); err != nil {
-			return nil, err
-		}
+	if err := idx.fenceResolutionWrites(inputs, idx.deferResolve.Load()); err != nil {
+		return nil, err
 	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
@@ -5290,7 +5287,7 @@ func (idx *Indexer) indexFile(
 	// so it must be captured before evictExisting runs.
 	priorNodes, legacyIDs, legacyPath := idx.filePriorWithLegacy(graphPath, idx.graph.GetFileNodes(graphPath))
 	var legacyCarried []*graph.Edge
-	var nuxtCallers []string
+	var bindingCallers []string
 	var oldFuncIDs []string
 	evictExisting := func(result *parser.ExtractionResult) {
 		idx.invalidateGoModuleSourceStamp(relPath)
@@ -5313,7 +5310,7 @@ func (idx *Indexer) indexFile(
 		idx.deleteSymbolFTS(oldFTSNodeIDs)
 		var npmConsumers []string
 		if len(legacyIDs) == 0 {
-			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &nuxtCallers)
+			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers)
 		} else {
 			// Extraction is still unprefixed here. Build only the identity surface
 			// needed by the same incoming frontier used by the structural batch.
@@ -5329,7 +5326,7 @@ func (idx *Indexer) indexFile(
 			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
 			stages := []*incrementalBatchStage{stage}
 			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages))
-			nuxtCallers = stage.nuxtCallers
+			bindingCallers = stage.bindingCallers
 		}
 		if markerBatch != nil {
 			markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
@@ -5615,7 +5612,10 @@ func (idx *Indexer) indexFile(
 	idx.graph.AddBatch(result.Nodes, append(result.Edges, legacyCarried...))
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
-	idx.rebindParkedNuxtCalls(nuxtCallers, markerBatch)
+	if jsModuleSurfaceChanged(graphPath, priorNodes, result.Nodes) {
+		bindingCallers = append(bindingCallers, parkModuleDependents(idx.graph, []string{graphPath})...)
+	}
+	idx.rebindParkedCalls(bindingCallers, markerBatch)
 	// No subsequent stage reads source bytes or the parse tree. Release both
 	// here instead of retaining them through resolver/enrichment work; the
 	// deferred calls above remain as idempotent guards for every early return.
@@ -6147,7 +6147,7 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
 	return idx.restubIncomingRefsForReplacement(graphPath, nil)
 }
 
-func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, nuxtCallers *[]string) []string {
+func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string) []string {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
 		return nil
@@ -6172,6 +6172,15 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, nuxtCalle
 	inEdges := idx.graph.GetInEdgesByNodeIDs(refIDs)
 	npmConsumers := restubTrackedNpmImportsFromView(idx.graph, evicted, inEdges)
 	var batch []graph.EdgeReindex
+	if closureJSTSPath(graphPath) {
+		for _, edges := range inEdges {
+			var files []string
+			batch, files = restubJSImports(edges, evicted, batch, files)
+			if bindingCallers != nil {
+				*bindingCallers = append(*bindingCallers, files...)
+			}
+		}
+	}
 	for _, n := range nodes {
 		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
 			continue
@@ -6188,7 +6197,10 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, nuxtCalle
 				continue // already a pending stub
 			}
 			oldTo := e.To
-			if parkNuxtCall(e, true, nuxtCallers) {
+			if parkExactCall(e) {
+				if bindingCallers != nil {
+					*bindingCallers = append(*bindingCallers, e.FilePath)
+				}
 				batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 				continue
 			}
@@ -7401,6 +7413,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	var staleFiles []string
 	var forcedDeletedFiles []string
 	var discoveryFailed []string
+	var missingRetry []string
 	var walkedDirs []string
 
 	merkleMode := idx.merkleEnabled()
@@ -7423,9 +7436,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if idx.resolutionInputsChanged && !fullRoot {
 		extra = []string{absRoot}
 	} else if idx.resolutionRetry != nil && !fullRoot {
-		paths = slices.Clip(paths)
 		for rel := range idx.resolutionRetry.files {
-			paths = append(paths, rel)
+			extra = append(extra, rel)
 		}
 	}
 	for _, discovery := range []struct {
@@ -7461,8 +7473,11 @@ func (idx *Indexer) incrementalReindexPathsMode(
 					// A build that proves its reads records the absence: the
 					// path's rows leave the payload on it.
 					idx.contentProof.recordRead(absPath, nil, statErr)
-					if mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
+					if discovery.requested && mode.forceExplicitFiles && idx.incrementalPathOwned(absPath) {
 						forcedDeletedFiles = append(forcedDeletedFiles, idx.relKey(absPath))
+					} else if !discovery.requested && !relPathInScope(idx.relKey(absPath), scopeRels) && idx.incrementalPathOwned(absPath) {
+						// The old rows still exist. Only an owning deletion request can certify them gone.
+						missingRetry = append(missingRetry, absPath)
 					}
 					continue
 				}
@@ -7689,11 +7704,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if len(markerBatches) > 0 && markerBatches[0] != nil {
 		markerBatch = markerBatches[0]
 	}
-	if idx.resolutionInputsChanged || markerBatch.deferResolverCatchup && inputs != nil && len(inputs.reads) != 0 &&
-		(slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath)) {
-		if err := idx.fenceResolutionWrites(inputs); err != nil {
-			return nil, err
-		}
+	deferredJS := markerBatch.deferResolverCatchup && (slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath))
+	if err := idx.fenceResolutionWrites(inputs, deferredJS); err != nil {
+		return nil, err
 	}
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
@@ -7708,7 +7721,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation.Merge(manifestPlan)
 	failedFiles = appendUniqueSorted(failedFiles, manifestFailed...)
 	failedFiles = appendUniqueSorted(failedFiles, discoveryFailed...)
-	invalidation.Files = appendUniqueSorted(invalidation.Files, markerBatch.nuxtCallers...)
+	failedFiles = appendUniqueSorted(failedFiles, missingRetry...)
+	invalidation.Files = appendUniqueSorted(invalidation.Files, markerBatch.bindingCallers...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.structuralFiles = appendUniqueSorted(invalidation.structuralFiles, idx.graphFilePaths(reparsedFiles)...)
 	invalidation.Files = appendUniqueSorted(invalidation.Files, deletedDependencyFiles...)
@@ -7844,7 +7858,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		completion.failed = appendUniqueSorted(completion.failed, versionChangedFiles...)
 	}
 	if idx.deferResolve.Load() {
-		completion.frontier = appendUniqueSorted(invalidation.Files, markerBatch.nuxtCallers...)
+		completion.frontier = invalidation.Files
 	}
 	return result, nil
 }

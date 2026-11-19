@@ -211,7 +211,7 @@ type reparsePendingEnrichmentBatch struct {
 	relationsRead    *relationsReadFrontier
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
-	nuxtCallers           []string
+	bindingCallers        []string
 	resolution            resolutionCompletion
 	byFile                map[string]bool
 	deferResolverCatchup  bool

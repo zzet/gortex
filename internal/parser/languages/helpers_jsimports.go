@@ -60,12 +60,147 @@ func jsNamedImportsNode(importNode *sitter.Node) *sitter.Node {
 	return nil
 }
 
-// Match only a named implementation or a local identifier, not an arbitrary
-// expression containing an identifier. Anonymous exports have no symbol ID.
-const jsDefaultExportQuery = `
-  (program (export_statement "default" declaration: (function_declaration name: (identifier) @default.name)))
-  (program (export_statement "default" value: (identifier) @default.name))
-`
+// visitJSPattern enumerates bindings, not property keys, types or initializers.
+func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "identifier", "type_identifier", "shorthand_property_identifier_pattern":
+		visit(n.Content(src))
+	case "required_parameter", "optional_parameter":
+		visitJSPattern(n.ChildByFieldName("pattern"), src, visit)
+	case "pair_pattern":
+		visitJSPattern(n.ChildByFieldName("value"), src, visit)
+	case "assignment_pattern", "object_assignment_pattern":
+		visitJSPattern(n.ChildByFieldName("left"), src, visit)
+	case "formal_parameters", "object_pattern", "array_pattern", "rest_pattern":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			visitJSPattern(n.NamedChild(i), src, visit)
+		}
+	}
+}
+
+func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
+		visitJSPattern(n.ChildByFieldName("name"), src, visit)
+	case "lexical_declaration", "variable_declaration":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			v := n.NamedChild(i)
+			if v.Type() == "variable_declarator" {
+				visitJSPattern(v.ChildByFieldName("name"), src, visit)
+			}
+		}
+	}
+}
+
+// Only the program's export statements define the module's value surface.
+func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
+	var bindings strings.Builder
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		s := root.NamedChild(i)
+		if s.Type() != "export_statement" || s.ChildByFieldName("source") != nil || tsExportStatementTypeOnly(s, src) {
+			continue
+		}
+		decl := s.ChildByFieldName("declaration")
+		if findChildByType(s, "default") != nil {
+			var local string
+			if value := s.ChildByFieldName("value"); value != nil && value.Type() == "identifier" {
+				local = value.Content(src)
+			} else {
+				visitJSDeclaration(decl, src, func(n string) { local = n })
+			}
+			if local != "" {
+				if file.Meta == nil {
+					file.Meta = map[string]any{}
+				}
+				file.Meta[graph.DefaultExportMeta] = local
+			}
+			continue
+		}
+		visitJSDeclaration(decl, src, func(n string) { graph.AppendJSBinding(&bindings, n, n) })
+		if clause := findChildByType(s, "export_clause"); clause != nil {
+			for _, sp := range jsCollectChildren(clause, "export_specifier") {
+				orig, alias := jsSpecifierNames(sp, src)
+				if orig != "" && !tsSpecifierTypeOnly(sp, src) {
+					if alias == "" {
+						alias = orig
+					}
+					graph.AppendJSBinding(&bindings, alias, orig)
+				}
+			}
+		}
+	}
+	if bindings.Len() != 0 {
+		if file.Meta == nil {
+			file.Meta = map[string]any{}
+		}
+		file.Meta[graph.JSLocalExportsMeta] = bindings.String()
+	}
+}
+
+// Cache direct declarations once per scope. A sibling function's declarations
+// cannot shadow this call; parameters of every enclosing function can.
+type jsScopeKey struct {
+	start, end uint32
+	kind       string
+}
+type jsScopeCache map[jsScopeKey]map[string]string
+
+func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
+	for n := expr.Parent(); n != nil; n = n.Parent() {
+		kind := n.Type()
+		switch kind {
+		case "program", "statement_block", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		default:
+			continue
+		}
+		key := jsScopeKey{n.StartByte(), n.EndByte(), kind}
+		names, ok := (*cache)[key]
+		if !ok {
+			add := func(name, value string) {
+				if names == nil {
+					names = map[string]string{}
+				}
+				names[name] = value
+			}
+			switch kind {
+			case "program", "statement_block":
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					s := n.NamedChild(i)
+					if s.Type() == "export_statement" {
+						s = s.ChildByFieldName("declaration")
+					}
+					visitJSDeclaration(s, src, func(id string) { add(id, "local") })
+				}
+			case "for_statement", "for_in_statement":
+				visitJSDeclaration(n.ChildByFieldName("initializer"), src, func(id string) { add(id, "local") })
+				if n.ChildByFieldName("kind") != nil {
+					visitJSPattern(n.ChildByFieldName("left"), src, func(id string) { add(id, "local") })
+				}
+			default:
+				param := func(id string) { add(id, graph.JSPendingParameter) }
+				visitJSPattern(n.ChildByFieldName("parameters"), src, param)
+				visitJSPattern(n.ChildByFieldName("parameter"), src, param)
+			}
+			if *cache == nil {
+				*cache = jsScopeCache{}
+			}
+			(*cache)[key] = names
+		}
+		if binding := names[name]; binding != "" {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta[graph.JSLexicalBindingMeta] = binding
+			return
+		}
+	}
+}
 
 // emitJSImports retains value bindings on the module edge: a per-symbol edge
 // can converge onto that edge when resolution finds the file but not the export.
@@ -79,28 +214,15 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		return
 	}
 	var locals strings.Builder
-	addLocal := func(name, exported string) {
-		if locals.Len() != 0 {
-			locals.WriteByte(' ')
-		}
-		locals.WriteString(name)
-		if name != exported {
-			locals.WriteByte(':')
-			locals.WriteString(exported)
-		}
-	}
 	typeOnly := tsImportStatementTypeOnly(importNode, src)
 	if clause := findChildByType(importNode, "import_clause"); clause != nil && !typeOnly {
 		if id := findChildByType(clause, "identifier"); id != nil {
 			name := id.Content(src)
-			addLocal(name, "default")
-			if strings.Contains(filePath, ".vue#script:") {
-				module.Meta = map[string]any{"vue_default_import": name}
-			}
+			graph.AppendJSBinding(&locals, name, graph.JSDefaultBinding)
 		}
 		if ns := findChildByType(clause, "namespace_import"); ns != nil {
 			if id := findChildByType(ns, "identifier"); id != nil {
-				addLocal(id.Content(src), "*")
+				graph.AppendJSBinding(&locals, id.Content(src), graph.JSNamespaceBinding)
 			}
 		}
 	}
@@ -115,9 +237,9 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		}
 		if !typeOnly && !tsSpecifierTypeOnly(sp, src) {
 			if alias == "" {
-				addLocal(orig, orig)
+				graph.AppendJSBinding(&locals, orig, orig)
 			} else {
-				addLocal(alias, orig)
+				graph.AppendJSBinding(&locals, alias, orig)
 			}
 		}
 		if len(specs) > jsImportBindingCap {
@@ -134,10 +256,16 @@ func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string,
 		result.Edges = append(result.Edges, edge)
 	}
 	if locals.Len() != 0 {
-		if module.Meta == nil {
-			module.Meta = map[string]any{}
+		bindings := locals.String()
+		module.Meta = map[string]any{graph.ImportBindingsMeta: bindings, graph.JSImportSourceMeta: importPath}
+		if len(result.Nodes) > 0 && result.Nodes[0].Kind == graph.KindFile {
+			meta := result.Nodes[0].Meta
+			exports, _ := meta[graph.JSLocalExportsMeta].(string)
+			def, _ := meta[graph.DefaultExportMeta].(string)
+			if graph.JSExportsImport(exports, def, bindings) {
+				module.Meta[graph.JSForwardsImportMeta] = true
+			}
 		}
-		module.Meta[graph.ImportBindingsMeta] = locals.String()
 	}
 }
 
@@ -167,9 +295,23 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 	if clause := findChildByType(exportNode, "export_clause"); clause != nil {
 		specs := jsCollectChildren(clause, "export_specifier")
 		if len(specs) > jsImportBindingCap {
+			var bindings strings.Builder
+			if !tsExportStatementTypeOnly(exportNode, src) {
+				for _, sp := range specs {
+					orig, alias := jsSpecifierNames(sp, src)
+					if orig == "" || tsSpecifierTypeOnly(sp, src) {
+						continue
+					}
+					if alias == "" {
+						alias = orig
+					}
+					graph.AppendJSBinding(&bindings, alias, orig)
+				}
+			}
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: fileID, To: "unresolved::import::" + importPath,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: line,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath, graph.ImportBindingsMeta: bindings.String()},
 			})
 			return
 		}
@@ -184,6 +326,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			edge := &graph.Edge{
 				From: fileID, To: "unresolved::import::" + importPath + "::" + orig,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath + "::" + orig},
 			}
 			if alias != "" && alias != orig {
 				edge.Alias = alias
@@ -233,6 +376,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			forward := &graph.Edge{
 				From: nodeID, To: "unresolved::import::" + importPath + "::" + orig,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath + "::" + orig},
 			}
 			if publicName != orig {
 				forward.Alias = publicName
@@ -245,6 +389,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 	edge := &graph.Edge{
 		From: fileID, To: "unresolved::import::" + importPath,
 		Kind: graph.EdgeReExports, FilePath: filePath, Line: line,
+		Meta: map[string]any{graph.JSImportSourceMeta: importPath},
 	}
 	// `export * as ns from "mod"` — record the namespace alias.
 	if ns := findChildByType(exportNode, "namespace_export"); ns != nil {
@@ -252,7 +397,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			edge.Alias = id.Content(src)
 		}
 	} else if !tsExportStatementTypeOnly(exportNode, src) {
-		edge.Meta = map[string]any{graph.StarReExportMeta: true}
+		edge.Meta[graph.StarReExportMeta] = true
 	}
 	result.Edges = append(result.Edges, edge)
 }

@@ -1005,7 +1005,6 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetNpmDependencyLookup(mi.npmDependencyLookup())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
 	master.SetNuxtAutoImportResolver(mi.nuxtAutoImportResolver())
-	master.SetNuxtIncomingNames(mi.visitNuxtIncomingNames)
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	master.SetGoPackageOwnershipInventoryFactory(mi.prepareGoPackageOwnership)
 	master.SetGoModules(mi.trackedGoModules())
@@ -3345,10 +3344,8 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
 			// content-addressed full-tree incremental check. A non-Merkle
-			// repository lands here only when its persisted extractor
-			// versions (or post-extraction policy epoch) are behind the
-			// running binary: the full-tree pass restages the stale
-			// languages and re-stamps the snapshot, so it fires once per bump.
+			// repository also comes here for stale extractor versions or unknown
+			// or changed resolution inputs, neither of which touches source mtimes.
 			route = "incremental"
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
 		case manifestOnly && idx.merkleEnabled():

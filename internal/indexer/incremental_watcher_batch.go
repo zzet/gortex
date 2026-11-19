@@ -125,6 +125,15 @@ func (o *derivedFanoutObservation) closeReceiptFanoutFacts() []graph.ReceiptFano
 	return append([]graph.ReceiptFanoutTruncation(nil), o.facts...)
 }
 
+func (batch *reparsePendingEnrichmentBatch) resolutionFrontier(result *IndexResult, receipt *graph.MutationReceipt) ([]string, bool, bool) {
+	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	if batch != nil && len(batch.bindingCallers) > 0 {
+		files = appendUniqueSorted(files, batch.bindingCallers...)
+		needed = true
+	}
+	return files, needed, exact
+}
+
 // incrementalResolutionFrontier chooses the narrowest quality-safe resolver
 // scope. A complete receipt is authoritative. Stores without receipt support
 // can still use the successful-file DerivedInvalidationPlan emitted by the
@@ -386,10 +395,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	if err != nil {
 		return result, err
 	}
-	files, needed, exact := incrementalResolutionFrontier(result, receipt)
-	if len(batch.nuxtCallers) > 0 {
-		files, needed = appendUniqueSorted(files, batch.nuxtCallers...), true
-	}
+	files, needed, exact := batch.resolutionFrontier(result, receipt)
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
@@ -596,10 +602,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	batch *reparsePendingEnrichmentBatch,
 	exactPointSemantic bool,
 ) []string {
-	files, needed, _ := incrementalResolutionFrontier(result, receipt)
-	if batch != nil && len(batch.nuxtCallers) > 0 {
-		files, needed = appendUniqueSorted(files, batch.nuxtCallers...), true
-	}
+	files, needed, _ := batch.resolutionFrontier(result, receipt)
 	wide := false
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()

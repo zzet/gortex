@@ -416,7 +416,7 @@ func reusableResolvedEdge(e *graph.Edge) bool {
 	if e == nil || e.To == "" {
 		return false
 	}
-	if _, generated := e.Meta[graph.NuxtImportNameMeta]; generated {
+	if _, exact := e.Meta[graph.JSBindingNameMeta]; exact {
 		return false // the reuse key names the implementation, not the caller's binding
 	}
 	if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {

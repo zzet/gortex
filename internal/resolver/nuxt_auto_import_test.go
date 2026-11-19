@@ -94,3 +94,30 @@ func TestExplicitImportPastBindingCapThroughStarBarrel(t *testing.T) {
 	New(g).ResolveAll()
 	require.Equal(t, "lib/impl.ts::actual", callEdgeTo(g, "app/page.ts::run", 2))
 }
+
+func TestExactExportSurface(t *testing.T) {
+	names := []string{"actual as useIt"}
+	for i := range 66 {
+		names = append(names, fmt.Sprintf("x%d", i))
+	}
+	for _, tc := range []struct{ name, barrel, exported string }{
+		{"private helper before star", "function useIt(){}; export * from './impl'", "useIt"},
+		{"large named list", "export {" + strings.Join(names, ",") + "} from './impl'", "useIt"},
+		{"local export alias", "import {actual} from './impl'; export {actual as useIt}", "useIt"},
+		{"default imported value", "import {actual} from './impl'; export default actual", "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := buildGraphFromSources(t, map[string]string{"lib/impl.ts": "export function actual(){};export {actual as useIt}", "lib/barrel.ts": tc.barrel, "page.ts": "import {" + tc.exported + " as local} from './lib/barrel'\nexport function run(){local()}"})
+			New(g).ResolveAll()
+			require.Equal(t, "lib/impl.ts::actual", callEdgeTo(g, "page.ts::run", 2))
+		})
+	}
+}
+func TestNuxtLexicalClosure(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{"lib.ts": "export function useIt(){}", "page.ts": "function outer(useIt: Function){\n function inner(){useIt()}\n}\nfunction sibling(){function useIt(){}}\nexport function run(){useIt()}"})
+	r := New(g)
+	r.SetNuxtAutoImportResolver(func(_, name string) (string, string) { return "lib", name })
+	r.ResolveAll()
+	require.Equal(t, "unresolved::useIt", callEdgeTo(g, "page.ts::inner", 2))
+	require.Equal(t, "lib.ts::useIt", callEdgeTo(g, "page.ts::run", 5))
+}

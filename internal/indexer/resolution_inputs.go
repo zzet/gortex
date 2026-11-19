@@ -121,12 +121,13 @@ type resolutionInputStore interface {
 	SetResolutionInputDigest(repo, digest string) error
 }
 
-func discoverResolutionInputs(root string, proof *buildContentProof) *resolutionInputs {
+func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutionInputs, error) {
 	proof.noteUnboundedReader()
-	dir, _ := os.OpenRoot(root)
-	if dir != nil {
-		defer dir.Close()
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
 	}
+	defer dir.Close()
 	t := &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir, reads: make(map[string]string), proof: proof}
 	t.Tree.Files(func(rel string) { t.paths = append(t.paths, rel) })
 	current := &resolutionInputs{aliases: tsalias.LoadScopes(t.Files, t.Read, t.Tree.Exists), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
@@ -136,7 +137,7 @@ func discoverResolutionInputs(root string, proof *buildContentProof) *resolution
 		writeFingerprintString(h, current.reads[rel])
 	}
 	current.digest = hex.EncodeToString(h.Sum(nil))
-	return current
+	return current, nil
 }
 
 type resolutionCompletion struct {
@@ -162,7 +163,10 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 	if idx.manifestTree().sourced() {
 		return true
 	}
-	current := discoverResolutionInputs(root, nil)
+	current, err := discoverResolutionInputs(root, nil)
+	if err != nil {
+		return false
+	}
 	store := idx.resolutionStore()
 	if store == nil {
 		prior := idx.appliedResolution.Load()
@@ -197,7 +201,11 @@ func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInpu
 	idx.resolutionInputsChanged = retry != nil && retry.files == nil
 	current := prior
 	if !prior.unchangedForPoint(root, point, idx.contentProof) {
-		current = discoverResolutionInputs(root, idx.contentProof)
+		var err error
+		current, err = discoverResolutionInputs(root, idx.contentProof)
+		if err != nil {
+			return nil, err
+		}
 		if prior != nil {
 			idx.resolutionInputsChanged = idx.resolutionInputsChanged || !prior.aliases.Equal(current.aliases) || !prior.nuxt.Equal(current.nuxt)
 		}
@@ -220,8 +228,8 @@ func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInpu
 
 // Invalidate the certificate before binding rows can be replaced. A deferred
 // resolver can leave a gap even when the input bytes themselves did not change.
-func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs) error {
-	if inputs == nil {
+func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs, deferredWrites bool) error {
+	if inputs == nil || (!idx.resolutionInputsChanged && !(deferredWrites && len(inputs.reads) != 0)) {
 		return nil
 	}
 	if store := idx.resolutionStore(); store != nil {
@@ -255,7 +263,12 @@ func workingResolutionInputs(root string, proof *buildContentProof) *resolutionI
 	resolutionCache.Lock()
 	inputs := resolutionCache.byRoot[root]
 	if inputs == nil {
-		inputs = discoverResolutionInputs(root, proof)
+		var err error
+		inputs, err = discoverResolutionInputs(root, proof)
+		if err != nil {
+			resolutionCache.Unlock()
+			return &resolutionInputs{}
+		}
 		resolutionCache.byRoot[root] = inputs
 		resolutionCache.Unlock()
 		return inputs

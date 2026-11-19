@@ -111,14 +111,8 @@ import (
 //     an Lstat of every ancestor of every read at the fence, for a layout
 //     (a symlinked directory inside a checkout, swapped twice mid-build)
 //     checkouts rarely hold.
-//   - Process-wide caches that hold bytes read before the build's sample:
-//     the C/C++ include directories from compile_commands.json (keyed by the
-//     database's mtime; the lookup's probes are claimed), and the
-//     tsconfig / jsconfig alias cache beyond the configs its scopes came
-//     from (a config that parsed to no scope is not held; the first load is
-//     a whole-tree scan, unbounded). Their staleness predates the proof and
-//     is the same for every build of the process, main's included; the proof
-//     holds what the build itself read, and their invalidation is theirs.
+//   - Cached C/C++ include directories from compile_commands.json predate the
+//     sample and are keyed by mtime. The lookup probes themselves are claimed.
 //   - The legacy unscoped contract path (no contract-core runtime, which the
 //     daemon never builds without): it reads cross-file handler sources and
 //     their directories beyond what the proof records, so on the equal-sample

@@ -279,3 +279,66 @@ func TestNuxtResolutionRejectsEscapingExtends(t *testing.T) {
 	require.Empty(t, idx.resolvePathAliasImport("page.ts", "@secret"))
 	require.Empty(t, in.reads["link/base.json"], "an out-of-root read cannot supply a content hash")
 }
+
+func TestExactBindingModuleEdits(t *testing.T) {
+	const page = "export function run(){return local()}"
+	const defs = "function first(){}\nfunction second(){}\nexport default "
+	for _, tc := range []struct{ name, initial, editPath, fresh, barrel, exp, want1, want2 string }{
+		{"repoint barrel", "export function first(){};export function second(){}", "barrel.ts", "export {second as publicIt} from './impl'", "export {first as publicIt} from './impl'", "publicIt", "impl.ts::first", "impl.ts::second"},
+		{"change default", defs + "first", "impl.ts", defs + "second", "", "default", "impl.ts::first", "impl.ts::second"},
+		{"rename default", "export default function first(){}", "impl.ts", "export default function second(){}", "", "default", "impl.ts::first", "impl.ts::second"},
+		{"add missing export", "export const other=1", "impl.ts", "export function actual(){}", "", "actual", "unresolved::local", "impl.ts::actual"},
+		{"add forwarded module", "", "impl.ts", "export function actual(){}", "export {actual as publicIt} from './impl'", "publicIt", "unresolved::local", "impl.ts::actual"},
+		{"add forwarded local import", "", "impl.ts", "export function actual(){}", "import {actual} from './impl'; export default actual", "default", "unresolved::local", "impl.ts::actual"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			module := "impl"
+			if tc.initial != "" {
+				writeFileMk(t, filepath.Join(root, "impl.ts"), tc.initial)
+			}
+			if tc.barrel != "" {
+				module = "barrel"
+				writeFileMk(t, filepath.Join(root, "barrel.ts"), tc.barrel)
+			}
+			writeFileMk(t, filepath.Join(root, "explicit.ts"), "import {"+tc.exp+" as local} from './"+module+"'\n"+page)
+			writeFileMk(t, filepath.Join(root, "generated.ts"), page)
+			writeFileMk(t, filepath.Join(root, ".nuxt/imports.d.ts"), "export {"+tc.exp+" as local} from '../"+module+"'")
+			idx, _ := newSQLiteIndexer(t)
+			_, err := idx.Index(root)
+			require.NoError(t, err)
+			check := func(want string) {
+				t.Helper()
+				for _, file := range []string{"explicit.ts", "generated.ts"} {
+					require.Equal(t, want, callTargetForName(t, idx.Graph(), file, "run"), file)
+				}
+			}
+			check(tc.want1)
+			changed := filepath.Join(root, tc.editPath)
+			bumpMtime(t, changed, tc.fresh)
+			_, err = idx.incrementalPointWatcherPath(root, changed)
+			require.NoError(t, err)
+			check(tc.want2)
+		})
+	}
+}
+func TestNuxtResolutionRetryCannotDelete(t *testing.T) {
+	root := t.TempDir()
+	page := filepath.Join(root, "page.ts")
+	list := filepath.Join(root, ".nuxt/imports.d.ts")
+	writeFileMk(t, page, "export function run(){useIt()}")
+	writeFileMk(t, list, "export {useIt} from '../old'")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	idx.transforms.transforms = append(idx.transforms.transforms, movingNuxtFile{file: page})
+	writeFileMk(t, list, "export {useIt} from '../new'")
+	result, err := idx.IncrementalReindexPaths(root, []string{list})
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, page)
+	require.NoError(t, os.Remove(page))
+	result, err = idx.IncrementalReindexPaths(root, []string{list})
+	require.NoError(t, err)
+	require.Zero(t, result.DeletedFileCount)
+	require.NotNil(t, idx.Graph().GetNode("page.ts::run"))
+}
