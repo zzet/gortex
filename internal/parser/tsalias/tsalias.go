@@ -23,9 +23,8 @@
 //     suffix; the substring matched by `*` is slotted into the target
 //     at the corresponding `*` position.
 //   - Patterns without `*` are exact-match.
-//   - Targets are joined with `baseUrl` (if set) and returned without
-//     the trailing `.ts/.tsx/.js/.jsx/.mts/.cts` extension — callers
-//     reuse the same probing logic as relative imports.
+//   - Targets are joined with `baseUrl` (if set). Source extensions are
+//     stripped for probing; explicit declaration files retain their suffix.
 //   - Multi-target arrays (`"@/*": ["a/*", "b/*"]`) are resolved by disk
 //     existence: each candidate is probed under the repo root in priority
 //     order and the first that exists on disk wins, falling back to the
@@ -201,9 +200,8 @@ func (c *Collection) FindForFile(relPath string) *Map {
 }
 
 // Resolve maps modulePath against m's aliases and returns the
-// repo-relative target (extension stripped) or "" when no entry
-// matches. The returned path is forward-slashed and rooted at the
-// repository root.
+// repo-relative probe path or "" when no entry matches. aliasProbePath
+// preserves explicit declaration files and strips implementation extensions.
 func Resolve(m *Map, modulePath string) string {
 	if m == nil || modulePath == "" {
 		return ""
@@ -297,7 +295,7 @@ func (m *Map) joinTarget(matched string) string {
 }
 
 // probeExts are the source extensions a path-alias target may resolve to,
-// matching stripExt's set plus declaration / json / index-file forms.
+// including declaration and JSON targets, both direct and under index.
 var probeExts = []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json"}
 
 // targetExistsInTree reports whether the repo-relative joined target resolves

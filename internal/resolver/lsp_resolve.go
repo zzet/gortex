@@ -185,6 +185,7 @@ func deferredLSPWorkKeyForEdge(e *graph.Edge) deferredLSPWorkKey {
 }
 
 type deferredLSPBatchResult struct {
+	dropped             []string
 	newlyResolved       int
 	resolved            int
 	attempted           int
@@ -488,7 +489,11 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	}
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		if !stats.applyReindexes(r.graph, reindexBatch) {
+			result.dropped = stats.DroppedFiles
+			result.resolved, result.newlyResolved = 0, 0
+			return result
+		}
 		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)

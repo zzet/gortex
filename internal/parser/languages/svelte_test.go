@@ -7,10 +7,10 @@ import (
 )
 
 func TestSvelteExtractor(t *testing.T) {
-	const svelte = `<script lang="ts">
+	const svelte = `<script data-note="x > y" lang=ts>
   import { onMount } from 'svelte'
   let count = 0
-  function increment() { count += 1 }
+  function increment(): void { count += 1 }
 </script>
 
 <button on:click={increment}>{count}</button>

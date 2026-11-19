@@ -20,6 +20,10 @@ func (r *Resolver) tryResolveNuxtAutoImport(e *graph.Edge, name string, stats *R
 	if stem == "" {
 		return false
 	}
-	r.resolveExactCall(e, name, stem, probeJSTSFile(r.cachedGetNode, stem), exported, graph.JSPendingGenerated, "nuxt_auto_import", stats)
+	var file string
+	if n := probeJSTSFile(r.cachedGetNode, stem); n != nil {
+		file = n.ID
+	}
+	r.resolveExactCall(e, name, stem, file, exported, graph.JSPendingGenerated, "nuxt_auto_import", stats)
 	return true
 }

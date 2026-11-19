@@ -168,7 +168,11 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		zap.Int("deleted_files", len(deletedFiles)))
 	defer deleteTiming.abort()
 	deletion := markerBatch.publicationStamps().beginPatchLap(patchApply)
-	_, _, parked := idx.evictDeletedFilesBatched(deletedFiles, &invalidation, markerBatch)
+	_, _, parked, err := idx.evictDeletedFilesBatched(deletedFiles, &invalidation, markerBatch)
+	if err != nil {
+		idx.contractRestatementErr = err
+		return invalidation, nil, deletedFiles, nil
+	}
 	idx.rebindParkedCalls(parked, markerBatch)
 	deletion.end()
 	deleteTiming.complete(nil)
@@ -924,6 +928,9 @@ func (idx *Indexer) commitIncrementalStages(
 
 	if len(structural) > 0 {
 		idx.commitStructuralIncrementalBatch(structural, view, markerBatch)
+		if idx.contractRestatementErr != nil {
+			return plan
+		}
 	}
 	if len(metadata) > 0 {
 		idx.commitMetadataIncrementalBatch(metadata)
@@ -1190,18 +1197,6 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		nodes = append(nodes, stage.result.Nodes...)
 		edges = append(edges, stage.result.Edges...)
 		priorPending = append(priorPending, stage.priorPending...)
-		for _, node := range stage.priorNodes {
-			if node == nil {
-				continue
-			}
-			if node.Kind != graph.KindContract {
-				oldFTSNodeIDs = append(oldFTSNodeIDs, node.ID)
-			}
-			idx.removeFromSearch(node)
-			if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
-				oldFuncIDs = append(oldFuncIDs, node.ID)
-			}
-		}
 	}
 
 	idx.applyLap("structural_prepare")
@@ -1217,9 +1212,27 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		markerBatch.recordDeferredPriorBindings(stagePriorBindings(idx.graph, stages, view))
 	}
 	idx.applyLap("prior_bindings")
-	carried, npmConsumers := restubIncomingRefsFromView(idx.graph, stages, view, markerBatch)
+	carried, npmConsumers, err := restubIncomingRefsFromView(idx.graph, stages, view, markerBatch)
+	if err != nil {
+		idx.contractRestatementErr = err
+		return
+	}
 	if markerBatch != nil {
 		markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
+	}
+	for _, stage := range stages {
+		for _, node := range stage.priorNodes {
+			if node == nil {
+				continue
+			}
+			if node.Kind != graph.KindContract {
+				oldFTSNodeIDs = append(oldFTSNodeIDs, node.ID)
+			}
+			idx.removeFromSearch(node)
+			if node.Kind == graph.KindFunction || node.Kind == graph.KindMethod {
+				oldFuncIDs = append(oldFuncIDs, node.ID)
+			}
+		}
 	}
 	idx.applyLap("restub")
 	// The capability state of the files, read before the eviction below
@@ -1291,7 +1304,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		for _, p := range paths {
 			own[p] = struct{}{}
 		}
-		idx.reresolveCSharpGlobalUsingDependents(globalChanged, own)
+		idx.reresolveCSharpGlobalUsingDependents(globalChanged, own, markerBatch)
 	}
 
 	if !idx.deferGlobalPasses.Load() {
@@ -1494,10 +1507,13 @@ func restubIncomingRefsFromView(
 	stages []*incrementalBatchStage,
 	view incrementalPriorView,
 	markerBatch *reparsePendingEnrichmentBatch,
-) ([]*graph.Edge, []string) {
+) ([]*graph.Edge, []string, error) {
 	evicted := structuralPriorIDs(stages)
 	reparsed := reparsedPaths(stages)
-	npmConsumers := restubTrackedNpmImportsFromView(g, evicted, view.inByNode)
+	npmConsumers, err := restubTrackedNpmImportsFromView(g, evicted, view.inByNode)
+	if err != nil {
+		return nil, nil, err
+	}
 	var reindexes []graph.EdgeReindex
 	var carried []*graph.Edge
 	carriedSeen := make(map[*graph.Edge]struct{})
@@ -1668,7 +1684,7 @@ func restubIncomingRefsFromView(
 		}
 	}
 	markerBatch.recordDropped(graph.ApplyEdgeReindexes(g, reindexes))
-	return canonicalizeLegacyCarried(stages, evicted, carried), npmConsumers
+	return canonicalizeLegacyCarried(stages, evicted, carried), npmConsumers, nil
 }
 
 // dataflowSourceSite is a reference's site: the file that records it and its
@@ -2615,7 +2631,12 @@ func (idx *Indexer) evictFileIncrementalRaw(relPath string) forcedFileEviction {
 	// recover this file's records from a sibling's canonical scalar payload.
 	idx.ensureIncrementalContractRegistry()
 	var invalidation DerivedInvalidationPlan
-	nodesRemoved, edgesRemoved, parked := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation, batch)
+	nodesRemoved, edgesRemoved, parked, err := idx.evictDeletedFilesBatched([]string{relPath}, &invalidation, batch)
+	if err != nil {
+		idx.activeResolution.Store(nil)
+		result.mutationErr = err
+		return forcedFileEviction{result: result, batch: batch}
+	}
 	invalidation.Files = appendUniqueSorted(invalidation.Files, parked...)
 	graphPath := idx.prefixPath(relPath)
 	idx.removeIncrementalContractsForFile(graphPath, &invalidation)
@@ -2666,9 +2687,9 @@ func (idx *Indexer) removeIncrementalContractsForFile(graphPath string, plan *De
 	plan.ContractSymbolIDs = appendUniqueSorted(plan.ContractSymbolIDs, refresh.SymbolIDs...)
 }
 
-func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan, markerBatch *reparsePendingEnrichmentBatch) (nodesRemoved, edgesRemoved int, parked []string) {
+func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInvalidationPlan, markerBatch *reparsePendingEnrichmentBatch) (nodesRemoved, edgesRemoved int, parked []string, err error) {
 	if len(deleted) == 0 {
-		return 0, 0, nil
+		return 0, 0, nil, nil
 	}
 	defer idx.flushFileIndexFailures()
 	idx.goModuleSourceMu.Lock()
@@ -2692,7 +2713,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		nodesByFile := idx.graph.GetFileNodesByPaths(graphPaths)
 		stages := make([]*incrementalBatchStage, 0, len(graphPaths))
 		var nodeIDs, ftsNodeIDs []string
-		for i, graphPath := range graphPaths {
+		for _, graphPath := range graphPaths {
 			priorNodes := nodesByFile[graphPath]
 			stage := &incrementalBatchStage{graphPath: graphPath, priorNodes: priorNodes}
 			stages = append(stages, stage)
@@ -2702,17 +2723,6 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 			)
 			deletedPlan.LegacyFallback = !priorDerived.complete()
 			plan.Merge(deletedPlan)
-			for _, node := range priorNodes {
-				if node == nil {
-					continue
-				}
-				nodeIDs = append(nodeIDs, node.ID)
-				if node.Kind != graph.KindContract {
-					ftsNodeIDs = append(ftsNodeIDs, node.ID)
-				}
-				idx.removeFromSearch(node)
-			}
-			_ = i
 		}
 		view := loadIncrementalPriorView(idx.graph, stages)
 		view.inByNode = withoutEdgesRecordedAt(view.inByNode, idx.deletionReparsePaths)
@@ -2730,7 +2740,23 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 		// carry therefore means a deletion stage stopped being conservative,
 		// which would destroy those edges with no compile error to show for
 		// it — so the assumption is checked, not just documented.
-		if carried, _ := restubIncomingRefsFromView(idx.graph, stages, view, markerBatch); len(carried) > 0 {
+		carried, _, err := restubIncomingRefsFromView(idx.graph, stages, view, markerBatch)
+		if err != nil {
+			return nodesRemoved, edgesRemoved, parked, err
+		}
+		for _, priorNodes := range nodesByFile {
+			for _, node := range priorNodes {
+				if node == nil {
+					continue
+				}
+				nodeIDs = append(nodeIDs, node.ID)
+				if node.Kind != graph.KindContract {
+					ftsNodeIDs = append(ftsNodeIDs, node.ID)
+				}
+				idx.removeFromSearch(node)
+			}
+		}
+		if len(carried) > 0 {
 			idx.logger.Error("indexer: deletion restub carried in-edges with no re-state path",
 				zap.String("repo", idx.repoPrefix),
 				zap.Int("carried", len(carried)),
@@ -2760,7 +2786,7 @@ func (idx *Indexer) evictDeletedFilesBatched(deleted []string, plan *DerivedInva
 	}
 	idx.mtimeMu.Unlock()
 	idx.clearRecoveredParseErrors(nil, nil, deleted)
-	return nodesRemoved, edgesRemoved, appendUniqueSorted(nil, parked...)
+	return nodesRemoved, edgesRemoved, appendUniqueSorted(nil, parked...), nil
 }
 
 func (idx *Indexer) deleteEnrichmentByNodeIDs(nodeIDs []string) {

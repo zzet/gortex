@@ -1296,8 +1296,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				if dropped := graph.ApplyEdgeReindexes(r.graph, reindexBatch); len(dropped) > 0 {
-					return resolveError(fmt.Errorf("binding write did not apply; %d caller edges need retry", len(dropped)))
+				if !total.applyReindexes(r.graph, reindexBatch) {
+					return resolveError(total.bindingWriteError())
 				}
 				applyStoreElapsed += time.Since(storeStart)
 				placeholderStart := time.Now()
@@ -1626,6 +1626,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				break
 			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if len(pageResult.dropped) != 0 {
+				total.DroppedFiles = append(total.DroppedFiles, pageResult.dropped...)
+				return resolveError(total.bindingWriteError()) // leave this spool page pending
+			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
 				// to its first skipped key.
@@ -1664,8 +1668,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				if dropped := graph.ApplyEdgeReindexes(r.graph, terminalClears); len(dropped) > 0 {
-					return resolveError(fmt.Errorf("terminal write did not apply; %d edges need retry", len(dropped)))
+				if !total.applyReindexes(r.graph, terminalClears) {
+					return resolveError(total.bindingWriteError())
 				}
 			}
 
@@ -1805,8 +1809,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			jobs := guardJobsFromRecords(r.graph, records)
 			r.warmGuardLookupCache(jobs)
-			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
+			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure, total)
 			r.clearLookupCache()
+			if err := total.bindingWriteError(); err != nil {
+				return resolveError(err)
+			}
 			guardPages++
 			guardJobs += len(jobs)
 			if time.Since(lastGuardLog) > 10*time.Second {
@@ -3480,6 +3487,19 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
+func (stats *ResolveStats) applyReindexes(g graph.Store, batch []graph.EdgeReindex) bool {
+	dropped := graph.ApplyEdgeReindexes(g, batch)
+	stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+	return len(dropped) == 0
+}
+
+func (stats *ResolveStats) bindingWriteError() error {
+	if len(stats.DroppedFiles) == 0 {
+		return nil
+	}
+	return fmt.Errorf("binding write did not apply; %d caller edges need retry", len(stats.DroppedFiles))
+}
+
 func (r *Resolver) applyIncrementalReindexesLocked(
 	reindexBatch []graph.EdgeReindex,
 	jobs []reindexJob,
@@ -3488,8 +3508,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		if dropped := graph.ApplyEdgeReindexes(r.graph, reindexBatch); len(dropped) != 0 {
-			stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+		if !stats.applyReindexes(r.graph, reindexBatch) {
 			return
 		}
 		legs.lap("reindex")
@@ -3517,7 +3536,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs.lap("import_closure")
 	defer legs.lap("cross_package_guard")
 	if len(closure) > 0 {
-		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
+		if guarded := r.guardCrossPackageCallEdges(jobs, closure, stats); guarded > 0 {
 			if stats.Resolved >= guarded {
 				stats.Resolved -= guarded
 			} else {

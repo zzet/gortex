@@ -354,12 +354,12 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 		idx.observeIncrementalCatchup("resolve", nil)
 		eviction.batch.resolution.catchupErr = idx.resolveAll()
 	}
-	if err := idx.finishResolutionPass(eviction.batch.resolution); err != nil {
-		return eviction.nodesRemoved, eviction.edgesRemoved, err
-	}
 	if evictedGlobals {
 		idx.reresolveCSharpGlobalUsingDependents(
-			[]string{graphPath}, map[string]struct{}{graphPath: {}})
+			[]string{graphPath}, map[string]struct{}{graphPath: {}}, eviction.batch)
+	}
+	if err := idx.finishResolutionPass(eviction.batch.resolution); err != nil {
+		return eviction.nodesRemoved, eviction.edgesRemoved, err
 	}
 	if result != nil && result.DeletedFileCount > 0 {
 		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)

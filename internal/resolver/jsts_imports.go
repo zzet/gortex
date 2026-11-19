@@ -114,25 +114,26 @@ func jstsImportTargetAndAliasStem(getNode func(string) *graph.Node, pathAlias Pa
 		alias = graph.JSModuleStem(stem)
 	}
 	file := probeJSTSFile(getNode, stem)
-	if file == "" {
+	if file == nil {
 		return "", alias
 	}
 	if symbol != "" {
-		var symID string
-		if strings.HasSuffix(file, ".vue") {
-			f := getNode(file)
-			if f == nil {
-				return "", alias
+		local := symbol
+		scope, _ := file.Meta[graph.JSExportScopeMeta].(string)
+		explicit := false
+		if scope != "" {
+			locals, _ := file.Meta[graph.JSLocalExportsMeta].(string)
+			if exported := graph.JSBinding(locals, symbol); exported != "" {
+				local = exported
+				explicit = true
 			}
-			symID = graph.JSExportID(f, symbol)
-		} else {
-			symID = file + "::" + symbol
 		}
-		if getNode(symID) != nil {
-			return symID, alias
+		if n := getNode(graph.JSExportID(file, local)); n != nil &&
+			(scope == "" || explicit || n.Meta["exported"] == true || graph.IsReExportNode(n)) {
+			return n.ID, alias
 		}
 	}
-	return file, alias
+	return file.ID, alias
 }
 
 // jsTSImportCallerFile returns the importing file's graph path for an
@@ -167,17 +168,19 @@ func expandJSTSSpecifier(pathAlias PathAliasResolver, callerFile, spec string) s
 	return ""
 }
 
-// probeJSTSFile returns the indexed KindFile node ID an extension-stripped
-// stem resolves to — trying an explicit author-written extension first,
+// probeJSTSFile returns the indexed KindFile node a specifier stem resolves
+// to — trying an explicit author-written extension first,
 // then each source extension, then a directory `index.<ext>` barrel — or
-// "" when no indexed file matches.
-func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
+// nil when no indexed file matches.
+func probeJSTSFile(getNode func(string) *graph.Node, stem string) *graph.Node {
 	if stem == "" {
-		return ""
+		return nil
 	}
-	isFile := func(id string) bool {
-		n := getNode(id)
-		return n != nil && n.Kind == graph.KindFile
+	file := func(id string) *graph.Node {
+		if n := getNode(id); n != nil && n.Kind == graph.KindFile {
+			return n
+		}
+		return nil
 	}
 	// An explicit source extension the author wrote (`./auth.js`) is tried
 	// verbatim first, then — when it names an emitted JavaScript file —
@@ -186,32 +189,29 @@ func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
 	case ".vue", ".svelte", ".astro":
 		// A single-file component is only ever imported by its full name
 		// (`./Foo.vue`); there is no extension probing on top of it.
-		if isFile(stem) {
-			return stem
-		}
-		return ""
+		return file(stem)
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		if isFile(stem) {
-			return stem
+		if n := file(stem); n != nil {
+			return n
 		}
 		base := strings.TrimSuffix(stem, ext)
 		for _, srcExt := range jsTSEmittedSourceExts[ext] {
-			if id := base + srcExt; isFile(id) {
-				return id
+			if n := file(base + srcExt); n != nil {
+				return n
 			}
 		}
 	}
 	for _, ext := range jsTSImportExts {
-		if id := stem + ext; isFile(id) {
-			return id
+		if n := file(stem + ext); n != nil {
+			return n
 		}
 	}
 	for _, ext := range jsTSImportExts {
-		if id := stem + "/index" + ext; isFile(id) {
-			return id
+		if n := file(stem + "/index" + ext); n != nil {
+			return n
 		}
 	}
-	return ""
+	return nil
 }
 
 // splitImportSpecSymbol splits an `import::` edge payload into the module

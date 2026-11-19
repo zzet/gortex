@@ -312,6 +312,17 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 
 func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr error) {
 	if dropped := work.dropped; len(dropped) > 0 {
+		if work.inputs == nil {
+			// A forced re-resolve or non-JS eviction is not an input pass.
+			// Merge its drops with any unfinished retry rather than replacing it.
+			work.inputs, work.success = idx.appliedResolution.Load(), true
+			if retry := idx.resolutionRetry; retry != nil {
+				work.inputs, work.success = retry.inputs, retry.files != nil
+				for rel := range retry.files {
+					work.failed = append(work.failed, filepath.Join(idx.rootPath, filepath.FromSlash(rel)))
+				}
+			}
+		}
 		// Preserve a failure of unknown extent. Otherwise retry only callers
 		// whose invalidation might have been dropped. Restart sees the fence.
 		if work.success || len(work.failed) > 0 {
@@ -323,16 +334,18 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 		}
 		work.success, work.warm = false, false
 		passErr = fmt.Errorf("binding write did not apply; %d caller edges need retry", len(dropped))
+		// Non-JS callers can fail outside the input-change preflight.
+		passErr = errors.Join(passErr, idx.invalidateResolutionDigest())
 	}
 	if work.catchupErr != nil {
 		work.success, work.warm, work.failed = false, false, nil
 		passErr = errors.Join(passErr, work.catchupErr)
 	}
-	if work.inputs == nil {
+	if work.inputs == nil && len(work.dropped) == 0 {
 		return passErr
 	}
 	prior := idx.appliedResolution.Load()
-	needsStamp := prior == nil || prior.digest != work.inputs.digest || idx.resolutionRetry != nil || idx.resolutionInputsChanged
+	needsStamp := prior == nil || work.inputs == nil || prior.digest != work.inputs.digest || idx.resolutionRetry != nil || idx.resolutionInputsChanged
 	idx.resolutionInputsChanged = false
 	if !work.warm {
 		defer idx.activeResolution.Store(nil)
@@ -380,7 +393,7 @@ func (idx *Indexer) stampResolution(inputs *resolutionInputs) error {
 }
 
 func (idx *Indexer) inputsStaleForFile(rel string) bool {
-	return closureJSTSPath(rel) && (idx.resolutionInputsChanged || idx.resolutionRetry != nil && idx.resolutionRetry.files[rel])
+	return idx.resolutionRetry != nil && idx.resolutionRetry.files[rel] || idx.resolutionInputsChanged && closureJSTSPath(rel)
 }
 
 // Capture the passes before the warm resolver starts. A repository mutated in

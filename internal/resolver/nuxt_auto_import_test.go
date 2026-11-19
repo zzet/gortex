@@ -132,6 +132,11 @@ func TestExactModuleScriptExports(t *testing.T) {
 		{"lib.cjs", "function run(){}; exports = {}; exports.run = run", "run", "unresolved::local"},
 		{"lib.cjs", "function run(){}; var exports = {}; exports.run = run", "run", "unresolved::local"},
 		{"lib.cjs", "function run(){}; module.exports = {}; exports = module.exports; exports.named = run", "named", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports = module.exports = {}; exports.run = run", "run", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; module.exports = exports = {}; exports.run = run", "run", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports.__esModule = true; exports.default = run; module.exports = {}", "default", "unresolved::local"},
+		{"lib.mjs", "function run(){}; let exports = {}; exports.named = run", "named", "unresolved::local"},
+		{"lib.mjs", "function run(){}; const exports = {}; exports.named = run", "named", "unresolved::local"},
 		{"lib.cjs", "function run(){}; exports.named = run; delete exports.named", "named", "unresolved::local"},
 		{"lib.vue", "<script data-x='not setup here'>export {real as run} from './dep'</script>", "run", "dep.ts::real"},
 		{"lib.vue", "<script lang='ts'>export function run(){}</script>\n<script setup>function hidden(){}</script>", "run", "lib.vue#script:1::run"},
@@ -143,6 +148,45 @@ func TestExactModuleScriptExports(t *testing.T) {
 			require.Equal(t, tc.want, callEdgeTo(g, "page.ts::go", 2))
 		})
 	}
+}
+
+func TestCompiledCommonJSDefault(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"lib.cjs":  "Object.defineProperty(exports, '__esModule', {value:true}); function actual(){}; exports.default = actual",
+		"page.cts": "import def from './lib.cjs'; export function run(){def()}",
+		"page.mjs": "import def from './lib.cjs'; export function run(){def()}",
+	})
+	New(g).ResolveAll()
+	require.Equal(t, "lib.cjs::actual", callEdgeTo(g, "page.cts::run", 1))
+	require.Equal(t, "unresolved::def", callEdgeTo(g, "page.mjs::run", 1))
+}
+
+func TestVueStarDoesNotImportPrivateFunction(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"lib.vue": "<script>function run(){}; export * from './dep'</script>",
+		"dep.ts":  "export function run(){}",
+		"page.ts": "import {run} from './lib.vue'; export function go(){run()}",
+	})
+	New(g).ResolveAll()
+	require.Equal(t, "dep.ts::run", callEdgeTo(g, "page.ts::go", 1))
+	var imports []string
+	for _, edge := range g.GetOutEdges("page.ts") {
+		if edge.Kind == graph.EdgeImports {
+			imports = append(imports, edge.To)
+		}
+	}
+	require.NotEmpty(t, imports)
+	for _, target := range imports {
+		require.Equal(t, "lib.vue", target)
+	}
+}
+
+func TestBodyVarRedeclaringParameter(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"page.js": "function callback(){}\nexport function run(callback){\n if(false){var callback;}\n callback()\n}",
+	})
+	New(g).ResolveAll()
+	require.Equal(t, "unresolved::callback", callEdgeTo(g, "page.js::run", 4))
 }
 
 func TestBodyVarDoesNotShadowDefaultParameter(t *testing.T) {

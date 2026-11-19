@@ -88,7 +88,9 @@ func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
 		return
 	}
 	switch n.Type() {
-	case "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
+	case "ambient_declaration":
+		visitJSDeclaration(n.NamedChild(0), src, visit)
+	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, visit)
 	case "lexical_declaration", "variable_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -105,6 +107,7 @@ func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
 type jsCommonExports struct {
 	named    map[string]string
 	def      string
+	interop  bool
 	detached bool
 }
 
@@ -117,50 +120,89 @@ func jsModuleExports(n *sitter.Node, src []byte) bool {
 		prop != nil && prop.Type() == "property_identifier" && prop.Content(src) == "exports"
 }
 
-func (c *jsCommonExports) write(left, value *sitter.Node, src []byte) {
-	if left == nil {
+func (c *jsCommonExports) activeObject(n *sitter.Node, src []byte) bool {
+	return jsModuleExports(n, src) || !c.detached && n != nil && n.Type() == "identifier" && n.Content(src) == "exports"
+}
+
+func (c *jsCommonExports) property(left *sitter.Node, src []byte) string {
+	if left == nil || left.Type() != "member_expression" || !c.activeObject(left.ChildByFieldName("object"), src) {
+		return ""
+	}
+	if prop := left.ChildByFieldName("property"); prop != nil && prop.Type() == "property_identifier" {
+		return prop.Content(src)
+	}
+	return ""
+}
+
+// Assignment expressions evaluate to their RHS. Retain the storage identity
+// as well as the value so either ordering of a chained alias reset works.
+func (c *jsCommonExports) assign(left, value *sitter.Node, src []byte) (local string, module, alias bool) {
+	if left == nil || value == nil {
 		return
 	}
-	if left.Type() == "identifier" && left.Content(src) == "exports" {
-		c.detached = !jsModuleExports(value, src)
-		return
+	switch value.Type() {
+	case "assignment_expression":
+		local, module, alias = c.assign(value.ChildByFieldName("left"), value.ChildByFieldName("right"), src)
+	case "identifier":
+		local = value.Content(src)
+		alias = local == "exports"
+		module = alias && !c.detached
+	case "function_expression", "generator_function":
+		if name := value.ChildByFieldName("name"); name != nil {
+			local = name.Content(src)
+		}
+	default:
+		module = jsModuleExports(value, src)
+		alias = module && !c.detached
 	}
-	if left.Type() != "member_expression" {
-		return
-	}
-	var local string
-	if value != nil {
-		switch value.Type() {
-		case "identifier":
-			local = value.Content(src)
-		case "function_expression", "generator_function":
-			if name := value.ChildByFieldName("name"); name != nil {
-				local = name.Content(src)
+	switch {
+	case jsModuleExports(left, src):
+		if !module {
+			c.def, c.named, c.interop = local, nil, false
+		}
+		c.detached, module = !alias, true
+	case left.Type() == "identifier" && left.Content(src) == "exports":
+		c.detached, alias = !module, true
+	default:
+		name := c.property(left, src)
+		switch {
+		case name == "":
+		case name == "__esModule":
+			c.interop = value.Type() == "true"
+		case local == "":
+			delete(c.named, name)
+		default:
+			if c.named == nil {
+				c.named = make(map[string]string)
 			}
+			c.named[name] = local
 		}
 	}
-	if jsModuleExports(left, src) {
-		c.def, c.named, c.detached = local, nil, true
+	return
+}
+
+// tsc and Babel also emit Object.defineProperty(exports, "__esModule", {value:true}).
+func (c *jsCommonExports) defineProperty(call *sitter.Node, src []byte) {
+	fn, args := call.ChildByFieldName("function"), call.ChildByFieldName("arguments")
+	if fn == nil || fn.Type() != "member_expression" || args == nil || args.NamedChildCount() != 3 {
 		return
 	}
-	obj, prop := left.ChildByFieldName("object"), left.ChildByFieldName("property")
-	if prop == nil || prop.Type() != "property_identifier" || obj == nil ||
-		!(jsModuleExports(obj, src) || !c.detached && obj.Type() == "identifier" && obj.Content(src) == "exports") {
+	obj, prop := fn.ChildByFieldName("object"), fn.ChildByFieldName("property")
+	name, descriptor := args.NamedChild(1), args.NamedChild(2)
+	if obj == nil || obj.Content(src) != "Object" || prop == nil || prop.Content(src) != "defineProperty" ||
+		!c.activeObject(args.NamedChild(0), src) || name.Type() != "string" || descriptor.Type() != "object" {
 		return
 	}
-	name := prop.Content(src)
-	// ESM default imports select module.exports itself, never its .default property.
-	if name == graph.JSDefaultBinding {
+	if marker := name.Content(src); marker != `"__esModule"` && marker != "'__esModule'" {
 		return
 	}
-	if local == "" {
-		delete(c.named, name)
-		return
+	for i := 0; i < int(descriptor.NamedChildCount()); i++ {
+		pair := descriptor.NamedChild(i)
+		key, val := pair.ChildByFieldName("key"), pair.ChildByFieldName("value")
+		if key != nil && key.Content(src) == "value" && val != nil {
+			c.interop = val.Type() == "true"
+		}
 	}
-	if c.named == nil {
-		c.named = make(map[string]string)
-	}
-	c.named[name] = local
 }
 
 // Read direct module statements in execution order; do not infer control flow.
@@ -174,20 +216,30 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 			if n != nil {
 				switch n.Type() {
 				case "assignment_expression":
-					common.write(n.ChildByFieldName("left"), n.ChildByFieldName("right"), src)
+					common.assign(n.ChildByFieldName("left"), n.ChildByFieldName("right"), src)
+				case "call_expression":
+					common.defineProperty(n, src)
 				case "unary_expression":
 					if op := n.ChildByFieldName("operator"); op != nil && op.Type() == "delete" {
-						common.write(n.ChildByFieldName("argument"), nil, src)
+						name := common.property(n.ChildByFieldName("argument"), src)
+						delete(common.named, name)
+						if name == "__esModule" {
+							common.interop = false
+						}
 					}
 				}
 			}
 			continue
 		}
-		if s.Type() == "variable_declaration" {
+		if s.Type() == "variable_declaration" || s.Type() == "lexical_declaration" {
 			for j := 0; j < int(s.NamedChildCount()); j++ {
 				v := s.NamedChild(j)
-				if value := v.ChildByFieldName("value"); value != nil {
-					common.write(v.ChildByFieldName("name"), value, src)
+				if name := v.ChildByFieldName("name"); name != nil && name.Type() == "identifier" && name.Content(src) == "exports" {
+					if value := v.ChildByFieldName("value"); value != nil {
+						common.assign(name, value, src)
+					} else if s.Type() == "lexical_declaration" {
+						common.detached = true
+					}
 				}
 			}
 			continue
@@ -225,7 +277,14 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(common.named)) {
-		graph.AppendJSBinding(&bindings, name, common.named[name])
+		key := name
+		if name == graph.JSDefaultBinding {
+			if !common.interop {
+				continue
+			}
+			key = graph.JSInteropDefaultBinding
+		}
+		graph.AppendJSBinding(&bindings, key, common.named[name])
 	}
 	if common.def != "" {
 		graph.AppendJSBinding(&bindings, graph.JSDefaultBinding, common.def)
@@ -264,14 +323,10 @@ func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
-func jsFunctionBody(block *sitter.Node) bool {
-	if parent := block.Parent(); parent != nil {
-		switch parent.Type() {
-		case "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function":
-			return true
-		}
+func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	if n != nil && n.Type() != "variable_declaration" {
+		visitJSDeclaration(n, src, visit)
 	}
-	return false
 }
 
 // Cache direct declarations once per scope. A sibling function's declarations
@@ -279,18 +334,22 @@ func jsFunctionBody(block *sitter.Node) bool {
 type jsScopeKey struct {
 	start, end uint32
 	kind       string
+	body       bool
 }
 type jsScopeCache map[jsScopeKey]map[string]string
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
-	for n := expr.Parent(); n != nil; n = n.Parent() {
+	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
 		kind := n.Type()
 		switch kind {
 		case "program", "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
 		default:
 			continue
 		}
-		key := jsScopeKey{n.StartByte(), n.EndByte(), kind}
+		// The body sees hoisted var declarations; parameter initializers do
+		// not. Cache the two environments separately for the same function.
+		body := child.Type() == "statement_block"
+		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		names, ok := (*cache)[key]
 		if !ok {
 			add := func(name, value string) {
@@ -302,7 +361,7 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			local := func(id string) { add(id, graph.JSLexicalLocal) }
 			switch kind {
 			case "program", "statement_block":
-				if kind == "program" || jsFunctionBody(n) {
+				if kind == "program" {
 					visitJSHoistedVars(n, src, local)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -310,22 +369,25 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 					if s.Type() == "export_statement" {
 						s = s.ChildByFieldName("declaration")
 					}
-					visitJSDeclaration(s, src, local)
+					visitJSBlockDeclaration(s, src, local)
 				}
 			case "switch_body":
 				for i := 0; i < int(n.NamedChildCount()); i++ {
 					clause := n.NamedChild(i)
 					for j := 0; j < int(clause.NamedChildCount()); j++ {
-						visitJSDeclaration(clause.NamedChild(j), src, local)
+						visitJSBlockDeclaration(clause.NamedChild(j), src, local)
 					}
 				}
 			case "for_statement", "for_in_statement":
-				visitJSDeclaration(n.ChildByFieldName("initializer"), src, local)
-				if n.ChildByFieldName("kind") != nil {
+				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local)
+				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
 			default:
 				param := func(id string) { add(id, graph.JSPendingParameter) }
+				if body && kind != "catch_clause" {
+					visitJSHoistedVars(child, src, local)
+				}
 				if kind == "function_expression" || kind == "generator_function" {
 					visitJSPattern(n.ChildByFieldName("name"), src, local)
 				}

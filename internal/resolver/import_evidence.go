@@ -114,7 +114,10 @@ func (r *Resolver) jsBindingSource(e *graph.Edge) (stem, file string) {
 		}
 	}
 	if stem != "" {
-		return stem, probeJSTSFile(r.cachedGetNode, stem)
+		if target := probeJSTSFile(r.cachedGetNode, stem); target != nil {
+			return stem, target.ID
+		}
+		return stem, ""
 	}
 	file = r.importedFileOf(e)
 	return file, file
@@ -130,7 +133,7 @@ func (r *Resolver) resolveExactCall(e *graph.Edge, local, stem, file, exported, 
 	} else {
 		delete(e.Meta, graph.JSBindingModuleMeta)
 	}
-	if target := r.exportedCallee(file, exported); target != nil {
+	if target := r.exportedCallee(e.FilePath, file, exported); target != nil {
 		bindImportCall(e, target, evidence, stats)
 	} else {
 		parkJSBinding(e, kind, stats)
@@ -156,9 +159,15 @@ func bindImportCall(e *graph.Edge, target *graph.Node, evidence string, stats *R
 
 // A named export (including a local alias or an imported value) wins over
 // stars. Stars never forward default and two distinct implementations conflict.
-func (r *Resolver) exportedCallee(file, name string) *graph.Node {
-	type binding struct{ file, name string }
-	pending := []binding{{file, name}}
+func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
+	type binding struct {
+		file, name string
+		nativeESM  bool
+	}
+	native := func(caller string) bool {
+		return strings.HasSuffix(caller, ".mjs") || strings.HasSuffix(caller, ".mts")
+	}
+	pending := []binding{{file, name, native(caller)}}
 	var seen map[binding]bool
 	var pick *graph.Node
 	for len(pending) > 0 {
@@ -175,6 +184,9 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 		local := graph.JSBinding(locals, b.name)
 		if local == "" && b.name == graph.JSDefaultBinding {
 			local, _ = f.Meta[graph.DefaultExportMeta].(string)
+			if local == "" && !b.nativeESM {
+				local = graph.JSBinding(locals, graph.JSInteropDefaultBinding)
+			}
 		}
 		if local != "" {
 			if n := r.cachedGetNode(graph.JSExportID(f, local)); n != nil && !graph.IsReExportNode(n) && importableValueKind(n.Kind) {
@@ -198,7 +210,7 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 				for _, edge := range r.callerOutEdges(n.ID) {
 					if edge.Kind == graph.EdgeReExports {
 						_, file := r.jsBindingSource(edge)
-						pending = append(pending, binding{file, orig})
+						pending = append(pending, binding{file, orig, native(b.file)})
 					}
 				}
 				continue
@@ -220,7 +232,7 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 			if forwarded != "" {
 				explicit = true
 				_, file := r.jsBindingSource(edge)
-				pending = append(pending, binding{file, forwarded})
+				pending = append(pending, binding{file, forwarded, native(b.file)})
 			}
 		}
 		if local != "" || explicit || b.name == graph.JSDefaultBinding {
@@ -229,7 +241,7 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 		for _, edge := range edges {
 			if edge.Kind == graph.EdgeReExports && edge.Meta[graph.StarReExportMeta] == true {
 				_, file := r.jsBindingSource(edge)
-				pending = append(pending, binding{file, b.name})
+				pending = append(pending, binding{file, b.name, native(b.file)})
 			}
 		}
 	}

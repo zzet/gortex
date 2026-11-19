@@ -368,9 +368,9 @@ func TestNuxtRemovedShadowRebinds(t *testing.T) {
 }
 
 func TestAliasPreferredModuleArrives(t *testing.T) {
-	for _, tc := range []struct{ name, alias, preferred string }{
-		{"wildcard", `"@impl/*":["src/*","fallback/*"]`, "src/lib.ts"},
-		{"declaration", `"@impl/lib":["src/lib.d.ts","fallback/lib.ts"]`, "src/lib.d.ts"},
+	for _, tc := range []struct{ name, alias, preferred, source string }{
+		{"wildcard", `"@impl/*":["src/*","fallback/*"]`, "src/lib.ts", "export function impl(){}"},
+		{"declaration", `"@impl/lib":["src/lib.d.ts","fallback/lib.ts"]`, "src/lib.d.ts", "export declare function impl(): void;"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -382,7 +382,7 @@ func TestAliasPreferredModuleArrives(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "fallback/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
 			preferred := filepath.Join(root, tc.preferred)
-			writeFileMk(t, preferred, "export function impl(){}")
+			writeFileMk(t, preferred, tc.source)
 			_, err = idx.incrementalPointWatcherPath(root, preferred)
 			require.NoError(t, err)
 			require.Equal(t, tc.preferred+"::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
@@ -486,6 +486,56 @@ func TestDroppedEvictionAndCatchupRetry(t *testing.T) {
 			require.True(t, idx.censusResolutionCurrent(root))
 		})
 	}
+}
+
+func TestDroppedGoBindingRetriesUnchangedCaller(t *testing.T) {
+	root := t.TempDir()
+	lib, page := filepath.Join(root, "lib.go"), filepath.Join(root, "page.go")
+	writeFileMk(t, lib, "package p\nfunc Impl(){}")
+	writeFileMk(t, page, "package p\nfunc Run(){Impl()}")
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	bumpMtime(t, page, "package p\nfunc Changed(){Impl()}")
+	original := idx.resolver
+	idx.resolver = resolver.New(refuseBindingInvalidation{store})
+	_, err = idx.incrementalPointWatcherPath(root, page)
+	require.ErrorContains(t, err, "binding write did not apply")
+	require.False(t, idx.censusResolutionCurrent(root))
+	idx.resolver = original
+	_, err = idx.IncrementalReindexPaths(root, []string{lib})
+	require.NoError(t, err)
+	require.Equal(t, "lib.go::Impl", callTargetForName(t, store, "page.go", "Changed"))
+	require.True(t, idx.censusResolutionCurrent(root))
+}
+
+type refuseGuardWrite struct{ *store_sqlite.Store }
+
+func (s refuseGuardWrite) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
+	for _, move := range batch {
+		if move.OldTo == "other/lib.ts::lookup" && graph.IsUnresolvedTarget(move.Edge.To) {
+			return false
+		}
+	}
+	return s.Store.ReindexEdgesApplied(batch)
+}
+
+func TestDroppedGuardWriteCannotCertify(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0")
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "other/lib.ts"), "export function lookup(){}")
+	page := filepath.Join(root, "page.ts")
+	writeFileMk(t, page, "function run(){const ns = {other:1}; ns.lookup()}")
+	idx, store := newSQLiteIndexer(t)
+	original := idx.resolver
+	idx.resolver = resolver.New(refuseGuardWrite{store})
+	_, err := idx.Index(root)
+	require.ErrorContains(t, err, "binding write did not apply")
+	require.False(t, idx.censusResolutionCurrent(root))
+	idx.resolver = original
+	_, err = idx.IncrementalReindexPaths(root, []string{page})
+	require.NoError(t, err)
+	require.True(t, graph.IsUnresolvedTarget(callTargetForName(t, store, "page.ts", "run")))
 }
 
 func TestDroppedFullBindingWriteCannotCertify(t *testing.T) {

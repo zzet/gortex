@@ -9,12 +9,16 @@ import (
 // evictRepoCurrentGeneration is the replacement path. An older backend that
 // does not expose generations has only one logical generation, so its ordinary
 // Store eviction is the compatible fallback.
-func evictRepoCurrentGeneration(target graph.Store, repoPrefix string) (nodesRemoved, edgesRemoved int) {
-	restubTrackedNpmRepoIncoming(target, repoPrefix)
-	if scoped, ok := target.(graph.CurrentGenerationRepoEvicter); ok {
-		return scoped.EvictRepoCurrentGeneration(repoPrefix)
+func evictRepoCurrentGeneration(target graph.Store, repoPrefix string) (nodesRemoved, edgesRemoved int, err error) {
+	if err := restubTrackedNpmRepoIncoming(target, repoPrefix); err != nil {
+		return 0, 0, err
 	}
-	return target.EvictRepo(repoPrefix)
+	if scoped, ok := target.(graph.CurrentGenerationRepoEvicter); ok {
+		nodesRemoved, edgesRemoved = scoped.EvictRepoCurrentGeneration(repoPrefix)
+	} else {
+		nodesRemoved, edgesRemoved = target.EvictRepo(repoPrefix)
+	}
+	return nodesRemoved, edgesRemoved, nil
 }
 
 // evictRepoAllGenerations is reserved for authoritative repository removal.

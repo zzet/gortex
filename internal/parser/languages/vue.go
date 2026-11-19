@@ -2,16 +2,10 @@ package languages
 
 import (
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
-)
-
-var (
-	vueScriptRe = regexp.MustCompile(`(?is)<script\b((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)</script>`)
-	vueAttrRe   = regexp.MustCompile(`([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?`)
 )
 
 // VueExtractor extracts Vue single-file components. Each .vue file becomes a
@@ -58,7 +52,7 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 	// Carve every <script> / <script setup> block and delegate to the matching
 	// embedded-language extractor, rebased into host-file coordinates.
-	for _, m := range vueScriptRe.FindAllSubmatchIndex(src, -1) {
+	for _, m := range markupScriptRe.FindAllSubmatchIndex(src, -1) {
 		attrs := src[m[2]:m[3]]
 		contentStart, contentEnd := m[4], m[5]
 		if contentStart < 0 {
@@ -67,7 +61,7 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		content := src[contentStart:contentEnd]
 		lineOffset := strings.Count(string(src[:contentStart]), "\n")
 		var delegate parser.Extractor = e.js
-		ts, setup := vueScriptAttributes(attrs)
+		ts, setup := markupScriptAttributes(attrs)
 		if ts {
 			delegate = e.ts
 		}
@@ -87,21 +81,6 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	mineTemplateComponentUsages(src, filePath, componentID, "vue", result)
 	applyFrameworkTemplatePasses(src, filePath, componentID, "vue", result)
 	return result, nil
-}
-
-func vueScriptAttributes(attrs []byte) (ts, setup bool) {
-	for _, attr := range vueAttrRe.FindAllSubmatch(attrs, -1) {
-		switch strings.ToLower(string(attr[1])) {
-		case "setup":
-			setup = true
-		case "lang":
-			switch strings.ToLower(strings.Trim(string(attr[2]), `"'`)) {
-			case "ts", "tsx", "typescript":
-				ts = true
-			}
-		}
-	}
-	return ts, setup
 }
 
 // vueComponentName derives the component name from the file name (Counter.vue ->

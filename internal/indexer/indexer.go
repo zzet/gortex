@@ -3514,15 +3514,21 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 			if retirement {
 				var err error
+				if err := restubTrackedNpmRepoIncoming(diskTarget, idx.RepoPrefix()); err != nil {
+					retErr = err
+					return
+				}
 				shadowReplacementStarted = true
-				restubTrackedNpmRepoIncoming(diskTarget, idx.RepoPrefix())
 				evictedNodes, evictedEdges, err = sqliteTarget.EvictRepoForShadowReplacement(ctx, idx.RepoPrefix())
 				if err != nil {
 					retErr = fmt.Errorf("indexer: retire shadow replacement rows: %w", err)
 					return
 				}
 			} else {
-				evictedNodes, evictedEdges = evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix())
+				evictedNodes, evictedEdges, retErr = evictRepoCurrentGeneration(diskTarget, idx.RepoPrefix())
+				if retErr != nil {
+					return
+				}
 			}
 			if n, e := evictedNodes, evictedEdges; n > 0 || e > 0 {
 				idx.logger.Info("indexer: evicted stale generation rows before shadow drain",
@@ -5291,8 +5297,32 @@ func (idx *Indexer) indexFile(
 	var legacyCarried []*graph.Edge
 	var bindingCallers []string
 	var oldFuncIDs []string
-	evictExisting := func(result *parser.ExtractionResult) {
+	evictExisting := func(result *parser.ExtractionResult) error {
 		idx.invalidateGoModuleSourceStamp(relPath)
+		var npmConsumers []string
+		var err error
+		if len(legacyIDs) == 0 {
+			npmConsumers, err = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers, markerBatch)
+		} else {
+			// Extraction is still unprefixed here. Build only the identity surface
+			// needed by the same incoming frontier used by the structural batch.
+			fresh := &parser.ExtractionResult{}
+			for _, node := range extractionNodes(result) {
+				if node == nil {
+					continue
+				}
+				copied := *node
+				copied.ID = idx.prefixPath(node.ID)
+				fresh.Nodes = append(fresh.Nodes, &copied)
+			}
+			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
+			stages := []*incrementalBatchStage{stage}
+			legacyCarried, npmConsumers, err = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages), markerBatch)
+			bindingCallers = stage.bindingCallers
+		}
+		if err != nil {
+			return err
+		}
 		var oldFTSNodeIDs []string
 		for _, n := range priorNodes {
 			if n == nil {
@@ -5310,26 +5340,6 @@ func (idx *Indexer) indexFile(
 		// batch replacement by deleting its prior documents explicitly;
 		// canonical contracts follow the store's owner-retention decision.
 		idx.deleteSymbolFTS(oldFTSNodeIDs)
-		var npmConsumers []string
-		if len(legacyIDs) == 0 {
-			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers, markerBatch)
-		} else {
-			// Extraction is still unprefixed here. Build only the identity surface
-			// needed by the same incoming frontier used by the structural batch.
-			fresh := &parser.ExtractionResult{}
-			for _, node := range extractionNodes(result) {
-				if node == nil {
-					continue
-				}
-				copied := *node
-				copied.ID = idx.prefixPath(node.ID)
-				fresh.Nodes = append(fresh.Nodes, &copied)
-			}
-			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
-			stages := []*incrementalBatchStage{stage}
-			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages), markerBatch)
-			bindingCallers = stage.bindingCallers
-		}
 		if markerBatch != nil {
 			markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
 		}
@@ -5338,6 +5348,7 @@ func (idx *Indexer) indexFile(
 		} else {
 			idx.evictFileIdentities([]string{graphPath}, legacyIDs, []string{legacyPath})
 		}
+		return nil
 	}
 
 	// A delta probe already owns a shared admission lease together with its
@@ -5410,7 +5421,9 @@ func (idx *Indexer) indexFile(
 					return err
 				}
 			}
-			evictExisting(result)
+			if err := evictExisting(result); err != nil {
+				return err
+			}
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
 				return idx.fileIndexFailureError(absPath)
@@ -5438,7 +5451,9 @@ func (idx *Indexer) indexFile(
 					return err
 				}
 			}
-			evictExisting(result)
+			if err := evictExisting(result); err != nil {
+				return err
+			}
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
 				return idx.fileIndexFailureError(absPath)
@@ -5551,7 +5566,9 @@ func (idx *Indexer) indexFile(
 		}
 	}
 	idx.retractUnchangedMtimeReceipts(map[string]fileReadVersion{mtimeKey: readVersion})
-	evictExisting(result)
+	if err := evictExisting(result); err != nil {
+		return err
+	}
 
 	// Coverage extractors (todos, licenses, ownership). A prepared watcher
 	// delta already ran this exact pipeline; reusing it avoids both a second
@@ -5586,9 +5603,9 @@ func (idx *Indexer) indexFile(
 	// the file — the reuse key carries no visibility evidence, so both the
 	// captured resolutions and the prior-unresolved skip are stale.
 	freshVis := csharpVisibilityStampForNodes(result.Nodes)
-	changedImports := visCaptured && closureJSTSPath(relPath) && (idx.inputsStaleForFile(relPath) ||
-		importSurfaceChanged(storedDerivedFingerprints(priorNodes), storedDerivedFingerprints(result.Nodes)))
-	if visCaptured && priorVis != freshVis || changedImports {
+	changedImports := visCaptured && closureJSTSPath(relPath) &&
+		importSurfaceChanged(storedDerivedFingerprints(priorNodes), storedDerivedFingerprints(result.Nodes))
+	if idx.inputsStaleForFile(relPath) || visCaptured && priorVis != freshVis || changedImports {
 		reuseIdx, priorUnresolved, priorDeclarations = nil, nil, nil
 	}
 	if len(legacyIDs) > 0 {
@@ -5686,7 +5703,7 @@ func (idx *Indexer) indexFile(
 		// them.
 		if visCaptured && priorVis.globals != freshVis.globals {
 			idx.reresolveCSharpGlobalUsingDependents(
-				[]string{graphPath}, map[string]struct{}{graphPath: {}})
+				[]string{graphPath}, map[string]struct{}{graphPath: {}}, markerBatch)
 		}
 		// CPG-lite dataflow placeholders for this file: inter-
 		// procedural callees may have just been lifted by
@@ -5800,7 +5817,7 @@ func (idx *Indexer) indexFile(
 		// dependents.
 		if visCaptured && priorVis.globals != freshVis.globals {
 			idx.reresolveCSharpGlobalUsingDependents(
-				[]string{graphPath}, map[string]struct{}{graphPath: {}})
+				[]string{graphPath}, map[string]struct{}{graphPath: {}}, markerBatch)
 		}
 	}
 
@@ -6118,7 +6135,9 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 		// re-parse's fact write puts it there.
 		idx.setReparsePendingEnrichment(graphPath, true)
 	}
-	idx.resolver.ResolveFileAndIncoming(graphPath)
+	if dropped := idx.resolver.ResolveFileAndIncoming(graphPath).DroppedFiles; len(dropped) != 0 {
+		return idx.finishResolutionPass(resolutionCompletion{dropped: dropped})
+	}
 	watchEnrichment := providersPresent && idx.semanticMgr.EnrichesOnWatch()
 	reEnriched := false
 	if watchEnrichment {
@@ -6154,14 +6173,14 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 // agnostic: GetInEdges + ReindexEdges are the same Store primitives the
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
-func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
+func (idx *Indexer) restubIncomingRefs(graphPath string) ([]string, error) {
 	return idx.restubIncomingRefsForReplacement(graphPath, nil, nil)
 }
 
-func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string, markerBatch *reparsePendingEnrichmentBatch) []string {
+func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string, markerBatch *reparsePendingEnrichmentBatch) ([]string, error) {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
-		return nil
+		return nil, nil
 	}
 	evicted := make(map[string]struct{}, len(nodes))
 	refIDs := make([]string, 0, len(nodes))
@@ -6175,13 +6194,16 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCa
 		}
 	}
 	if len(refIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Fetch the whole changed file's incoming adjacency in one bounded store
 	// operation. On SQLite this is chunked under the parameter limit; more
 	// importantly, it avoids one transaction/query per definition in the file.
 	inEdges := idx.graph.GetInEdgesByNodeIDs(refIDs)
-	npmConsumers := restubTrackedNpmImportsFromView(idx.graph, evicted, inEdges)
+	npmConsumers, err := restubTrackedNpmImportsFromView(idx.graph, evicted, inEdges)
+	if err != nil {
+		return nil, err
+	}
 	var batch []graph.EdgeReindex
 	if closureJSTSPath(graphPath) {
 		for _, edges := range inEdges {
@@ -6226,7 +6248,7 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCa
 		}
 	}
 	markerBatch.recordDropped(graph.ApplyEdgeReindexes(idx.graph, batch))
-	return npmConsumers
+	return npmConsumers, nil
 }
 
 // embeddingDimsOrDefault returns the embedder's reported vector width,
@@ -7743,7 +7765,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		for _, p := range evictedGlobalsFiles {
 			evicted[p] = struct{}{}
 		}
-		idx.reresolveCSharpGlobalUsingDependents(evictedGlobalsFiles, evicted)
+		idx.reresolveCSharpGlobalUsingDependents(evictedGlobalsFiles, evicted, markerBatch)
 	}
 
 	// No search rebuild here. Structural and metadata refreshes maintain the

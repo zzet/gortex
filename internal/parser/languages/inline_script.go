@@ -10,22 +10,23 @@ import (
 )
 
 var (
-	markupScriptRe   = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	markupLangAttrRe = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
+	markupScriptRe = regexp.MustCompile(`(?is)<script\b((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)</script>`)
+	markupAttrRe   = regexp.MustCompile(`([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?`)
 )
 
-// scriptTagIsTypeScript reports whether a <script> tag's attribute string
-// declares a TypeScript dialect.
-func scriptTagIsTypeScript(attrs []byte) bool {
-	m := markupLangAttrRe.FindSubmatch(attrs)
-	if m == nil {
-		return false
+func markupScriptAttributes(attrs []byte) (ts, setup bool) {
+	for _, attr := range markupAttrRe.FindAllSubmatch(attrs, -1) {
+		switch strings.ToLower(string(attr[1])) {
+		case "setup":
+			setup = true
+		case "lang":
+			switch strings.ToLower(strings.Trim(string(attr[2]), `"'`)) {
+			case "ts", "tsx", "typescript":
+				ts = true
+			}
+		}
 	}
-	switch strings.ToLower(string(m[1])) {
-	case "ts", "tsx", "typescript":
-		return true
-	}
-	return false
+	return ts, setup
 }
 
 // carveAndDelegateScripts runs every <script>/<script setup> block in src through
@@ -39,7 +40,7 @@ func carveAndDelegateScripts(src []byte, filePath, fileID, language string, ts, 
 			continue
 		}
 		delegate := js
-		if scriptTagIsTypeScript(src[m[2]:m[3]]) {
+		if isTS, _ := markupScriptAttributes(src[m[2]:m[3]]); isTS {
 			delegate = ts
 		}
 		lineOffset := strings.Count(string(src[:contentStart]), "\n")

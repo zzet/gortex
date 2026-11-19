@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
@@ -244,6 +245,44 @@ type fixedDefinitionLSP struct {
 func (helper fixedDefinitionLSP) SupportsPath(string) bool { return true }
 func (helper fixedDefinitionLSP) Definition(string, int, string) (string, int, bool) {
 	return helper.path, helper.line, true
+}
+
+type refusedLSPCorrection struct {
+	*store_sqlite.Store
+	refuse bool
+}
+
+func (s *refusedLSPCorrection) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
+	for _, move := range batch {
+		if s.refuse && move.Edge.Origin == graph.OriginLSPResolved {
+			return false
+		}
+	}
+	return s.Store.ReindexEdgesApplied(batch)
+}
+
+func TestRefusedLSPCorrectionRetriesResolvedEdge(t *testing.T) {
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	target := &graph.Node{ID: "def.ts::Target", Name: "Target", FilePath: "def.ts", StartLine: 5, Kind: graph.KindFunction}
+	edge := &graph.Edge{From: "caller.ts::run", To: "guess.ts::Target", FilePath: "caller.ts", Line: 1, Kind: graph.EdgeCalls}
+	store.AddBatch([]*graph.Node{target}, []*graph.Edge{edge})
+	writer := &refusedLSPCorrection{Store: store, refuse: true}
+	r := New(writer)
+	r.SetLSPHelper(fixedDefinitionLSP{path: target.FilePath, line: target.StartLine})
+	r.lspDeferredSpool, err = newDeferredLSPSpool()
+	require.NoError(t, err)
+	t.Cleanup(func() { r.SetGraph(store) })
+	require.NoError(t, r.lspDeferredSpool.append([]deferredLSPEdge{{edge: edge, target: "Target"}}))
+	stats, err := r.ResolveAllContext(t.Context())
+	require.ErrorContains(t, err, "binding write did not apply")
+	require.Contains(t, stats.DroppedFiles, edge.FilePath)
+	require.Equal(t, "guess.ts::Target", store.GetOutEdges(edge.From)[0].To)
+	writer.refuse = false
+	_, err = r.ResolveAllContext(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, target.ID, store.GetOutEdges(edge.From)[0].To)
 }
 
 func TestDeferredLSPSQLiteKindPromotionSurvivesReopen(t *testing.T) {

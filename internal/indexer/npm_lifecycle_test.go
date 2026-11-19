@@ -38,11 +38,14 @@ func TestTrackedNpmImportsSurviveEviction(t *testing.T) {
 				switch mode {
 				case "file":
 					idx := New(g, newTestRegistry(), config.IndexConfig{}, zap.NewNop())
-					assert.Equal(t, []string{"app/a.ts"}, idx.restubIncomingRefs("lib/index.ts"))
+					consumers, err := idx.restubIncomingRefs("lib/index.ts")
+					require.NoError(t, err)
+					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "batch":
 					stages := []*incrementalBatchStage{{graphPath: "lib/index.ts", priorNodes: nodes}}
-					_, consumers := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages), nil)
+					_, consumers, err := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages), nil)
+					require.NoError(t, err)
 					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "replace":
@@ -162,8 +165,19 @@ func TestTrackedNpmConsumersResolveWithoutRelevantReceipt(t *testing.T) {
 				return calls[0]
 			}
 			require.Equal(t, "lib/index.ts::f", call().To)
-			consumers := restubTrackedNpmImportsFromView(g, nil,
+			if db, ok := g.(*store_sqlite.Store); ok {
+				idx := mi.indexers["lib"]
+				idx.graph = refuseBindingInvalidation{db}
+				_, _, err := idx.incrementalEvictWatcherPath("index.ts")
+				idx.graph = db
+				require.ErrorContains(t, err, "refusing provider eviction")
+				require.NotNil(t, g.GetNode("lib/index.ts::f"))
+				require.Equal(t, "lib/index.ts::f", call().To)
+				require.False(t, idx.censusResolutionCurrent(provider))
+			}
+			consumers, err := restubTrackedNpmImportsFromView(g, nil,
 				g.GetInEdgesByNodeIDs([]string{"lib/index.ts", "lib/index.ts::f"}))
+			require.NoError(t, err)
 			require.Equal(t, []string{"app/app.ts"}, consumers)
 			require.Equal(t, "unresolved::f", call().To)
 

@@ -2339,7 +2339,9 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		}
 	}
 	restubGoModuleRepoIncoming(mi.graph, repoPrefix)
-	evictRepoCurrentGeneration(mi.graph, repoPrefix)
+	if _, _, err := evictRepoCurrentGeneration(mi.graph, repoPrefix); err != nil {
+		return nil, err
+	}
 	result, err := idx.indexCtxRaw(WithIndexOrigin(context.Background(), "index_repo"), meta.RootPath)
 	if err != nil {
 		return nil, fmt.Errorf("indexing %s: %w", meta.RootPath, err)

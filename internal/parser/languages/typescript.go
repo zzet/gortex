@@ -25,6 +25,9 @@ const tsQAll = `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
+  (ambient_declaration
+    (function_signature name: (identifier) @func.name) @func.def)
+
   (function_expression
     name: (identifier) @fnexpr.name) @fnexpr.def
 
@@ -2167,6 +2170,9 @@ func tsDocStartRow(def *parser.CapturedNode) (int, bool) {
 		return 0, false
 	}
 	parent := def.Node.Parent()
+	if parent != nil && parent.Type() == "ambient_declaration" {
+		parent = parent.Parent()
+	}
 	if parent != nil && parent.Type() == "export_statement" {
 		return int(parent.StartPoint().Row), true
 	}
