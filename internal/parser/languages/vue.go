@@ -10,9 +10,8 @@ import (
 )
 
 var (
-	vueScriptRe    = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	vueLangAttrRe  = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
-	vueSetupAttrRe = regexp.MustCompile(`(?i)(?:^|\s)setup(?:\s|=|$)`)
+	vueScriptRe = regexp.MustCompile(`(?is)<script\b((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)</script>`)
+	vueAttrRe   = regexp.MustCompile(`([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?`)
 )
 
 // VueExtractor extracts Vue single-file components. Each .vue file becomes a
@@ -68,12 +67,16 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		content := src[contentStart:contentEnd]
 		lineOffset := strings.Count(string(src[:contentStart]), "\n")
 		var delegate parser.Extractor = e.js
-		if vueScriptIsTypeScript(attrs) {
+		ts, setup := vueScriptAttributes(attrs)
+		if ts {
 			delegate = e.ts
 		}
 		script := delegateInlineScriptSlice(delegate, content, lineOffset, filePath, fileNode.ID, "vue", result)
-		if script != nil && !vueSetupAttrRe.Match(attrs) && (script.Meta[graph.JSLocalExportsMeta] != nil || script.Meta[graph.DefaultExportMeta] != nil) {
-			fileNode.Meta = map[string]any{graph.JSExportScopeMeta: strings.TrimPrefix(script.ID, filePath)}
+		if script != nil && !setup {
+			if fileNode.Meta == nil {
+				fileNode.Meta = make(map[string]any)
+			}
+			fileNode.Meta[graph.JSExportScopeMeta] = strings.TrimPrefix(script.ID, filePath)
 			for _, key := range [...]string{graph.JSLocalExportsMeta, graph.DefaultExportMeta} {
 				if value := script.Meta[key]; value != nil {
 					fileNode.Meta[key] = value
@@ -86,18 +89,19 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 	return result, nil
 }
 
-// vueScriptIsTypeScript reports whether a <script> tag's attributes declare a
-// TypeScript dialect.
-func vueScriptIsTypeScript(attrs []byte) bool {
-	m := vueLangAttrRe.FindSubmatch(attrs)
-	if m == nil {
-		return false
+func vueScriptAttributes(attrs []byte) (ts, setup bool) {
+	for _, attr := range vueAttrRe.FindAllSubmatch(attrs, -1) {
+		switch strings.ToLower(string(attr[1])) {
+		case "setup":
+			setup = true
+		case "lang":
+			switch strings.ToLower(strings.Trim(string(attr[2]), `"'`)) {
+			case "ts", "tsx", "typescript":
+				ts = true
+			}
+		}
 	}
-	switch strings.ToLower(string(m[1])) {
-	case "ts", "tsx", "typescript":
-		return true
-	}
-	return false
+	return ts, setup
 }
 
 // vueComponentName derives the component name from the file name (Counter.vue ->

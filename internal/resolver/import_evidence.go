@@ -177,8 +177,7 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 			local, _ = f.Meta[graph.DefaultExportMeta].(string)
 		}
 		if local != "" {
-			scope, _ := f.Meta[graph.JSExportScopeMeta].(string)
-			if n := r.cachedGetNode(b.file + scope + "::" + local); n != nil && !graph.IsReExportNode(n) && importableValueKind(n.Kind) {
+			if n := r.cachedGetNode(graph.JSExportID(f, local)); n != nil && !graph.IsReExportNode(n) && importableValueKind(n.Kind) {
 				if pick != nil && pick.ID != n.ID {
 					return nil
 				}
@@ -191,7 +190,7 @@ func (r *Resolver) exportedCallee(file, name string) *graph.Node {
 		}
 		seen[b] = true
 		if local == "" {
-			if n := r.cachedGetNode(b.file + "::" + b.name); graph.IsReExportNode(n) {
+			if n := r.cachedGetNode(graph.JSExportID(f, b.name)); graph.IsReExportNode(n) {
 				orig, _ := n.Meta["reexport_original"].(string)
 				if orig == "" {
 					orig = b.name

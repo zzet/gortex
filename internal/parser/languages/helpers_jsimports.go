@@ -100,47 +100,57 @@ func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
-// Only direct assignments to the CommonJS export object are module evidence.
-// A replacement drops its old properties and detaches the original exports alias.
+// Only unconditional, top-level writes are evidence: a nested assignment may
+// never execute. Track whether the local exports alias still names the module.
 type jsCommonExports struct {
 	named    map[string]string
 	def      string
-	replaced bool
+	detached bool
 }
 
-func (c *jsCommonExports) assign(stmt *sitter.Node, src []byte) {
-	n := stmt.NamedChild(0)
-	if n == nil || n.Type() != "assignment_expression" {
+func jsModuleExports(n *sitter.Node, src []byte) bool {
+	if n == nil || n.Type() != "member_expression" {
+		return false
+	}
+	obj, prop := n.ChildByFieldName("object"), n.ChildByFieldName("property")
+	return obj != nil && obj.Type() == "identifier" && obj.Content(src) == "module" &&
+		prop != nil && prop.Type() == "property_identifier" && prop.Content(src) == "exports"
+}
+
+func (c *jsCommonExports) write(left, value *sitter.Node, src []byte) {
+	if left == nil {
 		return
 	}
-	left, value := n.ChildByFieldName("left"), n.ChildByFieldName("right")
-	if left == nil || value == nil || left.Type() != "member_expression" {
+	if left.Type() == "identifier" && left.Content(src) == "exports" {
+		c.detached = !jsModuleExports(value, src)
 		return
 	}
-	obj, prop := left.ChildByFieldName("object"), left.ChildByFieldName("property")
-	if obj == nil || prop == nil || prop.Type() != "property_identifier" {
+	if left.Type() != "member_expression" {
 		return
 	}
 	var local string
-	switch value.Type() {
-	case "identifier":
-		local = value.Content(src)
-	case "function_expression", "generator_function":
-		if name := value.ChildByFieldName("name"); name != nil {
-			local = name.Content(src)
+	if value != nil {
+		switch value.Type() {
+		case "identifier":
+			local = value.Content(src)
+		case "function_expression", "generator_function":
+			if name := value.ChildByFieldName("name"); name != nil {
+				local = name.Content(src)
+			}
 		}
 	}
-	name := prop.Content(src)
-	if obj.Type() == "identifier" && obj.Content(src) == "module" && name == "exports" {
-		c.def, c.named, c.replaced = local, nil, true
+	if jsModuleExports(left, src) {
+		c.def, c.named, c.detached = local, nil, true
 		return
 	}
-	if obj.Type() == "member_expression" {
-		base, field := obj.ChildByFieldName("object"), obj.ChildByFieldName("property")
-		if base == nil || base.Type() != "identifier" || base.Content(src) != "module" || field == nil || field.Content(src) != "exports" {
-			return
-		}
-	} else if c.replaced || obj.Type() != "identifier" || obj.Content(src) != "exports" {
+	obj, prop := left.ChildByFieldName("object"), left.ChildByFieldName("property")
+	if prop == nil || prop.Type() != "property_identifier" || obj == nil ||
+		!(jsModuleExports(obj, src) || !c.detached && obj.Type() == "identifier" && obj.Content(src) == "exports") {
+		return
+	}
+	name := prop.Content(src)
+	// ESM default imports select module.exports itself, never its .default property.
+	if name == graph.JSDefaultBinding {
 		return
 	}
 	if local == "" {
@@ -153,14 +163,33 @@ func (c *jsCommonExports) assign(stmt *sitter.Node, src []byte) {
 	c.named[name] = local
 }
 
-// Nested declarations and assignments do not define the module's value surface.
+// Read direct module statements in execution order; do not infer control flow.
 func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 	var bindings strings.Builder
 	var common jsCommonExports
 	for i := 0; i < int(root.NamedChildCount()); i++ {
 		s := root.NamedChild(i)
 		if s.Type() == "expression_statement" {
-			common.assign(s, src)
+			n := s.NamedChild(0)
+			if n != nil {
+				switch n.Type() {
+				case "assignment_expression":
+					common.write(n.ChildByFieldName("left"), n.ChildByFieldName("right"), src)
+				case "unary_expression":
+					if op := n.ChildByFieldName("operator"); op != nil && op.Type() == "delete" {
+						common.write(n.ChildByFieldName("argument"), nil, src)
+					}
+				}
+			}
+			continue
+		}
+		if s.Type() == "variable_declaration" {
+			for j := 0; j < int(s.NamedChildCount()); j++ {
+				v := s.NamedChild(j)
+				if value := v.ChildByFieldName("value"); value != nil {
+					common.write(v.ChildByFieldName("name"), value, src)
+				}
+			}
 			continue
 		}
 		if s.Type() != "export_statement" || s.ChildByFieldName("source") != nil || tsExportStatementTypeOnly(s, src) {
@@ -235,6 +264,16 @@ func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
+func jsFunctionBody(block *sitter.Node) bool {
+	if parent := block.Parent(); parent != nil {
+		switch parent.Type() {
+		case "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function":
+			return true
+		}
+	}
+	return false
+}
+
 // Cache direct declarations once per scope. A sibling function's declarations
 // cannot shadow this call; parameters of every enclosing function can.
 type jsScopeKey struct {
@@ -263,7 +302,7 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			local := func(id string) { add(id, graph.JSLexicalLocal) }
 			switch kind {
 			case "program", "statement_block":
-				if kind == "program" {
+				if kind == "program" || jsFunctionBody(n) {
 					visitJSHoistedVars(n, src, local)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -287,9 +326,6 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				}
 			default:
 				param := func(id string) { add(id, graph.JSPendingParameter) }
-				if kind != "catch_clause" {
-					visitJSHoistedVars(n.ChildByFieldName("body"), src, local)
-				}
 				if kind == "function_expression" || kind == "generator_function" {
 					visitJSPattern(n.ChildByFieldName("name"), src, local)
 				}

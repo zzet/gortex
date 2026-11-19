@@ -48,6 +48,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // Alias is one entry in the `paths` map.
@@ -133,7 +135,7 @@ func NewCollection(maps []*Map) *Collection {
 			}
 			targets := make([]string, len(a.Targets))
 			for i, t := range a.Targets {
-				targets[i] = stripExt(m.joinTarget(t.Prefix + capture + t.Suffix))
+				targets[i] = graph.JSModuleStem(m.joinTarget(t.Prefix + capture + t.Suffix))
 			}
 			c.alternateTargets = append(c.alternateTargets, targets)
 		}
@@ -219,7 +221,7 @@ func Resolve(m *Map, modulePath string) string {
 		first := ""
 		for ti, tgt := range targets {
 			joined := m.joinTarget(tgt.Prefix + star + tgt.Suffix)
-			stripped := stripExt(joined)
+			stripped := aliasProbePath(joined)
 			if ti == 0 {
 				first = stripped
 			}
@@ -321,12 +323,13 @@ func targetExistsInTree(exists func(rel string) bool, joined string) bool {
 	return false
 }
 
-func stripExt(p string) string {
-	switch ext := filepath.Ext(p); ext {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		return strings.TrimSuffix(p, ext)
+func aliasProbePath(p string) string {
+	// Keep an explicit declaration file for forward probing; its reverse
+	// key, unlike its lookup path, is shared with the implementation.
+	if strings.HasSuffix(p, ".d.ts") || strings.HasSuffix(p, ".d.cts") || strings.HasSuffix(p, ".d.mts") {
+		return p
 	}
-	return p
+	return graph.JSModuleStem(p)
 }
 
 // Tree is the repository view a loader reads its configs out of. A working

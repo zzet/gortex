@@ -444,7 +444,6 @@ type Indexer struct {
 	appliedResolution       atomic.Pointer[resolutionInputs]
 	resolutionInputsChanged bool
 	resolutionRetry         *resolutionRetry
-	failedBindingWrites     []string // caller graph paths; drained at pass completion
 	warmResolution          *resolutionCompletion // guarded by resolutionMu
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
@@ -710,10 +709,9 @@ type Indexer struct {
 	// resolving its authority must never wait on the mutation mutex.
 	outputAuthority atomic.Pointer[OutputGenerationAuthority]
 
-	// incrementalResolveFilesHook is a focused test seam for proving a
-	// multi-file watcher batch invokes the scoped resolver exactly once. nil in
-	// production; the real path calls resolver.ResolveFilesAndIncoming.
-	incrementalResolveFilesHook func([]string)
+	// The edit-delta timer and watcher tests wrap the scoped resolver here.
+	// The wrapper returns its dropped caller files to the mutation's fence.
+	incrementalResolveFilesHook func([]string) []string
 	// incrementalCatchupHook observes resolution-dependent incremental tails.
 	// It is nil in production and lets focused tests prove a watcher storm runs
 	// each tail once after the bounded mutation batch, never once per chunk.
@@ -4754,7 +4752,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
 		resolveStarted := time.Now()
-		resolveStats := idx.resolver.ResolveAll()
+		resolveStats, resolveErr := idx.resolver.ResolveAllContext(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
 		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 		// Lift the dataflow placeholders exactly where the per-save path
 		// does (right after resolution, before the derived passes), so a
@@ -5311,7 +5312,7 @@ func (idx *Indexer) indexFile(
 		idx.deleteSymbolFTS(oldFTSNodeIDs)
 		var npmConsumers []string
 		if len(legacyIDs) == 0 {
-			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers)
+			npmConsumers = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers, markerBatch)
 		} else {
 			// Extraction is still unprefixed here. Build only the identity surface
 			// needed by the same incoming frontier used by the structural batch.
@@ -5326,7 +5327,7 @@ func (idx *Indexer) indexFile(
 			}
 			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
 			stages := []*incrementalBatchStage{stage}
-			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages))
+			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages), markerBatch)
 			bindingCallers = stage.bindingCallers
 		}
 		if markerBatch != nil {
@@ -5614,7 +5615,7 @@ func (idx *Indexer) indexFile(
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
 	if jsModuleSurfaceChanged(graphPath, priorNodes, result.Nodes) {
-		bindingCallers = append(bindingCallers, idx.parkModuleDependents([]string{graphPath})...)
+		bindingCallers = append(bindingCallers, idx.parkModuleDependents([]string{graphPath}, markerBatch)...)
 	}
 	idx.rebindParkedCalls(bindingCallers, markerBatch)
 	// No subsequent stage reads source bytes or the parse tree. Release both
@@ -5676,7 +5677,7 @@ func (idx *Indexer) indexFile(
 			idx.resolver.SetPriorDeclarations(map[string]resolver.DeclarationSurface{graphPath: priorDeclarations})
 		}
 		resolveStarted := time.Now()
-		idx.resolver.ResolveFileAndIncoming(graphPath)
+		markerBatch.recordDropped(idx.resolver.ResolveFileAndIncoming(graphPath).DroppedFiles)
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
 		idx.resolver.SetPriorDeclarations(nil)
@@ -5738,7 +5739,7 @@ func (idx *Indexer) indexFile(
 			// that referenced it — bounded, synchronous, and gated on the
 			// signature delta so a body-only edit fans out to nothing.
 			affectedStarted := time.Now()
-			idx.reresolveAffectedBy(graphPath, abSnap, result.Nodes)
+			markerBatch.recordDropped(idx.reresolveAffectedBy(graphPath, abSnap, result.Nodes))
 			affectedDuration = time.Since(affectedStarted)
 
 			// Incremental semantic enrichment for this single file. Mirrors the
@@ -5986,8 +5987,16 @@ func isStructuralKind(k graph.NodeKind) bool {
 // interface-implementation inference. Exposed for batch paths that
 // defer per-file resolver work until the end of a batch.
 func (idx *Indexer) ResolveAll() {
+	if err := idx.resolveAll(); err != nil {
+		idx.logger.Error("indexer: full resolution failed", zap.Error(err))
+	}
+}
+
+func (idx *Indexer) resolveAll() error {
 	idx.populateCppIncludeDirs(true)
-	idx.resolver.ResolveAll()
+	if _, err := idx.resolver.ResolveAllContext(context.Background()); err != nil {
+		return err
+	}
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
@@ -6009,6 +6018,7 @@ func (idx *Indexer) ResolveAll() {
 	// Seed the durable reference-facts sidecar from the fully-resolved graph
 	// (no-op on the in-memory backend).
 	idx.persistAllRefFacts()
+	return nil
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.
@@ -6145,10 +6155,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
 func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
-	return idx.restubIncomingRefsForReplacement(graphPath, nil)
+	return idx.restubIncomingRefsForReplacement(graphPath, nil, nil)
 }
 
-func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string) []string {
+func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string, markerBatch *reparsePendingEnrichmentBatch) []string {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
 		return nil
@@ -6215,9 +6225,7 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCa
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
 	}
-	if len(batch) > 0 {
-		idx.graph.ReindexEdges(batch)
-	}
+	markerBatch.recordDropped(graph.ApplyEdgeReindexes(idx.graph, batch))
 	return npmConsumers
 }
 
@@ -7377,14 +7385,17 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if err != nil {
 		return nil, err
 	}
-	var completion resolutionCompletion
+	markerBatch := &reparsePendingEnrichmentBatch{}
+	if len(markerBatches) > 0 && markerBatches[0] != nil {
+		markerBatch = markerBatches[0]
+	}
+	completion := &markerBatch.resolution
 	completion.inputs = inputs
 	defer func() {
-		if retErr == nil && len(markerBatches) != 0 && markerBatches[0] != nil && markerBatches[0].deferResolverCatchup {
-			markerBatches[0].resolution = completion
+		if retErr == nil && markerBatch.deferResolverCatchup {
 			return
 		}
-		if err := idx.finishResolutionPass(completion); err != nil {
+		if err := idx.finishResolutionPass(*completion); err != nil {
 			retErr = err
 		}
 	}()
@@ -7701,10 +7712,6 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	}
 	sourceStaleFiles, manifestFiles := splitIncrementalContractManifests(idx, staleFiles)
 	dependencyTiming.complete(nil, zap.Int("dependent_files", len(deletedDependencyFiles)))
-	markerBatch := &reparsePendingEnrichmentBatch{}
-	if len(markerBatches) > 0 && markerBatches[0] != nil {
-		markerBatch = markerBatches[0]
-	}
 	bindingWrites := slices.ContainsFunc(sourceStaleFiles, closureJSTSPath) || slices.ContainsFunc(deletedFiles, closureJSTSPath)
 	if err := idx.fenceResolutionWrites(inputs, bindingWrites); err != nil {
 		return nil, err

@@ -372,6 +372,12 @@ func JSExportsImport(exports, defaultLocal, imports string) bool {
 	return false
 }
 
+// JSExportID qualifies a module symbol in its normal script, if embedded.
+func JSExportID(file *Node, name string) string {
+	scope, _ := file.Meta[JSExportScopeMeta].(string)
+	return file.ID + scope + "::" + name
+}
+
 // JSModuleStem is a conservative reverse-lookup key, not a forward resolver.
 func JSModuleStem(file string) string {
 	for _, ext := range [...]string{".d.ts", ".d.cts", ".d.mts"} {

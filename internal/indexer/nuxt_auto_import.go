@@ -73,7 +73,7 @@ func parkJSImport(e *graph.Edge, spec string) graph.EdgeReindex {
 
 // Walk reverse module dependencies, not a name-only call graph. Two unrelated
 // modules may expose the same export. Only forwarding imports propagate edits.
-func (idx *Indexer) parkModuleDependents(files []string) []string {
+func (idx *Indexer) parkModuleDependents(files []string, batch *reparsePendingEnrichmentBatch) []string {
 	if !slices.ContainsFunc(files, closureJSTSPath) {
 		return nil
 	}
@@ -124,7 +124,7 @@ func (idx *Indexer) parkModuleDependents(files []string) []string {
 				}
 				raw, _ := e.Meta[graph.JSImportSourceMeta].(string)
 				if (aliasChoices[stem] || strings.HasPrefix(e.To, "external::")) &&
-					raw != "" && !strings.HasPrefix(raw, "./") && !strings.HasPrefix(raw, "../") && e.Meta[resolver.NpmImportSpecifierMeta] == nil {
+					raw != "" && !closureRelativeSpecifier(raw) && e.Meta[resolver.NpmImportSpecifierMeta] == nil {
 					callers = append(callers, e.FilePath)
 					if !graph.IsUnresolvedTarget(e.To) {
 						moves = append(moves, parkJSImport(e, raw))
@@ -141,21 +141,7 @@ func (idx *Indexer) parkModuleDependents(files []string) []string {
 			}
 		}
 	}
-	if len(moves) > 0 {
-		if w, ok := idx.graph.(interface {
-			ReindexEdgesApplied([]graph.EdgeReindex) bool
-		}); ok {
-			if !w.ReindexEdgesApplied(moves) {
-				// The batch can be partially applied. Re-extract its callers
-				// from source rather than replaying superseded edge identities.
-				for _, m := range moves {
-					idx.failedBindingWrites = append(idx.failedBindingWrites, m.Edge.FilePath)
-				}
-			}
-		} else {
-			idx.graph.ReindexEdges(moves)
-		}
-	}
+	batch.recordDropped(graph.ApplyEdgeReindexes(idx.graph, moves))
 	return appendUniqueSorted(nil, callers...)
 }
 
@@ -195,5 +181,5 @@ func (idx *Indexer) rebindParkedCalls(files []string, batch *reparsePendingEnric
 		batch.bindingCallers = appendUniqueSorted(batch.bindingCallers, files...)
 		return
 	}
-	idx.resolver.ResolveFilesOutgoing(files)
+	batch.recordDropped(idx.resolver.ResolveFilesOutgoing(files).DroppedFiles)
 }

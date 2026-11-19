@@ -45,7 +45,8 @@ import (
 // cascade, changing import edges for an unchanged corpus.
 // Exact JS/TS and Nuxt calls follow module exports, aliases and lexical scope,
 // including CommonJS assignments and the normal script of a Vue component.
-const ResolutionSemanticsVersion = 12
+// Vue forwarding exports bind through the normal script's symbol scope.
+const ResolutionSemanticsVersion = 13
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

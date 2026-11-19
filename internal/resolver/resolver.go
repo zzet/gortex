@@ -131,6 +131,8 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// DroppedFiles must be re-extracted before certifying incremental resolution.
+	DroppedFiles []string `json:"-"`
 	// LSP* exposes the deferred whole-pass circuit-breaker outcome. These are
 	// diagnostic counters: skipped edges keep the heuristic result produced by
 	// the normal resolve cascade and remain eligible for a later full pass.
@@ -1294,7 +1296,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				r.graph.ReindexEdges(reindexBatch)
+				if dropped := graph.ApplyEdgeReindexes(r.graph, reindexBatch); len(dropped) > 0 {
+					return resolveError(fmt.Errorf("binding write did not apply; %d caller edges need retry", len(dropped)))
+				}
 				applyStoreElapsed += time.Since(storeStart)
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
@@ -1660,7 +1664,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				r.graph.ReindexEdges(terminalClears)
+				if dropped := graph.ApplyEdgeReindexes(r.graph, terminalClears); len(dropped) > 0 {
+					return resolveError(fmt.Errorf("terminal write did not apply; %d edges need retry", len(dropped)))
+				}
 			}
 
 			completed := append([]deferredLSPWorkKey(nil), stale...)
@@ -3482,7 +3488,10 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		if dropped := graph.ApplyEdgeReindexes(r.graph, reindexBatch); len(dropped) != 0 {
+			stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+			return
+		}
 		legs.lap("reindex")
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.

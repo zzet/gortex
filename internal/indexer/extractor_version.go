@@ -47,12 +47,12 @@ var extractorVersions = map[string]int{
 	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
 	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
 	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
-	"javascript": 6,                                      // CommonJS export assignments and lexical scopes
-	"typescript": 7,
-	"vue":        5, // normal-script module exports, plus embedded JS/TS scope changes
-	"svelte":     5,
-	"astro":      5,
-	"html":       5,
+	"javascript": 7,                                      // default-parameter scope and CommonJS alias writes
+	"typescript": 8,
+	"vue":        6, // normal-script forwarding exports and embedded JS/TS scope changes
+	"svelte":     6,
+	"astro":      6,
+	"html":       6,
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language

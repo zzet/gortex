@@ -42,7 +42,7 @@ func TestTrackedNpmImportsSurviveEviction(t *testing.T) {
 					g.EvictFile("lib/index.ts")
 				case "batch":
 					stages := []*incrementalBatchStage{{graphPath: "lib/index.ts", priorNodes: nodes}}
-					_, consumers := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages))
+					_, consumers := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages), nil)
 					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "replace":

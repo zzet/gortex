@@ -128,15 +128,30 @@ func TestExactModuleScriptExports(t *testing.T) {
 		{"lib.cjs", "function run(){}; module.exports = run", "default", "lib.cjs::run"},
 		{"lib.cjs", "function run(){}; exports.publicRun = run", "publicRun", "lib.cjs::run"},
 		{"lib.cjs", "function run(){}; exports.old = run; module.exports = run", "old", "unresolved::local"},
+		{"lib.cjs", "function real(){}; function other(){}; module.exports = real; module.exports.default = other", "default", "lib.cjs::real"},
+		{"lib.cjs", "function run(){}; exports = {}; exports.run = run", "run", "unresolved::local"},
+		{"lib.cjs", "function run(){}; var exports = {}; exports.run = run", "run", "unresolved::local"},
+		{"lib.cjs", "function run(){}; module.exports = {}; exports = module.exports; exports.named = run", "named", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports.named = run; delete exports.named", "named", "unresolved::local"},
+		{"lib.vue", "<script data-x='not setup here'>export {real as run} from './dep'</script>", "run", "dep.ts::real"},
 		{"lib.vue", "<script lang='ts'>export function run(){}</script>\n<script setup>function hidden(){}</script>", "run", "lib.vue#script:1::run"},
 		{"lib.vue", "<script setup>function hidden(){}</script>", "hidden", "unresolved::local"},
 	} {
 		t.Run(tc.module+"/"+tc.binding, func(t *testing.T) {
-			g := buildGraphFromSources(t, map[string]string{tc.module: tc.body, "page.ts": "import {" + tc.binding + " as local} from './" + tc.module + "'\nexport function go(){local()}"})
+			g := buildGraphFromSources(t, map[string]string{tc.module: tc.body, "dep.ts": "export function real(){}", "page.ts": "import {" + tc.binding + " as local} from './" + tc.module + "'\nexport function go(){local()}"})
 			New(g).ResolveAll()
 			require.Equal(t, tc.want, callEdgeTo(g, "page.ts::go", 2))
 		})
 	}
+}
+
+func TestBodyVarDoesNotShadowDefaultParameter(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"lib.ts":  "export function useIt(){}",
+		"page.js": "import {useIt} from './lib';\nexport function run(x = useIt()) { if (x) { var useIt = x } }",
+	})
+	New(g).ResolveAll()
+	require.Equal(t, "lib.ts::useIt", callEdgeTo(g, "page.js::run", 2))
 }
 
 func TestNuxtShadowingBoundaries(t *testing.T) {

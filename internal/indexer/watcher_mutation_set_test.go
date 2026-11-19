@@ -64,11 +64,12 @@ func TestWatcherMutationSetParsesWholeFrontierBeforeResolution(t *testing.T) {
 	var mu sync.Mutex
 	resolveCalls, crossCalls := 0, 0
 	targetPresent := false
-	idx.incrementalResolveFilesHook = func(files []string) {
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		mu.Lock()
 		defer mu.Unlock()
 		resolveCalls++
 		targetPresent = len(g.FindNodesByName("Renamed")) == 1
+		return nil
 	}
 	idx.incrementalCatchupHook = func(kind string, _ []string) {
 		if kind == "cross_repo" {

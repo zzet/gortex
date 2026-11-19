@@ -31,6 +31,28 @@ type EdgeReindex struct {
 	OldLine         int
 }
 
+// ApplyEdgeReindexes returns the source files of a refused or partially
+// applied batch. Recover from source, not by replaying stale edge identities.
+func ApplyEdgeReindexes(g Store, batch []EdgeReindex) []string {
+	if len(batch) == 0 {
+		return nil
+	}
+	if w, ok := g.(interface{ ReindexEdgesApplied([]EdgeReindex) bool }); ok {
+		if w.ReindexEdgesApplied(batch) {
+			return nil
+		}
+		files := make([]string, 0, len(batch))
+		for _, move := range batch {
+			if move.Edge != nil {
+				files = append(files, move.Edge.FilePath)
+			}
+		}
+		return files
+	}
+	g.ReindexEdges(batch)
+	return nil
+}
+
 // EdgeProvenanceUpdate is the per-edge payload for
 // SetEdgeProvenanceBatch. Edge points at the stored Edge whose
 // origin should be promoted; NewOrigin is the target tier. The store

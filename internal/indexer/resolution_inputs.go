@@ -142,11 +142,13 @@ func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutio
 }
 
 type resolutionCompletion struct {
-	inputs   *resolutionInputs
-	success  bool
-	failed   []string // absolute paths; empty on a failure of unknown extent
-	warm     bool
-	frontier []string // nil means a deferred full build
+	inputs     *resolutionInputs
+	success    bool
+	failed     []string // absolute paths; empty on a failure of unknown extent
+	dropped    []string // graph paths from partially applied reindexes in this pass
+	catchupErr error    // interrupted whole-pass fallback; retry extent is unknown
+	warm       bool
+	frontier   []string // nil means a deferred full build
 }
 
 type resolutionRetry struct {
@@ -233,6 +235,10 @@ func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs, bindingWrite
 	if inputs == nil || (!idx.resolutionInputsChanged && !bindingWrites) {
 		return nil
 	}
+	return idx.invalidateResolutionDigest()
+}
+
+func (idx *Indexer) invalidateResolutionDigest() error {
 	if store := idx.resolutionStore(); store != nil {
 		if err := store.SetResolutionInputDigest(idx.repoPrefix, ""); err != nil {
 			return err
@@ -305,8 +311,7 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 }
 
 func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr error) {
-	if dropped := idx.failedBindingWrites; len(dropped) > 0 {
-		idx.failedBindingWrites = nil
+	if dropped := work.dropped; len(dropped) > 0 {
 		// Preserve a failure of unknown extent. Otherwise retry only callers
 		// whose invalidation might have been dropped. Restart sees the fence.
 		if work.success || len(work.failed) > 0 {
@@ -317,7 +322,11 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 			}
 		}
 		work.success, work.warm = false, false
-		passErr = fmt.Errorf("module invalidation did not apply; %d caller edges need retry", len(dropped))
+		passErr = fmt.Errorf("binding write did not apply; %d caller edges need retry", len(dropped))
+	}
+	if work.catchupErr != nil {
+		work.success, work.warm, work.failed = false, false, nil
+		passErr = errors.Join(passErr, work.catchupErr)
 	}
 	if work.inputs == nil {
 		return passErr

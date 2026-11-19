@@ -355,9 +355,10 @@ func TestWatcherStormBatchDeletionFailureIsolationAndOneResolve(t *testing.T) {
 
 	resolveCalls := 0
 	var resolvedFiles []string
-	idx.incrementalResolveFilesHook = func(files []string) {
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		resolveCalls++
 		resolvedFiles = append([]string(nil), files...)
+		return nil
 	}
 
 	watcher, err := NewWatcher(idx, config.WatchConfig{}, zap.NewNop())
@@ -399,9 +400,10 @@ func TestMultiWatcherBatchCallbackRunsOneExactResolveAndDerivedCatchup(t *testin
 
 	resolveCalls := 0
 	var frontier []string
-	idx.incrementalResolveFilesHook = func(files []string) {
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		resolveCalls++
 		frontier = append([]string(nil), files...)
+		return nil
 	}
 	crossRepoCalls := 0
 	var crossRepoFrontier []string

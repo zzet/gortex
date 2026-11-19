@@ -118,7 +118,7 @@ func runRestubStage(
 	stages := []*incrementalBatchStage{stage}
 	view := loadIncrementalPriorView(st, stages)
 
-	carried, _ := restubIncomingRefsFromView(st, stages, view)
+	carried, _ := restubIncomingRefsFromView(st, stages, view, nil)
 
 	evictFilesBatched(st, []string{restubDefPath})
 	st.AddBatch(fresh, append(append([]*graph.Edge{}, freshEdges...), carried...))

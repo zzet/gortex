@@ -118,7 +118,17 @@ func jstsImportTargetAndAliasStem(getNode func(string) *graph.Node, pathAlias Pa
 		return "", alias
 	}
 	if symbol != "" {
-		if symID := file + "::" + symbol; getNode(symID) != nil {
+		var symID string
+		if strings.HasSuffix(file, ".vue") {
+			f := getNode(file)
+			if f == nil {
+				return "", alias
+			}
+			symID = graph.JSExportID(f, symbol)
+		} else {
+			symID = file + "::" + symbol
+		}
+		if getNode(symID) != nil {
 			return symID, alias
 		}
 	}

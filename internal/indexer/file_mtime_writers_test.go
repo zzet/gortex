@@ -43,7 +43,7 @@ func TestBatchedFileMtimeEvictionDetachesPublishedSnapshot(t *testing.T) {
 	idx.fileMtimes = map[string]int64{"a.go": 1, "b.go": 2}
 	published := idx.publishFileMtimes()
 
-	idx.evictDeletedFilesBatched([]string{"a.go"}, &DerivedInvalidationPlan{})
+	idx.evictDeletedFilesBatched([]string{"a.go"}, &DerivedInvalidationPlan{}, nil)
 
 	assert.Equal(t, int64(1), published["a.go"])
 	assert.NotContains(t, idx.fileMtimes, "a.go")

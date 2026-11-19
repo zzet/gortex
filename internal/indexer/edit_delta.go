@@ -955,13 +955,14 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// content hash among them), which an inert save leaves unwritten.
 	// The resolver catch-up is the engine's largest phase with no log of its
 	// own; the delta times it and counts the pages it brings in.
-	idx.incrementalResolveFilesHook = func(frontier []string) {
+	idx.incrementalResolveFilesHook = func(frontier []string) []string {
 		started, io := time.Now(), editDeltaProcessIO()
-		idx.resolver.ResolveFilesAndIncoming(frontier)
+		stats := idx.resolver.ResolveFilesAndIncoming(frontier)
 		used := editDeltaProcessIO().since(io)
 		out.ResolveFrontier += len(frontier)
 		out.ResolveDuration += time.Since(started)
 		out.ResolveFaults += used.majorFaults
+		return stats.DroppedFiles
 	}
 	// Each engine pass is split into the stages the engine announces
 	// (observeIncrementalCatchup): the reconcile before the resolver, then

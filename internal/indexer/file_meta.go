@@ -204,6 +204,12 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 // tier is configured.
 const reparsePendingEnrichmentBatchSize = 256
 
+func (b *reparsePendingEnrichmentBatch) recordDropped(files []string) {
+	if len(files) != 0 && b != nil {
+		b.resolution.dropped = append(b.resolution.dropped, files...)
+	}
+}
+
 type reparsePendingEnrichmentBatch struct {
 	pointPreparation *watcherPointPreparation
 	publication      *PublicationStamps // optional local canonical attempt; never a live record

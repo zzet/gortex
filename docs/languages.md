@@ -130,11 +130,13 @@ barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
-Exact imports also follow top-level `module.exports = local`, `exports.name = local`
-and `module.exports.name = local` assignments, and named exports from a Vue
-component's normal `<script>`. `<script setup>` locals are not module exports.
-When a higher-priority tsconfig path target appears, a watcher edit rechecks
-calls that had selected a fallback target.
+For CommonJS, a default import selects `module.exports`, not its `.default`
+property. Named imports follow direct top-level property assignments and
+deletes on `module.exports` or its attached `exports` alias. Conditional and
+function-body writes are not treated as guaranteed exports.
+Normal Vue `<script>` blocks can export or re-export names; `<script setup>`
+locals are not module exports. A watcher rechecks fallback bindings when a
+preferred tsconfig target appears, including an explicit declaration file.
 
 ### Nuxt app auto-imports
 
@@ -154,8 +156,9 @@ outside the repository are ignored. An unprepared nested application does not
 inherit outer globals; a config in `layers/<name>/` belongs to the parent app.
 The app list excludes config and generated files and the project's or a layer's
 Nitro `server/`, not ordinary app paths such as `app/pages/server/`. SQLite records
-the applied input digest after resolver catch-up, so changed lists reconcile
-after restart even when all indexed source files have unchanged mtimes.
+the applied input digest after resolver catch-up. A dropped binding write leaves
+the digest invalid and queues the affected callers for re-extraction. A restart
+can therefore detect incomplete bindings even when source mtimes have not changed.
 
 ### Julia specifics
 

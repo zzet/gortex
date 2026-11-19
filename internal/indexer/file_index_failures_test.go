@@ -311,7 +311,7 @@ func TestIncrementalRetryLogsTerminalReadError(t *testing.T) {
 	require.Len(t, warnings, 1)
 	require.Contains(t, warnings[0].ContextMap()["error"], "no space left on device")
 	var plan DerivedInvalidationPlan
-	idx.evictDeletedFilesBatched([]string{"source.go"}, &plan)
+	idx.evictDeletedFilesBatched([]string{"source.go"}, &plan, nil)
 	require.Empty(t, LoadFileIndexFailures(g, ""), "explicit deletion clears even a never-indexed failure")
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 func TestNuxtAutoImports_ConfigOnlyIncrementalReindex(t *testing.T) {
@@ -177,15 +178,15 @@ func TestNuxtWatcherDigestUsesResolvedSnapshot(t *testing.T) {
 	other.SetRootPath(root)
 	set("new")
 	caughtUp := false
-	idx.incrementalResolveFilesHook = func(files []string) {
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		digest, err := store.ResolutionInputDigest("")
 		require.NoError(t, err)
 		require.Empty(t, digest, "a restart here must not trust the parsed but unresolved graph")
 		set("old")
 		_, err = other.refreshResolutionInputs(root, "")
 		require.NoError(t, err)
-		idx.resolver.ResolveFilesAndIncoming(files)
 		caughtUp = true
+		return idx.resolver.ResolveFilesAndIncoming(files).DroppedFiles
 	}
 	_, err = idx.incrementalPointWatcherPath(root, page)
 	require.NoError(t, err)
@@ -197,10 +198,10 @@ func TestNuxtWatcherDigestUsesResolvedSnapshot(t *testing.T) {
 
 	// A source-only edit also replaces call rows before resolver catch-up.
 	caughtUp = false
-	idx.incrementalResolveFilesHook = func(files []string) {
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		require.False(t, idx.censusResolutionCurrent(root), "unchanged inputs cannot certify unfinished rows")
-		idx.resolver.ResolveFilesAndIncoming(files)
 		caughtUp = true
+		return idx.resolver.ResolveFilesAndIncoming(files).DroppedFiles
 	}
 	bumpMtime(t, page, "export function secondCaller() { return useAuth() }")
 	_, err = idx.incrementalPointWatcherPath(root, page)
@@ -367,26 +368,33 @@ func TestNuxtRemovedShadowRebinds(t *testing.T) {
 }
 
 func TestAliasPreferredModuleArrives(t *testing.T) {
-	root := t.TempDir()
-	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{"@impl/*":["src/*","fallback/*"]}}}`)
-	writeFileMk(t, filepath.Join(root, "fallback/lib.ts"), "export function impl(){}")
-	writeFileMk(t, filepath.Join(root, "page.ts"), "import {impl} from '@impl/lib'; export function run(){impl()}")
-	idx, _ := newSQLiteIndexer(t)
-	_, err := idx.Index(root)
-	require.NoError(t, err)
-	require.Equal(t, "fallback/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
-	preferred := filepath.Join(root, "src/lib.ts")
-	writeFileMk(t, preferred, "export function impl(){}")
-	_, err = idx.incrementalPointWatcherPath(root, preferred)
-	require.NoError(t, err)
-	require.Equal(t, "src/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
-	var imports []string
-	for _, e := range idx.Graph().GetOutEdges("page.ts") {
-		if e.Kind == graph.EdgeImports {
-			imports = append(imports, e.To)
-		}
+	for _, tc := range []struct{ name, alias, preferred string }{
+		{"wildcard", `"@impl/*":["src/*","fallback/*"]`, "src/lib.ts"},
+		{"declaration", `"@impl/lib":["src/lib.d.ts","fallback/lib.ts"]`, "src/lib.d.ts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{`+tc.alias+`}}}`)
+			writeFileMk(t, filepath.Join(root, "fallback/lib.ts"), "export function impl(){}")
+			writeFileMk(t, filepath.Join(root, "page.ts"), "import {impl} from '@impl/lib'; export function run(){impl()}")
+			idx, _ := newSQLiteIndexer(t)
+			_, err := idx.Index(root)
+			require.NoError(t, err)
+			require.Equal(t, "fallback/lib.ts::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+			preferred := filepath.Join(root, tc.preferred)
+			writeFileMk(t, preferred, "export function impl(){}")
+			_, err = idx.incrementalPointWatcherPath(root, preferred)
+			require.NoError(t, err)
+			require.Equal(t, tc.preferred+"::impl", callTargetForName(t, idx.Graph(), "page.ts", "run"))
+			var imports []string
+			for _, e := range idx.Graph().GetOutEdges("page.ts") {
+				if e.Kind == graph.EdgeImports {
+					imports = append(imports, e.To)
+				}
+			}
+			require.ElementsMatch(t, []string{tc.preferred, tc.preferred + "::impl"}, imports)
+		})
 	}
-	require.ElementsMatch(t, []string{"src/lib.ts", "src/lib.ts::impl"}, imports)
 }
 
 func TestConfiglessBindingFence(t *testing.T) {
@@ -398,22 +406,24 @@ func TestConfiglessBindingFence(t *testing.T) {
 	_, err := idx.Index(root)
 	require.NoError(t, err)
 	require.True(t, idx.censusResolutionCurrent(root))
-	var catchups int
-	idx.incrementalResolveFilesHook = func(files []string) {
+	var sawFencedCatchup bool
+	idx.incrementalResolveFilesHook = func(files []string) []string {
 		require.False(t, idx.censusResolutionCurrent(root), "restart must not certify incomplete bindings")
-		idx.resolver.ResolveFilesAndIncoming(files)
-		catchups++
+		sawFencedCatchup = true
+		return idx.resolver.ResolveFilesAndIncoming(files).DroppedFiles
 	}
 	bumpMtime(t, page, "import {impl} from './lib'; export function changed(){impl()}")
 	_, err = idx.incrementalPointWatcherPath(root, page)
 	require.NoError(t, err)
 	require.Equal(t, "lib.js::impl", callTargetForName(t, idx.Graph(), "page.js", "changed"))
 	require.True(t, idx.censusResolutionCurrent(root))
+	require.True(t, sawFencedCatchup)
+	sawFencedCatchup = false
 	require.NoError(t, os.Remove(filepath.Join(root, "lib.js")))
 	_, _, err = idx.incrementalEvictWatcherPath("lib.js")
 	require.NoError(t, err)
 	require.Equal(t, "unresolved::impl", callTargetForName(t, idx.Graph(), "page.js", "changed"))
-	require.Equal(t, 2, catchups)
+	require.True(t, sawFencedCatchup)
 	require.True(t, idx.censusResolutionCurrent(root))
 }
 
@@ -434,11 +444,80 @@ func TestDroppedBindingInvalidationRetriesCaller(t *testing.T) {
 	bumpMtime(t, barrel, "export {fresh as impl} from './lib'")
 	idx.graph = refuseBindingInvalidation{store}
 	_, err = idx.incrementalPointWatcherPath(root, barrel)
-	require.ErrorContains(t, err, "invalidation did not apply")
+	require.ErrorContains(t, err, "binding write did not apply")
 	require.False(t, idx.censusResolutionCurrent(root))
 	idx.graph = store
 	_, err = idx.incrementalPointWatcherPath(root, barrel)
 	require.NoError(t, err)
 	require.Equal(t, "lib.ts::fresh", callTargetForName(t, store, "page.ts", "run"))
 	require.True(t, idx.censusResolutionCurrent(root))
+}
+
+func TestDroppedEvictionAndCatchupRetry(t *testing.T) {
+	for _, action := range []string{"evict", "save"} {
+		t.Run(action, func(t *testing.T) {
+			root := t.TempDir()
+			module := filepath.Join(root, "lib.js")
+			page := filepath.Join(root, "page.js")
+			writeFileMk(t, module, "export function impl(){}")
+			writeFileMk(t, page, "import {impl} from './lib'; export function run(){impl()}")
+			idx, store := newSQLiteIndexer(t)
+			_, err := idx.Index(root)
+			require.NoError(t, err)
+			caller, want := "run", "unresolved::impl"
+			if action == "evict" {
+				require.NoError(t, os.Remove(module))
+				idx.graph = refuseBindingInvalidation{store}
+				_, _, err = idx.incrementalEvictWatcherPath("lib.js")
+				idx.graph = store
+			} else {
+				caller, want = "changed", "lib.js::impl"
+				bumpMtime(t, page, "import {impl} from './lib'; export function changed(){impl()}")
+				original := idx.resolver
+				idx.resolver = resolver.New(refuseBindingInvalidation{store})
+				_, err = idx.incrementalPointWatcherPath(root, page)
+				idx.resolver = original
+			}
+			require.ErrorContains(t, err, "binding write did not apply")
+			require.False(t, idx.censusResolutionCurrent(root))
+			_, err = idx.IncrementalReindexPaths(root, []string{module})
+			require.NoError(t, err)
+			require.Equal(t, want, callTargetForName(t, store, "page.js", caller))
+			require.True(t, idx.censusResolutionCurrent(root))
+		})
+	}
+}
+
+func TestDroppedFullBindingWriteCannotCertify(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0") // resolve against SQLite, not the in-memory staging graph
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "lib.js"), "export function impl(){}")
+	writeFileMk(t, filepath.Join(root, "page.js"), "import {impl} from './lib'; export function run(){impl()}")
+	idx, store := newSQLiteIndexer(t)
+	original := idx.resolver
+	idx.resolver = resolver.New(refuseBindingInvalidation{store})
+	_, err := idx.Index(root)
+	require.ErrorContains(t, err, "binding write did not apply")
+	require.False(t, idx.censusResolutionCurrent(root))
+	idx.resolver = original
+	_, err = idx.IncrementalReindexPaths(root, []string{filepath.Join(root, "lib.js")})
+	require.NoError(t, err)
+	require.Equal(t, "lib.js::impl", callTargetForName(t, store, "page.js", "run"))
+	require.True(t, idx.censusResolutionCurrent(root))
+}
+
+func TestEvictAfterCheckoutMoves(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "checkout")
+	writeFileMk(t, filepath.Join(root, "lib.ts"), "export function impl(){}")
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.NoError(t, os.Rename(root, filepath.Join(parent, "moved")))
+	removed, _ := idx.EvictFile("lib.ts")
+	require.Positive(t, removed)
+	require.Nil(t, store.GetNode("lib.ts::impl"))
+	digest, err := store.ResolutionInputDigest("")
+	require.NoError(t, err)
+	require.Empty(t, digest)
 }
