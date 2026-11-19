@@ -156,7 +156,10 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 	// for the topology sweep. The lifecycle bounds and coalesces the metadata
 	// work; it never tracks an unknown family or waits for graph construction.
 	root, _, gitPath := gitstate.MarkerCommonDir(path)
-	nested := binding.Matched && gitPath && !pathkey.EqualPaths(root, binding.RootPath)
+	// MarkerCommonDir preserves the request's spelling; catalog roots are
+	// physical paths. An alias of the same checkout is not a nested worktree.
+	nested := binding.Matched && gitPath && !pathkey.EqualPaths(
+		pathkey.CanonicalExistingRoot(root), pathkey.CanonicalExistingRoot(binding.RootPath))
 	if (!binding.Matched || nested) && (c.multiIndexer == nil || !c.multiIndexer.RepoIdentityPending()) {
 		_, found, observeErr := c.lifecycle.ObserveCheckoutPath(ctx, path)
 		if observeErr != nil || (!found && nested) {
