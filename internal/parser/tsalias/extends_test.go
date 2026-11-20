@@ -1,6 +1,7 @@
 package tsalias
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -112,4 +113,17 @@ func TestExactAliasPrecedesWildcardWithSamePrefix(t *testing.T) {
 	scope := coll.FindForFile("caller.ts")
 	require.Equal(t, "exact", Resolve(scope, "foo"))
 	require.Equal(t, "wild/bar", Resolve(scope, "foobar"))
+}
+
+func TestLoad_ExtendsDoesNotLeaveRootThroughSymlink(t *testing.T) {
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "base.json"), []byte(`{"compilerOptions":{"paths":{"~/*":["leaked/*"]}}}`), 0o644))
+	root := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"extends":"./linked/base.json"}`), 0o644))
+	if c := Load(root); c != nil {
+		t.Fatalf("extends through a symlink out of the root loaded %+v", c)
+	}
 }

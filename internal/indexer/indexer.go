@@ -141,6 +141,9 @@ type IndexResult struct {
 	// serialized: coordinated callers surface it only after the committed graph
 	// has reached a coherent post-mutation state.
 	mutationErr error
+	// failuresRetryable: every failed file is in the persisted failure ledger,
+	// which retries it, and no directory walk failed.
+	failuresRetryable bool
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -7773,8 +7776,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// restage successful files of the same language forever. Discovery failures
 	// can hide an entire subtree, and torn passes cannot attest a completed
 	// restage. Keep the language-wide fence for either, or for an unsafe ledger.
-	if len(extractorStaleLangs) > 0 && len(discoveryFailed) == 0 && result.mutationErr == nil &&
-		idx.failedFilesSafelyRetryable(failedFiles) {
+	result.failuresRetryable = len(discoveryFailed) == 0 && idx.failedFilesSafelyRetryable(failedFiles)
+	if len(extractorStaleLangs) > 0 && result.mutationErr == nil && result.failuresRetryable {
 		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)

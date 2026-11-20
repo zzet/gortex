@@ -117,6 +117,11 @@ func (idx *Indexer) forceReparseDropsResolutions(filePath string) bool {
 	if idx.aliasResolutionChanged && closureJSTSPath(filePath) {
 		return true
 	}
+	// An alias pass may stamp its policy while a failed file still holds rows
+	// bound under the previous one. Its retry must not reuse them.
+	if closureJSTSPath(filePath) && idx.hasFileIndexFailure(filePath) {
+		return true
+	}
 	if len(idx.forcedReparse) == 0 {
 		return false
 	}

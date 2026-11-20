@@ -146,3 +146,33 @@ func TestTSConfigPathAlias_WarmSaveKeepsBoundedProof(t *testing.T) {
 	set, _ := buildReadSetFrom(proof.readSet(t.Context(), nil, nil))
 	require.True(t, readSetHolds(set, filepath.Base(configPath)))
 }
+
+// A file the alias rebind cannot read is retried from the failure ledger.
+// It must not keep every later save restaging all JS/TS callers.
+func TestTSConfigPathAlias_FailedFileDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	locked := filepath.Join(root, "pages/locked.ts")
+	writeFileMk(t, locked, "import { useRedirect } from '~/auth'\nexport function other() { return useRedirect() }\n")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	restore := denyFileRead(t, locked)
+	result, err := idx.IncrementalReindexPaths(root, []string{configPath})
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, locked)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{locked})
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/locked.ts", "other"))
+}

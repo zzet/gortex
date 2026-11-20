@@ -428,12 +428,20 @@ func LoadObserved(repoRoot string, observe func(rel string, data []byte, found b
 	if repoRoot == "" {
 		return nil
 	}
-	return LoadTree(dirTree{root: repoRoot, observe: observe})
+	// Config reads stay inside the root: a relative extends through a
+	// symlinked directory must not import another checkout's aliases.
+	dir, err := os.OpenRoot(repoRoot)
+	if err != nil {
+		return nil
+	}
+	defer dir.Close()
+	return LoadTree(dirTree{root: repoRoot, dir: dir, observe: observe})
 }
 
 // dirTree is the working copy at a root: the tree Load reads.
 type dirTree struct {
 	root    string
+	dir     *os.Root // config reads; nil only for a zero tree
 	observe func(string, []byte, bool)
 }
 
@@ -469,7 +477,10 @@ func (t dirTree) Files(visit func(rel string)) {
 }
 
 func (t dirTree) Read(rel string) ([]byte, bool) {
-	data, err := os.ReadFile(filepath.Join(t.root, filepath.FromSlash(rel)))
+	if t.dir == nil {
+		return nil, false
+	}
+	data, err := t.dir.ReadFile(filepath.FromSlash(rel))
 	if t.observe != nil {
 		t.observe(rel, data, err == nil)
 	}

@@ -51,11 +51,18 @@ func (s *aliasSnapshot) needsDiscovery(root string, paths []string) bool {
 			return true
 		}
 	}
+	// Recheck through the root, as LoadObserved read them.
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		return true
+	}
+	defer dir.Close()
 	for p, before := range s.inputs {
-		data, err := os.ReadFile(p)
 		var now [sha256.Size]byte
-		if err == nil {
-			now = sha256.Sum256(data)
+		if rel, err := filepath.Rel(root, p); err == nil {
+			if data, err := dir.ReadFile(rel); err == nil {
+				now = sha256.Sum256(data)
+			}
 		}
 		if now != before {
 			return true
@@ -150,8 +157,12 @@ func (idx *Indexer) beginAliasPass(root string, paths []string) error {
 
 func (idx *Indexer) finishAliasPass(result *IndexResult) error {
 	s := idx.passAliases.Load()
-	if s == nil || s.digest == idx.appliedAliases || result == nil ||
-		result.mutationErr != nil || len(result.Errors) != 0 || len(result.FailedFiles) != 0 {
+	if s == nil || s.digest == idx.appliedAliases || result == nil || result.mutationErr != nil {
+		return nil
+	}
+	// The failure ledger retries a failed file with the current policy. Waiting
+	// for it would restage every JS/TS caller on each save until it reads.
+	if (len(result.Errors) != 0 || len(result.FailedFiles) != 0) && !result.failuresRetryable {
 		return nil
 	}
 	if store, ok := idx.graph.(aliasStateStore); ok {
