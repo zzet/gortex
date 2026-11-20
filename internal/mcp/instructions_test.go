@@ -119,7 +119,7 @@ func TestStateAwareInstructionsWaitForAutomaticFamilyCheckout(t *testing.T) {
 }
 
 func TestPendingTextNoReconnect(t *testing.T) {
-	for _, text := range []string{ServerInstructionsPendingAutomaticCheckout("/checkout"), ServerInstructionsUntracked("/other")} {
+	for _, text := range []string{ServerInstructionsPendingAutomaticCheckout("/checkout"), ServerInstructionsUntracked("/other"), ServerInstructionsCheckoutLoading("/checkout", "view_building")} {
 		withoutException := strings.ReplaceAll(text, "no reconnect is needed", "")
 		require.NotContains(t, strings.ToLower(withoutException), "reconnect")
 		require.NotContains(t, text, "may return repo_not_tracked")
@@ -133,8 +133,21 @@ func TestStateAwareInstructionsChecksAdmissionErrors(t *testing.T) {
 	_, err := v.srv.CheckoutServesCWDChecked(ctx, v.worktreeRoot)
 	require.Error(t, err)
 	got := v.srv.stateAwareInstructionsContext(ctx, v.worktreeRoot, serverInstructions)
-	require.Equal(t, CheckoutAdmissionInstructions(v.worktreeRoot, err), got)
+	require.Equal(t, CheckoutAdmissionInstructions(v.worktreeRoot, err, serverInstructions), got)
+	require.Contains(t, got, "checkout_inaccessible", "a cancelled lookup is not retryable")
+	require.Contains(t, got, "No graph access has been granted")
 	require.NotContains(t, got, "gortex track")
+
+	// A retryable failure is a checkout still being admitted: the session
+	// keeps the ordinary instructions behind a loading preamble.
+	busy := func(context.Context, string) (bool, error) { return false, indexer.ErrCheckoutMutationBusy }
+	for _, base := range []string{serverInstructions, codingAgentInstructions} {
+		got = v.srv.stateAwareInstructionsWithCheckout(t.Context(), v.worktreeRoot, base, busy)
+		require.True(t, strings.HasPrefix(got, ServerInstructionsCheckoutLoading(v.worktreeRoot, "view_building")), got)
+		require.True(t, strings.HasSuffix(got, "\n\n"+base), got)
+		require.NotContains(t, got, "No graph access")
+		require.NotContains(t, got, "gortex track")
+	}
 }
 
 func TestStateAwareInstructionsGraceAndTransitionDoNotRecommendTrack(t *testing.T) {

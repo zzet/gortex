@@ -116,8 +116,30 @@ func CheckoutAdmissionFailure(err error) (code string, retryable bool) {
 
 // CheckoutAdmissionInstructions is shared with the daemon's initialize rewrite
 // so embedded and routed sessions receive the same checked-admission text.
-func CheckoutAdmissionInstructions(cwd string, err error) string {
+// A retryable failure keeps base behind a loading preamble, as a repository
+// loading after a restart does: MCP clients read instructions once and the
+// session keeps them after the checkout is admitted.
+func CheckoutAdmissionInstructions(cwd string, err error, base string) string {
 	code, retryable := CheckoutAdmissionFailure(err)
+	if retryable {
+		return ServerInstructionsCheckoutLoading(cwd, code) + "\n\n" + base
+	}
 	return fmt.Sprintf("Gortex checkout discovery is unavailable for %s (%s, retryable=%t): %v. "+
 		"No graph access has been granted. Retry after discovery can complete; do not change tracking configuration to resolve this admission error.", cwd, code, retryable, err)
+}
+
+// ServerInstructionsCheckoutLoading is the preamble for a checkout whose
+// admission is still pending. It claims no family membership: a retryable
+// catalog error can come from a directory no tracked family owns.
+func ServerInstructionsCheckoutLoading(cwd, code string) string {
+	return fmt.Sprintf("Gortex is LOADING checkout %s (%s). "+
+		"Graph tools return %s (retryable) until checkout discovery completes; a checkout of a tracked repository "+
+		"then works in place, no reconnect is needed. Until then, retry shortly or continue with work that does not need the graph. "+
+		"Do not change tracking configuration to resolve this.", cwd, code, code)
+}
+
+// CheckoutAdmissionInstructionsFor is CheckoutAdmissionInstructions on the
+// base the session's own initialize chose, for the daemon's rewrite.
+func (s *Server) CheckoutAdmissionInstructionsFor(ctx context.Context, cwd string, err error) string {
+	return CheckoutAdmissionInstructions(cwd, err, instructionsBase(s.effectiveSessionPolicy(ctx)))
 }

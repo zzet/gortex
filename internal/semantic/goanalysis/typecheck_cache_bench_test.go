@@ -1,12 +1,11 @@
 package goanalysis
 
 import (
-	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/semantic"
+	"github.com/zzet/gortex/internal/testutil/reporoot"
 	"go.uber.org/zap"
 )
 
@@ -16,11 +15,7 @@ import (
 // state does not imply a cold Go build cache: keep that distinction when
 // comparing a newly registered checkout with later edits in the same checkout.
 func BenchmarkTypecheckCacheRepositoryLoad(b *testing.B) {
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		b.Fatal("cannot locate benchmark source")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", ".."))
+	root := reporoot.Path(b)
 	scope := semantic.CheckoutCompilerScope{HandleRoots: true, StripSiblingBodies: true, TypecheckCache: true}
 	plan := planHandleRoots(root, root, "", map[string]struct{}{"internal/server/handler.go": {}}, scope)
 	if plan.full || plan.empty() {
