@@ -48,7 +48,7 @@ func TestImportEvidence_SymbolBindingBeatsFileClosure(t *testing.T) {
 func TestImportEvidence_ImportNodeIsNotLocalShadow(t *testing.T) {
 	g := buildGraphFromSources(t, map[string]string{
 		"app/composables/useRedirect.ts": "export const useRedirect = () => 1",
-		"app/pages/index.ts": "import { useRedirect } from '../composables/useRedirect'\nexport function run() { return useRedirect() }\n",
+		"app/pages/index.ts":             "import { useRedirect } from '../composables/useRedirect'\nexport function run() { return useRedirect() }\n",
 	})
 	New(g).ResolveAll()
 	for _, edge := range g.GetOutEdges("app/pages/index.ts::run") {
