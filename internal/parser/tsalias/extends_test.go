@@ -2,6 +2,7 @@ package tsalias
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -31,19 +32,19 @@ func TestLoad_Extends(t *testing.T) {
 			want: "app/composables/auth",
 		},
 		{
-			name: "dotted relative parent with implicit json extension",
+			name: "dotted stem falls back to json",
 			configs: map[string]string{
-				"tsconfig.json":      `{"extends":"./tsconfig.base"}`,
-				"tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
+				"tsconfig.json":             `{"extends":"./config/tsconfig.base"}`,
+				"config/tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["../app/*"]}}}`,
 			},
 			want: "app/composables/auth",
 		},
 		{
-			name: "exact parent takes precedence over json fallback",
+			name: "literal parent wins over json fallback",
 			configs: map[string]string{
-				"tsconfig.json":      `{"extends":"./tsconfig.base"}`,
-				"tsconfig.base":      `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
-				"tsconfig.base.json": `{"compilerOptions":{"paths":{"~/*":["wrong/*"]}}}`,
+				"tsconfig.json": `{"extends":"./base"}`,
+				"base":          `{"compilerOptions":{"paths":{"~/*":["app/*"]}}}`,
+				"base.json":     `{"compilerOptions":{"paths":{"~/*":["wrong/*"]}}}`,
 			},
 			want: "app/composables/auth",
 		},
@@ -104,6 +105,28 @@ func TestLoad_ExtendsChildPathsReplaceParent(t *testing.T) {
 	coll := Load(root)
 	require.NotNil(t, coll)
 	require.Empty(t, Resolve(coll.FindForFile("app/page.ts"), "~/composables/auth"))
+}
+
+func TestExactAliasPrecedesWildcardWithSamePrefix(t *testing.T) {
+	coll := LoadTree(memTree{files: map[string]string{
+		"tsconfig.json": `{"compilerOptions":{"paths":{"foo":["exact"],"foo*":["wild/*"]}}}`,
+	}})
+	scope := coll.FindForFile("caller.ts")
+	require.Equal(t, "exact", Resolve(scope, "foo"))
+	require.Equal(t, "wild/bar", Resolve(scope, "foobar"))
+}
+
+func TestLoad_ExtendsDoesNotLeaveRootThroughSymlink(t *testing.T) {
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "base.json"), []byte(`{"compilerOptions":{"paths":{"~/*":["leaked/*"]}}}`), 0o644))
+	root := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"extends":"./linked/base.json"}`), 0o644))
+	if c := Load(root); c != nil {
+		t.Fatalf("extends through a symlink out of the root loaded %+v", c)
+	}
 }
 
 type countingConfigTree struct {

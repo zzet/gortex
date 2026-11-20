@@ -130,9 +130,11 @@ func (in *resolutionInputs) unchangedForPoints(root string, points []string, pro
 	return true
 }
 
-type resolutionInputStore interface {
-	ResolutionInputDigest(repo string) (string, error)
-	SetResolutionInputDigest(repo, digest string) error
+// The durable digest lives in ts_alias_state. It covers every resolution
+// input, Nuxt generated lists included, not only tsconfig aliases.
+type aliasStateStore interface {
+	TSAliasDigest(repo string) (string, error)
+	SetTSAliasDigest(repo, digest string) error
 }
 
 func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutionInputs, error) {
@@ -144,7 +146,7 @@ func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutio
 	defer dir.Close()
 	t := &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir, reads: make(map[string]string), proof: proof}
 	t.Tree.Files(func(rel string) { t.paths = append(t.paths, rel) })
-	current := &resolutionInputs{aliases: tsalias.LoadScopes(t.Files, t.Read, t.Exists), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
+	current := &resolutionInputs{aliases: tsalias.LoadTree(t), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
 	h := sha256.New()
 	for _, rel := range slices.Sorted(maps.Keys(current.reads)) {
 		writeFingerprintString(h, rel)
@@ -169,8 +171,8 @@ type resolutionRetry struct {
 	files  map[string]bool // relative paths; nil means the pass did not complete discovery
 }
 
-func (idx *Indexer) resolutionStore() resolutionInputStore {
-	s, _ := idx.graph.(resolutionInputStore)
+func (idx *Indexer) resolutionStore() aliasStateStore {
+	s, _ := idx.graph.(aliasStateStore)
 	return s
 }
 
@@ -188,7 +190,7 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 		prior := idx.appliedResolution.Load()
 		return prior != nil && prior.digest == current.digest
 	}
-	stored, err := store.ResolutionInputDigest(idx.repoPrefix)
+	stored, err := store.TSAliasDigest(idx.repoPrefix)
 	if err == nil && stored == current.digest {
 		idx.appliedResolution.Store(current)
 		cacheResolutionInputs(root, current)
@@ -200,6 +202,14 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 func (idx *Indexer) refreshResolutionInputs(root string, points ...string) (*resolutionInputs, error) {
 	if idx.manifestTree().sourced() {
 		return nil, nil
+	}
+	if _, delta := idx.graph.(*graph.DeltaWriter); delta {
+		// The delta planner pinned the inputs and refused a changed policy.
+		// It does not certify a rebind for the checkout.
+		if idx.deltaResolution != nil {
+			idx.activeResolution.Store(idx.deltaResolution)
+		}
+		return idx.deltaResolution, nil
 	}
 	idx.resolutionMu.Lock()
 	if pending := idx.warmResolution; pending != nil {
@@ -228,11 +238,11 @@ func (idx *Indexer) refreshResolutionInputs(root string, points ...string) (*res
 			return nil, err
 		}
 		if prior != nil {
-			idx.resolutionInputsChanged = idx.resolutionInputsChanged || !prior.aliases.Equal(current.aliases) || !prior.nuxt.Equal(current.nuxt)
+			idx.resolutionInputsChanged = idx.resolutionInputsChanged || prior.aliases.Digest() != current.aliases.Digest() || !prior.nuxt.Equal(current.nuxt)
 		}
 	}
 	if store := idx.resolutionStore(); store != nil && prior == nil {
-		stored, err := store.ResolutionInputDigest(idx.repoPrefix)
+		stored, err := store.TSAliasDigest(idx.repoPrefix)
 		if err != nil {
 			return nil, err
 		}
@@ -258,7 +268,7 @@ func (idx *Indexer) fenceResolutionWrites(inputs *resolutionInputs, bindingWrite
 
 func (idx *Indexer) invalidateResolutionDigest() error {
 	if store := idx.resolutionStore(); store != nil {
-		if err := store.SetResolutionInputDigest(idx.repoPrefix, ""); err != nil {
+		if err := store.SetTSAliasDigest(idx.repoPrefix, ""); err != nil {
 			return err
 		}
 	}
@@ -314,6 +324,20 @@ func resolutionInputsForTree(tree manifestTree) *resolutionInputs {
 	}
 	proven, _ := tree.(provenManifestTree)
 	return workingResolutionInputs(tree.root(), proven.proof)
+}
+
+// checkoutResolutionInputs rechecks the cached inputs against the changed
+// paths, and discovers them again only when that cannot prove them unchanged.
+func checkoutResolutionInputs(root string, proof *buildContentProof, points []string) (*resolutionInputs, error) {
+	if cached := cachedResolutionInputs(root); cached.unchangedForPoints(root, points, proof) {
+		return cached, nil
+	}
+	current, err := discoverResolutionInputs(root, proof)
+	if err != nil {
+		return nil, err
+	}
+	cacheResolutionInputs(root, current)
+	return current, nil
 }
 
 func cachedResolutionInputs(root string) *resolutionInputs {
@@ -408,7 +432,7 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 
 func (idx *Indexer) stampResolution(inputs *resolutionInputs) error {
 	if store := idx.resolutionStore(); store != nil {
-		if err := store.SetResolutionInputDigest(idx.repoPrefix, inputs.digest); err != nil {
+		if err := store.SetTSAliasDigest(idx.repoPrefix, inputs.digest); err != nil {
 			return err
 		}
 	}
@@ -462,4 +486,25 @@ func finishWarmResolutions(pending map[*Indexer]*resolutionCompletion) error {
 		}
 	}
 	return nil
+}
+
+// The direct full pass upserts raw extraction rows and resolves after every
+// worker has finished. Remove this caller's old outgoing rows only once its
+// replacement is ready. EvictFile would also remove other files' incoming
+// edges, including ones already written by another worker.
+func (idx *Indexer) removePriorAliasEdges(file string) {
+	nodes := idx.graph.GetFileNodes(file)
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	var prior []*graph.Edge
+	for _, edges := range idx.graph.GetOutEdgesByNodeIDs(ids) {
+		for _, e := range edges {
+			if e.FilePath == file {
+				prior = append(prior, e)
+			}
+		}
+	}
+	graph.RemoveEdgesExact(idx.graph, prior)
 }

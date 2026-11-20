@@ -118,7 +118,9 @@ replace (not merge) `paths`. Targets without a `baseUrl` remain relative to the
 config that declares them, while the child config determines the caller scope.
 Generated `.nuxt` configs are read only when explicitly extended; the directory
 is not scanned as an independent scope. Package-specifier `extends` and project
-`references` are not traversed. Cycles and excessively deep chains stop.
+`references` are not traversed. Cycles and chains deeper than 32 configs stop.
+When an effective alias changes, reindexing rebinds existing JS/TS callers
+even if their source files have not changed.
 Relative parents are tried as written before the `.json` fallback.
 
 ### JS/TS call resolution

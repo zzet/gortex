@@ -142,6 +142,9 @@ type IndexResult struct {
 	// serialized: coordinated callers surface it only after the committed graph
 	// has reached a coherent post-mutation state.
 	mutationErr error
+	// failuresRetryable: every failed file is in the persisted failure ledger,
+	// which retries it, and no directory walk failed.
+	failuresRetryable bool
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -445,6 +448,7 @@ type Indexer struct {
 	resolutionInputsChanged bool
 	resolutionRetry         *resolutionRetry
 	warmResolution          *resolutionCompletion // guarded by resolutionMu
+	deltaResolution         *resolutionInputs     // private to a single edit-delta builder
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -4415,13 +4419,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// AddBatch. Direct SQLite writes enter a bounded cross-file
 					// accumulator, amortising transaction/statement setup without
 					// retaining a repository-sized graph in Go memory.
+					if diskTarget == nil && !skipped && err == nil && idx.inputsStaleForFile(relPath) {
+						idx.removePriorAliasEdges(idx.prefixPath(relPath))
+					}
 					if !contentHandled {
 						batchStart := time.Now()
-						// A full direct build adds batches; it does not use indexFile.
-						// Drop old bindings only once their replacement is ready.
-						if !shadowTaken && !skipped && err == nil && idx.inputsStaleForFile(relPath) {
-							idx.graph.EvictFile(idx.prefixPath(relPath))
-						}
 						durablePath, durableMtime := path, wf.mtimeNano
 						if !graphBatch.add(result.Nodes, result.Edges, func() {
 							recordStreamedMtime(durablePath, durableMtime)
@@ -5552,6 +5554,9 @@ func (idx *Indexer) indexFile(
 		priorDeclarations = resolver.DeclarationSurfaceOf(idx.graph.GetFileNodes(graphPath))
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
+	}
+	if idx.forceReparseDropsResolutions(absPath) {
+		reuseIdx, priorUnresolved = nil, nil
 	}
 
 	// We hold a usable result: evict the old state now, then add the
@@ -7400,11 +7405,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	var points []string
-	if mode.forceExplicitFiles {
-		points = paths
-	}
-	inputs, err := idx.refreshResolutionInputs(absRoot, points...)
+	// A directory or the root is not a point: it discovers inputs again.
+	inputs, err := idx.refreshResolutionInputs(absRoot, paths...)
 	if err != nil {
 		return nil, err
 	}
@@ -7858,8 +7860,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// restage successful files of the same language forever. Discovery failures
 	// can hide an entire subtree, and torn passes cannot attest a completed
 	// restage. Keep the language-wide fence for either, or for an unsafe ledger.
-	if len(extractorStaleLangs) > 0 && len(discoveryFailed) == 0 && result.mutationErr == nil &&
-		idx.failedFilesSafelyRetryable(failedFiles) {
+	result.failuresRetryable = len(discoveryFailed) == 0 && idx.failedFilesSafelyRetryable(failedFiles)
+	if len(extractorStaleLangs) > 0 && result.mutationErr == nil && result.failuresRetryable {
 		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)
@@ -7883,7 +7885,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	finalizeTiming.complete(nil, zap.Int("failed_files", len(failedFiles)),
 		zap.Int("nodes", result.NodeCount), zap.Int("edges", result.EdgeCount),
 		zap.Bool("counts_cached", countsCached))
-	completion.success = len(failedFiles) == 0 && len(versionChangedFiles) == 0 && result.mutationErr == nil
+	// The failure ledger retries its files under the current inputs and never
+	// reuses their old bindings, so they need not keep this pass uncertified.
+	completion.success = (len(failedFiles) == 0 || result.failuresRetryable) && len(versionChangedFiles) == 0 && result.mutationErr == nil
 	if !completion.success && len(discoveryFailed) == 0 {
 		completion.failed = appendUniqueSorted(nil, failedFiles...)
 		completion.failed = appendUniqueSorted(completion.failed, versionChangedFiles...)

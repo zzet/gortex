@@ -180,6 +180,16 @@ func (idx *Indexer) fileIndexFailureError(path string) error {
 	return errFileVersionChanged
 }
 
+func (idx *Indexer) hasFileIndexFailure(path string) bool {
+	graphPath := idx.prefixPath(idx.relKey(path))
+	state := &idx.fileIndexFailures
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	idx.loadFileIndexFailuresLocked()
+	_, failed := state.rows[graphPath]
+	return failed
+}
+
 func (idx *Indexer) fileIndexFailurePaths() []string {
 	state := &idx.fileIndexFailures
 	state.mu.Lock()

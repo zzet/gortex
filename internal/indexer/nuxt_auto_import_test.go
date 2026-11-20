@@ -180,7 +180,7 @@ func TestNuxtWatcherDigestUsesResolvedSnapshot(t *testing.T) {
 	set("new")
 	caughtUp := false
 	idx.incrementalResolveFilesHook = func(files []string) []string {
-		digest, err := store.ResolutionInputDigest("")
+		digest, err := store.TSAliasDigest("")
 		require.NoError(t, err)
 		require.Empty(t, digest, "a restart here must not trust the parsed but unresolved graph")
 		set("old")
@@ -568,7 +568,7 @@ func TestEvictAfterCheckoutMoves(t *testing.T) {
 	removed, _ := idx.EvictFile("lib.ts")
 	require.Positive(t, removed)
 	require.Nil(t, store.GetNode("lib.ts::impl"))
-	digest, err := store.ResolutionInputDigest("")
+	digest, err := store.TSAliasDigest("")
 	require.NoError(t, err)
 	require.Empty(t, digest)
 }

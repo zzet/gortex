@@ -43,6 +43,7 @@ import (
 // Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
+// Relative tsconfig extends can change bindings without changing source bytes.
 // Exact JS/TS and Nuxt calls follow module exports, aliases and lexical scope,
 // including CommonJS assignments and the normal script of a Vue component.
 // Vue forwarding exports bind through the normal script's symbol scope.

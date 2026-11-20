@@ -32,7 +32,7 @@ func TestResolve_ExactAlias(t *testing.T) {
 
 func TestResolve_BaseURLPrepended(t *testing.T) {
 	m := &Map{
-		TargetBase: "src",
+		BaseURL: "src",
 		Entries: []Alias{
 			{AliasPrefix: "@/", TargetPrefix: "", HasWildcard: true},
 		},

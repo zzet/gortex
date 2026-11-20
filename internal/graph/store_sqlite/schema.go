@@ -1326,7 +1326,7 @@ var viewGenSidecars = []viewGenSidecar{
 node_count, edge_count, extractor_versions`,
 	},
 	{
-		table: "resolution_input_state",
+		table: "ts_alias_state",
 		body: ` (
     view_gen INTEGER NOT NULL DEFAULT 0,
     repo_prefix TEXT NOT NULL,
