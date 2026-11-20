@@ -53,8 +53,12 @@ func (e *ViewBuildQueueFullError) Error() string {
 func (e *ViewBuildQueueFullError) Unwrap() error { return ErrViewBuildQueueFull }
 
 type viewBuildWaiter struct {
-	ready      chan struct{}
-	priority   ViewBuildPriority
+	ready    chan struct{}
+	priority ViewBuildPriority
+	// family names the repository family this build belongs to; empty for a
+	// family-less build. A family waiter is eligible for the lane once the
+	// latch is open OR its family's base is published (familyReady).
+	family     string
 	enqueuedAt time.Time
 	// backgroundAgeCredit affects scheduling only; wait metrics use enqueuedAt.
 	backgroundAgeCredit time.Duration
@@ -140,6 +144,14 @@ type ViewBuildGate struct {
 	open   bool
 	opened chan struct{}
 	active bool
+
+	// familyReady names families whose own committed base is published, so a
+	// build for one of them is eligible for the lane even while the global
+	// warmup latch (open) is still closed. familyWake holds the per-family
+	// eligibility channels a deferred waiter blocks on; each is closed when
+	// its family becomes ready or the latch opens. Both are guarded by mu.
+	familyReady map[string]struct{}
+	familyWake  map[string]chan struct{}
 
 	interactive []*viewBuildWaiter
 	background  []*viewBuildWaiter
@@ -252,7 +264,14 @@ func (g *ViewBuildGate) Open() {
 	}
 	g.open = true
 	close(g.opened)
+	for family, ch := range g.familyWake {
+		close(ch)
+		delete(g.familyWake, family)
+	}
 	g.grantNextLocked()
+	// Parked interactive waiters are now eligible; preempt an active background
+	// build for them just as an interactive enqueue would.
+	g.requestYieldLocked()
 }
 
 // Acquire waits for the one physical build lane. Capacity applies only while a
@@ -282,16 +301,30 @@ func (g *ViewBuildGate) AcquirePromotable(ctx context.Context, priority ViewBuil
 // order is arrival. rank must not block or take a lock that is held while
 // calling into the gate.
 func (g *ViewBuildGate) AcquireRanked(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64) (func(), error) {
-	return g.acquireRanked(ctx, priority, demand, rank, 0)
+	return g.acquireRanked(ctx, priority, demand, rank, 0, "")
+}
+
+// AcquireForFamily is Acquire for a build that belongs to a repository family.
+// It is eligible for the lane once the global latch is open OR the family's own
+// committed base is published (MarkFamilyReady), so a worktree whose base is
+// ready is served during startup without waiting for unrelated families to
+// finish warming. A empty family keeps the global-only rule.
+func (g *ViewBuildGate) AcquireForFamily(ctx context.Context, priority ViewBuildPriority, family string) (func(), error) {
+	return g.AcquireRankedForFamily(ctx, priority, nil, nil, family)
+}
+
+// AcquireRankedForFamily is AcquireRanked with a family eligibility bypass.
+func (g *ViewBuildGate) AcquireRankedForFamily(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64, family string) (func(), error) {
+	return g.acquireRanked(ctx, priority, demand, rank, 0, family)
 }
 
 // acquireRetirement carries offered-debt age across bounded service turns.
 // It changes neither background FIFO nor the foreground burst guarantee.
 func (g *ViewBuildGate) acquireRetirement(ctx context.Context, debtAge time.Duration) (func(), error) {
-	return g.acquireRanked(ctx, ViewBuildBackground, nil, nil, debtAge)
+	return g.acquireRanked(ctx, ViewBuildBackground, nil, nil, debtAge, "")
 }
 
-func (g *ViewBuildGate) acquireRanked(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64, backgroundAgeCredit time.Duration) (func(), error) {
+func (g *ViewBuildGate) acquireRanked(ctx context.Context, priority ViewBuildPriority, demand <-chan struct{}, rank func() int64, backgroundAgeCredit time.Duration, family string) (func(), error) {
 	if g == nil {
 		return func() {}, nil
 	}
@@ -314,7 +347,13 @@ func (g *ViewBuildGate) acquireRanked(ctx context.Context, priority ViewBuildPri
 	// Restore the invariant before evaluating the immediate path. Normally all
 	// state transitions already call grantNextLocked.
 	g.grantNextLocked()
-	idle := g.open && !g.active && len(g.interactive) == 0 && len(g.background) == 0
+	// An eligible caller — the latch open, or its family's committed base
+	// published — takes an idle lane directly. grantNextLocked just gave any
+	// eligible queued waiter first claim; if the lane is still idle, parked
+	// ineligible waiters cannot run, so they neither consume the idle lane nor
+	// reject this caller at the queue limit. A family-less caller while closed
+	// is ineligible and still queues exactly as before.
+	idle := !g.active && g.familyReadyLocked(family)
 	canWait := len(g.interactive) < g.interactiveLimit
 	if priority == ViewBuildBackground {
 		canWait = canWait || len(g.background) < g.backgroundLimit
@@ -367,6 +406,7 @@ func (g *ViewBuildGate) acquireRanked(ctx context.Context, priority ViewBuildPri
 	waiter := &viewBuildWaiter{
 		ready:               make(chan struct{}),
 		priority:            priority,
+		family:              family,
 		enqueuedAt:          time.Now(),
 		backgroundAgeCredit: backgroundAgeCredit,
 		demand:              demand,
@@ -494,7 +534,7 @@ func (g *ViewBuildGate) NoteYieldable(yields int) (yield <-chan struct{}, withdr
 		g.yield, g.yieldClosed = make(chan struct{}), false
 	}
 	armed := g.yield
-	if len(g.interactive) > 0 {
+	if g.eligibleCountLocked(g.interactive) > 0 {
 		g.requestYieldLocked()
 	}
 	return armed, func() {
@@ -506,10 +546,16 @@ func (g *ViewBuildGate) NoteYieldable(yields int) (yield <-chan struct{}, withdr
 	}
 }
 
-// requestYieldLocked asks an armed background holder to give the lane up.
-// Caller holds g.mu.
+// requestYieldLocked asks an armed background holder to give the lane up to an
+// interactive waiter that can actually run. A parked ineligible waiter (a
+// family-less ref build behind the closed latch, say) must not preempt a ready
+// family's background build: it cannot take the lane, so yielding to it would
+// only churn the ready build until the latch opens. Caller holds g.mu.
 func (g *ViewBuildGate) requestYieldLocked() {
 	if !g.active || g.activePriority != ViewBuildBackground || g.yield == nil || g.yieldClosed {
+		return
+	}
+	if g.eligibleCountLocked(g.interactive) == 0 {
 		return
 	}
 	close(g.yield)
@@ -519,23 +565,31 @@ func (g *ViewBuildGate) requestYieldLocked() {
 
 func (g *ViewBuildGate) grantNextLocked() {
 	g.promoteDemandedLocked()
-	if !g.open || g.active {
+	if g.active {
+		return
+	}
+	// Closed latch: a family-less waiter is ineligible until Open and a family
+	// waiter only once its base is published. With no ready family nothing
+	// queued is eligible, so the latch holds every waiter exactly as before.
+	if !g.open && len(g.familyReady) == 0 {
 		return
 	}
 	now := time.Now()
 	for {
 		var waiter *viewBuildWaiter
+		interactive := g.eligibleCountLocked(g.interactive)
+		background := g.eligibleCountLocked(g.background)
 		switch {
-		case len(g.interactive) > 0 && (len(g.background) == 0 || g.interactiveBurst < maxInteractiveBuildBurst ||
-			now.Sub(g.background[0].enqueuedAt)+g.background[0].backgroundAgeCredit < g.backgroundStarvation):
+		case interactive > 0 && (background == 0 || g.interactiveBurst < maxInteractiveBuildBurst ||
+			g.backgroundHeadWithinStarvationLocked(now)):
 			// Interactive first. Queued background work overtakes only once
 			// a burst of interactive grants has passed AND it has waited
-			// past the starvation bound.
+			// past the starvation bound. Only eligible waiters compete; an
+			// ineligible one keeps its queue place until its family is ready.
 			waiter = g.takeInteractiveLocked(now)
-		case len(g.background) > 0:
-			waiter = g.background[0]
-			g.background = g.background[1:]
-		case len(g.interactive) > 0:
+		case background > 0:
+			waiter = g.takeBackgroundEligibleLocked()
+		case interactive > 0:
 			waiter = g.takeInteractiveLocked(now)
 		default:
 			return
@@ -563,12 +617,12 @@ func (g *ViewBuildGate) grantNextLocked() {
 // demand goes first. A head passed over for interactiveStarvation is granted
 // in arrival order regardless.
 func (g *ViewBuildGate) takeInteractiveLocked(now time.Time) *viewBuildWaiter {
-	pick := 0
-	head := g.interactive[0]
+	pick := g.firstEligibleLocked(g.interactive)
+	head := g.interactive[pick]
 	if !head.canceled && now.Sub(head.enqueuedAt) < g.interactiveStarvation {
 		newest := head.enqueuedAt.UnixNano()
 		for i, waiter := range g.interactive {
-			if waiter.canceled || waiter.rank == nil {
+			if waiter.canceled || waiter.rank == nil || !g.eligibleLocked(waiter) {
 				continue
 			}
 			if demanded := waiter.rank(); demanded > newest {
@@ -580,6 +634,80 @@ func (g *ViewBuildGate) takeInteractiveLocked(now time.Time) *viewBuildWaiter {
 	copy(g.interactive[pick:], g.interactive[pick+1:])
 	g.interactive[len(g.interactive)-1] = nil
 	g.interactive = g.interactive[:len(g.interactive)-1]
+	return waiter
+}
+
+// eligibleLocked reports whether a queued waiter may be granted the lane: the
+// global latch is open, or the waiter's family has a published committed base.
+// Caller holds g.mu.
+func (g *ViewBuildGate) eligibleLocked(waiter *viewBuildWaiter) bool {
+	if g.open {
+		return true
+	}
+	if waiter.family == "" {
+		return false
+	}
+	_, ok := g.familyReady[waiter.family]
+	return ok
+}
+
+// eligibleCountLocked counts the eligible waiters in a queue. An open latch
+// admits every waiter, so the count is the queue length and the scheduler's
+// fairness order is exactly the original. Caller holds g.mu.
+func (g *ViewBuildGate) eligibleCountLocked(queue []*viewBuildWaiter) int {
+	if g.open {
+		return len(queue)
+	}
+	n := 0
+	for _, waiter := range queue {
+		if g.eligibleLocked(waiter) {
+			n++
+		}
+	}
+	return n
+}
+
+// firstEligibleLocked returns the index of the first eligible waiter in a
+// queue (0 when the latch is open). The caller guarantees one exists. Caller
+// holds g.mu.
+func (g *ViewBuildGate) firstEligibleLocked(queue []*viewBuildWaiter) int {
+	if g.open {
+		return 0
+	}
+	for i, waiter := range queue {
+		if g.eligibleLocked(waiter) {
+			return i
+		}
+	}
+	return 0
+}
+
+// backgroundHeadWithinStarvationLocked reports whether the oldest eligible
+// background waiter has waited less than the starvation bound, so interactive
+// demand still goes first. An open latch reads the queue head as before.
+// Caller holds g.mu and guarantees an eligible background waiter exists.
+func (g *ViewBuildGate) backgroundHeadWithinStarvationLocked(now time.Time) bool {
+	head := g.background[g.firstEligibleLocked(g.background)]
+	return now.Sub(head.enqueuedAt)+head.backgroundAgeCredit < g.backgroundStarvation
+}
+
+// takeBackgroundEligibleLocked removes and returns the oldest eligible
+// background waiter, preserving the order of every waiter left behind.
+// Caller holds g.mu and guarantees one exists.
+func (g *ViewBuildGate) takeBackgroundEligibleLocked() *viewBuildWaiter {
+	// Open latch: every waiter is eligible, so advance the head in constant
+	// time exactly as the original scheduler did. The copy below is only for
+	// the closed latch, where an ineligible head must keep its queue place.
+	if g.open {
+		waiter := g.background[0]
+		g.background = g.background[1:]
+		return waiter
+	}
+	i := g.firstEligibleLocked(g.background)
+	waiter := g.background[i]
+	copy(g.background[i:], g.background[i+1:])
+	g.background[len(g.background)-1] = nil
+	g.background = g.background[:len(g.background)-1]
 	return waiter
 }
 
@@ -757,6 +885,117 @@ func (g *ViewBuildGate) Admitted() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.open
+}
+
+// MarkFamilyReady records that a family's own committed base is published, so
+// builds for that family become eligible for the lane even while the global
+// warmup latch is closed. It wakes any deferred waiter for the family and
+// grants the lane if it is idle. Idempotent; a no-op once the latch is open.
+func (g *ViewBuildGate) MarkFamilyReady(family string) {
+	if g == nil || family == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.open {
+		return
+	}
+	if _, ok := g.familyReady[family]; ok {
+		return
+	}
+	if g.familyReady == nil {
+		g.familyReady = make(map[string]struct{})
+	}
+	g.familyReady[family] = struct{}{}
+	if ch, ok := g.familyWake[family]; ok {
+		close(ch)
+		delete(g.familyWake, family)
+	}
+	g.grantNextLocked()
+	// A queued interactive waiter for this family just became eligible; if a
+	// background build holds the lane, ask it to yield so the interactive work
+	// runs (the yield path only fires for an eligible interactive waiter).
+	g.requestYieldLocked()
+}
+
+// ResetFamilyReadiness revokes a family's early-admission bit when its primary
+// graph changes: the replacement primary must publish its own committed base
+// before builds for the family may bypass the global warmup latch again. Any
+// coordinator already parked on the family's wake channel is woken so it
+// re-checks eligibility (admissionWait re-seeds from the catalog); a coordinator
+// created after the switch waits for the new primary instead of inheriting the
+// old one's readiness.
+func (g *ViewBuildGate) ResetFamilyReadiness(family string) {
+	if g == nil || family == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.familyReady, family)
+	// Close the wake channel before dropping it. Deleting without closing would
+	// strand a pre-reset waiter: MarkFamilyReady and Open only close channels
+	// still in the map, so it would recover only on its next poll. A spurious
+	// wake is harmless because eligibility is re-checked on every wake.
+	if ch, ok := g.familyWake[family]; ok {
+		close(ch)
+		delete(g.familyWake, family)
+	}
+}
+
+// AdmittedForFamily reports whether a build for the family may run: the global
+// latch is open, or the family's own committed base is published.
+func (g *ViewBuildGate) AdmittedForFamily(family string) bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.familyReadyLocked(family)
+}
+
+// FamilyOpened is the channel a deferred family waiter blocks on: it is closed
+// when the global latch opens OR the family's base becomes ready. An already
+// eligible family gets an already-closed channel.
+func (g *ViewBuildGate) FamilyOpened(family string) <-chan struct{} {
+	if g == nil {
+		return admittedChannel
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.familyReadyLocked(family) {
+		return admittedChannel
+	}
+	return g.familyWakeChanLocked(family)
+}
+
+// familyReadyLocked reports eligibility under the mutex.
+func (g *ViewBuildGate) familyReadyLocked(family string) bool {
+	if g.open {
+		return true
+	}
+	if family == "" {
+		return false
+	}
+	_, ok := g.familyReady[family]
+	return ok
+}
+
+// familyWakeChanLocked returns the channel that fires when the family becomes
+// eligible, creating it on first use. A family-less waiter waits on the global
+// opened channel. Caller holds g.mu.
+func (g *ViewBuildGate) familyWakeChanLocked(family string) <-chan struct{} {
+	if family == "" {
+		return g.opened
+	}
+	if g.familyWake == nil {
+		g.familyWake = make(map[string]chan struct{})
+	}
+	ch, ok := g.familyWake[family]
+	if !ok {
+		ch = make(chan struct{})
+		g.familyWake[family] = ch
+	}
+	return ch
 }
 
 func (g *ViewBuildGate) Opened() <-chan struct{} {

@@ -208,6 +208,21 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 		return out, err
 	}
 
+	// The replacement primary must publish its own committed base before this
+	// family's builds may bypass the warmup latch again. Revoke the readiness the
+	// old primary earned; ResetFamilyReadiness wakes any parked waiter to re-check
+	// eligibility. A worktree rehomed onto an unpublished primary defers instead
+	// of composing over generation zero early.
+	l.buildGate().ResetFamilyReadiness(preview.FamilyID)
+	// If the replacement primary already has a servable committed base (it may
+	// have published while still a secondary), no new adoption event will fire for
+	// it, so re-mark readiness now — otherwise a rehome waits for the global latch.
+	if graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID); err == nil && found && graph.IsPrimaryBase {
+		if base, baseErr := graphBase(ctx, l.catalog, graph); baseErr == nil && base.generationID > 0 {
+			l.buildGate().MarkFamilyReady(preview.FamilyID)
+		}
+	}
+
 	for _, dependent := range preview.Dependents {
 		checkout, found, err := l.catalog.GetCheckout(ctx, dependent.ID)
 		if err != nil || !found {

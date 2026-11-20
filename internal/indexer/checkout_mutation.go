@@ -456,7 +456,7 @@ func (m *CheckoutMutation) Refresh(ctx context.Context) (CheckoutCycle, error) {
 	m.coordinator.cancelDirtyChainCompaction(compactionYieldCheckoutMutation)
 	laneQueued := time.Now()
 	laneBefore := m.coordinator.gate.Stats()
-	releaseLane, err := m.coordinator.gate.Acquire(ctx, ViewBuildInteractive)
+	releaseLane, err := m.coordinator.gate.AcquireForFamily(ctx, ViewBuildInteractive, m.coordinator.familyID)
 	if err != nil {
 		return CheckoutCycle{}, checkoutMutationAdmissionError(ctx, "shared view-build gate", err)
 	}
