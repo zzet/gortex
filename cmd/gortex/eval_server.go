@@ -110,7 +110,7 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 	}
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: server.WithAuth(handler, authToken),
+		Handler: composeEvalServerHandler(handler, authToken),
 	}
 
 	fmt.Fprintf(os.Stderr, "[gortex] eval-server listening on http://%s\n", addr)
@@ -134,4 +134,20 @@ func runEvalServer(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n[gortex] eval-server: received %s, shutting down\n", sig)
 		return httpServer.Close()
 	}
+}
+
+// composeEvalServerHandler wraps the eval-server HTTP handler the same way
+// the daemon and mcp --server surfaces wrap theirs (see
+// composeDaemonHTTPHandler / composeMCPServerHandler): WithAuth for the
+// optional bearer token, then browserOriginGuard outermost. A loopback
+// bind is reachable from any page a user opens, so a token-less bind
+// otherwise lets a cross-origin browser POST to /v1/tools/write_file
+// (a simple request needs no CORS preflight) overwrite files in the
+// indexed repo — the origin gap GHSA-2hvx closed for the other two
+// surfaces. With the guard outermost, any request carrying an Origin
+// header is refused before the handler runs. eval-server has no web UI,
+// so all browser origins are refused by default; local MCP clients send
+// no Origin header and keep working.
+func composeEvalServerHandler(handler http.Handler, token string) http.Handler {
+	return browserOriginGuard(server.WithAuth(handler, token), nil)
 }

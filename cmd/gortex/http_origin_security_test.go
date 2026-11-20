@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/eval"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -25,7 +26,7 @@ import (
 // filesystem sink. text/plain is deliberate: browsers can POST it without a
 // CORS preflight, so removing CORS headers alone cannot prevent the mutation.
 func TestHTTPBrowserOriginBlocksFileWrites(t *testing.T) {
-	for _, surface := range []string{"mcp-server", "daemon"} {
+	for _, surface := range []string{"mcp-server", "daemon", "eval-server"} {
 		for _, corsOrigin := range []string{"", "*"} {
 			t.Run(surface+"/cors="+corsOrigin, func(t *testing.T) {
 				root := t.TempDir()
@@ -40,6 +41,13 @@ func TestHTTPBrowserOriginBlocksFileWrites(t *testing.T) {
 					h = composeDaemonHTTPHandler(http.NotFoundHandler(), api, func() string { return "" }, corsOrigin)
 				} else {
 					h = composeMCPServerHandler(api, "", corsOrigin)
+				}
+				// The eval-server composes its handler via
+				// composeEvalServerHandler (WithAuth inside browserOriginGuard,
+				// mirroring the daemon and mcp --server surfaces).
+				if surface == "eval-server" {
+					evalHandler := eval.NewHandler(srv.MCPServer(), g, "test", logger)
+					h = composeEvalServerHandler(evalHandler, "")
 				}
 
 				target := filepath.Join(root, ".git", "hooks", "pre-commit")
