@@ -494,19 +494,9 @@ type Resolver struct {
 	namesMiss   map[resolverNameLookupScope]map[string][]*graph.Node
 	namesMissMu sync.RWMutex
 
-	// importFilesByCaller memoises, per caller file, the set of file
-	// paths that file imports (direct EdgeImports targets plus files
-	// reached through transitive EdgeReExports barrel hops). Built
-	// lazily inside the parallel resolve workers — importFilesMu guards
-	// it — and cleared with the per-pass lookup caches. Consulted by
-	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
-	// import_evidence.go for the precedence design.
-	importFilesByCaller map[string]map[string]struct{}
-	// importOutByFile is the batched out-edge prefetch importedFilesFor
-	// reads before falling back to a point GetOutEdges: one
-	// GetOutEdgesByNodeIDs over every JS/TS caller file of a pass
-	// (prefetchImportEdges) instead of one point read per call edge.
-	// Guarded by importFilesMu, cleared with the per-pass caches.
+	// Page-local JS/TS binding and file evidence. Adjacency is prefetched
+	// for callers and loaded on demand for barrels outside that frontier.
+	importsByCaller map[string]*callerImportEvidence
 	importOutByFile map[string][]*graph.Edge
 	importFilesMu   sync.RWMutex
 
@@ -2487,10 +2477,7 @@ func (r *Resolver) clearLookupCache() {
 	r.namesMissMu.Lock()
 	r.namesMiss = nil
 	r.namesMissMu.Unlock()
-	r.importFilesMu.Lock()
-	r.importFilesByCaller = nil
-	r.importOutByFile = nil
-	r.importFilesMu.Unlock()
+	r.clearImportEvidence()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
 	r.csharpNSMu.Unlock()

@@ -214,7 +214,8 @@ func TestImportEvidence_ResolvedEdgeStampsProvenance(t *testing.T) {
 `,
 		"tests/util.ts": `export function createStore(): unknown { return { helper: true }; }
 `,
-		"tests/a.test.ts": `import { createStore } from '../src/vanilla';
+		"src/index.ts": `export * from './vanilla'`,
+		"tests/a.test.ts": `import { createStore } from '../src/index';
 function setup(): unknown {
   return createStore({});
 }

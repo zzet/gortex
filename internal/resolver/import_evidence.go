@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/zzet/gortex/internal/graph"
 )
@@ -61,16 +62,14 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	if hasLocalValue(callerFile, candidates) {
 		return nil
 	}
-	imported := r.importedFilesFor(callerFile)
-	if len(imported) == 0 {
-		return nil
-	}
+	imports := r.importEvidenceFor(callerFile)
+	imports.closureOnce.Do(func() { imports.files = r.importClosureFiles(callerFile, imports.direct) })
 	var pick *graph.Node
 	for _, c := range candidates {
 		if !isImportableCallee(c, funcName) {
 			continue
 		}
-		if _, ok := imported[c.FilePath]; !ok {
+		if _, ok := imports.files[c.FilePath]; !ok {
 			continue
 		}
 		if pick != nil {
@@ -291,28 +290,61 @@ func importableValueKind(kind graph.NodeKind) bool {
 	return false
 }
 
-// importedFilesFor returns the set of file paths the caller file imports —
-// directly, plus every file reachable from an imported barrel through
-// transitive EdgeReExports hops. Memoised per caller file for the duration
-// of a resolve pass (r.importFilesMu guards the map because the resolver's
-// worker phase is parallel); cleared with the per-pass lookup caches.
-//
-// The set is built from the import edges' CURRENT state, whichever that
-// is: a resolved edge contributes its target node's file, an unresolved
-// one has its raw `import::` specifier expanded exactly the way
-// resolveImport will expand it. Both states yield the same file, so a call
-// edge resolved before its file's import edge sees the same closure as one
-// resolved after.
-func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
-	r.importFilesMu.RLock()
-	files, ok := r.importFilesByCaller[callerFile]
-	r.importFilesMu.RUnlock()
-	if ok {
-		return files
-	}
+// direct holds the expanded targets of the caller's imports. Exact bindings
+// are resolved through module exports; these targets only seed the file tier.
+// Walk barrels only if a call actually needs the file-level evidence.
+type callerImportEvidence struct {
+	directOnce  sync.Once
+	direct      map[string]struct{}
+	closureOnce sync.Once
+	files       map[string]struct{}
+}
 
-	files = make(map[string]struct{})
-	seen := map[string]bool{callerFile: true}
+func (r *Resolver) clearImportEvidence() {
+	r.importFilesMu.Lock()
+	r.importsByCaller = nil
+	r.importOutByFile = nil
+	r.importFilesMu.Unlock()
+}
+
+func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
+	r.importFilesMu.RLock()
+	imports := r.importsByCaller[callerFile]
+	r.importFilesMu.RUnlock()
+	if imports == nil {
+		r.importFilesMu.Lock()
+		if imports = r.importsByCaller[callerFile]; imports == nil {
+			if r.importsByCaller == nil {
+				r.importsByCaller = make(map[string]*callerImportEvidence)
+			}
+			imports = new(callerImportEvidence)
+			r.importsByCaller[callerFile] = imports
+		}
+		r.importFilesMu.Unlock()
+	}
+	imports.directOnce.Do(func() {
+		for _, e := range r.callerOutEdges(callerFile) {
+			if e.Kind != graph.EdgeImports {
+				continue
+			}
+			target := r.importedTargetOf(e)
+			if target == "" {
+				continue
+			}
+			if imports.direct == nil {
+				imports.direct = make(map[string]struct{})
+			}
+			imports.direct[target] = struct{}{}
+		}
+	})
+	return imports
+}
+
+func (r *Resolver) importClosureFiles(callerFile string, direct map[string]struct{}) map[string]struct{} {
+	if len(direct) == 0 {
+		return nil
+	}
+	files := make(map[string]struct{})
 	var pendingBarrels []string
 	addTarget := func(f string) {
 		if f == "" || f == callerFile {
@@ -325,11 +357,8 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 		pendingBarrels = append(pendingBarrels, f)
 	}
 
-	for _, e := range r.callerOutEdges(callerFile) {
-		if e.Kind != graph.EdgeImports {
-			continue
-		}
-		addTarget(r.importedFileOf(e))
+	for target := range direct {
+		addTarget(r.nodeFilePath(target))
 	}
 	// Barrel hops: an import that lands on a re-exporting module makes the
 	// re-exported modules visible too (`import { createStore } from
@@ -338,24 +367,14 @@ func (r *Resolver) importedFilesFor(callerFile string) map[string]struct{} {
 	for len(pendingBarrels) > 0 {
 		f := pendingBarrels[len(pendingBarrels)-1]
 		pendingBarrels = pendingBarrels[:len(pendingBarrels)-1]
-		if seen[f] {
-			continue
-		}
-		seen[f] = true
 		for _, e := range r.callerOutEdges(f) {
 			if e.Kind != graph.EdgeReExports {
 				continue
 			}
-			addTarget(r.importedFileOf(e))
+			addTarget(r.nodeFilePath(r.importedTargetOf(e)))
 		}
 	}
 
-	r.importFilesMu.Lock()
-	if r.importFilesByCaller == nil {
-		r.importFilesByCaller = make(map[string]map[string]struct{})
-	}
-	r.importFilesByCaller[callerFile] = files
-	r.importFilesMu.Unlock()
 	return files
 }
 
@@ -438,7 +457,7 @@ func (r *Resolver) callerOutEdges(callerFile string) []*graph.Edge {
 
 // prefetchImportEdges loads, in one batched read, the outgoing edges of
 // every JS/TS caller file behind edges — the import statements
-// importedFilesFor walks for every bare call. known is an optional
+// importEvidenceFor reads for bare calls. known is an optional
 // already-loaded out-edge map (the incremental page frontier) consumed
 // before asking the store. Without this every JS/TS call edge cost one
 // point GetOutEdges on the caller file, which on a disk backend is one
