@@ -14,7 +14,7 @@ import (
 // import fingerprint covers forwarded modules; the file anchor covers local
 // export lists (including changes between two already declared defaults).
 func jsModuleSurfaceChanged(file string, prior, fresh []*graph.Node) bool {
-	if !closureJSTSPath(file) {
+	if !closureJSTSPath(file) || parseSkipped(fresh) {
 		return false
 	}
 	a, b := storedDerivedFingerprints(prior), storedDerivedFingerprints(fresh)
@@ -32,6 +32,18 @@ func jsModuleSurfaceChanged(file string, prior, fresh []*graph.Node) bool {
 	ad, al := surface(prior)
 	bd, bl := surface(fresh)
 	return ad != bd || al != bl
+}
+
+// A skipped parse (minified, binary, timeout, size) says nothing about the
+// exports. Keep the callers' bindings and facts until a clean reparse.
+func parseSkipped(nodes []*graph.Node) bool {
+	for _, n := range nodes {
+		if n != nil && n.Kind == graph.KindFile {
+			_, skipped := n.Meta["skip_reason"]
+			return skipped
+		}
+	}
+	return false
 }
 
 // Resolve the caller's spelling again, not the old implementation name.

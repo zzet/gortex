@@ -5302,7 +5302,7 @@ func (idx *Indexer) indexFile(
 		var npmConsumers []string
 		var err error
 		if len(legacyIDs) == 0 {
-			npmConsumers, err = idx.restubIncomingRefsForReplacement(graphPath, &bindingCallers, markerBatch)
+			npmConsumers, err = idx.restubIncomingRefsForReplacement(graphPath, !parseSkipped(extractionNodes(result)), &bindingCallers, markerBatch)
 		} else {
 			// Extraction is still unprefixed here. Build only the identity surface
 			// needed by the same incoming frontier used by the structural batch.
@@ -6174,10 +6174,11 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
 func (idx *Indexer) restubIncomingRefs(graphPath string) ([]string, error) {
-	return idx.restubIncomingRefsForReplacement(graphPath, nil, nil)
+	return idx.restubIncomingRefsForReplacement(graphPath, true, nil, nil)
 }
 
-func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCallers *[]string, markerBatch *reparsePendingEnrichmentBatch) ([]string, error) {
+// jsBindings is false for a skipped parse, which says nothing about exports.
+func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, jsBindings bool, bindingCallers *[]string, markerBatch *reparsePendingEnrichmentBatch) ([]string, error) {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
 		return nil, nil
@@ -6205,7 +6206,7 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCa
 		return nil, err
 	}
 	var batch []graph.EdgeReindex
-	if closureJSTSPath(graphPath) {
+	if jsBindings && closureJSTSPath(graphPath) {
 		for _, edges := range inEdges {
 			var files []string
 			batch, files = restubJSImports(edges, evicted, batch, files)
@@ -6230,7 +6231,7 @@ func (idx *Indexer) restubIncomingRefsForReplacement(graphPath string, bindingCa
 				continue // already a pending stub
 			}
 			oldTo := e.To
-			if parkExactCall(e) {
+			if jsBindings && parkExactCall(e) {
 				if bindingCallers != nil {
 					*bindingCallers = append(*bindingCallers, e.FilePath)
 				}
@@ -7399,11 +7400,11 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	var point string
-	if mode.forceExplicitFiles && len(paths) == 1 {
-		point = paths[0]
+	var points []string
+	if mode.forceExplicitFiles {
+		points = paths
 	}
-	inputs, err := idx.refreshResolutionInputs(absRoot, point)
+	inputs, err := idx.refreshResolutionInputs(absRoot, points...)
 	if err != nil {
 		return nil, err
 	}

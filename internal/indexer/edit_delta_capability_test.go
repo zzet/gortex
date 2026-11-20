@@ -241,6 +241,9 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.OverlayLayerContractRepoProjectionReader":      "checked physical repo contract projection; DeltaWriter exposes the composed LoadContractRepoProjectionContext and applies selected-layer visibility, never physical layer seeds",
 	"graph.OverlayLayerNodeKindsByIDsReader":              "checked physical layer node-kind projection; DeltaWriter exposes composed GetNodeKindsByIDsContext with delta visibility, never a physical ancestry layer",
 	"graph.Unwrapper":                                     "transparent reader-wrapper capability; DeltaWriter is handled as a concrete composed reader before wrapper unwrapping, so unwrapping it would discard delta ownership",
+
+	"anonymous{JSModuleDependents}": "optional indexed reverse lookup of JS module bindings; graph.JSModuleDependencyLookup composes a DeltaWriter explicitly, projecting its overlay layers and filtering the base lookup through layer visibility, never enumerating the base call graph",
+	"indexer.resolutionInputStore":  "durable per-repository resolution-input digest kept in the SQLite sidecar; over a DeltaWriter the indexer compares inputs against its in-memory applied snapshot (appliedResolution) and re-binds on a change, without certifying a persisted digest",
 }
 
 // editDeltaCapabilityPackages are the engine packages whose assertions the

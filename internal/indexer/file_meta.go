@@ -131,7 +131,7 @@ func (idx *Indexer) fileMtimeMatches(filePath string) bool {
 		return false
 	}
 	return !closureJSTSPath(filePath) || idx.manifestTree().sourced() ||
-		idx.appliedResolution.Load().unchangedForPoint(idx.RootPath(), filePath, nil)
+		idx.appliedResolution.Load().unchangedForPoints(idx.RootPath(), []string{filePath}, nil)
 }
 
 // persistFileMeta records one file's per-file metadata row — the BLAKE3

@@ -138,6 +138,10 @@ func TestExactModuleScriptExports(t *testing.T) {
 		{"lib.mjs", "function run(){}; let exports = {}; exports.named = run", "named", "unresolved::local"},
 		{"lib.mjs", "function run(){}; const exports = {}; exports.named = run", "named", "unresolved::local"},
 		{"lib.cjs", "function run(){}; exports.named = run; delete exports.named", "named", "unresolved::local"},
+		{"lib.cjs", "function run(){}; module.exports = run; delete module.exports", "default", "unresolved::local"},
+		{"lib.cjs", "function real(){}; function inner(){}; module.exports = real; module.exports.x = module.exports = inner", "x", "unresolved::local"},
+		{"lib.cjs", "function run(){}; exports.__esModule = true; exports.default = run", "default", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; var api = {}; module.exports = api; module.exports.__esModule = true; module.exports.default = run", "default", "lib.cjs::run"},
 		{"lib.vue", "<script data-x='not setup here'>export {real as run} from './dep'</script>", "run", "dep.ts::real"},
 		{"lib.vue", "<script lang='ts'>export function run(){}</script>\n<script setup>function hidden(){}</script>", "run", "lib.vue#script:1::run"},
 		{"lib.vue", "<script setup>function hidden(){}</script>", "hidden", "unresolved::local"},
@@ -179,6 +183,36 @@ func TestVueStarDoesNotImportPrivateFunction(t *testing.T) {
 	for _, target := range imports {
 		require.Equal(t, "lib.vue", target)
 	}
+}
+
+func TestVueTypeImportTargetsInterface(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"lib.vue": "<script lang=\"ts\">export interface Model { id: string }</script>",
+		"page.ts": "import type {Model} from './lib.vue'; export function go(m: Model){}",
+	})
+	New(g).ResolveAll()
+	var imports []string
+	for _, edge := range g.GetOutEdges("page.ts") {
+		if edge.Kind == graph.EdgeImports {
+			imports = append(imports, edge.To)
+		}
+	}
+	require.Contains(t, imports, "lib.vue#script:1::Model")
+}
+
+func TestStaticBlockVarShadowsImport(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"lib.ts":  "export function useIt(){}",
+		"page.js": "import {useIt} from './lib';\nexport class Run {\n static { var useIt = globalThis.handler; useIt() }\n}",
+	})
+	New(g).ResolveAll()
+	var targets []string
+	for _, from := range []string{"page.js", "page.js::Run"} {
+		if to := callEdgeTo(g, from, 3); to != "" {
+			targets = append(targets, to)
+		}
+	}
+	require.Equal(t, []string{"unresolved::useIt"}, targets)
 }
 
 func TestBodyVarRedeclaringParameter(t *testing.T) {

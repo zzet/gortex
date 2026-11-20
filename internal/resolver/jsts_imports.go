@@ -128,8 +128,10 @@ func jstsImportTargetAndAliasStem(getNode func(string) *graph.Node, pathAlias Pa
 				explicit = true
 			}
 		}
+		// Value exports are listed in JSLocalExportsMeta; TypeScript marks
+		// exported types (interfaces, aliases) public instead.
 		if n := getNode(graph.JSExportID(file, local)); n != nil &&
-			(scope == "" || explicit || n.Meta["exported"] == true || graph.IsReExportNode(n)) {
+			(scope == "" || explicit || n.Meta["visibility"] == "public" || graph.IsReExportNode(n)) {
 			return n.ID, alias
 		}
 	}

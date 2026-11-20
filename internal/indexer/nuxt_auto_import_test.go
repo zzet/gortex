@@ -73,7 +73,8 @@ func TestNuxtPointSaveMetadataProof(t *testing.T) {
 	require.Equal(t, "lib/auth.ts::useAuth", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 
 	idx.contentProof = newBuildContentProof(root, gitstate.DirtySnapshot{})
-	idx.refreshResolutionInputs(root, caller)
+	_, err = idx.refreshResolutionInputs(root, caller)
+	require.NoError(t, err)
 	target, _ := idx.resolveNuxtAutoImport("pages/index.ts", "useAuth")
 	require.Equal(t, "lib/auth", target)
 	require.False(t, idx.contentProof.isUnbounded(), "unchanged point metadata must not require a full sample")

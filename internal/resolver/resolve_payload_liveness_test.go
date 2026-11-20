@@ -358,3 +358,27 @@ func assertPromotedLSPAdjacency(t *testing.T, store graph.Store, from, to, unres
 		t.Fatalf("promoted target in adjacency = %#v", in)
 	}
 }
+
+func TestRefusedLSPCorrectionStillRunsGuard(t *testing.T) {
+	mem := buildGraphFromSources(t, map[string]string{
+		"other/lib.ts": "export function lookup(){}",
+		"page.ts":      "function run(){const ns = {other:1}; ns.lookup()}",
+	})
+	store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	target := &graph.Node{ID: "def.ts::Target", Name: "Target", FilePath: "def.ts", StartLine: 5, Kind: graph.KindFunction}
+	edge := &graph.Edge{From: "caller.ts::run", To: "guess.ts::Target", FilePath: "caller.ts", Line: 1, Kind: graph.EdgeCalls}
+	store.AddBatch(append(mem.AllNodes(), target), append(mem.AllEdges(), edge))
+	writer := &refusedLSPCorrection{Store: store, refuse: true}
+	r := New(writer)
+	r.SetLSPHelper(fixedDefinitionLSP{path: target.FilePath, line: target.StartLine})
+	r.lspDeferredSpool, err = newDeferredLSPSpool()
+	require.NoError(t, err)
+	t.Cleanup(func() { r.SetGraph(store) })
+	require.NoError(t, r.lspDeferredSpool.append([]deferredLSPEdge{{edge: edge, target: "Target"}}))
+	_, err = r.ResolveAllContext(t.Context())
+	require.ErrorContains(t, err, "binding write did not apply")
+	// The guard still reverts a name-only binding into an unimported module.
+	require.True(t, graph.IsUnresolvedTarget(callEdgeTo(store, "page.ts::run", 1)), callEdgeTo(store, "page.ts::run", 1))
+}

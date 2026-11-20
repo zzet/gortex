@@ -182,10 +182,13 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 		}
 		locals, _ := f.Meta[graph.JSLocalExportsMeta].(string)
 		local := graph.JSBinding(locals, b.name)
-		if local == "" && b.name == graph.JSDefaultBinding {
-			local, _ = f.Meta[graph.DefaultExportMeta].(string)
-			if local == "" && !b.nativeESM {
-				local = graph.JSBinding(locals, graph.JSInteropDefaultBinding)
+		if b.name == graph.JSDefaultBinding {
+			// Compiled interop returns an __esModule object itself and reads its
+			// .default, even when module.exports was assigned another value.
+			if interop := graph.JSBinding(locals, graph.JSInteropDefaultBinding); interop != "" && !b.nativeESM {
+				local = interop
+			} else if local == "" {
+				local, _ = f.Meta[graph.DefaultExportMeta].(string)
 			}
 		}
 		if local != "" {

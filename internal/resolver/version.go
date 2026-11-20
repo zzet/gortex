@@ -47,7 +47,7 @@ import (
 // including CommonJS assignments and the normal script of a Vue component.
 // Vue forwarding exports bind through the normal script's symbol scope.
 // Scoped imports require export evidence; compiled CommonJS defaults can bind.
-const ResolutionSemanticsVersion = 14
+const ResolutionSemanticsVersion = 9
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

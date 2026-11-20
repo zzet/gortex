@@ -49,7 +49,8 @@ func TestTrackedNpmImportsSurviveEviction(t *testing.T) {
 					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "replace":
-					evictRepoCurrentGeneration(g, "lib")
+					_, _, err := evictRepoCurrentGeneration(g, "lib")
+					require.NoError(t, err)
 				case "untrack":
 					mi := &MultiIndexer{graph: g}
 					_, _, err := mi.purgeRepositoryPayload("lib", nil)
@@ -81,7 +82,8 @@ func TestTrackedNpmRepoParkingIsScoped(t *testing.T) {
 			g.AddEdge(&graph.Edge{From: "app/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeCalls, FilePath: "app/a.ts", CrossRepo: true})
 			g.AddEdge(&graph.Edge{From: "other/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeCalls, FilePath: "other/a.ts", CrossRepo: true})
 			g.AddEdge(&graph.Edge{From: "app/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeReferences, FilePath: "app/a.ts", CrossRepo: true})
-			evictRepoCurrentGeneration(g, "lib")
+			_, _, err := evictRepoCurrentGeneration(g, "lib")
+			require.NoError(t, err)
 			assert.Empty(t, g.GetOutEdges("other/a.ts::run"))
 			calls := g.GetOutEdges("app/a.ts::run")
 			if marked {
@@ -120,7 +122,8 @@ func TestNonNpmEvictionDoesNotHydrateIncoming(t *testing.T) {
 			if withImport {
 				g.AddEdge(&graph.Edge{From: "other/a.go", To: "lib/a.go", Kind: graph.EdgeImports, CrossRepo: true})
 			}
-			evictRepoCurrentGeneration(g, "lib")
+			_, _, err := evictRepoCurrentGeneration(g, "lib")
+			require.NoError(t, err)
 			assert.Zero(t, g.incomingReads, "non-npm eviction must not hydrate incoming adjacency")
 			assert.Empty(t, g.GetOutEdges("other/a.go::run"))
 		})

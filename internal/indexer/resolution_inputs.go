@@ -69,22 +69,30 @@ func readResolutionInput(dir *os.Root, root, rel string, proof *buildContentProo
 	return data, sum
 }
 
-// A point save is not a discovery pass. Recheck every known input by content
-// (not mtime), and check the caller's ancestors for a newly prepared project or
-// alias scope. A directory event or explicit reconcile still discovers all roots.
-func (in *resolutionInputs) unchangedForPoint(root, point string, proof *buildContentProof) bool {
-	if in == nil || point == "" {
+// A save of explicit files is not a discovery pass. Recheck every known input
+// by content (not mtime), and check each saved file's ancestors for a newly
+// prepared project or alias scope. A directory event or explicit reconcile
+// still discovers all roots.
+func (in *resolutionInputs) unchangedForPoints(root string, points []string, proof *buildContentProof) bool {
+	if in == nil || len(points) == 0 {
 		return false
 	}
-	if !filepath.IsAbs(point) {
-		point = filepath.Join(root, point)
-	}
-	rel, err := filepath.Rel(root, point)
-	if err != nil || !filepath.IsLocal(rel) {
-		return false
-	}
-	if info, err := os.Stat(point); err != nil || !info.Mode().IsRegular() {
-		return false
+	rels := make([]string, 0, len(points))
+	for _, point := range points {
+		if point == "" {
+			return false
+		}
+		if !filepath.IsAbs(point) {
+			point = filepath.Join(root, point)
+		}
+		rel, err := filepath.Rel(root, point)
+		if err != nil || !filepath.IsLocal(rel) {
+			return false
+		}
+		if info, err := os.Stat(point); err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+		rels = append(rels, rel)
 	}
 	confined, err := os.OpenRoot(root)
 	if err != nil {
@@ -98,23 +106,28 @@ func (in *resolutionInputs) unchangedForPoint(root, point string, proof *buildCo
 	}
 	tsNames, nuxtNames := tsalias.ConfigFileNames(), nuxtimports.ConfigFileNames()
 	names := append(append(tsNames[:], nuxtNames[:]...), nuxtimports.GeneratedList)
-	for dir := path.Dir(filepath.ToSlash(rel)); ; dir = path.Dir(dir) {
-		for _, name := range names {
-			candidate := path.Join(dir, name)
-			if _, known := in.reads[candidate]; known {
-				continue
+	checked := map[string]bool{}
+	for _, rel := range rels {
+		for dir := path.Dir(filepath.ToSlash(rel)); !checked[dir]; dir = path.Dir(dir) {
+			checked[dir] = true
+			for _, name := range names {
+				candidate := path.Join(dir, name)
+				if _, known := in.reads[candidate]; known {
+					continue
+				}
+				abs := filepath.Join(root, filepath.FromSlash(candidate))
+				_, err := confined.Stat(filepath.FromSlash(candidate))
+				if !errors.Is(err, os.ErrNotExist) {
+					return false
+				}
+				proof.record(abs, absentContent)
 			}
-			abs := filepath.Join(root, filepath.FromSlash(candidate))
-			_, err := confined.Stat(filepath.FromSlash(candidate))
-			if !errors.Is(err, os.ErrNotExist) {
-				return false
+			if dir == "." {
+				break
 			}
-			proof.record(abs, absentContent)
-		}
-		if dir == "." {
-			return true
 		}
 	}
+	return true
 }
 
 type resolutionInputStore interface {
@@ -131,7 +144,7 @@ func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutio
 	defer dir.Close()
 	t := &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir, reads: make(map[string]string), proof: proof}
 	t.Tree.Files(func(rel string) { t.paths = append(t.paths, rel) })
-	current := &resolutionInputs{aliases: tsalias.LoadScopes(t.Files, t.Read, t.Tree.Exists), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
+	current := &resolutionInputs{aliases: tsalias.LoadScopes(t.Files, t.Read, t.Exists), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
 	h := sha256.New()
 	for _, rel := range slices.Sorted(maps.Keys(current.reads)) {
 		writeFingerprintString(h, rel)
@@ -184,7 +197,7 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 	return false
 }
 
-func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInputs, error) {
+func (idx *Indexer) refreshResolutionInputs(root string, points ...string) (*resolutionInputs, error) {
 	if idx.manifestTree().sourced() {
 		return nil, nil
 	}
@@ -203,7 +216,12 @@ func (idx *Indexer) refreshResolutionInputs(root, point string) (*resolutionInpu
 	}
 	idx.resolutionInputsChanged = retry != nil && retry.files == nil
 	current := prior
-	if !prior.unchangedForPoint(root, point, idx.contentProof) {
+	if current == nil {
+		// A new indexer for a checkout another build already scanned. Recheck
+		// those inputs by content rather than scanning the whole tree again.
+		current = cachedResolutionInputs(root)
+	}
+	if !current.unchangedForPoints(root, points, idx.contentProof) {
 		var err error
 		current, err = discoverResolutionInputs(root, idx.contentProof)
 		if err != nil {
@@ -296,6 +314,12 @@ func resolutionInputsForTree(tree manifestTree) *resolutionInputs {
 	}
 	proven, _ := tree.(provenManifestTree)
 	return workingResolutionInputs(tree.root(), proven.proof)
+}
+
+func cachedResolutionInputs(root string) *resolutionInputs {
+	resolutionCache.Lock()
+	defer resolutionCache.Unlock()
+	return resolutionCache.byRoot[root]
 }
 
 func invalidateResolutionInputs(root string) {

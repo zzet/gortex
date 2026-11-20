@@ -109,6 +109,9 @@ type jsCommonExports struct {
 	def      string
 	interop  bool
 	detached bool
+	// replaced counts module.exports replacements, so a property write whose
+	// object was captured before its right-hand side ran is not misattributed.
+	replaced int
 }
 
 func jsModuleExports(n *sitter.Node, src []byte) bool {
@@ -140,6 +143,8 @@ func (c *jsCommonExports) assign(left, value *sitter.Node, src []byte) (local st
 	if left == nil || value == nil {
 		return
 	}
+	// JavaScript resolves the target object before evaluating the value.
+	name, replaced := c.property(left, src), c.replaced
 	switch value.Type() {
 	case "assignment_expression":
 		local, module, alias = c.assign(value.ChildByFieldName("left"), value.ChildByFieldName("right"), src)
@@ -159,14 +164,14 @@ func (c *jsCommonExports) assign(left, value *sitter.Node, src []byte) (local st
 	case jsModuleExports(left, src):
 		if !module {
 			c.def, c.named, c.interop = local, nil, false
+			c.replaced++
 		}
 		c.detached, module = !alias, true
 	case left.Type() == "identifier" && left.Content(src) == "exports":
 		c.detached, alias = !module, true
 	default:
-		name := c.property(left, src)
 		switch {
-		case name == "":
+		case name == "" || c.replaced != replaced:
 		case name == "__esModule":
 			c.interop = value.Type() == "true"
 		case local == "":
@@ -221,6 +226,11 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 					common.defineProperty(n, src)
 				case "unary_expression":
 					if op := n.ChildByFieldName("operator"); op != nil && op.Type() == "delete" {
+						if jsModuleExports(n.ChildByFieldName("argument"), src) {
+							common.def, common.named, common.interop, common.detached = "", nil, false, true
+							common.replaced++
+							continue
+						}
 						name := common.property(n.ChildByFieldName("argument"), src)
 						delete(common.named, name)
 						if name == "__esModule" {
@@ -361,7 +371,8 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			local := func(id string) { add(id, graph.JSLexicalLocal) }
 			switch kind {
 			case "program", "statement_block":
-				if kind == "program" {
+				// A class static block is its own var scope.
+				if p := n.Parent(); kind == "program" || p != nil && p.Type() == "class_static_block" {
 					visitJSHoistedVars(n, src, local)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {

@@ -267,6 +267,12 @@ func (idx *Indexer) reindexIncrementalStalePass(
 		reparsed = append(reparsed, chunkReparsed...)
 		failed = append(failed, chunkFailed...)
 		versionChanged = append(versionChanged, chunkVersionChanged...)
+		if idx.contractRestatementErr != nil {
+			// Stop at the refused chunk: a later chunk would commit and then
+			// be charged with this chunk's failure.
+			failed = append(failed, files[start:]...)
+			break
+		}
 	}
 	return plan,
 		appendUniqueSorted(nil, reparsed...),
@@ -1519,7 +1525,9 @@ func restubIncomingRefsFromView(
 	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, stage := range stages {
 		frontier := restubFrontierForStage(stage, view)
-		jsModule := closureJSTSPath(stage.graphPath)
+		// A skipped parse says nothing about the exports: restub as for
+		// any other language and keep the callers' facts.
+		jsModule := closureJSTSPath(stage.graphPath) && !parseSkipped(extractionNodes(stage.result))
 		// Separator repair changes identity, not the declaration contract.
 		// The normal shape/visibility/parameter gates still decide every carry.
 		if !frontier.conservative {
@@ -1661,7 +1669,7 @@ func restubIncomingRefsFromView(
 					continue
 				}
 				oldTo := edge.To
-				if restub && parkExactCall(edge) {
+				if restub && jsModule && parkExactCall(edge) {
 					stage.bindingCallers = append(stage.bindingCallers, edge.FilePath)
 					reindexes = append(reindexes, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 					continue

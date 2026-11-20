@@ -130,13 +130,14 @@ barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
-For CommonJS, a default import first looks for a callable `module.exports`.
-If none was recorded, the resolver also accepts a top-level `.default` on
-an object marked `__esModule`, as emitted by TypeScript and Babel. Explicit
-native ESM consumers (`.mjs` and `.mts`) do not use that fallback. For other
+For CommonJS, a default import binds `module.exports`. When the final export
+object is marked `__esModule`, as TypeScript and Babel emit, its top-level
+`.default` wins instead, matching their interop helpers. Explicit native ESM
+consumers (`.mjs` and `.mts`) always take `module.exports`. For other
 extensions this is an interop heuristic, not a check of the bundler settings.
 Named imports follow top-level property assignments and deletes on
-`module.exports` or its attached `exports` alias. Conditional and function-body
+`module.exports` or its attached `exports` alias; `delete module.exports`
+clears them all. Conditional and function-body
 writes are not treated as guaranteed exports.
 Normal Vue `<script>` blocks can export or re-export names; `<script setup>`
 locals are not module exports. A watcher rechecks fallback bindings when a

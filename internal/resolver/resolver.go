@@ -1059,6 +1059,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	defer guardSpool.close()
 	guardRepos := make(map[string]struct{})
 	total := &ResolveStats{}
+	// A refused LSP correction fails the pass only after the guard has run, so
+	// unrelated name-only bindings are still reverted.
+	var lspWriteErr error
 	resolveError := func(err error) (*ResolveStats, error) {
 		// Moves the pass deferred belong to references it already bound; an
 		// interrupted pass must not strand them (no later pass re-derives a
@@ -1628,7 +1631,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
 			if len(pageResult.dropped) != 0 {
 				total.DroppedFiles = append(total.DroppedFiles, pageResult.dropped...)
-				return resolveError(total.bindingWriteError()) // leave this spool page pending
+				lspWriteErr = total.bindingWriteError()
+				break // leave this spool page pending
 			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
@@ -1811,7 +1815,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			r.warmGuardLookupCache(jobs)
 			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure, total)
 			r.clearLookupCache()
-			if err := total.bindingWriteError(); err != nil {
+			if err := total.bindingWriteError(); err != nil && lspWriteErr == nil {
 				return resolveError(err)
 			}
 			guardPages++
@@ -1829,6 +1833,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	tAfterGuard := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
+	}
+	if lspWriteErr != nil {
+		return resolveError(total.bindingWriteError())
 	}
 
 	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
