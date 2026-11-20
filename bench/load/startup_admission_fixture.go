@@ -25,6 +25,13 @@ func buildStartupAdmissionFixture(ctx context.Context, sourceRoot, label string,
 		return startupAdmissionFixture{}, fmt.Errorf("fixture %s: files/functions must be >=1 and calls >=0", label)
 	}
 	dir := filepath.Join(sourceRoot, label)
+	// A re-run into an existing trial dir must start from a clean corpus: the fixture
+	// is deterministic, so a stale committed tree would leave `git commit` with
+	// nothing to commit and fail. The harness clones this dir, so removing a prior
+	// fixture is safe.
+	if err := os.RemoveAll(dir); err != nil {
+		return startupAdmissionFixture{}, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return startupAdmissionFixture{}, err
 	}
