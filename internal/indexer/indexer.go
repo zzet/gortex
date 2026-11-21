@@ -144,6 +144,9 @@ type IndexResult struct {
 	// failuresRetryable: every failed file is in the persisted failure ledger,
 	// which retries it, and no directory walk failed.
 	failuresRetryable bool
+	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
+	// receipt so the next pass rebinds the callers this one left unresolved.
+	resolutionErr error
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -446,6 +449,10 @@ type Indexer struct {
 	passAliases            atomic.Pointer[aliasSnapshot]
 	deltaAliases           *aliasSnapshot // private to a single edit-delta builder
 	appliedAliases         string         // fallback for in-memory stores, under the mutation lane
+	// A deferred full pass waiting for the shared resolve to certify it.
+	// aliasStateMu serializes that off-lane certification with beginAliasPass.
+	deferredAliases atomic.Pointer[aliasSnapshot]
+	aliasStateMu    sync.Mutex
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -2859,7 +2866,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	}
 	defer func() {
 		defer idx.clearAliasPass()
-		if retErr == nil {
+		switch {
+		case retErr != nil:
+		case idx.deferResolve.Load():
+			retErr = idx.holdAliasPass(result)
+		default:
 			retErr = idx.finishAliasPass(result)
 		}
 	}()
@@ -4756,7 +4767,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
 		resolveStarted := time.Now()
-		resolveStats := idx.resolver.ResolveAll()
+		resolveStats, resolveErr := idx.resolver.ResolveAllContext(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
 		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 		// Lift the dataflow placeholders exactly where the per-save path
 		// does (right after resolution, before the derived passes), so a
@@ -5983,8 +5997,16 @@ func isStructuralKind(k graph.NodeKind) bool {
 // interface-implementation inference. Exposed for batch paths that
 // defer per-file resolver work until the end of a batch.
 func (idx *Indexer) ResolveAll() {
+	if err := idx.resolveAll(); err != nil {
+		idx.logger.Error("indexer: full resolution failed", zap.Error(err))
+	}
+}
+
+func (idx *Indexer) resolveAll() error {
 	idx.populateCppIncludeDirs(true)
-	idx.resolver.ResolveAll()
+	if _, err := idx.resolver.ResolveAllContext(context.Background()); err != nil {
+		return err
+	}
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
@@ -6006,6 +6028,7 @@ func (idx *Indexer) ResolveAll() {
 	// Seed the durable reference-facts sidecar from the fully-resolved graph
 	// (no-op on the in-memory backend).
 	idx.persistAllRefFacts()
+	return nil
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.

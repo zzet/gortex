@@ -2,14 +2,34 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/resolver"
+	"github.com/zzet/gortex/internal/search"
 )
+
+// failingResolveStore fails a whole-graph resolve at its pending-edge read.
+type failingResolveStore struct {
+	graph.Store
+	err error
+}
+
+func (s failingResolveStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
+	return graph.UnresolvedEdgeScan{}, s.err
+}
+
+func (s failingResolveStore) ReadUnresolvedEdgePage(context.Context, graph.UnresolvedEdgeScan, int64, int, int) (graph.UnresolvedEdgePage, error) {
+	return graph.UnresolvedEdgePage{}, s.err
+}
 
 // Both targets declare the same symbol, so name-only fallback cannot stand
 // in for an alias-directed binding.
@@ -107,6 +127,90 @@ func TestTSConfigPathAlias_CancelledRebindKeepsGraphAndRetries(t *testing.T) {
 	_, err = idx.IncrementalReindexPaths(root, []string{configPath})
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_FailedFullResolveIsNotCertified(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	oldDigest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, oldDigest)
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	errResolve := errors.New("injected pending page failure")
+	healthy := idx.resolver
+	idx.resolver = resolver.New(failingResolveStore{Store: store, err: errResolve})
+	_, err = idx.Index(root)
+	idx.resolver = healthy
+	require.ErrorIs(t, err, errResolve)
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.Empty(t, digest, "a failed resolve must not certify either policy")
+	require.Empty(t, idx.appliedAliases)
+
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+	digest, err = store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest)
+	require.NotEqual(t, oldDigest, digest)
+}
+
+func TestTSConfigPathAlias_DeferredIndexCertifiesAfterSharedResolve(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{entry}}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+	seed, store := newSQLiteIndexer(t)
+	invalidateTSAliasCollection(root)
+	mi := NewMultiIndexer(store, seed.registry, search.NewNull(), cm, zap.NewNop())
+	_, err = mi.TrackRepoCtx(t.Context(), entry)
+	require.NoError(t, err)
+	require.Equal(t, "repo/old/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	idx := mi.GetIndexer("repo")
+	idx.SetDeferResolve(true)
+	_, err = idx.IndexCtx(t.Context(), root)
+	require.NoError(t, err)
+	digest, err := store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "the shared resolve has not run yet")
+
+	errResolve := errors.New("injected pending page failure")
+	mi.graph = failingResolveStore{Store: store, err: errResolve}
+	require.ErrorIs(t, mi.RunPreEnrichResolve(t.Context(), nil, nil), errResolve)
+	mi.graph = store
+	digest, err = store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "a failed shared resolve must not certify the policy")
+
+	require.NoError(t, mi.RunPreEnrichResolve(t.Context(), nil, nil))
+	require.Equal(t, "repo/new/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+	digest, err = store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.NotEmpty(t, digest)
+	require.Nil(t, idx.deferredAliases.Load())
+}
+
+func TestTSConfigPathAlias_FailedCatchupResolveIsNotCertified(t *testing.T) {
+	idx, store := newSQLiteIndexer(t)
+	idx.passAliases.Store(&aliasSnapshot{digest: "new"})
+	errResolve := errors.New("injected catch-up failure")
+	require.ErrorIs(t, idx.finishAliasPass(&IndexResult{resolutionErr: errResolve}), errResolve)
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.Empty(t, digest)
+	require.Empty(t, idx.appliedAliases)
 }
 
 func TestTSConfigPathAlias_RebindPreservesExplicitScope(t *testing.T) {

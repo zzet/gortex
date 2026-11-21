@@ -1012,18 +1012,17 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	return master
 }
 
-func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) {
-	mi.runMasterResolveHooked(scope, useLSP, nil)
-}
-
-// runMasterResolveHooked is runMasterResolve with an optional compute-done
-// hook threaded into the resolver (see Resolver.OnComputeDone).
-func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
-	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) error {
+	err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, nil)
+	if err != nil {
 		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
 	}
+	return err
 }
 
+// runMasterResolveHookedContext is runMasterResolve with cancellation and an
+// optional compute-done hook threaded into the resolver (see
+// Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1196,6 +1195,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	pendingAliases := mi.deferredAliasPasses(scope)
 	mi.runDeferredGoModAll()
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
@@ -1206,7 +1206,10 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	return mi.runCrossRepoResolveContext(ctx, false)
+	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+		return err
+	}
+	return certifyDeferredAliases(pendingAliases)
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through

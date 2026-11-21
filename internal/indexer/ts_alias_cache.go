@@ -129,6 +129,10 @@ func (idx *Indexer) beginAliasPass(root string, paths []string) error {
 		return nil
 	}
 	s := workingAliases(root, idx.contentProof, paths)
+	idx.aliasStateMu.Lock()
+	defer idx.aliasStateMu.Unlock()
+	// This mutation overtakes any full pass still waiting on the shared resolve.
+	idx.deferredAliases.Store(nil)
 	prior := idx.appliedAliases
 	store, durable := idx.graph.(aliasStateStore)
 	if durable && prior == "" {
@@ -155,22 +159,94 @@ func (idx *Indexer) beginAliasPass(root string, paths []string) error {
 	return nil
 }
 
-func (idx *Indexer) finishAliasPass(result *IndexResult) error {
+// aliasesToCertify returns the policy this pass rebound, or nil when it has
+// nothing to record. A failed whole-graph resolve surfaces only here, so an
+// unrelated save keeps the resolver's best-effort behavior.
+func (idx *Indexer) aliasesToCertify(result *IndexResult) (*aliasSnapshot, error) {
 	s := idx.passAliases.Load()
 	if s == nil || s.digest == idx.appliedAliases || result == nil || result.mutationErr != nil {
-		return nil
+		return nil, nil
+	}
+	if result.resolutionErr != nil {
+		return nil, result.resolutionErr
 	}
 	// The failure ledger retries a failed file with the current policy. Waiting
 	// for it would restage every JS/TS caller on each save until it reads.
 	if (len(result.Errors) != 0 || len(result.FailedFiles) != 0) && !result.failuresRetryable {
-		return nil
+		return nil, nil
 	}
+	return s, nil
+}
+
+func (idx *Indexer) finishAliasPass(result *IndexResult) error {
+	s, err := idx.aliasesToCertify(result)
+	if s == nil {
+		return err
+	}
+	return idx.certifyAliases(s)
+}
+
+// holdAliasPass parks a deferred full pass until the shared resolve succeeds.
+func (idx *Indexer) holdAliasPass(result *IndexResult) error {
+	s, err := idx.aliasesToCertify(result)
+	if s != nil {
+		idx.deferredAliases.Store(s)
+	}
+	return err
+}
+
+func (idx *Indexer) certifyAliases(s *aliasSnapshot) error {
 	if store, ok := idx.graph.(aliasStateStore); ok {
 		if err := store.SetTSAliasDigest(idx.repoPrefix, s.digest); err != nil {
 			return err
 		}
 	}
 	idx.appliedAliases = s.digest
+	return nil
+}
+
+// deferredAliasPasses captures held passes before the shared resolver starts,
+// so a pass parked after that point is not certified by a resolve that may
+// have missed its edges.
+func (mi *MultiIndexer) deferredAliasPasses(scope map[string]struct{}) map[*Indexer]*aliasSnapshot {
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	var pending map[*Indexer]*aliasSnapshot
+	for prefix, idx := range mi.indexers {
+		if _, ok := scope[prefix]; len(scope) > 0 && !ok {
+			continue
+		}
+		if s := idx.deferredAliases.Load(); s != nil {
+			if pending == nil {
+				pending = make(map[*Indexer]*aliasSnapshot)
+			}
+			pending[idx] = s
+		}
+	}
+	return pending
+}
+
+// The shared resolve may run with or without the repository lanes held, so
+// certification serializes with beginAliasPass on aliasStateMu instead.
+func certifyDeferredAliases(pending map[*Indexer]*aliasSnapshot) error {
+	for idx, s := range pending {
+		if err := idx.certifyDeferredAlias(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (idx *Indexer) certifyDeferredAlias(s *aliasSnapshot) error {
+	idx.aliasStateMu.Lock()
+	defer idx.aliasStateMu.Unlock()
+	if idx.deferredAliases.Load() != s {
+		return nil // a newer mutation owns the receipt
+	}
+	if err := idx.certifyAliases(s); err != nil {
+		return err
+	}
+	idx.deferredAliases.Store(nil)
 	return nil
 }
 
@@ -188,6 +264,8 @@ func (idx *Indexer) restoredAliasCaller(root string, mtimes map[string]int64) (s
 		}
 		s := workingAliases(root, nil, []string{root})
 		if store, ok := idx.graph.(aliasStateStore); ok {
+			idx.aliasStateMu.Lock()
+			defer idx.aliasStateMu.Unlock()
 			digest, err := store.TSAliasDigest(idx.repoPrefix)
 			if err != nil {
 				return "", err
