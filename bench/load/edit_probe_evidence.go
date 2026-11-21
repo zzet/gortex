@@ -56,7 +56,11 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
 	if step.ConsumerProbes {
-		oracles = append(oracles, editConsumerOracles(c)...)
+		consumers := editConsumerOracles(c)
+		oracles = append(oracles, consumers...)
+		if step.ProbeMode == "json" {
+			oracles = append(oracles, editConsumerGCXOracles(consumers)...)
+		}
 	}
 	return editProbeOutputOracles(c, oracles)
 }

@@ -267,6 +267,8 @@ func editProbeDispatchOutput(req request) map[string]any {
 	switch editProbeRequestOutput(req) {
 	case "toon":
 		output["format"] = "toon"
+	case "gcx":
+		output["format"] = "gcx"
 	case "compact":
 		output["compact"] = true
 	}
