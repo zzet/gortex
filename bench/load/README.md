@@ -342,6 +342,14 @@ editor arrival stream and global marker/mutation IDs; a route with no offered
 ordinal is not silently given an extra edit. Implementation and fixture tests
 do not establish a completed live or reference campaign.
 
+The six-repository, six-editor report adds `physical_topology_gate_wait_ms`
+and `physical_resolve_mutex_wait_ms` summary measures for accepted physical
+patches bound to the offered receipts. A patch serving multiple receipts
+contributes once. Phase metrics count edits without a physical binding and
+the summary censors missing or conflicting waits for bound patches.
+Resolve-mutex wait is part of the resolve lap and is never added to it.
+The separate `foreign-impact` command records read-side impact waits.
+
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
 record has no ACK, receipt, phases or derived time (each unavailable with its
