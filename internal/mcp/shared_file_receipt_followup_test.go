@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -429,6 +430,16 @@ func TestSharedReceiptCallerRefusalEvidence(t *testing.T) {
 		{"changed_stamp", "", func(first, _, _ map[string]any) {
 			first["decision"] = "stamp_changed"
 		}, 0},
+		{"suspect_before_with_later_peer", "", func(first, sample, _ map[string]any) {
+			first["site"], first["decision"], first["suspect"] = "projection.validation", "suspect_before", true
+			first["current_id"] = "UNOBSERVED"
+			delete(first, "current_seq")
+			delete(first, "current_source_seq")
+			sample["site"], sample["decision"] = "recovery.checked_change", "refused"
+			sample["selected_source_seq"], sample["current_id"] = 20, "new"
+			sample["current_seq"], sample["current_source_seq"] = 21, 21
+			sample["shared_remaining_ns"], sample["original_remaining_ns"] = 100, 200
+		}, 0},
 		{"unknown_nil", "", func(first, sample, _ map[string]any) {
 			first["current_id"], first["current_seq"], first["current_source_seq"] = "nil", 0, 0
 			sample["shared_remaining_ns"] = "UNOBSERVED"
@@ -524,6 +535,40 @@ func TestSharedReceiptFollowupVerifiesOriginalReceipt(t *testing.T) {
 	t.Logf("real follow-up status and caller verified original commit %d with latest physical commit %d at line %d", identity.Commit, peerIdentity.Commit, evidence.ExpectedLine)
 }
 
+// Hold only this fixture file's projection invalidation notifications. The
+// watcher still receives and indexes all source events and owns both tickets.
+func holdSharedReceiptFixtureSourceEvents(t *testing.T, watcher *sharedReceiptWatcher, registry *pendingProjections, path string) func() {
+	t.Helper()
+	key := pathkey.MutationKey(path)
+	var mu sync.Mutex
+	held, count := true, 0
+	watcher.OnSourceEvent(func(eventPath string) {
+		if pathkey.MutationKey(eventPath) != key {
+			registry.markSuspect(eventPath)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if held {
+			count++
+			return
+		}
+		registry.markSuspect(eventPath)
+	})
+	release := sync.OnceFunc(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		held = false
+		for range count {
+			registry.markSuspect(path)
+		}
+		watcher.OnSourceEvent(registry.markSuspect)
+		t.Logf("restored the target projection callback and replayed %d held source notifications", count)
+	})
+	t.Cleanup(release)
+	return release
+}
+
 // Exercise the actual registered refusal and later read for the same original
 // offer. Scheduling the transition after the leaf result keeps the original
 // freshness wait, deadline, attempt counter, and response checks in production.
@@ -540,6 +585,14 @@ func TestSharedReceiptRegisteredRefusalAndVerifiedFollowup(t *testing.T) {
 				registry: pendingFileProjections,
 				backend:  f.server.graph.(*projectionRetirementCoreOnlyStore).Store.(projectionStore),
 				key:      pathkey.MutationKey(path),
+			}
+			var releaseSourceEvents func()
+			if reason == "newer_physical_owner" {
+				// The owner-fence witness isolates B's real physical publish
+				// from native invalidation that can mark A suspect first.
+				watcher, ok := f.server.currentWatcher().(*sharedReceiptWatcher)
+				require.True(t, ok)
+				releaseSourceEvents = holdSharedReceiptFixtureSourceEvents(t, watcher, retirement.registry, path)
 			}
 			original := &sharedReceiptOffer{agent: 0, ordinal: 0, population: "loaded", ticket: make(chan *indexer.MutationTicket, 1)}
 			f.edit(original)
@@ -589,12 +642,29 @@ func TestSharedReceiptRegisteredRefusalAndVerifiedFollowup(t *testing.T) {
 					require.True(t, allowance.deadline.Before(outer))
 					require.True(t, time.Now().Before(allowance.deadline))
 					if reason == "newer_physical_owner" {
+						var originalACK sharedReceiptStatus
+						require.True(t, sharedReceiptDecode(original.content["edit_file"], &originalACK))
+						require.Equal(t, original.receipt, originalACK.MutationReceipt)
+						require.Equal(t, originalACK.Commit, selected.sourceCommitSeq)
+						require.NotEmpty(t, originalACK.SHA)
+						require.Equal(t, originalACK.SHA, selected.contentSHA256)
+						require.False(t, selected.suspect.Load())
+
 						peer = &sharedReceiptOffer{agent: 1, ordinal: 0, population: "loaded", ticket: make(chan *indexer.MutationTicket, 1)}
 						f.edit(peer)
 						require.NoError(t, peer.err)
 						successor := liveEntry(pendingFileProjections, path)
 						require.NotNil(t, successor)
+						var peerACK sharedReceiptStatus
+						require.True(t, sharedReceiptDecode(peer.content["edit_file"], &peerACK))
+						require.Equal(t, peer.receipt, peerACK.MutationReceipt)
+						require.Equal(t, peerACK.Commit, successor.commitSeq)
+						require.Equal(t, successor.commitSeq, successor.sourceCommitSeq)
 						require.Greater(t, successor.commitSeq, selected.sourceCommitSeq)
+						require.NotEmpty(t, peerACK.SHA)
+						require.Equal(t, peerACK.SHA, successor.contentSHA256)
+						require.NotEqual(t, originalACK.SHA, peerACK.SHA)
+						require.False(t, selected.suspect.Load())
 						return
 					}
 					retirement.run()
@@ -618,6 +688,9 @@ func TestSharedReceiptRegisteredRefusalAndVerifiedFollowup(t *testing.T) {
 			require.NotNil(t, allowance)
 			require.Equal(t, int32(1), allowance.attempts.Load())
 			first := append(json.RawMessage(nil), original.content["get_callers"]...)
+			if releaseSourceEvents != nil {
+				releaseSourceEvents()
+			}
 			t.Logf("controlled actual first caller response: %s", first)
 			require.Error(t, original.err)
 			require.False(t, original.callerExact)
