@@ -73,6 +73,11 @@ func (f *sharedReceiptFixture) Close() { f.close() }
 
 func newSharedReceiptFixture(tb testing.TB) *sharedReceiptFixture {
 	tb.Helper()
+	return newSharedReceiptFixtureWithRetirement(tb, true)
+}
+
+func newSharedReceiptFixtureWithRetirement(tb testing.TB, autoRetirement bool) *sharedReceiptFixture {
+	tb.Helper()
 	root, err := filepath.EvalSymlinks(tb.TempDir())
 	require.NoError(tb, err)
 	require.NoError(tb, os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc Target() {}\n// stream-0-tail\n// stream-1-tail\n"), 0600))
@@ -93,6 +98,11 @@ func newSharedReceiptFixture(tb testing.TB) *sharedReceiptFixture {
 	_, err = idx.Index(root)
 	require.NoError(tb, err)
 	s := NewServer(query.NewEngine(store), store, idx, nil, logger, nil)
+	if !autoRetirement {
+		// Keep the pending owner for a controlled first-response transition.
+		// The real indexer still publishes to the same SQLite store.
+		s.graph = &projectionRetirementCoreOnlyStore{Store: store}
+	}
 	closeLog := sync.OnceFunc(func() { s.queryLog.Close() })
 	tb.Cleanup(closeLog)
 	s.editAckMode = config.EditAckLocal

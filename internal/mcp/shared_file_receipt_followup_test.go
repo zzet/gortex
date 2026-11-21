@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/indexer"
@@ -521,4 +522,149 @@ func TestSharedReceiptFollowupVerifiesOriginalReceipt(t *testing.T) {
 	evidence.Original.Commit = peerIdentity.Commit
 	require.ErrorContains(t, f.verifyOwnCaller(original.agent, original.ordinal, time.Now().Add(freshnessDefaultWait), evidence), "differs from the original receipt")
 	t.Logf("real follow-up status and caller verified original commit %d with latest physical commit %d at line %d", identity.Commit, peerIdentity.Commit, evidence.ExpectedLine)
+}
+
+// Exercise the actual registered refusal and later read for the same original
+// offer. Scheduling the transition after the leaf result keeps the original
+// freshness wait, deadline, attempt counter, and response checks in production.
+func TestSharedReceiptRegisteredRefusalAndVerifiedFollowup(t *testing.T) {
+	for _, reason := range []string{"newer_physical_owner", "expired_projection_allowance"} {
+		t.Run(reason, func(t *testing.T) {
+			selectedProjectionRegistry(t)
+			t.Setenv("GORTEX_QUERY_LOG", filepath.Join(t.TempDir(), "query-log.jsonl"))
+			t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
+			t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+			f := newSharedReceiptFixtureWithRetirement(t, false)
+			path := filepath.Join(f.root, "main.go")
+			retirement := &sourceProjectionRetirement{
+				registry: pendingFileProjections,
+				backend:  f.server.graph.(*projectionRetirementCoreOnlyStore).Store.(projectionStore),
+				key:      pathkey.MutationKey(path),
+			}
+			original := &sharedReceiptOffer{agent: 0, ordinal: 0, population: "loaded", ticket: make(chan *indexer.MutationTicket, 1)}
+			f.edit(original)
+			require.NoError(t, original.err)
+			ackOwner := liveEntry(pendingFileProjections, path)
+			require.NotNil(t, ackOwner)
+			require.Positive(t, ackOwner.sourceCommitSeq)
+			var peer *sharedReceiptOffer
+			var allowance *projectedSourceAllowance
+			var onOwner func(func()) bool
+			leaf, ok := f.server.facades.legacy("get_callers")
+			require.True(t, ok)
+			f.server.addTool(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+				result, err := leaf.handler(ctx, req)
+				if offer, _ := ctx.Value(sharedReceiptOfferKey{}).(*sharedReceiptOffer); offer != original || allowance != nil {
+					return result, err
+				}
+				if !onOwner(func() {
+					require.NoError(t, err)
+					require.NotNil(t, result)
+					require.False(t, result.IsError)
+					require.True(t, f.server.hasRequestProjectionFact(ctx, "main.go"))
+					// The real watcher can mark this physical owner suspect. A
+					// checked read-built copy can retain the same ACK bytes.
+					facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+					facts.mu.RLock()
+					selected := facts.entries[ackOwner.key]
+					facts.mu.RUnlock()
+					require.NotNil(t, selected)
+					pendingFileProjections.mu.Lock()
+					current := pendingFileProjections.snap.Load().entries[ackOwner.key]
+					checked := selected.readVersionChecked
+					pendingFileProjections.mu.Unlock()
+					require.Same(t, selected, current)
+					require.Equal(t, ackOwner.sourceCommitSeq, selected.sourceCommitSeq)
+					require.Equal(t, ackOwner.contentSHA256, selected.contentSHA256)
+					require.True(t, ackOwner.disk.matches(selected.disk))
+					if selected != ackOwner {
+						require.Zero(t, selected.commitSeq)
+						require.True(t, checked)
+					}
+					allowance, _ = ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+					require.NotNil(t, allowance)
+					require.Equal(t, int32(1), allowance.attempts.Load())
+					outer, bounded := ctx.Deadline()
+					require.True(t, bounded)
+					require.True(t, allowance.deadline.Before(outer))
+					require.True(t, time.Now().Before(allowance.deadline))
+					if reason == "newer_physical_owner" {
+						peer = &sharedReceiptOffer{agent: 1, ordinal: 0, population: "loaded", ticket: make(chan *indexer.MutationTicket, 1)}
+						f.edit(peer)
+						require.NoError(t, peer.err)
+						successor := liveEntry(pendingFileProjections, path)
+						require.NotNil(t, successor)
+						require.Greater(t, successor.commitSeq, selected.sourceCommitSeq)
+						return
+					}
+					retirement.run()
+					require.Nil(t, liveEntry(pendingFileProjections, path))
+					require.True(t, selected.checkedRetired.Load())
+					timer := time.NewTimer(time.Until(allowance.deadline))
+					defer timer.Stop()
+					<-timer.C
+					require.NoError(t, ctx.Err())
+				}) {
+					return mcplib.NewToolResultError("controlled callback closed"), nil
+				}
+				return result, err
+			})
+			_, err := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
+				onOwner = dispatch
+				f.observe(original)
+				return nil, nil
+			})
+			require.NoError(t, err)
+			require.NotNil(t, allowance)
+			require.Equal(t, int32(1), allowance.attempts.Load())
+			first := append(json.RawMessage(nil), original.content["get_callers"]...)
+			t.Logf("controlled actual first caller response: %s", first)
+			require.Error(t, original.err)
+			require.False(t, original.callerExact)
+			classified, _, _, _ := sharedReceiptRefusal(first)
+			require.Equal(t, reason, classified, "original registered reply: %s", first)
+			rows := []*sharedReceiptOffer{original}
+			if peer != nil {
+				// The newer owner remained pending for A's first response.
+				// Release the test-only hold only after its real ticket settles,
+				// before performing B's separate source-observation checks.
+				commit, found := f.server.mutationCommits.byReceipt(peer.receipt)
+				require.True(t, found)
+				peerCommit := commit.snapshot()
+				value, found := f.server.mutationReceipts.Load(peerCommit.publicationReceipt)
+				require.True(t, found)
+				publication := value.(*mutationReceipt)
+				wait := time.NewTimer(freshnessDefaultWait)
+				defer wait.Stop()
+				select {
+				case <-publication.done:
+				case <-wait.C:
+					t.Fatal("the actual peer publication did not finish")
+				}
+				peerOwner := liveEntry(pendingFileProjections, path)
+				require.NotNil(t, peerOwner)
+				require.Equal(t, peerCommit.CommitSeq, peerOwner.sourceCommitSeq)
+				require.Equal(t, 1, retirement.registry.retirePaths(retirement.backend, []string{path}))
+				require.Nil(t, liveEntry(pendingFileProjections, path), "the peer's published path must leave the projection cache")
+				t.Logf("settled peer projection retired with replay authority=%v", peerOwner.checkedRetired.Load())
+				peerEdges := f.server.graph.GetOutEdges("main.go::Stream1Edit00")
+				require.Len(t, peerEdges, 1)
+				require.Equal(t, "main.go::Target", peerEdges[0].To)
+				require.Equal(t, "calls", string(peerEdges[0].Kind))
+				f.observe(peer)
+				require.NoError(t, peer.err, "peer's original caller envelope: %s", peer.content["get_callers"])
+				rows = append(rows, peer)
+			}
+			require.Nil(t, liveEntry(pendingFileProjections, path))
+			f.verifyRefusedCallers(rows)
+			require.Equal(t, first, original.content["get_callers"])
+			require.Error(t, original.err)
+			require.NotNil(t, original.followup)
+			later, err := json.Marshal(original.followup)
+			require.NoError(t, err)
+			t.Logf("controlled original caller follow-up: %s", later)
+			require.True(t, original.followup.Verified, "%+v", original.followup)
+			require.Equal(t, original.receipt, original.followup.Original.Receipt)
+		})
+	}
 }
