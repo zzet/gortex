@@ -197,6 +197,10 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 	for _, dependent := range preview.Dependents {
 		l.dropCoordinator(dependent.ID)
 	}
+	// Revoke readiness before the swap as well as after it: between the commit
+	// and the post-commit reset the old primary's readiness would otherwise
+	// still admit closed-gate builds over the unpublished replacement.
+	l.buildGate().ResetFamilyReadiness(preview.FamilyID)
 
 	err = l.catalog.SetPrimaryDedicatedGraph(ctx, store_sqlite.SetPrimaryDedicatedGraphRequest{
 		FamilyID:             preview.FamilyID,
@@ -206,6 +210,24 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 	})
 	if err != nil {
 		return out, err
+	}
+
+	// The replacement primary must publish its own committed base before this
+	// family's builds may bypass the warmup latch again. Revoke the readiness the
+	// old primary earned; ResetFamilyReadiness wakes any parked waiter to re-check
+	// eligibility. A worktree rehomed onto an unpublished primary defers instead
+	// of composing over generation zero early.
+	// The reset also bumps the readiness epoch, refusing any mark whose catalog
+	// evidence (an in-flight adoption observer or catalog seed) predates the swap.
+	l.buildGate().ResetFamilyReadiness(preview.FamilyID)
+	// If the replacement primary already has a servable committed base (it may
+	// have published while still a secondary), no new adoption event will fire for
+	// it, so re-mark readiness now — otherwise a rehome waits for the global latch.
+	epoch := l.buildGate().FamilyReadinessEpoch(preview.FamilyID)
+	if graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID); err == nil && found && graph.IsPrimaryBase {
+		if base, baseErr := graphBase(ctx, l.catalog, graph); baseErr == nil && base.generationID > 0 {
+			l.buildGate().MarkFamilyReady(preview.FamilyID, epoch)
+		}
 	}
 
 	for _, dependent := range preview.Dependents {
