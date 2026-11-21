@@ -137,6 +137,9 @@ type jsCommonExports struct {
 	// replaced counts module.exports replacements, so a property write whose
 	// object was captured before its right-hand side ran is not misattributed.
 	replaced int
+	// objects holds top-level locals still bound to an object literal. Such a
+	// module.exports is a container, so it cannot compete with a callable .default.
+	objects map[string]bool
 }
 
 func jsModuleExports(n *sitter.Node, src []byte) bool {
@@ -246,6 +249,9 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 			if n != nil {
 				switch n.Type() {
 				case "assignment_expression":
+					if left := n.ChildByFieldName("left"); left != nil && left.Type() == "identifier" {
+						delete(common.objects, left.Content(src))
+					}
 					common.assign(n.ChildByFieldName("left"), n.ChildByFieldName("right"), src)
 				case "call_expression":
 					common.defineProperty(n, src)
@@ -269,6 +275,16 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 		if s.Type() == "variable_declaration" || s.Type() == "lexical_declaration" {
 			for j := 0; j < int(s.NamedChildCount()); j++ {
 				v := s.NamedChild(j)
+				if name := v.ChildByFieldName("name"); name != nil && name.Type() == "identifier" {
+					if value := v.ChildByFieldName("value"); value != nil && value.Type() == "object" {
+						if common.objects == nil {
+							common.objects = make(map[string]bool)
+						}
+						common.objects[name.Content(src)] = true
+					} else {
+						delete(common.objects, name.Content(src))
+					}
+				}
 				if name := v.ChildByFieldName("name"); name != nil && name.Type() == "identifier" && name.Content(src) == "exports" {
 					if value := v.ChildByFieldName("value"); value != nil {
 						common.assign(name, value, src)
@@ -320,6 +336,9 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 			key = graph.JSInteropDefaultBinding
 		}
 		graph.AppendJSBinding(&bindings, key, common.named[name])
+	}
+	if common.interop && common.objects[common.def] {
+		common.def = ""
 	}
 	if common.def != "" {
 		graph.AppendJSBinding(&bindings, graph.JSDefaultBinding, common.def)

@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"path"
 	"strings"
 	"sync"
 
@@ -199,17 +200,35 @@ func bindImportCall(e *graph.Edge, target *graph.Node, evidence string, stats *R
 	stats.Resolved++
 }
 
+// jsConsumerMode is what a consumer's extension proves about a CommonJS default
+// import. A .js or .ts file depends on package "type", compiler module settings
+// or a bundler, none of which identify the runtime semantics on their own.
+type jsConsumerMode uint8
+
+const (
+	jsConsumerUnproven jsConsumerMode = iota
+	jsConsumerNative                  // default import is module.exports
+	jsConsumerCompiled                // interop helper reads an __esModule .default
+)
+
+func jsConsumerModeOf(file string) jsConsumerMode {
+	switch path.Ext(file) {
+	case ".mjs", ".mts":
+		return jsConsumerNative
+	case ".cjs", ".cts":
+		return jsConsumerCompiled
+	}
+	return jsConsumerUnproven
+}
+
 // A named export (including a local alias or an imported value) wins over
 // stars. Stars never forward default and two distinct implementations conflict.
 func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 	type binding struct {
 		file, name string
-		nativeESM  bool
+		mode       jsConsumerMode
 	}
-	native := func(caller string) bool {
-		return strings.HasSuffix(caller, ".mjs") || strings.HasSuffix(caller, ".mts")
-	}
-	pending := []binding{{file, name, native(caller)}}
+	pending := []binding{{file, name, jsConsumerModeOf(caller)}}
 	var seen map[binding]bool
 	var pick *graph.Node
 	for len(pending) > 0 {
@@ -225,12 +244,18 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 		locals, _ := f.Meta[graph.JSLocalExportsMeta].(string)
 		local := graph.JSBinding(locals, b.name)
 		if b.name == graph.JSDefaultBinding {
-			// Compiled interop returns an __esModule object itself and reads its
-			// .default, even when module.exports was assigned another value.
-			if interop := graph.JSBinding(locals, graph.JSInteropDefaultBinding); interop != "" && !b.nativeESM {
+			// Compiled interop reads an __esModule object's .default; native ESM
+			// takes module.exports. When they differ, only a proven mode can pick.
+			interop := graph.JSBinding(locals, graph.JSInteropDefaultBinding)
+			switch {
+			case interop == "" || b.mode == jsConsumerNative:
+				if local == "" {
+					local, _ = f.Meta[graph.DefaultExportMeta].(string)
+				}
+			case local != "" && local != interop && b.mode == jsConsumerUnproven:
+				return nil
+			default:
 				local = interop
-			} else if local == "" {
-				local, _ = f.Meta[graph.DefaultExportMeta].(string)
 			}
 		}
 		if local != "" {
@@ -255,7 +280,7 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 				for _, edge := range r.callerOutEdges(n.ID) {
 					if edge.Kind == graph.EdgeReExports {
 						_, file := r.jsBindingSource(edge)
-						pending = append(pending, binding{file, orig, native(b.file)})
+						pending = append(pending, binding{file, orig, jsConsumerModeOf(b.file)})
 					}
 				}
 				continue
@@ -277,7 +302,7 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 			if forwarded != "" {
 				explicit = true
 				_, file := r.jsBindingSource(edge)
-				pending = append(pending, binding{file, forwarded, native(b.file)})
+				pending = append(pending, binding{file, forwarded, jsConsumerModeOf(b.file)})
 			}
 		}
 		if local != "" || explicit || b.name == graph.JSDefaultBinding {
@@ -286,7 +311,7 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 		for _, edge := range edges {
 			if edge.Kind == graph.EdgeReExports && edge.Meta[graph.StarReExportMeta] == true {
 				_, file := r.jsBindingSource(edge)
-				pending = append(pending, binding{file, b.name, native(b.file)})
+				pending = append(pending, binding{file, b.name, jsConsumerModeOf(b.file)})
 			}
 		}
 	}
