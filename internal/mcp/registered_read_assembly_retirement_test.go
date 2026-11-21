@@ -130,7 +130,16 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					case "canonical_no_projection":
 						require.NoError(t, s.indexer.IndexFile(path))
 						retirement.run()
+						require.True(t, entry.checkedRetired.Load())
 						require.Nil(t, liveEntry(pendingFileProjections, path))
+						paths := []string{entry.graphPath}
+						files, err := sql.FileMetasByPaths(entry.repoPrefix, paths)
+						require.NoError(t, err)
+						require.Contains(t, files, entry.graphPath)
+						require.Equal(t, entry.hash, files[entry.graphPath].ContentHash)
+						// Delete the real file-inventory row to move the checked
+						// store revision without rewriting a canonical graph node.
+						backend.write = func() error { return sql.DeleteFileMetasByFiles(entry.repoPrefix, paths) }
 					case "canonical_retirement", "expired", "cancelled", "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "options_true_override_false":
 						// Prepare from the actual disk bytes with the indexer's own
 						// parser. The request must still select the live ACK over
@@ -175,7 +184,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 						// The durable file row advances the real payload input
 						// revision checked by the open SQL read transaction.
 						backend.write = func() error { return sql.SetFileMetas(entry.repoPrefix, fileMeta) }
-					} else if transition != "unchanged" {
+					} else if transition != "unchanged" && transition != "canonical_no_projection" {
 						neighbor := sql.GetNode("main.go::Neighbor")
 						require.NotNil(t, neighbor)
 						updated := *neighbor
@@ -201,6 +210,11 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							require.NoError(t, first.Err())
 							if transition == "canonical_no_projection" {
 								require.False(t, s.hasRequestProjectionFact(first, "main.go"))
+								require.Nil(t, liveEntry(pendingFileProjections, path))
+								files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath})
+								require.NoError(t, err)
+								require.NotContains(t, files, entry.graphPath)
+								remainingAfterProducer = time.Until(deadline)
 								return
 							}
 							require.True(t, s.hasRequestProjectionFact(first, "main.go"))
