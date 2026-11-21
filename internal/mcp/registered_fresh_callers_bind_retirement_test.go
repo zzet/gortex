@@ -30,8 +30,12 @@ func (s *callersRetirementCarryStore) LayerContractFileNodesContext(ctx context.
 
 func TestRegisteredFreshCallersRetirementDuringProjectionBind(t *testing.T) {
 	for _, surface := range []string{"raw", "facade"} {
-		for _, transition := range []string{"canonical_retirement", "read_built_retirement", "unchecked_removal", "physical_peer", "changed_bytes", "source_event", "read_cow"} {
-			t.Run(surface+"/"+transition, func(t *testing.T) {
+		for _, scenario := range []string{
+			"canonical_retirement", "read_built_retirement", "unchecked_removal", "physical_peer", "changed_bytes", "source_event", "read_cow",
+			"selection_canonical_retirement", "selection_read_built_retirement", "selection_unchecked_removal", "selection_physical_peer", "selection_event_then_retirement",
+		} {
+			t.Run(surface+"/"+scenario, func(t *testing.T) {
+				transition, atSelection := strings.CutPrefix(scenario, "selection_")
 				selectedProjectionRegistry(t)
 				if transition == "read_built_retirement" {
 					t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "0")
@@ -79,10 +83,11 @@ func TestRegisteredFreshCallersRetirementDuringProjectionBind(t *testing.T) {
 				var allowance *projectedSourceAllowance
 				var deadline time.Time
 				observed := false
-				s.graph = &callersRetirementCarryStore{Store: store, afterRead: func(ctx context.Context) bool {
+				moveOwner := func(ctx context.Context, selected *projectionEntry) bool {
 					return onOwner(func() {
 						require.False(t, observed, "a rebound must not carry the removed projection")
 						observed = true
+						require.Same(t, entry, selected)
 						allowance, _ = ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
 						require.NotNil(t, allowance)
 						require.True(t, allowance.afterFreshness)
@@ -92,7 +97,13 @@ func TestRegisteredFreshCallersRetirementDuringProjectionBind(t *testing.T) {
 						require.Same(t, entry, liveEntry(pendingFileProjections, path))
 						require.False(t, s.hasRequestProjectionFact(ctx, "main.go"))
 						switch transition {
-						case "canonical_retirement", "read_built_retirement":
+						case "canonical_retirement", "read_built_retirement", "event_then_retirement":
+							if transition == "event_then_retirement" {
+								pendingFileProjections.markSuspect(path)
+								current, err := pendingFileProjections.lookup(path)
+								require.NoError(t, err)
+								require.Same(t, entry, current, "the same bytes clear suspect without removing the source event")
+							}
 							require.NoError(t, s.indexer.IndexFile(path))
 							retirement.run()
 							require.Nil(t, liveEntry(pendingFileProjections, path))
@@ -131,7 +142,12 @@ func TestRegisteredFreshCallersRetirementDuringProjectionBind(t *testing.T) {
 						}
 						require.True(t, time.Now().Before(deadline))
 					})
-				}}
+				}
+				if !atSelection {
+					s.graph = &callersRetirementCarryStore{Store: store, afterRead: func(ctx context.Context) bool {
+						return moveOwner(ctx, entry)
+					}}
+				}
 
 				tool, args := "get_callers", sharedReceiptCallersArguments()
 				if surface == "facade" {
@@ -141,16 +157,23 @@ func TestRegisteredFreshCallersRetirementDuringProjectionBind(t *testing.T) {
 				ctx, cancel := context.WithTimeout(base, 5*time.Second)
 				defer cancel()
 				original, _ := ctx.Deadline()
+				if atSelection {
+					ctx = context.WithValue(ctx, checkedProjectionReadObserverKey{}, checkedProjectionReadObserver(func(ctx context.Context, selected *projectionEntry) {
+						if !moveOwner(ctx, selected) {
+							cancel()
+						}
+					}))
+				}
 				result, err := canonicalReadWithOwner(t, func(dispatch func(func()) bool) (*mcplib.CallToolResult, error) {
 					onOwner = dispatch
 					return externalVersionRegisteredCall(s, ctx, 20, tool, args)
 				})
 				require.NoError(t, err)
 				require.NotNil(t, result)
-				require.True(t, observed, "the actual carry read must move the selected owner before retain")
+				require.True(t, observed, "the selected projection must move at the controlled binding stage")
 				require.Equal(t, deadline, allowance.deadline)
 				require.True(t, allowance.deadline.Before(original))
-				t.Logf("surface=%s transition=%s attempts=%d response=%s meta=%v", surface, transition, allowance.attempts.Load(), resultText(result), result.Meta)
+				t.Logf("surface=%s transition=%s attempts=%d response=%s meta=%v", surface, scenario, allowance.attempts.Load(), resultText(result), result.Meta)
 				if transition != "canonical_retirement" && transition != "read_built_retirement" {
 					require.True(t, result.IsError)
 					require.Equal(t, int32(1), allowance.attempts.Load())

@@ -318,7 +318,12 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 				if current := checkedPendingSearchCOWSuccessor(buildCtx, expected); current != nil {
 					return current, nil
 				}
-				return nil, predicateError("selection.owner_before_retain", expected, currentOwner, func(r *projectionPredicateSample) { r.currentSeen = true; r.decision = "owner_changed_before_retain" })
+				refusal := predicateError("selection.owner_before_retain", expected, currentOwner, func(r *projectionPredicateSample) { r.currentSeen = true; r.decision = "owner_changed_before_retain" })
+				if currentOwner == nil && retryAfterCheckedProjectionBindRetirement(buildCtx, expected, &observed.sourceEvents) {
+					retainPredicateError(buildCtx, refusal)
+					return nil, errProjectedSourceMoved
+				}
+				return nil, refusal
 			}
 			if err := buildCtx.Err(); err != nil {
 				return nil, err
@@ -499,7 +504,8 @@ func requestStoreBusyFiles(ctx context.Context) []string {
 func retainRequestProjection(ctx context.Context, entry *projectionEntry) (context.Context, error) {
 	ctx = withRequestProjectionFacts(ctx)
 	if guard, _ := predicateRefusal(ctx, projectionReadRetain, entry); guard != projectionOwnerLive {
-		if retryAfterCheckedProjectionBindRetirement(ctx, entry, guard) {
+		absent := guard == projectionOwnerAbsentBefore || guard == projectionOwnerAbsentAfter
+		if absent && retryAfterCheckedProjectionBindRetirement(ctx, entry, nil) {
 			return ctx, errProjectedSourceMoved
 		}
 		return ctx, annotateProjectionReadRefusal(projectionReadRetain, guard, projectionSuperseded)
