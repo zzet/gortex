@@ -177,10 +177,28 @@ selectedWorkerObserved:
 	}
 	require.True(t, allocated, "the other family's new worktree has no identity: %+v", overview.Families)
 
-	for _, cwd := range []string{primary, filepath.Join(primary, "internal"), other} {
-		reply := searchFrom("answer-"+cwd, cwd)
-		require.Contains(t, toolResultText(t, reply), "Value", "%s must answer while another checkout's discovery hangs: %v", cwd, reply)
-		require.NotEqual(t, true, reply["result"].(map[string]any)["isError"], "%s: %v", cwd, reply)
+	for _, session := range []struct{ cwd, repo string }{
+		{primary, "primary"},
+		{filepath.Join(primary, "internal"), "primary"},
+		{other, "other"},
+	} {
+		reply := searchFrom("answer-"+session.cwd, session.cwd)
+		text := toolResultText(t, reply)
+		require.NotEqual(t, true, reply["result"].(map[string]any)["isError"], "%s: %v", session.cwd, reply)
+		var payload struct {
+			Results []struct {
+				ID         string `json:"id"`
+				RepoPrefix string `json:"repo_prefix"`
+			} `json:"results"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(text), &payload), "%s must return graph results: %s", session.cwd, text)
+		wantID := session.repo + "/fixture.go::Value"
+		found := false
+		for _, row := range payload.Results {
+			require.Equal(t, session.repo, row.RepoPrefix, "%s received a result outside its repo: %s", session.cwd, text)
+			found = found || row.ID == wantID
+		}
+		require.True(t, found, "%s must return indexed symbol %s while discovery hangs: %s", session.cwd, wantID, text)
 	}
 
 	// Only a path inside the unregistered nested worktree waits for discovery.
