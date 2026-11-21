@@ -70,6 +70,9 @@ func TestCLIStartupRefusalKeepsKnownScopeBeforeControllerHandoff(t *testing.T) {
 	health := startupIntrospectionHealth(t, reply, "migrating")
 	require.Len(t, health.Repos, 1)
 	require.Equal(t, primary, health.Repos[0].Path)
+	require.NotEmpty(t, control.Ack.DaemonInstance)
+	require.False(t, startupConfiguresCWD(control.Ack.DaemonInstance+"-stale", primary),
+		"the same configured root cannot establish ownership for a different daemon instance")
 
 	for _, test := range []struct {
 		name, cwd string
@@ -88,10 +91,13 @@ func TestCLIStartupRefusalKeepsKnownScopeBeforeControllerHandoff(t *testing.T) {
 			var loading *repoLoadingError
 			if !test.known {
 				require.NotErrorAs(t, err, &loading, "global startup does not establish this checkout's ownership")
+				require.ErrorContains(t, err, "could not verify repository ownership")
+				require.NotContains(t, err.Error(), "gortex track")
 				return
 			}
 			require.ErrorAs(t, err, &loading, "configured scope got %v (%s)", err, diagnostics.String())
 			assert.Equal(t, exitTempFail, loading.ExitCode())
+			assert.Equal(t, test.cwd, loading.repo)
 			assert.Equal(t, "repo_loading", loading.details.ErrorCode)
 			require.NotNil(t, loading.details.Retryable)
 			assert.True(t, *loading.details.Retryable)
