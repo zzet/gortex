@@ -125,7 +125,7 @@ func TestPolicyFullLayoutAndInvalidShards(t *testing.T) {
 		t.Fatal(err)
 	}
 	full := p.FullMatrix().Include
-	if len(full) != 16 {
+	if len(full) != 17 {
 		t.Fatal(full)
 	}
 	if err := CheckLayout(full, p); err != nil {
