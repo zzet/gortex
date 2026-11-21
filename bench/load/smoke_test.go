@@ -90,8 +90,17 @@ func TestIdleStopClosesSessionsAndRetainsCanceledInterval(t *testing.T) {
 			if err := json.Unmarshal(phase.Gate["idle_stop"], &receipt); err != nil {
 				t.Fatal(err)
 			}
-			if receipt.Complete == canceled || receipt.Sessions != 1 || !canceled && phase.DurationSec < 2 || len(phase.Attempts) != 0 {
-				t.Fatal("idle evidence invented work or waived cancellation/closed sessions")
+			if receipt.Complete == canceled {
+				t.Fatalf("idle completion is %t for canceled=%t", receipt.Complete, canceled)
+			}
+			if receipt.Sessions != 1 {
+				t.Fatalf("idle receipt reports %d closed sessions, want 1", receipt.Sessions)
+			}
+			if !canceled && phase.DurationSec < 2 {
+				t.Fatalf("idle duration was %.9f seconds, want at least 2 seconds", phase.DurationSec)
+			}
+			if len(phase.Attempts) != 0 {
+				t.Fatalf("idle phase recorded %d attempts, want 0", len(phase.Attempts))
 			}
 			select {
 			case <-client.done:
