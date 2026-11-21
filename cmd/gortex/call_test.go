@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strings"
@@ -32,6 +34,58 @@ func newCallTestCmd(t *testing.T) (*cobra.Command, *bytes.Buffer) {
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
 	return cmd, buf
+}
+
+func TestCall_ReportsRepoLoadingRefusal(t *testing.T) {
+	original := callDaemonTool
+	t.Cleanup(func() { callDaemonTool = original })
+
+	const loading = `{"error_code":"repo_loading","retryable":true,"repo":"app","phase":"parallel_parse","percent":15}`
+	const identityPending = `{"error_code":"repo_loading","retryable":true,"reason":"identity_pending","phase":"identity_resolution","percent":0}`
+	tests := []struct {
+		name    string
+		data    string
+		json    string
+		message []string
+	}{
+		{name: "default", data: loading, message: []string{"still loading app", "parallel_parse, 15%", "error_code=repo_loading", "retryable=true", "retry shortly"}},
+		{name: "identity pending", data: identityPending, message: []string{"resolving graph admission", "identity_pending", "identity_resolution, 0%", "error_code=repo_loading", "retryable=true", "retry shortly"}},
+		{name: "explicit JSON", data: loading, json: `{"error_code":"repo_loading","retryable":true,"phase":"parallel_parse","percent":15}`},
+		{name: "explicit JSON with zero progress", data: identityPending, json: `{"error_code":"repo_loading","retryable":true,"phase":"identity_resolution","percent":0}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
+				if tool == "tool_profile" {
+					return json.RawMessage(cannedToolProfileJSON), nil
+				}
+				frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"repository loading","data":%s}}`, tt.data)
+				return extractToolResult([]byte(frame))
+			}
+			cmd, stdout := newCallTestCmd(t)
+			cmd.SilenceUsage = true
+			var stderr bytes.Buffer
+			cmd.SetErr(&stderr)
+			cmd.Flags().StringVar(&callFormat, "format", "json", "")
+			args := []string{"search_symbols"}
+			if tt.json != "" {
+				args = append(args, "--format", "json")
+			}
+			cmd.SetArgs(args)
+			var coded interface{ ExitCode() int }
+			require.ErrorAs(t, cmd.Execute(), &coded)
+			require.Equal(t, exitTempFail, coded.ExitCode())
+			require.Empty(t, stdout.String())
+			require.NotContains(t, stderr.String(), "gortex track")
+			require.NotContains(t, stderr.String(), "gortex repos reconcile")
+			if tt.json != "" {
+				require.JSONEq(t, tt.json, stderr.String())
+			}
+			for _, fragment := range tt.message {
+				require.Contains(t, stderr.String(), fragment)
+			}
+		})
+	}
 }
 
 // TestCoerceScalar exhaustively covers the deterministic --arg value coercion.
@@ -207,7 +261,7 @@ func TestCallDry_NoDaemon(t *testing.T) {
 	t.Cleanup(func() { callDaemonTool = orig })
 
 	called := false
-	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		called = true
 		return nil, nil
 	}
@@ -244,11 +298,11 @@ func TestCall_AllCompactNamesUseFacadeRelay(t *testing.T) {
 		require.True(t, gortexmcp.IsFacadeToolName(name), "%q must remain a registered facade name", name)
 		t.Run(name, func(t *testing.T) {
 			var facadeTool string
-			callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+			callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 				t.Fatalf("compact call %q touched legacy relay with %q", name, tool)
 				return nil, nil
 			}
-			callFacadeDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+			callFacadeDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 				facadeTool = tool
 				return json.RawMessage(`{"ok":true}`), nil
 			}
@@ -275,12 +329,12 @@ func TestCall_CompactRequestObjectIsForwardedUnchanged(t *testing.T) {
 	t.Cleanup(func() {
 		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
 	})
-	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		t.Fatal("compact call must not use legacy relay")
 		return nil, nil
 	}
 	var got map[string]any
-	callFacadeDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(_ string, tool string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		require.Equal(t, "read", tool)
 		got = args
 		return json.RawMessage(`{"ok":true}`), nil
@@ -299,7 +353,7 @@ func TestCall_CompactDefaultPreservesRequestOutputFormat(t *testing.T) {
 	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
 	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
 	var got map[string]any
-	callFacadeDaemonTool = func(_ string, _ string, args map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(_ string, _ string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		got = args
 		return json.RawMessage("TOON|results|...\n"), nil
 	}
@@ -327,7 +381,7 @@ func TestCall_JSONFormatAlwaysEmitsJSON(t *testing.T) {
 	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
 
 	t.Run("explore task markdown is wrapped in an envelope", func(t *testing.T) {
-		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 			return json.RawMessage(exploreTaskMarkdown), nil
 		}
 		cmd, buf := newCallTestCmd(t)
@@ -343,7 +397,7 @@ func TestCall_JSONFormatAlwaysEmitsJSON(t *testing.T) {
 	})
 
 	t.Run("structured payloads pass through unwrapped", func(t *testing.T) {
-		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 			return json.RawMessage(`{"completion":{"state":"localized"},"symbols":["a"]}`), nil
 		}
 		cmd, buf := newCallTestCmd(t)
@@ -357,7 +411,7 @@ func TestCall_JSONFormatAlwaysEmitsJSON(t *testing.T) {
 	})
 
 	t.Run("legacy relay text is wrapped too", func(t *testing.T) {
-		callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+		callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 			if tool == "tool_profile" {
 				return json.RawMessage(cannedToolProfileJSON), nil
 			}
@@ -374,7 +428,7 @@ func TestCall_JSONFormatAlwaysEmitsJSON(t *testing.T) {
 	})
 
 	t.Run("format text keeps the rendered page verbatim", func(t *testing.T) {
-		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any) (json.RawMessage, error) {
+		callFacadeDaemonTool = func(_ string, _ string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 			return json.RawMessage(exploreTaskMarkdown), nil
 		}
 		cmd, buf := newCallTestCmd(t)
@@ -400,12 +454,12 @@ func TestCall_CompactFormatMergesIntoExistingOutput(t *testing.T) {
 	t.Cleanup(func() {
 		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
 	})
-	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		t.Fatal("compact call must not use legacy relay")
 		return nil, nil
 	}
 	var got map[string]any
-	callFacadeDaemonTool = func(_ string, _ string, args map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(_ string, _ string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		got = args
 		return json.RawMessage(`{"ok":true}`), nil
 	}
@@ -427,11 +481,11 @@ func TestCall_EffectfulCompactToolWarnsWithoutCatalog(t *testing.T) {
 	t.Cleanup(func() {
 		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
 	})
-	callDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		t.Fatal("compact call must not use legacy relay")
 		return nil, nil
 	}
-	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		return json.RawMessage(`{"ok":true}`), nil
 	}
 
@@ -451,14 +505,14 @@ func TestCall_LegacyNameUsesLegacyRelay(t *testing.T) {
 		callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade
 	})
 	var called []string
-	callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 		called = append(called, tool)
 		if tool == "tool_profile" {
 			return json.RawMessage(cannedToolProfileJSON), nil
 		}
 		return json.RawMessage(`{"ok":true}`), nil
 	}
-	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		t.Fatal("legacy name must not use the compact relay")
 		return nil, nil
 	}
@@ -472,7 +526,7 @@ func TestCall_LegacyEscapePreservesSharedAnalyzeContract(t *testing.T) {
 	origLegacy, origFacade := callDaemonTool, callFacadeDaemonTool
 	t.Cleanup(func() { callDaemonTool, callFacadeDaemonTool = origLegacy, origFacade })
 	var called []string
-	callDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		called = append(called, tool)
 		if tool == "tool_profile" {
 			return json.RawMessage(`{"live":["analyze"],"descriptors":[{"name":"analyze","mutating":false}]}`), nil
@@ -481,7 +535,7 @@ func TestCall_LegacyEscapePreservesSharedAnalyzeContract(t *testing.T) {
 		require.Equal(t, "temporal_verify", args["kind"])
 		return json.RawMessage(`{"ok":true}`), nil
 	}
-	callFacadeDaemonTool = func(string, string, map[string]any) (json.RawMessage, error) {
+	callFacadeDaemonTool = func(string, string, map[string]any, io.Writer) (json.RawMessage, error) {
 		t.Fatal("--legacy must not negotiate the compact surface")
 		return nil, nil
 	}
@@ -514,7 +568,7 @@ func TestCall_UnknownToolSuggestsNearest(t *testing.T) {
 	t.Cleanup(func() { callDaemonTool = orig })
 
 	var calledTools []string
-	callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 		calledTools = append(calledTools, tool)
 		if tool == "tool_profile" {
 			return json.RawMessage(cannedToolProfileJSON), nil
@@ -538,7 +592,7 @@ func TestCall_KnownMutatingToolWarns(t *testing.T) {
 	orig := callDaemonTool
 	t.Cleanup(func() { callDaemonTool = orig })
 
-	callDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		if tool == "tool_profile" {
 			return json.RawMessage(cannedToolProfileJSON), nil
 		}
@@ -558,7 +612,7 @@ func TestCall_KnownMutatingToolWarns(t *testing.T) {
 func TestCall_QuietSuppressesMutatingNote(t *testing.T) {
 	orig := callDaemonTool
 	t.Cleanup(func() { callDaemonTool = orig })
-	callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 		if tool == "tool_profile" {
 			return json.RawMessage(cannedToolProfileJSON), nil
 		}
@@ -578,7 +632,7 @@ func TestCall_NoDaemonSkipsValidation(t *testing.T) {
 	orig := callDaemonTool
 	t.Cleanup(func() { callDaemonTool = orig })
 
-	callDaemonTool = func(_ string, tool string, _ map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, _ map[string]any, _ io.Writer) (json.RawMessage, error) {
 		if tool == "tool_profile" {
 			return nil, daemonRequiredErr(".") // no catalog available
 		}
@@ -597,7 +651,7 @@ func TestCall_FormatGCXVerbatim(t *testing.T) {
 	orig := callDaemonTool
 	t.Cleanup(func() { callDaemonTool = orig })
 
-	callDaemonTool = func(_ string, tool string, args map[string]any) (json.RawMessage, error) {
+	callDaemonTool = func(_ string, tool string, args map[string]any, _ io.Writer) (json.RawMessage, error) {
 		if tool == "tool_profile" {
 			return json.RawMessage(cannedToolProfileJSON), nil
 		}

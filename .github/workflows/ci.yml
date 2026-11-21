@@ -216,6 +216,16 @@ jobs:
       - name: CI test layout
         run: go run ./scripts/ci-test --check-workflow .github/workflows/ci.yml
 
+      - name: Verify edit-loop checker and admitted regression seeds
+        shell: bash
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: local
+        run: |
+          # Keep the regex end anchor literal through Bash and Make.
+          make test "PKGS=-count=1 -run '^TestEditLoopCommandRetainsActualRowsAndSeededBreaches\$\$' ./bench/check-budgets"
+          make test "PKGS=-count=1 -tags=gortex_edit_gate_seed -run '^(TestEditGateACKSeedRunsInsideActualAdmittedWrite|TestEditGateClosedSeedUsesRealAdmissionAndPauseCounter)\$\$' ./internal/mcp ./internal/graph/store_sqlite"
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:

@@ -230,6 +230,11 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	if err != nil {
 		return nil, err
 	}
+	summary, _ := requestCtx.Value(canonicalSummarySourceKey{}).(*canonicalSummarySource)
+	var registry *projectionSnapshot
+	if summary != nil && sameVersion == nil && tracked && pendingFileProjections.enabled {
+		registry = pendingFileProjections.snap.Load()
+	}
 	observed := pendingFileProjections.captureReadExpectation(key)
 	expected := observed.entry
 	if sameVersion != nil && expected != sameVersion {
@@ -363,6 +368,13 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 			return nil, err
 		}
 		if matches {
+			if registry != nil && expected == nil && registry.entries[key] == nil &&
+				pendingFileProjections.snap.Load() == registry && buildCtx.Err() == nil {
+				*summary = canonicalSummarySource{
+					indexer: idx, root: root, abs: abs, readPath: readPath, key: key,
+					graphPath: graphPath, stamp: after, bytes: raw, registry: registry,
+				}
+			}
 			return nil, nil
 		}
 	} else if expected == nil {
