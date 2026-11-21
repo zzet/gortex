@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 )
@@ -73,8 +76,8 @@ func TestEditLoopTaskActuallySelectsGateInsteadOfLegacyEditTraffic(t *testing.T)
 				}
 				return ""
 			}
-			if arg("--scenario") != "edit-and-probe" || arg("--agents") != "0" || arg("--edit-count") != "100" || !slices.Contains(args, "--edit-gate-modes") {
-				t.Errorf("actual process still runs legacy edit traffic: %v", args)
+			if arg("--scenario") != "edit-and-probe" || arg("--agents") != "0" || arg("--edit-count") != "100" || !slices.Contains(args, "--edit-gate-modes") || !slices.Contains(args, "--lossless-edit-probe-evidence") {
+				t.Errorf("actual process lost edit-gate traffic or lossless encoding: %v", args)
 			}
 			if scenario == "loadedit-4-largefile" && (arg("--edit-repos") != "1" || arg("--edit-agents") != "4") {
 				t.Errorf("large-file row has no actual4-editor target: %v", args)
@@ -83,5 +86,34 @@ func TestEditLoopTaskActuallySelectsGateInsteadOfLegacyEditTraffic(t *testing.T)
 				t.Errorf("six-repository row lost real routing: %v", args)
 			}
 		})
+	}
+}
+
+func TestEditLoopNightlyEvidenceCannotOverlapLargeFileCorpus(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular")
+	large := filepath.Join(dir, "large")
+	for _, path := range []string{regular, large} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := fixtureLaneConfig()
+	c.Lane = "nightly"
+	c.Manifest = filepath.Join(dir, "normal.json")
+	c.LargeFileManifest = filepath.Join(dir, "large.json")
+	if err := writeNewJSON(c.Manifest, []map[string]string{{"source": regular}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNewJSON(c.LargeFileManifest, []map[string]string{{"source": large}}); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(large, "evidence")
+	err := collectLane(t.Context(), c, policy{}, lanePlan{Execution: "edit-loop"}, out, io.Discard, nil)
+	if err == nil {
+		t.Fatal("collector accepted an output inside the large-file source")
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("collector touched protected output: %v", err)
 	}
 }

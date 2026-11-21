@@ -279,6 +279,7 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	candidate := f.String("candidate-binary", "", "fresh workflow-built candidate binary; requires --expected-candidate")
 	loadBinary := f.String("load-binary", "", "fresh workflow-built load client")
 	requireLane := f.String("require-lane", "", "refuse config for any other lane")
+	requireEditGateSeed := f.String("require-edit-gate-seed", "", "require edit gate config to select none, ack-wait or closed-read-gate")
 	releaseStarted := f.String("release-started", "", "release entry RFC3339 start, including its compilation time")
 	jobHost := f.Bool("job-host", false, "bind hosted PR smoke to the actual ephemeral job hostname")
 	if err := f.Parse(args); err != nil {
@@ -295,6 +296,10 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "runtime overrides require a pinned configuration")
 		return 2
 	}
+	if *requireEditGateSeed != "" && (!editGate || *config == "" || !slices.Contains([]string{"none", "ack-wait", "closed-read-gate"}, *requireEditGateSeed)) {
+		fmt.Fprintln(stderr, "--require-edit-gate-seed needs an edit gate configuration and a supported seed")
+		return 2
+	}
 	c := laneConfig{Lane: *lane, HostClass: *host, Repeats: 3}
 	var err error
 	if *config != "" {
@@ -309,6 +314,16 @@ func laneCommand(command string, args []string, stdout, stderr io.Writer) int {
 	if *requireLane != "" && c.Lane != *requireLane {
 		fmt.Fprintln(stderr, "configuration selects the wrong required lane")
 		return 1
+	}
+	if *requireEditGateSeed != "" {
+		configuredSeed := c.EditGateSeed
+		if configuredSeed == "" {
+			configuredSeed = "none"
+		}
+		if configuredSeed != *requireEditGateSeed {
+			fmt.Fprintln(stderr, "configuration selects the wrong edit gate seed")
+			return 1
+		}
 	}
 	if *jobHost {
 		if c.Lane != "smoke" || c.HostClass != hostedSmokeClass || os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("RUNNER_ENVIRONMENT") != "github-hosted" {
@@ -485,7 +500,7 @@ func taskArgs(c laneConfig, task laneTask, manifest, scratch, report string) []s
 		args = append(args, "--nightly-workload-seed", c.NightlySeed.Kind)
 	}
 	if task.EditGate {
-		args = append(args, "--edit-gate-modes", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
+		args = append(args, "--edit-gate-modes", "--lossless-edit-probe-evidence", "--edit-count", "100", "--edit-repos", fmt.Sprint(spec.repos))
 	}
 	if task.EditGate && task.EditGateSeed != "" {
 		args = append(args, "--edit-gate-seed", task.EditGateSeed)
@@ -506,6 +521,11 @@ func collectLane(ctx context.Context, c laneConfig, p policy, plan lanePlan, out
 	}
 	if err := validateLaneOutput(c.Manifest, out); err != nil {
 		return err
+	}
+	if plan.Execution == "edit-loop" && c.Lane == "nightly" && c.LargeFileManifest != "" {
+		if err := validateLaneOutput(c.LargeFileManifest, out); err != nil {
+			return err
+		}
 	}
 	// The directory must not exist, including empty directories or symlinks.
 	if err := os.Mkdir(out, 0o700); err != nil {
