@@ -319,6 +319,22 @@ denominator remain required. Accepted attempts, separate checkouts and missing,
 ambiguous or capped evidence keep their strict requirements. This additive
 report/checker classification does not rewrite historical failed reports.
 
+The `qualified_functional_unavailable_timings` outcome certifies functional
+completion with explicitly unavailable original indexing timing. A later applied
+generation qualifies only with the original edit's immutable returned,
+no-accepted-witness refusal and affirmative absence of a winner, P/B and
+read-assisted proof. The report preserves the original accounting state and
+reasons. Settlement still requires each assigned post-ACK witness, all
+functional and fresh-tier checks, and complete evidence within the capture cap.
+
+Standalone `--edit-gate-modes` runs may opt into `--lossless-edit-probe-evidence`.
+The `lossless-rpc-payload-v2` JSONL encodes response bytes with their original
+length and SHA-256, using base64, gzip, exact backward references, or 16 KiB
+dictionary chunks. Predecessors are scoped to one edit and bounded at 4 MiB
+and 128 keys. All accepted events and metadata count toward the original
+16 MiB encoded cap. The legacy logical JSONL size is reported separately.
+The live oracles still consume the original response bytes.
+
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
 six distinct pinned repositories. Source checkouts that share one Git common
 directory count as one repository. For linked views of one pinned primary,

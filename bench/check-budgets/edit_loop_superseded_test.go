@@ -137,7 +137,7 @@ func TestEditLoopSupersededWholeGateKeepsAllFourteenRowsStrict(t *testing.T) {
 							value.(map[string]any)["t_ack_ms"] = map[string]any{"value": 3000, "unit": "ms", "reason": ""}
 						}
 					case "read_gate_closed":
-						r.Phases[0].Metrics["reclaim_gate_closures"] = metric{Value: pointer(1), Unit: "closures"}
+						setEditLoopReadGateClosures(t, &r.Phases[0], 1)
 					case "WAL_breach":
 						r.Phases[0].Metrics["peak_wal_bytes"] = metric{Value: pointer(20 * 1024 * 1024 * 1024), Unit: "bytes"}
 					case "missing_output_mode":

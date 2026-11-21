@@ -32,7 +32,7 @@ func functionalUnavailableEditLoopFixture(t *testing.T, preexisting bool) (repor
 }
 
 func TestEditLoopFunctionalUnavailableRequiresOwnedStatusAndAllFunctionalEvidence(t *testing.T) {
-	for _, mode := range []string{"direct43", "preexisting86", "direct53", "missing_proof", "accepted_stamps", "physical_window", "executed_original", "partial_physical", "read_assisted", "winner", "unknown_phase", "unknown_reason", "foreign_rpc", "foreign_background", "handoff", "isolated", "wrong_ACK", "incorrect_read", "missing_oracle", "pending_tier", "missing_tiers", "cap", "partial_capture", "executed_phase", "unknown_record_phase", "missing_phase", "measured_nil", "invalid_nil"} {
+	for _, mode := range []string{"direct43", "preexisting86", "direct53", "missing_winner", "missing_winner_with_accepted", "missing_proof", "accepted_stamps", "physical_window", "executed_original", "partial_physical", "read_assisted", "winner", "unknown_phase", "unknown_reason", "foreign_rpc", "foreign_background", "handoff", "isolated", "wrong_ACK", "incorrect_read", "missing_oracle", "pending_tier", "missing_tiers", "cap", "partial_capture", "executed_phase", "unknown_record_phase", "missing_phase", "measured_nil", "invalid_nil"} {
 		t.Run(mode, func(t *testing.T) {
 			r, raw, first := functionalUnavailableEditLoopFixture(t, mode == "preexisting86")
 			proof := first["functional_unavailable_receipt"].(map[string]any)
@@ -47,6 +47,16 @@ func TestEditLoopFunctionalUnavailableRequiresOwnedStatusAndAllFunctionalEvidenc
 			}
 			status := proof["status"].(map[string]any)
 			switch mode {
+			case "missing_winner", "missing_winner_with_accepted":
+				accounting := first["accounting"].(map[string]any)
+				const reason = "independent serving identity mismatch"
+				status["applied_generation"] = 4
+				accounting["state"], accounting["applied_generation"] = "unavailable", 4
+				accounting["reasons"] = append(accounting["reasons"].([]string), reason)
+				proof["original_accounting_error"] = proof["original_accounting_error"].(string) + "; " + reason
+				if mode == "missing_winner_with_accepted" {
+					status["accepted_attempt_stage"] = "accepted_stamps_retained"
+				}
 			case "measured_nil":
 				first["phases_ms"].(map[string]any)["apply"].(map[string]any)["reason"] = "producer phase state measured"
 			case "invalid_nil":
@@ -104,7 +114,7 @@ func TestEditLoopFunctionalUnavailableRequiresOwnedStatusAndAllFunctionalEvidenc
 			}
 			r.Phases[0].EditProbe = encoded
 			_, err = decodeEditLoopWire(r.Phases[0])
-			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53"
+			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53" || mode == "missing_winner"
 			if (err == nil) != want {
 				t.Fatalf("mode=%s err=%v", mode, err)
 			}

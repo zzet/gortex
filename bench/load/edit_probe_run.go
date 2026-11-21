@@ -100,6 +100,8 @@ type editProbeRecord struct {
 	Evidence                    string                              `json:"raw_evidence"`
 	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
 	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
+	EvidenceCodec               string                              `json:"evidence_codec,omitempty"`
+	EvidenceLogicalBytes        int64                               `json:"evidence_logical_jsonl_bytes,omitempty"`
 	EvidenceBytes               int                                 `json:"evidence_bytes"`
 	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
 	Errors                      []string                            `json:"errors"`
@@ -178,6 +180,9 @@ type editProbeState struct {
 	sinkMu                                            sync.Mutex
 	rawBytes                                          int
 	rawAccepted                                       int
+	rawLogicalBytes                                   int64
+	losslessEvidence                                  bool
+	payloadHistory                                    editProbePayloadHistory
 	rawPending                                        []byte
 	rawWake                                           chan struct{}
 	rawClosing                                        bool
@@ -491,7 +496,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
-		state := &editProbeState{step: step, record: record}
+		state := &editProbeState{step: step, record: record, losslessEvidence: o.LosslessEditProbeEvidence}
 		r.states = append(r.states, state)
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
@@ -551,11 +556,26 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 
 func (s *editProbeState) emit(value any) error {
 	started := time.Now()
-	data, err := json.Marshal(value)
+	if s.losslessEvidence {
+		s.sinkMu.Lock()
+	}
+	var data []byte
+	var logicalBytes int
+	var err error
+	if s.losslessEvidence {
+		data, logicalBytes, err = s.payloadHistory.encode(value)
+	} else {
+		data, logicalBytes, err = encodeEditProbeEvidence(value, false)
+	}
 	if err != nil {
+		if s.losslessEvidence {
+			s.sinkMu.Unlock()
+		}
 		return fmt.Errorf("%w: encode: %v", errEditProbeEvidenceIncomplete, err)
 	}
-	s.sinkMu.Lock()
+	if !s.losslessEvidence {
+		s.sinkMu.Lock()
+	}
 	defer func() { s.encodeNS += time.Since(started).Nanoseconds(); s.sinkMu.Unlock() }()
 	if s.sinkErr != nil {
 		return s.sinkErr
@@ -584,6 +604,12 @@ func (s *editProbeState) emit(value any) error {
 	s.rawPending = append(s.rawPending, data...)
 	s.rawPending = append(s.rawPending, '\n')
 	s.rawAccepted += len(data) + 1
+	s.rawLogicalBytes += int64(logicalBytes)
+	if s.losslessEvidence {
+		if purpose, payload, ok := evidencePayload(value); ok {
+			s.payloadHistory.remember(purpose, payload)
+		}
+	}
 	select {
 	case s.rawWake <- struct{}{}:
 	default: // Wake already pending; these bytes are still owned above.
@@ -1275,7 +1301,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if consumersDone && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+					if consumersDone && r.gateModeComplete(step) && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
 						break
 					}
 				}
@@ -1285,7 +1311,11 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			}
 		}
 	}
+	gateComplete := r.gateModeComplete(step)
 	s.mu.Lock()
+	if !gateComplete {
+		s.record.Errors = append(s.record.Errors, "assigned post-ACK gate coverage unavailable")
+	}
 	if s.firstProbeWrite.IsZero() || s.editWrite.IsZero() || !s.firstProbeWrite.Before(s.editWrite) {
 		s.record.Errors = append(s.record.Errors, "no actual prober wire start before edit wire")
 	}
@@ -1499,6 +1529,10 @@ func (r *editProbeRuntime) finish() error {
 		record.EvidenceWriteMS = float64(s.writeNS) / 1e6
 		record.EvidenceEncodeMS = float64(s.encodeNS) / 1e6
 		record.EvidenceBytes, record.EvidenceLimit = s.rawBytes, editProbeRawLimit
+		if s.losslessEvidence {
+			record.EvidenceCodec = editProbeLosslessCodec
+			record.EvidenceLogicalBytes = s.rawLogicalBytes
+		}
 		s.sinkMu.Unlock()
 		if sinkErr != nil {
 			record.Outcome = "harness_evidence_incomplete"

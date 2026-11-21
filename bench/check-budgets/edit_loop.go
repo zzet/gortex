@@ -154,6 +154,7 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 	inputsPath := flags.String("inputs", "", "pinned repeated edit-probe reports")
 	scenario := flags.String("scenario", "", "explicit edit-load cell")
 	output := flags.String("out", "", "new JSON evidence output")
+	perReportOutput := flags.String("per-report-out", "", "optional new per-validated-report row table; never certifies three-run stability")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -182,6 +183,12 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	dataset, loadErr := loadInputsChecked(*inputsPath, validateEditLoopReport)
+	if *perReportOutput != "" {
+		if err := writeEditLoopPerReportRows(*perReportOutput, budgets, dataset, loadErr); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
 	rows := make([]editLoopRow, 0, len(budgets))
 	pass := true
 	for _, b := range budgets {
@@ -405,6 +412,9 @@ func assessEditLoopRow(b budget, dataset dataset) editLoopRow {
 	if b.Metric == "silent_stale_compact" {
 		return assessCompactEditLoopRow(row, b, dataset)
 	}
+	if b.Metric == "reclaim_hold_p95" {
+		return assessEditLoopHoldRow(row, b, dataset)
+	}
 	values := make([]float64, 0, dataset.config.repeats(b.Scenario))
 	verdict := -1
 	for repeat := 1; repeat <= dataset.config.repeats(b.Scenario); repeat++ {
@@ -506,35 +516,9 @@ func assessCompactEditLoopRow(row editLoopRow, b budget, d dataset) editLoopRow 
 				continue
 			}
 			found = true
-			wire, err := decodeEditLoopWire(observation.data.Phases[0])
-			if err != nil {
+			if err := validateCompactEditLoopPhase(observation.data.Phases[0]); err != nil {
 				row.Reason = err.Error()
 				return row
-			}
-			expected := 0
-			for _, record := range wire.Edits {
-				if record.Mode == "compact" {
-					expected++
-				}
-			}
-			mode, exists := wire.Modes["compact"]
-			if !exists || expected == 0 || mode.ObservedEdits == nil || *mode.ObservedEdits != expected || mode.Answers < expected || mode.DecodeFailures != 0 || mode.Observable || mode.ClaimsFresh == nil || *mode.ClaimsFresh != 0 || mode.Stale.Value != nil || mode.Stale.Reason == "" {
-				row.Reason = "compact actual assigned-edit/decoder proof missing or contradicts known unobservable contract"
-				return row
-			}
-			for _, name := range []string{"read.summary", "search.symbols", "relations.callers", "trace.call_chain"} {
-				tool, exists := mode.Tools[name]
-				if !exists || tool.ObservedEdits == nil || *tool.ObservedEdits != expected || tool.CorrectEdits == nil || *tool.CorrectEdits != expected || tool.Answers < expected || tool.DecodeFailures != 0 {
-					row.Reason = "compact supported tool lacks post-ACK semantic witness: " + name
-					return row
-				}
-			}
-			for _, name := range []string{"read.source", "read.editing_context", "search.text"} {
-				tool, exists := mode.Tools[name]
-				if !exists || tool.State != "UNSUPPORTED" || tool.Reason == "" || tool.RefusedEdits == nil || *tool.RefusedEdits != expected || tool.FallbackAnswers == nil || *tool.FallbackAnswers < expected || tool.ObservedEdits == nil || *tool.ObservedEdits != 0 || tool.DecodeFailures != 0 {
-					row.Reason = "compact unsupported operation lacks explicit format refusal and actual fallback proof: " + name
-					return row
-				}
 			}
 		}
 		if !found {
@@ -543,7 +527,7 @@ func assessCompactEditLoopRow(row editLoopRow, b budget, d dataset) editLoopRow 
 		}
 	}
 	row.State = "UNOBSERVABLE"
-	row.Reason = "compact freshness metadata is unobservable under the accepted contract; actual supported content/tool and unsupported-refusal proofs passed; no numeric silent-stale claim"
+	row.Reason = compactEditLoopQualifiedReason
 	return row
 }
 
@@ -552,6 +536,9 @@ func editLoopRowBlocks(row editLoopRow) bool {
 		return false
 	}
 	if row.Metric == "silent_stale_compact" && row.State == "UNOBSERVABLE" && row.Value == nil {
+		return false
+	}
+	if row.Metric == "reclaim_hold_p95" && row.State == "NOT_EXERCISED" && row.Value == nil && row.Unit == "s" && row.Reason == editLoopZeroHoldReason {
 		return false
 	}
 	return row.State != "PASS"
@@ -585,7 +572,7 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 		value, err := number(phase.Metrics[key], "bytes")
 		return value / (1024 * 1024), err
 	case "read_gate_closures":
-		return number(phase.Metrics["reclaim_gate_closures"], "closures")
+		return measureReadGateClosures(phase)
 	case "reclaim_hold_p95":
 		value, err := number(phase.Metrics["reclaim_writer_hold_p95_ms"], "ms")
 		return value / 1000, err

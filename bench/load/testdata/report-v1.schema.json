@@ -1478,10 +1478,16 @@
                         "evidence_bytes": {
                           "type": "integer"
                         },
+                        "evidence_codec": {
+                          "type": "string"
+                        },
                         "evidence_encode_ms": {
                           "type": "number"
                         },
                         "evidence_limit_bytes": {
+                          "type": "integer"
+                        },
+                        "evidence_logical_jsonl_bytes": {
                           "type": "integer"
                         },
                         "evidence_write_ms": {
