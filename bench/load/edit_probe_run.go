@@ -40,6 +40,7 @@ type editProbeReadback struct {
 	ObservationOnly bool   `json:"observation_only,omitempty"`
 }
 type editProbeRecord struct {
+	patchWaits                  *editProbePatchWaits
 	Consumers                   map[string]editConsumerObservation `json:"relation_consumers,omitempty"`
 	Superseded                  *receiptproof.Superseded           `json:"superseded_receipt,omitempty"`
 	supersededStatus            *receiptproof.Status
@@ -1269,6 +1270,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.record.coalescedStatus = coalescedFunctionalStatus(status, raw, statusIdentity.ID, accounting)
 					s.record.functionalUnavailableStatus = functionalUnavailableStatus(status, raw, statusIdentity.ID, accounting)
 					s.record.PhasesMS = editProbePhases(status, "status exposes no phases_ms")
+					if r.plan.sixRepoTopology() {
+						s.record.patchWaits = readEditProbePatchWaits(status, step.Route, step.MutationID, receipt)
+					}
 					s.record.Derived = editProbeDerived(status)
 					s.record.MutationTiers = editProbeStatusTiers(status)
 					if s.record.MutationTiers != nil && s.record.MutationTiers.State == "invalid" {
@@ -1564,6 +1568,9 @@ func (r *editProbeRuntime) finish() error {
 	}
 	finishEditProbeMetrics(r.phase)
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
+	if r.plan.sixRepoTopology() {
+		appendEditProbeTopologyWaits(r.phase, r.plan.Seed)
+	}
 	r.phase.EditProbe.SearchReadbacks = summarizeSearchReadbacks(r.plan, r.phase.EditProbe.Records)
 	if r.phase.EditProbe.SearchReadbacks != nil && !r.phase.EditProbe.SearchReadbacks.Pass {
 		failures = append(failures, errors.New("immediate search readback acceptance incomplete or incorrect"))
