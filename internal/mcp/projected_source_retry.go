@@ -190,6 +190,31 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 	return checkedProjectionChange(ctx) && ctx.Err() == nil && predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.final_budget")
 }
 
+// A file can retire during edge carry, before it enters the retained facts
+// used by checkedProjectionChange. Give explicit-fresh callers the same whole
+// rebound for that exact checked retirement without borrowing the old layer.
+func retryAfterCheckedProjectionBindRetirement(ctx context.Context, entry *projectionEntry, guard projectionLivenessGuard) bool {
+	if guard != projectionOwnerAbsentBefore && guard != projectionOwnerAbsentAfter {
+		return false
+	}
+	allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	if allowance == nil || !allowance.afterFreshness || allowance.tool != "get_callers" || ctx.Err() != nil {
+		return false
+	}
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil && state.replayUnsafe {
+		return false
+	}
+	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+	if !ok || !predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.bind_entry_budget") {
+		return false
+	}
+	pendingFileProjections.mu.Lock()
+	retired := pendingFileProjections.snap.Load().entries[entry.key] == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+	pendingFileProjections.mu.Unlock()
+	return retired && validateRequestProjections(ctx) == nil && ctx.Err() == nil &&
+		predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.bind_final_budget")
+}
+
 // Structural ownership proof, independent of permission or time for another attempt.
 func checkedProjectionChange(ctx context.Context) bool {
 	if ctx.Err() != nil {

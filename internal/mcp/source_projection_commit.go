@@ -119,6 +119,9 @@ func observeProjectionLiveness(entry *projectionEntry, diagnostic *acknowledgeme
 	owner := pendingFileProjections.snap.Load().entries[entry.key]
 	diagnostic.observeOwner("before", entry, owner)
 	if owner != entry {
+		if owner == nil {
+			return projectionOwnerAbsentBefore
+		}
 		return projectionOwnerChangedBefore
 	}
 	stamp, err := statDiskStamp(entry.absPath)
@@ -143,6 +146,9 @@ func observeProjectionLiveness(entry *projectionEntry, diagnostic *acknowledgeme
 	owner = pendingFileProjections.snap.Load().entries[entry.key]
 	diagnostic.observeOwner("after", entry, owner)
 	if owner != entry {
+		if owner == nil {
+			return projectionOwnerAbsentAfter
+		}
 		return projectionOwnerChangedAfter
 	}
 	return projectionOwnerLive

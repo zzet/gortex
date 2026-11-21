@@ -499,6 +499,9 @@ func requestStoreBusyFiles(ctx context.Context) []string {
 func retainRequestProjection(ctx context.Context, entry *projectionEntry) (context.Context, error) {
 	ctx = withRequestProjectionFacts(ctx)
 	if guard, _ := predicateRefusal(ctx, projectionReadRetain, entry); guard != projectionOwnerLive {
+		if retryAfterCheckedProjectionBindRetirement(ctx, entry, guard) {
+			return ctx, errProjectedSourceMoved
+		}
 		return ctx, annotateProjectionReadRefusal(projectionReadRetain, guard, projectionSuperseded)
 	}
 	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
