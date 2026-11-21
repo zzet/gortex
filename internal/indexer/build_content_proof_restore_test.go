@@ -181,7 +181,7 @@ func tsAliasCheckout(t *testing.T, store *store_sqlite.Store) string {
 	builderGit(t, repoDir, "add", "-A")
 	builderGit(t, repoDir, "commit", "-m", "A")
 	builderIndex(t, store, repoDir)
-	if loadTSAliasCollection(repoDir) == nil {
+	if workingResolutionInputs(repoDir, nil).aliases == nil {
 		t.Fatal("no alias scope loaded: the case tests nothing")
 	}
 	builderWriteFile(t, repoDir, "pkg/a.go", "package pkg\n\nfunc A() int { return 2 }\n")
@@ -486,9 +486,9 @@ func TestACodeownersMovedAndRestoredTearsTheBuild(t *testing.T) {
 // indexed). What differs is only the wall-clock second the index ran at.
 //
 // The index also leaves one thing behind outside the store: the process-wide
-// alias-scope cache entry for the checkout's root (tsAliasCache, never
-// invalidated), which a later build resolves through instead of scanning the
-// working copy — a different proof path. checkout loads that entry at the
+// resolution-input cache entry for the checkout root. A later build may
+// resolve through that entry instead of scanning the working copy, which
+// is a different proof path. The checkout helper loads that entry at the
 // same point the index would have, so the builds take the same path.
 type sideInputBase struct {
 	db    []byte
@@ -583,7 +583,7 @@ func (b *sideInputBase) checkout(t *testing.T, name string) (*store_sqlite.Store
 	}
 	store := builderOpenStoreAt(t, path)
 	t.Cleanup(func() { _ = store.Close() })
-	loadTSAliasCollection(repoDir) // what the index of the committed tree caches
+	workingResolutionInputs(repoDir, nil) // what the index of the committed tree caches
 	builderWriteFile(t, repoDir, "pkg/a.go", sideInputEdit)
 	builderWriteFile(t, repoDir, "web/app.js", sideInputScriptEdit)
 	time.Sleep(2 * time.Second / 20) // past gitstate's change-stamp margin

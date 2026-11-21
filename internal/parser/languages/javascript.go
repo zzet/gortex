@@ -105,8 +105,8 @@ type jsDeferredCall struct {
 	receiver string // receiver text for member calls
 	line     int
 	isMember bool
-	// expr is the call_expression node, kept for member calls so the
-	// post-pass can inspect arguments for pub/sub topic detection.
+	// expr is the call_expression node: member calls use it to inspect
+	// pub/sub arguments, bare calls to read their lexical scope.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -138,6 +138,8 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	recordJSExports(root, src, fileNode)
+	var scopes jsScopeCache
 
 	arrowNames := make(map[string]bool)
 
@@ -248,6 +250,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			calls = append(calls, jsDeferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
+				expr:        expr.Node,
 				returnUsage: classifyReturnUsage(expr.Node, src, jsTSReturnUsageSpec),
 			})
 
@@ -419,8 +422,10 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 		}
 		stampReturnUsage(edge, c.returnUsage)
+		scopes.stamp(edge, c.expr, c.name, src)
 		result.Edges = append(result.Edges, edge)
 	}
+	clearCollapsedJSShadows(result.Edges)
 
 	// --- Event pub/sub edges ---
 	var pubsubEvents []pubsubEvent
@@ -851,14 +856,7 @@ func (e *JavaScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 	importPath := m.Captures["import.path"].Text
 	def := m.Captures["import.def"]
 	line := def.StartLine + 1
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + importPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-	})
-	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
-	if def.Node != nil {
-		emitJSPerBindingImports(def.Node, importPath, fileID, filePath, src, result)
-	}
+	emitJSImports(def.Node, importPath, fileID, filePath, line, src, result)
 }
 
 // emitReExport records the alias-aware re-export edges for an

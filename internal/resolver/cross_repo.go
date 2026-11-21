@@ -877,10 +877,7 @@ func (cr *CrossRepoResolver) buildReachableReposIndex() {
 			}
 			marked, _ := e.Meta[NpmImportSpecifierMeta].(string)
 			npmLinked := marked != "" && e.CrossRepo
-			alias, _ := e.Meta["import_alias"].(string)
-			if alias == "" {
-				alias = e.Alias
-			}
+			alias := importBindingAlias(e)
 			if e.CrossRepo && isJSTSPath(e.From) {
 				// JS/TS imports name bindings, not every symbol in the provider.
 				if _, name, ok := strings.Cut(e.To, "::"); ok {
@@ -1388,9 +1385,20 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
+	// The per-repo pass already bound any shadow with a same-file value.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+		stats.Unresolved++
+		return
+	}
 	file := cr.callerFileID(e)
+	pending, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	if pending != "" && pending != graph.JSPendingImport {
+		stats.Unresolved++
+		return
+	}
 	if target := cr.jsTSBindingsByFile[file][funcName]; target != "" {
 		if imported := cr.cachedGetNode(target); imported != nil && (imported.Kind == graph.KindFunction || imported.Kind == graph.KindMethod) {
+			delete(e.Meta, graph.JSPendingBindingMeta)
 			e.To = imported.ID
 			stats.Resolved++
 			if isCrossRepoHop(cr.callerRepoPrefix(e), imported.RepoPrefix) {
@@ -1400,6 +1408,10 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 			}
 			return
 		}
+	}
+	if pending != "" {
+		stats.Unresolved++
+		return
 	}
 	candidates := cr.scopedCandidates(e, funcName)
 	if len(candidates) == 0 {

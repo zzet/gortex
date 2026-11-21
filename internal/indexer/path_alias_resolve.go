@@ -21,10 +21,9 @@ import (
 // generation built from a committed tree expands its aliases through that
 // tree's tsconfig / jsconfig rather than through whatever the checkout holds.
 // Reading the checkout here would not leave an edge missing: it would land a
-// present, WRONG edge, on the file the checkout's config names. The
-// working-copy collection is still loaded once, lazily, and shared via the
-// package-level cache keyed on repo root path; a snapshot's is memoised on the
-// Indexer that owns the source (see Indexer.tsAliasCollection).
+// present, wrong edge on the file the checkout's config names. Working-copy
+// lookups use the active pass's pinned inputs, falling back to the shared
+// checkout cache outside a pass; a sourced indexer only reads its snapshot.
 func (idx *Indexer) resolvePathAliasImport(callerFile, specifier string) string {
 	return resolveTSPathAliasObserved(idx.tsAliasCollection(), idx.repoPrefix, callerFile, specifier, idx.tsAliasProbes())
 }
@@ -37,7 +36,7 @@ func (idx *Indexer) resolvePathAliasImport(callerFile, specifier string) string 
 // content source (whose maps probe the snapshot, never the working copy).
 func (idx *Indexer) tsAliasProbes() func(rel string, found bool) {
 	proof := idx.contentProof
-	if !proof.active() || idx.contentSrc.Load() != nil {
+	if !proof.active() || idx.manifestTree().sourced() {
 		return nil
 	}
 	root := idx.rootPath

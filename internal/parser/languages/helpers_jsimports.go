@@ -1,6 +1,8 @@
 package languages
 
 import (
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -60,44 +62,514 @@ func jsNamedImportsNode(importNode *sitter.Node) *sitter.Node {
 	return nil
 }
 
-// emitJSPerBindingImports emits one EdgeImports per named binding of an import
-// statement — `import { foo, bar as baz } from "mod"` yields an edge to
-// unresolved::import::mod::foo and one to unresolved::import::mod::bar with
-// Alias "baz". The module-level import edge is emitted separately by the
-// caller and left untouched; these per-binding edges let find_usages and
-// dependency analysis answer "who imports `foo` from mod" instead of only
-// "who imports mod". Over jsImportBindingCap bindings the per-binding edges are
-// skipped (the module edge still records the dependency).
-func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePath string, src []byte, result *parser.ExtractionResult) {
-	// Vue template tags refer to the local default binding, which need not
-	// match the component filename. Retain it on the module edge through resolve.
-	if strings.Contains(filePath, ".vue#script:") {
-		if clause := findChildByType(importNode, "import_clause"); clause != nil {
-			for _, id := range jsCollectChildren(clause, "identifier") {
-				for i := len(result.Edges) - 1; i >= 0; i-- {
-					edge := result.Edges[i]
-					if edge.Kind == graph.EdgeImports && edge.From == fileID && edge.To == "unresolved::import::"+importPath {
-						if edge.Meta == nil {
-							edge.Meta = map[string]any{}
-						}
-						edge.Meta["vue_default_import"] = id.Content(src)
-						break
+// visitJSPattern enumerates bindings, not property keys, types or initializers.
+func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "identifier", "type_identifier", "shorthand_property_identifier_pattern":
+		visit(n.Content(src))
+	case "required_parameter", "optional_parameter":
+		visitJSPattern(n.ChildByFieldName("pattern"), src, visit)
+	case "pair_pattern":
+		visitJSPattern(n.ChildByFieldName("value"), src, visit)
+	case "assignment_pattern", "object_assignment_pattern":
+		visitJSPattern(n.ChildByFieldName("left"), src, visit)
+	case "formal_parameters", "object_pattern", "array_pattern", "rest_pattern":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			visitJSPattern(n.NamedChild(i), src, visit)
+		}
+	}
+}
+
+// A local initialized from require() still names that module's export, so it
+// stays eligible for import evidence.
+func jsRequireInitializer(declarator *sitter.Node, src []byte) bool {
+	value := declarator.ChildByFieldName("value")
+	for value != nil && value.Type() == "member_expression" {
+		value = value.ChildByFieldName("object")
+	}
+	if value == nil || value.Type() != "call_expression" {
+		return false
+	}
+	callee := value.ChildByFieldName("function")
+	return callee != nil && callee.Content(src) == "require"
+}
+
+// visitJSDeclaration visits every declared name, as export records need.
+func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	visitJSScopeDeclaration(n, src, visit, visit)
+}
+
+// visitJSScopeDeclaration reports require() locals separately for scope stamps.
+func visitJSScopeDeclaration(n *sitter.Node, src []byte, visit, required func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "ambient_declaration":
+		visitJSScopeDeclaration(n.NamedChild(0), src, visit, required)
+	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
+		visitJSPattern(n.ChildByFieldName("name"), src, visit)
+	case "lexical_declaration", "variable_declaration":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			v := n.NamedChild(i)
+			if v.Type() != "variable_declarator" {
+				continue
+			}
+			if jsRequireInitializer(v, src) {
+				visitJSPattern(v.ChildByFieldName("name"), src, required)
+			} else {
+				visitJSPattern(v.ChildByFieldName("name"), src, visit)
+			}
+		}
+	}
+}
+
+// Only unconditional, top-level writes are evidence: a nested assignment may
+// never execute. Track whether the local exports alias still names the module.
+type jsCommonExports struct {
+	named    map[string]string
+	def      string
+	interop  bool
+	detached bool
+	// replaced counts module.exports replacements, so a property write whose
+	// object was captured before its right-hand side ran is not misattributed.
+	replaced int
+	// objects holds top-level locals still bound to an object literal. Such a
+	// module.exports is a container, so it cannot compete with a callable .default.
+	objects map[string]bool
+}
+
+func jsModuleExports(n *sitter.Node, src []byte) bool {
+	if n == nil || n.Type() != "member_expression" {
+		return false
+	}
+	obj, prop := n.ChildByFieldName("object"), n.ChildByFieldName("property")
+	return obj != nil && obj.Type() == "identifier" && obj.Content(src) == "module" &&
+		prop != nil && prop.Type() == "property_identifier" && prop.Content(src) == "exports"
+}
+
+func (c *jsCommonExports) activeObject(n *sitter.Node, src []byte) bool {
+	return jsModuleExports(n, src) || !c.detached && n != nil && n.Type() == "identifier" && n.Content(src) == "exports"
+}
+
+func (c *jsCommonExports) property(left *sitter.Node, src []byte) string {
+	if left == nil || left.Type() != "member_expression" || !c.activeObject(left.ChildByFieldName("object"), src) {
+		return ""
+	}
+	if prop := left.ChildByFieldName("property"); prop != nil && prop.Type() == "property_identifier" {
+		return prop.Content(src)
+	}
+	return ""
+}
+
+// Assignment expressions evaluate to their RHS. Retain the storage identity
+// as well as the value so either ordering of a chained alias reset works.
+func (c *jsCommonExports) assign(left, value *sitter.Node, src []byte) (local string, module, alias bool) {
+	if left == nil || value == nil {
+		return
+	}
+	// JavaScript resolves the target object before evaluating the value.
+	name, replaced := c.property(left, src), c.replaced
+	switch value.Type() {
+	case "assignment_expression":
+		local, module, alias = c.assign(value.ChildByFieldName("left"), value.ChildByFieldName("right"), src)
+	case "identifier":
+		local = value.Content(src)
+		alias = local == "exports"
+		module = alias && !c.detached
+	case "function_expression", "generator_function":
+		if name := value.ChildByFieldName("name"); name != nil {
+			local = name.Content(src)
+		}
+	default:
+		module = jsModuleExports(value, src)
+		alias = module && !c.detached
+	}
+	switch {
+	case jsModuleExports(left, src):
+		if !module {
+			c.def, c.named, c.interop = local, nil, false
+			c.replaced++
+		}
+		c.detached, module = !alias, true
+	case left.Type() == "identifier" && left.Content(src) == "exports":
+		c.detached, alias = !module, true
+	default:
+		switch {
+		case name == "" || c.replaced != replaced:
+		case name == "__esModule":
+			c.interop = value.Type() == "true"
+		case local == "":
+			delete(c.named, name)
+		default:
+			if c.named == nil {
+				c.named = make(map[string]string)
+			}
+			c.named[name] = local
+		}
+	}
+	return
+}
+
+// tsc and Babel also emit Object.defineProperty(exports, "__esModule", {value:true}).
+func (c *jsCommonExports) defineProperty(call *sitter.Node, src []byte) {
+	fn, args := call.ChildByFieldName("function"), call.ChildByFieldName("arguments")
+	if fn == nil || fn.Type() != "member_expression" || args == nil || args.NamedChildCount() != 3 {
+		return
+	}
+	obj, prop := fn.ChildByFieldName("object"), fn.ChildByFieldName("property")
+	name, descriptor := args.NamedChild(1), args.NamedChild(2)
+	if obj == nil || obj.Content(src) != "Object" || prop == nil || prop.Content(src) != "defineProperty" ||
+		!c.activeObject(args.NamedChild(0), src) || name.Type() != "string" || descriptor.Type() != "object" {
+		return
+	}
+	if marker := name.Content(src); marker != `"__esModule"` && marker != "'__esModule'" {
+		return
+	}
+	for i := 0; i < int(descriptor.NamedChildCount()); i++ {
+		pair := descriptor.NamedChild(i)
+		key, val := pair.ChildByFieldName("key"), pair.ChildByFieldName("value")
+		if key != nil && key.Content(src) == "value" && val != nil {
+			c.interop = val.Type() == "true"
+		}
+	}
+}
+
+// Read direct module statements in execution order; do not infer control flow.
+func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
+	var bindings strings.Builder
+	var common jsCommonExports
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		s := root.NamedChild(i)
+		if s.Type() == "expression_statement" {
+			n := s.NamedChild(0)
+			if n != nil {
+				switch n.Type() {
+				case "assignment_expression":
+					if left := n.ChildByFieldName("left"); left != nil && left.Type() == "identifier" {
+						delete(common.objects, left.Content(src))
 					}
+					common.assign(n.ChildByFieldName("left"), n.ChildByFieldName("right"), src)
+				case "call_expression":
+					common.defineProperty(n, src)
+				case "unary_expression":
+					if op := n.ChildByFieldName("operator"); op != nil && op.Type() == "delete" {
+						if jsModuleExports(n.ChildByFieldName("argument"), src) {
+							common.def, common.named, common.interop, common.detached = "", nil, false, true
+							common.replaced++
+							continue
+						}
+						name := common.property(n.ChildByFieldName("argument"), src)
+						delete(common.named, name)
+						if name == "__esModule" {
+							common.interop = false
+						}
+					}
+				}
+			}
+			continue
+		}
+		if s.Type() == "variable_declaration" || s.Type() == "lexical_declaration" {
+			for j := 0; j < int(s.NamedChildCount()); j++ {
+				v := s.NamedChild(j)
+				if name := v.ChildByFieldName("name"); name != nil && name.Type() == "identifier" {
+					if value := v.ChildByFieldName("value"); value != nil && value.Type() == "object" {
+						if common.objects == nil {
+							common.objects = make(map[string]bool)
+						}
+						common.objects[name.Content(src)] = true
+					} else {
+						delete(common.objects, name.Content(src))
+					}
+				}
+				if name := v.ChildByFieldName("name"); name != nil && name.Type() == "identifier" && name.Content(src) == "exports" {
+					if value := v.ChildByFieldName("value"); value != nil {
+						common.assign(name, value, src)
+					} else if s.Type() == "lexical_declaration" {
+						common.detached = true
+					}
+				}
+			}
+			continue
+		}
+		if s.Type() != "export_statement" || s.ChildByFieldName("source") != nil || tsExportStatementTypeOnly(s, src) {
+			continue
+		}
+		decl := s.ChildByFieldName("declaration")
+		if findChildByType(s, "default") != nil {
+			var local string
+			if value := s.ChildByFieldName("value"); value != nil && value.Type() == "identifier" {
+				local = value.Content(src)
+			} else {
+				visitJSDeclaration(decl, src, func(n string) { local = n })
+			}
+			if local != "" {
+				if file.Meta == nil {
+					file.Meta = map[string]any{}
+				}
+				file.Meta[graph.DefaultExportMeta] = local
+			}
+			continue
+		}
+		visitJSDeclaration(decl, src, func(n string) { graph.AppendJSBinding(&bindings, n, n) })
+		if clause := findChildByType(s, "export_clause"); clause != nil {
+			for _, sp := range jsCollectChildren(clause, "export_specifier") {
+				orig, alias := jsSpecifierNames(sp, src)
+				if orig != "" && !tsSpecifierTypeOnly(sp, src) {
+					if alias == "" {
+						alias = orig
+					}
+					graph.AppendJSBinding(&bindings, alias, orig)
 				}
 			}
 		}
 	}
-	named := jsNamedImportsNode(importNode)
-	if named == nil {
+	for _, name := range slices.Sorted(maps.Keys(common.named)) {
+		key := name
+		if name == graph.JSDefaultBinding {
+			if !common.interop {
+				continue
+			}
+			key = graph.JSInteropDefaultBinding
+		}
+		graph.AppendJSBinding(&bindings, key, common.named[name])
+	}
+	if common.interop && common.objects[common.def] {
+		common.def = ""
+	}
+	if common.def != "" {
+		graph.AppendJSBinding(&bindings, graph.JSDefaultBinding, common.def)
+	}
+	if bindings.Len() != 0 {
+		if file.Meta == nil {
+			file.Meta = map[string]any{}
+		}
+		file.Meta[graph.JSLocalExportsMeta] = bindings.String()
+	}
+}
+
+// var crosses statement-block boundaries but not function or class boundaries.
+// Only descend through statement containers: expressions cannot introduce a
+// var in this scope, even when they contain an entire function expression.
+func visitJSHoistedVars(n *sitter.Node, src []byte, visit, required func(string)) {
+	if n == nil {
 		return
 	}
-	specs := jsCollectChildren(named, "import_specifier")
-	if len(specs) == 0 || len(specs) > jsImportBindingCap {
+	switch n.Type() {
+	case "variable_declaration":
+		visitJSScopeDeclaration(n, src, visit, required)
 		return
+	case "for_in_statement":
+		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
+			visitJSPattern(n.ChildByFieldName("left"), src, visit)
+		}
+	case "program", "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
+		"switch_case", "switch_default", "for_statement", "while_statement", "do_statement",
+		"try_statement", "catch_clause", "finally_clause", "with_statement", "labeled_statement", "export_statement":
+	default:
+		return
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		visitJSHoistedVars(n.NamedChild(i), src, visit, required)
+	}
+}
+
+func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit, required func(string)) {
+	if n != nil && n.Type() != "variable_declaration" {
+		visitJSScopeDeclaration(n, src, visit, required)
+	}
+}
+
+// Cache direct declarations once per scope. A sibling function's declarations
+// cannot shadow this call; parameters of every enclosing function can. Module
+// names and require() locals are not import shadows: an ES import cannot share
+// module scope with a same-named declaration, and a require() local names that
+// module's export. Both still hide a generated global, so they get their own stamp.
+type jsScopeKey struct {
+	start, end uint32
+	kind       string
+	body       bool
+}
+type jsScopeCache map[jsScopeKey]map[string]string
+
+func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
+	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		kind := n.Type()
+		switch kind {
+		case "program", "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		default:
+			continue
+		}
+		// The body sees hoisted var declarations; parameter initializers do
+		// not. Cache the two environments separately for the same function.
+		body := child.Type() == "statement_block"
+		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
+		names, ok := (*cache)[key]
+		if !ok {
+			add := func(name, value string) {
+				if names == nil {
+					names = map[string]string{}
+				}
+				names[name] = value
+			}
+			local := func(id string) { add(id, graph.JSLexicalLocal) }
+			if kind == "program" {
+				local = func(id string) { add(id, graph.JSShadowModule) }
+			}
+			required := func(id string) { add(id, graph.JSShadowRequire) }
+			switch kind {
+			case "program", "statement_block":
+				// A class static block is its own var scope.
+				if p := n.Parent(); kind == "program" || p != nil && p.Type() == "class_static_block" {
+					visitJSHoistedVars(n, src, local, required)
+				}
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					s := n.NamedChild(i)
+					if s.Type() == "export_statement" {
+						s = s.ChildByFieldName("declaration")
+					}
+					visitJSBlockDeclaration(s, src, local, required)
+				}
+			case "switch_body":
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					clause := n.NamedChild(i)
+					for j := 0; j < int(clause.NamedChildCount()); j++ {
+						visitJSBlockDeclaration(clause.NamedChild(j), src, local, required)
+					}
+				}
+			case "for_statement", "for_in_statement":
+				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local, required)
+				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
+					visitJSPattern(n.ChildByFieldName("left"), src, local)
+				}
+			default:
+				param := func(id string) { add(id, graph.JSPendingParameter) }
+				if body && kind != "catch_clause" {
+					visitJSHoistedVars(child, src, local, required)
+				}
+				if kind == "function_expression" || kind == "generator_function" {
+					visitJSPattern(n.ChildByFieldName("name"), src, local)
+				}
+				visitJSPattern(n.ChildByFieldName("parameters"), src, param)
+				visitJSPattern(n.ChildByFieldName("parameter"), src, param)
+			}
+			if *cache == nil {
+				*cache = jsScopeCache{}
+			}
+			(*cache)[key] = names
+		}
+		if binding := names[name]; binding != "" {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			if binding == graph.JSShadowModule || binding == graph.JSShadowRequire {
+				edge.Meta[graph.JSAmbientShadowMeta] = binding
+			} else {
+				edge.Meta[graph.JSLexicalBindingMeta] = binding
+			}
+			return
+		}
+	}
+}
+
+func jsShadowRank(e *graph.Edge) int {
+	switch {
+	case e.Meta[graph.JSLexicalBindingMeta] != nil:
+		return 3
+	case e.Meta[graph.JSAmbientShadowMeta] == graph.JSShadowModule:
+		return 2
+	case e.Meta[graph.JSAmbientShadowMeta] != nil:
+		return 1
+	}
+	return 0
+}
+
+// Calls with one From/To/Line identity collapse into one stored edge. The
+// stored edge must stay eligible for the least-shadowed call at that site.
+func clearCollapsedJSShadows(edges []*graph.Edge) {
+	shadowed := make(map[graph.EdgeIdentity][]*graph.Edge)
+	for _, e := range edges {
+		if e.Kind == graph.EdgeCalls && jsShadowRank(e) != 0 {
+			id := graph.EdgeIdentityFor(e)
+			shadowed[id] = append(shadowed[id], e)
+		}
+	}
+	if len(shadowed) == 0 {
+		return
+	}
+	weakest := make(map[graph.EdgeIdentity]*graph.Edge, len(shadowed))
+	for _, e := range edges {
+		if e.Kind != graph.EdgeCalls {
+			continue
+		}
+		id := graph.EdgeIdentityFor(e)
+		if _, ok := shadowed[id]; !ok {
+			continue
+		}
+		if w := weakest[id]; w == nil || jsShadowRank(e) < jsShadowRank(w) {
+			weakest[id] = e
+		}
+	}
+	for id, group := range shadowed {
+		w := weakest[id]
+		lexical, ambient := w.Meta[graph.JSLexicalBindingMeta], w.Meta[graph.JSAmbientShadowMeta]
+		for _, s := range group {
+			delete(s.Meta, graph.JSLexicalBindingMeta)
+			delete(s.Meta, graph.JSAmbientShadowMeta)
+			if lexical != nil {
+				s.Meta[graph.JSLexicalBindingMeta] = lexical
+			}
+			if ambient != nil {
+				s.Meta[graph.JSAmbientShadowMeta] = ambient
+			}
+		}
+	}
+}
+
+// emitJSImports retains value bindings on the module edge: a per-symbol edge
+// can converge onto that edge when resolution finds the file but not the export.
+func emitJSImports(importNode *sitter.Node, importPath, fileID, filePath string, line int, src []byte, result *parser.ExtractionResult) {
+	module := &graph.Edge{
+		From: fileID, To: "unresolved::import::" + importPath,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+	}
+	result.Edges = append(result.Edges, module)
+	if importNode == nil {
+		return
+	}
+	var locals strings.Builder
+	typeOnly := tsImportStatementTypeOnly(importNode, src)
+	if clause := findChildByType(importNode, "import_clause"); clause != nil && !typeOnly {
+		if id := findChildByType(clause, "identifier"); id != nil {
+			name := id.Content(src)
+			graph.AppendJSBinding(&locals, name, graph.JSDefaultBinding)
+		}
+		if ns := findChildByType(clause, "namespace_import"); ns != nil {
+			if id := findChildByType(ns, "identifier"); id != nil {
+				graph.AppendJSBinding(&locals, id.Content(src), graph.JSNamespaceBinding)
+			}
+		}
+	}
+	var specs []*sitter.Node
+	if named := jsNamedImportsNode(importNode); named != nil {
+		specs = jsCollectChildren(named, "import_specifier")
 	}
 	for _, sp := range specs {
 		orig, alias := jsSpecifierNames(sp, src)
 		if orig == "" {
+			continue
+		}
+		if !typeOnly && !tsSpecifierTypeOnly(sp, src) {
+			if alias == "" {
+				graph.AppendJSBinding(&locals, orig, orig)
+			} else {
+				graph.AppendJSBinding(&locals, alias, orig)
+			}
+		}
+		if len(specs) > jsImportBindingCap {
 			continue
 		}
 		edge := &graph.Edge{
@@ -109,6 +581,18 @@ func emitJSPerBindingImports(importNode *sitter.Node, importPath, fileID, filePa
 			edge.Meta = map[string]any{"import_alias": alias}
 		}
 		result.Edges = append(result.Edges, edge)
+	}
+	if locals.Len() != 0 {
+		bindings := locals.String()
+		module.Meta = map[string]any{graph.ImportBindingsMeta: bindings, graph.JSImportSourceMeta: importPath}
+		if len(result.Nodes) > 0 && result.Nodes[0].Kind == graph.KindFile {
+			meta := result.Nodes[0].Meta
+			exports, _ := meta[graph.JSLocalExportsMeta].(string)
+			def, _ := meta[graph.DefaultExportMeta].(string)
+			if graph.JSExportsImport(exports, def, bindings) {
+				module.Meta[graph.JSForwardsImportMeta] = true
+			}
+		}
 	}
 }
 
@@ -138,9 +622,23 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 	if clause := findChildByType(exportNode, "export_clause"); clause != nil {
 		specs := jsCollectChildren(clause, "export_specifier")
 		if len(specs) > jsImportBindingCap {
+			var bindings strings.Builder
+			if !tsExportStatementTypeOnly(exportNode, src) {
+				for _, sp := range specs {
+					orig, alias := jsSpecifierNames(sp, src)
+					if orig == "" || tsSpecifierTypeOnly(sp, src) {
+						continue
+					}
+					if alias == "" {
+						alias = orig
+					}
+					graph.AppendJSBinding(&bindings, alias, orig)
+				}
+			}
 			result.Edges = append(result.Edges, &graph.Edge{
 				From: fileID, To: "unresolved::import::" + importPath,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: line,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath, graph.ImportBindingsMeta: bindings.String()},
 			})
 			return
 		}
@@ -155,6 +653,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			edge := &graph.Edge{
 				From: fileID, To: "unresolved::import::" + importPath + "::" + orig,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath + "::" + orig},
 			}
 			if alias != "" && alias != orig {
 				edge.Alias = alias
@@ -204,6 +703,7 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			forward := &graph.Edge{
 				From: nodeID, To: "unresolved::import::" + importPath + "::" + orig,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+				Meta: map[string]any{graph.JSImportSourceMeta: importPath + "::" + orig},
 			}
 			if publicName != orig {
 				forward.Alias = publicName
@@ -216,12 +716,15 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 	edge := &graph.Edge{
 		From: fileID, To: "unresolved::import::" + importPath,
 		Kind: graph.EdgeReExports, FilePath: filePath, Line: line,
+		Meta: map[string]any{graph.JSImportSourceMeta: importPath},
 	}
 	// `export * as ns from "mod"` — record the namespace alias.
 	if ns := findChildByType(exportNode, "namespace_export"); ns != nil {
 		if id := findChildByType(ns, "identifier"); id != nil {
 			edge.Alias = id.Content(src)
 		}
+	} else if !tsExportStatementTypeOnly(exportNode, src) {
+		edge.Meta[graph.StarReExportMeta] = true
 	}
 	result.Edges = append(result.Edges, edge)
 }

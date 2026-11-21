@@ -43,7 +43,7 @@ import (
 // phase; each carries the edge's pre-resolution target in oldTo, so a
 // reverted edge is restored exactly. closure is the import-reachability
 // map from buildImportClosure. Returns the number of edges reverted.
-func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}) int {
+func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}, stats *ResolveStats) int {
 	if len(jobs) == 0 {
 		return 0
 	}
@@ -210,8 +210,8 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			}
 		}
 	}
-	if len(reindexBatch) > 0 {
-		r.graph.ReindexEdges(reindexBatch)
+	if !stats.applyReindexes(r.graph, reindexBatch) {
+		return 0
 	}
 	if len(sourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
 		graph.ReconcilePlaceholderSources(r.graph, sourceReverts)

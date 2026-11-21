@@ -230,7 +230,8 @@ func TestLegacyIdentityRepairRebindsForeignCaller(t *testing.T) {
 			prior, ids, native := mergeLegacyFilePrior(legacy, fresh, old)
 			stage := &incrementalBatchStage{graphPath: path, legacyPath: native, legacyIDs: ids, priorNodes: prior, result: &parser.ExtractionResult{Nodes: fresh}}
 			stages := []*incrementalBatchStage{stage}
-			carried, _ := restubIncomingRefsFromView(store, stages, loadIncrementalPriorView(store, stages))
+			carried, _, err := restubIncomingRefsFromView(store, stages, loadIncrementalPriorView(store, stages), nil)
+			require.NoError(t, err)
 			idx := New(store, parser.NewRegistry(), config.Default().Index, zap.NewNop())
 			idx.SetRepoPrefix("repo")
 			idx.evictFileIdentities([]string{path}, ids, []string{native})
@@ -308,7 +309,8 @@ func TestLegacyIdentityRepairRespectsDataflowFrontier(t *testing.T) {
 					Nodes: fresh, Edges: []*graph.Edge{{From: fresh[2].ID, To: fresh[1].ID, Kind: graph.EdgeParamOf, FilePath: path}},
 				}}
 				stages := []*incrementalBatchStage{stage}
-				carried, _ := restubIncomingRefsFromView(store, stages, loadIncrementalPriorView(store, stages))
+				carried, _, err := restubIncomingRefsFromView(store, stages, loadIncrementalPriorView(store, stages), nil)
+				require.NoError(t, err)
 				store.(graph.FileIdentityBatchEvicter).EvictFilesWithNodeIDs([]string{path}, ids)
 				store.AddBatch(fresh, append(stage.result.Edges, carried...))
 				find := func(from, to string, kind graph.EdgeKind) bool {

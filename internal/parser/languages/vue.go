@@ -2,16 +2,10 @@ package languages
 
 import (
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
-)
-
-var (
-	vueScriptRe   = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	vueLangAttrRe = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
 )
 
 // VueExtractor extracts Vue single-file components. Each .vue file becomes a
@@ -58,7 +52,7 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 
 	// Carve every <script> / <script setup> block and delegate to the matching
 	// embedded-language extractor, rebased into host-file coordinates.
-	for _, m := range vueScriptRe.FindAllSubmatchIndex(src, -1) {
+	for _, m := range markupScriptRe.FindAllSubmatchIndex(src, -1) {
 		attrs := src[m[2]:m[3]]
 		contentStart, contentEnd := m[4], m[5]
 		if contentStart < 0 {
@@ -67,28 +61,26 @@ func (e *VueExtractor) Extract(filePath string, src []byte) (*parser.ExtractionR
 		content := src[contentStart:contentEnd]
 		lineOffset := strings.Count(string(src[:contentStart]), "\n")
 		var delegate parser.Extractor = e.js
-		if vueScriptIsTypeScript(attrs) {
+		ts, setup := markupScriptAttributes(attrs)
+		if ts {
 			delegate = e.ts
 		}
-		delegateInlineScriptSlice(delegate, content, lineOffset, filePath, fileNode.ID, "vue", result)
+		script := delegateInlineScriptSlice(delegate, content, lineOffset, filePath, fileNode.ID, "vue", result)
+		if script != nil && !setup {
+			if fileNode.Meta == nil {
+				fileNode.Meta = make(map[string]any)
+			}
+			fileNode.Meta[graph.JSExportScopeMeta] = strings.TrimPrefix(script.ID, filePath)
+			for _, key := range [...]string{graph.JSLocalExportsMeta, graph.DefaultExportMeta} {
+				if value := script.Meta[key]; value != nil {
+					fileNode.Meta[key] = value
+				}
+			}
+		}
 	}
 	mineTemplateComponentUsages(src, filePath, componentID, "vue", result)
 	applyFrameworkTemplatePasses(src, filePath, componentID, "vue", result)
 	return result, nil
-}
-
-// vueScriptIsTypeScript reports whether a <script> tag's attributes declare a
-// TypeScript dialect.
-func vueScriptIsTypeScript(attrs []byte) bool {
-	m := vueLangAttrRe.FindSubmatch(attrs)
-	if m == nil {
-		return false
-	}
-	switch strings.ToLower(string(m[1])) {
-	case "ts", "tsx", "typescript":
-		return true
-	}
-	return false
 }
 
 // vueComponentName derives the component name from the file name (Counter.vue ->

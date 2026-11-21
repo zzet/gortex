@@ -1,0 +1,296 @@
+package indexer
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/progress"
+	"github.com/zzet/gortex/internal/resolver"
+	"github.com/zzet/gortex/internal/search"
+)
+
+// failingResolveStore fails a whole-graph resolve at its pending-edge read.
+type failingResolveStore struct {
+	graph.Store
+	err error
+}
+
+func (s failingResolveStore) BeginUnresolvedEdgeScan(context.Context) (graph.UnresolvedEdgeScan, error) {
+	return graph.UnresolvedEdgeScan{}, s.err
+}
+
+func (s failingResolveStore) ReadUnresolvedEdgePage(context.Context, graph.UnresolvedEdgeScan, int64, int, int) (graph.UnresolvedEdgePage, error) {
+	return graph.UnresolvedEdgePage{}, s.err
+}
+
+// Both targets declare the same symbol, so name-only fallback cannot stand
+// in for an alias-directed binding.
+func aliasRebindFixture(t *testing.T, root string) string {
+	t.Helper()
+	configPath := filepath.Join(root, "tsconfig.json")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["old/*"]}}}`)
+	writeFileMk(t, filepath.Join(root, "old/auth.ts"), "export function useRedirect() { return 1 }\n")
+	writeFileMk(t, filepath.Join(root, "new/auth.ts"), "export function useRedirect() { return 2 }\n")
+	writeFileMk(t, filepath.Join(root, "pages/index.ts"), "import { useRedirect } from '~/auth'\nexport function run() { return useRedirect() }\n")
+	return configPath
+}
+
+func TestTSConfigPathAlias_ConfigChangeOnFullReindex(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = idx.IndexCtx(progress.WithReporter(ctx, firstIndexCancelReporter{cancel: cancel}), root)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotNil(t, idx.Graph().GetNode("old/auth.ts::useRedirect"))
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"), "same-root reindex must not keep the old config")
+}
+
+func TestTSConfigPathAlias_NewConfigAfterNegativeFullScan(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "lib/auth.ts"), "export function useRedirect() { return 1 }\n")
+	writeFileMk(t, filepath.Join(root, "pages/index.ts"), "import { useRedirect } from '~/auth'\nexport function run() { return useRedirect() }\n")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Nil(t, workingResolutionInputs(root, nil).aliases, "absence of configs is cached too")
+	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{"~/*":["lib/*"]}}}`)
+	idx, _ = newSQLiteIndexer(t)
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "lib/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_ConfigChangeOnIncrementalReindex(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	caller := filepath.Join(root, "pages/index.ts")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	_, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_ConfigOnlyIncrementalReindex(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	_, err = idx.IncrementalReindexPaths(root, []string{configPath})
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_CancelledRebindKeepsGraphAndRetries(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+
+	budget := newIndexMemoryAdmissionBudget(1)
+	held, err := budget.acquire(t.Context(), 1)
+	require.NoError(t, err)
+	defer held.Release()
+	idx.indexMemoryAdmission = budget
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := idx.IndexCtx(ctx, root)
+		done <- err
+	}()
+	waitForIndexMemoryWaiters(t, budget, 1)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+
+	// The lookup cache has already seen the new config. The graph has not.
+	_, err = idx.IncrementalReindexPaths(root, []string{configPath})
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_FailedFullResolveIsNotCertified(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	oldDigest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, oldDigest)
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	errResolve := errors.New("injected pending page failure")
+	healthy := idx.resolver
+	idx.resolver = resolver.New(failingResolveStore{Store: store, err: errResolve})
+	_, err = idx.Index(root)
+	idx.resolver = healthy
+	require.ErrorIs(t, err, errResolve)
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.Empty(t, digest, "a failed resolve must not certify either policy")
+	require.Nil(t, idx.appliedResolution.Load())
+
+	_, err = idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+	digest, err = store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest)
+	require.NotEqual(t, oldDigest, digest)
+}
+
+func TestTSConfigPathAlias_DeferredIndexCertifiesAfterSharedResolve(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{entry}}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+	seed, store := newSQLiteIndexer(t)
+	invalidateResolutionInputs(root)
+	mi := NewMultiIndexer(store, seed.registry, search.NewNull(), cm, zap.NewNop())
+	_, err = mi.TrackRepoCtx(t.Context(), entry)
+	require.NoError(t, err)
+	require.Equal(t, "repo/old/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	idx := mi.GetIndexer("repo")
+	idx.SetDeferResolve(true)
+	_, err = idx.IndexCtx(t.Context(), root)
+	require.NoError(t, err)
+	digest, err := store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "the shared resolve has not run yet")
+
+	errResolve := errors.New("injected pending page failure")
+	mi.graph = failingResolveStore{Store: store, err: errResolve}
+	require.ErrorIs(t, mi.RunPreEnrichResolve(t.Context(), nil, nil), errResolve)
+	mi.graph = store
+	digest, err = store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "a failed shared resolve must not certify the policy")
+
+	require.NoError(t, mi.RunPreEnrichResolve(t.Context(), nil, nil))
+	require.Equal(t, "repo/new/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+	digest, err = store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.NotEmpty(t, digest)
+	idx.resolutionMu.Lock()
+	defer idx.resolutionMu.Unlock()
+	require.Nil(t, idx.warmResolution)
+}
+
+func TestTSConfigPathAlias_FailedCatchupResolveIsNotCertified(t *testing.T) {
+	idx, store := newSQLiteIndexer(t)
+	errResolve := errors.New("injected catch-up failure")
+	work := resolutionCompletion{
+		inputs:     &resolutionInputs{digest: "new"},
+		success:    true,
+		catchupErr: errResolve,
+	}
+	require.ErrorIs(t, idx.finishResolutionPass(work), errResolve)
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.Empty(t, digest)
+	require.Nil(t, idx.appliedResolution.Load())
+	require.NotNil(t, idx.resolutionRetry, "the next pass must rebind the callers")
+}
+
+func TestTSConfigPathAlias_RebindPreservesExplicitScope(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	goFile := filepath.Join(root, "keep.go")
+	unrelated := filepath.Join(root, "other.go")
+	writeFileMk(t, goFile, "package p\nfunc Before() {}\n")
+	writeFileMk(t, unrelated, "package p\nfunc Other() {}\n")
+	idx, _ := newSQLiteIndexer(t)
+	idx.config.Merkle = false
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	stamp, err := os.Stat(goFile)
+	require.NoError(t, err)
+	writeFileMk(t, goFile, "package p\nfunc After() {}\n")
+	require.NoError(t, os.Chtimes(goFile, stamp.ModTime(), stamp.ModTime()))
+	require.NoError(t, os.Remove(unrelated))
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	require.NoError(t, idx.IndexFile(goFile))
+	require.NotEmpty(t, fnNodeID(t, idx.Graph(), "keep.go", "After"))
+	require.NotEmpty(t, fnNodeID(t, idx.Graph(), "other.go", "Other"))
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+}
+
+func TestTSConfigPathAlias_WarmSaveKeepsBoundedProof(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	proof := newBuildContentProof(root, gitstate.DirtySnapshot{})
+	idx.contentProof = proof
+	_, err = idx.IncrementalReindexPaths(root, []string{"pages/index.ts"})
+	require.NoError(t, err)
+	require.False(t, proof.isUnbounded())
+	set, _ := buildReadSetFrom(proof.readSet(t.Context(), nil, nil))
+	require.True(t, readSetHolds(set, filepath.Base(configPath)))
+}
+
+// A file the alias rebind cannot read is retried from the failure ledger.
+// It must not keep every later save restaging all JS/TS callers.
+func TestTSConfigPathAlias_FailedFileDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	locked := filepath.Join(root, "pages/locked.ts")
+	writeFileMk(t, locked, "import { useRedirect } from '~/auth'\nexport function other() { return useRedirect() }\n")
+	idx, _ := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	restore := denyFileRead(t, locked)
+	result, err := idx.IncrementalReindexPaths(root, []string{configPath})
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, locked)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{locked})
+	require.NoError(t, err)
+	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/locked.ts", "other"))
+}

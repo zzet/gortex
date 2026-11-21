@@ -149,44 +149,7 @@ func (w *tsBindingWalker) handleCatchClause(n *sitter.Node) {
 // (`{ a, b }`) and renamed (`{ a: aliased }`) both produce
 // identifier leaves the walker handles uniformly.
 func (w *tsBindingWalker) emitFromPattern(node *sitter.Node, line int) {
-	if node == nil {
-		return
-	}
-	switch node.Type() {
-	case "identifier", "shorthand_property_identifier_pattern":
-		w.bindLocal(node.Content(w.src), line)
-	case "object_pattern", "array_pattern":
-		for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
-			c := node.NamedChild(i)
-			if c == nil {
-				continue
-			}
-			switch c.Type() {
-			case "pair_pattern":
-				// `{ a: aliased }` — the bound name lives on the
-				// `value` field.
-				if v := c.ChildByFieldName("value"); v != nil {
-					w.emitFromPattern(v, line)
-				}
-			case "rest_pattern":
-				for j, _nc := 0, int(c.NamedChildCount()); j < _nc; j++ {
-					w.emitFromPattern(c.NamedChild(j), line)
-				}
-			default:
-				w.emitFromPattern(c, line)
-			}
-		}
-	case "assignment_pattern":
-		// `let x = 1` inside a destructure — the bound name is on
-		// the `left` field; the right is the default.
-		if l := node.ChildByFieldName("left"); l != nil {
-			w.emitFromPattern(l, line)
-		}
-	case "rest_pattern":
-		for i, _nc := 0, int(node.NamedChildCount()); i < _nc; i++ {
-			w.emitFromPattern(node.NamedChild(i), line)
-		}
-	}
+	visitJSPattern(node, w.src, func(name string) { w.bindLocal(name, line) })
 }
 
 // bindLocal emits the KindLocal node + owner edge. Idempotent on

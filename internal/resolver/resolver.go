@@ -131,6 +131,8 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// DroppedFiles must be re-extracted before certifying incremental resolution.
+	DroppedFiles []string `json:"-"`
 	// LSP* exposes the deferred whole-pass circuit-breaker outcome. These are
 	// diagnostic counters: skipped edges keep the heuristic result produced by
 	// the normal resolve cascade and remain eligible for a later full pass.
@@ -492,19 +494,9 @@ type Resolver struct {
 	namesMiss   map[resolverNameLookupScope]map[string][]*graph.Node
 	namesMissMu sync.RWMutex
 
-	// importFilesByCaller memoises, per caller file, the set of file
-	// paths that file imports (direct EdgeImports targets plus files
-	// reached through transitive EdgeReExports barrel hops). Built
-	// lazily inside the parallel resolve workers — importFilesMu guards
-	// it — and cleared with the per-pass lookup caches. Consulted by
-	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
-	// import_evidence.go for the precedence design.
-	importFilesByCaller map[string]map[string]struct{}
-	// importOutByFile is the batched out-edge prefetch importedFilesFor
-	// reads before falling back to a point GetOutEdges: one
-	// GetOutEdgesByNodeIDs over every JS/TS caller file of a pass
-	// (prefetchImportEdges) instead of one point read per call edge.
-	// Guarded by importFilesMu, cleared with the per-pass caches.
+	// Page-local JS/TS binding and file evidence. Adjacency is prefetched
+	// for callers and loaded on demand for barrels outside that frontier.
+	importsByCaller map[string]*callerImportEvidence
 	importOutByFile map[string][]*graph.Edge
 	importFilesMu   sync.RWMutex
 
@@ -664,6 +656,8 @@ type Resolver struct {
 	// repo-prefixed file stem it targets. See jsts_imports.go for the
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
+
+	nuxtAutoImport NuxtAutoImportResolver
 
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
@@ -1055,6 +1049,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	defer guardSpool.close()
 	guardRepos := make(map[string]struct{})
 	total := &ResolveStats{}
+	// A refused LSP correction fails the pass only after the guard has run, so
+	// unrelated name-only bindings are still reverted.
+	var lspWriteErr error
 	resolveError := func(err error) (*ResolveStats, error) {
 		// Moves the pass deferred belong to references it already bound; an
 		// interrupted pass must not strand them (no later pass re-derives a
@@ -1292,7 +1289,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				r.graph.ReindexEdges(reindexBatch)
+				if !total.applyReindexes(r.graph, reindexBatch) {
+					return resolveError(total.bindingWriteError())
+				}
 				applyStoreElapsed += time.Since(storeStart)
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
@@ -1620,6 +1619,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				break
 			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if len(pageResult.dropped) != 0 {
+				total.DroppedFiles = append(total.DroppedFiles, pageResult.dropped...)
+				lspWriteErr = total.bindingWriteError()
+				break // leave this spool page pending
+			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
 				// to its first skipped key.
@@ -1658,7 +1662,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				r.graph.ReindexEdges(terminalClears)
+				if !total.applyReindexes(r.graph, terminalClears) {
+					return resolveError(total.bindingWriteError())
+				}
 			}
 
 			completed := append([]deferredLSPWorkKey(nil), stale...)
@@ -1797,8 +1803,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			jobs := guardJobsFromRecords(r.graph, records)
 			r.warmGuardLookupCache(jobs)
-			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
+			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure, total)
 			r.clearLookupCache()
+			if err := total.bindingWriteError(); err != nil && lspWriteErr == nil {
+				return resolveError(err)
+			}
 			guardPages++
 			guardJobs += len(jobs)
 			if time.Since(lastGuardLog) > 10*time.Second {
@@ -1814,6 +1823,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	tAfterGuard := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
+	}
+	if lspWriteErr != nil {
+		return resolveError(total.bindingWriteError())
 	}
 
 	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
@@ -2465,10 +2477,7 @@ func (r *Resolver) clearLookupCache() {
 	r.namesMissMu.Lock()
 	r.namesMiss = nil
 	r.namesMissMu.Unlock()
-	r.importFilesMu.Lock()
-	r.importFilesByCaller = nil
-	r.importOutByFile = nil
-	r.importFilesMu.Unlock()
+	r.clearImportEvidence()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
 	r.csharpNSMu.Unlock()
@@ -3472,6 +3481,19 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
+func (stats *ResolveStats) applyReindexes(g graph.Store, batch []graph.EdgeReindex) bool {
+	dropped := graph.ApplyEdgeReindexes(g, batch)
+	stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+	return len(dropped) == 0
+}
+
+func (stats *ResolveStats) bindingWriteError() error {
+	if len(stats.DroppedFiles) == 0 {
+		return nil
+	}
+	return fmt.Errorf("binding write did not apply; %d caller edges need retry", len(stats.DroppedFiles))
+}
+
 func (r *Resolver) applyIncrementalReindexesLocked(
 	reindexBatch []graph.EdgeReindex,
 	jobs []reindexJob,
@@ -3480,7 +3502,9 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		if !stats.applyReindexes(r.graph, reindexBatch) {
+			return
+		}
 		legs.lap("reindex")
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
@@ -3506,7 +3530,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs.lap("import_closure")
 	defer legs.lap("cross_package_guard")
 	if len(closure) > 0 {
-		if guarded := r.guardCrossPackageCallEdges(jobs, closure); guarded > 0 {
+		if guarded := r.guardCrossPackageCallEdges(jobs, closure, stats); guarded > 0 {
 			if stats.Resolved >= guarded {
 				stats.Resolved -= guarded
 			} else {
@@ -3991,6 +4015,14 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if resolutionExempt(e) {
 		return oldTo, false
 	}
+	priorBinding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	delete(e.Meta, graph.JSPendingBindingMeta)
+	priorModule, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	if e.Meta[graph.JSImportSourceMeta] != nil && (e.Kind == graph.EdgeReExports || e.Meta[graph.JSForwardsImportMeta] == true) {
+		if stem, _ := r.jsBindingSource(e); stem != "" {
+			e.Meta[graph.JSBindingModuleMeta] = graph.JSModuleStem(stem)
+		}
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every
@@ -4150,7 +4182,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		}
 	}
 
-	return oldTo, e.To != oldTo
+	binding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	module, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	return oldTo, e.To != oldTo || binding != priorBinding || module != priorModule
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -4376,7 +4410,15 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+	to, aliasStem := jstsImportTargetAndAliasStem(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath)
+	if aliasStem != "" {
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		e.Meta[graph.JSImportSourceMeta] = importPath
+		e.Meta[graph.JSBindingModuleMeta] = aliasStem
+	}
+	if to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -4650,6 +4692,20 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
+	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
+		lexical, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
+		if lexical == graph.JSPendingParameter {
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return
+		}
+		if lexical == "" && !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
+			return
+		}
+		if lexical == graph.JSLexicalLocal && !hasSameFileValue(e.FilePath, candidates) {
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return
+		}
+	}
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
@@ -4768,26 +4824,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Import-evidence disambiguation (JS/TS only; see import_evidence.go
-	// for the full precedence design). The ES module system has no ambient
-	// directory scope, so before the locality cascade below can bind a
-	// same-dir shadow — and before cross-dir ambiguity guesses or refuses —
-	// ask the caller file's import closure. When the caller imports exactly
-	// one candidate's file (directly or through re-export/barrel hops) that
-	// import statement is structural, AST-grade evidence of the binding:
-	// resolve to it at OriginASTResolved, the tier resolveRendersChild's
-	// import-binding path already uses. A module-local candidate blocks the
-	// pick; no import or several imported candidates fall through to the
-	// existing cascade unchanged.
+	// Only file-level evidence remains after the explicit and generated binding tiers.
 	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
-		e.To = pick.ID
-		e.Origin = graph.OriginASTResolved
-		e.Confidence = 0.9
-		if e.Meta == nil {
-			e.Meta = map[string]any{}
-		}
-		e.Meta["resolution"] = "import_closure"
-		stats.Resolved++
+		bindImportCall(e, pick, "import_closure", stats)
 		return
 	}
 

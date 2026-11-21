@@ -146,13 +146,14 @@ func TestRepoPatchBindingAReferenceRetiresTheOtherRepo(t *testing.T) {
 
 	app := mi.GetIndexer("app")
 	resolved := false
-	app.incrementalResolveFilesHook = func(frontier []string) {
-		mi.runMasterResolveFilesWithEvidence(frontier, false, app.resolver)
+	app.incrementalResolveFilesHook = func(frontier []string) []string {
+		dropped := mi.runMasterResolveFilesObserved(frontier, false, app.resolver, nil)
 		g.AddBatch(nil, []*graph.Edge{{
 			From: "app/main.go::Extra", To: "lib/lib.go::Hello", Kind: graph.EdgeReferences,
 			FilePath: "app/main.go", Line: 4,
 		}})
 		resolved = true
+		return dropped
 	}
 	main := filepath.Join(roots["app"], "main.go")
 	writeFile(t, main, "package app\nfunc Run() {}\nfunc Start() { Run() }\nfunc Extra() { Run() }\n")

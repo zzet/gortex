@@ -33,6 +33,12 @@ func (r *Resolver) SetIncrementalSkip(priorUnresolved []*graph.Edge) {
 	terminalOverflow := false
 	for _, e := range priorUnresolved {
 		if e != nil {
+			// A fresh bare JS call has neither the old pending-binding state
+			// nor its reverse module key. Rebuild both, even when the spelling
+			// survived the edit (its lexical scope may not have).
+			if e.Meta[graph.JSPendingBindingMeta] != nil || e.Meta[graph.JSBindingModuleMeta] != nil || jsCallHasScopeEvidence(e) {
+				continue
+			}
 			skip[r.edgeShape(e)] = struct{}{}
 			if !terminalOverflow && edgeTerminalFlag(e) && e.FilePath != "" && e.Line > 0 {
 				if r.incrementalTerminals == nil {
@@ -67,7 +73,7 @@ func (r *Resolver) edgeShape(e *graph.Edge) string {
 // incrementalSkipped reports whether an unresolved edge should be left for the
 // incoming pass instead of re-running the forward cascade on it.
 func (r *Resolver) incrementalSkipped(e *graph.Edge) bool {
-	if r.incrementalSkip == nil {
+	if r.incrementalSkip == nil || jsCallHasScopeEvidence(e) {
 		return false
 	}
 	_, ok := r.incrementalSkip[r.edgeShape(e)]

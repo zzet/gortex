@@ -3,6 +3,7 @@ package indexer
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -74,7 +75,8 @@ func TestRestubIncomingRefsUsesOneInboundBatch(t *testing.T) {
 
 	counted := &watcherReadCountingStore{Store: g}
 	idx := newTestIndexer(counted)
-	idx.restubIncomingRefs("defs.go")
+	_, err := idx.restubIncomingRefs("defs.go")
+	require.NoError(t, err)
 
 	if counted.getInCalls != 0 || counted.getInBatchCalls != 1 {
 		t.Fatalf("incoming reads: point=%d batch=%d, want 0/1", counted.getInCalls, counted.getInBatchCalls)

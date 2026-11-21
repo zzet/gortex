@@ -66,7 +66,7 @@ func TestNonJSTSRepoEvictionSkipsNpmRestub(t *testing.T) {
 			file := "repo/main." + ext
 			g.AddNode(&graph.Node{ID: file, FilePath: file, RepoPrefix: "repo", Language: lang, Kind: graph.KindFile})
 			g.AddNode(&graph.Node{ID: file + "::Hello", FilePath: file, RepoPrefix: "repo", Language: lang, Kind: graph.KindFunction, Name: "Hello"})
-			restubTrackedNpmRepoIncoming(g, "repo")
+			require.NoError(t, restubTrackedNpmRepoIncoming(g, "repo"))
 			if lang == "go" {
 				assert.Zero(t, g.scans)
 			} else {

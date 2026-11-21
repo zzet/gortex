@@ -74,6 +74,9 @@ func (s *Store) EvictRepoForShadowReplacement(ctx context.Context, repo string) 
 	// Retire successful replacement provenance before the first partial graph commit.
 	// A canceled replacement must not be reused as a clean dedicated base.
 	if _, err := s.shadowEvictStep(ctx, func(tx *sql.Tx) (int, *sqliteMutationReceiptAccumulator, error) {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM ts_alias_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repo); err != nil {
+			return 0, nil, err
+		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM repo_index_state WHERE view_gen = ? AND repo_prefix = ?`, s.viewGen, repo)
 		if err != nil {
 			return 0, nil, err

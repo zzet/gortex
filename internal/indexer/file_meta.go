@@ -127,7 +127,11 @@ func (idx *Indexer) indexedFileReceiptMatches(filePath string) bool {
 // name, equal mtime alone never returns true — indexedFileReceiptMatches also
 // confirms the persisted content identity.
 func (idx *Indexer) fileMtimeMatches(filePath string) bool {
-	return idx.indexedFileReceiptMatches(filePath)
+	if !idx.indexedFileReceiptMatches(filePath) {
+		return false
+	}
+	return !closureJSTSPath(filePath) || idx.manifestTree().sourced() ||
+		idx.appliedResolution.Load().unchangedForPoints(idx.RootPath(), []string{filePath}, nil)
 }
 
 // persistFileMeta records one file's per-file metadata row — the BLAKE3
@@ -200,6 +204,12 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 // tier is configured.
 const reparsePendingEnrichmentBatchSize = 256
 
+func (b *reparsePendingEnrichmentBatch) recordDropped(files []string) {
+	if len(files) != 0 && b != nil {
+		b.resolution.dropped = append(b.resolution.dropped, files...)
+	}
+}
+
 type reparsePendingEnrichmentBatch struct {
 	pointPreparation *watcherPointPreparation
 	publication      *PublicationStamps // optional local canonical attempt; never a live record
@@ -207,6 +217,8 @@ type reparsePendingEnrichmentBatch struct {
 	relationsRead    *relationsReadFrontier
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
+	bindingCallers        []string
+	resolution            resolutionCompletion
 	byFile                map[string]bool
 	deferResolverCatchup  bool
 	deferredAffectedFiles map[string]struct{}
