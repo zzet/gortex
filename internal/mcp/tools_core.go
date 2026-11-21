@@ -2805,6 +2805,11 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	// mode — the cause of spurious file_not_indexed misses.
 	fp = s.graphRelPath(ctx, fp)
 
+	var canonical *canonicalSummarySource
+	if allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); allowance != nil && allowance.tool == "get_file_summary" {
+		canonical = &canonicalSummarySource{}
+		ctx = context.WithValue(ctx, canonicalSummarySourceKey{}, canonical)
+	}
 	ctx, err = s.ensureProjected(ctx, []string{fp})
 	if err != nil {
 		if errors.Is(err, errProjectedSourceMoved) {
@@ -2822,6 +2827,11 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 	if storeBusy {
 		ctx = markRequestStoreBusy(ctx, fp)
 		sg = requestLocalFileSummary(ctx, fp, gcxOnly)
+		if canonical != nil && len(sg.Nodes) == 0 && errors.Is(storeErr, context.DeadlineExceeded) {
+			if definitions := s.canonicalSummaryDefinitions(ctx, fp, canonical); definitions != nil {
+				sg = definitions
+			}
+		}
 	} else if storeErr != nil {
 		if errors.Is(storeErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
 			return nil, errProjectedSourceMoved

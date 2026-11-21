@@ -108,7 +108,7 @@ type fakeLoadingExecutor struct {
 func (f *fakeLoadingExecutor) CallTool(context.Context, string, map[string]any) (json.RawMessage, error) {
 	f.calls++
 	if f.calls <= f.loadingCalls {
-		return nil, &repoLoadingError{repo: "app", phase: "parallel_parse", percent: 15}
+		return nil, &repoLoadingError{repo: "app", details: repoLoadingDetails{Phase: "parallel_parse", Percent: new(15)}}
 	}
 	return json.RawMessage(`{"ok":true}`), nil
 }
@@ -118,21 +118,21 @@ func (f *fakeLoadingExecutor) Close() error { return nil }
 func TestCallToolWaitingForLoad(t *testing.T) {
 	t.Run("no wait fails fast with the loading error", func(t *testing.T) {
 		exec := &fakeLoadingExecutor{loadingCalls: 1}
-		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, 0)
+		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, 0, os.Stderr)
 		var loading *repoLoadingError
 		require.ErrorAs(t, err, &loading)
 		assert.Equal(t, 1, exec.calls)
 	})
 	t.Run("a wait retries until the repository is ready", func(t *testing.T) {
 		exec := &fakeLoadingExecutor{loadingCalls: 2}
-		out, err := callToolWaitingForLoad(exec, "search_symbols", nil, 10*time.Second)
+		out, err := callToolWaitingForLoad(exec, "search_symbols", nil, 10*time.Second, os.Stderr)
 		require.NoError(t, err)
 		assert.JSONEq(t, `{"ok":true}`, string(out))
 		assert.Equal(t, 3, exec.calls)
 	})
 	t.Run("running out of wait reports still loading", func(t *testing.T) {
 		exec := &fakeLoadingExecutor{loadingCalls: 1 << 30}
-		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, 1500*time.Millisecond)
+		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, 1500*time.Millisecond, os.Stderr)
 		var loading *repoLoadingError
 		require.ErrorAs(t, err, &loading)
 		assert.Positive(t, loading.waited)

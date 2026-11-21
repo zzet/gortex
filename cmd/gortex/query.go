@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -46,15 +48,15 @@ func init() {
 // does not track the repo, this returns an actionable error rather than
 // silently building a second-class in-process index.
 func requireDaemonTool(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
-	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode)
+	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode, os.Stderr)
 }
 
 // requireDaemonToolWithSurface runs one tool through a per-connection MCP
 // surface without changing daemon-global configuration. It shares the normal
 // daemon-required and repo-not-tracked error behavior.
-func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string) (json.RawMessage, error) {
+func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string, diagnostics io.Writer) (json.RawMessage, error) {
 	args = applyCLIRequireFresh(args)
-	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode)
+	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode, diagnostics)
 	if err != nil {
 		if errors.Is(err, ErrNoExecutor) {
 			return nil, daemonRequiredErr(repoPath)
@@ -62,7 +64,7 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 		return nil, err
 	}
 	defer exec.Close()
-	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait())
+	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait(), diagnostics)
 	if freshnessErr := checkCLIFreshness(rootCmd, out, err); freshnessErr != nil {
 		if _, coded := freshnessErr.(*exitCodeError); coded {
 			return nil, freshnessErr

@@ -56,7 +56,11 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
 	if step.ConsumerProbes {
-		oracles = append(oracles, editConsumerOracles(c)...)
+		consumers := editConsumerOracles(c)
+		oracles = append(oracles, consumers...)
+		if step.ProbeMode == "json" {
+			oracles = append(oracles, editConsumerGCXOracles(consumers)...)
+		}
 	}
 	return editProbeOutputOracles(c, oracles)
 }
@@ -282,21 +286,32 @@ func editProbeCompactCorrect(oracle string, answer editProbeCompactAnswer, c Cor
 }
 
 func editProbeClaimsFresh(body map[string]any) bool {
+	reportedTier := false
 	if labels, ok := body[editProbeTierLabelsKey].(editProbeTierLabels); ok {
+		reportedTier = len(labels) > 0
 		for _, label := range labels {
 			if label.State == "fresh" {
 				return true
 			}
 		}
 	}
-	claims := func(row map[string]any) bool {
-		if row["graph_freshness"] == "fresh" || row["freshness_state"] == "fresh" {
-			return true
-		}
-		return row["state"] == "fresh" || row["fresh"] == true
-	}
 	freshness, _ := body["freshness"].(map[string]any)
-	return body["freshness"] == "fresh" || claims(body) || claims(freshness)
+	for _, row := range []map[string]any{body, freshness} {
+		for _, field := range []string{"graph_freshness", "freshness_state"} {
+			if state, ok := row[field].(string); ok && state != "" {
+				if state == "fresh" {
+					return true
+				}
+				reportedTier = true
+			}
+		}
+	}
+	// A successful watcher wait can accompany an explicitly pending graph.
+	if reportedTier {
+		return false
+	}
+	return body["freshness"] == "fresh" || body["state"] == "fresh" || body["fresh"] == true ||
+		freshness["state"] == "fresh" || freshness["fresh"] == true
 }
 
 func strconvEditProbeUint(value any) (uint64, error) {
