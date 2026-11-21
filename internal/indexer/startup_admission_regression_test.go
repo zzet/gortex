@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ import (
 func TestViewBuildGateParkedIneligibleInteractiveDoesNotYieldReadyBackground(t *testing.T) {
 	ctx := context.Background()
 	gate := NewViewBuildGate()
-	gate.MarkFamilyReady("fam-a")
+	gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 
 	release, err := gate.AcquireForFamily(ctx, ViewBuildBackground, "fam-a")
 	require.NoError(t, err)
@@ -78,7 +79,7 @@ func TestViewBuildGateAdmitsEligibleArrivalOnIdleLaneWhileClosed(t *testing.T) {
 	ctx := context.Background()
 	t.Run("zero capacity", func(t *testing.T) {
 		gate := newViewBuildGateWithLimits(0, 0)
-		gate.MarkFamilyReady("fam-a")
+		gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 		release, err := gate.AcquireForFamily(ctx, ViewBuildInteractive, "fam-a")
 		require.NoError(t, err, "a ready family takes an idle lane even at zero capacity while closed")
 		release()
@@ -88,7 +89,7 @@ func TestViewBuildGateAdmitsEligibleArrivalOnIdleLaneWhileClosed(t *testing.T) {
 	})
 	t.Run("parked ineligible fill the queue", func(t *testing.T) {
 		gate := newViewBuildGateWithLimits(1, 1)
-		gate.MarkFamilyReady("fam-a")
+		gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 		parkedCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		parkedDone := make(chan error, 1)
@@ -118,7 +119,7 @@ func TestViewBuildGateAdmitsEligibleArrivalOnIdleLaneWhileClosed(t *testing.T) {
 // generation-zero rehome onto an unpublished replacement.
 func TestViewBuildGateResetFamilyReadinessRearmsWake(t *testing.T) {
 	gate := NewViewBuildGate()
-	gate.MarkFamilyReady("fam-a")
+	gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 	require.True(t, gate.AdmittedForFamily("fam-a"))
 
 	gate.ResetFamilyReadiness("fam-a")
@@ -130,7 +131,7 @@ func TestViewBuildGateResetFamilyReadinessRearmsWake(t *testing.T) {
 	default:
 	}
 
-	gate.MarkFamilyReady("fam-a")
+	gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 	select {
 	case <-ch:
 	case <-time.After(2 * time.Second):
@@ -243,7 +244,7 @@ func TestSetPrimaryRevokesFamilyReadinessUntilNewBasePublishes(t *testing.T) {
 	f.lc.SetBuildGate(gate)
 
 	// The incumbent primary is published: the family is ready.
-	gate.MarkFamilyReady(f.familyID)
+	gate.MarkFamilyReady(f.familyID, gate.FamilyReadinessEpoch(f.familyID))
 	require.True(t, gate.AdmittedForFamily(f.familyID))
 
 	// A candidate primary with a committed working tree but NO published dedicated
@@ -290,7 +291,7 @@ func TestViewBuildGateReadinessWakeYieldsToEligibleInteractive(t *testing.T) {
 	arm := func(t *testing.T, gate *ViewBuildGate, interactiveFamily string) (yield <-chan struct{}, release func(), parkedDone chan error) {
 		t.Helper()
 		ctx := context.Background()
-		gate.MarkFamilyReady("fam-bg")
+		gate.MarkFamilyReady("fam-bg", gate.FamilyReadinessEpoch("fam-bg"))
 		rel, err := gate.AcquireForFamily(ctx, ViewBuildBackground, "fam-bg")
 		require.NoError(t, err)
 		y, withdraw := gate.NoteYieldable(0)
@@ -317,7 +318,7 @@ func TestViewBuildGateReadinessWakeYieldsToEligibleInteractive(t *testing.T) {
 	t.Run("MarkFamilyReady", func(t *testing.T) {
 		gate := NewViewBuildGate()
 		yield, release, parkedDone := arm(t, gate, "fam-a")
-		gate.MarkFamilyReady("fam-a")
+		gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 		select {
 		case <-yield:
 		case <-time.After(2 * time.Second):
@@ -365,10 +366,72 @@ func TestViewBuildGateResetWakesPreResetWaiter(t *testing.T) {
 
 	// A channel obtained after the reset still fires when the family re-readies.
 	ch2 := gate.FamilyOpened("fam-a")
-	gate.MarkFamilyReady("fam-a")
+	gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a"))
 	select {
 	case <-ch2:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the post-reset wake did not fire when the family became ready again")
 	}
+}
+
+// A readiness mark whose catalog evidence was read before a primary
+// replacement's reset must be refused; one read after it is accepted.
+func TestViewBuildGateRefusesMarkFromBeforeReset(t *testing.T) {
+	gate := NewViewBuildGate()
+	stale := gate.FamilyReadinessEpoch("fam-a")
+	gate.ResetFamilyReadiness("fam-a")
+	require.False(t, gate.MarkFamilyReady("fam-a", stale),
+		"evidence read before the reset re-admitted the family")
+	require.False(t, gate.AdmittedForFamily("fam-a"))
+	require.True(t, gate.MarkFamilyReady("fam-a", gate.FamilyReadinessEpoch("fam-a")))
+	require.True(t, gate.AdmittedForFamily("fam-a"))
+}
+
+// A readiness reset wakes a deferred coordinator, but the wake does not make the
+// family eligible: the coordinator must re-arm and keep its claim instead of
+// entering a cycle that parks on the closed gate.
+func TestStartupAdmissionResetWakeKeepsIneligibleCoordinatorDeferred(t *testing.T) {
+	f := newStartupAdmissionFixture(t) // B's base never published.
+
+	synctest.Test(t, func(t *testing.T) {
+		gate := NewViewBuildGate()
+		b := f.coordinator(t, f.b, gate)
+		b.Signal("checkout registered")
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		gate.ResetFamilyReadiness(f.b.familyID)
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		if s := gate.Stats(); s.BackgroundQueued+s.InteractiveQueued != 0 || s.AdmittedBackground+s.AdmittedInteractive != 0 {
+			t.Fatalf("readiness reset entered a cycle while the family was ineligible: %+v", s)
+		}
+
+		// The claim survived: once the family becomes ready the deferred cycle runs.
+		require.True(t, gate.MarkFamilyReady(f.b.familyID, gate.FamilyReadinessEpoch(f.b.familyID)))
+		synctest.Wait()
+		if s := gate.Stats(); s.AdmittedBackground+s.AdmittedInteractive == 0 {
+			t.Fatalf("the deferred claim was lost across the reset wake: %+v", s)
+		}
+	})
+}
+
+// A primary move that lands while the catalog seed is mid-read must not let the
+// seed re-admit the family from the replaced primary's publication.
+func TestStartupAdmissionCatalogSeedRefusedAcrossPrimaryMove(t *testing.T) {
+	f := newStartupAdmissionFixture(t)
+	gate := NewViewBuildGate()
+	f.publishRealBase(t, f.a)
+	c := f.coordinator(t, f.a, gate)
+
+	// The seed's evidence (old primary published) is read, then the move resets.
+	epoch := gate.FamilyReadinessEpoch(f.a.familyID)
+	require.True(t, c.familyBasePublished())
+	gate.ResetFamilyReadiness(f.a.familyID)
+	require.False(t, gate.MarkFamilyReady(f.a.familyID, epoch),
+		"a seed read before the primary move re-admitted the family")
+	require.False(t, gate.AdmittedForFamily(f.a.familyID))
 }

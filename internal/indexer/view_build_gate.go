@@ -152,6 +152,10 @@ type ViewBuildGate struct {
 	// its family becomes ready or the latch opens. Both are guarded by mu.
 	familyReady map[string]struct{}
 	familyWake  map[string]chan struct{}
+	// familyEpoch counts readiness resets per family. A mark carries the epoch
+	// read before the catalog evidence that earned it, so evidence observed
+	// before a primary replacement can never re-admit the family afterwards.
+	familyEpoch map[string]uint64
 
 	interactive []*viewBuildWaiter
 	background  []*viewBuildWaiter
@@ -887,21 +891,38 @@ func (g *ViewBuildGate) Admitted() bool {
 	return g.open
 }
 
+// FamilyReadinessEpoch returns the family's readiness epoch. Read it BEFORE
+// reading the catalog evidence that a family's primary base is published, and
+// pass it to MarkFamilyReady.
+func (g *ViewBuildGate) FamilyReadinessEpoch(family string) uint64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.familyEpoch[family]
+}
+
 // MarkFamilyReady records that a family's own committed base is published, so
 // builds for that family become eligible for the lane even while the global
 // warmup latch is closed. It wakes any deferred waiter for the family and
-// grants the lane if it is idle. Idempotent; a no-op once the latch is open.
-func (g *ViewBuildGate) MarkFamilyReady(family string) {
+// grants the lane if it is idle. The mark is refused (false) when the family's
+// readiness was reset after epoch was read: the evidence may describe a primary
+// that has since been replaced. Idempotent; a no-op once the latch is open.
+func (g *ViewBuildGate) MarkFamilyReady(family string, epoch uint64) bool {
 	if g == nil || family == "" {
-		return
+		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.open {
-		return
+		return true
+	}
+	if g.familyEpoch[family] != epoch {
+		return false
 	}
 	if _, ok := g.familyReady[family]; ok {
-		return
+		return true
 	}
 	if g.familyReady == nil {
 		g.familyReady = make(map[string]struct{})
@@ -916,6 +937,7 @@ func (g *ViewBuildGate) MarkFamilyReady(family string) {
 	// background build holds the lane, ask it to yield so the interactive work
 	// runs (the yield path only fires for an eligible interactive waiter).
 	g.requestYieldLocked()
+	return true
 }
 
 // ResetFamilyReadiness revokes a family's early-admission bit when its primary
@@ -932,6 +954,12 @@ func (g *ViewBuildGate) ResetFamilyReadiness(family string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.familyReady, family)
+	// Bump the epoch so a mark whose evidence was read before this reset is
+	// refused rather than resurrecting the replaced primary's readiness.
+	if g.familyEpoch == nil {
+		g.familyEpoch = make(map[string]uint64)
+	}
+	g.familyEpoch[family]++
 	// Close the wake channel before dropping it. Deleting without closing would
 	// strand a pre-reset waiter: MarkFamilyReady and Open only close channels
 	// still in the map, so it would recover only on its next poll. A spurious

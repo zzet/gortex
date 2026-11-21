@@ -22,17 +22,19 @@ import (
 //
 // Two own-base cases are covered:
 //   - prepared (--prepare, default): family A's committed base is published by an
-//     unmeasured preparation boot (A's worktree exists beforehand so the warmup
-//     publishes its family base). The measured boot re-discovers the known
-//     checkout with its base already servable; t0 = BootStart. Family B's large
-//     corpus holds the global view-build gate closed well past t0.
+//     unmeasured preparation boot over a separate A checkout. The measured
+//     worktree is created after that daemon stops, so the measured boot discovers
+//     it fresh with its family base already servable; t0 = BootStart. Family B's
+//     large corpus holds the global view-build gate closed well past t0.
 //   - during-startup (--prepare=false): A's base is published during the measured
 //     boot; t0 is its adoption instant, read from the catalog by a dedicated tight
 //     poll goroutine (no control calls in that loop, so t0 is not biased late).
 //
 // Readiness is one indexed search response carrying the exact worktree rider
-// (view.exact && view.kind=="worktree" && view.repo_prefix==A) AND a hit named the
-// fixture marker — never a listening socket, a catalog row, or an empty exact view.
+// (view.exact && view.kind=="worktree" && view.repo_prefix==A && view.checkout_id
+// == the measured worktree's catalog ID) AND a hit named the fixture marker —
+// never a listening socket, a catalog row, or an empty exact view. It must land
+// before B's base publishes and before the gate opens; a missing B witness fails.
 // Every trial reports its own latency; a timeout, daemon exit, or negative latency
 // is a failure, never averaged away. The settled control discovers a FRESH worktree
 // after the gate opens and times discovery->first-exact (not a warm repeat query).
@@ -83,6 +85,7 @@ type startupAdmissionTrial struct {
 	Outcome        string    `json:"outcome"`
 	Error          string    `json:"error,omitempty"`
 	APrefix        string    `json:"a_prefix,omitempty"`
+	ACheckoutID    string    `json:"a_checkout_id,omitempty"`
 	BPrefix        string    `json:"b_prefix,omitempty"`
 	Root           string    `json:"root,omitempty"`
 	LogPath        string    `json:"log_path,omitempty"`
@@ -163,8 +166,14 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 	t := startupAdmissionTrial{Trial: index, Prepare: o.Prepare, Outcome: "error"}
 	trialCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
-	root := filepath.Join(o.Scratch, fmt.Sprintf("trial-%d", index))
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	// A fresh trial root per run: nothing pre-existing under --scratch is ever
+	// reused or removed by the fixture.
+	if err := os.MkdirAll(o.Scratch, 0o700); err != nil {
+		t.Error = err.Error()
+		return t
+	}
+	root, err := os.MkdirTemp(o.Scratch, fmt.Sprintf("trial-%d-", index))
+	if err != nil {
 		t.Error = err.Error()
 		return t
 	}
@@ -200,11 +209,23 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 		t.Error = "worktree B: " + err.Error()
 		return t
 	}
-	// A's worktree must exist BEFORE the preparation boot: the dedicated-base
-	// warmup only publishes a family base when the worktree is present (otherwise
-	// it reports skipped_owner_only). In during-startup mode there is no prep, so
-	// this same worktree is a fresh discovery at the measured boot.
-	if _, err := p.git(trialCtx, p.Repos[0].Path, "worktree", "add", "--detach", aWorktree, a.Corpus.Commit); err != nil {
+	// The dedicated-base warmup only publishes a family base when a worktree is
+	// present (otherwise it reports skipped_owner_only). In prepared mode a
+	// SEPARATE checkout earns A's base, and the measured worktree is created only
+	// after the preparation daemon stops, so the measured boot discovers it fresh
+	// with no route built for it. In during-startup mode the measured worktree
+	// itself is the fresh discovery that publishes the base.
+	addMeasured := func() error {
+		_, err := p.git(trialCtx, p.Repos[0].Path, "worktree", "add", "--detach", aWorktree, a.Corpus.Commit)
+		return err
+	}
+	if o.Prepare {
+		prepWorktree := filepath.Join(p.Root, "repos", "alpha-prep")
+		if _, err := p.git(trialCtx, p.Repos[0].Path, "worktree", "add", "--detach", prepWorktree, a.Corpus.Commit); err != nil {
+			t.Error = "prep worktree A: " + err.Error()
+			return t
+		}
+	} else if err := addMeasured(); err != nil {
 		t.Error = "worktree A: " + err.Error()
 		return t
 	}
@@ -236,6 +257,10 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 		stopCtx, stopCancel := context.WithTimeout(trialCtx, 30*time.Second)
 		_, _, _ = p.stop(stopCtx)
 		stopCancel()
+		if err := addMeasured(); err != nil {
+			t.Error = "worktree A: " + err.Error()
+			return t
+		}
 	}
 
 	if err := writeStartupAdmissionConfig(p, p.Repos); err != nil {
@@ -292,6 +317,7 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 	var aPrefix, bPrefix string
 	var settledStarted bool
 	var settledStart time.Time
+	var settledID string
 	settledWorktree := filepath.Join(p.Root, "repos", "alpha-settled")
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -342,11 +368,14 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 			}
 		}
 		t.APrefix, t.BPrefix = aPrefix, bPrefix
-		if aPrefix != "" && firstExact.IsZero() {
+		if t.ACheckoutID == "" {
+			t.ACheckoutID = startupAdmissionCheckoutID(trialCtx, catalog, aWorktree)
+		}
+		if aPrefix != "" && t.ACheckoutID != "" && firstExact.IsZero() {
 			exactCtx, exactCancel := context.WithTimeout(trialCtx, 2*time.Second)
 			raw, err := control(exactCtx, p.Socket, "search_symbols", map[string]any{"path": aWorktree, "query": a.Marker, "limit": 1})
 			exactCancel()
-			if err == nil && startupAdmissionExact(raw, aPrefix, a.Marker) {
+			if err == nil && startupAdmissionExact(raw, aPrefix, t.ACheckoutID, a.Marker) {
 				firstExact = time.Now()
 				t.FirstExactAt = firstExact
 			}
@@ -362,11 +391,14 @@ func runStartupAdmissionTrial(ctx context.Context, o startupAdmissionOptions, in
 				settledStart = time.Now()
 			}
 		}
-		if settledStarted && !settledStart.IsZero() && settledExact.IsZero() && aPrefix != "" {
+		if settledID == "" && !settledStart.IsZero() {
+			settledID = startupAdmissionCheckoutID(trialCtx, catalog, settledWorktree)
+		}
+		if settledStarted && settledID != "" && settledExact.IsZero() && aPrefix != "" {
 			settledCtx, settledCancel := context.WithTimeout(trialCtx, 2*time.Second)
 			raw, err := control(settledCtx, p.Socket, "search_symbols", map[string]any{"path": settledWorktree, "query": a.Marker, "limit": 1})
 			settledCancel()
-			if err == nil && startupAdmissionExact(raw, aPrefix, a.Marker) {
+			if err == nil && startupAdmissionExact(raw, aPrefix, settledID, a.Marker) {
 				settledExact = time.Now()
 				t.SettledExactMS = msPtr(settledExact.Sub(settledStart))
 			}
@@ -426,7 +458,14 @@ func finalizeStartupAdmissionTrial(t *startupAdmissionTrial, o startupAdmissionO
 		t.Outcome = "over_budget"
 	case t.GateHoldMS == nil:
 		t.Outcome = "no_gate_open"
-	case holdMS != nil && *holdMS < float64(o.HoldMin.Milliseconds()):
+	case t.HoldMS == nil:
+		// No witness of the unrelated family's publication: the hold is unproven.
+		t.Outcome = "no_hold_witness"
+	case !firstExact.Before(bBaseAt) || !firstExact.Before(gateOpen):
+		// The first exact answer must land while the unrelated family still holds
+		// startup (before its base publishes and before the gate opens).
+		t.Outcome = "not_during_hold"
+	case *holdMS < float64(o.HoldMin.Milliseconds()):
 		t.Outcome = "hold_too_short"
 	case t.SettledExactMS == nil:
 		t.Outcome = "no_settled_control"
@@ -435,14 +474,16 @@ func finalizeStartupAdmissionTrial(t *startupAdmissionTrial, o startupAdmissionO
 	}
 }
 
-// startupAdmissionExact requires the exact worktree rider AND a hit named the
-// fixture marker, so an exact-but-empty or fallback answer never counts.
-func startupAdmissionExact(raw json.RawMessage, prefix, marker string) bool {
+// startupAdmissionExact requires the exact worktree rider for the measured
+// checkout's own catalog identity AND a hit named the fixture marker, so an
+// exact-but-empty, fallback, or other-checkout answer never counts.
+func startupAdmissionExact(raw json.RawMessage, prefix, checkoutID, marker string) bool {
 	var answer struct {
 		View struct {
-			Exact  bool   `json:"exact"`
-			Kind   string `json:"kind"`
-			Prefix string `json:"repo_prefix"`
+			Exact      bool   `json:"exact"`
+			Kind       string `json:"kind"`
+			Prefix     string `json:"repo_prefix"`
+			CheckoutID string `json:"checkout_id"`
 		} `json:"view"`
 		Hits []struct {
 			Name string `json:"name"`
@@ -451,7 +492,7 @@ func startupAdmissionExact(raw json.RawMessage, prefix, marker string) bool {
 	if json.Unmarshal(raw, &answer) != nil {
 		return false
 	}
-	if !answer.View.Exact || answer.View.Kind != "worktree" || answer.View.Prefix != prefix {
+	if !answer.View.Exact || answer.View.Kind != "worktree" || answer.View.Prefix != prefix || answer.View.CheckoutID != checkoutID {
 		return false
 	}
 	for _, hit := range answer.Hits {
@@ -475,6 +516,21 @@ func startupAdmissionActiveGen(ctx context.Context, db *sql.DB, prefix string) i
 		return 0
 	}
 	return gen
+}
+
+// startupAdmissionCheckoutID reads the catalog checkout ID registered for a
+// worktree root, "" until the daemon has discovered it.
+func startupAdmissionCheckoutID(ctx context.Context, db *sql.DB, root string) string {
+	if canonical, err := filepath.EvalSymlinks(root); err == nil {
+		root = canonical
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	var id string
+	if err := db.QueryRowContext(queryCtx, `SELECT checkout_id FROM checkouts WHERE root_path=?`, root).Scan(&id); err != nil {
+		return ""
+	}
+	return id
 }
 
 func waitStartupAdmissionBase(ctx context.Context, db *sql.DB, prefix string, bound time.Duration) error {

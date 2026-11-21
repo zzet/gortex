@@ -589,8 +589,11 @@ func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBas
 	// event would let a worktree compose over the primary's generation-zero
 	// fallback and serve another checkout's uncommitted content. Gate the mark
 	// on the adopted graph being the primary base, matching the catalog seed.
+	// The epoch is read before the catalog: if SetPrimary replaces the primary
+	// after this read, its reset bumps the epoch and the stale mark is refused.
+	epoch := l.buildGate().FamilyReadinessEpoch(event.FamilyID)
 	if graph, found, err := l.catalog.GetDedicatedGraph(context.Background(), event.GraphID); err == nil && found && graph.IsPrimaryBase {
-		l.buildGate().MarkFamilyReady(event.FamilyID)
+		l.buildGate().MarkFamilyReady(event.FamilyID, epoch)
 	}
 	reason := fmt.Sprintf("committed base of %s advanced to generation %d",
 		event.GraphID, event.Adoption.GenerationID)

@@ -24,28 +24,32 @@ func buildStartupAdmissionFixture(ctx context.Context, sourceRoot, label string,
 	if files < 1 || functions < 1 || calls < 0 {
 		return startupAdmissionFixture{}, fmt.Errorf("fixture %s: files/functions must be >=1 and calls >=0", label)
 	}
+	if err := os.MkdirAll(sourceRoot, 0o700); err != nil {
+		return startupAdmissionFixture{}, err
+	}
 	dir := filepath.Join(sourceRoot, label)
-	// A re-run into an existing trial dir must start from a clean corpus: the fixture
-	// is deterministic, so a stale committed tree would leave `git commit` with
-	// nothing to commit and fail. The harness clones this dir, so removing a prior
-	// fixture is safe.
-	if err := os.RemoveAll(dir); err != nil {
+	// Only ever build into a directory this call creates: the caller hands in a
+	// fresh trial root, and an existing dir is refused rather than cleared.
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		return startupAdmissionFixture{}, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return startupAdmissionFixture{}, err
-	}
+	// The same isolation the private run uses: no inherited GIT_* (GIT_DIR,
+	// GIT_WORK_TREE, GIT_INDEX_FILE, ...) can point fixture git at another repo.
+	env := privateEnv(sourceRoot, "", os.DevNull)
 	marker := "AdmissionMarker" + strings.ToUpper(label[:1]) + label[1:]
-	if err := fixtureGit(ctx, dir, "init", "-q"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "init", "-q"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
-	if err := fixtureGit(ctx, dir, "config", "user.email", "fixture@example.invalid"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "config", "user.email", "fixture@example.invalid"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
-	if err := fixtureGit(ctx, dir, "config", "user.name", "fixture"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "config", "user.name", "fixture"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
 	for i := 0; i < files; i++ {
+		if err := ctx.Err(); err != nil {
+			return startupAdmissionFixture{}, err
+		}
 		var b strings.Builder
 		b.WriteString("package fixture\n\n")
 		if i == 0 {
@@ -74,18 +78,18 @@ func buildStartupAdmissionFixture(ctx context.Context, sourceRoot, label string,
 			return startupAdmissionFixture{}, err
 		}
 	}
-	if err := fixtureGit(ctx, dir, "add", "-A"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "add", "-A"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
-	if err := fixtureGit(ctx, dir, "commit", "-q", "-m", "fixture"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "commit", "-q", "-m", "fixture"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
 	// Pack objects so the harness's --no-hardlinks clone copies a packfile
 	// rather than thousands of loose objects (which races on large fixtures).
-	if err := fixtureGit(ctx, dir, "gc", "-q"); err != nil {
+	if err := fixtureGit(ctx, env, dir, "gc", "-q"); err != nil {
 		return startupAdmissionFixture{}, err
 	}
-	sha, err := fixtureGitOutput(ctx, dir, "rev-parse", "HEAD")
+	sha, err := fixtureGitOutput(ctx, env, dir, "rev-parse", "HEAD")
 	if err != nil {
 		return startupAdmissionFixture{}, err
 	}
@@ -103,15 +107,15 @@ func buildStartupAdmissionFixture(ctx context.Context, sourceRoot, label string,
 	}, nil
 }
 
-func fixtureGit(ctx context.Context, dir string, args ...string) error {
-	_, err := fixtureGitOutput(ctx, dir, args...)
+func fixtureGit(ctx context.Context, env []string, dir string, args ...string) error {
+	_, err := fixtureGitOutput(ctx, env, dir, args...)
 	return err
 }
 
-func fixtureGitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+func fixtureGitOutput(ctx context.Context, env []string, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

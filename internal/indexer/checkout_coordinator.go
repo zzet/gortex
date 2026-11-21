@@ -1250,8 +1250,12 @@ func (c *CheckoutCoordinator) run() {
 			}
 			c.cycle(lifetime)
 		case <-admitted:
-			admitted = nil
-			if !claimed {
+			// The channel also fires on a readiness reset (a primary replaced),
+			// which revokes eligibility: re-check and re-arm, keeping the
+			// deferred claim, rather than entering a cycle that would park on
+			// the gate while holding the coordinator's only loop.
+			admitted = c.admissionWait()
+			if admitted != nil || !claimed {
 				continue
 			}
 			claimed = false
@@ -1263,17 +1267,23 @@ func (c *CheckoutCoordinator) run() {
 // admissionWait is the channel the loop waits for build admission on, nil when
 // builds are already admitted.
 func (c *CheckoutCoordinator) admissionWait() <-chan struct{} {
-	if c.gate.AdmittedForFamily(c.familyID) {
-		return nil
+	for {
+		if c.gate.AdmittedForFamily(c.familyID) {
+			return nil
+		}
+		// A base published before this coordinator existed never sent it an
+		// adoption event, so seed readiness from the catalog: a servable committed
+		// generation means the family is ready now, without waiting for the latch.
+		// The epoch is read first so a primary replaced during the catalog read
+		// refuses the mark; the loop then re-reads against the new primary.
+		epoch := c.gate.FamilyReadinessEpoch(c.familyID)
+		if !c.familyBasePublished() {
+			return c.gate.FamilyOpened(c.familyID)
+		}
+		if c.gate.MarkFamilyReady(c.familyID, epoch) {
+			return nil
+		}
 	}
-	// A base published before this coordinator existed never sent it an
-	// adoption event, so seed readiness from the catalog: a servable committed
-	// generation means the family is ready now, without waiting for the latch.
-	if c.familyBasePublished() {
-		c.gate.MarkFamilyReady(c.familyID)
-		return nil
-	}
-	return c.gate.FamilyOpened(c.familyID)
 }
 
 // familyBasePublished reports whether the family's primary dedicated graph has
