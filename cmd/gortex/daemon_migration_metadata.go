@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"sync"
 
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 )
 
@@ -26,19 +28,22 @@ type migrationMetadataSession struct {
 }
 
 type migrationMetadataDispatcher struct {
-	catalog  *mcpDispatcher
-	target   *mcpDispatcher // immutable in a published dispatcher
-	reporter *daemonStartupReporter
-	sessions *sync.Map
+	catalog       *mcpDispatcher
+	target        *mcpDispatcher // immutable in a published dispatcher
+	reporter      *daemonStartupReporter
+	sessions      *sync.Map
+	declaredRepos *indexer.MultiIndexer // only the lexical load declarations are populated
 }
 
-func newMigrationMetadataDispatcher(cfg *config.Config, logger *zap.Logger, reporter *daemonStartupReporter) *migrationMetadataDispatcher {
+func newMigrationMetadataDispatcher(cfg *config.Config, repos []config.RepoEntry, logger *zap.Logger, reporter *daemonStartupReporter) *migrationMetadataDispatcher {
 	policy := gortexmcp.ToolPolicyConfig{Preset: cfg.MCP.Tools.Preset, Mode: cfg.MCP.Tools.Mode, Allow: cfg.MCP.Tools.Allow, Deny: cfg.MCP.Tools.Deny, OperatorPinned: cfg.MCP.Tools.Explicit}
 	// Metadata registration needs no graph or query engine. Every graph call
 	// is refused by this dispatcher until the real durable runtime is handed
 	// over, so constructing an in-memory persistence substitute is unnecessary.
 	server := gortexmcp.NewServer(nil, nil, nil, nil, logger, nil, gortexmcp.MultiRepoOptions{ToolPolicy: &policy})
-	return &migrationMetadataDispatcher{catalog: newMCPDispatcher(server, nil, logger), reporter: reporter, sessions: &sync.Map{}}
+	declared := &indexer.MultiIndexer{}
+	declared.DeclareRepos(repos)
+	return &migrationMetadataDispatcher{catalog: newMCPDispatcher(server, nil, logger), reporter: reporter, sessions: &sync.Map{}, declaredRepos: declared}
 }
 
 func (d *migrationMetadataDispatcher) handoff(target *mcpDispatcher) *migrationMetadataDispatcher {
@@ -92,6 +97,24 @@ func (d *migrationMetadataDispatcher) phase() string {
 	return "opening_store"
 }
 
+func (d *migrationMetadataDispatcher) indexHealth(frame []byte, cwd string) []byte {
+	// Use only a containing configured root. Neither linked worktree discovery
+	// nor symlink resolution should touch a repository mount in this phase.
+	phase := d.phase()
+	for dir := filepath.Clean(cwd); filepath.IsAbs(dir); {
+		if repo, ok := d.declaredRepos.RepoLoadFor(dir); ok {
+			return loadingIndexHealthFrame(frame, repo, phase, 0, gortexmcp.RepoLoadingSuggestion(repo.Label()), "")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return loadingIndexHealthFrame(frame, indexer.RepoLoad{}, phase, 0,
+		"The store is opening or migrating. Repository identity is pending; retry shortly.", "identity_pending")
+}
+
 func (d *migrationMetadataDispatcher) Dispatch(ctx context.Context, session *daemon.Session, frame []byte) ([]byte, error) {
 	value, ok := d.sessions.Load(session.ID)
 	if !ok {
@@ -128,13 +151,23 @@ func (d *migrationMetadataDispatcher) Dispatch(ctx context.Context, session *dae
 		rec.initialized = append([]byte(nil), frame...)
 	}
 	rec.mu.Unlock()
-	// Metadata never performs cwd, Git, catalog or graph admission. Until the
-	// store has opened, uncertainty is loading for every graph request.
-	if !loadingMetadataMethod(method) {
-		return jsonRPCErrorFrame(frame, "store schema is opening or migrating", map[string]any{"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": session.EffectiveCWD(), "phase": d.phase(), "percent": 0}), nil
-	}
 	srv := d.catalog.srv
-	ctx = gortexmcp.WithClientConnection(gortexmcp.WithSessionCWD(gortexmcp.WithSessionID(ctx, session.ID), session.EffectiveCWD()))
+	session.SetLiveCWD(peekFrameClientCWD(frame))
+	cwd := requestCWD(session, frame)
+	allowed := loadingMetadataMethod(method)
+	if method == "tools/call" {
+		name, args := peekFrameToolCall(frame)
+		if srv.LegacyToolForCall(name, args) == "index_health" {
+			return d.indexHealth(frame, cwd), nil
+		}
+		// The catalogs remain subject to the negotiated tool surface. Neither
+		// handler grants access to a graph or writes repo configuration.
+		allowed = name == "capabilities" || name == "tools_search"
+	}
+	if !allowed {
+		return jsonRPCErrorFrame(frame, "store schema is opening or migrating", map[string]any{"error_code": string(gortexmcp.ErrCodeRepoLoading), "retryable": true, "path": cwd, "phase": d.phase(), "percent": 0}), nil
+	}
+	ctx = gortexmcp.WithClientConnection(gortexmcp.WithSessionCWD(gortexmcp.WithSessionID(ctx, session.ID), cwd))
 	ctx = srv.WithClientSession(ctx, session.ID)
 	srv.NoteSessionToolPolicy(session.ID, session.ToolSpec, session.ToolMode)
 	d.catalog.maybeSnoopInitialize(session, frame)
