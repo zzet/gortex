@@ -343,7 +343,14 @@ func (f *sharedReceiptFixture) observe(offer *sharedReceiptOffer) {
 		// already-planned impact query below is not a caller success retry.
 		f.captureFailure(ctx, offer)
 	}
-	impact, err := sharedReceiptJSON(f.server, ctx, 400+offer.ordinal, "explain_change_impact", map[string]any{"ids": "main.go::Target", "format": "json", "max_bytes": 0, "limit": 100})
+	impact, err := sharedReceiptJSON(f.server, ctx, 400+offer.ordinal, "explain_change_impact", map[string]any{
+		"ids":             "main.go::Target",
+		"format":          "json",
+		"max_bytes":       0,
+		"limit":           100,
+		"require_fresh":   true,
+		"freshness_scope": "relations",
+	})
 	if err != nil {
 		offer.err = errors.Join(offer.err, err)
 		return
