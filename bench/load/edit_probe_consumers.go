@@ -325,7 +325,14 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 	}
 	s.record.Consumers[oracle.name] = row
 	s.mu.Unlock()
-	return s.emit(map[string]any{"event": "consumer_probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": mode, "wire_id": identity.ID, "start_ns": editProbeOffset(identity.WriteStarted, r.origin), "end_ns": editProbeOffset(identity.Finished, r.origin), "post_ack": postACK, "state": state})
+	evidence := map[string]any{"event": "consumer_probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": mode, "wire_id": identity.ID, "start_ns": editProbeOffset(identity.WriteStarted, r.origin), "end_ns": editProbeOffset(identity.Finished, r.origin), "post_ack": postACK, "state": state}
+	if oracle.name == "consumer_rename" {
+		// A labelled partial can already contain the exact provisional site.
+		// Site coverage is independent of the freshness verdict.
+		evidence["rename_site_observed"] = postACK && (state == "subject_observed" ||
+			state == "pending" && editConsumerRename(body, repo.Corpus.File, s.step.Marker, r.plan.Callee))
+	}
+	return s.emit(evidence)
 }
 
 func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c Corpus, step editProbeStep) string {
