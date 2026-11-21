@@ -321,6 +321,9 @@ const (
 	JSForwardsImportMeta    = "js_forwards_import"
 	JSLexicalBindingMeta    = "js_lexical_binding"
 	JSLexicalLocal          = "local"
+	JSAmbientShadowMeta     = "js_ambient_shadow" // a local hides generated globals but is not an import shadow
+	JSShadowModule          = "module"            // module-scope declaration
+	JSShadowRequire         = "require"           // local initialized from require(), keeps import evidence
 	JSPendingBindingMeta    = "pending_js_binding"
 	JSPendingImport         = "import"
 	JSPendingGenerated      = "nuxt"

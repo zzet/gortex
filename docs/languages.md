@@ -130,6 +130,10 @@ the repository has only one definition. A named import of the defining symbol
 outranks file-level closure evidence; otherwise a unique directly imported or
 barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
+A call whose name is bound by an enclosing parameter, catch clause, block or
+hoisted `var` is not an import call. It binds to a same-file declaration when
+one exists and otherwise stays unresolved. A local initialized from `require()`
+keeps its import evidence.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
 For CommonJS, a default import binds `module.exports`. When the final export

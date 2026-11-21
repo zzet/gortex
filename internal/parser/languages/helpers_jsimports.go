@@ -83,19 +83,44 @@ func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
+// A local initialized from require() still names that module's export, so it
+// stays eligible for import evidence.
+func jsRequireInitializer(declarator *sitter.Node, src []byte) bool {
+	value := declarator.ChildByFieldName("value")
+	for value != nil && value.Type() == "member_expression" {
+		value = value.ChildByFieldName("object")
+	}
+	if value == nil || value.Type() != "call_expression" {
+		return false
+	}
+	callee := value.ChildByFieldName("function")
+	return callee != nil && callee.Content(src) == "require"
+}
+
+// visitJSDeclaration visits every declared name, as export records need.
 func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	visitJSScopeDeclaration(n, src, visit, visit)
+}
+
+// visitJSScopeDeclaration reports require() locals separately for scope stamps.
+func visitJSScopeDeclaration(n *sitter.Node, src []byte, visit, required func(string)) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case "ambient_declaration":
-		visitJSDeclaration(n.NamedChild(0), src, visit)
+		visitJSScopeDeclaration(n.NamedChild(0), src, visit, required)
 	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, visit)
 	case "lexical_declaration", "variable_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
-			if v.Type() == "variable_declarator" {
+			if v.Type() != "variable_declarator" {
+				continue
+			}
+			if jsRequireInitializer(v, src) {
+				visitJSPattern(v.ChildByFieldName("name"), src, required)
+			} else {
 				visitJSPattern(v.ChildByFieldName("name"), src, visit)
 			}
 		}
@@ -310,13 +335,13 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 // var crosses statement-block boundaries but not function or class boundaries.
 // Only descend through statement containers: expressions cannot introduce a
 // var in this scope, even when they contain an entire function expression.
-func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
+func visitJSHoistedVars(n *sitter.Node, src []byte, visit, required func(string)) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case "variable_declaration":
-		visitJSDeclaration(n, src, visit)
+		visitJSScopeDeclaration(n, src, visit, required)
 		return
 	case "for_in_statement":
 		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
@@ -329,18 +354,21 @@ func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
 		return
 	}
 	for i := 0; i < int(n.NamedChildCount()); i++ {
-		visitJSHoistedVars(n.NamedChild(i), src, visit)
+		visitJSHoistedVars(n.NamedChild(i), src, visit, required)
 	}
 }
 
-func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit, required func(string)) {
 	if n != nil && n.Type() != "variable_declaration" {
-		visitJSDeclaration(n, src, visit)
+		visitJSScopeDeclaration(n, src, visit, required)
 	}
 }
 
 // Cache direct declarations once per scope. A sibling function's declarations
-// cannot shadow this call; parameters of every enclosing function can.
+// cannot shadow this call; parameters of every enclosing function can. Module
+// names and require() locals are not import shadows: an ES import cannot share
+// module scope with a same-named declaration, and a require() local names that
+// module's export. Both still hide a generated global, so they get their own stamp.
 type jsScopeKey struct {
 	start, end uint32
 	kind       string
@@ -369,35 +397,39 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				names[name] = value
 			}
 			local := func(id string) { add(id, graph.JSLexicalLocal) }
+			if kind == "program" {
+				local = func(id string) { add(id, graph.JSShadowModule) }
+			}
+			required := func(id string) { add(id, graph.JSShadowRequire) }
 			switch kind {
 			case "program", "statement_block":
 				// A class static block is its own var scope.
 				if p := n.Parent(); kind == "program" || p != nil && p.Type() == "class_static_block" {
-					visitJSHoistedVars(n, src, local)
+					visitJSHoistedVars(n, src, local, required)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
 					s := n.NamedChild(i)
 					if s.Type() == "export_statement" {
 						s = s.ChildByFieldName("declaration")
 					}
-					visitJSBlockDeclaration(s, src, local)
+					visitJSBlockDeclaration(s, src, local, required)
 				}
 			case "switch_body":
 				for i := 0; i < int(n.NamedChildCount()); i++ {
 					clause := n.NamedChild(i)
 					for j := 0; j < int(clause.NamedChildCount()); j++ {
-						visitJSBlockDeclaration(clause.NamedChild(j), src, local)
+						visitJSBlockDeclaration(clause.NamedChild(j), src, local, required)
 					}
 				}
 			case "for_statement", "for_in_statement":
-				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local)
+				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local, required)
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
 			default:
 				param := func(id string) { add(id, graph.JSPendingParameter) }
 				if body && kind != "catch_clause" {
-					visitJSHoistedVars(child, src, local)
+					visitJSHoistedVars(child, src, local, required)
 				}
 				if kind == "function_expression" || kind == "generator_function" {
 					visitJSPattern(n.ChildByFieldName("name"), src, local)
@@ -414,8 +446,66 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			if edge.Meta == nil {
 				edge.Meta = map[string]any{}
 			}
-			edge.Meta[graph.JSLexicalBindingMeta] = binding
+			if binding == graph.JSShadowModule || binding == graph.JSShadowRequire {
+				edge.Meta[graph.JSAmbientShadowMeta] = binding
+			} else {
+				edge.Meta[graph.JSLexicalBindingMeta] = binding
+			}
 			return
+		}
+	}
+}
+
+func jsShadowRank(e *graph.Edge) int {
+	switch {
+	case e.Meta[graph.JSLexicalBindingMeta] != nil:
+		return 3
+	case e.Meta[graph.JSAmbientShadowMeta] == graph.JSShadowModule:
+		return 2
+	case e.Meta[graph.JSAmbientShadowMeta] != nil:
+		return 1
+	}
+	return 0
+}
+
+// Calls with one From/To/Line identity collapse into one stored edge. The
+// stored edge must stay eligible for the least-shadowed call at that site.
+func clearCollapsedJSShadows(edges []*graph.Edge) {
+	shadowed := make(map[graph.EdgeIdentity][]*graph.Edge)
+	for _, e := range edges {
+		if e.Kind == graph.EdgeCalls && jsShadowRank(e) != 0 {
+			id := graph.EdgeIdentityFor(e)
+			shadowed[id] = append(shadowed[id], e)
+		}
+	}
+	if len(shadowed) == 0 {
+		return
+	}
+	weakest := make(map[graph.EdgeIdentity]*graph.Edge, len(shadowed))
+	for _, e := range edges {
+		if e.Kind != graph.EdgeCalls {
+			continue
+		}
+		id := graph.EdgeIdentityFor(e)
+		if _, ok := shadowed[id]; !ok {
+			continue
+		}
+		if w := weakest[id]; w == nil || jsShadowRank(e) < jsShadowRank(w) {
+			weakest[id] = e
+		}
+	}
+	for id, group := range shadowed {
+		w := weakest[id]
+		lexical, ambient := w.Meta[graph.JSLexicalBindingMeta], w.Meta[graph.JSAmbientShadowMeta]
+		for _, s := range group {
+			delete(s.Meta, graph.JSLexicalBindingMeta)
+			delete(s.Meta, graph.JSAmbientShadowMeta)
+			if lexical != nil {
+				s.Meta[graph.JSLexicalBindingMeta] = lexical
+			}
+			if ambient != nil {
+				s.Meta[graph.JSAmbientShadowMeta] = ambient
+			}
 		}
 	}
 }

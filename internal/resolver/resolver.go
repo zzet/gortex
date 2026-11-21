@@ -4698,10 +4698,10 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
 		}
-		if lexical == "" && !strings.Contains(funcName, ".") && (r.tryResolveExplicitImport(e, funcName, stats) || r.tryResolveNuxtAutoImport(e, funcName, stats)) {
+		if lexical == "" && !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
 			return
 		}
-		if lexical == graph.JSLexicalLocal && !hasLocalValue(e.FilePath, candidates) {
+		if lexical == graph.JSLexicalLocal && !hasSameFileValue(e.FilePath, candidates) {
 			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
 		}

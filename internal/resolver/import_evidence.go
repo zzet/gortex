@@ -84,6 +84,49 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	return pick
 }
 
+// jsCallHasScopeEvidence reports scope facts an edit can change while the call
+// keeps its shape, so neither a skip nor a carried binding can stand in for them.
+func jsCallHasScopeEvidence(e *graph.Edge) bool {
+	return e.Meta[graph.JSLexicalBindingMeta] != nil || e.Meta[graph.JSAmbientShadowMeta] != nil
+}
+
+// tryResolveUnshadowedBinding applies the explicit and generated tiers. A
+// module-scope declaration owns its name, so neither applies. A require() local
+// keeps import evidence but still hides a generated global. A module local with
+// no value node stays unresolved rather than falling through to a same-named
+// generated target by name.
+func (r *Resolver) tryResolveUnshadowedBinding(e *graph.Edge, name string, candidates []*graph.Node, stats *ResolveStats) bool {
+	ambient, _ := e.Meta[graph.JSAmbientShadowMeta].(string)
+	if ambient != graph.JSShadowModule && r.tryResolveExplicitImport(e, name, stats) {
+		return true
+	}
+	if ambient == "" {
+		return r.tryResolveNuxtAutoImport(e, name, stats)
+	}
+	if ambient == graph.JSShadowModule && r.nuxtAutoImport != nil && !hasSameFileValue(e.FilePath, candidates) {
+		if stem, _ := r.nuxtAutoImport(e.FilePath, name); stem != "" {
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return true
+		}
+	}
+	return false
+}
+
+// hasSameFileValue includes nested declarations, unlike hasLocalValue: a shadow
+// stamped on this call can be owned by a helper inside the enclosing function.
+func hasSameFileValue(file string, candidates []*graph.Node) bool {
+	for _, c := range candidates {
+		if c.FilePath != file {
+			continue
+		}
+		switch c.Kind {
+		case graph.KindFunction, graph.KindMethod, graph.KindVariable, graph.KindConstant:
+			return true
+		}
+	}
+	return false
+}
+
 // The module edge retains local:export pairs even for statements too large
 // to emit a symbol edge per specifier. Bare entries have identical names.
 func (r *Resolver) tryResolveExplicitImport(e *graph.Edge, name string, stats *ResolveStats) bool {
@@ -94,7 +137,7 @@ func (r *Resolver) tryResolveExplicitImport(e *graph.Edge, name string, stats *R
 		bindings, _ := imp.Meta[graph.ImportBindingsMeta].(string)
 		if exported := graph.JSBinding(bindings, name); exported != "" {
 			stem, file := r.jsBindingSource(imp)
-			r.resolveExactCall(e, name, stem, file, exported, graph.JSPendingImport, "import_closure", stats)
+			r.resolveExactCall(e, name, stem, file, exported, graph.JSPendingImport, "import_binding", stats)
 			return true
 		}
 	}

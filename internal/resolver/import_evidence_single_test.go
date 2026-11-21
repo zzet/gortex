@@ -30,7 +30,7 @@ func TestImportEvidence_SingleCandidate(t *testing.T) {
 			require.NotNil(t, call)
 			require.Equal(t, "app/composables/auth.ts::useRedirect", call.To)
 			require.Equal(t, graph.OriginASTResolved, call.Origin)
-			require.Equal(t, "import_closure", call.Meta["resolution"])
+			require.Equal(t, "import_binding", call.Meta["resolution"])
 		})
 	}
 }

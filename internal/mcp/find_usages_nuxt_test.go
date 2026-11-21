@@ -68,7 +68,7 @@ func TestFindUsages_NuxtAutoImports(t *testing.T) {
 			if edge.Kind == graph.EdgeCalls && edge.FilePath == file {
 				calls++
 				require.Equal(t, graph.OriginASTResolved, edge.Origin)
-				require.Equal(t, "import_closure", edge.Meta["resolution"])
+				require.Equal(t, "import_binding", edge.Meta["resolution"])
 			}
 		}
 		require.Equal(t, 1, calls, "each explicit-import caller must resolve once")

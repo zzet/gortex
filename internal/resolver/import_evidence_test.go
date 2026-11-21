@@ -233,8 +233,8 @@ function setup(): unknown {
 		if e.Origin != graph.OriginASTResolved {
 			t.Errorf("origin = %q, want %q", e.Origin, graph.OriginASTResolved)
 		}
-		if e.Meta == nil || e.Meta["resolution"] != "import_closure" {
-			t.Errorf("meta resolution = %v, want import_closure", e.Meta)
+		if e.Meta == nil || e.Meta["resolution"] != "import_binding" {
+			t.Errorf("meta resolution = %v, want import_binding", e.Meta)
 		}
 		return
 	}

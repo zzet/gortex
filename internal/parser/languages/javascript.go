@@ -105,7 +105,8 @@ type jsDeferredCall struct {
 	receiver string // receiver text for member calls
 	line     int
 	isMember bool
-	// Used for bare-call scope and member-call pub/sub evidence.
+	// expr is the call_expression node: member calls use it to inspect
+	// pub/sub arguments, bare calls to read their lexical scope.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -424,6 +425,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		scopes.stamp(edge, c.expr, c.name, src)
 		result.Edges = append(result.Edges, edge)
 	}
+	clearCollapsedJSShadows(result.Edges)
 
 	// --- Event pub/sub edges ---
 	var pubsubEvents []pubsubEvent

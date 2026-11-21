@@ -155,7 +155,8 @@ type deferredCall struct {
 	receiver string // receiver text for member calls
 	line     int    // 1-based line of the call_expression
 	isMember bool
-	// Used for bare-call scope and member-call pub/sub evidence.
+	// expr is the call_expression node: member calls use it to inspect
+	// pub/sub arguments, bare calls to read their lexical scope.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -566,6 +567,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
 	}
+	clearCollapsedJSShadows(result.Edges)
 
 	for _, v := range vars {
 		if arrowNames[v.name] || v.defNode == nil {
