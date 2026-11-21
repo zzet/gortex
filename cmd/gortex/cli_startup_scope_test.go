@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -21,9 +22,23 @@ func TestCLIStartupRefusalKeepsKnownScopeBeforeControllerHandoff(t *testing.T) {
 	require.NoError(t, err)
 	primary, linked := fakeLinkedWorktree(t, filepath.Join(dir, "configured"))
 	unrelated, foreignLinked := fakeLinkedWorktree(t, filepath.Join(dir, "unconfigured"))
+	for _, pair := range []struct{ main, checkout string }{{primary, linked}, {unrelated, foreignLinked}} {
+		admin := filepath.Join(pair.main, ".git", "worktrees", "feature")
+		backlink, err := filepath.Rel(admin, filepath.Join(pair.checkout, ".git"))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(admin, "gitdir"), []byte(backlink+"\n"), 0o644))
+	}
+	copied := filepath.Join(dir, "copied-gitdir")
+	require.NoError(t, os.Mkdir(copied, 0o755))
+	forward, err := os.ReadFile(filepath.Join(linked, ".git"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(copied, ".git"), forward, 0o644))
 	family, ok := linkedWorktreeAt(linked)
 	require.True(t, ok)
 	require.Equal(t, primary, family.mainRepo)
+	copiedFamily, ok := linkedWorktreeAt(copied)
+	require.True(t, ok, "the copied marker must fool the legacy one-way classifier")
+	require.Equal(t, family, copiedFamily)
 
 	socket := filepath.Join(dir, "s")
 	t.Setenv("GORTEX_DAEMON_SOCKET", socket)
@@ -82,6 +97,7 @@ func TestCLIStartupRefusalKeepsKnownScopeBeforeControllerHandoff(t *testing.T) {
 		{"configured_linked", linked, true},
 		{"unrelated_primary", unrelated, false},
 		{"unrelated_linked", foreignLinked, false},
+		{"copied_configured_gitdir", copied, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var diagnostics bytes.Buffer

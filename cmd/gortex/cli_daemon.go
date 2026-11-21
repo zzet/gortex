@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -349,12 +350,15 @@ func startupConfiguresCWD(instance, cwd string) bool {
 	if root := startupConfiguredRoot(deadline, instance, cwd); root != "" && pathkey.HasPathPrefix(cwd, root) {
 		return true
 	}
-	family, ok := linkedWorktreeAt(cwd)
-	if !ok || family.mainRepo == "" || time.Now().After(deadline) {
+	if time.Now().After(deadline) {
 		return false
 	}
-	root := startupConfiguredRoot(deadline, instance, family.mainRepo)
-	return root != "" && pathkey.SamePathIdentity(root, family.mainRepo)
+	main := gitstate.LinkedCheckoutMain(cwd)
+	if main == "" || time.Now().After(deadline) {
+		return false
+	}
+	root := startupConfiguredRoot(deadline, instance, main)
+	return root != "" && pathkey.SamePathIdentity(root, main)
 }
 
 func startupConfiguredRoot(deadline time.Time, instance, cwd string) string {
