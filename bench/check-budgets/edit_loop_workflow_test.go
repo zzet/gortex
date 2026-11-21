@@ -45,7 +45,7 @@ func TestEditLoopWorkflowHasRealBlockingReferenceLanesAndRetainedEvidence(t *tes
 		for _, step := range job.Steps {
 			if strings.Contains(step.Run, "edit-collect") {
 				collects++
-				for _, flag := range []string{"--expected-candidate", "--candidate-binary", "--load-binary", "--require-lane " + lane} {
+				for _, flag := range []string{"--expected-candidate", "--candidate-binary", "--load-binary", "--require-edit-gate-seed", "--require-lane " + lane} {
 					if !strings.Contains(step.Run, flag) {
 						t.Errorf("%s collector lost %s", lane, flag)
 					}
@@ -59,7 +59,7 @@ func TestEditLoopWorkflowHasRealBlockingReferenceLanesAndRetainedEvidence(t *tes
 			t.Fatalf("%s has no actual strict collection/retained failure artifact", lane)
 		}
 	}
-	for _, proof := range []string{"ack-wait", "closed-read-gate", "gortex_edit_gate_seed", "edit_gate_seed", "EDIT_GATE_REFERENCE_SMOKE_CONFIG", "EDIT_GATE_REFERENCE_NIGHTLY_CONFIG"} {
+	for _, proof := range []string{"ack-wait", "closed-read-gate", "gortex_edit_gate_seed", "EDIT_GATE_REFERENCE_SMOKE_CONFIG", "EDIT_GATE_REFERENCE_NIGHTLY_CONFIG"} {
 		if !strings.Contains(string(data), proof) {
 			t.Errorf("workflow has no actual %s contract", proof)
 		}

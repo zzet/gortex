@@ -8,7 +8,7 @@ import (
 )
 
 func TestFunctionalUnavailableRequiresExplicitOwnedUnavailability(t *testing.T) {
-	for _, mode := range []string{"direct43", "preexisting86", "direct53", "accepted_stamps", "physical_window", "foreign_rpc", "foreign_background", "handoff", "missing_absence", "read_assisted", "winner", "unknown_P", "unknown_B", "B_P_mismatch", "A_failure", "bad_window_identity"} {
+	for _, mode := range []string{"direct43", "preexisting86", "direct53", "missing_winner", "missing_winner_without_diagnostic", "missing_winner_with_callback", "missing_winner_with_accepted", "missing_winner_with_witness", "missing_winner_with_unknown_reason", "accepted_stamps", "physical_window", "foreign_rpc", "foreign_background", "handoff", "missing_absence", "read_assisted", "winner", "unknown_P", "unknown_B", "B_P_mismatch", "A_failure", "bad_window_identity"} {
 		t.Run(mode, func(t *testing.T) {
 			data, err := os.ReadFile("testdata/superseded.json")
 			if err != nil {
@@ -19,7 +19,23 @@ func TestFunctionalUnavailableRequiresExplicitOwnedUnavailability(t *testing.T) 
 				t.Fatal(err)
 			}
 			p.PhysicalEvidenceAbsent, p.ReadAssistedAbsent = true, true
+			applied := uint64(3)
+			if strings.HasPrefix(mode, "missing_winner") {
+				applied++
+				p.Status.Applied = applied
+				if mode != "missing_winner_without_diagnostic" {
+					p.AccountingError += "; independent serving identity mismatch"
+				}
+			}
 			switch mode {
+			case "missing_winner_with_callback":
+				p.Status.BackgroundStage = "executing"
+			case "missing_winner_with_accepted":
+				p.Status.AcceptedStage = "accepted_stamps_retained"
+			case "missing_winner_with_witness":
+				p.Status.CoalescedAbsent = false
+			case "missing_winner_with_unknown_reason":
+				p.AccountingError += "; source read was incorrect"
 			case "preexisting86":
 				p.Status.Refusal = "preexisting_path_work"
 				p.Status.BindingPredicate, p.Status.BackgroundStage, p.Status.AcceptedStage = "", "", ""
@@ -52,8 +68,8 @@ func TestFunctionalUnavailableRequiresExplicitOwnedUnavailability(t *testing.T) 
 			case "bad_window_identity":
 				p.Status.Requested = 99
 			}
-			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53"
-			if p.Matches("commit-a", "edit-a", "rpc-2", 3, 3) != want {
+			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53" || mode == "missing_winner"
+			if p.Matches("commit-a", "edit-a", "rpc-2", 3, applied) != want {
 				t.Fatalf("mode=%s misclassified", mode)
 			}
 		})

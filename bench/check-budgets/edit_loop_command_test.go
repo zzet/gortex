@@ -71,7 +71,7 @@ func TestEditLoopCommandRetainsActualRowsAndSeededBreaches(t *testing.T) {
 					}
 				}
 				if variant == "closed_gate" {
-					r.Phases[0].Metrics["reclaim_gate_closures"] = metric{Value: pointer(1), Unit: "closures"}
+					setEditLoopReadGateClosures(t, &r.Phases[0], 1)
 				}
 				data, err := json.Marshal(raw)
 				if err != nil {

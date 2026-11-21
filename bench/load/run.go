@@ -58,12 +58,15 @@ type runOptions struct {
 	pairedDriver             func(context.Context, *privateRun, []*socketClient, []*socketClient, *Phase) error
 	smokeState               *privateRun // only the fixed smoke entry lends its freshly owned store
 	smokeMarkers             []string
+
+	LosslessEditProbeEvidence bool
 }
 
 func parseRun(args []string) (runOptions, error) {
 	var o runOptions
 	f := flag.NewFlagSet("load run", flag.ContinueOnError)
 	bindRunFlags(f, &o)
+	f.BoolVar(&o.LosslessEditProbeEvidence, "lossless-edit-probe-evidence", false, "retain exact RPC payloads in bounded edit-gate evidence")
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
 	bindChurnFlags(f, &o.Churn)
@@ -127,6 +130,9 @@ func (o runOptions) editACKPolicy() string {
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.LosslessEditProbeEvidence && (o.Scenario != editProbeScenario || !o.EditGateModes) {
+		return errors.New("--lossless-edit-probe-evidence requires edit-and-probe with --edit-gate-modes")
+	}
 	if o.EditConsumerProbes && (o.Scenario != editProbeScenario || o.Worktrees != 0 || o.EditRepos != 1 || o.SearchReadbackAcceptance) {
 		return errors.New("--edit-consumer-probes requires one primary edit-and-probe fixture without linked worktrees or search-readback acceptance")
 	}
