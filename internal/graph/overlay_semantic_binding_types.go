@@ -11,6 +11,64 @@ type OverlayLayerSemanticBindingTypeReader interface {
 	LayerSemanticBindingTypes([]SemanticBindingSite) (map[SemanticBindingSite]string, error)
 }
 
+type OverlayLayerSemanticBindingFileReader interface {
+	LayerSemanticBindingTypesForFiles(string, []string) (map[SemanticBindingSite]string, error)
+}
+
+func (v *OverlaidView) SemanticBindingTypesForFiles(repo string, files []string) (map[SemanticBindingSite]string, error) {
+	out := make(map[SemanticBindingSite]string)
+	owned, inherited := map[string]bool{}, map[string]bool{}
+	var ownFiles, baseFiles []string
+	for _, file := range files {
+		if owned[file] || inherited[file] {
+			continue
+		}
+		if v.layer != nil && v.layer.HasFile(file) {
+			owned[file] = true
+			if !v.layer.IsTombstone(file) {
+				ownFiles = append(ownFiles, file)
+			}
+		} else {
+			inherited[file] = true
+			baseFiles = append(baseFiles, file)
+		}
+	}
+	merge := func(rows map[SemanticBindingSite]string, wanted map[string]bool) error {
+		for site, value := range rows {
+			if site.RepoPrefix != repo || !wanted[site.FilePath] || (owned[site.FilePath] && v.layer.IsTombstone(site.FilePath)) {
+				return ErrSemanticBindingProjectionIncomplete
+			}
+			out[site] = value
+		}
+		return nil
+	}
+	if len(baseFiles) > 0 {
+		reader, ok := v.base.(SemanticBindingFileReader)
+		if !ok {
+			return nil, ErrSemanticBindingProjectionUnsupported
+		}
+		rows, err := reader.SemanticBindingTypesForFiles(repo, baseFiles)
+		if err != nil {
+			return nil, err
+		}
+		if err := merge(rows, inherited); err != nil {
+			return nil, err
+		}
+	}
+	if reader, ok := v.layer.(OverlayLayerSemanticBindingFileReader); ok {
+		rows, err := reader.LayerSemanticBindingTypesForFiles(repo, ownFiles)
+		if err != nil {
+			return nil, err
+		}
+		if err := merge(rows, owned); err != nil {
+			return nil, err
+		}
+	} else if len(owned) > 0 {
+		return nil, ErrSemanticBindingProjectionUnsupported
+	}
+	return out, nil
+}
+
 // SemanticBindingTypes follows the same file ownership as the selected graph.
 // It never substitutes a mutable corpus or a process-global compiler reader.
 func (v *OverlaidView) SemanticBindingTypes(sites []SemanticBindingSite) (map[SemanticBindingSite]string, error) {

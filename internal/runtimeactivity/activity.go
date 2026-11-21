@@ -118,6 +118,17 @@ func (t *Tracker) KindEpoch(kind string) uint64 {
 	return t.kindEpoch[kind]
 }
 
+// KindActive reports whether work of kind is running, without allocating a
+// snapshot. Background scans use this between rows to yield to foreground work.
+func (t *Tracker) KindActive(kind string) bool {
+	if t == nil {
+		return false
+	}
+	t.kindsMu.Lock()
+	defer t.kindsMu.Unlock()
+	return t.byKind[normalizeKind(kind)] > 0
+}
+
 // Snapshot returns process activity without blocking a running maintenance
 // callback for longer than the small map copy.
 func (t *Tracker) Snapshot() Snapshot {
@@ -189,6 +200,9 @@ func Current() Snapshot { return process.Snapshot() }
 
 // KindEpoch returns the process-wide KindEpoch of kind.
 func KindEpoch(kind string) uint64 { return process.KindEpoch(kind) }
+
+// KindActive reports whether process work of kind is running.
+func KindActive(kind string) bool { return process.KindActive(kind) }
 
 // RunIfQuiet executes fn behind the process-wide exclusive gate.
 func RunIfQuiet(quiet time.Duration, fn func()) (bool, time.Duration) {

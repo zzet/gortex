@@ -15,6 +15,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/resolver"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // Pre-warming a stack's per-delta caches.
@@ -58,7 +59,11 @@ func editDeltaBegin() func() {
 // the contract registry, the Go inventory, the dependency contracts, the
 // provides scan — keep running: a delta that needs one would otherwise
 // start it over.)
-func prewarmStandDown() bool { return editDeltaActive.Load() > 0 || editCycleHoldsLane() }
+func prewarmStandDown() bool {
+	// Sparse builds can be selected without an edit ticket. Their requested
+	// views take priority over speculative cache reads just as edits do.
+	return editDeltaActive.Load() > 0 || runtimeactivity.KindActive(sparseGenerationBuildActivity) || editCycleHoldsLane()
+}
 
 // editCycleSources are the edit-cycle predicates of the pre-warm runs in
 // flight (SparseGenerationBuilder.EditCycleActive: the edit-cycle predicate, the build

@@ -61,10 +61,11 @@ func cloneTokenCount(v any) int {
 	}
 }
 
-// stripCloneShingles removes the large parser-only shingle slice from the
-// SQLite Meta payload without mutating the caller's map. clone_sig remains a
-// promoted flat column and is hydrated back into Meta on every node read.
-func stripCloneShingles(meta map[string]any) map[string]any {
+// WithoutCloneTransportMeta returns node metadata without the parser-only
+// shingle payload, without mutating the caller's map. The writer and sparse
+// row comparison share this rule: these two fields live in the clone sidecar,
+// while clone_body and clone_sig remain facts carried by the node row.
+func WithoutCloneTransportMeta(meta map[string]any) map[string]any {
 	_, hasShingles := meta["clone_shingles"]
 	_, hasTokens := meta["clone_tokens"]
 	if !hasShingles && !hasTokens {
@@ -80,6 +81,9 @@ func stripCloneShingles(meta map[string]any) map[string]any {
 		if key != "clone_shingles" && key != "clone_tokens" {
 			out[key] = value
 		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

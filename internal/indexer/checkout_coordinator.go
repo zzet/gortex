@@ -177,6 +177,8 @@ func initialCheckoutPollDelay(checkoutID string, interval time.Duration) time.Du
 // flips again, because that would be forcing its answer over the winner's.
 var errRouteMoved = errors.New("indexer: the checkout route moved under this coordinator")
 
+var errCommitTargetMoved = errors.New("indexer: the checkout no longer needs the commit build")
+
 // errCheckoutUnsettled reports that two working-tree builds in a row were torn
 // by edits landing under them. A cycle answers it by rescheduling; a caller
 // driving a transition has to decide whether to wait for the checkout to go
@@ -845,6 +847,9 @@ type primaryBase struct {
 	// was would have to be guessed at. graphBase never sets it, so every
 	// unpinned path keeps the exact comparison it always had.
 	pinned bool
+	// pinAnchor is the dedicated ancestor retained by a reused committed
+	// parent. Zero keeps the ordinary dedicated-base pin representation.
+	pinAnchor int64
 }
 
 // NewCheckoutCoordinator builds a coordinator and starts its loop. The caller
@@ -1938,8 +1943,21 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	//
 	// pinRoutedBase refuses in the legacy regime and whenever anything but the
 	// base moved, so both fall through to the paths they always took.
+	primary := base
 	base, pinned := c.pinRoutedBase(ctx, base, route)
+	if pinned && c.preferPrimaryAfterCommitMove(ctx, primary, base, route, head.HeadTree) {
+		base, pinned = primary, false
+		c.notePinnedBase(0)
+	}
 	out.BasePinned = pinned
+	if !pinned && route.CommitGenerationID == 0 {
+		if parent, release, ok := c.chooseCommittedParent(ctx, base, head.HeadTree); ok {
+			defer release()
+			base = parent
+			c.notePinnedBase(base.retirementAnchor())
+			out.BasePinned = true
+		}
+	}
 
 	// A committed base that advanced under a checkout whose own tree did not
 	// move is recomposed, not torn down: both layers are rebuilt off-route and
@@ -1965,6 +1983,9 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	commitGeneration, err := c.reconcileCommitSlot(ctx, base, head.HeadTree, &route, &out)
 	lap("commit_slot")
 	if err != nil {
+		if c.rescheduleObsoleteCommit(err, &out) {
+			return out
+		}
 		if errors.Is(err, errRouteMoved) {
 			out.Rescheduled, out.rescheduledBy = true, stallReasonRouteMoved
 			c.rescheduleOnLostRoute("route moved under the commit flip")
@@ -2141,6 +2162,9 @@ func (c *CheckoutCoordinator) recomposeOverAdvancedBase(
 	previousCommit, previousDirty := commitRow.GenerationID, dirtyRow.GenerationID
 	commitGeneration, reused, err := c.resolveCommitLayer(ctx, base, head.HeadTree)
 	if err != nil {
+		if c.rescheduleObsoleteCommit(err, out) {
+			return true, nil
+		}
 		return true, err
 	}
 	// The checkout is free to commit while the delta over the new base is
@@ -2737,7 +2761,7 @@ func (c *CheckoutCoordinator) pinRoutedBase(
 		c.notePinnedBase(0)
 		return base, false
 	}
-	c.notePinnedBase(pinned.generationID)
+	c.notePinnedBase(pinned.retirementAnchor())
 	return pinned, true
 }
 
@@ -2810,6 +2834,14 @@ func (c *CheckoutCoordinator) validatedPinnedCommitBaseFor(
 	baseRow, found, err := c.catalog.GetViewGeneration(ctx, commitRow.BaseGenerationID)
 	if err != nil {
 		return out, false, err
+	}
+	if found && baseRow.TreeOID == commitRow.LowerViewFingerprint && baseRow.GenerationKind == CommitLayerGenerationKind {
+		parent, view, ok := c.openCommittedParent(ctx, base.graphID, baseRow)
+		if !ok {
+			return out, false, nil
+		}
+		view.Close()
+		return parent, true, nil
 	}
 	if !found || !servableGeneration(baseRow.State) ||
 		baseRow.GenerationKind != DedicatedBaseGenerationKind ||
@@ -3070,12 +3102,19 @@ func (c *CheckoutCoordinator) baseMovedUnderCycle(ctx context.Context, base prim
 		if base.generationID <= 0 || base.treeOID == "" {
 			return true, nil
 		}
-		if base.generationID == c.releaseRequestedBasePin() {
+		if base.generationID == c.releaseRequestedBasePin() || base.retirementAnchor() == c.releaseRequestedBasePin() {
 			return true, nil
 		}
 		row, found, err := c.catalog.GetViewGeneration(ctx, base.generationID)
 		if err != nil {
 			return false, err
+		}
+		if base.pinAnchor > 0 {
+			parent, view, ok := c.openCommittedParent(ctx, base.graphID, row)
+			if ok {
+				view.Close()
+			}
+			return !found || !ok || parent != base, nil
 		}
 		return !found || !servableGeneration(row.State) || row.TreeOID != base.treeOID, nil
 	}
@@ -3119,6 +3158,7 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 		baseReader = c.ancestryLayerBase(view)
 	}
 	generationID, report, err := c.builder.BuildCommitLayer(WithIndexOrigin(ctx, "checkout_coordinator"), CommitLayerRequest{
+		checkNeeded:   c.commitTargetCheck(targetTree),
 		Identity:      identity,
 		Base:          baseReader,
 		RepoDir:       c.root,
@@ -3139,6 +3179,50 @@ func (c *CheckoutCoordinator) resolveCommitLayer(
 			zap.Int("cap", report.ClosureCap))
 	}
 	return generationID, false, nil
+}
+
+// Each build calls this check serially at dispatch and phase boundaries.
+// Metadata only confirms an authoritative Git sample captured inside the
+// same unchanged interval. An unreadable layout or any ref-file change asks
+// Git again; a same-tree commit or pack-refs need not abandon the build.
+// Publication retains its independent, authoritative post-build HEAD guard.
+func (c *CheckoutCoordinator) commitTargetCheck(targetTree string) func(context.Context) error {
+	var confirmed gitstate.HeadEvidence
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if confirmed.Unchanged() {
+			return nil
+		}
+		evidence := c.sampler.CaptureHeadEvidence()
+		head, err := gitstate.SampleHEAD(ctx, c.root)
+		if err != nil {
+			return err
+		}
+		if head.TreeOID != targetTree {
+			return fmt.Errorf("%w: built for %s, now at %s", errCommitTargetMoved, targetTree, head.TreeOID)
+		}
+		if evidence.Unchanged() {
+			confirmed = evidence
+		}
+		return nil
+	}
+}
+
+// The builder has already abandoned its unpublished generation. Preserve the
+// existing route and retry the current tree without a failure backoff. The
+// later HEAD guard remains necessary for moves after the last early check.
+func (c *CheckoutCoordinator) rescheduleObsoleteCommit(err error, out *CheckoutCycle) bool {
+	if !errors.Is(err, errCommitTargetMoved) {
+		return false
+	}
+	out.Rescheduled, out.rescheduledBy = true, stallReasonHeadMoved
+	viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeHeadMoved)
+	c.logger.Debug("checkout coordinator: skipped obsolete commit build",
+		zap.String("checkout", c.checkoutID), zap.Error(err))
+	c.Signal("the checkout moved to another commit under the cycle")
+	return true
 }
 
 // moveCommitSlot points the commit slot at a different generation, dropping
@@ -3945,21 +4029,7 @@ func (c *CheckoutCoordinator) adoptedCommitRowFor(row store_sqlite.ViewGeneratio
 // evicting one and attributes every write to the generation the cache gave up.
 func (c *CheckoutCoordinator) storedCommit(ctx context.Context, identity GenerationIdentity) (int64, bool) {
 	key := generationIdentityKey(identity)
-	rows, err := c.catalog.FindReusableViewGenerations(ctx, store_sqlite.ViewGeneration{
-		OwnerKind:            identity.OwnerKind,
-		GraphID:              identity.GraphID,
-		LayerID:              identity.LayerID,
-		CheckoutID:           identity.CheckoutID,
-		GenerationKind:       identity.GenerationKind,
-		BaseGenerationID:     identity.BaseGenerationID,
-		LowerViewFingerprint: identity.LowerViewFingerprint,
-		TreeOID:              identity.TreeOID,
-		ProvenanceCommitOID:  identity.ProvenanceCommitOID,
-		ConfigHash:           identity.ConfigHash,
-		ExtractorVersions:    identity.ExtractorVersions,
-		ResolverVersion:      identity.ResolverVersion,
-		DependencyRevision:   identity.DependencyRevision,
-	}, maxStoredCommitLayerCandidates)
+	rows, err := c.catalog.FindReusableViewGenerations(ctx, commitGenerationLookup(identity), maxStoredCommitLayerCandidates)
 	if err != nil {
 		// A reuse lookup that cannot be answered is not a failed cycle: the
 		// build below produces the same payload, at the price this item exists

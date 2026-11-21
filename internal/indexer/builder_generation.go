@@ -176,6 +176,11 @@ type LayerBase interface {
 
 // BuildRequest is one sparse generation build.
 type BuildRequest struct {
+	// checkNeeded avoids expensive work for obsolete checkout demand. It is
+	// an optimization, not a replacement for the publication/route fences.
+	// Immutable ref builds leave it nil.
+	checkNeeded func(context.Context) error
+
 	// contractFullCensus is set only by the claimed complete-snapshot producer.
 	contractFullCensus bool
 	// importBatch marks the one-file quantum of a large working-tree import.
@@ -363,6 +368,10 @@ type EnrichmentOutcome struct {
 // have re-derived, and UnmaskedPayloadNodes says the payload carries a node at
 // a path no mask claims.
 type BuildReport struct {
+	// The committed compiler pass ran against the complete in-memory corpus
+	// before context withdrawal. Do not repeat it against the drained subset.
+	committedTypecheckInMemory bool
+
 	GenerationID int64
 
 	// ChangedBodyFiles are the graph paths of the files holding a function
@@ -793,6 +802,14 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 			}
 		}()
 		var separation contextSeparation
+		// An empty delta has no expensive pass/enrichment to avoid. Its
+		// coordinator's existing post-build HEAD guard is enough; avoid adding
+		// Git probes to the common equal-HEAD startup path.
+		if req.checkNeeded != nil && len(plan.indexed) > 0 {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
+		}
 		if adopted || len(plan.indexed) > 0 {
 			var err error
 			if separation, err = b.runPass(ctx, req, plan, handle, &report); err != nil {
@@ -815,7 +832,14 @@ func (b *SparseGenerationBuilder) buildReservedGenerationWithCallbacks(ctx conte
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b.runEnrichment(ctx, req, handle, &report)
+		if req.checkNeeded != nil && len(plan.indexed) > 0 {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
+		}
+		if !report.committedTypecheckInMemory {
+			b.runEnrichment(ctx, req, handle, &report)
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -976,6 +1000,17 @@ type buildPlan struct {
 	declared map[string]struct{}
 }
 
+// Declared Go context is withdrawn without comparison, so reading it alone
+// must not start a compiler. A docs-only edit can carry such resolution context.
+func (p buildPlan) hasGoOutputCandidates() bool {
+	for _, rel := range p.indexed {
+		if _, readOnly := p.declared[rel]; !readOnly && strings.HasSuffix(rel, ".go") {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *SparseGenerationBuilder) planFileSetContext(
 	ctx context.Context,
 	req BuildRequest,
@@ -1129,6 +1164,7 @@ func (b *SparseGenerationBuilder) runPass(
 	}
 	defer idx.Close()
 	idx.headProvenance = req.headProvenance
+	idx.passCheckNeeded = req.checkNeeded
 
 	// The read-only-context mode. Installing the filter is what lets a pass
 	// writing through a derived generation handle hold its corpus in memory at
@@ -1151,11 +1187,47 @@ func (b *SparseGenerationBuilder) runPass(
 	// pass read.
 	var filteredNodes, filteredEdges int
 	filtered := false
+	var compiled *committedBindingCorpus
 	idx.setPassCorpusFilter(func(corpus *graph.Graph) error {
+		canSeparate := true
+		var payload contextCorpus = corpus
+		if req.checkNeeded != nil {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
+		}
+		// Compare typed context with typed context, and persist the compiler's
+		// changes once. Previously the untyped pass could not equal an enriched
+		// base, so unchanged context was drained and then updated by the compiler.
+		// A refused shadow admission still uses the existing post-pass stage.
+		if req.Identity.GenerationKind == CommitLayerGenerationKind && req.committedTypecheck != nil && req.Enrich == nil && b.Semantic != nil && plan.hasGoOutputCandidates() {
+			compiled = &committedBindingCorpus{Graph: corpus}
+			b.runCommittedTypecheck(ctx, req, compiled, report)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			report.committedTypecheckInMemory = report.CommittedTypecheck.Ran
+			// A refused/preempted compiler cannot prove typed context equal.
+			// Keep the complete corpus and use the established post-pass stage
+			// and separation instead, including its normal completeness report.
+			canSeparate = report.CommittedTypecheck.Ran
+			if canSeparate {
+				payload = compiled
+			}
+		}
 		var err error
-		separation, err = b.separateAndPrune(ctx, req, plan, corpus)
-		if err != nil {
-			return err
+		if canSeparate {
+			separation, err = b.separateAndPrune(ctx, req, plan, payload)
+			if err != nil {
+				return err
+			}
+		}
+		// Base comparison can itself take time. Recheck immediately before
+		// allowing the pass to drain, including a move during comparison.
+		if req.checkNeeded != nil {
+			if err := req.checkNeeded(ctx); err != nil {
+				return err
+			}
 		}
 		filteredNodes, filteredEdges = passCorpusCounts(corpus, req.RepoPrefix)
 		filtered = true
@@ -1179,6 +1251,14 @@ func (b *SparseGenerationBuilder) runPass(
 	result, err := idx.IndexCtx(ctx, req.RootPath)
 	if err != nil {
 		return contextSeparation{}, fmt.Errorf("indexer: index generation payload: %w", err)
+	}
+	if report.committedTypecheckInMemory {
+		if err := ctx.Err(); err != nil {
+			return contextSeparation{}, err
+		}
+		if err := compiled.persist(req.RepoPrefix, handle); err != nil {
+			return contextSeparation{}, fmt.Errorf("indexer: persist committed compiler bindings: %w", err)
+		}
 	}
 	if result != nil {
 		report.NodeCount = result.NodeCount
@@ -1633,6 +1713,10 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	var withheldPaths []string
 	var withheldContracts []string
 	declaredWithheld := false
+	bindingMatches, err := b.matchingContextBindings(req, plan, corpus)
+	if err != nil {
+		return contextSeparation{}, err
+	}
 	for _, graphPath := range contextPaths {
 		if err := ctx.Err(); err != nil {
 			return contextSeparation{}, err
@@ -1643,6 +1727,10 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 			// no payload to withhold and no re-derivation to compare, so the
 			// generation stays silent about it and PlannedNotCovered keeps
 			// reporting the absence for what it is.
+			continue
+		}
+		if equal, compared := bindingMatches[graphPath]; compared && !equal {
+			out.retainedPaths = append(out.retainedPaths, graphPath)
 			continue
 		}
 		if _, isDeclared := declaredPaths[graphPath]; isDeclared && !carried.holdsContentBody(graphPath) &&
@@ -1729,6 +1817,11 @@ func (b *SparseGenerationBuilder) withholdContextPayload(
 	}) // required: requireContextCorpus
 	if err := constants.DeleteConstantValuesByFiles(req.RepoPrefix, withheldPaths); err != nil {
 		return contextSeparation{}, fmt.Errorf("indexer: withhold generation constant values: %w", err)
+	}
+	if bindings, ok := corpus.(graph.SemanticBindingTypeWriter); ok {
+		if err := bindings.DeleteSemanticBindingTypesByFiles(req.RepoPrefix, withheldPaths); err != nil {
+			return contextSeparation{}, fmt.Errorf("indexer: withhold generation semantic bindings: %w", err)
+		}
 	}
 	// Symbol FTS (a store corpus; the in-memory corpus derives it at the
 	// drain) and clone shingles are keyed by identity and survive the node
@@ -2292,6 +2385,8 @@ func builderNodeEquivalent(carried, base *graph.Node) bool {
 	left, right := *carried, *base
 	left.AbsoluteFilePath, right.AbsoluteFilePath = "", ""
 	left.FetchedAt, right.FetchedAt = time.Time{}, time.Time{}
+	left.Meta = store_sqlite.WithoutCloneTransportMeta(left.Meta)
+	right.Meta = store_sqlite.WithoutCloneTransportMeta(right.Meta)
 	return reflect.DeepEqual(left, right)
 }
 

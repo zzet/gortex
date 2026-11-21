@@ -42,6 +42,7 @@ func newFixture(t *testing.T) *fixture {
 	f.pkg("internal/indexer", "func Value()int{return 42}", "TestIndexer")
 	f.write("internal/indexer/other_test.go", "package indexer\nimport \"testing\"\nfunc TestOtherIndexer(t *testing.T){}\nfunc TestWatchFixture(t *testing.T){}\n")
 	f.pkg("internal/graph/store_sqlite", "func Value()int{return 42}", "TestStore")
+	f.pkg("cmd/gortex", "func Value()int{return 42}", "TestCLI")
 	f.git("init", "-q", "-b", "main")
 	f.base = f.commit()
 	return f
@@ -196,7 +197,7 @@ func TestSelectionResourcesDependenciesAndCIAlwaysFull(t *testing.T) {
 			}
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != 16 {
+			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != 19 {
 				t.Fatalf("fallback %s %s", m.Mode, m.Reason)
 			}
 		})
@@ -236,7 +237,7 @@ func TestSelectionNestedCgoGeneratedAndUnsupportedInputs(t *testing.T) {
 			f.git("reset", "--hard", f.base)
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || len(m.Matrix.Include) != 16 {
+			if m.Mode != "full" || len(m.Matrix.Include) != 19 {
 				t.Fatalf("unsafe input optimized: %s", m.Reason)
 			}
 		})
