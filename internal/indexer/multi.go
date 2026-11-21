@@ -1017,18 +1017,17 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	return master
 }
 
-func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) {
-	mi.runMasterResolveHooked(scope, useLSP, nil)
-}
-
-// runMasterResolveHooked is runMasterResolve with an optional compute-done
-// hook threaded into the resolver (see Resolver.OnComputeDone).
-func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
-	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) error {
+	err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, nil)
+	if err != nil {
 		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
 	}
+	return err
 }
 
+// runMasterResolveHookedContext is runMasterResolve with cancellation and an
+// optional compute-done hook threaded into the resolver (see
+// Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
 	if ctx == nil {
 		ctx = context.Background()
