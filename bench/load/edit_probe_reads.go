@@ -35,6 +35,9 @@ func (r *editProbeRuntime) readClass(at time.Time) string {
 	case at.Before(r.origin):
 		return "no_edit_baseline"
 	case r.pendingEdits.Load() > 0:
+		if r.plan.OwnACKReadbackOnly {
+			return "during_own_transaction"
+		}
 		return "under_edit"
 	default:
 		return "between_edits"
