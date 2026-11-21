@@ -23,6 +23,8 @@ func editProbeOutputMode(c Corpus) (string, error) {
 // harness cannot select, so absent coverage is explicit rather than silent.
 var editProbeOutputModes = []string{"json", "toon", "compact", "cli", "gcx"}
 
+var editProbeGateTools = []string{"read.source", "read.summary", "read.editing_context", "search.symbols", "search.text", "relations.callers", "trace.call_chain"}
+
 type editProbeModes map[string]editProbeModeCoverage
 
 type editProbeToolCoverage struct {
@@ -89,7 +91,7 @@ func editProbeOutputCoverage(selected string, counts map[string]editProbeModeCou
 		if selected == "gate" {
 			observed := 0
 			coverage.Tools = map[string]editProbeToolCoverage{}
-			for _, tool := range []string{"read.source", "read.summary", "read.editing_context", "search.symbols", "search.text", "relations.callers", "trace.call_chain"} {
+			for _, tool := range editProbeGateTools {
 				row := editProbeToolCoverage{State: "MISSING"}
 				if mode == "compact" && !editProbeCompactOperations[tool] {
 					zero := 0
@@ -234,6 +236,41 @@ func (r *editProbeRuntime) countGateMode(step editProbeStep, mode, tool string, 
 		}
 	}
 	r.modeCounts[step.ProbeMode] = count
+}
+
+// FirstCorrect also records useful pre-ACK observations. They cannot supply
+// the smoke gate's assigned post-ACK denominator. Keep the original probers
+// alive until the already-required per-tool witnesses exist for THIS edit.
+// Call outside state.mu; the observation path releases state.mu before mu.
+func (r *editProbeRuntime) gateModeComplete(step editProbeStep) bool {
+	if !r.plan.GateModes {
+		return true
+	}
+	mode := r.stepProbeMode(step)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gate := r.modeCounts[mode].gate
+	if gate == nil {
+		return false
+	}
+	for _, tool := range editProbeGateTools {
+		count := gate.tools[tool]
+		if count == nil {
+			return false
+		}
+		if mode == "compact" && !editProbeCompactOperations[tool] {
+			// The existing compact exception requires the assigned edit's
+			// actual decoded post-ACK JSON fallback/refusal witness.
+			if !count.refused[step.Ordinal] {
+				return false
+			}
+			continue
+		}
+		if !count.edits[step.Ordinal] || mode == "compact" && !count.correct[step.Ordinal] {
+			return false
+		}
+	}
+	return true
 }
 
 func editProbeRequestOutput(req request) string {

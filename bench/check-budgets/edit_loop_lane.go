@@ -56,12 +56,14 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 	for _, task := range plan.Tasks {
 		scenarios[task.Scenario] = true
 	}
+	var budgets []budget
 	rows := []editLoopRow{}
 	pass := true
 	for _, b := range p.Budgets {
 		if b.HostClass != c.HostClass || !scenarios[b.Scenario] || !slices.Contains(b.Lane, "edit-smoke") {
 			continue
 		}
+		budgets = append(budgets, b)
 		row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit}
 		if loadErr != nil {
 			row.Reason = loadErr.Error()
@@ -79,6 +81,9 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 		if editLoopRowBlocks(row) {
 			pass = false
 		}
+	}
+	if err := writeEditLoopPerReportRows(filepath.Join(out, "budget-results-per-report.json"), budgets, d, loadErr); err != nil {
+		failures = append(failures, err)
 	}
 	var table bytes.Buffer
 	if err := printEditLoopRows(io.MultiWriter(stdout, &table), rows); err != nil {

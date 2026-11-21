@@ -49,6 +49,7 @@ func editLoopEvidenceFixture(t *testing.T) report {
 	if err != nil {
 		t.Fatal(err)
 	}
+	setEditLoopReadGateClosures(t, &result.Phases[0], 0)
 	return result
 }
 
@@ -64,6 +65,34 @@ func TestEditLoopMeasurementsUseActualRecordsAndCounters(t *testing.T) {
 			t.Errorf("%s=%v error%v, want%v", name, got, err, want)
 		}
 	}
+}
+
+func TestEditLoopReadGateClosureRequiresOwnedPauseCount(t *testing.T) {
+	p := editLoopEvidenceFixture(t).Phases[0]
+	setEditLoopReadGateClosures(t, &p, 2)
+	got, err := measureEditLoopRow(p, "read_gate_closures")
+	if err != nil || got != 2 {
+		t.Fatalf("owned pause_count delta=%v, err=%v", got, err)
+	}
+	p.Metrics["reclaim_gate_closures"] = metric{Value: pointer(0), Unit: "closures"}
+	if _, err := measureEditLoopRow(p, "read_gate_closures"); err == nil {
+		t.Fatal("contradictory producer aggregate accepted despite positive owned pause_count delta")
+	}
+	p.Status = nil
+	if _, err := measureEditLoopRow(p, "read_gate_closures"); err == nil {
+		t.Fatal("unowned zero-closure aggregate accepted")
+	}
+}
+
+func setEditLoopReadGateClosures(t *testing.T, p *phase, count int) {
+	t.Helper()
+	fixture := readGateFixture(t)
+	for name, value := range fixture.Gate {
+		p.Gate[name] = value
+	}
+	p.Status = fixture.Status
+	p.Status[1] = json.RawMessage(fmt.Sprintf(`{"pid":123,"storage":{"wal_reclaim":{"pause_count":%d}}}`, 7+count))
+	p.Metrics["reclaim_gate_closures"] = metric{Value: pointer(float64(count)), Unit: "closures"}
 }
 
 func TestEditLoopEvidenceRejectsWrongPhaseCadenceAndWall(t *testing.T) {

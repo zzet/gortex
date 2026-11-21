@@ -176,7 +176,6 @@ func (d *mcpDispatcher) loadingIndexHealth(inbound []byte, rec indexer.RepoLoad)
 	if d.srv != nil {
 		phase, percent = d.srv.WarmupProgress()
 	}
-	repos := []map[string]any{}
 	message := gortexmcp.ServerInstructionsIdentityPending()
 	reason := ""
 	if rec.State == indexer.RepoLoadIdentityPending {
@@ -185,8 +184,15 @@ func (d *mcpDispatcher) loadingIndexHealth(inbound []byte, rec indexer.RepoLoad)
 			phase, reason, message = "scope_binding", rec.Reason, gortexmcp.ServerInstructionsScopeBindingPending()
 		}
 	} else {
-		repos = append(repos, map[string]any{"repo": rec.Prefix, "path": rec.Root, "state": string(rec.State), "since": rec.Since})
 		message = gortexmcp.RepoLoadingSuggestion(rec.Label())
+	}
+	return loadingIndexHealthFrame(inbound, rec, phase, percent, message, reason)
+}
+
+func loadingIndexHealthFrame(inbound []byte, rec indexer.RepoLoad, phase string, percent int, message, reason string) []byte {
+	repos := []map[string]any{}
+	if rec.Root != "" && rec.State != indexer.RepoLoadIdentityPending {
+		repos = append(repos, map[string]any{"repo": rec.Prefix, "path": rec.Root, "state": string(rec.State), "since": rec.Since})
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"status": "loading", "phase": phase, "percent": percent, "repos": repos, "message": message, "reason": reason,
