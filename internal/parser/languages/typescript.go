@@ -152,8 +152,8 @@ type deferredCall struct {
 	receiver string // receiver text for member calls
 	line     int    // 1-based line of the call_expression
 	isMember bool
-	// expr is the call_expression node, kept for member calls so the
-	// post-pass can inspect arguments for pub/sub topic detection.
+	// expr is the call_expression node: member calls use it to inspect
+	// pub/sub arguments, bare calls to read their lexical scope.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -199,6 +199,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	var scopes jsScopeCache
 
 	imports := map[string]string{}
 	arrowNames := map[string]bool{}
@@ -299,6 +300,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			calls = append(calls, deferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
+				expr:        expr.Node,
 				returnUsage: classifyReturnUsage(expr.Node, src, jsTSReturnUsageSpec),
 			})
 
@@ -494,6 +496,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 			}
 			stampReturnUsage(edge, c.returnUsage)
+			scopes.stamp(edge, c.expr, c.name, src)
 			result.Edges = append(result.Edges, edge)
 			continue
 		}
@@ -559,6 +562,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		stampReturnUsage(edge, c.returnUsage)
 		result.Edges = append(result.Edges, edge)
 	}
+	clearCollapsedJSShadows(result.Edges)
 
 	for _, v := range vars {
 		if arrowNames[v.name] || v.defNode == nil {

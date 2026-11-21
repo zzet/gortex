@@ -4637,6 +4637,10 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
+	if jsLexicallyShadowed(e, candidates) {
+		stats.Unresolved++
+		return
+	}
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the

@@ -43,7 +43,8 @@ import (
 // Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
-// Direct named JS/TS import bindings now disambiguate otherwise competing files.
+// Direct named JS/TS import bindings now disambiguate otherwise competing files,
+// and lexically shadowed bare calls no longer bind by name.
 const ResolutionSemanticsVersion = 8
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two

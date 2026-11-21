@@ -118,6 +118,10 @@ declaration takes precedence (`import_binding`). Otherwise, a unique candidate
 in a directly imported file or its barrel re-exports can supply file-level
 evidence (`import_closure`). A same-file declaration blocks import promotion;
 when imports don't settle the call, the usual resolution rules still apply.
+A call whose name is bound by an enclosing parameter, catch clause, block or
+hoisted `var` is not an import call. It binds to a same-file declaration when
+one exists and otherwise stays unresolved. A local initialized from `require()`
+keeps its import evidence.
 
 ### Julia specifics
 

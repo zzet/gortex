@@ -33,6 +33,28 @@ import (
 // Same-file declarations block both import tiers. Restrict these rules to
 // JS/TS: importing a package does not put its bare names in scope in Go.
 
+// jsLexicallyShadowed reports a bare call whose name an enclosing parameter or
+// local owns. A local with a same-file value node continues to the same-file
+// tier; otherwise no graph symbol is the callee, so the stub stays unresolved.
+func jsLexicallyShadowed(e *graph.Edge, candidates []*graph.Node) bool {
+	switch e.Meta[graph.JSLexicalBindingMeta] {
+	case graph.JSPendingParameter:
+		return true
+	case graph.JSLexicalLocal:
+		for _, c := range candidates {
+			if c.FilePath != e.FilePath {
+				continue
+			}
+			switch c.Kind {
+			case graph.KindFunction, graph.KindMethod, graph.KindVariable, graph.KindConstant:
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) (*graph.Node, string) {
 	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
 		return nil, ""
@@ -41,13 +63,18 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	// local — the import pick must stand down and let the locality/scope
 	// cascade bind it. Any kind blocks: a local class, const, or nested
 	// helper of the same name all shadow an import at some scope, and
-	// falling through only preserves today's behaviour. The one exception
-	// is the caller's own import-statement node: its display name is the
-	// imported module's basename, so `import { useX } from './useX'` puts a
-	// same-named KindImport node in the caller file. That node is the
-	// import evidence itself, not a shadow.
+	// falling through only preserves today's behaviour. Two exceptions: the
+	// caller's own import-statement node, whose display name is the imported
+	// module's basename (`import { useX } from './useX'`), is the import
+	// evidence itself; and a parameter or local of some other function says
+	// nothing about this call, whose own scope jsLexicallyShadowed checked.
 	for _, c := range candidates {
-		if c.FilePath == callerFile && c.Kind != graph.KindImport {
+		if c.FilePath != callerFile {
+			continue
+		}
+		switch c.Kind {
+		case graph.KindImport, graph.KindParam, graph.KindLocal:
+		default:
 			return nil, ""
 		}
 	}

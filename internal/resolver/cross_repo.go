@@ -1388,6 +1388,11 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
+	// The per-repo pass already bound any shadow with a same-file value.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+		stats.Unresolved++
+		return
+	}
 	file := cr.callerFileID(e)
 	if target := cr.jsTSBindingsByFile[file][funcName]; target != "" {
 		if imported := cr.cachedGetNode(target); imported != nil && (imported.Kind == graph.KindFunction || imported.Kind == graph.KindMethod) {

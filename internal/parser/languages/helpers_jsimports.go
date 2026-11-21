@@ -25,6 +25,196 @@ func jsNamedExportMeta(decl *sitter.Node, meta map[string]any) map[string]any {
 	return meta
 }
 
+func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "identifier", "type_identifier", "shorthand_property_identifier_pattern":
+		visit(n.Content(src))
+	case "required_parameter", "optional_parameter":
+		visitJSPattern(n.ChildByFieldName("pattern"), src, visit)
+	case "pair_pattern":
+		visitJSPattern(n.ChildByFieldName("value"), src, visit)
+	case "assignment_pattern", "object_assignment_pattern":
+		visitJSPattern(n.ChildByFieldName("left"), src, visit)
+	case "formal_parameters", "object_pattern", "array_pattern", "rest_pattern":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			visitJSPattern(n.NamedChild(i), src, visit)
+		}
+	}
+}
+
+// A local initialized from require() still names that module's export, so it
+// stays eligible for import evidence.
+func jsRequireInitializer(declarator *sitter.Node, src []byte) bool {
+	value := declarator.ChildByFieldName("value")
+	for value != nil && value.Type() == "member_expression" {
+		value = value.ChildByFieldName("object")
+	}
+	if value == nil || value.Type() != "call_expression" {
+		return false
+	}
+	callee := value.ChildByFieldName("function")
+	return callee != nil && callee.Content(src) == "require"
+}
+
+func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "ambient_declaration":
+		visitJSDeclaration(n.NamedChild(0), src, visit)
+	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
+		visitJSPattern(n.ChildByFieldName("name"), src, visit)
+	case "lexical_declaration", "variable_declaration":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			v := n.NamedChild(i)
+			if v.Type() == "variable_declarator" && !jsRequireInitializer(v, src) {
+				visitJSPattern(v.ChildByFieldName("name"), src, visit)
+			}
+		}
+	}
+}
+
+// var crosses statement-block boundaries but not function or class boundaries.
+// Only descend through statement containers: expressions cannot introduce a
+// var in this scope, even when they contain an entire function expression.
+func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "variable_declaration":
+		visitJSDeclaration(n, src, visit)
+		return
+	case "for_in_statement":
+		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
+			visitJSPattern(n.ChildByFieldName("left"), src, visit)
+		}
+	case "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
+		"switch_case", "switch_default", "for_statement", "while_statement", "do_statement",
+		"try_statement", "catch_clause", "finally_clause", "with_statement", "labeled_statement":
+	default:
+		return
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		visitJSHoistedVars(n.NamedChild(i), src, visit)
+	}
+}
+
+func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+	if n != nil && n.Type() != "variable_declaration" {
+		visitJSDeclaration(n, src, visit)
+	}
+}
+
+// Cache direct declarations once per scope. A sibling function's declarations
+// cannot shadow this call; parameters of every enclosing function can. Module
+// scope is not recorded: an ES import cannot share it with a same-named
+// declaration, and the resolver's same-file tier already handles the rest.
+type jsScopeKey struct {
+	start, end uint32
+	kind       string
+	body       bool
+}
+type jsScopeCache map[jsScopeKey]map[string]string
+
+func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
+	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		kind := n.Type()
+		switch kind {
+		case "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		default:
+			continue
+		}
+		// The body sees hoisted var declarations; parameter initializers do
+		// not. Cache the two environments separately for the same function.
+		body := child.Type() == "statement_block"
+		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
+		names, ok := (*cache)[key]
+		if !ok {
+			add := func(name, value string) {
+				if names == nil {
+					names = map[string]string{}
+				}
+				names[name] = value
+			}
+			local := func(id string) { add(id, graph.JSLexicalLocal) }
+			switch kind {
+			case "statement_block":
+				// A class static block is its own var scope.
+				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
+					visitJSHoistedVars(n, src, local)
+				}
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					visitJSBlockDeclaration(n.NamedChild(i), src, local)
+				}
+			case "switch_body":
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					clause := n.NamedChild(i)
+					for j := 0; j < int(clause.NamedChildCount()); j++ {
+						visitJSBlockDeclaration(clause.NamedChild(j), src, local)
+					}
+				}
+			case "for_statement", "for_in_statement":
+				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local)
+				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
+					visitJSPattern(n.ChildByFieldName("left"), src, local)
+				}
+			default:
+				param := func(id string) { add(id, graph.JSPendingParameter) }
+				if body && kind != "catch_clause" {
+					visitJSHoistedVars(child, src, local)
+				}
+				if kind == "function_expression" || kind == "generator_function" {
+					visitJSPattern(n.ChildByFieldName("name"), src, local)
+				}
+				visitJSPattern(n.ChildByFieldName("parameters"), src, param)
+				visitJSPattern(n.ChildByFieldName("parameter"), src, param)
+			}
+			if *cache == nil {
+				*cache = jsScopeCache{}
+			}
+			(*cache)[key] = names
+		}
+		if binding := names[name]; binding != "" {
+			if edge.Meta == nil {
+				edge.Meta = map[string]any{}
+			}
+			edge.Meta[graph.JSLexicalBindingMeta] = binding
+			return
+		}
+	}
+}
+
+// Calls with one From/To/Line identity collapse into one stored edge. When a
+// real call shares that site with a shadowed one, the stored edge must stay
+// eligible for the real call's binding.
+func clearCollapsedJSShadows(edges []*graph.Edge) {
+	shadowed := make(map[graph.EdgeIdentity][]*graph.Edge)
+	for _, e := range edges {
+		if e.Kind == graph.EdgeCalls && e.Meta[graph.JSLexicalBindingMeta] != nil {
+			id := graph.EdgeIdentityFor(e)
+			shadowed[id] = append(shadowed[id], e)
+		}
+	}
+	if len(shadowed) == 0 {
+		return
+	}
+	for _, e := range edges {
+		if e.Kind != graph.EdgeCalls || e.Meta[graph.JSLexicalBindingMeta] != nil {
+			continue
+		}
+		id := graph.EdgeIdentityFor(e)
+		for _, s := range shadowed[id] {
+			delete(s.Meta, graph.JSLexicalBindingMeta)
+		}
+		delete(shadowed, id)
+	}
+}
+
 // jsImportBindingCap bounds how many per-binding import / re-export edges a
 // single statement may emit. Barrel files (`export { ... } from`) routinely
 // re-export hundreds of names; without a cap one statement could add hundreds
