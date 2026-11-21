@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,6 +89,17 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					s, sql, path := newAssemblyRetirementFixture(t)
 					backend := &assemblyRetirementStore{Store: sql}
 					s.graph, s.engine = backend, query.NewEngine(backend)
+					var revisionFile string
+					switch transition {
+					case "physical_peer_same_bytes", "changed_bytes", "source_event", "unchecked_eviction", "canonical_no_projection":
+						// Stage an independently indexed inventory row before
+						// the ACK. Its later removal changes the store revision
+						// without advancing the requested file's graph or hash.
+						revisionFile = "metadata_revision_witness.go"
+						revisionPath := filepath.Join(filepath.Dir(path), revisionFile)
+						require.NoError(t, os.WriteFile(revisionPath, []byte("package probe\n\nfunc metadataRevisionWitness() {}\n"), 0600))
+						require.NoError(t, s.indexer.IndexFile(revisionPath))
+					}
 					pending := make(chan indexer.MutationResult)
 					s.SetWatcher(mutationTestWatcher{done: pending})
 					t.Cleanup(func() {
@@ -132,14 +142,6 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 						retirement.run()
 						require.True(t, entry.checkedRetired.Load())
 						require.Nil(t, liveEntry(pendingFileProjections, path))
-						paths := []string{entry.graphPath}
-						files, err := sql.FileMetasByPaths(entry.repoPrefix, paths)
-						require.NoError(t, err)
-						require.Contains(t, files, entry.graphPath)
-						require.Equal(t, entry.hash, files[entry.graphPath].ContentHash)
-						// Delete the real file-inventory row to move the checked
-						// store revision without rewriting a canonical graph node.
-						backend.write = func() error { return sql.DeleteFileMetasByFiles(entry.repoPrefix, paths) }
 					case "canonical_retirement", "expired", "cancelled", "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "options_true_override_false":
 						// Prepare from the actual disk bytes with the indexer's own
 						// parser. The request must still select the live ACK over
@@ -180,21 +182,28 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 						}
 						return captured.handler(ctx, req)
 					})
+					var revisionGraphPath string
+					var targetMeta graph.FileMetaRow
 					if prepared != nil {
 						// The durable file row advances the real payload input
 						// revision checked by the open SQL read transaction.
 						backend.write = func() error { return sql.SetFileMetas(entry.repoPrefix, fileMeta) }
-					} else if transition != "unchanged" && transition != "canonical_no_projection" {
-						neighbor := sql.GetNode("main.go::Neighbor")
-						require.NotNil(t, neighbor)
-						updated := *neighbor
-						updated.Meta = maps.Clone(neighbor.Meta)
-						if updated.Meta == nil {
-							updated.Meta = make(map[string]any)
+					} else if revisionFile != "" {
+						revisionGraphPath = filepath.ToSlash(filepath.Join(filepath.Dir(entry.graphPath), revisionFile))
+						files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath, revisionGraphPath})
+						require.NoError(t, err)
+						require.Contains(t, files, entry.graphPath)
+						require.Contains(t, files, revisionGraphPath)
+						require.NotEmpty(t, files[revisionGraphPath].ContentHash)
+						targetMeta = files[entry.graphPath]
+						if transition == "canonical_no_projection" {
+							require.Equal(t, entry.hash, targetMeta.ContentHash)
+						} else {
+							require.NotEqual(t, entry.hash, targetMeta.ContentHash)
+							require.Same(t, entry, liveEntry(pendingFileProjections, path))
 						}
-						updated.Meta["assembly_revision"] = "actual checked writer"
 						backend.write = func() error {
-							return sql.AddBatchChecked([]*graph.Node{&updated}, nil)
+							return sql.DeleteFileMetasByFiles(entry.repoPrefix, []string{revisionGraphPath})
 						}
 					}
 					backend.after = func(_ context.Context, scopeErr error) {
@@ -208,12 +217,15 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							}
 							require.ErrorIs(t, scopeErr, graph.ErrContractProjectionStale, "RED requires a REAL revision refusal, not a budget/setup failure")
 							require.NoError(t, first.Err())
+							if revisionGraphPath != "" {
+								files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath, revisionGraphPath})
+								require.NoError(t, err)
+								require.Equal(t, targetMeta, files[entry.graphPath])
+								require.NotContains(t, files, revisionGraphPath)
+							}
 							if transition == "canonical_no_projection" {
 								require.False(t, s.hasRequestProjectionFact(first, "main.go"))
 								require.Nil(t, liveEntry(pendingFileProjections, path))
-								files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath})
-								require.NoError(t, err)
-								require.NotContains(t, files, entry.graphPath)
 								remainingAfterProducer = time.Until(deadline)
 								return
 							}
