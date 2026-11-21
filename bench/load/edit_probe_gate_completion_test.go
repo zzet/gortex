@@ -98,6 +98,17 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 			if err := run.observeProbe(state, initial, initialID.WriteStarted, initialRaw, initialID, initialErr, false); err != nil {
 				t.Fatal(err)
 			}
+			if initialID.WriteStarted.IsZero() {
+				t.Fatal("missing initial probe's wire start")
+			}
+			// Settlement checks strict timestamp ordering. Give the clock
+			// time to advance past the observed probe on coarse-clock hosts
+			// before starting the edit and its original call deadline.
+			for !time.Now().After(initialID.WriteStarted) {
+				if err := waitContext(ctx, time.Millisecond); err != nil {
+					t.Fatalf("clock did not advance past pre-edit wire start: %v", err)
+				}
+			}
 			_, callCtx, stopCall, started := run.beginEdit(ctx, step)
 			originalDeadline, hasDeadline := callCtx.Deadline()
 			if !hasDeadline {
@@ -221,7 +232,9 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 					defer state.mu.Unlock()
 					record := state.record
 					if record.functionalUnavailableStatus == nil || record.Accounting.State != "unavailable" || record.Accounting.P != nil || record.Accounting.B != nil || len(record.Errors) != 1 {
-						t.Fatal("terminal collector lost the functional candidate or changed original unavailable accounting")
+						t.Fatalf("terminal settlement candidate=%t accounting=%q P_present=%t B_present=%t probe_lead=%s errors=%v",
+							record.functionalUnavailableStatus != nil, record.Accounting.State, record.Accounting.P != nil, record.Accounting.B != nil,
+							state.editWrite.Sub(state.firstProbeWrite), record.Errors)
 					}
 				}
 			} else if callCtx.Err() == nil {
