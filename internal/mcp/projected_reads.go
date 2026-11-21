@@ -83,6 +83,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	buildCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	layers := append([]graph.OverlayLayerReader(nil), requestProjectionLayers(ctx)...)
+	sourceID, _ := ctx.Value(indexedSymbolSourceTargetKey{}).(string)
 	for _, graphPath := range paths {
 		if err := buildCtx.Err(); err != nil {
 			if ctx.Err() != nil {
@@ -150,13 +151,14 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				markRequestProjectionDeferred(ctx, graphPath, "external_write")
 				continue
 			}
-			layer, err := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry)
-			if err != nil {
-				// Carry is optional relation evidence. Unknown checked capability
-				// keeps the exact file projection, with its pending relation facts.
-				// Required disk/parse failures above and actual cancellation still
-				// refuse; no errorless or canonical carry fallback is introduced.
-				layer = entry.layer
+			var layer graph.OverlayLayerReader = entry.layer
+			// Source hydration needs the checked file's exact symbol and bytes.
+			// Avoid spending its allowance on optional relation carry once the
+			// source handler's target is present in that immutable layer.
+			if sourceID == "" || entry.layer.NodeByID(sourceID) == nil {
+				if carried, carryErr := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry); carryErr == nil {
+					layer = carried
+				}
 			}
 			if err := buildCtx.Err(); err != nil {
 				if ctx.Err() != nil {
@@ -170,8 +172,8 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				if auditedSourceProjectionMismatch(ctx, err) {
 					return ctx, errProjectedSourceMoved
 				}
-				// This entry was already selected for checked retirement/carry.
-				// A new owner forbids serving its old facts or falling back.
+				// A new owner forbids serving the selected entry's old facts or
+				// falling back.
 				return ctx, err
 			}
 			layers = append(layers, layer)
