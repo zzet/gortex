@@ -197,7 +197,7 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string, diagnosti
 	switch verdict.reach {
 	case reachDaemon, reachStartupScoped:
 	case reachStartupUnknown:
-		return nil, fmt.Errorf("the gortex daemon is starting and could not verify repository ownership for %s. Retry shortly.", abs)
+		return nil, fmt.Errorf("retry shortly because the starting gortex daemon could not verify repository ownership for %s", abs)
 	case reachUnboundWorktree:
 		// The daemon knows the family and would serve the worktree once it is
 		// bound; refusing with ErrNoExecutor here would hand the caller the
@@ -222,7 +222,7 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string, diagnosti
 	}
 	if verdict.startupDaemon != "" && c.Ack.DaemonInstance != verdict.startupDaemon {
 		_ = c.Close()
-		return nil, errors.New("the gortex daemon changed while resolving repository startup. Retry shortly.")
+		return nil, errors.New("retry shortly because the gortex daemon changed while resolving repository startup")
 	}
 	return &daemonExecutor{
 		client:         c,
@@ -383,15 +383,22 @@ func startupConfiguredRoot(deadline time.Time, instance, cwd string) string {
 		Phase  string `json:"phase"`
 		Reason string `json:"reason"`
 		Repos  []struct {
-			Path string `json:"path"`
+			Path  string                `json:"path"`
+			State indexer.RepoLoadState `json:"state"`
 		} `json:"repos"`
 	}
-	if json.Unmarshal(data, &health) != nil || health.Status != "loading" || health.Reason != "" ||
-		(health.Phase != "opening_store" && health.Phase != "migrating") ||
+	if json.Unmarshal(data, &health) != nil || health.Status != "loading" || health.Phase == "" || health.Reason != "" ||
 		len(health.Repos) != 1 || !filepath.IsAbs(health.Repos[0].Path) {
 		return ""
 	}
-	return health.Repos[0].Path
+	// Both startup dispatchers use the scoped loading frame. The runtime
+	// can take over between ControlProbe and index_health, changing the
+	// phase while the configured repository is still queued or running.
+	repo := health.Repos[0]
+	if repo.State != indexer.RepoLoadQueued && repo.State != indexer.RepoLoadRunning {
+		return ""
+	}
+	return repo.Path
 }
 
 // trackedRootContains reports whether p lies inside a tracked repo root.
