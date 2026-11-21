@@ -3345,6 +3345,9 @@
                                 "null"
                               ]
                             },
+                            "own_ack_readback_only": {
+                              "type": "boolean"
+                            },
                             "probe_period_ns": {
                               "type": "integer"
                             },
@@ -5736,6 +5739,9 @@
                           "array",
                           "null"
                         ]
+                      },
+                      "own_ack_readback_only": {
+                        "type": "boolean"
                       },
                       "probe_period_ns": {
                         "type": "integer"

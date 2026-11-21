@@ -276,7 +276,11 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 		role = "candidate"
 	}
 	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
-	if plan.Readers > 0 {
+	if plan.OwnACKReadbackOnly {
+		out.AccountingRequired = false
+		out.Limitations = []string{"local ACK and immediate same-session file/source only; no graph-terminal, visibility or A/P/B phase qualification",
+			"reader overlap is measured while the edit RPC or its own immediate readbacks are in flight"}
+	} else if plan.Readers > 0 {
 		out.Limitations = append(out.Limitations, "pure reads are classed when issued (no-edit baseline before the edit origin, under edit while any sent edit's receipt is not yet observed terminal, otherwise between edits); an edit without a receipt to observe stays pending until its loop ends, and an edit sent while a read is in flight does not reclass it")
 	}
 	if plan.Mode == "toon" {
@@ -383,7 +387,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	if len(editors) != max(1, plan.Editors) || len(readers) != plan.Readers {
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
-	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance}
+	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance && !plan.OwnACKReadbackOnly}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -512,6 +516,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		}
 		state.sink = sink
 		state.startRaw()
+		if plan.OwnACKReadbackOnly {
+			continue // The fixed editor owns the edit and both readbacks.
+		}
 		if plan.SearchReadbackAcceptance && len(clients) != 0 {
 			// One owned setup/diagnostic connection, never one per queued offer.
 			state.client = clients[0]
@@ -899,7 +906,7 @@ func editProbeSummaryOmittedByBudget(body map[string]any, file, marker string) b
 func (r *editProbeRuntime) activate(ctx context.Context, step editProbeStep) {
 	probeCtx, cancel := context.WithCancel(ctx)
 	state := r.activateProbeState(step, cancel)
-	if !r.plan.SearchReadbackAcceptance {
+	if !r.plan.SearchReadbackAcceptance && !r.plan.OwnACKReadbackOnly {
 		r.probe(probeCtx, cancel, state)
 	}
 }
@@ -1082,7 +1089,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 		return
 	}
-	if r.plan.GateModes {
+	if r.plan.GateModes || r.plan.OwnACKReadbackOnly {
 		s.mu.Lock()
 		if exact, ok := body["readback_exact"].(bool); ok {
 			s.record.ACKReadbackExact = &exact
@@ -1095,6 +1102,13 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.mu.Unlock()
 	}
 	receipt, _ := body["mutation_receipt"].(string)
+	if r.plan.OwnACKReadbackOnly && (body["ack_mode"] != "local" || body["mutation_id"] != step.MutationID || receipt == "" || identity.Finished.IsZero()) {
+		s.mu.Lock()
+		s.record.Outcome = "invalid_ack"
+		s.record.Errors = append(s.record.Errors, "local ACK identity or response endpoint unavailable")
+		s.mu.Unlock()
+		return
+	}
 	var move *editProbeMoveReferences
 	var batch *editProbeBatchReferences
 	var batchOffered []byte
@@ -1214,10 +1228,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if s.pairedTransaction != nil {
 		s.pairedTransaction.finish(ctx, callCtx, readbackEnd, readbacksCorrect && len(s.record.Errors) == 0)
 	}
-	if r.plan.SearchReadbackAcceptance {
-		// This named profile certifies ACK plus its four immediate searches,
-		// never canonical publication, relation readiness or A/P/B accounting.
-		if !searchReadbackObjectACK(s.record.SearchACK) {
+	if r.plan.SearchReadbackAcceptance || r.plan.OwnACKReadbackOnly {
+		// These profiles end the transaction after the required immediate readbacks.
+		// Background visibility and phase observations belong to the ordinary mode.
+		if r.plan.SearchReadbackAcceptance && !searchReadbackObjectACK(s.record.SearchACK) {
 			s.record.Errors = append(s.record.Errors, "exact local search ACK unavailable")
 		}
 		if ctx.Err() != nil {
@@ -1352,6 +1366,21 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Unlock()
 }
 
+func editProbeReadbackRequest(file string, step editProbeStep, kind string) request {
+	target := map[string]any{"file": file}
+	if kind == "file" && step.Relocated {
+		target["file"] = step.DestinationFile
+	}
+	if kind == "source" {
+		symbol := file + "::" + step.Marker
+		if step.TargetSymbol != "" {
+			symbol = step.TargetSymbol
+		}
+		target = map[string]any{"symbol": symbol}
+	}
+	return request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+}
+
 // Immediate same editing session, with no sleep/receipt/freshness barrier.
 // Observation-only kinds are recorded but neither gate the readback time nor
 // fail the record.
@@ -1369,17 +1398,7 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		file = step.File
 	}
 	for index, kind := range readbackKinds {
-		target := map[string]any{"file": file}
-		if kind == "file" && step.Relocated {
-			target["file"] = step.DestinationFile
-		}
-		if kind == "source" {
-			target = map[string]any{"symbol": file + "::" + step.Marker}
-			if step.TargetSymbol != "" {
-				target = map[string]any{"symbol": step.TargetSymbol}
-			}
-		}
-		req := request{Tool: "read", Operation: kind, Arguments: map[string]any{"operation": kind, "target": target}}
+		req := editProbeReadbackRequest(file, step, kind)
 		if kind == "search_visible" || kind == "text" {
 			operation := "symbols"
 			if kind == "text" {
@@ -1627,6 +1646,12 @@ func (r *editProbeRuntime) close() error {
 }
 
 func (r *editProbeRuntime) restore(ctx context.Context) error {
+	if r.plan.OwnACKReadbackOnly {
+		// Normal shutdown removes the fresh owned clone; no restore mutation is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "owned clone discarded after local ACK cell")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"owned_clone_discard_on_stop","restored":false}`)
+		return nil
+	}
 	if r.plan.SearchReadbackAcceptance && r.options.KeepState {
 		r.phase.EditProbe.RestoreMS = unavailable("ms", "not restored: owned non-pristine search-acceptance clone retained")
 		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"preserved_owned_non_pristine_keep_state","restored":false,"fresh_seed_reuse_allowed":false}`)

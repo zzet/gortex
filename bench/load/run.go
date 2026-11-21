@@ -45,6 +45,7 @@ type runOptions struct {
 	SweepBudget              time.Duration
 	EditMean                 time.Duration
 	EditCount                int
+	OwnACKReadbackOnly       bool
 	SearchReadbackAcceptance bool
 	EditGateModes            bool
 	EditConsumerProbes       bool
@@ -66,6 +67,7 @@ func parseRun(args []string) (runOptions, error) {
 	var o runOptions
 	f := flag.NewFlagSet("load run", flag.ContinueOnError)
 	bindRunFlags(f, &o)
+	f.BoolVar(&o.OwnACKReadbackOnly, "edit-ack-readback-only", false, "local ACK and immediate same-session file/source readback with paced readers, without visibility polling")
 	f.BoolVar(&o.LosslessEditProbeEvidence, "lossless-edit-probe-evidence", false, "retain exact RPC payloads in bounded edit-gate evidence")
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
@@ -141,6 +143,16 @@ func validateRunOptions(o runOptions) error {
 	}
 	if o.EditACKMode != "" && o.EditACKMode != "local" && o.EditACKMode != "full" {
 		return errors.New("--edit-ack must be local or full when explicitly set")
+	}
+	if o.OwnACKReadbackOnly {
+		if o.Scenario != editProbeScenario || o.EditACKMode != "local" || o.EditCount != 100 ||
+			o.Editors != 1 && o.Editors != 8 || o.Agents != 4 || o.EditRepos != 1 || o.Worktrees != 0 ||
+			o.EditMean != 0 && o.EditMean != editProbeMean {
+			return errors.New("--edit-ack-readback-only requires edit-and-probe with local ACKs, 100 offers, 1 or 8 editors, four paced readers, a 15s edit mean, and one primary repository")
+		}
+		if o.SearchReadbackAcceptance || o.EditGateModes || o.EditConsumerProbes || o.EditProbeRole == "baseline" || o.KeepState {
+			return errors.New("--edit-ack-readback-only requires a fresh candidate clone and excludes other edit probe modes")
+		}
 	}
 	if o.SearchReadbackAcceptance && o.EditACKMode == "full" {
 		return errors.New("--search-readback-acceptance requires local ACKs; --edit-ack full conflicts with that profile")
