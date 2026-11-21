@@ -611,7 +611,7 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 }
 func (m Manifest) Summary() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "## Test selection\n\nMode: **%s**\n\n%s\n\nTest jobs: **%d / 12**\n\n", m.Mode, m.Reason, len(m.Matrix.Include))
+	fmt.Fprintf(&b, "## Test selection\n\nMode: **%s**\n\n%s\n\nTest jobs: **%d**\n\n", m.Mode, m.Reason, len(m.Matrix.Include))
 	keys := make([]string, 0, len(m.Packages))
 	for key := range m.Packages {
 		keys = append(keys, key)
