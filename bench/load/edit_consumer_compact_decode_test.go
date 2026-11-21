@@ -258,3 +258,77 @@ func TestEditConsumerCompactDoesNotInventIdleFreshness(t *testing.T) {
 		})
 	}
 }
+
+func TestEditConsumerCompactRenameRetainsPostACKSiteWitness(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		pending     bool
+		foreign     bool
+		preACK      bool
+		malformed   bool
+		wantSite    bool
+	}{
+		{name: "resolved", state: "subject_observed", wantSite: true},
+		{name: "provisional", state: "pending", pending: true, wantSite: true},
+		{name: "pending_without_owned_site", state: "pending", pending: true, foreign: true},
+		{name: "unidentifiable_site", state: "unassessed", foreign: true},
+		{name: "pre_ack", state: "subject_observed", preACK: true},
+		{name: "malformed", state: "malformed", malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, plan := editConsumerTestFixture(t)
+			plan.Steps[0].ProbeMode = "compact"
+			step := plan.Steps[0]
+			marker := step.Marker
+			if tc.foreign {
+				marker = "other"
+			}
+			confidence := "high"
+			if tc.pending {
+				confidence = "provisional"
+			}
+			before := fmt.Sprintf("func %s() int { return helper() }", marker)
+			after := fmt.Sprintf("func %s() int { return helperRenamed() }", marker)
+			text := fmt.Sprintf("rename_v1\t%q\t%q\ttrue\t1\nedit\t%q\t3\t%q\t%q\t%q\t%q\nrename_status\t%q\tfalse\n",
+				"helper", "helperRenamed", c.File, before, after, confidence, "reference", "would_apply")
+			if tc.pending {
+				text = "relations: pending (1 files)\n" + text + fmt.Sprintf("pending_file %q\n", c.File)
+			}
+			if tc.malformed {
+				text += "unexpected_row\n"
+			}
+			sink := newEditProbeHeldSink(t)
+			sink.unblock()
+			s := startHeldEditProbeSpool(t, sink)
+			s.step, s.record = step, newEditProbeRecord(c, step)
+			origin := time.Now()
+			s.started, s.acknowledged = origin, origin.Add(time.Millisecond)
+			identity := wireCallIdentity{ID: 21, WriteStarted: origin.Add(2 * time.Millisecond), Finished: origin.Add(3 * time.Millisecond)}
+			if tc.preACK {
+				identity.WriteStarted = origin
+			}
+			r := &editProbeRuntime{origin: origin, plan: plan, p: &privateRun{Repos: []privateRepo{{Corpus: c}}}, phase: &Phase{EditProbe: newEditProbeReport(plan, c, true)}}
+			oracle := editConsumerOracles(c)[0]
+			oracle.call = editProbeWithOutput(oracle.call, "compact")
+			if err := r.observeConsumer(s, oracle, outputWire(text, nil), identity, nil); err != nil {
+				t.Fatal(err)
+			}
+			s.finishRaw()
+			var row struct {
+				WireID             int64  `json:"wire_id"`
+				State              string `json:"state"`
+				PostACK            bool   `json:"post_ack"`
+				RenameSiteObserved bool   `json:"rename_site_observed"`
+			}
+			if err := json.Unmarshal(sink.data.Bytes(), &row); err != nil {
+				t.Fatal(err)
+			}
+			if row.WireID != identity.ID || row.State != tc.state || row.PostACK == tc.preACK || row.RenameSiteObserved != tc.wantSite {
+				t.Fatalf("retained rename row=%+v, want state=%s, site=%v, postACK=%v", row, tc.state, tc.wantSite, !tc.preACK)
+			}
+			if s.record.Consumers["consumer_rename"].SilentStale.Value != nil {
+				t.Fatal("a compact rename witness manufactured a freshness counter")
+			}
+		})
+	}
+}

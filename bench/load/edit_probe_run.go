@@ -243,6 +243,9 @@ func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
 			if mode == "" {
 				mode = "json"
 			}
+			if editProbeRequestOutput(oracle.call) == "gcx" {
+				mode = "gcx"
+			}
 			record.Consumers[oracle.name] = editConsumerObservation{State: "missing", RequestedMode: mode, SilentStale: unavailable("answers", "no consumer response observed")}
 			continue
 		}
