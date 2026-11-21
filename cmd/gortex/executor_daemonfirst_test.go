@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -46,7 +49,8 @@ type stubDaemonServer struct {
 type stubRPCError struct {
 	Code      int
 	Message   string
-	ErrorCode string // rides on error.data.error_code
+	ErrorCode string
+	Data      map[string]any
 }
 
 // startStubDaemon binds a unix socket, points GORTEX_DAEMON_SOCKET at it,
@@ -224,13 +228,17 @@ func (s *stubDaemonServer) serveMCP(conn net.Conn, reader *bufio.Reader) {
 		s.mu.Unlock()
 
 		if mcpErr != nil {
+			data := mcpErr.Data
+			if data == nil {
+				data = map[string]any{"error_code": mcpErr.ErrorCode}
+			}
 			resp := map[string]any{
 				"jsonrpc": "2.0",
 				"id":      json.RawMessage(frame.ID),
 				"error": map[string]any{
 					"code":    mcpErr.Code,
 					"message": mcpErr.Message,
-					"data":    map[string]any{"error_code": mcpErr.ErrorCode},
+					"data":    data,
 				},
 			}
 			b, _ := json.Marshal(resp)
@@ -260,6 +268,67 @@ func (s *stubDaemonServer) seenMCPHandshake() daemon.Handshake {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastMCPHandshake
+}
+
+func TestCall_ExplicitJSONLoadingSocket(t *testing.T) {
+	repo := t.TempDir()
+	stub := startStubDaemon(t, []string{repo})
+	refusal := &stubRPCError{Code: -32000, Message: "repository loading", Data: map[string]any{
+		"error_code": "repo_loading", "retryable": true, "phase": "migrating", "percent": 0,
+	}}
+	for _, test := range []struct {
+		name string
+		tool string
+		wait time.Duration
+		err  *stubRPCError
+	}{
+		{"positive loading wait", "workspace", time.Millisecond, refusal},
+		{"effectful rejection", "session", 0, refusal},
+		{"effectful success", "session", 0, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stub.mu.Lock()
+			stub.mcpError = test.err
+			stub.mu.Unlock()
+
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+			require.NoError(t, err)
+			originalStderr := os.Stderr
+			os.Stderr = stderr
+			waitFlag := rootCmd.PersistentFlags().Lookup("loading-wait")
+			originalWait, originalChanged := loadingWait, waitFlag.Changed
+			t.Cleanup(func() {
+				loadingWait, waitFlag.Changed = originalWait, originalChanged
+				os.Stderr = originalStderr
+				require.NoError(t, stderr.Close())
+			})
+
+			cmd, stdout := newCallTestCmd(t)
+			cmd.SilenceUsage = true
+			cmd.SetErr(stderr)
+			cmd.Flags().StringVar(&callFormat, "format", "json", "")
+			cmd.Flags().AddFlag(waitFlag)
+			callIndex = repo
+			cmd.SetArgs([]string{test.tool, "--format", "json", "--loading-wait", test.wait.String()})
+			callErr := cmd.Execute()
+			output, err := os.ReadFile(stderr.Name())
+			require.NoError(t, err)
+			if test.err == nil {
+				require.NoError(t, callErr)
+				require.Contains(t, string(output), "note: session can change session state")
+				require.JSONEq(t, `{"ok":true}`, stdout.String())
+				return
+			}
+			var loading *repoLoadingError
+			require.ErrorAs(t, callErr, &loading)
+			require.Equal(t, exitTempFail, loading.ExitCode())
+			if test.wait > 0 {
+				require.Positive(t, loading.waited)
+			}
+			require.Empty(t, stdout.String())
+			require.JSONEq(t, `{"error_code":"repo_loading","retryable":true,"phase":"migrating","percent":0}`, string(output))
+		})
+	}
 }
 
 // TestResolveExecutor_DaemonFirst asserts resolveExecutor is daemon-first:
@@ -338,7 +407,7 @@ func TestCallFacadeDaemonTool_SurfaceIsConnectionScoped(t *testing.T) {
 	if _, err := callFacadeDaemonTool(repo, "read", map[string]any{
 		"operation": "file",
 		"target":    map[string]any{"file": "main.go"},
-	}); err != nil {
+	}, os.Stderr); err != nil {
 		t.Fatalf("facade relay: %v", err)
 	}
 
