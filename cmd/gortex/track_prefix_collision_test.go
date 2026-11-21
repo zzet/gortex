@@ -87,7 +87,7 @@ func TestRunTrackIdentityPendingRemovesOnlyItsNewEntry(t *testing.T) {
 				trackWait, trackName, trackAsWorktree = wait, "chosen", false
 				trackEnsureDaemonReadyFn = func(bool) daemonDecision { return daemonReady }
 				trackNotifyDaemonTrackFn = func(string, string, time.Time) error {
-					return &repoLoadingError{admissionReason: "identity_pending", phase: "identity_resolution"}
+					return &repoLoadingError{admissionReason: "identity_pending", details: repoLoadingDetails{Phase: "identity_resolution"}}
 				}
 				cmd := &cobra.Command{}
 				cmd.SetErr(&bytes.Buffer{})

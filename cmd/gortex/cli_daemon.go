@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -117,11 +118,9 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
 			Data    struct {
-				ErrorCode  string `json:"error_code"`
+				repoLoadingDetails
 				Repo       string `json:"repo"`
 				RepoPath   string `json:"repo_path"`
-				Phase      string `json:"phase"`
-				Percent    int    `json:"percent"`
 				Reason     string `json:"reason"`
 				Suggestion string `json:"suggestion"`
 			} `json:"data"`
@@ -144,7 +143,7 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 			if data.Reason == "identity_pending" || data.Reason == "scope_binding_pending" {
 				admissionReason = data.Reason
 			}
-			return nil, &repoLoadingError{repo: repo, phase: data.Phase, percent: data.Percent, admissionReason: admissionReason}
+			return nil, &repoLoadingError{repo: repo, details: data.repoLoadingDetails, admissionReason: admissionReason}
 		case string(gortexmcp.ErrCodeRepoUnavailable):
 			return nil, fmt.Errorf("the gortex daemon could not load %s after its restart (%s). %s",
 				data.RepoPath, data.Reason, data.Suggestion)
@@ -173,7 +172,7 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 // no-executor case; --oneshot and autostart land with the shared
 // constructor and the autostart primitive.
 func resolveExecutor(repoPath string) (cliExecutor, error) {
-	return resolveExecutorWithToolSurface(repoPath, cliLegacyToolSurface, cliLegacyToolMode)
+	return resolveExecutorWithToolSurface(repoPath, cliLegacyToolSurface, cliLegacyToolMode, os.Stderr)
 }
 
 // resolveExecutorWithToolSurface is the daemon-first executor with an
@@ -181,7 +180,7 @@ func resolveExecutor(repoPath string) (cliExecutor, error) {
 // core/defer so legacy tool names keep their historical semantics regardless
 // of daemon/client defaults; compact calls request facade-v1/hide. Neither path
 // changes the shared daemon or any other session.
-func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecutor, error) {
+func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string, diagnostics io.Writer) (cliExecutor, error) {
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		abs = repoPath
@@ -189,7 +188,7 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string) (cliExecu
 	if !daemon.IsRunning() {
 		return nil, ErrNoExecutor
 	}
-	switch verdict := probeCWDReach(abs); verdict.reach {
+	switch verdict := probeCWDReach(abs, diagnostics); verdict.reach {
 	case reachDaemon:
 	case reachUnboundWorktree:
 		// The daemon knows the family and would serve the worktree once it is
@@ -244,7 +243,7 @@ type cwdVerdict struct {
 
 // daemonOwnsRepo reports whether the running daemon can answer for abs.
 func daemonOwnsRepo(abs string) bool {
-	return probeCWDReach(abs).reach == reachDaemon
+	return probeCWDReach(abs, os.Stderr).reach == reachDaemon
 }
 
 // probeCWDReach asks the running daemon how it reaches abs.
@@ -268,7 +267,7 @@ func daemonOwnsRepo(abs string) bool {
 // still loading after a restart reads as ours here (the probe lists the
 // config) and comes back from the MCP path as repo_loading, never as "not
 // tracked".
-func probeCWDReach(abs string) cwdVerdict {
+func probeCWDReach(abs string, diagnostics io.Writer) cwdVerdict {
 	c, err := daemon.Dial(daemon.Handshake{Mode: daemon.ModeControl, ClientName: "cli"})
 	if err != nil {
 		return cwdVerdict{reach: reachNone}
@@ -277,7 +276,7 @@ func probeCWDReach(abs string) cwdVerdict {
 	st, answer := trackedReposOf(c)
 	switch answer {
 	case trackedReposIndeterminate:
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(diagnostics,
 			"[gortex] daemon did not answer within %s (a track / reload / enrichment may be holding it) — asking it anyway\n",
 			daemonRoutingProbeTimeout)
 		return cwdVerdict{reach: reachDaemon}
@@ -585,7 +584,7 @@ func checkoutsRelayPath(repoPath string) string {
 	if _, ok := linkedWorktreeAt(abs); !ok {
 		return repoPath
 	}
-	if v := probeCWDReach(abs); v.reach == reachUnboundWorktree && v.familyRepo != "" {
+	if v := probeCWDReach(abs, os.Stderr); v.reach == reachUnboundWorktree && v.familyRepo != "" {
 		return v.familyRepo
 	}
 	return repoPath
