@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/testenv"
 )
 
@@ -124,4 +126,31 @@ func TestCLIStartupRefusalKeepsKnownScopeBeforeControllerHandoff(t *testing.T) {
 			assert.NotContains(t, loading.Error(), "repos reconcile")
 		})
 	}
+
+	t.Run("same_daemon_runtime_handoff", func(t *testing.T) {
+		_, answer := trackedReposOf(control)
+		require.Equal(t, trackedReposStartupPending, answer)
+		instance := control.Ack.DaemonInstance
+
+		dispatcher, multi, sibling, _ := loadingDispatcherSetup(t)
+		multi.ExpectRepos([]config.RepoEntry{{Path: primary}, {Path: sibling}})
+		multi.StartRepoLoad(primary)
+		controller := probeController(t, fmt.Sprintf("repos:\n  - path: %q\n  - path: %q\n", primary, sibling))
+		controller.multiIndexer, controller.graph = multi, multi.Graph()
+		require.NoError(t, srv.PublishStartupRuntime(controller, metadata.handoff(dispatcher),
+			func() (bool, string) { return false, "starting" }, nil, nil, daemon.RuntimeStatePath()))
+
+		client := openStartupIntrospectionSession(t, socket, primary, "core", "defer", time.Now().Add(3*time.Second))
+		require.Equal(t, instance, client.Ack.DaemonInstance)
+		_, reply := startupIntrospectionRoundTrip(t, client, 2, "tools/call", map[string]any{"name": "index_health"})
+		health := startupIntrospectionHealth(t, reply, "starting")
+		require.Empty(t, health.Reason)
+		require.Len(t, health.Repos, 1)
+		require.Equal(t, primary, health.Repos[0].Path)
+		require.Equal(t, indexer.RepoLoadRunning, health.Repos[0].State)
+
+		assert.True(t, startupConfiguresCWD(instance, primary), "controller handoff must keep the scoped loading witness usable")
+		assert.True(t, startupConfiguresCWD(instance, linked), "the reciprocal link still names the same configured primary")
+		assert.False(t, startupConfiguresCWD(instance, copied), "controller handoff cannot grant a copied marker scope")
+	})
 }
