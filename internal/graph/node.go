@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"iter"
 	"path"
 	"strings"
 	"time"
@@ -347,16 +348,27 @@ func AppendJSBinding(b *strings.Builder, local, original string) {
 }
 
 func JSBinding(bindings, local string) string {
-	for pair := range strings.FieldsSeq(bindings) {
-		name, orig, renamed := strings.Cut(pair, ":")
+	for name, orig := range JSBindingPairs(bindings) {
 		if name == local {
-			if renamed {
-				return orig
-			}
-			return name
+			return orig
 		}
 	}
 	return ""
+}
+
+// JSBindingPairs yields each encoded local name with its original name.
+func JSBindingPairs(bindings string) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for pair := range strings.FieldsSeq(bindings) {
+			name, orig, renamed := strings.Cut(pair, ":")
+			if !renamed {
+				orig = name
+			}
+			if !yield(name, orig) {
+				return
+			}
+		}
+	}
 }
 
 // JSExportsImport reports whether a local export names a value in this import.

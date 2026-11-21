@@ -131,18 +131,31 @@ func hasSameFileValue(file string, candidates []*graph.Node) bool {
 // The module edge retains local:export pairs even for statements too large
 // to emit a symbol edge per specifier. Bare entries have identical names.
 func (r *Resolver) tryResolveExplicitImport(e *graph.Edge, name string, stats *ResolveStats) bool {
-	for _, imp := range r.callerOutEdges(e.FilePath) {
-		if imp.Kind != graph.EdgeImports {
-			continue
+	imports := r.callerEvidence(e.FilePath)
+	imports.bindingsOnce.Do(func() {
+		for _, imp := range r.callerOutEdges(e.FilePath) {
+			if imp.Kind != graph.EdgeImports {
+				continue
+			}
+			raw, _ := imp.Meta[graph.ImportBindingsMeta].(string)
+			for local, exported := range graph.JSBindingPairs(raw) {
+				if _, taken := imports.bindings[local]; taken || exported == "" {
+					continue
+				}
+				if imports.bindings == nil {
+					imports.bindings = make(map[string]jsImportBinding)
+				}
+				imports.bindings[local] = jsImportBinding{imp, exported}
+			}
 		}
-		bindings, _ := imp.Meta[graph.ImportBindingsMeta].(string)
-		if exported := graph.JSBinding(bindings, name); exported != "" {
-			stem, file := r.jsBindingSource(imp)
-			r.resolveExactCall(e, name, stem, file, exported, graph.JSPendingImport, "import_binding", stats)
-			return true
-		}
+	})
+	binding, ok := imports.bindings[name]
+	if !ok {
+		return false
 	}
-	return false
+	stem, file := r.jsBindingSource(binding.edge)
+	r.resolveExactCall(e, name, stem, file, binding.exported, graph.JSPendingImport, "import_binding", stats)
+	return true
 }
 
 // Expand the source spelling even if the old import row was parked on an
@@ -362,10 +375,17 @@ func importableValueKind(kind graph.NodeKind) bool {
 // are resolved through module exports; these targets only seed the file tier.
 // Walk barrels only if a call actually needs the file-level evidence.
 type callerImportEvidence struct {
-	directOnce  sync.Once
-	direct      map[string]struct{}
-	closureOnce sync.Once
-	files       map[string]struct{}
+	directOnce   sync.Once
+	direct       map[string]struct{}
+	closureOnce  sync.Once
+	files        map[string]struct{}
+	bindingsOnce sync.Once
+	bindings     map[string]jsImportBinding // first import statement wins
+}
+
+type jsImportBinding struct {
+	edge     *graph.Edge
+	exported string
 }
 
 func (r *Resolver) clearImportEvidence() {
@@ -375,7 +395,7 @@ func (r *Resolver) clearImportEvidence() {
 	r.importFilesMu.Unlock()
 }
 
-func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
+func (r *Resolver) callerEvidence(callerFile string) *callerImportEvidence {
 	r.importFilesMu.RLock()
 	imports := r.importsByCaller[callerFile]
 	r.importFilesMu.RUnlock()
@@ -390,6 +410,11 @@ func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
 		}
 		r.importFilesMu.Unlock()
 	}
+	return imports
+}
+
+func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
+	imports := r.callerEvidence(callerFile)
 	imports.directOnce.Do(func() {
 		for _, e := range r.callerOutEdges(callerFile) {
 			if e.Kind != graph.EdgeImports {

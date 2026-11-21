@@ -14,7 +14,7 @@ import (
 // faithful end-to-end harness for the resolver tests below: a real
 // extractor produces the unresolved edges, then ResolveAll runs against
 // them exactly as it does on a live index.
-func buildGraphFromSources(t *testing.T, files map[string]string) graph.Store {
+func buildGraphFromSources(t testing.TB, files map[string]string) graph.Store {
 	t.Helper()
 	g := graph.New()
 	ts := languages.NewTypeScriptExtractor()
