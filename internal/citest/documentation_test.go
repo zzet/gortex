@@ -83,7 +83,7 @@ func TestDocumentationUnsafeOwnershipAndContentStayFull(t *testing.T) {
 				f.write("unknown.data", "unclassified input\n")
 			}
 			m := f.plan(f.commit())
-			if m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 16 {
+			if m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 17 {
 				t.Fatalf("unsafe documentation omitted: %+v", m)
 			}
 		})
@@ -136,7 +136,7 @@ func TestDocumentationOverridesAndUnsafeStatusesRemainFull(t *testing.T) {
 			e.Author = "dependabot[bot]"
 		}
 		m, err := f.planner.Plan(t.Context(), e)
-		if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 16 {
+		if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 17 {
 			t.Fatalf("%s override ignored: %+v %v", name, m, err)
 		}
 	}

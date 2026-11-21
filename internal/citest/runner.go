@@ -543,6 +543,14 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if opts.Partition == darwinRacePartition && (runtime.GOOS != "darwin" || opts.Windows) {
 		return report, fmt.Errorf("indexer-race requires native macOS")
 	}
+	separateCLI := opts.SelectionFile != "" && policy.ownsUbuntuCLI(opts.Target)
+	if separateCLI && (opts.Partition == "rest" || opts.Partition == ubuntuCLIPartition) &&
+		(runtime.GOOS != "linux" || opts.Windows) {
+		return report, fmt.Errorf("selected Ubuntu rest job requires native Linux")
+	}
+	if opts.Partition == ubuntuCLIPartition && !separateCLI {
+		return report, fmt.Errorf("rest-cli requires a native Ubuntu selection")
+	}
 	planner := NewPlanner(opts.Root)
 	planner.Env = baseEnv(opts.Env)
 	module, err := planner.exec(ctx, planner.Env, "go", "list", "-m")
@@ -596,7 +604,7 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if err != nil {
 		return report, err
 	}
-	j.cliPackage = module + "/cmd/gortex"
+	j.cliPackage = module + cliPackageSuffix
 	defer func() {
 		report = Report{j.scratch, j.failures, j.flaky, j.durations}
 		err = errors.Join(err, j.report())
@@ -615,6 +623,9 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 		if part.Group == "rest" {
 			rest := []string{}
 			for _, pkg := range packages {
+				if separateCLI && pkg == j.cliPackage {
+					continue
+				}
 				if !slices.ContainsFunc([]string{"indexer", "mcp", "store"}, func(group string) bool { return large[group] == pkg }) && (selected == nil || selected.has(pkg)) {
 					rest = append(rest, pkg)
 				}
@@ -623,6 +634,13 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 				if err := j.runRest(rest); err != nil {
 					return report, err
 				}
+			}
+		} else if part.Group == ubuntuCLIPartition {
+			if !all.has(j.cliPackage) || selected != nil && !selected.has(j.cliPackage) {
+				return report, fmt.Errorf("selected job is missing the Ubuntu CLI package")
+			}
+			if err := j.runRest([]string{j.cliPackage}); err != nil {
+				return report, err
 			}
 		} else if part.Group == darwinRacePartition {
 			// Preserve the all-race override: its normal indexer shards already
