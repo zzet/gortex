@@ -33,6 +33,10 @@ func (r *Resolver) SetIncrementalSkip(priorUnresolved []*graph.Edge) {
 	terminalOverflow := false
 	for _, e := range priorUnresolved {
 		if e != nil {
+			// An edit can remove the shadow while the call keeps its shape.
+			if e.Meta[graph.JSLexicalBindingMeta] != nil {
+				continue
+			}
 			skip[r.edgeShape(e)] = struct{}{}
 			if !terminalOverflow && edgeTerminalFlag(e) && e.FilePath != "" && e.Line > 0 {
 				if r.incrementalTerminals == nil {

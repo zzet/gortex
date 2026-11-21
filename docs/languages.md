@@ -110,6 +110,19 @@ language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
 
+### JS/TS import evidence
+
+Bare JS/TS calls can resolve at `ast_resolved` even when the repository has
+only one candidate. An unrenamed named import that matches a directly exported
+declaration takes precedence (`import_binding`). Otherwise, a unique candidate
+in a directly imported file or its barrel re-exports can supply file-level
+evidence (`import_closure`). A same-file declaration blocks import promotion;
+when imports don't settle the call, the usual resolution rules still apply.
+A call whose name is bound by an enclosing parameter, catch clause, block or
+hoisted `var` is not an import call. It binds to a same-file declaration when
+one exists and otherwise stays unresolved. A local initialized from `require()`
+keeps its import evidence.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`
