@@ -382,6 +382,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	topologyChanged := true
 	defer func() { finishTopologyMutation(topologyChanged) }()
 
+	defer idx.clearAliasPass()
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(root, paths, mode)
 	if err != nil {
 		return result, err
@@ -407,7 +408,10 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
 		resolve := mode.publication.beginPatchLap(patchResolve)
-		idx.ResolveAll()
+		if err := idx.resolveAll(); err != nil {
+			idx.logger.Error("indexer: full resolution failed", zap.Error(err))
+			result.resolutionErr = err
+		}
 		resolve.end()
 	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
@@ -425,7 +429,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		derived.endDerived()
 	}
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, nil
+	return result, idx.finishAliasPass(result)
 }
 
 // resolveReceiptNamePendings rebinds pending references parked under the
@@ -640,7 +644,9 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			scope = nil
 		}
 		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
-		mi.runMasterResolve(scope, false)
+		if err := mi.runMasterResolve(scope, false); err != nil && result != nil {
+			result.resolutionErr = err
+		}
 		resolve.end()
 		// No scoped frontier survived. Refresh any known files without adding a
 		// second graph-wide dataflow or durable-fact scan.

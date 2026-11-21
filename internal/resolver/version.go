@@ -43,7 +43,8 @@ import (
 // Import evidence on single-candidate JS/TS calls raises those edges out of text_matched.
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
-const ResolutionSemanticsVersion = 7
+// Relative tsconfig extends can change bindings without changing source bytes.
+const ResolutionSemanticsVersion = 8
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

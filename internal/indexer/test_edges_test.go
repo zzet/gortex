@@ -557,7 +557,9 @@ func TestMasterResolveWholeGraphReconcilesRetargetedTestCalls(t *testing.T) {
 
 	t.Run("subject_runMasterResolve_wholegraph", func(t *testing.T) {
 		mi, call, g := build()
-		mi.runMasterResolve(nil, false) // the fullFallback lane
+		if err := mi.runMasterResolve(nil, false); err != nil { // the fullFallback lane
+			t.Fatalf("master resolve: %v", err)
+		}
 		if call.To != "repoA/pkg/foo.go::Foo" {
 			t.Fatalf("fixture: call must bind, got %q", call.To)
 		}

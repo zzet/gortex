@@ -141,6 +141,12 @@ type IndexResult struct {
 	// serialized: coordinated callers surface it only after the committed graph
 	// has reached a coherent post-mutation state.
 	mutationErr error
+	// failuresRetryable: every failed file is in the persisted failure ledger,
+	// which retries it, and no directory walk failed.
+	failuresRetryable bool
+	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
+	// receipt so the next pass rebinds the callers this one left unresolved.
+	resolutionErr error
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -436,6 +442,17 @@ type Indexer struct {
 	// handle is disqualified, because nothing would then bound what the drain
 	// writes.
 	passCorpusFilter func(*graph.Graph) error
+
+	// Set only while the repository mutation lane is held. Alias changes
+	// invalidate source-shape resolution reuse, including unchanged callers.
+	aliasResolutionChanged bool
+	passAliases            atomic.Pointer[aliasSnapshot]
+	deltaAliases           *aliasSnapshot // private to a single edit-delta builder
+	appliedAliases         string         // fallback for in-memory stores, under the mutation lane
+	// A deferred full pass waiting for the shared resolve to certify it.
+	// aliasStateMu serializes that off-lane certification with beginAliasPass.
+	deferredAliases atomic.Pointer[aliasSnapshot]
+	aliasStateMu    sync.Mutex
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -849,6 +866,9 @@ func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
 func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
+		if s := idx.passAliases.Load(); s != nil {
+			return s.collection
+		}
 		return tsAliasCollectionForTree(tree)
 	}
 	idx.tsAliasMu.Lock()
@@ -2844,6 +2864,16 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 	}
+	defer func() {
+		defer idx.clearAliasPass()
+		switch {
+		case retErr != nil:
+		case idx.deferResolve.Load():
+			retErr = idx.holdAliasPass(result)
+		default:
+			retErr = idx.finishAliasPass(result)
+		}
+	}()
 	// Registered before the failed-file report below, so it runs after that
 	// report is complete: every failed file of this cold pass is staged as a
 	// failure envelope before the door accepts the namespace.
@@ -2956,6 +2986,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+	if err := idx.beginAliasPass(absRoot, []string{absRoot}); err != nil {
+		return nil, err
+	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -4393,6 +4426,9 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// AddBatch. Direct SQLite writes enter a bounded cross-file
 					// accumulator, amortising transaction/statement setup without
 					// retaining a repository-sized graph in Go memory.
+					if diskTarget == nil && idx.aliasResolutionChanged && closureJSTSPath(path) && !skipped {
+						idx.removePriorAliasEdges(idx.prefixPath(relPath))
+					}
 					if !contentHandled {
 						batchStart := time.Now()
 						durablePath, durableMtime := path, wf.mtimeNano
@@ -4731,7 +4767,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
 		resolveStarted := time.Now()
-		resolveStats := idx.resolver.ResolveAll()
+		resolveStats, resolveErr := idx.resolver.ResolveAllContext(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
 		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 		// Lift the dataflow placeholders exactly where the per-save path
 		// does (right after resolution, before the derived passes), so a
@@ -5512,6 +5551,9 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
+	if idx.forceReparseDropsResolutions(absPath) {
+		reuseIdx, priorUnresolved = nil, nil
+	}
 
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
@@ -5955,8 +5997,16 @@ func isStructuralKind(k graph.NodeKind) bool {
 // interface-implementation inference. Exposed for batch paths that
 // defer per-file resolver work until the end of a batch.
 func (idx *Indexer) ResolveAll() {
+	if err := idx.resolveAll(); err != nil {
+		idx.logger.Error("indexer: full resolution failed", zap.Error(err))
+	}
+}
+
+func (idx *Indexer) resolveAll() error {
 	idx.populateCppIncludeDirs(true)
-	idx.resolver.ResolveAll()
+	if _, err := idx.resolver.ResolveAllContext(context.Background()); err != nil {
+		return err
+	}
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
@@ -5978,6 +6028,7 @@ func (idx *Indexer) ResolveAll() {
 	// Seed the durable reference-facts sidecar from the fully-resolved graph
 	// (no-op on the in-memory backend).
 	idx.persistAllRefFacts()
+	return nil
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.
@@ -7140,8 +7191,8 @@ func (idx *Indexer) SetRootPath(root string) {
 	idx.storeRootPath(abs)
 }
 
-// IncrementalReindexPaths re-indexes only the files reachable from the
-// supplied paths, instead of walking the whole repository root.
+// IncrementalReindexPaths reconciles the supplied paths. An effective alias
+// change also refreshes existing JS/TS callers, without widening deletion scope.
 //
 // Each path may be absolute or relative to root, and may be a file or a
 // directory; directories are walked recursively with the same
@@ -7317,6 +7368,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+	if err := idx.beginAliasPass(absRoot, paths); err != nil {
+		return nil, err
+	}
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
@@ -7482,6 +7536,32 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		if relPath, ok := idx.graphPathRelKey(graphPath); ok && diskFiles[relPath] {
 			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		}
+	}
+	if idx.aliasResolutionChanged {
+		// Rebind surviving callers without widening the requested deletion,
+		// mtime, or Merkle scope. In-scope files have already been admitted.
+		for rel := range diskFiles {
+			if closureJSTSPath(rel) {
+				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(rel)))
+			}
+		}
+		if !fullRoot {
+			for _, p := range graph.ReadRepoFilePaths(idx.graph, idx.repoPrefix, "", nil, nil) {
+				rel, owned := idx.graphPathRelKey(p)
+				if !owned || diskFiles[rel] || !closureJSTSPath(rel) {
+					continue
+				}
+				abs := filepath.Join(absRoot, filepath.FromSlash(rel))
+				if idx.shouldExclude(abs, absRoot, false) {
+					continue
+				}
+				if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+					staleFiles = append(staleFiles, abs)
+				} else if err != nil && !os.IsNotExist(err) {
+					return nil, err
+				}
+			}
 		}
 	}
 	staleFiles = appendUniqueSorted(nil, staleFiles...)
@@ -7719,8 +7799,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// restage successful files of the same language forever. Discovery failures
 	// can hide an entire subtree, and torn passes cannot attest a completed
 	// restage. Keep the language-wide fence for either, or for an unsafe ledger.
-	if len(extractorStaleLangs) > 0 && len(discoveryFailed) == 0 && result.mutationErr == nil &&
-		idx.failedFilesSafelyRetryable(failedFiles) {
+	result.failuresRetryable = len(discoveryFailed) == 0 && idx.failedFilesSafelyRetryable(failedFiles)
+	if len(extractorStaleLangs) > 0 && result.mutationErr == nil && result.failuresRetryable {
 		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)

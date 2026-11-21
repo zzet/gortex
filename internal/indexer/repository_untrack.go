@@ -196,6 +196,9 @@ func (mi *MultiIndexer) untrackRepoWithOwner(
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.metadata != nil {
+		invalidateTSAliasCollection(state.metadata.RootPath)
+	}
 	state.retainAdmission = state.retainAdmission || retainAdmission
 	if state.finalize == nil && finalize != nil {
 		state.finalize = finalize
