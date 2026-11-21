@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/pathkey"
@@ -121,6 +122,7 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 				repoLoadingDetails
 				Repo       string `json:"repo"`
 				RepoPath   string `json:"repo_path"`
+				Path       string `json:"path"`
 				Reason     string `json:"reason"`
 				Suggestion string `json:"suggestion"`
 			} `json:"data"`
@@ -138,6 +140,9 @@ func extractToolResult(resp []byte) (json.RawMessage, error) {
 			repo := data.Repo
 			if repo == "" {
 				repo = data.RepoPath
+			}
+			if repo == "" {
+				repo = data.Path
 			}
 			admissionReason := ""
 			if data.Reason == "identity_pending" || data.Reason == "scope_binding_pending" {
@@ -188,8 +193,11 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string, diagnosti
 	if !daemon.IsRunning() {
 		return nil, ErrNoExecutor
 	}
-	switch verdict := probeCWDReach(abs, diagnostics); verdict.reach {
-	case reachDaemon:
+	verdict := probeCWDReach(abs, diagnostics)
+	switch verdict.reach {
+	case reachDaemon, reachStartupScoped:
+	case reachStartupUnknown:
+		return nil, fmt.Errorf("retry shortly because the starting gortex daemon could not verify repository ownership for %s", abs)
 	case reachUnboundWorktree:
 		// The daemon knows the family and would serve the worktree once it is
 		// bound; refusing with ErrNoExecutor here would hand the caller the
@@ -207,7 +215,14 @@ func resolveExecutorWithToolSurface(repoPath, tools, toolsMode string, diagnosti
 		ToolsMode:  toolsMode,
 	})
 	if err != nil {
+		if verdict.reach == reachStartupScoped {
+			return nil, fmt.Errorf("could not reconnect to the gortex daemon during repository startup: %w", err)
+		}
 		return nil, ErrNoExecutor
+	}
+	if verdict.startupDaemon != "" && c.Ack.DaemonInstance != verdict.startupDaemon {
+		_ = c.Close()
+		return nil, errors.New("retry shortly because the gortex daemon changed while resolving repository startup")
 	}
 	return &daemonExecutor{
 		client:         c,
@@ -226,11 +241,20 @@ const (
 	// reachUnboundWorktree — the path is a linked git worktree of a tracked
 	// repository that the daemon has not bound to a checkout view.
 	reachUnboundWorktree
+	// reachStartupScoped — a verified configured scope can receive the
+	// original graph request while the startup dispatcher is active.
+	reachStartupScoped
+	// reachStartupUnknown — the daemon is starting and cannot verify this
+	// path's configured scope yet.
+	reachStartupUnknown
 )
 
 // cwdVerdict is what the routing probe decided about one working directory.
 type cwdVerdict struct {
 	reach cwdReach
+	// startupDaemon binds a pre-controller scope witness to the daemon
+	// that will receive the original tool call.
+	startupDaemon string
 	// family is the linked-worktree family the path belongs to. Set only for
 	// reachUnboundWorktree.
 	family worktreeFamily
@@ -275,6 +299,11 @@ func probeCWDReach(abs string, diagnostics io.Writer) cwdVerdict {
 	defer c.Close()
 	st, answer := trackedReposOf(c)
 	switch answer {
+	case trackedReposStartupPending:
+		if startupConfiguresCWD(c.Ack.DaemonInstance, abs) {
+			return cwdVerdict{reach: reachStartupScoped, startupDaemon: c.Ack.DaemonInstance}
+		}
+		return cwdVerdict{reach: reachStartupUnknown}
 	case trackedReposIndeterminate:
 		fmt.Fprintf(diagnostics,
 			"[gortex] daemon did not answer within %s (a track / reload / enrichment may be holding it) — asking it anyway\n",
@@ -309,6 +338,67 @@ func probeCWDReach(abs string, diagnostics io.Writer) cwdVerdict {
 		}
 	}
 	return cwdVerdict{reach: reachNone}
+}
+
+// A startup ControlProbe speaks for the daemon, not for the caller's repo.
+// Ask its scoped metadata reader for the configured root before relaying.
+func startupConfiguresCWD(instance, cwd string) bool {
+	if instance == "" {
+		return false
+	}
+	deadline := time.Now().Add(daemonRoutingProbeTimeout)
+	if root := startupConfiguredRoot(deadline, instance, cwd); root != "" && pathkey.HasPathPrefix(cwd, root) {
+		return true
+	}
+	if time.Now().After(deadline) {
+		return false
+	}
+	main := gitstate.LinkedCheckoutMain(cwd)
+	if main == "" || time.Now().After(deadline) {
+		return false
+	}
+	root := startupConfiguredRoot(deadline, instance, main)
+	return root != "" && pathkey.SamePathIdentity(root, main)
+}
+
+func startupConfiguredRoot(deadline time.Time, instance, cwd string) string {
+	client, err := daemon.DialToWithDeadline(daemon.SocketPath(), daemon.Handshake{
+		Mode: daemon.ModeMCP, CWD: cwd, ClientName: "cli",
+		Tools: cliLegacyToolSurface, ToolsMode: cliLegacyToolMode,
+	}, deadline)
+	if err != nil {
+		return ""
+	}
+	defer client.Close()
+	if client.Ack.DaemonInstance != instance {
+		return ""
+	}
+	executor := &daemonExecutor{client: client, pinJSONDefault: true}
+	data, err := executor.CallTool(context.Background(), "index_health", nil)
+	if err != nil {
+		return ""
+	}
+	var health struct {
+		Status string `json:"status"`
+		Phase  string `json:"phase"`
+		Reason string `json:"reason"`
+		Repos  []struct {
+			Path  string                `json:"path"`
+			State indexer.RepoLoadState `json:"state"`
+		} `json:"repos"`
+	}
+	if json.Unmarshal(data, &health) != nil || health.Status != "loading" || health.Phase == "" || health.Reason != "" ||
+		len(health.Repos) != 1 || !filepath.IsAbs(health.Repos[0].Path) {
+		return ""
+	}
+	// Both startup dispatchers use the scoped loading frame. The runtime
+	// can take over between ControlProbe and index_health, changing the
+	// phase while the configured repository is still queued or running.
+	repo := health.Repos[0]
+	if repo.State != indexer.RepoLoadQueued && repo.State != indexer.RepoLoadRunning {
+		return ""
+	}
+	return repo.Path
 }
 
 // trackedRootContains reports whether p lies inside a tracked repo root.
@@ -479,6 +569,9 @@ const (
 	// trackedReposUnknown — the daemon answered with an error or an unusable
 	// payload.
 	trackedReposUnknown
+	// trackedReposStartupPending — the control socket is in its
+	// pre-controller phase and cannot yet list the tracked repositories.
+	trackedReposStartupPending
 )
 
 // trackedReposOf lists the repositories the daemon tracks, identity only.
@@ -497,6 +590,9 @@ func trackedReposOf(c *daemon.Client) (daemon.StatusResponse, trackedReposAnswer
 	resp, err := c.ControlWithTimeout(daemon.ControlProbe, nil, daemonRoutingProbeTimeout)
 	if daemonProbeIndeterminate(err, resp) {
 		return daemon.StatusResponse{}, trackedReposIndeterminate
+	}
+	if err == nil && !resp.OK && resp.ErrorCode == daemon.ErrRepoLoading && resp.Retryable {
+		return daemon.StatusResponse{}, trackedReposStartupPending
 	}
 	if err == nil && resp.OK {
 		var probe daemon.ProbeResponse
