@@ -51,7 +51,7 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 	if err := writeNewJSON(filepath.Join(out, "inputs.json"), index); err != nil {
 		failures = append(failures, err)
 	}
-	d, loadErr := loadInputsChecked(filepath.Join(out, "inputs.json"), validateEditLoopReport)
+	d, loadErr := loadEditLoopInputs(filepath.Join(out, "inputs.json"))
 	scenarios := map[string]bool{}
 	for _, task := range plan.Tasks {
 		scenarios[task.Scenario] = true
@@ -64,12 +64,7 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 			continue
 		}
 		budgets = append(budgets, b)
-		row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit}
-		if loadErr != nil {
-			row.Reason = loadErr.Error()
-		} else {
-			row = assessEditLoopRow(b, d)
-		}
+		row := editLoopBudgetRow(b, d, loadErr)
 		if editLoopRowBlocks(row) {
 			pass = false
 		}
