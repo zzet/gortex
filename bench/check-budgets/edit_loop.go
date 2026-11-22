@@ -49,6 +49,7 @@ type editLoopWire struct {
 			Mode     string `json:"mode"`
 		} `json:"routes"`
 		LinkedWorktrees int    `json:"linked_worktrees"`
+		Seed            int64  `json:"seed"`
 		MeanNS          *int64 `json:"mean_interarrival_ns"`
 		Arrival         string `json:"arrival"`
 		GateModes       bool   `json:"gate_modes"`
@@ -57,10 +58,12 @@ type editLoopWire struct {
 		Mode            string `json:"mode"`
 		Session         string `json:"session_model"`
 		Steps           []struct {
-			Editor  int    `json:"editor"`
-			Route   string `json:"route"`
-			Ordinal int    `json:"ordinal"`
-			Mode    string `json:"probe_mode"`
+			Editor      int    `json:"editor"`
+			Route       string `json:"route"`
+			Ordinal     int    `json:"ordinal"`
+			Mode        string `json:"probe_mode"`
+			MutationID  string `json:"mutation_id"`
+			RequestHash string `json:"request_sha256"`
 		} `json:"steps"`
 	} `json:"plan"`
 	Edits []struct {
@@ -182,7 +185,7 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "scenario has no declared edit-loop gate rows")
 		return 2
 	}
-	dataset, loadErr := loadInputsChecked(*inputsPath, validateEditLoopReport)
+	dataset, loadErr := loadEditLoopInputs(*inputsPath)
 	if *perReportOutput != "" {
 		if err := writeEditLoopPerReportRows(*perReportOutput, budgets, dataset, loadErr); err != nil {
 			fmt.Fprintln(stderr, err)
@@ -192,12 +195,7 @@ func editLoopCommand(args []string, stdout, stderr io.Writer) int {
 	rows := make([]editLoopRow, 0, len(budgets))
 	pass := true
 	for _, b := range budgets {
-		row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit}
-		if loadErr != nil {
-			row.Reason = loadErr.Error()
-		} else {
-			row = assessEditLoopRow(b, dataset)
-		}
+		row := editLoopBudgetRow(b, dataset, loadErr)
 		if editLoopRowBlocks(row) {
 			pass = false
 		}
@@ -242,7 +240,32 @@ func editLoopNumber(value *float64) string {
 }
 
 func validateEditLoopReport(config inputs, input runInput, r report) error {
-	if r.Version != 1 || !r.Complete || r.RunID == "" || r.Revision != map[string]string{"candidate": config.CandidateRevision, "main": config.MainRevision, "tag": config.TagRevision}[input.Role] || r.Profile != "agent" || !planPattern.MatchString(r.Plan) || len(r.Errors) != 0 || len(r.Phases) != 1 {
+	if err := validateEditLoopReportEnvelope(config, input, r, true); err != nil {
+		return err
+	}
+	phase := r.Phases[0]
+	wire, err := decodeEditLoopWire(phase)
+	if err != nil {
+		return err
+	}
+	if wire.PhysicalWriteScope != nil && (len(r.Corpus) != 1 || !sharedPhysicalEditLoop(wire)) {
+		return errors.New("shared ACK scope lacks the admitted single-worktree/file topology")
+	}
+	editors := wire.Plan.Editors
+	if editors == 0 && wire.Plan.Session == "one_editor_plus_one_separate_prober_per_edit" {
+		editors = 1
+	}
+	if editors != editLoopEditors(input.Scenario) || wire.Plan.Session != phase.SessionModel {
+		return errors.New("plan editor population differs from workload")
+	}
+	return validateEditLoopRoutes(input, r, wire)
+}
+
+// Verification shared by strict passage and the failure-only ACK assessment.
+// Only completion predicates tied to other report rows can differ.
+func validateEditLoopReportEnvelope(config inputs, input runInput, r report, requireComplete bool) error {
+	if r.Version != 1 || r.RunID == "" || r.Revision != map[string]string{"candidate": config.CandidateRevision, "main": config.MainRevision, "tag": config.TagRevision}[input.Role] || r.Profile != "agent" || !planPattern.MatchString(r.Plan) || len(r.Phases) != 1 ||
+		requireComplete && (!r.Complete || len(r.Errors) != 0) {
 		return errors.New("incomplete or unpinned edit-loop report")
 	}
 	if err := validateHost(input.HostClass, config.Hosts[input.HostClass], r); err != nil {
@@ -254,7 +277,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 		}
 	}
 	phase := r.Phases[0]
-	if phase.Name != "edit-and-probe" || phase.SessionModel == "" || len(phase.Errors) != 0 || !finiteNonnegative(phase.Duration) || phase.Duration <= 0 || input.Scenario == "loadedit-4" && phase.Duration > 900 {
+	if phase.Name != "edit-and-probe" || phase.SessionModel == "" || requireComplete && len(phase.Errors) != 0 || !finiteNonnegative(phase.Duration) || phase.Duration <= 0 || input.Scenario == "loadedit-4" && phase.Duration > 900 {
 		return errors.New("edit-loop phase incomplete or exceeds the 15-minute gate")
 	}
 	var wall struct {
@@ -262,7 +285,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 		NS       *int64 `json:"wall_ns"`
 		Complete bool   `json:"complete"`
 	}
-	if json.Unmarshal(phase.Gate["edit_loop_wall"], &wall) != nil || wall.Clock != "monotonic" || wall.NS == nil || *wall.NS <= 0 || input.Scenario == "loadedit-4" && *wall.NS > 900000000000 || float64(*wall.NS) < phase.Duration*1e9 || !wall.Complete {
+	if json.Unmarshal(phase.Gate["edit_loop_wall"], &wall) != nil || wall.Clock != "monotonic" || wall.NS == nil || *wall.NS <= 0 || input.Scenario == "loadedit-4" && *wall.NS > 900000000000 || float64(*wall.NS) < phase.Duration*1e9 || requireComplete && !wall.Complete {
 		return errors.New("missing, incomplete or over-15-minute whole-run wall observation")
 	}
 	if _, coupled := phase.Gate["paired_measurement_window"]; coupled {
@@ -280,10 +303,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	if err := json.Unmarshal(r.Workload, &workload); err != nil {
 		return err
 	}
-	expected := scenarioSpecs[input.Scenario].editors
-	if input.Scenario == "loadedit-4-largefile" {
-		expected = 4
-	}
+	expected := editLoopEditors(input.Scenario)
 	session := "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 	if expected == 1 {
 		session = "one_editor_plus_one_separate_prober_per_edit"
@@ -291,20 +311,17 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	if workload.Scenario != "edit-and-probe" || workload.Agents != 0 || workload.Editors != expected || workload.Session != session || phase.SessionModel != session {
 		return errors.New("incorrect edit-loop workload population or session model")
 	}
-	wire, err := decodeEditLoopWire(phase)
-	if err != nil {
-		return err
+	return nil
+}
+
+func editLoopEditors(scenario string) int {
+	if scenario == "loadedit-4-largefile" {
+		return 4
 	}
-	if wire.PhysicalWriteScope != nil && (len(r.Corpus) != 1 || !sharedPhysicalEditLoop(wire)) {
-		return errors.New("shared ACK scope lacks the admitted single-worktree/file topology")
-	}
-	editors := wire.Plan.Editors
-	if editors == 0 && wire.Plan.Session == "one_editor_plus_one_separate_prober_per_edit" {
-		editors = 1
-	}
-	if editors != expected || wire.Plan.Session != session {
-		return errors.New("plan editor population differs from workload")
-	}
+	return scenarioSpecs[scenario].editors
+}
+
+func validateEditLoopRoutes(input runInput, r report, wire editLoopWire) error {
 	if input.Scenario == "loadedit-4-largefile" {
 		for _, record := range wire.Edits {
 			if record.TargetLines == nil || *record.TargetLines < 10000 {
@@ -348,19 +365,12 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 }
 
 func decodeEditLoopWire(phase phase) (editLoopWire, error) {
-	var wire editLoopWire
-	if err := json.Unmarshal(phase.EditProbe, &wire); err != nil {
-		return wire, fmt.Errorf("missing edit-probe evidence: %w", err)
+	wire, err := decodeEditLoopPopulation(phase)
+	if err != nil {
+		return wire, err
 	}
-	if wire.Plan.MeanNS == nil || *wire.Plan.MeanNS != 15000000000 || wire.Plan.Arrival != "precomputed_open_loop_poisson" {
-		return wire, errors.New("gate changed the offered 15-second-per-editor open-loop schedule")
-	}
-	if !wire.Plan.GateModes || wire.Plan.Count < 100 || len(wire.Edits) != wire.Plan.Count || len(wire.Plan.Steps) != wire.Plan.Count || wire.Plan.Mode != "json" {
-		return wire, errors.New("gate needs the complete >=100-total JSON-ACK/five-mode denominator")
-	}
-	modes := []string{"json", "toon", "compact", "facade", "cli"}
 	for i, record := range wire.Edits {
-		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode || record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome && record.Outcome != receiptproof.CoalescedFunctionalOutcome && record.Outcome != receiptproof.FunctionalUnavailableOutcome || len(record.Errors) != 0 {
+		if record.Outcome != "complete" && record.Outcome != receiptproof.SupersededOutcome && record.Outcome != receiptproof.CoalescedFunctionalOutcome && record.Outcome != receiptproof.FunctionalUnavailableOutcome || len(record.Errors) != 0 {
 			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
 		}
 
@@ -381,6 +391,26 @@ func decodeEditLoopWire(phase phase) (editLoopWire, error) {
 				record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
 				return wire, errors.New("superseded receipt lacks exact shared-worktree status/guard/ACK proof")
 			}
+		}
+	}
+	return wire, nil
+}
+
+func decodeEditLoopPopulation(phase phase) (editLoopWire, error) {
+	var wire editLoopWire
+	if err := json.Unmarshal(phase.EditProbe, &wire); err != nil {
+		return wire, fmt.Errorf("missing edit-probe evidence: %w", err)
+	}
+	if wire.Plan.MeanNS == nil || *wire.Plan.MeanNS != 15000000000 || wire.Plan.Arrival != "precomputed_open_loop_poisson" {
+		return wire, errors.New("gate changed the offered 15-second-per-editor open-loop schedule")
+	}
+	if !wire.Plan.GateModes || wire.Plan.Count < 100 || len(wire.Edits) != wire.Plan.Count || len(wire.Plan.Steps) != wire.Plan.Count || wire.Plan.Mode != "json" {
+		return wire, errors.New("gate needs the complete >=100-total JSON-ACK/five-mode denominator")
+	}
+	modes := []string{"json", "toon", "compact", "facade", "cli"}
+	for i, record := range wire.Edits {
+		if record.Ordinal != i || wire.Plan.Steps[i].Ordinal != i || record.Mode != modes[i%5] || wire.Plan.Steps[i].Mode != record.Mode {
+			return wire, errors.New("missing, duplicate, failed or incorrectly routed gate edit")
 		}
 	}
 	return wire, nil
@@ -564,6 +594,12 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 		return 0, err
 	}
 	switch name {
+	case "edit_ack_p95", "edit_ack_max":
+		samples, err := editLoopACKSamples(wire)
+		if err != nil {
+			return 0, err
+		}
+		return editLoopLatencyRank(name, samples)
 	case "wal_p95_mib", "wal_peak_mib":
 		key := "p95_wal_bytes"
 		if name == "wal_peak_mib" {
@@ -598,26 +634,8 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 	}
 	var values []float64
 	correct, total := 0, 0
-	sharedPhysical := sharedPhysicalEditLoop(wire)
 	for _, record := range wire.Edits {
-		if name == "edit_ack_p95" || name == "edit_ack_max" {
-			if record.ACKExact == nil {
-				return 0, errors.New("ACK lacks exact readback proof")
-			}
-			if sharedPhysical {
-				digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
-				if record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
-					return 0, errors.New("ACK lacks confirmed shared-write commit evidence")
-				}
-			} else if !*record.ACKExact {
-				return 0, errors.New("ACK lacks exact readback proof")
-			}
-			value, err := number(record.ACK, "ms")
-			if err != nil {
-				return 0, err
-			}
-			values = append(values, value/1000)
-		} else if name == "readback_p95" || name == "readback_max" {
+		if name == "readback_p95" || name == "readback_max" {
 			value, err := number(record.OneRead, "ms")
 			if err != nil {
 				return 0, err
@@ -654,6 +672,34 @@ func measureEditLoopRow(phase phase, name string) (float64, error) {
 		}
 		return float64(correct) / float64(total), nil
 	}
+	return editLoopLatencyRank(name, values)
+}
+
+func editLoopACKSamples(wire editLoopWire) ([]float64, error) {
+	values := make([]float64, 0, len(wire.Edits))
+	sharedPhysical := sharedPhysicalEditLoop(wire)
+	for _, record := range wire.Edits {
+		if record.ACKExact == nil {
+			return nil, errors.New("ACK lacks exact readback proof")
+		}
+		if sharedPhysical {
+			digest, digestErr := hex.DecodeString(record.ACKContentSHA256)
+			if record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || digestErr != nil || len(digest) != 32 {
+				return nil, errors.New("ACK lacks confirmed shared-write commit evidence")
+			}
+		} else if !*record.ACKExact {
+			return nil, errors.New("ACK lacks exact readback proof")
+		}
+		value, err := number(record.ACK, "ms")
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value/1000)
+	}
+	return values, nil
+}
+
+func editLoopLatencyRank(name string, values []float64) (float64, error) {
 	if len(values) == 0 {
 		return 0, errors.New("required edit-loop measure unavailable")
 	}
