@@ -261,7 +261,7 @@ func validateEditLoopReport(config inputs, input runInput, r report) error {
 	return validateEditLoopRoutes(input, r, wire)
 }
 
-// Verification shared by strict passage and the failure-only ACK assessment.
+// Verification shared by strict passage and the seeded failure assessments.
 // Only completion predicates tied to other report rows can differ.
 func validateEditLoopReportEnvelope(config inputs, input runInput, r report, requireComplete bool) error {
 	if r.Version != 1 || r.RunID == "" || r.Revision != map[string]string{"candidate": config.CandidateRevision, "main": config.MainRevision, "tag": config.TagRevision}[input.Role] || r.Profile != "agent" || !planPattern.MatchString(r.Plan) || len(r.Phases) != 1 ||
