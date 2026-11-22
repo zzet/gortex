@@ -476,6 +476,11 @@ func editConsumersFinished(rows map[string]editConsumerObservation) bool {
 		if row.PostACKAttempts == 0 && row.State != "unsupported" {
 			return false
 		}
+		// Keep looking within the original edit window when the latest
+		// post-ACK attempt failed and there is still no assessed answer.
+		if row.State == "error" && row.Assessed == 0 {
+			return false
+		}
 	}
 	return true
 }
