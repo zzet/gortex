@@ -36,12 +36,16 @@ func fixtureDaemon(mode string) int {
 	}
 	// The startup probe runs the CLI and the hook through the same binary;
 	// answer them as against a ready daemon instead of starting another one.
+	grepMarker := filepath.Join(filepath.Dir(os.Getenv("GORTEX_DAEMON_PIDFILE")), "fixture-startup-grep")
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "call":
 			fmt.Println(`{"results":[]}`)
 			return 0
 		case "hook":
+			if mode == "startup-scope-evidence" {
+				return fixtureStartupGrep(grepMarker)
+			}
 			return 0
 		}
 	}
@@ -71,6 +75,12 @@ func fixtureDaemon(mode string) int {
 		return 5
 	}
 	defer listener.Close()
+	if mode == "startup-scope-evidence" {
+		_ = os.Remove(grepMarker)
+		for _, socket := range []string{listener.Addr().String() + ".other", listener.Addr().String()} {
+			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"msg": "daemon: serving", "ts": float64(time.Now().UnixNano()) / 1e9, "socket": socket})
+		}
+	}
 	// A loopback pprof listener whose heap endpoint serves a fixed body that
 	// names any forced collection, so captured profiles are recognisable.
 	pprof, err := net.Listen("tcp", "127.0.0.1:0")
@@ -138,11 +148,20 @@ func fixtureDaemon(mode string) int {
 					case "probe":
 						var repos []any
 						var roots []string
+						ready := true
+						if mode == "startup-scope-evidence" {
+							_, grepErr := os.Stat(grepMarker)
+							ready = grepErr == nil
+						}
+						state := "ready"
+						if !ready {
+							state = "running"
+						}
 						for _, repo := range config.Repos {
-							repos = append(repos, map[string]any{"path": repo.Path, "prefix": repo.Name, "state": "ready"})
+							repos = append(repos, map[string]any{"path": repo.Path, "prefix": repo.Name, "state": state})
 							roots = append(roots, repo.Path)
 						}
-						result = map[string]any{"ready": true, "enriched": true, "tracked_repos": repos, "loaded_roots": roots}
+						result = map[string]any{"ready": ready, "enriched": ready, "tracked_repos": repos, "loaded_roots": roots}
 					case "status":
 						result = map[string]any{"ready": true, "enriched": true, "views": map[string]any{"coordinators": coordinators()}, "storage": map[string]any{"wal_pending_frames": 0}, "pprof_addr": pprof.Addr().String()}
 					case "search_symbols":
@@ -185,6 +204,31 @@ func fixtureDaemon(mode string) int {
 					}
 					arguments, _ := frame.Params["arguments"].(map[string]any)
 					switch {
+					case mode == "startup-scope-evidence":
+						name, tools := frame.Params["name"], handshake["tools"]
+						var refusal *rpcError
+						if name == "graph_stats" || (name == "workspace" && arguments["operation"] == "graph") {
+							refusal = &rpcError{Code: -32000, Message: "repository loading",
+								Data: map[string]any{"error_code": "repo_loading", "retryable": true, "phase": "starting", "percent": 0}}
+						}
+						if (tools == "core" && name == "capabilities") || (tools == "facade-v1" && name == "tools_search") {
+							refusal = &rpcError{Code: -32601, Message: "hidden tool"}
+						}
+						if refusal != nil {
+							if encode(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "error": refusal}) != nil {
+								return
+							}
+							continue
+						}
+						switch name {
+						case "tools_search":
+							result = stubContent(map[string]any{"query": arguments["query"], "tools": []map[string]string{{"name": "index_health"}}})
+						case "capabilities":
+							result = stubContent(map[string]any{"surface_version": "facade-v1", "domains": []map[string]string{{"name": "workspace"}}})
+						default:
+							result = stubContent(map[string]any{"status": "loading", "phase": "starting", "percent": 0,
+								"repos": []map[string]string{{"path": config.Repos[0].Path, "state": "running"}}})
+						}
 					case frame.Params["name"] == "analyze":
 						result = stubContent(map[string]any{"hotspots": []any{}, "total": 0})
 					case frame.Params["name"] == "session" && arguments["channel"] == "daemon_health" && arguments["operation"] == "subscribe":
@@ -240,6 +284,34 @@ func fixtureDaemon(mode string) int {
 			}
 		}()
 	}
+}
+
+func fixtureStartupGrep(marker string) int {
+	var input struct {
+		Tool  string            `json:"tool_name"`
+		CWD   string            `json:"cwd"`
+		Input map[string]string `json:"tool_input"`
+	}
+	if json.NewDecoder(os.Stdin).Decode(&input) != nil {
+		return 7
+	}
+	if input.Tool != "Grep" {
+		return 0
+	}
+	if input.Input["path"] != filepath.Join(input.CWD, "sample.go") || input.Input["pattern"] != "Example" {
+		return 7
+	}
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	switch {
+	case err == nil:
+		_ = f.Close()
+		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"repository is loading"}}`)
+	case os.IsExist(err):
+		fmt.Println(`{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"file indexed"}}`)
+	default:
+		return 7
+	}
+	return 0
 }
 
 func TestPrivateDaemonLifecycleSelfTest(t *testing.T) {
