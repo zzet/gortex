@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/platform"
 )
 
 type queryMicroChild struct {
@@ -25,6 +27,8 @@ type queryMicroChild struct {
 	pgid           int
 	stdout, stderr []byte
 	err            error
+	owner          platform.ProcessIdentity
+	descendant     platform.ProcessIdentity
 }
 
 func startQueryMicroChild(t *testing.T, mode string) *queryMicroChild {
@@ -45,21 +49,13 @@ func startQueryMicroChild(t *testing.T, mode string) *queryMicroChild {
 	}()
 	t.Cleanup(func() {
 		cancel()
-		// Only this helper can create this fresh PID receipt. Retain cleanup
-		// even when the implementation under test leaves its child behind.
-		if data, err := os.ReadFile(ready + ".child"); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
+		killRunningQueryFixture(child.descendant)
 		select {
 		case <-child.done:
 			return
 		case <-time.After(15 * time.Second):
 		}
-		if child.pid > 0 {
-			_ = syscall.Kill(child.pid, syscall.SIGKILL)
-		}
+		killRunningQueryFixture(child.owner)
 		select {
 		case <-child.done:
 		case <-time.After(5 * time.Second):
@@ -87,7 +83,57 @@ func startQueryMicroChild(t *testing.T, mode string) *queryMicroChild {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+		if child.pgid != child.pid {
+			t.Fatalf("query did not own its process group: pid=%d pgid=%d", child.pid, child.pgid)
+		}
+		child.owner = captureRunningQueryFixture(t, child.pid, child.pgid)
+		if mode == "descendants" {
+			data, err := os.ReadFile(ready + ".child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || pid <= 0 || pid == child.pid {
+				t.Fatalf("invalid query descendant receipt: %q", data)
+			}
+			child.descendant = captureRunningQueryFixture(t, pid, child.pgid)
+		}
+	}
 	return child
+}
+
+func captureRunningQueryFixture(t *testing.T, pid, pgid int) platform.ProcessIdentity {
+	t.Helper()
+	identity, err := platform.CaptureProcessIdentity(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := syscall.Getpgid(pid); err != nil || observed != pgid {
+		t.Fatalf("query fixture PID %d is outside the owned process group: pgid=%d, err=%v", pid, observed, err)
+	}
+	if running, err := identity.Running(); err != nil || !running {
+		t.Fatalf("query fixture PID %d was not observed running: %v", pid, err)
+	}
+	return identity
+}
+
+func killRunningQueryFixture(identity platform.ProcessIdentity) {
+	if identity.PID() > 0 {
+		if running, err := identity.Running(); err == nil && running {
+			_ = identity.Kill()
+		}
+	}
+}
+
+func queryFixtureExitState(running bool, err error) error {
+	if err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("owned process state is unknown: %w", err)
+	}
+	if running {
+		return errors.New("owned process is still running")
+	}
+	return nil
 }
 
 func joinQueryMicroChild(t *testing.T, child *queryMicroChild) {
@@ -100,7 +146,11 @@ func joinQueryMicroChild(t *testing.T, child *queryMicroChild) {
 	if !errors.Is(child.err, context.Canceled) {
 		t.Fatalf("expired query was not failed evidence: %v", child.err)
 	}
-	if err := syscall.Kill(child.pid, 0); !errors.Is(err, syscall.ESRCH) {
+	if child.owner.PID() > 0 {
+		if err := queryFixtureExitState(child.owner.Running()); err != nil {
+			t.Fatalf("query child remains after join: %v", err)
+		}
+	} else if err := syscall.Kill(child.pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("query child remains after join: %v", err)
 	}
 }
@@ -146,8 +196,39 @@ func TestQueryMicroTimeoutReapsOwnedDescendants(t *testing.T) {
 	}
 	child.cancel()
 	joinQueryMicroChild(t, child)
+	if child.descendant.PID() > 0 {
+		if err := queryFixtureExitState(child.descendant.Running()); err != nil {
+			t.Fatalf("query descendant PID %d did not exit: %v; query result: %v", child.descendant.PID(), err, child.err)
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		// This fixture starts exactly one verified descendant. Its native
+		// process state supplies exit evidence while the OS reaps it.
+		return
+	}
 	if err := syscall.Kill(-child.pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("owned descendant group survived failed query cleanup: %v", err)
+	}
+}
+
+func TestQueryMicroOwnedExitRequiresKnownProcessState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		running bool
+		err     error
+		fail    bool
+	}{
+		{name: "running", running: true, fail: true},
+		{name: "exited"},
+		{name: "absent", err: os.ErrProcessDone},
+		{name: "inaccessible", err: syscall.EPERM, fail: true},
+		{name: "reused", err: platform.ErrProcessIdentityChanged, fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := queryFixtureExitState(tc.running, tc.err); (err != nil) != tc.fail {
+				t.Fatalf("unexpected owned process exit verdict: %v", err)
+			}
+		})
 	}
 }
 
