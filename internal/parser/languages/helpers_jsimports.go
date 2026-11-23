@@ -127,9 +127,55 @@ func visitJSImportBindings(importStmt *sitter.Node, src []byte, visit func(strin
 	}
 }
 
+func firstNonCommentNamedChild(n *sitter.Node) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		if c := n.NamedChild(i); c != nil && c.Type() != "comment" {
+			return c
+		}
+	}
+	return nil
+}
+
+// tsUsingAssignment returns the assignment_expression of a TypeScript
+// `using x = ...` or `await using x = ...` statement (tree-sitter-typescript
+// attaches an anonymous "using" token to assignment_expression instead of
+// emitting JS's using_declaration).
+func tsUsingAssignment(n *sitter.Node) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	if n.Type() == "expression_statement" {
+		n = firstNonCommentNamedChild(n)
+	}
+	if n != nil && n.Type() == "await_expression" {
+		n = firstNonCommentNamedChild(n)
+	}
+	if n == nil || n.Type() != "assignment_expression" {
+		return nil
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.Type() == "comment" {
+			continue
+		}
+		if !c.IsNamed() && c.Type() == "using" {
+			return n
+		}
+		return nil
+	}
+	return nil
+}
+
 func visitJSNamespaceName(n *sitter.Node, src []byte, visit func(string)) {
-	for n != nil && n.Type() == "nested_identifier" {
-		n = n.NamedChild(0)
+	for n != nil && (n.Type() == "nested_identifier" || n.Type() == "member_expression") {
+		next := n.ChildByFieldName("object")
+		if next == nil {
+			next = firstNonCommentNamedChild(n)
+		}
+		n = next
 	}
 	if n != nil && n.Type() == "identifier" {
 		visit(n.Content(src))
@@ -158,18 +204,26 @@ func visitJSAllDeclarations(n *sitter.Node, src []byte, includeAmbient bool, vis
 	switch n.Type() {
 	case "ambient_declaration":
 		if includeAmbient {
-			visitJSAllDeclarations(n.NamedChild(0), src, includeAmbient, visit)
+			visitJSAllDeclarations(firstNonCommentNamedChild(n), src, includeAmbient, visit)
 		}
 	case "export_statement":
 		visitJSAllDeclarations(n.ChildByFieldName("declaration"), src, includeAmbient, visit)
 	case "expression_statement":
-		if child := n.NamedChild(0); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+		if assign := tsUsingAssignment(n); assign != nil {
+			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
+			return
+		}
+		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
 			visitJSNamespaceName(child.ChildByFieldName("name"), src, visit)
+		}
+	case "await_expression", "assignment_expression":
+		if assign := tsUsingAssignment(n); assign != nil {
+			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
 		}
 	case "internal_module", "module":
 		visitJSNamespaceName(n.ChildByFieldName("name"), src, visit)
 	case "import_alias":
-		if id := n.NamedChild(0); id != nil && id.Type() == "identifier" {
+		if id := findChildByType(n, "identifier"); id != nil {
 			visit(id.Content(src))
 		}
 	case "function_signature":
@@ -253,8 +307,16 @@ func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, loca
 }
 
 func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool {
+	inDecorator := false
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		if child.Type() == "decorator" {
+			inDecorator = true
+		}
 		kind := n.Type()
+		if kind == "class_body" {
+			inDecorator = false
+			continue
+		}
 		switch kind {
 		case "program", "statement_block", "switch_body", "class",
 			"function_declaration", "generator_function_declaration", "method_definition",
@@ -264,14 +326,18 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 			continue
 		}
 		body := child.Type() == "statement_block"
-		// Computed method keys and decorators evaluate outside the method's
-		// parameter scope; class decorators evaluate outside the class name.
-		if kind == "method_definition" && !body && child.Type() != "formal_parameters" {
+		// Computed method keys, method decorators, and parameter decorators
+		// evaluate outside the method's parameter scope; class decorators
+		// evaluate outside the class name.
+		if kind == "method_definition" && (inDecorator || (!body && child.Type() != "formal_parameters")) {
+			inDecorator = false
 			continue
 		}
 		if kind == "class" && child.Type() == "decorator" {
+			inDecorator = false
 			continue
 		}
+		inDecorator = false
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		shadowed, ok := cache.requireShadow[key]
 		if !ok {
@@ -393,17 +459,25 @@ func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local fu
 	}
 	switch n.Type() {
 	case "ambient_declaration":
-		cache.visitDeclaration(n.NamedChild(0), src, local, required)
+		cache.visitDeclaration(firstNonCommentNamedChild(n), src, local, required)
 	case "export_statement":
 		cache.visitDeclaration(n.ChildByFieldName("declaration"), src, local, required)
 	case "expression_statement":
-		if child := n.NamedChild(0); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+		if assign := tsUsingAssignment(n); assign != nil {
+			visitJSPattern(assign.ChildByFieldName("left"), src, local)
+			return
+		}
+		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
 			visitJSNamespaceName(child.ChildByFieldName("name"), src, local)
+		}
+	case "await_expression", "assignment_expression":
+		if assign := tsUsingAssignment(n); assign != nil {
+			visitJSPattern(assign.ChildByFieldName("left"), src, local)
 		}
 	case "internal_module", "module":
 		visitJSNamespaceName(n.ChildByFieldName("name"), src, local)
 	case "import_alias":
-		if id := n.NamedChild(0); id != nil && id.Type() == "identifier" {
+		if id := findChildByType(n, "identifier"); id != nil {
 			local(id.Content(src))
 		}
 	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
@@ -469,8 +543,16 @@ type jsScopeCache struct {
 }
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
+	inDecorator := false
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		if child.Type() == "decorator" {
+			inDecorator = true
+		}
 		kind := n.Type()
+		if kind == "class_body" {
+			inDecorator = false
+			continue
+		}
 		switch kind {
 		case "statement_block", "switch_body", "class",
 			"function_declaration", "generator_function_declaration", "method_definition",
@@ -482,12 +564,15 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 		// The body sees hoisted var declarations; parameter initializers do
 		// not. Cache the two environments separately for the same function.
 		body := child.Type() == "statement_block"
-		if kind == "method_definition" && !body && child.Type() != "formal_parameters" {
+		if kind == "method_definition" && (inDecorator || (!body && child.Type() != "formal_parameters")) {
+			inDecorator = false
 			continue
 		}
 		if kind == "class" && child.Type() == "decorator" {
+			inDecorator = false
 			continue
 		}
+		inDecorator = false
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		names, ok := cache.scopes[key]
 		if !ok {

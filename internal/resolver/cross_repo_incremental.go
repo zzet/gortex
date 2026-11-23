@@ -95,7 +95,7 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		if cr.npmPackages != nil {
 			for _, edges := range frontier.outByNode {
 				for _, edge := range edges {
-					if trackedNpmImportSpec(edge) != "" {
+					if trackedNpmImportSpec(edge) != "" || trackedNpmRequireCall(edge) {
 						frontier.pending = append(frontier.pending, edge)
 					}
 				}
@@ -104,7 +104,7 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		pending := make([]*graph.Edge, 0, len(frontier.pending))
 		seen := make(map[graph.EdgeIdentity]struct{}, len(frontier.pending))
 		for _, edge := range frontier.pending {
-			if edge == nil || !graph.IsUnresolvedTarget(edge.To) && trackedNpmImportSpec(edge) == "" {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) && trackedNpmImportSpec(edge) == "" && !trackedNpmRequireCall(edge) {
 				continue
 			}
 			identity := graph.EdgeIdentityFor(edge)
