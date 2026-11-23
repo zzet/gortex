@@ -251,6 +251,7 @@ type mcpDispatchBusyError struct {
 	waited     time.Duration
 	retryAfter time.Duration
 	lane       MCPDispatchClass
+	occupancy  *mcpDispatchOccupancy
 }
 
 func (e *mcpDispatchBusyError) Error() string { return errMCPDispatchSaturated.Error() }
