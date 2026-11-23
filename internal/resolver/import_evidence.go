@@ -33,12 +33,16 @@ import (
 // Same-file declarations block both import tiers. Restrict these rules to
 // JS/TS: importing a package does not put its bare names in scope in Go.
 
-// jsLexicallyShadowed reports a bare call whose name an enclosing parameter or
-// local owns. A local with a same-file value node continues to the same-file
-// tier; otherwise no graph symbol is the callee, so the stub stays unresolved.
-func jsLexicallyShadowed(e *graph.Edge, candidates []*graph.Node) bool {
+// handleJSLexicalBinding handles a bare JS/TS call whose name is bound in an
+// enclosing scope. A parameter always stays unresolved; a local with a
+// same-file value node continues to the same-file tier; a local initialized
+// from an unshadowed static require(spec) resolves strictly against spec (and
+// its barrel re-exports) and otherwise stays unresolved rather than falling
+// through to file-wide imports or locality heuristics.
+func (r *Resolver) handleJSLexicalBinding(e *graph.Edge, funcName string, candidates []*graph.Node, stats *ResolveStats) bool {
 	switch e.Meta[graph.JSLexicalBindingMeta] {
 	case graph.JSPendingParameter:
+		stats.Unresolved++
 		return true
 	case graph.JSLexicalLocal:
 		for _, c := range candidates {
@@ -50,9 +54,62 @@ func jsLexicallyShadowed(e *graph.Edge, candidates []*graph.Node) bool {
 				return false
 			}
 		}
+		stats.Unresolved++
+		return true
+	case graph.JSLexicalRequire:
+		if pick := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
+			e.To = pick.ID
+			e.Origin = graph.OriginASTResolved
+			e.Confidence = 0.9
+			if e.Meta == nil {
+				e.Meta = map[string]any{}
+			}
+			e.Meta["resolution"] = "import_closure"
+			stats.Resolved++
+			return true
+		}
+		stats.Unresolved++
 		return true
 	}
 	return false
+}
+
+func (r *Resolver) resolveJSRequireCallee(e *graph.Edge, funcName string, candidates []*graph.Node) *graph.Node {
+	spec, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string)
+	callerFile := e.FilePath
+	if spec == "" || callerFile == "" || !isJSTSPath(callerFile) || len(candidates) == 0 {
+		return nil
+	}
+	target := r.resolveJSTSSpecTarget(e, spec)
+	if target == "" {
+		return nil
+	}
+	files := r.importClosureFiles(callerFile, map[string]bool{target: true})
+	return pickUniqueFileCandidate(files, funcName, candidates)
+}
+
+func pickUniqueFileCandidate(files map[string]struct{}, funcName string, candidates []*graph.Node) *graph.Node {
+	if len(files) == 0 {
+		return nil
+	}
+	var pick *graph.Node
+	for _, c := range candidates {
+		if !isImportableCallee(c, funcName) {
+			continue
+		}
+		if _, ok := files[c.FilePath]; !ok {
+			continue
+		}
+		if pick != nil {
+			// Two imported files (or one file with two same-named
+			// top-level symbols) both define the name — the import
+			// statement alone cannot arbitrate. Refuse, exactly like
+			// the no-import case.
+			return nil
+		}
+		pick = c
+	}
+	return pick
 }
 
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) (*graph.Node, string) {
@@ -93,23 +150,7 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 		return symbolPick, "import_binding"
 	}
 	imports.closureOnce.Do(func() { imports.files = r.importClosureFiles(callerFile, imports.direct) })
-	var pick *graph.Node
-	for _, c := range candidates {
-		if !isImportableCallee(c, funcName) {
-			continue
-		}
-		if _, ok := imports.files[c.FilePath]; !ok {
-			continue
-		}
-		if pick != nil {
-			// Two imported files (or one file with two same-named
-			// top-level symbols) both define the name — the import
-			// statement alone cannot arbitrate. Refuse, exactly like
-			// the no-import case.
-			return nil, ""
-		}
-		pick = c
-	}
+	pick := pickUniqueFileCandidate(imports.files, funcName, candidates)
 	if pick == nil {
 		return nil, ""
 	}
@@ -225,6 +266,19 @@ func (r *Resolver) importClosureFiles(callerFile string, direct map[string]bool)
 	return files
 }
 
+func (r *Resolver) resolveJSTSSpecTarget(e *graph.Edge, payload string) string {
+	// Same expansion, same precedence as resolveImport: tsconfig
+	// paths / relative join first, npm-alias rewrite second.
+	callerFile := jsTSImportCallerFile(e)
+	target := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, payload)
+	if target == "" {
+		if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, payload); aliased {
+			target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, rewritten)
+		}
+	}
+	return target
+}
+
 // importedTargetOf shares symbol/file expansion across both evidence tiers.
 // Parallel resolve workers mutate cloned edges, not these stored import edges.
 func (r *Resolver) importedTargetOf(e *graph.Edge) string {
@@ -237,15 +291,7 @@ func (r *Resolver) importedTargetOf(e *graph.Edge) string {
 		if !ok || payload == "" {
 			return ""
 		}
-		// Same expansion, same precedence as resolveImport: tsconfig
-		// paths / relative join first, npm-alias rewrite second.
-		target := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), payload)
-		if target == "" {
-			if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, payload); aliased {
-				target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), rewritten)
-			}
-		}
-		return target
+		return r.resolveJSTSSpecTarget(e, payload)
 	}
 	if strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
 		return ""

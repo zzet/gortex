@@ -308,11 +308,14 @@ var validNodeKinds = map[NodeKind]bool{
 }
 
 // Persisted lexical evidence on bare JS/TS call edges: the name is bound by an
-// enclosing scope, so a module import of that name cannot be the callee.
+// enclosing scope, so a module import of that name cannot be the callee unless
+// the binding came from an unshadowed static require() of a specific module.
 const (
-	JSLexicalBindingMeta = "js_lexical_binding"
-	JSLexicalLocal       = "local"
-	JSPendingParameter   = "parameter"
+	JSLexicalBindingMeta     = "js_lexical_binding"
+	JSLexicalLocal           = "local"
+	JSPendingParameter       = "parameter"
+	JSLexicalRequire         = "require"
+	JSLexicalRequireSpecMeta = "js_lexical_require"
 )
 
 type Node struct {

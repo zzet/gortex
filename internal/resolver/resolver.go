@@ -4637,8 +4637,7 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
-	if jsLexicallyShadowed(e, candidates) {
-		stats.Unresolved++
+	if r.handleJSLexicalBinding(e, funcName, candidates, stats) {
 		return
 	}
 	if len(candidates) == 0 {

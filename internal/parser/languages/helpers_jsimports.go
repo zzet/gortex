@@ -45,34 +45,321 @@ func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
-// A local initialized from require() still names that module's export, so it
-// stays eligible for import evidence.
-func jsRequireInitializer(declarator *sitter.Node, src []byte) bool {
-	value := declarator.ChildByFieldName("value")
-	for value != nil && value.Type() == "member_expression" {
-		value = value.ChildByFieldName("object")
+// jsSingleStringContent returns the non-empty text of a plain string literal
+// with a single string_fragment child, or "".
+func jsSingleStringContent(n *sitter.Node, src []byte) string {
+	if n == nil || n.Type() != "string" || n.NamedChildCount() != 1 {
+		return ""
 	}
-	if value == nil || value.Type() != "call_expression" {
-		return false
+	frag := n.NamedChild(0)
+	if frag == nil || frag.Type() != "string_fragment" {
+		return ""
 	}
-	callee := value.ChildByFieldName("function")
-	return callee != nil && callee.Content(src) == "require"
+	return frag.Content(src)
 }
 
-func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+// jsStaticRequireCall returns the static string specifier of a single-argument
+// require("...") call, ignoring comments in the argument list.
+func jsStaticRequireCall(call *sitter.Node, src []byte) string {
+	if call == nil || call.Type() != "call_expression" {
+		return ""
+	}
+	callee := call.ChildByFieldName("function")
+	if callee == nil || callee.Type() != "identifier" || callee.Content(src) != "require" {
+		return ""
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return ""
+	}
+	var arg *sitter.Node
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		c := args.NamedChild(i)
+		if c == nil || c.Type() == "comment" {
+			continue
+		}
+		if arg != nil {
+			return ""
+		}
+		arg = c
+	}
+	return jsSingleStringContent(arg, src)
+}
+
+func visitJSImportBindings(importStmt *sitter.Node, src []byte, visit func(string)) {
+	if importStmt == nil || importStmt.Type() != "import_statement" || tsImportStatementTypeOnly(importStmt, src) {
+		return
+	}
+	visitNamed := func(named *sitter.Node) {
+		for _, sp := range jsCollectChildren(named, "import_specifier") {
+			if tsSpecifierTypeOnly(sp, src) {
+				continue
+			}
+			orig, alias := jsSpecifierNames(sp, src)
+			if alias != "" {
+				visit(alias)
+			} else if orig != "" {
+				visit(orig)
+			}
+		}
+	}
+	if clause := findChildByType(importStmt, "import_clause"); clause != nil {
+		for i := 0; i < int(clause.NamedChildCount()); i++ {
+			c := clause.NamedChild(i)
+			switch c.Type() {
+			case "identifier":
+				visit(c.Content(src))
+			case "namespace_import":
+				if id := findChildByType(c, "identifier"); id != nil {
+					visit(id.Content(src))
+				}
+			case "named_imports":
+				visitNamed(c)
+			}
+		}
+	} else if named := findChildByType(importStmt, "named_imports"); named != nil {
+		visitNamed(named)
+	}
+	if reqClause := findChildByType(importStmt, "import_require_clause"); reqClause != nil {
+		if id := findChildByType(reqClause, "identifier"); id != nil {
+			visit(id.Content(src))
+		}
+	}
+}
+
+// visitJSAllDeclarations visits every binding declared by n without exempting
+// require() initializers, so checking whether `require` itself is shadowed
+// never recurses into require matching.
+func visitJSAllDeclarations(n *sitter.Node, src []byte, includeAmbient bool, visit func(string)) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case "ambient_declaration":
-		visitJSDeclaration(n.NamedChild(0), src, visit)
-	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "enum_declaration":
+		if includeAmbient {
+			visitJSAllDeclarations(n.NamedChild(0), src, includeAmbient, visit)
+		}
+	case "export_statement":
+		visitJSAllDeclarations(n.ChildByFieldName("declaration"), src, includeAmbient, visit)
+	case "function_signature":
+		if includeAmbient {
+			visitJSPattern(n.ChildByFieldName("name"), src, visit)
+		}
+	case "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, visit)
 	case "lexical_declaration", "variable_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
-			if v.Type() == "variable_declarator" && !jsRequireInitializer(v, src) {
+			if v.Type() == "variable_declarator" {
 				visitJSPattern(v.ChildByFieldName("name"), src, visit)
+			}
+		}
+	}
+}
+
+func visitJSAllHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "variable_declaration":
+		visitJSAllDeclarations(n, src, false, visit)
+		return
+	case "for_in_statement":
+		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
+			visitJSPattern(n.ChildByFieldName("left"), src, visit)
+		}
+	case "program", "export_statement", "statement_block", "if_statement", "else_clause",
+		"switch_statement", "switch_body", "switch_case", "switch_default",
+		"for_statement", "while_statement", "do_statement",
+		"try_statement", "catch_clause", "finally_clause", "with_statement", "labeled_statement":
+	default:
+		return
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		visitJSAllHoistedVars(n.NamedChild(i), src, visit)
+	}
+}
+
+func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, local func(string), required func(string, string)) {
+	for i := 0; i < int(pat.NamedChildCount()); i++ {
+		c := pat.NamedChild(i)
+		switch c.Type() {
+		case "shorthand_property_identifier_pattern":
+			required(c.Content(src), spec)
+		case "object_assignment_pattern":
+			left := c.ChildByFieldName("left")
+			if left != nil && left.Type() == "shorthand_property_identifier_pattern" {
+				required(left.Content(src), spec)
+			} else {
+				visitJSPattern(left, src, local)
+			}
+		case "pair_pattern":
+			key := c.ChildByFieldName("key")
+			val := c.ChildByFieldName("value")
+			target := val
+			if target != nil && target.Type() == "assignment_pattern" {
+				target = target.ChildByFieldName("left")
+			}
+			var keyName string
+			if key != nil {
+				switch key.Type() {
+				case "property_identifier":
+					keyName = key.Content(src)
+				case "string":
+					keyName = jsSingleStringContent(key, src)
+				}
+			}
+			if keyName != "" && target != nil && target.Type() == "identifier" && target.Content(src) == keyName {
+				required(keyName, spec)
+			} else {
+				visitJSPattern(val, src, local)
+			}
+		default:
+			visitJSPattern(c, src, local)
+		}
+	}
+}
+
+func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool {
+	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		kind := n.Type()
+		switch kind {
+		case "program", "statement_block", "switch_body",
+			"function_declaration", "generator_function_declaration", "method_definition",
+			"function_expression", "generator_function", "arrow_function",
+			"catch_clause", "for_statement", "for_in_statement":
+		default:
+			continue
+		}
+		body := child.Type() == "statement_block"
+		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
+		shadowed, ok := cache.requireShadow[key]
+		if !ok {
+			check := func(id string) {
+				if id == "require" {
+					shadowed = true
+				}
+			}
+			switch kind {
+			case "program":
+				visitJSAllHoistedVars(n, src, check)
+				for i := 0; i < int(n.NamedChildCount()) && !shadowed; i++ {
+					s := n.NamedChild(i)
+					if s.Type() == "import_statement" {
+						visitJSImportBindings(s, src, check)
+						continue
+					}
+					if s.Type() != "variable_declaration" {
+						visitJSAllDeclarations(s, src, false, check)
+					}
+				}
+			case "statement_block":
+				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
+					visitJSAllHoistedVars(n, src, check)
+				}
+				for i := 0; i < int(n.NamedChildCount()) && !shadowed; i++ {
+					s := n.NamedChild(i)
+					if s.Type() != "variable_declaration" {
+						visitJSAllDeclarations(s, src, true, check)
+					}
+				}
+			case "switch_body":
+				for i := 0; i < int(n.NamedChildCount()) && !shadowed; i++ {
+					clause := n.NamedChild(i)
+					for j := 0; j < int(clause.NamedChildCount()) && !shadowed; j++ {
+						s := clause.NamedChild(j)
+						if s.Type() != "variable_declaration" {
+							visitJSAllDeclarations(s, src, true, check)
+						}
+					}
+				}
+			case "for_statement", "for_in_statement":
+				if init := n.ChildByFieldName("initializer"); init != nil && init.Type() != "variable_declaration" {
+					visitJSAllDeclarations(init, src, true, check)
+				}
+				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
+					visitJSPattern(n.ChildByFieldName("left"), src, check)
+				}
+			default:
+				if body && kind != "catch_clause" {
+					visitJSAllHoistedVars(child, src, check)
+				}
+				if kind == "function_expression" || kind == "generator_function" {
+					visitJSPattern(n.ChildByFieldName("name"), src, check)
+				}
+				visitJSPattern(n.ChildByFieldName("parameters"), src, check)
+				visitJSPattern(n.ChildByFieldName("parameter"), src, check)
+			}
+			if cache.requireShadow == nil {
+				cache.requireShadow = map[jsScopeKey]bool{}
+			}
+			cache.requireShadow[key] = shadowed
+		}
+		if shadowed {
+			return true
+		}
+	}
+	return false
+}
+
+// staticRequireSpec returns the static module specifier of call only when
+// `require` is not lexically shadowed in any enclosing scope (including
+// module scope) and receives a single non-empty string literal.
+func (cache *jsScopeCache) staticRequireSpec(call *sitter.Node, src []byte) string {
+	spec := jsStaticRequireCall(call, src)
+	if spec == "" || cache.isRequireShadowed(call, src) {
+		return ""
+	}
+	return spec
+}
+
+func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
+	name := v.ChildByFieldName("name")
+	if name == nil {
+		return
+	}
+	value := v.ChildByFieldName("value")
+	if value != nil {
+		switch value.Type() {
+		case "call_expression":
+			if spec := cache.staticRequireSpec(value, src); spec != "" {
+				switch name.Type() {
+				case "identifier":
+					required(name.Content(src), spec)
+					return
+				case "object_pattern":
+					visitJSRequireObjectPattern(name, spec, src, local, required)
+					return
+				}
+			}
+		case "member_expression":
+			prop := value.ChildByFieldName("property")
+			if name.Type() == "identifier" && prop != nil && prop.Type() == "property_identifier" && name.Content(src) == prop.Content(src) {
+				if spec := cache.staticRequireSpec(value.ChildByFieldName("object"), src); spec != "" {
+					required(name.Content(src), spec)
+					return
+				}
+			}
+		}
+	}
+	visitJSPattern(name, src, local)
+}
+
+func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
+	if n == nil {
+		return
+	}
+	switch n.Type() {
+	case "ambient_declaration":
+		cache.visitDeclaration(n.NamedChild(0), src, local, required)
+	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
+		visitJSPattern(n.ChildByFieldName("name"), src, local)
+	case "lexical_declaration", "variable_declaration":
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			v := n.NamedChild(i)
+			if v.Type() == "variable_declarator" {
+				cache.visitDeclarator(v, src, local, required)
 			}
 		}
 	}
@@ -81,17 +368,17 @@ func visitJSDeclaration(n *sitter.Node, src []byte, visit func(string)) {
 // var crosses statement-block boundaries but not function or class boundaries.
 // Only descend through statement containers: expressions cannot introduce a
 // var in this scope, even when they contain an entire function expression.
-func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
+func (cache *jsScopeCache) visitHoistedVars(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case "variable_declaration":
-		visitJSDeclaration(n, src, visit)
+		cache.visitDeclaration(n, src, local, required)
 		return
 	case "for_in_statement":
 		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
-			visitJSPattern(n.ChildByFieldName("left"), src, visit)
+			visitJSPattern(n.ChildByFieldName("left"), src, local)
 		}
 	case "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
 		"switch_case", "switch_default", "for_statement", "while_statement", "do_statement",
@@ -100,13 +387,13 @@ func visitJSHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
 		return
 	}
 	for i := 0; i < int(n.NamedChildCount()); i++ {
-		visitJSHoistedVars(n.NamedChild(i), src, visit)
+		cache.visitHoistedVars(n.NamedChild(i), src, local, required)
 	}
 }
 
-func visitJSBlockDeclaration(n *sitter.Node, src []byte, visit func(string)) {
+func (cache *jsScopeCache) visitBlockDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if n != nil && n.Type() != "variable_declaration" {
-		visitJSDeclaration(n, src, visit)
+		cache.visitDeclaration(n, src, local, required)
 	}
 }
 
@@ -119,7 +406,14 @@ type jsScopeKey struct {
 	kind       string
 	body       bool
 }
-type jsScopeCache map[jsScopeKey]map[string]string
+type jsBinding struct {
+	kind string
+	spec string
+}
+type jsScopeCache struct {
+	scopes        map[jsScopeKey]map[string]jsBinding
+	requireShadow map[jsScopeKey]bool
+}
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
@@ -133,40 +427,50 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 		// not. Cache the two environments separately for the same function.
 		body := child.Type() == "statement_block"
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
-		names, ok := (*cache)[key]
+		names, ok := cache.scopes[key]
 		if !ok {
-			add := func(name, value string) {
+			add := func(id string, b jsBinding) {
 				if names == nil {
-					names = map[string]string{}
+					names = map[string]jsBinding{}
 				}
-				names[name] = value
+				if prev, exists := names[id]; exists && prev != b {
+					if prev.kind == graph.JSPendingParameter || b.kind == graph.JSPendingParameter {
+						b = jsBinding{kind: graph.JSPendingParameter}
+					} else {
+						// Conflicting local/require or differing require specs
+						// cannot be trusted to name a single module binding.
+						b = jsBinding{kind: graph.JSLexicalLocal}
+					}
+				}
+				names[id] = b
 			}
-			local := func(id string) { add(id, graph.JSLexicalLocal) }
+			local := func(id string) { add(id, jsBinding{kind: graph.JSLexicalLocal}) }
+			required := func(id, spec string) { add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec}) }
 			switch kind {
 			case "statement_block":
 				// A class static block is its own var scope.
 				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
-					visitJSHoistedVars(n, src, local)
+					cache.visitHoistedVars(n, src, local, required)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
-					visitJSBlockDeclaration(n.NamedChild(i), src, local)
+					cache.visitBlockDeclaration(n.NamedChild(i), src, local, required)
 				}
 			case "switch_body":
 				for i := 0; i < int(n.NamedChildCount()); i++ {
 					clause := n.NamedChild(i)
 					for j := 0; j < int(clause.NamedChildCount()); j++ {
-						visitJSBlockDeclaration(clause.NamedChild(j), src, local)
+						cache.visitBlockDeclaration(clause.NamedChild(j), src, local, required)
 					}
 				}
 			case "for_statement", "for_in_statement":
-				visitJSBlockDeclaration(n.ChildByFieldName("initializer"), src, local)
+				cache.visitBlockDeclaration(n.ChildByFieldName("initializer"), src, local, required)
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
 			default:
-				param := func(id string) { add(id, graph.JSPendingParameter) }
+				param := func(id string) { add(id, jsBinding{kind: graph.JSPendingParameter}) }
 				if body && kind != "catch_clause" {
-					visitJSHoistedVars(child, src, local)
+					cache.visitHoistedVars(child, src, local, required)
 				}
 				if kind == "function_expression" || kind == "generator_function" {
 					visitJSPattern(n.ChildByFieldName("name"), src, local)
@@ -174,44 +478,82 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				visitJSPattern(n.ChildByFieldName("parameters"), src, param)
 				visitJSPattern(n.ChildByFieldName("parameter"), src, param)
 			}
-			if *cache == nil {
-				*cache = jsScopeCache{}
+			if cache.scopes == nil {
+				cache.scopes = map[jsScopeKey]map[string]jsBinding{}
 			}
-			(*cache)[key] = names
+			cache.scopes[key] = names
 		}
-		if binding := names[name]; binding != "" {
+		if binding, found := names[name]; found {
 			if edge.Meta == nil {
 				edge.Meta = map[string]any{}
 			}
-			edge.Meta[graph.JSLexicalBindingMeta] = binding
+			edge.Meta[graph.JSLexicalBindingMeta] = binding.kind
+			if binding.spec != "" {
+				edge.Meta[graph.JSLexicalRequireSpecMeta] = binding.spec
+			}
 			return
 		}
 	}
 }
 
+func jsLexicalRank(e *graph.Edge) int {
+	switch e.Meta[graph.JSLexicalBindingMeta] {
+	case nil:
+		return 0
+	case graph.JSLexicalRequire:
+		return 1
+	default:
+		return 2
+	}
+}
+
 // Calls with one From/To/Line identity collapse into one stored edge. When a
-// real call shares that site with a shadowed one, the stored edge must stay
-// eligible for the real call's binding.
+// less-shadowed call shares that site with a shadowed one, the stored edge
+// must keep the least-shadowed binding so a real call is not dropped.
 func clearCollapsedJSShadows(edges []*graph.Edge) {
-	shadowed := make(map[graph.EdgeIdentity][]*graph.Edge)
+	var hasStamped bool
 	for _, e := range edges {
 		if e.Kind == graph.EdgeCalls && e.Meta[graph.JSLexicalBindingMeta] != nil {
-			id := graph.EdgeIdentityFor(e)
-			shadowed[id] = append(shadowed[id], e)
+			hasStamped = true
+			break
 		}
 	}
-	if len(shadowed) == 0 {
+	if !hasStamped {
 		return
 	}
+	best := make(map[graph.EdgeIdentity]*graph.Edge)
+	byID := make(map[graph.EdgeIdentity][]*graph.Edge)
 	for _, e := range edges {
-		if e.Kind != graph.EdgeCalls || e.Meta[graph.JSLexicalBindingMeta] != nil {
+		if e.Kind != graph.EdgeCalls {
 			continue
 		}
 		id := graph.EdgeIdentityFor(e)
-		for _, s := range shadowed[id] {
-			delete(s.Meta, graph.JSLexicalBindingMeta)
+		byID[id] = append(byID[id], e)
+		if cur, ok := best[id]; !ok || jsLexicalRank(e) < jsLexicalRank(cur) {
+			best[id] = e
 		}
-		delete(shadowed, id)
+	}
+	for id, group := range byID {
+		if len(group) < 2 {
+			continue
+		}
+		winner := best[id]
+		winnerRank := jsLexicalRank(winner)
+		if winnerRank == 2 {
+			continue
+		}
+		for _, e := range group {
+			if jsLexicalRank(e) <= winnerRank {
+				continue
+			}
+			if winnerRank == 0 {
+				delete(e.Meta, graph.JSLexicalBindingMeta)
+				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+			} else {
+				e.Meta[graph.JSLexicalBindingMeta] = winner.Meta[graph.JSLexicalBindingMeta]
+				e.Meta[graph.JSLexicalRequireSpecMeta] = winner.Meta[graph.JSLexicalRequireSpecMeta]
+			}
+		}
 	}
 }
 
