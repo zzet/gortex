@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,6 +141,84 @@ func TestCallToolWaitingForLoad(t *testing.T) {
 		assert.Positive(t, loading.waited)
 		assert.Contains(t, err.Error(), "still loading after waiting")
 	})
+}
+
+func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
+	dir, err := os.MkdirTemp("", "gxw")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "d.sock")
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	retrySeen := make(chan struct{})
+	releasePeer := make(chan struct{})
+	defer close(releasePeer)
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer conn.Close()
+		peerDone <- func() error {
+			reader := bufio.NewReader(conn)
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			if err := daemon.WriteJSONLine(conn, daemon.HandshakeAck{OK: true}); err != nil {
+				return err
+			}
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			const refusal = `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"loading","data":{"error_code":"repo_loading","retryable":true,"phase":"migrating","percent":15}}}` + "\n"
+			if _, err := io.WriteString(conn, refusal); err != nil {
+				return err
+			}
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			close(retrySeen)
+			<-releasePeer
+			return nil
+		}()
+	}()
+
+	client, err := daemon.DialTo(socket, daemon.Handshake{Mode: daemon.ModeMCP})
+	require.NoError(t, err)
+	exec := &daemonExecutor{client: client}
+	defer exec.Close()
+	const wait = 2 * loadingWaitPoll
+	result := make(chan error, 1)
+	go func() {
+		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, wait, io.Discard)
+		result <- err
+	}()
+
+	select {
+	case <-retrySeen:
+	case err := <-peerDone:
+		t.Fatalf("socket fixture failed before the retry: %v", err)
+	case <-time.After(wait + 2*time.Second):
+		t.Fatal("daemon did not receive a real retry after the first typed refusal")
+	}
+	select {
+	case err := <-result:
+		var loading *repoLoadingError
+		require.ErrorAs(t, err, &loading)
+		require.Equal(t, exitTempFail, loading.ExitCode())
+		require.Equal(t, "repo_loading", loading.details.ErrorCode)
+		require.NotNil(t, loading.details.Retryable)
+		require.True(t, *loading.details.Retryable)
+		require.Equal(t, "migrating", loading.details.Phase)
+		require.NotNil(t, loading.details.Percent)
+		require.Equal(t, 15, *loading.details.Percent)
+	case <-time.After(wait + time.Second):
+		t.Fatal("CLI remained blocked on a Unix socket retry beyond its loading wait")
+	}
 }
 
 // Hooks and scripts run the CLI without a terminal; they must fail fast with
