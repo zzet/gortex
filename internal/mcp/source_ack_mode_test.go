@@ -65,10 +65,24 @@ func TestEditAckLocalConfigurationReturnsBeforeQueuedPublication(t *testing.T) {
 	}
 	require.NoError(t, resultErr)
 	require.False(t, result.IsError, "%v", result.Content)
-	text := toolResultText(result)
-	require.Contains(t, text, `"ack_mode":"local"`)
-	require.Contains(t, text, `"reindex_pending":true`)
-	require.NotContains(t, text, `"graph_status":"fresh"`)
+	ack := resultJSON(t, result)
+	require.Equal(t, "local", ack["ack_mode"])
+	require.Equal(t, "committed", ack["disk_status"])
+	require.Equal(t, true, ack["reindex_pending"])
+	require.NotEqual(t, "fresh", ack["graph_status"])
+	status := mutationStatusFor(t, s, ack)
+	require.Equal(t, ack["mutation_receipt"], status["receipt"])
+	require.Equal(t, ack["commit_seq"], status["commit_seq"])
+	require.Equal(t, ack["content_sha256"], status["content_sha256"])
+	window := status["acknowledgement"].(map[string]any)
+	require.NotEmpty(t, window["rpc_id"])
+	require.Equal(t, "not_applicable", window["phase_states"].(map[string]any)["reindex_wait"])
+	require.Contains(t, window["phases_ms"], "reindex_wait")
+	require.Nil(t, window["phases_ms"].(map[string]any)["reindex_wait"])
+	require.Contains(t, window["observed_execution_ms"], "reindex_wait")
+	require.Nil(t, window["observed_execution_ms"].(map[string]any)["reindex_wait"])
+	require.Equal(t, map[string]any{"started": float64(1), "completed": float64(1), "not_applicable": float64(1)},
+		window["counts"].(map[string]any)["reindex_wait"])
 }
 
 func TestEditAckDefaultAndExplicitFullWaitForActualPublication(t *testing.T) {
