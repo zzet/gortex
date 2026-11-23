@@ -515,6 +515,12 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	if cr == nil {
 		return nil
 	}
+	cr.InheritPendingPlaceholderRepoints(mi.takePendingCrossRepoRepoints())
+	defer func() {
+		if rem := cr.TakePendingPlaceholderRepoints(); len(rem) > 0 {
+			mi.savePendingCrossRepoRepoints(rem)
+		}
+	}()
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -546,16 +552,16 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 // and the topology-writer gates of every repository the mutation can affect, so
 // the graph cannot expose a half-resolved batch between same-repo, semantic,
 // and cross-repository phases.
-func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
-	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
+func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) *resolver.CrossRepoStats {
@@ -566,6 +572,12 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionF
 	if cr == nil {
 		return nil
 	}
+	cr.InheritPendingPlaceholderRepoints(mi.takePendingCrossRepoRepoints())
+	defer func() {
+		if rem := cr.TakePendingPlaceholderRepoints(); len(rem) > 0 {
+			mi.savePendingCrossRepoRepoints(rem)
+		}
+	}()
 	stats := cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())

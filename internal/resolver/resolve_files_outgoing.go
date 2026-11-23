@@ -49,6 +49,19 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	r.scopedCSharpVisibilityInvalidate(filePaths)
 	frontier = collectOutgoingFileFrontier(r.graph, filePaths, r.incrementalSkipped)
 	if len(frontier.pending) == 0 {
+		if r.hasPendingGuardReverts() {
+			if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+				outcome = "write_refused"
+				return stats
+			}
+		}
+		if r.placeholderSrcIdx.hasDeferred() {
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				stats.WriteRefused = true
+				outcome = "write_refused"
+				return stats
+			}
+		}
 		outcome = "no_pending"
 		r.attributeFrontierGoBuiltins(frontier)
 		if !stats.WriteRefused {
@@ -74,14 +87,33 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats, frontier.detached...)
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
+	if stats.WriteRefused {
+		outcome = "write_refused"
+		return stats
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+			outcome = "write_refused"
+			return stats
+		}
+	}
 	finish = r.startIncrementalPhase(logger, "outgoing_attribution")
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
+	if !stats.WriteRefused && r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			stats.WriteRefused = true
+		}
+	}
 	if !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	}
 	attributionDuration = finish()
+	if stats.WriteRefused {
+		outcome = "write_refused"
+		return stats
+	}
 	outcome = "complete"
 	return stats
 }

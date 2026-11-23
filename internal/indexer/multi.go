@@ -127,6 +127,14 @@ type MultiIndexer struct {
 	npmPackageMu         sync.Mutex
 	npmPackageCache      *npmPackageSnapshot
 
+	// pendingResolveRetryMu protects refused placeholder repoints and
+	// cross-package guard reverts handed back from short-lived master/cross-repo
+	// resolvers so a retry pass completes them without requiring a file reparse.
+	pendingResolveRetryMu     sync.Mutex
+	pendingMasterRepoints     []graph.PlaceholderRepoint
+	pendingMasterGuardReverts []resolver.PendingGuardRevert
+	pendingCrossRepoRepoints  []graph.PlaceholderRepoint
+
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and
 	// derived-contract cleanup have all succeeded.
@@ -956,23 +964,73 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 		}
 
 		if receipt.ResolutionRelevant {
-			mi.runMasterResolveFiles(resolutionFiles, false)
+			if stats := mi.runMasterResolveFiles(resolutionFiles, false); stats != nil && stats.WriteRefused {
+				mi.logger.Error("DEFERRED-TIMING exact master file resolve refused writes")
+				return deferredResolveFailed, false
+			}
 			// Evicted definitions' pending references live outside the file
 			// frontier (their name is no longer declared in any frontier
 			// file); rebind them by the names the receipt recorded that no
 			// definition file re-declares.
-			mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt))
+			if stats := mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt)); stats != nil && stats.WriteRefused {
+				mi.logger.Error("DEFERRED-TIMING exact master name resolve refused writes")
+				return deferredResolveFailed, false
+			}
 		}
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
 		// repeating the substantially larger name-resolution frontier.
-		mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles)
+		if stats := mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles); stats != nil && stats.WriteRefused {
+			mi.logger.Error("DEFERRED-TIMING exact cross-repo resolve refused writes")
+			return deferredResolveFailed, false
+		}
 		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
 		return deferredResolveSkipped, true
 	}
 	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
+}
+
+func (mi *MultiIndexer) takePendingMasterRetry() ([]graph.PlaceholderRepoint, []resolver.PendingGuardRevert) {
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	repoints := mi.pendingMasterRepoints
+	mi.pendingMasterRepoints = nil
+	reverts := mi.pendingMasterGuardReverts
+	mi.pendingMasterGuardReverts = nil
+	return repoints, reverts
+}
+
+func (mi *MultiIndexer) savePendingMasterRetry(repoints []graph.PlaceholderRepoint, reverts []resolver.PendingGuardRevert) {
+	if len(repoints) == 0 && len(reverts) == 0 {
+		return
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	if len(repoints) > 0 {
+		mi.pendingMasterRepoints = append(mi.pendingMasterRepoints, repoints...)
+	}
+	if len(reverts) > 0 {
+		mi.pendingMasterGuardReverts = append(mi.pendingMasterGuardReverts, reverts...)
+	}
+}
+
+func (mi *MultiIndexer) takePendingCrossRepoRepoints() []graph.PlaceholderRepoint {
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	repoints := mi.pendingCrossRepoRepoints
+	mi.pendingCrossRepoRepoints = nil
+	return repoints
+}
+
+func (mi *MultiIndexer) savePendingCrossRepoRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	mi.pendingCrossRepoRepoints = append(mi.pendingCrossRepoRepoints, repoints...)
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
@@ -1041,6 +1099,12 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 		return ctx.Err()
 	}
 	master.OnComputeDone = onComputeDone
+	pendingRepoints, pendingReverts := mi.takePendingMasterRetry()
+	master.InheritPendingPlaceholderRepoints(pendingRepoints)
+	master.InheritPendingGuardReverts(pendingReverts)
+	defer func() {
+		mi.savePendingMasterRetry(master.TakePendingPlaceholderRepoints(), master.TakePendingGuardReverts())
+	}()
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
 	if scoped {
 		master.SetScope(scope)
@@ -1077,16 +1141,16 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	return err
 }
 
-func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) {
-	mi.runMasterResolveFilesWithEvidence(files, useLSP, nil)
+func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) *resolver.ResolveStats {
+	return mi.runMasterResolveFilesWithEvidence(files, useLSP, nil)
 }
 
 // runMasterResolveFilesWithEvidence is runMasterResolveFiles for a repository
 // mutation's catch-up: evidence, when non-nil, is the repository's resolver
 // holding the mutation's pre-eviction evidence (resolveWithDeferredEvidence),
 // which the master resolver inherits for this one resolve.
-func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP bool, evidence *resolver.Resolver) {
-	mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
+func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP bool, evidence *resolver.Resolver) *resolver.ResolveStats {
+	return mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
 }
 
 func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
@@ -1094,6 +1158,12 @@ func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP boo
 	if master == nil {
 		return nil
 	}
+	pendingRepoints, pendingReverts := mi.takePendingMasterRetry()
+	master.InheritPendingPlaceholderRepoints(pendingRepoints)
+	master.InheritPendingGuardReverts(pendingReverts)
+	defer func() {
+		mi.savePendingMasterRetry(master.TakePendingPlaceholderRepoints(), master.TakePendingGuardReverts())
+	}()
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
 	stats := master.ResolveFilesAndIncomingObserved(files, observe)
@@ -1223,7 +1293,9 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		return err
 	}
 	if len(files) > 0 {
-		mi.runMasterResolveFiles(files, true)
+		if stats := mi.runMasterResolveFiles(files, true); stats != nil && stats.WriteRefused {
+			return resolver.ErrReindexWriteRefused
+		}
 	}
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -1243,7 +1315,9 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 	if resolutionAffected > 0 {
 		return mi.runCrossRepoResolveContext(ctx, false)
 	}
-	mi.runCrossRepoResolveFiles(files)
+	if stats := mi.runCrossRepoResolveFiles(files); stats != nil && stats.WriteRefused {
+		return resolver.ErrReindexWriteRefused
+	}
 	return context.Cause(ctx)
 }
 
@@ -2660,7 +2734,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mi.mu.Unlock()
 	mtimes.end()
 
-	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+	if mode.onRelations != nil && len(result.FailedFiles) == 0 && result.resolutionErr == nil {
 		mode.onRelations()
 	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)

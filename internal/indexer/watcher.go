@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // ChangeKind describes the type of filesystem change.
@@ -336,7 +337,7 @@ func retryableMutationError(err error) bool {
 	if errors.As(err, &committed) && committed.Committed() {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, resolver.ErrReindexWriteRefused)
 }
 
 func mutationRetryBackoff(attempt int) time.Duration {

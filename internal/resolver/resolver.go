@@ -498,6 +498,11 @@ type Resolver struct {
 	// report a clean apply. Never held across an r.mu yield.
 	passWriteRefused *bool
 
+	// pendingGuardReverts retains cross-package guard reverts whose write was
+	// refused under writer-gate contention so a subsequent resolve pass finishes
+	// reverting the weak-tier edges even when they are no longer unresolved.
+	pendingGuardReverts []PendingGuardRevert
+
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
 	// the worker fan-out and cleared on return. Workers consult these
@@ -837,15 +842,41 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	}
 	r.lspDeferredCursor = deferredLSPWorkKey{}
 	r.lspDeferredCursorSet = false
+	r.placeholderSrcIdx = placeholderSourceIndex{}
+	r.pendingGuardReverts = nil
 	if oldMu != nil {
 		oldMu.Unlock()
 	}
+}
+
+// TakePendingPlaceholderRepoints detaches any deferred placeholder dataflow
+// source repoints that a refused write left unapplied so a caller constructing
+// a fresh Resolver can hand them to the retry pass.
+func (r *Resolver) TakePendingPlaceholderRepoints() []graph.PlaceholderRepoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.placeholderSrcIdx.takeDeferred()
+}
+
+// InheritPendingPlaceholderRepoints attaches unapplied placeholder repoints
+// from a prior refused pass on the same store.
+func (r *Resolver) InheritPendingPlaceholderRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.placeholderSrcIdx.inheritDeferred(repoints)
 }
 
 func (r *Resolver) trackPassWriteRefused(flag *bool) func() {
 	prev := r.passWriteRefused
 	r.passWriteRefused = flag
 	return func() { r.passWriteRefused = prev }
+}
+
+func (r *Resolver) writeRefused() bool {
+	return r.passWriteRefused != nil && *r.passWriteRefused
 }
 
 func (r *Resolver) notePassWriteRefused() {
@@ -924,9 +955,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// from scratch. Scoped resolves maintain it incrementally instead.
 	r.clearCSharpVisibilityCaches()
 
-	// Fresh placeholder-source set per pass: dataflow edges indexed since the
-	// previous pass must be visible, and a moved source must not linger.
-	r.placeholderSrcIdx = placeholderSourceIndex{}
+	// Fresh placeholder-source census per pass while retaining any deferred
+	// repoints a prior refused write left unapplied.
+	r.placeholderSrcIdx.beginPass()
 
 	// Keep the unresolved corpus disk-resident. SQLite captures a rowid
 	// high-water mark and keyset-pages beneath it; legacy stores are consumed
@@ -1007,7 +1038,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if pendingErr != nil {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
-	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
+	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() && !r.hasPendingGuardReverts() {
+		if r.placeholderSrcIdx.hasDeferred() {
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				return &ResolveStats{
+					PendingBefore: pendingBefore,
+					PendingAfter:  pendingAfter,
+					WriteRefused:  true,
+				}, fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused)
+			}
+		}
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, nil
 	}
 
@@ -1133,9 +1173,14 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	total := &ResolveStats{}
 	resolveError := func(err error) (*ResolveStats, error) {
 		// Moves the pass deferred belong to references it already bound; an
-		// interrupted pass must not strand them (no later pass re-derives a
-		// repoint once its reference is resolved).
-		r.placeholderSrcIdx.applyDeferred(r.graph)
+		// interrupted (non-refusal) pass flushes them immediately, whereas a
+		// refused-write abort must not fire straight back into the contended
+		// writer gate — retain them on r.placeholderSrcIdx for retry.
+		if !errors.Is(err, ErrReindexWriteRefused) && !total.WriteRefused {
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				total.WriteRefused = true
+			}
+		}
 		total.PendingBefore = pendingBefore
 		total.PendingAfter = pendingAfter
 		return total, err
@@ -1862,6 +1907,14 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// pre-resolution target so a reverted edge is restored exactly.
 	tailPhase("cross_package_guard")
 	guarded := 0
+	if r.hasPendingGuardReverts() {
+		reverted, ok := r.flushPendingGuardRevertsLocked()
+		guarded += reverted
+		if !ok {
+			total.WriteRefused = true
+			return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
+		}
+	}
 	// The guard consults the import-reachability closure only for the caller
 	// files of the jobs the compute loop resolved. On a scoped warm pass those
 	// jobs live in the changed repos (plus any repo whose bare-name call
@@ -1892,10 +1945,6 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			r.warmGuardLookupCache(jobs)
 			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
 			r.clearLookupCache()
-			if tailWriteRefused {
-				total.WriteRefused = true
-				return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
-			}
 			guardPages++
 			guardJobs += len(jobs)
 			if time.Since(lastGuardLog) > 10*time.Second {
@@ -1906,6 +1955,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 					zap.Int("reverted", guarded))
 			}
 			done = exhausted
+		}
+		if tailWriteRefused {
+			total.WriteRefused = true
+			return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
 		}
 	}
 	tAfterGuard := time.Now()
@@ -1971,9 +2024,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				return resolveError(err)
 			}
 			r.runFileAttributionPassesForFileLocked(fp)
+			if tailWriteRefused {
+				break
+			}
 		}
 	}
 	tAfterAttrib := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: go attribution", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1985,6 +2045,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	ldStart := time.Now()
 	r.resolveRelativeImports()
 	ld1 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: relative imports", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1993,11 +2057,19 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// imports above; resolveRelativeImports never touches Lua, so this lands
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: lua requires", ErrReindexWriteRefused))
+	}
 	// Godot `res://` binding — scene `[ext_resource]` references and
 	// GDScript `preload(...)`. Same settle window and the same path-suffix
 	// net as the Lua requires above.
 	r.resolveGodotResPaths()
 	ld2 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: godot res paths", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -2006,6 +2078,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// binds simple-type references reachable only via an imported namespace.
 	r.resolveRazorUsings()
 	ld3 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: razor usings", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -2016,6 +2092,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// dep-module bridge has had its chance.
 	r.attributeNonGoModuleImports()
 	ld4 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: non-go module imports", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -2029,6 +2109,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	overrideDispatchCandidates := r.collectOverrideDispatchCandidates()
 	r.resolveJavaOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld5 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: java override dispatch", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -2039,6 +2123,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// every implementation. Same post-guard placement as the Java pass.
 	r.resolvePHPOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld6 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: php override dispatch", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -2827,6 +2915,17 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// survives for them.
 	recordFrontierIncomingAdmission(r.logger, stats, frontier, "preparation")
 	if len(pending) == 0 {
+		if r.hasPendingGuardReverts() {
+			if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+				return stats
+			}
+		}
+		if r.placeholderSrcIdx.hasDeferred() {
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				stats.WriteRefused = true
+				return stats
+			}
+		}
 		r.attributeFrontierGoBuiltins(frontier)
 		if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 			r.restoreIncrementalTerminalStampsLocked([]string{filePath})
@@ -2859,12 +2958,28 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	forwardStarted := time.Now()
 	r.resolveFileEdgesLocked(filePath, stats)
 	forwardDuration := time.Since(forwardStarted)
+	if stats.WriteRefused {
+		return stats
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+			return stats
+		}
+	}
 	attributionStarted := time.Now()
 	r.runFileAttributionPassesForFileLocked(filePath)
 	attributionDuration := time.Since(attributionStarted)
+	if stats.WriteRefused {
+		return stats
+	}
 	incomingStarted := time.Now()
 	r.resolveIncomingLocked(filePath, stats)
 	incomingDuration := time.Since(incomingStarted)
+	if !stats.WriteRefused && r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			stats.WriteRefused = true
+		}
+	}
 	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 	}
@@ -3290,6 +3405,19 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		}()
 	}
 	if len(frontier.pending) == 0 && len(carried) == 0 {
+		if r.hasPendingGuardReverts() {
+			if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+				outcome = "write_refused"
+				return stats
+			}
+		}
+		if r.placeholderSrcIdx.hasDeferred() {
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				stats.WriteRefused = true
+				outcome = "write_refused"
+				return stats
+			}
+		}
 		outcome = "no_pending"
 		r.attributeFrontierGoBuiltins(frontier)
 		if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
@@ -3331,6 +3459,10 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats, frontier.detached...)
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
+	if stats.WriteRefused {
+		outcome = "write_refused"
+		return stats
+	}
 	beforeIncoming := *stats
 	finish = r.startIncrementalPhase(logger, "resolve_incoming")
 	r.resolveIncomingStubKeysLocked(frontier.incomingKeys(), stats)
@@ -3338,14 +3470,33 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		zap.Int("resolved", stats.Resolved-beforeIncoming.Resolved),
 		zap.Int("unresolved", stats.Unresolved-beforeIncoming.Unresolved),
 		zap.Int("external", stats.External-beforeIncoming.External))
+	if stats.WriteRefused {
+		outcome = "write_refused"
+		return stats
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+			outcome = "write_refused"
+			return stats
+		}
+	}
 	finish = r.startIncrementalPhase(logger, "attribution")
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
+	if !stats.WriteRefused && r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			stats.WriteRefused = true
+		}
+	}
 	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	}
 	attributionDuration = finish()
+	if stats.WriteRefused {
+		outcome = "write_refused"
+		return stats
+	}
 	outcome = "complete"
 	return stats
 }
@@ -3451,7 +3602,20 @@ func (r *Resolver) startIncrementalPhase(logger *zap.Logger, phase string) func(
 // has built the per-pass indexes.
 func (r *Resolver) resolveFileLocked(filePath string, stats *ResolveStats) {
 	r.resolveFileEdgesLocked(filePath, stats)
+	if stats.WriteRefused {
+		return
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok {
+			return
+		}
+	}
 	r.runFileAttributionPassesForFileLocked(filePath)
+	if !stats.WriteRefused && r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			stats.WriteRefused = true
+		}
+	}
 }
 
 // fileOutEdges returns every outgoing edge of every node defined in
@@ -3593,6 +3757,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, reindexBatch); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
 			stats.WriteRefused = true
 			r.notePassWriteRefused()
 		}
@@ -3646,9 +3811,15 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	t0 := time.Now()
 	sub("rebind_go_method_receivers")
 	r.rebindGoMethodReceivers()
+	if r.writeRefused() {
+		return
+	}
 	t1 := time.Now()
 	sub("bind_bare_name_scope_refs")
 	r.bindBareNameScopeRefs()
+	if r.writeRefused() {
+		return
+	}
 	t2 := time.Now()
 	sub("shared_dataflow_generic_census")
 	census, censusStats := r.buildPostBareAttributionCensus(defaultAttributionCensusLimits)
@@ -3676,6 +3847,9 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	} else {
 		r.bindDataflowCalleeRefs()
 	}
+	if r.writeRefused() {
+		return
+	}
 	t3 := time.Now()
 	sub("bind_generic_param_refs")
 	if census != nil {
@@ -3684,12 +3858,21 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	} else {
 		r.bindGenericParamRefs()
 	}
+	if r.writeRefused() {
+		return
+	}
 	t4 := time.Now()
 	sub("attribute_go_builtins")
 	r.attributeGoBuiltins()
+	if r.writeRefused() {
+		return
+	}
 	t5 := time.Now()
 	sub("attribute_go_external_calls")
 	r.attributeGoExternalCalls()
+	if r.writeRefused() {
+		return
+	}
 	t6 := time.Now()
 	// Last, so refs the passes above just bound to a partial fragment are
 	// folded onto the canonical node in the same sweep.
@@ -3724,11 +3907,29 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 // builtin attribution so a local named `len` shadows the builtin.
 func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 	r.rebindGoMethodReceiversForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindBareNameScopeRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindDataflowCalleeRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindGenericParamRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.attributeGoBuiltinsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.attributeGoExternalCallsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.mergeCSharpPartialTypesForFile(filePath)
 }
 

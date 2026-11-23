@@ -429,7 +429,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		} else {
 			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
 		}
-		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+		if mode.onRelations != nil && len(result.FailedFiles) == 0 && result.resolutionErr == nil {
 			mode.onRelations()
 		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)

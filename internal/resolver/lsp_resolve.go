@@ -494,6 +494,7 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 			return result
 		}
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, &r.placeholderSrcIdx, reindexBatch); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
 			r.notePassWriteRefused()
 			result.writeRefused = true
 		}
