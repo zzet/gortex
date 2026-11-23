@@ -1277,7 +1277,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break // Foreign terminal/accounting fields cannot settle this edit.
 					}
-					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
+					countedNoWait := localFileAcknowledgementMatches(body, status, r.plan.Tool, step.MutationID)
+					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool, countedNoWait)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)

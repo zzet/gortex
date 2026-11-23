@@ -56,7 +56,7 @@ func TestSharedReportRoundTripPreservesOwnersAndOfferedDenominator(t *testing.T)
 	runtime := &editProbeRuntime{phase: &Phase{EditProbe: got}, sharedReport: *got.SharedOwners}
 	status := editProbeAccountingFixture()
 	status["shared_owner_accounting_v1"] = map[string]any{}
-	accounting := runtime.accountingForStatus(t.Context(), status, "receipt-a", "edit.file")
+	accounting := runtime.accountingForStatus(t.Context(), status, "receipt-a", "edit.file", false)
 	if accounting.State == "observed_shared_owner_windows_checks_pass" || accounting.Shared != nil || accounting.P != nil || accounting.B != nil || len(accounting.Reasons) == 0 {
 		t.Fatal("saved report dictionary became fresh process/member authority")
 	}
