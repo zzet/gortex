@@ -21,6 +21,16 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		return phase, nil, nil, nil, "", err
 	}
+	if scenario == checkoutDiscoveryScenario {
+		selected := os.Getenv(firstSummaryRefusalRequestEnv)
+		if selected != "" && os.Getenv("GORTEX_SEARCH_REFUSAL_EVIDENCE") != "1" {
+			return phase, nil, nil, nil, "", errors.New("first summary refusal evidence requires the daemon projection predicate opt-in")
+		}
+		ctx, err = withFirstSummaryRefusalEvidence(ctx, selected)
+		if err != nil {
+			return phase, nil, nil, nil, "", err
+		}
+	}
 	var gateWallStart time.Time
 	if o.EditGateModes {
 		gateWallStart = time.Now()
@@ -149,6 +159,9 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 	if err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
+	if selected := firstSummaryRefusalFrom(ctx); selected != nil {
+		selected.root = p.Root
+	}
 	p.Env = append(p.Env, seedEnv...)
 	if o.Churn.ReconcileInterval > 0 {
 		p.Env = append(p.Env, "GORTEX_RECONCILE_INTERVAL="+o.Churn.ReconcileInterval.String())
@@ -248,7 +261,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}()
 	}
 	coldStart := time.Now()
-	if err := p.startWithScenarioRefusalEvidence(scenario, o); err != nil {
+	if err := p.startWithScenarioRefusalEvidence(ctx, scenario, o); err != nil {
 		return phase, nil, artifacts, crashes, "", err
 	}
 	startupMonitor := startMonitor(p, newProcessSampler(), group)
@@ -703,8 +716,9 @@ func editRequest(corpus Corpus, marker string) request {
 	return request{Tool: "edit", Operation: "file", Arguments: map[string]any{"operation": "file", "target": map[string]any{"file": corpus.File}, "match": corpus.EditAnchor, "replacement": corpus.EditAnchor + strings.ReplaceAll(corpus.EditTemplate, "{{marker}}", marker)}}
 }
 
-// Use the existing daemon-only opt-in for explicitly selected edit diagnostics.
-// Generic scenarios and the private CLI/Git environment keep their isolation.
-func (p *privateRun) startWithScenarioRefusalEvidence(scenario string, o runOptions) error {
-	return p.startWithSearchRefusalEvidence(scenario == editProbeScenario && (o.SearchReadbackAcceptance || o.EditGateModes))
+// Use the existing daemon-only opt-in for the selected edit or discovery diagnostic.
+func (p *privateRun) startWithScenarioRefusalEvidence(ctx context.Context, scenario string, o runOptions) error {
+	selectedEdit := scenario == editProbeScenario && (o.SearchReadbackAcceptance || o.EditGateModes)
+	selectedSummary := scenario == checkoutDiscoveryScenario && firstSummaryRefusalFrom(ctx) != nil
+	return p.startWithSearchRefusalEvidence(selectedEdit || selectedSummary)
 }
