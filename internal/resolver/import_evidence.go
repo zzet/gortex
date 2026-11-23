@@ -55,22 +55,30 @@ import (
 // an import edge has already been resolved by this pass or not — the pick
 // is order-independent inside the parallel worker phase.
 
-// pickImportEvidenceCallee is the file-closure fallback, not an explicit binding.
-func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
-	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
+func (r *Resolver) resolveJSRequireCallee(e *graph.Edge, funcName string, candidates []*graph.Node) *graph.Node {
+	spec, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string)
+	callerFile := e.FilePath
+	if spec == "" || callerFile == "" || !isJSTSPath(callerFile) || len(candidates) == 0 {
 		return nil
 	}
-	if hasLocalValue(callerFile, candidates) {
+	target := r.resolveJSTSSpecTarget(e, spec)
+	if target == "" {
 		return nil
 	}
-	imports := r.importEvidenceFor(callerFile)
-	imports.closureOnce.Do(func() { imports.files = r.importClosureFiles(callerFile, imports.direct) })
+	files := r.importClosureFiles(callerFile, map[string]struct{}{target: {}})
+	return pickUniqueFileCandidate(files, funcName, candidates)
+}
+
+func pickUniqueFileCandidate(files map[string]struct{}, funcName string, candidates []*graph.Node) *graph.Node {
+	if len(files) == 0 {
+		return nil
+	}
 	var pick *graph.Node
 	for _, c := range candidates {
 		if !isImportableCallee(c, funcName) {
 			continue
 		}
-		if _, ok := imports.files[c.FilePath]; !ok {
+		if _, ok := files[c.FilePath]; !ok {
 			continue
 		}
 		if pick != nil {
@@ -85,6 +93,19 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	return pick
 }
 
+// pickImportEvidenceCallee is the file-closure fallback, not an explicit binding.
+func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) *graph.Node {
+	if callerFile == "" || len(candidates) == 0 || !isJSTSPath(callerFile) {
+		return nil
+	}
+	if hasLocalValue(callerFile, candidates) {
+		return nil
+	}
+	imports := r.importEvidenceFor(callerFile)
+	imports.closureOnce.Do(func() { imports.files = r.importClosureFiles(callerFile, imports.direct) })
+	return pickUniqueFileCandidate(imports.files, funcName, candidates)
+}
+
 // jsCallHasScopeEvidence reports scope facts an edit can change while the call
 // keeps its shape, so neither a skip nor a carried binding can stand in for them.
 func jsCallHasScopeEvidence(e *graph.Edge) bool {
@@ -92,8 +113,7 @@ func jsCallHasScopeEvidence(e *graph.Edge) bool {
 }
 
 // tryResolveUnshadowedBinding applies the explicit and generated tiers. A
-// module-scope declaration owns its name, so neither applies. A require() local
-// keeps import evidence but still hides a generated global. A module local with
+// module-scope declaration owns its name, so neither applies. A module local with
 // no value node stays unresolved rather than falling through to a same-named
 // generated target by name.
 func (r *Resolver) tryResolveUnshadowedBinding(e *graph.Edge, name string, candidates []*graph.Node, stats *ResolveStats) bool {
@@ -478,6 +498,19 @@ func (r *Resolver) importedFileOf(e *graph.Edge) string {
 	return r.nodeFilePath(r.importedTargetOf(e))
 }
 
+func (r *Resolver) resolveJSTSSpecTarget(e *graph.Edge, payload string) string {
+	// Same expansion, same precedence as resolveImport: tsconfig
+	// paths / relative join first, npm-alias rewrite second.
+	callerFile := jsTSImportCallerFile(e)
+	target := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, payload)
+	if target == "" {
+		if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, payload); aliased {
+			target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, rewritten)
+		}
+	}
+	return target
+}
+
 // importedTargetOf shares symbol/file expansion across both evidence tiers.
 // Parallel resolve workers mutate cloned edges, not these stored import edges.
 func (r *Resolver) importedTargetOf(e *graph.Edge) string {
@@ -490,15 +523,7 @@ func (r *Resolver) importedTargetOf(e *graph.Edge) string {
 		if !ok || payload == "" {
 			return ""
 		}
-		// Same expansion, same precedence as resolveImport: tsconfig
-		// paths / relative join first, npm-alias rewrite second.
-		target := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), payload)
-		if target == "" {
-			if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, payload); aliased {
-				target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), rewritten)
-			}
-		}
-		return target
+		return r.resolveJSTSSpecTarget(e, payload)
 	}
 	if strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
 		return ""

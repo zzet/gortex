@@ -209,11 +209,8 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			e.emitReExport(m, filePath, fileID, src, result)
 
 		case m.Captures["req.def"] != nil:
-			e.emitRequire(m, filePath, fileID, result)
-			if m.Captures["req.name"] != nil && m.Captures["req.name"].Text == "require" {
-				if p := m.Captures["req.path"]; p != nil {
-					importPaths = append(importPaths, p.Text)
-				}
+			if reqPath := e.emitRequire(m, filePath, fileID, src, &scopes, result); reqPath != "" {
+				importPaths = append(importPaths, reqPath)
 			}
 
 		case m.Captures["new.expr"] != nil:
@@ -870,16 +867,20 @@ func (e *JavaScriptExtractor) emitReExport(m parser.QueryResult, filePath, fileI
 	emitJSReExport(def.Node, importPath, fileID, filePath, "javascript", src, result)
 }
 
-func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
-	if m.Captures["req.name"].Text != "require" {
-		return
+func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, src []byte, scopes *jsScopeCache, result *parser.ExtractionResult) string {
+	def := m.Captures["req.def"]
+	if def == nil || def.Node == nil {
+		return ""
 	}
-	reqPath := m.Captures["req.path"].Text
-	line := m.Captures["req.def"].StartLine + 1
+	reqPath := scopes.staticRequireSpec(def.Node, src)
+	if reqPath == "" {
+		return ""
+	}
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: "unresolved::import::" + reqPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	return reqPath
 }
 
 // --- Helpers --------------------------------------------------------

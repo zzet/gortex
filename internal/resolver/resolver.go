@@ -4799,16 +4799,26 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
 		lexical, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
-		if lexical == graph.JSPendingParameter {
+		switch lexical {
+		case graph.JSPendingParameter:
 			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
-		}
-		if lexical == "" && !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
+		case graph.JSLexicalRequire:
+			if pick := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
+				bindImportCall(e, pick, "import_closure", stats)
+				return
+			}
+			stats.Unresolved++
 			return
-		}
-		if lexical == graph.JSLexicalLocal && !hasSameFileValue(e.FilePath, candidates) {
-			parkJSBinding(e, graph.JSPendingParameter, stats)
-			return
+		case graph.JSLexicalLocal:
+			if !hasSameFileValue(e.FilePath, candidates) {
+				parkJSBinding(e, graph.JSPendingParameter, stats)
+				return
+			}
+		case "":
+			if !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
+				return
+			}
 		}
 	}
 	if len(candidates) == 0 {

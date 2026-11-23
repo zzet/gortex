@@ -311,27 +311,28 @@ var validNodeKinds = map[NodeKind]bool{
 
 // Persisted JS/TS binding evidence shared by extraction, resolution and restubbing.
 const (
-	DefaultExportMeta       = "default_export"
-	ImportBindingsMeta      = "import_bindings"
-	StarReExportMeta        = "star_reexport"
-	JSBindingNameMeta       = "js_binding_name"   // caller spelling on exact calls only
-	JSBindingModuleMeta     = "js_binding_module" // reverse lookup key for calls and forwarding modules
-	JSImportSourceMeta      = "js_import_source"
-	JSLocalExportsMeta      = "js_local_exports"
-	JSExportScopeMeta       = "js_export_scope" // virtual ID suffix of a Vue normal script
-	JSForwardsImportMeta    = "js_forwards_import"
-	JSLexicalBindingMeta    = "js_lexical_binding"
-	JSLexicalLocal          = "local"
-	JSAmbientShadowMeta     = "js_ambient_shadow" // a local hides generated globals but is not an import shadow
-	JSShadowModule          = "module"            // module-scope declaration
-	JSShadowRequire         = "require"           // local initialized from require(), keeps import evidence
-	JSPendingBindingMeta    = "pending_js_binding"
-	JSPendingImport         = "import"
-	JSPendingGenerated      = "nuxt"
-	JSPendingParameter      = "parameter"
-	JSDefaultBinding        = "default"
-	JSInteropDefaultBinding = ".default" // compiled CommonJS default, distinct from module.exports
-	JSNamespaceBinding      = "*"
+	DefaultExportMeta        = "default_export"
+	ImportBindingsMeta       = "import_bindings"
+	StarReExportMeta         = "star_reexport"
+	JSBindingNameMeta        = "js_binding_name"   // caller spelling on exact calls only
+	JSBindingModuleMeta      = "js_binding_module" // reverse lookup key for calls and forwarding modules
+	JSImportSourceMeta       = "js_import_source"
+	JSLocalExportsMeta       = "js_local_exports"
+	JSExportScopeMeta        = "js_export_scope" // virtual ID suffix of a Vue normal script
+	JSForwardsImportMeta     = "js_forwards_import"
+	JSLexicalBindingMeta     = "js_lexical_binding"
+	JSLexicalLocal           = "local"
+	JSLexicalRequire         = "require"
+	JSLexicalRequireSpecMeta = "js_lexical_require"
+	JSAmbientShadowMeta      = "js_ambient_shadow" // a local hides generated globals but is not an import shadow
+	JSShadowModule           = "module"            // module-scope declaration
+	JSPendingBindingMeta     = "pending_js_binding"
+	JSPendingImport          = "import"
+	JSPendingGenerated       = "nuxt"
+	JSPendingParameter       = "parameter"
+	JSDefaultBinding         = "default"
+	JSInteropDefaultBinding  = ".default" // compiled CommonJS default, distinct from module.exports
+	JSNamespaceBinding       = "*"
 )
 
 // AppendJSBinding encodes one identifier pair. Unrenamed bindings need only

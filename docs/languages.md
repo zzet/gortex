@@ -132,8 +132,9 @@ barrel-re-exported defining file supplies the binding. Same-file declarations
 still win, and ambiguous import evidence does not promote a guessed target.
 A call whose name is bound by an enclosing parameter, catch clause, block or
 hoisted `var` is not an import call. It binds to a same-file declaration when
-one exists and otherwise stays unresolved. A local initialized from `require()`
-keeps its import evidence.
+one exists and otherwise stays unresolved. A local initialized from an
+unshadowed static `require("...")` binding resolves only against that required
+module instead of file-wide imports.
 Import statement evidence is batch-loaded per resolver page and cleared after
 interleaved mutations, so promotion does not add per-call adjacency queries.
 For CommonJS, a default import binds `module.exports`. When the final export
