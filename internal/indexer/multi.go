@@ -133,6 +133,8 @@ type MultiIndexer struct {
 	pendingResolveRetryMu     sync.Mutex
 	pendingMasterRepoints     []graph.PlaceholderRepoint
 	pendingMasterGuardReverts []resolver.PendingGuardRevert
+	pendingMasterTailRetry    bool
+	pendingMasterAttribFiles  map[string]struct{}
 	pendingCrossRepoRepoints  []graph.PlaceholderRepoint
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
@@ -992,27 +994,51 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
 }
 
-func (mi *MultiIndexer) takePendingMasterRetry() ([]graph.PlaceholderRepoint, []resolver.PendingGuardRevert) {
+func (mi *MultiIndexer) takePendingMasterRetry() resolver.MasterRetryState {
 	mi.pendingResolveRetryMu.Lock()
 	defer mi.pendingResolveRetryMu.Unlock()
-	repoints := mi.pendingMasterRepoints
+	state := resolver.MasterRetryState{
+		PlaceholderRepoints: mi.pendingMasterRepoints,
+		GuardReverts:        mi.pendingMasterGuardReverts,
+		TailRetry:           mi.pendingMasterTailRetry,
+	}
 	mi.pendingMasterRepoints = nil
-	reverts := mi.pendingMasterGuardReverts
 	mi.pendingMasterGuardReverts = nil
-	return repoints, reverts
+	mi.pendingMasterTailRetry = false
+	if len(mi.pendingMasterAttribFiles) > 0 {
+		state.AttributionFiles = make([]string, 0, len(mi.pendingMasterAttribFiles))
+		for p := range mi.pendingMasterAttribFiles {
+			state.AttributionFiles = append(state.AttributionFiles, p)
+		}
+		mi.pendingMasterAttribFiles = nil
+	}
+	return state
 }
 
-func (mi *MultiIndexer) savePendingMasterRetry(repoints []graph.PlaceholderRepoint, reverts []resolver.PendingGuardRevert) {
-	if len(repoints) == 0 && len(reverts) == 0 {
+func (mi *MultiIndexer) savePendingMasterRetry(state resolver.MasterRetryState) {
+	if len(state.PlaceholderRepoints) == 0 && len(state.GuardReverts) == 0 && !state.TailRetry && len(state.AttributionFiles) == 0 {
 		return
 	}
 	mi.pendingResolveRetryMu.Lock()
 	defer mi.pendingResolveRetryMu.Unlock()
-	if len(repoints) > 0 {
-		mi.pendingMasterRepoints = append(mi.pendingMasterRepoints, repoints...)
+	if len(state.PlaceholderRepoints) > 0 {
+		mi.pendingMasterRepoints = append(mi.pendingMasterRepoints, state.PlaceholderRepoints...)
 	}
-	if len(reverts) > 0 {
-		mi.pendingMasterGuardReverts = append(mi.pendingMasterGuardReverts, reverts...)
+	if len(state.GuardReverts) > 0 {
+		mi.pendingMasterGuardReverts = append(mi.pendingMasterGuardReverts, state.GuardReverts...)
+	}
+	if state.TailRetry {
+		mi.pendingMasterTailRetry = true
+	}
+	if len(state.AttributionFiles) > 0 {
+		if mi.pendingMasterAttribFiles == nil {
+			mi.pendingMasterAttribFiles = make(map[string]struct{}, len(state.AttributionFiles))
+		}
+		for _, p := range state.AttributionFiles {
+			if p != "" {
+				mi.pendingMasterAttribFiles[p] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -1067,6 +1093,7 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetGoModules(mi.trackedGoModules())
 	master.SetGoModuleReplacementLookup(mi.trackedGoModuleReplacements)
 	master.SetCrossWorkspaceDepLookup(mi.crossWorkspacePassLookup())
+	master.SetRetryStateBridge(mi.takePendingMasterRetry, mi.savePendingMasterRetry)
 	return master
 }
 
@@ -1099,12 +1126,6 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 		return ctx.Err()
 	}
 	master.OnComputeDone = onComputeDone
-	pendingRepoints, pendingReverts := mi.takePendingMasterRetry()
-	master.InheritPendingPlaceholderRepoints(pendingRepoints)
-	master.InheritPendingGuardReverts(pendingReverts)
-	defer func() {
-		mi.savePendingMasterRetry(master.TakePendingPlaceholderRepoints(), master.TakePendingGuardReverts())
-	}()
 	scoped := len(scope) > 0 && mi.scopedGlobalPassesEnabled()
 	if scoped {
 		master.SetScope(scope)
@@ -1158,12 +1179,6 @@ func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP boo
 	if master == nil {
 		return nil
 	}
-	pendingRepoints, pendingReverts := mi.takePendingMasterRetry()
-	master.InheritPendingPlaceholderRepoints(pendingRepoints)
-	master.InheritPendingGuardReverts(pendingReverts)
-	defer func() {
-		mi.savePendingMasterRetry(master.TakePendingPlaceholderRepoints(), master.TakePendingGuardReverts())
-	}()
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
 	stats := master.ResolveFilesAndIncomingObserved(files, observe)
@@ -2745,7 +2760,13 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	derived.endDerived()
 
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, idx.finishAliasPass(result)
+	if err := idx.finishAliasPass(result); err != nil {
+		return result, err
+	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		return result, result.resolutionErr
+	}
+	return result, nil
 }
 
 // PrefixCollisionError reports a prefix already owned by another repository.

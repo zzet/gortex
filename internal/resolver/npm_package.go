@@ -245,11 +245,17 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 			batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
 		}
 	}
-	if len(batch) > 0 {
-		if !reindexEdgesApplied(cr.graph, batch) {
-			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch))
+	// Chunk below SQLite's 5,000-row reindexChunkSize so each ReindexEdgesApplied
+	// call commits atomically as one transaction and its matching parallel
+	// EdgeCrossRepoCalls are removed immediately after; a refusal on chunk 2+
+	// then cannot orphan chunk 1's parallels.
+	const npmRestubChunkSize = 2048
+	for start := 0; start < len(batch); start += npmRestubChunkSize {
+		end := min(start+npmRestubChunkSize, len(batch))
+		if !reindexEdgesApplied(cr.graph, batch[start:end]) {
+			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch)-start)
 		}
-		graph.RemoveEdgesExact(cr.graph, obsolete)
+		graph.RemoveEdgesExact(cr.graph, obsolete[start:end])
 	}
 	return nil
 }

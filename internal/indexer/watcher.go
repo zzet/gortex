@@ -2325,7 +2325,10 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 	if w.pointMutationPatch != nil {
 		patchErr = w.pointMutationPatch(path, kind, generation)
 	} else {
-		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, false, &fanout, publication)
+		// Retry attempts must bypass the pointDuplicateSourceContent fast path:
+		// a prior attempt that failed after persisting file_meta/fileMtimes
+		// (e.g. ErrReindexWriteRefused during resolution) still needs re-resolution.
+		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, retryAttempt > 0, &fanout, publication)
 	}
 	var storageErr *store_sqlite.StorageError
 	if errors.As(patchErr, &storageErr) {
@@ -3200,7 +3203,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	// A startup replay that already checked a receipt still forces its original
 	// exact path. Otherwise the persisted hash/size/version gate identifies a
 	// duplicate; only its checked source proof may restore the prior witness.
-	if kind == ChangeModified && !receiptChecked {
+	if kind == ChangeModified && !receiptChecked && !idx.hasPendingResolutionRetry() {
 		duplicate, content := idx.pointDuplicateSourceContent(ctx, path)
 		if duplicate {
 			if observe != nil && content != nil {

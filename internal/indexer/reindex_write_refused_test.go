@@ -208,3 +208,129 @@ func TestMultiIndexer_RunPreEnrichResolveCarriesPlaceholderRepointsAndGuardRever
 	})
 }
 
+func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
+	t.Run("non_alias_ts_edit_surfaces_refusal_and_retries_past_duplicate_gate", func(t *testing.T) {
+		root := t.TempDir()
+		writeFileMk(t, filepath.Join(root, "lib.ts"), "export function helper() { return 1 }\n")
+		callerPath := filepath.Join(root, "caller.ts")
+		writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return 0 }\n")
+
+		idx, store := newSQLiteIndexer(t)
+		_, err := idx.Index(root)
+		require.NoError(t, err)
+
+		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
+		require.NoError(t, err)
+
+		// Edit caller.ts (no tsconfig change) to call helper().
+		writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return helper() }\n")
+
+		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+		defer restoreTimeout()
+		contended := &gateHoldingReindexStore{Store: store}
+		idx.resolver.SetGraph(contended)
+
+		// Attempt 1 (receiptChecked=false): must return ErrReindexWriteRefused even for a non-alias edit.
+		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
+		idx.resolver.SetGraph(store)
+		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused, "non-alias edit must surface ErrReindexWriteRefused so watcher retries")
+		assert.Equal(t, "unresolved::helper", callTargetForName(t, store, "caller.ts", "run"))
+
+		// Attempt 2 (retryAttempt=1 -> receiptChecked=true): must NOT short-circuit via pointDuplicateSourceContent or empty receipt.
+		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, true, nil, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "lib.ts::helper", callTargetForName(t, store, "caller.ts", "run"))
+	})
+
+	t.Run("tsconfig_edit_retry_bypasses_duplicate_gate_and_certifies", func(t *testing.T) {
+		root := t.TempDir()
+		configPath := aliasRebindFixture(t, root)
+		idx, store := newSQLiteIndexer(t)
+		_, err := idx.Index(root)
+		require.NoError(t, err)
+
+		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
+		require.NoError(t, err)
+
+		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+		defer restoreTimeout()
+		contended := &gateHoldingReindexStore{Store: store}
+		idx.resolver.SetGraph(contended)
+
+		err = w.patchGraphWithReceiptStateObserved(configPath, ChangeModified, 0, false, nil, nil)
+		idx.resolver.SetGraph(store)
+		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+		assert.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+
+		err = w.patchGraphWithReceiptStateObserved(configPath, ChangeModified, 0, true, nil, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+		digest, err := store.TSAliasDigest(idx.repoPrefix)
+		require.NoError(t, err)
+		assert.NotEmpty(t, digest)
+	})
+}
+
+func TestMultiIndexer_RunMasterResolveNamesPreservesPendingRetryState(t *testing.T) {
+	mi, store := newTestMultiIndexerWithRefusingStore(t, func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // #1 commits incoming call, #2 refuses reconcilePlaceholderSourcesApplied
+	})
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repo/caller.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repo/caller.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repo/target.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repo/target.ts", RepoPrefix: "repo", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repo/caller.ts", To: "repo/target.ts", Kind: graph.EdgeImports, FilePath: "repo/caller.ts", Line: 1},
+		{From: "repo/caller.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "repo/caller.ts", Line: 2},
+		{From: "repo/unresolved::helper", To: "repo/caller.ts::run", Kind: graph.EdgeArgOf, FilePath: "repo/caller.ts", Line: 2},
+	})
+
+	stats := mi.runMasterResolveNames([]string{"helper"})
+	require.NotNil(t, stats)
+	assert.True(t, stats.WriteRefused)
+	assert.Len(t, store.GetOutEdges("repo/unresolved::helper"), 1)
+
+	store.refuseFunc = nil
+	stats = mi.runMasterResolveNames([]string{"helper"})
+	require.NotNil(t, stats)
+	assert.False(t, stats.WriteRefused)
+	assert.Empty(t, store.GetOutEdges("repo/unresolved::helper"), "runMasterResolveNames must hand off and flush retained placeholder repoints")
+	moved := store.GetOutEdges("repo/target.ts::helper")
+	require.Len(t, moved, 1)
+	assert.Equal(t, graph.EdgeArgOf, moved[0].Kind)
+}
+
+func TestMultiIndexer_ConcurrentRepoLanesCannotStealPendingRetryStateOutsideResolveMutex(t *testing.T) {
+	mi, store := newTestMultiIndexerWithRefusingStore(t, nil)
+	mi.savePendingMasterRetry(resolver.MasterRetryState{
+		PlaceholderRepoints: []graph.PlaceholderRepoint{
+			{OldFrom: "repoB/unresolved::x", FilePath: "repoB/a.ts", Line: 2, NewFrom: "repoB/b.ts::x"},
+		},
+	})
+
+	// Hold ResolveMutex so a competing repo lane blocks before entering resolution.
+	mu := store.ResolveMutex()
+	mu.Lock()
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(entered)
+		mi.runMasterResolveFiles([]string{"repoA/other.ts"}, false)
+	}()
+	<-entered
+	// Give the competing goroutine time to reach ResolveMutex.
+	time.Sleep(25 * time.Millisecond)
+
+	mi.pendingResolveRetryMu.Lock()
+	queuedWhileBlocked := len(mi.pendingMasterRepoints)
+	mi.pendingResolveRetryMu.Unlock()
+	mu.Unlock()
+	<-done
+
+	assert.Equal(t, 1, queuedWhileBlocked, "competing repo lane must not dequeue mi pending retry state before acquiring ResolveMutex")
+}
+
+

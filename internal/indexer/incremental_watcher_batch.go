@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -373,6 +374,56 @@ func (idx *Indexer) incrementalPointWatcherPathObserved(root, path string, stamp
 	})
 }
 
+func (idx *Indexer) recordPendingResolutionRetry(files []string, full bool) {
+	if idx == nil {
+		return
+	}
+	idx.pendingResolutionMu.Lock()
+	defer idx.pendingResolutionMu.Unlock()
+	if full {
+		idx.pendingResolutionFull = true
+	}
+	if len(files) > 0 {
+		if idx.pendingResolutionFiles == nil {
+			idx.pendingResolutionFiles = make(map[string]struct{}, len(files))
+		}
+		for _, f := range files {
+			if f != "" {
+				idx.pendingResolutionFiles[f] = struct{}{}
+			}
+		}
+	}
+}
+
+func (idx *Indexer) takePendingResolutionRetry() ([]string, bool) {
+	if idx == nil {
+		return nil, false
+	}
+	idx.pendingResolutionMu.Lock()
+	defer idx.pendingResolutionMu.Unlock()
+	full := idx.pendingResolutionFull
+	idx.pendingResolutionFull = false
+	if len(idx.pendingResolutionFiles) == 0 {
+		return nil, full
+	}
+	files := make([]string, 0, len(idx.pendingResolutionFiles))
+	for f := range idx.pendingResolutionFiles {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+	idx.pendingResolutionFiles = nil
+	return files, full
+}
+
+func (idx *Indexer) hasPendingResolutionRetry() bool {
+	if idx == nil {
+		return false
+	}
+	idx.pendingResolutionMu.Lock()
+	defer idx.pendingResolutionMu.Unlock()
+	return idx.pendingResolutionFull || len(idx.pendingResolutionFiles) > 0
+}
+
 func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode incrementalPathMode) (*IndexResult, error) {
 	// The coordinator owns the repository lane before invoking this executor.
 	// Take the reachability topology gate second and retain it through resolver
@@ -389,6 +440,16 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		return result, err
 	}
 	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	if retryFiles, retryFull := idx.takePendingResolutionRetry(); retryFull || len(retryFiles) > 0 {
+		if retryFull {
+			needed = true
+			exact = false
+		}
+		if len(retryFiles) > 0 {
+			files = appendUniqueSorted(files, retryFiles...)
+			needed = true
+		}
+	}
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
@@ -423,6 +484,9 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		}
 		resolve.end()
 	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		idx.recordPendingResolutionRetry(files, !exact || len(files) == 0)
+	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
 		if mode.exactPointSemantic {
 			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
@@ -438,7 +502,13 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		derived.endDerived()
 	}
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, idx.finishAliasPass(result)
+	if err := idx.finishAliasPass(result); err != nil {
+		return result, err
+	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		return result, result.resolutionErr
+	}
+	return result, nil
 }
 
 // resolveReceiptNamePendings rebinds pending references parked under the
@@ -605,6 +675,19 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 ) []string {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
 	wide := false
+	idx := mi.GetIndexer(repoPrefix)
+	if idx != nil {
+		if retryFiles, retryFull := idx.takePendingResolutionRetry(); retryFull || len(retryFiles) > 0 {
+			if retryFull {
+				needed = true
+				files = nil
+				wide = true
+			} else {
+				files = appendUniqueSorted(files, retryFiles...)
+				needed = true
+			}
+		}
+	}
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
@@ -615,7 +698,6 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	if result != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
 	}
-	idx := mi.GetIndexer(repoPrefix)
 	if !needed || len(files) == 0 || idx == nil {
 		batch.publicationStamps().markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered")
 	}
@@ -709,6 +791,10 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			}
 		}
 		cross.end()
+	}
+	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		retryFiles := appendUniqueSorted(files, crossRepoFiles...)
+		idx.recordPendingResolutionRetry(retryFiles, wide || len(retryFiles) == 0)
 	}
 	if wide {
 		return nil

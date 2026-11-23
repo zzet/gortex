@@ -454,6 +454,14 @@ type Indexer struct {
 	deferredAliases atomic.Pointer[aliasSnapshot]
 	aliasStateMu    sync.Mutex
 
+	// pendingResolution* remembers incremental resolution frontiers whose
+	// writes were refused under SQLite writer-gate contention so a Watcher
+	// retry (whose reparse sees identical bytes and an empty receipt) still
+	// re-runs resolution instead of short-circuiting as a duplicate no-op.
+	pendingResolutionMu    sync.Mutex
+	pendingResolutionFiles map[string]struct{}
+	pendingResolutionFull  bool
+
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
 	// its package defaults.

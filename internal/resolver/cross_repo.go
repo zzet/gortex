@@ -183,6 +183,35 @@ type CrossRepoResolver struct {
 	// can reconcile their tests projections.
 	retargetedMu            sync.Mutex
 	retargetedTestCallFiles map[string]struct{}
+
+	// takeRetryState / saveRetryState hand off unapplied placeholder repoints
+	// strictly while cr.mu (g.ResolveMutex()) is held, preventing concurrent
+	// short-lived resolvers from stealing another lane's retry queue.
+	takeRetryState func() []graph.PlaceholderRepoint
+	saveRetryState func([]graph.PlaceholderRepoint)
+}
+
+// SetRetryStateBridge installs callbacks invoked strictly while cr.mu
+// (g.ResolveMutex()) is held to inherit and return unapplied placeholder
+// repoints across short-lived CrossRepoResolver instances.
+func (cr *CrossRepoResolver) SetRetryStateBridge(take func() []graph.PlaceholderRepoint, save func([]graph.PlaceholderRepoint)) {
+	cr.takeRetryState = take
+	cr.saveRetryState = save
+}
+
+func (cr *CrossRepoResolver) bridgeRetryStateLocked() func() {
+	if cr.takeRetryState != nil {
+		if repoints := cr.takeRetryState(); len(repoints) > 0 {
+			cr.placeholderSrcIdx.inheritDeferred(repoints)
+		}
+	}
+	return func() {
+		if cr.saveRetryState != nil {
+			if rem := cr.placeholderSrcIdx.takeDeferred(); len(rem) > 0 {
+				cr.saveRetryState(rem)
+			}
+		}
+	}
 }
 
 // noteRetargetedCall mirrors Resolver.noteRetargetedCall for the
@@ -418,6 +447,7 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *C
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -682,6 +712,12 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *C
 func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			return &CrossRepoStats{ByRepo: make(map[string]int), WriteRefused: true}
+		}
+	}
 	// One backend query for every out-edge from this repo's nodes,
 	// instead of GetRepoNodes followed by GetOutEdges per node. On
 	// disk backends (SQLite, DuckDB) the per-node loop
@@ -717,6 +753,12 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			return &CrossRepoStats{ByRepo: make(map[string]int), WriteRefused: true}
+		}
+	}
 	graphPath := relPath
 	if repoPrefix != "" && relPath != repoPrefix && !strings.HasPrefix(relPath, repoPrefix+"/") {
 		graphPath = repoPrefix + "/" + strings.TrimPrefix(relPath, "/")

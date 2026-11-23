@@ -500,6 +500,7 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	cr.SetNpmPackageLookup(mi.npmPackageLookup())
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	cr.SetRetryStateBridge(mi.takePendingCrossRepoRepoints, mi.savePendingCrossRepoRepoints)
 	mi.applyRemoteStitch(cr)
 	return cr
 }
@@ -515,12 +516,6 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	if cr == nil {
 		return nil
 	}
-	cr.InheritPendingPlaceholderRepoints(mi.takePendingCrossRepoRepoints())
-	defer func() {
-		if rem := cr.TakePendingPlaceholderRepoints(); len(rem) > 0 {
-			mi.savePendingCrossRepoRepoints(rem)
-		}
-	}()
 	mi.mu.RLock()
 	indexers := make([]*Indexer, 0, len(mi.indexers))
 	for _, idx := range mi.indexers {
@@ -572,12 +567,6 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionF
 	if cr == nil {
 		return nil
 	}
-	cr.InheritPendingPlaceholderRepoints(mi.takePendingCrossRepoRepoints())
-	defer func() {
-		if rem := cr.TakePendingPlaceholderRepoints(); len(rem) > 0 {
-			mi.savePendingCrossRepoRepoints(rem)
-		}
-	}()
 	stats := cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())

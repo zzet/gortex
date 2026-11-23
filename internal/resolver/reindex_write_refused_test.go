@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -168,12 +169,17 @@ func TestRefusedOutgoingIncrementalDoesNotLeakMutatedFrontierIntoAttribution(t *
 				{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
 				{ID: "a/caller.go::Run#local:x", Kind: graph.KindLocal, Name: "x", FilePath: "a/caller.go", Language: "go", StartLine: 2},
 				{ID: "b/other.go", Kind: graph.KindFile, Name: "other.go", FilePath: "b/other.go", Language: "go"},
-				{ID: "b/other.go::T.Foo", Kind: graph.KindMethod, Name: "Foo", FilePath: "b/other.go", Language: "go"},
+				{ID: "b/other.go::T.Foo", Kind: graph.KindMethod, Name: "Foo", FilePath: "b/other.go", Language: "go", Meta: map[string]any{"receiver": "T"}},
+				// Second same-name method makes untyped EdgeArgOf ambiguous during outgoing
+				// resolution so it stays unresolved::*.Foo and would be misbound by
+				// bindDataflowCalleeRefsForFile if mutated EdgeCalls leaked into attribution.
+				{ID: "d/other.go", Kind: graph.KindFile, Name: "other.go", FilePath: "d/other.go", Language: "go"},
+				{ID: "d/other.go::U.Foo", Kind: graph.KindMethod, Name: "Foo", FilePath: "d/other.go", Language: "go", Meta: map[string]any{"receiver": "U"}},
 				{ID: "c/other.go", Kind: graph.KindFile, Name: "other.go", FilePath: "c/other.go", Language: "go"},
 				{ID: "c/other.go::Dep", Kind: graph.KindFunction, Name: "Dep", FilePath: "c/other.go", Language: "go"},
 			}, []*graph.Edge{
 				{From: "a/caller.go", To: "c/other.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
-				{From: "a/caller.go::Run", To: "unresolved::*.Foo", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 10},
+				{From: "a/caller.go::Run", To: "unresolved::*.Foo", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 10, Meta: map[string]any{"receiver_type": "T"}},
 				{From: "a/caller.go::Run#local:x", To: "unresolved::*.Foo", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: 10},
 			})
 
@@ -468,3 +474,341 @@ func TestRefusedCrossPackageGuardRevertCompletesOnRetry(t *testing.T) {
 	assert.Equal(t, "unresolved::Secret", edges[0].To, "retry must finish reverting the weak-tier binding without reparsing")
 	assert.Equal(t, true, edges[0].Meta["guard_reverted"])
 }
+
+func TestReusedResolverPlaceholderRepointsSurviveAfterStartupResolveAll(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "init.ts", Kind: graph.KindFile, Name: "init.ts", FilePath: "init.ts", Language: "typescript"},
+		{ID: "init.ts::boot", Kind: graph.KindFunction, Name: "boot", FilePath: "init.ts", Language: "typescript"},
+		{ID: "util.ts", Kind: graph.KindFile, Name: "util.ts", FilePath: "util.ts", Language: "typescript"},
+		{ID: "util.ts::initUtil", Kind: graph.KindFunction, Name: "initUtil", FilePath: "util.ts", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "init.ts", To: "util.ts", Kind: graph.EdgeImports, FilePath: "init.ts", Line: 1},
+		{From: "init.ts::boot", To: "unresolved::initUtil", Kind: graph.EdgeCalls, FilePath: "init.ts", Line: 2},
+		{From: "unresolved::initUtil", To: "init.ts::boot", Kind: graph.EdgeArgOf, FilePath: "init.ts", Line: 2},
+	})
+
+	r := New(store)
+	// Startup ResolveAll populates placeholderSrcIdx and succeeds.
+	_, err := r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, store.GetOutEdges("unresolved::initUtil"))
+
+	// Later incremental save adds a new call + dataflow edge; call commits, placeholder move is refused.
+	store.AddBatch([]*graph.Node{
+		{ID: "inc.ts", Kind: graph.KindFile, Name: "inc.ts", FilePath: "inc.ts", Language: "typescript"},
+		{ID: "inc.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "inc.ts", Language: "typescript"},
+		{ID: "inc_target.ts", Kind: graph.KindFile, Name: "inc_target.ts", FilePath: "inc_target.ts", Language: "typescript"},
+		{ID: "inc_target.ts::incHelper", Kind: graph.KindFunction, Name: "incHelper", FilePath: "inc_target.ts", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "inc.ts", To: "inc_target.ts", Kind: graph.EdgeImports, FilePath: "inc.ts", Line: 1},
+		{From: "inc.ts::run", To: "unresolved::incHelper", Kind: graph.EdgeCalls, FilePath: "inc.ts", Line: 2},
+		{From: "unresolved::incHelper", To: "inc.ts::run", Kind: graph.EdgeArgOf, FilePath: "inc.ts", Line: 2},
+	})
+
+	callsBefore := store.calls
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == callsBefore+2 // call #1 commits EdgeCalls, call #2 refuses placeholder move
+	}
+	stats := r.ResolveFilesAndIncoming([]string{"inc.ts"})
+	assert.True(t, stats.WriteRefused)
+	assert.Len(t, store.GetOutEdges("unresolved::incHelper"), 1)
+
+	store.refuseFunc = nil
+	stats = r.ResolveFilesAndIncoming([]string{"inc.ts"})
+	assert.False(t, stats.WriteRefused)
+	assert.Empty(t, store.GetOutEdges("unresolved::incHelper"), "reused resolver must rebuild placeholder census instead of erasing retained repoints")
+	moved := store.GetOutEdges("inc_target.ts::incHelper")
+	require.Len(t, moved, 1)
+	assert.Equal(t, graph.EdgeArgOf, moved[0].Kind)
+}
+
+func TestIncrementalRetryDoesNotBindDataflowOntoGuardRejectedTarget(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // call #1 commits weak-tier call, call #2 refuses reconcilePlaceholderSourcesApplied
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+		{ID: "c/imported.go::Other", Kind: graph.KindFunction, Name: "Other", FilePath: "c/imported.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+		{From: "a/caller.go::Run", To: "unresolved::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
+		{From: "unresolved::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: 5},
+	})
+
+	r := New(store)
+	stats := r.ResolveFilesAndIncoming([]string{"a/caller.go"})
+	assert.True(t, stats.WriteRefused)
+
+	store.refuseFunc = nil
+	stats = r.ResolveFilesAndIncoming([]string{"a/caller.go"})
+	assert.False(t, stats.WriteRefused)
+	assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"), "dataflow edge must never move onto a guard-rejected target")
+	assert.Len(t, store.GetOutEdges("unresolved::Secret"), 1)
+	calls := store.GetOutEdges("a/caller.go::Run")
+	require.Len(t, calls, 1)
+	assert.Equal(t, "unresolved::Secret", calls[0].To)
+}
+
+func TestPendingGuardRevertDoesNotClobberUpgradedOriginOrRunStaleSourceReverts(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 3 // #1 commits call, #2 moves placeholder From, #3 refuses guard revert
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+		{ID: "c/imported.go::Other", Kind: graph.KindFunction, Name: "Other", FilePath: "c/imported.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+		{From: "a/caller.go::Run", To: "unresolved::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
+		{From: "unresolved::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: 5},
+	})
+
+	r := New(store)
+	_, err := r.ResolveAllContext(context.Background())
+	require.ErrorIs(t, err, ErrReindexWriteRefused)
+	require.True(t, r.hasPendingGuardReverts())
+
+	// Simulate an LSP upgrade promoting the edge before retry runs.
+	store.refuseFunc = nil
+	upgraded := store.GetOutEdges("a/caller.go::Run")[0]
+	upgraded.Origin = graph.OriginLSPResolved
+	store.ReindexEdges([]graph.EdgeReindex{{Edge: upgraded, OldTo: upgraded.To}})
+
+	_, err = r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	calls := store.GetOutEdges("a/caller.go::Run")
+	require.Len(t, calls, 1)
+	assert.Equal(t, "b/unimported.go::Secret", calls[0].To, "queued weak-tier guard revert must not clobber OriginLSPResolved")
+	assert.Equal(t, graph.OriginLSPResolved, calls[0].Origin)
+	assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), 1, "stale SourceReverts must not run when edge was not reverted")
+}
+
+func TestCrossRepoMutationFrontierFlushesCarriedRepointsWhenPendingEmpty(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // #1 commits cross-repo call, #2 refuses reconcilePlaceholderSourcesApplied
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "a/caller.ts", RepoPrefix: "a", Language: "typescript"},
+		{ID: "a/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "a/caller.ts", RepoPrefix: "a", Language: "typescript"},
+		{ID: "b/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "b/target.ts", RepoPrefix: "b", Language: "typescript"},
+		{ID: "b/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "b/target.ts", RepoPrefix: "b", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "a/caller.ts", To: "b/target.ts", Kind: graph.EdgeImports, FilePath: "a/caller.ts", Line: 1, CrossRepo: true},
+		{From: "a/caller.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "a/caller.ts", Line: 2},
+		{From: "a/unresolved::helper", To: "a/caller.ts::run", Kind: graph.EdgeArgOf, FilePath: "a/caller.ts", Line: 2},
+	})
+
+	cr := NewCrossRepo(store)
+	stats := cr.ResolveMutationFrontiers([]string{"a/caller.ts"}, []string{"a/caller.ts"}, []string{"a/caller.ts"})
+	assert.True(t, stats.WriteRefused)
+	assert.Len(t, store.GetOutEdges("a/unresolved::helper"), 1)
+
+	store.refuseFunc = nil
+	stats = cr.ResolveMutationFrontiers([]string{"a/caller.ts"}, []string{"a/caller.ts"}, []string{"a/caller.ts"})
+	assert.False(t, stats.WriteRefused)
+	assert.Empty(t, store.GetOutEdges("a/unresolved::helper"), "scoped cross-repo retry with len(pending)==0 must flush carried placeholder repoints")
+	var sawMoved bool
+	for _, e := range store.GetOutEdges("b/target.ts::helper") {
+		if e.Kind == graph.EdgeArgOf && e.To == "a/caller.ts::run" {
+			sawMoved = true
+		}
+	}
+	assert.True(t, sawMoved)
+}
+
+func TestIncrementalGuardRevertRetryBindsShadowedLocalBeforeGoBuiltins(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // #1 commits weak-tier promotion to b/pkg.go::min, #2 refuses guard revert
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "a/shadow.go", Kind: graph.KindFile, Name: "shadow.go", FilePath: "a/shadow.go", Language: "go"},
+		{ID: "a/shadow.go::F", Kind: graph.KindFunction, Name: "F", FilePath: "a/shadow.go", Language: "go", StartLine: 1},
+		{ID: "a/shadow.go::F#local:min", Kind: graph.KindLocal, Name: "min", FilePath: "a/shadow.go", Language: "go", StartLine: 2},
+		{ID: "b/pkg.go", Kind: graph.KindFile, Name: "pkg.go", FilePath: "b/pkg.go", Language: "go"},
+		{ID: "b/pkg.go::min", Kind: graph.KindFunction, Name: "min", FilePath: "b/pkg.go", Language: "go"},
+		{ID: "c/imp.go", Kind: graph.KindFile, Name: "imp.go", FilePath: "c/imp.go", Language: "go"},
+		{ID: "c/imp.go::Other", Kind: graph.KindFunction, Name: "Other", FilePath: "c/imp.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/shadow.go", To: "c/imp.go", Kind: graph.EdgeImports, FilePath: "a/shadow.go", Line: 1},
+		{From: "a/shadow.go::F", To: "unresolved::min", Kind: graph.EdgeReads, FilePath: "a/shadow.go", Line: 5},
+		{From: "a/shadow.go::F", To: "unresolved::Other", Kind: graph.EdgeCalls, FilePath: "a/shadow.go", Line: 6},
+	})
+
+	r := New(store)
+	stats := r.ResolveFilesAndIncoming([]string{"a/shadow.go"})
+	assert.True(t, stats.WriteRefused)
+
+	store.refuseFunc = nil
+	stats = r.ResolveFilesAndIncoming([]string{"a/shadow.go"})
+	assert.False(t, stats.WriteRefused)
+	var minTarget string
+	for _, e := range store.GetOutEdges("a/shadow.go::F") {
+		if e.Line == 5 {
+			minTarget = e.To
+		}
+	}
+	assert.Equal(t, "a/shadow.go::F#local:min", minTarget, "flushing guard reverts before frontier snapshot must let bare-name bind shadow builtin::go::min")
+}
+
+func TestPreGuardChunk2RefusalDrainsGuardSpoolSoChunk1WeakCallIsGuardedOnRetry(t *testing.T) {
+	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // chunk 1 commits weak-tier cross-pkg call, chunk 2 is refused before guard runs
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+		{ID: "c/imported.go::Allowed", Kind: graph.KindFunction, Name: "Allowed", FilePath: "c/imported.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+		{From: "a/caller.go::Run", To: "unresolved::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
+		{From: "a/caller.go::Run", To: "unresolved::Allowed", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 6},
+	})
+
+	r := New(store)
+	_, err := r.ResolveAllContext(context.Background())
+	require.ErrorIs(t, err, ErrReindexWriteRefused)
+	assert.Equal(t, 2, store.calls, "draining guard spool on refusal must not fire additional writes into contended gate")
+
+	store.refuseFunc = nil
+	_, err = r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	var secretEdge, allowedEdge *graph.Edge
+	for _, e := range store.GetOutEdges("a/caller.go::Run") {
+		if e.Line == 5 {
+			secretEdge = e
+		}
+		if e.Line == 6 {
+			allowedEdge = e
+		}
+	}
+	require.NotNil(t, secretEdge)
+	require.NotNil(t, allowedEdge)
+	assert.Equal(t, "unresolved::Secret", secretEdge.To, "chunk-1 weak-tier call must still be guarded after chunk-2 refusal")
+	assert.Equal(t, true, secretEdge.Meta["guard_reverted"])
+	assert.Equal(t, "c/imported.go::Allowed", allowedEdge.To)
+}
+
+func TestResolveAllRetryWithZeroPendingStillCompletesAbortedTailPasses(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // #1 commits unresolved::helper, #2 refuses attributeNonGoModuleImports on external::requests
+	}
+	store.AddBatch([]*graph.Node{
+		{ID: "app.py", Kind: graph.KindFile, Name: "app.py", FilePath: "app.py", Language: "python"},
+		{ID: "app.py::run", Kind: graph.KindFunction, Name: "run", FilePath: "app.py", Language: "python"},
+		{ID: "util.py", Kind: graph.KindFile, Name: "util.py", FilePath: "util.py", Language: "python"},
+		{ID: "util.py::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "util.py", Language: "python"},
+	}, []*graph.Edge{
+		{From: "app.py", To: "util.py", Kind: graph.EdgeImports, FilePath: "app.py", Line: 1},
+		{From: "app.py", To: "external::requests", Kind: graph.EdgeImports, FilePath: "app.py", Line: 2},
+		{From: "app.py::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "app.py", Line: 4},
+	})
+
+	r := New(store)
+	_, err := r.ResolveAllContext(context.Background())
+	require.ErrorIs(t, err, ErrReindexWriteRefused)
+	assert.Equal(t, 1, store.refused)
+
+	store.refuseFunc = nil
+	_, err = r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	var attributedTo string
+	for _, e := range store.GetOutEdges("app.py") {
+		if e.Kind == graph.EdgeImports && e.Line == 2 {
+			attributedTo = e.To
+		}
+	}
+	assert.NotEqual(t, "external::requests", attributedTo, "retry with zero pending unresolved edges must still complete aborted non-unresolved tail passes")
+	assert.NotEmpty(t, attributedTo)
+}
+
+func TestRestubCallsForChangedNpmImportsChunksWithoutOrphaningParallels(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // chunk 1 (2048 calls) commits, chunk 2 (2 calls) is refused
+	}
+	const totalCalls = 2050
+	nodes := make([]*graph.Node, 0, totalCalls+5)
+	edges := make([]*graph.Edge, 0, totalCalls*2+1)
+	nodes = append(nodes,
+		&graph.Node{ID: "app/src/app.ts", Kind: graph.KindFile, FilePath: "app/src/app.ts", RepoPrefix: "app", Language: "typescript"},
+		&graph.Node{ID: "oldlib/src/index.ts", Kind: graph.KindFile, FilePath: "oldlib/src/index.ts", RepoPrefix: "oldlib", Language: "typescript"},
+		&graph.Node{ID: "oldlib/src/index.ts::f", Kind: graph.KindFunction, Name: "f", FilePath: "oldlib/src/index.ts", RepoPrefix: "oldlib", Language: "typescript", Meta: map[string]any{"visibility": "public"}},
+		&graph.Node{ID: "newlib/src/index.ts", Kind: graph.KindFile, FilePath: "newlib/src/index.ts", RepoPrefix: "newlib", Language: "typescript"},
+		&graph.Node{ID: "newlib/src/index.ts::f", Kind: graph.KindFunction, Name: "f", FilePath: "newlib/src/index.ts", RepoPrefix: "newlib", Language: "typescript", Meta: map[string]any{"visibility": "public"}},
+	)
+	edges = append(edges, &graph.Edge{
+		From: "app/src/app.ts", To: "oldlib/src/index.ts::f",
+		Kind: graph.EdgeImports, FilePath: "app/src/app.ts", Line: 1, CrossRepo: true,
+		Meta: map[string]any{NpmImportSpecifierMeta: "p::f"},
+	})
+	for i := 0; i < totalCalls; i++ {
+		fnID := fmt.Sprintf("app/src/app.ts::run%d", i)
+		nodes = append(nodes, &graph.Node{
+			ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("run%d", i),
+			FilePath: "app/src/app.ts", RepoPrefix: "app", Language: "typescript",
+		})
+		edges = append(edges,
+			&graph.Edge{From: fnID, To: "oldlib/src/index.ts::f", Kind: graph.EdgeCalls, FilePath: "app/src/app.ts", Line: i + 2, CrossRepo: true},
+			&graph.Edge{From: fnID, To: "oldlib/src/index.ts::f", Kind: graph.EdgeCrossRepoCalls, FilePath: "app/src/app.ts", Line: i + 2, CrossRepo: true},
+		)
+	}
+	store.AddBatch(nodes, edges)
+
+	cr := NewCrossRepo(store)
+	cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "p" })
+	cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+		if spec != "p" {
+			return nil
+		}
+		return map[string]NpmPackageTarget{"newlib": {Entries: []string{"newlib/src/index.ts", "newlib"}}}
+	})
+
+	_, err := cr.ResolveAllContext(context.Background())
+	require.ErrorIs(t, err, ErrReindexWriteRefused)
+	// Chunk 1's 2048 parallels were removed immediately; only chunk 2's 2 calls + 2 parallels remain on oldlib.
+	var oldCalls, oldParallels int
+	for _, e := range store.GetInEdges("oldlib/src/index.ts::f") {
+		switch e.Kind {
+		case graph.EdgeCalls:
+			oldCalls++
+		case graph.EdgeCrossRepoCalls:
+			oldParallels++
+		}
+	}
+	assert.Equal(t, 2, oldCalls)
+	assert.Equal(t, 2, oldParallels, "chunked restubbing must not orphan chunk-1 parallels when chunk 2 is refused")
+
+	store.refuseFunc = nil
+	_, err = cr.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, store.GetInEdges("oldlib/src/index.ts::f"), "retry must drain all remaining oldlib calls and parallels")
+}
+
