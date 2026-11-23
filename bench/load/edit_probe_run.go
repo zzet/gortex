@@ -1448,8 +1448,7 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		} else {
 			if readErr != nil {
 				back.Error = readErr.Error()
-			}
-			if decodeErr != nil {
+			} else if decodeErr != nil {
 				back.Error = decodeErr.Error()
 			}
 		}
