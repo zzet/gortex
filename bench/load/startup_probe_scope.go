@@ -27,6 +27,7 @@ type startupScopeSample struct {
 	Completed     time.Time       `json:"completed"`
 	Frame         json.RawMessage `json:"frame,omitempty"`
 	FrameTooLarge bool            `json:"frame_too_large,omitempty"`
+	AfterGrepNS   *int64          `json:"after_grep_ns,omitempty"`
 }
 
 type startupScopeEvidence struct {
@@ -99,16 +100,23 @@ func (s *startupScopeObserver) observeServing(stderr *os.File, started time.Time
 		{Tool: "workspace", Operation: "graph", Arguments: map[string]any{"operation": "graph"}},
 	}
 	var burst sync.WaitGroup
-	burst.Go(func() { s.evidence.Core = s.capture(ctx, "core", "defer", "initialize", legacy) })
-	burst.Go(func() { s.evidence.Facade = s.capture(ctx, "facade-v1", "hide", "initialize_facade", facade) })
+	burst.Go(func() { s.evidence.Core = s.capture(ctx, "core", "defer", "initialize", legacy, time.Time{}) })
+	burst.Go(func() {
+		s.evidence.Facade = s.capture(ctx, "facade-v1", "hide", "initialize_facade", facade, time.Time{})
+	})
 	burst.Go(s.observeEarlyGrep)
 	burst.Wait()
 }
 
-func (s *startupScopeObserver) capture(ctx context.Context, tools, mode, initialize string, steps []request) []startupScopeSample {
+func (s *startupScopeObserver) capture(ctx context.Context, tools, mode, initialize string, steps []request, grepReturned time.Time) []startupScopeSample {
 	var samples []startupScopeSample
 	s.probe.mcpSession(ctx, s.cwd, tools, mode, initialize, steps, func(sample probeSample, frame []byte) bool {
 		row := startupScopeSample{probeSample: sample, Completed: sample.completed()}
+		if !grepReturned.IsZero() {
+			// Sub uses the process's monotonic clock before JSON strips it.
+			after := sample.Started.Sub(grepReturned).Nanoseconds()
+			row.AfterGrepNS = &after
+		}
 		if len(frame) <= startupScopeFrameMax {
 			row.Frame = frame
 		} else {
@@ -129,11 +137,12 @@ func (s *startupScopeObserver) observeEarlyGrep() {
 	if s.evidence.EarlyGrep == nil || !s.evidence.EarlyGrep.OK {
 		return
 	}
+	grepReturned := time.Now()
 	// The first ready poll is an upper bound. A separate matching loading
 	// answer after Grep exits can establish that it actually ran while loading.
 	ctx, cancel := context.WithTimeout(s.ctx, startupScopeDeadline)
 	defer cancel()
-	s.evidence.EarlyGrepHealth = s.capture(ctx, "core", "defer", "initialize", []request{{Tool: "index_health"}})
+	s.evidence.EarlyGrepHealth = s.capture(ctx, "core", "defer", "initialize", []request{{Tool: "index_health"}}, grepReturned)
 }
 
 func (s *startupScopeObserver) grep(ctx context.Context) *probeSample {
