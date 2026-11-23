@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -70,11 +71,13 @@ func (s *watcherRelationRebindStore) ReindexEdgesApplied(batch []graph.EdgeReind
 
 func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		deny bool
+		name                    string
+		deny                    bool
+		duplicateBeforeComplete bool
 	}{
 		{name: "applied"},
 		{name: "writer_gate_refused", deny: true},
+		{name: "writer_gate_refused_before_completion", deny: true, duplicateBeforeComplete: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -100,24 +103,58 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			idx.resolver.SetGraph(probe)
 			watcher, err := NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 5}, zap.NewNop())
 			require.NoError(t, err)
+			beforeComplete := make(chan struct{})
+			allowComplete := make(chan struct{})
+			releaseCompletion := sync.OnceFunc(func() { close(allowComplete) })
+			if tc.duplicateBeforeComplete {
+				watcher.mutationBeforeComplete = func(candidate string, generation uint64) {
+					if candidate == path && generation == 1 {
+						close(beforeComplete)
+						<-allowComplete
+					}
+				}
+			}
 			// Exclude native save echoes. The explicit owned save still uses
 			// the real admission, incremental resolver and publication paths.
 			require.NoError(t, watcher.Start([]string{t.TempDir()}))
 			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
-			submit := func(path string) (*MutationTicket, MutationResult) {
+			defer releaseCompletion()
+			enqueue := func(path string) *MutationTicket {
 				t.Helper()
 				ticket, err := watcher.EnqueueToolMutation(ctx, path)
 				require.NoError(t, err)
+				return ticket
+			}
+			wait := func(ticket *MutationTicket) MutationResult {
+				t.Helper()
 				select {
 				case result := <-ticket.Done:
-					return ticket, result
+					return result
 				case <-ctx.Done():
 					t.Fatal("owned mutation did not complete")
-					return nil, MutationResult{}
+					return MutationResult{}
 				}
 			}
+			submit := func(path string) (*MutationTicket, MutationResult) {
+				t.Helper()
+				ticket := enqueue(path)
+				return ticket, wait(ticket)
+			}
 			require.NoError(t, os.WriteFile(path, []byte(after), 0600))
-			ticket, result := submit(path)
+			ticket := enqueue(path)
+			var duplicate *MutationTicket
+			var duplicateResult MutationResult
+			if tc.duplicateBeforeComplete {
+				select {
+				case <-beforeComplete:
+				case <-ctx.Done():
+					t.Fatal("refused mutation did not reach the pre-completion boundary")
+				}
+				require.EqualValues(t, 1, ticket.Generation)
+				duplicate, duplicateResult = submit(path)
+				releaseCompletion()
+			}
+			result := wait(ticket)
 			var observation watcherRelationRebindObservation
 			select {
 			case observation = <-probe.first:
@@ -149,11 +186,14 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			require.True(t, result.Reindexed && state.Partial && !state.Failed)
 			require.False(t, state.FileGraphAt.IsZero())
 
-			duplicate, duplicateResult := submit(path)
+			if duplicate == nil {
+				duplicate, duplicateResult = submit(path)
+			}
 			require.NoError(t, duplicateResult.Err)
 			require.Greater(t, duplicate.Generation, ticket.Generation)
 			require.EqualValues(t, 1, probe.calls.Load(), "same bytes must not silently run a rebind")
-			require.True(t, duplicate.TierState().Partial)
+			t.Logf("same-byte generation=%d applied=%d tiers=%+v", duplicate.Generation, duplicateResult.AppliedGeneration, duplicate.TierState())
+			require.True(t, duplicate.TierState().Partial, "same bytes still carry the checked refusal")
 			require.True(t, duplicate.TierState().RelationsAt.IsZero())
 
 			other := filepath.Join(root, "other", "other.go")
