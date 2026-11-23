@@ -118,11 +118,13 @@ func TestRegisteredFreshCallersLateProjectionTransitionBoundary(t *testing.T) {
 							require.Nil(t, liveEntry(pendingFileProjections, path))
 							require.True(t, entry.checkedRetired.Load())
 							require.False(t, entry.suspect.Load())
-							require.True(t, time.Now().Before(deadline), "controlled publication must fit the original allowance")
 							if transition == "expired_allowance" {
 								timer := time.NewTimer(time.Until(deadline))
 								defer timer.Stop()
 								<-timer.C
+								require.False(t, time.Now().Before(deadline), "controlled expiry must precede the refusal")
+							} else {
+								require.True(t, time.Now().Before(deadline), "controlled publication must fit the original allowance")
 							}
 						default:
 							after := raw
