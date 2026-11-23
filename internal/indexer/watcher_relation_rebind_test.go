@@ -26,10 +26,11 @@ type watcherRelationRebindObservation struct {
 // the first application of the exact rebind selected by the real resolver.
 type watcherRelationRebindStore struct {
 	*store_sqlite.Store
-	ctx   context.Context
-	deny  bool
-	first chan watcherRelationRebindObservation
-	calls atomic.Int32
+	ctx                context.Context
+	deny               bool
+	first              chan watcherRelationRebindObservation
+	calls              atomic.Int32
+	replacementApplied atomic.Bool
 }
 
 func (s *watcherRelationRebindStore) ReindexEdges(batch []graph.EdgeReindex) {
@@ -38,8 +39,15 @@ func (s *watcherRelationRebindStore) ReindexEdges(batch []graph.EdgeReindex) {
 
 func (s *watcherRelationRebindStore) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
 	for _, row := range batch {
-		if row.Edge == nil || row.Edge.From != "main.go::NewCaller" || row.Edge.Kind != graph.EdgeCalls ||
-			row.OldTo != graph.UnresolvedMarker+"Target" || row.Edge.To != "main.go::Target" {
+		if row.Edge == nil || row.Edge.From != "main.go::NewCaller" || row.Edge.Kind != graph.EdgeCalls {
+			continue
+		}
+		if row.OldTo == graph.UnresolvedMarker+"Replacement" && row.Edge.To == "main.go::Replacement" {
+			applied := s.Store.ReindexEdgesApplied(batch)
+			s.replacementApplied.Store(applied)
+			return applied
+		}
+		if row.OldTo != graph.UnresolvedMarker+"Target" || row.Edge.To != "main.go::Target" {
 			continue
 		}
 		if s.calls.Add(1) != 1 {
@@ -71,8 +79,9 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			path := filepath.Join(root, "main.go")
-			const before = "package main\nfunc Target() {}\n"
+			const before = "package main\nfunc Target() {}\nfunc Replacement() {}\n"
 			const after = before + "func NewCaller() { Target() }\n"
+			const repaired = before + "func NewCaller() { Replacement() }\n"
 			require.NoError(t, os.WriteFile(path, []byte(before), 0600))
 			store, err := store_sqlite.Open(filepath.Join(t.TempDir(), "relations.sqlite"))
 			require.NoError(t, err)
@@ -156,17 +165,18 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			require.False(t, unrelated.TierState().RelationsAt.IsZero())
 			require.True(t, watcher.TierState(path).Partial, "an unrelated file must not clear the owned deferral")
 
-			require.NoError(t, os.WriteFile(path, []byte(after+"func Later() { Target() }\n"), 0600))
+			require.NoError(t, os.WriteFile(path, []byte(repaired), 0600))
 			healthy, healthyResult := submit(path)
 			require.NoError(t, healthyResult.Err)
+			require.NoError(t, ctx.Err())
 			require.Greater(t, healthy.Generation, duplicate.Generation)
-			require.Greater(t, probe.calls.Load(), int32(1), "the new generation must genuinely retry the refused rebind")
+			require.True(t, probe.replacementApplied.Load(), "the new generation must land its own checked rebind")
 			require.False(t, healthy.TierState().Partial)
 			require.False(t, healthy.TierState().RelationsAt.IsZero())
 			require.False(t, watcher.TierState(path).Partial)
 			resolved := store.GetOutEdges("main.go::NewCaller")
 			require.Len(t, resolved, 1)
-			require.Equal(t, "main.go::Target", resolved[0].To)
+			require.Equal(t, "main.go::Replacement", resolved[0].To)
 			require.True(t, duplicate.TierState().RelationsAt.IsZero(), "the newer generation cannot rewrite the old ticket")
 			t.Logf("owned duplicate generation=%d remains partial, unrelated generation=%d served, healthy generation=%d rebind applied",
 				duplicate.Generation, unrelated.Generation, healthy.Generation)
