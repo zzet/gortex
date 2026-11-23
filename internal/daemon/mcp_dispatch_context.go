@@ -12,6 +12,7 @@ type mcpDispatchRequestInfo struct {
 	class    MCPDispatchClass
 	session  string
 	protocol bool
+	occupant mcpDispatchOccupant
 }
 
 var mcpDispatchConnectionSequence atomic.Uint64
@@ -35,15 +36,21 @@ func prepareMCPDispatchContext(ctx context.Context, session string, envelope mcp
 	// remote tools remain fast; the shared total cap and session fairness still
 	// apply. Do not invent remote effects from a spelling or claim census parity.
 	class, _ := ToolDispatchClass(envelope.Params.Name)
-	if envelope.Method == "tools/call" && classifier != nil {
+	var occupant mcpDispatchOccupant
+	if envelope.Method == "tools/call" && (classifier != nil || mcpDispatchProcess.observeOccupancy) {
 		var arguments map[string]any
 		_ = json.Unmarshal(envelope.Params.Arguments, &arguments)
-		class = classifier.DispatchClass(envelope.Params.Name, arguments)
+		if classifier != nil {
+			class = classifier.DispatchClass(envelope.Params.Name, arguments)
+		}
+		if mcpDispatchProcess.observeOccupancy {
+			occupant = mcpDispatchOccupantFor(envelope.Params.Name, arguments)
+		}
 	}
 	if envelope.Method != "tools/call" {
 		class = MCPDispatchFast
 	}
-	ctx = withMCPDispatchRequest(ctx, mcpDispatchRequestInfo{class: class, session: session, protocol: isMCPInitializationRequest(envelope.Method) || len(envelope.ID) == 0 && envelope.Method != ""})
+	ctx = withMCPDispatchRequest(ctx, mcpDispatchRequestInfo{class: class, session: session, occupant: occupant, protocol: isMCPInitializationRequest(envelope.Method) || len(envelope.ID) == 0 && envelope.Method != ""})
 	if isLongLivedMCPRequest(envelope.Method) || isMCPCancellation(envelope.Method) {
 		ctx = withMCPDispatchUnbounded(ctx)
 	}
@@ -110,6 +117,9 @@ func mcpDispatchBusyResponse(id json.RawMessage, method string, err error) []byt
 	var busy *mcpDispatchBusyError
 	if errors.As(err, &busy) {
 		data["queue_wait_ms"] = busy.waited.Milliseconds()
+		if busy.occupancy != nil {
+			data["dispatch_occupancy"] = busy.occupancy.wire(busy.lane)
+		}
 		retry := busy.retryAfter
 		if retry <= 0 {
 			retry = mcpDispatchBusyRetryAfter
