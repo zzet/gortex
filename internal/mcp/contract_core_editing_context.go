@@ -209,6 +209,31 @@ func requestLocalEditingContext(ctx context.Context, path string) *graph.FileEdi
 	return result
 }
 
+// canonicalEditingContext keeps only definitions independently proven from
+// this request's canonical file bytes. The rejected SQL bundle has no
+// authority to supply imports, calls or callers.
+func (s *Server) canonicalEditingContext(ctx context.Context, path string, proof *canonicalSummarySource) *graph.FileEditingContextResult {
+	if proof == nil || validateRequestProjections(ctx) != nil {
+		return nil
+	}
+	definitions := s.canonicalSummaryDefinitions(ctx, path, proof)
+	if definitions == nil {
+		return nil
+	}
+	result := &graph.FileEditingContextResult{}
+	for _, node := range definitions.Nodes {
+		if node.Kind == graph.KindFile {
+			result.FileNode = node
+		} else {
+			result.Defines = append(result.Defines, node)
+		}
+	}
+	if result.FileNode == nil {
+		return nil
+	}
+	return result
+}
+
 // fileSummaryContext preserves the full legacy symbols/subgraph/count shape
 // while all physical rows, endpoint hydration and importer facts share one
 // checked transaction and budget. Counts never use an errorless scalar API.

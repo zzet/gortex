@@ -365,6 +365,12 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 	// mode — the cause of spurious "no symbols found for file" misses.
 	fp = s.graphRelPath(ctx, fp)
 
+	var canonical *canonicalSummarySource
+	if allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance); allowance != nil &&
+		allowance.tool == "get_editing_context" && s.metadataReadRetryScope(req) {
+		canonical = &canonicalSummarySource{}
+		ctx = context.WithValue(ctx, canonicalSummarySourceKey{}, canonical)
+	}
 	ctx, err = s.ensureProjected(ctx, []string{fp})
 	if err != nil {
 		if errors.Is(err, errProjectedSourceMoved) {
@@ -389,10 +395,17 @@ func (s *Server) handleGetEditingContext(ctx context.Context, req mcp.CallToolRe
 		ctx = markRequestStoreBusy(ctx, fp)
 		bundle = requestLocalEditingContext(ctx, fp)
 	} else if bundleErr != nil {
-		if errors.Is(bundleErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
-			return nil, errProjectedSourceMoved
+		if errors.Is(bundleErr, graph.ErrContractProjectionStale) {
+			if s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+				return nil, errProjectedSourceMoved
+			}
+			bundle = s.canonicalEditingContext(ctx, fp, canonical)
 		}
-		return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
+		if bundle == nil {
+			return mcp.NewToolResultError("get_editing_context: " + bundleErr.Error()), nil
+		}
+		ctx = markRequestStoreBusy(ctx, fp)
+		storeBusy = true
 	}
 
 	if !storeBusy && (bundle == nil || (bundle.FileNode == nil && len(bundle.Defines) == 0)) {
