@@ -572,3 +572,37 @@ func TestEvictAfterCheckoutMoves(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, digest)
 }
+
+func TestNuxtAutoImports_IgnoresCommentedAndStringExports(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, ".nuxt/imports.d.ts"), `/*
+export { run as hidden } from '../composables/example'
+*/
+const note = `+"`"+`
+export { run as fromString } from '../composables/example'
+`+"`"+`;
+export { real } from '../composables/real';
+`)
+	writeFileMk(t, filepath.Join(root, "composables/example.ts"), "export function run() { return 1 }\n")
+	writeFileMk(t, filepath.Join(root, "composables/real.ts"), "export function real() { return 2 }\n")
+	writeFileMk(t, filepath.Join(root, "pages/index.ts"), `export function callHidden() { return hidden() }
+export function callString() { return fromString() }
+export function callReal() { return real() }
+`)
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	require.Equal(t, "unresolved::hidden", callTargetForName(t, store, "pages/index.ts", "callHidden"))
+	require.Equal(t, "unresolved::fromString", callTargetForName(t, store, "pages/index.ts", "callString"))
+	require.Equal(t, "composables/real.ts::real", callTargetForName(t, store, "pages/index.ts", "callReal"))
+	var realEdge *graph.Edge
+	for _, e := range store.GetOutEdges("pages/index.ts::callReal") {
+		if e.Kind == graph.EdgeCalls {
+			realEdge = e
+		}
+	}
+	require.NotNil(t, realEdge)
+	require.Equal(t, graph.OriginASTResolved, realEdge.Origin)
+	require.Equal(t, "nuxt_auto_import", realEdge.Meta["resolution"])
+}

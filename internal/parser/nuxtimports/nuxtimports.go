@@ -2,6 +2,7 @@
 package nuxtimports
 
 import (
+	"context"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/zzet/gortex/internal/parser/tsalias"
+	sitter "github.com/zzet/gortex/internal/parser/tsitter"
+	"github.com/zzet/gortex/internal/parser/tsitter/typescript"
 )
 
 // Binding names the repository-relative module path and its original export.
@@ -28,7 +31,6 @@ type Collection struct {
 	scopes []scope
 }
 
-var exportRE = regexp.MustCompile(`(?m)^\s*export\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
 const GeneratedList = ".nuxt/imports.d.ts"
@@ -101,9 +103,37 @@ func collection(scopes []scope) *Collection {
 
 func parse(repoRoot, generatedDir, source string) map[string]Binding {
 	bindings := make(map[string]Binding)
+	if !strings.Contains(source, "export") {
+		return bindings
+	}
+	src := []byte(source)
+	p := sitter.NewParser()
+	defer p.Close()
+	p.SetLanguage(typescript.GetLanguage())
+	tree, err := p.ParseCtx(context.Background(), nil, src)
+	if err != nil || tree == nil {
+		return bindings
+	}
+	defer tree.Close()
+	root := tree.RootNode()
+	if root == nil {
+		return bindings
+	}
 	ambiguous := make(map[string]bool)
-	for _, match := range exportRE.FindAllStringSubmatch(source, -1) {
-		specifier := match[2]
+	for i, n := 0, int(root.NamedChildCount()); i < n; i++ {
+		stmt := root.NamedChild(i)
+		if stmt == nil {
+			continue
+		}
+		// Stop on syntax errors so error recovery after an unclosed comment or
+		// string cannot interpret trailing text as a real export.
+		if stmt.HasError() {
+			break
+		}
+		if stmt.Type() != "export_statement" || exportStatementTypeOnly(stmt, src) {
+			continue
+		}
+		specifier := plainStringContent(stmt.ChildByFieldName("source"), src)
 		if !strings.HasPrefix(specifier, "./") && !strings.HasPrefix(specifier, "../") {
 			continue
 		}
@@ -112,12 +142,16 @@ func parse(repoRoot, generatedDir, source string) map[string]Binding {
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			continue
 		}
-		for _, item := range strings.Split(match[1], ",") {
-			words := strings.Fields(item)
-			if len(words) != 1 && (len(words) != 3 || words[1] != "as") {
+		clause := findChild(stmt, "export_clause")
+		if clause == nil {
+			continue
+		}
+		for j, m := 0, int(clause.NamedChildCount()); j < m; j++ {
+			sp := clause.NamedChild(j)
+			if sp == nil || sp.Type() != "export_specifier" || sp.HasError() || specifierTypeOnly(sp, src) {
 				continue
 			}
-			name, local := words[0], words[len(words)-1]
+			name, local := specifierNames(sp, src)
 			if !identifierRE.MatchString(name) || !identifierRE.MatchString(local) {
 				continue
 			}
@@ -132,6 +166,70 @@ func parse(repoRoot, generatedDir, source string) map[string]Binding {
 		delete(bindings, name)
 	}
 	return bindings
+}
+
+func findChild(node *sitter.Node, kind string) *sitter.Node {
+	for i, n := 0, int(node.ChildCount()); i < n; i++ {
+		if c := node.Child(i); c != nil && c.Type() == kind {
+			return c
+		}
+	}
+	return nil
+}
+
+func plainStringContent(node *sitter.Node, src []byte) string {
+	if node == nil || node.Type() != "string" || node.NamedChildCount() != 1 {
+		return ""
+	}
+	frag := node.NamedChild(0)
+	if frag == nil || frag.Type() != "string_fragment" {
+		return ""
+	}
+	return frag.Content(src)
+}
+
+func exportStatementTypeOnly(stmt *sitter.Node, src []byte) bool {
+	for i, n := 0, int(stmt.ChildCount()); i < n; i++ {
+		c := stmt.Child(i)
+		if c == nil {
+			continue
+		}
+		if c.Type() == "export_clause" {
+			break
+		}
+		if c.Type() == "type" || (!c.IsNamed() && c.Content(src) == "type") {
+			return true
+		}
+	}
+	return false
+}
+
+func specifierTypeOnly(sp *sitter.Node, src []byte) bool {
+	for i, n := 0, int(sp.ChildCount()); i < n; i++ {
+		c := sp.Child(i)
+		if c == nil {
+			continue
+		}
+		if c.Type() == "type" || (!c.IsNamed() && c.Content(src) == "type") {
+			return true
+		}
+	}
+	return false
+}
+
+func specifierNames(sp *sitter.Node, src []byte) (name, local string) {
+	nameNode := sp.ChildByFieldName("name")
+	if nameNode == nil || nameNode.Type() != "identifier" {
+		return "", ""
+	}
+	name = nameNode.Content(src)
+	if aliasNode := sp.ChildByFieldName("alias"); aliasNode != nil {
+		if aliasNode.Type() != "identifier" {
+			return "", ""
+		}
+		return name, aliasNode.Content(src)
+	}
+	return name, name
 }
 
 // Resolve never applies app imports to Nitro server files or generated files.

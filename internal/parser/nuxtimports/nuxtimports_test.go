@@ -62,3 +62,37 @@ func TestPreparedNuxtExample(t *testing.T) {
 	got := parse(".", ".nuxt", string(data))
 	require.Equal(t, map[string]Binding{"sayHello": {File: "composables/hello", Name: "sayHello"}, "upperCase": {File: "utils/string", Name: "upperCase"}}, got)
 }
+
+func TestIgnoreExportsInCommentsAndStrings(t *testing.T) {
+	source := `/*
+export { run as hidden } from '../composables/example'
+*/
+// export { run as lineCommented } from '../composables/example'
+const tpl = ` + "`" + `
+export { run as inTemplate } from '../composables/example'
+` + "`" + `;
+const str = "\
+export { run as inString } from '../composables/example'";
+declare module 'pkg' {
+  export { run as inModule } from '../composables/example'
+}
+export type { TypeStmt } from '../composables/real';
+export { type TypeSpec, valueSpec } from '../composables/real';
+export { real as "strAlias" } from '../composables/real';
+/* leading */ export { /* skip, */ real /* a */ as /* b */ visible, default as useDefault } from /* c */ '../composables/real';
+export { one } from '../composables/one'; export { two } from '../composables/two';
+/* unclosed
+export { run as unclosed } from '../composables/example'
+`
+	got := parse(".", ".nuxt", source)
+	require.Equal(t, map[string]Binding{
+		"valueSpec":  {File: "composables/real", Name: "valueSpec"},
+		"visible":    {File: "composables/real", Name: "real"},
+		"useDefault": {File: "composables/real", Name: "default"},
+		"one":        {File: "composables/one", Name: "one"},
+		"two":        {File: "composables/two", Name: "two"},
+	}, got)
+
+	unclosedTemplate := "const s = `\nexport { run as hidden } from '../composables/example'\n"
+	require.Empty(t, parse(".", ".nuxt", unclosedTemplate))
+}
