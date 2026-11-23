@@ -173,6 +173,13 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		//     knob the server cannot parse is a request the server does not
 		//     understand; answering it anyway is how a caller ends up reading
 		//     a stale route it explicitly bounded.
+		// The plain facade catalog describes the available tools without
+		// consulting a checkout. Identify it before stripping request-level
+		// view and capability arguments so explicit requests still take the
+		// usual view and scope checks.
+		args, _ := req.Params.Arguments.(map[string]any)
+		plainFacadeCatalog := req.Params.Name == "capabilities" &&
+			(req.Params.Arguments == nil || args != nil && len(args) == 0)
 		freshness := takeRequestFreshness(&req)
 		if freshness.err != nil {
 			return mcp.NewToolResultError(freshness.err.Error()), nil
@@ -252,7 +259,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 		// Catalog authority that needs no view at all: a recovery or receipt
 		// read that must stay reachable while publication is pending, and the
 		// tools that must not be hostage to the binding they exist to fix.
-		viewless := catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
+		viewless := plainFacadeCatalog || catalogOnlyCheckoutControl(controlOperation) || viewlessCatalogTool(legacyName)
 		ctx = s.withMutationPublicationStamps(ctx, req.Params.Name)
 		byteCtx, byteView, releaseByte, byteRefusal := s.prepareByteEditAuthority(ctx, &req, selector, freshness, capabilities)
 		if byteRefusal != nil {
