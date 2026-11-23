@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,7 +144,8 @@ func TestCallToolWaitingForLoad(t *testing.T) {
 	})
 }
 
-func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
+func stalledLoadingRetry(t *testing.T, tool string, wait time.Duration) (<-chan error, func()) {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "gxw")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
@@ -154,7 +156,8 @@ func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
 
 	retrySeen := make(chan struct{})
 	releasePeer := make(chan struct{})
-	defer close(releasePeer)
+	release := sync.OnceFunc(func() { close(releasePeer) })
+	t.Cleanup(release)
 	peerDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -190,11 +193,10 @@ func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
 	client, err := daemon.DialTo(socket, daemon.Handshake{Mode: daemon.ModeMCP})
 	require.NoError(t, err)
 	exec := &daemonExecutor{client: client}
-	defer exec.Close()
-	const wait = 2 * loadingWaitPoll
+	t.Cleanup(func() { _ = exec.Close() })
 	result := make(chan error, 1)
 	go func() {
-		_, err := callToolWaitingForLoad(exec, "search_symbols", nil, wait, io.Discard)
+		_, err := callToolWaitingForLoad(exec, tool, nil, wait, io.Discard)
 		result <- err
 	}()
 
@@ -205,6 +207,12 @@ func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
 	case <-time.After(wait + 2*time.Second):
 		t.Fatal("daemon did not receive a real retry after the first typed refusal")
 	}
+	return result, release
+}
+
+func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
+	const wait = 2 * loadingWaitPoll
+	result, _ := stalledLoadingRetry(t, "search_symbols", wait)
 	select {
 	case err := <-result:
 		var loading *repoLoadingError
@@ -218,6 +226,27 @@ func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
 		require.Equal(t, 15, *loading.details.Percent)
 	case <-time.After(wait + time.Second):
 		t.Fatal("CLI remained blocked on a Unix socket retry beyond its loading wait")
+	}
+}
+
+func TestLoadingWaitPreservesUncertainGenericRetry(t *testing.T) {
+	const wait = 2 * loadingWaitPoll
+	for _, tool := range []string{"write_file", "unrecognized_tool"} {
+		t.Run(tool, func(t *testing.T) {
+			result, release := stalledLoadingRetry(t, tool, wait)
+			select {
+			case err := <-result:
+				t.Fatalf("retry ended before the peer resolved its outcome: %v", err)
+			case <-time.After(wait):
+			}
+			release()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, io.EOF)
+			case <-time.After(time.Second):
+				t.Fatal("CLI did not report the real peer close")
+			}
+		})
 	}
 }
 
