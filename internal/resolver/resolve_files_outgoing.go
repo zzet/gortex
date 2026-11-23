@@ -52,6 +52,7 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	// reverts BEFORE collecting the frontier so frontier.outByNode and
 	// frontier.pending observe the reverted unresolved::* rows cleanly.
 	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked(filePaths)
 		outcome = "write_refused"
 		return stats
 	}
@@ -104,6 +105,7 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
 	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
 		outcome = "write_refused"
 		return stats
 	}

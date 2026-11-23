@@ -476,6 +476,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		resolvedViaLSP := r.tryResolveViaLSP(e, de.target, &stats)
 		result.attemptsDur += time.Since(attemptStart)
 		if resolvedViaLSP {
+			if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+				delete(e.Meta, "guard_reverted")
+			}
 			result.resolved++
 			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {

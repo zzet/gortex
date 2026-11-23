@@ -76,6 +76,11 @@ func (r *Resolver) InheritPendingGuardReverts(reverts []PendingGuardRevert) {
 	r.pendingGuardReverts = append(r.pendingGuardReverts, reverts...)
 }
 
+// guardRevertChunkSize stays strictly below SQLite's 5,000-row reindexChunkSize
+// so each guard revert batch commits in one atomic transaction paired with its
+// exact SourceReverts and spoolReverts.
+const guardRevertChunkSize = 2048
+
 func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 	if len(r.pendingGuardReverts) == 0 {
 		return 0, true
@@ -83,8 +88,10 @@ func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 	reverted := 0
 	for i := range r.pendingGuardReverts {
 		entry := &r.pendingGuardReverts[i]
-		var activeSourceReverts []graph.PlaceholderRepoint
 		if !entry.reindexesApplied {
+			var live []graph.EdgeReindex
+			var liveSources []graph.PlaceholderRepoint
+			var liveSpool []lspSpoolRevert
 			if len(entry.Reindexes) > 0 {
 				sites := make([]graph.EdgeSite, 0, len(entry.Reindexes))
 				for _, ri := range entry.Reindexes {
@@ -94,9 +101,10 @@ func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 					sites = append(sites, graph.EdgeSite{From: ri.Edge.From, Line: ri.Edge.Line, Kind: ri.Edge.Kind})
 				}
 				candidates := r.graph.GetEdgeCandidates(nil, sites)
-				live := make([]graph.EdgeReindex, 0, len(entry.Reindexes))
+				paired := len(entry.SourceReverts) == len(entry.Reindexes)
+				pairedSpool := len(entry.spoolReverts) == len(entry.Reindexes)
 				liveSites := make(map[placeholderSourceSite]struct{}, len(entry.Reindexes))
-				for _, ri := range entry.Reindexes {
+				for idx, ri := range entry.Reindexes {
 					if ri.Edge == nil {
 						continue
 					}
@@ -114,45 +122,103 @@ func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 							continue
 						}
 						live = append(live, ri)
+						if paired {
+							liveSources = append(liveSources, entry.SourceReverts[idx])
+						}
+						if pairedSpool {
+							liveSpool = append(liveSpool, entry.spoolReverts[idx])
+						}
 						liveSites[placeholderSourceSite{from: ri.OldTo, filePath: ri.Edge.FilePath, line: ri.Edge.Line}] = struct{}{}
 						break
 					}
 				}
-				if len(live) > 0 {
-					if !r.applyReindexEdges(live) {
-						r.pendingGuardReverts = r.pendingGuardReverts[i:]
-						return reverted, false
-					}
-					reverted += len(live)
+				if !paired && len(live) > 0 {
 					for _, sr := range entry.SourceReverts {
 						if _, ok := liveSites[placeholderSourceSite{from: sr.OldFrom, filePath: sr.FilePath, line: sr.Line}]; ok {
-							activeSourceReverts = append(activeSourceReverts, sr)
+							liveSources = append(liveSources, sr)
 						}
 					}
-					if len(entry.spoolReverts) > 0 {
-						keptSpool := entry.spoolReverts[:0]
-						for _, sp := range entry.spoolReverts {
-							if sp.edge == nil {
-								continue
-							}
-							if _, ok := liveSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; ok {
-								keptSpool = append(keptSpool, sp)
-							}
+				}
+				if !pairedSpool && len(live) > 0 {
+					for _, sp := range entry.spoolReverts {
+						if sp.edge == nil {
+							continue
 						}
-						entry.spoolReverts = keptSpool
+						if _, ok := liveSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; ok {
+							liveSpool = append(liveSpool, sp)
+						}
 					}
-				} else {
-					entry.spoolReverts = nil
+				}
+			}
+			for start := 0; start < len(live); start += guardRevertChunkSize {
+				end := min(start+guardRevertChunkSize, len(live))
+				if !r.applyReindexEdges(live[start:end]) {
+					rem := PendingGuardRevert{Reindexes: live[start:]}
+					if len(liveSources) == len(live) {
+						rem.SourceReverts = liveSources[start:]
+					} else {
+						rem.SourceReverts = liveSources
+					}
+					if len(liveSpool) == len(live) {
+						rem.spoolReverts = liveSpool[start:]
+					} else {
+						rem.spoolReverts = liveSpool
+					}
+					r.pendingGuardReverts[i] = rem
+					r.pendingGuardReverts = r.pendingGuardReverts[i:]
+					return reverted, false
+				}
+				reverted += end - start
+				var chunkSources []graph.PlaceholderRepoint
+				if len(liveSources) == len(live) {
+					chunkSources = liveSources[start:end]
+				} else if end == len(live) {
+					chunkSources = liveSources
+				}
+				chunkSpool := []lspSpoolRevert(nil)
+				if len(liveSpool) == len(live) {
+					chunkSpool = liveSpool[start:end]
+				} else if end == len(live) {
+					chunkSpool = liveSpool
+				}
+				if len(chunkSources) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
+					if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, chunkSources); !ok {
+						r.notePassWriteRefused()
+						var tail []PendingGuardRevert
+						tail = append(tail, PendingGuardRevert{
+							SourceReverts:    chunkSources,
+							spoolReverts:     chunkSpool,
+							reindexesApplied: true,
+						})
+						if end < len(live) {
+							rem := PendingGuardRevert{Reindexes: live[end:]}
+							if len(liveSources) == len(live) {
+								rem.SourceReverts = liveSources[end:]
+							}
+							if len(liveSpool) == len(live) {
+								rem.spoolReverts = liveSpool[end:]
+							}
+							tail = append(tail, rem)
+						}
+						tail = append(tail, r.pendingGuardReverts[i+1:]...)
+						r.pendingGuardReverts = tail
+						return reverted, false
+					}
+				}
+				if len(chunkSpool) > 0 && r.lspDeferredSpool != nil {
+					if err := r.lspDeferredSpool.refreshRevertedEdges(chunkSpool); err != nil {
+						r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+					}
 				}
 			}
 			entry.Reindexes = nil
-			entry.SourceReverts = activeSourceReverts
+			entry.SourceReverts = nil
+			entry.spoolReverts = nil
 			entry.reindexesApplied = true
-		} else {
-			activeSourceReverts = entry.SourceReverts
+			continue
 		}
-		if len(activeSourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
-			if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, activeSourceReverts); !ok {
+		if len(entry.SourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
+			if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, entry.SourceReverts); !ok {
 				r.notePassWriteRefused()
 				r.pendingGuardReverts = r.pendingGuardReverts[i:]
 				return reverted, false
@@ -174,9 +240,12 @@ func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 // spooled during a ResolveAll pass that is aborting early on write refusal.
 // It runs read-only (zero store writes) and queues every unreachable revert
 // onto r.pendingGuardReverts so retry finishes guarding them before they vanish
-// from the unresolved stream. Caller holds r.mu.
-func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool, guardRepos map[string]struct{}) {
-	if guardSpool == nil || guardSpool.count == 0 {
+// from the unresolved stream. stampGuardReverted is false when aborting mid-
+// compute before every import edge has committed, avoiding a premature
+// guard_reverted stamp on calls whose imports were still in later chunks.
+// Caller holds r.mu.
+func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool, guardRepos map[string]struct{}, stampGuardReverted bool) {
+	if guardSpool == nil || guardSpool.count == 0 || guardSpool.readAt >= guardSpool.count {
 		return
 	}
 	var guardClosure map[string]map[string]struct{}
@@ -199,7 +268,7 @@ func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool,
 		jobs := guardJobsFromRecords(r.graph, records)
 		r.clearLookupCache()
 		r.warmGuardLookupCache(jobs)
-		r.guardCrossPackageCallEdges(jobs, guardClosure)
+		r.guardCrossPackageCallEdgesWithStamp(jobs, guardClosure, stampGuardReverted)
 		r.clearLookupCache()
 		done = exhausted
 	}
@@ -213,6 +282,10 @@ func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool,
 // reverted edge is restored exactly. closure is the import-reachability
 // map from buildImportClosure. Returns the number of edges reverted.
 func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}) int {
+	return r.guardCrossPackageCallEdgesWithStamp(jobs, closure, true)
+}
+
+func (r *Resolver) guardCrossPackageCallEdgesWithStamp(jobs []reindexJob, closure map[string]map[string]struct{}, stampGuardReverted bool) int {
 	if len(jobs) == 0 {
 		return 0
 	}
@@ -347,15 +420,21 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// after the provenance drop, which blocks any selective replay — a
 		// future pass cannot learn which speculative shapes never survive
 		// scrutiny. The stamp rides the reindex write it already pays for.
-		if j.edge.Meta == nil {
-			j.edge.Meta = map[string]any{}
+		// Mid-compute write-refusal drains suppress the stamp because later
+		// chunks' import edges have not committed yet.
+		if stampGuardReverted {
+			if j.edge.Meta == nil {
+				j.edge.Meta = map[string]any{}
+			}
+			j.edge.Meta["guard_reverted"] = true
 		}
-		j.edge.Meta["guard_reverted"] = true
 		// The abandoned bind's provenance must not shadow a later
 		// rebind — the receiver gate exempts resolution shapes like
 		// extension_method, and a stale tag would carry that exemption
 		// to whatever the edge binds to next.
-		delete(j.edge.Meta, "resolution")
+		if j.edge.Meta != nil {
+			delete(j.edge.Meta, "resolution")
+		}
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}
@@ -364,11 +443,8 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// this guard just rejected so retry never lifts From onto it.
 		r.placeholderSrcIdx.pruneSites(sourceReverts)
 	}
-	if r.writeRefused() {
-		// An earlier write in this pass was already refused under writer-gate
-		// contention. Clear in-memory provenance and queue this revert batch
-		// without firing another write into the contended gate.
-		for _, u := range provBatch {
+	clearInMemoryProvenance := func(updates []graph.EdgeProvenanceUpdate) {
+		for _, u := range updates {
 			if u.Edge == nil || u.Edge.Origin == u.NewOrigin {
 				continue
 			}
@@ -377,6 +453,12 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 				u.Edge.Tier = graph.ResolvedBy(u.NewOrigin)
 			}
 		}
+	}
+	if r.writeRefused() {
+		// An earlier write in this pass was already refused under writer-gate
+		// contention. Clear in-memory provenance and queue this revert batch
+		// without firing another write into the contended gate.
+		clearInMemoryProvenance(provBatch)
 		if len(reindexBatch) > 0 || len(sourceReverts) > 0 {
 			r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
 				Reindexes:     reindexBatch,
@@ -386,56 +468,68 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		}
 		return 0
 	}
-	if len(provBatch) > 0 {
-		r.graph.SetEdgeProvenanceBatch(provBatch)
-		// The reindex below persists each edge struct as it stands. The
-		// in-memory store's SetEdgeProvenance clears Origin on this very
-		// pointer, but a store that answers reads with copies (the per-file
-		// delta writer) may leave the caller's copy untouched, and the
-		// reverted row would then keep the abandoned bind's origin — a row a
-		// whole index (which reverts in memory) never writes. Apply the same
-		// clear to the struct, with SetEdgeProvenance's Tier rule; on the
-		// in-memory store it is already done.
-		for _, u := range provBatch {
-			if u.Edge == nil || u.Edge.Origin == u.NewOrigin {
-				continue
+	reverted := 0
+	for start := 0; start < len(reindexBatch); start += guardRevertChunkSize {
+		end := min(start+guardRevertChunkSize, len(reindexBatch))
+		if end <= len(provBatch) && start < end {
+			r.graph.SetEdgeProvenanceBatch(provBatch[start:end])
+			// The reindex below persists each edge struct as it stands. The
+			// in-memory store's SetEdgeProvenance clears Origin on this very
+			// pointer, but a store that answers reads with copies (the per-file
+			// delta writer) may leave the caller's copy untouched, and the
+			// reverted row would then keep the abandoned bind's origin — a row a
+			// whole index (which reverts in memory) never writes. Apply the same
+			// clear to the struct, with SetEdgeProvenance's Tier rule; on the
+			// in-memory store it is already done.
+			clearInMemoryProvenance(provBatch[start:end])
+		}
+		if !r.applyReindexEdges(reindexBatch[start:end]) {
+			if end < len(provBatch) {
+				clearInMemoryProvenance(provBatch[end:])
 			}
-			u.Edge.Origin = u.NewOrigin
-			if u.Edge.Tier != "" {
-				u.Edge.Tier = graph.ResolvedBy(u.NewOrigin)
+			r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
+				Reindexes:     reindexBatch[start:],
+				SourceReverts: sourceReverts[start:],
+				spoolReverts:  spoolReverts[start:],
+			})
+			return reverted
+		}
+		reverted += end - start
+		chunkSources := sourceReverts[start:end]
+		chunkSpool := spoolReverts[start:end]
+		if len(chunkSources) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
+			if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, chunkSources); !ok {
+				r.notePassWriteRefused()
+				if end < len(provBatch) {
+					clearInMemoryProvenance(provBatch[end:])
+				}
+				r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
+					SourceReverts:    chunkSources,
+					spoolReverts:     chunkSpool,
+					reindexesApplied: true,
+				})
+				if end < len(reindexBatch) {
+					r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
+						Reindexes:     reindexBatch[end:],
+						SourceReverts: sourceReverts[end:],
+						spoolReverts:  spoolReverts[end:],
+					})
+				}
+				return reverted
+			}
+		}
+		// A reverted edge may still hold a deferred LSP verify-record spooled
+		// while it was heuristically bound. Re-snapshot those records to the
+		// post-revert edge state (after both batches, so the struct fields are
+		// authoritative on either backend) — otherwise the next pass's exact
+		// liveness matching declares them stale and deletes the queued retry.
+		if len(chunkSpool) > 0 && r.lspDeferredSpool != nil {
+			if err := r.lspDeferredSpool.refreshRevertedEdges(chunkSpool); err != nil {
+				r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
 			}
 		}
 	}
-	if len(reindexBatch) > 0 {
-		if !r.applyReindexEdges(reindexBatch) {
-			r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
-				Reindexes:     reindexBatch,
-				SourceReverts: sourceReverts,
-				spoolReverts:  spoolReverts,
-			})
-			return 0
-		}
-	}
-	if len(sourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
-		if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, sourceReverts); !ok {
-			r.notePassWriteRefused()
-			r.pendingGuardReverts = append(r.pendingGuardReverts, PendingGuardRevert{
-				SourceReverts:    sourceReverts,
-				reindexesApplied: true,
-			})
-		}
-	}
-	// A reverted edge may still hold a deferred LSP verify-record spooled
-	// while it was heuristically bound. Re-snapshot those records to the
-	// post-revert edge state (after both batches, so the struct fields are
-	// authoritative on either backend) — otherwise the next pass's exact
-	// liveness matching declares them stale and deletes the queued retry.
-	if len(spoolReverts) > 0 && r.lspDeferredSpool != nil {
-		if err := r.lspDeferredSpool.refreshRevertedEdges(spoolReverts); err != nil {
-			r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
-		}
-	}
-	return len(reindexBatch)
+	return reverted
 }
 
 // isBareNameCallTarget reports whether an unresolved edge target is a

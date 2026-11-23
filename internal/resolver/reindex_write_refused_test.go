@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -810,5 +811,409 @@ func TestRestubCallsForChangedNpmImportsChunksWithoutOrphaningParallels(t *testi
 	_, err = cr.ResolveAllContext(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, store.GetInEdges("oldlib/src/index.ts::f"), "retry must drain all remaining oldlib calls and parallels")
+}
+
+func TestResolveAllContextReleasesNonInFlightRetryStateAcrossChunkYield(t *testing.T) {
+	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "repoA/ext.go", Kind: graph.KindFile, Name: "ext.go", FilePath: "repoA/ext.go", RepoPrefix: "repoA", Language: "go"},
+		{ID: "repoA/ext.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "repoA/ext.go", RepoPrefix: "repoA", Language: "go"},
+		{ID: "repoB/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "repoB/caller.go", RepoPrefix: "repoB", Language: "go"},
+		{ID: "repoB/caller.go::Main", Kind: graph.KindFunction, Name: "Main", FilePath: "repoB/caller.go", RepoPrefix: "repoB", Language: "go"},
+		{ID: "repoB/callee.go", Kind: graph.KindFile, Name: "callee.go", FilePath: "repoB/callee.go", RepoPrefix: "repoB", Language: "go"},
+		{ID: "repoB/callee.go::One", Kind: graph.KindFunction, Name: "One", FilePath: "repoB/callee.go", RepoPrefix: "repoB", Language: "go"},
+		{ID: "repoB/callee.go::Two", Kind: graph.KindFunction, Name: "Two", FilePath: "repoB/callee.go", RepoPrefix: "repoB", Language: "go"},
+	}, []*graph.Edge{
+		{From: "repoA/ext.go::Run", To: "stdlib::fmt::Println", Kind: graph.EdgeCalls, FilePath: "repoA/ext.go", Line: 5},
+		{From: "repoB/caller.go", To: "repoB/callee.go", Kind: graph.EdgeImports, FilePath: "repoB/caller.go", Line: 1},
+		{From: "repoB/caller.go::Main", To: "unresolved::One", Kind: graph.EdgeCalls, FilePath: "repoB/caller.go", Line: 5},
+		{From: "repoB/caller.go::Main", To: "unresolved::Two", Kind: graph.EdgeCalls, FilePath: "repoB/caller.go", Line: 6},
+	})
+
+	var bridgeMu sync.Mutex
+	bridge := MasterRetryState{AttributionFiles: []string{"repoA/ext.go"}}
+	take := func() MasterRetryState {
+		bridgeMu.Lock()
+		defer bridgeMu.Unlock()
+		out := bridge
+		bridge = MasterRetryState{}
+		return out
+	}
+	save := func(s MasterRetryState) {
+		bridgeMu.Lock()
+		defer bridgeMu.Unlock()
+		bridge.PlaceholderRepoints = append(bridge.PlaceholderRepoints, s.PlaceholderRepoints...)
+		bridge.GuardReverts = append(bridge.GuardReverts, s.GuardReverts...)
+		bridge.TailRetryAll = bridge.TailRetryAll || s.TailRetryAll
+		bridge.TailRetryScopes = append(bridge.TailRetryScopes, s.TailRetryScopes...)
+		bridge.AttributionFiles = append(bridge.AttributionFiles, s.AttributionFiles...)
+	}
+
+	m1 := New(store)
+	m1.SetScope(map[string]struct{}{"repoB": {}})
+	m1.SetRetryStateBridge(take, save)
+	interleaved := false
+	m1.chunkYieldHook = func() {
+		if interleaved {
+			return
+		}
+		interleaved = true
+		m2 := New(store)
+		m2.SetRetryStateBridge(take, save)
+		stats := m2.ResolveFilesAndIncoming([]string{"repoA/ext.go"})
+		assert.False(t, stats.WriteRefused)
+		// repoA/ext.go had zero unresolved::* edges, so it must have seen its
+		// bridged pendingAttribFiles during m1's inter-chunk yield.
+		assert.NotNil(t, store.GetNode("stdlib::fmt::Println"), "interleaving repoA retry must observe bridged pendingAttribFiles during repoB chunk yield")
+	}
+
+	_, err := m1.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.True(t, interleaved)
+	assert.Empty(t, bridge.AttributionFiles, "completed repoA attribution must not be spuriously re-queued after repoB finishes")
+}
+
+func TestCrossRepoResolveAllFlushesInheritedRepointsBeforeChunking(t *testing.T) {
+	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "a/caller.ts", RepoPrefix: "a", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "a/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "a/caller.ts", RepoPrefix: "a", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "b/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "b/caller.ts", RepoPrefix: "b", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "b/caller.ts::use", Kind: graph.KindFunction, Name: "use", FilePath: "b/caller.ts", RepoPrefix: "b", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "c/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "c/target.ts", RepoPrefix: "c", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "c/target.ts::one", Kind: graph.KindFunction, Name: "one", FilePath: "c/target.ts", RepoPrefix: "c", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "c/target.ts::two", Kind: graph.KindFunction, Name: "two", FilePath: "c/target.ts", RepoPrefix: "c", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "c/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "c/target.ts", RepoPrefix: "c", WorkspaceID: "ws", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "a/caller.ts", To: "c/target.ts", Kind: graph.EdgeImports, FilePath: "a/caller.ts", Line: 1, CrossRepo: true},
+		{From: "a/caller.ts::run", To: "unresolved::one", Kind: graph.EdgeCalls, FilePath: "a/caller.ts", Line: 2},
+		{From: "a/caller.ts::run", To: "unresolved::two", Kind: graph.EdgeCalls, FilePath: "a/caller.ts", Line: 3},
+		{From: "b/caller.ts::use", To: "c/target.ts::helper", Kind: graph.EdgeCalls, FilePath: "b/caller.ts", Line: 2, CrossRepo: true},
+		{From: "b/unresolved::helper", To: "b/caller.ts::use", Kind: graph.EdgeArgOf, FilePath: "b/caller.ts", Line: 2},
+	})
+
+	queued := []graph.PlaceholderRepoint{
+		{OldFrom: "b/unresolved::helper", FilePath: "b/caller.ts", Line: 2, NewFrom: "c/target.ts::helper"},
+	}
+	take := func() []graph.PlaceholderRepoint {
+		out := queued
+		queued = nil
+		return out
+	}
+	save := func(repoints []graph.PlaceholderRepoint) {
+		queued = append(queued, repoints...)
+	}
+
+	// Refuse call #2 (chunk 1 reindex) while allowing call #1 (initial flush of inherited repoint).
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2
+	}
+	cr := NewCrossRepo(store)
+	cr.SetRetryStateBridge(take, save)
+	_, err := cr.ResolveAllContext(context.Background())
+	require.ErrorIs(t, err, ErrReindexWriteRefused)
+	assert.Empty(t, store.GetOutEdges("b/unresolved::helper"), "inherited repoint must be flushed before streaming/chunking")
+	assert.Len(t, store.GetOutEdges("c/target.ts::helper"), 1)
+	assert.Empty(t, queued)
+}
+
+func TestScopedResolveAllPreservesOtherScopeAndUnscopedTailRetry(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "repoA/app.py", Kind: graph.KindFile, Name: "app.py", FilePath: "repoA/app.py", RepoPrefix: "repoA", Language: "python"},
+		{ID: "repoA/ext.go", Kind: graph.KindFile, Name: "ext.go", FilePath: "repoA/ext.go", RepoPrefix: "repoA", Language: "go"},
+		{ID: "repoA/ext.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "repoA/ext.go", RepoPrefix: "repoA", Language: "go"},
+		{ID: "repoB/ok.go", Kind: graph.KindFile, Name: "ok.go", FilePath: "repoB/ok.go", RepoPrefix: "repoB", Language: "go"},
+	}, []*graph.Edge{
+		{From: "repoA/app.py", To: "external::requests", Kind: graph.EdgeImports, FilePath: "repoA/app.py", Line: 1},
+		{From: "repoA/ext.go::Run", To: "stdlib::fmt::Println", Kind: graph.EdgeCalls, FilePath: "repoA/ext.go", Line: 5},
+	})
+
+	bridge := MasterRetryState{
+		TailRetryAll:     true,
+		TailRetryScopes:  []string{"repoA"},
+		AttributionFiles: []string{"repoA/ext.go"},
+	}
+	take := func() MasterRetryState {
+		out := bridge
+		bridge = MasterRetryState{}
+		return out
+	}
+	save := func(s MasterRetryState) {
+		bridge.PlaceholderRepoints = append(bridge.PlaceholderRepoints, s.PlaceholderRepoints...)
+		bridge.GuardReverts = append(bridge.GuardReverts, s.GuardReverts...)
+		bridge.TailRetryAll = bridge.TailRetryAll || s.TailRetryAll
+		bridge.TailRetryScopes = append(bridge.TailRetryScopes, s.TailRetryScopes...)
+		bridge.AttributionFiles = append(bridge.AttributionFiles, s.AttributionFiles...)
+	}
+
+	// repoB-scoped ResolveAllContext must NOT clear unscoped TailRetryAll or repoA state.
+	rB := New(store)
+	rB.SetScope(map[string]struct{}{"repoB": {}})
+	rB.SetRetryStateBridge(take, save)
+	_, err := rB.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.Nil(t, store.GetNode("stdlib::fmt::Println"), "repoB-scoped pass must skip repoA go_attribution")
+	assert.True(t, bridge.TailRetryAll, "scoped pass must not clear unscoped TailRetryAll")
+	assert.Equal(t, []string{"repoA"}, bridge.TailRetryScopes, "repoB pass must not clear repoA TailRetryScopes")
+	assert.Equal(t, []string{"repoA/ext.go"}, bridge.AttributionFiles)
+
+	// repoA-scoped ResolveAllContext with zero pending must still run repoA go_attribution,
+	// clear repoA's scope/files, and preserve unscoped TailRetryAll.
+	rA := New(store)
+	rA.SetScope(map[string]struct{}{"repoA": {}})
+	rA.SetRetryStateBridge(take, save)
+	_, err = rA.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.NotNil(t, store.GetNode("stdlib::fmt::Println"), "repoA-scoped retry must complete repoA go_attribution")
+	assert.True(t, bridge.TailRetryAll, "repoA-scoped pass must still preserve unscoped TailRetryAll")
+	assert.Empty(t, bridge.TailRetryScopes)
+	assert.Empty(t, bridge.AttributionFiles)
+
+	// Unscoped ResolveAllContext with zero pending edges must clear TailRetryAll.
+	rAll := New(store)
+	rAll.SetStampTerminal(true)
+	rAll.SetRetryStateBridge(take, save)
+	_, err = rAll.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.False(t, bridge.TailRetryAll)
+	assert.Empty(t, bridge.TailRetryScopes)
+	assert.Empty(t, bridge.AttributionFiles)
+}
+
+func TestResolveAllWithZeroPendingDrainsPendingAttribFiles(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "a/ext.go", Kind: graph.KindFile, Name: "ext.go", FilePath: "a/ext.go", Language: "go"},
+		{ID: "a/ext.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/ext.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/ext.go::Run", To: "stdlib::fmt::Println", Kind: graph.EdgeCalls, FilePath: "a/ext.go", Line: 5},
+	})
+
+	r := New(store)
+	r.notePendingAttributionFilesLocked([]string{"a/ext.go"})
+
+	_, err := r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.NotNil(t, store.GetNode("stdlib::fmt::Println"), "ResolveAllContext must not skip go_attribution when pendingAttribFiles is non-empty")
+	assert.Empty(t, r.pendingAttribFiles)
+}
+
+func TestPreAttributionIncrementalWriteRefusedNotesPendingAttribFiles(t *testing.T) {
+	for _, mode := range []string{"files_and_incoming", "files_outgoing"} {
+		t.Run(mode, func(t *testing.T) {
+			store := openRefusingReindexStore(t)
+			store.refuseNext = false
+			store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+				return call == 2 // #1 commits outgoing reindex (including stdlib::fmt::Println), #2 refuses reconcilePlaceholderSourcesApplied before attribution
+			}
+			store.AddBatch([]*graph.Node{
+				{ID: "a/foo.go", Kind: graph.KindFile, Name: "foo.go", FilePath: "a/foo.go", Language: "go"},
+				{ID: "a/foo.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/foo.go", Language: "go"},
+				{ID: "a/foo.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "a/foo.go", Language: "go"},
+			}, []*graph.Edge{
+				{From: "a/foo.go::Run", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "a/foo.go", Line: 5},
+				{From: "unresolved::Helper", To: "a/foo.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/foo.go", Line: 5},
+				{From: "a/foo.go::Run", To: "unresolved::extern::fmt::Println", Kind: graph.EdgeCalls, FilePath: "a/foo.go", Line: 6},
+			})
+
+			r := New(store)
+			var stats *ResolveStats
+			if mode == "files_and_incoming" {
+				stats = r.ResolveFilesAndIncoming([]string{"a/foo.go"})
+			} else {
+				stats = r.ResolveFilesOutgoing([]string{"a/foo.go"})
+			}
+			assert.True(t, stats.WriteRefused)
+			assert.Nil(t, store.GetNode("stdlib::fmt::Println"), "attribution must not run on refused pass")
+
+			store.refuseFunc = nil
+			if mode == "files_and_incoming" {
+				stats = r.ResolveFilesAndIncoming([]string{"a/foo.go"})
+			} else {
+				stats = r.ResolveFilesOutgoing([]string{"a/foo.go"})
+			}
+			assert.False(t, stats.WriteRefused)
+			assert.Empty(t, store.GetOutEdges("unresolved::Helper"), "retry must apply retained placeholder repoint")
+			assert.NotNil(t, store.GetNode("stdlib::fmt::Println"), "retry with zero unresolved::* edges must still run per-file attribution")
+		})
+	}
+}
+
+func TestChunkedGuardRevertPreservesChunk1SourceRevertsWhenChunk2Refused(t *testing.T) {
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+
+	const totalCalls = guardRevertChunkSize + 2
+	nodes := []*graph.Node{
+		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+	}
+	edges := make([]*graph.Edge, 0, 1+totalCalls*2)
+	edges = append(edges, &graph.Edge{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1})
+	for i := 0; i < totalCalls; i++ {
+		line := 10 + i
+		edges = append(edges,
+			&graph.Edge{From: "a/caller.go::Run", To: "b/unimported.go::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: line, Confidence: 0.5, Origin: graph.OriginTextMatched},
+			&graph.Edge{From: "b/unimported.go::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: line},
+		)
+	}
+	store.AddBatch(nodes, edges)
+
+	r := New(store)
+	// Build guard jobs directly for the 2050 weak-tier calls and refuse chunk 2's reindex (call #3:
+	// call #1 = chunk 1 reindex, call #2 = chunk 1 source revert, call #3 = chunk 2 reindex).
+	var jobs []reindexJob
+	for _, e := range store.GetOutEdges("a/caller.go::Run") {
+		if e.Kind == graph.EdgeCalls {
+			jobs = append(jobs, reindexJob{
+				edge:       e,
+				oldTo:      "unresolved::Secret",
+				newTo:      e.To,
+				kind:       e.Kind,
+				confidence: e.Confidence,
+				origin:     e.Origin,
+			})
+		}
+	}
+	require.Len(t, jobs, totalCalls)
+
+	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+		return call == 3
+	}
+	var refused bool
+	restore := r.trackPassWriteRefused(&refused)
+	closure := r.buildImportClosure()
+	reverted := r.guardCrossPackageCallEdges(jobs, closure)
+	restore()
+	assert.True(t, refused)
+	assert.Equal(t, guardRevertChunkSize, reverted)
+	// Chunk 1's 2048 SourceReverts must already have reverted atomically with Chunk 1.
+	assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), 2)
+	assert.Len(t, store.GetOutEdges("unresolved::Secret"), guardRevertChunkSize)
+
+	store.refuseFunc = nil
+	_, err := r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"), "retry must finish reverting chunk 2's remaining 2 SourceReverts")
+	assert.Len(t, store.GetOutEdges("unresolved::Secret"), totalCalls)
+}
+
+func TestMidComputeRefusalDoesNotStampGuardRevertedAndResolveClearsStaleStamp(t *testing.T) {
+	t.Run("mid_compute_drain_suppresses_guard_reverted_stamp", func(t *testing.T) {
+		t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+		t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+		store := openRefusingReindexStore(t)
+		store.refuseNext = false
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 2 // chunk 1 commits call, chunk 2 refuses before imports commit
+		}
+		store.AddBatch([]*graph.Node{
+			{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+			{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+			{ID: "b/target.go", Kind: graph.KindFile, Name: "target.go", FilePath: "b/target.go", Language: "go"},
+			{ID: "b/target.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "b/target.go", Language: "go"},
+			{ID: "other/noop.go", Kind: graph.KindFile, Name: "noop.go", FilePath: "other/noop.go", Language: "go"},
+		}, []*graph.Edge{
+			{From: "a/caller.go::Run", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
+			{From: "a/caller.go", To: "unresolved::import::./b/target", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+		})
+
+		r := New(store)
+		_, err := r.ResolveAllContext(context.Background())
+		require.ErrorIs(t, err, ErrReindexWriteRefused)
+
+		// Flush pending guard reverts via an unrelated incremental pass: mid-compute
+		// drain must NOT have stamped guard_reverted=true on the reverted call.
+		store.refuseFunc = nil
+		stats := r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.False(t, stats.WriteRefused)
+		edges := store.GetOutEdges("a/caller.go::Run")
+		require.Len(t, edges, 1)
+		assert.Equal(t, "unresolved::Helper", edges[0].To)
+		assert.Nil(t, edges[0].Meta["guard_reverted"], "mid-compute refusal drain must not stamp guard_reverted before later-chunk imports commit")
+	})
+
+	t.Run("resolving_edge_clears_stale_guard_reverted_stamp", func(t *testing.T) {
+		store := openRefusingReindexStore(t)
+		store.refuseNext = false
+		store.AddBatch([]*graph.Node{
+			{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+			{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+			{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+			{ID: "c/imported.go::Allowed", Kind: graph.KindFunction, Name: "Allowed", FilePath: "c/imported.go", Language: "go"},
+		}, []*graph.Edge{
+			{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+			{From: "a/caller.go::Run", To: "unresolved::Allowed", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5, Meta: map[string]any{"guard_reverted": true}},
+		})
+
+		r := New(store)
+		_, err := r.ResolveAllContext(context.Background())
+		require.NoError(t, err)
+		edges := store.GetOutEdges("a/caller.go::Run")
+		require.Len(t, edges, 1)
+		assert.Equal(t, "c/imported.go::Allowed", edges[0].To)
+		assert.Nil(t, edges[0].Meta["guard_reverted"], "re-resolving an edge must clear stale guard_reverted metadata")
+	})
+}
+
+func TestCancelWithRefusedDeferredFlushStillDrainsGuardSpool(t *testing.T) {
+	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+		{ID: "c/imported.go::Allowed", Kind: graph.KindFunction, Name: "Allowed", FilePath: "c/imported.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+		{From: "a/caller.go::Run", To: "unresolved::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
+		{From: "unresolved::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: 5},
+		{From: "a/caller.go::Run", To: "unresolved::Allowed", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 6},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Call #1 commits chunk 1 (Secret); chunkYieldHook cancels ctx AND arms refusal
+	// on call #2 so resolveError's applyDeferredApplied is refused.
+	r := New(store)
+	r.chunkYieldHook = func() {
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool { return call == 2 }
+		cancel()
+	}
+
+	stats, err := r.ResolveAllContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.True(t, stats.WriteRefused, "refused applyDeferredApplied inside cancel resolveError must set WriteRefused")
+
+	store.refuseFunc = nil
+	_, err = r.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	var secretEdge *graph.Edge
+	for _, e := range store.GetOutEdges("a/caller.go::Run") {
+		if e.Line == 5 {
+			secretEdge = e
+		}
+	}
+	require.NotNil(t, secretEdge)
+	assert.Equal(t, "unresolved::Secret", secretEdge.To, "guardSpool must still drain when cancel's deferred flush is refused")
 }
 

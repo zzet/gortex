@@ -147,6 +147,10 @@ type IndexResult struct {
 	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
 	// receipt so the next pass rebinds the callers this one left unresolved.
 	resolutionErr error
+	// retriedResolution is true when this incremental pass drained a previously
+	// refused resolution retry frontier (so topology invalidation must run even
+	// if the re-parsed files classified inert or 0-stale).
+	retriedResolution bool
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -458,9 +462,10 @@ type Indexer struct {
 	// writes were refused under SQLite writer-gate contention so a Watcher
 	// retry (whose reparse sees identical bytes and an empty receipt) still
 	// re-runs resolution instead of short-circuiting as a duplicate no-op.
-	pendingResolutionMu    sync.Mutex
-	pendingResolutionFiles map[string]struct{}
-	pendingResolutionFull  bool
+	pendingResolutionMu      sync.Mutex
+	pendingResolutionFiles   map[string]struct{}
+	pendingResolutionFull    bool
+	pendingResolutionDerived DerivedInvalidationPlan
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to

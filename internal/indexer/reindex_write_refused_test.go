@@ -209,7 +209,7 @@ func TestMultiIndexer_RunPreEnrichResolveCarriesPlaceholderRepointsAndGuardRever
 }
 
 func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
-	t.Run("non_alias_ts_edit_surfaces_refusal_and_retries_past_duplicate_gate", func(t *testing.T) {
+	t.Run("patch_receiptChecked_false_bypasses_duplicate_gate_via_pending_retry", func(t *testing.T) {
 		root := t.TempDir()
 		writeFileMk(t, filepath.Join(root, "lib.ts"), "export function helper() { return 1 }\n")
 		callerPath := filepath.Join(root, "caller.ts")
@@ -222,7 +222,6 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
 		require.NoError(t, err)
 
-		// Edit caller.ts (no tsconfig change) to call helper().
 		writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return helper() }\n")
 
 		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
@@ -230,41 +229,41 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 		contended := &gateHoldingReindexStore{Store: store}
 		idx.resolver.SetGraph(contended)
 
-		// Attempt 1 (receiptChecked=false): must return ErrReindexWriteRefused even for a non-alias edit.
+		// Attempt 1 (receiptChecked=false): non-alias edit surfaces ErrReindexWriteRefused and records pending retry.
 		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
 		idx.resolver.SetGraph(store)
 		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused, "non-alias edit must surface ErrReindexWriteRefused so watcher retries")
+		assert.True(t, idx.hasPendingResolutionRetry())
 		assert.Equal(t, "unresolved::helper", callTargetForName(t, store, "caller.ts", "run"))
 
-		// Attempt 2 (retryAttempt=1 -> receiptChecked=true): must NOT short-circuit via pointDuplicateSourceContent or empty receipt.
-		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, true, nil, nil)
+		// Attempt 2 with receiptChecked=false exercises watcher.go's !idx.hasPendingResolutionRetry() gate directly.
+		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
 		require.NoError(t, err)
+		assert.False(t, idx.hasPendingResolutionRetry())
 		assert.Equal(t, "lib.ts::helper", callTargetForName(t, store, "caller.ts", "run"))
 	})
 
-	t.Run("tsconfig_edit_retry_bypasses_duplicate_gate_and_certifies", func(t *testing.T) {
+	t.Run("runPointMutationObserved_retryAttempt_bypasses_duplicate_gate_without_pending_retry", func(t *testing.T) {
 		root := t.TempDir()
 		configPath := aliasRebindFixture(t, root)
+		callerPath := filepath.Join(root, "pages", "index.ts")
 		idx, store := newSQLiteIndexer(t)
 		_, err := idx.Index(root)
 		require.NoError(t, err)
+		require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 
 		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
 		require.NoError(t, err)
 
+		// Update tsconfig.json behind the scenes while leaving callerPath unchanged on disk:
+		// pointDuplicateSourceContent(callerPath) is provably true and hasPendingResolutionRetry() is false,
+		// so ONLY watcher.go's retryAttempt > 0 -> receiptChecked=true can bypass the duplicate gate.
 		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
-		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
-		defer restoreTimeout()
-		contended := &gateHoldingReindexStore{Store: store}
-		idx.resolver.SetGraph(contended)
+		dup, _ := idx.pointDuplicateSourceContent(context.Background(), callerPath)
+		require.True(t, dup, "callerPath bytes must match persisted file_meta so the duplicate gate is armed")
+		require.False(t, idx.hasPendingResolutionRetry())
 
-		err = w.patchGraphWithReceiptStateObserved(configPath, ChangeModified, 0, false, nil, nil)
-		idx.resolver.SetGraph(store)
-		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
-		assert.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
-
-		err = w.patchGraphWithReceiptStateObserved(configPath, ChangeModified, 0, true, nil, nil)
-		require.NoError(t, err)
+		w.runPointMutationObserved(callerPath, ChangeModified, 0, 1, nil)
 		assert.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 		digest, err := store.TSAliasDigest(idx.repoPrefix)
 		require.NoError(t, err)
@@ -331,6 +330,299 @@ func TestMultiIndexer_ConcurrentRepoLanesCannotStealPendingRetryStateOutsideReso
 	<-done
 
 	assert.Equal(t, 1, queuedWhileBlocked, "competing repo lane must not dequeue mi pending retry state before acquiring ResolveMutex")
+}
+
+func TestIncrementalWatcherPaths_PendingRetryFullNotDowngradedByOverlappingEdit(t *testing.T) {
+	root := t.TempDir()
+	aPath := filepath.Join(root, "a.ts")
+	bPath := filepath.Join(root, "b.ts")
+	cPath := filepath.Join(root, "c.ts")
+	writeFileMk(t, aPath, "export function a() { return 1 }\n")
+	writeFileMk(t, bPath, "export function b() { return 2 }\n")
+	writeFileMk(t, cPath, "import { a } from './a'\nexport function c() { return a() }\n")
+
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	// Simulate an unrecovered full-graph resolution demand plus an unresolved edge in untouched c.ts.
+	var cEdge *graph.Edge
+	for _, e := range store.GetOutEdges("c.ts::c") {
+		if e.Kind == graph.EdgeCalls {
+			cEdge = e
+			break
+		}
+	}
+	require.NotNil(t, cEdge)
+	oldTo := cEdge.To
+	cEdge.To = "unresolved::a"
+	require.True(t, store.ReindexEdgesApplied([]graph.EdgeReindex{{Edge: cEdge, OldTo: oldTo}}))
+
+	idx.recordPendingResolutionRetry([]string{"a.ts"}, true, DerivedInvalidationPlan{Files: []string{"a.ts"}})
+
+	// Overlapping edit to b.ts yields non-empty files=["b.ts"], yet retryFull must
+	// still run full resolveAll() instead of downgrading to a file-scoped pass.
+	writeFileMk(t, bPath, "export function b() { return 3 }\n")
+	var resolveCatchups [][]string
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		if kind == "resolve" {
+			resolveCatchups = append(resolveCatchups, files)
+		}
+	}
+	res, err := idx.incrementalWatcherPaths(root, []string{bPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.retriedResolution)
+	assert.True(t, incrementalTopologyChanged(res))
+	require.Len(t, resolveCatchups, 1)
+	assert.Empty(t, resolveCatchups[0], "retryFull must dispatch whole-repo resolveAll() (nil frontier), not file-scoped resolution")
+	assert.Equal(t, "a.ts::a", callTargetForName(t, store, "c.ts", "c"), "full resolveAll() retry must resolve untouched c.ts")
+}
+
+func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *testing.T) {
+	root := t.TempDir()
+	aPath := filepath.Join(root, "a.ts")
+	bPath := filepath.Join(root, "b.ts")
+	cPath := filepath.Join(root, "c.ts")
+	writeFileMk(t, aPath, "export function foo() { return 1 }\n")
+	writeFileMk(t, bPath, "export function foo() { return 2 }\n")
+	writeFileMk(t, cPath, "import { foo } from './b'\nexport function run() { return foo() }\n")
+
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	// Force c.ts::run -> a.ts::foo so removing foo from a.ts parks c.ts::run on
+	// unresolved::foo and exercises resolveReceiptNamePendings(receipt).
+	var runCall *graph.Edge
+	for _, e := range store.GetOutEdges("c.ts::run") {
+		if e.Kind == graph.EdgeCalls {
+			runCall = e
+			break
+		}
+	}
+	require.NotNil(t, runCall)
+	prevTo := runCall.To
+	runCall.To = "a.ts::foo"
+	require.True(t, store.ReindexEdgesApplied([]graph.EdgeReindex{{Edge: runCall, OldTo: prevTo}}))
+
+	// Remove foo from a.ts; refuse writes during resolveReceiptNamePendings.
+	writeFileMk(t, aPath, "export function bar() { return 1 }\n")
+	refusing := &countingRefuseReindexStore{
+		Store: store,
+		refuseFunc: func(_ int, _ []graph.EdgeReindex) bool {
+			return true
+		},
+	}
+	idx.resolver.SetGraph(refusing)
+	_, err = idx.incrementalWatcherPaths(root, []string{aPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	idx.resolver.SetGraph(store)
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	assert.Equal(t, "unresolved::foo", callTargetForName(t, store, "c.ts", "run"))
+
+	// Attempt 2 on unchanged a.ts (inert reparse): must run full resolution and rebind c.ts::run -> b.ts::foo.
+	res, err := idx.incrementalWatcherPaths(root, []string{aPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.retriedResolution)
+	assert.True(t, incrementalTopologyChanged(res), "inert retry pass that completed resolution must signal topologyChanged")
+	assert.Equal(t, "b.ts::foo", callTargetForName(t, store, "c.ts", "run"))
+}
+
+func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopologyChange(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "lib.ts"), "export function helper() { return 1 }\n")
+	callerPath := filepath.Join(root, "caller.ts")
+	writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return 0 }\n")
+
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return helper() }\n")
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	idx.resolver.SetGraph(&gateHoldingReindexStore{Store: store})
+	_, err = idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	idx.resolver.SetGraph(store)
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+
+	var derivedFiles []string
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		if kind == "derived" {
+			derivedFiles = append(derivedFiles, files...)
+		}
+	}
+	// Attempt 2 sees identical bytes on disk (inert reparse) yet must still signal
+	// topologyChanged and carry the retried file into DerivedInvalidation.
+	res, err := idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.retriedResolution)
+	assert.True(t, incrementalTopologyChanged(res), "successful inert retry must invalidate reachability topology")
+	assert.Contains(t, res.DerivedInvalidation.Files, "caller.ts")
+	assert.True(t, res.DerivedInvalidation.Flags.Has(DerivedInvalidatesTests))
+	assert.Contains(t, derivedFiles, "caller.ts")
+	assert.Equal(t, "lib.ts::helper", callTargetForName(t, store, "caller.ts", "run"))
+}
+
+func TestMultiIndexer_RetryFullWideStillRunsWholeGraphCrossRepoAndRetryFileFacts(t *testing.T) {
+	mi, store := newTestMultiIndexerWithRefusingStore(t, nil)
+	idxA := mi.newPerRepoIndexerGuardedWithMode(config.IndexConfig{}, multiIndexerBatchMode{})
+	idxA.SetRepoPrefix("repoA")
+	mi.mu.Lock()
+	mi.indexers["repoA"] = idxA
+	mi.mu.Unlock()
+
+	store.AddBatch([]*graph.Node{
+		{ID: "repoA/a.ts", Kind: graph.KindFile, Name: "a.ts", FilePath: "repoA/a.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoA/b.ts", Kind: graph.KindFile, Name: "b.ts", FilePath: "repoA/b.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoA/c.ts", Kind: graph.KindFile, Name: "c.ts", FilePath: "repoA/c.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoA/c.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repoA/c.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoB/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repoB/target.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoB/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repoB/target.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repoA/c.ts", To: "repoB/target.ts", Kind: graph.EdgeImports, FilePath: "repoA/c.ts", Line: 1, CrossRepo: true},
+		{From: "repoA/c.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "repoA/c.ts", Line: 2},
+	})
+
+	idxA.recordPendingResolutionRetry([]string{"repoA/a.ts"}, true, DerivedInvalidationPlan{Files: []string{"repoA/a.ts"}})
+
+	var refFactFiles []string
+	idxA.incrementalCatchupHook = func(kind string, files []string) {
+		if kind == "ref_facts" {
+			refFactFiles = append(refFactFiles, files...)
+		}
+	}
+	// Overlapping edit to repoA/b.ts populates result.DerivedInvalidation.Files = ["repoA/b.ts"].
+	res := &IndexResult{
+		DerivedInvalidation: DerivedInvalidationPlan{Files: []string{"repoA/b.ts"}},
+	}
+	batch := &reparsePendingEnrichmentBatch{deferResolverCatchup: true}
+	returned := mi.resolveIncrementalRepoMutationMode("repoA", res, nil, batch, false)
+	assert.Nil(t, returned, "wide retry must return nil frontier")
+	assert.True(t, res.retriedResolution)
+	assert.Contains(t, refFactFiles, "repoA/a.ts", "wide retry must preserve retryFiles for ref_facts refresh")
+	var callTarget string
+	for _, e := range store.GetOutEdges("repoA/c.ts::run") {
+		if e.Kind == graph.EdgeCalls {
+			callTarget = e.To
+		}
+	}
+	assert.Equal(t, "repoB/target.ts::helper", callTarget, "wide retry must run whole-graph cross-repo resolve even when crossRepoFiles is non-empty")
+}
+
+func TestMultiIndexer_PerRepoIndexerResolverBridgesRetryStateToFreshMaster(t *testing.T) {
+	mi, store := newTestMultiIndexerWithRefusingStore(t, func(call int, _ []graph.EdgeReindex) bool {
+		return call == 2 // #1 commits outgoing call on idx.resolver, #2 refuses reconcilePlaceholderSourcesApplied
+	})
+	idx := mi.newPerRepoIndexerGuardedWithMode(config.IndexConfig{}, multiIndexerBatchMode{})
+	store.AddBatch([]*graph.Node{
+		{ID: "repo/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repo/caller.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repo/caller.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repo/target.ts", RepoPrefix: "repo", Language: "typescript"},
+		{ID: "repo/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repo/target.ts", RepoPrefix: "repo", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repo/caller.ts", To: "repo/target.ts", Kind: graph.EdgeImports, FilePath: "repo/caller.ts", Line: 1},
+		{From: "repo/caller.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "repo/caller.ts", Line: 2},
+		{From: "repo/unresolved::helper", To: "repo/caller.ts::run", Kind: graph.EdgeArgOf, FilePath: "repo/caller.ts", Line: 2},
+	})
+
+	// Simulates executeAffectedByPlan calling idx.resolver.ResolveFilesOutgoing directly.
+	stats := idx.resolver.ResolveFilesOutgoing([]string{"repo/caller.ts"})
+	require.NotNil(t, stats)
+	assert.True(t, stats.WriteRefused)
+	assert.Len(t, store.GetOutEdges("repo/unresolved::helper"), 1)
+
+	// Attempt 2 runs through a fresh master resolver on MultiIndexer; it must inherit
+	// the repoint queued by idx.resolver via SetRetryStateBridge.
+	store.refuseFunc = nil
+	require.NoError(t, mi.RunPreEnrichResolveFiles(context.Background(), []string{"repo/caller.ts"}, nil))
+	assert.Empty(t, store.GetOutEdges("repo/unresolved::helper"), "fresh master resolver must inherit retry state bridged from per-repo idx.resolver")
+	moved := store.GetOutEdges("repo/target.ts::helper")
+	require.Len(t, moved, 1)
+	assert.Equal(t, graph.EdgeArgOf, moved[0].Kind)
+}
+
+func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t *testing.T) {
+	root := t.TempDir()
+	defPath := filepath.Join(root, "def.go")
+	helperPath := filepath.Join(root, "helper.go")
+	callerPath := filepath.Join(root, "caller.go")
+	writeFileMk(t, defPath, "package demo\n\nfunc Calc(x int) int { return x }\n")
+	writeFileMk(t, helperPath, "package demo\n\nfunc Other() int { return 2 }\n")
+	writeFileMk(t, callerPath, "package demo\n\nfunc Run() int { return Calc(1) }\n")
+
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "def.go::Calc", callTargetForName(t, store, "caller.go", "Run"))
+
+	// Change Calc's signature (a genuine contract change putting caller.go into
+	// batch.deferredAffectedPlan().files) AND add an unresolved call to helper.go::Other
+	// in caller.go (untouched by def.go's incoming leg, so ONLY ResolveFilesOutgoing
+	// on affected_by resolves it).
+	writeFileMk(t, defPath, "package demo\n\nfunc Calc(x, y int) int { return x + y }\n")
+	store.AddBatch(nil, []*graph.Edge{
+		{From: "caller.go::Run", To: "unresolved::Other", Kind: graph.EdgeCalls, FilePath: "caller.go", Line: 99},
+	})
+
+	// Refuse writes only when ResolveFilesOutgoing runs on affected_by (caller.go).
+	var inAffected bool
+	var observedAffected []string
+	idx.incrementalCatchupHook = func(kind string, files []string) {
+		inAffected = kind == "affected_by"
+		if kind == "affected_by" {
+			observedAffected = append(observedAffected, files...)
+		}
+	}
+	refusing := &countingRefuseReindexStore{
+		Store: store,
+		refuseFunc: func(_ int, _ []graph.EdgeReindex) bool {
+			return inAffected
+		},
+	}
+	idx.resolver.SetGraph(refusing)
+	_, err = idx.incrementalWatcherPaths(root, []string{defPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	idx.resolver.SetGraph(store)
+	require.NotEmpty(t, observedAffected, "signature change must enqueue caller.go in affected_by plan")
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+
+	// Attempt 2 on unchanged def.go (inert reparse): affected_by plan is now empty,
+	// so ONLY retaining factFiles from Attempt 1 re-resolves caller.go's edge!
+	idx.incrementalCatchupHook = nil
+	res, err := idx.incrementalWatcherPaths(root, []string{defPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.retriedResolution)
+	var line99Target string
+	for _, e := range store.GetOutEdges("caller.go::Run") {
+		if e.Line == 99 {
+			line99Target = e.To
+		}
+	}
+	assert.Equal(t, "helper.go::Other", line99Target, "Attempt 2 must include affected.files retained from Attempt 1 refusal")
 }
 
 

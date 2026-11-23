@@ -503,10 +503,15 @@ type Resolver struct {
 	// reverting the weak-tier edges even when they are no longer unresolved.
 	pendingGuardReverts []PendingGuardRevert
 
-	// pendingTailRetry marks that a prior ResolveAllContext pass aborted on a
-	// refused write so the retry does not short-circuit on len(pending) == 0
-	// before completing non-unresolved tail/attribution passes.
-	pendingTailRetry bool
+	// pendingTailRetryAll marks that an unscoped ResolveAllContext pass aborted
+	// on a refused write so a subsequent unscoped retry does not short-circuit
+	// on len(pending) == 0 before completing tail passes and terminal stamping.
+	pendingTailRetryAll bool
+
+	// pendingTailRetryScopes tracks per-repo scopes whose ResolveAllContext
+	// pass aborted on a refused write so a scoped pass for another repo cannot
+	// clear pending tail work belonging to this scope or an unscoped pass.
+	pendingTailRetryScopes map[string]struct{}
 
 	// pendingAttribFiles remembers incremental file frontiers whose attribution
 	// pass was refused so a retry with len(pending) == 0 still runs full
@@ -860,7 +865,8 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	r.lspDeferredCursorSet = false
 	r.placeholderSrcIdx = placeholderSourceIndex{}
 	r.pendingGuardReverts = nil
-	r.pendingTailRetry = false
+	r.pendingTailRetryAll = false
+	r.pendingTailRetryScopes = nil
 	r.pendingAttribFiles = nil
 	if oldMu != nil {
 		oldMu.Unlock()
@@ -872,7 +878,8 @@ func (r *Resolver) SetGraph(g graph.Store) {
 type MasterRetryState struct {
 	PlaceholderRepoints []graph.PlaceholderRepoint
 	GuardReverts        []PendingGuardRevert
-	TailRetry           bool
+	TailRetryAll        bool
+	TailRetryScopes     []string
 	AttributionFiles    []string
 }
 
@@ -884,21 +891,64 @@ func (r *Resolver) SetRetryStateBridge(take func() MasterRetryState, save func(M
 	r.saveRetryState = save
 }
 
+func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
+	if len(state.PlaceholderRepoints) > 0 {
+		r.placeholderSrcIdx.inheritDeferred(state.PlaceholderRepoints)
+	}
+	if len(state.GuardReverts) > 0 {
+		r.pendingGuardReverts = append(r.pendingGuardReverts, state.GuardReverts...)
+	}
+	if state.TailRetryAll {
+		r.pendingTailRetryAll = true
+	}
+	if len(state.TailRetryScopes) > 0 {
+		if r.pendingTailRetryScopes == nil {
+			r.pendingTailRetryScopes = make(map[string]struct{}, len(state.TailRetryScopes))
+		}
+		for _, s := range state.TailRetryScopes {
+			if s != "" {
+				r.pendingTailRetryScopes[s] = struct{}{}
+			}
+		}
+	}
+	if len(state.AttributionFiles) > 0 {
+		r.notePendingAttributionFilesLocked(state.AttributionFiles)
+	}
+}
+
+// releaseNonInFlightRetryStateLocked returns queued tail/attribution retry
+// demands to saveRetryState before an inter-chunk r.mu.Unlock() yield so a
+// concurrent repository retry can observe and drain its own pending files
+// instead of falsely certifying on an empty bridge.
+func (r *Resolver) releaseNonInFlightRetryStateLocked() {
+	if r.saveRetryState == nil {
+		return
+	}
+	var out MasterRetryState
+	out.TailRetryAll = r.pendingTailRetryAll
+	r.pendingTailRetryAll = false
+	if len(r.pendingTailRetryScopes) > 0 {
+		out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
+		for s := range r.pendingTailRetryScopes {
+			out.TailRetryScopes = append(out.TailRetryScopes, s)
+		}
+		r.pendingTailRetryScopes = nil
+	}
+	if len(r.pendingAttribFiles) > 0 {
+		out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
+		for p := range r.pendingAttribFiles {
+			out.AttributionFiles = append(out.AttributionFiles, p)
+		}
+		r.pendingAttribFiles = nil
+	}
+	if out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
+		r.saveRetryState(out)
+	}
+}
+
 func (r *Resolver) bridgeRetryStateLocked() func() {
 	if r.takeRetryState != nil {
-		state := r.takeRetryState()
-		if len(state.PlaceholderRepoints) > 0 {
-			r.placeholderSrcIdx.inheritDeferred(state.PlaceholderRepoints)
-		}
-		if len(state.GuardReverts) > 0 {
-			r.pendingGuardReverts = append(r.pendingGuardReverts, state.GuardReverts...)
-		}
-		if state.TailRetry {
-			r.pendingTailRetry = true
-		}
-		if len(state.AttributionFiles) > 0 {
-			r.notePendingAttributionFilesLocked(state.AttributionFiles)
-		}
+		r.adoptRetryStateLocked(r.takeRetryState())
 	}
 	return func() {
 		if r.saveRetryState == nil {
@@ -910,8 +960,15 @@ func (r *Resolver) bridgeRetryStateLocked() func() {
 			out.GuardReverts = r.pendingGuardReverts
 			r.pendingGuardReverts = nil
 		}
-		out.TailRetry = r.pendingTailRetry
-		r.pendingTailRetry = false
+		out.TailRetryAll = r.pendingTailRetryAll
+		r.pendingTailRetryAll = false
+		if len(r.pendingTailRetryScopes) > 0 {
+			out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
+			for s := range r.pendingTailRetryScopes {
+				out.TailRetryScopes = append(out.TailRetryScopes, s)
+			}
+			r.pendingTailRetryScopes = nil
+		}
 		if len(r.pendingAttribFiles) > 0 {
 			out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
 			for p := range r.pendingAttribFiles {
@@ -919,8 +976,68 @@ func (r *Resolver) bridgeRetryStateLocked() func() {
 			}
 			r.pendingAttribFiles = nil
 		}
-		if len(out.PlaceholderRepoints) > 0 || len(out.GuardReverts) > 0 || out.TailRetry || len(out.AttributionFiles) > 0 {
+		if len(out.PlaceholderRepoints) > 0 || len(out.GuardReverts) > 0 || out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
 			r.saveRetryState(out)
+		}
+	}
+}
+
+func (r *Resolver) notePendingTailRetryLocked() {
+	if len(r.scope) == 0 {
+		r.pendingTailRetryAll = true
+		return
+	}
+	if r.pendingTailRetryScopes == nil {
+		r.pendingTailRetryScopes = make(map[string]struct{}, len(r.scope))
+	}
+	for prefix := range r.scope {
+		if prefix != "" {
+			r.pendingTailRetryScopes[prefix] = struct{}{}
+		}
+	}
+}
+
+func (r *Resolver) hasPendingTailWorkForScopeLocked() bool {
+	if len(r.scope) == 0 {
+		return r.pendingTailRetryAll || len(r.pendingTailRetryScopes) > 0 || len(r.pendingAttribFiles) > 0
+	}
+	if r.pendingTailRetryAll {
+		return true
+	}
+	for prefix := range r.scope {
+		if _, ok := r.pendingTailRetryScopes[prefix]; ok {
+			return true
+		}
+	}
+	for fp := range r.pendingAttribFiles {
+		if _, ok := r.scope[graph.RepoPrefixOfID(fp)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) clearPendingTailRetryForScopeLocked() {
+	if len(r.scope) == 0 {
+		r.pendingTailRetryAll = false
+		r.pendingTailRetryScopes = nil
+		r.pendingAttribFiles = nil
+		return
+	}
+	for prefix := range r.scope {
+		delete(r.pendingTailRetryScopes, prefix)
+	}
+	if len(r.pendingTailRetryScopes) == 0 {
+		r.pendingTailRetryScopes = nil
+	}
+	if len(r.pendingAttribFiles) > 0 {
+		for fp := range r.pendingAttribFiles {
+			if _, ok := r.scope[graph.RepoPrefixOfID(fp)]; ok {
+				delete(r.pendingAttribFiles, fp)
+			}
+		}
+		if len(r.pendingAttribFiles) == 0 {
+			r.pendingAttribFiles = nil
 		}
 	}
 }
@@ -1101,7 +1218,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		_, ok := r.flushPendingRetryWritesLocked()
 		restoreRefused()
 		if !ok || startWriteRefused {
-			r.pendingTailRetry = true
+			r.notePendingTailRetryLocked()
 			return &ResolveStats{WriteRefused: true}, fmt.Errorf("%w: pending retry writes", ErrReindexWriteRefused)
 		}
 	}
@@ -1185,7 +1302,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if pendingErr != nil {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
-	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() && !r.pendingTailRetry {
+	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() && !r.hasPendingTailWorkForScopeLocked() {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, nil
 	}
 
@@ -1309,24 +1426,30 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	defer guardSpool.close()
 	guardDrained := false
 	guardRepos := make(map[string]struct{})
+	var tailWriteRefused bool
+	computeLoopDone := false
+	yielded := false
 	total := &ResolveStats{}
 	resolveError := func(err error) (*ResolveStats, error) {
+		if tailWriteRefused {
+			total.WriteRefused = true
+		}
+		if !errors.Is(err, ErrReindexWriteRefused) && !total.WriteRefused {
+			// Moves the pass deferred belong to references it already bound; an
+			// interrupted (non-refusal) pass flushes them immediately.
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				total.WriteRefused = true
+			}
+		}
 		if errors.Is(err, ErrReindexWriteRefused) || total.WriteRefused {
 			// Retain tail completion demand so a retry with len(pending) == 0
 			// still runs non-unresolved attribution/tail passes, and evaluate
 			// any already-spooled weak-tier guard jobs read-only so committed
 			// chunks are never left permanently unguarded.
-			r.pendingTailRetry = true
+			r.notePendingTailRetryLocked()
 			if guardSpoolErr == nil && guardSpool.count > 0 && !guardDrained {
 				guardDrained = true
-				r.drainGuardSpoolToPendingLocked(guardSpool, guardRepos)
-			}
-		} else {
-			// Moves the pass deferred belong to references it already bound; an
-			// interrupted (non-refusal) pass flushes them immediately.
-			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
-				total.WriteRefused = true
-				r.pendingTailRetry = true
+				r.drainGuardSpoolToPendingLocked(guardSpool, guardRepos, computeLoopDone)
 			}
 		}
 		total.PendingBefore = pendingBefore
@@ -1616,8 +1739,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			// Hand the resolve mutex to any waiting interactive edit before the
 			// next chunk. Drop bulk mode across the hand-off so an interleaving
 			// single-file ResolveFile on a shared instance resolves LSP-first.
+			// Return non-in-flight tail/attribution retry demands to the bridge
+			// before unlocking so a concurrent repository retry can see and
+			// drain its own pending files instead of falsely certifying.
 			if r.validateLiveness && (hi < len(pending) || !streamDone) {
 				r.bulkMode = false
+				r.releaseNonInFlightRetryStateLocked()
+				yielded = true
 				yieldHook := r.chunkYieldHook
 				r.mu.Unlock()
 				if yieldHook != nil {
@@ -1667,8 +1795,14 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			return resolveError(err)
 		}
 	}
-	var tailWriteRefused bool
+	computeLoopDone = true
 	defer r.trackPassWriteRefused(&tailWriteRefused)()
+	if yielded && r.takeRetryState != nil {
+		// Re-absorb any remaining bridged retry state now that no further
+		// r.mu yields will occur so pending repoints/reverts are flushed before
+		// the tail runs and only this pass's scope is cleared on completion.
+		r.adoptRetryStateLocked(r.takeRetryState())
+	}
 	placeholderFlushStart := time.Now()
 	_, placeholderOK := r.placeholderSrcIdx.applyDeferredApplied(r.graph)
 	applyPlaceholderElapsed += time.Since(placeholderFlushStart)
@@ -1677,6 +1811,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if !placeholderOK {
 		total.WriteRefused = true
 		return resolveError(fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused))
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok || tailWriteRefused {
+			total.WriteRefused = true
+			return resolveError(fmt.Errorf("%w: pending guard reverts", ErrReindexWriteRefused))
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
@@ -2317,19 +2457,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		total.WriteRefused = true
 		return resolveError(fmt.Errorf("%w: terminal stamping", ErrReindexWriteRefused))
 	}
-	r.pendingTailRetry = false
-	if len(r.scope) == 0 {
-		r.pendingAttribFiles = nil
-	} else if len(r.pendingAttribFiles) > 0 {
-		for fp := range r.pendingAttribFiles {
-			if _, ok := r.scope[graph.RepoPrefixOfID(fp)]; ok {
-				delete(r.pendingAttribFiles, fp)
-			}
-		}
-		if len(r.pendingAttribFiles) == 0 {
-			r.pendingAttribFiles = nil
-		}
-	}
+	r.clearPendingTailRetryForScopeLocked()
 	// Unresolved skipped work is already represented by the graph's pending
 	// set; retain explicit pointers only for skipped edges a heuristic or tail
 	// pass resolved, since those would otherwise vanish from the next pass.
@@ -3027,6 +3155,7 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked([]string{filePath})
 		return stats
 	}
 
@@ -3055,6 +3184,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// persistent index instead of paying the workspace rescan per save.
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked([]string{filePath})
 		return stats
 	}
 
@@ -3133,6 +3263,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	r.resolveFileEdgesLocked(filePath, stats)
 	forwardDuration := time.Since(forwardStarted)
 	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
 		return stats
 	}
 	attributionStarted := time.Now()
@@ -3540,6 +3671,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	// (second) BEFORE collecting the frontier so frontier.outByNode and
 	// frontier.pending observe reverted unresolved::* rows cleanly.
 	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked(filePaths)
 		outcome = "write_refused"
 		return stats
 	}
@@ -3646,6 +3778,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
 	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
 		outcome = "write_refused"
 		return stats
 	}
@@ -3657,6 +3790,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		zap.Int("unresolved", stats.Unresolved-beforeIncoming.Unresolved),
 		zap.Int("external", stats.External-beforeIncoming.External))
 	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
 		outcome = "write_refused"
 		return stats
 	}
@@ -3780,6 +3914,7 @@ func (r *Resolver) startIncrementalPhase(logger *zap.Logger, phase string) func(
 func (r *Resolver) resolveFileLocked(filePath string, stats *ResolveStats) {
 	r.resolveFileEdgesLocked(filePath, stats)
 	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
 		return
 	}
 	r.runFileAttributionPassesForFileLocked(filePath)
@@ -4517,6 +4652,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	// override this inline branch gives single-file paths, where bulkMode is
 	// false and an interactive edit still resolves LSP-first.
 	if !r.bulkMode && r.tryResolveViaLSP(e, target, stats) {
+		if e.To != oldTo && !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+			delete(e.Meta, "guard_reverted")
+		}
 		return oldTo, e.To != oldTo
 	}
 
@@ -4644,6 +4782,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		}
 	}
 
+	if e.To != oldTo && !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+		delete(e.Meta, "guard_reverted")
+	}
 	return oldTo, e.To != oldTo
 }
 

@@ -457,6 +457,15 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *C
 	// Fresh placeholder-source census per pass while retaining any deferred
 	// repoints a prior refused write left unapplied.
 	cr.placeholderSrcIdx.beginPass()
+	// Flush inherited deferred repoints BEFORE streaming or yielding cr.mu
+	// between chunks so a concurrent repo retry never sees an empty queue while
+	// its dataflow edges are still unapplied.
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			stats.WriteRefused = true
+			return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+		}
+	}
 	// Flush deferred moves on non-refusal exits (e.g. cancellation after chunk 1
 	// committed), but never fire back into a contended writer gate after a
 	// refusal — keep idx.deferred for retry instead.

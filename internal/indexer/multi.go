@@ -130,12 +130,13 @@ type MultiIndexer struct {
 	// pendingResolveRetryMu protects refused placeholder repoints and
 	// cross-package guard reverts handed back from short-lived master/cross-repo
 	// resolvers so a retry pass completes them without requiring a file reparse.
-	pendingResolveRetryMu     sync.Mutex
-	pendingMasterRepoints     []graph.PlaceholderRepoint
-	pendingMasterGuardReverts []resolver.PendingGuardRevert
-	pendingMasterTailRetry    bool
-	pendingMasterAttribFiles  map[string]struct{}
-	pendingCrossRepoRepoints  []graph.PlaceholderRepoint
+	pendingResolveRetryMu      sync.Mutex
+	pendingMasterRepoints      []graph.PlaceholderRepoint
+	pendingMasterGuardReverts  []resolver.PendingGuardRevert
+	pendingMasterTailRetryAll  bool
+	pendingMasterTailScopes    map[string]struct{}
+	pendingMasterAttribFiles   map[string]struct{}
+	pendingCrossRepoRepoints   []graph.PlaceholderRepoint
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and
@@ -424,6 +425,9 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 	idx.nativeParseAdmission.Store(mi.nativeParseAdmission.Load())
 	idx.repositoryMutationOwner = mi
 	idx.installGoResolverContext()
+	if idx.resolver != nil {
+		idx.resolver.SetRetryStateBridge(mi.takePendingMasterRetry, mi.savePendingMasterRetry)
+	}
 	idx.search = mi.search
 	if mi.embedder != nil {
 		idx.SetEmbedder(mi.embedder)
@@ -1000,11 +1004,18 @@ func (mi *MultiIndexer) takePendingMasterRetry() resolver.MasterRetryState {
 	state := resolver.MasterRetryState{
 		PlaceholderRepoints: mi.pendingMasterRepoints,
 		GuardReverts:        mi.pendingMasterGuardReverts,
-		TailRetry:           mi.pendingMasterTailRetry,
+		TailRetryAll:        mi.pendingMasterTailRetryAll,
 	}
 	mi.pendingMasterRepoints = nil
 	mi.pendingMasterGuardReverts = nil
-	mi.pendingMasterTailRetry = false
+	mi.pendingMasterTailRetryAll = false
+	if len(mi.pendingMasterTailScopes) > 0 {
+		state.TailRetryScopes = make([]string, 0, len(mi.pendingMasterTailScopes))
+		for s := range mi.pendingMasterTailScopes {
+			state.TailRetryScopes = append(state.TailRetryScopes, s)
+		}
+		mi.pendingMasterTailScopes = nil
+	}
 	if len(mi.pendingMasterAttribFiles) > 0 {
 		state.AttributionFiles = make([]string, 0, len(mi.pendingMasterAttribFiles))
 		for p := range mi.pendingMasterAttribFiles {
@@ -1016,7 +1027,7 @@ func (mi *MultiIndexer) takePendingMasterRetry() resolver.MasterRetryState {
 }
 
 func (mi *MultiIndexer) savePendingMasterRetry(state resolver.MasterRetryState) {
-	if len(state.PlaceholderRepoints) == 0 && len(state.GuardReverts) == 0 && !state.TailRetry && len(state.AttributionFiles) == 0 {
+	if len(state.PlaceholderRepoints) == 0 && len(state.GuardReverts) == 0 && !state.TailRetryAll && len(state.TailRetryScopes) == 0 && len(state.AttributionFiles) == 0 {
 		return
 	}
 	mi.pendingResolveRetryMu.Lock()
@@ -1027,8 +1038,18 @@ func (mi *MultiIndexer) savePendingMasterRetry(state resolver.MasterRetryState) 
 	if len(state.GuardReverts) > 0 {
 		mi.pendingMasterGuardReverts = append(mi.pendingMasterGuardReverts, state.GuardReverts...)
 	}
-	if state.TailRetry {
-		mi.pendingMasterTailRetry = true
+	if state.TailRetryAll {
+		mi.pendingMasterTailRetryAll = true
+	}
+	if len(state.TailRetryScopes) > 0 {
+		if mi.pendingMasterTailScopes == nil {
+			mi.pendingMasterTailScopes = make(map[string]struct{}, len(state.TailRetryScopes))
+		}
+		for _, s := range state.TailRetryScopes {
+			if s != "" {
+				mi.pendingMasterTailScopes[s] = struct{}{}
+			}
+		}
 	}
 	if len(state.AttributionFiles) > 0 {
 		if mi.pendingMasterAttribFiles == nil {
