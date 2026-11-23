@@ -331,7 +331,8 @@ const (
 	JSPendingGenerated       = "nuxt"
 	JSPendingParameter       = "parameter"
 	JSDefaultBinding         = "default"
-	JSInteropDefaultBinding  = ".default" // compiled CommonJS default, distinct from module.exports
+	JSInteropDefaultBinding  = ".default"    // compiled CommonJS default, distinct from module.exports
+	JSInteropMarkerBinding   = ".__esModule" // marks a CommonJS module with __esModule = true
 	JSNamespaceBinding       = "*"
 )
 

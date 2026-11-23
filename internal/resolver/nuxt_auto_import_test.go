@@ -140,8 +140,8 @@ func TestExactModuleScriptExports(t *testing.T) {
 		{"lib.cjs", "function run(){}; exports.named = run; delete exports.named", "named", "unresolved::local"},
 		{"lib.cjs", "function run(){}; module.exports = run; delete module.exports", "default", "unresolved::local"},
 		{"lib.cjs", "function real(){}; function inner(){}; module.exports = real; module.exports.x = module.exports = inner", "x", "unresolved::local"},
-		{"lib.cjs", "function run(){}; exports.__esModule = true; exports.default = run", "default", "lib.cjs::run"},
-		{"lib.cjs", "function run(){}; var api = {}; module.exports = api; module.exports.__esModule = true; module.exports.default = run", "default", "lib.cjs::run"},
+		{"lib.cjs", "function run(){}; exports.__esModule = true; exports.default = run", "default", "unresolved::local"},
+		{"lib.cjs", "function run(){}; var api = {}; module.exports = api; module.exports.__esModule = true; module.exports.default = run", "default", "unresolved::local"},
 		{"lib.vue", "<script data-x='not setup here'>export {real as run} from './dep'</script>", "run", "dep.ts::real"},
 		{"lib.vue", "<script lang='ts'>export function run(){}</script>\n<script setup>function hidden(){}</script>", "run", "lib.vue#script:1::run"},
 		{"lib.vue", "<script setup>function hidden(){}</script>", "hidden", "unresolved::local"},
@@ -159,10 +159,12 @@ func TestCompiledCommonJSDefault(t *testing.T) {
 		"lib.cjs":  "Object.defineProperty(exports, '__esModule', {value:true}); function actual(){}; exports.default = actual",
 		"page.cts": "import def from './lib.cjs'; export function run(){def()}",
 		"page.mjs": "import def from './lib.cjs'; export function run(){def()}",
+		"page.js":  "import def from './lib.cjs'; export function run(){def()}",
 	})
 	New(g).ResolveAll()
 	require.Equal(t, "lib.cjs::actual", callEdgeTo(g, "page.cts::run", 1))
 	require.Equal(t, "unresolved::def", callEdgeTo(g, "page.mjs::run", 1))
+	require.Equal(t, "unresolved::def", callEdgeTo(g, "page.js::run", 1))
 }
 
 func TestVueStarDoesNotImportPrivateFunction(t *testing.T) {

@@ -142,8 +142,9 @@ object is marked `__esModule`, as TypeScript and Babel emit, its top-level
 `.default` is the compiled-interop target. `.mjs` and `.mts` consumers are
 native ESM and always take `module.exports`; `.cjs` and `.cts` consumers take
 `.default`. Other extensions depend on package `type`, compiler module settings
-or a bundler, so when `module.exports` and `.default` name different values the
-call stays unresolved instead of guessing.
+or a bundler, so when `__esModule` is set they bind only when both modes name
+the same value — an absent callable in either mode is disagreement and stays
+unresolved instead of guessing.
 Named imports follow top-level property assignments and deletes on
 `module.exports` or its attached `exports` alias; `delete module.exports`
 clears them all. Conditional and function-body

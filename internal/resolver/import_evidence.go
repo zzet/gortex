@@ -278,17 +278,31 @@ func (r *Resolver) exportedCallee(caller, file, name string) *graph.Node {
 		local := graph.JSBinding(locals, b.name)
 		if b.name == graph.JSDefaultBinding {
 			// Compiled interop reads an __esModule object's .default; native ESM
-			// takes module.exports. When they differ, only a proven mode can pick.
+			// takes module.exports. Without a proven consumer mode, both modes
+			// must justify the same callable; an absent callable in either mode
+			// is disagreement.
+			native := local
+			if native == "" {
+				native, _ = f.Meta[graph.DefaultExportMeta].(string)
+			}
 			interop := graph.JSBinding(locals, graph.JSInteropDefaultBinding)
-			switch {
-			case interop == "" || b.mode == jsConsumerNative:
-				if local == "" {
-					local, _ = f.Meta[graph.DefaultExportMeta].(string)
+			esModule := interop != "" || graph.JSBinding(locals, graph.JSInteropMarkerBinding) != ""
+			switch b.mode {
+			case jsConsumerNative:
+				local = native
+			case jsConsumerCompiled:
+				if esModule {
+					local = interop
+				} else {
+					local = native
 				}
-			case local != "" && local != interop && b.mode == jsConsumerUnproven:
-				return nil
 			default:
-				local = interop
+				if esModule {
+					if native == "" || native != interop {
+						return nil
+					}
+				}
+				local = native
 			}
 		}
 		if local != "" {

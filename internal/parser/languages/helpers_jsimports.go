@@ -608,6 +608,9 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 			}
 		}
 	}
+	if common.interop {
+		graph.AppendJSBinding(&bindings, graph.JSInteropMarkerBinding, graph.JSInteropMarkerBinding)
+	}
 	for _, name := range slices.Sorted(maps.Keys(common.named)) {
 		key := name
 		if name == graph.JSDefaultBinding {
