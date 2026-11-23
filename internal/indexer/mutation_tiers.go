@@ -8,14 +8,15 @@ import (
 // MutationTierState is the publication evidence for one admitted path. An
 // absent timestamp is unobserved, rather than evidence of a fresh tier.
 type MutationTierState struct {
-	Generation  uint64    `json:"generation"`
-	AckAt       time.Time `json:"ack_at"`
-	FileGraphAt time.Time `json:"file_graph_at,omitempty"`
-	RelationsAt time.Time `json:"relations_at,omitempty"`
-	DerivedAt   time.Time `json:"derived_at,omitempty"`
-	Failed      bool      `json:"failed,omitempty"`
-	Partial     bool      `json:"partial,omitempty"`
-	failedAt    time.Time
+	Generation    uint64    `json:"generation"`
+	AckAt         time.Time `json:"ack_at"`
+	FileGraphAt   time.Time `json:"file_graph_at,omitempty"`
+	RelationsAt   time.Time `json:"relations_at,omitempty"`
+	DerivedAt     time.Time `json:"derived_at,omitempty"`
+	Failed        bool      `json:"failed,omitempty"`
+	Partial       bool      `json:"partial,omitempty"`
+	failedAt      time.Time
+	rebindRefused bool
 }
 
 func newMutationTierTicket(path string, generation uint64, done <-chan MutationResult) *MutationTicket {
@@ -247,6 +248,29 @@ func (w *Watcher) markDeferredMutationTiers(frontier map[string]uint64) {
 				waiter.ticket.tiers.Partial = true
 				waiter.ticket.tierMu.Unlock()
 			}
+		}
+	}
+}
+
+// Keep a checked rebind refusal with the owned ticket. A duplicate source
+// receipt does not resolve edges, so it can only preserve this pending tier.
+func (w *Watcher) markRefusedRelationTiers(path string, generation uint64, duplicate bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if duplicate {
+		prior := w.failedPaths[path]
+		if !prior.rebindRefused || prior.Generation > generation {
+			return
+		}
+	}
+	for ordinal, waiter := range w.mutationWaiters[path] {
+		if ordinal <= generation && waiter.ticket != nil {
+			waiter.ticket.tierMu.Lock()
+			state := &waiter.ticket.tiers
+			state.rebindRefused = true
+			state.Partial = true
+			state.RelationsAt = time.Time{}
+			waiter.ticket.tierMu.Unlock()
 		}
 	}
 }

@@ -95,15 +95,20 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			// the real admission, incremental resolver and publication paths.
 			require.NoError(t, watcher.Start([]string{t.TempDir()}))
 			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
-			require.NoError(t, os.WriteFile(path, []byte(after), 0600))
-			ticket, err := watcher.EnqueueToolMutation(ctx, path)
-			require.NoError(t, err)
-			var result MutationResult
-			select {
-			case result = <-ticket.Done:
-			case <-ctx.Done():
-				t.Fatal("owned mutation did not complete")
+			submit := func(path string) (*MutationTicket, MutationResult) {
+				t.Helper()
+				ticket, err := watcher.EnqueueToolMutation(ctx, path)
+				require.NoError(t, err)
+				select {
+				case result := <-ticket.Done:
+					return ticket, result
+				case <-ctx.Done():
+					t.Fatal("owned mutation did not complete")
+					return nil, MutationResult{}
+				}
 			}
+			require.NoError(t, os.WriteFile(path, []byte(after), 0600))
+			ticket, result := submit(path)
 			var observation watcherRelationRebindObservation
 			select {
 			case observation = <-probe.first:
@@ -121,16 +126,50 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			state := ticket.TierState()
 			t.Logf("matching rebind applied=%t attempts=%d ticket=%d applied=%d error=%v target=%q tiers=%+v",
 				observation.applied, probe.calls.Load(), ticket.Generation, result.AppliedGeneration, result.Err, edges[0].To, state)
-			if edges[0].To == "main.go::Target" {
+			if !tc.deny {
+				require.Equal(t, "main.go::Target", edges[0].To)
 				require.NoError(t, result.Err)
 				require.GreaterOrEqual(t, result.AppliedGeneration, ticket.Generation)
 				require.False(t, state.RelationsAt.IsZero())
 				require.False(t, state.Failed || state.Partial)
 				return
 			}
-			require.True(t, tc.deny, "healthy application must resolve the actual call")
 			require.Equal(t, graph.UnresolvedMarker+"Target", edges[0].To)
 			require.True(t, state.RelationsAt.IsZero(), "a denied SQLite rebind must leave relations unobserved")
+			require.NoError(t, result.Err, "the structural write already landed")
+			require.True(t, result.Reindexed && state.Partial && !state.Failed)
+			require.False(t, state.FileGraphAt.IsZero())
+
+			duplicate, duplicateResult := submit(path)
+			require.NoError(t, duplicateResult.Err)
+			require.Greater(t, duplicate.Generation, ticket.Generation)
+			require.EqualValues(t, 1, probe.calls.Load(), "same bytes must not silently run a rebind")
+			require.True(t, duplicate.TierState().Partial)
+			require.True(t, duplicate.TierState().RelationsAt.IsZero())
+
+			other := filepath.Join(root, "other", "other.go")
+			require.NoError(t, os.Mkdir(filepath.Dir(other), 0700))
+			require.NoError(t, os.WriteFile(other, []byte("package other\nfunc Unrelated() {}\n"), 0600))
+			unrelated, unrelatedResult := submit(other)
+			require.NoError(t, unrelatedResult.Err)
+			require.False(t, unrelated.TierState().Partial)
+			require.False(t, unrelated.TierState().RelationsAt.IsZero())
+			require.True(t, watcher.TierState(path).Partial, "an unrelated file must not clear the owned deferral")
+
+			require.NoError(t, os.WriteFile(path, []byte(after+"func Later() { Target() }\n"), 0600))
+			healthy, healthyResult := submit(path)
+			require.NoError(t, healthyResult.Err)
+			require.Greater(t, healthy.Generation, duplicate.Generation)
+			require.Greater(t, probe.calls.Load(), int32(1), "the new generation must genuinely retry the refused rebind")
+			require.False(t, healthy.TierState().Partial)
+			require.False(t, healthy.TierState().RelationsAt.IsZero())
+			require.False(t, watcher.TierState(path).Partial)
+			resolved := store.GetOutEdges("main.go::NewCaller")
+			require.Len(t, resolved, 1)
+			require.Equal(t, "main.go::Target", resolved[0].To)
+			require.True(t, duplicate.TierState().RelationsAt.IsZero(), "the newer generation cannot rewrite the old ticket")
+			t.Logf("owned duplicate generation=%d remains partial, unrelated generation=%d served, healthy generation=%d rebind applied",
+				duplicate.Generation, unrelated.Generation, healthy.Generation)
 		})
 	}
 }

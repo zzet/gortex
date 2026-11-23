@@ -131,6 +131,9 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// RefusedRebindFiles names sources whose incremental rebind batch the
+	// store could not confirm. Only stores with a checked apply report it.
+	RefusedRebindFiles map[string]struct{} `json:"-"`
 	// LSP* exposes the deferred whole-pass circuit-breaker outcome. These are
 	// diagnostic counters: skipped edges keep the heuristic result produced by
 	// the normal resolve cascade and remain eligible for a later full pass.
@@ -3480,7 +3483,25 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		if checked, ok := r.graph.(interface {
+			ReindexEdgesApplied([]graph.EdgeReindex) bool
+		}); ok {
+			if !checked.ReindexEdgesApplied(reindexBatch) {
+				if stats.RefusedRebindFiles == nil {
+					stats.RefusedRebindFiles = make(map[string]struct{})
+				}
+				for _, rebind := range reindexBatch {
+					if rebind.Edge == nil {
+						continue
+					}
+					if file := r.edgeCallerFile(rebind.Edge); file != "" {
+						stats.RefusedRebindFiles[file] = struct{}{}
+					}
+				}
+			}
+		} else {
+			r.graph.ReindexEdges(reindexBatch)
+		}
 		legs.lap("reindex")
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.

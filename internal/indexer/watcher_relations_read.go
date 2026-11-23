@@ -1,5 +1,7 @@
 package indexer
 
+import "github.com/zzet/gortex/internal/resolver"
+
 // relationsReadFrontier belongs to one point executor and one absolute path.
 // It records a conservative admission bound immediately before an OS source
 // read. Only the existing successful post-commit version fence can validate it.
@@ -45,6 +47,16 @@ func (b *reparsePendingEnrichmentBatch) relationsReadFrontier() *relationsReadFr
 	return b.relationsRead
 }
 
+func (idx *Indexer) observePointRebind(batch *reparsePendingEnrichmentBatch, stats *resolver.ResolveStats) {
+	read := batch.relationsReadFrontier()
+	if read == nil || stats == nil || len(stats.RefusedRebindFiles) == 0 {
+		return
+	}
+	if _, refused := stats.RefusedRebindFiles[idx.prefixPath(idx.relKey(read.path))]; refused {
+		batch.pointRebindRefused = true
+	}
+}
+
 func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *PublicationStamps) incrementalPathMode {
 	read := &relationsReadFrontier{path: path, capture: func() uint64 {
 		w.mu.Lock()
@@ -59,6 +71,12 @@ func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *Pub
 	return incrementalPathMode{
 		detectDeletions: true, forceExplicitFiles: true, publication: stamps,
 		relationsRead: read,
-		onRelations:   func() { w.markRelations(path, max(generation, read.covered)) },
+		onRelations: func(refused bool) {
+			if refused {
+				w.markRefusedRelationTiers(path, generation, false)
+				return
+			}
+			w.markRelations(path, max(generation, read.covered))
+		},
 	}
 }
