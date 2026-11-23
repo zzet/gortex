@@ -104,8 +104,15 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 			if prior, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && prior.Before(deadline) {
 				deadline = prior
 			}
+			allowance := &projectedSourceAllowance{tool: legacy, symbolMetadata: legacy == "get_symbol" && auditedProjectionReadRetry(legacy, req)}
+			if legacy == "get_file_summary" {
+				allowance.diagnostic = newProjectionPredicateTrace()
+				if allowance.diagnostic != nil {
+					allowance.diagnostic.originalDeadline = deadline
+				}
+			}
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
-			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, symbolMetadata: legacy == "get_symbol" && auditedProjectionReadRetry(legacy, req)})
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 		}
 		return next(ctx, req)
 	}
