@@ -681,6 +681,10 @@ func (s *Server) awaitSourceMutations(ctx context.Context, admission sourceMutat
 		return outcome
 	}
 	if admission.policy.local() {
+		// The committed source call took the local path without a publication wait.
+		lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+		lap.applicable = false
+		lap.finish()
 		outcome := receipt.outcome(true)
 		if err := editGateCheckoutACKSeed(ctx, s); err != nil {
 			outcome.Err = err
