@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 		editGateModes bool
 		scenario      string
 		ownedOverride bool
+		selectSummary bool
 		want          string
 	}{
 		{name: "default_off", search: true},
@@ -45,6 +47,8 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 		{name: "edit_gate_off", editGateModes: true},
 		{name: "edit_gate_invalid_flag", flag: "true", editGateModes: true},
 		{name: "other_scenario", flag: "1", search: true, editGateModes: true, scenario: "read"},
+		{name: "selected_discovery_summary", flag: "1", scenario: checkoutDiscoveryScenario, selectSummary: true, want: "1"},
+		{name: "discovery_without_selector", flag: "1", scenario: checkoutDiscoveryScenario},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("LOAD_DAEMON_FIXTURE", "")
@@ -65,7 +69,12 @@ func TestSearchRefusalEvidenceEnvBridgeReachesOnlySelectedDaemon(t *testing.T) {
 			if scenario == "" {
 				scenario = editProbeScenario
 			}
-			require.NoError(t, p.startWithScenarioRefusalEvidence(scenario, runOptions{SearchReadbackAcceptance: tc.search, EditGateModes: tc.editGateModes}))
+			ctx := t.Context()
+			if tc.selectSummary {
+				ctx, err = withFirstSummaryRefusalEvidence(ctx, strings.Repeat("a", 64)+":"+strings.Repeat("b", 64))
+				require.NoError(t, err)
+			}
+			require.NoError(t, p.startWithScenarioRefusalEvidence(ctx, scenario, runOptions{SearchReadbackAcceptance: tc.search, EditGateModes: tc.editGateModes}))
 			wait, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			select {

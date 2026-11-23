@@ -350,10 +350,11 @@ func TestStartupScopeEvidenceOwnedServingAndGrep(t *testing.T) {
 		t.Fatalf("startup scenario: %v", err)
 	}
 	type call struct {
-		Surface   string          `json:"surface"`
-		Started   time.Time       `json:"started"`
-		Completed time.Time       `json:"completed"`
-		Frame     json.RawMessage `json:"frame"`
+		Surface     string          `json:"surface"`
+		Started     time.Time       `json:"started"`
+		Completed   time.Time       `json:"completed"`
+		Frame       json.RawMessage `json:"frame"`
+		AfterGrepNS *int64          `json:"after_grep_ns"`
 	}
 	var gate struct {
 		Boots []struct {
@@ -444,9 +445,10 @@ func TestStartupScopeEvidenceOwnedServingAndGrep(t *testing.T) {
 			!scope.EarlyGrep.Started.Before(ready) || scope.ReadyGrep.Started.Before(ready) {
 			t.Errorf("boot %d Grep did not capture both sides of readiness: %+v", i, scope)
 		}
-		if len(scope.EarlyGrepHealth) != 2 || scope.EarlyGrepHealth[1].Surface != "index_health" ||
-			scope.EarlyGrepHealth[1].Started.Before(scope.EarlyGrep.completed()) || len(scope.EarlyGrepHealth[1].Frame) == 0 {
+		if len(scope.EarlyGrepHealth) != 2 || scope.EarlyGrepHealth[1].Surface != "index_health" || len(scope.EarlyGrepHealth[1].Frame) == 0 {
 			t.Errorf("boot %d Grep lacked a subsequent health readback: %+v", i, scope.EarlyGrepHealth)
+		} else if after := scope.EarlyGrepHealth[1].AfterGrepNS; after == nil || *after < 0 {
+			t.Errorf("boot %d Grep health lacked nonnegative monotonic ordering evidence", i)
 		}
 	}
 }
