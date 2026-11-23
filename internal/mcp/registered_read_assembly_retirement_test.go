@@ -346,7 +346,10 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					} else {
 						require.NoError(t, callErr)
 						require.NotNil(t, result)
-						if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
+						if transition == "canonical_no_projection" && tool == "get_editing_context" {
+							requireCanonicalEditingContextPartial(t, result)
+							require.Equal(t, 1, calls, "a checked file-only response must not replay the rejected bundle")
+						} else if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
 							require.False(t, result.IsError, "checked retirement before leaf success must use the existing fresh attempt: %s", resultText(result))
 							var body map[string]any
 							require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body))
