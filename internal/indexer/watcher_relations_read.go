@@ -76,7 +76,7 @@ func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *Pub
 				w.markRefusedRelationTiers(path, generation, false)
 				return
 			}
-			w.markRelations(path, max(generation, read.covered))
+			w.markRelations(path, max(generation, read.covered), generation)
 		},
 	}
 }

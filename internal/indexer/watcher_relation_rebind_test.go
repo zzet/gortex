@@ -182,6 +182,7 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			}
 			require.Equal(t, graph.UnresolvedMarker+"Target", edges[0].To)
 			require.True(t, state.RelationsAt.IsZero(), "a denied SQLite rebind must leave relations unobserved")
+			require.True(t, state.DerivedAt.IsZero())
 			require.NoError(t, result.Err, "the structural write already landed")
 			require.True(t, result.Reindexed && state.Partial && !state.Failed)
 			require.False(t, state.FileGraphAt.IsZero())
@@ -195,6 +196,7 @@ func TestWatcherRelationTierRequiresAppliedRebind(t *testing.T) {
 			t.Logf("same-byte generation=%d applied=%d tiers=%+v", duplicate.Generation, duplicateResult.AppliedGeneration, duplicate.TierState())
 			require.True(t, duplicate.TierState().Partial, "same bytes still carry the checked refusal")
 			require.True(t, duplicate.TierState().RelationsAt.IsZero())
+			require.True(t, duplicate.TierState().DerivedAt.IsZero())
 
 			other := filepath.Join(root, "other", "other.go")
 			require.NoError(t, os.Mkdir(filepath.Dir(other), 0700))
