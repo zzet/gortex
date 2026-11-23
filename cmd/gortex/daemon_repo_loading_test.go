@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +142,112 @@ func TestCallToolWaitingForLoad(t *testing.T) {
 		assert.Positive(t, loading.waited)
 		assert.Contains(t, err.Error(), "still loading after waiting")
 	})
+}
+
+func stalledLoadingRetry(t *testing.T, tool string, wait time.Duration) (<-chan error, func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gxw")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "d.sock")
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	retrySeen := make(chan struct{})
+	releasePeer := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releasePeer) })
+	t.Cleanup(release)
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer conn.Close()
+		peerDone <- func() error {
+			reader := bufio.NewReader(conn)
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			if err := daemon.WriteJSONLine(conn, daemon.HandshakeAck{OK: true}); err != nil {
+				return err
+			}
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			const refusal = `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"loading","data":{"error_code":"repo_loading","retryable":true,"phase":"migrating","percent":15}}}` + "\n"
+			if _, err := io.WriteString(conn, refusal); err != nil {
+				return err
+			}
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				return err
+			}
+			close(retrySeen)
+			<-releasePeer
+			return nil
+		}()
+	}()
+
+	client, err := daemon.DialTo(socket, daemon.Handshake{Mode: daemon.ModeMCP})
+	require.NoError(t, err)
+	exec := &daemonExecutor{client: client}
+	t.Cleanup(func() { _ = exec.Close() })
+	result := make(chan error, 1)
+	go func() {
+		_, err := callToolWaitingForLoad(exec, tool, nil, wait, io.Discard)
+		result <- err
+	}()
+
+	select {
+	case <-retrySeen:
+	case err := <-peerDone:
+		t.Fatalf("socket fixture failed before the retry: %v", err)
+	case <-time.After(wait + 2*time.Second):
+		t.Fatal("daemon did not receive a real retry after the first typed refusal")
+	}
+	return result, release
+}
+
+func TestLoadingWaitBoundsStalledSocketRetry(t *testing.T) {
+	const wait = 2 * loadingWaitPoll
+	result, _ := stalledLoadingRetry(t, "search_symbols", wait)
+	select {
+	case err := <-result:
+		var loading *repoLoadingError
+		require.ErrorAs(t, err, &loading)
+		require.Equal(t, exitTempFail, loading.ExitCode())
+		require.Equal(t, "repo_loading", loading.details.ErrorCode)
+		require.NotNil(t, loading.details.Retryable)
+		require.True(t, *loading.details.Retryable)
+		require.Equal(t, "migrating", loading.details.Phase)
+		require.NotNil(t, loading.details.Percent)
+		require.Equal(t, 15, *loading.details.Percent)
+	case <-time.After(wait + time.Second):
+		t.Fatal("CLI remained blocked on a Unix socket retry beyond its loading wait")
+	}
+}
+
+func TestLoadingWaitPreservesUncertainGenericRetry(t *testing.T) {
+	const wait = 2 * loadingWaitPoll
+	for _, tool := range []string{"write_file", "unrecognized_tool"} {
+		t.Run(tool, func(t *testing.T) {
+			result, release := stalledLoadingRetry(t, tool, wait)
+			select {
+			case err := <-result:
+				t.Fatalf("retry ended before the peer resolved its outcome: %v", err)
+			case <-time.After(wait):
+			}
+			release()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, io.EOF)
+			case <-time.After(time.Second):
+				t.Fatal("CLI did not report the real peer close")
+			}
+		})
+	}
 }
 
 // Hooks and scripts run the CLI without a terminal; they must fail fast with
