@@ -55,7 +55,7 @@ func (s *watcherRelationRebindStore) ReindexEdgesApplied(batch []graph.EdgeReind
 			break
 		}
 		if s.deny {
-			release, err := s.Store.HoldWriteGate(s.ctx)
+			release, err := s.HoldWriteGate(s.ctx)
 			if err != nil {
 				s.first <- watcherRelationRebindObservation{gateErr: err}
 				return false
