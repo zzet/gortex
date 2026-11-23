@@ -60,3 +60,27 @@ func TestGoModuleReindexApplied(t *testing.T) {
 	require.True(t, store.ReindexEdgesApplied(batch))
 	requireReindexedTarget(t, store, "repo/target.go::Target")
 }
+
+func TestReindexUnresolvedEdgeTargetsApplied(t *testing.T) {
+	store, batch := openBusyReindexFixture(t, filepath.Join(t.TempDir(), "graph.sqlite"))
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	restore := store.SetBusyRetryTimeoutForTest(time.Millisecond)
+	defer restore()
+	targetBatch := []graph.UnresolvedEdgeTargetReindex{{
+		Old: graph.EdgeIdentity{
+			From:     batch[0].Edge.From,
+			To:       batch[0].OldTo,
+			Kind:     batch[0].Edge.Kind,
+			FilePath: batch[0].Edge.FilePath,
+			Line:     batch[0].Edge.Line,
+		},
+		NewTo: batch[0].Edge.To,
+	}}
+	release, err := store.HoldWriteGate(t.Context())
+	require.NoError(t, err)
+	applied := store.ReindexUnresolvedEdgeTargetsApplied(targetBatch)
+	release()
+	require.False(t, applied)
+	require.True(t, store.ReindexUnresolvedEdgeTargetsApplied(targetBatch))
+	requireReindexedTarget(t, store, "repo/target.go::Target")
+}

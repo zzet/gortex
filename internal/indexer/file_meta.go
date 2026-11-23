@@ -210,6 +210,22 @@ func (b *reparsePendingEnrichmentBatch) recordDropped(files []string) {
 	}
 }
 
+func (b *reparsePendingEnrichmentBatch) recordResolveStats(stats *resolver.ResolveStats) {
+	if stats == nil || b == nil {
+		return
+	}
+	b.recordDropped(stats.DroppedFiles)
+	if stats.WriteRefused && len(stats.DroppedFiles) == 0 && b.resolution.catchupErr == nil {
+		b.resolution.catchupErr = resolver.ErrReindexWriteRefused
+	}
+}
+
+func (b *reparsePendingEnrichmentBatch) recordCatchupErr(err error) {
+	if err != nil && b != nil && b.resolution.catchupErr == nil {
+		b.resolution.catchupErr = err
+	}
+}
+
 type reparsePendingEnrichmentBatch struct {
 	pointPreparation *watcherPointPreparation
 	publication      *PublicationStamps // optional local canonical attempt; never a live record

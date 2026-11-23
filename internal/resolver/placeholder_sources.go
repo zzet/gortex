@@ -173,11 +173,16 @@ func (idx *placeholderSourceIndex) currentIdentity(identity graph.EdgeIdentity) 
 // applyDeferred applies the repoints deferRepoints recorded, in page order
 // (first repoint of a site wins, as before), and forgets them.
 func (idx *placeholderSourceIndex) applyDeferred(g graph.Store) int {
+	moved, _ := idx.applyDeferredApplied(g)
+	return moved
+}
+
+func (idx *placeholderSourceIndex) applyDeferredApplied(g graph.Store) (int, bool) {
 	repoints := idx.deferred
 	idx.deferred = nil
 	if len(repoints) == 0 {
 		idx.retargeted = nil
-		return 0
+		return 0, true
 	}
 	defer func() { idx.retargeted = nil }()
 	if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
@@ -185,24 +190,24 @@ func (idx *placeholderSourceIndex) applyDeferred(g graph.Store) int {
 		for i := range moves {
 			moves[i].identity = idx.currentIdentity(moves[i].identity)
 		}
-		return reconcileIndexedPlaceholderSources(g, finder, moves)
+		return reconcileIndexedPlaceholderSourcesApplied(g, finder, moves)
 	}
 	repoints = idx.filter(repoints)
 	if len(repoints) == 0 {
-		return 0
+		return 0, true
 	}
-	return graph.ReconcilePlaceholderSources(g, repoints)
+	return graph.ReconcilePlaceholderSourcesApplied(g, repoints)
 }
 
-// reconcileIndexedPlaceholderSources exact-refetches only claimed identities
-// in bounded pages. Each backend closes its read cursor (or releases graph
-// locks) before ReindexEdges runs, so the SQLite one-connection contract and
-// in-memory mutation safety are both preserved.
-func reconcileIndexedPlaceholderSources(
+// reconcileIndexedPlaceholderSourcesApplied exact-refetches only claimed
+// identities in bounded pages. Each backend closes its read cursor (or releases
+// graph locks) before ReindexEdges runs, so the SQLite one-connection contract
+// and in-memory mutation safety are both preserved.
+func reconcileIndexedPlaceholderSourcesApplied(
 	g graph.Store,
 	finder graph.EdgeIdentityBatchFinder,
 	moves []placeholderSourceMove,
-) int {
+) (int, bool) {
 	moved := 0
 	for start := 0; start < len(moves); start += placeholderSourceReindexBatchSize {
 		end := start + placeholderSourceReindexBatchSize
@@ -235,10 +240,12 @@ func reconcileIndexedPlaceholderSources(
 		if len(batch) == 0 {
 			continue
 		}
-		g.ReindexEdges(batch)
+		if !reindexEdgesApplied(g, batch) {
+			return moved, false
+		}
 		moved += len(batch)
 	}
-	return moved
+	return moved, true
 }
 
 // reconcilePlaceholderSources re-points dataflow edges keyed FROM an
@@ -250,24 +257,29 @@ func reconcileIndexedPlaceholderSources(
 // whole-graph stream would cost more than the probes it avoids.
 // GORTEX_RESOLVE_FROM_RECONCILE=0 disables the reconciliation entirely.
 func reconcilePlaceholderSources(g graph.Store, idx *placeholderSourceIndex, reindexes []graph.EdgeReindex) int {
+	moved, _ := reconcilePlaceholderSourcesApplied(g, idx, reindexes)
+	return moved
+}
+
+func reconcilePlaceholderSourcesApplied(g graph.Store, idx *placeholderSourceIndex, reindexes []graph.EdgeReindex) (int, bool) {
 	if len(reindexes) == 0 || os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") == "0" {
-		return 0
+		return 0, true
 	}
 	repoints := graph.PlaceholderSourceRepoints(reindexes)
 	if len(repoints) == 0 {
-		return 0
+		return 0, true
 	}
 	if idx != nil {
 		idx.ensure(g)
 		if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
-			return reconcileIndexedPlaceholderSources(g, finder, idx.take(repoints))
+			return reconcileIndexedPlaceholderSourcesApplied(g, finder, idx.take(repoints))
 		}
 		repoints = idx.filter(repoints)
 		if len(repoints) == 0 {
-			return 0
+			return 0, true
 		}
 	}
-	return graph.ReconcilePlaceholderSources(g, repoints)
+	return graph.ReconcilePlaceholderSourcesApplied(g, repoints)
 }
 
 // RepointPlaceholderSourcesInBatch applies the from-side placeholder

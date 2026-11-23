@@ -105,6 +105,6 @@ func (r *Resolver) resolveGodotResPaths() {
 	}
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		r.applyReindexEdges(reindexBatch)
 	}
 }

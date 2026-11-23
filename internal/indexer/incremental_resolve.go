@@ -406,7 +406,7 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 		}
 	}
 	idx.observeIncrementalCatchup("resolve", resolveList)
-	batch.recordDropped(idx.resolver.ResolveFilesAndIncoming(resolveList).DroppedFiles)
+	batch.recordResolveStats(idx.resolver.ResolveFilesAndIncoming(resolveList))
 }
 
 func reusableResolvedEdge(e *graph.Edge) bool {

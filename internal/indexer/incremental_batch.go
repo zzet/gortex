@@ -1285,7 +1285,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.observeIncrementalCatchup("resolve", paths)
 		idx.resolver.SetIncrementalSkip(priorPending)
 		idx.resolver.SetPriorDeclarations(stagePriorDeclarations(stages))
-		markerBatch.recordDropped(idx.resolver.ResolveFilesAndIncoming(paths).DroppedFiles)
+		markerBatch.recordResolveStats(idx.resolver.ResolveFilesAndIncoming(paths))
 		idx.resolver.SetIncrementalSkip(nil)
 		idx.resolver.SetPriorDeclarations(nil)
 		idx.observeIncrementalCatchup("dataflow", paths)
@@ -1329,7 +1329,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 		idx.observeIncrementalCatchup("ref_facts", paths)
 		idx.persistRefFactsForFiles(paths)
 		if !idx.deferGlobalPasses.Load() {
-			markerBatch.recordDropped(idx.reresolveAffectedByStages(stages))
+			markerBatch.recordResolveStats(idx.reresolveAffectedByStages(stages))
 		}
 	} else if !idx.deferGlobalPasses.Load() {
 		idx.applyLap("structural_tail")
@@ -2566,7 +2566,7 @@ func (idx *Indexer) emptyAffectedByPlan() affectedByBatchPlan {
 	}
 }
 
-func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) []string {
+func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) *resolver.ResolveStats {
 	if len(plan.files) == 0 {
 		return nil
 	}
@@ -2579,20 +2579,20 @@ func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) []string {
 	// (argOfIntoSurvivingOwner); map them onto its current parameters.
 	idx.materializeDataflowParamsForFiles(plan.files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), plan.files)
-	return stats.DroppedFiles
+	return stats
 }
 
-func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) []string {
+func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) *resolver.ResolveStats {
 	// The plan (the changed declarations' referrers, read from the reference
 	// facts) is its own observed stage.
 	idx.observeIncrementalCatchup("affected_plan", nil)
 	plan := idx.planAffectedByStages(stages).bounded()
-	dropped := idx.executeAffectedByPlan(plan)
+	stats := idx.executeAffectedByPlan(plan)
 	if len(plan.files) > 0 {
 		idx.observeIncrementalCatchup("ref_facts", plan.files)
 		idx.persistRefFactsForFiles(plan.files)
 	}
-	return dropped
+	return stats
 }
 
 type forcedFileEviction struct {

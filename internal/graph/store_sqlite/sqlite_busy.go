@@ -45,11 +45,21 @@ func isSQLiteBusyErr(err error) bool {
 	}
 }
 
+// SetBusyRetryTimeoutForTest overrides the store's contention retry window for
+// deterministic cross-package tests and returns a restore callback.
+func (s *Store) SetBusyRetryTimeoutForTest(d time.Duration) (restore func()) {
+	prev := s.busyRetryTimeoutOverride.Swap(int64(d))
+	return func() { s.busyRetryTimeoutOverride.Store(prev) }
+}
+
 // withSQLiteBusyRetry retries fn only when an entire idempotent transaction
 // has rolled back with SQLITE_BUSY/SQLITE_LOCKED. Callers must never use it
 // around a statement in an already-open transaction: replaying from the
 // transaction boundary is what preserves atomicity.
 func (s *Store) sqliteBusyRetryWindow() time.Duration {
+	if override := time.Duration(s.busyRetryTimeoutOverride.Load()); override > 0 {
+		return override
+	}
 	if s.busyRetryTimeout > 0 {
 		return s.busyRetryTimeout
 	}

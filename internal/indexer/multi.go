@@ -956,21 +956,23 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 		}
 
 		if receipt.ResolutionRelevant {
-			if dropped := mi.runMasterResolveFiles(resolutionFiles, false); len(dropped) != 0 {
+			if stats := mi.runMasterResolveFiles(resolutionFiles, false); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
 				return deferredResolveFailed, false
 			}
 			// Evicted definitions' pending references live outside the file
 			// frontier (their name is no longer declared in any frontier
 			// file); rebind them by the names the receipt recorded that no
 			// definition file re-declares.
-			if dropped := mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt)); len(dropped) != 0 {
+			if stats := mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt)); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
 				return deferredResolveFailed, false
 			}
 		}
 		// Resolve only files that can create or bind unresolved edges. Resolved
 		// edge sources still materialise their cross_repo_* generation without
 		// repeating the substantially larger name-resolution frontier.
-		mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles)
+		if stats := mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, receipt.ChangedFiles, receipt.DefinitionFiles, nil); stats != nil && stats.WriteRefused {
+			return deferredResolveFailed, false
+		}
 		return deferredResolveExact, true
 	}
 	if !fallbackNeeded {
@@ -1082,12 +1084,12 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	return err
 }
 
-func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) []string {
+func (mi *MultiIndexer) runMasterResolveFiles(files []string, useLSP bool) *resolver.ResolveStats {
 	return mi.runMasterResolveFilesObserved(files, useLSP, nil, nil)
 }
 
 // A master handling one repo mutation inherits its pre-eviction evidence.
-func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) []string {
+func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
 	if len(files) == 0 {
 		return nil
 	}
@@ -1105,7 +1107,7 @@ func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP boo
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
 	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
-	return stats.DroppedFiles
+	return stats
 }
 
 // reconcileRetargetedTestCalls re-runs the scoped test projection over the
@@ -1137,7 +1139,7 @@ func (mi *MultiIndexer) reconcileRetargetedTestCallsContext(ctx context.Context,
 // bare single-repo form. Companion to runMasterResolveFiles for the
 // receipt-exact path: an evicted definition's pending references are reachable
 // by name only, never by file frontier.
-func (mi *MultiIndexer) runMasterResolveNames(names []string) []string {
+func (mi *MultiIndexer) runMasterResolveNames(names []string) *resolver.ResolveStats {
 	if len(names) == 0 {
 		return nil
 	}
@@ -1165,7 +1167,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) []string {
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Int("names", len(names)),
 		zap.Int("resolved", stats.Resolved))
-	return stats.DroppedFiles
+	return stats
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
@@ -1230,8 +1232,8 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
-	if dropped := mi.runMasterResolveFiles(files, true); len(dropped) != 0 {
-		return fmt.Errorf("warm binding write did not apply; %d caller edges need retry", len(dropped))
+	if stats := mi.runMasterResolveFiles(files, true); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
+		return fmt.Errorf("%w: warm binding write did not apply; %d caller edges need retry", resolver.ErrReindexWriteRefused, len(stats.DroppedFiles))
 	}
 	if err := context.Cause(ctx); err != nil {
 		return err
@@ -1252,8 +1254,8 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
 			return err
 		}
-	} else {
-		mi.runCrossRepoResolveFiles(files)
+	} else if stats := mi.runCrossRepoResolveMutationFrontiersObserved(files, files, files, nil); stats != nil && stats.WriteRefused {
+		return resolver.ErrReindexWriteRefused
 	}
 	if err := context.Cause(ctx); err != nil {
 		return err

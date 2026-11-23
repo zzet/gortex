@@ -5699,7 +5699,7 @@ func (idx *Indexer) indexFile(
 			idx.resolver.SetPriorDeclarations(map[string]resolver.DeclarationSurface{graphPath: priorDeclarations})
 		}
 		resolveStarted := time.Now()
-		markerBatch.recordDropped(idx.resolver.ResolveFileAndIncoming(graphPath).DroppedFiles)
+		markerBatch.recordResolveStats(idx.resolver.ResolveFileAndIncoming(graphPath))
 		resolveDuration = time.Since(resolveStarted)
 		idx.resolver.SetIncrementalSkip(nil)
 		idx.resolver.SetPriorDeclarations(nil)
@@ -6140,8 +6140,12 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 		// re-parse's fact write puts it there.
 		idx.setReparsePendingEnrichment(graphPath, true)
 	}
-	if dropped := idx.resolver.ResolveFileAndIncoming(graphPath).DroppedFiles; len(dropped) != 0 {
-		return idx.finishResolutionPass(resolutionCompletion{dropped: dropped})
+	if stats := idx.resolver.ResolveFileAndIncoming(graphPath); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
+		work := resolutionCompletion{dropped: stats.DroppedFiles}
+		if len(stats.DroppedFiles) == 0 {
+			work.catchupErr = resolver.ErrReindexWriteRefused
+		}
+		return idx.finishResolutionPass(work)
 	}
 	watchEnrichment := providersPresent && idx.semanticMgr.EnrichesOnWatch()
 	reEnriched := false

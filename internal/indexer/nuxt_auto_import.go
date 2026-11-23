@@ -193,5 +193,5 @@ func (idx *Indexer) rebindParkedCalls(files []string, batch *reparsePendingEnric
 		batch.bindingCallers = appendUniqueSorted(batch.bindingCallers, files...)
 		return
 	}
-	batch.recordDropped(idx.resolver.ResolveFilesOutgoing(files).DroppedFiles)
+	batch.recordResolveStats(idx.resolver.ResolveFilesOutgoing(files))
 }

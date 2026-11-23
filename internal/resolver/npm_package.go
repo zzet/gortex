@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"strings"
 
@@ -170,15 +171,25 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 			}
 		}
 		if len(batch) > 0 {
-			cr.graph.ReindexEdges(batch)
-			cr.restubCallsForChangedNpmImports(batch)
+			if !reindexEdgesApplied(cr.graph, batch) {
+				if stats != nil {
+					stats.WriteRefused = true
+				}
+				return fmt.Errorf("%w: %d npm import edge(s)", ErrReindexWriteRefused, len(batch))
+			}
+			if err := cr.restubCallsForChangedNpmImports(batch); err != nil {
+				if stats != nil {
+					stats.WriteRefused = true
+				}
+				return err
+			}
 		}
 	}
 	return ctx.Err()
 }
 
 // A call resolved through a binding cannot outlive that binding's target.
-func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex) {
+func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex) error {
 	callers := make(map[string]map[string]string)
 	var ids []string
 	for _, change := range changes {
@@ -196,7 +207,7 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 		callers[change.OldTo][change.Edge.From] = name
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	var batch []graph.EdgeReindex
 	var obsolete []*graph.Edge
@@ -220,8 +231,11 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 	}
 	if len(batch) > 0 {
 		graph.RemoveEdgesExact(cr.graph, obsolete)
-		cr.graph.ReindexEdges(batch)
+		if !reindexEdgesApplied(cr.graph, batch) {
+			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch))
+		}
 	}
+	return nil
 }
 
 func trackedNpmImportSpec(e *graph.Edge) string {

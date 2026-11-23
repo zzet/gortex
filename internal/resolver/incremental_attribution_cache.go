@@ -134,7 +134,7 @@ func (r *Resolver) flushIncrementalAttributionReindexes() {
 		if len(batch) < n {
 			n = len(batch)
 		}
-		r.graph.ReindexEdges(batch[:n])
+		r.applyReindexEdges(batch[:n])
 		batch = batch[n:]
 	}
 }
@@ -157,7 +157,7 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 			if len(batch) < n {
 				n = len(batch)
 			}
-			r.graph.ReindexEdges(batch[:n])
+			r.applyReindexEdges(batch[:n])
 			batch = batch[n:]
 		}
 		return

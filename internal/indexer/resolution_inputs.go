@@ -16,6 +16,7 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser/nuxtimports"
 	"github.com/zzet/gortex/internal/parser/tsalias"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // Shared lookup caches describe the checkout, not what any one graph has applied.
@@ -381,13 +382,13 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 			}
 		}
 		work.success, work.warm = false, false
-		passErr = fmt.Errorf("binding write did not apply; %d caller edges need retry", len(dropped))
+		passErr = fmt.Errorf("%w: binding write did not apply; %d caller edges need retry", resolver.ErrReindexWriteRefused, len(dropped))
 		// Non-JS callers can fail outside the input-change preflight.
 		passErr = errors.Join(passErr, idx.invalidateResolutionDigest())
 	}
 	if work.catchupErr != nil {
 		work.success, work.warm, work.failed = false, false, nil
-		passErr = errors.Join(passErr, work.catchupErr)
+		passErr = errors.Join(passErr, work.catchupErr, idx.invalidateResolutionDigest())
 	}
 	if work.inputs == nil && len(work.dropped) == 0 {
 		return passErr

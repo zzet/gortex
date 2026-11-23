@@ -80,8 +80,16 @@ func PlaceholderSourceRepoints(reindexes []EdgeReindex) []PlaceholderRepoint {
 // forbidden inside resolver passes.
 // Returns the number of dataflow edges re-pointed.
 func ReconcilePlaceholderSources(g Store, repoints []PlaceholderRepoint) int {
+	moved, _ := ReconcilePlaceholderSourcesApplied(g, repoints)
+	return moved
+}
+
+// ReconcilePlaceholderSourcesApplied is ReconcilePlaceholderSources with
+// checked writer-gate reporting when the backing store supports
+// ReindexEdgesApplied.
+func ReconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint) (int, bool) {
 	if g == nil || len(repoints) == 0 {
-		return 0
+		return 0, true
 	}
 	candidateKinds := [...]EdgeKind{EdgeArgOf, EdgeValueFlow}
 	sites := make([]EdgeSite, 0, len(repoints)*len(candidateKinds))
@@ -100,7 +108,7 @@ func ReconcilePlaceholderSources(g Store, repoints []PlaceholderRepoint) int {
 		}
 	}
 	if len(sites) == 0 {
-		return 0
+		return 0, true
 	}
 	candidates := LookupEdgeCandidates(g, nil, sites)
 	var batch []EdgeReindex
@@ -140,8 +148,16 @@ func ReconcilePlaceholderSources(g Store, repoints []PlaceholderRepoint) int {
 		}
 	}
 	if len(batch) == 0 {
-		return 0
+		return 0, true
+	}
+	if writer, ok := g.(interface {
+		ReindexEdgesApplied([]EdgeReindex) bool
+	}); ok {
+		if !writer.ReindexEdgesApplied(batch) {
+			return 0, false
+		}
+		return len(batch), true
 	}
 	g.ReindexEdges(batch)
-	return len(batch)
+	return len(batch), true
 }
