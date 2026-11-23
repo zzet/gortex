@@ -65,11 +65,17 @@ type daemonExecutor struct {
 	pinJSONDefault bool
 }
 
-func (d *daemonExecutor) CallTool(_ context.Context, tool string, args map[string]any) (json.RawMessage, error) {
+func (d *daemonExecutor) CallTool(ctx context.Context, tool string, args map[string]any) (json.RawMessage, error) {
 	d.nextID++
 	frame, err := buildToolCallFrameWithDefault(d.nextID, tool, args, d.pinJSONDefault)
 	if err != nil {
 		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := d.client.Conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+		defer func() { _ = d.client.Conn.SetDeadline(time.Time{}) }()
 	}
 	if err := d.client.WriteMCPFrame(frame); err != nil {
 		return nil, err
