@@ -1388,8 +1388,14 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
-	// The per-repo pass already bound any shadow with a same-file value.
-	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+	// Lexical shadows (parameters and non-require locals) have no cross-repo
+	// callee; local require() bindings resolve strictly against their own
+	// required module rather than unrelated file-wide ES imports.
+	if binding := e.Meta[graph.JSLexicalBindingMeta]; binding != nil {
+		if binding == graph.JSLexicalRequire {
+			cr.resolveJSRequireCall(e, funcName, stats)
+			return
+		}
 		stats.Unresolved++
 		return
 	}

@@ -119,6 +119,12 @@ func stagePriorBindings(g graph.Store, stages []*incrementalBatchStage, view inc
 				if edge.To == "" || graph.IsUnresolvedTarget(edge.To) || graph.IsStub(edge.To) {
 					continue
 				}
+				// Prior lexical shadows and local require() bindings can be
+				// deleted or retargeted without changing the file's KindImport
+				// nodes; never carry their binding forward.
+				if edge.Meta[graph.JSLexicalBindingMeta] != nil {
+					continue
+				}
 				key := refKey{from: node.ID, kind: edge.Kind, rel: edge.Line - node.StartLine}
 				prior[key] = append(prior[key], priorRef{edge: edge, target: edge.To})
 				targetIDs = append(targetIDs, edge.To)
@@ -129,7 +135,7 @@ func stagePriorBindings(g graph.Store, stages []*incrementalBatchStage, view inc
 		}
 		targets := g.GetNodesByIDs(targetIDs)
 		for _, edge := range stage.result.Edges {
-			if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) || edge.Meta[graph.JSLexicalBindingMeta] != nil {
 				continue
 			}
 			if _, ok := priorBindingKinds[edge.Kind]; !ok {
@@ -230,6 +236,9 @@ func sameImports(prior, fresh []*graph.Node) bool {
 func resolutionMetaAdded(prior, fresh map[string]any) map[string]any {
 	var out map[string]any
 	for k, v := range prior {
+		if k == graph.JSLexicalBindingMeta || k == graph.JSLexicalRequireSpecMeta {
+			continue
+		}
 		if _, extracted := fresh[k]; extracted {
 			continue
 		}

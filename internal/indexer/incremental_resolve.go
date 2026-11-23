@@ -189,7 +189,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 	// to be re-added and deliberately do not need a store lookup.
 	targetIDSet := make(map[string]struct{})
 	for _, e := range edges {
-		if e == nil || !graph.IsUnresolvedTarget(e.To) {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil {
 			continue
 		}
 		name := reuseIdentifier(graph.UnresolvedName(e.To))
@@ -214,7 +214,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 	}
 	reused := 0
 	for _, e := range edges {
-		if e == nil || !graph.IsUnresolvedTarget(e.To) {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil {
 			continue
 		}
 		name := reuseIdentifier(graph.UnresolvedName(e.To))
@@ -417,6 +417,11 @@ func reusableResolvedEdge(e *graph.Edge) bool {
 		return false
 	}
 	if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
+		return false
+	}
+	// Lexical shadows and local require() bindings depend on enclosing-scope
+	// declarations that reuseKey does not encode; always re-resolve them.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil {
 		return false
 	}
 	return true

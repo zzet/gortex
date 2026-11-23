@@ -127,6 +127,27 @@ func visitJSImportBindings(importStmt *sitter.Node, src []byte, visit func(strin
 	}
 }
 
+func visitJSNamespaceName(n *sitter.Node, src []byte, visit func(string)) {
+	for n != nil && n.Type() == "nested_identifier" {
+		n = n.NamedChild(0)
+	}
+	if n != nil && n.Type() == "identifier" {
+		visit(n.Content(src))
+	}
+}
+
+func isJSBlockVarScope(block *sitter.Node) bool {
+	p := block.Parent()
+	if p == nil {
+		return false
+	}
+	switch p.Type() {
+	case "class_static_block", "internal_module", "module":
+		return true
+	}
+	return false
+}
+
 // visitJSAllDeclarations visits every binding declared by n without exempting
 // require() initializers, so checking whether `require` itself is shadowed
 // never recurses into require matching.
@@ -141,13 +162,23 @@ func visitJSAllDeclarations(n *sitter.Node, src []byte, includeAmbient bool, vis
 		}
 	case "export_statement":
 		visitJSAllDeclarations(n.ChildByFieldName("declaration"), src, includeAmbient, visit)
+	case "expression_statement":
+		if child := n.NamedChild(0); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+			visitJSNamespaceName(child.ChildByFieldName("name"), src, visit)
+		}
+	case "internal_module", "module":
+		visitJSNamespaceName(n.ChildByFieldName("name"), src, visit)
+	case "import_alias":
+		if id := n.NamedChild(0); id != nil && id.Type() == "identifier" {
+			visit(id.Content(src))
+		}
 	case "function_signature":
 		if includeAmbient {
 			visitJSPattern(n.ChildByFieldName("name"), src, visit)
 		}
 	case "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, visit)
-	case "lexical_declaration", "variable_declaration":
+	case "lexical_declaration", "variable_declaration", "using_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
 			if v.Type() == "variable_declarator" {
@@ -225,7 +256,7 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
 		kind := n.Type()
 		switch kind {
-		case "program", "statement_block", "switch_body",
+		case "program", "statement_block", "switch_body", "class",
 			"function_declaration", "generator_function_declaration", "method_definition",
 			"function_expression", "generator_function", "arrow_function",
 			"catch_clause", "for_statement", "for_in_statement":
@@ -233,6 +264,14 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 			continue
 		}
 		body := child.Type() == "statement_block"
+		// Computed method keys and decorators evaluate outside the method's
+		// parameter scope; class decorators evaluate outside the class name.
+		if kind == "method_definition" && !body && child.Type() != "formal_parameters" {
+			continue
+		}
+		if kind == "class" && child.Type() == "decorator" {
+			continue
+		}
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		shadowed, ok := cache.requireShadow[key]
 		if !ok {
@@ -255,7 +294,7 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 					}
 				}
 			case "statement_block":
-				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
+				if isJSBlockVarScope(n) {
 					visitJSAllHoistedVars(n, src, check)
 				}
 				for i := 0; i < int(n.NamedChildCount()) && !shadowed; i++ {
@@ -281,6 +320,8 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, check)
 				}
+			case "class":
+				visitJSPattern(n.ChildByFieldName("name"), src, check)
 			default:
 				if body && kind != "catch_clause" {
 					visitJSAllHoistedVars(child, src, check)
@@ -353,9 +394,21 @@ func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local fu
 	switch n.Type() {
 	case "ambient_declaration":
 		cache.visitDeclaration(n.NamedChild(0), src, local, required)
+	case "export_statement":
+		cache.visitDeclaration(n.ChildByFieldName("declaration"), src, local, required)
+	case "expression_statement":
+		if child := n.NamedChild(0); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+			visitJSNamespaceName(child.ChildByFieldName("name"), src, local)
+		}
+	case "internal_module", "module":
+		visitJSNamespaceName(n.ChildByFieldName("name"), src, local)
+	case "import_alias":
+		if id := n.NamedChild(0); id != nil && id.Type() == "identifier" {
+			local(id.Content(src))
+		}
 	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, local)
-	case "lexical_declaration", "variable_declaration":
+	case "lexical_declaration", "variable_declaration", "using_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
 			if v.Type() == "variable_declarator" {
@@ -380,7 +433,7 @@ func (cache *jsScopeCache) visitHoistedVars(n *sitter.Node, src []byte, local fu
 		if kind := n.ChildByFieldName("kind"); kind != nil && kind.Type() == "var" {
 			visitJSPattern(n.ChildByFieldName("left"), src, local)
 		}
-	case "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
+	case "export_statement", "statement_block", "if_statement", "else_clause", "switch_statement", "switch_body",
 		"switch_case", "switch_default", "for_statement", "while_statement", "do_statement",
 		"try_statement", "catch_clause", "finally_clause", "with_statement", "labeled_statement":
 	default:
@@ -419,13 +472,22 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
 		kind := n.Type()
 		switch kind {
-		case "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		case "statement_block", "switch_body", "class",
+			"function_declaration", "generator_function_declaration", "method_definition",
+			"function_expression", "generator_function", "arrow_function",
+			"catch_clause", "for_statement", "for_in_statement":
 		default:
 			continue
 		}
 		// The body sees hoisted var declarations; parameter initializers do
 		// not. Cache the two environments separately for the same function.
 		body := child.Type() == "statement_block"
+		if kind == "method_definition" && !body && child.Type() != "formal_parameters" {
+			continue
+		}
+		if kind == "class" && child.Type() == "decorator" {
+			continue
+		}
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		names, ok := cache.scopes[key]
 		if !ok {
@@ -448,8 +510,8 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			required := func(id, spec string) { add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec}) }
 			switch kind {
 			case "statement_block":
-				// A class static block is its own var scope.
-				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
+				// Class static blocks and TS namespaces are their own var scopes.
+				if isJSBlockVarScope(n) {
 					cache.visitHoistedVars(n, src, local, required)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -467,6 +529,8 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
+			case "class":
+				visitJSPattern(n.ChildByFieldName("name"), src, local)
 			default:
 				param := func(id string) { add(id, jsBinding{kind: graph.JSPendingParameter}) }
 				if body && kind != "catch_clause" {
@@ -502,14 +566,17 @@ func jsLexicalRank(e *graph.Edge) int {
 		return 0
 	case graph.JSLexicalRequire:
 		return 1
-	default:
+	case graph.JSLexicalLocal:
 		return 2
+	default:
+		return 3
 	}
 }
 
 // Calls with one From/To/Line identity collapse into one stored edge. When a
-// less-shadowed call shares that site with a shadowed one, the stored edge
-// must keep the least-shadowed binding so a real call is not dropped.
+// less-shadowed call shares that site with a shadowed one, normalize every
+// colliding edge to the same deterministic least-shadowed binding so last-wins
+// in-memory stores and first-wins SQLite stores agree.
 func clearCollapsedJSShadows(edges []*graph.Edge) {
 	var hasStamped bool
 	for _, e := range edges {
@@ -539,19 +606,49 @@ func clearCollapsedJSShadows(edges []*graph.Edge) {
 		}
 		winner := best[id]
 		winnerRank := jsLexicalRank(winner)
-		if winnerRank == 2 {
+		if winnerRank == 3 {
 			continue
+		}
+		// Two colliding local require() calls on one line that disagree on
+		// their module specifier cannot pick one deterministically across
+		// stores; downgrade the whole group to JSLexicalLocal.
+		if winnerRank == 1 {
+			spec, _ := winner.Meta[graph.JSLexicalRequireSpecMeta].(string)
+			ambiguousSpec := false
+			for _, e := range group {
+				if jsLexicalRank(e) != 1 {
+					continue
+				}
+				if s, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string); s != spec {
+					ambiguousSpec = true
+					break
+				}
+			}
+			if ambiguousSpec {
+				for _, e := range group {
+					if e.Meta == nil {
+						e.Meta = map[string]any{}
+					}
+					e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
+					delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+				}
+				continue
+			}
 		}
 		for _, e := range group {
 			if jsLexicalRank(e) <= winnerRank {
 				continue
 			}
-			if winnerRank == 0 {
+			switch winnerRank {
+			case 0:
 				delete(e.Meta, graph.JSLexicalBindingMeta)
 				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
-			} else {
+			case 1:
 				e.Meta[graph.JSLexicalBindingMeta] = winner.Meta[graph.JSLexicalBindingMeta]
 				e.Meta[graph.JSLexicalRequireSpecMeta] = winner.Meta[graph.JSLexicalRequireSpecMeta]
+			case 2:
+				e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
+				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
 			}
 		}
 	}
