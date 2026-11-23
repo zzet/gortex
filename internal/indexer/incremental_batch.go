@@ -2516,19 +2516,20 @@ func (idx *Indexer) emptyAffectedByPlan() affectedByBatchPlan {
 	}
 }
 
-func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) {
+func (idx *Indexer) executeAffectedByPlan(plan affectedByBatchPlan) bool {
 	if len(plan.files) == 0 {
-		return
+		return false
 	}
 	idx.observeIncrementalCatchup("affected_by", plan.files)
 	// The affected files are referrers of the changed declarations: their own
 	// references re-bind, while the references parked on the names they
 	// declare did not move (ResolveFilesOutgoing).
-	idx.resolver.ResolveFilesOutgoing(plan.files)
+	stats := idx.resolver.ResolveFilesOutgoing(plan.files)
 	// A changed contract moved the referrers' arguments back to the callee
 	// (argOfIntoSurvivingOwner); map them onto its current parameters.
 	idx.materializeDataflowParamsForFiles(plan.files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), plan.files)
+	return stats != nil && stats.WriteRefused
 }
 
 func (idx *Indexer) reresolveAffectedByStages(stages []*incrementalBatchStage) {

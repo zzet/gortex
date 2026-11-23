@@ -190,6 +190,7 @@ type deferredLSPBatchResult struct {
 	attempted           int
 	skipped             int
 	budgetExhausted     bool
+	writeRefused        bool
 	terminalityExcluded map[deferredLSPWorkKey]struct{}
 	livenessDur         time.Duration
 	attemptsDur         time.Duration
@@ -488,8 +489,14 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	}
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
-		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+		if !r.applyReindexEdges(reindexBatch) {
+			result.writeRefused = true
+			return result
+		}
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, &r.placeholderSrcIdx, reindexBatch); !ok {
+			r.notePassWriteRefused()
+			result.writeRefused = true
+		}
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}

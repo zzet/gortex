@@ -211,10 +211,14 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		}
 	}
 	if len(reindexBatch) > 0 {
-		r.graph.ReindexEdges(reindexBatch)
+		if !r.applyReindexEdges(reindexBatch) {
+			return 0
+		}
 	}
 	if len(sourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
-		graph.ReconcilePlaceholderSources(r.graph, sourceReverts)
+		if _, ok := graph.ReconcilePlaceholderSourcesApplied(r.graph, sourceReverts); !ok {
+			r.notePassWriteRefused()
+		}
 	}
 	// A reverted edge may still hold a deferred LSP verify-record spooled
 	// while it was heuristically bound. Re-snapshot those records to the

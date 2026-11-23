@@ -48,7 +48,8 @@ var editDeltaAbsentCapabilities = map[string]string{
 	"graph.CallAncestorReader":            "optional native recursive closure; CallAncestorsOf walks the delta's composed incoming adjacency and hydrates selected source identities",
 	"graph.ScopedOutlineNodeReader":       "optional indexed scoped names/membership; the scoped-name helper keeps composed FindNodesByName and intersects NodeScope without reaching a physical store",
 	"graph.ExternalCallCandidateIterator": "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
-	"anonymous{ReindexEdgesApplied}":      "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+	"anonymous{ReindexEdgesApplied}":                 "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+	"anonymous{ReindexUnresolvedEdgeTargetsApplied}": "batch-drop receipt for persistent stores; DeltaWriter applies unresolved target reindexes locally and unconditionally through ReindexUnresolvedEdgeTargets",
 	"anonymous{AddBatchChecked}":          "checked durable publication: DeltaWriter stages non-failing writes in its local work graph through AddBatch; its owner checks final layer publication, and forwarding this capability would bypass the delta",
 	"anonymous{WriteMark}":                "process/store write telemetry, not a graph capability: the per-save indexer and resolver receive the underlying store handle's sampler explicitly; a MultiIndexer without this optional sampler falls back to process-wide counters",
 

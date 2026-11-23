@@ -147,7 +147,8 @@ type storeCore struct {
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
 	// persistent-lock exhaustion deterministically.
-	busyRetryTimeout time.Duration
+	busyRetryTimeout         time.Duration
+	busyRetryTimeoutOverride atomic.Int64
 
 	// passiveCheckpointTimeout bounds one periodic PASSIVE checkpoint. The zero
 	// value selects walPassiveCheckpointTimeout; tests shorten it to exercise

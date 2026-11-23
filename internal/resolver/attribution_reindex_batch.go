@@ -145,7 +145,7 @@ func (r *Resolver) reindexAttributionTargetsBatched(
 	}
 	if len(direct) > 0 {
 		r.noteImportTargetReindexes(direct)
-		targeter.ReindexUnresolvedEdgeTargets(direct)
+		r.applyUnresolvedTargetReindexes(targeter, direct)
 	}
 	if len(fallback) > 0 {
 		r.reindexAttributionIdentitiesBatched(finder, fallback, rewrite)

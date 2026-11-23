@@ -126,11 +126,50 @@ func (s *unresolvedEdgeStream) nextPage() ([]*graph.Edge, bool, error) {
 // so only the first full resolve pass is profiled.
 var resolveProfileStarted atomic.Bool
 
+// ErrReindexWriteRefused reports that the backing store refused or dropped an
+// edge reindex batch (for example because the SQLite writer gate stayed
+// contended past its bounded retry window). Callers that certify durable policy
+// state must leave it uncertified until a subsequent pass applies the rebinds.
+var ErrReindexWriteRefused = errors.New("resolver: edge reindex batch refused")
+
+func reindexEdgesApplied(g graph.Store, batch []graph.EdgeReindex) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	if writer, ok := g.(interface {
+		ReindexEdgesApplied([]graph.EdgeReindex) bool
+	}); ok {
+		return writer.ReindexEdgesApplied(batch)
+	}
+	g.ReindexEdges(batch)
+	return true
+}
+
+func reindexUnresolvedTargetsApplied(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	batch []graph.UnresolvedEdgeTargetReindex,
+) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	if writer, ok := targeter.(interface {
+		ReindexUnresolvedEdgeTargetsApplied([]graph.UnresolvedEdgeTargetReindex) bool
+	}); ok {
+		return writer.ReindexUnresolvedEdgeTargetsApplied(batch)
+	}
+	targeter.ReindexUnresolvedEdgeTargets(batch)
+	return true
+}
+
 // ResolveStats holds counts from a resolution pass.
 type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// WriteRefused reports that the backing store refused or dropped at least
+	// one edge reindex batch during this pass. Callers that certify durable
+	// policy state must not certify a pass whose writes were refused.
+	WriteRefused bool `json:"write_refused,omitempty"`
 	// LSP* exposes the deferred whole-pass circuit-breaker outcome. These are
 	// diagnostic counters: skipped edges keep the heuristic result produced by
 	// the normal resolve cascade and remain eligible for a later full pass.
@@ -452,6 +491,12 @@ type Resolver struct {
 	// instance still gets inline LSP precision. Independent of scope /
 	// validateLiveness; never set on any single-file path.
 	bulkMode bool
+
+	// passWriteRefused points at the active non-yielding locked pass's
+	// refused-write flag, guarded by r.mu. Any sub-pass write that SQLite drops
+	// under writer-gate contention flips it so the enclosing pass refuses to
+	// report a clean apply. Never held across an r.mu yield.
+	passWriteRefused *bool
 
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
@@ -795,6 +840,37 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	if oldMu != nil {
 		oldMu.Unlock()
 	}
+}
+
+func (r *Resolver) trackPassWriteRefused(flag *bool) func() {
+	prev := r.passWriteRefused
+	r.passWriteRefused = flag
+	return func() { r.passWriteRefused = prev }
+}
+
+func (r *Resolver) notePassWriteRefused() {
+	if r.passWriteRefused != nil {
+		*r.passWriteRefused = true
+	}
+}
+
+func (r *Resolver) applyReindexEdges(batch []graph.EdgeReindex) bool {
+	applied := reindexEdgesApplied(r.graph, batch)
+	if !applied {
+		r.notePassWriteRefused()
+	}
+	return applied
+}
+
+func (r *Resolver) applyUnresolvedTargetReindexes(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	batch []graph.UnresolvedEdgeTargetReindex,
+) bool {
+	applied := reindexUnresolvedTargetsApplied(targeter, batch)
+	if !applied {
+		r.notePassWriteRefused()
+	}
+	return applied
 }
 
 // ResolveAll resolves all unresolved edges in the graph.
@@ -1292,8 +1368,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				r.graph.ReindexEdges(reindexBatch)
+				applied := reindexEdgesApplied(r.graph, reindexBatch)
 				applyStoreElapsed += time.Since(storeStart)
+				if !applied {
+					total.WriteRefused = true
+					return resolveError(fmt.Errorf("%w: %d edge(s)", ErrReindexWriteRefused, len(reindexBatch)))
+				}
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
 				// applying them per page made the result depend on the paging.
@@ -1394,11 +1474,17 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			return resolveError(err)
 		}
 	}
+	var tailWriteRefused bool
+	defer r.trackPassWriteRefused(&tailWriteRefused)()
 	placeholderFlushStart := time.Now()
-	r.placeholderSrcIdx.applyDeferred(r.graph)
+	_, placeholderOK := r.placeholderSrcIdx.applyDeferredApplied(r.graph)
 	applyPlaceholderElapsed += time.Since(placeholderFlushStart)
 	stopProgress()
 	loopElapsed := time.Since(passStart) - warmElapsed
+	if !placeholderOK {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1620,6 +1706,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				break
 			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if pageResult.writeRefused {
+				total.WriteRefused = true
+				return resolveError(fmt.Errorf("%w: deferred LSP batch", ErrReindexWriteRefused))
+			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
 				// to its first skipped key.
@@ -1658,7 +1748,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				r.graph.ReindexEdges(terminalClears)
+				if !r.applyReindexEdges(terminalClears) {
+					total.WriteRefused = true
+					return resolveError(fmt.Errorf("%w: %d terminal clear(s)", ErrReindexWriteRefused, len(terminalClears)))
+				}
 			}
 
 			completed := append([]deferredLSPWorkKey(nil), stale...)
@@ -1799,6 +1892,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			r.warmGuardLookupCache(jobs)
 			guarded += r.guardCrossPackageCallEdges(jobs, guardClosure)
 			r.clearLookupCache()
+			if tailWriteRefused {
+				total.WriteRefused = true
+				return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
+			}
 			guardPages++
 			guardJobs += len(jobs)
 			if time.Since(lastGuardLog) > 10*time.Second {
@@ -1970,6 +2067,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// left the entire unresolved residual unstamped, so every subsequent
 	// full pass re-paged ~300k edges that the first pass had already proven
 	// unbindable.
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: post-resolution tail", ErrReindexWriteRefused))
+	}
 	if r.stampTerminal && len(r.scope) == 0 {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
@@ -2673,13 +2774,14 @@ func (r *Resolver) buildPassIndexesForPending(pending []*graph.Edge) (clear func
 func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 
 	clear := r.buildPassIndexes()
 	defer clear()
 
-	stats := &ResolveStats{}
 	r.resolveFileLocked(filePath, stats)
 	return stats
 }
@@ -2694,6 +2796,8 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	// The edited file may have (re)stamped global usings — reconcile the
 	// persistent index instead of paying the workspace rescan per save.
@@ -2712,7 +2816,6 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	defer func() { r.incomingCarried = nil }()
 	pending := frontier.pending
 	pendingDuration := time.Since(pendingStarted)
-	stats := &ResolveStats{}
 	// The bound is a fact about THIS save before it is anything else. A refused
 	// incoming leg contributes zero entries to pending, so a changed file with
 	// no outgoing work of its own — the ordinary shape for a widely referenced
@@ -2725,7 +2828,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	recordFrontierIncomingAdmission(r.logger, stats, frontier, "preparation")
 	if len(pending) == 0 {
 		r.attributeFrontierGoBuiltins(frontier)
-		if !stats.IncomingAdmissionRefused {
+		if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 			r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 		}
 		return stats
@@ -2762,7 +2865,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	incomingStarted := time.Now()
 	r.resolveIncomingLocked(filePath, stats)
 	incomingDuration := time.Since(incomingStarted)
-	if !stats.IncomingAdmissionRefused {
+	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 	}
 	if elapsed := time.Since(started); elapsed >= time.Second {
@@ -3140,6 +3243,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		mutexAcquired = time.Now()
 	}
 	defer r.mu.Unlock()
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	if observe != nil {
 		observe(mutexStarted, mutexAcquired)
 	}
@@ -3188,7 +3292,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	if len(frontier.pending) == 0 && len(carried) == 0 {
 		outcome = "no_pending"
 		r.attributeFrontierGoBuiltins(frontier)
-		if !stats.IncomingAdmissionRefused {
+		if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 			r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 		}
 		return stats
@@ -3238,7 +3342,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
-	if !stats.IncomingAdmissionRefused {
+	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	}
 	attributionDuration = finish()
@@ -3480,11 +3584,18 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
+		applied := r.applyReindexEdges(reindexBatch)
 		legs.lap("reindex")
+		if !applied {
+			stats.WriteRefused = true
+			return
+		}
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
-		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, reindexBatch); !ok {
+			stats.WriteRefused = true
+			r.notePassWriteRefused()
+		}
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}
@@ -3636,13 +3747,14 @@ func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
 
 	clear := r.buildPassIndexes()
 	defer clear()
 
-	stats := &ResolveStats{}
 	r.resolveIncomingLocked(filePath, stats)
 	return stats
 }
@@ -3664,6 +3776,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 
 	seen := make(map[string]struct{}, len(names))

@@ -1089,10 +1089,10 @@ func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP
 	mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
 }
 
-func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) {
+func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
-		return
+		return nil
 	}
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
@@ -1104,6 +1104,7 @@ func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP boo
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
 	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
+	return stats
 }
 
 // reconcileRetargetedTestCalls re-runs the scoped test projection over the
@@ -1135,13 +1136,13 @@ func (mi *MultiIndexer) reconcileRetargetedTestCallsContext(ctx context.Context,
 // bare single-repo form. Companion to runMasterResolveFiles for the
 // receipt-exact path: an evicted definition's pending references are reachable
 // by name only, never by file frontier.
-func (mi *MultiIndexer) runMasterResolveNames(names []string) {
+func (mi *MultiIndexer) runMasterResolveNames(names []string) *resolver.ResolveStats {
 	if len(names) == 0 {
-		return
+		return nil
 	}
 	master := mi.newMasterResolver(false)
 	if master == nil {
-		return
+		return nil
 	}
 	// Snapshot the prefixes under the registry lock and release it before
 	// resolver work: the deferred receipt tail runs concurrently with
@@ -1163,6 +1164,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Int("names", len(names)),
 		zap.Int("resolved", stats.Resolved))
+	return stats
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
