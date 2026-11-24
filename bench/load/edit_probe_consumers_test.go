@@ -69,6 +69,41 @@ func TestEditConsumerProbeEligiblePlanDeclaresAllConsumers(t *testing.T) {
 	}
 }
 
+func TestEditConsumerGCXUsesCompanionsWithoutChangingGateSchedule(t *testing.T) {
+	c, _ := editConsumerTestFixture(t)
+	options := runOptions{Seed: 1, EditCount: 100, Editors: 8, EditGateModes: true}
+	base, err := planEditProbe(c, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.EditConsumerProbes = true
+	withConsumers, err := planEditProbe(c, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var companions int
+	for i, step := range withConsumers.Steps {
+		if step.ProbeMode != base.Steps[i].ProbeMode || step.RequestHash != base.Steps[i].RequestHash || step.DueNS != base.Steps[i].DueNS {
+			t.Fatalf("consumer probes changed offered edit %d", i)
+		}
+		c.EditOutput = step.ProbeMode
+		record := newEditProbeRecord(c, step)
+		for _, oracle := range editProbeOracles(c, step) {
+			if !strings.HasSuffix(oracle.name, "_gcx") {
+				continue
+			}
+			companions++
+			if step.ProbeMode != "json" || editProbeDispatchOutput(oracle.call)["format"] != "gcx" ||
+				record.Consumers[oracle.name].RequestedMode != "gcx" {
+				t.Fatalf("GCX companion lost offered or dispatched format in edit %d: %+v %+v", i, oracle, record.Consumers)
+			}
+		}
+	}
+	if companions != 60 {
+		t.Fatalf("GCX companions=%d, want three each on 20 JSON steps", companions)
+	}
+}
+
 // These are payload recognizers, not completion or silent-stale verdicts.
 // Runtime integration must retain pending/absent/error separately and require
 // an observed dead-code baseline before interpreting a membership transition.

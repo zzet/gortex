@@ -18,14 +18,17 @@ func editProbeHasSharedOwnerFields(status map[string]any) bool {
 
 // accountingForStatus is the runtime boundary at which an actual owned child
 // can be associated with a reply. Pure wire decoding cannot supply that bond.
-func (r *editProbeRuntime) accountingForStatus(ctx context.Context, status map[string]any, receipt, tool string) editProbeAccounting {
+func (r *editProbeRuntime) accountingForStatus(ctx context.Context, status map[string]any, receipt, tool string, countedNoWait bool) editProbeAccounting {
 	if !editProbeHasSharedOwnerFields(status) {
+		if countedNoWait {
+			return checkEditProbeAccountingWithWaitDisposition(status, receipt, "reindex_generation", nil, false, true)
+		}
 		return checkEditProbeAccountingForTool(status, receipt, tool)
 	}
 	if tool == "edit.symbol" && status["tool"] != "edit_symbol" {
 		return editProbeAccounting{State: "unavailable_shared_owner", Reasons: []string{"status tool does not match offered edit.symbol"}}
 	}
-	out := checkEditProbeAcknowledgement(status, receipt, "reindex_generation", nil, tool == "edit.symbol")
+	out := checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, "reindex_generation", nil, tool == "edit.symbol", countedNoWait)
 	out.State = "unavailable_shared_owner"
 	ref, credible, err := r.referenceForSharedStatus(ctx, status, receipt, "")
 	if err != nil {

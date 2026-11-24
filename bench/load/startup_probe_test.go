@@ -58,6 +58,8 @@ func TestDecodeProbeFrameReadsAdmissionAnswers(t *testing.T) {
 			frame: mustInitialize(t, "Gortex is LOADING app after a restart (starting, 0%). Graph tools return repo_loading (retryable) until it is ready; Do not re-track it or change tracking configuration: the repository is already configured.\n\n"+active)},
 		{name: "admission pending instructions", outcome: "admission_pending", ok: true,
 			frame: mustInitialize(t, "Gortex is LOADING graph admission after a restart (identity_resolution, 0%). Graph admission for this path is not yet established.")},
+		{name: "checkout loading instructions", outcome: "checkout_loading", ok: true,
+			frame: mustInitialize(t, "Gortex is LOADING checkout /w/wt (view_building). Graph tools return view_building (retryable) until the checkout is admitted. Do not change tracking configuration to resolve this.\n\n"+active)},
 		{name: "unavailable instructions", outcome: "unavailable", ok: true, advice: true,
 			frame: mustInitialize(t, "Gortex is connected but could not load /w after the restart: boom.\n\nGraph tools return repo_unavailable for it. To repair, run `gortex track /w` to index it again.")},
 		{name: "untracked instructions", outcome: "untracked", ok: true, advice: true,
@@ -324,5 +326,129 @@ func TestStartupScenarioProbesAcrossARestart(t *testing.T) {
 	claim, err := os.ReadFile(filepath.Join(artifacts["private_root"], "repos", corpus.Label, ".gortex-probe-router", ".gortex.yaml"))
 	if err != nil || string(claim) != "workspace: "+startupRosterWorkspace+"\n" {
 		t.Fatalf("router cwd claim: %q %v", claim, err)
+	}
+}
+
+func TestStartupScopeEvidenceOwnedServingAndGrep(t *testing.T) {
+	t.Setenv("LOAD_DAEMON_FIXTURE", "startup-scope-evidence")
+	corpus := gitFixture(t)
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	options, err := parseRun([]string{"--binary", binary, "--manifest", filepath.Join(dir, "manifest.json"),
+		"--scratch", dir, "--scenario", "startup", "--restarts", "1", "--startup-scope-evidence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.Duration, options.WarmTimeout, options.StopTimeout = time.Second, 15*time.Second, 5*time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	phase, _, _, _, _, err := runPhase(ctx, options, startupScenario, []Corpus{corpus}, "", dir)
+	if err != nil {
+		t.Fatalf("startup scenario: %v", err)
+	}
+	type call struct {
+		Surface     string          `json:"surface"`
+		Started     time.Time       `json:"started"`
+		Completed   time.Time       `json:"completed"`
+		Frame       json.RawMessage `json:"frame"`
+		AfterGrepNS *int64          `json:"after_grep_ns"`
+	}
+	var gate struct {
+		Boots []struct {
+			ReadyAt map[string]time.Time `json:"ready_at"`
+			Scope   struct {
+				PID     int    `json:"pid"`
+				Socket  string `json:"socket"`
+				Root    string `json:"root"`
+				Serving struct {
+					Socket string `json:"socket"`
+				} `json:"serving"`
+				ServingAt       time.Time   `json:"serving_at"`
+				Core            []call      `json:"core"`
+				Facade          []call      `json:"facade"`
+				EarlyGrep       probeSample `json:"early_grep"`
+				EarlyGrepHealth []call      `json:"early_grep_health"`
+				ReadyGrep       probeSample `json:"ready_grep"`
+			} `json:"scope_evidence"`
+		} `json:"boots"`
+	}
+	if err := json.Unmarshal(phase.Gate["startup_probe"], &gate); err != nil || len(gate.Boots) != 2 {
+		t.Fatalf("startup scope gate = %+v, %v", gate, err)
+	}
+	for i, boot := range gate.Boots {
+		scope := boot.Scope
+		if scope.PID <= 0 || scope.PID == os.Getpid() || (i > 0 && scope.PID == gate.Boots[i-1].Scope.PID) ||
+			scope.Socket == "" || scope.Serving.Socket != scope.Socket || scope.ServingAt.IsZero() {
+			t.Fatalf("boot %d missing owned serving origin: %+v", i, scope)
+		}
+		for mode, calls := range map[string][]call{"core": scope.Core, "facade-v1": scope.Facade} {
+			got := make(map[string]bool)
+			for _, call := range calls {
+				if (mode == "core" && call.Surface == "capabilities") ||
+					(mode == "facade-v1" && call.Surface == "tools_search_facade") {
+					t.Errorf("boot %d queried hidden tool %s on %s", i, call.Surface, mode)
+				}
+				if call.Started.Before(scope.ServingAt) || call.Completed.Before(call.Started) ||
+					call.Completed.After(scope.ServingAt.Add(time.Second)) {
+					t.Errorf("boot %d %s %s outside serving window: %+v", i, mode, call.Surface, call)
+				}
+				if call.Surface == "graph_stats" || call.Surface == "workspace_graph" {
+					answer := decodeProbeFrame(call.Frame)
+					got[call.Surface] = outcomeKey(answer) == "repo_loading"
+					continue
+				}
+				var reply struct {
+					Result json.RawMessage `json:"result"`
+				}
+				if json.Unmarshal(call.Frame, &reply) != nil || !decodeProbeFrame(call.Frame).OK {
+					continue
+				}
+				content, err := textPayload(reply.Result, "content")
+				var body struct {
+					Status string `json:"status"`
+					Repos  []struct {
+						Path  string `json:"path"`
+						State string `json:"state"`
+					} `json:"repos"`
+					Query   string            `json:"query"`
+					Tools   []json.RawMessage `json:"tools"`
+					Domains []json.RawMessage `json:"domains"`
+				}
+				if err != nil || json.Unmarshal(content, &body) != nil {
+					continue
+				}
+				switch call.Surface {
+				case "index_health", "workspace_index":
+					got[call.Surface] = len(body.Repos) == 1 && body.Repos[0].Path == scope.Root &&
+						body.Status == "loading" && body.Repos[0].State == "running"
+				case "tools_search":
+					got[call.Surface] = body.Query == "index" && len(body.Tools) == 1
+				case "capabilities_facade":
+					got[call.Surface] = len(body.Domains) == 1
+				}
+			}
+			want := []string{"index_health", "tools_search", "graph_stats"}
+			if mode == "facade-v1" {
+				want = []string{"workspace_index", "capabilities_facade", "workspace_graph"}
+			}
+			for _, surface := range want {
+				if scope.Root == "" || !got[surface] {
+					t.Errorf("boot %d %s %s missing raw scoped response: %+v", i, mode, surface, calls)
+				}
+			}
+		}
+		if ready := boot.ReadyAt[corpus.Label]; ready.IsZero() || scope.EarlyGrep.Variant != "allow" ||
+			scope.ReadyGrep.Variant != "deny" || scope.EarlyGrep.Started.Before(scope.ServingAt) ||
+			!scope.EarlyGrep.Started.Before(ready) || scope.ReadyGrep.Started.Before(ready) {
+			t.Errorf("boot %d Grep did not capture both sides of readiness: %+v", i, scope)
+		}
+		if len(scope.EarlyGrepHealth) != 2 || scope.EarlyGrepHealth[1].Surface != "index_health" || len(scope.EarlyGrepHealth[1].Frame) == 0 {
+			t.Errorf("boot %d Grep lacked a subsequent health readback: %+v", i, scope.EarlyGrepHealth)
+		} else if after := scope.EarlyGrepHealth[1].AfterGrepNS; after == nil || *after < 0 {
+			t.Errorf("boot %d Grep health lacked nonnegative monotonic ordering evidence", i)
+		}
 	}
 }

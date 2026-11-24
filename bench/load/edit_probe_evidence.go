@@ -56,7 +56,11 @@ func editProbeOracles(c Corpus, step editProbeStep) []editProbeOracle {
 		oracles = append(oracles, editProbeOracle{name: "old_source_absent", call: request{Tool: "read", Operation: "source", ExpectedAbsentSymbol: step.BeforeSymbol, Arguments: map[string]any{"operation": "source", "target": map[string]any{"symbol": step.BeforeSymbol}}}})
 	}
 	if step.ConsumerProbes {
-		oracles = append(oracles, editConsumerOracles(c)...)
+		consumers := editConsumerOracles(c)
+		oracles = append(oracles, consumers...)
+		if step.ProbeMode == "json" {
+			oracles = append(oracles, editConsumerGCXOracles(consumers)...)
+		}
 	}
 	return editProbeOutputOracles(c, oracles)
 }
@@ -282,21 +286,32 @@ func editProbeCompactCorrect(oracle string, answer editProbeCompactAnswer, c Cor
 }
 
 func editProbeClaimsFresh(body map[string]any) bool {
+	reportedTier := false
 	if labels, ok := body[editProbeTierLabelsKey].(editProbeTierLabels); ok {
+		reportedTier = len(labels) > 0
 		for _, label := range labels {
 			if label.State == "fresh" {
 				return true
 			}
 		}
 	}
-	claims := func(row map[string]any) bool {
-		if row["graph_freshness"] == "fresh" || row["freshness_state"] == "fresh" {
-			return true
-		}
-		return row["state"] == "fresh" || row["fresh"] == true
-	}
 	freshness, _ := body["freshness"].(map[string]any)
-	return body["freshness"] == "fresh" || claims(body) || claims(freshness)
+	for _, row := range []map[string]any{body, freshness} {
+		for _, field := range []string{"graph_freshness", "freshness_state"} {
+			if state, ok := row[field].(string); ok && state != "" {
+				if state == "fresh" {
+					return true
+				}
+				reportedTier = true
+			}
+		}
+	}
+	// A successful watcher wait can accompany an explicitly pending graph.
+	if reportedTier {
+		return false
+	}
+	return body["freshness"] == "fresh" || body["state"] == "fresh" || body["fresh"] == true ||
+		freshness["state"] == "fresh" || freshness["fresh"] == true
 }
 
 func strconvEditProbeUint(value any) (uint64, error) {
@@ -389,6 +404,26 @@ type editProbeAccounting struct {
 	Reasons   []string                  `json:"reasons"`
 }
 
+func localFileAcknowledgementMatches(ack, status map[string]any, tool, mutationID string) bool {
+	if tool != "edit.file" || mutationID == "" || ack["status"] != "applied" ||
+		ack["ack_mode"] != "local" || ack["disk_status"] != "committed" || ack["mutation_id"] != mutationID {
+		return false
+	}
+	if replayed, present := ack["replayed"]; present && replayed != false {
+		return false
+	}
+	if status["found"] != true || status["tool"] != "edit_file" || status["ack_mode"] != "local" ||
+		status["disk_status"] != "committed" || status["mutation_id"] != mutationID {
+		return false
+	}
+	receipt, _ := ack["mutation_receipt"].(string)
+	digest, _ := ack["content_sha256"].(string)
+	commit, commitErr := strconvEditProbeUint(ack["commit_seq"])
+	observedCommit, observedErr := strconvEditProbeUint(status["commit_seq"])
+	return receipt != "" && status["receipt"] == receipt && digest != "" && status["content_sha256"] == digest &&
+		commitErr == nil && observedErr == nil && commit > 0 && observedCommit == commit
+}
+
 func checkEditProbeAccounting(status map[string]any, receipt string) editProbeAccounting {
 	return checkEditProbeAccountingWithAcknowledgement(status, receipt, "reindex_generation", nil, false)
 }
@@ -411,8 +446,8 @@ func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedFiel
 	return checkEditProbeAcknowledgementWithWaitDisposition(status, receipt, requestedField, sharedAcknowledgement, parseMayBeInapplicable, false)
 }
 
-// Existing callers stay strict. The batch-bound route may select an executed
-// local no-wait disposition only after original journal/ACK identity checks.
+// Callers stay strict unless the original committed ACK and receipt establish
+// local no-wait eligibility. The producer must still attest the skipped phase.
 func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }

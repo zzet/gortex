@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,9 @@ type editConsumerBaseline struct {
 }
 
 var editConsumerNames = []string{"consumer_rename", "consumer_verify", "consumer_dead_code", "consumer_detect"}
+var editConsumerGCXNames = []string{"consumer_rename_gcx", "consumer_verify_gcx", "consumer_dead_code_gcx"}
+
+const editConsumerDeadCodeLimit = 1000
 
 func isEditConsumer(name string) bool { return strings.HasPrefix(name, "consumer_") }
 
@@ -72,7 +76,21 @@ func editConsumerOracles(c Corpus) []editProbeOracle {
 }
 
 func editConsumerDeadCodeRequest() request {
-	return request{Tool: "analyze", Operation: "dead_code", Arguments: map[string]any{"kind": "dead_code", "options": map[string]any{"limit": 1000}}}
+	return request{Tool: "analyze", Operation: "dead_code", Arguments: map[string]any{"kind": "dead_code", "options": map[string]any{"limit": editConsumerDeadCodeLimit}}}
+}
+
+func editConsumerGCXOracles(ordinary []editProbeOracle) []editProbeOracle {
+	var companions []editProbeOracle
+	for _, oracle := range ordinary {
+		if oracle.name == "consumer_detect" {
+			continue
+		}
+		oracle.name += "_gcx"
+		oracle.call.Arguments = copyJSON(oracle.call.Arguments)
+		oracle.call.Arguments["output"] = map[string]any{"format": "gcx", "max_bytes": 0}
+		companions = append(companions, oracle)
+	}
+	return companions
 }
 
 func editConsumerUint(value any) (uint64, bool) {
@@ -282,16 +300,26 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 	if err != nil {
 		return err
 	}
+	name := strings.TrimSuffix(oracle.name, "_gcx")
+	requestedMode := r.stepProbeMode(s.step)
 	mode := r.probeOutput(oracle, s.step)
-	body, decodeErr := decodeEditProbeOutput(data, mode, oracle.call.name())
+	var body map[string]any
+	var decodeErr error
+	if mode == "gcx" {
+		requestedMode = "gcx"
+		body, mode, decodeErr = decodeEditConsumerGCXOutput(data, oracle.call.name())
+	} else {
+		body, decodeErr = decodeEditProbeOutput(data, mode, oracle.call.name())
+	}
 	state := "malformed"
 	if callErr != nil {
 		state = "error"
 	} else if decodeErr == nil && editConsumerPayloadValid(body) {
-		state = r.consumerVerdict(oracle.name, body, repo.Corpus, s.step)
+		state = r.consumerVerdict(name, body, repo.Corpus, s.step)
 	}
 	s.mu.Lock()
 	row := s.record.Consumers[oracle.name]
+	row.RequestedMode = requestedMode
 	row.Attempts++
 	postACK := !s.acknowledged.IsZero() && !identity.WriteStarted.IsZero() && !identity.WriteStarted.Before(s.acknowledged)
 	if callErr != nil || decodeErr != nil || state == "malformed" {
@@ -325,7 +353,14 @@ func (r *editProbeRuntime) observeConsumer(s *editProbeState, oracle editProbeOr
 	}
 	s.record.Consumers[oracle.name] = row
 	s.mu.Unlock()
-	return s.emit(map[string]any{"event": "consumer_probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": mode, "wire_id": identity.ID, "start_ns": editProbeOffset(identity.WriteStarted, r.origin), "end_ns": editProbeOffset(identity.Finished, r.origin), "post_ack": postACK, "state": state})
+	evidence := map[string]any{"event": "consumer_probe", "oracle": oracle.name, "requested_mode": requestedMode, "output_mode": mode, "wire_id": identity.ID, "start_ns": editProbeOffset(identity.WriteStarted, r.origin), "end_ns": editProbeOffset(identity.Finished, r.origin), "post_ack": postACK, "state": state}
+	if name == "consumer_rename" {
+		// A labelled partial can already contain the exact provisional site.
+		// Site coverage is independent of the freshness verdict.
+		evidence["rename_site_observed"] = postACK && (state == "subject_observed" ||
+			state == "pending" && editConsumerRename(body, repo.Corpus.File, s.step.Marker, r.plan.Callee))
+	}
+	return s.emit(evidence)
 }
 
 func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c Corpus, step editProbeStep) string {
@@ -344,6 +379,14 @@ func (r *editProbeRuntime) consumerVerdict(name string, body map[string]any, c C
 	}
 	if editConsumerPending(body, c.File, scope) {
 		if name != "consumer_dead_code" || editConsumerDeadPending(body, c.File, r.plan.Callee) {
+			return "pending"
+		}
+		return "malformed"
+	}
+	// Native GCX carries scalar scope metadata and typed pending_unknown rows.
+	// Its header cannot convey the general pending_files array.
+	if _, gcx := body[editConsumerGCXDeadCodeKey].(editConsumerGCXDeadCode); gcx && !editConsumerFresh(body) {
+		if name == "consumer_dead_code" && editConsumerDeadPending(body, c.File, r.plan.Callee) {
 			return "pending"
 		}
 		return "malformed"
@@ -418,15 +461,24 @@ func editConsumersFinished(rows map[string]editConsumerObservation) bool {
 	if len(rows) == 0 {
 		return true // the unchanged default profile has no consumer denominator
 	}
-	if len(rows) != len(editConsumerNames) {
+	names := editConsumerNames
+	if len(rows) == len(editConsumerNames)+len(editConsumerGCXNames) {
+		names = append(slices.Clone(names), editConsumerGCXNames...)
+	}
+	if len(rows) != len(names) {
 		return false
 	}
-	for _, name := range editConsumerNames {
+	for _, name := range names {
 		row, exists := rows[name]
 		if !exists {
 			return false
 		}
 		if row.PostACKAttempts == 0 && row.State != "unsupported" {
+			return false
+		}
+		// Keep looking within the original edit window when the latest
+		// post-ACK attempt failed and there is still no assessed answer.
+		if row.State == "error" && row.Assessed == 0 {
 			return false
 		}
 	}

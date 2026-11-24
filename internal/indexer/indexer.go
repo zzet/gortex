@@ -7244,7 +7244,7 @@ type incrementalPathMode struct {
 	publication   *PublicationStamps
 	readRepair    *ReadRepairObservation
 	relationsRead *relationsReadFrontier // optional point-only validated read coverage
-	onRelations   func()                 // resolver and file publication complete, before derived work
+	onRelations   func(bool)             // file publication complete; true means the owned rebind was refused
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph

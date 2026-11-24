@@ -38,8 +38,20 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 // A real completed leaf must still refuse a different physical publication.
 // This tests wire classification, never permission to replay that leaf.
 func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
-	for _, tc := range []struct{ legacy, operation string }{{"get_file_summary", "summary"}, {"get_editing_context", "editing_context"}} {
-		t.Run(tc.operation, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, legacy, operation string
+		capture                 bool
+	}{
+		{name: "summary", legacy: "get_file_summary", operation: "summary"},
+		{name: "summary_predicate", legacy: "get_file_summary", operation: "summary", capture: true},
+		{name: "editing_context", legacy: "get_editing_context", operation: "editing_context"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.capture {
+				t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "1")
+			} else {
+				t.Setenv("GORTEX_SEARCH_REFUSAL_EVIDENCE", "")
+			}
 			s, backend, base, path, _ := snapshotFacadeFixture(t)
 			idx, _ := s.indexerForRel("main.go")
 			require.NotNil(t, idx.Search)
@@ -89,7 +101,9 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			require.NoError(t, old.err)
 			require.NotNil(t, old.result)
 			require.False(t, old.result.IsError, resultText(old.result))
-			require.NoError(t, validateRequestProjections(old.ctx))
+			// The independent fixture oracle must never record the wire's first predicate.
+			oldFacts := context.WithValue(old.ctx, projectedSourceAllowanceKey{}, (*projectedSourceAllowance)(nil))
+			require.NoError(t, validateRequestProjections(oldFacts))
 			ack := snapshotRegisteredCall(t, s, base, 30, "edit", snapshotEditArgs(path, "NeighborBefore", "NeighborAfter"))
 			require.False(t, ack.IsError, resultText(ack))
 			fields := extractTextResult(t, ack)
@@ -98,7 +112,7 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			require.NoError(t, err)
 			require.Contains(t, string(raw), "NeighborAfter")
 			require.Equal(t, fields["content_sha256"], fmtReadSHA(raw))
-			require.ErrorIs(t, validateRequestProjections(old.ctx), projectionSuperseded)
+			require.ErrorIs(t, validateRequestProjections(oldFacts), projectionSuperseded)
 			require.True(t, time.Now().Before(deadline), "original150ms must be live at the actual physical peer transition")
 			unblock()
 			got := <-answered
@@ -106,10 +120,28 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			require.NoError(t, got.err)
 			t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t", fts, tc.operation, time.Until(deadline), got.result != nil && got.result.IsError)
 			requireReadFreshnessContract(t, got.result, "projection_superseded")
+			if tc.capture {
+				require.NotNil(t, got.result.Meta)
+				trace, ok := got.result.Meta.AdditionalFields["gortex_projection_predicate"].(map[string]any)
+				require.True(t, ok, "the real registered summary refusal must carry its predicate")
+				first, ok := trace["first_refusal"].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, float64(1), first["attempt"])
+				require.Equal(t, "owner_before", first["decision"])
+				require.NotEqual(t, first["selected_id"], first["current_id"])
+				require.Greater(t, first["current_source_seq"], first["selected_source_seq"])
+				wire, err := json.Marshal(got.result)
+				require.NoError(t, err)
+				require.LessOrEqual(t, len(wire), 4096)
+				require.NotContains(t, string(wire), path)
+				t.Logf("SUMMARY_PREDICATE_WIRE %s", wire)
+			} else if got.result.Meta != nil {
+				require.NotContains(t, got.result.Meta.AdditionalFields, "gortex_projection_predicate")
+			}
 			fresh := snapshotRegisteredCall(t, s, logical, 40, "read", map[string]any{"operation": tc.operation, "target": map[string]any{"file": path}, "output": map[string]any{"format": "json", "max_bytes": 0}})
 			require.False(t, fresh.IsError, resultText(fresh))
 			require.Contains(t, resultText(fresh), "NeighborAfter")
-			require.ErrorIs(t, validateRequestProjections(context.WithoutCancel(old.ctx)), projectionSuperseded, "old ownership stays invalid independently of completed RPC cancellation")
+			require.ErrorIs(t, validateRequestProjections(context.WithoutCancel(oldFacts)), projectionSuperseded, "old ownership stays invalid independently of completed RPC cancellation")
 		})
 	}
 }

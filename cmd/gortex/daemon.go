@@ -289,14 +289,15 @@ func runDaemonStart(cmd *cobra.Command, _ []string) error {
 	daemonEmbeddingsChanged = cmd.Flags().Changed("embeddings")
 
 	// The existing socket owner serves metadata before Store.Open can
-	// migrate. No graph/catalog/CWD admission runs in this temporary gate.
+	// migrate. Only lexical configuration and static tool metadata are
+	// available until the store-backed runtime is published.
 	metadataConfig, err := config.Load(cfgFile)
 	if err != nil {
 		startupReporter.Fail(err)
 		return fmt.Errorf("build daemon state: load config: %w", err)
 	}
 	applyToolPresetFlags(metadataConfig, daemonTools, daemonToolsMode)
-	metadata := newMigrationMetadataDispatcher(metadataConfig, logger, startupReporter)
+	metadata := newMigrationMetadataDispatcher(metadataConfig, gc.ReposSnapshot(), logger, startupReporter)
 	srv.MCPDispatcher = metadata
 	srv.Ready = func() (bool, string) { return false, metadata.phase() }
 	srv.CancelShutdownOwners, srv.JoinRuntimeWriter = startupReporter.Cancel, startupReporter.Stop

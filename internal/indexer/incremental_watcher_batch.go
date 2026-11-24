@@ -488,6 +488,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 				return
 			}
 			stats := idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
+			idx.observePointRebind(batch, stats)
 			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
@@ -514,7 +515,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		}
 		resolve.end()
 	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) && (idx.hasUncertifiedAliasPass() || result.retriedResolution) {
 		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, factFiles...), carriedRetryFiles...)
 		idx.recordPendingResolutionRetry(retrySaveFiles, !exact || len(retrySaveFiles) == 0 || namesWriteRefused, result.DerivedInvalidation)
 	}
@@ -524,8 +525,8 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		} else {
 			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
 		}
-		if mode.onRelations != nil && len(result.FailedFiles) == 0 && result.resolutionErr == nil {
-			mode.onRelations()
+		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+			mode.onRelations(batch.pointRebindRefused || result.resolutionErr != nil)
 		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 		derived := mode.publication.beginDerivedPatchLap()
@@ -535,9 +536,6 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	topologyChanged = incrementalTopologyChanged(result)
 	if err := idx.finishAliasPass(result); err != nil {
 		return result, err
-	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
-		return result, result.resolutionErr
 	}
 	return result, nil
 }
@@ -633,7 +631,11 @@ func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, front
 			w.markDeferredMutationTiers(frontier)
 		}
 		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, publication: stamps,
-			onRelations: func() { w.markRelationsFrontier(frontier) }}
+			onRelations: func(refused bool) {
+				if !refused {
+					w.markRelationsFrontier(frontier)
+				}
+			}}
 		var err error
 		stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
 		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
@@ -749,6 +751,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 				return
 			}
 			stats := mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
+			idx.observePointRebind(batch, stats)
 			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
@@ -837,7 +840,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		cross.end()
 	}
-	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) && (idx.hasUncertifiedAliasPass() || result.retriedResolution) {
 		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, crossRepoFiles...), carriedRetryFiles...)
 		idx.recordPendingResolutionRetry(retrySaveFiles, wide || len(retrySaveFiles) == 0, result.DerivedInvalidation)
 	}

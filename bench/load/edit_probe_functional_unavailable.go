@@ -97,7 +97,11 @@ func knownFunctionalPhase(name string) bool {
 }
 
 func functionalUnavailableAccounting(a editProbeAccounting) bool {
-	return a.State == "terminal_unavailable_background" && a.A != nil && receiptproof.Window(*a.A).Complete() && a.P == nil && a.B == nil && a.R == nil && a.Shared == nil
+	// The strict accounting decoder keeps an absent independent winner as
+	// unavailable. The separate functional proof still validates its exact
+	// owned immutable absence; no P/B or winner identity is inferred here.
+	state := a.State == "terminal_unavailable_background" || a.State == "unavailable" && a.Requested > 0 && a.Applied > a.Requested
+	return state && a.A != nil && receiptproof.Window(*a.A).Complete() && a.P == nil && a.B == nil && a.R == nil && a.Shared == nil
 }
 
 func classifyFunctionalUnavailableRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {

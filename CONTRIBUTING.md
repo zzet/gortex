@@ -59,6 +59,10 @@ A cold build compiles several hundred vendored tree-sitter grammars, so expect
 minutes rather than seconds the first time. Later builds hit the Go build cache
 and are fast.
 
+Add `-trimpath` (as `AGENTS.md` and the Makefile do) if you work in more than
+one worktree: it keeps the Go build cache shared between them, at the cost of
+module-relative paths in stack traces. CI builds untrimmed.
+
 `make build` does the same thing but adds `-tags llama` for the in-process
 llama.cpp LLM provider. The plain `go build` above is the configuration CI
 checks and is the right default for most work. Other optional build tags:

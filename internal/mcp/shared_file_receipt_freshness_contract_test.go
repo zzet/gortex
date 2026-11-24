@@ -46,6 +46,11 @@ func (s *sharedReceiptFreshContractStore) BulkSetFileMtimes(repo string, mtimes 
 }
 func newSharedReceiptFreshContractFixture(t *testing.T) (*sharedReceiptFixture, *sharedReceiptFreshContractStore, *sharedReceiptFreshContractWatcher) {
 	t.Helper()
+	return newSharedReceiptFreshContractFixtureWithRetirement(t, true)
+}
+
+func newSharedReceiptFreshContractFixtureWithRetirement(t *testing.T, autoRetirement bool) (*sharedReceiptFixture, *sharedReceiptFreshContractStore, *sharedReceiptFreshContractWatcher) {
+	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc Target() {}\n// stream-0-tail\n// stream-1-tail\n"), 0600))
@@ -62,6 +67,11 @@ func newSharedReceiptFreshContractFixture(t *testing.T) (*sharedReceiptFixture, 
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	s := NewServer(query.NewEngine(store), store, idx, nil, logger, nil)
+	if !autoRetirement {
+		// Indexing still publishes through the real store. The test controls
+		// the later canonical projection acknowledgement explicitly.
+		s.graph = &projectionRetirementCoreOnlyStore{Store: store}
+	}
 	closeLog := sync.OnceFunc(func() { s.DrainBackground(); s.queryLog.Close() })
 	t.Cleanup(closeLog)
 	s.editAckMode = config.EditAckLocal

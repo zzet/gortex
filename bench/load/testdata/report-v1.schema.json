@@ -1478,10 +1478,16 @@
                         "evidence_bytes": {
                           "type": "integer"
                         },
+                        "evidence_codec": {
+                          "type": "string"
+                        },
                         "evidence_encode_ms": {
                           "type": "number"
                         },
                         "evidence_limit_bytes": {
+                          "type": "integer"
+                        },
+                        "evidence_logical_jsonl_bytes": {
                           "type": "integer"
                         },
                         "evidence_write_ms": {
@@ -3325,6 +3331,9 @@
                           "array",
                           "null"
                         ]
+                      },
+                      "own_ack_readback_only": {
+                        "type": "boolean"
                       },
                       "probe_period_ns": {
                         "type": "integer"
@@ -5717,6 +5726,9 @@
                     "array",
                     "null"
                   ]
+                },
+                "own_ack_readback_only": {
+                  "type": "boolean"
                 },
                 "probe_period_ns": {
                   "type": "integer"
