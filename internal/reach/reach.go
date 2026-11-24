@@ -549,6 +549,9 @@ type repoCoupling struct {
 	// pending holds what mutations learned while the read was in flight.
 	pending [][2]string
 	parent  map[string]string
+	// lastRead is the last read of the whole store, or a later read of one
+	// mutation's frontier that missed, for Topology.
+	lastRead couplingRead
 }
 
 // couplingReadBudget bounds each coupling read. A store whose read misses it
@@ -603,7 +606,7 @@ func (c *repoCoupling) component(prefix string) []string {
 // stays missed.
 func (c *repoCoupling) reset(g graph.Store) {
 	if c.store != g {
-		c.missed = false
+		c.missed, c.lastRead = false, couplingRead{}
 	}
 	c.store, c.epoch = g, c.epoch+1
 	c.ready, c.seeding, c.pending, c.parent = false, false, nil, nil
@@ -647,6 +650,7 @@ func ensureRepoCoupling(g graph.Store) {
 // snapshot can miss edges of a mutation that runs beside it; such a mutation
 // learns its own couplings into pending, which the read adds on landing.
 func readRepoCoupling(g graph.Store, source repoCouplingSource, epoch uint64) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
 	pairs, err := source.RepoCouplingPairs(ctx)
 	cancel()
@@ -654,9 +658,14 @@ func readRepoCoupling(g graph.Store, source repoCouplingSource, epoch uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c := &t.coupling
-	if c.store != g || c.epoch != epoch {
+	if c.store != g {
 		return
 	}
+	if c.epoch != epoch {
+		c.lastRead = endCouplingRead(couplingScopeStore, started, nil, true)
+		return
+	}
+	c.lastRead = endCouplingRead(couplingScopeStore, started, err, false)
 	if err != nil {
 		c.miss()
 		return
@@ -683,6 +692,7 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	if !wanted {
 		return
 	}
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
 	pairs, err := source.RepoCouplingPairsForFiles(ctx, frontier)
 	cancel()
@@ -693,6 +703,7 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	case c.store != g || c.epoch != epoch:
 		// Forgotten meanwhile: the next read sees these edges.
 	case err != nil:
+		c.lastRead = endCouplingRead(couplingScopeFrontier, started, err, false)
 		c.miss()
 	case c.seeding:
 		c.pending = append(c.pending, pairs...)

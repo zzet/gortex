@@ -2,6 +2,7 @@ package reach
 
 import (
 	"context"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,6 +92,12 @@ func TestRepoTopologyMutationsHoldOnlyTheirRepository(t *testing.T) {
 	store := repoTopologyStore(t)
 	awaitRepoCoupling(t, store)
 	finishA := BeginRepoTopologyMutation(store, "a")
+	status := Topology(store, "a", "b")
+	if want := []RepositoryTopologyGate{{Repo: "a", TopologyGate: TopologyGate{Writers: 1}}, {Repo: "b"}}; status.Coupling != "ready" ||
+		status.WholeGraph != (TopologyGate{}) || !reflect.DeepEqual(status.Repositories, want) {
+		finishA(false, nil)
+		t.Fatalf("topology status beside a mutation of a = %+v, want coupling ready, only a's gate held", status)
+	}
 
 	finishB, ok := admitted(func() func(bool, []string) { return BeginRepoTopologyMutation(store, "b") })
 	if !ok {
@@ -222,6 +229,9 @@ func TestWholeGraphMutationForgetsRepoCoupling(t *testing.T) {
 func TestRepoTopologyMutationWithoutCouplingHoldsTheWholeGraph(t *testing.T) {
 	g, ids := newCallChain(t, 3)
 	BuildIndex(g)
+	if coupling := Topology(g).Coupling; coupling != "unsupported" {
+		t.Fatalf("coupling of a store without a coupling source = %q, want unsupported", coupling)
+	}
 	BeginRepoTopologyMutation(g, "b")(true, []string{})
 	if _, _, _, hit, _ := LookupCached(g, ids[2]); hit {
 		t.Fatal("a repository mutation of a store without coupling kept unrelated records")
@@ -253,6 +263,10 @@ func TestRepoTopologyMutationDoesNotWaitForTheCouplingRead(t *testing.T) {
 	store := &slowCouplingStore{Store: repoTopologyStore(t), release: make(chan struct{})}
 	started := time.Now()
 	finish := BeginRepoTopologyMutation(store, "b")
+	if status := Topology(store); status.Coupling != "reading" || status.WholeGraph.Writers != 1 || status.LastRead != nil {
+		finish(false, nil)
+		t.Fatalf("topology status while the coupling is read = %+v, want reading, the mutation holding the whole graph", status)
+	}
 	store.AddBatch(nil, []*graph.Edge{{From: seedB, To: seedA, Kind: graph.EdgeReferences, Confidence: 1}})
 	finish(true, []string{"b/b.go"})
 	if waited := time.Since(started); waited > time.Second {
@@ -261,6 +275,10 @@ func TestRepoTopologyMutationDoesNotWaitForTheCouplingRead(t *testing.T) {
 
 	close(store.release)
 	awaitCoupling(t, store, func(c *repoCoupling) bool { return c.ready })
+	if status := Topology(store); status.Coupling != "ready" || status.LastRead == nil ||
+		status.LastRead.Scope != "store" || status.LastRead.Outcome != "ready" || status.LastRead.TookMS <= 0 {
+		t.Fatalf("topology status after the read landed = %+v, want ready with the store read recorded", status)
+	}
 	BuildIndex(store)
 	BeginRepoTopologyMutation(store, "b")(true, []string{})
 	if _, _, _, hit, _ := LookupCached(store, seedA); hit {
@@ -275,6 +293,10 @@ func TestFailedCouplingReadIsNotRetried(t *testing.T) {
 	BeginRepoTopologyMutation(store, "b")(false, nil)
 	close(store.release)
 	awaitCoupling(t, store, func(c *repoCoupling) bool { return c.missed })
+	if status := Topology(store); status.Coupling != "missed" || status.LastRead == nil ||
+		status.LastRead.Scope != "store" || status.LastRead.Outcome != "timed_out" {
+		t.Fatalf("topology status after a read ran out of budget = %+v, want missed with a timed-out store read", status)
+	}
 
 	BuildIndex(store)
 	BeginRepoTopologyMutation(store, "b")(true, []string{"b/b.go"})
