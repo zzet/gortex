@@ -462,8 +462,7 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 			}
 			return
 		}
-		fullDir := filePathDir(file.FilePath)
-		if fullDir == rewritten || strings.HasSuffix(fullDir, "/"+rewritten) {
+		if dirMatchesImport(filePathDir(file.FilePath), rewritten) {
 			crossRepoAll = append(crossRepoAll, file)
 		}
 	}

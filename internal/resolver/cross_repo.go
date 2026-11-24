@@ -747,6 +747,9 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
 	defer cr.clearRequireCache()
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
+	if len(edges) == 0 {
+		return stats
+	}
 	restubbed, _ := cr.resolveTrackedNpmImportsScoped(context.Background(), edges, stats)
 	pending := make([]*graph.Edge, 0, len(edges)+len(restubbed))
 	seen := make(map[graph.EdgeIdentity]struct{}, len(edges)+len(restubbed))

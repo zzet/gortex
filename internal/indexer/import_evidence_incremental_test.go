@@ -504,4 +504,124 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("TrackRepoCtx for competing or higher-priority provider discovers already-resolved ES import consumers", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				var g graph.Store = graph.New()
+				if backend == "sqlite" {
+					db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, db.Close()) })
+					g = db
+				}
+				provA, provB, provC, consumer := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+				writePackageJSON(t, provA, `{"name":"p","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, provA, "index.ts", "export function f() { return 1; }\n")
+				writePackageJSON(t, provB, `{"name":"p","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, provB, "index.ts", "export function f() { return 2; }\n")
+				writePackageJSON(t, provC, `{"name":"p","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, provC, "index.ts", "export function f() { return 3; }\n")
+				writePackageJSON(t, consumer, `{"name":"app","dependencies":{"p":"^1"}}`)
+				writeWorkspaceFile(t, consumer, ".gortex.yaml", "workspace: wsB\ncross_workspace_deps:\n  - workspace: wsA\n    modules: [p]\n    mode: read-only\n")
+				writeWorkspaceFile(t, consumer, "app.ts", "import { f } from 'p'\nexport function run() { return f(); }\n")
+
+				reg := newTestRegistry()
+				reg.Register(languages.NewTypeScriptExtractor())
+				mi := NewMultiIndexer(g, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+				t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+				esCall := func() *graph.Edge {
+					t.Helper()
+					var found []*graph.Edge
+					for _, edge := range g.GetOutEdges("app/app.ts::run") {
+						if edge.Kind == graph.EdgeCalls {
+							found = append(found, edge)
+						}
+					}
+					require.Len(t, found, 1)
+					return found[0]
+				}
+
+				_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provA", Path: provA, Workspace: "wsA"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "app", Path: consumer, Workspace: "wsB"})
+				require.NoError(t, err)
+				require.Equal(t, "provA/index.ts::f", esCall().To)
+
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provB", Path: provB, Workspace: "wsB"})
+				require.NoError(t, err)
+				require.Equal(t, "provB/index.ts::f", esCall().To)
+				require.True(t, esCall().CrossRepo)
+
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provC", Path: provC, Workspace: "wsB"})
+				require.NoError(t, err)
+				c := esCall()
+				require.Equal(t, graph.UnresolvedMarker+"f", c.To)
+				require.False(t, c.CrossRepo)
+			})
+		}
+	})
+
+	t.Run("npmConsumerFilesForRepo skips cross-repo edge hydration for non-provider repos", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				var base graph.Store = graph.New()
+				if backend == "sqlite" {
+					db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, db.Close()) })
+					base = db
+				}
+				counting := &candidateCountingStore{Store: base}
+				prov, consumer, goRepo, unnamedJS := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+				writePackageJSON(t, prov, `{"name":"p","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, prov, "index.ts", "export function f() { return 1; }\n")
+				writePackageJSON(t, consumer, `{"name":"app","dependencies":{"p":"^1"}}`)
+				writeWorkspaceFile(t, consumer, "app.ts", "import { f } from 'p'\nexport function viaES() { return f(); }\nexport function viaReq() { const { f } = require('p'); return f(); }\n")
+				writeWorkspaceFile(t, goRepo, "go.mod", "module example.com/g\n\ngo 1.23\n")
+				writeWorkspaceFile(t, goRepo, "main.go", "package main\nfunc main() {}\n")
+				writePackageJSON(t, unnamedJS, `{"private":true}`)
+				writeWorkspaceFile(t, unnamedJS, "index.js", "export function noop() { return 0 }\n")
+
+				reg := newTestRegistry()
+				reg.Register(languages.NewJavaScriptExtractor())
+				reg.Register(languages.NewTypeScriptExtractor())
+				reg.Register(languages.NewGoExtractor())
+				mi := NewMultiIndexer(counting, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+				t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+				_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "prov", Path: prov, Workspace: "shared"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "app", Path: consumer, Workspace: "shared"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "gorepo", Path: goRepo, Workspace: "shared"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "unnamed", Path: unnamedJS, Workspace: "shared"})
+				require.NoError(t, err)
+
+				// Neither gorepo nor unnamed declares any npm package; scanning
+				// consumers for them must perform zero GetEdgeCandidates hydrations.
+				counting.candidateCalls = 0
+				assert.Empty(t, mi.npmConsumerFilesForRepo("gorepo"))
+				assert.Empty(t, mi.npmConsumerFilesForRepo("unnamed"))
+				assert.Zero(t, counting.candidateCalls, "non-provider repos must not hydrate workspace cross-repo JS/TS edges")
+
+				// Provider repo DOES hydrate and find app/app.ts.
+				counting.candidateCalls = 0
+				assert.Equal(t, []string{"app/app.ts"}, mi.npmConsumerFilesForRepo("prov"))
+				assert.Positive(t, counting.candidateCalls)
+			})
+		}
+	})
+}
+
+type candidateCountingStore struct {
+	graph.Store
+	candidateCalls int
+}
+
+func (s *candidateCountingStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
+	s.candidateCalls++
+	return s.Store.GetEdgeCandidates(endpoints, sites)
 }

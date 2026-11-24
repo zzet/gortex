@@ -493,15 +493,76 @@ func TestImportEvidence_LocalRequirePrefersDirectBarrelSymbol(t *testing.T) {
 				})
 			}
 
-			// Renamed export { other as init } must NOT mark a private `init` as js_named_export.
-			g := buildGraphFromSources(t, map[string]string{
-				"lib/impl" + ext:   "export function init() { return 2 }\n",
-				"lib/barrel" + ext: "function other() { return 3 }\nfunction init() { return 1 }\nexport { other as init }\nexport * from './impl'\n",
-				"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+			// Renamed exports (identifier, JS default keyword, and string aliases)
+			// must NOT mark a private `init` as js_named_export.
+			renamedCases := map[string]string{
+				"export other as init":    "function other() { return 3 }\nfunction init() { return 1 }\nexport { other as init }\nexport * from './impl'\n",
+				"export init as string":   "function init() { return 1 }\nexport { init as \"other\" }\nexport * from './impl'\n",
+				"export init as str def":  "function init() { return 1 }\nexport { init as \"default\" }\nexport * from './impl'\n",
+				"export init as default":  "function init() { return 1 }\nexport { init as default }\nexport * from './impl'\n",
+			}
+			for name, barrelSrc := range renamedCases {
+				exts := []string{ext}
+				if ext == ".ts" {
+					exts = []string{".ts", ".tsx"}
+				}
+				for _, bx := range exts {
+					t.Run(name+"/"+bx, func(t *testing.T) {
+						g := buildGraphFromSources(t, map[string]string{
+							"lib/impl" + ext:  "export function init() { return 2 }\n",
+							"lib/barrel" + bx: barrelSrc,
+							"app/caller" + bx: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+						})
+						New(g).ResolveAll()
+						require.Empty(t, callsInto(g, "lib/barrel"+bx+"::init"))
+						require.Len(t, callsInto(g, "lib/impl"+ext+"::init"), 1)
+					})
+				}
+			}
+
+			// String alias matching the original binding name (`export { init as "init" }`)
+			// IS a valid unrenamed named export.
+			t.Run("export init as same string", func(t *testing.T) {
+				g := buildGraphFromSources(t, map[string]string{
+					"lib/impl" + ext:   "export function init() { return 2 }\n",
+					"lib/barrel" + ext: "function init() { return 1 }\nexport { init as \"init\" }\nexport * from './impl'\n",
+					"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+				})
+				New(g).ResolveAll()
+				require.Len(t, callsInto(g, "lib/barrel"+ext+"::init"), 1)
+				require.Empty(t, callsInto(g, "lib/impl"+ext+"::init"))
 			})
-			New(g).ResolveAll()
-			require.Empty(t, callsInto(g, "lib/barrel"+ext+"::init"))
-			require.Len(t, callsInto(g, "lib/impl"+ext+"::init"), 1)
+
+			// Non-top-level declarations (nested functions, nested arrows, named
+			// function expressions, TS namespace functions) must NOT be stamped
+			// js_named_export by a local `export { init }` clause.
+			nonTopCases := map[string]string{
+				"nested function":      "export function setup() { function init() { return 1 }; return init() }\nexport { init }\nexport * from './impl'\n",
+				"nested arrow":         "export function setup() { const init = () => 1; return init() }\nexport { init }\nexport * from './impl'\n",
+				"named function expr":  "export const wrap = function init() { return 1 }\nexport { init }\nexport * from './impl'\n",
+			}
+			if ext == ".ts" {
+				nonTopCases["ts namespace function"] = "namespace Internal { export function init() { return 1 } }\nexport { init }\nexport * from './impl'\n"
+			}
+			for name, barrelSrc := range nonTopCases {
+				t.Run("non-top-level/"+name, func(t *testing.T) {
+					g := buildGraphFromSources(t, map[string]string{
+						"lib/impl" + ext:   "export function init() { return 2 }\n",
+						"lib/barrel" + ext: barrelSrc,
+						"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+					})
+					if node := g.GetNode("lib/barrel" + ext + "::init"); node != nil {
+						require.NotEqual(t, true, node.Meta["js_named_export"])
+					}
+					New(g).ResolveAll()
+					for _, c := range callsInto(g, "lib/barrel"+ext+"::init") {
+						require.NotEqual(t, "app/caller"+ext+"::run", c.From, "caller must not bind non-top-level %s", name)
+					}
+					implCalls := callsInto(g, "lib/impl"+ext+"::init")
+					require.Len(t, implCalls, 1)
+					require.Equal(t, "app/caller"+ext+"::run", implCalls[0].From)
+				})
+			}
 		})
 	}
 
@@ -606,6 +667,32 @@ func TestImportEvidence_LocalRequireResolvesCrossRepo(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("cross-repo bare single-segment require never grabs foreign directories", func(t *testing.T) {
+		for _, ext := range []string{".js", ".ts"} {
+			t.Run(ext, func(t *testing.T) {
+				g := buildGraphFromSources(t, map[string]string{
+					"lib/src/internal/events/index" + ext: "export function emit() { return 1 }\n",
+					"lib/logger/index" + ext:              "export function log() { return 1 }\n",
+					"app/web/handler" + ext:               "export function run() { const { emit } = require('events'); const { log } = require('logger'); return emit() + log() }\n",
+				})
+				for _, n := range g.AllNodes() {
+					if strings.HasPrefix(n.FilePath, "lib/") {
+						n.RepoPrefix = "lib"
+					} else {
+						n.RepoPrefix = "app"
+					}
+					n.WorkspaceID = "shared"
+				}
+				New(g).ResolveAll()
+				NewCrossRepo(g).ResolveAll()
+				require.Empty(t, callsInto(g, "lib/src/internal/events/index"+ext+"::emit"))
+				require.Empty(t, callsInto(g, "lib/logger/index"+ext+"::log"))
+				require.NotNil(t, findCallEdge(g, "app/web/handler"+ext+"::run", graph.UnresolvedMarker+"emit"))
+				require.NotNil(t, findCallEdge(g, "app/web/handler"+ext+"::run", graph.UnresolvedMarker+"log"))
+			})
+		}
+	})
 
 	t.Run("cross-repo tracked npm package and isolation", func(t *testing.T) {
 		g := buildGraphFromSources(t, map[string]string{
@@ -757,6 +844,8 @@ func TestImportEvidence_CrossRepoScopedPassPreservesOutOfScopeRequire(t *testing
 				"provA/index.ts": "export function work() { return 1 }\n",
 				"provB/index.ts": "export function work() { return 2 }\n",
 				"other/x.ts":     "export function noop() { return 0 }\n",
+				"other/empty.ts": "// comment-only file with zero out-edges\n",
+				"emptyRepo/a.ts": "export {}\n",
 				"app/main.ts":    "export function viaReq() { const { work } = require('p'); return work() }\n",
 			}
 			rawNodes, rawEdges := extractRawSources(t, files)
@@ -770,6 +859,9 @@ func TestImportEvidence_CrossRepoScopedPassPreservesOutOfScopeRequire(t *testing
 					n.WorkspaceID = "wsB"
 				case strings.HasPrefix(n.FilePath, "other/"):
 					n.RepoPrefix = "other"
+					n.WorkspaceID = "wsB"
+				case strings.HasPrefix(n.FilePath, "emptyRepo/"):
+					n.RepoPrefix = "emptyRepo"
 					n.WorkspaceID = "wsB"
 				default:
 					n.RepoPrefix = "app"
@@ -812,11 +904,14 @@ func TestImportEvidence_CrossRepoScopedPassPreservesOutOfScopeRequire(t *testing
 			cr.ResolveAll()
 			require.Len(t, callsInto(store, "provA/index.ts::work"), 1)
 
-			// Add provB, then run scoped passes that do NOT include app/main.ts.
+			// Add provB, then run scoped passes that do NOT include app/main.ts
+			// (including 0-edge files and empty repos where edges == nil).
 			// Out-of-scope app/main.ts::viaReq must NOT be orphaned.
 			providers["provB"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provB/index.ts"}}
 			cr.ResolveForRepo("provB")
+			cr.ResolveForRepo("emptyRepo")
 			cr.ResolveForFile("other", "x.ts")
+			cr.ResolveForFile("other", "empty.ts")
 			cr.ResolveFilesAndIncoming([]string{"other/x.ts"})
 
 			callsA := callsInto(store, "provA/index.ts::work")
@@ -978,15 +1073,23 @@ func TestImportEvidence_CrossRepoNpmAliasSiblingImportNoChurn(t *testing.T) {
 
 type cancelAfterPagesStore struct {
 	graph.Store
-	cancelAfter int
-	pages       int
-	cancel      context.CancelFunc
-	reindexIDs  []graph.EdgeIdentity
+	cancelAfter   int
+	pages         int
+	sitesHydrated int
+	importSites   int
+	cancel        context.CancelFunc
+	reindexIDs    []graph.EdgeIdentity
 }
 
 func (s *cancelAfterPagesStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
 	res := s.Store.GetEdgeCandidates(endpoints, sites)
 	s.pages++
+	s.sitesHydrated += len(sites)
+	for _, site := range sites {
+		if site.Kind == graph.EdgeImports {
+			s.importSites++
+		}
+	}
 	if s.cancel != nil && s.pages >= s.cancelAfter {
 		s.cancel()
 	}
@@ -1079,8 +1182,10 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 			{ID: "provA/index.ts::workA", Kind: graph.KindFunction, Name: "workA", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
 			{ID: "provA/index.ts::workB", Kind: graph.KindFunction, Name: "workB", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
 		}
+		// Insert resolvePendingPageRows unique pad sites + 2 EdgeCrossRepoCalls
+		// sharing {shared, 1}, yielding resolvePendingPageRows+1 unique sites (2 pages).
 		edges := make([]*graph.Edge, 0, (resolvePendingPageRows+2)*2)
-		for i := 0; i < resolvePendingPageRows-1; i++ {
+		for i := 0; i < resolvePendingPageRows; i++ {
 			fnID := fmt.Sprintf("app/main.ts::pad%d", i)
 			nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("pad%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
 			call := &graph.Edge{
@@ -1112,12 +1217,151 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 		memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
 		cr.restubStaleTrackedNpmRequireCallsAll(context.Background(), memo)
 
+		require.Equal(t, 2, wrapped.pages, "expected 2 hydration pages to run")
+		require.Equal(t, resolvePendingPageRows+1, wrapped.sitesHydrated, "siteSeen must deduplicate {shared, 1} before paging")
 		seenReindex := make(map[graph.EdgeIdentity]int)
 		for _, id := range wrapped.reindexIDs {
 			seenReindex[id]++
 			require.Equal(t, 1, seenReindex[id], "duplicate ReindexEdges for %+v", id)
 		}
-		require.Equal(t, resolvePendingPageRows+1, len(wrapped.reindexIDs))
+		require.Equal(t, resolvePendingPageRows+2, len(wrapped.reindexIDs))
+	})
+}
+
+func TestImportEvidence_CrossRepoNpmPrepassSkipsNonImportEdges(t *testing.T) {
+	t.Run("ResolveForFile with cross-repo require and zero EdgeImports issues no EdgeImports hydration", func(t *testing.T) {
+		g := buildGraphFromSources(t, map[string]string{
+			"prov/index.ts": "export function work() { return 1 }\n",
+			"app/main.ts":   "export function run() { const { work } = require('p'); return work() }\n",
+		})
+		for _, n := range g.AllNodes() {
+			if strings.HasPrefix(n.FilePath, "prov/") {
+				n.RepoPrefix = "prov"
+			} else {
+				n.RepoPrefix = "app"
+			}
+			n.WorkspaceID = "shared"
+		}
+		npmDep := func(_, spec string) bool { return spec == "p" }
+		npmPkgs := func(spec string) map[string]NpmPackageTarget {
+			if spec != "p" {
+				return nil
+			}
+			return map[string]NpmPackageTarget{"prov": {WorkspaceID: "shared", Entries: []string{"prov/index.ts"}}}
+		}
+		r := New(g)
+		r.SetNpmDependencyLookup(npmDep)
+		r.ResolveAll()
+
+		wrapped := &cancelAfterPagesStore{Store: g}
+		cr := NewCrossRepo(wrapped)
+		cr.SetNpmDependencyLookup(npmDep)
+		cr.SetNpmPackageLookup(npmPkgs)
+		cr.ResolveAll()
+		require.Len(t, callsInto(g, "prov/index.ts::work"), 1)
+
+		wrapped.importSites = 0
+		cr.ResolveForFile("app", "main.ts")
+		require.Zero(t, wrapped.importSites, "resolveTrackedNpmImportsPass must not hydrate EdgeCalls as EdgeImports")
+	})
+
+	t.Run("single-line top-level require plus import retargets cleanly", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				files := map[string]string{
+					"provA/index.ts": "export function work() { return 1 }\n",
+					"provB/index.ts": "export function work() { return 2 }\n",
+					"app/main.ts":    "{ const { work } = require('p'); work() }; import { work } from 'p'\n",
+				}
+				rawNodes, rawEdges := extractRawSources(t, files)
+				for _, n := range rawNodes {
+					switch {
+					case strings.HasPrefix(n.FilePath, "provA/"):
+						n.RepoPrefix = "provA"
+						n.WorkspaceID = "wsA"
+					case strings.HasPrefix(n.FilePath, "provB/"):
+						n.RepoPrefix = "provB"
+						n.WorkspaceID = "wsB"
+					default:
+						n.RepoPrefix = "app"
+						n.WorkspaceID = "wsB"
+					}
+				}
+				var store graph.Store = graph.New()
+				if backend == "sqlite" {
+					sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					defer sq.Close()
+					store = sq
+				}
+				store.AddBatch(rawNodes, rawEdges)
+
+				npmDep := func(_, spec string) bool { return spec == "p" }
+				providers := map[string]NpmPackageTarget{
+					"provA": {WorkspaceID: "wsA", Entries: []string{"provA/index.ts"}},
+				}
+				r := New(store)
+				r.SetNpmDependencyLookup(npmDep)
+				r.ResolveAll()
+
+				cr := NewCrossRepo(store)
+				cr.SetNpmDependencyLookup(npmDep)
+				cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+					if spec != "p" {
+						return nil
+					}
+					return providers
+				})
+				cr.SetCrossWorkspaceDepLookup(func(sourceWS string) []CrossWorkspaceDepRule {
+					if sourceWS == "wsB" {
+						return []CrossWorkspaceDepRule{{Workspace: "wsA", Modules: []string{"p"}}}
+					}
+					return nil
+				})
+				cr.ResolveAll()
+				require.Len(t, callsInto(store, "provA/index.ts::work"), 1)
+
+				providers["provB"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provB/index.ts"}}
+				cr.ResolveForFile("app", "main.ts")
+				require.Empty(t, callsInto(store, "provA/index.ts::work"))
+				require.Len(t, callsInto(store, "provB/index.ts::work"), 1)
+			})
+		}
+	})
+}
+
+func TestImportEvidence_CrossRepoRequireCacheClearedOnLookupClearAndNoRevYield(t *testing.T) {
+	t.Run("clearLookupCache flushes require caches", func(t *testing.T) {
+		cr := NewCrossRepo(graph.New())
+		cr.outEdgesByFile = map[string][]*graph.Edge{"a.ts": nil}
+		cr.requireTargetCache = map[string]jsRequireTarget{"a.ts\x00p": {target: "prov/index.ts"}}
+		cr.clearLookupCache()
+		require.Nil(t, cr.outEdgesByFile)
+		require.Nil(t, cr.requireTargetCache)
+	})
+
+	t.Run("chunk yield without mutationRevisioner flushes require cache", func(t *testing.T) {
+		t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+		g := buildGraphFromSources(t, map[string]string{
+			"app/main.ts": "export function run1() { const { work } = require('missing-p'); return work() }\nexport function run2() { const { work } = require('missing-p'); return work() }\n",
+		})
+		for _, n := range g.AllNodes() {
+			n.RepoPrefix = "app"
+			n.WorkspaceID = "shared"
+		}
+		// outEdgesCountingStore embeds the graph.Store interface, so it does NOT
+		// implement mutationRevisioner (revKnown == false). Because both calls stay
+		// unresolved (len(scBatch) == 0), ONLY the !revKnown yield clears the cache.
+		wrapped := &outEdgesCountingStore{Store: g}
+		var npmCalls atomic.Int64
+		cr := NewCrossRepo(wrapped)
+		cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "missing-p" })
+		cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+			npmCalls.Add(1)
+			return nil
+		})
+		cr.ResolveAll()
+		require.Equal(t, int64(2), npmCalls.Load(), "!revKnown yield must flush requireTargetCache between chunks")
 	})
 }
 

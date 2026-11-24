@@ -10,12 +10,28 @@ import (
 
 // A same-named declaration is not necessarily the value imported by name:
 // `export { other as work }` can coexist with a private `work`.
-func jsNamedExportMeta(decl *sitter.Node, meta map[string]any) map[string]any {
-	parent := decl.Parent()
-	if parent == nil || parent.Type() != "export_statement" || findChildByType(parent, "default") != nil {
+func jsNamedExportMeta(decl *sitter.Node, name string, localExports map[string]bool, meta map[string]any) map[string]any {
+	if decl == nil {
 		return meta
 	}
-	if scope := parent.Parent(); scope == nil || scope.Type() != "program" {
+	parent := decl.Parent()
+	if parent == nil {
+		return meta
+	}
+	exported := false
+	switch {
+	case parent.Type() == "export_statement" && findChildByType(parent, "default") == nil:
+		if scope := parent.Parent(); scope != nil && scope.Type() == "program" {
+			exported = true
+		}
+	case localExports[name] && decl.Type() != "function_expression" && decl.Type() != "generator_function":
+		if parent.Type() == "program" {
+			exported = true
+		} else if parent.Type() == "export_statement" && parent.Parent() != nil && parent.Parent().Type() == "program" {
+			exported = true
+		}
+	}
+	if !exported {
 		return meta
 	}
 	if meta == nil {
@@ -25,13 +41,77 @@ func jsNamedExportMeta(decl *sitter.Node, meta map[string]any) map[string]any {
 	return meta
 }
 
-// stampJSLocalExportClauses stamps js_named_export on top-level declarations
-// exported by separate-clause `export { foo }` statements (without `from`).
-// Renamed clauses like `export { other as foo }` are excluded so a private
-// `foo` cannot hijack an aliased export.
-func stampJSLocalExportClauses(root *sitter.Node, src []byte, fileID string, nodes []*graph.Node) {
-	if root == nil || len(nodes) == 0 {
-		return
+// jsLocalExportSpecifierName returns the local binding name of a local
+// `export_specifier` when it is exported under its own name (`export { init }`,
+// `export { init as init }`, `export { init as "init" }`), or "" when renamed
+// (including `export { init as default }` and `export { init as "other" }`).
+func jsLocalExportSpecifierName(sp *sitter.Node, src []byte) string {
+	if sp == nil {
+		return ""
+	}
+	nameNode := sp.ChildByFieldName("name")
+	if nameNode == nil {
+		for i := 0; i < int(sp.NamedChildCount()); i++ {
+			if c := sp.NamedChild(i); c != nil && c.Type() == "identifier" {
+				nameNode = c
+				break
+			}
+		}
+	}
+	if nameNode == nil || nameNode.Type() != "identifier" {
+		return ""
+	}
+	orig := nameNode.Content(src)
+	if orig == "" {
+		return ""
+	}
+	aliasNode := sp.ChildByFieldName("alias")
+	hasAs := aliasNode != nil
+	if !hasAs {
+		seenAs := false
+		for i := 0; i < int(sp.ChildCount()); i++ {
+			c := sp.Child(i)
+			if c == nil || c.Type() == "comment" {
+				continue
+			}
+			if !seenAs {
+				if !c.IsNamed() && c.Type() == "as" {
+					seenAs = true
+					hasAs = true
+				}
+				continue
+			}
+			aliasNode = c
+			break
+		}
+	}
+	if !hasAs {
+		return orig
+	}
+	if aliasNode == nil {
+		return ""
+	}
+	var aliasName string
+	switch aliasNode.Type() {
+	case "identifier":
+		aliasName = aliasNode.Content(src)
+	case "string":
+		aliasName = jsSingleStringContent(aliasNode, src)
+	default:
+		aliasName = aliasNode.Content(src)
+	}
+	if aliasName != orig {
+		return ""
+	}
+	return orig
+}
+
+// jsLocalExportClauseNames collects the names exported unrenamed by top-level
+// local `export { foo }` statements (without `from`). Returns nil when no such
+// clauses exist in root.
+func jsLocalExportClauseNames(root *sitter.Node, src []byte) map[string]bool {
+	if root == nil {
+		return nil
 	}
 	var exported map[string]bool
 	for i := 0; i < int(root.NamedChildCount()); i++ {
@@ -50,8 +130,8 @@ func stampJSLocalExportClauses(root *sitter.Node, src []byte, fileID string, nod
 			if tsSpecifierTypeOnly(sp, src) {
 				continue
 			}
-			orig, alias := jsSpecifierNames(sp, src)
-			if orig == "" || (alias != "" && alias != orig) {
+			orig := jsLocalExportSpecifierName(sp, src)
+			if orig == "" {
 				continue
 			}
 			if exported == nil {
@@ -60,21 +140,7 @@ func stampJSLocalExportClauses(root *sitter.Node, src []byte, fileID string, nod
 			exported[orig] = true
 		}
 	}
-	if len(exported) == 0 {
-		return
-	}
-	for _, n := range nodes {
-		if n == nil || !exported[n.Name] || n.ID != fileID+"::"+n.Name {
-			continue
-		}
-		switch n.Kind {
-		case graph.KindFunction, graph.KindVariable, graph.KindConstant:
-			if n.Meta == nil {
-				n.Meta = make(map[string]any)
-			}
-			n.Meta["js_named_export"] = true
-		}
-	}
+	return exported
 }
 
 func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {

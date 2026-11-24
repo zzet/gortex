@@ -107,15 +107,15 @@ func (cr *CrossRepoResolver) trackedNpmImport(callerRepo, callerWS, importPath s
 // The per-repo pass has already made unindexed npm imports external. Retry only
 // imports with positive tracked-package evidence before building call reachability.
 func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges iter.Seq[*graph.Edge], stats *CrossRepoStats) error {
-	_, err := cr.resolveTrackedNpmImportsPass(ctx, edges, nil, stats)
+	_, err := cr.resolveTrackedNpmImportsPass(ctx, edges, nil, false, stats)
 	return err
 }
 
 func (cr *CrossRepoResolver) resolveTrackedNpmImportsScoped(ctx context.Context, edges []*graph.Edge, stats *CrossRepoStats) ([]*graph.Edge, error) {
-	return cr.resolveTrackedNpmImportsPass(ctx, slices.Values(edges), edges, stats)
+	return cr.resolveTrackedNpmImportsPass(ctx, slices.Values(edges), edges, true, stats)
 }
 
-func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, edges iter.Seq[*graph.Edge], scopedEdges []*graph.Edge, stats *CrossRepoStats) ([]*graph.Edge, error) {
+func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, edges iter.Seq[*graph.Edge], scopedEdges []*graph.Edge, scoped bool, stats *CrossRepoStats) ([]*graph.Edge, error) {
 	if cr.npmPackages == nil {
 		return nil, ctx.Err()
 	}
@@ -125,6 +125,9 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, e
 	for e := range edges {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if e == nil || e.Kind != graph.EdgeImports {
+			continue
 		}
 		spec := trackedNpmImportSpec(e)
 		if marked, _ := e.Meta[NpmImportSpecifierMeta].(string); marked != "" && e.CrossRepo {
@@ -148,7 +151,6 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, e
 		}
 	}
 	memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
-	scoped := scopedEdges != nil
 	var restubbed []*graph.Edge
 	var alreadyRestubbed map[graph.EdgeIdentity]struct{}
 	if scoped {
@@ -311,8 +313,9 @@ func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsScoped(
 }
 
 // restubStaleTrackedNpmRequireCallsAll re-evaluates resolved cross-repo local
-// require() calls graph-wide in bounded pages, flushing each page atomically so
-// cancellation never leaves live edges mutated without reindexing.
+// require() calls graph-wide in bounded pages, flushing each page
+// (RemoveEdgesExact + ReindexEdges) before checking cancellation for the next
+// page so cancellation never leaves mutated live edges un-reindexed.
 func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsAll(ctx context.Context, memo *npmImportMemo) {
 	if cr.npmPackages == nil {
 		return

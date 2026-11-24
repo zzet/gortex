@@ -208,15 +208,28 @@ func isJSTSNpmPath(path string) bool {
 // provider. Used after a full index or track; incremental saves carry exact
 // consumer files from the restub step.
 func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
-	lookup := mi.npmPackageLookup()
-	if lookup == nil {
+	snap := mi.loadNpmPackageSnapshot()
+	if snap == nil || snap.lookup == nil || len(snap.repoPackages) == 0 {
 		return nil
 	}
+	lookup := snap.lookup
+	declaredByRepo := snap.repoPackages[repo]
+	isProvider := len(declaredByRepo) > 0
 	files := make(map[string]struct{})
 	claims := make(map[string]map[string]resolver.NpmPackageTarget)
 	checkSpec := func(spec, ownerFile string) {
 		if spec == "" || ownerFile == "" {
 			return
+		}
+		ownerInRepo := graph.RepoPrefixOfID(ownerFile) == repo
+		if !ownerInRepo {
+			if !isProvider {
+				return
+			}
+			pkgName, _ := splitPackageSpecifier(spec)
+			if _, owned := declaredByRepo[pkgName]; !owned {
+				return
+			}
 		}
 		providers, known := claims[spec]
 		if !known {
@@ -224,7 +237,7 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 			claims[spec] = providers
 		}
 		for dir := range providers {
-			if dir == repo || strings.HasPrefix(dir, repo+"/") || graph.RepoPrefixOfID(ownerFile) == repo {
+			if dir == repo || strings.HasPrefix(dir, repo+"/") || ownerInRepo {
 				files[ownerFile] = struct{}{}
 				break
 			}
@@ -234,11 +247,14 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 	importSiteSeen := make(map[graph.EdgeSite]struct{})
 	for edge := range graph.EdgesLightSeq(mi.graph, graph.EdgeImports) {
 		if strings.HasPrefix(edge.To, "external::") {
+			if !isProvider && graph.RepoPrefixOfID(edge.From) != repo {
+				continue
+			}
 			spec, _, _ := strings.Cut(strings.TrimPrefix(edge.To, "external::"), "::")
 			checkSpec(spec, edge.From)
 			continue
 		}
-		if edge.CrossRepo && isJSTSNpmPath(edge.From) {
+		if isProvider && edge.CrossRepo && isJSTSNpmPath(edge.From) {
 			site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeImports}
 			if _, dup := importSiteSeen[site]; !dup {
 				importSiteSeen[site] = struct{}{}
@@ -264,37 +280,42 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 			}
 		}
 	}
-	var resolvedCallSites []graph.EdgeSite
-	callSiteSeen := make(map[graph.EdgeSite]struct{})
-	for edge := range graph.EdgesLightSeq(mi.graph, graph.EdgeCrossRepoCalls) {
-		if !isJSTSNpmPath(edge.FilePath) {
-			continue
+	if isProvider {
+		var resolvedCallSites []graph.EdgeSite
+		callSiteSeen := make(map[graph.EdgeSite]struct{})
+		for edge := range graph.EdgesLightSeq(mi.graph, graph.EdgeCrossRepoCalls) {
+			if !isJSTSNpmPath(edge.FilePath) {
+				continue
+			}
+			site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeCalls}
+			if _, dup := callSiteSeen[site]; !dup {
+				callSiteSeen[site] = struct{}{}
+				resolvedCallSites = append(resolvedCallSites, site)
+			}
 		}
-		site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeCalls}
-		if _, dup := callSiteSeen[site]; !dup {
-			callSiteSeen[site] = struct{}{}
-			resolvedCallSites = append(resolvedCallSites, site)
-		}
-	}
-	for start := 0; start < len(resolvedCallSites); start += hydrationPage {
-		page := resolvedCallSites[start:min(start+hydrationPage, len(resolvedCallSites))]
-		full := mi.graph.GetEdgeCandidates(nil, page)
-		for _, site := range page {
-			for _, edge := range full.Site(site.From, site.Line, graph.EdgeCalls) {
-				if edge == nil || !edge.CrossRepo || edge.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
-					continue
+		for start := 0; start < len(resolvedCallSites); start += hydrationPage {
+			page := resolvedCallSites[start:min(start+hydrationPage, len(resolvedCallSites))]
+			full := mi.graph.GetEdgeCandidates(nil, page)
+			for _, site := range page {
+				for _, edge := range full.Site(site.From, site.Line, graph.EdgeCalls) {
+					if edge == nil || !edge.CrossRepo || edge.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+						continue
+					}
+					marked, _ := edge.Meta[resolver.NpmImportSpecifierMeta].(string)
+					if marked == "" {
+						continue
+					}
+					mod, _, _ := strings.Cut(marked, "::")
+					checkSpec(mod, edge.FilePath)
 				}
-				marked, _ := edge.Meta[resolver.NpmImportSpecifierMeta].(string)
-				if marked == "" {
-					continue
-				}
-				mod, _, _ := strings.Cut(marked, "::")
-				checkSpec(mod, edge.FilePath)
 			}
 		}
 	}
 	for edge := range mi.graph.EdgesWithUnresolvedTarget() {
 		if edge == nil || edge.Kind != graph.EdgeCalls || edge.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+			continue
+		}
+		if !isProvider && graph.RepoPrefixOfID(edge.FilePath) != repo {
 			continue
 		}
 		spec, _ := edge.Meta[graph.JSLexicalRequireSpecMeta].(string)
