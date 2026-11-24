@@ -449,10 +449,11 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu             sync.RWMutex
-	entries        map[string]*projectionEntry
-	deferredFiles  map[string]string   // projection deferral observations, not publication authority
-	storeBusyFiles map[string]struct{} // selected store sections were unavailable
+	mu                sync.RWMutex
+	entries           map[string]*projectionEntry
+	deferredFiles     map[string]string   // projection deferral observations, not publication authority
+	storeBusyFiles    map[string]struct{} // selected store sections were unavailable
+	callChainBoundary callChainFreshnessBoundary
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {

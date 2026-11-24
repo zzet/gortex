@@ -3029,6 +3029,7 @@ func (s *Server) handleGetCallChain(ctx context.Context, req mcp.CallToolRequest
 	sg = filterSubGraphByResolvedScope(sg, resolved)
 	sg.FilterByMinTier(minTier)
 	sg.FilterSpeculative(req.GetBool("include_speculative", false))
+	s.recordCallChainFreshnessBoundary(ctx, id, sg)
 	enrichSubGraphEdges(sg)
 	annotateProxyFreshness(sg)
 	return s.returnScopedSubGraph(ctx, req, sg, resolved)
