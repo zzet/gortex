@@ -167,6 +167,9 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
 	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
 	attachReceiptTiers(payload, receipt)
+	if outcome.Pending {
+		s.attachPendingRepositoryLane(payload, receipt.repo, receipt.path)
+	}
 	return payload, true
 }
 
@@ -260,10 +263,18 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	if publicationReceipt == "" {
 		publicationReceipt = snap.publicationReceipt
 	}
+	repo := ""
 	if value, found := s.mutationReceipts.Load(publicationReceipt); found {
 		if receipt, ok := value.(*mutationReceipt); ok {
 			attachReceiptTiers(payload, receipt)
+			repo = receipt.repo
 		}
+	}
+	if !graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded) {
+		record.mu.RLock()
+		absPath := record.absPath
+		record.mu.RUnlock()
+		s.attachPendingRepositoryLane(payload, repo, absPath)
 	}
 	record.attachFileProjection(payload)
 	s.attachSharedOwnerAccounting(payload, record, retained)
