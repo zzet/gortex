@@ -9,8 +9,12 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/query"
 )
 
 func TestVerifyChangeNeverBareCleanWhilePending(t *testing.T) {
@@ -90,6 +94,77 @@ func TestDeadCodePendingUnknownInEveryMode(t *testing.T) {
 			}
 		})
 	}
+	// The cases above inject the pending receipt. This one reaches the same
+	// state through a real local edit ACK whose publication is held, and reads
+	// the registered analyze facade with compact output.
+	t.Run("registered_compact_after_local_ack", func(t *testing.T) {
+		t.Setenv("GORTEX_TOOLS", "full")
+		t.Setenv(batchTransactionDirEnv, filepath.Join(t.TempDir(), "transactions"))
+		selectedProjectionRegistry(t)
+		root := t.TempDir()
+		caller := filepath.Join(root, "caller.go")
+		const before = "package probe\n\nfunc Caller() {}\n"
+		const after = "package probe\n\nfunc Caller() { unused() }\n"
+		require.NoError(t, os.WriteFile(caller, []byte(before), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(root, "target.go"), []byte("package probe\n\nfunc unused() {}\n"), 0o600))
+		sql, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, sql.Close()) })
+		idx := newProjectionTestIndexer(t, sql)
+		_, err = idx.Index(root)
+		require.NoError(t, err)
+		s := NewServer(query.NewEngine(sql), sql, idx, nil, zap.NewNop(), nil)
+		s.editAckMode = config.EditAckLocal
+		held := make(chan indexer.MutationResult)
+		s.SetWatcher(mutationTestWatcher{done: held})
+		t.Cleanup(func() {
+			close(held)
+			s.mutationReceipts.Range(func(_, value any) bool {
+				select {
+				case <-value.(*mutationReceipt).done:
+				case <-time.After(3 * time.Second):
+					t.Error("local edit publication ticket did not join")
+				}
+				return true
+			})
+		})
+		editor := relationBarrierRegisteredSession(t, s, "legacy")
+		reader := relationBarrierRegisteredSession(t, s, "facade")
+		args := map[string]any{
+			"kind":    "dead_code",
+			"options": map[string]any{"limit": 100},
+			"output":  map[string]any{"format": "json", "compact": true, "max_bytes": 0},
+		}
+		const candidate = "\"function\"\t\"target.go::unused\"\t\"unused\"\t\"target.go\"\t3\n"
+		baseline := guardE2ECall(t, s, reader, 2, "analyze", args)
+		require.False(t, baseline.IsError, resultText(baseline))
+		require.Contains(t, freshnessToolResultText(baseline), "dead\t"+candidate, "prove a real dead-code candidate before the edit adds its caller")
+
+		ack := preselectionRegisteredCall(t, s, editor, 3, "batch_edit", map[string]any{
+			"transaction_id": "compact-dead-code-pending",
+			"edits": []any{
+				map[string]any{"op": "edit_file", "path": caller, "old_string": before, "new_string": after},
+			},
+		})
+		reply := guardE2ECall(t, s, reader, 4, "analyze", args)
+
+		require.False(t, ack.IsError, resultText(ack))
+		body := extractTextResult(t, ack)
+		require.Equal(t, "committed", body["disk_status"])
+		require.Equal(t, "local", body["ack_mode"])
+		require.Equal(t, "pending", body["graph_status"])
+		contents, err := os.ReadFile(caller)
+		require.NoError(t, err)
+		require.Equal(t, after, string(contents))
+
+		require.False(t, reply.IsError, resultText(reply))
+		text := freshnessToolResultText(reply)
+		require.True(t, strings.HasPrefix(text, "derived: pending ("), "compact freshness must precede the membership rows: %s", text)
+		require.Contains(t, text, "\ndead_code_v1\t")
+		require.Contains(t, text, "\npending_file \"caller.go\"\n")
+		require.Contains(t, text, "\npending_unknown\t"+candidate)
+		require.NotContains(t, text, "\ndead\t"+candidate, "pending candidate must never be rendered as dead")
+	})
 }
 
 func TestRenameFindsNewSite100Of100(t *testing.T) {
