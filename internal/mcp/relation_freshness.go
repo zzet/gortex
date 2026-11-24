@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/query"
 )
 
 // relationFreshnessWait bounds how long a change tool waits for the edits in
@@ -179,6 +181,61 @@ func (s *Server) laggingMutationReceipts(ctx context.Context) []*mutationReceipt
 	return lagging
 }
 
+type callChainFreshnessBoundary struct {
+	root, prefix string
+	names        []string
+}
+
+// Only use unresolved call edges from the actual scoped walk's root. The
+// dropped targets are already captured by the walk, including on the fast
+// path, so the pending scope needs no additional graph or filesystem read.
+func (s *Server) recordCallChainFreshnessBoundary(ctx context.Context, seed string, sg *query.SubGraph) {
+	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
+	if !ok || sg == nil || len(sg.Boundaries) == 0 || requestReadsCommittedTree(ctx) ||
+		requestViewFromContext(ctx).readsOwnCheckout() {
+		return
+	}
+	var names []string
+	for _, boundary := range sg.Boundaries {
+		if boundary.SeedID == seed && boundary.Direction == "callees" &&
+			boundary.Reason == graph.BoundaryDynamicDispatch && boundary.EdgeKind == string(graph.EdgeCalls) &&
+			simpleCallBoundaryName(boundary.Target) && !slices.Contains(names, boundary.Target) {
+			names = append(names, boundary.Target)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	for _, node := range sg.Nodes {
+		if node == nil || node.ID != seed {
+			continue
+		}
+		root, prefix := "", node.RepoPrefix
+		switch {
+		case s.multiIndexer != nil && prefix != "":
+			root, _ = s.multiIndexer.RepoRoot(prefix)
+		case s.multiIndexer == nil && s.indexer != nil:
+			root = s.indexer.RootPath()
+		}
+		facts.mu.Lock()
+		facts.callChainBoundary = callChainFreshnessBoundary{root: root, prefix: prefix, names: names}
+		facts.mu.Unlock()
+		return
+	}
+}
+
+func simpleCallBoundaryName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range len(name) {
+		if !isIdentByte(name[i]) || i == 0 && name[i] >= '0' && name[i] <= '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // relationScope reports whether an edit to a file can change the relations
 // of ids: the file defines one of them, holds an edge into one of them, is one
 // of files (graph-keyed), or its current bytes name one of them as a whole
@@ -217,9 +274,16 @@ func (s *Server) relationScope(ctx context.Context, ids, files []string) func(ab
 			}
 		}
 	}
+	var boundary callChainFreshnessBoundary
+	if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
+		facts.mu.RLock()
+		boundary = facts.callChainBoundary
+		facts.mu.RUnlock()
+	}
 	named := make(map[string]bool)
 	return func(absPath string) bool {
-		if scoped[s.repoRelative(absPath)] {
+		rel := s.repoRelative(absPath)
+		if scoped[rel] {
 			return true
 		}
 		hit, seen := named[absPath]
@@ -227,6 +291,10 @@ func (s *Server) relationScope(ctx context.Context, ids, files []string) func(ab
 			data, err := os.ReadFile(absPath)
 			// Unknown pending bytes cannot establish that a new caller is unrelated.
 			hit = err != nil || namesAnyIdentifier(data, names)
+			if !hit && pathContainedIn(absPath, boundary.root) &&
+				(s.multiIndexer == nil || boundary.prefix != "" && strings.HasPrefix(rel, boundary.prefix+"/")) {
+				hit = namesAnyIdentifier(data, boundary.names)
+			}
 			named[absPath] = hit
 		}
 		return hit
