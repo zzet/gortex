@@ -686,6 +686,15 @@ labeled after a 2-second settle period, not proof that background work is idle.
 Whole-client CPU is a conservative upper bound on refusal-handling CPU, not
 overlapping per-request CPU attribution.
 
+Linux also records the daemon's major page faults over the phase
+(`daemon_major_faults`, from procfs `majflt`) and pressure stall information
+for cpu, memory and io, both `some` and `full`: host-wide from `/proc/pressure`
+(`host_psi_*`) and for the run's cgroup v2 group (`cgroup_psi_*`). Each has
+`_stall_us`, the delta of the cumulative stall total over the phase, and
+`_peak_avg10_pct`, the highest ten-second average seen by the 500 ms samples.
+macOS, a kernel without pressure files, a missing `full` line and a run
+without a cgroup keep these measures unavailable with a reason, never zero.
+
 Status and `gortex://stats` receipts preserve view-build counters, WAL pending
 frames, checkpoint estimates, reclaim counters, graph size and runtime heap.
 Daemon stdout/stderr and available daemon/crash logs are copied after stop,
