@@ -25,6 +25,58 @@ func jsNamedExportMeta(decl *sitter.Node, meta map[string]any) map[string]any {
 	return meta
 }
 
+// stampJSLocalExportClauses stamps js_named_export on top-level declarations
+// exported by separate-clause `export { foo }` statements (without `from`).
+// Renamed clauses like `export { other as foo }` are excluded so a private
+// `foo` cannot hijack an aliased export.
+func stampJSLocalExportClauses(root *sitter.Node, src []byte, fileID string, nodes []*graph.Node) {
+	if root == nil || len(nodes) == 0 {
+		return
+	}
+	var exported map[string]bool
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		stmt := root.NamedChild(i)
+		if stmt == nil || stmt.Type() != "export_statement" || stmt.ChildByFieldName("source") != nil {
+			continue
+		}
+		if tsExportStatementTypeOnly(stmt, src) {
+			continue
+		}
+		clause := findChildByType(stmt, "export_clause")
+		if clause == nil {
+			continue
+		}
+		for _, sp := range jsCollectChildren(clause, "export_specifier") {
+			if tsSpecifierTypeOnly(sp, src) {
+				continue
+			}
+			orig, alias := jsSpecifierNames(sp, src)
+			if orig == "" || (alias != "" && alias != orig) {
+				continue
+			}
+			if exported == nil {
+				exported = make(map[string]bool)
+			}
+			exported[orig] = true
+		}
+	}
+	if len(exported) == 0 {
+		return
+	}
+	for _, n := range nodes {
+		if n == nil || !exported[n.Name] || n.ID != fileID+"::"+n.Name {
+			continue
+		}
+		switch n.Kind {
+		case graph.KindFunction, graph.KindVariable, graph.KindConstant:
+			if n.Meta == nil {
+				n.Meta = make(map[string]any)
+			}
+			n.Meta["js_named_export"] = true
+		}
+	}
+}
+
 func visitJSPattern(n *sitter.Node, src []byte, visit func(string)) {
 	if n == nil {
 		return
@@ -139,18 +191,15 @@ func firstNonCommentNamedChild(n *sitter.Node) *sitter.Node {
 	return nil
 }
 
-// tsUsingAssignment returns the assignment_expression of a TypeScript
-// `using x = ...` or `await using x = ...` statement (tree-sitter-typescript
+// tsSingleUsingAssignment returns the assignment_expression of a single
+// TypeScript `using x = ...` or `await using x = ...` binding (tree-sitter-typescript
 // attaches an anonymous "using" token to assignment_expression instead of
 // emitting JS's using_declaration).
-func tsUsingAssignment(n *sitter.Node) *sitter.Node {
+func tsSingleUsingAssignment(n *sitter.Node) *sitter.Node {
 	if n == nil {
 		return nil
 	}
-	if n.Type() == "expression_statement" {
-		n = firstNonCommentNamedChild(n)
-	}
-	if n != nil && n.Type() == "await_expression" {
+	if n.Type() == "await_expression" {
 		n = firstNonCommentNamedChild(n)
 	}
 	if n == nil || n.Type() != "assignment_expression" {
@@ -167,6 +216,60 @@ func tsUsingAssignment(n *sitter.Node) *sitter.Node {
 		return nil
 	}
 	return nil
+}
+
+func flattenJSSequence(n *sitter.Node, out *[]*sitter.Node) {
+	if n == nil {
+		return
+	}
+	if n.Type() == "sequence_expression" {
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			c := n.NamedChild(i)
+			if c != nil && c.Type() != "comment" {
+				flattenJSSequence(c, out)
+			}
+		}
+		return
+	}
+	*out = append(*out, n)
+}
+
+// visitTSUsingAssignments visits every assignment_expression belonging to a
+// single- or multi-declarator TypeScript `using` / `await using` statement
+// (including `sequence_expression` chains like `using a = mk(), b = mk()`).
+func visitTSUsingAssignments(n *sitter.Node, visit func(*sitter.Node)) bool {
+	if n == nil {
+		return false
+	}
+	if n.Type() == "expression_statement" {
+		n = firstNonCommentNamedChild(n)
+	}
+	if n == nil {
+		return false
+	}
+	if n.Type() == "sequence_expression" {
+		var elems []*sitter.Node
+		flattenJSSequence(n, &elems)
+		if len(elems) == 0 {
+			return false
+		}
+		first := tsSingleUsingAssignment(elems[0])
+		if first == nil {
+			return false
+		}
+		visit(first)
+		for _, el := range elems[1:] {
+			if el != nil && el.Type() == "assignment_expression" {
+				visit(el)
+			}
+		}
+		return true
+	}
+	if assign := tsSingleUsingAssignment(n); assign != nil {
+		visit(assign)
+		return true
+	}
+	return false
 }
 
 func visitJSNamespaceName(n *sitter.Node, src []byte, visit func(string)) {
@@ -209,17 +312,18 @@ func visitJSAllDeclarations(n *sitter.Node, src []byte, includeAmbient bool, vis
 	case "export_statement":
 		visitJSAllDeclarations(n.ChildByFieldName("declaration"), src, includeAmbient, visit)
 	case "expression_statement":
-		if assign := tsUsingAssignment(n); assign != nil {
+		if visitTSUsingAssignments(n, func(assign *sitter.Node) {
 			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
+		}) {
 			return
 		}
 		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
 			visitJSNamespaceName(child.ChildByFieldName("name"), src, visit)
 		}
-	case "await_expression", "assignment_expression":
-		if assign := tsUsingAssignment(n); assign != nil {
+	case "sequence_expression", "await_expression", "assignment_expression":
+		visitTSUsingAssignments(n, func(assign *sitter.Node) {
 			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
-		}
+		})
 	case "internal_module", "module":
 		visitJSNamespaceName(n.ChildByFieldName("name"), src, visit)
 	case "import_alias":
@@ -421,12 +525,10 @@ func (cache *jsScopeCache) staticRequireSpec(call *sitter.Node, src []byte) stri
 	return spec
 }
 
-func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
-	name := v.ChildByFieldName("name")
+func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if name == nil {
 		return
 	}
-	value := v.ChildByFieldName("value")
 	if value != nil {
 		switch value.Type() {
 		case "call_expression":
@@ -453,6 +555,10 @@ func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local fun
 	visitJSPattern(name, src, local)
 }
 
+func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
+	cache.visitBinding(v.ChildByFieldName("name"), v.ChildByFieldName("value"), src, local, required)
+}
+
 func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if n == nil {
 		return
@@ -463,17 +569,18 @@ func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local fu
 	case "export_statement":
 		cache.visitDeclaration(n.ChildByFieldName("declaration"), src, local, required)
 	case "expression_statement":
-		if assign := tsUsingAssignment(n); assign != nil {
-			visitJSPattern(assign.ChildByFieldName("left"), src, local)
+		if visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			cache.visitBinding(assign.ChildByFieldName("left"), assign.ChildByFieldName("right"), src, local, required)
+		}) {
 			return
 		}
 		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
 			visitJSNamespaceName(child.ChildByFieldName("name"), src, local)
 		}
-	case "await_expression", "assignment_expression":
-		if assign := tsUsingAssignment(n); assign != nil {
-			visitJSPattern(assign.ChildByFieldName("left"), src, local)
-		}
+	case "sequence_expression", "await_expression", "assignment_expression":
+		visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			cache.visitBinding(assign.ChildByFieldName("left"), assign.ChildByFieldName("right"), src, local, required)
+		})
 	case "internal_module", "module":
 		visitJSNamespaceName(n.ChildByFieldName("name"), src, local)
 	case "import_alias":

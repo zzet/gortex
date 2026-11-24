@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -651,6 +650,8 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 						cr.hotCache.flush()
 						cr.clearRequireCache()
 					}
+				} else {
+					cr.clearRequireCache()
 				}
 			}
 		}
@@ -746,13 +747,7 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
 	defer cr.clearRequireCache()
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	scopeFiles := make(map[string]struct{}, len(edges))
-	for _, edge := range edges {
-		if edge != nil && edge.FilePath != "" {
-			scopeFiles[edge.FilePath] = struct{}{}
-		}
-	}
-	restubbed, _ := cr.resolveTrackedNpmImportsCollect(context.Background(), slices.Values(edges), stats)
+	restubbed, _ := cr.resolveTrackedNpmImportsScoped(context.Background(), edges, stats)
 	pending := make([]*graph.Edge, 0, len(edges)+len(restubbed))
 	seen := make(map[graph.EdgeIdentity]struct{}, len(edges)+len(restubbed))
 	for _, edge := range edges {
@@ -766,9 +761,6 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 	}
 	for _, edge := range restubbed {
 		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
-			continue
-		}
-		if _, inScope := scopeFiles[edge.FilePath]; !inScope {
 			continue
 		}
 		id := graph.EdgeIdentityFor(edge)
@@ -1202,6 +1194,7 @@ func (cr *CrossRepoResolver) clearLookupCache() {
 	cr.nodesByName = nil
 	cr.nodesByNameRepo = nil
 	cr.nodesByQualName = nil
+	cr.clearRequireCache()
 }
 
 // scopedCandidates returns the candidates named `name` the caller of e could

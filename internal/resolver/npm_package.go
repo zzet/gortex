@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"iter"
+	"slices"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -106,11 +107,15 @@ func (cr *CrossRepoResolver) trackedNpmImport(callerRepo, callerWS, importPath s
 // The per-repo pass has already made unindexed npm imports external. Retry only
 // imports with positive tracked-package evidence before building call reachability.
 func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges iter.Seq[*graph.Edge], stats *CrossRepoStats) error {
-	_, err := cr.resolveTrackedNpmImportsCollect(ctx, edges, stats)
+	_, err := cr.resolveTrackedNpmImportsPass(ctx, edges, nil, stats)
 	return err
 }
 
-func (cr *CrossRepoResolver) resolveTrackedNpmImportsCollect(ctx context.Context, edges iter.Seq[*graph.Edge], stats *CrossRepoStats) ([]*graph.Edge, error) {
+func (cr *CrossRepoResolver) resolveTrackedNpmImportsScoped(ctx context.Context, edges []*graph.Edge, stats *CrossRepoStats) ([]*graph.Edge, error) {
+	return cr.resolveTrackedNpmImportsPass(ctx, slices.Values(edges), edges, stats)
+}
+
+func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, edges iter.Seq[*graph.Edge], scopedEdges []*graph.Edge, stats *CrossRepoStats) ([]*graph.Edge, error) {
 	if cr.npmPackages == nil {
 		return nil, ctx.Err()
 	}
@@ -143,9 +148,15 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsCollect(ctx context.Context
 		}
 	}
 	memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
+	scoped := scopedEdges != nil
 	var restubbed []*graph.Edge
+	var alreadyRestubbed map[graph.EdgeIdentity]struct{}
+	if scoped {
+		alreadyRestubbed = make(map[graph.EdgeIdentity]struct{})
+	}
 	// Close the light-edge cursor before reading or writing full edges. Hydrate
-	// only one bounded page at a time; metadata never accumulates across pages.
+	// only one bounded page at a time; whole-graph passes never accumulate
+	// hydrated edges across pages.
 	for start := 0; start < len(eligible); start += resolvePendingPageRows {
 		if err := ctx.Err(); err != nil {
 			return restubbed, err
@@ -175,45 +186,165 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsCollect(ctx context.Context
 		}
 		if len(batch) > 0 {
 			cr.graph.ReindexEdges(batch)
-			restubbed = append(restubbed, cr.restubCallsForChangedNpmImports(batch)...)
+			changed := cr.restubCallsForChangedNpmImports(batch, alreadyRestubbed)
+			if scoped {
+				restubbed = append(restubbed, changed...)
+			}
 		}
 	}
-	// Re-check cross-repo local require() calls (both JS module-level requires
-	// and TS requires, which emit no EdgeImports) even when eligible is empty,
-	// so provider retargets or ambiguity restub them before the pending call pass.
-	restubbed = append(restubbed, cr.restubStaleTrackedNpmRequireCalls(ctx, memo)...)
+	// Re-check cross-repo local require() calls (in both JS and TS, where TS
+	// emits no EdgeImports) even when eligible is empty, so provider retargets
+	// or ambiguity restub them before the pending call pass. Scoped passes only
+	// inspect in-scope edges so unrelated consumers are never orphaned.
+	if scoped {
+		restubbed = append(restubbed, cr.restubStaleTrackedNpmRequireCallsScoped(ctx, scopedEdges, alreadyRestubbed, memo)...)
+	} else {
+		cr.restubStaleTrackedNpmRequireCallsAll(ctx, memo)
+	}
 	return restubbed, ctx.Err()
 }
 
-// restubStaleTrackedNpmRequireCalls re-evaluates resolved cross-repo local
-// require() calls against current tracked-npm providers so ambiguity, provider
-// removal, or workspace retargets restub both JS and TS callers cleanly.
-func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCalls(ctx context.Context, memo *npmImportMemo) []*graph.Edge {
-	if cr.npmPackages == nil {
-		return nil
+func resetRestubbedNpmCall(call *graph.Edge, name string) {
+	delete(call.Meta, NpmImportSpecifierMeta)
+	delete(call.Meta, "resolution")
+	call.To = graph.UnresolvedMarker + name
+	call.CrossRepo = false
+	call.Origin, call.Tier, call.Confidence, call.ConfidenceLabel = "", "", 0, ""
+}
+
+func (cr *CrossRepoResolver) staleTrackedNpmRequireCallName(call *graph.Edge, memo *npmImportMemo) (string, bool) {
+	if call == nil || !call.CrossRepo || call.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+		return "", false
 	}
-	var sites []graph.EdgeSite
-	for e := range graph.EdgesLightSeq(cr.graph, graph.EdgeCrossRepoCalls) {
-		if ctx.Err() != nil {
-			return nil
+	marked, _ := call.Meta[NpmImportSpecifierMeta].(string)
+	spec := marked
+	if spec == "" {
+		spec, _ = call.Meta[graph.JSLexicalRequireSpecMeta].(string)
+	}
+	if spec == "" {
+		return "", false
+	}
+	eligible := cr.eligibleTrackedNpmImport(call, spec)
+	if marked == "" && !eligible {
+		return "", false
+	}
+	stillValid := false
+	if eligible {
+		from := memo.getNode(cr, call.From)
+		callerRepo := ""
+		if from != nil {
+			callerRepo = from.RepoPrefix
 		}
-		if isJSTSPath(e.FilePath) {
-			sites = append(sites, graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeCalls})
+		if picked := cr.trackedNpmImport(callerRepo, candidateWorkspaceID(from), spec, memo); picked != nil {
+			targetFile := cr.nodeFilePath(call.To)
+			if targetFile != "" {
+				if targetFile == cr.nodeFilePath(picked.ID) {
+					stillValid = true
+				} else {
+					_, stillValid = cr.importClosureFiles(picked.ID)[targetFile]
+				}
+			}
 		}
 	}
-	if len(sites) == 0 {
+	if stillValid {
+		return "", false
+	}
+	_, name, hasSym := strings.Cut(call.To, "::")
+	if !hasSym || name == "" {
+		if n := memo.getNode(cr, call.To); n != nil {
+			name = n.Name
+		}
+	}
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+// restubStaleTrackedNpmRequireCallsScoped re-evaluates only in-scope cross-repo
+// local require() calls so scoped passes never orphan unrelated consumers.
+func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsScoped(
+	ctx context.Context,
+	edges []*graph.Edge,
+	alreadyRestubbed map[graph.EdgeIdentity]struct{},
+	memo *npmImportMemo,
+) []*graph.Edge {
+	if cr.npmPackages == nil || len(edges) == 0 {
 		return nil
 	}
 	var batch []graph.EdgeReindex
 	var obsolete []*graph.Edge
 	var restubbed []*graph.Edge
+	seen := make(map[graph.EdgeIdentity]struct{})
+	for _, call := range edges {
+		if ctx.Err() != nil {
+			break
+		}
+		if call == nil || call.Kind != graph.EdgeCalls || !call.CrossRepo || call.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+			continue
+		}
+		id := graph.EdgeIdentityFor(call)
+		if _, done := alreadyRestubbed[id]; done {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		name, stale := cr.staleTrackedNpmRequireCallName(call, memo)
+		if !stale {
+			continue
+		}
+		oldTo := call.To
+		parallel := *call
+		parallel.Kind = graph.EdgeCrossRepoCalls
+		obsolete = append(obsolete, &parallel)
+		resetRestubbedNpmCall(call, name)
+		batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: oldTo})
+		restubbed = append(restubbed, call)
+	}
+	if len(batch) > 0 {
+		graph.RemoveEdgesExact(cr.graph, obsolete)
+		cr.graph.ReindexEdges(batch)
+	}
+	return restubbed
+}
+
+// restubStaleTrackedNpmRequireCallsAll re-evaluates resolved cross-repo local
+// require() calls graph-wide in bounded pages, flushing each page atomically so
+// cancellation never leaves live edges mutated without reindexing.
+func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsAll(ctx context.Context, memo *npmImportMemo) {
+	if cr.npmPackages == nil {
+		return
+	}
+	var sites []graph.EdgeSite
+	siteSeen := make(map[graph.EdgeSite]struct{})
+	for e := range graph.EdgesLightSeq(cr.graph, graph.EdgeCrossRepoCalls) {
+		if ctx.Err() != nil {
+			return
+		}
+		if !isJSTSPath(e.FilePath) {
+			continue
+		}
+		site := graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeCalls}
+		if _, dup := siteSeen[site]; dup {
+			continue
+		}
+		siteSeen[site] = struct{}{}
+		sites = append(sites, site)
+	}
+	if len(sites) == 0 {
+		return
+	}
+	seen := make(map[graph.EdgeIdentity]struct{})
 	for start := 0; start < len(sites); start += resolvePendingPageRows {
 		if ctx.Err() != nil {
-			return restubbed
+			return
 		}
 		page := sites[start:min(start+resolvePendingPageRows, len(sites))]
 		full := cr.graph.GetEdgeCandidates(nil, page)
-		seen := make(map[graph.EdgeIdentity]struct{})
+		var batch []graph.EdgeReindex
+		var obsolete []*graph.Edge
 		for _, site := range page {
 			for _, call := range full.Site(site.From, site.Line, graph.EdgeCalls) {
 				if call == nil || !call.CrossRepo || call.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
@@ -224,70 +355,27 @@ func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCalls(ctx context.Conte
 					continue
 				}
 				seen[id] = struct{}{}
-				marked, _ := call.Meta[NpmImportSpecifierMeta].(string)
-				spec := marked
-				if spec == "" {
-					spec, _ = call.Meta[graph.JSLexicalRequireSpecMeta].(string)
-				}
-				if spec == "" {
-					continue
-				}
-				eligible := cr.eligibleTrackedNpmImport(call, spec)
-				if marked == "" && !eligible {
-					continue
-				}
-				stillValid := false
-				if eligible {
-					from := memo.getNode(cr, call.From)
-					callerRepo := ""
-					if from != nil {
-						callerRepo = from.RepoPrefix
-					}
-					if picked := cr.trackedNpmImport(callerRepo, candidateWorkspaceID(from), spec, memo); picked != nil {
-						targetFile := cr.nodeFilePath(call.To)
-						if targetFile != "" {
-							if targetFile == cr.nodeFilePath(picked.ID) {
-								stillValid = true
-							} else {
-								_, stillValid = cr.importClosureFiles(picked.ID)[targetFile]
-							}
-						}
-					}
-				}
-				if stillValid {
+				name, stale := cr.staleTrackedNpmRequireCallName(call, memo)
+				if !stale {
 					continue
 				}
 				oldTo := call.To
-				_, name, hasSym := strings.Cut(oldTo, "::")
-				if !hasSym || name == "" {
-					if n := memo.getNode(cr, oldTo); n != nil {
-						name = n.Name
-					}
-				}
-				if name == "" {
-					continue
-				}
 				parallel := *call
 				parallel.Kind = graph.EdgeCrossRepoCalls
 				obsolete = append(obsolete, &parallel)
-				delete(call.Meta, NpmImportSpecifierMeta)
-				graph.StashRestubProvenance(call)
-				call.To = graph.UnresolvedMarker + name
-				call.CrossRepo, call.ConfidenceLabel = false, ""
+				resetRestubbedNpmCall(call, name)
 				batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: oldTo})
-				restubbed = append(restubbed, call)
 			}
 		}
+		if len(batch) > 0 {
+			graph.RemoveEdgesExact(cr.graph, obsolete)
+			cr.graph.ReindexEdges(batch)
+		}
 	}
-	if len(batch) > 0 {
-		graph.RemoveEdgesExact(cr.graph, obsolete)
-		cr.graph.ReindexEdges(batch)
-	}
-	return restubbed
 }
 
 // A call resolved through a binding cannot outlive that binding's target.
-func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex) []*graph.Edge {
+func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex, recorded map[graph.EdgeIdentity]struct{}) []*graph.Edge {
 	callers := make(map[string]map[string]string)
 	changedModuleSpecs := make(map[string]map[string]struct{})
 	var ids []string
@@ -319,26 +407,34 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 	var obsolete []*graph.Edge
 	var restubbedList []*graph.Edge
 	restubbed := make(map[graph.EdgeIdentity]struct{})
+	recordID := func(id graph.EdgeIdentity) {
+		restubbed[id] = struct{}{}
+		if recorded != nil {
+			recorded[id] = struct{}{}
+		}
+	}
 	if len(ids) > 0 {
 		for target, edges := range cr.graph.GetInEdgesByNodeIDs(ids) {
 			for _, call := range edges {
 				if call == nil || call.Kind != graph.EdgeCalls || !call.CrossRepo {
 					continue
 				}
+				// Local require() bindings carry their own symbol name and must
+				// never inherit an ES import alias from a sibling import statement.
+				if call.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+					continue
+				}
 				name, affected := callers[target][cr.callerFileID(call)]
 				if !affected {
 					continue
 				}
+				recordID(graph.EdgeIdentityFor(call))
 				parallel := *call
 				parallel.Kind = graph.EdgeCrossRepoCalls
 				obsolete = append(obsolete, &parallel)
-				delete(call.Meta, NpmImportSpecifierMeta)
-				graph.StashRestubProvenance(call)
-				call.To = graph.UnresolvedMarker + name
-				call.CrossRepo, call.ConfidenceLabel = false, ""
+				resetRestubbedNpmCall(call, name)
 				batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
 				restubbedList = append(restubbedList, call)
-				restubbed[graph.EdgeIdentityFor(call)] = struct{}{}
 			}
 		}
 	}
@@ -355,12 +451,17 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 				if call == nil || call.Kind != graph.EdgeCalls || !call.CrossRepo || call.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
 					continue
 				}
-				if _, done := restubbed[graph.EdgeIdentityFor(call)]; done {
+				id := graph.EdgeIdentityFor(call)
+				if _, done := restubbed[id]; done {
 					continue
 				}
+				marked, _ := call.Meta[NpmImportSpecifierMeta].(string)
 				spec, _ := call.Meta[graph.JSLexicalRequireSpecMeta].(string)
-				mod, _ := splitImportSpecSymbol(spec)
-				if _, hit := specs[mod]; !hit {
+				markedMod, _ := splitImportSpecSymbol(marked)
+				specMod, _ := splitImportSpecSymbol(spec)
+				_, hitMarked := specs[markedMod]
+				_, hitSpec := specs[specMod]
+				if !hitMarked && !hitSpec {
 					continue
 				}
 				oldTo := call.To
@@ -373,13 +474,11 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 				if name == "" {
 					continue
 				}
+				recordID(id)
 				parallel := *call
 				parallel.Kind = graph.EdgeCrossRepoCalls
 				obsolete = append(obsolete, &parallel)
-				delete(call.Meta, NpmImportSpecifierMeta)
-				graph.StashRestubProvenance(call)
-				call.To = graph.UnresolvedMarker + name
-				call.CrossRepo, call.ConfidenceLabel = false, ""
+				resetRestubbedNpmCall(call, name)
 				batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: oldTo})
 				restubbedList = append(restubbedList, call)
 			}

@@ -307,6 +307,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.line,
 		})
 	}
+	stampJSLocalExportClauses(root, src, fileID, result.Nodes)
 
 	// Store-factory destructuring: `const {a,b} = useStore.getState()` binds
 	// later bare `a()` / `b()` calls to the store's actions.

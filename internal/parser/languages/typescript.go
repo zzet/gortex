@@ -601,6 +601,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			FilePath: filePath, Line: v.startLn + 1,
 		})
 	}
+	stampJSLocalExportClauses(root, src, fileID, result.Nodes)
 
 	// --- Event pub/sub edges ---
 	var pubsubEvents []pubsubEvent

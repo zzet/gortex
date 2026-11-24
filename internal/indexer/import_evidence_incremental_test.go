@@ -330,13 +330,71 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 				require.Len(t, calls, 1)
 				assert.Equal(t, graph.UnresolvedMarker+"f", calls[0].To)
 				assert.False(t, calls[0].CrossRepo)
+				assert.Empty(t, calls[0].Origin)
 				assert.NotContains(t, calls[0].Meta, resolver.NpmImportSpecifierMeta)
+				assert.NotContains(t, calls[0].Meta, "resolution")
+				assert.False(t, graph.HasRestubProvenance(calls[0]))
 				if mode == "replace" || mode == "untrack" {
 					assert.Empty(t, g.GetOutEdges("other/b.ts::run"), "non-npm cross-repo require must not be parked on repo eviction")
 				}
 			})
 		}
 	}
+
+	t.Run("mixed aliased ES import and local require park with distinct names and clean meta", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				var g graph.Store = graph.New()
+				if backend == "sqlite" {
+					db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, db.Close()) })
+					g = db
+				}
+				nodes := []*graph.Node{
+					{ID: "lib/index.ts", Kind: graph.KindFile, FilePath: "lib/index.ts", Language: "typescript", RepoPrefix: "lib"},
+					{ID: "lib/index.ts::f", Kind: graph.KindFunction, Name: "f", FilePath: "lib/index.ts", Language: "typescript", RepoPrefix: "lib"},
+				}
+				g.AddBatch(nodes, []*graph.Edge{
+					{
+						From: "app/a.ts", To: "lib/index.ts::f", Kind: graph.EdgeImports,
+						FilePath: "app/a.ts", Line: 1, CrossRepo: true, Alias: "aliased",
+						Meta: map[string]any{resolver.NpmImportSpecifierMeta: "p::f", "import_alias": "aliased"},
+					},
+					{
+						From: "app/a.ts::viaES", To: "lib/index.ts::f", Kind: graph.EdgeCalls,
+						FilePath: "app/a.ts", Line: 2, CrossRepo: true, Origin: graph.OriginASTResolved, Confidence: 0.9,
+						Meta: map[string]any{"resolution": "import_binding"},
+					},
+					{
+						From: "app/a.ts::viaReq", To: "lib/index.ts::f", Kind: graph.EdgeCalls,
+						FilePath: "app/a.ts", Line: 3, CrossRepo: true, Origin: graph.OriginASTResolved, Confidence: 0.9,
+						Meta: map[string]any{
+							graph.JSLexicalBindingMeta:      graph.JSLexicalRequire,
+							graph.JSLexicalRequireSpecMeta:  "p",
+							resolver.NpmImportSpecifierMeta: "p",
+							"resolution":                    "import_closure",
+						},
+					},
+				})
+				consumers := restubTrackedNpmImportsFromView(g, nil, g.GetInEdgesByNodeIDs([]string{"lib/index.ts", "lib/index.ts::f"}))
+				assert.Equal(t, []string{"app/a.ts"}, consumers)
+
+				esCalls := g.GetOutEdges("app/a.ts::viaES")
+				require.Len(t, esCalls, 1)
+				assert.Equal(t, graph.UnresolvedMarker+"aliased", esCalls[0].To)
+				assert.False(t, graph.HasRestubProvenance(esCalls[0]))
+				assert.NotContains(t, esCalls[0].Meta, "resolution")
+
+				reqCalls := g.GetOutEdges("app/a.ts::viaReq")
+				require.Len(t, reqCalls, 1)
+				assert.Equal(t, graph.UnresolvedMarker+"f", reqCalls[0].To)
+				assert.False(t, graph.HasRestubProvenance(reqCalls[0]))
+				assert.NotContains(t, reqCalls[0].Meta, "resolution")
+				assert.NotContains(t, reqCalls[0].Meta, resolver.NpmImportSpecifierMeta)
+			})
+		}
+	})
 
 	t.Run("TS local require consumer discovered without EdgeImports on provider track", func(t *testing.T) {
 		for _, backend := range []string{"memory", "sqlite"} {
@@ -376,6 +434,74 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 				assert.True(t, fCalls[0].CrossRepo)
 				assert.Equal(t, "p", fCalls[0].Meta[resolver.NpmImportSpecifierMeta])
 			})
+		}
+	})
+
+	t.Run("TrackRepoCtx for competing or higher-priority provider discovers already-resolved require consumers", func(t *testing.T) {
+		for _, ext := range []string{".js", ".ts"} {
+			for _, backend := range []string{"memory", "sqlite"} {
+				t.Run(ext+"/"+backend, func(t *testing.T) {
+					var g graph.Store = graph.New()
+					if backend == "sqlite" {
+						db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+						require.NoError(t, err)
+						t.Cleanup(func() { require.NoError(t, db.Close()) })
+						g = db
+					}
+					provA, provB, provC, consumer := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+					writePackageJSON(t, provA, `{"name":"p","exports":"./index`+ext+`"}`)
+					writeWorkspaceFile(t, provA, "index"+ext, "export function f() { return 1; }\n")
+					writePackageJSON(t, provB, `{"name":"p","exports":"./index`+ext+`"}`)
+					writeWorkspaceFile(t, provB, "index"+ext, "export function f() { return 2; }\n")
+					writePackageJSON(t, provC, `{"name":"p","exports":"./index`+ext+`"}`)
+					writeWorkspaceFile(t, provC, "index"+ext, "export function f() { return 3; }\n")
+					writePackageJSON(t, consumer, `{"name":"app","dependencies":{"p":"^1"}}`)
+					writeWorkspaceFile(t, consumer, ".gortex.yaml", "workspace: wsB\ncross_workspace_deps:\n  - workspace: wsA\n    modules: [p]\n    mode: read-only\n")
+					writeWorkspaceFile(t, consumer, "app"+ext, "export function run() { const { f } = require('p'); return f(); }\n")
+
+					reg := newTestRegistry()
+					reg.Register(languages.NewJavaScriptExtractor())
+					reg.Register(languages.NewTypeScriptExtractor())
+					mi := NewMultiIndexer(g, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+					t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+					reqCall := func() *graph.Edge {
+						t.Helper()
+						var found []*graph.Edge
+						for _, edge := range g.GetOutEdges("app/app" + ext + "::run") {
+							if edge.Kind == graph.EdgeCalls && edge.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+								found = append(found, edge)
+							}
+						}
+						require.Len(t, found, 1)
+						return found[0]
+					}
+
+					// 1. Track foreign provA + consumer in wsB -> binds to provA.
+					_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provA", Path: provA, Workspace: "wsA"})
+					require.NoError(t, err)
+					_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "app", Path: consumer, Workspace: "wsB"})
+					require.NoError(t, err)
+					require.Equal(t, "provA/index"+ext+"::f", reqCall().To)
+
+					// 2. Track higher-priority same-workspace provB -> npmConsumerFilesForRepo discovers
+					// already-resolved app/app.{js,ts} and retargets cleanly to provB.
+					_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provB", Path: provB, Workspace: "wsB"})
+					require.NoError(t, err)
+					require.Equal(t, "provB/index"+ext+"::f", reqCall().To)
+					require.True(t, reqCall().CrossRepo)
+
+					// 3. Track competing provC in wsB -> ambiguity restubs to unresolved::f.
+					_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provC", Path: provC, Workspace: "wsB"})
+					require.NoError(t, err)
+					c := reqCall()
+					require.Equal(t, graph.UnresolvedMarker+"f", c.To)
+					require.False(t, c.CrossRepo)
+					require.NotContains(t, c.Meta, resolver.NpmImportSpecifierMeta)
+					require.NotContains(t, c.Meta, "resolution")
+					require.False(t, graph.HasRestubProvenance(c))
+				})
+			}
 		}
 	})
 }

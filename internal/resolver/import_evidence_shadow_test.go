@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -463,6 +464,45 @@ func TestImportEvidence_LocalRequirePrefersDirectBarrelSymbol(t *testing.T) {
 			require.Equal(t, "app/web/caller"+ext+"::run", xcalls[0].From)
 			require.True(t, xcalls[0].CrossRepo)
 		})
+		t.Run("separate-clause ESM export beats re-exports/"+ext, func(t *testing.T) {
+			cases := map[string]map[string]string{
+				"export star": {
+					"lib/impl" + ext:   "export function init() { return 2 }\n",
+					"lib/barrel" + ext: "function init() { return 1 }\nexport { init }\nexport * from './impl'\n",
+					"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+				},
+				"re-export other with exported init": {
+					"lib/other" + ext:  "export function init() { return 2 }\nexport function other() { return init() }\n",
+					"lib/barrel" + ext: "function init() { return 1 }\nexport { init }\nexport { other } from './other'\n",
+					"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+				},
+				"re-export other with private init": {
+					"lib/other" + ext:  "function init() { return 2 }\nexport function other() { return init() }\n",
+					"lib/barrel" + ext: "function init() { return 1 }\nexport { init }\nexport { other } from './other'\n",
+					"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+				},
+			}
+			for name, files := range cases {
+				t.Run(name, func(t *testing.T) {
+					g := buildGraphFromSources(t, files)
+					New(g).ResolveAll()
+					calls := callsInto(g, "lib/barrel"+ext+"::init")
+					require.Len(t, calls, 1)
+					require.Equal(t, "app/caller"+ext+"::run", calls[0].From)
+					require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
+				})
+			}
+
+			// Renamed export { other as init } must NOT mark a private `init` as js_named_export.
+			g := buildGraphFromSources(t, map[string]string{
+				"lib/impl" + ext:   "export function init() { return 2 }\n",
+				"lib/barrel" + ext: "function other() { return 3 }\nfunction init() { return 1 }\nexport { other as init }\nexport * from './impl'\n",
+				"app/caller" + ext: "export function run() { const { init } = require('../lib/barrel'); return init() }\n",
+			})
+			New(g).ResolveAll()
+			require.Empty(t, callsInto(g, "lib/barrel"+ext+"::init"))
+			require.Len(t, callsInto(g, "lib/impl"+ext+"::init"), 1)
+		})
 	}
 
 	t.Run("pure CJS module without js_named_export still binds", func(t *testing.T) {
@@ -491,58 +531,78 @@ func TestImportEvidence_LocalRequireResolvesBareDirEntry(t *testing.T) {
 			require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
 		})
 
-		t.Run("multi-segment spec rejects unrelated lastDirIndex neighbour/"+ext, func(t *testing.T) {
+		t.Run("multi-segment spec rejects 1-level and nested lastDirIndex neighbours/"+ext, func(t *testing.T) {
 			for _, spec := range []string{"lib/logger", "@acme/logger"} {
-				t.Run(spec, func(t *testing.T) {
-					g := buildGraphFromSources(t, map[string]string{
-						"app/internal/logger/index" + ext: "export function log() { return 0 }\n",
-						"app/web/handler" + ext:           "export function run() { const { log } = require('" + spec + "'); return log() }\n",
+				for _, neighbour := range []string{"app/logger/index", "app/internal/logger/index"} {
+					t.Run(spec+"/"+neighbour, func(t *testing.T) {
+						g := buildGraphFromSources(t, map[string]string{
+							neighbour + ext:         "export function log() { return 0 }\n",
+							"app/web/handler" + ext: "export function run() { const { log } = require('" + spec + "'); return log() }\n",
+						})
+						for _, n := range g.AllNodes() {
+							n.RepoPrefix = "app"
+						}
+						New(g).ResolveAll()
+						require.Empty(t, callsInto(g, neighbour+ext+"::log"))
+						require.NotNil(t, findCallEdge(g, "app/web/handler"+ext+"::run", graph.UnresolvedMarker+"log"))
 					})
-					for _, n := range g.AllNodes() {
-						n.RepoPrefix = "app"
-					}
-					New(g).ResolveAll()
-					require.Empty(t, callsInto(g, "app/internal/logger/index"+ext+"::log"))
-					require.NotNil(t, findCallEdge(g, "app/web/handler"+ext+"::run", graph.UnresolvedMarker+"log"))
-				})
+				}
 			}
+		})
+
+		t.Run("scoped package beats 1-level same-repo logger dir/"+ext, func(t *testing.T) {
+			g := buildGraphFromSources(t, map[string]string{
+				"app/logger/index" + ext:                "export function log() { return 0 }\n",
+				"app/packages/@acme/logger/index" + ext: "export function log() { return 1 }\n",
+				"app/web/handler" + ext:                 "export function run() { const { log } = require('@acme/logger'); return log() }\n",
+			})
+			for _, n := range g.AllNodes() {
+				n.RepoPrefix = "app"
+			}
+			New(g).ResolveAll()
+			require.Empty(t, callsInto(g, "app/logger/index"+ext+"::log"))
+			calls := callsInto(g, "app/packages/@acme/logger/index"+ext+"::log")
+			require.Len(t, calls, 1)
+			require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
 		})
 	}
 }
 
 func TestImportEvidence_LocalRequireResolvesCrossRepo(t *testing.T) {
 	for _, ext := range []string{".js", ".ts"} {
-		t.Run("cross-repo bare dir entry ignores same-repo lastDirIndex neighbour/"+ext, func(t *testing.T) {
-			for _, neighbourHasLog := range []bool{false, true} {
-				name := "neighbour without log"
-				neighbourSrc := "export function other() { return 0 }\n"
-				if neighbourHasLog {
-					name = "neighbour with log"
-					neighbourSrc = "export function log() { return 0 }\n"
-				}
-				t.Run(name, func(t *testing.T) {
-					g := buildGraphFromSources(t, map[string]string{
-						"lib/logger/index" + ext:          "export function log() { return 1 }\n",
-						"app/internal/logger/index" + ext: neighbourSrc,
-						"app/web/handler" + ext:           "export function run() { const { log } = require('lib/logger'); return log() }\n",
-					})
-					for _, n := range g.AllNodes() {
-						if strings.HasPrefix(n.FilePath, "lib/") {
-							n.RepoPrefix = "lib"
-						} else {
-							n.RepoPrefix = "app"
-						}
+		t.Run("cross-repo bare dir entry ignores 1-level and nested same-repo neighbours/"+ext, func(t *testing.T) {
+			for _, neighbour := range []string{"app/logger/index", "app/internal/logger/index"} {
+				for _, neighbourHasLog := range []bool{false, true} {
+					name := neighbour + "/without log"
+					neighbourSrc := "export function other() { return 0 }\n"
+					if neighbourHasLog {
+						name = neighbour + "/with log"
+						neighbourSrc = "export function log() { return 0 }\n"
 					}
-					New(g).ResolveAll()
-					require.Empty(t, callsInto(g, "lib/logger/index"+ext+"::log"))
-					require.Empty(t, callsInto(g, "app/internal/logger/index"+ext+"::log"))
-					NewCrossRepo(g).ResolveAll()
-					require.Empty(t, callsInto(g, "app/internal/logger/index"+ext+"::log"))
-					calls := callsInto(g, "lib/logger/index"+ext+"::log")
-					require.Len(t, calls, 1)
-					require.True(t, calls[0].CrossRepo)
-					require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
-				})
+					t.Run(name, func(t *testing.T) {
+						g := buildGraphFromSources(t, map[string]string{
+							"lib/logger/index" + ext: "export function log() { return 1 }\n",
+							neighbour + ext:          neighbourSrc,
+							"app/web/handler" + ext:  "export function run() { const { log } = require('lib/logger'); return log() }\n",
+						})
+						for _, n := range g.AllNodes() {
+							if strings.HasPrefix(n.FilePath, "lib/") {
+								n.RepoPrefix = "lib"
+							} else {
+								n.RepoPrefix = "app"
+							}
+						}
+						New(g).ResolveAll()
+						require.Empty(t, callsInto(g, "lib/logger/index"+ext+"::log"))
+						require.Empty(t, callsInto(g, neighbour+ext+"::log"))
+						NewCrossRepo(g).ResolveAll()
+						require.Empty(t, callsInto(g, neighbour+ext+"::log"))
+						calls := callsInto(g, "lib/logger/index"+ext+"::log")
+						require.Len(t, calls, 1)
+						require.True(t, calls[0].CrossRepo)
+						require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
+					})
+				}
 			}
 		})
 	}
@@ -664,13 +724,17 @@ func TestImportEvidence_CrossRepoTrackedNpmRequireRestubsOnProviderChange(t *tes
 				}
 				require.Equal(t, []string{"provB/index" + ext + "::work"}, crossCalls)
 
-				// 3. Adding a competing provider in wsB introduces ambiguity -> restubs to unresolved.
+				// 3. Adding a competing provider in wsB introduces ambiguity -> restubs to unresolved
+				// cleanly with no leaked restub_prev_* or stale resolution metadata.
 				providers["provC"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provC/index" + ext}}
 				cr.ResolveAll()
 				require.Empty(t, callsInto(store, "provB/index"+ext+"::work"))
 				call := unresolvedCall(t, store, "app/main"+ext+"::viaReq", "work")
 				require.False(t, call.CrossRepo)
+				require.Empty(t, call.Origin)
 				require.NotContains(t, call.Meta, NpmImportSpecifierMeta)
+				require.NotContains(t, call.Meta, "resolution")
+				require.False(t, graph.HasRestubProvenance(call))
 				for e := range graph.EdgesLightSeq(store, graph.EdgeCrossRepoCalls) {
 					t.Fatalf("unexpected stale cross_repo_calls edge to %q", e.To)
 				}
@@ -684,6 +748,377 @@ func TestImportEvidence_CrossRepoTrackedNpmRequireRestubsOnProviderChange(t *tes
 			})
 		}
 	}
+}
+
+func TestImportEvidence_CrossRepoScopedPassPreservesOutOfScopeRequire(t *testing.T) {
+	for _, backend := range []string{"memory", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			files := map[string]string{
+				"provA/index.ts": "export function work() { return 1 }\n",
+				"provB/index.ts": "export function work() { return 2 }\n",
+				"other/x.ts":     "export function noop() { return 0 }\n",
+				"app/main.ts":    "export function viaReq() { const { work } = require('p'); return work() }\n",
+			}
+			rawNodes, rawEdges := extractRawSources(t, files)
+			for _, n := range rawNodes {
+				switch {
+				case strings.HasPrefix(n.FilePath, "provA/"):
+					n.RepoPrefix = "provA"
+					n.WorkspaceID = "wsA"
+				case strings.HasPrefix(n.FilePath, "provB/"):
+					n.RepoPrefix = "provB"
+					n.WorkspaceID = "wsB"
+				case strings.HasPrefix(n.FilePath, "other/"):
+					n.RepoPrefix = "other"
+					n.WorkspaceID = "wsB"
+				default:
+					n.RepoPrefix = "app"
+					n.WorkspaceID = "wsB"
+				}
+			}
+			var store graph.Store = graph.New()
+			if backend == "sqlite" {
+				sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+				require.NoError(t, err)
+				defer sq.Close()
+				store = sq
+			}
+			store.AddBatch(rawNodes, rawEdges)
+
+			npmDep := func(_, spec string) bool { return spec == "p" }
+			providers := map[string]NpmPackageTarget{
+				"provA": {WorkspaceID: "wsA", Entries: []string{"provA/index.ts"}},
+			}
+			npmPkgs := func(spec string) map[string]NpmPackageTarget {
+				if spec != "p" {
+					return nil
+				}
+				return providers
+			}
+			crossWS := func(sourceWS string) []CrossWorkspaceDepRule {
+				if sourceWS == "wsB" {
+					return []CrossWorkspaceDepRule{{Workspace: "wsA", Modules: []string{"p"}}}
+				}
+				return nil
+			}
+			r := New(store)
+			r.SetNpmDependencyLookup(npmDep)
+			r.ResolveAll()
+
+			cr := NewCrossRepo(store)
+			cr.SetNpmDependencyLookup(npmDep)
+			cr.SetNpmPackageLookup(npmPkgs)
+			cr.SetCrossWorkspaceDepLookup(crossWS)
+			cr.ResolveAll()
+			require.Len(t, callsInto(store, "provA/index.ts::work"), 1)
+
+			// Add provB, then run scoped passes that do NOT include app/main.ts.
+			// Out-of-scope app/main.ts::viaReq must NOT be orphaned.
+			providers["provB"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provB/index.ts"}}
+			cr.ResolveForRepo("provB")
+			cr.ResolveForFile("other", "x.ts")
+			cr.ResolveFilesAndIncoming([]string{"other/x.ts"})
+
+			callsA := callsInto(store, "provA/index.ts::work")
+			require.Len(t, callsA, 1, "scoped pass for unrelated repo/file must not restub out-of-scope require()")
+			require.True(t, callsA[0].CrossRepo)
+			var crossCalls []string
+			for e := range graph.EdgesLightSeq(store, graph.EdgeCrossRepoCalls) {
+				crossCalls = append(crossCalls, e.To)
+			}
+			require.Equal(t, []string{"provA/index.ts::work"}, crossCalls)
+
+			// Now a scoped pass that DOES include app/main.ts retargets cleanly to provB.
+			cr.ResolveFilesAndIncoming([]string{"app/main.ts"})
+			require.Empty(t, callsInto(store, "provA/index.ts::work"))
+			require.Len(t, callsInto(store, "provB/index.ts::work"), 1)
+		})
+	}
+}
+
+func TestImportEvidence_CrossRepoMixedAliasedImportAndLocalRequire(t *testing.T) {
+	for _, backend := range []string{"memory", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			files := map[string]string{
+				"provA/index.ts": "export function work() { return 1 }\n",
+				"provB/index.ts": "export function work() { return 2 }\n",
+				"app/main.ts":    "import { work as aliased } from 'p'\nexport function viaES() { return aliased() }\nexport function viaReq() { const { work } = require('p'); return work() }\n",
+			}
+			rawNodes, rawEdges := extractRawSources(t, files)
+			for _, n := range rawNodes {
+				switch {
+				case strings.HasPrefix(n.FilePath, "provA/"):
+					n.RepoPrefix = "provA"
+					n.WorkspaceID = "wsA"
+				case strings.HasPrefix(n.FilePath, "provB/"):
+					n.RepoPrefix = "provB"
+					n.WorkspaceID = "wsB"
+				default:
+					n.RepoPrefix = "app"
+					n.WorkspaceID = "wsB"
+				}
+			}
+			var store graph.Store = graph.New()
+			if backend == "sqlite" {
+				sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+				require.NoError(t, err)
+				defer sq.Close()
+				store = sq
+			}
+			store.AddBatch(rawNodes, rawEdges)
+
+			npmDep := func(_, spec string) bool { return spec == "p" }
+			providers := map[string]NpmPackageTarget{
+				"provA": {WorkspaceID: "wsA", Entries: []string{"provA/index.ts"}},
+			}
+			cr := NewCrossRepo(store)
+			cr.SetNpmDependencyLookup(npmDep)
+			cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+				if spec != "p" {
+					return nil
+				}
+				return providers
+			})
+			cr.SetCrossWorkspaceDepLookup(func(sourceWS string) []CrossWorkspaceDepRule {
+				if sourceWS == "wsB" {
+					return []CrossWorkspaceDepRule{{Workspace: "wsA", Modules: []string{"p"}}}
+				}
+				return nil
+			})
+			r := New(store)
+			r.SetNpmDependencyLookup(npmDep)
+			r.ResolveAll()
+			cr.ResolveAll()
+			require.Len(t, callsInto(store, "provA/index.ts::work"), 2)
+
+			// Retarget from provA to provB: viaReq must rebind cleanly (not unresolved::aliased, no duplicates).
+			providers["provB"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provB/index.ts"}}
+			cr.ResolveAll()
+			require.Empty(t, callsInto(store, "provA/index.ts::work"))
+			require.Len(t, callsInto(store, "provB/index.ts::work"), 2)
+			var reqCalls []*graph.Edge
+			for _, e := range store.GetOutEdges("app/main.ts::viaReq") {
+				if e.Kind == graph.EdgeCalls && e.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+					reqCalls = append(reqCalls, e)
+				}
+			}
+			require.Len(t, reqCalls, 1)
+			require.Equal(t, "provB/index.ts::work", reqCalls[0].To)
+
+			// Ambiguity: viaES -> unresolved::aliased, viaReq -> unresolved::work (no duplicate, clean meta).
+			providers["provC"] = NpmPackageTarget{WorkspaceID: "wsB", Entries: []string{"provC/index.ts"}}
+			cr.ResolveAll()
+			require.Empty(t, callsInto(store, "provB/index.ts::work"))
+			esCall := unresolvedCall(t, store, "app/main.ts::viaES", "aliased")
+			require.False(t, graph.HasRestubProvenance(esCall))
+			reqCall := unresolvedCall(t, store, "app/main.ts::viaReq", "work")
+			require.Nil(t, findCallEdge(store, "app/main.ts::viaReq", graph.UnresolvedMarker+"aliased"))
+			require.False(t, graph.HasRestubProvenance(reqCall))
+			require.NotContains(t, reqCall.Meta, "resolution")
+			require.NotContains(t, reqCall.Meta, NpmImportSpecifierMeta)
+		})
+	}
+}
+
+func TestImportEvidence_CrossRepoNpmAliasSiblingImportNoChurn(t *testing.T) {
+	g := buildGraphFromSources(t, map[string]string{
+		"prov/index.js": "export function other() { return 1 }\nexport function work() { return 2 }\n",
+		"other/x.js":    "export function noop() { return 0 }\n",
+		"app/main.js":   "import { other } from 'p'\nexport function run() { const { work } = require('p-alias'); return other() + work() }\n",
+	})
+	for _, n := range g.AllNodes() {
+		switch {
+		case strings.HasPrefix(n.FilePath, "prov/"):
+			n.RepoPrefix = "prov"
+			n.WorkspaceID = "shared"
+		case strings.HasPrefix(n.FilePath, "other/"):
+			n.RepoPrefix = "other"
+			n.WorkspaceID = "shared"
+		default:
+			n.RepoPrefix = "app"
+			n.WorkspaceID = "shared"
+		}
+	}
+	npmDep := func(_, spec string) bool { return spec == "p" || spec == "p-alias" }
+	npmAlias := func(_, spec string) string {
+		if spec == "p-alias" {
+			return "p"
+		}
+		return ""
+	}
+	r := New(g)
+	r.SetNpmDependencyLookup(npmDep)
+	r.SetNpmAliasResolver(npmAlias)
+	r.ResolveAll()
+
+	cr := NewCrossRepo(g)
+	cr.SetNpmDependencyLookup(npmDep)
+	cr.SetNpmAliasResolver(npmAlias)
+	cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+		if spec != "p" {
+			return nil
+		}
+		return map[string]NpmPackageTarget{"prov": {WorkspaceID: "shared", Entries: []string{"prov/index.js"}}}
+	})
+	cr.ResolveAll()
+
+	calls := callsInto(g, "prov/index.js::work")
+	require.Len(t, calls, 1)
+	require.Equal(t, "p", calls[0].Meta[NpmImportSpecifierMeta])
+
+	// Second ResolveAll must not restub/re-resolve (zero churn).
+	stats2 := cr.ResolveAll()
+	require.Zero(t, stats2.Resolved)
+	require.Len(t, callsInto(g, "prov/index.js::work"), 1)
+
+	// Scoped pass on another file must preserve the binding.
+	cr.ResolveForFile("other", "x.js")
+	require.Len(t, callsInto(g, "prov/index.js::work"), 1)
+}
+
+type cancelAfterPagesStore struct {
+	graph.Store
+	cancelAfter int
+	pages       int
+	cancel      context.CancelFunc
+	reindexIDs  []graph.EdgeIdentity
+}
+
+func (s *cancelAfterPagesStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
+	res := s.Store.GetEdgeCandidates(endpoints, sites)
+	s.pages++
+	if s.cancel != nil && s.pages >= s.cancelAfter {
+		s.cancel()
+	}
+	return res
+}
+
+func (s *cancelAfterPagesStore) ReindexEdges(batch []graph.EdgeReindex) {
+	for _, item := range batch {
+		if item.Edge != nil {
+			s.reindexIDs = append(s.reindexIDs, graph.EdgeIdentityFor(item.Edge))
+		}
+	}
+	s.Store.ReindexEdges(batch)
+}
+
+func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) {
+	t.Run("mid-pagination ctx cancel flushes completed page without corrupting indexes", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				var base graph.Store = graph.New()
+				if backend == "sqlite" {
+					sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					defer sq.Close()
+					base = sq
+				}
+				total := resolvePendingPageRows + 5
+				nodes := make([]*graph.Node, 0, total+3)
+				nodes = append(nodes,
+					&graph.Node{ID: "app/main.ts", Kind: graph.KindFile, FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"},
+					&graph.Node{ID: "provA/index.ts", Kind: graph.KindFile, FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
+					&graph.Node{ID: "provA/index.ts::work", Kind: graph.KindFunction, Name: "work", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
+				)
+				edges := make([]*graph.Edge, 0, total*2)
+				for i := 0; i < total; i++ {
+					fnID := fmt.Sprintf("app/main.ts::run%d", i)
+					nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("run%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
+					call := &graph.Edge{
+						From: fnID, To: "provA/index.ts::work", Kind: graph.EdgeCalls,
+						FilePath: "app/main.ts", Line: i + 1, CrossRepo: true,
+						Meta: map[string]any{
+							graph.JSLexicalBindingMeta:     graph.JSLexicalRequire,
+							graph.JSLexicalRequireSpecMeta: "p",
+							NpmImportSpecifierMeta:         "p",
+						},
+					}
+					xcall := *call
+					xcall.Kind = graph.EdgeCrossRepoCalls
+					edges = append(edges, call, &xcall)
+				}
+				base.AddBatch(nodes, edges)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				wrapped := &cancelAfterPagesStore{Store: base, cancelAfter: 1, cancel: cancel}
+				cr := NewCrossRepo(wrapped)
+				cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "p" })
+				// Return empty providers so every inspected call is stale and must restub.
+				cr.SetNpmPackageLookup(func(string) map[string]NpmPackageTarget { return nil })
+
+				memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
+				cr.restubStaleTrackedNpmRequireCallsAll(ctx, memo)
+
+				// Exactly page 1 flushed; remaining 5 stay cleanly indexed at provA/index.ts::work.
+				inProv := callsInto(base, "provA/index.ts::work")
+				require.Len(t, inProv, 5)
+				for _, e := range inProv {
+					require.Equal(t, "provA/index.ts::work", e.To, "in-edge bucket must never hold mutated unresolved edge")
+				}
+				unresolvedCount := 0
+				for e := range base.EdgesWithUnresolvedTarget() {
+					if e.Kind == graph.EdgeCalls && e.To == graph.UnresolvedMarker+"work" {
+						unresolvedCount++
+					}
+				}
+				require.Equal(t, resolvePendingPageRows, unresolvedCount)
+			})
+		}
+	})
+
+	t.Run("duplicate EdgeCrossRepoCalls on same site straddling page boundary reindexes once on SQLite", func(t *testing.T) {
+		sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+		require.NoError(t, err)
+		defer sq.Close()
+
+		nodes := []*graph.Node{
+			{ID: "app/main.ts", Kind: graph.KindFile, FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"},
+			{ID: "app/main.ts::shared", Kind: graph.KindFunction, Name: "shared", FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"},
+			{ID: "provA/index.ts", Kind: graph.KindFile, FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
+			{ID: "provA/index.ts::workA", Kind: graph.KindFunction, Name: "workA", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
+			{ID: "provA/index.ts::workB", Kind: graph.KindFunction, Name: "workB", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
+		}
+		edges := make([]*graph.Edge, 0, (resolvePendingPageRows+2)*2)
+		for i := 0; i < resolvePendingPageRows-1; i++ {
+			fnID := fmt.Sprintf("app/main.ts::pad%d", i)
+			nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("pad%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
+			call := &graph.Edge{
+				From: fnID, To: "provA/index.ts::workA", Kind: graph.EdgeCalls,
+				FilePath: "app/main.ts", Line: i + 10, CrossRepo: true,
+				Meta: map[string]any{graph.JSLexicalBindingMeta: graph.JSLexicalRequire, graph.JSLexicalRequireSpecMeta: "p", NpmImportSpecifierMeta: "p"},
+			}
+			xcall := *call
+			xcall.Kind = graph.EdgeCrossRepoCalls
+			edges = append(edges, call, &xcall)
+		}
+		for _, target := range []string{"provA/index.ts::workA", "provA/index.ts::workB"} {
+			call := &graph.Edge{
+				From: "app/main.ts::shared", To: target, Kind: graph.EdgeCalls,
+				FilePath: "app/main.ts", Line: 1, CrossRepo: true,
+				Meta: map[string]any{graph.JSLexicalBindingMeta: graph.JSLexicalRequire, graph.JSLexicalRequireSpecMeta: "p", NpmImportSpecifierMeta: "p"},
+			}
+			xcall := *call
+			xcall.Kind = graph.EdgeCrossRepoCalls
+			edges = append(edges, call, &xcall)
+		}
+		sq.AddBatch(nodes, edges)
+
+		wrapped := &cancelAfterPagesStore{Store: sq}
+		cr := NewCrossRepo(wrapped)
+		cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "p" })
+		cr.SetNpmPackageLookup(func(string) map[string]NpmPackageTarget { return nil })
+
+		memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
+		cr.restubStaleTrackedNpmRequireCallsAll(context.Background(), memo)
+
+		seenReindex := make(map[graph.EdgeIdentity]int)
+		for _, id := range wrapped.reindexIDs {
+			seenReindex[id]++
+			require.Equal(t, 1, seenReindex[id], "duplicate ReindexEdges for %+v", id)
+		}
+		require.Equal(t, resolvePendingPageRows+1, len(wrapped.reindexIDs))
+	})
 }
 
 func TestImportEvidence_CrossRepoParallelRequireAndReExportNoRace(t *testing.T) {
@@ -757,12 +1192,12 @@ func TestImportEvidence_CrossRepoRequireTargetCacheAvoidsRepeatLookups(t *testin
 			"prov": {WorkspaceID: "shared", Entries: []string{"prov/index.ts"}},
 		}
 	})
-	cr.ResolveAll()
+	cr.ResolveForFile("app", "main.ts")
 	require.Len(t, callsInto(g, "prov/impl.ts::work"), 12)
-	// Caching avoids N+1 lookups across the 12 require('p') calls; allow small
-	// bounded headroom for parallel worker cold fills.
-	require.LessOrEqual(t, npmCalls.Load(), int64(6))
-	require.LessOrEqual(t, counting.outEdgeCalls.Load(), int64(10))
+	// Deterministic single-threaded scoped pass: requireTargetCache and
+	// outEdgesByFile must serve all 12 require('p') calls from a single lookup.
+	require.Equal(t, int64(1), npmCalls.Load())
+	require.LessOrEqual(t, counting.outEdgeCalls.Load(), int64(2))
 }
 
 func TestImportEvidence_CrossRepoLexicalShadowNeverRemoteStitches(t *testing.T) {
@@ -985,35 +1420,67 @@ func TestImportEvidence_ConflictingRequireVarSpecsDowngrade(t *testing.T) {
 }
 
 func TestImportEvidence_AdditionalLexicalRequireShadows(t *testing.T) {
-	tsCases := map[string]string{
-		"namespace export const":            "namespace N { export const require = () => () => 2; export function run() { const work = require('../a/one'); return work() } }",
-		"namespace export const work":       "namespace N { export const work = () => 2; export function run() { return work() } }",
-		"namespace export var work":         "namespace N { export function run() { return work() } export var work = () => 2 }",
-		"namespace hoisted var":             "namespace N { export function run() { const work = require('../a/one'); return work() } if (true) { var require = () => () => 2 } }",
-		"top-level namespace":               "namespace require { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }",
-		"nested namespace":                  "namespace require.Sub { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }",
-		"3-segment namespace":               "namespace require.Sub.Leaf { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }",
-		"export 3-segment namespace":        "export namespace require.Sub.Leaf { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }",
-		"inner 3-segment namespace work":    "namespace N { namespace work.Sub.Leaf { export const x = 1 } export function run() { return work() } }",
-		"import alias":                      "namespace Loader { export function require(s: string) { return () => 2 } }\nimport require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }",
-		"import alias with comment":         "namespace Loader { export function require(s: string) { return () => 2 } }\nimport /* compat */ require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }",
-		"export import alias":               "namespace Loader { export function require(s: string) { return () => 2 } }\nexport import require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }",
-		"export import alias with comment":  "namespace Loader { export function require(s: string) { return () => 2 } }\nexport import /* compat */ require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }",
-		"inner import alias with comment":   "namespace Loader { export function work() { return 2 } }\nnamespace N { import /* alias */ work = Loader.work; export function run() { return work() } }",
-		"using declaration require":         "export function run(mk: any) { using require = mk(); const work = require('../a/one'); return work() }",
-		"await using declaration require":   "export async function run(mk: any) { await using require = mk(); const work = require('../a/one'); return work() }",
-		"using declaration work":            "export function run(mk: any) { using work = mk(); return work() }",
-		"await using declaration work":      "export async function run(mk: any) { await using work = mk(); return work() }",
+	tsCases := map[string]struct {
+		body            string
+		assertLocalFrom string
+	}{
+		"namespace export const":            {body: "namespace N { export const require = () => () => 2; export function run() { const work = require('../a/one'); return work() } }"},
+		"namespace export const work":       {body: "declare function get(): any\nnamespace N { export const work = get(); export function run() { return work() } }", assertLocalFrom: "app/main$EXT::run"},
+		"namespace export var work":         {body: "declare function get(): any\nnamespace N { export function run() { return work() } export var work = get() }", assertLocalFrom: "app/main$EXT::run"},
+		"namespace hoisted var":             {body: "namespace N { export function run() { const work = require('../a/one'); return work() } if (true) { var require = () => () => 2 } }"},
+		"top-level namespace":               {body: "namespace require { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }"},
+		"nested namespace":                  {body: "namespace require.Sub { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }"},
+		"3-segment namespace":               {body: "namespace require.Sub.Leaf { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }"},
+		"export 3-segment namespace":        {body: "export namespace require.Sub.Leaf { export const x = 1 }\nexport function run() { const work = require('../a/one'); return work() }"},
+		"inner 3-segment namespace work":    {body: "namespace N { namespace work.Sub.Leaf { export const x = 1 } export function run() { return work() } }", assertLocalFrom: "app/main$EXT::run"},
+		"import alias":                      {body: "namespace Loader { export function require(s: string) { return () => 2 } }\nimport require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }"},
+		"import alias with comment":         {body: "namespace Loader { export function require(s: string) { return () => 2 } }\nimport /* compat */ require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }"},
+		"export import alias":               {body: "namespace Loader { export function require(s: string) { return () => 2 } }\nexport import require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }"},
+		"export import alias with comment":  {body: "namespace Loader { export function require(s: string) { return () => 2 } }\nexport import /* compat */ require = Loader.require\nexport function run() { const work = require('../a/one'); return work() }"},
+		"inner import alias with comment":   {body: "namespace Loader { export function other() { return 2 } }\nnamespace N { import /* alias */ work = Loader.other; export function run() { return work() } }", assertLocalFrom: "app/main$EXT::run"},
+		"using declaration require":         {body: "export function run(mk: any) { using require = mk(); const work = require('../a/one'); return work() }"},
+		"await using declaration require":   {body: "export async function run(mk: any) { await using require = mk(); const work = require('../a/one'); return work() }"},
+		"using declaration work":            {body: "export function run(mk: any) { using work = mk(); return work() }", assertLocalFrom: "app/main$EXT::run"},
+		"await using declaration work":      {body: "export async function run(mk: any) { await using work = mk(); return work() }", assertLocalFrom: "app/main$EXT::run"},
+		"multi using first work":            {body: "export function run(mk: any) { using work = mk(), b = mk(); return work() }", assertLocalFrom: "app/main$EXT::run"},
+		"multi using second work":           {body: "export function run(mk: any) { using a = mk(), work = mk(); return work() }", assertLocalFrom: "app/main$EXT::run"},
+		"multi await using second work":     {body: "export async function run(mk: any) { await using a = mk(), work = mk(); return work() }", assertLocalFrom: "app/main$EXT::run"},
+		"triple using require":              {body: "export function run(mk: any) { using a = mk(), b = mk(), require = mk(); const work = require('../a/one'); return work() }"},
+		"for multi using work":              {body: "export function run(mk: any) { for (using a = mk(), work = mk(); false;) { return work() } }", assertLocalFrom: "app/main$EXT::run"},
 	}
-	for name, body := range tsCases {
+	for name, tc := range tsCases {
 		for _, ext := range []string{".ts", ".tsx"} {
 			t.Run(ext+"/"+name, func(t *testing.T) {
 				g := buildGraphFromSources(t, map[string]string{
 					"a/one.ts":        "export function work() { return 1 }",
-					"app/main" + ext: "import { work } from '../a/one'\n" + body + "\n",
+					"app/main" + ext: "import { work } from '../a/one'\n" + tc.body + "\n",
 				})
 				New(g).ResolveAll()
 				require.Empty(t, callsInto(g, "a/one.ts::work"))
+				if tc.assertLocalFrom != "" {
+					from := strings.ReplaceAll(tc.assertLocalFrom, "$EXT", ext)
+					call := unresolvedCall(t, g, from, "work")
+					require.Equal(t, graph.JSLexicalLocal, call.Meta[graph.JSLexicalBindingMeta])
+				}
+			})
+		}
+	}
+
+	for _, ext := range []string{".ts", ".tsx"} {
+		for name, body := range map[string]string{
+			"using require binds":             "export function run() { using work = require('../a/one'); return work() }",
+			"await using require binds":       "export async function run() { await using work = require('../a/one'); return work() }",
+			"multi using second require binds": "export function run(mk: any) { using a = mk(), work = require('../a/one'); return work() }",
+		} {
+			t.Run(ext+"/"+name, func(t *testing.T) {
+				g := buildGraphFromSources(t, map[string]string{
+					"a/one.ts":        "export function work() { return 1 }",
+					"app/main" + ext: body + "\n",
+				})
+				New(g).ResolveAll()
+				calls := callsInto(g, "a/one.ts::work")
+				require.Len(t, calls, 1)
+				require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
 			})
 		}
 	}
