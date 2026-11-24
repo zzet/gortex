@@ -694,6 +694,32 @@ func TestImportEvidence_LocalRequireResolvesCrossRepo(t *testing.T) {
 		}
 	})
 
+	t.Run("cross-repo scoped subpath matches resolveImport dirMatchesImport parity", func(t *testing.T) {
+		for _, ext := range []string{".js", ".ts"} {
+			t.Run(ext, func(t *testing.T) {
+				g := buildGraphFromSources(t, map[string]string{
+					"logger/sub/index" + ext: "export function log() { return 1 }\n",
+					"app/web/h" + ext:        "export function run() { const { log } = require('@acme/logger/sub'); return log() }\n",
+				})
+				for _, n := range g.AllNodes() {
+					if strings.HasPrefix(n.FilePath, "logger/") {
+						n.RepoPrefix = "logger"
+					} else {
+						n.RepoPrefix = "app"
+					}
+					n.WorkspaceID = "shared"
+				}
+				New(g).ResolveAll()
+				require.Empty(t, callsInto(g, "logger/sub/index"+ext+"::log"))
+				NewCrossRepo(g).ResolveAll()
+				calls := callsInto(g, "logger/sub/index"+ext+"::log")
+				require.Len(t, calls, 1)
+				require.True(t, calls[0].CrossRepo)
+				require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
+			})
+		}
+	})
+
 	t.Run("cross-repo tracked npm package and isolation", func(t *testing.T) {
 		g := buildGraphFromSources(t, map[string]string{
 			"provider/index.js": "export function work() { return 1 }\n",
@@ -1182,10 +1208,13 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 			{ID: "provA/index.ts::workA", Kind: graph.KindFunction, Name: "workA", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
 			{ID: "provA/index.ts::workB", Kind: graph.KindFunction, Name: "workB", FilePath: "provA/index.ts", Language: "typescript", RepoPrefix: "provA", WorkspaceID: "shared"},
 		}
-		// Insert resolvePendingPageRows unique pad sites + 2 EdgeCrossRepoCalls
-		// sharing {shared, 1}, yielding resolvePendingPageRows+1 unique sites (2 pages).
+		// Insert resolvePendingPageRows-1 pad rows before the 2 {shared, 1} rows
+		// and 1 trailing pad row after so the duplicate {shared, 1} rows sit at
+		// raw indices [resolvePendingPageRows-1, resolvePendingPageRows]
+		// (straddling the page boundary) while yielding resolvePendingPageRows+1
+		// unique sites across 2 pages.
 		edges := make([]*graph.Edge, 0, (resolvePendingPageRows+2)*2)
-		for i := 0; i < resolvePendingPageRows; i++ {
+		appendPad := func(i int) {
 			fnID := fmt.Sprintf("app/main.ts::pad%d", i)
 			nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("pad%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
 			call := &graph.Edge{
@@ -1197,6 +1226,9 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 			xcall.Kind = graph.EdgeCrossRepoCalls
 			edges = append(edges, call, &xcall)
 		}
+		for i := 0; i < resolvePendingPageRows-1; i++ {
+			appendPad(i)
+		}
 		for _, target := range []string{"provA/index.ts::workA", "provA/index.ts::workB"} {
 			call := &graph.Edge{
 				From: "app/main.ts::shared", To: target, Kind: graph.EdgeCalls,
@@ -1207,6 +1239,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 			xcall.Kind = graph.EdgeCrossRepoCalls
 			edges = append(edges, call, &xcall)
 		}
+		appendPad(resolvePendingPageRows - 1)
 		sq.AddBatch(nodes, edges)
 
 		wrapped := &cancelAfterPagesStore{Store: sq}

@@ -450,10 +450,13 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 	var sameRepoFound bool
 	var sameRepoAll, crossRepoAll []graph.FileNodeIdentity
 	consider := func(file graph.FileNodeIdentity) {
-		if !isJSTSDirEntryPoint(file.FilePath) || !jsBareDirMatches(file, rewritten) {
+		if !isJSTSDirEntryPoint(file.FilePath) {
 			return
 		}
 		if file.RepoPrefix == callerRepo {
+			if !jsBareDirMatches(file, rewritten) {
+				return
+			}
 			if !sameRepoFound {
 				sameRepo, sameRepoFound = file, true
 			}
