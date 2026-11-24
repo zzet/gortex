@@ -240,11 +240,8 @@ func (r *Resolver) flushPendingGuardRevertsLocked() (int, bool) {
 // spooled during a ResolveAll pass that is aborting early on write refusal.
 // It runs read-only (zero store writes) and queues every unreachable revert
 // onto r.pendingGuardReverts so retry finishes guarding them before they vanish
-// from the unresolved stream. stampGuardReverted is false when aborting mid-
-// compute before every import edge has committed, avoiding a premature
-// guard_reverted stamp on calls whose imports were still in later chunks.
-// Caller holds r.mu.
-func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool, guardRepos map[string]struct{}, stampGuardReverted bool) {
+// from the unresolved stream. Caller holds r.mu.
+func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool, guardRepos map[string]struct{}) {
 	if guardSpool == nil || guardSpool.count == 0 || guardSpool.readAt >= guardSpool.count {
 		return
 	}
@@ -268,7 +265,7 @@ func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool,
 		jobs := guardJobsFromRecords(r.graph, records)
 		r.clearLookupCache()
 		r.warmGuardLookupCache(jobs)
-		r.guardCrossPackageCallEdgesWithStamp(jobs, guardClosure, stampGuardReverted)
+		r.guardCrossPackageCallEdges(jobs, guardClosure)
 		r.clearLookupCache()
 		done = exhausted
 	}
@@ -282,10 +279,6 @@ func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool,
 // reverted edge is restored exactly. closure is the import-reachability
 // map from buildImportClosure. Returns the number of edges reverted.
 func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[string]map[string]struct{}) int {
-	return r.guardCrossPackageCallEdgesWithStamp(jobs, closure, true)
-}
-
-func (r *Resolver) guardCrossPackageCallEdgesWithStamp(jobs []reindexJob, closure map[string]map[string]struct{}, stampGuardReverted bool) int {
 	if len(jobs) == 0 {
 		return 0
 	}
@@ -419,22 +412,18 @@ func (r *Resolver) guardCrossPackageCallEdgesWithStamp(jobs []reindexJob, closur
 		// Durable revert stamp: the guard's verdicts are otherwise invisible
 		// after the provenance drop, which blocks any selective replay — a
 		// future pass cannot learn which speculative shapes never survive
-		// scrutiny. The stamp rides the reindex write it already pays for.
-		// Mid-compute write-refusal drains suppress the stamp because later
-		// chunks' import edges have not committed yet.
-		if stampGuardReverted {
-			if j.edge.Meta == nil {
-				j.edge.Meta = map[string]any{}
-			}
-			j.edge.Meta["guard_reverted"] = true
+		// scrutiny. The stamp rides the reindex write it already pays for and
+		// also protects reverted Go calls from CrossRepoResolver resurrecting
+		// unimported same-repo decoys while allowing genuine imported targets.
+		if j.edge.Meta == nil {
+			j.edge.Meta = map[string]any{}
 		}
+		j.edge.Meta["guard_reverted"] = true
 		// The abandoned bind's provenance must not shadow a later
 		// rebind — the receiver gate exempts resolution shapes like
 		// extension_method, and a stale tag would carry that exemption
 		// to whatever the edge binds to next.
-		if j.edge.Meta != nil {
-			delete(j.edge.Meta, "resolution")
-		}
+		delete(j.edge.Meta, "resolution")
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
 	}

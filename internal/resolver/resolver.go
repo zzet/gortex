@@ -521,8 +521,11 @@ type Resolver struct {
 	// takeRetryState / saveRetryState hand off MasterRetryState strictly while
 	// r.mu (g.ResolveMutex()) is held so concurrent short-lived resolvers on
 	// separate repo lanes cannot dequeue another lane's pending retry items.
-	takeRetryState func() MasterRetryState
-	saveRetryState func(MasterRetryState)
+	// retryBridgeGraph pins the bridge to the store installed alongside it so a
+	// temporary SetGraph(inMemShadow) cold build never touches durable retry state.
+	takeRetryState   func() MasterRetryState
+	saveRetryState   func(MasterRetryState)
+	retryBridgeGraph graph.Store
 
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
@@ -885,10 +888,21 @@ type MasterRetryState struct {
 
 // SetRetryStateBridge installs callbacks invoked strictly while r.mu
 // (g.ResolveMutex()) is held so concurrent short-lived resolvers on separate
-// repository lanes cannot steal another lane's pending retry items.
+// repository lanes cannot steal another lane's pending retry items. The bridge
+// is pinned to the graph store currently attached to r so temporary cold shadow
+// swaps (SetGraph(inMemShadow)) leave durable retry state untouched.
 func (r *Resolver) SetRetryStateBridge(take func() MasterRetryState, save func(MasterRetryState)) {
 	r.takeRetryState = take
 	r.saveRetryState = save
+	if take != nil || save != nil {
+		r.retryBridgeGraph = r.graph
+	} else {
+		r.retryBridgeGraph = nil
+	}
+}
+
+func (r *Resolver) retryBridgeActiveLocked() bool {
+	return r.retryBridgeGraph != nil && r.graph == r.retryBridgeGraph
 }
 
 func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
@@ -921,7 +935,7 @@ func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
 // concurrent repository retry can observe and drain its own pending files
 // instead of falsely certifying on an empty bridge.
 func (r *Resolver) releaseNonInFlightRetryStateLocked() {
-	if r.saveRetryState == nil {
+	if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
 		return
 	}
 	var out MasterRetryState
@@ -947,11 +961,14 @@ func (r *Resolver) releaseNonInFlightRetryStateLocked() {
 }
 
 func (r *Resolver) bridgeRetryStateLocked() func() {
+	if !r.retryBridgeActiveLocked() {
+		return func() {}
+	}
 	if r.takeRetryState != nil {
 		r.adoptRetryStateLocked(r.takeRetryState())
 	}
 	return func() {
-		if r.saveRetryState == nil {
+		if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
 			return
 		}
 		var out MasterRetryState
@@ -1427,7 +1444,6 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	guardDrained := false
 	guardRepos := make(map[string]struct{})
 	var tailWriteRefused bool
-	computeLoopDone := false
 	yielded := false
 	total := &ResolveStats{}
 	resolveError := func(err error) (*ResolveStats, error) {
@@ -1449,7 +1465,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			r.notePendingTailRetryLocked()
 			if guardSpoolErr == nil && guardSpool.count > 0 && !guardDrained {
 				guardDrained = true
-				r.drainGuardSpoolToPendingLocked(guardSpool, guardRepos, computeLoopDone)
+				r.drainGuardSpoolToPendingLocked(guardSpool, guardRepos)
 			}
 		}
 		total.PendingBefore = pendingBefore
@@ -1795,9 +1811,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			return resolveError(err)
 		}
 	}
-	computeLoopDone = true
 	defer r.trackPassWriteRefused(&tailWriteRefused)()
-	if yielded && r.takeRetryState != nil {
+	if yielded && r.takeRetryState != nil && r.retryBridgeActiveLocked() {
 		// Re-absorb any remaining bridged retry state now that no further
 		// r.mu yields will occur so pending repoints/reverts are flushed before
 		// the tail runs and only this pass's scope is cleared on completion.

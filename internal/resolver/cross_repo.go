@@ -189,6 +189,9 @@ type CrossRepoResolver struct {
 	// short-lived resolvers from stealing another lane's retry queue.
 	takeRetryState func() []graph.PlaceholderRepoint
 	saveRetryState func([]graph.PlaceholderRepoint)
+	// chunkYieldHook is a deterministic inter-chunk interleave seam used by
+	// resolver tests. Nil in production.
+	chunkYieldHook func()
 }
 
 // SetRetryStateBridge installs callbacks invoked strictly while cr.mu
@@ -457,9 +460,10 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *C
 	// Fresh placeholder-source census per pass while retaining any deferred
 	// repoints a prior refused write left unapplied.
 	cr.placeholderSrcIdx.beginPass()
-	// Flush inherited deferred repoints BEFORE streaming or yielding cr.mu
-	// between chunks so a concurrent repo retry never sees an empty queue while
-	// its dataflow edges are still unapplied.
+	// Flush previously queued deferred repoints BEFORE streaming or yielding
+	// cr.mu between chunks; in-pass deferred repoints are handed back across
+	// each inter-chunk yield so concurrent repo lanes never certify on an empty
+	// bridge while their dataflow edges remain unapplied.
 	if cr.placeholderSrcIdx.hasDeferred() {
 		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
 			stats.WriteRefused = true
@@ -674,18 +678,42 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *C
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
+				if cr.saveRetryState != nil {
+					if deferred := cr.placeholderSrcIdx.takeDeferred(); len(deferred) > 0 {
+						cr.saveRetryState(deferred)
+					}
+				}
+				yieldHook := cr.chunkYieldHook
 				cr.mu.Unlock()
+				if yieldHook != nil {
+					yieldHook()
+				}
 				runtime.Gosched()
 				cr.mu.Lock()
-				if err := ctx.Err(); err != nil {
-					return stats, err
-				}
+				mutated := !revKnown
 				if revKnown {
 					if revAfter, _ := loadMutationRevision(cr.graph); revAfter != revBefore {
+						mutated = true
 						// An interleaving writer may have created nodes or
 						// changed name buckets; drop cross-page retention.
 						cr.hotCache.flush()
 					}
+				}
+				if cr.takeRetryState != nil {
+					if deferred := cr.takeRetryState(); len(deferred) > 0 {
+						if mutated {
+							cr.placeholderSrcIdx.inheritDeferred(deferred)
+						} else {
+							cr.placeholderSrcIdx.deferred = append(cr.placeholderSrcIdx.deferred, deferred...)
+						}
+					} else if mutated {
+						cr.placeholderSrcIdx.beginPass()
+					}
+				} else if mutated {
+					cr.placeholderSrcIdx.beginPass()
+				}
+				if err := ctx.Err(); err != nil {
+					return stats, err
 				}
 			}
 		}
@@ -1385,6 +1413,9 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	if e.To != oldTo {
+		if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+			delete(e.Meta, "guard_reverted")
+		}
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		cr.noteRetargetedCall(e)
 	}

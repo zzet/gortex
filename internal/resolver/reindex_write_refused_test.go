@@ -1051,76 +1051,194 @@ func TestPreAttributionIncrementalWriteRefusedNotesPendingAttribFiles(t *testing
 }
 
 func TestChunkedGuardRevertPreservesChunk1SourceRevertsWhenChunk2Refused(t *testing.T) {
-	store := openRefusingReindexStore(t)
-	store.refuseNext = false
+	setup := func(t *testing.T) (*refusingReindexStore, *Resolver, []reindexJob, map[string]map[string]struct{}, int) {
+		t.Helper()
+		store := openRefusingReindexStore(t)
+		store.refuseNext = false
 
-	const totalCalls = guardRevertChunkSize + 2
-	nodes := []*graph.Node{
-		{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
-		{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
-		{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
-		{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
-		{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
-	}
-	edges := make([]*graph.Edge, 0, 1+totalCalls*2)
-	edges = append(edges, &graph.Edge{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1})
-	for i := 0; i < totalCalls; i++ {
-		line := 10 + i
-		edges = append(edges,
-			&graph.Edge{From: "a/caller.go::Run", To: "b/unimported.go::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: line, Confidence: 0.5, Origin: graph.OriginTextMatched},
-			&graph.Edge{From: "b/unimported.go::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: line},
-		)
-	}
-	store.AddBatch(nodes, edges)
-
-	r := New(store)
-	// Build guard jobs directly for the 2050 weak-tier calls and refuse chunk 2's reindex (call #3:
-	// call #1 = chunk 1 reindex, call #2 = chunk 1 source revert, call #3 = chunk 2 reindex).
-	var jobs []reindexJob
-	for _, e := range store.GetOutEdges("a/caller.go::Run") {
-		if e.Kind == graph.EdgeCalls {
-			jobs = append(jobs, reindexJob{
-				edge:       e,
-				oldTo:      "unresolved::Secret",
-				newTo:      e.To,
-				kind:       e.Kind,
-				confidence: e.Confidence,
-				origin:     e.Origin,
-			})
+		const totalCalls = guardRevertChunkSize + 2
+		nodes := []*graph.Node{
+			{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
+			{ID: "a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "a/caller.go", Language: "go"},
+			{ID: "b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "b/unimported.go", Language: "go"},
+			{ID: "b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "b/unimported.go", Language: "go"},
+			{ID: "c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "c/imported.go", Language: "go"},
+			{ID: "other/noop.go", Kind: graph.KindFile, Name: "noop.go", FilePath: "other/noop.go", Language: "go"},
 		}
-	}
-	require.Len(t, jobs, totalCalls)
+		edges := make([]*graph.Edge, 0, 1+totalCalls*2)
+		edges = append(edges, &graph.Edge{From: "a/caller.go", To: "c/imported.go", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1})
+		for i := 0; i < totalCalls; i++ {
+			line := 10 + i
+			edges = append(edges,
+				&graph.Edge{From: "a/caller.go::Run", To: "b/unimported.go::Secret", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: line, Confidence: 0.5, Origin: graph.OriginTextMatched},
+				&graph.Edge{From: "b/unimported.go::Secret", To: "a/caller.go::Run", Kind: graph.EdgeArgOf, FilePath: "a/caller.go", Line: line},
+			)
+		}
+		store.AddBatch(nodes, edges)
 
-	store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
-		return call == 3
+		r := New(store)
+		var jobs []reindexJob
+		for _, e := range store.GetOutEdges("a/caller.go::Run") {
+			if e.Kind == graph.EdgeCalls {
+				jobs = append(jobs, reindexJob{
+					edge:       e,
+					oldTo:      "unresolved::Secret",
+					newTo:      e.To,
+					kind:       e.Kind,
+					confidence: e.Confidence,
+					origin:     e.Origin,
+				})
+			}
+		}
+		require.Len(t, jobs, totalCalls)
+		return store, r, jobs, r.buildImportClosure(), totalCalls
 	}
-	var refused bool
-	restore := r.trackPassWriteRefused(&refused)
-	closure := r.buildImportClosure()
-	reverted := r.guardCrossPackageCallEdges(jobs, closure)
-	restore()
-	assert.True(t, refused)
-	assert.Equal(t, guardRevertChunkSize, reverted)
-	// Chunk 1's 2048 SourceReverts must already have reverted atomically with Chunk 1.
-	assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), 2)
-	assert.Len(t, store.GetOutEdges("unresolved::Secret"), guardRevertChunkSize)
 
-	store.refuseFunc = nil
-	_, err := r.ResolveAllContext(context.Background())
-	require.NoError(t, err)
-	assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"), "retry must finish reverting chunk 2's remaining 2 SourceReverts")
-	assert.Len(t, store.GetOutEdges("unresolved::Secret"), totalCalls)
+	t.Run("guard_pass_chunk2_refused_flushed_via_unrelated_file", func(t *testing.T) {
+		store, r, jobs, closure, totalCalls := setup(t)
+		// Call #1 = chunk 1 reindex (2048), call #2 = chunk 1 source reverts, call #3 = chunk 2 reindex (2).
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 3
+		}
+		var refused bool
+		restore := r.trackPassWriteRefused(&refused)
+		reverted := r.guardCrossPackageCallEdges(jobs, closure)
+		restore()
+		assert.True(t, refused)
+		assert.Equal(t, guardRevertChunkSize, reverted)
+		assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), 2)
+		assert.Len(t, store.GetOutEdges("unresolved::Secret"), guardRevertChunkSize)
+
+		// Flush via an unrelated file so a/caller.go is NEVER re-resolved or re-guarded:
+		// ONLY flushPendingGuardRevertsLocked can revert Chunk 2's 2 calls and 2 SourceReverts.
+		store.refuseFunc = nil
+		stats := r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.False(t, stats.WriteRefused)
+		assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"), "flushPendingGuardRevertsLocked must revert chunk 2's remaining 2 SourceReverts")
+		assert.Len(t, store.GetOutEdges("unresolved::Secret"), totalCalls)
+		for _, e := range store.GetOutEdges("a/caller.go::Run") {
+			assert.Equal(t, "unresolved::Secret", e.To)
+		}
+	})
+
+	t.Run("flush_pending_multi_chunk_refuses_chunk2_then_completes_via_unrelated_file", func(t *testing.T) {
+		store, r, jobs, closure, totalCalls := setup(t)
+		// Refuse call #1 in guardCrossPackageCallEdges so all 2050 items (> guardRevertChunkSize)
+		// are queued in r.pendingGuardReverts.
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 1
+		}
+		var refused bool
+		restore := r.trackPassWriteRefused(&refused)
+		reverted := r.guardCrossPackageCallEdges(jobs, closure)
+		restore()
+		assert.True(t, refused)
+		assert.Equal(t, 0, reverted)
+		assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), totalCalls)
+
+		// Now exercise flushPendingGuardRevertsLocked's multi-chunk loop:
+		// reset call count, allow chunk 1 reindex (#1) + chunk 1 SourceReverts (#2), refuse chunk 2 reindex (#3).
+		store.calls = 0
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 3
+		}
+		stats := r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.True(t, stats.WriteRefused)
+		assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), 2, "flushPendingGuardRevertsLocked must commit chunk 1's 2048 SourceReverts before chunk 2 refusal")
+		assert.Len(t, store.GetOutEdges("unresolved::Secret"), guardRevertChunkSize)
+
+		// Second unrelated-file flush completes the remaining 2 reindexes + 2 SourceReverts.
+		store.refuseFunc = nil
+		stats = r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.False(t, stats.WriteRefused)
+		assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"))
+		assert.Len(t, store.GetOutEdges("unresolved::Secret"), totalCalls)
+	})
+
+	t.Run("flush_pending_chunk1_source_revert_refused_retains_chunk1_sources_and_chunk2_reindexes", func(t *testing.T) {
+		store, r, jobs, closure, totalCalls := setup(t)
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 1
+		}
+		var refused bool
+		restore := r.trackPassWriteRefused(&refused)
+		_ = r.guardCrossPackageCallEdges(jobs, closure)
+		restore()
+		require.True(t, refused)
+
+		// Refuse call #2 (ReconcilePlaceholderSourcesApplied for chunk 1) inside flushPendingGuardRevertsLocked.
+		store.calls = 0
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 2
+		}
+		stats := r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.True(t, stats.WriteRefused)
+		assert.Len(t, store.GetOutEdges("b/unimported.go::Secret"), totalCalls, "chunk 1 source reverts were refused and must remain queued")
+
+		store.refuseFunc = nil
+		stats = r.ResolveFilesAndIncoming([]string{"other/noop.go"})
+		assert.False(t, stats.WriteRefused)
+		assert.Empty(t, store.GetOutEdges("b/unimported.go::Secret"), "retry must drain chunk 1 reindexesApplied SourceReverts and chunk 2 reindexes+SourceReverts")
+		assert.Len(t, store.GetOutEdges("unresolved::Secret"), totalCalls)
+	})
 }
 
-func TestMidComputeRefusalDoesNotStampGuardRevertedAndResolveClearsStaleStamp(t *testing.T) {
-	t.Run("mid_compute_drain_suppresses_guard_reverted_stamp", func(t *testing.T) {
+func TestMidComputeRefusalPreservesGuardRevertedAgainstCrossRepoAndClearsOnResolve(t *testing.T) {
+	t.Run("mid_compute_drain_blocks_cross_repo_same_repo_decoy", func(t *testing.T) {
 		t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
 		t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
 
 		store := openRefusingReindexStore(t)
 		store.refuseNext = false
 		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
-			return call == 2 // chunk 1 commits call, chunk 2 refuses before imports commit
+			return call == 2 // chunk 1 commits weak-tier call, chunk 2 refuses before compute completes
+		}
+		store.AddBatch([]*graph.Node{
+			{ID: "repoA/a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "repoA/a/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "repoA/a/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/b/unimported.go", Kind: graph.KindFile, Name: "unimported.go", FilePath: "repoA/b/unimported.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/b/unimported.go::Secret", Kind: graph.KindFunction, Name: "Secret", FilePath: "repoA/b/unimported.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/c/imported.go", Kind: graph.KindFile, Name: "imported.go", FilePath: "repoA/c/imported.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/c/imported.go::Allowed", Kind: graph.KindFunction, Name: "Allowed", FilePath: "repoA/c/imported.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/noop.go", Kind: graph.KindFile, Name: "noop.go", FilePath: "repoB/noop.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+		}, []*graph.Edge{
+			{From: "repoA/a/caller.go", To: "repoA/c/imported.go", Kind: graph.EdgeImports, FilePath: "repoA/a/caller.go", Line: 1},
+			{From: "repoA/a/caller.go::Run", To: "unresolved::Secret", Kind: graph.EdgeCalls, FilePath: "repoA/a/caller.go", Line: 5},
+			{From: "repoA/a/caller.go::Run", To: "unresolved::Allowed", Kind: graph.EdgeCalls, FilePath: "repoA/a/caller.go", Line: 6},
+		})
+
+		r := New(store)
+		_, err := r.ResolveAllContext(context.Background())
+		require.ErrorIs(t, err, ErrReindexWriteRefused)
+
+		// Sibling repoB flushes pending guard reverts and runs whole-graph CrossRepoResolver
+		// before repoA retries: guard_reverted must block CrossRepoResolver from permanently
+		// binding repoA/a/caller.go::Run to unimported same-repo decoy repoA/b/unimported.go::Secret.
+		store.refuseFunc = nil
+		stats := r.ResolveFilesAndIncoming([]string{"repoB/noop.go"})
+		assert.False(t, stats.WriteRefused)
+		_, err = NewCrossRepo(store).ResolveAllContext(context.Background())
+		require.NoError(t, err)
+
+		var secretEdge *graph.Edge
+		for _, e := range store.GetOutEdges("repoA/a/caller.go::Run") {
+			if e.Line == 5 {
+				secretEdge = e
+			}
+		}
+		require.NotNil(t, secretEdge)
+		assert.Equal(t, "unresolved::Secret", secretEdge.To, "mid-compute drain must keep guard_reverted so CrossRepoResolver never binds an unimported same-repo Go decoy")
+		assert.Equal(t, true, secretEdge.Meta["guard_reverted"])
+	})
+
+	t.Run("mid_compute_drain_then_import_retry_clears_guard_reverted", func(t *testing.T) {
+		t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+		t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+		store := openRefusingReindexStore(t)
+		store.refuseNext = false
+		store.refuseFunc = func(call int, _ []graph.EdgeReindex) bool {
+			return call == 2 // chunk 1 commits call, chunk 2 refuses import edge
 		}
 		store.AddBatch([]*graph.Node{
 			{ID: "a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "a/caller.go", Language: "go"},
@@ -1130,22 +1248,28 @@ func TestMidComputeRefusalDoesNotStampGuardRevertedAndResolveClearsStaleStamp(t 
 			{ID: "other/noop.go", Kind: graph.KindFile, Name: "noop.go", FilePath: "other/noop.go", Language: "go"},
 		}, []*graph.Edge{
 			{From: "a/caller.go::Run", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "a/caller.go", Line: 5},
-			{From: "a/caller.go", To: "unresolved::import::./b/target", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
+			{From: "a/caller.go", To: "unresolved::import::b", Kind: graph.EdgeImports, FilePath: "a/caller.go", Line: 1},
 		})
 
 		r := New(store)
 		_, err := r.ResolveAllContext(context.Background())
 		require.ErrorIs(t, err, ErrReindexWriteRefused)
 
-		// Flush pending guard reverts via an unrelated incremental pass: mid-compute
-		// drain must NOT have stamped guard_reverted=true on the reverted call.
 		store.refuseFunc = nil
 		stats := r.ResolveFilesAndIncoming([]string{"other/noop.go"})
 		assert.False(t, stats.WriteRefused)
+
+		// Once retry resolves the deferred import and re-resolves the call,
+		// guard_reverted must be cleared.
+		_, err = r.ResolveAllContext(context.Background())
+		require.NoError(t, err)
+		imports := store.GetOutEdges("a/caller.go")
+		require.Len(t, imports, 1)
+		require.Equal(t, "b/target.go", imports[0].To, "chunk-2 import must resolve on retry")
 		edges := store.GetOutEdges("a/caller.go::Run")
 		require.Len(t, edges, 1)
-		assert.Equal(t, "unresolved::Helper", edges[0].To)
-		assert.Nil(t, edges[0].Meta["guard_reverted"], "mid-compute refusal drain must not stamp guard_reverted before later-chunk imports commit")
+		assert.Equal(t, "b/target.go::Helper", edges[0].To)
+		assert.Nil(t, edges[0].Meta["guard_reverted"], "re-resolving after chunk-2 import lands must clear guard_reverted")
 	})
 
 	t.Run("resolving_edge_clears_stale_guard_reverted_stamp", func(t *testing.T) {
@@ -1169,6 +1293,94 @@ func TestMidComputeRefusalDoesNotStampGuardRevertedAndResolveClearsStaleStamp(t 
 		assert.Equal(t, "c/imported.go::Allowed", edges[0].To)
 		assert.Nil(t, edges[0].Meta["guard_reverted"], "re-resolving an edge must clear stale guard_reverted metadata")
 	})
+
+	t.Run("cross_repo_resolve_clears_stale_guard_reverted_on_imported_target", func(t *testing.T) {
+		store := openRefusingReindexStore(t)
+		store.refuseNext = false
+		store.AddBatch([]*graph.Node{
+			{ID: "repoA/a/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "repoA/a/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/a/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "repoA/a/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/b/target.go", Kind: graph.KindFile, Name: "target.go", FilePath: "repoB/b/target.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/b/target.go::Helper", Kind: graph.KindFunction, Name: "Helper", FilePath: "repoB/b/target.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+		}, []*graph.Edge{
+			{From: "repoA/a/caller.go", To: "repoB/b/target.go", Kind: graph.EdgeImports, FilePath: "repoA/a/caller.go", Line: 1, CrossRepo: true},
+			{From: "repoA/a/caller.go::Run", To: "unresolved::Helper", Kind: graph.EdgeCalls, FilePath: "repoA/a/caller.go", Line: 5, Meta: map[string]any{"guard_reverted": true}},
+		})
+
+		_, err := NewCrossRepo(store).ResolveAllContext(context.Background())
+		require.NoError(t, err)
+		var callEdge *graph.Edge
+		for _, e := range store.GetOutEdges("repoA/a/caller.go::Run") {
+			if e.Kind == graph.EdgeCalls {
+				callEdge = e
+			}
+		}
+		require.NotNil(t, callEdge)
+		assert.Equal(t, "repoB/b/target.go::Helper", callEdge.To)
+		assert.Nil(t, callEdge.Meta["guard_reverted"], "CrossRepoResolver must clear stale guard_reverted when binding a real target")
+	})
+}
+
+func TestCrossRepoResolveAllReleasesChunkDeferredRepointsAcrossYield(t *testing.T) {
+	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
+	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
+
+	store := openRefusingReindexStore(t)
+	store.refuseNext = false
+	store.AddBatch([]*graph.Node{
+		{ID: "repoA/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repoA/caller.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoA/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repoA/caller.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoB/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repoB/caller.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoB/caller.ts::use", Kind: graph.KindFunction, Name: "use", FilePath: "repoB/caller.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoC/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repoC/target.ts", RepoPrefix: "repoC", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoC/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repoC/target.ts", RepoPrefix: "repoC", WorkspaceID: "ws", Language: "typescript"},
+		{ID: "repoC/target.ts::other", Kind: graph.KindFunction, Name: "other", FilePath: "repoC/target.ts", RepoPrefix: "repoC", WorkspaceID: "ws", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repoA/caller.ts", To: "repoC/target.ts", Kind: graph.EdgeImports, FilePath: "repoA/caller.ts", Line: 1, CrossRepo: true},
+		{From: "repoA/caller.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "repoA/caller.ts", Line: 2},
+		{From: "repoA/unresolved::helper", To: "repoA/caller.ts::run", Kind: graph.EdgeArgOf, FilePath: "repoA/caller.ts", Line: 2},
+		{From: "repoB/caller.ts", To: "repoC/target.ts", Kind: graph.EdgeImports, FilePath: "repoB/caller.ts", Line: 1, CrossRepo: true},
+		{From: "repoB/caller.ts::use", To: "unresolved::other", Kind: graph.EdgeCalls, FilePath: "repoB/caller.ts", Line: 2},
+	})
+
+	var bridgeMu sync.Mutex
+	var queued []graph.PlaceholderRepoint
+	take := func() []graph.PlaceholderRepoint {
+		bridgeMu.Lock()
+		defer bridgeMu.Unlock()
+		out := queued
+		queued = nil
+		return out
+	}
+	save := func(repoints []graph.PlaceholderRepoint) {
+		bridgeMu.Lock()
+		defer bridgeMu.Unlock()
+		queued = append(queued, repoints...)
+	}
+
+	cr1 := NewCrossRepo(store)
+	cr1.SetRetryStateBridge(take, save)
+	interleaved := false
+	cr1.chunkYieldHook = func() {
+		if interleaved {
+			return
+		}
+		interleaved = true
+		// Concurrent repoA lane enters during cr1's inter-chunk yield after Chunk 1
+		// committed repoA/caller.ts::run -> repoC/target.ts::helper. It must observe
+		// and apply Chunk 1's deferred repoint before certifying repoA fresh.
+		cr2 := NewCrossRepo(store)
+		cr2.SetRetryStateBridge(take, save)
+		stats := cr2.ResolveMutationFrontiers([]string{"repoA/caller.ts"}, []string{"repoA/caller.ts"}, nil)
+		assert.False(t, stats.WriteRefused)
+		assert.Empty(t, store.GetOutEdges("repoA/unresolved::helper"), "interleaving repoA pass must observe and flush Chunk 1 deferred repoints during yield")
+		assert.Len(t, store.GetOutEdges("repoC/target.ts::helper"), 1)
+	}
+
+	_, err := cr1.ResolveAllContext(context.Background())
+	require.NoError(t, err)
+	assert.True(t, interleaved)
+	assert.Empty(t, queued, "bridge queue must be empty after both passes complete")
 }
 
 func TestCancelWithRefusedDeferredFlushStillDrainsGuardSpool(t *testing.T) {

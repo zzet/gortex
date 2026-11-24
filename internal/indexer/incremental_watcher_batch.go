@@ -290,7 +290,7 @@ func incrementalTopologyChanged(result *IndexResult) bool {
 	if result.DeletedFileCount > 0 || result.FullRetrack {
 		return true
 	}
-	if result.retriedResolution && result.resolutionErr == nil {
+	if result.retriedResolution {
 		return true
 	}
 	plan := result.DerivedInvalidation
@@ -458,6 +458,8 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		if result != nil {
 			result.retriedResolution = true
 			result.DerivedInvalidation.Merge(retryDerived)
+			result.DerivedInvalidation.HierarchyUnchanged = nil
+			result.capabilityPrior = nil
 			result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
 			result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
 		}
@@ -712,6 +714,8 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			if result != nil {
 				result.retriedResolution = true
 				result.DerivedInvalidation.Merge(retryDerived)
+				result.DerivedInvalidation.HierarchyUnchanged = nil
+				result.capabilityPrior = nil
 				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
 				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
 			}

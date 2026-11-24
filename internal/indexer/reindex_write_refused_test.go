@@ -625,4 +625,128 @@ func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t
 	assert.Equal(t, "helper.go::Other", line99Target, "Attempt 2 must include affected.files retained from Attempt 1 refusal")
 }
 
+func TestMultiIndexer_ShadowBuildSetGraphDoesNotStealOrWipePendingMasterRetry(t *testing.T) {
+	mi, store := newTestMultiIndexerWithRefusingStore(t, nil)
+	store.AddBatch([]*graph.Node{
+		{ID: "repoA/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repoA/caller.ts", RepoPrefix: "repoA", Language: "typescript"},
+		{ID: "repoA/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repoA/caller.ts", RepoPrefix: "repoA", Language: "typescript"},
+		{ID: "repoA/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repoA/target.ts", RepoPrefix: "repoA", Language: "typescript"},
+		{ID: "repoA/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repoA/target.ts", RepoPrefix: "repoA", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repoA/caller.ts", To: "repoA/target.ts", Kind: graph.EdgeImports, FilePath: "repoA/caller.ts", Line: 1},
+		{From: "repoA/caller.ts::run", To: "repoA/target.ts::helper", Kind: graph.EdgeCalls, FilePath: "repoA/caller.ts", Line: 2},
+		{From: "repoA/unresolved::helper", To: "repoA/caller.ts::run", Kind: graph.EdgeArgOf, FilePath: "repoA/caller.ts", Line: 2},
+	})
+
+	mi.savePendingMasterRetry(resolver.MasterRetryState{
+		PlaceholderRepoints: []graph.PlaceholderRepoint{
+			{OldFrom: "repoA/unresolved::helper", FilePath: "repoA/caller.ts", Line: 2, NewFrom: "repoA/target.ts::helper"},
+		},
+		GuardReverts: []resolver.PendingGuardRevert{
+			{Reindexes: []graph.EdgeReindex{{Edge: &graph.Edge{From: "repoA/a.go::F", To: "unresolved::G", Kind: graph.EdgeCalls, FilePath: "repoA/a.go", Line: 5}, OldTo: "repoA/b.go::G"}}},
+		},
+		TailRetryAll:     true,
+		TailRetryScopes:  []string{"repoA"},
+		AttributionFiles: []string{"repoA/ext.go"},
+	})
+
+	idxB := mi.newPerRepoIndexerGuardedWithMode(config.IndexConfig{}, multiIndexerBatchMode{})
+	inMemShadow := graph.New()
+	inMemShadow.AddBatch([]*graph.Node{
+		{ID: "repoB/caller.ts", Kind: graph.KindFile, Name: "caller.ts", FilePath: "repoB/caller.ts", RepoPrefix: "repoB", Language: "typescript"},
+		{ID: "repoB/caller.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repoB/caller.ts", RepoPrefix: "repoB", Language: "typescript"},
+		{ID: "repoB/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repoB/target.ts", RepoPrefix: "repoB", Language: "typescript"},
+		{ID: "repoB/target.ts::ok", Kind: graph.KindFunction, Name: "ok", FilePath: "repoB/target.ts", RepoPrefix: "repoB", Language: "typescript"},
+	}, []*graph.Edge{
+		{From: "repoB/caller.ts", To: "repoB/target.ts", Kind: graph.EdgeImports, FilePath: "repoB/caller.ts", Line: 1},
+		{From: "repoB/caller.ts::run", To: "unresolved::ok", Kind: graph.EdgeCalls, FilePath: "repoB/caller.ts", Line: 2},
+	})
+
+	// Simulate idx.indexCtxRaw redirecting idxB.resolver onto inMemShadow, then
+	// hold durable store.ResolveMutex() while inMemShadow resolves to prove
+	// shadow resolution uses inMemShadow's mutex and never touches mi.pendingMaster*.
+	idxB.resolver.SetGraph(inMemShadow)
+	storeMu := store.ResolveMutex()
+	storeMu.Lock()
+	_, err := idxB.resolver.ResolveAllContext(context.Background())
+	storeMu.Unlock()
+	require.NoError(t, err)
+	idxB.resolver.SetGraph(store)
+
+	// Every pendingMaster* field must survive the shadow ResolveAllContext completely untouched.
+	mi.pendingResolveRetryMu.Lock()
+	assert.Len(t, mi.pendingMasterRepoints, 1, "shadow build must not steal or clear durable PlaceholderRepoints")
+	assert.Len(t, mi.pendingMasterGuardReverts, 1, "shadow build must not steal or clear durable GuardReverts")
+	assert.True(t, mi.pendingMasterTailRetryAll, "shadow build must not wipe durable TailRetryAll")
+	assert.Contains(t, mi.pendingMasterTailScopes, "repoA", "shadow build must not wipe durable TailRetryScopes")
+	assert.Contains(t, mi.pendingMasterAttribFiles, "repoA/ext.go", "shadow build must not wipe durable AttributionFiles")
+	mi.pendingResolveRetryMu.Unlock()
+
+	// Once SetGraph(store) restores the durable store, the bridge resumes automatically.
+	stats := idxB.resolver.ResolveFilesOutgoing([]string{"repoA/caller.ts"})
+	require.NotNil(t, stats)
+	assert.False(t, stats.WriteRefused)
+	assert.Empty(t, store.GetOutEdges("repoA/unresolved::helper"), "restored durable resolver must resume retry bridge and flush repoints")
+	assert.Len(t, store.GetOutEdges("repoA/target.ts::helper"), 1)
+}
+
+func TestIncrementalWatcherPaths_OverlappingBodyEditOnPendingRetryStillInfersOverrides(t *testing.T) {
+	root := t.TempDir()
+	basePath := filepath.Join(root, "base.ts")
+	subPath := filepath.Join(root, "sub.ts")
+	writeFileMk(t, basePath, "export class Base {\n  run() { return 1 }\n}\n")
+	writeFileMk(t, subPath, "export class Sub {\n  run() { return 0 }\n}\n")
+
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+
+	countOverrides := func() int {
+		n := 0
+		for range store.EdgesByKind(graph.EdgeOverrides) {
+			n++
+		}
+		return n
+	}
+
+	// Attempt 1 adds extends Base under resolution write refusal: EdgeExtends stays
+	// unresolved::Base, so Attempt 1's derived pass produces 0 EdgeOverrides.
+	writeFileMk(t, subPath, "import { Base } from './base'\nexport class Sub extends Base {\n  run() { return 2 }\n}\n")
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	idx.resolver.SetGraph(&gateHoldingReindexStore{Store: store})
+	_, err = idx.incrementalWatcherPaths(root, []string{subPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	idx.resolver.SetGraph(store)
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	assert.Zero(t, countOverrides(), "unresolved extends on Attempt 1 produces no EdgeOverrides")
+
+	// Overlapping body-only edit to sub.ts leaves its hierarchy fingerprint unchanged
+	// relative to Attempt 1, arming HierarchyUnchanged + empty capabilityPrior.hierarchy.
+	writeFileMk(t, subPath, "import { Base } from './base'\nexport class Sub extends Base {\n  run() { return 3 }\n}\n")
+	res, err := idx.incrementalWatcherPaths(root, []string{subPath}, incrementalPathMode{
+		detectDeletions:    true,
+		forceExplicitFiles: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.retriedResolution)
+	assert.Empty(t, res.DerivedInvalidation.HierarchyUnchanged)
+	assert.Nil(t, res.capabilityPrior)
+	assert.Positive(t, countOverrides(), "Attempt 2 must clear stale HierarchyUnchanged/capabilityPrior so InferOverridesForFrontier emits EdgeOverrides")
+}
+
+func TestIncrementalTopologyChanged_TrueOnChainedRetriedResolutionRefusal(t *testing.T) {
+	assert.True(t, incrementalTopologyChanged(&IndexResult{
+		StaleFileCount: 1,
+		DerivedInvalidation: DerivedInvalidationPlan{
+			InertFiles: 1,
+		},
+		retriedResolution: true,
+		resolutionErr:     resolver.ErrReindexWriteRefused,
+	}), "chained Attempt 2 refusal on an inert reparse must still invalidate reachability topology")
+}
+
 
