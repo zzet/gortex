@@ -176,6 +176,7 @@ func runForeignImpactWithEdits(ctx context.Context, o runOptions, p *privateRun,
 	if err != nil {
 		return report, err
 	}
+	phase.EditProbe.ProjectionBefore = runtime.projectionBookend(ctx)
 	phase.Started = time.Now()
 	runtime.origin = phase.Started
 	done := make(chan error, 1)
@@ -231,6 +232,7 @@ awaitWrite:
 	resultErr = errors.Join(resultErr, editErr)
 	phase.EditProbe.StatsAfter, err = runtime.stats(ctx)
 	resultErr = errors.Join(resultErr, err)
+	phase.EditProbe.ProjectionAfter = runtime.projectionBookend(ctx)
 	if ctx.Err() == nil {
 		restoreCtx, stop := context.WithTimeout(ctx, o.Deadline)
 		resultErr = errors.Join(resultErr, runtime.restore(restoreCtx))
