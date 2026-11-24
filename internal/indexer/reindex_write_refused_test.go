@@ -762,5 +762,3 @@ func TestIncrementalTopologyChanged_TrueOnChainedRetriedResolutionRefusal(t *tes
 		resolutionErr:     resolver.ErrReindexWriteRefused,
 	}), "chained Attempt 2 refusal on an inert reparse must still invalidate reachability topology")
 }
-
-

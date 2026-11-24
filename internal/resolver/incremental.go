@@ -73,7 +73,7 @@ func (r *Resolver) edgeShape(e *graph.Edge) string {
 // incrementalSkipped reports whether an unresolved edge should be left for the
 // incoming pass instead of re-running the forward cascade on it.
 func (r *Resolver) incrementalSkipped(e *graph.Edge) bool {
-	if r.incrementalSkip == nil || jsCallHasScopeEvidence(e) {
+	if r.incrementalSkip == nil || e == nil || jsCallHasScopeEvidence(e) {
 		return false
 	}
 	_, ok := r.incrementalSkip[r.edgeShape(e)]

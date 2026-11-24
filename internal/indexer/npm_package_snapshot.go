@@ -24,6 +24,7 @@ type npmPackageSnapshot struct {
 	files             map[string]npmPackageFileStamp
 	stampedAt         time.Time
 	lookup            resolver.NpmPackageLookup
+	repoPackages      map[string]map[string]struct{}
 }
 
 func npmPackageStamp(file string) npmPackageFileStamp {

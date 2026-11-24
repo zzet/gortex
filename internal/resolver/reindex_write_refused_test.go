@@ -1428,4 +1428,3 @@ func TestCancelWithRefusedDeferredFlushStillDrainsGuardSpool(t *testing.T) {
 	require.NotNil(t, secretEdge)
 	assert.Equal(t, "unresolved::Secret", secretEdge.To, "guardSpool must still drain when cancel's deferred flush is refused")
 }
-

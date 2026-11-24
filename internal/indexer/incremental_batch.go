@@ -1087,7 +1087,7 @@ func applyResolvedOutEdgesFromView(
 	reused := 0
 	var retargeted []graph.EdgeReindex
 	for _, edge := range edges {
-		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || edge.Meta[graph.JSLexicalBindingMeta] != nil || edge.Meta[graph.JSAmbientShadowMeta] != nil {
 			continue
 		}
 		name := reuseIdentifier(graph.UnresolvedName(edge.To))

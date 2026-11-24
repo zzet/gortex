@@ -18,22 +18,74 @@ import (
 const jsImportBindingCap = 64
 
 // jsSpecifierNames reads an import_specifier / export_specifier and returns its
-// upstream (original) name and its renamed name. The grammar lays both out
-// positionally: the first identifier is the name in the source module, the
-// second (present only for `x as y`) is the local alias (imports) or the
-// exported name (re-exports). Returns ("", "") when no identifier is present.
+// upstream (original) name and its renamed name. Handles named `name`/`alias`
+// fields, anonymous `as` / `default` tokens, and single-fragment string aliases
+// (e.g. `export { init as "other" }`, `export { init as default }`). Returns
+// ("", "") when no valid binding name is present or an explicit `as` alias
+// cannot be decoded cleanly.
 func jsSpecifierNames(spec *sitter.Node, src []byte) (orig, alias string) {
-	var ids []*sitter.Node
-	for i, _nc := 0, int(spec.NamedChildCount()); i < _nc; i++ {
-		if c := spec.NamedChild(i); c != nil && c.Type() == "identifier" {
-			ids = append(ids, c)
+	if spec == nil {
+		return "", ""
+	}
+	nameNode := spec.ChildByFieldName("name")
+	if nameNode == nil {
+		for i, _nc := 0, int(spec.NamedChildCount()); i < _nc; i++ {
+			if c := spec.NamedChild(i); c != nil && (c.Type() == "identifier" || c.Type() == "string") {
+				nameNode = c
+				break
+			}
 		}
 	}
-	if len(ids) > 0 {
-		orig = ids[0].Content(src)
+	if nameNode == nil {
+		return "", ""
 	}
-	if len(ids) > 1 {
-		alias = ids[1].Content(src)
+	switch nameNode.Type() {
+	case "identifier":
+		orig = nameNode.Content(src)
+	case "string":
+		orig = jsSingleStringContent(nameNode, src)
+	default:
+		orig = nameNode.Content(src)
+	}
+	if orig == "" {
+		return "", ""
+	}
+	aliasNode := spec.ChildByFieldName("alias")
+	hasAs := aliasNode != nil
+	if !hasAs {
+		seenAs := false
+		for i, _nc := 0, int(spec.ChildCount()); i < _nc; i++ {
+			c := spec.Child(i)
+			if c == nil || c.Type() == "comment" {
+				continue
+			}
+			if !seenAs {
+				if !c.IsNamed() && c.Type() == "as" {
+					seenAs = true
+					hasAs = true
+				}
+				continue
+			}
+			aliasNode = c
+			break
+		}
+	}
+	if !hasAs {
+		return orig, ""
+	}
+	if aliasNode == nil {
+		return "", ""
+	}
+	switch aliasNode.Type() {
+	case "identifier":
+		alias = aliasNode.Content(src)
+	case "string":
+		alias = jsSingleStringContent(aliasNode, src)
+	default:
+		alias = aliasNode.Content(src)
+	}
+	if alias == "" {
+		return "", ""
 	}
 	return orig, alias
 }
@@ -165,6 +217,124 @@ func visitJSImportBindings(importStmt *sitter.Node, src []byte, visit func(strin
 	}
 }
 
+func firstNonCommentNamedChild(n *sitter.Node) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		if c := n.NamedChild(i); c != nil && c.Type() != "comment" {
+			return c
+		}
+	}
+	return nil
+}
+
+// tsSingleUsingAssignment returns the assignment_expression of a single
+// TypeScript `using x = ...` or `await using x = ...` binding (tree-sitter-typescript
+// attaches an anonymous "using" token to assignment_expression instead of
+// emitting JS's using_declaration).
+func tsSingleUsingAssignment(n *sitter.Node) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	if n.Type() == "await_expression" {
+		n = firstNonCommentNamedChild(n)
+	}
+	if n == nil || n.Type() != "assignment_expression" {
+		return nil
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c := n.Child(i)
+		if c == nil || c.Type() == "comment" {
+			continue
+		}
+		if !c.IsNamed() && c.Type() == "using" {
+			return n
+		}
+		return nil
+	}
+	return nil
+}
+
+func flattenJSSequence(n *sitter.Node, out *[]*sitter.Node) {
+	if n == nil {
+		return
+	}
+	if n.Type() == "sequence_expression" {
+		for i := 0; i < int(n.NamedChildCount()); i++ {
+			c := n.NamedChild(i)
+			if c != nil && c.Type() != "comment" {
+				flattenJSSequence(c, out)
+			}
+		}
+		return
+	}
+	*out = append(*out, n)
+}
+
+// visitTSUsingAssignments visits every assignment_expression belonging to a
+// single- or multi-declarator TypeScript `using` / `await using` statement
+// (including `sequence_expression` chains like `using a = mk(), b = mk()`).
+func visitTSUsingAssignments(n *sitter.Node, visit func(*sitter.Node)) bool {
+	if n == nil {
+		return false
+	}
+	if n.Type() == "expression_statement" {
+		n = firstNonCommentNamedChild(n)
+	}
+	if n == nil {
+		return false
+	}
+	if n.Type() == "sequence_expression" {
+		var elems []*sitter.Node
+		flattenJSSequence(n, &elems)
+		if len(elems) == 0 {
+			return false
+		}
+		first := tsSingleUsingAssignment(elems[0])
+		if first == nil {
+			return false
+		}
+		visit(first)
+		for _, el := range elems[1:] {
+			if el != nil && el.Type() == "assignment_expression" {
+				visit(el)
+			}
+		}
+		return true
+	}
+	if assign := tsSingleUsingAssignment(n); assign != nil {
+		visit(assign)
+		return true
+	}
+	return false
+}
+
+func visitJSNamespaceName(n *sitter.Node, src []byte, visit func(string)) {
+	for n != nil && (n.Type() == "nested_identifier" || n.Type() == "member_expression") {
+		next := n.ChildByFieldName("object")
+		if next == nil {
+			next = firstNonCommentNamedChild(n)
+		}
+		n = next
+	}
+	if n != nil && n.Type() == "identifier" {
+		visit(n.Content(src))
+	}
+}
+
+func isJSBlockVarScope(block *sitter.Node) bool {
+	p := block.Parent()
+	if p == nil {
+		return false
+	}
+	switch p.Type() {
+	case "class_static_block", "internal_module", "module":
+		return true
+	}
+	return false
+}
+
 // visitJSAllDeclarations visits every binding declared by n without exempting
 // require() initializers, so export recording and checking whether `require`
 // itself is shadowed never recurse into require matching.
@@ -175,17 +345,36 @@ func visitJSAllDeclarations(n *sitter.Node, src []byte, includeAmbient bool, vis
 	switch n.Type() {
 	case "ambient_declaration":
 		if includeAmbient {
-			visitJSAllDeclarations(n.NamedChild(0), src, includeAmbient, visit)
+			visitJSAllDeclarations(firstNonCommentNamedChild(n), src, includeAmbient, visit)
 		}
 	case "export_statement":
 		visitJSAllDeclarations(n.ChildByFieldName("declaration"), src, includeAmbient, visit)
+	case "expression_statement":
+		if visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
+		}) {
+			return
+		}
+		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+			visitJSNamespaceName(child.ChildByFieldName("name"), src, visit)
+		}
+	case "sequence_expression", "await_expression", "assignment_expression":
+		visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			visitJSPattern(assign.ChildByFieldName("left"), src, visit)
+		})
+	case "internal_module", "module":
+		visitJSNamespaceName(n.ChildByFieldName("name"), src, visit)
+	case "import_alias":
+		if id := findChildByType(n, "identifier"); id != nil {
+			visit(id.Content(src))
+		}
 	case "function_signature":
 		if includeAmbient {
 			visitJSPattern(n.ChildByFieldName("name"), src, visit)
 		}
 	case "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, visit)
-	case "lexical_declaration", "variable_declaration":
+	case "lexical_declaration", "variable_declaration", "using_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
 			if v.Type() == "variable_declarator" {
@@ -265,10 +454,18 @@ func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, loca
 }
 
 func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool {
+	inDecorator := false
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		if child.Type() == "decorator" {
+			inDecorator = true
+		}
 		kind := n.Type()
+		if kind == "class_body" {
+			inDecorator = false
+			continue
+		}
 		switch kind {
-		case "program", "statement_block", "switch_body",
+		case "program", "statement_block", "switch_body", "class",
 			"function_declaration", "generator_function_declaration", "method_definition",
 			"function_expression", "generator_function", "arrow_function",
 			"catch_clause", "for_statement", "for_in_statement":
@@ -276,6 +473,18 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 			continue
 		}
 		body := child.Type() == "statement_block"
+		// Computed method keys, method decorators, and parameter decorators
+		// evaluate outside the method's parameter scope; class decorators
+		// evaluate outside the class name.
+		if kind == "method_definition" && (inDecorator || (!body && child.Type() != "formal_parameters")) {
+			inDecorator = false
+			continue
+		}
+		if kind == "class" && child.Type() == "decorator" {
+			inDecorator = false
+			continue
+		}
+		inDecorator = false
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		shadowed, ok := cache.requireShadow[key]
 		if !ok {
@@ -298,7 +507,7 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 					}
 				}
 			case "statement_block":
-				if p := n.Parent(); p != nil && p.Type() == "class_static_block" {
+				if isJSBlockVarScope(n) {
 					visitJSAllHoistedVars(n, src, check)
 				}
 				for i := 0; i < int(n.NamedChildCount()) && !shadowed; i++ {
@@ -324,6 +533,8 @@ func (cache *jsScopeCache) isRequireShadowed(expr *sitter.Node, src []byte) bool
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, check)
 				}
+			case "class":
+				visitJSPattern(n.ChildByFieldName("name"), src, check)
 			default:
 				if body && kind != "catch_clause" {
 					visitJSAllHoistedVars(child, src, check)
@@ -357,12 +568,10 @@ func (cache *jsScopeCache) staticRequireSpec(call *sitter.Node, src []byte) stri
 	return spec
 }
 
-func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
-	name := v.ChildByFieldName("name")
+func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if name == nil {
 		return
 	}
-	value := v.ChildByFieldName("value")
 	if value != nil {
 		switch value.Type() {
 		case "call_expression":
@@ -389,16 +598,41 @@ func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local fun
 	visitJSPattern(name, src, local)
 }
 
+func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
+	cache.visitBinding(v.ChildByFieldName("name"), v.ChildByFieldName("value"), src, local, required)
+}
+
 func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
 	if n == nil {
 		return
 	}
 	switch n.Type() {
 	case "ambient_declaration":
-		cache.visitDeclaration(n.NamedChild(0), src, local, required)
+		cache.visitDeclaration(firstNonCommentNamedChild(n), src, local, required)
+	case "export_statement":
+		cache.visitDeclaration(n.ChildByFieldName("declaration"), src, local, required)
+	case "expression_statement":
+		if visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			cache.visitBinding(assign.ChildByFieldName("left"), assign.ChildByFieldName("right"), src, local, required)
+		}) {
+			return
+		}
+		if child := firstNonCommentNamedChild(n); child != nil && (child.Type() == "internal_module" || child.Type() == "module") {
+			visitJSNamespaceName(child.ChildByFieldName("name"), src, local)
+		}
+	case "sequence_expression", "await_expression", "assignment_expression":
+		visitTSUsingAssignments(n, func(assign *sitter.Node) {
+			cache.visitBinding(assign.ChildByFieldName("left"), assign.ChildByFieldName("right"), src, local, required)
+		})
+	case "internal_module", "module":
+		visitJSNamespaceName(n.ChildByFieldName("name"), src, local)
+	case "import_alias":
+		if id := findChildByType(n, "identifier"); id != nil {
+			local(id.Content(src))
+		}
 	case "function_signature", "function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "enum_declaration":
 		visitJSPattern(n.ChildByFieldName("name"), src, local)
-	case "lexical_declaration", "variable_declaration":
+	case "lexical_declaration", "variable_declaration", "using_declaration":
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			v := n.NamedChild(i)
 			if v.Type() == "variable_declarator" {
@@ -519,10 +753,44 @@ func (c *jsCommonExports) defineProperty(call *sitter.Node, src []byte) {
 	}
 }
 
+// jsTopLevelBindingNames collects names bound at module scope (top-level
+// declarations, hoisted vars, and top-level imports) so a local `export { x }`
+// clause never claims a nested function, nested arrow, named function
+// expression, or TS namespace member as a module export.
+func jsTopLevelBindingNames(root *sitter.Node, src []byte) map[string]bool {
+	names := make(map[string]bool)
+	add := func(name string) {
+		if name != "" {
+			names[name] = true
+		}
+	}
+	visitJSAllHoistedVars(root, src, add)
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		s := root.NamedChild(i)
+		if s == nil {
+			continue
+		}
+		if s.Type() == "import_statement" {
+			visitJSImportBindings(s, src, add)
+			continue
+		}
+		visitJSAllDeclarations(s, src, true, add)
+		decl := s
+		if decl.Type() == "export_statement" {
+			decl = decl.ChildByFieldName("declaration")
+		}
+		if decl != nil && (decl.Type() == "interface_declaration" || decl.Type() == "type_alias_declaration") {
+			visitJSPattern(decl.ChildByFieldName("name"), src, add)
+		}
+	}
+	return names
+}
+
 // Read direct module statements in execution order; do not infer control flow.
 func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 	var bindings strings.Builder
 	var common jsCommonExports
+	var topBindings map[string]bool
 	for i := 0; i < int(root.NamedChildCount()); i++ {
 		s := root.NamedChild(i)
 		if s.Type() == "expression_statement" {
@@ -597,14 +865,21 @@ func recordJSExports(root *sitter.Node, src []byte, file *graph.Node) {
 		}
 		visitJSDeclaration(decl, src, func(n string) { graph.AppendJSBinding(&bindings, n, n) })
 		if clause := findChildByType(s, "export_clause"); clause != nil {
+			if topBindings == nil {
+				topBindings = jsTopLevelBindingNames(root, src)
+			}
 			for _, sp := range jsCollectChildren(clause, "export_specifier") {
 				orig, alias := jsSpecifierNames(sp, src)
-				if orig != "" && !tsSpecifierTypeOnly(sp, src) {
-					if alias == "" {
-						alias = orig
-					}
-					graph.AppendJSBinding(&bindings, alias, orig)
+				if orig == "" || tsSpecifierTypeOnly(sp, src) || !topBindings[orig] {
+					continue
 				}
+				if alias == "" {
+					alias = orig
+				}
+				if strings.ContainsAny(alias, " \t\r\n:") || strings.ContainsAny(orig, " \t\r\n:") {
+					continue
+				}
+				graph.AppendJSBinding(&bindings, alias, orig)
 			}
 		}
 	}
@@ -686,16 +961,36 @@ type jsScopeCache struct {
 }
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
+	inDecorator := false
 	for child, n := expr, expr.Parent(); n != nil; child, n = n, n.Parent() {
+		if child.Type() == "decorator" {
+			inDecorator = true
+		}
 		kind := n.Type()
+		if kind == "class_body" {
+			inDecorator = false
+			continue
+		}
 		switch kind {
-		case "program", "statement_block", "switch_body", "function_declaration", "generator_function_declaration", "method_definition", "function_expression", "generator_function", "arrow_function", "catch_clause", "for_statement", "for_in_statement":
+		case "program", "statement_block", "switch_body", "class",
+			"function_declaration", "generator_function_declaration", "method_definition",
+			"function_expression", "generator_function", "arrow_function",
+			"catch_clause", "for_statement", "for_in_statement":
 		default:
 			continue
 		}
 		// The body sees hoisted var declarations; parameter initializers do
 		// not. Cache the two environments separately for the same function.
 		body := child.Type() == "statement_block"
+		if kind == "method_definition" && (inDecorator || (!body && child.Type() != "formal_parameters")) {
+			inDecorator = false
+			continue
+		}
+		if kind == "class" && child.Type() == "decorator" {
+			inDecorator = false
+			continue
+		}
+		inDecorator = false
 		key := jsScopeKey{n.StartByte(), n.EndByte(), kind, body}
 		names, ok := cache.scopes[key]
 		if !ok {
@@ -723,8 +1018,8 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			required := func(id, spec string) { add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec}) }
 			switch kind {
 			case "program", "statement_block":
-				// A class static block is its own var scope.
-				if p := n.Parent(); kind == "program" || p != nil && p.Type() == "class_static_block" {
+				// Program, class static blocks, and TS namespaces are their own var scopes.
+				if kind == "program" || isJSBlockVarScope(n) {
 					cache.visitHoistedVars(n, src, local, required)
 				}
 				for i := 0; i < int(n.NamedChildCount()); i++ {
@@ -746,6 +1041,8 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				if k := n.ChildByFieldName("kind"); k != nil && k.Type() != "var" {
 					visitJSPattern(n.ChildByFieldName("left"), src, local)
 				}
+			case "class":
+				visitJSPattern(n.ChildByFieldName("name"), src, local)
 			default:
 				param := func(id string) { add(id, jsBinding{kind: graph.JSPendingParameter}) }
 				if body && kind != "catch_clause" {
@@ -781,8 +1078,6 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 
 func jsShadowRank(e *graph.Edge) int {
 	switch e.Meta[graph.JSLexicalBindingMeta] {
-	case graph.JSLexicalRequire:
-		return 1
 	case nil:
 		if e.Meta[graph.JSAmbientShadowMeta] == graph.JSShadowModule {
 			return 2
@@ -791,13 +1086,19 @@ func jsShadowRank(e *graph.Edge) int {
 			return 1
 		}
 		return 0
-	default:
+	case graph.JSLexicalRequire:
+		return 1
+	case graph.JSLexicalLocal:
 		return 3
+	default:
+		return 4
 	}
 }
 
-// Calls with one From/To/Line identity collapse into one stored edge. The
-// stored edge must stay eligible for the least-shadowed call at that site.
+// Calls with one From/To/Line identity collapse into one stored edge. When a
+// less-shadowed call shares that site with a shadowed one, normalize every
+// colliding edge to the same deterministic least-shadowed binding so last-wins
+// in-memory stores and first-wins SQLite stores agree.
 func clearCollapsedJSShadows(edges []*graph.Edge) {
 	shadowed := make(map[graph.EdgeIdentity][]*graph.Edge)
 	for _, e := range edges {
@@ -823,10 +1124,38 @@ func clearCollapsedJSShadows(edges []*graph.Edge) {
 		}
 	}
 	for id, group := range shadowed {
-		w := weakest[id]
-		lexical := w.Meta[graph.JSLexicalBindingMeta]
-		reqSpec := w.Meta[graph.JSLexicalRequireSpecMeta]
-		ambient := w.Meta[graph.JSAmbientShadowMeta]
+		winner := weakest[id]
+		winnerRank := jsShadowRank(winner)
+		// Two colliding local require() calls on one line that disagree on
+		// their module specifier cannot pick one deterministically across
+		// stores; downgrade the whole group to JSLexicalLocal.
+		if winnerRank == 1 && winner.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+			spec, _ := winner.Meta[graph.JSLexicalRequireSpecMeta].(string)
+			ambiguousSpec := false
+			for _, e := range group {
+				if e.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+					continue
+				}
+				if s, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string); s != spec {
+					ambiguousSpec = true
+					break
+				}
+			}
+			if ambiguousSpec {
+				for _, e := range group {
+					if e.Meta == nil {
+						e.Meta = map[string]any{}
+					}
+					e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
+					delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+					delete(e.Meta, graph.JSAmbientShadowMeta)
+				}
+				continue
+			}
+		}
+		lexical := winner.Meta[graph.JSLexicalBindingMeta]
+		reqSpec := winner.Meta[graph.JSLexicalRequireSpecMeta]
+		ambient := winner.Meta[graph.JSAmbientShadowMeta]
 		for _, s := range group {
 			delete(s.Meta, graph.JSLexicalBindingMeta)
 			delete(s.Meta, graph.JSLexicalRequireSpecMeta)

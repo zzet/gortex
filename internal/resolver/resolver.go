@@ -5339,8 +5339,13 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 			parkJSBinding(e, graph.JSPendingParameter, stats)
 			return
 		case graph.JSLexicalRequire:
-			if pick := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
+			if pick, trackedNpmSpec := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
 				bindImportCall(e, pick, "import_closure", stats)
+				if trackedNpmSpec != "" {
+					e.Meta[NpmImportSpecifierMeta] = trackedNpmSpec
+				} else {
+					delete(e.Meta, NpmImportSpecifierMeta)
+				}
 				return
 			}
 			stats.Unresolved++
