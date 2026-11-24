@@ -346,6 +346,21 @@ and 128 keys. All accepted events and metadata count toward the original
 16 MiB encoded cap. The legacy logical JSONL size is reported separately.
 The live oracles still consume the original response bytes.
 
+In every standalone edit-and-probe run, once an oracle's first-correct time is
+recorded and the receipt has reported the graph terminal, a background probe
+whose one successful attempt returns exactly the bytes of that oracle's
+previous correct answer is folded: instead of its `rpc`, `logical_call` and
+`probe` rows the spool keeps one `repeat_fold` row per run of identical
+answers, with the count, the answer's SHA-256 and size, its output mode and
+freshness claim, and the first and last wire IDs and times. A run ends at the
+first answer that differs, fails, is pending or is not correct, and that
+answer is kept in full. `evidence_folded_repeat_calls` counts folded calls per
+record. Immediate readbacks, the edit ACK, receipt status, CLI probes, relation
+consumer probes and paired runs are never folded, and the record, attempts,
+output-mode counts and stale checks still observe every call. The 16 MiB
+per-edit cap is unchanged; a long accounting wait after every oracle settled
+no longer fills it with repeats.
+
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
 six distinct pinned repositories. Source checkouts that share one Git common
 directory count as one repository. For linked views of one pinned primary,
