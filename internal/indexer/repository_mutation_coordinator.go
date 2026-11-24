@@ -131,6 +131,7 @@ type repositoryMutationCoordinator struct {
 	pending             repositoryMutationScope
 	waiters             []*repositoryMutationWaiter
 	readRepairPending   bool
+	laneTelemetry       repositoryLaneTelemetry
 }
 
 func newRepositoryMutationCoordinator(executor repositoryMutationExecutor) *repositoryMutationCoordinator {
@@ -201,14 +202,17 @@ func (c *repositoryMutationCoordinator) drain() {
 		// gate and then deadlock waiting for a lane held by this drain.
 		c.mu.Lock()
 		batchMutationGate := c.batchMutationGate
+		c.laneTelemetry.batchWaiting++
 		c.mu.Unlock()
 		if batchMutationGate != nil {
 			batchMutationGate.RLock()
 		}
+		c.noteLaneWait(-1, 1)
 		<-c.lane
 
 		c.mu.Lock()
 		if len(c.waiters) == 0 {
+			c.laneTelemetry.laneWaiting--
 			c.running = false
 			c.mu.Unlock()
 			c.lane <- struct{}{}
@@ -227,6 +231,7 @@ func (c *repositoryMutationCoordinator) drain() {
 		readRepairExecutor := c.readRepairExecutor
 		outputGeneration := c.outputGeneration
 		authorityRequired := c.authorityRequired
+		c.beginLaneTenureLocked(OutputEntryRepositoryReconcileLane, true)
 		c.mu.Unlock()
 
 		var observation *ReadRepairObservation
@@ -255,6 +260,7 @@ func (c *repositoryMutationCoordinator) drain() {
 				observation.acceptedBlobSHA = ""
 			}
 		}
+		c.endLaneTenure()
 		c.lane <- struct{}{}
 		if batchMutationGate != nil {
 			batchMutationGate.RUnlock()
@@ -354,7 +360,13 @@ func (c *repositoryMutationCoordinator) bindOutputGeneration(
 }
 
 func (c *repositoryMutationCoordinator) runExclusive(ctx context.Context, fn func() error) error {
-	return c.runExclusiveMode(ctx, true, fn)
+	return c.runExclusiveMode(ctx, true, "", fn)
+}
+
+// runExclusiveFor is runExclusive with the lane's tenure attributed to holder,
+// the registered entry fn runs for.
+func (c *repositoryMutationCoordinator) runExclusiveFor(ctx context.Context, holder OutputMutationEntry, fn func() error) error {
+	return c.runExclusiveMode(ctx, true, holder, fn)
 }
 
 // runExclusiveLaneOnly acquires only the stable repository lane. A multi-repo
@@ -362,12 +374,20 @@ func (c *repositoryMutationCoordinator) runExclusive(ctx context.Context, fn fun
 // shared batch gate after every lane is held. Calling runExclusive there would
 // nest batch read locks and can deadlock behind a queued transition writer.
 func (c *repositoryMutationCoordinator) runExclusiveLaneOnly(ctx context.Context, fn func() error) error {
-	return c.runExclusiveMode(ctx, false, fn)
+	return c.runExclusiveMode(ctx, false, "", fn)
 }
 
+// runExclusiveLaneOnlyFor is runExclusiveLaneOnly attributed to holder.
+func (c *repositoryMutationCoordinator) runExclusiveLaneOnlyFor(ctx context.Context, holder OutputMutationEntry, fn func() error) error {
+	return c.runExclusiveMode(ctx, false, holder, fn)
+}
+
+// runExclusiveMode runs fn on the lane, recording holder (empty when the
+// caller names none) as the lane's tenant while fn runs.
 func (c *repositoryMutationCoordinator) runExclusiveMode(
 	ctx context.Context,
 	acquireBatchGate bool,
+	holder OutputMutationEntry,
 	fn func() error,
 ) (retErr error) {
 	// This boundary is registered before the lane and batch-gate defers, so
@@ -404,6 +424,7 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 		batchMutationGate = c.batchMutationGate
 	}
 	c.work.Add(1)
+	c.laneTelemetry.batchWaiting++
 	c.mu.Unlock()
 	defer c.work.Done()
 
@@ -426,17 +447,24 @@ func (c *repositoryMutationCoordinator) runExclusiveMode(
 	}
 	batchAdmission.end()
 	if err := ctx.Err(); err != nil {
+		c.noteLaneWait(-1, 0)
 		return err
 	}
 
+	c.noteLaneWait(-1, 1)
 	laneTiming := beginCanonicalLaneWait(ctx)
 	select {
 	case <-ctx.Done():
+		c.noteLaneWait(0, -1)
 		return ctx.Err()
 	case <-c.lane:
 		laneTiming.canonicalLaneAcquired()
 	}
-	defer func() { c.lane <- struct{}{} }()
+	c.beginLaneTenure(holder, true)
+	defer func() {
+		c.endLaneTenure()
+		c.lane <- struct{}{}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -621,6 +649,17 @@ func (mi *MultiIndexer) withRepositoryMutationLanes(
 	prefixes []string,
 	fn func() error,
 ) error {
+	return mi.withRepositoryMutationLanesFor(ctx, "", prefixes, fn)
+}
+
+// withRepositoryMutationLanesFor is withRepositoryMutationLanes with each
+// lane's tenure attributed to holder.
+func (mi *MultiIndexer) withRepositoryMutationLanesFor(
+	ctx context.Context,
+	holder OutputMutationEntry,
+	prefixes []string,
+	fn func() error,
+) error {
 	if fn == nil {
 		return nil
 	}
@@ -645,7 +684,7 @@ func (mi *MultiIndexer) withRepositoryMutationLanes(
 			// The caller holds this lane already (TryRepositoryMutationLanes).
 			return acquire(i + 1)
 		}
-		return coordinators[i].runExclusiveLaneOnly(ctx, func() error {
+		return coordinators[i].runExclusiveLaneOnlyFor(ctx, holder, func() error {
 			return acquire(i + 1)
 		})
 	}
@@ -658,6 +697,12 @@ func (mi *MultiIndexer) withRepositoryMutationLanes(
 // that holds no lane cannot be part of a lane cycle. ok=false holds nothing;
 // the release returns the lanes in reverse order.
 func (mi *MultiIndexer) TryRepositoryMutationLanes(repos []string) (release func(), ok bool) {
+	return mi.TryRepositoryMutationLanesFor("", repos)
+}
+
+// TryRepositoryMutationLanesFor is TryRepositoryMutationLanes with each lane's
+// tenure attributed to holder.
+func (mi *MultiIndexer) TryRepositoryMutationLanesFor(holder OutputMutationEntry, repos []string) (release func(), ok bool) {
 	ordered := append([]string(nil), repos...)
 	sort.Strings(ordered)
 	ordered = slices.Compact(ordered)
@@ -668,7 +713,7 @@ func (mi *MultiIndexer) TryRepositoryMutationLanes(repos []string) (release func
 		}
 	}
 	for _, prefix := range ordered {
-		lane, ok := mi.repositoryMutationCoordinator(prefix).tryExclusive()
+		lane, ok := mi.repositoryMutationCoordinator(prefix).tryExclusive(holder)
 		if !ok {
 			releaseAll()
 			return nil, false
@@ -679,8 +724,9 @@ func (mi *MultiIndexer) TryRepositoryMutationLanes(repos []string) (release func
 }
 
 // tryExclusive is runExclusiveMode's admission without waiting: the batch
-// gate's read side, then the lane, each only if free.
-func (c *repositoryMutationCoordinator) tryExclusive() (func(), bool) {
+// gate's read side, then the lane, each only if free. holder is recorded as
+// the lane's tenant until the release.
+func (c *repositoryMutationCoordinator) tryExclusive(holder OutputMutationEntry) (func(), bool) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -702,7 +748,9 @@ func (c *repositoryMutationCoordinator) tryExclusive() (func(), bool) {
 		c.work.Done()
 		return nil, false
 	}
+	c.beginLaneTenure(holder, false)
 	return func() {
+		c.endLaneTenure()
 		c.lane <- struct{}{}
 		if gate != nil {
 			gate.RUnlock()
@@ -980,7 +1028,7 @@ func (idx *Indexer) coordinateRepositoryMutationPreparedSource(ctx context.Conte
 		release := idx.primaryWatcherWriteIntent()
 		defer release()
 	}
-	return idx.repositoryMutations().runExclusive(ctx, func() error {
+	return idx.repositoryMutations().runExclusiveFor(ctx, entry, func() error {
 		if entry == OutputEntryWatcherPatchGraph && preparation != nil && fn != nil {
 			defer preparation.release()
 			preparation.prepare(ctx)
