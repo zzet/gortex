@@ -158,13 +158,15 @@ func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutio
 }
 
 type resolutionCompletion struct {
-	inputs     *resolutionInputs
-	success    bool
-	failed     []string // absolute paths; empty on a failure of unknown extent
-	dropped    []string // graph paths from partially applied reindexes in this pass
-	catchupErr error    // interrupted whole-pass fallback; retry extent is unknown
-	warm       bool
-	frontier   []string // nil means a deferred full build
+	inputs            *resolutionInputs
+	success           bool
+	failed            []string // absolute paths; empty on a failure of unknown extent
+	dropped           []string // graph paths from partially applied invalidation reindexes requiring re-extraction
+	retryResolveFiles []string // graph paths from refused binding writes retried by resolution without re-extraction
+	retryScoped       bool     // true when catchupErr is a scoped refusal captured in pendingResolutionRetry
+	catchupErr        error    // interrupted whole-pass or refused-write catch-up error
+	warm              bool
+	frontier          []string // nil means a deferred full build
 }
 
 type resolutionRetry struct {
@@ -387,7 +389,10 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 		passErr = errors.Join(passErr, idx.invalidateResolutionDigest())
 	}
 	if work.catchupErr != nil {
-		work.success, work.warm, work.failed = false, false, nil
+		work.success, work.warm = false, false
+		if !work.retryScoped {
+			work.failed = nil
+		}
 		passErr = errors.Join(passErr, work.catchupErr, idx.invalidateResolutionDigest())
 	}
 	if work.inputs == nil && len(work.dropped) == 0 {
@@ -408,6 +413,15 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 			retry.files = make(map[string]bool, len(work.failed))
 			for _, file := range work.failed {
 				retry.files[idx.relKey(file)] = true
+			}
+		} else if work.retryScoped && len(work.dropped) == 0 {
+			// Scoped binding-write refusal is already captured in pendingResolutionRetry;
+			// keep inputs pinned without forcing disk re-extraction of unchanged files,
+			// while leaving the durable digest empty for restart recovery.
+			if prev := idx.resolutionRetry; prev != nil && prev.files != nil {
+				retry.files = prev.files
+			} else {
+				retry.files = map[string]bool{}
 			}
 		}
 		idx.resolutionRetry = retry

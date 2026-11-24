@@ -78,7 +78,7 @@ func (r *Resolver) resolveJavaOverrideDispatchCandidates(candidates overrideDisp
 		j.edge.Meta[graph.MetaSpeculative] = true
 		j.edge.Meta["dispatch"] = "override"
 		if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
-			continue
+			break
 		}
 		n++
 		for _, o := range j.others {

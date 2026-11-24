@@ -477,6 +477,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		resolvedViaLSP := r.tryResolveViaLSP(e, de.target, &stats)
 		result.attemptsDur += time.Since(attemptStart)
 		if resolvedViaLSP {
+			if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+				delete(e.Meta, "guard_reverted")
+			}
 			result.resolved++
 			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {
@@ -491,14 +494,13 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
 		if !stats.applyReindexes(r.graph, reindexBatch) {
-			r.notePassWriteRefused()
 			result.dropped = stats.DroppedFiles
 			result.writeRefused = true
 			result.resolved, result.newlyResolved = 0, 0
 			return result
 		}
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, &r.placeholderSrcIdx, reindexBatch); !ok {
-			r.notePassWriteRefused()
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
 			result.writeRefused = true
 		}
 		for _, ri := range reindexBatch {

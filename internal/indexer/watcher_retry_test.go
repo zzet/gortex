@@ -11,6 +11,7 @@ import (
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/resolver"
 	"go.uber.org/zap"
 )
 
@@ -463,6 +464,12 @@ func TestRetryableMutationErrorClassifier(t *testing.T) {
 	}
 	if !retryableMutationError(fmt.Errorf("writer gate: %w", context.DeadlineExceeded)) {
 		t.Fatal("wrapped deadline must retry")
+	}
+	if !retryableMutationError(resolver.ErrReindexWriteRefused) {
+		t.Fatal("refused reindex write must retry")
+	}
+	if !retryableMutationError(fmt.Errorf("resolve: %w", resolver.ErrReindexWriteRefused)) {
+		t.Fatal("wrapped refused reindex write must retry")
 	}
 	if retryableMutationError(context.Canceled) {
 		t.Fatal("cancellation must remain terminal")

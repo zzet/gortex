@@ -214,10 +214,16 @@ func (b *reparsePendingEnrichmentBatch) recordResolveStats(stats *resolver.Resol
 	if stats == nil || b == nil {
 		return
 	}
-	b.recordDropped(stats.DroppedFiles)
-	if stats.WriteRefused && len(stats.DroppedFiles) == 0 && b.resolution.catchupErr == nil {
-		b.resolution.catchupErr = resolver.ErrReindexWriteRefused
+	if len(stats.DroppedFiles) != 0 || stats.WriteRefused {
+		b.resolution.retryResolveFiles = append(b.resolution.retryResolveFiles, stats.DroppedFiles...)
+		if b.resolution.catchupErr == nil {
+			b.resolution.catchupErr = fmt.Errorf("%w: binding write did not apply; %d caller edges need retry", resolver.ErrReindexWriteRefused, len(stats.DroppedFiles))
+		}
 	}
+}
+
+func (b *reparsePendingEnrichmentBatch) resolutionWriteRefused() bool {
+	return b != nil && (len(b.resolution.dropped) > 0 || len(b.resolution.retryResolveFiles) > 0 || errors.Is(b.resolution.catchupErr, resolver.ErrReindexWriteRefused))
 }
 
 func (b *reparsePendingEnrichmentBatch) recordCatchupErr(err error) {

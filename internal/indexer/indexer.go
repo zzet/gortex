@@ -145,6 +145,13 @@ type IndexResult struct {
 	// failuresRetryable: every failed file is in the persisted failure ledger,
 	// which retries it, and no directory walk failed.
 	failuresRetryable bool
+	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
+	// receipt so the next pass rebinds the callers this one left unresolved.
+	resolutionErr error
+	// retriedResolution is true when this incremental pass drained a previously
+	// refused resolution retry frontier (so topology invalidation must run even
+	// if the re-parsed files classified inert or 0-stale).
+	retriedResolution bool
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -449,6 +456,15 @@ type Indexer struct {
 	resolutionRetry         *resolutionRetry
 	warmResolution          *resolutionCompletion // guarded by resolutionMu
 	deltaResolution         *resolutionInputs     // private to a single edit-delta builder
+
+	// pendingResolution* remembers incremental resolution frontiers whose
+	// writes were refused under SQLite writer-gate contention so a Watcher
+	// retry (whose reparse sees identical bytes and an empty receipt) still
+	// re-runs resolution instead of short-circuiting as a duplicate no-op.
+	pendingResolutionMu      sync.Mutex
+	pendingResolutionFiles   map[string]struct{}
+	pendingResolutionFull    bool
+	pendingResolutionDerived DerivedInvalidationPlan
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -7895,6 +7911,44 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	if !completion.success && len(discoveryFailed) == 0 {
 		completion.failed = appendUniqueSorted(nil, failedFiles...)
 		completion.failed = appendUniqueSorted(completion.failed, versionChangedFiles...)
+	}
+	if !markerBatch.deferResolverCatchup && !idx.deferResolve.Load() {
+		var carriedRetryFiles []string
+		var retryFull bool
+		if retryFiles, full, retryDerived := idx.takePendingResolutionRetry(); full || len(retryFiles) > 0 {
+			carriedRetryFiles = retryFiles
+			retryFull = full
+			result.retriedResolution = true
+			result.DerivedInvalidation.Merge(retryDerived)
+			result.DerivedInvalidation.HierarchyUnchanged = nil
+			result.capabilityPrior = nil
+			result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
+			result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+			if full {
+				if err := idx.resolveAll(); err != nil {
+					idx.logger.Error("indexer: full resolution retry failed", zap.Error(err))
+					markerBatch.recordCatchupErr(err)
+				}
+			} else {
+				markerBatch.recordResolveStats(idx.resolver.ResolveFilesAndIncoming(retryFiles))
+				idx.materializeDataflowParamsForFiles(retryFiles)
+				idx.persistRefFactsForFiles(retryFiles)
+			}
+		}
+		if markerBatch.resolutionWriteRefused() {
+			retrySaveFiles := appendUniqueSorted(
+				appendUniqueSorted(nil, markerBatch.resolution.retryResolveFiles...),
+				carriedRetryFiles...,
+			)
+			if len(retrySaveFiles) == 0 {
+				retrySaveFiles = appendUniqueSorted(retrySaveFiles, result.DerivedInvalidation.Files...)
+			}
+			fullRetry := retryFull || len(retrySaveFiles) == 0
+			idx.recordPendingResolutionRetry(retrySaveFiles, fullRetry, result.DerivedInvalidation)
+			if !fullRetry && len(completion.dropped) == 0 {
+				completion.retryScoped = true
+			}
+		}
 	}
 	if idx.deferResolve.Load() {
 		completion.frontier = invalidation.Files
