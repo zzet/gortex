@@ -127,10 +127,9 @@ func boundedIndexMemoryBudget(calculated, current int64) int64 {
 
 // cgroupMemoryLimit returns the active cgroup memory ceiling in bytes, or 0
 // when the process is not under a cgroup memory limit (or detection fails).
-// cgroup v2 (`memory.max`) is consulted first, then v1
-// (`memory/memory.limit_in_bytes`). Missing files, the literal "max", and
-// implausible sentinels all degrade to 0. Linux-only in practice; on other
-// platforms the files are absent and this returns 0.
+// The process's mounted cgroup v2 ancestry is consulted first, followed by
+// the conventional v2 and v1 root paths. Missing files, the literal "max",
+// and implausible sentinels all degrade to 0.
 func cgroupMemoryLimit() uint64 {
 	return cgroupMemoryLimitFrom(os.ReadFile)
 }
@@ -138,6 +137,9 @@ func cgroupMemoryLimit() uint64 {
 // cgroupMemoryLimitFrom is cgroupMemoryLimit with an injectable file reader,
 // so the cgroup-detection logic is testable without a real cgroup hierarchy.
 func cgroupMemoryLimitFrom(readFile func(string) ([]byte, error)) uint64 {
+	if limit := cgroupV2MemoryLimit(readFile); limit != 0 {
+		return limit
+	}
 	for _, path := range []string{
 		"/sys/fs/cgroup/memory.max",                   // cgroup v2 unified hierarchy
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1

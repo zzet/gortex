@@ -12,12 +12,14 @@ const (
 	projectionOwnerMissing
 	projectionOwnerSuspectBefore
 	projectionOwnerChangedBefore
+	projectionOwnerAbsentBefore
 	projectionOwnerStatError
 	projectionOwnerStampChanged
 	projectionOwnerTombstonePresent
 	projectionOwnerNotRegular
 	projectionOwnerSuspectAfter
 	projectionOwnerChangedAfter
+	projectionOwnerAbsentAfter
 	projectionOwnerFactsConflict
 	projectionOwnerFactUnavailable
 )
@@ -28,7 +30,7 @@ func (guard projectionLivenessGuard) label() string {
 		return "missing_entry"
 	case projectionOwnerSuspectBefore:
 		return "suspect_before"
-	case projectionOwnerChangedBefore:
+	case projectionOwnerChangedBefore, projectionOwnerAbsentBefore:
 		return "owner_before"
 	case projectionOwnerStatError:
 		return "stat_error"
@@ -40,7 +42,7 @@ func (guard projectionLivenessGuard) label() string {
 		return "not_regular"
 	case projectionOwnerSuspectAfter:
 		return "suspect_after"
-	case projectionOwnerChangedAfter:
+	case projectionOwnerChangedAfter, projectionOwnerAbsentAfter:
 		return "owner_after"
 	case projectionOwnerFactsConflict:
 		return "facts_conflict"

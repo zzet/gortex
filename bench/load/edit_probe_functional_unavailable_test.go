@@ -35,7 +35,7 @@ func functionalUnavailableRecordFixture(t *testing.T, preexisting bool) (editPro
 }
 
 func TestEditProbeFunctionalUnavailablePreservesUnknownTimingAndRejectsExecutedOriginal(t *testing.T) {
-	for _, mode := range []string{"direct43", "preexisting86", "direct53", "accepted_stamps", "physical_window", "physical_accounting", "physical_phase", "measured_state", "unknown_phase", "read_assisted", "winner", "foreign_owner", "foreign_rpc", "handoff", "unknown_refusal", "isolated", "missing_A", "bad_ACK", "read_failure", "missing_oracle", "pending_tier", "cap", "extra_error", "malformed_stage", "malformed_timing", "malformed_phases"} {
+	for _, mode := range []string{"direct43", "preexisting86", "direct53", "missing_winner", "missing_winner_with_accepted", "accepted_stamps", "physical_window", "physical_accounting", "physical_phase", "measured_state", "unknown_phase", "read_assisted", "winner", "foreign_owner", "foreign_rpc", "handoff", "unknown_refusal", "isolated", "missing_A", "bad_ACK", "read_failure", "missing_oracle", "pending_tier", "cap", "extra_error", "malformed_stage", "malformed_timing", "malformed_phases"} {
 		t.Run(mode, func(t *testing.T) {
 			record, status := functionalUnavailableRecordFixture(t, mode == "preexisting86")
 
@@ -48,6 +48,11 @@ func TestEditProbeFunctionalUnavailablePreservesUnknownTimingAndRejectsExecutedO
 			bg := status["requested_background_unavailable"].(map[string]any)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
 			switch mode {
+			case "missing_winner", "missing_winner_with_accepted":
+				status["applied_generation"] = json.Number("4")
+				if mode == "missing_winner_with_accepted" {
+					bg["accepted_attempt_stage"] = "accepted_stamps_retained"
+				}
 			case "malformed_stage":
 				bg["reason"] = "preexisting_path_work"
 				bg["binding_predicate"], bg["background_stage"], bg["accepted_attempt_stage"] = nil, nil, json.Number("1")
@@ -115,11 +120,14 @@ func TestEditProbeFunctionalUnavailablePreservesUnknownTimingAndRejectsExecutedO
 				record.functionalUnavailableStatus.Status.RPCID = "foreign"
 			}
 			got := classifyFunctionalUnavailableRecord(&record, scope)
-			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53"
+			want := mode == "direct43" || mode == "preexisting86" || mode == "direct53" || mode == "missing_winner"
 			if got != want {
 				t.Fatalf("mode=%s qualified=%v candidate=%+v reasons=%v", mode, got, record.functionalUnavailableStatus, record.Accounting.Reasons)
 			}
 			if got {
+				if mode == "missing_winner" && (record.Accounting.State != "unavailable" || record.Accounting.Requested != 3 || record.Accounting.Applied != 4 || !strings.Contains(record.FunctionalUnavailable.AccountingError, "independent serving identity mismatch")) {
+					t.Fatal("original unavailable ownership evidence changed")
+				}
 				if record.Accounting.P != nil || record.Accounting.B != nil || record.CoalescedFunctional != nil || record.Superseded != nil || record.Outcome != receiptproof.FunctionalUnavailableOutcome || len(record.Errors) != 0 {
 					t.Fatal("invented window/owner or lost original diagnostic")
 				}

@@ -231,13 +231,15 @@ func (s *startupProbe) mcpTick(ctx context.Context, cwd probeCWD) {
 		{"facade-v1", "hide", "initialize_facade", facade},
 	}
 	for _, session := range sessions {
-		if !s.mcpSession(ctx, cwd, session.tools, session.mode, session.initialize, session.steps) {
+		if !s.mcpSession(ctx, cwd, session.tools, session.mode, session.initialize, session.steps, func(sample probeSample, _ []byte) bool {
+			return s.recordLive(ctx, sample)
+		}) {
 			return
 		}
 	}
 }
 
-func (s *startupProbe) mcpSession(ctx context.Context, cwd probeCWD, tools, mode, initialize string, steps []request) bool {
+func (s *startupProbe) mcpSession(ctx context.Context, cwd probeCWD, tools, mode, initialize string, steps []request, record func(probeSample, []byte) bool) bool {
 	started := time.Now()
 	dialCtx, cancel := context.WithTimeout(ctx, startupCallTimeout)
 	conn, reader, version, err := dialSocketSurface(dialCtx, s.socket, cwd.Dir, "mcp", tools, mode)
@@ -248,7 +250,7 @@ func (s *startupProbe) mcpSession(ctx context.Context, cwd probeCWD, tools, mode
 		if errors.As(err, &opErr) && opErr.Op == "dial" {
 			code = "no_socket"
 		}
-		s.recordLive(ctx, probeSample{CWD: cwd.Role, Surface: "connect", Started: started, LatencyMS: elapsedMS(started), Code: code, Text: clip(err.Error())})
+		record(probeSample{CWD: cwd.Role, Surface: "connect", Started: started, LatencyMS: elapsedMS(started), Code: code, Text: clip(err.Error())}, nil)
 		return false
 	}
 	defer conn.Close()
@@ -287,7 +289,7 @@ func (s *startupProbe) mcpSession(ctx context.Context, cwd probeCWD, tools, mode
 			sample = probeSample{Code: "transport_error", Text: clip(err.Error())}
 		}
 		sample.CWD, sample.Surface, sample.Started, sample.LatencyMS = cwd.Role, call.surface, start, elapsedMS(start)
-		if !s.recordLive(ctx, sample) || err != nil {
+		if !record(sample, frame) || err != nil {
 			return ctx.Err() == nil
 		}
 		if i == 0 && c.notify("notifications/initialized") != nil {
@@ -551,7 +553,11 @@ func ttyCommand(ctx context.Context, binary string, argv []string) (*exec.Cmd, e
 // explicit no-checkout fixture that linked path is absent, as the gate receipt
 // discloses; its decisions do not prove indexed-file hook coverage.
 func (s *startupProbe) hookRead(ctx context.Context, cwd probeCWD) probeSample {
-	payload, _ := json.Marshal(map[string]any{"hook_event_name": "PreToolUse", "session_id": "gortex-load-startup", "tool_name": "Read", "tool_input": map[string]any{"file_path": cwd.File}, "cwd": cwd.Dir})
+	return s.nativeHook(ctx, cwd, "Read", "hook_read", map[string]string{"file_path": cwd.File})
+}
+
+func (s *startupProbe) nativeHook(ctx context.Context, cwd probeCWD, tool, surface string, input map[string]string) probeSample {
+	payload, _ := json.Marshal(map[string]any{"hook_event_name": "PreToolUse", "session_id": "gortex-load-startup", "tool_name": tool, "tool_input": input, "cwd": cwd.Dir})
 	callCtx, cancel := context.WithTimeout(ctx, startupCallTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(callCtx, s.binary, "hook")
@@ -560,7 +566,7 @@ func (s *startupProbe) hookRead(ctx context.Context, cwd probeCWD) probeSample {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	started := time.Now()
 	exitCode, err := runOwned(cmd, cwd.Dir, s.env)
-	sample := probeSample{CWD: cwd.Role, Surface: "hook_read", Started: started, LatencyMS: elapsedMS(started), ExitCode: &exitCode}
+	sample := probeSample{CWD: cwd.Role, Surface: surface, Started: started, LatencyMS: elapsedMS(started), ExitCode: &exitCode}
 	decision, text := decodeHookOutput(stdout.Bytes())
 	sample.Variant, sample.TrackAdvice, sample.Text = decision, adviceIn(text), clip(text)
 	sample.OK = err == nil

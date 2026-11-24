@@ -9,7 +9,8 @@ import (
 func functionalUnavailableEditLoopRecord(wire editLoopWire, index int) bool {
 	r := wire.Edits[index]
 	p := r.FunctionalUnavailable
-	if !sharedFunctionalEditLoopRecord(wire, index) || r.CoalescedFunctional != nil || r.Accounting.State != "terminal_unavailable_background" ||
+	state := r.Accounting.State == "terminal_unavailable_background" || r.Accounting.State == "unavailable" && r.Accounting.Requested > 0 && r.Accounting.Applied > r.Accounting.Requested
+	if !sharedFunctionalEditLoopRecord(wire, index) || r.CoalescedFunctional != nil || !state ||
 		!p.Matches(r.Receipt, r.MutationID, r.Accounting.RPCID, r.Accounting.Requested, r.Accounting.Applied) || p.AccountingError != "A/P/B accounting unavailable: "+strings.Join(r.Accounting.Reasons, "; ") {
 		return false
 	}

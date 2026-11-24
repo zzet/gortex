@@ -55,6 +55,46 @@ func TestEditControlAccumulatesActualOnlineABALeafIntervals(t *testing.T) {
 	require.Equal(t, 7.0, *a.snapshot().EditControl.AckMS, "snapshots own scalar values")
 }
 
+func TestAcknowledgementAccountsForCompleteMeasuredReply(t *testing.T) {
+	origin := time.Now()
+	acknowledgement := beginControlledLeaf(t, origin)
+	for _, interval := range []struct {
+		kind       editAcknowledgementLapKind
+		start, end time.Duration
+	}{
+		{editAckParseGate, 2 * time.Millisecond, 3 * time.Millisecond},
+		{editAckDiskWrite, 4 * time.Millisecond, 5 * time.Millisecond},
+		{editAckTicketAdmission, 6 * time.Millisecond, 7 * time.Millisecond},
+		{editAckReindexWait, 8 * time.Millisecond, 10 * time.Millisecond},
+	} {
+		lap := acknowledgement.beginLapAt(interval.kind, origin.Add(interval.start))
+		lap.finishAt(origin.Add(interval.end))
+	}
+	endControlledLeaf(acknowledgement, origin.Add(12*time.Millisecond))
+	acknowledgement.finishActualAt(origin.Add(14 * time.Millisecond))
+	acknowledgement.finishReplyAt(origin.Add(15*time.Millisecond), "result")
+	snapshot := acknowledgement.snapshot()
+	wire := buildAcknowledgementPayload(&snapshot, "observed")
+
+	require.Equal(t, "monotonic", wire.Clock)
+	require.True(t, wire.Disjoint)
+	for name, want := range map[string]float64{
+		"middleware": 1, "parse": 1, "disk_write": 1, "publish": 1,
+		"reindex_wait": 2, "edit_control": 6, "reply_prepare": 2, "caller_result": 1,
+	} {
+		require.Equal(t, "measured", wire.PhaseStates[name], name)
+		require.NotNil(t, wire.PhasesMS[name], name)
+		require.Equal(t, want, *wire.PhasesMS[name], name)
+	}
+	require.NotNil(t, wire.ReplyWallMS)
+	require.NotNil(t, wire.SubtotalMS)
+	require.NotNil(t, wire.UnattributedMS)
+	require.Equal(t, 15.0, *wire.ReplyWallMS)
+	require.InDelta(t, *wire.ReplyWallMS, *wire.SubtotalMS, *wire.ReplyWallMS/20)
+	require.Zero(t, *wire.UnattributedMS)
+	require.Equal(t, "not_additive_overlapping_lifetimes", wire.CombinedAckPatchSumState)
+}
+
 func TestEditControlRecordsRealNotApplicableGuardWithoutInventingParse(t *testing.T) {
 	origin := time.Now()
 	a := beginControlledLeaf(t, origin)

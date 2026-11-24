@@ -532,7 +532,7 @@ func notifyDaemonTrack(absPath, name string, deadline time.Time) error {
 	}
 	if !resp.OK {
 		if resp.ErrorCode == daemon.ErrRepoLoading {
-			return &repoLoadingError{admissionReason: "identity_pending", phase: "identity_resolution"}
+			return &repoLoadingError{admissionReason: "identity_pending", details: repoLoadingDetails{Phase: "identity_resolution"}}
 		}
 		if resp.ErrorCode == daemon.ErrPrefixCollision {
 			return &trackPrefixCollisionError{message: resp.ErrorMsg}

@@ -65,6 +65,7 @@ type editProbeRoute struct {
 type editProbePlan struct {
 	ConsumerProbes           bool             `json:"consumer_probes,omitempty"`
 	GateModes                bool             `json:"gate_modes,omitempty"`
+	OwnACKReadbackOnly       bool             `json:"own_ack_readback_only,omitempty"`
 	SearchReadbackAcceptance bool             `json:"search_readback_acceptance,omitempty"`
 	Version                  int              `json:"version"`
 	Arrival                  string           `json:"arrival"`
@@ -151,6 +152,14 @@ func planEditProbe(c Corpus, o runOptions) (editProbePlan, error) {
 	}
 	if err != nil {
 		return p, err
+	}
+	if o.OwnACKReadbackOnly {
+		if p.Kind != "add_intrafile_call" || p.Tool != "edit.file" || p.Mode != "json" || p.Language != "go" || p.Sender != "" || c.EditExpect != "" {
+			return editProbePlan{}, errors.New("--edit-ack-readback-only requires an ordinary Go call addition through JSON edit.file")
+		}
+		p.OwnACKReadbackOnly = true
+		p.SessionModel = "fixed_editors_local_ack_file_source_with_paced_readers"
+		p.NotSelected = append(p.NotSelected, "auxiliary visibility polling, graph terminal status and A/P/B phase accounting")
 	}
 	if o.EditConsumerProbes {
 		if err := bindEditConsumerPlan(c, &p); err != nil {
@@ -646,6 +655,10 @@ func editProbeOperations(plan editProbePlan, c Corpus) []request {
 	var operations []request
 	for _, step := range plan.Steps {
 		operations = append(operations, step.Request)
+		if plan.OwnACKReadbackOnly {
+			operations = append(operations, editProbeReadbackRequest(c.File, step, "file"), editProbeReadbackRequest(c.File, step, "source"))
+			continue
+		}
 		for _, oracle := range editProbeOracles(c, step) {
 			operations = append(operations, oracle.call)
 		}

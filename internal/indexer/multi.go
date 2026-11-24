@@ -2793,8 +2793,8 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mi.mu.Unlock()
 	mtimes.end()
 
-	if mode.onRelations != nil && len(result.FailedFiles) == 0 && result.resolutionErr == nil {
-		mode.onRelations()
+	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
+		mode.onRelations(batch.pointRebindRefused || result.resolutionErr != nil)
 	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 	derived := mode.publication.beginDerivedPatchLap()
@@ -2806,9 +2806,6 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	topologyChanged = incrementalTopologyChanged(result)
 	if err := idx.finishResolutionPass(batch.resolution); err != nil {
 		return result, err
-	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
-		return result, result.resolutionErr
 	}
 	return result, nil
 }

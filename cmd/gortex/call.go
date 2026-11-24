@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,15 +31,17 @@ var (
 // callDaemonTool is the daemon-tool relay seam. It is indirected through a
 // package var so a test can stub the daemon call (and the catalog fetch used
 // for name validation) without a running daemon.
-var callDaemonTool = requireDaemonTool
+var callDaemonTool = func(repoPath, tool string, args map[string]any, diagnostics io.Writer) (json.RawMessage, error) {
+	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode, diagnostics)
+}
 
 // callFacadeDaemonTool uses the same shell argument lowering and output path as
 // callDaemonTool, but negotiates the compact facade surface for this one daemon
 // connection. Kept as a separate seam so tests prove surface selection without
 // a running daemon.
-var callFacadeDaemonTool = func(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
+var callFacadeDaemonTool = func(repoPath, tool string, args map[string]any, diagnostics io.Writer) (json.RawMessage, error) {
 	return requireDaemonToolWithSurface(
-		repoPath, tool, args, gortexmcp.FacadeSurfaceVersion, "hide",
+		repoPath, tool, args, gortexmcp.FacadeSurfaceVersion, "hide", diagnostics,
 	)
 }
 
@@ -63,7 +67,8 @@ Use --dry to print the lowered argument object and the target tool without
 calling the daemon (works with no daemon running). Use --format to pick the
 wire format the tool renders (json|gcx|toon|text). --format json always prints
 parseable JSON: a tool that answers in prose is wrapped as
-{"tool":…,"format":"text","text":…}.
+{"tool":…,"format":"text","text":…}. An explicit --format json also prints
+repository loading refusals as JSON on stderr and exits with status 75.
 
 When <tool> is one of the compact public tool names, this command automatically
 selects the compact surface for that connection and accepts the exact MCP
@@ -121,21 +126,31 @@ func runCall(cmd *cobra.Command, args []string) error {
 	if callDry {
 		return printCallDry(cmd, tool, argObj)
 	}
+	stderr := cmd.ErrOrStderr()
+	diagnostics := stderr
+	var pendingDiagnostics bytes.Buffer
+	jsonRefusals := formatExplicit && callFormat == "json"
+	if jsonRefusals {
+		// A loading refusal owns stderr in explicit JSON mode. Keep notices
+		// until we know whether the call ends with that refusal.
+		diagnostics = &pendingDiagnostics
+	}
 	facadeEffectful := compactCall && daemon.IsEffectful(tool)
 	if facadeEffectful && !callQuiet {
-		fmt.Fprintf(cmd.ErrOrStderr(), "note: %s can change %s\n", tool, describeToolEffects(daemon.EffectOf(tool)))
+		fmt.Fprintf(diagnostics, "note: %s can change %s\n", tool, describeToolEffects(daemon.EffectOf(tool)))
 	}
 
 	// Best-effort name validation against the live daemon's catalog. When no
 	// daemon is reachable this is skipped entirely so the call below returns
 	// the normal daemonRequiredErr instead of a confusing "unknown tool".
 	if !compactCall {
-		if cat, ok := fetchToolCatalog(callIndex); ok {
+		if cat, ok := fetchToolCatalog(callIndex, diagnostics); ok {
 			if !cat.has(tool) {
+				_, _ = pendingDiagnostics.WriteTo(stderr)
 				return unknownToolErr(tool, cat)
 			}
 			if cat.mutating(tool) && !callQuiet {
-				fmt.Fprintf(cmd.ErrOrStderr(), "note: %s writes to your working tree / graph\n", tool)
+				fmt.Fprintf(diagnostics, "note: %s writes to your working tree / graph\n", tool)
 			}
 		}
 	}
@@ -144,7 +159,17 @@ func runCall(cmd *cobra.Command, args []string) error {
 	if compactCall {
 		relay = callFacadeDaemonTool
 	}
-	raw, err := relay(callIndex, tool, argObj)
+	raw, err := relay(callIndex, tool, argObj, diagnostics)
+	if jsonRefusals {
+		var loading *repoLoadingError
+		if errors.As(err, &loading) {
+			if encodeErr := json.NewEncoder(stderr).Encode(loading.details); encodeErr == nil {
+				cmd.SilenceErrors = true
+			}
+			return err
+		}
+		_, _ = pendingDiagnostics.WriteTo(stderr)
+	}
 	if cliRequireFresh {
 		err = checkCLIFreshness(cmd, raw, err)
 	}
@@ -400,8 +425,8 @@ func (c *toolCatalog) mutating(name string) bool { return c != nil && c.mutators
 // into a toolCatalog. The bool result is false when no daemon is reachable (or
 // the response is unusable) — the caller then SKIPS validation so the real call
 // surfaces the normal daemonRequiredErr.
-func fetchToolCatalog(repoPath string) (*toolCatalog, bool) {
-	raw, err := callDaemonTool(repoPath, "tool_profile", map[string]any{})
+func fetchToolCatalog(repoPath string, diagnostics io.Writer) (*toolCatalog, bool) {
+	raw, err := callDaemonTool(repoPath, "tool_profile", map[string]any{}, diagnostics)
 	if err != nil {
 		return nil, false
 	}

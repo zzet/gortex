@@ -361,6 +361,15 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 	resolutionCache.Unlock()
 }
 
+func (idx *Indexer) hasUncertifiedResolutionPass() bool {
+	active := idx.activeResolution.Load()
+	if active == nil {
+		return idx.resolutionRetry != nil || idx.resolutionInputsChanged
+	}
+	applied := idx.appliedResolution.Load()
+	return applied == nil || applied.digest != active.digest || idx.resolutionRetry != nil || idx.resolutionInputsChanged
+}
+
 func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr error) {
 	if dropped := work.dropped; len(dropped) > 0 {
 		if work.inputs == nil {

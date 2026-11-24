@@ -139,15 +139,20 @@ func TestIncrementalWatcherPaths_SkipsOnRelationsWhenResolutionRefused(t *testin
 	idx.resolver.SetGraph(contended)
 
 	onRelationsCalled := false
+	onRelationsRefused := false
 	_, err = idx.incrementalWatcherPaths(root, []string{configPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
-		onRelations:        func() { onRelationsCalled = true },
+		onRelations: func(refused bool) {
+			onRelationsCalled = true
+			onRelationsRefused = refused
+		},
 	})
 	idx.resolver.SetGraph(store)
 
 	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
-	assert.False(t, onRelationsCalled, "onRelations must not stamp RelationsAt fresh when resolution refused writes")
+	assert.True(t, onRelationsCalled, "onRelations must report refused rebind state")
+	assert.True(t, onRelationsRefused, "onRelations must signal refused=true so RelationsAt stays unobserved")
 }
 
 func TestMultiIndexer_RunPreEnrichResolveCarriesPlaceholderRepointsAndGuardRevertsAcrossFreshResolvers(t *testing.T) {
@@ -211,36 +216,41 @@ func TestMultiIndexer_RunPreEnrichResolveCarriesPlaceholderRepointsAndGuardRever
 func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 	t.Run("patch_receiptChecked_false_bypasses_duplicate_gate_via_pending_retry", func(t *testing.T) {
 		root := t.TempDir()
-		writeFileMk(t, filepath.Join(root, "lib.ts"), "export function helper() { return 1 }\n")
-		callerPath := filepath.Join(root, "caller.ts")
-		writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return 0 }\n")
-
+		configPath := aliasRebindFixture(t, root)
+		probePath := filepath.Join(root, "keep.go")
+		writeFileMk(t, probePath, "package demo\nfunc Keep() int { return 1 }\n")
 		idx, store := newSQLiteIndexer(t)
 		_, err := idx.Index(root)
 		require.NoError(t, err)
+		require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 
 		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
 		require.NoError(t, err)
 
-		writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return helper() }\n")
+		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
 
 		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
 		defer restoreTimeout()
 		contended := &gateHoldingReindexStore{Store: store}
 		idx.resolver.SetGraph(contended)
 
-		// Attempt 1 (receiptChecked=false): non-alias edit surfaces ErrReindexWriteRefused and records pending retry.
-		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
+		// Attempt 1 (receiptChecked=false): uncertified alias edit surfaces ErrReindexWriteRefused and records pending retry.
+		err = w.patchGraphWithReceiptStateObserved(configPath, ChangeModified, 0, false, nil, nil)
 		idx.resolver.SetGraph(store)
-		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused, "non-alias edit must surface ErrReindexWriteRefused so watcher retries")
+		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused, "uncertified alias edit must surface ErrReindexWriteRefused so watcher retries")
 		assert.True(t, idx.hasPendingResolutionRetry())
-		assert.Equal(t, "unresolved::helper", callTargetForName(t, store, "caller.ts", "run"))
+		assert.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 
-		// Attempt 2 with receiptChecked=false exercises watcher.go's !idx.hasPendingResolutionRetry() gate directly.
-		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
+		// Attempt 2 on unchanged non-JS probePath with receiptChecked=false exercises watcher.go's !idx.hasPendingResolutionRetry() gate directly.
+		dup, _ := idx.pointDuplicateSourceContent(context.Background(), probePath)
+		require.True(t, dup, "probePath bytes must match persisted file_meta so the duplicate gate is armed")
+		err = w.patchGraphWithReceiptStateObserved(probePath, ChangeModified, 0, false, nil, nil)
 		require.NoError(t, err)
 		assert.False(t, idx.hasPendingResolutionRetry())
-		assert.Equal(t, "lib.ts::helper", callTargetForName(t, store, "caller.ts", "run"))
+		assert.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+		digest, err := store.TSAliasDigest(idx.repoPrefix)
+		require.NoError(t, err)
+		assert.NotEmpty(t, digest)
 	})
 
 	t.Run("runPointMutationObserved_retryAttempt_bypasses_duplicate_gate_without_pending_retry", func(t *testing.T) {
@@ -398,21 +408,24 @@ func TestIncrementalWatcherPaths_PendingRetryFullNotDowngradedByOverlappingEdit(
 
 func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *testing.T) {
 	root := t.TempDir()
-	aPath := filepath.Join(root, "a.ts")
-	bPath := filepath.Join(root, "b.ts")
-	cPath := filepath.Join(root, "c.ts")
-	writeFileMk(t, aPath, "export function foo() { return 1 }\n")
-	writeFileMk(t, bPath, "export function foo() { return 2 }\n")
-	writeFileMk(t, cPath, "import { foo } from './b'\nexport function run() { return foo() }\n")
+	configPath := filepath.Join(root, "tsconfig.json")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v1/*"]}}}`)
+	aPath := filepath.Join(root, "a", "a.go")
+	bPath := filepath.Join(root, "b.go")
+	cPath := filepath.Join(root, "c.go")
+	writeFileMk(t, aPath, "package a\nfunc Foo() int { return 1 }\n")
+	writeFileMk(t, bPath, "package demo\nfunc Foo() int { return 2 }\n")
+	writeFileMk(t, cPath, "package demo\nfunc Run() int { return Foo() }\n")
 
 	idx, store := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
+	require.Equal(t, "b.go::Foo", callTargetForName(t, store, "c.go", "Run"))
 
-	// Force c.ts::run -> a.ts::foo so removing foo from a.ts parks c.ts::run on
-	// unresolved::foo and exercises resolveReceiptNamePendings(receipt).
+	// Force c.go::Run -> a/a.go::Foo so removing Foo from a/a.go parks c.go::Run on
+	// unresolved::Foo and exercises resolveReceiptNamePendings(receipt).
 	var runCall *graph.Edge
-	for _, e := range store.GetOutEdges("c.ts::run") {
+	for _, e := range store.GetOutEdges("c.go::Run") {
 		if e.Kind == graph.EdgeCalls {
 			runCall = e
 			break
@@ -420,11 +433,13 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	}
 	require.NotNil(t, runCall)
 	prevTo := runCall.To
-	runCall.To = "a.ts::foo"
+	runCall.To = "a/a.go::Foo"
 	require.True(t, store.ReindexEdgesApplied([]graph.EdgeReindex{{Edge: runCall, OldTo: prevTo}}))
 
-	// Remove foo from a.ts; refuse writes during resolveReceiptNamePendings.
-	writeFileMk(t, aPath, "export function bar() { return 1 }\n")
+	// Arm an uncertified alias pass (no .ts files exist, so the Go frontier stays exact)
+	// and remove Foo from a/a.go; refuse writes during resolveReceiptNamePendings.
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v2/*"]}}}`)
+	writeFileMk(t, aPath, "package a\nfunc Bar() int { return 1 }\n")
 	refusing := &countingRefuseReindexStore{
 		Store: store,
 		refuseFunc: func(_ int, _ []graph.EdgeReindex) bool {
@@ -438,9 +453,9 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	})
 	idx.resolver.SetGraph(store)
 	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
-	assert.Equal(t, "unresolved::foo", callTargetForName(t, store, "c.ts", "run"))
+	assert.Equal(t, "unresolved::Foo", callTargetForName(t, store, "c.go", "Run"))
 
-	// Attempt 2 on unchanged a.ts (inert reparse): must run full resolution and rebind c.ts::run -> b.ts::foo.
+	// Attempt 2 on unchanged a/a.go (inert reparse): must run full resolution and rebind c.go::Run -> b.go::Foo.
 	res, err := idx.incrementalWatcherPaths(root, []string{aPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
@@ -449,20 +464,23 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	require.NotNil(t, res)
 	assert.True(t, res.retriedResolution)
 	assert.True(t, incrementalTopologyChanged(res), "inert retry pass that completed resolution must signal topologyChanged")
-	assert.Equal(t, "b.ts::foo", callTargetForName(t, store, "c.ts", "run"))
+	assert.Equal(t, "b.go::Foo", callTargetForName(t, store, "c.go", "Run"))
 }
 
 func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopologyChange(t *testing.T) {
 	root := t.TempDir()
-	writeFileMk(t, filepath.Join(root, "lib.ts"), "export function helper() { return 1 }\n")
-	callerPath := filepath.Join(root, "caller.ts")
-	writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return 0 }\n")
+	configPath := filepath.Join(root, "tsconfig.json")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v1/*"]}}}`)
+	writeFileMk(t, filepath.Join(root, "lib.go"), "package demo\nfunc Helper() int { return 1 }\n")
+	callerPath := filepath.Join(root, "caller.go")
+	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return 0 }\n")
 
 	idx, store := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
 
-	writeFileMk(t, callerPath, "import { helper } from './lib'\nexport function run() { return helper() }\n")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v2/*"]}}}`)
+	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return Helper() }\n")
 	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
 	defer restoreTimeout()
 	idx.resolver.SetGraph(&gateHoldingReindexStore{Store: store})
@@ -489,10 +507,10 @@ func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopolo
 	require.NotNil(t, res)
 	assert.True(t, res.retriedResolution)
 	assert.True(t, incrementalTopologyChanged(res), "successful inert retry must invalidate reachability topology")
-	assert.Contains(t, res.DerivedInvalidation.Files, "caller.ts")
+	assert.Contains(t, res.DerivedInvalidation.Files, "caller.go")
 	assert.True(t, res.DerivedInvalidation.Flags.Has(DerivedInvalidatesTests))
-	assert.Contains(t, derivedFiles, "caller.ts")
-	assert.Equal(t, "lib.ts::helper", callTargetForName(t, store, "caller.ts", "run"))
+	assert.Contains(t, derivedFiles, "caller.go")
+	assert.Equal(t, "lib.go::Helper", callTargetForName(t, store, "caller.go", "Run"))
 }
 
 func TestMultiIndexer_RetryFullWideStillRunsWholeGraphCrossRepoAndRetryFileFacts(t *testing.T) {
@@ -575,6 +593,8 @@ func TestMultiIndexer_PerRepoIndexerResolverBridgesRetryStateToFreshMaster(t *te
 
 func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t *testing.T) {
 	root := t.TempDir()
+	configPath := filepath.Join(root, "tsconfig.json")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v1/*"]}}}`)
 	defPath := filepath.Join(root, "def.go")
 	helperPath := filepath.Join(root, "helper.go")
 	callerPath := filepath.Join(root, "caller.go")
@@ -587,10 +607,12 @@ func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t
 	require.NoError(t, err)
 	require.Equal(t, "def.go::Calc", callTargetForName(t, store, "caller.go", "Run"))
 
-	// Change Calc's signature (a genuine contract change putting caller.go into
-	// batch.deferredAffectedPlan().files) AND add an unresolved call to helper.go::Other
+	// Arm an uncertified alias pass (no .ts files exist, so the Go frontier stays exact),
+	// change Calc's signature (a genuine contract change putting caller.go into
+	// batch.deferredAffectedPlan().files), AND add an unresolved call to helper.go::Other
 	// in caller.go (untouched by def.go's incoming leg, so ONLY ResolveFilesOutgoing
 	// on affected_by resolves it).
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v2/*"]}}}`)
 	writeFileMk(t, defPath, "package demo\n\nfunc Calc(x, y int) int { return x + y }\n")
 	store.AddBatch(nil, []*graph.Edge{
 		{From: "caller.go::Run", To: "unresolved::Other", Kind: graph.EdgeCalls, FilePath: "caller.go", Line: 99},
@@ -706,6 +728,8 @@ func TestMultiIndexer_ShadowBuildSetGraphDoesNotStealOrWipePendingMasterRetry(t 
 
 func TestIncrementalWatcherPaths_OverlappingBodyEditOnPendingRetryStillInfersOverrides(t *testing.T) {
 	root := t.TempDir()
+	configPath := filepath.Join(root, "tsconfig.json")
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v1/*"]}}}`)
 	basePath := filepath.Join(root, "base.ts")
 	subPath := filepath.Join(root, "sub.ts")
 	writeFileMk(t, basePath, "export class Base {\n  run() { return 1 }\n}\n")
@@ -723,8 +747,9 @@ func TestIncrementalWatcherPaths_OverlappingBodyEditOnPendingRetryStillInfersOve
 		return n
 	}
 
-	// Attempt 1 adds extends Base under resolution write refusal: EdgeExtends stays
-	// unresolved::Base, so Attempt 1's derived pass produces 0 EdgeOverrides.
+	// Attempt 1 adds extends Base under an uncertified alias pass and resolution write refusal:
+	// EdgeExtends stays unresolved::Base, so Attempt 1's derived pass produces 0 EdgeOverrides.
+	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v2/*"]}}}`)
 	writeFileMk(t, subPath, "import { Base } from './base'\nexport class Sub extends Base {\n  run() { return 2 }\n}\n")
 	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
 	defer restoreTimeout()

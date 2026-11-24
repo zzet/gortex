@@ -233,10 +233,11 @@ func (b *reparsePendingEnrichmentBatch) recordCatchupErr(err error) {
 }
 
 type reparsePendingEnrichmentBatch struct {
-	pointPreparation *watcherPointPreparation
-	publication      *PublicationStamps // optional local canonical attempt; never a live record
-	readRepair       *ReadRepairObservation
-	relationsRead    *relationsReadFrontier
+	pointPreparation   *watcherPointPreparation
+	publication        *PublicationStamps // optional local canonical attempt; never a live record
+	readRepair         *ReadRepairObservation
+	relationsRead      *relationsReadFrontier
+	pointRebindRefused bool
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
 	bindingCallers        []string

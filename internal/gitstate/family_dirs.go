@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 // ResolveFamilyDirs resolves dir's own Git directory and shared common
@@ -38,26 +42,93 @@ func ResolveFamilyDirs(ctx context.Context, dir string) (gitDir, commonDir strin
 // is found or this read cannot follow it; Git remains the authority on
 // anything that must be proven.
 func MarkerCommonDir(dir string) (root, commonDir string, ok bool) {
-	root, err := absDir(dir)
-	if err != nil {
+	root, ok = checkoutMarkerRoot(dir)
+	if !ok {
 		return "", "", false
-	}
-	for {
-		if _, err := os.Lstat(filepath.Join(root, ".git")); err == nil {
-			break
-		}
-		parent := filepath.Dir(root)
-		if parent == root {
-			return "", "", false
-		}
-		root = parent
 	}
 	if _, commonDir = resolveGitDirsFromDotGit(root); commonDir == "" {
 		return "", "", false
 	}
 	// Git reports the common directory with its symlinks resolved.
-	if commonDir, err = filepath.EvalSymlinks(commonDir); err != nil {
+	commonDir, err := filepath.EvalSymlinks(commonDir)
+	if err != nil {
 		return "", "", false
 	}
 	return root, commonDir, true
+}
+
+// LinkedCheckoutMain reads the linked checkout's reciprocal Git markers.
+// A copied .git file does not name a member unless the family's admin
+// entry points back to that exact checkout. Bare families have no main.
+func LinkedCheckoutMain(dir string) string {
+	root, ok := checkoutMarkerRoot(dir)
+	if !ok {
+		return ""
+	}
+	marker := filepath.Join(root, ".git")
+	target, ok := strings.CutPrefix(readWorktreeMarker(marker), "gitdir: ")
+	if !ok || target == "" {
+		return ""
+	}
+	admin, err := filepath.EvalSymlinks(resolveAgainst(root, target))
+	if err != nil {
+		return ""
+	}
+	commonMarker := readWorktreeMarker(filepath.Join(admin, "commondir"))
+	if commonMarker == "" {
+		return ""
+	}
+	common, err := filepath.EvalSymlinks(resolveAgainst(admin, commonMarker))
+	if err != nil || filepath.Base(common) != ".git" ||
+		!pathkey.SamePathIdentity(filepath.Dir(admin), filepath.Join(common, "worktrees")) {
+		return ""
+	}
+	backlink := readWorktreeMarker(filepath.Join(admin, "gitdir"))
+	if backlink == "" {
+		return ""
+	}
+	back, err := filepath.EvalSymlinks(resolveAgainst(admin, backlink))
+	if err != nil || filepath.Base(back) != ".git" {
+		return ""
+	}
+	physicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil || !pathkey.SamePathIdentity(filepath.Dir(back), physicalRoot) {
+		return ""
+	}
+	return filepath.Dir(common)
+}
+
+func checkoutMarkerRoot(dir string) (string, bool) {
+	root, err := absDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(root, ".git")); err == nil {
+			return root, true
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", false
+		}
+		root = parent
+	}
+}
+
+func readWorktreeMarker(path string) string {
+	const maxMarkerBytes = 64 * 1024
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxMarkerBytes {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxMarkerBytes+1))
+	if err != nil || len(raw) > maxMarkerBytes {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
 }

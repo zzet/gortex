@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +45,7 @@ func newAssemblyRetirementFixture(t *testing.T) (*Server, *store_sqlite.Store, s
 
 // The real SQL reader detects the writer revision before the leaf can assemble
 // a successful result. The observer runs after that transaction has released
-// its connection, so real IndexFile/checked retirement can complete without a
+// its connection, so the checked publication and retirement can read without a
 // nested acquisition of SQLite's sole read connection.
 type assemblyRetirementStore struct {
 	*store_sqlite.Store
@@ -90,6 +89,17 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					s, sql, path := newAssemblyRetirementFixture(t)
 					backend := &assemblyRetirementStore{Store: sql}
 					s.graph, s.engine = backend, query.NewEngine(backend)
+					var revisionFile string
+					switch transition {
+					case "physical_peer_same_bytes", "changed_bytes", "source_event", "unchecked_eviction", "canonical_no_projection":
+						// Stage an independently indexed inventory row before
+						// the ACK. Its later removal changes the store revision
+						// without advancing the requested file's graph or hash.
+						revisionFile = "metadata_revision_witness.go"
+						revisionPath := filepath.Join(filepath.Dir(path), revisionFile)
+						require.NoError(t, os.WriteFile(revisionPath, []byte("package probe\n\nfunc metadataRevisionWitness() {}\n"), 0600))
+						require.NoError(t, s.indexer.IndexFile(revisionPath))
+					}
 					pending := make(chan indexer.MutationResult)
 					s.SetWatcher(mutationTestWatcher{done: pending})
 					t.Cleanup(func() {
@@ -124,10 +134,35 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					require.NotNil(t, retirement)
 					physical, err := os.ReadFile(path)
 					require.NoError(t, err)
-					if transition == "canonical_no_projection" {
+					var prepared *indexer.Projection
+					var fileMeta []graph.FileMetaRow
+					switch transition {
+					case "canonical_no_projection":
 						require.NoError(t, s.indexer.IndexFile(path))
 						retirement.run()
+						require.True(t, entry.checkedRetired.Load())
 						require.Nil(t, liveEntry(pendingFileProjections, path))
+					case "canonical_retirement", "expired", "cancelled", "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "options_true_override_false":
+						// Prepare from the actual disk bytes with the indexer's own
+						// parser. The request must still select the live ACK over
+						// the old canonical rows. Neither write happens in setup.
+						prepared, err = s.indexer.ProjectSource(t.Context(), path, physical)
+						require.NoError(t, err)
+						require.True(t, prepared.ParseChecked)
+						require.Zero(t, prepared.ParseErrors)
+						require.Equal(t, entry.graphPath, prepared.GraphPath)
+						require.Equal(t, entry.hash, prepared.ContentHash)
+						files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath})
+						require.NoError(t, err)
+						require.Contains(t, files, entry.graphPath)
+						require.NotEqual(t, prepared.ContentHash, files[entry.graphPath].ContentHash)
+						require.NotEmpty(t, indexer.DiffProjectedNodes(prepared.Nodes, sql.GetFileNodes(entry.graphPath)))
+						require.Same(t, entry, liveEntry(pendingFileProjections, path))
+						require.False(t, entry.checkedRetired.Load())
+						fileMeta = []graph.FileMetaRow{{
+							FilePath: prepared.GraphPath, ContentHash: prepared.ContentHash,
+							Size: len(physical), NodeCount: len(prepared.Nodes),
+						}}
 					}
 					caller, cancel := context.WithCancel(base)
 					defer cancel()
@@ -147,17 +182,28 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 						}
 						return captured.handler(ctx, req)
 					})
-					if transition != "unchanged" {
-						neighbor := sql.GetNode("main.go::Neighbor")
-						require.NotNil(t, neighbor)
+					var revisionGraphPath string
+					var targetMeta graph.FileMetaRow
+					if prepared != nil {
+						// The durable file row advances the real payload input
+						// revision checked by the open SQL read transaction.
+						backend.write = func() error { return sql.SetFileMetas(entry.repoPrefix, fileMeta) }
+					} else if revisionFile != "" {
+						revisionGraphPath = filepath.ToSlash(filepath.Join(filepath.Dir(entry.graphPath), revisionFile))
+						files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath, revisionGraphPath})
+						require.NoError(t, err)
+						require.Contains(t, files, entry.graphPath)
+						require.Contains(t, files, revisionGraphPath)
+						require.NotEmpty(t, files[revisionGraphPath].ContentHash)
+						targetMeta = files[entry.graphPath]
+						if transition == "canonical_no_projection" {
+							require.Equal(t, entry.hash, targetMeta.ContentHash)
+						} else {
+							require.NotEqual(t, entry.hash, targetMeta.ContentHash)
+							require.Same(t, entry, liveEntry(pendingFileProjections, path))
+						}
 						backend.write = func() error {
-							updated := *neighbor
-							updated.Meta = maps.Clone(neighbor.Meta)
-							if updated.Meta == nil {
-								updated.Meta = make(map[string]any)
-							}
-							updated.Meta["assembly_revision"] = "actual checked writer"
-							return sql.AddBatchChecked([]*graph.Node{&updated}, nil)
+							return sql.DeleteFileMetasByFiles(entry.repoPrefix, []string{revisionGraphPath})
 						}
 					}
 					backend.after = func(_ context.Context, scopeErr error) {
@@ -171,20 +217,31 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 							}
 							require.ErrorIs(t, scopeErr, graph.ErrContractProjectionStale, "RED requires a REAL revision refusal, not a budget/setup failure")
 							require.NoError(t, first.Err())
+							if revisionGraphPath != "" {
+								files, err := sql.FileMetasByPaths(entry.repoPrefix, []string{entry.graphPath, revisionGraphPath})
+								require.NoError(t, err)
+								require.Equal(t, targetMeta, files[entry.graphPath])
+								require.NotContains(t, files, revisionGraphPath)
+							}
 							if transition == "canonical_no_projection" {
 								require.False(t, s.hasRequestProjectionFact(first, "main.go"))
+								require.Nil(t, liveEntry(pendingFileProjections, path))
+								remainingAfterProducer = time.Until(deadline)
 								return
 							}
 							require.True(t, s.hasRequestProjectionFact(first, "main.go"))
-							switch transition {
-							case "canonical_retirement", "expired", "cancelled", "nested_context_true", "nested_output_true", "nested_arguments_true", "nested_context_malformed", "nested_output_malformed", "nested_arguments_malformed", "nested_context_override_false", "malformed_options_container", "options_true_override_false":
-								require.NoError(t, s.indexer.IndexFile(path))
+							switch {
+							case prepared != nil:
+								// This fixture changes node spans without changing
+								// membership. Publish the prepared rows on the real
+								// store before the ordinary hash/node/hash proof.
+								require.NoError(t, sql.AddBatchChecked(prepared.Nodes, nil))
 								retirement.run()
 								require.True(t, entry.checkedRetired.Load())
 								require.False(t, entry.suspect.Load())
 								require.Nil(t, liveEntry(pendingFileProjections, path))
 								require.True(t, checkedProjectionChange(first))
-							case "physical_peer_same_bytes", "changed_bytes":
+							case transition == "physical_peer_same_bytes" || transition == "changed_bytes":
 								after := append([]byte(nil), physical...)
 								if transition == "changed_bytes" {
 									after = append(after, []byte("\nfunc ChangedPeer() {}\n")...)
@@ -194,9 +251,9 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 								_, commitErr := s.commitFileMutation(held, "write_file", "", "", "main.go", path, after, 0600)
 								release()
 								require.NoError(t, commitErr)
-							case "source_event":
+							case transition == "source_event":
 								pendingFileProjections.markSuspect(path)
-							case "unchecked_eviction":
+							case transition == "unchecked_eviction":
 								pendingFileProjections.drop(entry)
 							}
 							require.ErrorIs(t, validateRequestProjections(first), projectionSuperseded)
@@ -289,7 +346,10 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					} else {
 						require.NoError(t, callErr)
 						require.NotNil(t, result)
-						if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
+						if transition == "canonical_no_projection" && tool == "get_editing_context" {
+							requireCanonicalEditingContextPartial(t, result)
+							require.Equal(t, 1, calls, "a checked file-only response must not replay the rejected bundle")
+						} else if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
 							require.False(t, result.IsError, "checked retirement before leaf success must use the existing fresh attempt: %s", resultText(result))
 							var body map[string]any
 							require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body))

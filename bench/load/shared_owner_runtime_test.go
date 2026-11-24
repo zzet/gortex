@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"slices"
+	"testing"
+)
 
 // These runtime controls use a real owned child plus typed model witnesses.
 // They do not replace the separate actual Server/transport integration proof.
@@ -8,7 +12,7 @@ func TestSharedRuntimeKeepsIndependentACKAndOwnerWindows(t *testing.T) {
 	p, _, status := sharedOwnerProofModel(t)
 	status["acknowledgement"] = editProbeAccountingFixture()["acknowledgement"]
 	r := &editProbeRuntime{p: p, phase: &Phase{EditProbe: &editProbeReport{Role: "candidate"}}}
-	got := r.accountingForStatus(t.Context(), status, "commit-a", "edit.file")
+	got := r.accountingForStatus(t.Context(), status, "commit-a", "edit.file", false)
 	if got.State != "observed_shared_owner_windows_checks_pass" || got.A == nil || got.P != nil || got.B != nil || got.Shared == nil {
 		t.Fatalf("complete owned shared execution must keep independent A and no per-file P/B: %+v", got)
 	}
@@ -27,7 +31,7 @@ func TestSharedRuntimeKeepsIndependentACKAndOwnerWindows(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			value := cloneSharedOwnerModel(t, status)
 			tc.change(value)
-			got := r.accountingForStatus(t.Context(), value, "commit-a", "edit.file")
+			got := r.accountingForStatus(t.Context(), value, "commit-a", "edit.file", false)
 			if got.State == "observed_shared_owner_windows_checks_pass" || got.P != nil || got.B != nil || len(got.Reasons) == 0 {
 				t.Fatalf("current missing proof borrowed an earlier dictionary entry: %+v", got)
 			}
@@ -65,9 +69,71 @@ func TestSharedRuntimeFinalContradictionKeepsEditDenominatorAndACK(t *testing.T)
 func TestSharedRuntimeLeavesPointAccountingUnchanged(t *testing.T) {
 	r := &editProbeRuntime{}
 	status := editProbeAccountingFixture()
-	got := r.accountingForStatus(t.Context(), status, "receipt-a", "edit.file")
+	got := r.accountingForStatus(t.Context(), status, "receipt-a", "edit.file", false)
 	if got.State != "observed_single_window_checks_pass" || got.A == nil || got.P == nil || got.B == nil {
 		t.Fatalf("ordinary point path acquired an owned-child dependency: %+v", got)
+	}
+}
+
+func TestEditProbeLocalFileACKWaitRequiresOwnedCountedEvidence(t *testing.T) {
+	for _, name := range []string{"bound", "refusal", "replayed", "full", "foreign receipt", "foreign mutation", "foreign commit", "foreign content", "missing count", "missing P/B"} {
+		t.Run(name, func(t *testing.T) {
+			ack := map[string]any{
+				"status": "applied", "disk_status": "committed", "ack_mode": "local",
+				"mutation_id": "mutation-a", "mutation_receipt": "receipt-a",
+				"commit_seq": json.Number("2"), "content_sha256": "content-a",
+			}
+			status := editProbeAccountingFixture()
+			status["found"], status["tool"] = true, "edit_file"
+			for _, field := range []string{"disk_status", "ack_mode", "mutation_id", "commit_seq", "content_sha256"} {
+				status[field] = ack[field]
+			}
+			window := status["acknowledgement"].(map[string]any)
+			window["caller_response_ready_ms"] = json.Number("7")
+			window["observed_execution_ms"].(map[string]any)["reindex_wait"] = nil
+			window["phase_states"].(map[string]any)["reindex_wait"] = "not_applicable"
+			window["phases_ms"] = map[string]any{"reindex_wait": nil}
+			window["counts"] = map[string]any{"reindex_wait": map[string]any{
+				"started": json.Number("1"), "completed": json.Number("1"), "not_applicable": json.Number("1"),
+			}}
+			switch name {
+			case "refusal":
+				ack["status"] = "refused"
+			case "replayed":
+				ack["replayed"] = true
+			case "full":
+				ack["ack_mode"], status["ack_mode"] = "full", "full"
+			case "foreign receipt":
+				status["receipt"] = "receipt-b"
+			case "foreign mutation":
+				status["mutation_id"] = "mutation-b"
+			case "foreign commit":
+				status["commit_seq"] = json.Number("3")
+			case "foreign content":
+				status["content_sha256"] = "content-b"
+			case "missing count":
+				delete(window, "counts")
+			case "missing P/B":
+				delete(status, "coalesced_publication")
+				delete(status, "requested_background")
+			}
+			runtime := &editProbeRuntime{}
+			owned := localFileAcknowledgementMatches(ack, status, "edit.file", "mutation-a")
+			got := runtime.accountingForStatus(t.Context(), status, "receipt-a", "edit.file", owned)
+			missingWait := slices.Contains(got.Reasons, "missing applicable A phase reindex_wait")
+			if missingWait != (name != "bound" && name != "missing P/B") {
+				t.Fatalf("unexpected wait disposition: %+v", got)
+			}
+			if passed := got.State == "observed_single_window_checks_pass"; passed != (name == "bound") {
+				t.Fatalf("unexpected whole accounting verdict: %+v", got)
+			}
+			if name == "missing P/B" && (got.A == nil || got.P != nil || got.B != nil) {
+				t.Fatalf("missing physical/background windows changed A or became a sample: %+v", got)
+			}
+			if editProbeFinished(true, false, true, got) {
+				t.Fatal("wait applicability passed a missing readback")
+			}
+		})
 	}
 }
 

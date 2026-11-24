@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,13 +62,91 @@ func TestForeignImpactQueryTargetsRequireEachForeignCheckoutOwnSession(t *testin
 }
 
 func TestForeignImpactCommandRejectsChangedTrafficAndBudgets(t *testing.T) {
-	args := []string{"--binary", "/owned/product", "--manifest", "/owned/manifest", "--scratch", "/owned/runs", "--scenario", "many", "--agents", "6", "--edit-agents", "1", "--worktrees", "0", "--seed", "42", "--duration", "10m"}
+	args := foreignImpactTestArgs()
 	if _, _, err := parseForeignImpact(args); err != nil {
 		t.Fatal(err)
 	}
 	for _, changed := range [][]string{{"--seed", "43"}, {"--edit-count", "1"}, {"--duration", "9m"}, {"--agents", "7"}, {"--deadline", "119s"}, {"--edited-repo", "6"}} {
-		if _, _, err := parseForeignImpact(append(append([]string(nil), args...), changed...)); err == nil {
+		bad := append(foreignImpactTestArgs(), changed...)
+		if _, _, err := parseForeignImpact(bad); err == nil {
 			t.Fatalf("accepted changed foreign cell %v", changed)
+		}
+		if _, _, err := parseForeignImpact(append(bad, "--lossless-edit-probe-evidence")); err == nil {
+			t.Fatalf("lossless capture accepted changed foreign cell %v", changed)
+		}
+	}
+}
+
+func foreignImpactTestArgs() []string {
+	return []string{"--binary", "/owned/product", "--manifest", "/owned/manifest", "--scratch", "/owned/runs", "--scenario", "many", "--agents", "6", "--edit-agents", "1", "--worktrees", "0", "--seed", "42", "--duration", "10m"}
+}
+
+func TestForeignImpactLosslessEvidenceIsExplicitAndScoped(t *testing.T) {
+	args := append(foreignImpactTestArgs(), "--edited-repo", "2")
+	legacy, edited, err := parseForeignImpact(args)
+	if err != nil || legacy.LosslessEditProbeEvidence || edited != 2 {
+		t.Fatalf("legacy foreign-impact options changed: edited=%d err=%v", edited, err)
+	}
+	off, edited, err := parseForeignImpact(append(args, "--lossless-edit-probe-evidence=false"))
+	if err != nil || edited != 2 || !reflect.DeepEqual(off, legacy) {
+		t.Fatalf("explicit false differs from the default: edited=%d err=%v", edited, err)
+	}
+	args = append(args, "--lossless-edit-probe-evidence")
+	lossless, edited, err := parseForeignImpact(args)
+	if err != nil || !lossless.LosslessEditProbeEvidence || edited != 2 {
+		t.Fatalf("foreign-impact did not activate lossless capture: edited=%d err=%v", edited, err)
+	}
+	legacy.LosslessEditProbeEvidence = true
+	if !reflect.DeepEqual(lossless, legacy) {
+		t.Fatal("lossless capture changed other foreign-impact options")
+	}
+	if _, err := parseRun(append(foreignImpactTestArgs(), "--lossless-edit-probe-evidence")); err == nil || !strings.Contains(err.Error(), "requires edit-and-probe with --edit-gate-modes") {
+		t.Fatalf("standalone run accepted the foreign-impact opt-in: %v", err)
+	}
+}
+
+func TestForeignImpactLosslessEvidencePreservesEditRPCBytesAndFailure(t *testing.T) {
+	o, _, err := parseForeignImpact(append(foreignImpactTestArgs(), "--lossless-edit-probe-evidence"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	large := json.RawMessage(" {\"source\":\"" + strings.Repeat("exact source body\\n", 4096) + "\"} \n")
+	payloads := []json.RawMessage{large, large, nil}
+	callErrors := []string{"", "", "context deadline exceeded"}
+	var sink bytes.Buffer
+	state := &editProbeState{losslessEvidence: o.LosslessEditProbeEvidence, sink: losslessTestSink{&sink}}
+	state.startRaw()
+	t.Cleanup(state.finishRaw)
+	for i, payload := range payloads {
+		if err := state.emit(map[string]any{"event": "rpc", "purpose": "oracle:source", "wire_id": int64(i + 1), "error": callErrors[i], "payload": payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state.finishRaw()
+	lines := bytes.Split(bytes.TrimSuffix(sink.Bytes(), []byte("\n")), []byte("\n"))
+	if len(lines) != len(payloads) || state.rawBytes != sink.Len() || state.rawAccepted != sink.Len() || state.rawLogicalBytes <= int64(sink.Len()) {
+		t.Fatalf("incomplete or uncompressed evidence: rows=%d bytes=%d logical=%d", len(lines), sink.Len(), state.rawLogicalBytes)
+	}
+	decoder := &editProbePayloadHistory{}
+	for i, line := range lines {
+		var row map[string]json.RawMessage
+		if err := json.Unmarshal(line, &row); err != nil {
+			t.Fatal(err)
+		}
+		got, err := decoder.decode(row)
+		if err != nil || !bytes.Equal(got, payloads[i]) {
+			t.Fatalf("row %d changed RPC bytes: %v", i, err)
+		}
+		var wire int64
+		var callError string
+		if err := json.Unmarshal(row["wire_id"], &wire); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(row["error"], &callError); err != nil {
+			t.Fatal(err)
+		}
+		if wire != int64(i+1) || callError != callErrors[i] || string(row["purpose"]) != `"oracle:source"` {
+			t.Fatalf("row %d changed RPC identity or error", i)
 		}
 	}
 }
