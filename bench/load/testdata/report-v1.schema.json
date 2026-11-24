@@ -1170,6 +1170,15 @@
                             }
                           ]
                         },
+                        "busy_refusals": {
+                          "additionalProperties": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "checkout_id": {
                           "type": "string"
                         },
@@ -1462,6 +1471,9 @@
                               "type": "null"
                             }
                           ]
+                        },
+                        "deadline_reason": {
+                          "type": "string"
                         },
                         "editor": {
                           "type": "integer"
@@ -2954,6 +2966,40 @@
                           "type": "object"
                         },
                         "t_gate_readback_ms": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "t_graph_terminal_ms": {
                           "anyOf": [
                             {
                               "additionalProperties": false,
@@ -4569,6 +4615,24 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "busy_refusals": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "deadline_reasons": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
                           "measures": {
                             "additionalProperties": {
                               "additionalProperties": false,

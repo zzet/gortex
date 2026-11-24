@@ -98,6 +98,9 @@ type editProbeRecord struct {
 	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
 	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
 	GraphTerminal               bool                                `json:"graph_terminal"`
+	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
+	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
+	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
 	Evidence                    string                              `json:"raw_evidence"`
 	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
 	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
@@ -772,6 +775,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
+	s.countBusy(purpose, attempts)
 	evidenceErr := s.emit(map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
@@ -1240,6 +1244,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.record.Outcome = "phase_censored"
 		} else if callCtx.Err() != nil {
 			s.record.Outcome = "product_deadline"
+			s.record.DeadlineReason = editProbeDeadlineReadbacks
 		} else if readbacksCorrect && len(s.record.Errors) == 0 {
 			s.record.Outcome = "complete"
 		} else {
@@ -1249,6 +1254,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		return
 	}
 	s.mu.Unlock()
+	var wait *editProbeReceiptWait // only the ordinary receipt loop attributes its deadline
 	if move != nil {
 		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
 	} else if batchSet != nil {
@@ -1261,6 +1267,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			options = map[string]any{"receipt": receipt}
 		}
 		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
+		wait = &editProbeReceiptWait{entered: callCtx.Err() == nil}
 		for callCtx.Err() == nil {
 			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
 			s.mu.Lock()
@@ -1298,6 +1305,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					if s.record.GraphTerminal {
 						r.settlePendingLocked(s)
+						s.noteGraphTerminalLocked(statusIdentity.Finished)
 					}
 					all := true
 					for _, value := range s.record.FirstCorrect {
@@ -1322,7 +1330,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if consumersDone && r.gateModeComplete(step) && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+					coverage := consumersDone && r.gateModeComplete(step)
+					*wait = editProbeReceiptWait{entered: true, observed: true, terminal: terminal, allCorrect: all, coverage: coverage, qualified: qualifiedCandidate, freshTiers: coalescedFreshTiers(qualifiedTiers)}
+					if coverage && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
 						break
 					}
 				}
@@ -1361,6 +1371,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Outcome = "phase_censored"
 	} else if callCtx.Err() != nil {
 		s.record.Outcome = "product_deadline"
+		if wait != nil {
+			s.record.DeadlineReason = editProbeDeadlineReason(*wait)
+		}
 	} else if len(s.record.Errors) == 0 {
 		s.record.Outcome = "complete"
 	} else {
