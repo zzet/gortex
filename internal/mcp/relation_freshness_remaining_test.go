@@ -88,9 +88,10 @@ func TestDeadCodePendingUnknownInEveryMode(t *testing.T) {
 				}
 				require.True(t, found, "pending candidate belongs in the separate unknown list")
 			case "compact":
-				for _, line := range strings.Split(text, "\n") {
-					require.False(t, strings.HasPrefix(line, "function unused.go::unused "), "pending candidate must never be rendered as dead")
-				}
+				// Compact rows are tab-separated, with each field quoted.
+				const row = "\t\"function\"\t\"unused.go::unused\"\t"
+				require.Contains(t, text, "\npending_unknown"+row)
+				require.NotContains(t, text, "\ndead"+row, "pending candidate must never be rendered as dead")
 			}
 		})
 	}
