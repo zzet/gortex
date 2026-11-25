@@ -548,8 +548,12 @@ func (t *topologyState) writeScope(g graph.Store, prefix string) ([]string, uint
 // read again. Only one store is tracked; a mutation of another store holds the
 // whole graph until it is read again.
 type repoCoupling struct {
-	store   graph.Store
-	epoch   uint64
+	store graph.Store
+	epoch uint64
+	// resets counts the resets of the coupling. Unlike epoch, it does not move
+	// when a component grows, so a frontier read can tell a coupling that was
+	// forgotten while it ran from one that grew.
+	resets  uint64
 	ready   bool
 	seeding bool
 	missed  bool
@@ -615,7 +619,7 @@ func (c *repoCoupling) reset(g graph.Store) {
 	if c.store != g {
 		c.missed, c.lastRead = false, couplingRead{}
 	}
-	c.store, c.epoch = g, c.epoch+1
+	c.store, c.epoch, c.resets = g, c.epoch+1, c.resets+1
 	c.ready, c.seeding, c.pending, c.parent = false, false, nil, nil
 }
 
@@ -694,7 +698,7 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	t := topology
 	t.mu.Lock()
 	c := &t.coupling
-	epoch, wanted := c.epoch, c.store == g && (c.ready || c.seeding)
+	resets, wanted := c.resets, c.store == g && (c.ready || c.seeding)
 	t.mu.Unlock()
 	if !wanted {
 		return
@@ -707,8 +711,9 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch {
-	case c.store != g || c.epoch != epoch:
-		// Forgotten meanwhile: the next read sees these edges.
+	case c.store != g || c.resets != resets:
+		// Forgotten meanwhile: the next read sees these edges. Another
+		// mutation's union, or the store read landing, only grew it.
 	case err != nil:
 		c.lastRead = endCouplingRead(couplingScopeFrontier, started, err, false)
 		c.miss()
