@@ -18,6 +18,17 @@ type repositoryLaneTenure struct {
 	holder OutputMutationEntry
 	since  time.Time
 	held   time.Duration
+	// batch is the scope of a coalesced reconcile pass, nil for any other
+	// tenant.
+	batch *repositoryLaneBatch
+}
+
+// repositoryLaneBatch is what one coalesced reconcile pass took on: the
+// requests it serves and their union of paths, or the whole repository.
+type repositoryLaneBatch struct {
+	requests int
+	paths    int
+	full     bool
 }
 
 // repositoryLaneKindTotals totals the completed tenures of one holder kind.
@@ -100,6 +111,18 @@ type RepositoryLaneTenure struct {
 	// HeldForMS is how long the tenure lasted or, for the current tenant, how
 	// long it has held the lane so far.
 	HeldForMS float64 `json:"held_for_ms"`
+	// Batch is the scope of a coalesced reconcile pass; absent for any other
+	// tenant.
+	Batch *RepositoryLaneBatch `json:"batch,omitempty"`
+}
+
+// RepositoryLaneBatch is the scope of one coalesced reconcile pass: how many
+// requests it serves and how many paths they name, or Full when the pass
+// reconciles the whole repository.
+type RepositoryLaneBatch struct {
+	Requests int  `json:"requests"`
+	Paths    int  `json:"paths"`
+	Full     bool `json:"full"`
 }
 
 // RepositoryLaneKindTotals totals the completed tenures of one holder kind
@@ -121,11 +144,14 @@ type RepositoryLaneStatus struct {
 	// BatchAdmissionWaiting counts callers waiting for the batch gate every
 	// repository shares, which they take before the lane; LaneWaiting those
 	// waiting for the lane itself.
-	BatchAdmissionWaiting int                        `json:"batch_admission_waiting"`
-	LaneWaiting           int                        `json:"lane_waiting"`
-	Last                  *RepositoryLaneTenure      `json:"last,omitempty"`
-	ByKind                []RepositoryLaneKindTotals `json:"by_kind,omitempty"`
-	Topology              *reach.TopologyStatus      `json:"topology,omitempty"`
+	BatchAdmissionWaiting int `json:"batch_admission_waiting"`
+	LaneWaiting           int `json:"lane_waiting"`
+	// ReconcileQueued counts reconcile requests queued for the lane's next
+	// coalesced pass.
+	ReconcileQueued int                        `json:"reconcile_queued"`
+	Last            *RepositoryLaneTenure      `json:"last,omitempty"`
+	ByKind          []RepositoryLaneKindTotals `json:"by_kind,omitempty"`
+	Topology        *reach.TopologyStatus      `json:"topology,omitempty"`
 }
 
 func repositoryLaneTenureStatus(tenure repositoryLaneTenure, held time.Duration) RepositoryLaneTenure {
@@ -133,11 +159,15 @@ func repositoryLaneTenureStatus(tenure repositoryLaneTenure, held time.Duration)
 	if kind == "" {
 		kind = repositoryLaneUndeclared
 	}
-	return RepositoryLaneTenure{
+	status := RepositoryLaneTenure{
 		Kind:        kind,
 		SinceUnixMS: tenure.since.UnixMilli(),
 		HeldForMS:   float64(held.Microseconds()) / 1000,
 	}
+	if batch := tenure.batch; batch != nil {
+		status.Batch = &RepositoryLaneBatch{Requests: batch.requests, Paths: batch.paths, Full: batch.full}
+	}
+	return status
 }
 
 func (c *repositoryMutationCoordinator) laneStatus(repo string, now time.Time) RepositoryLaneStatus {
@@ -148,6 +178,7 @@ func (c *repositoryMutationCoordinator) laneStatus(repo string, now time.Time) R
 		Repo:                  repo,
 		BatchAdmissionWaiting: lt.batchWaiting,
 		LaneWaiting:           lt.laneWaiting,
+		ReconcileQueued:       len(c.waiters),
 	}
 	if !lt.tenant.since.IsZero() {
 		holder := repositoryLaneTenureStatus(lt.tenant, max(now.Sub(lt.tenant.since), 0))

@@ -10,8 +10,10 @@ import (
 )
 
 // A repository lane names its tenant while it holds the lane, counts the
-// callers waiting at the shared batch admission and at the lane itself, and
-// closes each tenure into its holder kind's totals, whichever door took it.
+// callers waiting at the shared batch admission and at the lane itself and the
+// reconcile requests queued for its next pass, and closes each tenure into its
+// holder kind's totals, whichever door took it. A reconcile pass carries the
+// scope it took on.
 func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	coordinator := newRepositoryMutationCoordinator(func([]string) (*IndexResult, error) { return &IndexResult{}, nil })
 	var batchGate sync.RWMutex
@@ -57,24 +59,37 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	require.ErrorIs(t, <-queuedDone, context.Canceled)
 	eventually("the abandoned caller still counts as waiting", func(s RepositoryLaneStatus) bool { return s.LaneWaiting == 0 })
 
+	// Two reconcile requests queue for one coalesced pass behind the patch.
+	reconciled := make(chan error, 2)
+	for _, path := range []string{"a.go", "b.go"} {
+		go func() {
+			_, err := coordinator.reconcile(context.Background(), []string{path})
+			reconciled <- err
+		}()
+	}
+	eventually("the queued reconcile requests were not counted", func(s RepositoryLaneStatus) bool {
+		return s.ReconcileQueued == 2 && s.LaneWaiting == 1
+	})
+
 	time.Sleep(5 * time.Millisecond)
 	close(release)
 	require.NoError(t, <-patchDone)
+	require.NoError(t, <-reconciled)
+	require.NoError(t, <-reconciled)
 
-	// The try door and the coalescing drain each record a tenure.
+	// The try door records a tenure as well.
 	releaseTry, free := coordinator.tryExclusive(OutputEntryContractRepair)
 	require.True(t, free)
 	require.Equal(t, string(OutputEntryContractRepair), status().Holder.Kind)
 	releaseTry()
-	_, err := coordinator.reconcile(context.Background(), []string{"a.go"})
-	require.NoError(t, err)
 
 	idle := status()
 	require.Nil(t, idle.Holder, "an idle lane reports a tenant")
 	require.Zero(t, idle.LaneWaiting)
 	require.Zero(t, idle.BatchAdmissionWaiting)
+	require.Zero(t, idle.ReconcileQueued)
 	require.NotNil(t, idle.Last)
-	require.Equal(t, string(OutputEntryRepositoryReconcileLane), idle.Last.Kind)
+	require.Equal(t, string(OutputEntryContractRepair), idle.Last.Kind)
 	totals := make(map[string]RepositoryLaneKindTotals, len(idle.ByKind))
 	for _, kind := range idle.ByKind {
 		totals[kind.Kind] = kind
@@ -83,6 +98,9 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	for _, kind := range []OutputMutationEntry{OutputEntryWatcherPatchGraph, OutputEntryContractRepair, OutputEntryRepositoryReconcileLane} {
 		require.Equal(t, uint64(1), totals[string(kind)].Tenures, "tenures of %s", kind)
 	}
+	require.Equal(t, &RepositoryLaneBatch{Requests: 2, Paths: 2},
+		totals[string(OutputEntryRepositoryReconcileLane)].Longest.Batch, "the reconcile pass's scope")
+	require.Nil(t, totals[string(OutputEntryContractRepair)].Longest.Batch, "a tenant other than a reconcile pass carries a batch")
 	patch := totals[string(OutputEntryWatcherPatchGraph)]
 	require.GreaterOrEqual(t, patch.Longest.HeldForMS, float64(5), "the patch's tenure covers its hold")
 	require.Equal(t, patch.HeldTotalMS, patch.Longest.HeldForMS)

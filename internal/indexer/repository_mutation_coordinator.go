@@ -232,6 +232,7 @@ func (c *repositoryMutationCoordinator) drain() {
 		outputGeneration := c.outputGeneration
 		authorityRequired := c.authorityRequired
 		c.beginLaneTenureLocked(OutputEntryRepositoryReconcileLane, true)
+		c.laneTelemetry.tenant.batch = &repositoryLaneBatch{requests: len(waiters), paths: len(paths), full: paths == nil}
 		c.mu.Unlock()
 
 		var observation *ReadRepairObservation
