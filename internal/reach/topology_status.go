@@ -29,6 +29,53 @@ type TopologyStatus struct {
 	WholeGraph TopologyGate `json:"whole_graph"`
 	// Repositories lists the repository gates in use, or the gates asked for.
 	Repositories []RepositoryTopologyGate `json:"repositories,omitempty"`
+	// Writers names every mutation that holds or waits for topology gates,
+	// the longest held or waited first, so a wait can be traced to the
+	// mutation it waits behind.
+	Writers []TopologyWriter `json:"writers,omitempty"`
+}
+
+// TopologyWriter is one mutation that holds or waits for topology gates.
+type TopologyWriter struct {
+	// Repo is the repository the mutation changes, empty for a mutation of
+	// the whole graph.
+	Repo string `json:"repo,omitempty"`
+	// WholeGraph says the mutation holds or waits for the whole graph: a
+	// whole-graph mutation, or a repository mutation that began while the
+	// coupling was not ready.
+	WholeGraph bool `json:"whole_graph"`
+	// State is "holding" or "waiting".
+	State string `json:"state"`
+	// SinceUnixMS is when the mutation took its gates or began to wait for
+	// them, and ForMS how long it has held or waited so far.
+	SinceUnixMS int64   `json:"since_unix_ms"`
+	ForMS       float64 `json:"for_ms"`
+}
+
+// topologyWriter is a mutation's entry in topologyState.writers. It is
+// guarded by the state's mu.
+type topologyWriter struct {
+	repo       string
+	wholeGraph bool
+	holding    bool
+	since      time.Time
+}
+
+// noteWriter records a writer of prefix that starts waiting for scope now.
+// t.mu is held.
+func (t *topologyState) noteWriter(prefix string, scope []string) *topologyWriter {
+	writer := &topologyWriter{repo: prefix, wholeGraph: scope == nil, since: time.Now()}
+	if t.writers == nil {
+		t.writers = make(map[*topologyWriter]struct{})
+	}
+	t.writers[writer] = struct{}{}
+	return writer
+}
+
+// admit marks the writer as holding its gates from now on. The state's mu is
+// held.
+func (w *topologyWriter) admit() {
+	w.holding, w.since = true, time.Now()
 }
 
 // TopologyGate counts one gate's readers, writers and waiting writers.
@@ -128,5 +175,26 @@ func Topology(g graph.Store, repos ...string) TopologyStatus {
 		}
 		status.Repositories = append(status.Repositories, gate)
 	}
+	now := time.Now()
+	for writer := range t.writers {
+		state := "waiting"
+		if writer.holding {
+			state = "holding"
+		}
+		status.Writers = append(status.Writers, TopologyWriter{
+			Repo:        writer.repo,
+			WholeGraph:  writer.wholeGraph,
+			State:       state,
+			SinceUnixMS: writer.since.UnixMilli(),
+			ForMS:       float64(max(now.Sub(writer.since), 0).Microseconds()) / 1000,
+		})
+	}
+	sort.Slice(status.Writers, func(i, j int) bool {
+		a, b := status.Writers[i], status.Writers[j]
+		if a.ForMS != b.ForMS {
+			return a.ForMS > b.ForMS
+		}
+		return a.Repo < b.Repo
+	})
 	return status
 }

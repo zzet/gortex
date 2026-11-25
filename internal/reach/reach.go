@@ -189,6 +189,9 @@ type topologyState struct {
 	repoBuild map[string]uint64
 
 	coupling repoCoupling
+	// writers names each mutation that holds or waits for gates, for
+	// Topology; it does not take part in admission.
+	writers map[*topologyWriter]struct{}
 }
 
 var topology = &topologyState{
@@ -476,6 +479,7 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 	t := topology
 	t.mu.Lock()
 	scope, epoch := t.writeScope(g, prefix)
+	writer := t.noteWriter(prefix, scope)
 	t.add(scope, 0, 0, 1)
 	for !t.writable(scope) {
 		t.wait(context.Background())
@@ -484,10 +488,12 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 			// waited.
 			t.add(scope, 0, 0, -1)
 			scope, epoch = t.writeScope(g, prefix)
+			writer.wholeGraph = scope == nil
 			t.add(scope, 0, 0, 1)
 		}
 	}
 	t.add(scope, 0, 1, -1)
+	writer.admit()
 	t.mu.Unlock()
 
 	var once sync.Once
@@ -513,6 +519,7 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 				t.retire(retired)
 			}
 			t.add(scope, 0, -1, 0)
+			delete(t.writers, writer)
 			t.wakeWaiters()
 			t.mu.Unlock()
 		})
