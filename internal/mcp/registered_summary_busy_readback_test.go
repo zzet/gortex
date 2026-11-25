@@ -12,19 +12,21 @@ import (
 	"testing"
 	"time"
 
+	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/pathkey"
 	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
 func TestRegisteredFullAckSummaryReturnsOwnDefinitionOnStoreDeadline(t *testing.T) {
-	for _, scenario := range []string{"unchanged", "changed_bytes_same_stamp", "changed_owner_same_bytes"} {
+	for _, scenario := range []string{"unchanged", "changed_bytes_same_stamp", "changed_owner_same_bytes", "second_editor_commit"} {
 		t.Run(scenario, func(t *testing.T) {
 			testRegisteredFullAckSummaryStoreDeadline(t, scenario)
 		})
@@ -97,6 +99,12 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 	require.Equal(t, string(raw), read(4, "file", fileTarget)["content"])
 	firstStamp, err := statDiskStamp(path)
 	require.NoError(t, err)
+	const second = "func SecondEditorSummary() int { return 3 }"
+	const secondID = "main.go::SecondEditorSummary"
+	var secondOwner *projectionEntry
+	var secondAck *mcplib.CallToolResult
+	var secondErr error
+	releaseSecond, joinSecond := func() {}, func() {}
 	var alterSelection func()
 	switch scenario {
 	case "changed_bytes_same_stamp":
@@ -120,6 +128,46 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 			require.NoError(t, pendingFileProjections.publish(next))
 			require.Same(t, next, pendingFileProjections.snap.Load().entries[next.key])
 		}
+	case "second_editor_commit":
+		// A second editor's registered full-ACK edit keeps the own definition
+		// and commits after this summary selected its canonical bytes, while
+		// its store read is open. Its publication is held, so its committed
+		// owner stays live as the file's pending version.
+		published := make(chan indexer.MutationResult)
+		s.SetWatcher(mutationTestWatcher{done: published})
+		const editorB = "full-ack-summary-second-editor"
+		require.NoError(t, s.ConnectSession(editorB, func([]byte) error { return nil }))
+		t.Cleanup(func() { s.DisconnectSession(editorB) })
+		secondCtx := s.WithClientSession(WithSessionID(t.Context(), editorB), editorB)
+		s.NoteSessionToolPolicy(editorB, FacadeSurfaceVersion, "hide")
+		require.NotNil(t, s.MCPServer().HandleMessage(secondCtx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"summary-second-editor","version":"1"}}}`)))
+		done := make(chan struct{})
+		releaseSecond = sync.OnceFunc(func() { close(published) })
+		joinSecond = sync.OnceFunc(func() {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("the second editor's held full ACK did not join")
+			}
+		})
+		t.Cleanup(func() {
+			releaseSecond()
+			joinSecond()
+		})
+		ownSeq := uint64(commit["commit_seq"].(float64))
+		alterSelection = func() {
+			go func() {
+				defer close(done)
+				secondAck, secondErr = externalVersionRegisteredCall(s, secondCtx, 30, "edit", snapshotEditArgs(path, own, own+"\n\n"+second))
+			}()
+			for waited := time.Now(); time.Since(waited) < 5*time.Second; time.Sleep(time.Millisecond) {
+				if entry := liveEntry(pendingFileProjections, path); entry != nil && entry.commitSeq > ownSeq {
+					secondOwner = entry
+					return
+				}
+			}
+			t.Error("the second editor did not commit while the summary was in flight")
+		}
 	}
 
 	// Activate actual SQLite reader holders only in the checked summary bundle,
@@ -136,6 +184,8 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 	holderErrors := make(chan error, count)
 	var selected context.Context
 	var projectionRemainingAtStore time.Duration
+	var holdErr error
+	started := 0
 	backend.hold = func(ctx context.Context) error {
 		selected = ctx
 		if deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok {
@@ -144,6 +194,20 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 		if alterSelection != nil {
 			alterSelection()
 		}
+		if scenario == "second_editor_commit" {
+			// The second editor's real commit runs inside the private store
+			// scope and may outlast it. The store stays busy for the rest of
+			// the scope, so the read ends on the same store deadline however
+			// long the commit took.
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+				t.Error("the store scope has no deadline")
+			}
+			holdErr = ctx.Err()
+			return holdErr
+		}
+		started = count
 		entered := make(chan struct{}, count)
 		for range count {
 			holders.Go(func() {
@@ -165,14 +229,33 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 	}
 	require.Nil(t, liveEntry(pendingFileProjections, path))
 	backend.armed.Store(true)
-	first := read(5, "summary", fileTarget)
-	require.ErrorIs(t, backend.observedErr, context.DeadlineExceeded)
-	require.Positive(t, backend.waits, "summary must actually wait for the real SQLite reader pool")
+	allowance := &projectedSourceAllowance{tool: "get_file_summary"}
+	budget := projectedReadBudget
+	var first map[string]any
+	if scenario == "second_editor_commit" {
+		// The second editor's real commit runs inside this request in the
+		// fixture, so the shared allowance is widened as other lifecycle
+		// tests do. Production keeps the original allowance.
+		budget = canonicalLifecycleFixtureBudget
+		ctx := context.WithValue(base, projectedSourceDeadlineKey{}, time.Now().Add(budget))
+		ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
+		result := snapshotRegisteredCall(t, s, ctx, 5, "read", map[string]any{"operation": "summary", "target": fileTarget, "output": output})
+		require.False(t, result.IsError, resultText(result))
+		first = extractTextResult(t, result)
+	} else {
+		first = read(5, "summary", fileTarget)
+	}
+	if scenario == "second_editor_commit" {
+		require.ErrorIs(t, holdErr, context.DeadlineExceeded)
+	} else {
+		require.ErrorIs(t, backend.observedErr, context.DeadlineExceeded)
+		require.Positive(t, backend.waits, "summary must actually wait for the real SQLite reader pool")
+	}
 	require.Positive(t, backend.budget)
 	require.LessOrEqual(t, backend.budget, 30*time.Millisecond)
 	require.Positive(t, projectionRemainingAtStore)
-	require.LessOrEqual(t, projectionRemainingAtStore, projectedReadBudget)
-	for range count {
+	require.LessOrEqual(t, projectionRemainingAtStore, budget)
+	for range started {
 		require.NoError(t, <-holderErrors)
 	}
 	require.NotNil(t, selected)
@@ -188,6 +271,30 @@ func testRegisteredFullAckSummaryStoreDeadline(t *testing.T, scenario string) {
 	require.Nil(t, proof.registry.entries[proof.key])
 	freshness, valid := first["freshness"].(map[string]any)
 	require.True(t, valid)
+	if scenario == "second_editor_commit" {
+		// The newer owner is a recorded tool commit whose bytes are on disk.
+		// The summary answers from it and stays pending. The earlier
+		// canonical bytes never answer after that commit.
+		require.NotNil(t, secondOwner)
+		require.Same(t, secondOwner, liveEntry(pendingFileProjections, path), "the second editor's publication stays held")
+		require.Nil(t, sql.GetNode(secondID))
+		t.Logf("second editor commit: attempts=%d store_waits=%d hold_err=%v response=%v", allowance.attempts.Load(), backend.waits, holdErr, first)
+		require.Equal(t, "pending", freshness["graph_freshness"])
+		require.Equal(t, false, freshness["complete"])
+		ids := map[string]bool{}
+		for _, row := range first["nodes"].([]any) {
+			ids[row.(map[string]any)["id"].(string)] = true
+		}
+		require.True(t, ids[ownID], "the first summary must contain the own acknowledged definition")
+		require.True(t, ids[secondID], "the summary answers from the newer committed version")
+		require.EqualValues(t, 2, allowance.attempts.Load())
+		releaseSecond()
+		joinSecond()
+		require.NoError(t, secondErr)
+		require.NotNil(t, secondAck)
+		require.Equal(t, mutationDiskCommitted, extractTextResult(t, secondAck)["disk_status"])
+		return
+	}
 	require.Equal(t, "pending", freshness["graph_freshness"])
 	require.Equal(t, "store_busy", freshness["reason"])
 	require.Equal(t, false, freshness["complete"])
