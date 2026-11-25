@@ -2344,8 +2344,153 @@
                                 "items": {
                                   "additionalProperties": false,
                                   "properties": {
+                                    "concurrent_same_file_commits": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "commits": {
+                                              "items": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "ack_in_window": {
+                                                    "type": "boolean"
+                                                  },
+                                                  "ack_ns": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "integer"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  },
+                                                  "commit_seq": {
+                                                    "type": "integer"
+                                                  },
+                                                  "edit_write_ns": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "integer"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  },
+                                                  "editor": {
+                                                    "type": "integer"
+                                                  },
+                                                  "ordinal": {
+                                                    "type": "integer"
+                                                  },
+                                                  "receipt": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "ordinal",
+                                                  "editor",
+                                                  "ack_in_window"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "type": [
+                                                "array",
+                                                "null"
+                                              ]
+                                            },
+                                            "state": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "state"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
                                     "correct": {
                                       "type": "boolean"
+                                    },
+                                    "disposition": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "error_code": {
+                                              "type": "string"
+                                            },
+                                            "freshness_complete": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "boolean"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "freshness_reason": {
+                                              "type": "string"
+                                            },
+                                            "freshness_state": {
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "type": "string"
+                                            },
+                                            "node_count": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "projection_predicate": {
+                                              "additionalProperties": {},
+                                              "type": [
+                                                "object",
+                                                "null"
+                                              ]
+                                            },
+                                            "reason": {
+                                              "type": "string"
+                                            },
+                                            "retriable": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "boolean"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "retry_scope": {
+                                              "type": "string"
+                                            },
+                                            "rpc_code": {
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     },
                                     "error": {
                                       "type": "string"

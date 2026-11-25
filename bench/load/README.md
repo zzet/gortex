@@ -481,6 +481,23 @@ unavailable. `t_derived_ms` is daemon-clock time from receipt origin to
 because no probe observes the derived step; it is not additive with client
 times and stays unavailable for coalesced receipts and relocations.
 
+Each immediate readback also carries a typed `disposition` that explains its
+result without changing it: `answer` (the reply's freshness state, reason and
+completeness, and its node count, when the reply has them), `typed_refusal`
+(the structured `error_code`, `retriable`, `retry_scope` and `reason`),
+`untyped_tool_error`, `rpc_error` (numeric code, with the dispatcher's outcome
+and retryable flag when present), `deadline`, `transport_error`,
+`undecodable_answer` or `expected_absence`. A typed read-only
+`projection_superseded` summary refusal adds the daemon's bounded projection
+predicate, which the daemon emits only under its refusal-evidence opt-in;
+otherwise the predicate is `unavailable`. `concurrent_same_file_commits` lists
+the other edits of the same file whose edit RPC overlapped the readback's wire
+window, with their ACK `commit_seq`, receipt and whether that ACK returned
+inside the window; `none_observed` and `unavailable` stay distinct. Neither
+field changes `correct`, the record's errors or its outcome: a truthful
+pending reply without the edited definition and wrong content both remain
+incorrect, but they are no longer indistinguishable.
+
 The report `summary` covers the complete offered denominator: outcome counts
 and, for every per-record time, each readback, each `phases_ms` lap and each
 oracle's first-correct time, nearest-rank p50/p95/p99/max with percentile
