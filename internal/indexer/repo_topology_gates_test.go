@@ -137,22 +137,24 @@ func holdRepoPatch(t *testing.T, mi *MultiIndexer, door repoPatchDoor, tail, pre
 }
 
 // A patch parked in one repository's resolver or derived tail holds that
-// repository's lane and topology gate, and the lane's status names it. A patch
-// of another repository in the same store must still take its own lane and
-// gate and publish its relations, whichever door the edits come through.
+// repository's lane and topology gate, and the lane's status names it. Patches
+// of the five other repositories in the same store, submitted together, must
+// still take their own lanes and gates and publish their relations, whichever
+// door the edits come through.
 func TestTopologyGatePerRepoAllowsParallelPatches(t *testing.T) {
 	holders := map[string]OutputMutationEntry{
 		"reconcile": OutputEntryRepositoryReconcileLane,
 		"watcher":   OutputEntryWatcherPatchGraph,
 	}
+	others := []string{"lib", "beta", "gamma", "delta", "epsilon"}
 	for _, door := range []string{"reconcile", "watcher"} {
 		for _, tail := range []string{"resolve", "derived"} {
 			t.Run(door+"/"+tail, func(t *testing.T) {
-				mi, g, roots := repoTopologyFixture(t)
+				mi, g, roots := repoTopologyFixture(t, others[1:]...)
 				awaitRepoCoupling(t, g)
 				submit := reconcileDoor(mi)
 				if door == "watcher" {
-					submit = watcherDoor(t, mi, "app", "lib")
+					submit = watcherDoor(t, mi, append([]string{"app"}, others...)...)
 				}
 				finishApp := holdRepoPatch(t, mi, submit, tail, "app", filepath.Join(roots["app"], "main.go"),
 					"package app\nfunc Run() {}\nfunc Start() { Run() }\nfunc Extra() { Run() }\n")
@@ -166,34 +168,49 @@ func TestTopologyGatePerRepoAllowsParallelPatches(t *testing.T) {
 				require.Equal(t, "ready", appLane.Topology.Coupling)
 				require.Equal(t, []reach.RepositoryTopologyGate{{Repo: "app", TopologyGate: reach.TopologyGate{Writers: 1}}},
 					appLane.Topology.Repositories, "the parked patch holds only the topology gate of app")
-				libLane, ok := mi.RepositoryLane("lib")
-				require.True(t, ok)
-				require.Nil(t, libLane.Holder, "the lane of lib reports a tenant beside a parked patch of app")
+				require.Equal(t, []reach.TopologyWriter{{Repo: "app", State: "holding"}}, untimedWriters(appLane.Topology.Writers),
+					"the parked patch is not named as the one topology writer")
 
 				held, free := mi.TryRepositoryMutationLanes([]string{"app"})
 				if free {
 					held()
 				}
 				require.False(t, free, "control: the parked patch must hold the lane of app")
-				release, free := mi.TryRepositoryMutationLanes([]string{"lib"})
-				require.True(t, free, "the lane of lib is held beside a parked patch of app")
-				release()
-				gate, ok := admittedWithin(5*time.Second, func() func(bool, []string) {
-					return reach.BeginRepoTopologyMutation(g, "lib")
-				})
-				require.True(t, ok, "the topology gate of lib waited for a parked patch of app")
-				gate(false, nil)
-
-				lib := filepath.Join(roots["lib"], "lib.go")
-				writeFile(t, lib, "package library\nfunc Hello() {}\nfunc Local() { Hello() }\nfunc More() { Hello() }\n")
-				select {
-				case err := <-submit(t, "lib", lib):
-					require.NoError(t, err)
-				case <-time.After(5 * time.Second):
-					t.Fatal("a patch of lib waited behind a parked patch of app")
+				for _, repo := range others {
+					lane, ok := mi.RepositoryLane(repo)
+					require.True(t, ok)
+					require.Nil(t, lane.Holder, "the lane of %s reports a tenant beside a parked patch of app", repo)
+					release, free := mi.TryRepositoryMutationLanes([]string{repo})
+					require.True(t, free, "the lane of %s is held beside a parked patch of app", repo)
+					release()
+					gate, ok := admittedWithin(5*time.Second, func() func(bool, []string) {
+						return reach.BeginRepoTopologyMutation(g, repo)
+					})
+					require.True(t, ok, "the topology gate of %s waited for a parked patch of app", repo)
+					gate(false, nil)
 				}
-				require.True(t, hasInEdge(g, "lib/lib.go::Hello", "lib/lib.go::More", graph.EdgeCalls),
-					"the patch of lib did not publish its new caller")
+
+				done := make(map[string]<-chan error, len(others))
+				for _, repo := range others {
+					path := filepath.Join(roots[repo], "lib.go")
+					pkg := repo
+					if repo == "lib" {
+						pkg = "library"
+					}
+					writeFile(t, path, "package "+pkg+"\nfunc Hello() {}\nfunc Local() { Hello() }\nfunc More() { Hello() }\n")
+					done[repo] = submit(t, repo, path)
+				}
+				bound := time.After(10 * time.Second)
+				for _, repo := range others {
+					select {
+					case err := <-done[repo]:
+						require.NoError(t, err, "the patch of %s", repo)
+					case <-bound:
+						t.Fatalf("a patch of %s waited behind a parked patch of app", repo)
+					}
+					require.True(t, hasInEdge(g, repo+"/lib.go::Hello", repo+"/lib.go::More", graph.EdgeCalls),
+						"the patch of %s did not publish its new caller", repo)
+				}
 
 				releasing := time.Now()
 				require.NoError(t, finishApp())
@@ -209,9 +226,23 @@ func TestTopologyGatePerRepoAllowsParallelPatches(t *testing.T) {
 					}
 					return false
 				}, 5*time.Second, time.Millisecond, "the parked patch's tenure of at least %.1f ms was not recorded", parkedMS)
+				require.Empty(t, reach.Topology(g).Writers, "finished patches are still listed as topology writers")
 			})
 		}
 	}
+}
+
+// untimedWriters is writers without their times, which it requires to be set.
+func untimedWriters(writers []reach.TopologyWriter) []reach.TopologyWriter {
+	out := make([]reach.TopologyWriter, 0, len(writers))
+	for _, writer := range writers {
+		if writer.SinceUnixMS <= 0 || writer.ForMS < 0 {
+			return nil
+		}
+		writer.SinceUnixMS, writer.ForMS = 0, 0
+		out = append(out, writer)
+	}
+	return out
 }
 
 // admittedWithin reports whether begin returns within d.
