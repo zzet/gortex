@@ -536,6 +536,16 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 		revisions[e] = e.sourceEvents
 	}
 	p.mu.Unlock() // metadata/node/layer reads stay outside the registry lock
+	retired := p.dropCheckedRetired(p.caughtUp(store, byRepo, revisions), revisions)
+	p.retired.Add(int64(retired))
+	return retired
+}
+
+// caughtUp returns the entries whose bytes the store holds, checked durable
+// hash -> node comparison -> durable hash outside the registry lock. A
+// divergent payload is still caught up, but loses its revision so dropping it
+// grants no retry hint.
+func (p *pendingProjections) caughtUp(store projectionStore, byRepo map[string][]*projectionEntry, revisions map[*projectionEntry]uint64) []*projectionEntry {
 	var caughtUp []*projectionEntry
 	for prefix, entries := range byRepo {
 		candidates := storeHolds(store, prefix, entries)
@@ -555,12 +565,10 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 	// Checked selected adapters must finish all I/O before dropAll takes mu.
 	if checked, ok := store.(interface{ validateProjectionRetirement() error }); ok {
 		if checked.validateProjectionRetirement() != nil {
-			return 0
+			return nil
 		}
 	}
-	retired := p.dropCheckedRetired(caughtUp, revisions)
-	p.retired.Add(int64(retired))
-	return retired
+	return caughtUp
 }
 
 func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revisions map[*projectionEntry]uint64) int {
