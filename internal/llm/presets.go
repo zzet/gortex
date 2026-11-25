@@ -110,6 +110,15 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// TeamoRouter (https://teamorouter.com) is an OpenAI-compatible gateway;
+	// model ids are bare slugs (list: GET /v1/models with the key).
+	"teamorouter": {
+		BaseURL:       "https://api.teamorouter.com/v1",
+		Model:         "deepseek-v4-flash",
+		APIKeyEnv:     "TEAMOROUTER_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// UberLLM (https://uberllm.dev/docs/quickstart) is an OpenAI-compatible
 	// gateway; model ids carry a vendor prefix (list: GET /v1/models).
 	"uberllm": {
