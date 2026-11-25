@@ -366,6 +366,18 @@ the summary censors missing or conflicting waits for bound patches.
 Resolve-mutex wait is part of the resolve lap and is never added to it.
 The separate `foreign-impact` command records read-side impact waits.
 
+`--edit-wait-cochange` adds one setup step to that six-repository,
+six-editor cell, under either `--edit-ack` policy. The daemon's startup
+co-change mine runs once per process and commits graph writes after
+enrichment. After the first root's source preflight and before any analysis
+gate, the run reads public `analyze` `co_change` for that root's pinned file.
+The facade never starts a new mine. While the reply reports
+`mining_in_progress`, the run waits five seconds and reads again inside the
+warm budget. A wrong target, an invalid collection or mining status, a
+failed mine or an expired budget fails setup before any offer. The last
+bounded reply is kept as `<label>.cochange_setup` and the wait as the
+`cochange_setup_seconds` metric. The choice is part of the workload identity.
+
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
 record has no ACK, receipt, phases or derived time (each unavailable with its
