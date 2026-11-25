@@ -151,8 +151,9 @@ type ContractScheduleRequest struct {
 	PriorityTarget bool
 	// Strict marks a request whose caller waits on this request's promise.
 	// For the rest of the caller's budget, at most the interest TTL, the
-	// actor's jobs start and run outside its linked policy, and its fill
-	// keeps the job slot from actors no strict request waits on.
+	// actor's jobs start and run outside its linked policy, start ahead of
+	// queued actors no strict request waits on, and its fill keeps the job
+	// slot from them.
 	Strict bool
 }
 
@@ -1030,7 +1031,16 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 		}
 	}
 	// Pick the first queued actor its linked policy lets start. A held one
-	// keeps its place, so a primary actor behind it is not held up.
+	// keeps its place, so a primary actor behind it is not held up. The
+	// first queued actor a strict request waits on, which no linked policy
+	// holds, goes ahead of the ones nobody waits on.
+	var strict *contractActor
+	for _, candidate := range ring.queue {
+		if candidate.state == contractActorQueued && now.Before(candidate.strictUntil) {
+			strict = candidate
+			break
+		}
+	}
 	var next *contractActor
 	var unpinned []*ContractCaptureSource
 	for i := 0; i < len(ring.queue) && next == nil; {
@@ -1044,6 +1054,10 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			if recheck > 0 && (wait < 0 || recheck < wait) {
 				wait = recheck
 			}
+			i++
+			continue
+		}
+		if strict != nil && candidate != strict {
 			i++
 			continue
 		}

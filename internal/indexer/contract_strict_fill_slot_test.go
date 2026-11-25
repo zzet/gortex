@@ -57,3 +57,37 @@ func TestContractStrictFillCheckpointsOnlyForStrictWaiters(t *testing.T) {
 		})
 	}
 }
+
+// TestContractDispatcherPicksStrictActorsFirst: when the slot frees, a
+// ring's dispatcher picks the first queued actor a strict request waits on
+// ahead of actors queued before it that nobody waits on; strict actors keep
+// their queue order among themselves.
+func TestContractDispatcherPicksStrictActorsFirst(t *testing.T) {
+	h := newLinkedHoldProbe(t, ContractLinkedEager, nil)
+	h.hold("r/@running")
+	h.hold("r/@blocked")
+	h.schedule("", []string{"r"}, "r", "running")
+	h.waitStarts(1)
+	// The ring's dispatcher picks the next actor and waits for the slot.
+	h.schedule("", []string{"r", "s"}, "r", "blocked")
+	require.Eventually(t, func() bool { return h.slotWaiters() == 1 }, 10*time.Second, time.Millisecond)
+	primary := h.schedule("", []string{"r", "t"}, "r", "primary")
+	first := h.scheduleLinked(t.Context(), "wt1", "r", "first", true)
+	second := h.scheduleLinked(t.Context(), "wt2", "r", "second", true)
+	state := func(actor ContractActor) contractActorState {
+		h.c.mu.Lock()
+		defer h.c.mu.Unlock()
+		return h.c.actors[actor].state
+	}
+	for _, queued := range []ContractActor{primary.Actor, first.Actor, second.Actor} {
+		require.Equal(t, contractActorQueued, state(queued))
+	}
+	h.release("r/@running")
+	require.Eventually(t, func() bool { return len(h.started()) == 2 && h.slotWaiters() == 1 }, 10*time.Second, time.Millisecond)
+	require.Equal(t, contractActorCapturing, state(first.Actor), "the first strict actor takes the slot next")
+	require.Equal(t, contractActorQueued, state(second.Actor))
+	require.Equal(t, contractActorQueued, state(primary.Actor))
+	h.release("r/@blocked")
+	require.Equal(t, []string{"r/@running", "r/@blocked", "r/wt1@first", "r/wt2@second", "r/@primary"}, h.waitStarts(5))
+	require.Equal(t, ContractActorPublished, h.wait(primary).Result)
+}
