@@ -346,10 +346,11 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 					} else {
 						require.NoError(t, callErr)
 						require.NotNil(t, result)
-						if transition == "canonical_no_projection" && tool == "get_editing_context" {
-							requireCanonicalEditingContextPartial(t, result)
+						switch transition {
+						case "canonical_no_projection":
+							requireCanonicalFileReadPartial(t, tool, result)
 							require.Equal(t, 1, calls, "a checked file-only response must not replay the rejected bundle")
-						} else if transition == "unchanged" || transition == "canonical_retirement" || transition == "nested_context_override_false" {
+						case "unchanged", "canonical_retirement", "nested_context_override_false":
 							require.False(t, result.IsError, "checked retirement before leaf success must use the existing fresh attempt: %s", resultText(result))
 							var body map[string]any
 							require.NoError(t, json.Unmarshal([]byte(resultText(result)), &body))
@@ -362,7 +363,7 @@ func TestRegisteredMetadataEarlyScopeRetirementUsesExistingBoundedAttempt(t *tes
 								require.Equal(t, 8, sql.GetNode("main.go::Neighbor").StartLine)
 							}
 							require.Equal(t, expectedCalls, calls)
-						} else {
+						default:
 							require.True(t, result.IsError, "unproved/physical transitions must not gain replay")
 							require.Equal(t, 1, calls)
 						}
