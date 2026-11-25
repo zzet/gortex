@@ -2830,6 +2830,8 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 		if canonical != nil && len(sg.Nodes) == 0 && errors.Is(storeErr, context.DeadlineExceeded) {
 			if definitions := s.canonicalSummaryDefinitions(ctx, fp, canonical); definitions != nil {
 				sg = definitions
+			} else if s.retryAfterSummaryCanonicalToolCommit(ctx, canonical) {
+				return nil, errProjectedSourceMoved
 			}
 		}
 	} else if storeErr != nil {
