@@ -437,6 +437,23 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
 	}
+	// A linked checkout's selected view can already hold these verified bytes.
+	// An owner published for them would only be retired by this request, and
+	// a concurrent reader that selected it would then refuse as if the
+	// unchanged file had moved. Read the selected view instead. A proof that
+	// spends the read's budget first publishes nothing either: this request
+	// could neither retire nor serve that owner. Bytes the selected view does
+	// not hold keep the publication path, and an owner that appeared since the
+	// observation still refuses there.
+	if expected == nil {
+		held, err := s.selectedViewHoldsProjection(buildCtx, requestCtx, entry)
+		if err != nil {
+			return nil, err
+		}
+		if held {
+			return nil, nil
+		}
+	}
 	if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
 		return nil, err
 	}

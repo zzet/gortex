@@ -23,6 +23,28 @@ func (s *Server) retireSelectedProjection(ctx, requestCtx context.Context, entry
 	return pendingFileProjections.retireSelected(adapter, map[string]struct{}{entry.key: {}}) == 1
 }
 
+// selectedViewHoldsProjection reports whether retireSelectedProjection would
+// drop this read-built entry as soon as it was published. It publishes and
+// retires nothing. The error is ctx's when the proof ran out of it before the
+// selected view answered that it holds other content.
+func (s *Server) selectedViewHoldsProjection(ctx, requestCtx context.Context, entry *projectionEntry) (bool, error) {
+	if entry == nil || entry.tombstone || entry.layer == nil {
+		return false, nil
+	}
+	adapter, release := s.selectedProjectionAdapter(ctx, requestCtx, entry)
+	if adapter == nil {
+		return false, nil
+	}
+	defer release()
+	if pendingFileProjections.holdsUnpublished(adapter, entry) {
+		return true, nil
+	}
+	if row, ok := adapter.initial[entry.graphPath]; adapter.initial != nil && (!ok || row.ContentHash != entry.hash) {
+		return false, nil // the selected view holds other content
+	}
+	return false, ctx.Err()
+}
+
 // selectedProjectionAdapter binds entry to the request's leased selected
 // reader. A nil adapter means that reader cannot supply checked evidence.
 func (s *Server) selectedProjectionAdapter(ctx, requestCtx context.Context, entry *projectionEntry) (*selectedProjectionStore, func()) {
