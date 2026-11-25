@@ -2833,10 +2833,22 @@ func (s *Server) handleGetFileSummary(ctx context.Context, req mcp.CallToolReque
 			}
 		}
 	} else if storeErr != nil {
-		if errors.Is(storeErr, graph.ErrContractProjectionStale) && s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
-			return nil, errProjectedSourceMoved
+		if errors.Is(storeErr, graph.ErrContractProjectionStale) {
+			if s.metadataReadRetryScope(req) && retryAfterCheckedProjectionChange(ctx) {
+				return nil, errProjectedSourceMoved
+			}
+			// The rejected rows have no authority. Only definitions proven
+			// again from this request's unchanged canonical bytes may answer,
+			// without edges or dependents, and the reply stays pending.
+			if canonical != nil && validateRequestProjections(ctx) == nil {
+				sg = s.canonicalSummaryDefinitions(ctx, fp, canonical)
+			}
 		}
-		return mcp.NewToolResultError("get_file_summary: " + storeErr.Error()), nil
+		if sg == nil {
+			return mcp.NewToolResultError("get_file_summary: " + storeErr.Error()), nil
+		}
+		ctx = markRequestStoreBusy(ctx, fp)
+		storeBusy = true
 	}
 	if len(sg.Nodes) == 0 && !storeBusy {
 		// Not in the graph. Say whether the walk will EVER hold it — an
