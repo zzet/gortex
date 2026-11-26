@@ -60,6 +60,7 @@ type canonicalPatchLaps struct {
 	nativeMtimeDuplicate             bool      // observed early return before the executor
 	origin, enqueued                 time.Time // immutable original admission identity, for attempt logs
 	ticket                           uint64
+	writer                           writerAttributionState // canonical_writer_attribution.go
 }
 
 // This disposition belongs only to the native mtime gate, not to a failed or
@@ -278,6 +279,9 @@ func (s *PublicationStamps) beginDerivedPatchLap() canonicalLapSpan {
 	span := s.beginPatchLap(patchDerived)
 	if span.stamps != nil {
 		s.markAt(PublicationPatchDerivedStarted, span.started)
+		s.mu.Lock()
+		s.patchLaps.cutWriterBeforeDerivedLocked()
+		s.mu.Unlock()
 	}
 	return span
 }

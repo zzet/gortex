@@ -98,7 +98,7 @@ func (mi *MultiIndexer) coordinateRepositoryTopologyMutation(
 		// The lane-only arm is the second door into the same generation-zero
 		// payload. It names its output generation through the same authority,
 		// inside the lane, exactly as the coordinated arm does.
-		return idx.repositoryMutations().runExclusiveLaneOnly(ctx, func() error {
+		return idx.repositoryMutations().runExclusiveLaneOnlyFor(ctx, OutputEntryRepositoryTopology, func() error {
 			return idx.withOutputGeneration(ctx, OutputEntryRepositoryTopology, fn)
 		})
 	}
