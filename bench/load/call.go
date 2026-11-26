@@ -77,10 +77,6 @@ func checkToolResult(data json.RawMessage) error {
 	return &rpcError{Code: code, Message: body.Code + ": " + body.Message, Data: body.Data, Retriable: body.Code == "repo_loading" && body.Retriable}
 }
 
-// busyBackoffEnded leads the synthetic terminal attempt of a logical call
-// whose deadline ended while it waited to re-send after a refusal.
-const busyBackoffEnded = "busy backoff ended"
-
 type toolCaller interface {
 	call(context.Context, string, any) (json.RawMessage, error)
 }
