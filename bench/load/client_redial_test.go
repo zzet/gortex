@@ -177,6 +177,43 @@ func TestSessionRedialsAfterWriteTimeout(t *testing.T) {
 	}
 }
 
+// The call that re-opens a session carries the time it spent doing so, so
+// that time can be told apart from the daemon's in its latency. The call that
+// gave up its write, and a call on an open stream, carry none.
+func TestRedialedCallCarriesItsRedialTime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	socket, _ := startRedialStub(t, func(connection int) stubStream {
+		if connection == 1 {
+			return stubStall
+		}
+		return stubServe
+	})
+	c := openRedialClient(t, ctx, socket, 2)
+	_, stalled, err := c.callWithIdentity(ctx, "large", redialLargeParams)
+	requireWriteTimeout(t, err, "the stalled write")
+	if stalled.Redial != 0 {
+		t.Fatalf("the call that gave up its write carries re-dial time %s", stalled.Redial)
+	}
+	_, redialed, err := c.callWithIdentity(ctx, "after", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if redialed.Redial <= 0 {
+		t.Fatalf("the call that re-dialed carries re-dial time %s", redialed.Redial)
+	}
+	if before := redialed.WriteStarted.Sub(redialed.Started); redialed.Redial > before {
+		t.Fatalf("re-dial time %s is longer than the %s the call spent before its write", redialed.Redial, before)
+	}
+	_, open, err := c.callWithIdentity(ctx, "again", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Redial != 0 {
+		t.Fatalf("a call on an open stream carries re-dial time %s", open.Redial)
+	}
+}
+
 func TestSessionRedialLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()

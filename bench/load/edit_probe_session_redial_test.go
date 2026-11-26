@@ -10,7 +10,9 @@ import (
 )
 
 // An edit probe's editor and prober sessions re-dial after a write timeout,
-// and the report names each session that did.
+// and the report names each session that did. The edit call that absorbed a
+// re-dial carries its time in its attempt and in the edit's record, and each
+// session row counts the records it marked.
 func TestEditProbeReportsSessionRedials(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -45,18 +47,39 @@ func TestEditProbeReportsSessionRedials(t *testing.T) {
 	if len(probers) != 1 {
 		t.Fatalf("probers: %d", len(probers))
 	}
-	for role, session := range map[string]*socketClient{"editor": editor, "prober": probers[0]} {
+	state := run.states[0]
+	status := request{Tool: "change", Operation: "status", Arguments: map[string]any{"operation": "status"}}
+	for _, role := range []string{"editor", "prober"} {
+		session := map[string]*socketClient{"editor": editor, "prober": probers[0]}[role]
 		session.writeTimeout = 100 * time.Millisecond
 		_, err := session.call(ctx, "large", redialLargeParams)
 		requireWriteTimeout(t, err, role+"'s stalled write")
-		if _, err := session.call(ctx, "after", nil); err != nil {
-			t.Fatalf("the edit probe's %s did not re-dial: %v", role, err)
+		for _, want := range []string{"re-dialed", "open"} {
+			_, identity, attempts, err := run.performObserved(ctx, state, session, status, "status", "probe", 0)
+			if err != nil {
+				t.Fatalf("the edit probe's %s did not re-dial: %v", role, err)
+			}
+			if len(attempts) != 1 || attempts[0].RedialNS != identity.Redial.Nanoseconds() {
+				t.Fatalf("%s %s call: attempts %+v, identity re-dial %s", role, want, attempts, identity.Redial)
+			}
+			if got := attempts[0].RedialNS; (want == "re-dialed") != (got > 0) {
+				t.Fatalf("%s %s call carries redial_ns %d", role, want, got)
+			}
 		}
 	}
-	_ = run.finish() // The planned edit never ran; only the session rows matter.
-	want := []editProbeSessionRedials{{Role: "editor", Index: 0, Redials: 1}, {Role: "prober", Index: 0, Redials: 1}}
+	state.mu.Lock()
+	recordRedial := state.record.RedialNS
+	state.mu.Unlock()
+	if recordRedial <= 0 {
+		t.Fatalf("the edit record carries redial_ns %d after two re-dialed calls", recordRedial)
+	}
+	_ = run.finish() // The planned edit never ran; only the re-dial marks matter.
+	want := []editProbeSessionRedials{{Role: "editor", Index: 0, Redials: 1, AffectedRecords: 1}, {Role: "prober", Index: 0, Redials: 1, AffectedRecords: 1}}
 	if got := phase.EditProbe.SessionRedials; !reflect.DeepEqual(got, want) {
 		t.Fatalf("session re-dials: %+v, want %+v", got, want)
+	}
+	if got := phase.EditProbe.Records; len(got) != 1 || got[0].RedialNS != recordRedial {
+		t.Fatalf("records: %+v, want one with redial_ns %d", got, recordRedial)
 	}
 	if got := sessions(); got != 4 {
 		t.Fatalf("sessions accepted: %d, want 4", got)

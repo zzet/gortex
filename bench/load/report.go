@@ -103,6 +103,10 @@ type Attempt struct {
 	Error             string                     `json:"error"`
 	ExpectedOutcome   string                     `json:"expected_outcome,omitempty"`
 	Outcome           string                     `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	// Time the call spent re-opening its session after an earlier write on it
+	// was given up; it is inside duration_ms and logical_ms. Absent when the
+	// call found its stream open.
+	RedialNS int64 `json:"redial_ns,omitempty"`
 }
 
 type ToolMetrics struct {

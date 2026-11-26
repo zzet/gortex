@@ -333,9 +333,18 @@ number or the edit ordinal that opened it, its re-dials, the re-dials that
 failed, and whether it reached the limit. The list is absent when no session
 re-dialed. Re-dialing ends with the measured workload, so the restore batch
 and the closing receipts run without it. A re-opened stream is a new daemon
-session, so a subscription made on the old one is not renewed. Reader sessions
-and the sessions of other scenarios do not re-dial: one given-up write closes
-them for good.
+session, so a subscription made on the old one is not renewed. Reader sessions,
+sessions the restart cell reopens, and the sessions of other scenarios do not
+re-dial: one given-up write closes them for good.
+
+Re-dial time is recorded per call. A call that re-opens its session, or waits
+for another call's re-dial, carries `redial_ns` in its attempt and in its raw
+`rpc` evidence row: the wait, the old reader's exit, the dial, handshake and
+initialize, and any back-off after a failed re-dial. That time is inside the
+call's `duration_ms`. An edit record's `redial_ns` sums the re-dial time of
+its calls, which is inside its `t_ack_ms`, `t_readback_ms` and probe timings,
+and each `session_redials` row counts the edit records it marked in
+`affected_records`. A call on an open stream carries no `redial_ns`.
 
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest

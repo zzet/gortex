@@ -116,6 +116,12 @@ type wireCallIdentity struct {
 	onWriteStart                                                   func(time.Time)
 	failure                                                        *failureWireCapture
 	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
+	// Redial is the time this call spent re-opening its session before it
+	// could write: waiting for another call's re-dial, the old reader's exit,
+	// the dial, handshake and initialize, and any back-off after a failed
+	// re-dial. It lies between Started and WriteStarted, so it is inside the
+	// call's latency. Zero for a call that found its stream open.
+	Redial time.Duration
 }
 
 func readWireLine(reader *bufio.Reader) ([]byte, error) {
@@ -615,7 +621,12 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 	c.mu.Lock()
 	if c.closed != nil {
 		c.mu.Unlock()
-		if err := c.reopen(ctx); err != nil {
+		redialStarted := time.Now()
+		err := c.reopen(ctx)
+		if observation != nil {
+			observation.Redial = time.Since(redialStarted)
+		}
+		if err != nil {
 			return nil, err
 		}
 		c.mu.Lock()
