@@ -229,7 +229,9 @@ func editProbeBatchIntent(req request) (string, []byte, error) {
 // its accounting gets this many consecutive unchanged status cycles to become
 // terminal. A native-duplicate physical attempt whose earlier publisher is
 // never reported stays unavailable indefinitely, and repeating identical
-// status reads would only fill the per-edit raw evidence cap.
+// status reads would only fill the per-edit raw evidence cap. The bound
+// applies to any accounting that is not yet terminal, so late P or B evidence
+// and unknown diagnostics that arrive after it leave an accounting gap.
 const editProbeAccountingSettlePolls = 8
 
 var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
@@ -301,7 +303,11 @@ func (r *editProbeRuntime) collectBatchEvidence(ctx context.Context, s *editProb
 					return
 				}
 				// Only cycles with every observable in count, and any change
-				// in the accounting restarts the count.
+				// in the accounting restarts the count. A cycle whose
+				// transaction, file or acknowledgement status read fails
+				// never gets here, so it neither counts nor resets: the
+				// bound counts successful observations, possibly with
+				// failed reads between them.
 				if !terminal || !all {
 					unchanged = 0
 				} else if unchanged == 0 || !reflect.DeepEqual(settling, accounting) {
