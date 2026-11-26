@@ -38,6 +38,10 @@ type editProbeReadback struct {
 	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 	Refusal         string `json:"refusal,omitempty"`
 	ObservationOnly bool   `json:"observation_only,omitempty"`
+	// Attribution only: neither field changes Correct, errors or outcomes.
+	Disposition       *editProbeReadbackDisposition `json:"disposition,omitempty"`
+	ConcurrentCommits *editProbeCommitWitness       `json:"concurrent_same_file_commits,omitempty"`
+	sent, received    time.Time                     // this readback's wire window
 }
 type editProbeRecord struct {
 	patchWaits                  *editProbePatchWaits
@@ -1510,6 +1514,11 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 		}
+		back.Disposition = editProbeReadbackDispositionOf(kind, raw, payload, readErr, decodeErr)
+		back.sent, back.received = identity.WriteStarted, identity.Finished
+		if back.sent.IsZero() && !back.received.IsZero() {
+			back.sent = begin
+		}
 		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
 		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
 			back.Correct = true
@@ -1599,6 +1608,7 @@ func (r *editProbeRuntime) finish() error {
 		s.finishRaw()
 	}
 	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
+	r.attributeConcurrentCommits()
 	r.phase.EditProbe.Records = nil
 	guards := r.supersededGuards()
 	for _, s := range r.states {
