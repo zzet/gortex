@@ -100,6 +100,11 @@ type projectionEntry struct {
 	// its ACK. Both flags are guarded by the owning registry mutex after publish.
 	acknowledgementPending    bool
 	acknowledgementRetirement bool
+	// catchUpPublished records that the catch-up a read admitted for this
+	// read-built entry completed. It is only permission for a later read to
+	// run the checked retirement, never proof by itself. Guarded by the
+	// owning registry mutex; it uses existing tail padding.
+	catchUpPublished bool
 }
 
 // projectionRefusal is why a publish left the live entries as they were.
@@ -536,6 +541,16 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 		revisions[e] = e.sourceEvents
 	}
 	p.mu.Unlock() // metadata/node/layer reads stay outside the registry lock
+	retired := p.dropCheckedRetired(p.caughtUp(store, byRepo, revisions), revisions)
+	p.retired.Add(int64(retired))
+	return retired
+}
+
+// caughtUp returns the entries whose bytes the store holds, checked durable
+// hash -> node comparison -> durable hash outside the registry lock. A
+// divergent payload is still caught up, but loses its revision so dropping it
+// grants no retry hint.
+func (p *pendingProjections) caughtUp(store projectionStore, byRepo map[string][]*projectionEntry, revisions map[*projectionEntry]uint64) []*projectionEntry {
 	var caughtUp []*projectionEntry
 	for prefix, entries := range byRepo {
 		candidates := storeHolds(store, prefix, entries)
@@ -555,12 +570,36 @@ func (p *pendingProjections) retireSelected(store projectionStore, selected map[
 	// Checked selected adapters must finish all I/O before dropAll takes mu.
 	if checked, ok := store.(interface{ validateProjectionRetirement() error }); ok {
 		if checked.validateProjectionRetirement() != nil {
-			return 0
+			return nil
 		}
 	}
-	retired := p.dropCheckedRetired(caughtUp, revisions)
-	p.retired.Add(int64(retired))
-	return retired
+	return caughtUp
+}
+
+// retireCaughtUp runs the same checked retirement for the one entry a read
+// selected, and reports whether that entry left the registry because the
+// store holds its bytes, so the read can answer from the store instead. A
+// newer owner, a held acknowledgement, bytes the store does not hold, or a
+// read-built entry whose catch-up has not completed keep the entry, and the
+// read serves it as before.
+func (p *pendingProjections) retireCaughtUp(store projectionStore, entry *projectionEntry) bool {
+	p.mu.Lock()
+	current, revision, published := p.snap.Load().entries[entry.key], entry.sourceEvents, entry.catchUpPublished
+	p.mu.Unlock()
+	if entry.commitSeq == 0 && !published {
+		return false // a read-built entry waits for the catch-up its read admitted
+	}
+	if current != entry {
+		// A receipt or a concurrent read may already have retired it.
+		return current == nil && entry.checkedRetired.Load()
+	}
+	revisions := map[*projectionEntry]uint64{entry: revision}
+	caughtUp := p.caughtUp(store, map[string][]*projectionEntry{entry.repoPrefix: {entry}}, revisions)
+	if len(caughtUp) == 0 {
+		return false
+	}
+	p.retired.Add(int64(p.dropCheckedRetired(caughtUp, revisions)))
+	return p.snap.Load().entries[entry.key] == nil
 }
 
 // holdsUnpublished applies retireSelected's evidence to one entry that was

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -102,4 +103,66 @@ func TestMonitorWALRawCensusRetainsActualFileSizesAndMissingSamples(t *testing.T
 	require.Equal(t, 4, raw.Count)
 	require.Nil(t, raw.Samples[2].Bytes)
 	require.NotEmpty(t, raw.Samples[2].Error)
+}
+
+// Pressure and major faults come from the run's cgroup files here; the host
+// files exist only on Linux. A missing file, line or counter is unavailable.
+func TestMonitorPressureAndMajorFaultsNeverInferZero(t *testing.T) {
+	for _, tc := range []struct {
+		stat  string
+		value *float64
+	}{
+		{"123 (cmd with ) paren) S 1 2 3 4 5 6 7 8 42 9 250 50", new(42.0)},
+		{"malformed", nil},
+		{"123 (cmd) S 1 2", nil},
+		{"123 (cmd) S 1 2 3 4 5 6 7 8 x 9", nil},
+	} {
+		got := procStatMajorFaults(tc.stat)
+		if (got.Value == nil) != (tc.value == nil) || tc.value != nil && *got.Value != *tc.value || got.Unit != "faults" || got.Value == nil && got.Reason == "" {
+			t.Fatalf("stat %q: %+v", tc.stat, got)
+		}
+	}
+	group := t.TempDir()
+	setPressure := func(resource, body string) {
+		require.NoError(t, os.WriteFile(filepath.Join(group, resource+".pressure"), []byte(body), 0o600))
+	}
+	setPressure("cpu", "some avg10=1.50 avg60=0.00 avg300=0.00 total=1000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=10\n")
+	setPressure("memory", "some avg10=0.00 avg60=0.00 avg300=0.00 total=500\n") // no full line
+	self, err := os.FindProcess(os.Getpid())
+	require.NoError(t, err)
+	m := &phaseMonitor{p: &privateRun{Store: filepath.Join(t.TempDir(), "store.db"), process: &exec.Cmd{Process: self}}, sampler: absentSampler{}, group: group, pid: os.Getpid(), started: time.Now(), peaks: make(map[string]Metric), cancel: func() {}}
+	m.pressureBefore = m.pressure()
+	m.observe()
+	setPressure("cpu", "some avg10=7.25 avg60=0.00 avg300=0.00 total=4000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=10\n")
+	m.observe()
+	setPressure("cpu", "some avg10=2.00 avg60=0.00 avg300=0.00 total=5000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=10\n")
+	phase := &Phase{Metrics: make(map[string]Metric)}
+	m.finish(phase)
+
+	value := func(name string) float64 {
+		metric := phase.Metrics[name]
+		require.NotNil(t, metric.Value, "%s: %+v", name, metric)
+		return *metric.Value
+	}
+	require.Equal(t, 4000.0, value("cgroup_psi_cpu_some_stall_us"))
+	require.Equal(t, 7.25, value("cgroup_psi_cpu_some_peak_avg10_pct"))
+	require.Equal(t, 0.0, value("cgroup_psi_cpu_full_stall_us")) // an observed zero delta
+	require.Equal(t, 0.0, value("cgroup_psi_memory_some_stall_us"))
+	for _, name := range []string{"cgroup_psi_memory_full_stall_us", "cgroup_psi_memory_full_peak_avg10_pct", "cgroup_psi_io_some_stall_us", "cgroup_psi_io_full_peak_avg10_pct", "daemon_major_faults"} {
+		metric, present := phase.Metrics[name]
+		require.True(t, present, name)
+		require.Nil(t, metric.Value, "%s inferred a value: %+v", name, metric)
+		require.NotEmpty(t, metric.Reason, name)
+	}
+	if runtime.GOOS != "linux" {
+		for _, resource := range pressureResources {
+			for _, kind := range []string{"some", "full"} {
+				for _, suffix := range []string{"_stall_us", "_peak_avg10_pct"} {
+					metric := phase.Metrics["host_psi_"+resource+"_"+kind+suffix]
+					require.Nil(t, metric.Value, "host pressure off Linux: %+v", metric)
+					require.NotEmpty(t, metric.Reason)
+				}
+			}
+		}
+	}
 }
