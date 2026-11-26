@@ -61,6 +61,7 @@ type runOptions struct {
 	smokeMarkers             []string
 
 	LosslessEditProbeEvidence bool
+	EditProbeRawLimitMiB      int
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -69,6 +70,7 @@ func parseRun(args []string) (runOptions, error) {
 	bindRunFlags(f, &o)
 	f.BoolVar(&o.OwnACKReadbackOnly, "edit-ack-readback-only", false, "local ACK and immediate same-session file/source readback with paced readers, without visibility polling")
 	f.BoolVar(&o.LosslessEditProbeEvidence, "lossless-edit-probe-evidence", false, "retain exact RPC payloads in bounded edit-gate evidence")
+	f.IntVar(&o.EditProbeRawLimitMiB, "edit-probe-raw-limit-mib", 0, "edit-and-probe per-edit raw evidence cap in MiB, 16..256; 0 selects 16, or 64 with --lossless-edit-probe-evidence")
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
 	bindMemoryFlags(f, &o)
 	bindChurnFlags(f, &o.Churn)
@@ -131,9 +133,24 @@ func (o runOptions) editACKPolicy() string {
 	return o.EditACKMode
 }
 
+// The per-edit raw evidence cap. Only lossless gate-mode cells default above
+// 16 MiB; their encoded rows are compact enough to retain a longer burst.
+func (o runOptions) rawEvidenceLimit() int {
+	switch {
+	case o.EditProbeRawLimitMiB > 0:
+		return o.EditProbeRawLimitMiB << 20
+	case o.LosslessEditProbeEvidence && o.EditGateModes:
+		return editProbeLosslessRawLimit
+	}
+	return editProbeRawLimit
+}
+
 func validateRunOptions(o runOptions) error {
 	if o.LosslessEditProbeEvidence && (o.Scenario != editProbeScenario || !o.EditGateModes) {
 		return errors.New("--lossless-edit-probe-evidence requires edit-and-probe with --edit-gate-modes")
+	}
+	if mib := o.EditProbeRawLimitMiB; mib != 0 && (o.Scenario != editProbeScenario || mib < editProbeRawLimit>>20 || mib > editProbeMaxRawLimit>>20) {
+		return fmt.Errorf("--edit-probe-raw-limit-mib requires edit-and-probe and %d..%d MiB", editProbeRawLimit>>20, editProbeMaxRawLimit>>20)
 	}
 	if o.EditConsumerProbes && (o.Scenario != editProbeScenario || o.Worktrees != 0 || o.EditRepos != 1 || o.SearchReadbackAcceptance) {
 		return errors.New("--edit-consumer-probes requires one primary edit-and-probe fixture without linked worktrees or search-readback acceptance")
