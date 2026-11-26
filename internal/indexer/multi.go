@@ -126,6 +126,9 @@ type MultiIndexer struct {
 	goModuleRetry        resolver.GoModuleDepRetry
 	npmPackageMu         sync.Mutex
 	npmPackageCache      *npmPackageSnapshot
+	// npmRequireChecked is the package snapshot the last complete
+	// whole-graph require re-check ran against; see npmPackageLookups.
+	npmRequireChecked atomic.Pointer[npmPackageSnapshot]
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and

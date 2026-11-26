@@ -245,7 +245,7 @@ func TestStaleLangsDetection(t *testing.T) {
 			snapshotJSON(t, map[string]int{"javascript": 2, "typescript": 3})); !reflect.DeepEqual(got, []string{"javascript", "typescript"}) {
 			t.Errorf("snapshot stored before named export evidence = %v, want [javascript typescript]", got)
 		}
-		for path, want := range map[string]string{"model.js": policySalt + "|javascript@3", "model.ts": policySalt + "|typescript@4"} {
+		for path, want := range map[string]string{"model.js": policySalt + "|javascript@4", "model.ts": policySalt + "|typescript@5"} {
 			if got := merkleSaltFor(path); got != want {
 				t.Errorf("extractor salt for %s = %q, want %q", path, got, want)
 			}

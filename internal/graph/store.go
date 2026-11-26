@@ -79,6 +79,13 @@ type UnresolvedEdgeScan struct {
 	// same keep rule as the consumer's edgeInResolveScope, minus the shapes
 	// only Go can parse, which fail open.
 	ScopeFilter bool
+	// SourceOnly, when set with ScopeAnchors, keeps only rows whose source
+	// repo is in scope, so a consumer that only wants one repository's own
+	// unresolved edges does not hydrate the bare-target rows ScopeFilter
+	// keeps for every repository. NULL source repos still load (fail-open).
+	SourceOnly bool
+	// Kinds, when non-empty, keeps only rows of these edge kinds.
+	Kinds []EdgeKind
 }
 
 // UnresolvedEdgePage is one bounded keyset page from an UnresolvedEdgeScan.
