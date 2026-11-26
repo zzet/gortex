@@ -105,6 +105,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("standardcompute preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(sc))
 	}
 
+	tr := Config{Provider: "teamorouter"}
+	cp, ok = tr.ActiveCustom()
+	if !ok || cp.BaseURL != "https://api.teamorouter.com/v1" || cp.Model != "deepseek-v4-flash" || cp.APIKeyEnv != "TEAMOROUTER_API_KEY" || cp.SchemaMode != "json_schema" || cp.ReasoningEffort != "none" || ProfileFor(tr) != ProfileFrontier {
+		t.Errorf("teamorouter preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(tr))
+	}
+
 	ul := Config{Provider: "uberllm"}
 	cp, ok = ul.ActiveCustom()
 	if !ok || cp.BaseURL != "https://api.uberllm.dev/v1" || cp.Model != "deepseek/deepseek-v4-flash" || cp.APIKeyEnv != "UBERLLM_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(ul) != ProfileFrontier {
