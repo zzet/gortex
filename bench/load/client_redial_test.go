@@ -15,7 +15,8 @@ import (
 
 // stubStream says what a redialStub connection does once its session is
 // initialized: answer every request, stop reading (so a large client write
-// blocks until its deadline), or hang up. stubRefuse refuses the handshake.
+// blocks until its deadline), or hang up. stubRefuse refuses the handshake;
+// stubServeSlow holds its handshake reply for redialStubHold, then serves.
 type stubStream int
 
 const (
@@ -23,11 +24,20 @@ const (
 	stubStall
 	stubHangUp
 	stubRefuse
+	stubServeSlow
 )
+
+// How long a stubServeSlow connection holds its handshake reply. A re-dial
+// onto it takes at least this long, which every platform's clock resolves:
+// a re-dial over a pipe otherwise takes microseconds, and the Windows
+// runner's clock measured that as zero.
+const redialStubHold = 30 * time.Millisecond
 
 // startRedialStub is a newline-framed daemon that answers the handshake and
 // initialize on every connection; behave picks what connection n (from 1)
-// does after that. It returns the socket and the count of accepted sessions.
+// does after that. It returns the socket, the count of accepted sessions,
+// and how long connection n held its handshake reply, as measured by the
+// clock that times the client's re-dial (zero unless stubServeSlow).
 //
 // The socket is served over net.Pipe through socketDialers, not a real unix
 // socket. A pipe write blocks until the stub reads it and its deadline fires
@@ -35,11 +45,12 @@ const (
 // every platform. Over a real socket the OS decides how much an unread stream
 // buffers and whether a blocked send is interrupted at its deadline: on the
 // Windows runner the stalled write never reached the client's write timeout.
-func startRedialStub(t *testing.T, behave func(connection int) stubStream) (string, func() int) {
+func startRedialStub(t *testing.T, behave func(connection int) stubStream) (string, func() int, func(connection int) time.Duration) {
 	t.Helper()
 	socket := "redial-stub/" + t.Name()
 	var mu sync.Mutex
 	var connections []net.Conn
+	held := make(map[int]time.Duration)
 	var workers sync.WaitGroup
 	release := make(chan struct{})
 	serve := func(conn net.Conn, connection int) {
@@ -49,9 +60,19 @@ func startRedialStub(t *testing.T, behave func(connection int) stubStream) (stri
 		if _, err := reader.ReadBytes('\n'); err != nil {
 			return
 		}
-		if behave(connection) == stubRefuse {
+		stream := behave(connection)
+		switch stream {
+		case stubRefuse:
 			write(map[string]any{"ok": false, "error_msg": "stub refused"})
 			return
+		case stubServeSlow:
+			// Measured inside the client's re-dial, so the client's re-dial
+			// time is at least this on any monotonic clock, however coarse.
+			holding := time.Now()
+			time.Sleep(redialStubHold)
+			mu.Lock()
+			held[connection] = time.Since(holding)
+			mu.Unlock()
 		}
 		write(map[string]any{"ok": true, "daemon_version": "stub-v1"})
 		for {
@@ -68,7 +89,7 @@ func startRedialStub(t *testing.T, behave func(connection int) stubStream) (stri
 			}
 			switch {
 			case frame.Method == "notifications/initialized":
-				switch behave(connection) {
+				switch stream {
 				case stubStall:
 					<-release
 					return
@@ -105,11 +126,17 @@ func startRedialStub(t *testing.T, behave func(connection int) stubStream) (stri
 		mu.Unlock()
 		workers.Wait()
 	})
-	return socket, func() int {
+	sessions := func() int {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(connections)
 	}
+	hold := func(connection int) time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return held[connection]
+	}
+	return socket, sessions, hold
 }
 
 // A frame whose write blocks until the client's write deadline once the stub
@@ -138,7 +165,7 @@ func requireWriteTimeout(t *testing.T, err error, what string) {
 func TestSessionRedialsAfterWriteTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	socket, sessions := startRedialStub(t, func(connection int) stubStream {
+	socket, sessions, _ := startRedialStub(t, func(connection int) stubStream {
 		if connection == 1 {
 			return stubStall
 		}
@@ -165,30 +192,34 @@ func TestSessionRedialsAfterWriteTimeout(t *testing.T) {
 	}
 }
 
-// The call that re-opens a session carries the time it spent doing so, so
-// that time can be told apart from the daemon's in its latency. The call that
-// gave up its write, and a call on an open stream, carry none.
+// The call that re-opens a session is marked as re-dialed and carries the
+// time it spent doing so, so that time can be told apart from the daemon's in
+// its latency. The call that gave up its write, and a call on an open stream,
+// carry neither.
 func TestRedialedCallCarriesItsRedialTime(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	socket, _ := startRedialStub(t, func(connection int) stubStream {
+	socket, _, held := startRedialStub(t, func(connection int) stubStream {
 		if connection == 1 {
 			return stubStall
 		}
-		return stubServe
+		return stubServeSlow
 	})
 	c := openRedialClient(t, ctx, socket, 2)
 	_, stalled, err := c.callWithIdentity(ctx, "large", redialLargeParams)
 	requireWriteTimeout(t, err, "the stalled write")
-	if stalled.Redial != 0 {
-		t.Fatalf("the call that gave up its write carries re-dial time %s", stalled.Redial)
+	if stalled.Redialed || stalled.Redial != 0 {
+		t.Fatalf("the call that gave up its write carries re-dial mark %t, time %s", stalled.Redialed, stalled.Redial)
 	}
 	_, redialed, err := c.callWithIdentity(ctx, "after", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if redialed.Redial <= 0 {
-		t.Fatalf("the call that re-dialed carries re-dial time %s", redialed.Redial)
+	if !redialed.Redialed {
+		t.Fatal("the call that re-dialed is not marked as re-dialed")
+	}
+	if hold := held(2); hold <= 0 || redialed.Redial < hold {
+		t.Fatalf("the call that re-dialed carries re-dial time %s, under the stub's %s handshake hold", redialed.Redial, hold)
 	}
 	if before := redialed.WriteStarted.Sub(redialed.Started); redialed.Redial > before {
 		t.Fatalf("re-dial time %s is longer than the %s the call spent before its write", redialed.Redial, before)
@@ -197,15 +228,15 @@ func TestRedialedCallCarriesItsRedialTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if open.Redial != 0 {
-		t.Fatalf("a call on an open stream carries re-dial time %s", open.Redial)
+	if open.Redialed || open.Redial != 0 {
+		t.Fatalf("a call on an open stream carries re-dial mark %t, time %s", open.Redialed, open.Redial)
 	}
 }
 
 func TestSessionRedialLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	socket, sessions := startRedialStub(t, func(int) stubStream { return stubStall })
+	socket, sessions, _ := startRedialStub(t, func(int) stubStream { return stubStall })
 	const limit = 2
 	c := openRedialClient(t, ctx, socket, limit)
 	for i := range limit + 1 {
@@ -216,10 +247,13 @@ func TestSessionRedialLimit(t *testing.T) {
 		}
 	}
 	started := time.Now()
-	_, err := c.call(ctx, "after-limit", nil)
+	_, refused, err := c.callWithIdentity(ctx, "after-limit", nil)
 	requireWriteTimeout(t, err, "a call past the re-dial limit")
 	if !strings.Contains(err.Error(), "re-dial limit 2 reached") {
 		t.Fatalf("a call past the limit does not say the session stayed closed: %v", err)
+	}
+	if refused.Redialed || refused.Redial != 0 {
+		t.Fatalf("a call refused without a re-dial carries re-dial mark %t, time %s", refused.Redialed, refused.Redial)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("a call past the limit waited %s", elapsed)
@@ -237,7 +271,7 @@ func TestSessionRedialLimit(t *testing.T) {
 func TestSessionRedialBacksOffAfterAFailedRedial(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	socket, sessions := startRedialStub(t, func(connection int) stubStream {
+	socket, sessions, _ := startRedialStub(t, func(connection int) stubStream {
 		switch connection {
 		case 1:
 			return stubStall
@@ -274,7 +308,7 @@ func TestSessionRedialBacksOffAfterAFailedRedial(t *testing.T) {
 func TestSessionClosedByDaemonIsNotRedialed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	socket, sessions := startRedialStub(t, func(int) stubStream { return stubHangUp })
+	socket, sessions, _ := startRedialStub(t, func(int) stubStream { return stubHangUp })
 	c := openRedialClient(t, ctx, socket, 2)
 	select {
 	case <-c.done:
@@ -282,8 +316,12 @@ func TestSessionClosedByDaemonIsNotRedialed(t *testing.T) {
 		t.Fatal("the client never saw the daemon hang up")
 	}
 	for range 2 {
-		if _, err := c.call(ctx, "after-hangup", nil); err == nil {
+		_, identity, err := c.callWithIdentity(ctx, "after-hangup", nil)
+		if err == nil {
 			t.Fatal("a call succeeded on a stream the daemon closed")
+		}
+		if identity.Redialed || identity.Redial != 0 {
+			t.Fatalf("a call on a stream the daemon closed carries re-dial mark %t, time %s", identity.Redialed, identity.Redial)
 		}
 	}
 	if got := sessions(); got != 1 {

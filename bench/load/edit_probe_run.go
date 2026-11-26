@@ -98,7 +98,8 @@ type editProbeRecord struct {
 	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
 	Accounting                  editProbeAccounting                 `json:"accounting"`
 	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
-	RedialNS                    int64                               `json:"redial_ns,omitempty"` // this edit's calls re-opening their session; inside t_ack, t_readback and probe timings
+	RedialedCalls               int                                 `json:"redialed_calls,omitempty"` // this edit's calls that went through a re-dial, whatever the clock measured
+	RedialNS                    int64                               `json:"redial_ns,omitempty"`      // their time re-opening the session; inside t_ack, t_readback and probe timings
 	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
 	ProbeErrors                 int                                 `json:"probe_errors"`
 	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
@@ -151,9 +152,9 @@ type editProbeSessionRedials struct {
 	Redials      int    `json:"redials"`
 	Failed       int    `json:"failed"`        // re-dials that did not open a session
 	LimitReached bool   `json:"limit_reached"` // later calls failed with the stream closed
-	// Edit records with a call on this session that absorbed re-dial time
-	// (their redial_ns). A re-dial absorbed outside an edit's calls, such as
-	// a setup read, counts in redials but marks no record.
+	// Edit records with a call on this session that went through a re-dial
+	// (their redialed_calls). A re-dial absorbed outside an edit's calls, such
+	// as a setup read, counts in redials but marks no record.
 	AffectedRecords int `json:"affected_records"`
 }
 
@@ -179,7 +180,7 @@ func (r *editProbeRuntime) watchSession(role string, index int, client *socketCl
 }
 
 // noteRedialedRecord marks the edit record ordinal as holding a call on
-// client that absorbed re-dial time.
+// client that went through a re-dial.
 func (r *editProbeRuntime) noteRedialedRecord(client *socketClient, ordinal int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -313,7 +314,7 @@ type editProbeRuntime struct {
 	restarter         editProbeRestarter // restart cell only
 	restarted         []*socketClient    // sessions reopened after a restart; closed by close
 	sessions          []editProbeSession // editor and prober sessions that may re-dial
-	// Per session, the edit records whose calls absorbed re-dial time; under mu.
+	// Per session, the edit records whose calls went through a re-dial; under mu.
 	redialedRecords map[*socketClient]map[int]bool
 }
 
@@ -784,14 +785,14 @@ type editProbeCaller struct {
 
 func (c *editProbeCaller) responseReturnedAt() time.Time { return c.last.Finished }
 
-// lastCallRedial is the re-dial time of the caller's latest call, when that
-// call started at or after since, so an attempt never takes an earlier
-// attempt's mark.
-func (c *editProbeCaller) lastCallRedial(since time.Time) time.Duration {
+// lastCallRedial is the re-dial time and mark of the caller's latest call,
+// when that call started at or after since, so an attempt never takes an
+// earlier attempt's mark.
+func (c *editProbeCaller) lastCallRedial(since time.Time) (time.Duration, bool) {
 	if c.last.Started.Before(since) {
-		return 0
+		return 0, false
 	}
-	return c.last.Redial
+	return c.last.Redial, c.last.Redialed
 }
 
 func (c *editProbeCaller) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -817,11 +818,12 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 	if strings.HasPrefix(c.purpose, "oracle:") && !identity.WriteStarted.IsZero() && (c.state.firstProbeWrite.IsZero() || identity.WriteStarted.Before(c.state.firstProbeWrite)) {
 		c.state.firstProbeWrite = identity.WriteStarted
 	}
-	if identity.Redial > 0 {
+	if identity.Redialed {
+		c.state.record.RedialedCalls++
 		c.state.record.RedialNS += identity.Redial.Nanoseconds()
 	}
 	c.state.mu.Unlock()
-	if identity.Redial > 0 {
+	if identity.Redialed {
 		c.runtime.noteRedialedRecord(c.client, c.state.step.Ordinal)
 	}
 	if err == nil {
@@ -830,8 +832,11 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 		}
 	}
 	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "output_mode": editProbeRequestOutput(c.request), "payload": data}
-	if identity.Redial > 0 {
-		row["redial_ns"] = identity.Redial.Nanoseconds()
+	if identity.Redialed {
+		row["redialed"] = true
+		if identity.Redial > 0 {
+			row["redial_ns"] = identity.Redial.Nanoseconds()
+		}
 	}
 	if err != nil {
 		row["error"] = err.Error()

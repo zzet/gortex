@@ -116,11 +116,19 @@ type wireCallIdentity struct {
 	onWriteStart                                                   func(time.Time)
 	failure                                                        *failureWireCapture
 	Started, WriteStarted, WriteFinished, ReplyDelivered, Finished time.Time
+	// Redialed reports that this call found its stream given up and went
+	// through a re-dial before it could write: it re-dialed the session, or
+	// waited for another call's re-dial, whether or not a stream opened. A
+	// call refused without one (the daemon closed the stream, the session may
+	// not re-dial, or its limit is spent) is not redialed. Unlike Redial it
+	// does not depend on the clock: a re-dial quicker than the clock's
+	// resolution is redialed with Redial zero.
+	Redialed bool
 	// Redial is the time this call spent re-opening its session before it
 	// could write: waiting for another call's re-dial, the old reader's exit,
 	// the dial, handshake and initialize, and any back-off after a failed
 	// re-dial. It lies between Started and WriteStarted, so it is inside the
-	// call's latency. Zero for a call that found its stream open.
+	// call's latency. Zero unless Redialed.
 	Redial time.Duration
 }
 
@@ -355,44 +363,46 @@ func (c *socketClient) redialRefusalLocked() error {
 
 // reopen replaces the closed stream of a session that may re-dial. It
 // returns nil once a stream is open, or the reason the session stays closed.
-func (c *socketClient) reopen(ctx context.Context) error {
+// redialed reports that the call went through a re-dial, its own or one it
+// waited for, rather than finding the stream open or being refused at once.
+func (c *socketClient) reopen(ctx context.Context) (redialed bool, err error) {
 	c.mu.Lock()
 	if c.closed == nil { // another call re-opened it meanwhile
 		c.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	if err := c.redialRefusalLocked(); err != nil {
 		c.mu.Unlock()
-		return err
+		return false, err
 	}
 	gate := c.redial.gate
 	c.mu.Unlock()
 	select {
 	case gate <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return true, ctx.Err()
 	}
 	defer func() { <-gate }()
 	c.mu.Lock()
 	if c.closed == nil {
 		c.mu.Unlock()
-		return nil
+		return true, nil
 	}
 	if err := c.redialRefusalLocked(); err != nil {
 		c.mu.Unlock()
-		return err
+		return true, err
 	}
 	if wait := time.Until(c.redial.retryAt); wait > 0 {
 		// Holding the gate, only Close can change the session meanwhile.
 		c.mu.Unlock()
 		if err := waitContext(ctx, wait); err != nil {
-			return err
+			return true, err
 		}
 		c.mu.Lock()
 		if c.redial.shut {
 			err := c.closed
 			c.mu.Unlock()
-			return err
+			return true, err
 		}
 	}
 	c.redial.counts.Attempts++
@@ -410,14 +420,14 @@ func (c *socketClient) reopen(ctx context.Context) error {
 	if err != nil {
 		c.redial.counts.Failed++
 		c.redial.retryAt = time.Now().Add(redialBackoff(c.redial.counts.Failed))
-		return fmt.Errorf("%w (re-dial %d of %d failed: %v)", cause, attempt, c.redial.limit, err)
+		return true, fmt.Errorf("%w (re-dial %d of %d failed: %v)", cause, attempt, c.redial.limit, err)
 	}
 	done := make(chan struct{})
 	c.conn, c.reader, c.done = conn, reader, done
 	c.pending, c.capturePending = make(map[int64]chan wireReply), nil
 	c.closed, c.redial.abandoned = nil, false
 	go c.readStream(conn, reader, done)
-	return nil
+	return true, nil
 }
 
 // dialStream opens and initializes a new session before any call can see it.
@@ -636,9 +646,9 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 	if c.closed != nil {
 		c.mu.Unlock()
 		redialStarted := time.Now()
-		err := c.reopen(ctx)
-		if observation != nil {
-			observation.Redial = time.Since(redialStarted)
+		redialed, err := c.reopen(ctx)
+		if observation != nil && redialed {
+			observation.Redialed, observation.Redial = true, time.Since(redialStarted)
 		}
 		if err != nil {
 			return nil, err

@@ -163,9 +163,10 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			a.CWD = session.cwd
 		}
 		if redial, ok := client.(interface {
-			lastCallRedial(since time.Time) time.Duration
+			lastCallRedial(since time.Time) (time.Duration, bool)
 		}); ok {
-			a.RedialNS = redial.lastCallRedial(start).Nanoseconds()
+			took, redialed := redial.lastCallRedial(start)
+			a.Redialed, a.RedialNS = redialed, took.Nanoseconds()
 		}
 		var remote *rpcError
 		var retainedSummaryRefusal bool

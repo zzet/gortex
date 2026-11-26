@@ -337,14 +337,18 @@ session, so a subscription made on the old one is not renewed. Reader sessions,
 sessions the restart cell reopens, and the sessions of other scenarios do not
 re-dial: one given-up write closes them for good.
 
-Re-dial time is recorded per call. A call that re-opens its session, or waits
-for another call's re-dial, carries `redial_ns` in its attempt and in its raw
-`rpc` evidence row: the wait, the old reader's exit, the dial, handshake and
-initialize, and any back-off after a failed re-dial. That time is inside the
-call's `duration_ms`. An edit record's `redial_ns` sums the re-dial time of
-its calls, which is inside its `t_ack_ms`, `t_readback_ms` and probe timings,
-and each `session_redials` row counts the edit records it marked in
-`affected_records`. A call on an open stream carries no `redial_ns`.
+Re-dials are recorded per call. A call that re-opens its session, or waits
+for another call's re-dial, carries `redialed: true` and its re-dial time
+`redial_ns` in its attempt and in its raw `rpc` evidence row: the wait, the
+old reader's exit, the dial, handshake and initialize, and any back-off after
+a failed re-dial. That time is inside the call's `duration_ms`. `redial_ns` is
+absent when it measured zero, which a re-dial quicker than the clock's
+resolution can, so `redialed` alone says that a re-dial happened. An edit
+record counts its calls that re-dialed in `redialed_calls` and sums their time
+in `redial_ns`, which is inside its `t_ack_ms`, `t_readback_ms` and probe
+timings, and each `session_redials` row counts the edit records it marked in
+`affected_records`. A call on an open stream, and a call refused without a
+re-dial, carries neither.
 
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest
