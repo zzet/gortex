@@ -34,7 +34,9 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
-	"indexer.aliasStateStore": "the delta pins the build's resolution inputs and refuses a base digest that differs; a per-file delta cannot certify a repository-wide rebind or write a receipt to its base",
+	"indexer.aliasStateStore":           "the delta pins the build's resolution inputs and refuses a base digest that differs; a per-file delta cannot certify a repository-wide rebind or write a receipt to its base",
+	"indexer.resolutionInputStore":      "inputs are persisted only beside a certified digest, which a per-file delta never writes; the delta reuses the inputs the build pinned",
+	"indexer.resolutionCallerInventory": "resolutionPassNeeded is skipped for a DeltaWriter; deltaMayUseAliases asks the base store for the same inventory",
 
 	"graph.FoldedNameCandidateReader": "handler-only coherent candidate/payload snapshot; mutable DeltaWriter owns neither a physical read transaction nor a frozen delta layer, so the name-only handler refuses unsupported composition instead of forwarding base-only complete absence",
 	"anonymous{DBStats}":              "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",

@@ -253,7 +253,8 @@ func TestApplyResolvedOutEdges_SkipsJSLexicalBindingEdges(t *testing.T) {
 	})
 
 	reuse, _, _ := captureIncrementalState(g, "app.ts")
-	require.NotContains(t, reuse, reuseKey{from: "app.ts::run", kind: graph.EdgeCalls, name: "helper"})
+	// Absent or poisoned (nil): either way the key never donates a target.
+	require.Nil(t, reuse[reuseKey{from: "app.ts::run", kind: graph.EdgeCalls, name: "helper"}])
 	require.Contains(t, reuse, reuseKey{from: "app.ts::run", kind: graph.EdgeCalls, name: "keep"})
 
 	freshUnstamped := &graph.Edge{From: "app.ts::run", To: graph.UnresolvedMarker + "keep", Kind: graph.EdgeCalls, FilePath: "app.ts", Line: 3}
