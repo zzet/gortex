@@ -68,7 +68,9 @@ type pendingProjections struct {
 type projectionSnapshot struct {
 	entries map[string]*projectionEntry
 	bytes   int64
-	seq     uint64 // swaps of this registry before this snapshot
+	// seq counts this registry's swaps up to and including the one that
+	// installed this snapshot; the initial snapshot is 0.
+	seq uint64
 }
 
 // projectionChange is one swap's entry in the registry's change log.
