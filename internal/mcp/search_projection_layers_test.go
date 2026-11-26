@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/zzet/gortex/internal/search"
 	"github.com/zzet/gortex/internal/search/rerank"
 )
+
+const projectedSearchLayersReadBudget = time.Second
 
 type projectionBundleStore struct {
 	graph.Store
@@ -53,7 +56,7 @@ func TestProjectedSearchLayersOwnOnlyCoveredBundleHits(t *testing.T) {
 				original, err := os.ReadFile(path)
 				require.NoError(t, err)
 				require.NoError(t, os.WriteFile(path, append([]byte("\n\n\n"), original...), 0o644))
-				ctx := t.Context()
+				ctx := context.WithValue(t.Context(), projectedReadBudgetKey{}, projectedSearchLayersReadBudget)
 				var buffer *graph.Node
 				if editor {
 					layer := graph.NewOverlayLayer()
