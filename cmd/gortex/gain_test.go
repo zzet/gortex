@@ -8,7 +8,6 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +17,7 @@ import (
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
 	"github.com/zzet/gortex/internal/persistence"
 	"github.com/zzet/gortex/internal/savings"
+	"github.com/zzet/gortex/internal/testutil/reporoot"
 )
 
 func TestHumanDuration(t *testing.T) {
@@ -350,15 +350,11 @@ func TestLoadHistory_CloseDoesNotDropTheWritersWindow(t *testing.T) {
 // every error return in between) and it must be registered after the stack's
 // own `defer ss.Close()`, so LIFO commits the ledger before teardown.
 func TestRunMCPDefersTheOneshotSavingsFlush(t *testing.T) {
-	// Resolve mcp.go from THIS file's own location rather than the working
+	// Resolve mcp.go from the module root rather than the working
 	// directory: other tests in this package chdir, and the assertion must
 	// not depend on who ran last.
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate this test file")
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(self), "mcp.go"), nil, 0)
+	file, err := parser.ParseFile(fset, reporoot.Path(t, "cmd", "gortex", "mcp.go"), nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

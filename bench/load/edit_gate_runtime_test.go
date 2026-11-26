@@ -96,6 +96,70 @@ func TestEditGateRuntimeReadsEveryRequiredKindAndRetainsLiveTiers(t *testing.T) 
 	}
 }
 
+func TestEditGateImmediateSummaryPreservesReadError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wire json.RawMessage
+		want string
+	}{
+		{
+			name: "projection_superseded",
+			wire: json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"{\"error_code\":\"projection_superseded\",\"message\":\"projection not published: superseded\",\"retriable\":true,\"data\":{\"retry_scope\":\"read_only\",\"delivery_unknown\":false}}"}]}`),
+			want: "RPC -32000: projection_superseded: projection not published: superseded",
+		},
+		{
+			name: "malformed_success",
+			wire: json.RawMessage(`{"content":[]}`),
+			want: "output requires one successful payload and only known auxiliary notes",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			corpus := editProbeCorpus()
+			plan, err := makeEditProbePlan(corpus, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.GateModes = true
+			client := searchSequenceClient(t, func(frame stubFrame) any {
+				args, _ := frame.Params["arguments"].(map[string]any)
+				if frame.Method == "tools/call" && frame.Params["name"] == "read" && args["operation"] == "summary" {
+					return tc.wire
+				}
+				return stubContent(map[string]any{})
+			})
+			sink := newEditProbeHeldSink(t)
+			sink.unblock()
+			state := startHeldEditProbeSpool(t, sink)
+			state.step = plan.Steps[0]
+			state.record = newEditProbeRecord(corpus, state.step)
+			state.record.Outcome, state.record.Errors = "not_started", nil
+			run := &editProbeRuntime{
+				options: runOptions{Deadline: 3 * time.Second},
+				p:       &privateRun{Repos: []privateRepo{{Prefix: "fixture", Corpus: corpus}}},
+				phase:   &Phase{},
+				plan:    plan,
+				editors: []*socketClient{client},
+				origin:  time.Now(),
+			}
+			_, correct := run.immediateReadbacks(ctx, state, state.step, []string{"summary"}, nil)
+			if correct || len(state.record.Readbacks) != 1 || state.record.Readbacks[0].Correct {
+				t.Fatalf("failed summary became correct: %+v", state.record.Readbacks)
+			}
+			if got := state.record.Readbacks[0].Error; got != tc.want {
+				t.Errorf("readback diagnostic = %q, want %q", got, tc.want)
+			}
+			if len(run.phase.Attempts) != 1 || run.phase.Attempts[0].Tool != "read.summary" {
+				t.Fatalf("immediate summary retried or changed calls: %+v", run.phase.Attempts)
+			}
+			if len(state.record.Errors) != 1 || state.record.Errors[0] != "immediate summary readback incorrect" {
+				t.Fatalf("required readback failure changed: %v", state.record.Errors)
+			}
+		})
+	}
+}
+
 func TestEditGateFreshnessPrefixSurvivesActualWireDecoding(t *testing.T) {
 	for _, mode := range []string{"compact", "toon", "gcx"} {
 		t.Run(mode, func(t *testing.T) {

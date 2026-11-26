@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -216,15 +217,28 @@ func (f *cleanLinkedSourceFixture) call(t *testing.T, root string, requestID int
 		return result, callErr
 	})
 	defer f.srv.facades.capture(leaf.tool, leaf.handler)
-	session := root
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	return f.readSource(t, f.session(t, ctx, root, root), requestID)
+}
+
+// session connects and initializes a facade session whose working directory
+// is root.
+func (f *cleanLinkedSourceFixture) session(t *testing.T, base context.Context, root, session string) context.Context {
+	t.Helper()
 	require.NoError(t, f.srv.ConnectSession(session, func([]byte) error { return nil }))
 	t.Cleanup(func() { f.srv.DisconnectSession(session) })
-	ctx, cancel := context.WithTimeout(WithSessionCWD(WithSessionID(t.Context(), session), root), 3*time.Second)
-	defer cancel()
-	ctx = f.srv.WithClientSession(ctx, session)
+	ctx := f.srv.WithClientSession(WithSessionCWD(WithSessionID(base, session), root), session)
 	f.srv.NoteSessionToolPolicy(session, FacadeSurfaceVersion, "hide")
 	require.NotNil(t, f.srv.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"gortex-load","version":"1"}}}`)))
 	f.srv.MCPServer().HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	return ctx
+}
+
+// readSource issues the registered read facade's source operation for the
+// fixture symbol.
+func (f *cleanLinkedSourceFixture) readSource(t *testing.T, ctx context.Context, requestID int) *mcplib.CallToolResult {
+	t.Helper()
 	args := map[string]any{"operation": "source", "target": map[string]any{"symbol": "repo/main.go::" + f.symbol}, "output": map[string]any{"format": "json", "max_bytes": 0}}
 	result, err := externalVersionRegisteredCall(f.srv, ctx, requestID, "read", args)
 	require.NoError(t, err)
@@ -355,5 +369,115 @@ func TestCleanLinkedPersistedSourceRealWriteNeverServesOldBytes(t *testing.T) {
 		require.NotContains(t, source, `return "clean"`)
 	} else {
 		require.Contains(t, resultText(result), "pending", "a true write may refuse but never certify old bytes")
+	}
+}
+
+// A normal read builds the linked checkout's pending owner, and the checkout
+// then publishes the same bytes. While a second reader is inside verified reuse
+// of that owner, a peer read either performs the checked retirement of the
+// unchanged bytes or, after a physical write, builds a new owner. The second
+// reader must keep serving the owned bytes in the first case and must never
+// serve them in the second.
+func TestCleanLinkedPersistedSourceOwnerRetirementAndPhysicalChange(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write bool
+	}{
+		{name: "checked_peer_retirement"},
+		{name: "physical_replacement", write: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selectedProjectionRegistry(t)
+			t.Setenv("GORTEX_QUERY_LOG_DISABLE", "1")
+			f := newCleanLinkedSourceFixture(t)
+			root := f.roots[1]
+			path := filepath.Join(root, "main.go")
+			const owned = "package sample\n\nfunc Target() string { return \"owned\" }\n"
+			const replacement = "package sample\n\nfunc Target() string { return \"replacement\" }\n"
+			require.NoError(t, os.WriteFile(path, []byte(owned), 0o644))
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			reader := f.session(t, ctx, root, "linked-owner-selected")
+			peer := f.session(t, ctx, root, "linked-owner-peer")
+
+			seed := f.readSource(t, peer, 2)
+			require.False(t, seed.IsError, resultText(seed))
+			require.Contains(t, extractTextResult(t, seed)["source"], `return "owned"`)
+			owner := liveEntry(pendingFileProjections, path)
+			require.NotNil(t, owner, "a normal linked read must retain its own pending projection")
+			require.Equal(t, blake3.Sum256([]byte(owned)), owner.rawHash)
+			require.Zero(t, owner.commitSeq, "the owner must have been built by a read")
+			require.Zero(t, owner.sourceCommitSeq)
+
+			refresh, err := f.srv.lifecycle.RequestCheckoutRefresh(ctx, f.ids[1].CheckoutID, root)
+			require.NoError(t, err)
+			require.Equal(t, f.ids[1].Incarnation, refresh.Incarnation)
+			select {
+			case completion, ok := <-refresh.Ticket.Done:
+				require.True(t, ok)
+				require.NoError(t, completion.Err)
+				require.True(t, completion.Reindexed)
+				require.Positive(t, completion.AppliedGeneration)
+			case <-ctx.Done():
+				t.Fatal("linked checkout did not publish the owned bytes")
+			}
+			require.Same(t, owner, liveEntry(pendingFileProjections, path), "route publication must leave the read-built owner in place")
+			require.False(t, owner.checkedRetired.Load())
+			stamp, err := statDiskStamp(path)
+			require.NoError(t, err)
+
+			observed := false
+			reader = context.WithValue(reader, checkedProjectionReadObserverKey{}, checkedProjectionReadObserver(func(build context.Context, selected *projectionEntry) {
+				if observed {
+					return
+				}
+				observed = true
+				require.Same(t, owner, selected)
+				require.NoError(t, build.Err())
+				if tc.write {
+					require.NoError(t, os.WriteFile(path, []byte(replacement), 0o644))
+				}
+				other := f.readSource(t, peer, 3)
+				require.False(t, other.IsError, resultText(other))
+				otherSource := extractTextResult(t, other)["source"]
+				current := liveEntry(pendingFileProjections, path)
+				latest, err := statDiskStamp(path)
+				require.NoError(t, err)
+				if tc.write {
+					require.Contains(t, otherSource, `return "replacement"`)
+					require.NotNil(t, current)
+					require.NotSame(t, owner, current)
+					require.Equal(t, blake3.Sum256([]byte(replacement)), current.rawHash)
+					require.False(t, owner.checkedRetired.Load())
+					require.False(t, stamp.matches(latest))
+				} else {
+					require.Contains(t, otherSource, `return "owned"`)
+					require.Nil(t, current)
+					require.True(t, owner.checkedRetired.Load(), "the peer must perform the checked retirement")
+					require.False(t, owner.suspect.Load())
+					require.True(t, stamp.matches(latest))
+				}
+			}))
+			actual := f.readSource(t, reader, 4)
+			require.True(t, observed, "the registered source read must reach verified owner reuse")
+			if !tc.write {
+				require.False(t, actual.IsError, resultText(actual))
+				require.Contains(t, extractTextResult(t, actual)["source"], `return "owned"`)
+				return
+			}
+			// A physical change may refuse, but it never certifies the old bytes.
+			if actual.IsError {
+				text := resultText(actual)
+				require.True(t, strings.Contains(text, errProjectedSourceMoved.Error()) || strings.Contains(text, "pending"), text)
+				return
+			}
+			if source, ok := extractTextResult(t, actual)["source"].(string); ok {
+				require.NotContains(t, source, `return "owned"`)
+				require.Contains(t, source, `return "replacement"`)
+			} else {
+				require.Contains(t, resultText(actual), "pending")
+			}
+		})
 	}
 }

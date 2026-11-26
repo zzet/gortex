@@ -213,35 +213,71 @@ func TestPostTaskBriefingPrintsPendingRelations(t *testing.T) {
 			"risk":"LOW","complete":false,"graph_freshness":"pending","pending_file_count":2,"pending_files":["a.go","b.go"]}`,
 		"worktree": `{"changed_files":["a.go"],"changed_symbols":[],"risk":"UNKNOWN","complete":false,"graph_status":"pending"}`,
 	} {
-		srv := newRecordingFakeServer(map[string]string{"detect_changes": detect, "get_test_targets": "a_test.go TestA\n"})
-		port := portFromURL(t, srv.URL)
-		started := time.Now()
-		for builder, briefing := range map[string]string{
-			"stop":     buildPostTaskBriefing(port, sessionScope{}),
-			"mutation": buildMutationBriefing(port, sessionScope{}),
-		} {
-			want := "relations: pending (2 files)"
-			if name == "worktree" {
-				want = "relations: pending (1 files)"
-			}
-			if !strings.Contains(briefing, want) || !strings.Contains(briefing, "`a.go`") {
-				t.Errorf("%s %s briefing missing %q and the changed files:\n%s", name, builder, want, briefing)
-			}
+		for _, event := range []string{"Stop", "PostToolUse"} {
+			t.Run(name+"/"+event, func(t *testing.T) {
+				srv := newRecordingFakeServer(map[string]string{"detect_changes": detect, "get_test_targets": "a_test.go TestA\n"})
+				defer srv.Close()
+				port := portFromURL(t, srv.URL)
+				started := time.Now()
+				briefing := captureBriefingHook(t, event, port, "")
+				want := "relations: pending (2 files)"
+				if name == "worktree" {
+					want = "relations: pending (1 files)"
+				}
+				if !strings.Contains(briefing, want) || !strings.Contains(briefing, "`a.go`") {
+					t.Errorf("briefing missing %q and the changed files:\n%s", want, briefing)
+				}
+				if n := srv.callCount("get_test_targets"); n != 0 {
+					t.Errorf("diagnostics ran over lagging relations (%d get_test_targets calls)", n)
+				}
+				// The wait deadline leaves time to label and return the diff.
+				calls := srv.argsFor("detect_changes")
+				if len(calls) != 1 {
+					t.Fatalf("detect_changes calls = %d, want 1", len(calls))
+				}
+				deadline, err := time.Parse(time.RFC3339Nano, fmt.Sprint(calls[0]["wait_deadline"]))
+				if err != nil || !deadline.After(started) || !deadline.Before(started.Add(detectChangesBudget)) {
+					t.Errorf("detect_changes wait_deadline %v does not end inside the %v budget", calls[0]["wait_deadline"], detectChangesBudget)
+				}
+			})
 		}
-		if n := srv.callCount("get_test_targets"); n != 0 {
-			t.Errorf("%s: diagnostics ran over lagging relations (%d get_test_targets calls)", name, n)
-		}
-		// The daemon waits for pending edits until wait_deadline and labels
-		// the rest. Without one it waits past the budget, and the labelled
-		// answer arrives after the briefing has given up on it.
-		for _, args := range srv.argsFor("detect_changes") {
-			deadline, err := time.Parse(time.RFC3339Nano, fmt.Sprint(args["wait_deadline"]))
-			if err != nil || !deadline.After(started) || !deadline.Before(started.Add(detectChangesBudget)) {
-				t.Errorf("%s: detect_changes wait_deadline %v does not end inside the %v budget", name, args["wait_deadline"], detectChangesBudget)
-			}
-		}
-		srv.Close()
 	}
+}
+
+func captureBriefingHook(t *testing.T, event string, port int, session string) string {
+	t.Helper()
+	input := postHookInput{HookEventName: event, SessionID: session}
+	if event == "PostToolUse" {
+		input.ToolName = "apply_patch"
+		input.ToolInput = map[string]any{"command": "*** Begin Patch"}
+		input.ToolResponse = "Done!"
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	out := captureStdout(t, func() {
+		if event == "Stop" {
+			runFromBytes(t, data, port)
+			return
+		}
+		withStdin(t, data, func() { RunCodex(port, CodexModeEnrich) })
+	})
+	elapsed := time.Since(started)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("%s briefing took %v", event, elapsed)
+	}
+	t.Logf("%s hook returned in %v", event, elapsed)
+	if out == "" {
+		return ""
+	}
+	decoded := decodeHookOutput(t, out)
+	briefing := decoded.HookSpecificOutput
+	if decoded.Decision != "" || briefing == nil || briefing.HookEventName != event || briefing.PermissionDecision != "" {
+		t.Fatalf("expected a %s advisory, got %s", event, out)
+	}
+	return briefing.AdditionalContext
 }
 
 // A detect_changes that does not answer within its budget is reported, and
@@ -276,27 +312,22 @@ func TestPostTaskBriefingBoundedWhenDetectStalls(t *testing.T) {
 
 	for name, srv := range map[string]*httptest.Server{"stalled": stalled, "refused late": late} {
 		port := portFromURL(t, srv.URL)
-		for builder, build := range map[string]func(int, sessionScope) string{
-			"stop":     buildPostTaskBriefing,
-			"mutation": buildMutationBriefing,
-		} {
+		for _, event := range []string{"Stop", "PostToolUse"} {
 			for session, report := range map[string]bool{"": true, "writer": true, "reader": false} {
 				if name != "stalled" && session != "" {
 					continue
 				}
-				started := time.Now()
-				briefing := build(port, sessionScope{SessionID: session})
-				if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-					t.Errorf("%s %s briefing took %v", name, builder, elapsed)
-				}
-				switch {
-				case !report && briefing != "":
-					t.Errorf("%s %s briefing warned session %q, which wrote nothing:\n%q", name, builder, session, briefing)
-				case report && !strings.Contains(briefing, "relations: pending"):
-					t.Errorf("%s %s briefing did not report the busy detect_changes to session %q:\n%q", name, builder, session, briefing)
-				case report && strings.Contains(briefing, "publishing"):
-					t.Errorf("%s %s briefing claims edits are publishing without an answer:\n%q", name, builder, briefing)
-				}
+				t.Run(name+"/"+event+"/session="+session, func(t *testing.T) {
+					briefing := captureBriefingHook(t, event, port, session)
+					switch {
+					case !report && briefing != "":
+						t.Errorf("briefing warned a session that wrote nothing:\n%q", briefing)
+					case report && !strings.Contains(briefing, "relations: pending"):
+						t.Errorf("briefing did not report the busy detect_changes:\n%q", briefing)
+					case report && strings.Contains(briefing, "publishing"):
+						t.Errorf("briefing claims edits are publishing without an answer:\n%q", briefing)
+					}
+				})
 			}
 		}
 	}

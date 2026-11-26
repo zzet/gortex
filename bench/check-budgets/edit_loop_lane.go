@@ -51,23 +51,20 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 	if err := writeNewJSON(filepath.Join(out, "inputs.json"), index); err != nil {
 		failures = append(failures, err)
 	}
-	d, loadErr := loadInputsChecked(filepath.Join(out, "inputs.json"), validateEditLoopReport)
+	d, loadErr := loadEditLoopInputs(filepath.Join(out, "inputs.json"))
 	scenarios := map[string]bool{}
 	for _, task := range plan.Tasks {
 		scenarios[task.Scenario] = true
 	}
+	var budgets []budget
 	rows := []editLoopRow{}
 	pass := true
 	for _, b := range p.Budgets {
 		if b.HostClass != c.HostClass || !scenarios[b.Scenario] || !slices.Contains(b.Lane, "edit-smoke") {
 			continue
 		}
-		row := editLoopRow{Metric: b.Metric, Scenario: b.Scenario, State: "UNAVAILABLE", Budget: b.Target, Unit: b.Unit}
-		if loadErr != nil {
-			row.Reason = loadErr.Error()
-		} else {
-			row = assessEditLoopRow(b, d)
-		}
+		budgets = append(budgets, b)
+		row := editLoopBudgetRow(b, d, loadErr)
 		if editLoopRowBlocks(row) {
 			pass = false
 		}
@@ -79,6 +76,9 @@ func finishEditLoopLaneEvidence(c laneConfig, p policy, plan lanePlan, out strin
 		if editLoopRowBlocks(row) {
 			pass = false
 		}
+	}
+	if err := writeEditLoopPerReportRows(filepath.Join(out, "budget-results-per-report.json"), budgets, d, loadErr); err != nil {
+		failures = append(failures, err)
 	}
 	var table bytes.Buffer
 	if err := printEditLoopRows(io.MultiWriter(stdout, &table), rows); err != nil {

@@ -170,6 +170,9 @@ type ResolveStats struct {
 	// one edge reindex batch during this pass. Callers that certify durable
 	// policy state must not certify a pass whose writes were refused.
 	WriteRefused bool `json:"write_refused,omitempty"`
+	// RefusedRebindFiles names sources whose incremental rebind batch the
+	// store could not confirm. Only stores with a checked apply report it.
+	RefusedRebindFiles map[string]struct{} `json:"-"`
 	// LSP* exposes the deferred whole-pass circuit-breaker outcome. These are
 	// diagnostic counters: skipped edges keep the heuristic result produced by
 	// the normal resolve cascade and remain eligible for a later full pass.
@@ -3586,14 +3589,29 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		r.noteImportEdgeReindexes(reindexBatch)
 		applied := r.applyReindexEdges(reindexBatch)
 		legs.lap("reindex")
+		recordRefusedRebindFiles := func() {
+			if stats.RefusedRebindFiles == nil {
+				stats.RefusedRebindFiles = make(map[string]struct{})
+			}
+			for _, rebind := range reindexBatch {
+				if rebind.Edge == nil {
+					continue
+				}
+				if file := r.edgeCallerFile(rebind.Edge); file != "" {
+					stats.RefusedRebindFiles[file] = struct{}{}
+				}
+			}
+		}
 		if !applied {
 			stats.WriteRefused = true
+			recordRefusedRebindFiles()
 			return
 		}
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, reindexBatch); !ok {
 			stats.WriteRefused = true
+			recordRefusedRebindFiles()
 			r.notePassWriteRefused()
 		}
 		for _, ri := range reindexBatch {

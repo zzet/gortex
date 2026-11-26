@@ -28,23 +28,25 @@ const (
 )
 
 type startupOptions struct {
-	Restarts   int
-	SeedStore  string
-	NoCheckout bool
+	Restarts      int
+	SeedStore     string
+	NoCheckout    bool
+	ScopeEvidence bool
 }
 
 func bindStartupFlags(f *flag.FlagSet, o *startupOptions) {
 	f.IntVar(&o.Restarts, "restarts", 0, "startup: warm restarts after the initial boot, each probed from before its socket exists")
 	f.StringVar(&o.SeedStore, "seed-store", "", "startup: store file copied into the private run before the initial boot, e.g. one written by an older schema; the source is only read")
 	f.BoolVar(&o.NoCheckout, "startup-no-checkout", false, "startup: create linked Git worktrees without checking out files; linked Read hook targets remain absent")
+	f.BoolVar(&o.ScopeEvidence, "startup-scope-evidence", false, "startup: retain bounded primary-scope MCP responses from serving and native Grep decisions around readiness")
 }
 
 func (o startupOptions) validate(scenario string) error {
 	if o.Restarts < 0 {
 		return errors.New("--restarts must be nonnegative")
 	}
-	if scenario != startupScenario && (o.Restarts != 0 || o.SeedStore != "" || o.NoCheckout) {
-		return errors.New("--restarts, --seed-store and --startup-no-checkout apply to the startup scenario only")
+	if scenario != startupScenario && (o.Restarts != 0 || o.SeedStore != "" || o.NoCheckout || o.ScopeEvidence) {
+		return errors.New("--restarts, --seed-store, --startup-no-checkout and --startup-scope-evidence apply to the startup scenario only")
 	}
 	return nil
 }
@@ -65,6 +67,7 @@ type bootTiming struct {
 	CensusErrors       []string                   `json:"census_errors"`
 	Views              json.RawMessage            `json:"views"`
 	TransitionEvidence *startupTransitionEvidence `json:"transition_evidence,omitempty"`
+	ScopeEvidence      *startupScopeEvidence      `json:"scope_evidence,omitempty"`
 }
 
 func runStartupPhase(ctx context.Context, o runOptions, corpora []Corpus, outputRoot string) (phase Phase, _ []SweepEntry, artifacts map[string]string, crashes map[string]int, version string, resultErr error) {
@@ -196,6 +199,13 @@ func runStartupBoot(ctx context.Context, o runOptions, p *privateRun, probe *sta
 		return timing, err
 	}
 	primary := configured[0].Corpus.Label
+	var scope *startupScopeObserver
+	scopeReady := false
+	if o.Startup.ScopeEvidence {
+		scope = startStartupScopeObserver(ctx, p, probe, timing.Started)
+		timing.ScopeEvidence = &scope.evidence
+		defer scope.close()
+	}
 	var transitions *startupTransitionObserver
 	if o.Worktrees >= 24 {
 		transitions = startStartupTransitionObserver(ctx, p, configured[0], timing.Started, o.WarmTimeout)
@@ -224,6 +234,10 @@ func runStartupBoot(ctx context.Context, o runOptions, p *privateRun, probe *sta
 			transitions.observeCatalog(ctx, p)
 		}
 		ready, registered := timing.ReadyAt[primary]
+		if scope != nil && registered && !scopeReady {
+			scope.observeReady()
+			scopeReady = true
+		}
 		if registered && now.Sub(ready) <= startupCoordinatorWindow {
 			readCoordinators(ctx, p, &timing)
 		}

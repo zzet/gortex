@@ -504,12 +504,13 @@ func contractReceiptContent(payload []byte, source string) string {
 // the scan and the census. seenAt is the clock of the latest scan, full or
 // point, that observed a path's current stamp.
 type contractChangeClock struct {
-	clock      uint64
-	last       map[string]ContractReceiptStamp
-	lastCensus map[string]bool
-	changedAt  map[string]uint64
-	seenAt     map[string]uint64
-	maxChanged uint64
+	clock           uint64
+	censusChangedAt uint64
+	last            map[string]ContractReceiptStamp
+	lastCensus      map[string]bool
+	changedAt       map[string]uint64
+	seenAt          map[string]uint64
+	maxChanged      uint64
 }
 
 func (c *contractChangeClock) observe(stamps map[string]ContractReceiptStamp, census map[string]bool) uint64 {
@@ -535,14 +536,20 @@ func (c *contractChangeClock) observe(stamps map[string]ContractReceiptStamp, ce
 			mark(path)
 		}
 	}
-	for path := range census {
+	for path, live := range census {
 		if !c.lastCensus[path] {
 			mark(path)
+			if live {
+				c.censusChangedAt = c.clock
+			}
 		}
 	}
-	for path := range c.lastCensus {
+	for path, wasLive := range c.lastCensus {
 		if !census[path] {
 			mark(path)
+			if wasLive {
+				c.censusChangedAt = c.clock
+			}
 		}
 	}
 	c.last = stamps

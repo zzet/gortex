@@ -3205,6 +3205,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 			if observe != nil && content != nil {
 				observe(content)
 			}
+			w.markRefusedRelationTiers(path, generation, true)
 			stamps.recordNativeMtimeDuplicate()
 			return nil
 		}

@@ -2661,7 +2661,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mtimes.end()
 
 	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
-		mode.onRelations()
+		mode.onRelations(batch.pointRebindRefused)
 	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 	derived := mode.publication.beginDerivedPatchLap()

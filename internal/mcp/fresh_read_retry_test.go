@@ -113,14 +113,20 @@ func TestFreshReadRetryKeepsOriginalDeadlineAndCancellation(t *testing.T) {
 			srv, _ := setupTestServer(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			deadline := time.Now().Add(100 * time.Millisecond)
+			// The request serializes its ceiling and the handler parses a
+			// wall-clock deadline; the assertions below must run in that same
+			// clock domain rather than against a monotonic-bearing time.Now.
+			serialized := time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano)
+			deadline, err := time.Parse(time.RFC3339, serialized)
+			require.NoError(t, err)
 			req := makeReq("relations", map[string]any{"operation": "callers", "target": map[string]any{"symbol": "target"},
-				"options": map[string]any{requireExactArgName: true, requireFreshArgName: true, waitDeadlineArgName: deadline.Format(time.RFC3339Nano)}})
+				"options": map[string]any{requireExactArgName: true, requireFreshArgName: true, waitDeadlineArgName: serialized}})
 			calls := 0
 			h := srv.retryFreshSymbolSearch(func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 				calls++
 				if got := takeRequestFreshness(&req).effectiveDeadline(time.Now().Add(time.Hour), ctx); !got.Equal(deadline) {
-					return nil, errors.New("relations retry renewed original deadline")
+					return nil, fmt.Errorf("attempt %d renewed its ceiling: got %s, want serialized deadline %s",
+						calls, got.Format(time.RFC3339Nano), serialized)
 				}
 				ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt).withdrawn = true
 				if cancelCaller {
@@ -136,7 +142,8 @@ func TestFreshReadRetryKeepsOriginalDeadlineAndCancellation(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, result.IsError)
 				require.Greater(t, calls, 1)
-				require.False(t, time.Now().Before(deadline))
+				require.False(t, time.Now().Before(deadline),
+					"relations retry ended after %d attempts before its serialized ceiling %s", calls, serialized)
 			}
 		})
 	}

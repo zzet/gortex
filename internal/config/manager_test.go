@@ -153,6 +153,102 @@ llm:
 	require.True(t, ok, "repo-local llm.custom must be honored with opt-in")
 }
 
+// TestGetRepoConfig_RepoLocalSemanticProvidersGated verifies that semantic
+// providers declared in a repo-local .gortex.yaml are dropped unless the
+// operator opts in via GORTEX_ALLOW_LOCAL_SEMANTIC_PROVIDERS — otherwise a
+// cloned repo can make the victim's daemon spawn attacker-chosen subprocesses
+// (an scip indexer or an LSP server).
+func TestGetRepoConfig_RepoLocalSemanticProvidersGated(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+semantic:
+  providers:
+    - name: evil
+      command: "/bin/sh"
+      args: ["-c", "cat"]
+      languages: ["go"]
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	// Default (no opt-in): the repo-local semantic provider is dropped.
+	t.Setenv(SemanticProvidersLocalOptInEnv, "0")
+	cfg := cm.GetRepoConfig("my-repo")
+	require.Empty(t, cfg.Semantic.Providers)
+
+	// Opted in: the provider is honoured.
+	t.Setenv(SemanticProvidersLocalOptInEnv, "1")
+	cfg = cm.GetRepoConfig("my-repo")
+	require.Len(t, cfg.Semantic.Providers, 1)
+	require.Equal(t, "/bin/sh", cfg.Semantic.Providers[0].Command)
+}
+
+// TestGetRepoConfig_RepoLocalTransformsGated verifies that transforms declared
+// in a repo-local .gortex.yaml are dropped unless the operator opts in via
+// GORTEX_ALLOW_LOCAL_TRANSFORMS — otherwise a cloned repo can make the victim's
+// indexer run attacker-chosen commands on matching files.
+func TestGetRepoConfig_RepoLocalTransformsGated(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+index:
+  transforms:
+    - name: poc
+      extensions: [".go"]
+      command: ["sh", "-c", "cat"]
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	// Default (no opt-in): the repo-local transform is dropped.
+	t.Setenv(TransformsLocalOptInEnv, "0")
+	cfg := cm.GetRepoConfig("my-repo")
+	require.Empty(t, cfg.Index.Transforms)
+
+	// Opted in: the transform is honoured.
+	t.Setenv(TransformsLocalOptInEnv, "1")
+	cfg = cm.GetRepoConfig("my-repo")
+	require.Len(t, cfg.Index.Transforms, 1)
+	require.Equal(t, []string{"sh", "-c", "cat"}, cfg.Index.Transforms[0].Command)
+}
+
+// TestGetRepoConfig_RepoLocalGrammarsGated verifies that grammar declarations
+// in a repo-local .gortex.yaml are dropped unless the operator opts in via
+// GORTEX_ALLOW_LOCAL_GRAMMARS — otherwise a cloned repo can inject
+// attacker-chosen native code (a dlopen'd shared object) into the victim's
+// indexer at startup.
+func TestGetRepoConfig_RepoLocalGrammarsGated(t *testing.T) {
+	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
+	require.NoError(t, err)
+
+	repoDir := t.TempDir()
+	wsContent := `
+index:
+  grammars:
+    - language: evil
+      library: /tmp/evil.so
+      extensions: [".evil"]
+`
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, ".gortex.yaml"), []byte(wsContent), 0644))
+	cm.LoadWorkspaceConfig("my-repo", repoDir)
+
+	// Default (no opt-in): the repo-local grammar is dropped.
+	t.Setenv(GrammarsLocalOptInEnv, "0")
+	cfg := cm.GetRepoConfig("my-repo")
+	require.Empty(t, cfg.Index.Grammars)
+
+	// Opted in: the grammar is honoured.
+	t.Setenv(GrammarsLocalOptInEnv, "1")
+	cfg = cm.GetRepoConfig("my-repo")
+	require.Len(t, cfg.Index.Grammars, 1)
+	require.Equal(t, "/tmp/evil.so", cfg.Index.Grammars[0].Library)
+}
+
 func TestEffectiveExclude_WorkspaceAppendsToBuiltin(t *testing.T) {
 	cm, err := NewConfigManager("/tmp/nonexistent-gortex-test-cm/config.yaml")
 	require.NoError(t, err)

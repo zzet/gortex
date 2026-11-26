@@ -6,12 +6,16 @@ Code intelligence engine written in Go. Indexes repositories into a knowledge gr
 
 ```bash
 CGO_CFLAGS="-O2 -g -fno-strict-aliasing" CGO_CXXFLAGS="-O2 -g -fno-strict-aliasing" \
-  go build -o gortex ./cmd/gortex/   # requires CGO (tree-sitter C bindings)
+  go build -trimpath -o gortex ./cmd/gortex/   # requires CGO (tree-sitter C bindings)
 make test PKGS=./internal/<pkg>/... # packages you touched; CI runs the full suite
 ```
 
-`make test` (all packages when `PKGS` is unset) runs `go test -race` with SQLite's transpiled C and libc left out of
-race instrumentation, as CI does. Plain `go test -race ./...` instruments them
+`-trimpath` keeps the Go build cache shared across worktrees — without it every checkout caches its own copy of
+every package. It costs IDE click-through on stack traces, and a debugger needs a source-path substitution. CI builds
+untrimmed (stable checkout paths), so the two configurations do not share cache entries.
+
+`make test` (all packages when `PKGS` is unset) runs `go test -trimpath -race` with SQLite's transpiled C and libc left
+out of race instrumentation, as CI does (CI omits `-trimpath`). Plain `go test -race ./...` instruments them
 too, which makes `store_sqlite`, `indexer` and `mcp` several times slower and
 can trip package timeouts. To run a heavy package with one worker per CPU like
 CI: `TEST_RACE=true go run ./scripts/ci-test --partition indexer:1/2`.
@@ -25,7 +29,7 @@ Building with clang (`CC=clang CXX=clang++`) is another option.
 
 - **Languages:** go (primary)
 - **Entry point:** `cmd/gortex/main.go`
-- **Source:** 1,338 Go files (728 non-test) across the `cmd/` and `internal/` trees
+- **Source:** ~7,300 Go files (~2,700 non-test) across the `cmd/` and `internal/` trees
 - **Graph size:** ~31k nodes, ~206k edges when the daemon indexes this repo
 
 ## MANDATORY: Use Gortex's graph tools instead of file reads and text search
@@ -87,7 +91,7 @@ Selected via `llm.provider` in `.gortex.yaml` or `~/.config/gortex/config.yaml`.
 - **Capability edges** — `reads_env` / `executes_process` / `accesses_field` are first-class traversable edges (in the `walk_graph`/`nav`/`graph_query` surface) synthesised post-resolution, so a supply-chain / least-privilege audit can ask "what reads $AWS_SECRET", "what shells out", "what writes this field" in one hop.
 - **PR review, end-to-end** — `gortex prs` triages open pull requests from the graph (`gortex prs <N>` for one PR; `--triage` / `--conflicts` / `--worktrees` / `--base` / `--format`; `gortex prs bundle`), and `gortex review [<base>|--diff] [--audience agent|human] [--post]` reviews a diff. The MCP surface mirrors it: `pr_risk` / `list_prs` / `get_pr_impact` / `triage_prs` / `conflicts_prs` / `suggest_reviewers` score and rank PRs against the graph, while `review` / `review_pack` / `post_review` / `pr_review_context` / `suggested_review_questions` / `critique_review` / `suppress_finding` drive the review itself.
 - **Multimodal + broad ingest** — image files (`KindImage` assets with format/dimensions/sha256) and PDF documents (per-page searchable `KindDoc` nodes) are graph nodes; new first-class extractors cover Terraform/HCL cross-block references, Helm charts/templates, Ansible playbooks, .NET `.sln`/`.csproj`, MCP server configs, Quarto `.qmd`, Luau, COBOL paragraphs + JCL, and C/C++ `#define` macros. Grammar-less languages can register a regex fallback chunker (`index.fallback_chunkers`) or an external extractor plugin (`index.extractor_plugins`) from config — no fork. `gortex db schema --postgres <dsn>` ingests a live database's schema.
-- **`analyze` is a 61-kind dispatcher** — beyond the structural kinds, it now covers `impact` (composite change-risk score), `bottlenecks` (interprocedural computation-bottleneck risk — cognitive complexity, loop depth, transitive/hidden-O(n^k) loop nesting across calls, unguarded recursion), `health_score` (per-symbol A–F grade), `sast` / `named` / `unsafe_patterns` (security), `clusters`, `suggest_boundaries` (Leiden-community-seeded architecture-layer suggestions), `connectivity_health`, `tests_as_edges`, `synthesizers` (framework-dispatch-synthesized edges, grouped by pass + provenance), `resolution_outcomes` (structured why-unresolved taxonomy), `review` (an idiomatic/correctness rulepack — NPE, thread-safety check-then-act, N+1, logic errors across Go + Python — with a graph-grounded false-positive-reduction pass), and more.
+- **`analyze` is a 78-kind dispatcher** — beyond the structural kinds, it now covers `impact` (composite change-risk score), `bottlenecks` (interprocedural computation-bottleneck risk — cognitive complexity, loop depth, transitive/hidden-O(n^k) loop nesting across calls, unguarded recursion), `health_score` (per-symbol A–F grade), `sast` / `named` / `unsafe_patterns` (security), `clusters`, `suggest_boundaries` (Leiden-community-seeded architecture-layer suggestions), `connectivity_health`, `tests_as_edges`, `synthesizers` (framework-dispatch-synthesized edges, grouped by pass + provenance), `resolution_outcomes` (structured why-unresolved taxonomy), `review` (an idiomatic/correctness rulepack — NPE, thread-safety check-then-act, N+1, logic errors across Go + Python — with a graph-grounded false-positive-reduction pass), and more.
 
 ## MANDATORY: Session memory — save, recall, distill
 

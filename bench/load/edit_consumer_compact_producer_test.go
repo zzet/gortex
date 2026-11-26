@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
@@ -69,7 +70,7 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 	corpus.Symbol = "main.go::helper"
 	corpus.Query = "helper"
 	corpus.ProposedSignature = "func helper(probe int) int"
-	call := func(t *testing.T, probe request, compact bool) json.RawMessage {
+	call := func(t *testing.T, probe request, format string) json.RawMessage {
 		t.Helper()
 		tool := server.MCPServer().GetTool(probe.Tool)
 		if tool == nil {
@@ -78,9 +79,9 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 		// A real single-indexer server owns unprefixed graph paths; benchmark
 		// multi-repo dispatch prefixing is tested separately below.
 		args := copyJSON(probe.Arguments)
-		args["output"] = map[string]any{"format": "json", "max_bytes": 0}
-		if compact {
-			args["output"].(map[string]any)["compact"] = true
+		args["output"] = map[string]any{"format": format, "max_bytes": 0}
+		if format == "compact" {
+			args["output"] = map[string]any{"format": "json", "compact": true, "max_bytes": 0}
 		}
 		req := mcplib.CallToolRequest{}
 		req.Params.Name, req.Params.Arguments = probe.Tool, args
@@ -94,7 +95,7 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 		}
 		return raw
 	}
-	baseline, err := decodeEditProbeOutput(call(t, editConsumerDeadCodeRequest(), false), "json", "analyze.dead_code")
+	baseline, err := decodeEditProbeOutput(call(t, editConsumerDeadCodeRequest(), "json"), "json", "analyze.dead_code")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +115,7 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 		t.Run(oracle.name, func(t *testing.T) {
 			// Prove the actual JSON producer and semantic subject first, independently
 			// of the compact parser under test. This is no fallback for compact credit.
-			rich, err := decodeEditProbeOutput(call(t, oracle.call, false), "json", oracle.call.name())
+			rich, err := decodeEditProbeOutput(call(t, oracle.call, "json"), "json", oracle.call.name())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -125,7 +126,7 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 			if got := runtime.consumerVerdict(oracle.name, rich, corpus, step); got != want {
 				t.Fatalf("real JSON positive prerequisite: got %q want %q body=%v", got, want, rich)
 			}
-			raw := call(t, oracle.call, true)
+			raw := call(t, oracle.call, "compact")
 			text, err := editOutputPayload(raw, false)
 			if err != nil {
 				t.Fatal(err)
@@ -142,6 +143,48 @@ func TestEditConsumerCompactActualProducers(t *testing.T) {
 			}
 			if oracle.name == "consumer_verify" && (rich["return_usage"] == nil || !reflect.DeepEqual(body["return_usage"], rich["return_usage"])) {
 				t.Fatalf("compact lost actual JSON return-usage distribution: compact=%v JSON=%v", body["return_usage"], rich["return_usage"])
+			}
+			if oracle.name != "consumer_detect" {
+				t.Run("gcx_request", func(t *testing.T) {
+					raw := call(t, oracle.call, "gcx")
+					gcx := oracle
+					gcx.name += "_gcx"
+					gcx.call.Arguments = copyJSON(gcx.call.Arguments)
+					gcx.call.Arguments["output"] = map[string]any{"format": "gcx"}
+					now := time.Now()
+					sink := newEditProbeHeldSink(t)
+					sink.unblock()
+					s := startHeldEditProbeSpool(t, sink)
+					s.step = step
+					s.step.ProbeMode = "json"
+					s.record.Consumers = make(map[string]editConsumerObservation)
+					s.acknowledged = now
+					runtime.origin, runtime.p = now, &privateRun{Repos: []privateRepo{{Corpus: corpus}}}
+					identity := wireCallIdentity{ID: 1, WriteStarted: now.Add(time.Millisecond), Finished: now.Add(2 * time.Millisecond)}
+					if err := runtime.observeConsumer(s, gcx, raw, identity, nil); err != nil {
+						t.Fatal(err)
+					}
+					row := s.record.Consumers[gcx.name]
+					if row.State != want || row.RequestedMode != "gcx" || row.Assessed != 1 {
+						t.Fatalf("actual GCX request did not retain consumer proof: %+v (want %s)", row, want)
+					}
+					s.finishRaw()
+					var event struct {
+						Requested  string `json:"requested_mode"`
+						Served     string `json:"output_mode"`
+						RenameSite bool   `json:"rename_site_observed"`
+					}
+					if err := json.Unmarshal(sink.data.Bytes(), &event); err != nil {
+						t.Fatal(err)
+					}
+					served := "toon"
+					if oracle.name == "consumer_dead_code" {
+						served = "gcx"
+					}
+					if event.Requested != "gcx" || event.Served != served || event.RenameSite != (oracle.name == "consumer_rename") {
+						t.Fatalf("GCX request mode attribution or site lost: %+v, want served=%q", event, served)
+					}
+				})
 			}
 		})
 	}

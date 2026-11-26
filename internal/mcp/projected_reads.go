@@ -83,6 +83,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	buildCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	layers := append([]graph.OverlayLayerReader(nil), requestProjectionLayers(ctx)...)
+	sourceID, _ := ctx.Value(indexedSymbolSourceTargetKey{}).(string)
 	for _, graphPath := range paths {
 		if err := buildCtx.Err(); err != nil {
 			if ctx.Err() != nil {
@@ -150,13 +151,14 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				markRequestProjectionDeferred(ctx, graphPath, "external_write")
 				continue
 			}
-			layer, err := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry)
-			if err != nil {
-				// Carry is optional relation evidence. Unknown checked capability
-				// keeps the exact file projection, with its pending relation facts.
-				// Required disk/parse failures above and actual cancellation still
-				// refuse; no errorless or canonical carry fallback is introduced.
-				layer = entry.layer
+			var layer graph.OverlayLayerReader = entry.layer
+			// Source hydration needs the checked file's exact symbol and bytes.
+			// Avoid spending its allowance on optional relation carry once the
+			// source handler's target is present in that immutable layer.
+			if sourceID == "" || entry.layer.NodeByID(sourceID) == nil {
+				if carried, carryErr := projectedFileVisibility(buildCtx, s.requestSelectedBaseReader(ctx), entry); carryErr == nil {
+					layer = carried
+				}
 			}
 			if err := buildCtx.Err(); err != nil {
 				if ctx.Err() != nil {
@@ -170,14 +172,19 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 				if auditedSourceProjectionMismatch(ctx, err) {
 					return ctx, errProjectedSourceMoved
 				}
-				// This entry was already selected for checked retirement/carry.
-				// A new owner forbids serving its old facts or falling back.
+				// A new owner forbids serving the selected entry's old facts or
+				// falling back.
 				return ctx, err
 			}
 			layers = append(layers, layer)
 		}
 	}
-	if err := validateRequestProjectionStage(ctx, projectionReadSelection); err != nil {
+	if guard, err := requestProjectionStageRefusal(ctx, projectionReadSelection); err != nil {
+		allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+		if allowance != nil && allowance.afterFreshness && allowance.tool == "get_callers" &&
+			(guard == projectionOwnerAbsentBefore || guard == projectionOwnerAbsentAfter) && retryAfterCheckedProjectionChange(ctx) {
+			return ctx, errProjectedSourceMoved
+		}
 		return ctx, err
 	}
 	if len(layers) == 0 {
@@ -227,6 +234,11 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	root, readPath, key, err := selectedProjectionReadPath(requestCtx, idx.RootPath(), idx.RepoPrefix(), abs)
 	if err != nil {
 		return nil, err
+	}
+	summary, _ := requestCtx.Value(canonicalSummarySourceKey{}).(*canonicalSummarySource)
+	var registry *projectionSnapshot
+	if summary != nil && sameVersion == nil && tracked && pendingFileProjections.enabled {
+		registry = pendingFileProjections.snap.Load()
 	}
 	observed := pendingFileProjections.captureReadExpectation(key)
 	expected := observed.entry
@@ -318,7 +330,12 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 				if current := checkedPendingSearchCOWSuccessor(buildCtx, expected); current != nil {
 					return current, nil
 				}
-				return nil, predicateError("selection.owner_before_retain", expected, currentOwner, func(r *projectionPredicateSample) { r.currentSeen = true; r.decision = "owner_changed_before_retain" })
+				refusal := predicateError("selection.owner_before_retain", expected, currentOwner, func(r *projectionPredicateSample) { r.currentSeen = true; r.decision = "owner_changed_before_retain" })
+				if currentOwner == nil && retryAfterCheckedProjectionBindRetirement(buildCtx, expected, &observed.sourceEvents) {
+					retainPredicateError(buildCtx, refusal)
+					return nil, errProjectedSourceMoved
+				}
+				return nil, refusal
 			}
 			if err := buildCtx.Err(); err != nil {
 				return nil, err
@@ -356,6 +373,13 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 			return nil, err
 		}
 		if matches {
+			if registry != nil && expected == nil && registry.entries[key] == nil &&
+				pendingFileProjections.snap.Load() == registry && buildCtx.Err() == nil {
+				*summary = canonicalSummarySource{
+					indexer: idx, root: root, abs: abs, readPath: readPath, key: key,
+					graphPath: graphPath, stamp: after, bytes: raw, registry: registry,
+				}
+			}
 			return nil, nil
 		}
 	} else if expected == nil {
@@ -425,10 +449,11 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu             sync.RWMutex
-	entries        map[string]*projectionEntry
-	deferredFiles  map[string]string   // projection deferral observations, not publication authority
-	storeBusyFiles map[string]struct{} // selected store sections were unavailable
+	mu                sync.RWMutex
+	entries           map[string]*projectionEntry
+	deferredFiles     map[string]string   // projection deferral observations, not publication authority
+	storeBusyFiles    map[string]struct{} // selected store sections were unavailable
+	callChainBoundary callChainFreshnessBoundary
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {
@@ -499,6 +524,10 @@ func requestStoreBusyFiles(ctx context.Context) []string {
 func retainRequestProjection(ctx context.Context, entry *projectionEntry) (context.Context, error) {
 	ctx = withRequestProjectionFacts(ctx)
 	if guard, _ := predicateRefusal(ctx, projectionReadRetain, entry); guard != projectionOwnerLive {
+		absent := guard == projectionOwnerAbsentBefore || guard == projectionOwnerAbsentAfter
+		if absent && retryAfterCheckedProjectionBindRetirement(ctx, entry, nil) {
+			return ctx, errProjectedSourceMoved
+		}
 		return ctx, annotateProjectionReadRefusal(projectionReadRetain, guard, projectionSuperseded)
 	}
 	facts := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
@@ -519,24 +548,29 @@ func validateRequestProjections(ctx context.Context) error {
 }
 
 func validateRequestProjectionStage(ctx context.Context, stage projectionReadStage) error {
+	_, err := requestProjectionStageRefusal(ctx, stage)
+	return err
+}
+
+func requestProjectionStageRefusal(ctx context.Context, stage projectionReadStage) (projectionLivenessGuard, error) {
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
-		return nil
+		return projectionOwnerLive, nil
 	}
 	facts.mu.RLock()
 	defer facts.mu.RUnlock()
 	if len(facts.entries) == 0 {
-		return nil
+		return projectionOwnerLive, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return projectionOwnerLive, err
 	}
 	for _, entry := range facts.entries {
 		if guard, _ := predicateRefusal(ctx, stage, entry); guard != projectionOwnerLive {
-			return annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
+			return guard, annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
 		}
 	}
-	return nil
+	return projectionOwnerLive, nil
 }
 
 func withProjectedReadToolFacts(ctx context.Context, name string) context.Context {

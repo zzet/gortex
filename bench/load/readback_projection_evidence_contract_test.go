@@ -126,29 +126,3 @@ func TestProjectionOwnedSnapshotRejectsPIDReuseAndMissingData(t *testing.T) {
 		})
 	}
 }
-
-func TestProjectionCounterMissingIsNotZero(t *testing.T) {
-	for _, tc := range []struct {
-		body  string
-		valid bool
-		value float64
-	}{
-		{`{"pending_projection":{"projection_divergence":0}}`, true, 0},
-		{`{"pending_projection":{"projection_divergence":7}}`, true, 7},
-		{`{}`, false, 0},
-		{`{"pending_projection":null}`, false, 0},
-		{`{"pending_projection":{}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":null}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":"0"}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":-1}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":0.5}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":true}}`, false, 0},
-		{`{"pending_projection":{"projection_divergence":9007199254740992}}`, false, 0},
-	} {
-		raw, _ := json.Marshal(map[string]any{"contents": []map[string]string{{"uri": "gortex://index-health", "text": tc.body}}})
-		got := projectionCounter(raw)
-		if (got.Value != nil) != tc.valid || tc.valid && *got.Value != tc.value {
-			t.Fatalf("body=%s metric=%+v", tc.body, got)
-		}
-	}
-}

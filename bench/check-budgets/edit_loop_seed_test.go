@@ -79,6 +79,30 @@ func TestEditLoopCollectorSeedUsesExplicitTaskAndActualProcessArguments(t *testi
 	}
 }
 
+func TestEditLoopCollectorRequiresSelectedSeed(t *testing.T) {
+	for _, tc := range []struct {
+		requested  string
+		configured string
+	}{
+		{requested: "none"},
+		{requested: "ack-wait", configured: "ack-wait"},
+		{requested: "closed-read-gate", configured: "closed-read-gate"},
+		{requested: "none", configured: "ack-wait"},
+		{requested: "ack-wait", configured: "closed-read-gate"},
+		{requested: "closed-read-gate"},
+	} {
+		t.Run(tc.requested+"/"+tc.configured, func(t *testing.T) {
+			config := editLoopSeedConfig(t, tc.configured, "smoke")
+			var out, diagnostics bytes.Buffer
+			code := run([]string{"edit-plan", "--config", config, "--budgets", "../budgets.yaml", "--require-edit-gate-seed", tc.requested}, &out, &diagnostics)
+			want := tc.requested == tc.configured || tc.requested == "none" && tc.configured == ""
+			if want != (code == 0) || !want && !strings.Contains(diagnostics.String(), "configuration selects the wrong edit gate seed") {
+				t.Fatalf("requested=%q config=%q exit=%d: %s", tc.requested, tc.configured, code, diagnostics.String())
+			}
+		})
+	}
+}
+
 func TestEditLoopSixRepoReadP95RemainsVisibleWithoutInventedBudget(t *testing.T) {
 	var out, diagnostics bytes.Buffer
 	code := run([]string{"edit-loop", "--budgets", "../budgets.yaml", "--scenario", "multirepoedit-6", "--inputs", filepath.Join(t.TempDir(), "absent.json")}, &out, &diagnostics)

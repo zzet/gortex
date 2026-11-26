@@ -27,6 +27,8 @@ concurrency:
 
 env:
   CGO_ENABLED: '1'
+  CC: clang
+  CXX: clang++
   CGO_CFLAGS: -O2 -g -fno-strict-aliasing
   CGO_CXXFLAGS: -O2 -g -fno-strict-aliasing
   GOTOOLCHAIN: local
@@ -41,7 +43,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
       - name: Build the exact candidate and gate commands
@@ -75,28 +77,18 @@ jobs:
             closed-read-gate) config="$EDIT_GATE_CLOSED_SEED_CONFIG" ;;
             *) exit 2 ;;
           esac
-          # Keep the reviewed config in place: its corpus/build paths are
-          # config-relative. Verify the requested fault matches actual tasks.
-          python3 - "$config" "$EDIT_GATE_SEED" <<'PY'
-          import json, sys
-          with open(sys.argv[1], encoding="utf-8") as source:
-              config = json.load(source)
-          expected = "" if sys.argv[2] == "none" else sys.argv[2]
-          if config.get("edit_gate_seed", "") != expected:
-              raise SystemExit("reviewed config disagrees with the requested fault")
-          PY
           "$RUNNER_TEMP/edit-check-budgets" edit-collect \
-            --config "$config" --require-lane smoke \
+            --config "$config" --require-lane smoke --require-edit-gate-seed "$EDIT_GATE_SEED" \
             --expected-candidate "$EXPECTED_CANDIDATE" \
             --candidate-binary "$RUNNER_TEMP/edit-candidate" \
             --load-binary "$RUNNER_TEMP/edit-load" \
-            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID"
+            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - name: Preserve raw JSON, failed rows and owned stop receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: edit-smoke-${{ inputs.seed }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}/
+          name: edit-smoke-${{ inputs.seed }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}-${{ github.run_attempt }}/
           retention-days: 90
           if-no-files-found: error
 
@@ -106,7 +98,7 @@ jobs:
     timeout-minutes: 1440
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
       - name: Build the normal production candidate and gate commands
@@ -127,16 +119,16 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/edit-check-budgets" edit-collect \
-            --config "$EDIT_GATE_REFERENCE_NIGHTLY_CONFIG" --require-lane nightly \
+            --config "$EDIT_GATE_REFERENCE_NIGHTLY_CONFIG" --require-lane nightly --require-edit-gate-seed none \
             --expected-candidate "$EXPECTED_CANDIDATE" \
             --candidate-binary "$RUNNER_TEMP/edit-candidate" \
             --load-binary "$RUNNER_TEMP/edit-load" \
-            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID"
+            --out "$RUNNER_TEMP/edit-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - name: Preserve every matrix report, failure and owned stop receipt
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: edit-nightly-${{ github.run_id }}
-          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}/
+          name: edit-nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/edit-evidence-${{ github.run_id }}-${{ github.run_attempt }}/
           retention-days: 90
           if-no-files-found: error

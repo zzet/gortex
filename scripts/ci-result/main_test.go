@@ -127,7 +127,7 @@ func TestCIWorkflowWiresSelectionBuildsCoverageAndStableGate(t *testing.T) {
 	}
 	lf := strings.ReplaceAll(string(data), "\r\n", "\n")
 	_, resultJob, found := strings.Cut(lf, "  ci-result:\n")
-	if !found || !strings.Contains(resultJob, "uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e") ||
+	if !found || !strings.Contains(resultJob, "uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5") ||
 		!strings.Contains(resultJob, "go-version-file: go.mod") {
 		t.Fatal("the final gate must install the repository's pinned Go toolchain")
 	}

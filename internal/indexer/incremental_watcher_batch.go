@@ -402,6 +402,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 				return
 			}
 			stats := idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
+			idx.observePointRebind(batch, stats)
 			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
@@ -430,7 +431,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
 		}
 		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
-			mode.onRelations()
+			mode.onRelations(batch.pointRebindRefused)
 		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 		derived := mode.publication.beginDerivedPatchLap()
@@ -532,7 +533,7 @@ func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, front
 			w.markDeferredMutationTiers(frontier)
 		}
 		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, publication: stamps,
-			onRelations: func() { w.markRelationsFrontier(frontier) }}
+			onRelations: func(bool) { w.markRelationsFrontier(frontier) }}
 		var err error
 		stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
 		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
@@ -626,6 +627,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 				return
 			}
 			stats := mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
+			idx.observePointRebind(batch, stats)
 			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
