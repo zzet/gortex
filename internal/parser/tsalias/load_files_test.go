@@ -58,8 +58,8 @@ func TestWalkOrderLess(t *testing.T) {
 		{"tsconfig.json", "ab/tsconfig.json", false},
 	}
 	for _, c := range cases {
-		if got := walkOrderLess(c.a, c.b); got != c.less {
-			t.Errorf("walkOrderLess(%q, %q) = %v, want %v", c.a, c.b, got, c.less)
+		if got := WalkOrderLess(c.a, c.b); got != c.less {
+			t.Errorf("WalkOrderLess(%q, %q) = %v, want %v", c.a, c.b, got, c.less)
 		}
 	}
 }
