@@ -661,8 +661,9 @@ legacy receipt and must still pass source-backed per-root checks.
 contract change in the primary checkout takes to read back fresh. It requires
 `--contract-freshness-edits N` (1–200), `--edit-agents 1`, `--worktrees 0` and
 one repository; `--agents` (0–16) adds pure readers on the primary checkout
-that stop when the witness finishes. The first manifest entry must be a Go file
-whose `edit_template` inserts a top-level function after its `edit_anchor`.
+that stop when the witness finishes. The manifest must hold exactly one entry
+(a longer one is refused), a Go file whose `edit_template` inserts a top-level
+function after its `edit_anchor`.
 
 ```sh
 go run ./bench/load run --binary /private/bin/gortex \

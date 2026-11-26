@@ -322,6 +322,13 @@ func TestContractFreshnessRunOptionsAndPlan(t *testing.T) {
 	if plan := report.Workload.ContractFreshness; plan == nil || *plan != newContractFreshnessPlan(20) || report.Workload.LinkedWorktrees != 0 || report.Workload.EditAgents != 1 {
 		t.Fatalf("workload identity: %+v", report.Workload)
 	}
+	// The witness edits one repository; a second manifest entry is refused,
+	// not silently left out.
+	second := contractFreshnessCorpus()
+	second.Label += "-second"
+	if _, err := newRunReport(o, []Corpus{corpus, second}, strings.Repeat("b", 40), Host{}, t.TempDir()); err == nil || !strings.Contains(err.Error(), "manifest lists 2") {
+		t.Fatalf("two-entry manifest: %v", err)
+	}
 	names := make(map[string]request)
 	for _, operation := range report.Workload.Operations {
 		names[operation.name()] = operation

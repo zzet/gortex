@@ -382,6 +382,11 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 		report.Workload.SessionModel = plan.SessionModel
 	}
 	if o.Scenario == contractFreshnessScenario {
+		// The witness edits one repository; the phase would otherwise use the
+		// first entry and leave the rest out without a word.
+		if len(corpora) != 1 {
+			return report, fmt.Errorf("contract-freshness witnesses one repository, and the manifest lists %d", len(corpora))
+		}
 		plan := newContractFreshnessPlan(o.ContractFreshnessEdits)
 		report.Workload.ContractFreshness = &plan
 		operations, err := contractFreshnessOperations(corpora[0], o)
