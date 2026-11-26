@@ -1,6 +1,9 @@
 package mcp
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -62,6 +65,31 @@ func TestChangeToolsAnswerByWaitDeadlineWhileTopologyGateHeld(t *testing.T) {
 		assert.Equal(t, false, payload["complete"], "%s: %v", name, payload)
 		assert.Equal(t, "pending", payload["graph_freshness"], "%s: %v", name, payload)
 		assert.Equal(t, "publication_in_flight", payload["reason"], "%s: %v", name, payload)
+	}
+
+	// A wait_deadline that passes while git diffs the tree still bounds the
+	// walk: detect_changes reads the deadline before it runs git, so a slow
+	// diff does not turn the caller's deadline into the walk's 3 s budget.
+	if os.PathSeparator == '\\' {
+		t.Log("skipping the slow-diff step: the stand-in git is a POSIX shell script")
+	} else {
+		realGit, err := exec.LookPath("git")
+		require.NoError(t, err)
+		const diffDelay = 400 * time.Millisecond
+		stubDir := t.TempDir()
+		stub := "#!/bin/sh\nfor arg in \"$@\"; do\n\tif [ \"$arg\" = diff ]; then sleep 0.4; break; fi\ndone\nexec '" + realGit + "' \"$@\"\n"
+		require.NoError(t, os.WriteFile(filepath.Join(stubDir, "git"), []byte(stub), 0o755))
+		t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		started := time.Now()
+		payload := detect(map[string]any{"wait_deadline": within(wait)})
+		elapsed := time.Since(started)
+		t.Logf("detect_changes answered in %v with a %v diff and the topology gate held", elapsed, diffDelay)
+		require.GreaterOrEqual(t, elapsed, diffDelay, "the stand-in git did not hold the diff past wait_deadline")
+		assert.Less(t, elapsed, diffDelay+slack, "a wait_deadline that passed during the diff stopped bounding the walk")
+		assert.Equal(t, false, payload["complete"], "%v", payload)
+		assert.Equal(t, "pending", payload["graph_freshness"], "%v", payload)
+		assert.Equal(t, "publication_in_flight", payload["reason"], "%v", payload)
 	}
 
 	// Freed before the deadline: the walk waits for it and answers in full.
