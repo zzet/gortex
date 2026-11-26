@@ -189,7 +189,8 @@ func TestAffectedBy_SidecarDiscovery_SQLite(t *testing.T) {
 
 	// Park the caller's live edge on a stub — the state a prior evict
 	// leaves behind — so only the sidecar can name b.go as affected.
-	idx.restubIncomingRefs("a.go")
+	_, err = idx.restubIncomingRefs("a.go")
+	require.NoError(t, err)
 	require.True(t, graph.IsUnresolvedTarget(callTargetFrom(t, g, callerID)),
 		"precondition: the live in-edge must be parked on a stub")
 

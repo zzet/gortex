@@ -145,6 +145,7 @@ var bulkDroppableIndexes = []bulkDroppableIndex{
 	// outgoing plan; both participate in the same bulk drop/rebuild lifecycle.
 	{"edges_by_from_line_kind", edgesByFromLineKindIndexDDL},
 	{"edges_by_to", `CREATE INDEX IF NOT EXISTS edges_by_to ON edges(view_gen, to_id, kind)`},
+	{"edges_by_js_module", `CREATE INDEX IF NOT EXISTS edges_by_js_module ON edges(view_gen, ` + jsModuleExpr + `) WHERE ` + jsModuleExpr + ` IS NOT NULL`},
 	{"edges_by_kind", `CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind)`},
 	// Exact changed-file frontiers (watcher and partial indexing) must not
 	// scan every edge merely to find source sites owned by one file.

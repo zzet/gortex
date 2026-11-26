@@ -101,8 +101,7 @@ func (cr *CrossRepoResolver) trackedNpmImport(callerRepo, callerWS, importPath s
 	node, seen := memo.probes[key]
 	if !seen {
 		for _, stem := range packages[dir].Entries {
-			if file := probeJSTSFile(cr.cachedGetNode, stem); file != "" {
-				node = cr.cachedGetNode(file)
+			if node = probeJSTSFile(cr.cachedGetNode, stem); node != nil {
 				break
 			}
 		}

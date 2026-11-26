@@ -47,8 +47,12 @@ var extractorVersions = map[string]int{
 	"swift":      2,                                      // generic calls and ordinary member calls emit call edges
 	"sql":        2,                                      // dollar-quoted bodies are blanked before parsing so a plpgsql body the grammar cannot read no longer drops its CREATE FUNCTION; CREATE PROCEDURE is indexed
 	"julia":      3,                                      // callee and macro decoding from CST children (chained/parametric callees, Base.@time, Base.:(==)), macro/operator exports, member_of for module consts and nested modules, @doc and public metadata (was: bespoke tree-sitter extractor replaced the regex extractor)
-	"javascript": 4,                                      // locals bound by a static require() carry their module specifier (3: directly named exports and lexically shadowed bare calls carry binding evidence)
-	"typescript": 5,                                      // same binding evidence as JavaScript
+	"javascript": 5,                                      // module export lists, CommonJS exports, require-bound locals and lexical shadowing for exact call binding
+	"typescript": 6,                                      // same export and shadowing evidence as JavaScript, plus ambient function declarations
+	"vue":        2,                                      // embedded JS/TS export bindings (normal script) and shared script-tag parsing
+	"svelte":     2,
+	"astro":      2,
+	"html":       2,
 }
 
 // extractorSaltExtLang maps a lower-case file extension to the language
@@ -57,29 +61,34 @@ var extractorVersions = map[string]int{
 // staleness, the pre-existing behaviour). Extensions are grouped to the
 // extractor that owns them.
 var extractorSaltExtLang = map[string]string{
-	".go":   "go",
-	".py":   "python",
-	".pyi":  "python",
-	".js":   "javascript",
-	".jsx":  "javascript",
-	".mjs":  "javascript",
-	".cjs":  "javascript",
-	".ts":   "typescript",
-	".tsx":  "typescript",
-	".mts":  "typescript",
-	".cts":  "typescript",
-	".java": "java",
-	".rb":   "ruby",
-	".rs":   "rust",
-	".c":    "c",
-	".h":    "c",
-	".cc":   "cpp",
-	".cpp":  "cpp",
-	".cxx":  "cpp",
-	".hpp":  "cpp",
-	".hh":   "cpp",
-	".hxx":  "cpp",
-	".cs":   "csharp",
+	".go":     "go",
+	".py":     "python",
+	".pyi":    "python",
+	".js":     "javascript",
+	".jsx":    "javascript",
+	".mjs":    "javascript",
+	".cjs":    "javascript",
+	".ts":     "typescript",
+	".tsx":    "typescript",
+	".mts":    "typescript",
+	".cts":    "typescript",
+	".vue":    "vue",
+	".svelte": "svelte",
+	".astro":  "astro",
+	".html":   "html",
+	".htm":    "html",
+	".java":   "java",
+	".rb":     "ruby",
+	".rs":     "rust",
+	".c":      "c",
+	".h":      "c",
+	".cc":     "cpp",
+	".cpp":    "cpp",
+	".cxx":    "cpp",
+	".hpp":    "cpp",
+	".hh":     "cpp",
+	".hxx":    "cpp",
+	".cs":     "csharp",
 	// Razor templates are extracted by the C# extractor over their
 	// embedded code blocks, so a C# extraction fix has to re-flag them
 	// too — otherwise the same stale extraction survives on exactly the

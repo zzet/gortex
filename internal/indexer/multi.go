@@ -973,7 +973,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 		}
 
 		if receipt.ResolutionRelevant {
-			if stats := mi.runMasterResolveFiles(resolutionFiles, false); stats != nil && stats.WriteRefused {
+			if stats := mi.runMasterResolveFiles(resolutionFiles, false); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
 				mi.logger.Error("DEFERRED-TIMING exact master file resolve refused writes")
 				return deferredResolveFailed, false
 			}
@@ -981,7 +981,7 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			// frontier (their name is no longer declared in any frontier
 			// file); rebind them by the names the receipt recorded that no
 			// definition file re-declares.
-			if stats := mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt)); stats != nil && stats.WriteRefused {
+			if stats := mi.runMasterResolveNames(vanishedReceiptNames(mi.graph, receipt)); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
 				mi.logger.Error("DEFERRED-TIMING exact master name resolve refused writes")
 				return deferredResolveFailed, false
 			}
@@ -1112,6 +1112,7 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetNpmAliasResolver(mi.npmAliasResolver())
 	master.SetNpmDependencyLookup(mi.npmDependencyLookup())
 	master.SetPathAliasResolver(mi.pathAliasResolver())
+	master.SetNuxtAutoImportResolver(mi.nuxtAutoImportResolver())
 	master.SetWorkspaceMembership(mi.workspaceMembershipResolver())
 	master.SetGoPackageOwnershipInventoryFactory(mi.prepareGoPackageOwnership)
 	master.SetGoModules(mi.trackedGoModules())
@@ -1198,7 +1199,11 @@ func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP
 	return mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
 }
 
+// A master handling one repo mutation inherits its pre-eviction evidence.
 func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
+	if len(files) == 0 {
+		return nil
+	}
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
 		return nil
@@ -1306,7 +1311,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) *resolver.ResolveS
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
-	pendingAliases := mi.deferredAliasPasses(scope)
+	pending := mi.warmResolutionPasses(scope)
 	mi.runDeferredGoModAll()
 	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
 		return err
@@ -1320,20 +1325,27 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
 		return err
 	}
-	return certifyDeferredAliases(pendingAliases)
+	return finishWarmResolutions(pending)
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
 // same-repository and cross-repository resolution. A restart that reparsed one
 // file must not promote that delta to every unresolved edge in its repository.
 func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []string, onComputeDone func()) error {
+	pending := mi.warmResolutionPasses(nil)
+	for _, work := range pending {
+		if work.frontier == nil {
+			return mi.RunPreEnrichResolve(ctx, nil, onComputeDone)
+		}
+		files = appendUniqueSorted(files, work.frontier...)
+	}
 	mi.runDeferredGoModAll()
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
 	if len(files) > 0 {
-		if stats := mi.runMasterResolveFiles(files, true); stats != nil && stats.WriteRefused {
-			return resolver.ErrReindexWriteRefused
+		if stats := mi.runMasterResolveFiles(files, true); stats != nil && (len(stats.DroppedFiles) != 0 || stats.WriteRefused) {
+			return fmt.Errorf("%w: warm binding write did not apply; %d caller edges need retry", resolver.ErrReindexWriteRefused, len(stats.DroppedFiles))
 		}
 	}
 	if err := context.Cause(ctx); err != nil {
@@ -1352,12 +1364,16 @@ func (mi *MultiIndexer) RunPreEnrichResolveFiles(ctx context.Context, files []st
 		return err
 	}
 	if resolutionAffected > 0 {
-		return mi.runCrossRepoResolveContext(ctx, false)
-	}
-	if stats := mi.runCrossRepoResolveFiles(files); stats != nil && stats.WriteRefused {
+		if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
+			return err
+		}
+	} else if stats := mi.runCrossRepoResolveFiles(files); stats != nil && stats.WriteRefused {
 		return resolver.ErrReindexWriteRefused
 	}
-	return context.Cause(ctx)
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return finishWarmResolutions(pending)
 }
 
 func (mi *MultiIndexer) runDeferredGoModAll() {
@@ -2437,7 +2453,9 @@ func (mi *MultiIndexer) indexRepoRaw(repoPrefix string) (*IndexResult, error) {
 		}
 	}
 	restubGoModuleRepoIncoming(mi.graph, repoPrefix)
-	evictRepoCurrentGeneration(mi.graph, repoPrefix)
+	if _, _, err := evictRepoCurrentGeneration(mi.graph, repoPrefix); err != nil {
+		return nil, err
+	}
 	result, err := idx.indexCtxRaw(WithIndexOrigin(context.Background(), "index_repo"), meta.RootPath)
 	if err != nil {
 		return nil, fmt.Errorf("indexing %s: %w", meta.RootPath, err)
@@ -2657,8 +2675,14 @@ func (mi *MultiIndexer) incrementalEvictRepoRaw(repoPrefix, path string) (nodesR
 			"evicting %s from %s returned a nil result", path, repoPrefix,
 		)
 	}
+	if result.mutationErr != nil {
+		return 0, 0, result.mutationErr
+	}
 	if result.DeletedFileCount > 0 {
 		topologyFrontier = mi.resolveIncrementalRepoMutation(repoPrefix, result, nil, eviction.batch)
+	}
+	if err := idx.finishResolutionPass(eviction.batch.resolution); err != nil {
+		return eviction.nodesRemoved, eviction.edgesRemoved, err
 	}
 
 	fileMtimes := idx.publishFileMtimes()
@@ -2730,7 +2754,6 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 			break
 		}
 	}
-	defer idx.clearAliasPass()
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(meta.RootPath, paths, mode)
 	if err != nil {
 		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
@@ -2784,7 +2807,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	derived.endDerived()
 
 	topologyChanged = incrementalTopologyChanged(result)
-	if err := idx.finishAliasPass(result); err != nil {
+	if err := idx.finishResolutionPass(batch.resolution); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -3428,7 +3451,6 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
 			zap.Bool("force_full", forceFull), zap.Bool("census_failed", censusErr != nil))
 		defer applyTiming.abort()
-		defer idx.clearAliasPass()
 		switch {
 		case censusErr != nil:
 			// A partial filesystem census cannot safely authorize replacement:
@@ -3439,26 +3461,15 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		case forceFull:
 			route = "full_retrack"
 			result, err = fullRetrack()
-		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0:
-			caller, aliasErr := idx.restoredAliasCaller(absPath, priorMtimes)
-			if aliasErr != nil {
-				return aliasErr
-			}
-			if caller != "" {
-				route = "scoped"
-				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, []string{caller}, false)
-			} else {
-				route = "census_noop"
-				result, err = idx.cleanCensusResult(ctx, detected, start)
-			}
+		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0 && idx.censusResolutionCurrent(absPath):
+			route = "census_noop"
+			result, err = idx.cleanCensusResult(ctx, detected, start)
 		case churn == 0:
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
 			// content-addressed full-tree incremental check. A non-Merkle
-			// repository lands here only when its persisted extractor
-			// versions (or post-extraction policy epoch) are behind the
-			// running binary: the full-tree pass restages the stale
-			// languages and re-stamps the snapshot, so it fires once per bump.
+			// repository also comes here for stale extractor versions or unknown
+			// or changed resolution inputs, neither of which touches source mtimes.
 			route = "incremental"
 			result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, nil, true)
 		case manifestOnly && idx.merkleEnabled():
@@ -3551,9 +3562,6 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// pipeline and only needs the existing cross-repository contract reconcile.
 		if !result.FullRetrack && !batchMode.deferResolve {
 			mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
-			if err := idx.finishAliasPass(result); err != nil {
-				return err
-			}
 			if !batchMode.deferGlobalPasses {
 				idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 				mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
@@ -3569,6 +3577,12 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 					mi.logger.Warn("post-publish Go module follow-up", zap.Error(err))
 				}
 				mi.ReconcileContractEdges()
+			}
+		}
+		if batch != nil {
+			batch.resolution.warm = batchMode.deferResolve && (result.StaleFileCount > 0 || result.DeletedFileCount > 0)
+			if err := idx.finishResolutionPass(batch.resolution); err != nil {
+				return err
 			}
 		}
 
@@ -4076,21 +4090,7 @@ func (mi *MultiIndexer) ResolveFilePath(prefixedPath string) string {
 	mi.mu.RLock()
 	defer mi.mu.RUnlock()
 
-	// Longest matching prefix wins. With worktree instances two prefixes
-	// can share a leading segment (`oas-orm` vs `oas-orm@task-ws`); map
-	// iteration order is random, so a plain first-match could resolve a
-	// `oas-orm@task-ws/...` path against the shorter `oas-orm` root. The
-	// "/"-boundary check already keeps the two disjoint, but ranking by
-	// length makes that robust regardless of any future prefix shapes.
-	var bestPrefix, bestRoot string
-	for prefix, meta := range mi.repos {
-		if meta == nil {
-			continue
-		}
-		if strings.HasPrefix(prefixedPath, prefix+"/") && len(prefix) > len(bestPrefix) {
-			bestPrefix, bestRoot = prefix, meta.RootPath
-		}
-	}
+	bestPrefix, meta := mi.graphFileRepoLocked(prefixedPath)
 	if bestPrefix == "" {
 		// No known prefix leads this path. Graph paths are always prefixed,
 		// so this is a caller-supplied repo-relative path — an agent naming
@@ -4102,7 +4102,22 @@ func (mi *MultiIndexer) ResolveFilePath(prefixedPath string) string {
 		}
 		return ""
 	}
-	return filepath.Join(bestRoot, strings.TrimPrefix(prefixedPath, bestPrefix+"/"))
+	return filepath.Join(meta.RootPath, strings.TrimPrefix(prefixedPath, bestPrefix+"/"))
+}
+
+// Walk whole graph-path segments from the innermost repository out. The caller
+// holds mi.mu; no metadata copy or filesystem lookup is needed.
+func (mi *MultiIndexer) graphFileRepoLocked(file string) (string, *RepoMetadata) {
+	for {
+		i := strings.LastIndexByte(file, '/')
+		if i <= 0 {
+			return "", nil
+		}
+		file = file[:i]
+		if meta := mi.repos[file]; meta != nil {
+			return file, meta
+		}
+	}
 }
 
 // RepoPrefixes returns the set of registered repo prefixes. The returned

@@ -128,7 +128,8 @@ func TestReresolveFileScoped_RebindsDroppedIncomingEdges(t *testing.T) {
 
 	// Simulate the live drop: restub Foo's incoming caller edges to
 	// unresolved::Foo (what a re-parse of def.go does before it re-resolves).
-	idx.restubIncomingRefs("def.go")
+	_, err = idx.restubIncomingRefs("def.go")
+	require.NoError(t, err)
 	require.Empty(t, incomingCallEdges(t, g, fooID), "precondition: callers dropped to stubs")
 
 	// The forced scoped re-resolve must rebind every dropped caller AND restore

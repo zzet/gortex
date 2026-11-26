@@ -1,6 +1,7 @@
 package tsalias
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,4 +127,26 @@ func TestLoad_ExtendsDoesNotLeaveRootThroughSymlink(t *testing.T) {
 	if c := Load(root); c != nil {
 		t.Fatalf("extends through a symlink out of the root loaded %+v", c)
 	}
+}
+
+type countingConfigTree struct {
+	memTree
+	reads int
+}
+
+func (t *countingConfigTree) Read(rel string) ([]byte, bool) {
+	t.reads++
+	return t.memTree.Read(rel)
+}
+
+func TestSharedExtendsVisitsBoundedParents(t *testing.T) {
+	files := map[string]string{"tsconfig.json": `{"extends":"./level0.json"}`}
+	for i := range 20 {
+		files[fmt.Sprintf("level%d.json", i)] = fmt.Sprintf(`{"extends":["./level%d.json","./level%d.json"]}`, i+1, i+1)
+	}
+	files["level20.json"] = `{"compilerOptions":{"paths":{"~/*":["src/*"]}}}`
+	tree := &countingConfigTree{memTree: memTree{files: files}}
+	m := LoadTree(tree).FindForFile("app.ts")
+	require.Equal(t, "src/auth", Resolve(m, "~/auth"))
+	require.Equal(t, len(files), tree.reads)
 }

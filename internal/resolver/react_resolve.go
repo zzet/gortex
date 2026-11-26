@@ -61,7 +61,7 @@ func resolveReactHooksContext(g graph.Store, cands *frameworkPassCandidates) int
 	var reindex []graph.EdgeReindex
 	for _, stream := range []iter.Seq[*graph.Edge]{callsStream, refsStream, g.EdgesByKind(graph.EdgeRendersChild)} {
 		for e := range stream {
-			if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil {
+			if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSPendingBindingMeta] != nil || e.Meta[graph.JSLexicalBindingMeta] != nil {
 				continue
 			}
 			head := graph.UnresolvedName(e.To)

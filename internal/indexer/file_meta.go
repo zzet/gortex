@@ -127,7 +127,11 @@ func (idx *Indexer) indexedFileReceiptMatches(filePath string) bool {
 // name, equal mtime alone never returns true — indexedFileReceiptMatches also
 // confirms the persisted content identity.
 func (idx *Indexer) fileMtimeMatches(filePath string) bool {
-	return idx.indexedFileReceiptMatches(filePath)
+	if !idx.indexedFileReceiptMatches(filePath) {
+		return false
+	}
+	return !closureJSTSPath(filePath) || idx.manifestTree().sourced() ||
+		idx.appliedResolution.Load().unchangedForPoints(idx.RootPath(), []string{filePath}, nil)
 }
 
 // persistFileMeta records one file's per-file metadata row — the BLAKE3
@@ -200,6 +204,34 @@ func persistFileMetaRows(target graph.Store, repoPrefix string, rows []graph.Fil
 // tier is configured.
 const reparsePendingEnrichmentBatchSize = 256
 
+func (b *reparsePendingEnrichmentBatch) recordDropped(files []string) {
+	if len(files) != 0 && b != nil {
+		b.resolution.dropped = append(b.resolution.dropped, files...)
+	}
+}
+
+func (b *reparsePendingEnrichmentBatch) recordResolveStats(stats *resolver.ResolveStats) {
+	if stats == nil || b == nil {
+		return
+	}
+	if len(stats.DroppedFiles) != 0 || stats.WriteRefused {
+		b.resolution.retryResolveFiles = append(b.resolution.retryResolveFiles, stats.DroppedFiles...)
+		if b.resolution.catchupErr == nil {
+			b.resolution.catchupErr = fmt.Errorf("%w: binding write did not apply; %d caller edges need retry", resolver.ErrReindexWriteRefused, len(stats.DroppedFiles))
+		}
+	}
+}
+
+func (b *reparsePendingEnrichmentBatch) resolutionWriteRefused() bool {
+	return b != nil && (len(b.resolution.dropped) > 0 || len(b.resolution.retryResolveFiles) > 0 || errors.Is(b.resolution.catchupErr, resolver.ErrReindexWriteRefused))
+}
+
+func (b *reparsePendingEnrichmentBatch) recordCatchupErr(err error) {
+	if err != nil && b != nil && b.resolution.catchupErr == nil {
+		b.resolution.catchupErr = err
+	}
+}
+
 type reparsePendingEnrichmentBatch struct {
 	pointPreparation   *watcherPointPreparation
 	publication        *PublicationStamps // optional local canonical attempt; never a live record
@@ -208,6 +240,8 @@ type reparsePendingEnrichmentBatch struct {
 	pointRebindRefused bool
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
+	bindingCallers        []string
+	resolution            resolutionCompletion
 	byFile                map[string]bool
 	deferResolverCatchup  bool
 	deferredAffectedFiles map[string]struct{}

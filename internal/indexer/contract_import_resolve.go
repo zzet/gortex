@@ -311,69 +311,31 @@ func (mi *MultiIndexer) rustImportCandidateNames(srcFile, name string, srcCache 
 // config exists — callers must handle that as "no alias resolution
 // available, fall through to bare-name behaviour."
 func (mi *MultiIndexer) tsAliasMapFor(srcFile string) (*tsalias.Map, string) {
-	if srcFile == "" {
-		return nil, ""
+	in, prefix, idx := mi.resolutionInputsForFile(srcFile)
+	if in == nil || in.aliases == nil {
+		return nil, prefix
 	}
-	for _, m := range mi.AllMetadata() {
-		prefix := m.RepoPrefix
-		// A tracked repo always carries a prefix; a metadata entry without
-		// one is malformed rather than a lone-repo special case, so it
-		// cannot claim srcFile. Nor can a repo whose prefix does not lead
-		// the path.
-		if prefix == "" || !strings.HasPrefix(srcFile, prefix+"/") {
-			continue
-		}
-		rel := strings.TrimPrefix(srcFile, prefix+"/")
-		coll := mi.tsAliasCollectionFor(prefix, m.RootPath)
-		if coll == nil {
-			return nil, prefix
-		}
-		scope := coll.FindForFile(path.Dir(rel))
-		if idx := mi.GetIndexer(prefix); idx != nil {
-			// The repository's own build, when it proves its reads, records
-			// the working-copy probes this map makes (tsAliasProbes).
-			scope = scope.ObservingProbes(idx.tsAliasProbes())
-		}
-		return scope, prefix
+	scope := in.aliases.FindForFile(path.Dir(strings.TrimPrefix(srcFile, prefix+"/")))
+	if idx != nil {
+		scope = scope.ObservingProbes(idx.tsAliasProbes())
 	}
-	return nil, ""
+	return scope, prefix
 }
 
-// tsAliasCollectionFor returns the tsconfig / jsconfig alias scopes a tracked
-// repository's path-alias lookups must go through.
-//
-// A sourced indexer owns snapshot resolution. A live mutation pins its
-// checkout scopes until resolver catch-up; other lookups use the root cache.
-func (mi *MultiIndexer) tsAliasCollectionFor(prefix, root string) *tsalias.Collection {
-	// GetIndexer holds mi.mu only for this lookup; no I/O happens under it.
-	if idx := mi.GetIndexer(prefix); idx != nil {
-		if idx.manifestTree().sourced() || idx.passAliases.Load() != nil {
-			return idx.tsAliasCollection()
-		}
+// Resolution uses the registered snapshot or pinned pass before the shared
+// checkout cache. Never hold the metadata lock during discovery.
+func (mi *MultiIndexer) resolutionInputsForFile(file string) (*resolutionInputs, string, *Indexer) {
+	mi.mu.RLock()
+	prefix, meta := mi.graphFileRepoLocked(file)
+	idx := mi.indexers[prefix]
+	mi.mu.RUnlock()
+	if meta == nil {
+		return nil, "", nil
 	}
-	return loadTSAliasCollection(root)
-}
-
-// tsAliasCollectionForTree loads the alias scopes out of one tree.
-//
-// A working-copy tree keeps the process-wide root-keyed cache it has always
-// used. A sourced tree is loaded through tsalias.LoadTree over the snapshot
-// itself — every config file it holds, read out of it, with its multi-target
-// aliases grounded in its own bytes — and never touches that cache. A sourced
-// tree that cannot enumerate answers "no scopes" rather than falling back to
-// the checkout: a build that declared source authority must not read the
-// working copy, and a wrong alias scope is a wrong EDGE, not a missing one.
-func tsAliasCollectionForTree(tree manifestTree) *tsalias.Collection {
-	if !tree.sourced() {
-		if proven, ok := tree.(provenManifestTree); ok {
-			return workingAliases(tree.root(), proven.proof, nil).collection
-		}
-		return loadTSAliasCollection(tree.root())
+	if idx != nil {
+		return idx.lookupResolutionInputs(), prefix, idx
 	}
-	if src, ok := tree.(tsalias.Tree); ok {
-		return tsalias.LoadTree(src)
-	}
-	return nil
+	return workingResolutionInputs(meta.RootPath, nil), prefix, idx
 }
 
 // readFileFromAnyRepo finds the bytes for a repo-prefixed file path by

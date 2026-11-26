@@ -166,6 +166,8 @@ type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// DroppedFiles must be re-extracted before certifying incremental resolution.
+	DroppedFiles []string `json:"-"`
 	// WriteRefused reports that the backing store refused or dropped at least
 	// one edge reindex batch during this pass. Callers that certify durable
 	// policy state must not certify a pass whose writes were refused.
@@ -731,6 +733,8 @@ type Resolver struct {
 	// repo-prefixed file stem it targets. See jsts_imports.go for the
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
+
+	nuxtAutoImport NuxtAutoImportResolver
 
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
@@ -1439,6 +1443,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	var tailWriteRefused bool
 	yielded := false
 	total := &ResolveStats{}
+	// A refused LSP correction fails the pass only after the guard has run, so
+	// unrelated name-only bindings are still reverted.
+	var lspWriteErr error
 	resolveError := func(err error) (*ResolveStats, error) {
 		if tailWriteRefused {
 			total.WriteRefused = true
@@ -1693,11 +1700,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				applied := reindexEdgesApplied(r.graph, reindexBatch)
+				applied := total.applyReindexes(r.graph, reindexBatch)
 				applyStoreElapsed += time.Since(storeStart)
 				if !applied {
-					total.WriteRefused = true
-					return resolveError(fmt.Errorf("%w: %d edge(s)", ErrReindexWriteRefused, len(reindexBatch)))
+					return resolveError(total.bindingWriteError())
 				}
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
@@ -2047,9 +2053,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				break
 			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
-			if pageResult.writeRefused {
+			if len(pageResult.dropped) != 0 || pageResult.writeRefused {
 				total.WriteRefused = true
-				return resolveError(fmt.Errorf("%w: deferred LSP batch", ErrReindexWriteRefused))
+				total.DroppedFiles = append(total.DroppedFiles, pageResult.dropped...)
+				lspWriteErr = total.bindingWriteError()
+				break // leave this spool page pending
 			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
@@ -2089,9 +2097,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				if !r.applyReindexEdges(terminalClears) {
-					total.WriteRefused = true
-					return resolveError(fmt.Errorf("%w: %d terminal clear(s)", ErrReindexWriteRefused, len(terminalClears)))
+				if !total.applyReindexes(r.graph, terminalClears) {
+					return resolveError(total.bindingWriteError())
 				}
 			}
 
@@ -2247,13 +2254,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		guardDrained = true
 		if tailWriteRefused {
 			total.WriteRefused = true
-			return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
+			return resolveError(total.bindingWriteError())
 		}
 	}
 	guardDrained = true
 	tAfterGuard := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
+	}
+	if lspWriteErr != nil {
+		return resolveError(total.bindingWriteError())
 	}
 
 	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
@@ -4052,6 +4062,23 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
+func (stats *ResolveStats) applyReindexes(g graph.Store, batch []graph.EdgeReindex) bool {
+	dropped := graph.ApplyEdgeReindexes(g, batch)
+	if len(dropped) == 0 {
+		return true
+	}
+	stats.WriteRefused = true
+	stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+	return false
+}
+
+func (stats *ResolveStats) bindingWriteError() error {
+	if len(stats.DroppedFiles) == 0 && !stats.WriteRefused {
+		return nil
+	}
+	return fmt.Errorf("%w: binding write did not apply; %d caller edges need retry", ErrReindexWriteRefused, len(stats.DroppedFiles))
+}
+
 func (r *Resolver) applyIncrementalReindexesLocked(
 	reindexBatch []graph.EdgeReindex,
 	jobs []reindexJob,
@@ -4060,7 +4087,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		applied := r.applyReindexEdges(reindexBatch)
+		applied := stats.applyReindexes(r.graph, reindexBatch)
 		legs.lap("reindex")
 		recordRefusedRebindFiles := func() {
 			if stats.RefusedRebindFiles == nil {
@@ -4078,6 +4105,7 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		if !applied {
 			stats.WriteRefused = true
 			recordRefusedRebindFiles()
+			r.notePassWriteRefused()
 			return
 		}
 		// nil index: incremental batches are file-sized, direct probes
@@ -4640,6 +4668,14 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if resolutionExempt(e) {
 		return oldTo, false
 	}
+	priorBinding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	delete(e.Meta, graph.JSPendingBindingMeta)
+	priorModule, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	if e.Meta[graph.JSImportSourceMeta] != nil && (e.Kind == graph.EdgeReExports || e.Meta[graph.JSForwardsImportMeta] == true) {
+		if stem, _ := r.jsBindingSource(e); stem != "" {
+			e.Meta[graph.JSBindingModuleMeta] = graph.JSModuleStem(stem)
+		}
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every
@@ -4805,7 +4841,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if e.To != oldTo && !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
 		delete(e.Meta, "guard_reverted")
 	}
-	return oldTo, e.To != oldTo
+	binding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	module, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	return oldTo, e.To != oldTo || binding != priorBinding || module != priorModule
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -5031,7 +5069,15 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+	to, aliasStem := jstsImportTargetAndAliasStem(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath)
+	if aliasStem != "" {
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		e.Meta[graph.JSImportSourceMeta] = importPath
+		e.Meta[graph.JSBindingModuleMeta] = aliasStem
+	}
+	if to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -5305,8 +5351,34 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
-	if r.handleJSLexicalBinding(e, funcName, candidates, stats) {
-		return
+	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
+		lexical, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
+		switch lexical {
+		case graph.JSPendingParameter:
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return
+		case graph.JSLexicalRequire:
+			if pick, trackedNpmSpec := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
+				bindImportCall(e, pick, "import_closure", stats)
+				if trackedNpmSpec != "" {
+					e.Meta[NpmImportSpecifierMeta] = trackedNpmSpec
+				} else {
+					delete(e.Meta, NpmImportSpecifierMeta)
+				}
+				return
+			}
+			stats.Unresolved++
+			return
+		case graph.JSLexicalLocal:
+			if !hasSameFileValue(e.FilePath, candidates) {
+				parkJSBinding(e, graph.JSPendingParameter, stats)
+				return
+			}
+		case "":
+			if !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
+				return
+			}
+		}
 	}
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
@@ -5426,16 +5498,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Check JS/TS import evidence before directory locality (see import_evidence.go).
-	if pick, reason := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
-		e.To = pick.ID
-		e.Origin = graph.OriginASTResolved
-		e.Confidence = 0.9
-		if e.Meta == nil {
-			e.Meta = map[string]any{}
-		}
-		e.Meta["resolution"] = reason
-		stats.Resolved++
+	// Only file-level evidence remains after the explicit and generated binding tiers.
+	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
+		bindImportCall(e, pick, "import_closure", stats)
 		return
 	}
 

@@ -387,7 +387,8 @@ func TestDeletionShapedStagesCarryNoInEdges(t *testing.T) {
 	stages := []*incrementalBatchStage{{graphPath: restubDefPath, priorNodes: prior}}
 	view := loadIncrementalPriorView(st, stages)
 
-	carried, _ := restubIncomingRefsFromView(st, stages, view)
+	carried, _, err := restubIncomingRefsFromView(st, stages, view, nil)
+	require.NoError(t, err)
 	require.Empty(t, carried,
 		"a deletion stage must park every in-edge; a carried edge has no re-state path here")
 	assert.Equal(t, 1, st.restubWrites("Foo"),

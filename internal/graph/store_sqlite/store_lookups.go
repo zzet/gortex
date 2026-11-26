@@ -63,6 +63,13 @@ const nodesByIDSource = `nodes INDEXED BY ` + nodesPrimaryKeyIndexName
 const lookupEdgeCols = `from_id, to_id, kind, file_path, line, confidence, confidence_label, origin, tier, cross_repo, meta, resolve_terminal, resolve_terminal_reason, semantic_source`
 const lookupQualifiedEdgeCols = `e.from_id, e.to_id, e.kind, e.file_path, e.line, e.confidence, e.confidence_label, e.origin, e.tier, e.cross_repo, e.meta, e.resolve_terminal, e.resolve_terminal_reason, e.semantic_source`
 
+// The guard excludes ordinary flat/gob metadata; legacy JSON is also readable.
+const jsModuleExpr = `CASE WHEN substr(meta,1,1)=x'7b' AND json_valid(CAST(meta AS TEXT)) THEN json_extract(CAST(meta AS TEXT), '$.` + graph.JSBindingModuleMeta + `') END`
+
+func (s *Store) JSModuleDependents(stem string) []*graph.Edge {
+	return s.queryEdgesSQL(`SELECT `+lookupEdgeCols+` FROM edges WHERE view_gen=? AND `+jsModuleExpr+`=?`, s.viewGen, stem)
+}
+
 // Compile-time assertion: *Store satisfies graph.NodeNameClassCounter.
 var _ graph.NodeNameClassCounter = (*Store)(nil)
 var _ graph.ExistingNodeIDFinder = (*Store)(nil)

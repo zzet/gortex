@@ -25,6 +25,9 @@ const tsQAll = `
   (function_declaration
     name: (identifier) @func.name) @func.def
 
+  (ambient_declaration
+    (function_signature name: (identifier) @func.name) @func.def)
+
   (function_expression
     name: (identifier) @fnexpr.name) @fnexpr.def
 
@@ -199,8 +202,8 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	recordJSExports(root, src, fileNode)
 	var scopes jsScopeCache
-	localExports := jsLocalExportClauseNames(root, src)
 
 	imports := map[string]string{}
 	arrowNames := map[string]bool{}
@@ -250,14 +253,15 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 	parser.EachMatch(qAll, root, src, func(m parser.QueryResult) {
 		switch {
+
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, seenIDs, localExports)
+			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
 
 		case m.Captures["fnexpr.def"] != nil:
-			e.emitFunctionExpression(m, filePath, fileID, src, result, seenIDs, localExports)
+			e.emitFunctionExpression(m, filePath, fileID, src, result, seenIDs)
 
 		case m.Captures["arrow.def"] != nil:
-			if name := e.emitArrow(m, filePath, fileID, src, result, seenIDs, localExports); name != "" {
+			if name := e.emitArrow(m, filePath, fileID, src, result, seenIDs); name != "" {
 				arrowNames[name] = true
 			}
 
@@ -595,7 +599,6 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				}
 			}
 		}
-		node.Meta = jsNamedExportMeta(v.defNode, v.name, localExports, node.Meta)
 		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -685,8 +688,8 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 // --- per-match emit helpers ------------------------------------------
 
-func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
-	e.emitNamedFunction(m.Captures["func.name"], m.Captures["func.def"], filePath, fileID, src, result, seenIDs, localExports)
+func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
+	e.emitNamedFunction(m.Captures["func.name"], m.Captures["func.def"], filePath, fileID, src, result, seenIDs)
 }
 
 // emitFunctionExpression emits a *named* function expression — the
@@ -697,11 +700,11 @@ func (e *TypeScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 // as a declaration, so it emits through the same path. Anonymous
 // function expressions carry no name field and never match the query
 // pattern.
-func (e *TypeScriptExtractor) emitFunctionExpression(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
-	e.emitNamedFunction(m.Captures["fnexpr.name"], m.Captures["fnexpr.def"], filePath, fileID, src, result, seenIDs, localExports)
+func (e *TypeScriptExtractor) emitFunctionExpression(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
+	e.emitNamedFunction(m.Captures["fnexpr.name"], m.Captures["fnexpr.def"], filePath, fileID, src, result, seenIDs)
 }
 
-func (e *TypeScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
+func (e *TypeScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
 	if nameCap == nil || def == nil {
 		return
 	}
@@ -727,7 +730,7 @@ func (e *TypeScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNod
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "typescript",
-		Meta:     jsNamedExportMeta(def.Node, name, localExports, meta),
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -763,7 +766,7 @@ func tsFunctionBody(decl *sitter.Node) *sitter.Node {
 	return nil
 }
 
-func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) string {
+func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) string {
 	name := m.Captures["arrow.name"].Text
 	def := m.Captures["arrow.def"]
 	id, ok := disambiguateID(seenIDs, filePath+"::"+name, def.StartLine+1)
@@ -780,7 +783,7 @@ func (e *TypeScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		ID: id, Kind: graph.KindFunction, Name: name,
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "typescript",
-		Meta:     jsNamedExportMeta(def.Node, name, localExports, meta),
+		Meta:     meta,
 	})
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines,
@@ -1252,18 +1255,16 @@ func (e *TypeScriptExtractor) emitImport(m parser.QueryResult, filePath, fileID 
 		From: fileID, To: importNodeID,
 		Kind: graph.EdgeContains, FilePath: filePath, Line: line,
 	})
-	result.Edges = append(result.Edges, &graph.Edge{
-		From: fileID, To: "unresolved::import::" + importPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
-	})
-	defCap, ok := m.Captures["import.def"]
-	if !ok || defCap.Node == nil {
+	var importNode *sitter.Node
+	if def := m.Captures["import.def"]; def != nil {
+		importNode = def.Node
+	}
+	emitJSImports(importNode, importPath, fileID, filePath, line, src, result)
+	if importNode == nil {
 		return
 	}
-	// Per-binding edges (`import { a, b as c }`) on top of the module edge.
-	emitJSPerBindingImports(defCap.Node, importPath, fileID, filePath, src, result)
-	for i, _nc := 0, int(defCap.Node.NamedChildCount()); i < _nc; i++ {
-		child := defCap.Node.NamedChild(i)
+	for i, _nc := 0, int(importNode.NamedChildCount()); i < _nc; i++ {
+		child := importNode.NamedChild(i)
 		if child.Type() != "import_clause" {
 			continue
 		}
@@ -2171,6 +2172,9 @@ func tsDocStartRow(def *parser.CapturedNode) (int, bool) {
 		return 0, false
 	}
 	parent := def.Node.Parent()
+	if parent != nil && parent.Type() == "ambient_declaration" {
+		parent = parent.Parent()
+	}
 	if parent != nil && parent.Type() == "export_statement" {
 		return int(parent.StartPoint().Row), true
 	}

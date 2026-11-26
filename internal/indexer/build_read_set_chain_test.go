@@ -35,6 +35,11 @@ func TestChainedDirtyBuildConfirmsByReadSet(t *testing.T) {
 	c.compaction.quiet = -1
 	coordinatorReconcile(t, c)
 	confirmsReadSet := coordinatorReadSetCapability(t, c)
+	// The first build of a checkout this process never scanned discovers its
+	// resolution inputs over the whole tree, which only a full sample fences.
+	// Scan it up front, as a running daemon has, so each step tests the chain.
+	t.Cleanup(func() { invalidateResolutionInputs(f.worktree) })
+	workingResolutionInputs(f.worktree, nil)
 
 	for step, body := range []string{
 		"package fixture\n\nfunc Extra() int { return 1 }\n",

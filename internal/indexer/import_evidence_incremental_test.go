@@ -304,15 +304,19 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 				switch mode {
 				case "file":
 					idx := New(g, newTestRegistry(), config.IndexConfig{}, zap.NewNop())
-					assert.Equal(t, []string{"app/a.ts"}, idx.restubIncomingRefs("lib/index.ts"))
+					consumers, err := idx.restubIncomingRefs("lib/index.ts")
+					require.NoError(t, err)
+					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "batch":
 					stages := []*incrementalBatchStage{{graphPath: "lib/index.ts", priorNodes: nodes}}
-					_, consumers := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages))
+					_, consumers, err := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages), nil)
+					require.NoError(t, err)
 					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "replace":
-					evictRepoCurrentGeneration(g, "lib")
+					_, _, err := evictRepoCurrentGeneration(g, "lib")
+					require.NoError(t, err)
 				case "untrack":
 					mi := &MultiIndexer{graph: g}
 					_, _, err := mi.purgeRepositoryPayload("lib", nil)
@@ -377,7 +381,8 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 						},
 					},
 				})
-				consumers := restubTrackedNpmImportsFromView(g, nil, g.GetInEdgesByNodeIDs([]string{"lib/index.ts", "lib/index.ts::f"}))
+				consumers, err := restubTrackedNpmImportsFromView(g, nil, g.GetInEdgesByNodeIDs([]string{"lib/index.ts", "lib/index.ts::f"}))
+				require.NoError(t, err)
 				assert.Equal(t, []string{"app/a.ts"}, consumers)
 
 				esCalls := g.GetOutEdges("app/a.ts::viaES")

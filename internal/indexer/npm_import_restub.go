@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"strings"
 
@@ -11,14 +12,14 @@ import (
 
 // Park only npm-linked incoming imports and their calls before replacing or
 // removing a provider. Other references keep their existing eviction rules.
-func restubTrackedNpmRepoIncoming(g graph.Store, repo string) {
+func restubTrackedNpmRepoIncoming(g graph.Store, repo string) error {
 	if repo == "" || len(graph.ReadRepoFilePaths(g, repo, "", nil, []string{
 		"js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "vue", "svelte", "astro",
 	})) == 0 {
-		return
+		return nil
 	}
 	var ids []string
-	flush := func() {
+	flush := func() error {
 		identities := graph.InEdgeIdentitiesByNodeIDs(g, ids)
 		var sites []graph.EdgeSite
 		for _, edges := range identities {
@@ -30,7 +31,7 @@ func restubTrackedNpmRepoIncoming(g graph.Store, repo string) {
 		}
 		if len(sites) == 0 {
 			ids = ids[:0]
-			return
+			return nil
 		}
 		hydrated := g.GetEdgeCandidates(nil, sites)
 		var targets []string
@@ -69,27 +70,33 @@ func restubTrackedNpmRepoIncoming(g graph.Store, repo string) {
 					}
 				}
 			}
-			restubTrackedNpmImportsFromView(g, evicted, incoming)
+			if _, err := restubTrackedNpmImportsFromView(g, evicted, incoming); err != nil {
+				return err
+			}
 		}
 		ids = ids[:0]
+		return nil
 	}
 	for node := range graph.RepoNodeIdentitiesSeq(g, []string{repo},
 		graph.KindFile, graph.KindFunction, graph.KindMethod, graph.KindType,
 		graph.KindInterface, graph.KindVariable, graph.KindConstant) {
 		ids = append(ids, node.ID)
 		if len(ids) == 512 {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
 	if len(ids) > 0 {
-		flush()
+		return flush()
 	}
+	return nil
 }
 
-func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{}, incoming map[string][]*graph.Edge) []string {
+func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{}, incoming map[string][]*graph.Edge) ([]string, error) {
 	var consumerFiles []string
 	consumers := make(map[string]map[string]string)
-	var batch []graph.EdgeReindex
+	var imports, calls []graph.EdgeReindex
 	for _, edges := range incoming {
 		for _, edge := range edges {
 			if edge == nil || edge.Kind != graph.EdgeImports {
@@ -115,7 +122,7 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 			// A parked import keeps its identity in its target; the marker
 			// returns when the package links again, as in a cold index.
 			delete(edge.Meta, resolver.NpmImportSpecifierMeta)
-			batch = append(batch, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
+			imports = append(imports, graph.EdgeReindex{Edge: edge, OldTo: oldTo})
 		}
 	}
 	var obsolete []*graph.Edge
@@ -149,7 +156,7 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 			parallel.Kind = graph.EdgeCrossRepoCalls
 			obsolete = append(obsolete, &parallel)
 			resetNpmCall(edge, name)
-			batch = append(batch, graph.EdgeReindex{Edge: edge, OldTo: target})
+			calls = append(calls, graph.EdgeReindex{Edge: edge, OldTo: target})
 		}
 	}
 	for target, edges := range incoming {
@@ -180,17 +187,26 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 			parallel.Kind = graph.EdgeCrossRepoCalls
 			obsolete = append(obsolete, &parallel)
 			resetNpmCall(edge, name)
-			batch = append(batch, graph.EdgeReindex{Edge: edge, OldTo: target})
+			calls = append(calls, graph.EdgeReindex{Edge: edge, OldTo: target})
 		}
 	}
 
-	if len(obsolete) > 0 {
-		graph.RemoveEdgesExact(g, obsolete)
+	// Keep the import that identifies each call until the call is safe, and
+	// remove obsolete parallel EdgeCrossRepoCalls only after their chunk's
+	// reindex commits. Even after a partial write, retry can still find every
+	// unparked call.
+	const npmRestubChunkSize = 2048
+	for start := 0; start < len(calls); start += npmRestubChunkSize {
+		end := min(start+npmRestubChunkSize, len(calls))
+		if dropped := graph.ApplyEdgeReindexes(g, calls[start:end]); len(dropped) != 0 {
+			return nil, fmt.Errorf("npm binding write did not apply; refusing provider eviction (%d caller edges)", len(dropped))
+		}
+		graph.RemoveEdgesExact(g, obsolete[start:end])
 	}
-	if len(batch) > 0 {
-		g.ReindexEdges(batch)
+	if dropped := graph.ApplyEdgeReindexes(g, imports); len(dropped) != 0 {
+		return nil, fmt.Errorf("npm binding write did not apply; refusing provider eviction (%d caller edges)", len(dropped))
 	}
-	return consumerFiles
+	return consumerFiles, nil
 }
 
 func isJSTSNpmPath(path string) bool {

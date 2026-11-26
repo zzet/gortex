@@ -13,9 +13,16 @@ func (r *Resolver) resolveVueTemplateImport(e *graph.Edge, name string, stats *R
 	importedPath := ""
 	raw, _ := e.Meta["template_name"].(string)
 	for _, imp := range r.graph.GetOutEdges(e.FilePath) {
-		local, _ := imp.Meta["vue_default_import"].(string)
-		if imp.Kind != graph.EdgeImports || local == "" || (local != name && local != raw) {
+		if imp.Kind != graph.EdgeImports {
 			continue
+		}
+		bindings, _ := imp.Meta[graph.ImportBindingsMeta].(string)
+		local := name
+		if graph.JSBinding(bindings, local) != graph.JSDefaultBinding {
+			local = raw
+			if local == "" || graph.JSBinding(bindings, local) != graph.JSDefaultBinding {
+				continue
+			}
 		}
 		matched = true
 		path, _, _ := importBindingOf(imp)

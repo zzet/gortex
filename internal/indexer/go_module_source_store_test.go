@@ -87,7 +87,8 @@ func TestGoModuleSourceStoreDropsTrustAfterConcurrentEviction(t *testing.T) {
 		if reads == 1 {
 			// The file is deleted and evicted during the read.
 			require.NoError(t, os.Remove(main))
-			idx.evictDeletedFilesBatched([]string{"main.go"}, &DerivedInvalidationPlan{})
+			_, _, _, err := idx.evictDeletedFilesBatched([]string{"main.go"}, &DerivedInvalidationPlan{}, nil)
+			require.NoError(t, err)
 		}
 		return src, err
 	}

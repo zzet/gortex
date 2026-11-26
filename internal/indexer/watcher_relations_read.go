@@ -1,6 +1,10 @@
 package indexer
 
-import "github.com/zzet/gortex/internal/resolver"
+import (
+	"errors"
+
+	"github.com/zzet/gortex/internal/resolver"
+)
 
 // relationsReadFrontier belongs to one point executor and one absolute path.
 // It records a conservative admission bound immediately before an OS source
@@ -55,6 +59,41 @@ func (idx *Indexer) observePointRebind(batch *reparsePendingEnrichmentBatch, sta
 	if _, refused := stats.RefusedRebindFiles[idx.prefixPath(idx.relKey(read.path))]; refused {
 		batch.pointRebindRefused = true
 	}
+}
+
+// ownedPointRebindOnly reports whether a resolution write refusal belongs
+// exclusively to the checked point-rebind path owned by Watcher.pointRelationsMode:
+// no uncertified resolution-input pass, no carried resolution retry, no dropped
+// invalidation writes, and no refused caller files outside the owned path.
+// In that case Watcher.markRefusedRelationTiers records the partial/refused state
+// on the ticket and preserves it across same-byte duplicate saves without turning
+// the already-landed structural write into a failed mutation or forcing a silent
+// duplicate rebind.
+func (idx *Indexer) ownedPointRebindOnly(
+	batch *reparsePendingEnrichmentBatch,
+	result *IndexResult,
+	extraRefused bool,
+) bool {
+	read := batch.relationsReadFrontier()
+	if idx == nil || read == nil || batch == nil || !batch.pointRebindRefused || extraRefused {
+		return false
+	}
+	if idx.hasUncertifiedResolutionPass() || (result != nil && result.retriedResolution) {
+		return false
+	}
+	if len(batch.resolution.dropped) > 0 {
+		return false
+	}
+	if !errors.Is(batch.resolution.catchupErr, resolver.ErrReindexWriteRefused) {
+		return false
+	}
+	ownedPath := idx.prefixPath(idx.relKey(read.path))
+	for _, f := range batch.resolution.retryResolveFiles {
+		if f != ownedPath {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *PublicationStamps) incrementalPathMode {

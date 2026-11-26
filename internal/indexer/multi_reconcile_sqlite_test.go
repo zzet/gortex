@@ -99,7 +99,7 @@ func TestTSConfigPathAlias_WarmRestartChecksInheritedConfig(t *testing.T) {
 	require.NoError(t, err)
 	idx, store := newSQLiteIndexer(t)
 	start := func() *MultiIndexer {
-		invalidateTSAliasCollection(root)
+		invalidateResolutionInputs(root)
 		return NewMultiIndexer(store, idx.registry, search.NewNull(), cm, zap.NewNop())
 	}
 	first := start()

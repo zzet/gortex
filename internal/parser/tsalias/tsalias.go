@@ -23,9 +23,8 @@
 //     suffix; the substring matched by `*` is slotted into the target
 //     at the corresponding `*` position.
 //   - Patterns without `*` are exact-match.
-//   - Targets are joined with `baseUrl` (if set) and returned without
-//     the trailing `.ts/.tsx/.js/.jsx/.mts/.cts` extension — callers
-//     reuse the same probing logic as relative imports.
+//   - Targets are joined with `baseUrl` (if set). Source extensions are
+//     stripped for probing; explicit declaration files retain their suffix.
 //   - Multi-target arrays (`"@/*": ["a/*", "b/*"]`) are resolved by disk
 //     existence: each candidate is probed under the repo root in priority
 //     order and the first that exists on disk wins, falling back to the
@@ -47,8 +46,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+
+	"github.com/zzet/gortex/internal/graph"
 )
 
 // Alias is one entry in the `paths` map.
@@ -103,7 +105,8 @@ type Map struct {
 // DirPrefix length descending so nearest-ancestor lookup is a single
 // linear scan.
 type Collection struct {
-	scopes []*Map
+	scopes           []*Map
+	alternateTargets [][]string // normalized target patterns, only for multi-target aliases
 }
 
 // NewCollection returns a Collection over maps, ordered nearest-ancestor
@@ -124,7 +127,24 @@ func NewCollection(maps []*Map) *Collection {
 	sort.SliceStable(scopes, func(i, j int) bool {
 		return len(scopes[i].DirPrefix) > len(scopes[j].DirPrefix)
 	})
-	return &Collection{scopes: scopes}
+	c := &Collection{scopes: scopes}
+	for _, m := range scopes {
+		for _, a := range m.Entries {
+			if len(a.Targets) < 2 {
+				continue
+			}
+			var capture string
+			if a.HasWildcard {
+				capture = "*"
+			}
+			targets := make([]string, len(a.Targets))
+			for i, t := range a.Targets {
+				targets[i] = graph.JSModuleStem(m.joinTarget(t.Prefix + capture + t.Suffix))
+			}
+			c.alternateTargets = append(c.alternateTargets, targets)
+		}
+	}
+	return c
 }
 
 // ObservingProbes returns m with every existence probe Resolve makes on it
@@ -191,9 +211,8 @@ func (c *Collection) FindForFile(relPath string) *Map {
 }
 
 // Resolve maps modulePath against m's aliases and returns the
-// repo-relative target (extension stripped) or "" when no entry
-// matches. The returned path is forward-slashed and rooted at the
-// repository root.
+// repo-relative probe path or "" when no entry matches. aliasProbePath
+// preserves explicit declaration files and strips implementation extensions.
 func Resolve(m *Map, modulePath string) string {
 	if m == nil || modulePath == "" {
 		return ""
@@ -211,7 +230,7 @@ func Resolve(m *Map, modulePath string) string {
 		first := ""
 		for ti, tgt := range targets {
 			joined := m.joinTarget(tgt.Prefix + star + tgt.Suffix)
-			stripped := stripExt(joined)
+			stripped := aliasProbePath(joined)
 			if ti == 0 {
 				first = stripped
 			}
@@ -226,6 +245,34 @@ func Resolve(m *Map, modulePath string) string {
 		return first
 	}
 	return ""
+}
+
+// VisitAlternateStems reports the other possible selections of a multi-target
+// alias when one of its target stems changes. Invert the target's wildcard,
+// not the importer's path: an inherited map may have a different target base.
+func (c *Collection) VisitAlternateStems(stem string, visit func(string)) {
+	if c == nil {
+		return
+	}
+	for _, targets := range c.alternateTargets {
+		for i, target := range targets {
+			prefix, suffix, wildcard := strings.Cut(target, "*")
+			var star string
+			if wildcard {
+				if len(stem) < len(prefix)+len(suffix) || !strings.HasPrefix(stem, prefix) || !strings.HasSuffix(stem, suffix) {
+					continue
+				}
+				star = stem[len(prefix) : len(stem)-len(suffix)]
+			} else if target != stem {
+				continue
+			}
+			for j, alt := range targets {
+				if j != i {
+					visit(strings.Replace(alt, "*", star, 1))
+				}
+			}
+		}
+	}
 }
 
 // matchAlias reports whether modulePath matches a and, when it does, returns
@@ -273,7 +320,7 @@ func (m *Map) joinTarget(matched string) string {
 }
 
 // probeExts are the source extensions a path-alias target may resolve to,
-// matching stripExt's set plus declaration / json / index-file forms.
+// matching aliasProbePath's set plus declaration / json / index-file forms.
 var probeExts = []string{".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json"}
 
 // targetExistsInTree reports whether the repo-relative joined target resolves
@@ -304,12 +351,13 @@ func fileExists(p string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func stripExt(p string) string {
-	switch ext := filepath.Ext(p); ext {
-	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
-		return strings.TrimSuffix(p, ext)
+func aliasProbePath(p string) string {
+	// Keep an explicit declaration file for forward probing; its reverse
+	// key, unlike its lookup path, is shared with the implementation.
+	if strings.HasSuffix(p, ".d.ts") || strings.HasSuffix(p, ".d.cts") || strings.HasSuffix(p, ".d.mts") {
+		return p
 	}
-	return p
+	return graph.JSModuleStem(p)
 }
 
 // Tree is the repository view a loader reads its configs out of. A working
@@ -332,6 +380,9 @@ type Tree interface {
 
 // configFileNames are the config files a loader reads.
 var configFileNames = [...]string{"tsconfig.json", "jsconfig.json"}
+
+// ConfigFileNames returns the filenames that can introduce an alias scope.
+func ConfigFileNames() [len(configFileNames)]string { return configFileNames }
 
 // IsConfigFileName reports whether base — a file's base name — is a config
 // file the loaders parse. Exported so a Tree implementation that must decide
@@ -496,11 +547,20 @@ func (t listedTree) Files(visit func(rel string)) {
 	}
 }
 
+// WorkingTree visits config candidates plus an optional file in a pruned
+// directory. The optional extra has exactly the form "directory/file".
+func WorkingTree(root, extra string, scopeFiles ...string) Tree {
+	dir, file := path.Split(extra)
+	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file, scopeFiles: scopeFiles}
+}
+
 // dirTree is the working copy at a root: the tree Load reads.
 type dirTree struct {
-	root    string
-	dir     *os.Root // config reads; nil only for a zero tree
-	observe func(string, []byte, bool)
+	root                string
+	dir                 *os.Root // shared config reads during LoadObserved
+	observe             func(string, []byte, bool)
+	extraDir, extraFile string
+	scopeFiles          []string
 }
 
 var _ Tree = dirTree{}
@@ -520,9 +580,17 @@ func (t dirTree) Files(visit func(rel string)) {
 			return nil
 		}
 		if d.IsDir() {
-			if SkipDirName(d.Name()) {
+			if p != t.root && SkipDirName(d.Name()) {
+				if d.Name() == t.extraDir {
+					if rel, err := filepath.Rel(t.root, p); err == nil {
+						visit(path.Join(filepath.ToSlash(rel), t.extraFile))
+					}
+				}
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if !IsConfigFileName(d.Name()) && !slices.Contains(t.scopeFiles, d.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(t.root, p)
@@ -535,10 +603,15 @@ func (t dirTree) Files(visit func(rel string)) {
 }
 
 func (t dirTree) Read(rel string) ([]byte, bool) {
-	if t.dir == nil {
-		return nil, false
+	dir := t.dir
+	if dir == nil {
+		var err error
+		if dir, err = os.OpenRoot(t.root); err != nil {
+			return nil, false
+		}
+		defer dir.Close()
 	}
-	data, err := t.dir.ReadFile(filepath.FromSlash(rel))
+	data, err := dir.ReadFile(filepath.FromSlash(rel))
 	if t.observe != nil {
 		t.observe(rel, data, err == nil)
 	}

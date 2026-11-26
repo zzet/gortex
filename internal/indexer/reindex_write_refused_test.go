@@ -217,7 +217,8 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 	t.Run("patch_receiptChecked_false_bypasses_duplicate_gate_via_pending_retry", func(t *testing.T) {
 		root := t.TempDir()
 		configPath := aliasRebindFixture(t, root)
-		callerPath := filepath.Join(root, "pages", "index.ts")
+		probePath := filepath.Join(root, "keep.go")
+		writeFileMk(t, probePath, "package demo\nfunc Keep() int { return 1 }\n")
 		idx, store := newSQLiteIndexer(t)
 		_, err := idx.Index(root)
 		require.NoError(t, err)
@@ -240,10 +241,10 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 		assert.True(t, idx.hasPendingResolutionRetry())
 		assert.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 
-		// Attempt 2 on unchanged callerPath with receiptChecked=false exercises watcher.go's !idx.hasPendingResolutionRetry() gate directly.
-		dup, _ := idx.pointDuplicateSourceContent(context.Background(), callerPath)
-		require.True(t, dup, "callerPath bytes must match persisted file_meta so the duplicate gate is armed")
-		err = w.patchGraphWithReceiptStateObserved(callerPath, ChangeModified, 0, false, nil, nil)
+		// Attempt 2 on unchanged non-JS probePath with receiptChecked=false exercises watcher.go's !idx.hasPendingResolutionRetry() gate directly.
+		dup, _ := idx.pointDuplicateSourceContent(context.Background(), probePath)
+		require.True(t, dup, "probePath bytes must match persisted file_meta so the duplicate gate is armed")
+		err = w.patchGraphWithReceiptStateObserved(probePath, ChangeModified, 0, false, nil, nil)
 		require.NoError(t, err)
 		assert.False(t, idx.hasPendingResolutionRetry())
 		assert.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
@@ -264,14 +265,29 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 		w, err := NewWatcher(idx, config.WatchConfig{DebounceMs: 1, StormThreshold: -1, StormQuietPeriodMs: 1}, zap.NewNop())
 		require.NoError(t, err)
 
-		// Update tsconfig.json behind the scenes while leaving callerPath unchanged on disk:
-		// pointDuplicateSourceContent(callerPath) is provably true and hasPendingResolutionRetry() is false,
-		// so ONLY the retry flag (retryAttempt > 0) can bypass the duplicate gate; receiptChecked stays false.
-		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+		// With callerPath and resolution inputs unchanged, pointDuplicateSourceContent(callerPath)
+		// is provably true and hasPendingResolutionRetry() is false, so retryAttempt == 0 hits
+		// the duplicate gate while only the retry flag (retryAttempt > 0) bypasses it;
+		// receiptChecked stays false.
 		dup, _ := idx.pointDuplicateSourceContent(context.Background(), callerPath)
 		require.True(t, dup, "callerPath bytes must match persisted file_meta so the duplicate gate is armed")
 		require.False(t, idx.hasPendingResolutionRetry())
 
+		executorRan := false
+		idx.incrementalCatchupHook = func(kind string, _ []string) {
+			if kind == "derived" {
+				executorRan = true
+			}
+		}
+		w.runPointMutationObserved(callerPath, ChangeModified, 0, 0, nil)
+		assert.False(t, executorRan, "retryAttempt == 0 must short-circuit at the duplicate gate")
+
+		w.runPointMutationObserved(callerPath, ChangeModified, 0, 1, nil)
+		assert.True(t, executorRan, "retryAttempt > 0 must bypass the duplicate gate without pendingResolutionRetry")
+		idx.incrementalCatchupHook = nil
+
+		// Updating tsconfig.json behind the scenes also invalidates fileMtimeMatches and rebinds on retry.
+		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
 		w.runPointMutationObserved(callerPath, ChangeModified, 0, 1, nil)
 		assert.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 		digest, err := store.TSAliasDigest(idx.repoPrefix)

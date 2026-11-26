@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
+	"github.com/zzet/gortex/internal/progress"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -89,6 +90,12 @@ func TestTSConfigPathAlias_ConfigChangeOnFullReindex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = idx.IndexCtx(progress.WithReporter(ctx, firstIndexCancelReporter{cancel: cancel}), root)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotNil(t, idx.Graph().GetNode("old/auth.ts::useRedirect"))
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"))
 	_, err = idx.Index(root)
 	require.NoError(t, err)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, idx.Graph(), "pages/index.ts", "run"), "same-root reindex must not keep the old config")
@@ -101,7 +108,7 @@ func TestTSConfigPathAlias_NewConfigAfterNegativeFullScan(t *testing.T) {
 	idx, _ := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
-	require.Nil(t, loadTSAliasCollection(root), "absence of configs is cached too")
+	require.Nil(t, workingResolutionInputs(root, nil).aliases, "absence of configs is cached too")
 	writeFileMk(t, filepath.Join(root, "tsconfig.json"), `{"compilerOptions":{"paths":{"~/*":["lib/*"]}}}`)
 	idx, _ = newSQLiteIndexer(t)
 	_, err = idx.Index(root)
@@ -187,7 +194,7 @@ func TestTSConfigPathAlias_FailedFullResolveIsNotCertified(t *testing.T) {
 	digest, err := store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
 	require.Empty(t, digest, "a failed resolve must not certify either policy")
-	require.Empty(t, idx.appliedAliases)
+	require.Nil(t, idx.appliedResolution.Load())
 
 	_, err = idx.Index(root)
 	require.NoError(t, err)
@@ -209,7 +216,7 @@ func TestTSConfigPathAlias_DeferredIndexCertifiesAfterSharedResolve(t *testing.T
 	cm, err := config.NewConfigManager(configFile)
 	require.NoError(t, err)
 	seed, store := newSQLiteIndexer(t)
-	invalidateTSAliasCollection(root)
+	invalidateResolutionInputs(root)
 	mi := NewMultiIndexer(store, seed.registry, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.TrackRepoCtx(t.Context(), entry)
 	require.NoError(t, err)
@@ -237,18 +244,25 @@ func TestTSConfigPathAlias_DeferredIndexCertifiesAfterSharedResolve(t *testing.T
 	digest, err = store.TSAliasDigest("repo")
 	require.NoError(t, err)
 	require.NotEmpty(t, digest)
-	require.Nil(t, idx.deferredAliases.Load())
+	idx.resolutionMu.Lock()
+	defer idx.resolutionMu.Unlock()
+	require.Nil(t, idx.warmResolution)
 }
 
 func TestTSConfigPathAlias_FailedCatchupResolveIsNotCertified(t *testing.T) {
 	idx, store := newSQLiteIndexer(t)
-	idx.passAliases.Store(&aliasSnapshot{digest: "new"})
 	errResolve := errors.New("injected catch-up failure")
-	require.ErrorIs(t, idx.finishAliasPass(&IndexResult{resolutionErr: errResolve}), errResolve)
+	work := resolutionCompletion{
+		inputs:     &resolutionInputs{digest: "new"},
+		success:    true,
+		catchupErr: errResolve,
+	}
+	require.ErrorIs(t, idx.finishResolutionPass(work), errResolve)
 	digest, err := store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
 	require.Empty(t, digest)
-	require.Empty(t, idx.appliedAliases)
+	require.Nil(t, idx.appliedResolution.Load())
+	require.NotNil(t, idx.resolutionRetry, "the next pass must rebind the callers")
 }
 
 func TestTSConfigPathAlias_RebindPreservesExplicitScope(t *testing.T) {
@@ -344,7 +358,7 @@ func TestTSConfigPathAlias_RefusedFullResolveWriteIsNotCertified(t *testing.T) {
 	digest, err := store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
 	require.Empty(t, digest, "a refused resolver write must not certify the new alias digest")
-	require.Empty(t, idx.appliedAliases)
+	require.Nil(t, idx.appliedResolution.Load())
 
 	_, err = idx.Index(root)
 	require.NoError(t, err)
@@ -378,7 +392,7 @@ func TestTSConfigPathAlias_RefusedIncrementalResolveWriteIsNotCertified(t *testi
 	digest, err := store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
 	require.Empty(t, digest, "a refused incremental rebind write must not certify the new alias digest")
-	require.Empty(t, idx.appliedAliases)
+	require.Nil(t, idx.appliedResolution.Load())
 
 	_, err = idx.IncrementalReindexPaths(root, []string{configPath})
 	require.NoError(t, err)
@@ -400,7 +414,7 @@ func TestTSConfigPathAlias_RefusedDeferredSharedResolveWriteIsNotCertified(t *te
 	cm, err := config.NewConfigManager(configFile)
 	require.NoError(t, err)
 	seed, store := newSQLiteIndexer(t)
-	invalidateTSAliasCollection(root)
+	invalidateResolutionInputs(root)
 	mi := NewMultiIndexer(store, seed.registry, search.NewNull(), cm, zap.NewNop())
 	_, err = mi.TrackRepoCtx(t.Context(), entry)
 	require.NoError(t, err)
@@ -424,12 +438,16 @@ func TestTSConfigPathAlias_RefusedDeferredSharedResolveWriteIsNotCertified(t *te
 	digest, err := store.TSAliasDigest("repo")
 	require.NoError(t, err)
 	require.Empty(t, digest, "a refused shared resolve write must not certify the deferred alias policy")
-	require.NotNil(t, idx.deferredAliases.Load())
+	idx.resolutionMu.Lock()
+	require.NotNil(t, idx.warmResolution)
+	idx.resolutionMu.Unlock()
 
 	require.NoError(t, mi.RunPreEnrichResolve(t.Context(), nil, nil))
 	require.Equal(t, "repo/new/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
 	digest, err = store.TSAliasDigest("repo")
 	require.NoError(t, err)
 	require.NotEmpty(t, digest)
-	require.Nil(t, idx.deferredAliases.Load())
+	idx.resolutionMu.Lock()
+	defer idx.resolutionMu.Unlock()
+	require.Nil(t, idx.warmResolution)
 }

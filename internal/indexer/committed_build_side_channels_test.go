@@ -23,7 +23,6 @@ import (
 	"github.com/zzet/gortex/internal/indexer/source"
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
-	"github.com/zzet/gortex/internal/parser/tsalias"
 )
 
 // A build that indexes a committed tree reads its payload through the
@@ -888,7 +887,7 @@ func TestCommittedBuildPathAliasComesFromTheSnapshotConfig(t *testing.T) {
 	checkout, snapshot := t.TempDir(), t.TempDir()
 	writeSideChannelTree(t, checkout, tsAliasTree("src/a/x.ts", "0"))
 	writeSideChannelTree(t, snapshot, tsAliasTree("src/b/x.ts", "1"))
-	t.Cleanup(func() { forgetTSAliasCache(checkout, snapshot) })
+	t.Cleanup(func() { forgetResolutionInputs(checkout, snapshot) })
 
 	live := npmIndexer(t, checkout, nil)
 	assert.Equal(t, "src/a/x", live.resolvePathAliasImport("src/app.ts", "@x"),
@@ -899,34 +898,24 @@ func TestCommittedBuildPathAliasComesFromTheSnapshotConfig(t *testing.T) {
 		"a build that declared source authority expands the alias through its own tree")
 }
 
-// forgetTSAliasCache drops the process-wide working-copy entries a test
+// forgetResolutionInputs drops the process-wide working-copy entries a test
 // planted, so one test's temp root cannot answer another's.
-func forgetTSAliasCache(roots ...string) {
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
+func forgetResolutionInputs(roots ...string) {
 	for _, root := range roots {
-		delete(tsAliasCache, root)
+		invalidateResolutionInputs(root)
 	}
 }
 
-// tsAliasCacheEntry reports what the process-wide cache holds for a root.
-func tsAliasCacheEntry(root string) (*tsalias.Collection, bool) {
-	tsAliasCacheMu.Lock()
-	defer tsAliasCacheMu.Unlock()
-	slot := tsAliasCache[root]
-	if slot == nil {
-		return nil, false
-	}
-	slot.mu.Lock()
-	defer slot.mu.Unlock()
-	if slot.snapshot == nil {
-		return nil, false
-	}
-	return slot.snapshot.collection, true
+// resolutionInputsEntry reports what the process-wide cache holds for a root.
+func resolutionInputsEntry(root string) (*resolutionInputs, bool) {
+	resolutionCache.Lock()
+	defer resolutionCache.Unlock()
+	inputs, ok := resolutionCache.byRoot[root]
+	return inputs, ok
 }
 
 // TestSnapshotAliasScopesNeitherReadNorFillTheProcessCache pins the cache
-// keying. tsAliasCache is keyed by working-copy root, so otherwise a
+// keying. The cache is keyed by repo root, so without source isolation a
 // committed build and the live index at the same root would share one
 // checkout-derived Collection. A sourced load must ignore a primed entry for
 // its root and must not leave one behind.
@@ -934,23 +923,23 @@ func TestSnapshotAliasScopesNeitherReadNorFillTheProcessCache(t *testing.T) {
 	checkout, snapshot := t.TempDir(), t.TempDir()
 	writeSideChannelTree(t, checkout, tsAliasTree("src/a/x.ts", "0"))
 	writeSideChannelTree(t, snapshot, tsAliasTree("src/b/x.ts", "1"))
-	t.Cleanup(func() { forgetTSAliasCache(checkout, snapshot) })
+	t.Cleanup(func() { forgetResolutionInputs(checkout, snapshot) })
 
 	// Prime the root's entry with the checkout's answer, exactly as a live
 	// index of the same checkout would have.
 	live := npmIndexer(t, checkout, nil)
 	require.Equal(t, "src/a/x", live.resolvePathAliasImport("src/app.ts", "@x"))
-	primed, ok := tsAliasCacheEntry(checkout)
+	primed, ok := resolutionInputsEntry(checkout)
 	require.True(t, ok, "the working-copy load must still use the shared cache")
 
 	committed := npmIndexer(t, checkout, snapshotOf(t, snapshot))
 	assert.Equal(t, "src/b/x", committed.resolvePathAliasImport("src/app.ts", "@x"),
 		"a primed root entry must not decide a snapshot's aliases")
 
-	after, ok := tsAliasCacheEntry(checkout)
+	after, ok := resolutionInputsEntry(checkout)
 	assert.True(t, ok)
 	assert.Same(t, primed, after, "a sourced load must not overwrite the root's entry")
-	_, ok = tsAliasCacheEntry(snapshot)
+	_, ok = resolutionInputsEntry(snapshot)
 	assert.False(t, ok, "a sourced load must not fill the cache under any root")
 }
 
@@ -962,7 +951,7 @@ func TestIndexerAliasScopesFollowASwappedSource(t *testing.T) {
 	writeSideChannelTree(t, checkout, tsAliasTree("src/a/x.ts", "0"))
 	writeSideChannelTree(t, first, tsAliasTree("src/a/x.ts", "0"))
 	writeSideChannelTree(t, second, tsAliasTree("src/b/x.ts", "1"))
-	t.Cleanup(func() { forgetTSAliasCache(checkout, first, second) })
+	t.Cleanup(func() { forgetResolutionInputs(checkout, first, second) })
 
 	idx := npmIndexer(t, checkout, snapshotOf(t, first))
 	require.Equal(t, "src/a/x", idx.resolvePathAliasImport("src/app.ts", "@x"))
@@ -987,10 +976,10 @@ func TestAliasScopesAgreeAcrossDiskAndSnapshot(t *testing.T) {
 		"src/b/x.ts":               "export const x = 1;\n",
 		"packages/web/nested/x.ts": "export const x = 2;\n",
 	})
-	t.Cleanup(func() { forgetTSAliasCache(root) })
+	t.Cleanup(func() { forgetResolutionInputs(root) })
 
-	disk := tsAliasCollectionForTree(newDiskManifestTree(root))
-	snap := tsAliasCollectionForTree(sourceManifestTree{rootPath: root, src: snapshotOf(t, root)})
+	disk := resolutionInputsForTree(newDiskManifestTree(root)).aliases
+	snap := resolutionInputsForTree(sourceManifestTree{rootPath: root, src: snapshotOf(t, root)}).aliases
 	require.NotNil(t, disk)
 	require.NotNil(t, snap)
 	require.Len(t, disk.Maps(), 2, "the node_modules config is not a scope")
@@ -1018,10 +1007,10 @@ func TestAliasScopesAgreeAcrossDiskAndSnapshot(t *testing.T) {
 func TestSourcedTreeThatCannotEnumerateAnswersNoScopes(t *testing.T) {
 	root := t.TempDir()
 	writeSideChannelTree(t, root, tsAliasTree("src/a/x.ts", "0"))
-	t.Cleanup(func() { forgetTSAliasCache(root) })
+	t.Cleanup(func() { forgetResolutionInputs(root) })
 
-	require.NotNil(t, tsAliasCollectionForTree(newDiskManifestTree(root)))
-	assert.Nil(t, tsAliasCollectionForTree(sourceManifestTree{rootPath: root}),
+	require.NotNil(t, resolutionInputsForTree(newDiskManifestTree(root)).aliases)
+	assert.Nil(t, resolutionInputsForTree(sourceManifestTree{rootPath: root}).aliases,
 		"a sourced tree with nothing behind it answers no scopes, not the checkout's")
 }
 
@@ -1035,7 +1024,7 @@ func TestMultiIndexerAliasScopesPreferASourcedIndexer(t *testing.T) {
 	metaRoot, snapshot := t.TempDir(), t.TempDir()
 	writeSideChannelTree(t, metaRoot, tsAliasTree("src/a/x.ts", "0"))
 	writeSideChannelTree(t, snapshot, tsAliasTree("src/b/x.ts", "1"))
-	t.Cleanup(func() { forgetTSAliasCache(metaRoot, snapshot) })
+	t.Cleanup(func() { forgetResolutionInputs(metaRoot, snapshot) })
 
 	idx := sideChannelIndexer(t, graph.New(), metaRoot)
 	mi := &MultiIndexer{

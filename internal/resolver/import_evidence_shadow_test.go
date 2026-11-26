@@ -1192,7 +1192,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 				cr.SetNpmPackageLookup(func(string) map[string]NpmPackageTarget { return nil })
 
 				memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
-				cr.restubStaleTrackedNpmRequireCallsAll(ctx, memo)
+				require.ErrorIs(t, cr.restubStaleTrackedNpmRequireCallsAll(ctx, memo), context.Canceled)
 
 				// Exactly page 1 flushed; remaining 5 stay cleanly indexed at provA/index.ts::work.
 				inProv := callsInto(base, "provA/index.ts::work")
@@ -1263,7 +1263,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 		cr.SetNpmPackageLookup(func(string) map[string]NpmPackageTarget { return nil })
 
 		memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
-		cr.restubStaleTrackedNpmRequireCallsAll(context.Background(), memo)
+		require.NoError(t, cr.restubStaleTrackedNpmRequireCallsAll(context.Background(), memo))
 
 		require.Equal(t, 2, wrapped.pages, "expected 2 hydration pages to run")
 		require.Equal(t, resolvePendingPageRows+1, wrapped.sitesHydrated, "siteSeen must deduplicate {shared, 1} before paging")

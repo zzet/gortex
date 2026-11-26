@@ -5,26 +5,28 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser"
 )
 
 var (
-	markupScriptRe   = regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`)
-	markupLangAttrRe = regexp.MustCompile(`(?i)\blang\s*=\s*["']([a-z]+)["']`)
+	markupScriptRe = regexp.MustCompile(`(?is)<script\b((?:[^>"']|"[^"]*"|'[^']*')*)>(.*?)</script>`)
+	markupAttrRe   = regexp.MustCompile(`([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?`)
 )
 
-// scriptTagIsTypeScript reports whether a <script> tag's attribute string
-// declares a TypeScript dialect.
-func scriptTagIsTypeScript(attrs []byte) bool {
-	m := markupLangAttrRe.FindSubmatch(attrs)
-	if m == nil {
-		return false
+func markupScriptAttributes(attrs []byte) (ts, setup bool) {
+	for _, attr := range markupAttrRe.FindAllSubmatch(attrs, -1) {
+		switch strings.ToLower(string(attr[1])) {
+		case "setup":
+			setup = true
+		case "lang":
+			switch strings.ToLower(strings.Trim(string(attr[2]), `"'`)) {
+			case "ts", "tsx", "typescript":
+				ts = true
+			}
+		}
 	}
-	switch strings.ToLower(string(m[1])) {
-	case "ts", "tsx", "typescript":
-		return true
-	}
-	return false
+	return ts, setup
 }
 
 // carveAndDelegateScripts runs every <script>/<script setup> block in src through
@@ -38,7 +40,7 @@ func carveAndDelegateScripts(src []byte, filePath, fileID, language string, ts, 
 			continue
 		}
 		delegate := js
-		if scriptTagIsTypeScript(src[m[2]:m[3]]) {
+		if isTS, _ := markupScriptAttributes(src[m[2]:m[3]]); isTS {
 			delegate = ts
 		}
 		lineOffset := strings.Count(string(src[:contentStart]), "\n")
@@ -58,17 +60,22 @@ func carveAndDelegateScripts(src []byte, filePath, fileID, language string, ts, 
 // It is the shared spine behind every markup extractor that embeds another
 // language (HTML/Vue/Svelte/Astro <script>, Razor @code), so the error-prone
 // offset-rebase math lives — and is tested — in exactly one place.
-func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOffset int, filePath, fileID, language string, result *parser.ExtractionResult) {
+func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOffset int, filePath, fileID, language string, result *parser.ExtractionResult) *graph.Node {
 	if delegate == nil || result == nil || strings.TrimSpace(string(content)) == "" {
-		return
+		return nil
 	}
 	virtual := filePath + "#script:" + strconv.Itoa(lineOffset+1)
 	sub, err := delegate.Extract(virtual, content)
 	if err != nil || sub == nil {
-		return
+		return nil
 	}
+	var file *graph.Node
 	for _, n := range sub.Nodes {
-		if n == nil || n.ID == virtual { // drop the synthetic file node
+		if n == nil {
+			continue
+		}
+		if n.ID == virtual {
+			file = n
 			continue
 		}
 		n.FilePath = filePath
@@ -100,4 +107,5 @@ func delegateInlineScriptSlice(delegate parser.Extractor, content []byte, lineOf
 		}
 		result.Edges = append(result.Edges, ed)
 	}
+	return file
 }

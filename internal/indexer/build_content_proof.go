@@ -55,9 +55,8 @@ import (
 //     handler-source reads, the scoped walk's finding
 //     that an explicit path is gone, and every change the plan demoted to a
 //     deletion because the working copy no longer held it;
-//   - recorded as a read of unknown bytes, held to its change stamp: each
-//     config read to build the cached alias snapshot,
-//     when the process-wide alias cache answered the build;
+//   - recorded by content identity: config and generated-list reads during
+//     discovery, bounded point refresh, and replay from workingResolutionInputs;
 //   - recorded as an existence probe with its answer (probe): the deletion
 //     walk's checks of the files it plans and of the root manifests, the
 //     importer scan's check of a deleted file's importers, and a tsconfig
@@ -112,14 +111,8 @@ import (
 //     an Lstat of every ancestor of every read at the fence, for a layout
 //     (a symlinked directory inside a checkout, swapped twice mid-build)
 //     checkouts rarely hold.
-//   - Process-wide caches that hold bytes read before the build's sample:
-//     the C/C++ include directories from compile_commands.json (keyed by the
-//     database's mtime; the lookup's probes are claimed), and the
-//     tsconfig / jsconfig alias cache beyond the configs its scopes came
-//     from (a config that parsed to no scope is not held; the first load is
-//     a whole-tree scan, unbounded). Their staleness predates the proof and
-//     is the same for every build of the process, main's included; the proof
-//     holds what the build itself read, and their invalidation is theirs.
+//   - Cached C/C++ include directories from compile_commands.json predate the
+//     sample and are keyed by mtime. The lookup probes themselves are claimed.
 //   - The legacy unscoped contract path (no contract-core runtime, which the
 //     daemon never builds without): it reads cross-file handler sources and
 //     their directories beyond what the proof records, so on the equal-sample
