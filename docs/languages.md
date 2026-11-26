@@ -121,8 +121,8 @@ when imports don't settle the call, the usual resolution rules still apply.
 A call whose name is bound by an enclosing parameter, catch clause, block or
 hoisted `var` is not an import call. It binds to a same-file declaration when
 one exists and otherwise stays unresolved. A local initialized from an
-unshadowed static `require("...")` binding resolves only against that required
-module instead of file-wide imports.
+unshadowed static `require("...")` is not treated as a shadow: the call keeps
+the ordinary import tiers.
 
 ### Julia specifics
 

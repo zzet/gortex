@@ -706,6 +706,11 @@ type jsScopeKey struct {
 	kind       string
 	body       bool
 }
+// jsRequireBinding marks a local bound directly by an unshadowed static
+// require(). It ends the scope walk without stamping the call, which keeps
+// the call on the ordinary import tiers.
+const jsRequireBinding = "require"
+
 type jsBinding struct {
 	kind string
 	spec string
@@ -765,7 +770,7 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				names[id] = b
 			}
 			local := func(id string) { add(id, jsBinding{kind: graph.JSLexicalLocal}) }
-			required := func(id, spec string) { add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec}) }
+			required := func(id, spec string) { add(id, jsBinding{kind: jsRequireBinding, spec: spec}) }
 			switch kind {
 			case "statement_block":
 				// Class static blocks and TS namespaces are their own var scopes.
@@ -806,13 +811,13 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 			cache.scopes[key] = names
 		}
 		if binding, found := names[name]; found {
+			if binding.kind == jsRequireBinding {
+				return
+			}
 			if edge.Meta == nil {
 				edge.Meta = map[string]any{}
 			}
 			edge.Meta[graph.JSLexicalBindingMeta] = binding.kind
-			if binding.spec != "" {
-				edge.Meta[graph.JSLexicalRequireSpecMeta] = binding.spec
-			}
 			return
 		}
 	}
@@ -822,12 +827,10 @@ func jsLexicalRank(e *graph.Edge) int {
 	switch e.Meta[graph.JSLexicalBindingMeta] {
 	case nil:
 		return 0
-	case graph.JSLexicalRequire:
-		return 1
 	case graph.JSLexicalLocal:
-		return 2
+		return 1
 	default:
-		return 3
+		return 2
 	}
 }
 
@@ -862,51 +865,15 @@ func clearCollapsedJSShadows(edges []*graph.Edge) {
 		if len(group) < 2 {
 			continue
 		}
-		winner := best[id]
-		winnerRank := jsLexicalRank(winner)
-		if winnerRank == 3 {
-			continue
-		}
-		// Two colliding local require() calls on one line that disagree on
-		// their module specifier cannot pick one deterministically across
-		// stores; downgrade the whole group to JSLexicalLocal.
-		if winnerRank == 1 {
-			spec, _ := winner.Meta[graph.JSLexicalRequireSpecMeta].(string)
-			ambiguousSpec := false
-			for _, e := range group {
-				if jsLexicalRank(e) != 1 {
-					continue
-				}
-				if s, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string); s != spec {
-					ambiguousSpec = true
-					break
-				}
-			}
-			if ambiguousSpec {
-				for _, e := range group {
-					if e.Meta == nil {
-						e.Meta = map[string]any{}
-					}
-					e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
-					delete(e.Meta, graph.JSLexicalRequireSpecMeta)
-				}
-				continue
-			}
-		}
+		winnerRank := jsLexicalRank(best[id])
 		for _, e := range group {
 			if jsLexicalRank(e) <= winnerRank {
 				continue
 			}
-			switch winnerRank {
-			case 0:
+			if winnerRank == 0 {
 				delete(e.Meta, graph.JSLexicalBindingMeta)
-				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
-			case 1:
-				e.Meta[graph.JSLexicalBindingMeta] = winner.Meta[graph.JSLexicalBindingMeta]
-				e.Meta[graph.JSLexicalRequireSpecMeta] = winner.Meta[graph.JSLexicalRequireSpecMeta]
-			case 2:
+			} else {
 				e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
-				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
 			}
 		}
 	}

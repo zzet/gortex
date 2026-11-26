@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,11 +113,6 @@ type CrossRepoResolver struct {
 	// same-repo name-only binding just because the repository is reachable.
 	importedDirsByFile map[string]map[string]struct{}
 	jsTSBindingsByFile map[string]map[string]string
-	// Per-pass cache for JS/TS local require() resolution so parallel workers
-	// share out-edge adjacency and tracked-npm target lookups without N+1 reads.
-	requireCacheMu     sync.RWMutex
-	outEdgesByFile     map[string][]*graph.Edge
-	requireTargetCache map[string]jsRequireTarget
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes from the caller's go.mod. Same shape and rationale as
 	// the field of the same name on Resolver — see resolver.go for
@@ -399,7 +395,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
-	defer cr.clearRequireCache()
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -531,19 +526,7 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			if workers < 1 {
 				workers = 1
 			}
-			type crossRepoJob struct {
-				orig            *graph.Edge
-				oldTo           string
-				newTo           string
-				kind            graph.EdgeKind
-				crossRepo       bool
-				confidence      float64
-				confidenceLabel string
-				origin          string
-				tier            string
-				meta            map[string]any
-			}
-			perWorkerJobs := make([][]crossRepoJob, workers)
+			perWorkerBatch := make([][]graph.EdgeReindex, workers)
 			perWorkerStats := make([]*CrossRepoStats, workers)
 			var wg sync.WaitGroup
 			chunk := (len(sc) + workers - 1) / workers
@@ -560,37 +543,16 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 				go func(idx int, slice []*graph.Edge) {
 					defer wg.Done()
 					ws := &CrossRepoStats{ByRepo: make(map[string]int)}
-					var jobs []crossRepoJob
-					var scratchBatch []graph.EdgeReindex
+					var batch []graph.EdgeReindex
 					for _, edge := range slice {
 						if ctx.Err() != nil {
 							break
 						}
-						// Operate on a shallow clone so sibling workers reading
-						// graph adjacency (e.g. local require() barrel walks)
-						// never race with in-place Edge.To / Edge.Meta writes.
-						clone := cloneEdgeForResolve(edge)
-						scratchBatch = scratchBatch[:0]
-						cr.resolveEdge(clone, ws, &scratchBatch)
-						if len(scratchBatch) > 0 {
-							jobs = append(jobs, crossRepoJob{
-								orig:            edge,
-								oldTo:           scratchBatch[0].OldTo,
-								newTo:           clone.To,
-								kind:            clone.Kind,
-								crossRepo:       clone.CrossRepo,
-								confidence:      clone.Confidence,
-								confidenceLabel: clone.ConfidenceLabel,
-								origin:          clone.Origin,
-								tier:            clone.Tier,
-								meta:            clone.Meta,
-							})
-						}
-						releaseResolverClone(clone)
+						cr.resolveEdge(edge, ws, &batch)
 						processed.Add(1)
 					}
 					perWorkerStats[idx] = ws
-					perWorkerJobs[idx] = jobs
+					perWorkerBatch[idx] = batch
 				}(w, sc[start:end])
 			}
 			wg.Wait()
@@ -599,18 +561,8 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			}
 
 			var scBatch []graph.EdgeReindex
-			for i := range perWorkerJobs {
-				for _, job := range perWorkerJobs[i] {
-					job.orig.To = job.newTo
-					job.orig.Kind = job.kind
-					job.orig.CrossRepo = job.crossRepo
-					job.orig.Confidence = job.confidence
-					job.orig.ConfidenceLabel = job.confidenceLabel
-					job.orig.Origin = job.origin
-					job.orig.Tier = job.tier
-					job.orig.Meta = job.meta
-					scBatch = append(scBatch, graph.EdgeReindex{Edge: job.orig, OldTo: job.oldTo})
-				}
+			for i := range perWorkerBatch {
+				scBatch = append(scBatch, perWorkerBatch[i]...)
 			}
 			for _, ws := range perWorkerStats {
 				if ws == nil {
@@ -633,7 +585,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 				cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
 				reindexTotal += len(scBatch)
 				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
-				cr.clearRequireCache()
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
@@ -648,10 +599,7 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 						// An interleaving writer may have created nodes or
 						// changed name buckets; drop cross-page retention.
 						cr.hotCache.flush()
-						cr.clearRequireCache()
 					}
-				} else {
-					cr.clearRequireCache()
 				}
 			}
 		}
@@ -745,30 +693,11 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 // layer. Shared by repository, legacy file, and batched files-plus-incoming
 // scopes. Caller holds cr.mu.
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
-	defer cr.clearRequireCache()
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	if len(edges) == 0 {
-		return stats
-	}
-	restubbed, _ := cr.resolveTrackedNpmImportsScoped(context.Background(), edges, stats)
-	pending := make([]*graph.Edge, 0, len(edges)+len(restubbed))
-	seen := make(map[graph.EdgeIdentity]struct{}, len(edges)+len(restubbed))
+	_ = cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats)
+	pending := make([]*graph.Edge, 0, len(edges))
 	for _, edge := range edges {
 		if edge != nil && graph.IsUnresolvedTarget(edge.To) {
-			id := graph.EdgeIdentityFor(edge)
-			if _, dup := seen[id]; !dup {
-				seen[id] = struct{}{}
-				pending = append(pending, edge)
-			}
-		}
-	}
-	for _, edge := range restubbed {
-		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
-			continue
-		}
-		id := graph.EdgeIdentityFor(edge)
-		if _, dup := seen[id]; !dup {
-			seen[id] = struct{}{}
 			pending = append(pending, edge)
 		}
 	}
@@ -989,14 +918,6 @@ func (cr *CrossRepoResolver) clearReachableReposIndex() {
 	cr.reachableReposByFile = nil
 	cr.importedDirsByFile = nil
 	cr.jsTSBindingsByFile = nil
-	cr.clearRequireCache()
-}
-
-func (cr *CrossRepoResolver) clearRequireCache() {
-	cr.requireCacheMu.Lock()
-	cr.outEdgesByFile = nil
-	cr.requireTargetCache = nil
-	cr.requireCacheMu.Unlock()
 }
 
 // A package-guard refusal is stronger than the cross-repo pass's same-repo
@@ -1197,7 +1118,6 @@ func (cr *CrossRepoResolver) clearLookupCache() {
 	cr.nodesByName = nil
 	cr.nodesByNameRepo = nil
 	cr.nodesByQualName = nil
-	cr.clearRequireCache()
 }
 
 // scopedCandidates returns the candidates named `name` the caller of e could
@@ -1333,8 +1253,9 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 		cr.resolveFunctionCall(e, target, stats)
 		// Last-resort cross-daemon proxy-edge stitch: only when local
 		// resolution left the edge unresolved, proxy-edge minting is on,
-		// and a prober is wired. Never stitch a lexically shadowed or
-		// locally required JS/TS call.
+		// and a prober is wired. The evidence gate inside tryRemoteStitch
+		// refuses to probe on a bare name. Never stitch a lexically shadowed
+		// JS/TS call.
 		if e.To == oldTo && cr.edgesEnabled && cr.prober != nil && e.Meta[graph.JSLexicalBindingMeta] == nil {
 			cr.tryRemoteStitch(e, target, stats)
 		}
@@ -1468,14 +1389,8 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
-	// Lexical shadows (parameters and non-require locals) have no cross-repo
-	// callee; local require() bindings resolve strictly against their own
-	// required module rather than unrelated file-wide ES imports.
-	if binding := e.Meta[graph.JSLexicalBindingMeta]; binding != nil {
-		if binding == graph.JSLexicalRequire {
-			cr.resolveJSRequireCall(e, funcName, stats)
-			return
-		}
+	// A lexically shadowed JS/TS call (parameter or local) has no cross-repo callee.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil {
 		stats.Unresolved++
 		return
 	}

@@ -119,9 +119,8 @@ func stagePriorBindings(g graph.Store, stages []*incrementalBatchStage, view inc
 				if edge.To == "" || graph.IsUnresolvedTarget(edge.To) || graph.IsStub(edge.To) {
 					continue
 				}
-				// Prior lexical shadows and local require() bindings can be
-				// deleted or retargeted without changing the file's KindImport
-				// nodes; never carry their binding forward.
+				// Prior lexical shadows can be deleted without changing the
+				// file's KindImport nodes; never carry their binding forward.
 				if edge.Meta[graph.JSLexicalBindingMeta] != nil {
 					continue
 				}
@@ -236,7 +235,7 @@ func sameImports(prior, fresh []*graph.Node) bool {
 func resolutionMetaAdded(prior, fresh map[string]any) map[string]any {
 	var out map[string]any
 	for k, v := range prior {
-		if k == graph.JSLexicalBindingMeta || k == graph.JSLexicalRequireSpecMeta {
+		if k == graph.JSLexicalBindingMeta {
 			continue
 		}
 		if _, extracted := fresh[k]; extracted {

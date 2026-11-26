@@ -45,7 +45,7 @@ import (
 // cascade, changing import edges for an unchanged corpus.
 // Direct named JS/TS import bindings now disambiguate otherwise competing files,
 // and lexically shadowed bare calls no longer bind by name.
-const ResolutionSemanticsVersion = 8
+const ResolutionSemanticsVersion = 9
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

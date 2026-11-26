@@ -14,48 +14,9 @@ import (
 	"github.com/zzet/gortex/internal/resolver"
 )
 
-func (mi *MultiIndexer) npmPackageRoots() (roots, workspaces map[string]string) {
-	roots = map[string]string{}
-	workspaces = map[string]string{}
-	for prefix, meta := range mi.AllMetadata() {
-		if meta != nil && meta.RootPath != "" {
-			roots[prefix] = meta.RootPath
-			workspaces[prefix] = prefix
-			if idx := mi.GetIndexer(prefix); idx != nil && idx.WorkspaceID() != "" {
-				workspaces[prefix] = idx.WorkspaceID()
-			}
-		}
-	}
-	return roots, workspaces
-}
-
 // npmPackageLookup gives each resolver an immutable manifest snapshot. Unchanged
 // roots, config and manifest/directory stamps share the previous lookup.
 func (mi *MultiIndexer) npmPackageLookup() resolver.NpmPackageLookup {
-	roots, workspaces := mi.npmPackageRoots()
-	if len(roots) == 0 {
-		return nil
-	}
-	var once sync.Once
-	var snap *npmPackageSnapshot
-	return func(specifier string) map[string]resolver.NpmPackageTarget {
-		once.Do(func() { snap = mi.loadNpmPackageSnapshotFor(roots, workspaces) })
-		if snap == nil || snap.lookup == nil {
-			return nil
-		}
-		return snap.lookup(specifier)
-	}
-}
-
-func (mi *MultiIndexer) loadNpmPackageSnapshot() *npmPackageSnapshot {
-	roots, workspaces := mi.npmPackageRoots()
-	if len(roots) == 0 {
-		return nil
-	}
-	return mi.loadNpmPackageSnapshotFor(roots, workspaces)
-}
-
-func (mi *MultiIndexer) loadNpmPackageSnapshotFor(roots, workspaces map[string]string) *npmPackageSnapshot {
 	type entry struct {
 		dir          string
 		workspaceID  string
@@ -69,84 +30,103 @@ func (mi *MultiIndexer) loadNpmPackageSnapshotFor(roots, workspaces map[string]s
 
 		recognizedRoot bool
 	}
-	mi.npmPackageMu.Lock()
-	defer mi.npmPackageMu.Unlock()
-	var revision uint64
-	if mi.configMgr != nil {
-		revision = mi.configMgr.Revision()
+	roots := map[string]string{}
+	workspaces := map[string]string{}
+	for prefix, meta := range mi.AllMetadata() {
+		if meta != nil && meta.RootPath != "" {
+			roots[prefix] = meta.RootPath
+			workspaces[prefix] = prefix
+			if idx := mi.GetIndexer(prefix); idx != nil && idx.WorkspaceID() != "" {
+				workspaces[prefix] = idx.WorkspaceID()
+			}
+		}
 	}
-	prior := mi.npmPackageCache
-	if prior != nil && prior.revision == revision && maps.Equal(prior.roots, roots) && maps.Equal(prior.workspaces, workspaces) && prior.unchanged() {
-		return prior
+	if len(roots) == 0 {
+		return nil
 	}
-	// Taken before the first stat, so a racy stamp is never judged against a later time.
-	stampedAt := time.Now()
-	files := make(map[string]npmPackageFileStamp)
-	watch := func(file string) { files[file] = npmPackageStamp(file) }
 	packages := map[string][]entry{}
-	repoPackages := map[string]map[string]struct{}{}
-	for prefix, root := range roots {
-		watch(root)
-		watch(filepath.Join(root, "package.json"))
-		watch(filepath.Join(root, "pnpm-workspace.yaml"))
-		rootSrc, _ := readDiskFile(joinPath(root, "package.json"))
-		workspace := &modules.WorkspaceManifest{Ecosystem: modules.WorkspaceNPM, Patterns: modules.ParsePackageJSONWorkspaces(rootSrc)}
-		if len(workspace.Patterns) == 0 {
-			src, _ := readDiskFile(joinPath(root, "pnpm-workspace.yaml"))
-			workspace.Ecosystem = modules.WorkspacePnpm
-			workspace.Patterns = modules.ParsePnpmWorkspaceYAML(src)
+	var once sync.Once
+	var lookup, cached resolver.NpmPackageLookup
+	build := func() {
+		mi.npmPackageMu.Lock()
+		defer mi.npmPackageMu.Unlock()
+		var revision uint64
+		if mi.configMgr != nil {
+			revision = mi.configMgr.Revision()
 		}
-		watchNpmWorkspacePaths(root, workspace.Patterns, watch)
-		dirs := []string{"."}
-		for _, member := range modules.ResolveWorkspaceMembers(root, workspace) {
-			dirs = append(dirs, member.Dir)
+		prior := mi.npmPackageCache
+		if prior != nil && prior.revision == revision && maps.Equal(prior.roots, roots) && maps.Equal(prior.workspaces, workspaces) && prior.unchanged() {
+			cached = prior.lookup
+			return
 		}
-		for _, dir := range dirs {
-			if path.IsAbs(dir) || hasDotDotSegment(dir) {
-				continue
+		// Taken before the first stat, so a racy stamp is never judged against a later time.
+		stampedAt := time.Now()
+		files := make(map[string]npmPackageFileStamp)
+		watch := func(file string) { files[file] = npmPackageStamp(file) }
+		for prefix, root := range roots {
+			watch(root)
+			watch(filepath.Join(root, "package.json"))
+			watch(filepath.Join(root, "pnpm-workspace.yaml"))
+			rootSrc, _ := readDiskFile(joinPath(root, "package.json"))
+			workspace := &modules.WorkspaceManifest{Ecosystem: modules.WorkspaceNPM, Patterns: modules.ParsePackageJSONWorkspaces(rootSrc)}
+			if len(workspace.Patterns) == 0 {
+				src, _ := readDiskFile(joinPath(root, "pnpm-workspace.yaml"))
+				workspace.Ecosystem = modules.WorkspacePnpm
+				workspace.Patterns = modules.ParsePnpmWorkspaceYAML(src)
 			}
-			src := rootSrc
-			if dir != "." {
-				src, _ = readDiskFile(joinPath(root, joinRel(dir, "package.json")))
+			watchNpmWorkspacePaths(root, workspace.Patterns, watch)
+			dirs := []string{"."}
+			for _, member := range modules.ResolveWorkspaceMembers(root, workspace) {
+				dirs = append(dirs, member.Dir)
 			}
-			var manifest struct {
-				Name    string          `json:"name"`
-				Exports json.RawMessage `json:"exports"`
-				Types   string          `json:"types"`
-				Main    string          `json:"main"`
-			}
-			if json.Unmarshal(src, &manifest) != nil || manifest.Name == "" {
-				continue
-			}
-			var conditions map[string]json.RawMessage
-			_ = json.Unmarshal(manifest.Exports, &conditions)
-			if root, ok := conditions["."]; ok {
-				conditions = nil
-				_ = json.Unmarshal(root, &conditions)
-			}
-			exports := parsePackageExports(src)
-			declared := declaredNpmExports(manifest.Exports)
-			// Keep unsupported and blocked keys in the target map so an
-			// exact key cannot fall through to a broader wildcard target.
-			if exports != nil {
-				for key := range declared {
-					if _, ok := exports.subpaths[key]; !ok {
-						exports.subpaths[key] = ""
+			for _, dir := range dirs {
+				if path.IsAbs(dir) || hasDotDotSegment(dir) {
+					continue
+				}
+				src := rootSrc
+				if dir != "." {
+					src, _ = readDiskFile(joinPath(root, joinRel(dir, "package.json")))
+				}
+				var manifest struct {
+					Name    string          `json:"name"`
+					Exports json.RawMessage `json:"exports"`
+					Types   string          `json:"types"`
+					Main    string          `json:"main"`
+				}
+				if json.Unmarshal(src, &manifest) != nil || manifest.Name == "" {
+					continue
+				}
+				var conditions map[string]json.RawMessage
+				_ = json.Unmarshal(manifest.Exports, &conditions)
+				if root, ok := conditions["."]; ok {
+					conditions = nil
+					_ = json.Unmarshal(root, &conditions)
+				}
+				exports := parsePackageExports(src)
+				declared := declaredNpmExports(manifest.Exports)
+				// Keep unsupported and blocked keys in the target map so an
+				// exact key cannot fall through to a broader wildcard target.
+				if exports != nil {
+					for key := range declared {
+						if _, ok := exports.subpaths[key]; !ok {
+							exports.subpaths[key] = ""
+						}
 					}
 				}
-			}
-			packages[manifest.Name] = append(packages[manifest.Name], entry{
-				recognizedRoot: hasRecognizedNpmCondition(conditions),
+				packages[manifest.Name] = append(packages[manifest.Name], entry{
+					recognizedRoot: hasRecognizedNpmCondition(conditions),
 
-				dir: path.Join(prefix, dir), workspaceID: workspaces[prefix], exports: exports, declared: declared, typesExports: npmTypesExportTargets(manifest.Exports), arrayRoot: npmExportsArrayRoot(manifest.Exports), hasExports: hasPackageExports(manifest.Exports), types: manifest.Types, main: manifest.Main,
-			})
-			if repoPackages[prefix] == nil {
-				repoPackages[prefix] = make(map[string]struct{})
+					dir: path.Join(prefix, dir), workspaceID: workspaces[prefix], exports: exports, declared: declared, typesExports: npmTypesExportTargets(manifest.Exports), arrayRoot: npmExportsArrayRoot(manifest.Exports), hasExports: hasPackageExports(manifest.Exports), types: manifest.Types, main: manifest.Main,
+				})
 			}
-			repoPackages[prefix][manifest.Name] = struct{}{}
 		}
+		mi.npmPackageCache = &npmPackageSnapshot{revision: revision, roots: roots, workspaces: workspaces, files: files, stampedAt: stampedAt, lookup: lookup}
 	}
-	lookup := func(specifier string) map[string]resolver.NpmPackageTarget {
+	lookup = func(specifier string) map[string]resolver.NpmPackageTarget {
+		once.Do(build)
+		if cached != nil {
+			return cached(specifier)
+		}
 		name, sub := splitPackageSpecifier(specifier)
 		if name == "" || hasDotDotSegment(sub) || len(packages[name]) == 0 {
 			return nil
@@ -195,17 +175,7 @@ func (mi *MultiIndexer) loadNpmPackageSnapshotFor(roots, workspaces map[string]s
 		}
 		return targets
 	}
-	snap := &npmPackageSnapshot{
-		revision:     revision,
-		roots:        roots,
-		workspaces:   workspaces,
-		files:        files,
-		stampedAt:    stampedAt,
-		lookup:       lookup,
-		repoPackages: repoPackages,
-	}
-	mi.npmPackageCache = snap
-	return snap
+	return lookup
 }
 
 // declaredNpmExports retains entry keys independently of supported conditions.
