@@ -1,0 +1,258 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// A typed refusal that says the product changed no files is a known outcome.
+// The restore proceeds past it, rewrites only checkouts whose bytes moved, and
+// sends nothing for a checkout whose edits were all refused. An abandoned tool
+// deadline, or a busy reply whose delivery is unknown, can still hide a write,
+// so those records keep blocking the restore.
+func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
+	const checkout = "expected-linked-checkout"
+	toolError := func(text string) func() (any, *rpcError) {
+		return func() (any, *rpcError) {
+			return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": text}}}, nil
+		}
+	}
+	// Exact product texts from a linked-checkout smoke run.
+	routeMoved := toolError("view_read_only: checkout mutation was not admitted; no files were changed: indexer: checkout mutation view is stale: the selected route moved: checkout route changed; read the current exact view and retry. Native fallback status was not established for this checkout. Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session.")
+	notRouted := toolError(`view_building: checkout "` + checkout + `" is not fully routed yet`)
+	abandoned := toolError(`tool "edit" exceeded its 55.071287166s deadline and was abandoned so the session stays responsive. The work may still complete in the background, so treat any side effect as unknown. This usually means the graph is busy (indexing, enrichment, or a slow store) — retry, or check ` + "`gortex daemon status`.")
+	busy := func() (any, *rpcError) {
+		return nil, &rpcError{Code: -32002, Message: "MCP dispatcher is busy", Data: map[string]any{"outcome": "server_busy", "retryable": true, "retry_after_ms": 1, "delivery_unknown": false}}
+	}
+	unknownBusy := func() (any, *rpcError) {
+		return nil, &rpcError{Code: -32002, Message: "MCP dispatcher is busy", Data: map[string]any{"outcome": "server_busy", "retryable": true, "delivery_unknown": true}}
+	}
+	for _, cell := range []struct {
+		name    string
+		routes  int                       // 2: an applied primary edit beside the refused linked edit
+		replies []func() (any, *rpcError) // refused edit's replies in order; the last repeats
+		refusal string                    // the record's not-admitted refusal; empty means unknown
+	}{
+		{"view_read_only_route_moved", 2, []func() (any, *rpcError){routeMoved}, "view_read_only"},
+		{"view_building_not_routed", 2, []func() (any, *rpcError){notRouted}, "view_building"},
+		{"busy_then_typed_refusal", 2, []func() (any, *rpcError){busy, notRouted}, "view_building"},
+		{"busy_until_deadline", 2, []func() (any, *rpcError){busy}, "server_busy"},
+		{"single_checkout_all_refused", 1, []func() (any, *rpcError){routeMoved}, "view_read_only"},
+		{"tool_deadline_abandoned", 2, []func() (any, *rpcError){abandoned}, ""},
+		{"busy_delivery_unknown", 2, []func() (any, *rpcError){unknownBusy}, ""},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			c := editProbeCorpus()
+			c.Label = "fixture"
+			p := &privateRun{Root: t.TempDir()}
+			labels := []string{"fixture", "linked-1"}[:cell.routes]
+			originals := make([]string, len(labels))
+			for i, label := range labels {
+				root := filepath.Join(p.Root, label)
+				if err := os.Mkdir(root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				originals[i] = fmt.Sprintf("package sample\n// checkout%d\nfunc Example() int { return 1 }\n%s\n", i, c.EditAnchor)
+				if err := os.WriteFile(filepath.Join(root, c.File), []byte(originals[i]), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				corpus := c
+				corpus.Label = label
+				p.Repos = append(p.Repos, privateRepo{Path: root, File: filepath.Join(root, c.File), Prefix: "fixture", Corpus: corpus})
+			}
+			refused := len(p.Repos) - 1 // the linked checkout, or the only one
+			disks := make(map[string]func(stubFrame) (any, *rpcError))
+			for _, repo := range p.Repos {
+				disks[repo.Path] = editProbeDiskStub(t, c, repo.Path)
+			}
+			var mu sync.Mutex
+			refusedCalls := 0
+			batches := make(map[string]int)
+			mutations := make(map[string]string)
+			p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
+				if frame.Kind == "search_symbols" {
+					return map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": "fixture", "checkout_id": checkout}}, nil
+				}
+				if frame.Method != "tools/call" {
+					return stubContent(map[string]any{}), nil
+				}
+				repo := -1
+				for i, candidate := range p.Repos {
+					if frame.Cwd == candidate.Path {
+						repo = i
+					}
+				}
+				if repo < 0 {
+					return nil, &rpcError{Code: -32000, Message: "unknown checkout"}
+				}
+				args, _ := frame.Params["arguments"].(map[string]any)
+				options, _ := args["options"].(map[string]any)
+				switch {
+				case frame.Params["name"] == "edit" && args["operation"] == "file" && repo == refused:
+					mu.Lock()
+					reply := cell.replies[min(refusedCalls, len(cell.replies)-1)]
+					refusedCalls++
+					mu.Unlock()
+					return reply()
+				case frame.Params["name"] == "edit" && args["operation"] == "file":
+					data, err := os.ReadFile(p.Repos[repo].File)
+					if err != nil {
+						t.Error(err)
+						return nil, &rpcError{Code: -32000, Message: "read failed"}
+					}
+					match, _ := args["match"].(string)
+					replacement, _ := args["replacement"].(string)
+					if match == "" || strings.Count(string(data), match) != 1 {
+						return nil, &rpcError{Code: -32000, Message: "exact match missing"}
+					}
+					if err := os.WriteFile(p.Repos[repo].File, []byte(strings.Replace(string(data), match, replacement, 1)), 0o600); err != nil {
+						t.Error(err)
+						return nil, &rpcError{Code: -32000, Message: "write failed"}
+					}
+					mutation, _ := options["mutation_id"].(string)
+					mu.Lock()
+					mutations[frame.Cwd] = mutation
+					mu.Unlock()
+					return stubContent(map[string]any{"mutation_receipt": "applied-receipt"}), nil
+				case frame.Params["name"] == "change" && args["operation"] == "receipt":
+					mu.Lock()
+					mutation := mutations[frame.Cwd]
+					mu.Unlock()
+					return stubContent(map[string]any{"found": true, "receipt": "applied-receipt", "mutation_id": mutation, "graph_status_terminal": true, "graph_status": "fresh"}), nil
+				case frame.Params["name"] == "edit" && args["operation"] == "batch":
+					// The product refuses a rewrite whose old and new bytes match.
+					changes, _ := args["changes"].([]any)
+					change, _ := changes[0].(map[string]any)
+					current, err := os.ReadFile(p.Repos[repo].File)
+					if err != nil || len(changes) != 1 || change["old_string"] != string(current) {
+						return nil, &rpcError{Code: -32000, Message: "restore guard differs from disk"}
+					}
+					if change["old_string"] == change["new_string"] {
+						return toolError("old_string and new_string are identical")()
+					}
+					mu.Lock()
+					batches[frame.Cwd]++
+					mu.Unlock()
+				}
+				return disks[frame.Cwd](frame)
+			})
+			phase := &Phase{Metrics: map[string]Metric{}, Gate: map[string]json.RawMessage{}}
+			if cell.routes > 1 {
+				gate, err := json.Marshal(map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": "fixture", "checkout_id": checkout}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				phase.Gate["linked-1.view"] = gate
+			}
+			var clients []*socketClient
+			t.Cleanup(func() { closeClients(clients) })
+			for _, repo := range p.Repos {
+				client, err := openMCP(ctx, p.Socket, repo.Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				clients = append(clients, client)
+			}
+			run, probers, err := prepareEditProbe(ctx, runOptions{Seed: 42, EditCount: 100, Editors: len(p.Repos), Worktrees: len(p.Repos) - 1, Deadline: 2 * time.Second, editProbeBaseline: true}, p, nil, clients, phase)
+			clients = append(clients, probers...)
+			if run != nil {
+				t.Cleanup(func() { _ = run.close() })
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			run.origin = time.Now()
+			phase.EditProbe.Records = nil
+			for editor := range p.Repos {
+				var step editProbeStep
+				for _, candidate := range run.plan.Steps {
+					if candidate.Editor == editor {
+						step = candidate
+						break
+					}
+				}
+				state := run.states[step.Ordinal]
+				run.activate(ctx, step)
+				awaitEditProbeFirstProbe(t, state)
+				run.doEdit(ctx, step)
+				record := state.record
+				if editor != refused {
+					if record.Outcome != "complete" || !record.GraphTerminal {
+						t.Fatalf("applied primary edit did not complete: %+v", record)
+					}
+				} else if record.Outcome != "edit_error" || record.Receipt != "" {
+					t.Fatalf("refused edit gained a receipt or another outcome: %+v", record)
+				}
+				phase.EditProbe.Records = append(phase.EditProbe.Records, record)
+			}
+			before := make([]string, len(p.Repos))
+			for i, repo := range p.Repos {
+				data, err := os.ReadFile(repo.File)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[i] = string(data)
+			}
+			if before[refused] != originals[refused] {
+				t.Fatalf("a refused edit changed its checkout: %q", before[refused])
+			}
+			restoreErr := run.restore(ctx)
+			mu.Lock()
+			sent, refusedBatches := 0, batches[p.Repos[refused].Path]
+			for _, count := range batches {
+				sent += count
+			}
+			mu.Unlock()
+			// The report names why a receipt-less record did not block the restore.
+			wire, err := json.Marshal(phase.EditProbe.Records[refused])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatal(err)
+			}
+			refusal, _ := fields["not_admitted"].(string)
+			if cell.refusal == "" {
+				if restoreErr == nil || !strings.Contains(restoreErr.Error(), "unknown/pending") {
+					t.Fatalf("an unknown edit outcome permitted the restore: %v", restoreErr)
+				}
+				for i, repo := range p.Repos {
+					if data, err := os.ReadFile(repo.File); err != nil || string(data) != before[i] {
+						t.Fatalf("a refused restore changed checkout%d: %v", i, err)
+					}
+				}
+				if sent != 0 || refusal != "" {
+					t.Fatalf("a refused restore sent %d rewrites; record names not_admitted %q", sent, refusal)
+				}
+				return
+			}
+			if restoreErr != nil {
+				t.Fatalf("a typed no-mutation refusal blocked the restore: %v (%s)", restoreErr, phase.EditProbe.Restore)
+			}
+			for i, repo := range p.Repos {
+				if data, err := os.ReadFile(repo.File); err != nil || string(data) != originals[i] {
+					t.Fatalf("checkout%d not at its original after restore: %q %v", i, data, err)
+				}
+			}
+			if refusedBatches != 0 || sent != len(p.Repos)-1 {
+				t.Fatalf("restore rewrote %d checkouts (%d unchanged), want only the applied one", sent, refusedBatches)
+			}
+			if !strings.Contains(string(phase.EditProbe.Restore), "unchanged") {
+				t.Fatalf("restore evidence does not name the unchanged checkout: %s", phase.EditProbe.Restore)
+			}
+			if refusal != cell.refusal {
+				t.Fatalf("refused record names not_admitted %q, want %q: %s", refusal, cell.refusal, wire)
+			}
+		})
+	}
+}
