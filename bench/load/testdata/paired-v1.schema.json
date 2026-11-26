@@ -2286,6 +2286,9 @@
                                   }
                                 ]
                               },
+                              "not_admitted": {
+                                "type": "string"
+                              },
                               "ordinal": {
                                 "type": "integer"
                               },

@@ -86,6 +86,7 @@ type editProbeRecord struct {
 	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
 	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
 	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	NotAdmitted                 string                              `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
 	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
 	Ack                         Metric                              `json:"t_ack_ms"`
 	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
@@ -785,6 +786,13 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	s.countBusy(purpose, attempts)
+	if purpose == "edit" && err != nil {
+		if refusal := editProbeNotAdmitted(attempts); refusal != "" {
+			s.mu.Lock()
+			s.record.NotAdmitted = refusal
+			s.mu.Unlock()
+		}
+	}
 	evidenceErr := s.emitOrHold(ctx, purpose, map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
