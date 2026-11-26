@@ -245,7 +245,16 @@ func TestEditProbeBatchPlanKeepsOfferedPrefixAndScheduleAcrossFixtureLanguages(t
 	}
 }
 
-func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) {
+// editProbeBatchCollectorStub serves the three public owners a one-file batch
+// collector reads: the fresh transaction, the file observation built from an
+// ordinary receipt-status fixture, and the shared acknowledgement.
+type editProbeBatchCollectorStub struct {
+	refs             editProbeBatchReferences
+	tx, file, shared map[string]any
+}
+
+func newEditProbeBatchCollectorStub(t *testing.T, status map[string]any) *editProbeBatchCollectorStub {
+	t.Helper()
 	refs, err := decodeEditProbeBatchAcknowledgement(editProbeBatchACKFixture(), "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
 	if err != nil {
 		t.Fatal(err)
@@ -255,13 +264,19 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 	tx["graph_status"] = "fresh"
 	tx["files"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
 	tx["results"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
-	file := editProbeAccountingFixture()
-	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": file["acknowledgement"]}
-	delete(file, "acknowledgement")
-	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
-	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
-	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
-	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": status["acknowledgement"]}
+	delete(status, "acknowledgement")
+	status["found"], status["receipt_kind"], status["receipt"] = true, "batch_file_observation", refs.Observation
+	status["transaction_id"], status["path"], status["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	status["after_sha256"], status["publication_receipt"], status["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	status["writer_return_observed"], status["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	return &editProbeBatchCollectorStub{refs: refs, tx: tx, file: status, shared: shared}
+}
+
+// collect runs the actual collector against a stub daemon and returns the
+// owner each status read named, in order.
+func (f *editProbeBatchCollectorStub) collect(ctx context.Context, t *testing.T, state *editProbeState) []string {
+	t.Helper()
 	var mu sync.Mutex
 	var owners []string
 	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
@@ -271,14 +286,14 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		var response map[string]any
 		if frame.Params["name"] == "edit" {
 			owner, _ = options["transaction_id"].(string)
-			response = tx
+			response = f.tx
 		} else {
 			owner, _ = options["receipt"].(string)
 			switch owner {
-			case refs.Observation:
-				response = file
-			case refs.Acknowledgement:
-				response = shared
+			case f.refs.Observation:
+				response = f.file
+			case f.refs.Acknowledgement:
+				response = f.shared
 			}
 		}
 		mu.Lock()
@@ -286,8 +301,6 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		mu.Unlock()
 		return stubContent(response), nil
 	})
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
 	client, err := openMCP(ctx, socket, "")
 	if err != nil {
 		t.Fatal(err)
@@ -298,17 +311,26 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer sink.Close()
-	state := &editProbeState{client: client, sink: sink, record: editProbeRecord{FirstCorrect: map[string]Metric{"oracle": measured(1, "ms")}}}
+	state.client, state.sink = client, sink
 	state.startRaw()
-	defer state.finishRaw()
 	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "repo"}}}, phase: &Phase{Metrics: map[string]Metric{}}, origin: time.Now(), requireAccounting: true}
-	run.collectBatchEvidence(ctx, state, refs, editProbeBatchOfferedBytes())
+	run.collectBatchEvidence(ctx, state, f.refs, editProbeBatchOfferedBytes())
+	state.finishRaw()
+	mu.Lock()
+	defer mu.Unlock()
+	return owners
+}
+
+func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) {
+	stub := newEditProbeBatchCollectorStub(t, editProbeAccountingFixture())
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	state := &editProbeState{record: editProbeRecord{FirstCorrect: map[string]Metric{"oracle": measured(1, "ms")}}}
+	owners := stub.collect(ctx, t, state)
 	if ctx.Err() != nil || !state.record.GraphTerminal || state.record.Accounting.State != "observed_single_window_checks_pass" {
 		t.Fatalf("actual collector failed: %+v %v", state.record, ctx.Err())
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if !reflect.DeepEqual(owners, []string{refs.TransactionID, refs.Observation, refs.Acknowledgement}) {
+	if refs := stub.refs; !reflect.DeepEqual(owners, []string{refs.TransactionID, refs.Observation, refs.Acknowledgement}) {
 		t.Fatal("owner route mismatch", owners)
 	}
 	if state.record.Receipt != "" {
