@@ -81,6 +81,11 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	require.NoError(t, <-patchDone)
 	require.NoError(t, <-reconciled)
 	require.NoError(t, <-reconciled)
+	// Having answered both callers, the drain takes the lane once more, finds
+	// no waiters and stops; it clears Running just before it hands the lane
+	// back. Wait for both, so the try and the idle counts below do not race it.
+	require.Eventually(t, func() bool { return !coordinator.stats().Running && len(coordinator.lane) == 1 },
+		5*time.Second, time.Millisecond, "the reconcile drain did not stop")
 
 	// The try door records a tenure as well.
 	releaseTry, free := coordinator.tryExclusive(OutputEntryContractRepair)
