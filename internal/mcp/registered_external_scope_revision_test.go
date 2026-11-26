@@ -280,9 +280,9 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 						require.Equal(t, false, freshness["complete"])
 					}
 				case "canonical_no_projection":
-					if tool == "get_editing_context" && errors.Is(observed.err, graph.ErrContractProjectionStale) {
+					if errors.Is(observed.err, graph.ErrContractProjectionStale) {
 						requireCanonicalDefinitionRows(t, tool, result, expected)
-						requireCanonicalEditingContextPartial(t, result)
+						requireCanonicalFileReadPartial(t, tool, result)
 						break
 					}
 					fallthrough

@@ -121,7 +121,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 	}()
 	// The census and the pending marker share one lane interval, so no core
 	// write of this repository lands between the inventory and the marker.
-	err := options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
+	err := options.MultiIndexer.withRepositoryMutationLanesFor(ctx, OutputEntryContractBaseline, []string{repo}, func() error {
 		return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
 			var err error
 			snapshot, err = captureAcceptedContractFiles(ctx, options, nil, []string{repo})
@@ -259,7 +259,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			}
 			reconstructed[file.Path] = encoded
 		}
-		err = options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
+		err = options.MultiIndexer.withRepositoryMutationLanesFor(ctx, OutputEntryContractBaseline, []string{repo}, func() error {
 			return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
 				// The fence is the pending input state alone: a key-moving save
 				// rewrote it, and only that supersedes the baseline.
@@ -307,7 +307,7 @@ func reconcilePrimaryContractBaseline(ctx context.Context, options ContractFollo
 			return err
 		}
 	}
-	return options.MultiIndexer.withRepositoryMutationLanes(ctx, []string{repo}, func() error {
+	return options.MultiIndexer.withRepositoryMutationLanesFor(ctx, OutputEntryContractBaseline, []string{repo}, func() error {
 		return options.MultiIndexer.withContractBaselineOutput(ctx, options.Store, repo, OutputEntryContractBaseline, func() error {
 			current, found, err := store.ContractInputStateContext(ctx, repo, "")
 			if err != nil {

@@ -26,6 +26,11 @@ type sqliteWriteGate struct {
 	// onRelease runs at every Unlock while the gate is still held (the
 	// writer connection's page-cache counters; writer_cache_counters.go).
 	onRelease atomic.Pointer[func()]
+	// writerTLS is the libc TLS of the store's writer connection, set only on
+	// a store's writer gate (writer_cache_counters.go); owned is the current
+	// hold when a writer attribution owns it (writer_attribution.go).
+	writerTLS atomic.Uintptr
+	owned     atomic.Pointer[ownedWriterHold]
 	// holds counts completed holds (measurement: how often a path takes the
 	// writer).
 	holds atomic.Int64
@@ -83,9 +88,13 @@ func (g *sqliteWriteGate) lockContext(ctx context.Context, foreground bool) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Decided before waiting, outside the hold: a goroutine blocked here
+	// cannot enter or leave a writer attribution.
+	owner := g.acquiringOwner()
 	select {
 	case <-g.token:
 		g.holder.Store(newHoldRecord())
+		g.attributeHold(owner)
 		return nil
 	default:
 	}
@@ -107,6 +116,7 @@ func (g *sqliteWriteGate) lockContext(ctx context.Context, foreground bool) erro
 			return err
 		}
 		g.holder.Store(newHoldRecord())
+		g.attributeHold(owner)
 		return nil
 	}
 }
@@ -136,9 +146,11 @@ func (g *sqliteWriteGate) beginReclaim(burst bool) {
 
 func (g *sqliteWriteGate) TryLock() bool {
 	g.init()
+	owner := g.acquiringOwner()
 	select {
 	case <-g.token:
 		g.holder.Store(newHoldRecord())
+		g.attributeHold(owner)
 		return true
 	default:
 		return false
@@ -147,8 +159,16 @@ func (g *sqliteWriteGate) TryLock() bool {
 
 func (g *sqliteWriteGate) Unlock() {
 	g.init()
+	owned := g.owned.Load()
+	var released time.Time
+	if owned != nil {
+		released = time.Now()
+	}
 	if f := g.onRelease.Load(); f != nil {
 		(*f)()
+	}
+	if owned != nil {
+		g.finishOwnedHold(owned, released)
 	}
 	// Only the reclaim holding the gate sets reclaimSince, so an ordinary
 	// release pays one load here.

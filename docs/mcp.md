@@ -542,6 +542,17 @@ current disk state. CLI verbs print the freshness line on stderr;
 `--require-fresh` exits with code 4 when the requested tier remains pending or
 failed.
 
+`mutation_status` also carries `tier_after_commit_ms`: for `file_graph`,
+`relations` and `derived`, the milliseconds from the disk commit to that tier's
+stamp, on the daemon's clock, or `null` while the tier is unpublished. It is
+the daemon-side publication latency of the edit, read beside the latency a
+caller observes, not a replacement for it. While `graph_status` is pending, the
+receipt's `repository_lane` names what holds the mutation lane of the edit's
+repository (holder kind, since, held time), the callers queued for it, and the
+topology gates the holder takes. Daemon status (`repository_lanes`,
+`reach_topology`) and `index_health` (`repository_lanes`) report the same
+lanes, with past tenures in daemon status.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |
