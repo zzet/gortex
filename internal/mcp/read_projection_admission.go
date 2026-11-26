@@ -18,6 +18,7 @@ func (s *Server) admitReadBuiltProjection(ctx context.Context, root string, idx 
 	}); ok {
 		ticket, err := watcher.EnqueueToolMutation(ctx, entry.absPath)
 		if err == nil && ticket != nil {
+			noteReadBuiltCatchUp(pendingFileProjections, entry, ticket)
 			return
 		}
 	}
@@ -26,4 +27,20 @@ func (s *Server) admitReadBuiltProjection(ctx context.Context, root string, idx 
 	if _, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
 		markRequestProjectionDeferred(ctx, entry.graphPath, "watcher_unavailable")
 	}
+}
+
+// The catch-up's completion only permits a later read of the file to run the
+// checked retirement for this entry; it drops nothing itself, so no read that
+// already retained the entry can be refused for it.
+func noteReadBuiltCatchUp(registry *pendingProjections, entry *projectionEntry, ticket *indexer.MutationTicket) {
+	if ticket.Done == nil {
+		return
+	}
+	go func() {
+		if result, ok := <-ticket.Done; ok && result.Err == nil {
+			registry.mu.Lock()
+			entry.catchUpPublished = true
+			registry.mu.Unlock()
+		}
+	}()
 }

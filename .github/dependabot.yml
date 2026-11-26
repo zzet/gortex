@@ -52,11 +52,47 @@ updates:
     # tree under tree-sitter-* is large and would otherwise drown the
     # inbox in individual PRs.
     groups:
-      go-minor-patch:
-        patterns: ["*"]
+      # The embedding stack is pre-1.0 and released in lockstep: hugot
+      # and onnx-gomlx build only against the gomlx version they were
+      # released with, so a lone transitive bump (go-huggingface raising
+      # gomlx) breaks every package that reaches internal/embedding.
+      # Move the stack together in its own PR and review it against the
+      # internal/embedding call sites; a 0.x minor bump can change the
+      # API. onnxruntime_go is tied to the ONNX Runtime C API version
+      # that ci.yml downloads, so it moves with this stack as well.
+      ml-stack:
+        patterns:
+          - github.com/gomlx/*
+          - github.com/knights-analytics/*
+          - github.com/yalue/onnxruntime_go
         update-types:
           - minor
           - patch
+      go-minor-patch:
+        patterns: ["*"]
+        # Keep these out of the catch-all group explicitly instead of
+        # relying on group order. Keep the ml-stack entries in sync with
+        # the patterns above. modernc.org/sqlite gets its own PR: a
+        # sqlite bump swaps the transpiled SQLite runtime and can raise
+        # modernc.org/libc and modernc.org/memory (see ignore below).
+        exclude-patterns:
+          - github.com/gomlx/*
+          - github.com/knights-analytics/*
+          - github.com/yalue/onnxruntime_go
+          - modernc.org/sqlite
+        update-types:
+          - minor
+          - patch
+    # modernc.org/sqlite asks consumers to use exactly the modernc.org/libc
+    # version its own go.mod pins (the "Fragile modernc.org/libc
+    # dependency" section of its package documentation): the transpiled
+    # SQLite code is built against that libc. libc and memory therefore
+    # never move on their own. A modernc.org/sqlite bump raises them
+    # through minimal version selection when its pins are newer; if they
+    # end up ahead of its pins, set them back to those versions by hand.
+    ignore:
+      - dependency-name: modernc.org/libc
+      - dependency-name: modernc.org/memory
     # Open a manageable number of PRs at once — default 5 for gomod is
     # fine; bumping to 10 covers our broader dep tree without flooding.
     open-pull-requests-limit: 10

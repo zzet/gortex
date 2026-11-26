@@ -590,6 +590,58 @@
                       }
                     ]
                   },
+                  "consumer_ownership": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "censored": {
+                            "type": "integer"
+                          },
+                          "complete": {
+                            "type": "boolean"
+                          },
+                          "editors": {
+                            "type": "integer"
+                          },
+                          "owned_acks": {
+                            "type": "integer"
+                          },
+                          "plan_bound": {
+                            "type": "boolean"
+                          },
+                          "planned_ordinals": {
+                            "type": "integer"
+                          },
+                          "raw_evidence": {
+                            "type": "integer"
+                          },
+                          "unowned_ordinals": {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "editors",
+                          "planned_ordinals",
+                          "plan_bound",
+                          "owned_acks",
+                          "raw_evidence",
+                          "censored",
+                          "complete"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "edits": {
                     "items": {
                       "additionalProperties": false,
@@ -1170,6 +1222,15 @@
                             }
                           ]
                         },
+                        "busy_refusals": {
+                          "additionalProperties": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "checkout_id": {
                           "type": "string"
                         },
@@ -1463,6 +1524,19 @@
                             }
                           ]
                         },
+                        "consumer_own_ack": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "deadline_reason": {
+                          "type": "string"
+                        },
                         "editor": {
                           "type": "integer"
                         },
@@ -1483,6 +1557,9 @@
                         },
                         "evidence_encode_ms": {
                           "type": "number"
+                        },
+                        "evidence_folded_repeat_calls": {
+                          "type": "integer"
                         },
                         "evidence_limit_bytes": {
                           "type": "integer"
@@ -2254,8 +2331,153 @@
                           "items": {
                             "additionalProperties": false,
                             "properties": {
+                              "concurrent_same_file_commits": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "commits": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "ack_in_window": {
+                                              "type": "boolean"
+                                            },
+                                            "ack_ns": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "commit_seq": {
+                                              "type": "integer"
+                                            },
+                                            "edit_write_ns": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "integer"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "editor": {
+                                              "type": "integer"
+                                            },
+                                            "ordinal": {
+                                              "type": "integer"
+                                            },
+                                            "receipt": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "ordinal",
+                                            "editor",
+                                            "ack_in_window"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "type": [
+                                          "array",
+                                          "null"
+                                        ]
+                                      },
+                                      "state": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "state"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "correct": {
                                 "type": "boolean"
+                              },
+                              "disposition": {
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "error_code": {
+                                        "type": "string"
+                                      },
+                                      "freshness_complete": {
+                                        "anyOf": [
+                                          {
+                                            "type": "boolean"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "freshness_reason": {
+                                        "type": "string"
+                                      },
+                                      "freshness_state": {
+                                        "type": "string"
+                                      },
+                                      "kind": {
+                                        "type": "string"
+                                      },
+                                      "node_count": {
+                                        "anyOf": [
+                                          {
+                                            "type": "integer"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "projection_predicate": {
+                                        "additionalProperties": {},
+                                        "type": [
+                                          "object",
+                                          "null"
+                                        ]
+                                      },
+                                      "reason": {
+                                        "type": "string"
+                                      },
+                                      "retriable": {
+                                        "anyOf": [
+                                          {
+                                            "type": "boolean"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "retry_scope": {
+                                        "type": "string"
+                                      },
+                                      "rpc_code": {
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
                               },
                               "error": {
                                 "type": "string"
@@ -2987,6 +3209,40 @@
                             }
                           ]
                         },
+                        "t_graph_terminal_ms": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "t_readback_ms": {
                           "additionalProperties": false,
                           "properties": {
@@ -3560,6 +3816,128 @@
                   },
                   "plan_sha256": {
                     "type": "string"
+                  },
+                  "projection_after": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "error": {
+                            "type": "string"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "pending_projection": {},
+                          "projection_divergence": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "reason": {
+                                "type": "string"
+                              },
+                              "unit": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "value",
+                              "unit",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "wire_id": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "projection_divergence"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "projection_before": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "error": {
+                            "type": "string"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "pending_projection": {},
+                          "projection_divergence": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "reason": {
+                                "type": "string"
+                              },
+                              "unit": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "value",
+                              "unit",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "wire_id": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "projection_divergence"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "reads": {
                     "additionalProperties": {
@@ -4447,6 +4825,24 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "busy_refusals": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "deadline_reasons": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
                           "measures": {
                             "additionalProperties": {
                               "additionalProperties": false,

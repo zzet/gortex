@@ -114,6 +114,10 @@ type editProbeSummary struct {
 	Offered  int                           `json:"offered"`
 	Outcomes map[string]int                `json:"outcomes"`
 	Measures map[string]editProbeQuantiles `json:"measures"`
+	// Attribution only: why each product deadline expired, and dispatcher
+	// busy refusals by call purpose. Outcome counts keep their meaning.
+	DeadlineReasons map[string]int `json:"deadline_reasons,omitempty"`
+	BusyRefusals    map[string]int `json:"busy_refusals,omitempty"`
 }
 
 func editProbeRank(q float64, n int) int { return max(0, int(math.Ceil(q*float64(n)))-1) }
@@ -221,5 +225,6 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 	for name, m := range values {
 		out.Measures[name] = editProbeQuantilesOf(m.observed, m.censored, len(records)-len(m.observed)-m.censored, "ms", seed, name)
 	}
+	summarizeEditProbeAttribution(out, records)
 	return out
 }
