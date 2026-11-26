@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -225,15 +223,6 @@ func editProbeBatchIntent(req request) (string, []byte, error) {
 	return id, []byte(after), nil
 }
 
-// Once a batch edit's graph is fresh and every first-correct time is measured,
-// its accounting gets this many consecutive unchanged status cycles to become
-// terminal. A native-duplicate physical attempt whose earlier publisher is
-// never reported stays unavailable indefinitely, and repeating identical
-// status reads would only fill the per-edit raw evidence cap.
-const editProbeAccountingSettlePolls = 8
-
-var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
-
 // Poll the durable transaction separately from the shared A and original file
 // P/B/R owners. This begins only after own-ACK immediate readbacks; neither
 // scheduling nor the readback continuation waits for another offered edit.
@@ -245,8 +234,7 @@ func (r *editProbeRuntime) collectBatchEvidence(ctx context.Context, s *editProb
 		}
 		return decodeEditProbeResult(raw)
 	}
-	var settling editProbeAccounting
-	unchanged := 0
+	var settle editProbeAccountingSettle
 	for ctx.Err() == nil {
 		tx, err := perform(request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "options": map[string]any{"transaction_id": refs.TransactionID, "status_only": true}}}, "batch_transaction_status", 200)
 		if errors.Is(err, errEditProbeEvidenceIncomplete) {
@@ -300,16 +288,7 @@ func (r *editProbeRuntime) collectBatchEvidence(ctx context.Context, s *editProb
 				if editProbeFinished(terminal, all, r.requireAccounting, accounting) {
 					return
 				}
-				// Only cycles with every observable in count, and any change
-				// in the accounting restarts the count.
-				if !terminal || !all {
-					unchanged = 0
-				} else if unchanged == 0 || !reflect.DeepEqual(settling, accounting) {
-					settling, unchanged = accounting, 1
-				} else {
-					unchanged++
-				}
-				if unchanged >= editProbeAccountingSettlePolls {
+				if settle.unsettled(terminal && all, accounting) {
 					s.mu.Lock()
 					s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)
 					s.mu.Unlock()

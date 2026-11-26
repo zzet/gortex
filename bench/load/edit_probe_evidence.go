@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"path/filepath"
+	"reflect"
 	"strings"
 )
 
@@ -688,6 +689,42 @@ func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accoun
 
 func editProbeAccountingComplete(accounting editProbeAccounting) bool {
 	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
+}
+
+// Once a status loop awaits nothing but terminal accounting (the graph is
+// fresh, every first-correct time is measured, and any assigned post-ACK
+// coverage is in), the accounting gets this many consecutive unchanged status
+// cycles to become terminal. A native-duplicate physical attempt whose
+// earlier publisher is never reported stays unavailable indefinitely, and
+// repeating identical status reads would only fill the per-edit raw evidence
+// cap.
+const editProbeAccountingSettlePolls = 8
+
+var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
+
+// editProbeAccountingSettle counts one status loop's consecutive evaluated
+// cycles that await only terminal accounting and see it unchanged.
+type editProbeAccountingSettle struct {
+	last      []any
+	unchanged int
+}
+
+// unsettled records one evaluated status cycle and reports whether the loop
+// should stop with its accounting still unavailable. ready says that every
+// exit condition other than terminal accounting held on this cycle;
+// accounting is all the accounting the cycle observed. A cycle that is not
+// ready, or whose accounting differs from the last counted one, restarts the
+// count.
+func (w *editProbeAccountingSettle) unsettled(ready bool, accounting ...any) bool {
+	switch {
+	case !ready:
+		w.unchanged = 0
+	case w.unchanged == 0 || !reflect.DeepEqual(w.last, accounting):
+		w.last, w.unchanged = accounting, 1
+	default:
+		w.unchanged++
+	}
+	return w.unchanged >= editProbeAccountingSettlePolls
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {
