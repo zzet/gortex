@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
@@ -57,22 +58,36 @@ type resolutionInputStat struct {
 	size    int64
 	mtime   int64
 	missing bool
+	// racy marks a stat taken within racyStatWindow of its mtime: a later
+	// same-size rewrite in the same mtime tick would match it.
+	racy bool
 }
 
+// racyStatWindow covers file systems whose mtimes are coarser than the clock.
+const racyStatWindow = 2 * time.Second
+
 func statResolutionInput(dir *os.Root, rel string) resolutionInputStat {
+	now := time.Now()
 	info, err := dir.Stat(filepath.FromSlash(rel))
 	if err != nil {
 		return resolutionInputStat{missing: true}
 	}
-	return resolutionInputStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+	mtime := info.ModTime()
+	return resolutionInputStat{size: info.Size(), mtime: mtime.UnixNano(), racy: !mtime.Before(now.Add(-racyStatWindow))}
 }
 
 // statUnchanged reports whether rel still has the stat recorded with its read.
+// A racy recorded stat never vouches for the bytes.
 func (in *resolutionInputs) statUnchanged(dir *os.Root, rel string) bool {
 	in.statsMu.Lock()
 	defer in.statsMu.Unlock()
 	recorded, ok := in.stats[rel]
-	return ok && recorded == statResolutionInput(dir, rel)
+	if !ok || recorded.racy {
+		return false
+	}
+	current := statResolutionInput(dir, rel)
+	current.racy = false
+	return recorded == current
 }
 
 func (in *resolutionInputs) noteStat(rel string, stat resolutionInputStat) {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -214,4 +215,26 @@ func TestResolutionDiscovery_RestoreRejectsNewGeneratedList(t *testing.T) {
 
 	writeFileMk(t, filepath.Join(root, ".nuxt", "imports.d.ts"), "export { useAuth } from '../auth'\n")
 	require.Nil(t, restoreResolutionInputs(abs, current.digest, current.reads))
+}
+
+// A stat taken in the same mtime tick as a later same-size rewrite would match
+// it, so a recent stat never stands in for the bytes.
+func TestResolutionDiscovery_RacyStatDoesNotVouchForInputs(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	abs := absRootForTest(t, root)
+	tick := time.Now().Truncate(time.Second)
+	require.NoError(t, os.Chtimes(configPath, tick, tick))
+	current, err := discoverResolutionInputs(abs, nil)
+	require.NoError(t, err)
+	require.True(t, current.stats["tsconfig.json"].racy)
+
+	original, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	rewritten := []byte(strings.Replace(string(original), "old/*", "new/*", 1))
+	require.Len(t, rewritten, len(original))
+	require.NoError(t, os.WriteFile(configPath, rewritten, 0o644))
+	require.NoError(t, os.Chtimes(configPath, tick, tick)) // same tick, same size
+	caller := filepath.Join(abs, "pages", "index.ts")
+	require.False(t, current.unchangedForPoints(abs, []string{caller}, nil))
 }
