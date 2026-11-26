@@ -379,6 +379,9 @@
                 "redial_ns": {
                   "type": "integer"
                 },
+                "redialed": {
+                  "type": "boolean"
+                },
                 "request_sha256": {
                   "type": "string"
                 },
@@ -2551,6 +2554,9 @@
                           "type": "integer"
                         },
                         "redial_ns": {
+                          "type": "integer"
+                        },
+                        "redialed_calls": {
                           "type": "integer"
                         },
                         "relation_consumers": {
