@@ -536,10 +536,15 @@ fields. Never classify a symbol as dead while its file is pending.
 `mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
 `derived_at` stamps when a watcher ticket or a linked checkout's publication
 observed them. Missing stamps mean unobserved work. A linked checkout publishes
-an edit's working-tree generation in one step, so its three graph stamps are
-equal. Its `derived` tier reads `partial` while the checkout still owes the
-file deferred enrichment or clone rows, and every graph tier reads `failed`
-when its ticket ends without a publication. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+an edit's working-tree generation in one step: `file_graph_at` equals
+`relations_at`, and the three graph stamps are equal only when `derived` is
+fresh. Its `derived` tier means what the primary's does. It reads `partial`,
+with no `derived_at`, when the publication still owes the edited files
+deferred semantic enrichment or the edit's affected closure was truncated;
+clone rows still to be recomputed do not make it partial. `partial` is
+terminal on the receipt: it does not turn `fresh` when a later follow-up
+lands. Every graph tier reads `failed` when its ticket ends without a
+publication. Unknown receipt or mutation IDs return `state:"lost"` immediately;
 a lost receipt cannot certify freshness. After restart, relation queries remain
 pending until the shared startup resolver has published. File reads still check
 current disk state. CLI verbs print the freshness line on stderr;
