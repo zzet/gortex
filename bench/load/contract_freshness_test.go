@@ -321,32 +321,36 @@ func TestContractFreshnessRunOptionsAndPlan(t *testing.T) {
 	}
 }
 
-func TestContractFreshnessReportValidation(t *testing.T) {
-	sample := func() Report {
-		r := sampleReport(t)
-		plan := newContractFreshnessPlan(1)
-		corpus := contractFreshnessCorpus()
-		operations, err := contractFreshnessOperations(corpus, runOptions{ContractFreshnessEdits: 1})
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.Corpus = []Corpus{corpus}
-		r.Workload.Scenario, r.Workload.Agents, r.Workload.EditAgents, r.Workload.ContractFreshness, r.Workload.Operations = contractFreshnessScenario, 0, 1, &plan, operations
-		witness := &contractFreshnessReport{Observations: []ContractFreshnessObservation{{
-			Identity: plan.witness(0).Identity, Symbol: plan.witness(0).Symbol, Baseline: "absent", Outcome: "fresh", Started: r.Started,
-			AcknowledgedMS: measured(3, "ms"), FreshMS: measured(40, "ms"), FreshAfterAckMS: measured(37, "ms"), FreshNotBeforeMS: measured(20, "ms"), FreshReadMS: measured(2, "ms"),
-			Reads: 2, ReadOutcomes: map[string]int{"absent": 1, "fresh": 1}, Acknowledgement: json.RawMessage(`{"status":"applied"}`),
-		}}}
-		witness.finish()
-		r.Phases[0].Name, r.Phases[0].Operations, r.Phases[0].ContractFreshness = contractFreshnessScenario, operations, witness
-		hash, err := hashJSON(r.Workload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.RequestPlan = hash
-		return r
+// sampleContractFreshnessReport is a complete one-edit witness report whose
+// edit read back fresh after freshMS.
+func sampleContractFreshnessReport(t *testing.T, freshMS float64) Report {
+	t.Helper()
+	r := sampleReport(t)
+	plan := newContractFreshnessPlan(1)
+	corpus := contractFreshnessCorpus()
+	operations, err := contractFreshnessOperations(corpus, runOptions{ContractFreshnessEdits: 1})
+	if err != nil {
+		t.Fatal(err)
 	}
-	r := sample()
+	r.Corpus = []Corpus{corpus}
+	r.Workload.Scenario, r.Workload.Agents, r.Workload.EditAgents, r.Workload.ContractFreshness, r.Workload.Operations = contractFreshnessScenario, 0, 1, &plan, operations
+	witness := &contractFreshnessReport{Observations: []ContractFreshnessObservation{{
+		Identity: plan.witness(0).Identity, Symbol: plan.witness(0).Symbol, Baseline: "absent", Outcome: "fresh", Started: r.Started,
+		AcknowledgedMS: measured(3, "ms"), FreshMS: measured(freshMS, "ms"), FreshAfterAckMS: measured(freshMS-3, "ms"), FreshNotBeforeMS: measured(0, "ms"), FreshReadMS: measured(2, "ms"),
+		Reads: 2, ReadOutcomes: map[string]int{"absent": 1, "fresh": 1}, Acknowledgement: json.RawMessage(`{"status":"applied"}`),
+	}}}
+	witness.finish()
+	r.Phases[0].Name, r.Phases[0].Operations, r.Phases[0].ContractFreshness = contractFreshnessScenario, operations, witness
+	hash, err := hashJSON(r.Workload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.RequestPlan = hash
+	return r
+}
+
+func TestContractFreshnessReportValidation(t *testing.T) {
+	r := sampleContractFreshnessReport(t, 40)
 	path := t.TempDir() + "/report.json"
 	if err := writeReport(path, r); err != nil {
 		t.Fatal(err)
@@ -365,7 +369,7 @@ func TestContractFreshnessReportValidation(t *testing.T) {
 			r.Phases[0].ContractFreshness.finish()
 		},
 	} {
-		broken := sample()
+		broken := sampleContractFreshnessReport(t, 40)
 		mutate(&broken)
 		if hash, err := hashJSON(broken.Workload); err == nil {
 			broken.RequestPlan = hash
@@ -374,5 +378,22 @@ func TestContractFreshnessReportValidation(t *testing.T) {
 		if err := validateReport(data, broken); err == nil {
 			t.Fatalf("%s accepted", name)
 		}
+	}
+}
+
+func TestContractFreshnessDeltaComparesFreshTimes(t *testing.T) {
+	var output strings.Builder
+	if err := printDelta(&output, sampleContractFreshnessReport(t, 40), sampleContractFreshnessReport(t, 50)); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	for _, row := range []string{"contract-freshness.contract_fresh.p95", "contract-freshness.contract_fresh_after_ack.p50", "contract-freshness.contract_acknowledged.p95", "contract-freshness.contract_outcomes.fresh"} {
+		if !strings.Contains(text, row) {
+			t.Fatalf("delta lacks %s:\n%s", row, text)
+		}
+	}
+	worse := text[strings.Index(text, "more than 15% worse"):]
+	if !strings.Contains(worse, "contract-freshness.contract_fresh.p95") || strings.Contains(worse, "contract_acknowledged") {
+		t.Fatalf("freshness regression verdict wrong:\n%s", worse)
 	}
 }

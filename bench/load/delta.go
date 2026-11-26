@@ -70,6 +70,15 @@ func metricTable(r Report) map[string]Metric {
 		addDist(prefix+"visible_latency", phase.Visibility)
 		metrics[prefix+"never_visible"] = measured(float64(phase.NeverSeen), "edits")
 		metrics[prefix+"visibility_censored"] = measured(float64(phase.Censored), "edits")
+		if witness := phase.ContractFreshness; witness != nil {
+			addDist(prefix+"contract_fresh", witness.Fresh)
+			addDist(prefix+"contract_fresh_after_ack", witness.FreshAfterAck)
+			addDist(prefix+"contract_fresh_read", witness.FreshRead)
+			addDist(prefix+"contract_acknowledged", witness.Acknowledged)
+			for outcome, count := range witness.Outcomes {
+				metrics[prefix+"contract_outcomes."+outcome] = measured(float64(count), "edits")
+			}
+		}
 	}
 	return metrics
 }
