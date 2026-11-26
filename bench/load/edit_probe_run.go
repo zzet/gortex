@@ -1763,6 +1763,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
+		if record.NotAdmitted != "" && record.Receipt == "" && record.Batch == nil && record.Move == nil {
+			continue // The product refused this edit before admission; no file changed.
+		}
 		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
@@ -1773,6 +1776,13 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	if string(current) == string(r.original) && r.plan.Tool != "refactor.move" {
+		// Every edit was refused before admission. The product refuses a
+		// rewrite whose old and new bytes match, so none is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: source bytes equal the original")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"unchanged","write_sent":false}`)
+		return nil
 	}
 	// A terminal batch authorizes restoring only its retained owned after-image.
 	// The public conditional transaction still checks these bytes again at write time.

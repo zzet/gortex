@@ -23,6 +23,9 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		File     string          `json:"file"`
 		Response json.RawMessage `json:"response"`
 		Error    string          `json:"error,omitempty"`
+		// No write was sent: every edit on this checkout was refused before
+		// admission, and the product refuses a rewrite of identical bytes.
+		Unchanged bool `json:"unchanged,omitempty"`
 	}
 	var rows []restoredRoute
 	started := time.Now()
@@ -51,6 +54,10 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		current, err := os.ReadFile(file)
 		if err != nil {
 			return err
+		}
+		if string(current) == string(original) {
+			rows = append(rows, restoredRoute{Route: repo.Corpus.Label, Editor: editor, File: repo.Corpus.File, Unchanged: true})
+			continue
 		}
 		changes := []any{map[string]any{"op": "edit_file", "path": repo.Prefix + "/" + repo.Corpus.File, "old_string": string(current), "new_string": string(original)}}
 		req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x-route-%d", uint64(r.options.Seed), ordinal)}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
