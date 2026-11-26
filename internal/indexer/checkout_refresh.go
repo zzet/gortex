@@ -150,8 +150,9 @@ func (m *CheckoutMutation) committedRefreshRequest(ctx context.Context, path str
 		ticket: &CheckoutRefreshTicket{
 			CheckoutID: m.checkout.CheckoutID, Incarnation: m.checkout.Incarnation,
 			Root: m.checkout.RootPath, RepoPrefix: m.coordinator.repoPrefix,
-			// A committed write's ticket carries tier evidence from its
-			// acknowledgement on, as a watcher tool ticket does.
+			// A committed write's ticket, and a batch journal recovery's,
+			// carries tier evidence from its acknowledgement on, as a watcher
+			// tool ticket does.
 			Ticket: newMutationTierTicket(path, 0, done),
 		},
 	}
@@ -751,8 +752,8 @@ func (c *CheckoutCoordinator) finishCheckoutRefresh(request *checkoutRefreshRequ
 }
 
 // finishCheckoutRefreshTiered is finishCheckoutRefresh for a verified
-// publication that knows whether its routed chain still owes the ticket's
-// paths a deferred derived producer (checkout_refresh_tiers.go).
+// publication that knows whether the ticket's derived tier is partial
+// (checkout_refresh_tiers.go).
 func (c *CheckoutCoordinator) finishCheckoutRefreshTiered(request *checkoutRefreshRequest, generation uint64, err error, derivedOwed bool) {
 	c.refreshMu.Lock()
 	sequence := request.ticket.Ticket.Generation

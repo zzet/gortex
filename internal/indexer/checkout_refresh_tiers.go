@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zzet/gortex/internal/graphview"
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
@@ -16,13 +17,23 @@ import (
 // generation that holds an edited file's syntax graph, its resolution and its
 // re-derived dependents, and routes it in one flip. So a committed checkout
 // write's ticket stamps file_graph, relations and derived at the instant its
-// publication is verified (completeCheckoutRefreshTickets). Derived is partial
-// instead while the routed chain owes the path a deferred derived producer
-// (derivedDebt): the generation was published without that data.
+// publication is verified (completeCheckoutRefreshTickets).
 //
-// Only a committed write's ticket carries this evidence. It opens with the
-// acknowledgement stamp (newMutationTierTicket). A recovery or require_fresh
-// ticket has no acknowledgement, so it has nothing to time tiers from.
+// Derived means what it means on the primary, so the two compare. It is
+// partial instead, with no stamp, when the routed chain owes one of the
+// ticket's paths a deferred producer the primary counts (semantic enrichment,
+// checkoutDerivedProducers), or when the published generation's affected
+// closure was truncated. Clone rows owed to a follow-up do not make it
+// partial. The stamp is terminal: a follow-up that later pays the debt does
+// not revisit it.
+//
+// Every ticket committedRefreshRequest admits carries this evidence: a
+// committed write's, single-file or batch, and a batch journal recovery's,
+// which re-admits its batch through EnqueueBatchRefresh. Each opens with the
+// acknowledgement stamp (newMutationTierTicket). A whole-checkout recovery or
+// require_fresh ticket (captureCheckoutRefreshFrom,
+// captureBoundCheckoutRefresh) has no acknowledgement, so it has nothing to
+// time tiers from.
 
 // bindTierGeneration records the admission sequence on a ticket that carries
 // tier evidence, so its tier state names the generation its ticket does.
@@ -61,17 +72,54 @@ func stampCheckoutPublicationTiers(ticket *MutationTicket, err error, derivedOwe
 	state.DerivedAt = at
 }
 
+// checkoutDerivedProducers are the deferred producers whose debt makes a
+// checkout ticket's derived tier partial: those the primary's derived tier
+// counts. A watcher edit that skips its semantic pass reads derived partial,
+// while its clone index catching up later does not, so graph.similarity is
+// not among them.
+var checkoutDerivedProducers = []graphview.CapabilityID{graphview.CapSemantic}
+
+// checkoutDerivedGaps reads a routed chain, oldest first with the published
+// generation last, for what makes a checkout ticket's derived tier partial:
+// the graph paths owed a producer the primary counts, and whether the
+// published generation's affected closure was truncated. A truncated closure
+// leaves dependents past the cap on a stale resolution whatever paths a
+// ticket names, as an incomplete bounded fan-out does on the primary.
+func checkoutDerivedGaps(layers []derivedDebtLayer) (owed map[string]struct{}, truncated bool) {
+	if len(layers) == 0 {
+		// The chain always lists its top; without it nothing vouches for
+		// the closure.
+		return nil, true
+	}
+	for _, row := range layers[len(layers)-1].rows {
+		if truncatedClosureRow(row) {
+			truncated = true
+			break
+		}
+	}
+	debt := derivedDebt(layers)
+	for _, producer := range checkoutDerivedProducers {
+		for _, path := range debt[producer].Paths {
+			if owed == nil {
+				owed = make(map[string]struct{})
+			}
+			owed[path] = struct{}{}
+		}
+	}
+	return owed, truncated
+}
+
 // derivedOwedLookup answers, for the tickets one publication completes,
-// whether the routed chain under top still owes a ticket's paths a deferred
-// derived producer. The chain is read at most once, and only when a ticket
-// that carries tier evidence asks. A debt that cannot be read never
-// certifies derived data.
+// whether a ticket's derived tier is partial (checkoutDerivedGaps). The chain
+// under top is read at most once, and only when a ticket that carries tier
+// evidence asks. A chain that cannot be read never certifies derived data.
 func (c *CheckoutCoordinator) derivedOwedLookup(ctx context.Context, top int64) func(*checkoutRefreshRequest) bool {
 	var (
-		read bool
-		err  error
-		owed map[string]struct{}
-		root string
+		read      bool
+		err       error
+		owed      map[string]struct{}
+		truncated bool
+		root      string
 	)
 	return func(request *checkoutRefreshRequest) bool {
 		ticket := request.ticket.Ticket
@@ -82,18 +130,11 @@ func (c *CheckoutCoordinator) derivedOwedLookup(ctx context.Context, top int64) 
 			read = true
 			var layers []derivedDebtLayer
 			if layers, err = c.derivedDebtLayers(ctx, top); err == nil {
-				for _, debt := range derivedDebt(layers) {
-					for _, path := range debt.Paths {
-						if owed == nil {
-							owed = make(map[string]struct{})
-						}
-						owed[path] = struct{}{}
-					}
-				}
+				owed, truncated = checkoutDerivedGaps(layers)
 				root = pathkey.CanonicalExistingRoot(c.root)
 			}
 		}
-		if err != nil {
+		if err != nil || truncated {
 			return true
 		}
 		if len(owed) == 0 {
