@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -171,6 +174,153 @@ func TestEditProbeReceiptLoopStopsWhenAccountingStaysUnsettled(t *testing.T) {
 			wantErrors := []string{"A/P/B accounting unavailable: " + strings.Join(accounting.Reasons, "; ")}
 			if record.Outcome != "diagnostic_failure" || record.DeadlineReason != "" || !slices.Equal(record.Errors, wantErrors) {
 				t.Fatalf("record = %s (deadline reason %q) %q, want diagnostic_failure with only the accounting gap", record.Outcome, record.DeadlineReason, record.Errors)
+			}
+		})
+	}
+}
+
+// editProbeBatchSetSettleFixture is a committed two-file batch whose shared
+// acknowledgement is reported but whose members' typed shared-owner proof is
+// not, so its accounting stays unavailable_shared_owner however long the
+// collector polls.
+func editProbeBatchSetSettleFixture(t *testing.T) (editProbeBatchSetReferences, []editProbeBatchIntentMember, map[string]any, map[string]map[string]any) {
+	t.Helper()
+	root := filepath.Join(os.TempDir(), "edit-probe-owned-set")
+	changes := []any{}
+	for _, name := range []string{"a.go", "b.go"} {
+		changes = append(changes, map[string]any{"op": "edit_file", "path": "repo/" + name, "old_string": "package fixture\n", "new_string": "package fixture\nfunc Added" + strings.ToUpper(name[:1]) + "() {}\n"})
+	}
+	offered := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"changes": changes, "options": map[string]any{"transaction_id": "transaction-set"}}}
+	transaction, intents, err := editProbeBatchSetIntent(offered, root, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files, results, observations []any
+	for i, intent := range intents {
+		sum := sha256.Sum256(intent.Offered)
+		receipt, generation := fmt.Sprintf("mutation-%d", 3+i), json.Number(fmt.Sprint(4+i))
+		files = append(files, map[string]any{"path": intent.Path, "relative_path": intent.RelativePath, "after_sha256": hex.EncodeToString(sum[:]), "reindex_receipt": receipt, "reindex_generation": generation})
+		results = append(results, map[string]any{"op": "edit_file", "path": intent.RelativePath, "status": "applied", "reindex_receipt": receipt, "reindex_generation": generation})
+		observations = append(observations, map[string]any{"path": intent.RelativePath, "receipt": fmt.Sprintf("batch-file-%d", 5+i)})
+	}
+	fingerprint := sha256.Sum256([]byte(transaction))
+	tx := map[string]any{"transaction_id": transaction, "status": "committed", "disk_status": "committed", "fingerprint": hex.EncodeToString(fingerprint[:]), "ack_mode": "local",
+		"acknowledgement_receipt": "batch-ack-2", "acknowledgement_state": "reference_only_query_mutation_status", "files": files, "results": results, "file_observations": observations}
+	refs, err := decodeEditProbeBatchSetAcknowledgement(tx, transaction, intents, "17")
+	if err != nil || refs.validateReferences() != nil {
+		t.Fatalf("batch set references: %v %v", err, refs.validateReferences())
+	}
+	receipts := map[string]map[string]any{refs.Acknowledgement: {"found": true, "receipt_kind": "batch_acknowledgement", "receipt": refs.Acknowledgement,
+		"acknowledgement": map[string]any{"rpc_id": refs.RPCID, "clock": "monotonic", "scope": "shared_rpc_mcp_bound_call"}}}
+	for _, file := range refs.Files {
+		receipts[file.Observation] = map[string]any{"found": true, "receipt_kind": "batch_file_observation", "receipt": file.Observation, "transaction_id": file.TransactionID,
+			"path": file.RelativePath, "batch_disk_verdict": "committed", "after_sha256": file.AfterSHA256, "publication_receipt": file.GraphReceipt,
+			"publication_generation": json.Number(fmt.Sprint(file.GraphGeneration)), "writer_return_observed": true, "acknowledgement_state": "not_applicable_shared_transaction_rpc",
+			"shared_owner_accounting_v1_availability": map[string]any{"state": "pending"}}
+	}
+	tx["graph_status"] = "fresh"
+	return refs, intents, tx, receipts
+}
+
+// The multi-file batch collector has its own shared-owner accounting and the
+// same bound: unchanged unsettled accounting ends the poll once the graph is
+// fresh and every first-correct time is measured.
+func TestEditProbeBatchSetCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) {
+	const n = editProbeAccountingSettlePolls
+	for _, tc := range []struct {
+		name string
+		// The transaction read on which the graph turns fresh, the last
+		// first-correct time is measured, or the accounting changes (still
+		// unsettled).
+		graphAt, lateAt, changeAt int
+	}{
+		{name: "observables_complete"},
+		{name: "graph_late", graphAt: 2 * n},
+		{name: "first_correct_late", lateAt: 3 * n},
+		{name: "accounting_changes", changeAt: n - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			refs, intents, tx, receipts := editProbeBatchSetSettleFixture(t)
+			statuses := map[string]map[string]any{}
+			for _, file := range refs.Files {
+				statuses[file.Observation] = receipts[file.Observation]
+			}
+			fixture, batch := (&editProbeRuntime{}).accountingForBatchSetStatuses(ctx, statuses, receipts[refs.Acknowledgement], refs)
+			proofPending := slices.ContainsFunc(fixture.Reasons, func(reason string) bool {
+				return strings.HasSuffix(reason, "complete typed shared owner proof unavailable")
+			})
+			if fixture.State != "unavailable_shared_owner" || batch.State != "unavailable_batch_shared_owner" || editProbeFinished(true, true, true, fixture) || !proofPending {
+				t.Fatalf("fixture is not the unsettled shared-owner shape: %+v %+v", fixture, batch)
+			}
+			if tc.graphAt > 0 {
+				tx["graph_status"] = "pending"
+			}
+			c := editProbeCorpus()
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, c.File), []byte("package sample\n\n"+c.EditAnchor+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			reads := 0
+			var state *editProbeState
+			run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, func(frame stubFrame) (any, *rpcError) {
+				args, _ := frame.Params["arguments"].(map[string]any)
+				options, _ := args["options"].(map[string]any)
+				// Serialized, so a change below is visible to this cycle's
+				// reads and every later one.
+				mu.Lock()
+				defer mu.Unlock()
+				if frame.Params["name"] == "edit" {
+					reads++
+					switch reads {
+					case tc.graphAt:
+						tx["graph_status"] = "fresh"
+					case tc.lateAt:
+						state.mu.Lock()
+						state.record.FirstCorrect["text"] = measured(2, "ms")
+						state.mu.Unlock()
+					case tc.changeAt:
+						receipts[refs.Files[1].Observation]["writer_return_observed"] = false
+					}
+					return stubContent(tx), nil
+				}
+				receipt, _ := options["receipt"].(string)
+				return stubContent(receipts[receipt]), nil
+			})
+			state = run.states[0]
+			first := map[string]Metric{"source": measured(1, "ms"), "text": measured(1, "ms")}
+			if tc.lateAt > 0 {
+				first["text"] = unavailable("ms", "not yet observed")
+			}
+			state.mu.Lock()
+			state.record.FirstCorrect = first
+			state.mu.Unlock()
+			run.collectBatchSetEvidence(ctx, state, refs, intents)
+			mu.Lock()
+			got := reads
+			mu.Unlock()
+			state.mu.Lock()
+			record := state.record
+			state.mu.Unlock()
+			if ctx.Err() != nil {
+				t.Fatalf("batch set collector polled until the deadline (%d status cycles) after every observable was complete", got)
+			}
+			if want := max(tc.graphAt, tc.lateAt, tc.changeAt, 1) + n - 1; got != want {
+				t.Fatalf("status cycles = %d, want %d", got, want)
+			}
+			accounting := record.Accounting
+			if !record.GraphTerminal || accounting.State != "unavailable_shared_owner" || editProbeAccountingComplete(accounting) || !slices.Contains(accounting.Reasons, editProbeAccountingUnsettledReason) ||
+				record.BatchAccounting == nil || record.BatchAccounting.State != "unavailable_batch_shared_owner" || !slices.Contains(record.BatchAccounting.Reasons, editProbeAccountingUnsettledReason) {
+				t.Fatalf("unsettled accounting was not kept unavailable with its stop reason: %+v %+v", accounting, record.BatchAccounting)
+			}
+			if len(record.Errors) != 0 {
+				t.Fatalf("collector added errors: %q", record.Errors)
 			}
 		})
 	}

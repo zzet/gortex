@@ -570,16 +570,16 @@ deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.
 A complete native duplicate P keeps collecting until independent publisher R
 and requested-background B arrive; absent late evidence is not terminal proof
-of missing work. The single-edit receipt loop and the one-file `edit.batch`
-collector bound that wait. Once the graph is fresh, every first-correct time
-is measured and any assigned post-ACK coverage is in, each stops after eight
-consecutive status cycles with unchanged accounting. The accounting stays unavailable, with a reason naming
+of missing work. The single-edit receipt loop and the one-file and
+multi-file `edit.batch` collectors bound that wait. Once the graph is fresh,
+every first-correct time is measured and any assigned post-ACK coverage is
+in, each stops after eight consecutive status cycles with unchanged
+accounting. The accounting stays unavailable, with a reason naming
 the stop, and the record keeps its evidence instead of filling the per-edit
 cap. A change in the accounting restarts the count; a graph that is not yet
 fresh, a missing first-correct time, outstanding coverage or a qualified
-functional candidate keeps polling. The multi-file batch collector does not
-have this bound. A validated immutable R phase failure can end failed
-coverage.
+functional candidate keeps polling. A validated immutable R phase failure can
+end failed coverage.
 An original-publication-bound `requested_background_unavailable` is also
 terminal failed coverage, not a measured zero or a successful accounting check.
 Unknown or foreign diagnostics do not stop late-evidence collection.

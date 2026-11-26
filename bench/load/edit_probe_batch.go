@@ -640,6 +640,7 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 		}
 		return decodeEditProbeResult(raw)
 	}
+	var settle editProbeAccountingSettle
 	for ctx.Err() == nil {
 		tx, err := perform(request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "options": map[string]any{"transaction_id": refs.TransactionID, "status_only": true}}}, "batch_transaction_status", 200)
 		if errors.Is(err, errEditProbeEvidenceIncomplete) {
@@ -701,6 +702,13 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				}
 				s.mu.Unlock()
 				if terminal && tx["graph_status"] != "fresh" || editProbeFinished(terminal, all, r.requireAccounting, accounting) {
+					return
+				}
+				if settle.unsettled(terminal && all, accounting, batch) {
+					s.mu.Lock()
+					s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)
+					s.record.BatchAccounting.Reasons = append(slices.Clip(s.record.BatchAccounting.Reasons), editProbeAccountingUnsettledReason)
+					s.mu.Unlock()
 					return
 				}
 			}
