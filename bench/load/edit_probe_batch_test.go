@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -251,6 +252,9 @@ func TestEditProbeBatchPlanKeepsOfferedPrefixAndScheduleAcrossFixtureLanguages(t
 type editProbeBatchCollectorStub struct {
 	refs             editProbeBatchReferences
 	tx, file, shared map[string]any
+	// onTransaction runs inside the stub, before any later status read is
+	// served, on each transaction status read with its 1-based count.
+	onTransaction func(int)
 }
 
 func newEditProbeBatchCollectorStub(t *testing.T, status map[string]any) *editProbeBatchCollectorStub {
@@ -279,13 +283,20 @@ func (f *editProbeBatchCollectorStub) collect(ctx context.Context, t *testing.T,
 	t.Helper()
 	var mu sync.Mutex
 	var owners []string
+	transactions := 0
 	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
 		args, _ := frame.Params["arguments"].(map[string]any)
 		options, _ := args["options"].(map[string]any)
+		mu.Lock()
+		defer mu.Unlock()
 		var owner string
 		var response map[string]any
 		if frame.Params["name"] == "edit" {
 			owner, _ = options["transaction_id"].(string)
+			transactions++
+			if f.onTransaction != nil {
+				f.onTransaction(transactions)
+			}
 			response = f.tx
 		} else {
 			owner, _ = options["receipt"].(string)
@@ -296,9 +307,7 @@ func (f *editProbeBatchCollectorStub) collect(ctx context.Context, t *testing.T,
 				response = f.shared
 			}
 		}
-		mu.Lock()
 		owners = append(owners, owner)
-		mu.Unlock()
 		return stubContent(response), nil
 	})
 	client, err := openMCP(ctx, socket, "")
@@ -335,6 +344,72 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 	}
 	if state.record.Receipt != "" {
 		t.Fatal("invented single-file mutation receipt")
+	}
+}
+
+// The fresh batch shape that exhausted the per-edit raw cap: every
+// first-correct time is measured, but the physical attempt is a native
+// duplicate whose earlier publisher is never reported, so the accounting is
+// not terminal however long the collector waits.
+func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// The transaction read on which the last first-correct time is
+		// measured, or on which the accounting changes (still unsettled).
+		lateAt, changeAt int
+	}{
+		{name: "observables_complete"},
+		{name: "first_correct_late", lateAt: 3 * editProbeAccountingSettlePolls},
+		{name: "accounting_changes", changeAt: editProbeAccountingSettlePolls - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := editProbeRepairAccountingFixture()
+			delete(status, "read_assisted_publication")
+			stub := newEditProbeBatchCollectorStub(t, status)
+			if got := stub.refs.accounting(stub.file, stub.shared); got.State != "unavailable" || !slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || editProbeFinished(true, true, true, got) {
+				t.Fatalf("fixture is not the unsettled duplicate shape: %+v", got)
+			}
+			first := measured(1, "ms")
+			if tc.lateAt > 0 {
+				first = unavailable("ms", "not yet observed")
+			}
+			state := &editProbeState{record: editProbeRecord{FirstCorrect: map[string]Metric{"source": measured(1, "ms"), "text": first}}}
+			stub.onTransaction = func(count int) {
+				switch count {
+				case tc.lateAt:
+					state.mu.Lock()
+					state.record.FirstCorrect["text"] = measured(2, "ms")
+					state.mu.Unlock()
+				case tc.changeAt:
+					stub.file["requested_background"].(map[string]any)["background_wall_ms"] = json.Number("13")
+				}
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			owners := stub.collect(ctx, t, state)
+			reads := 0
+			for _, owner := range owners {
+				if owner == stub.refs.TransactionID {
+					reads++
+				}
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("collector polled until the deadline (%d status cycles, %d raw bytes) after every observable was complete", reads, state.rawBytes)
+			}
+			// Reads before the last first-correct time, and before the last
+			// accounting change, do not count toward the bound.
+			if want := max(tc.lateAt, tc.changeAt, 1) + editProbeAccountingSettlePolls - 1; reads != want {
+				t.Fatalf("status cycles = %d, want %d", reads, want)
+			}
+			got := state.record.Accounting
+			if !state.record.GraphTerminal || got.State != "unavailable" || editProbeAccountingComplete(got) ||
+				!slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || !slices.Contains(got.Reasons, editProbeAccountingUnsettledReason) {
+				t.Fatalf("unsettled accounting was not kept unavailable with its stop reason: %+v", got)
+			}
+			if state.sinkErr != nil || state.rawBytes == 0 {
+				t.Fatalf("raw evidence incomplete or missing: bytes=%d err=%v", state.rawBytes, state.sinkErr)
+			}
+		})
 	}
 }
 
