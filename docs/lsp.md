@@ -534,7 +534,8 @@ for the full edit-time diagnostic loop without polling.
 A few servers need per-language handling beyond the generic router. These
 knobs are **environment variables** read by the daemon process — set them
 where you launch `gortex daemon` / `gortex server`. There is no `.gortex.yaml`
-key for them today.
+key for them today; the one exception is `GORTEX_LSP_JDTLS_XMX`, which is also
+read from the server's `env:` list (see the heap cap below).
 
 ### C# — NuGet audit advisories (`omnisharp` / `csharp-ls`)
 
@@ -579,18 +580,37 @@ for repositories you trust.
 Gortex starts `jdtls` with a 2 GiB maximum heap (`--jvm-arg=-Xmx2G`). Without
 a cap the JVM's heap ceiling is a quarter of physical RAM, and G1 lets the heap
 grow to it before collecting, so one server can hold many gigabytes of garbage.
+On a Linux or macOS host with less than 8 GiB of RAM the default is lowered to
+a quarter of RAM (at least `1G`, the launcher's fixed `-Xms`), so it never
+raises the JVM's own ceiling. Where Gortex cannot read host RAM (other
+platforms) the default stays `2G`, and in a container with a memory limit below
+host RAM the default is computed from host RAM; set the cap explicitly there.
+
 Set `GORTEX_LSP_JDTLS_XMX` to change the cap (JVM size syntax, e.g. `4G` or
-`3072m`; at least `1G`, the launcher's fixed `-Xms`) or to `off` to pass none,
-either in the daemon's environment or in the server's `env:` list in
+`3072m`; at least `1G`) or to `off` (or `0`, `false`, `no`, `n`, `none`) to pass
+none, either in the daemon's environment or in the server's `env:` list in
 `.gortex.yaml` (which wins). No cap is added when the configured `jdtls` args
-already size the heap (`-Xmx`, `-XX:MaxHeapSize`, `-XX:MaxRAMPercentage`), or
-when `JDK_JAVA_OPTIONS`, `JAVA_TOOL_OPTIONS` or `_JAVA_OPTIONS` does (in the
-server's `env:` or the daemon's environment) and `GORTEX_LSP_JDTLS_XMX` is
-unset. The chosen value is logged as
-`lsp: jdtls max heap` when the server starts.
+already size the heap with any max-heap or max-RAM flag (`-Xmx`,
+`-XX:MaxHeapSize=`, `-XX:MaxRAM=`, `-XX:MaxRAMPercentage=`,
+`-XX:MaxRAMFraction=`), or when `JDK_JAVA_OPTIONS`, `JAVA_TOOL_OPTIONS` or
+`_JAVA_OPTIONS` does (in the server's `env:` or the daemon's environment) and
+`GORTEX_LSP_JDTLS_XMX` is unset. The chosen value is logged as
+`lsp: jdtls max heap` when the server starts, with a warning when
+`_JAVA_OPTIONS` also sizes the heap, since the JVM applies it last.
+
+The cap goes through the upstream `jdtls` launcher's `--jvm-arg` option, and
+heap flags in the configured args only count in that form
+(`--jvm-arg=-Xmx4G`): the launcher passes other unrecognised args to jdtls
+itself, not to the JVM. A packaged `jdtls` wrapper that runs `java` directly may
+not understand `--jvm-arg`; if jdtls fails to start or ignores the cap, set
+`GORTEX_LSP_JDTLS_XMX=off` and size the heap through the wrapper.
 
 ## Troubleshooting
 
+- **Java enrichment failing, `OutOfMemoryError` in jdtls's stderr:** the
+  project needs more than the default heap cap, which is likely with
+  `GORTEX_LSP_JDTLS_TRUST_BUILD=1` or many workspace folders. Raise
+  `GORTEX_LSP_JDTLS_XMX` (e.g. `4G`).
 - **`no_lsp_for` error:** the file extension didn't match any
   registered spec. Either the spec isn't enabled in `.gortex.yaml`, or
   the binary isn't on `PATH`. Run the spec's `--version` directly to
