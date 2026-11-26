@@ -2318,6 +2318,106 @@
                         "planned_due_ns": {
                           "type": "integer"
                         },
+                        "post_workload_receipt": {
+                          "anyOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "attempts": {
+                                  "type": "integer"
+                                },
+                                "graph_status": {
+                                  "type": "string"
+                                },
+                                "mutation_tiers": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "ack_at": {
+                                          "type": "string"
+                                        },
+                                        "derived_at": {
+                                          "type": "string"
+                                        },
+                                        "file_graph_at": {
+                                          "type": "string"
+                                        },
+                                        "observation_state": {
+                                          "type": "string"
+                                        },
+                                        "reason": {
+                                          "type": "string"
+                                        },
+                                        "relations_at": {
+                                          "type": "string"
+                                        },
+                                        "tier_state": {
+                                          "additionalProperties": {
+                                            "type": "string"
+                                          },
+                                          "type": [
+                                            "object",
+                                            "null"
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "observation_state"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "poll_ms": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "value": {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "value",
+                                    "unit",
+                                    "reason"
+                                  ],
+                                  "type": "object"
+                                },
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "state": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "state",
+                                "attempts",
+                                "poll_ms"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "precommit_fresh_mismatches_unassessed": {
                           "type": "integer"
                         },
