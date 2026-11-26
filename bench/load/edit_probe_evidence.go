@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type editProbeOracle struct {
@@ -220,7 +222,6 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			path, _ := row["path"].(string)
 			text, _ := row["text"].(string)
 			line, err := strconvEditProbeUint(row["line"])
-			prefix := "func "
 			if filepath.Ext(c.File) == ".ts" {
 				textCallee := callee
 				if c.EditKind == "append_leaf" {
@@ -232,7 +233,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			if filepath.Ext(c.File) == ".py" {
 				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && strings.TrimSuffix(text, "\r") == "def "+step.Marker+"():"
 			}
-			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
+			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && editProbeGoTextDeclares(text, step.Marker)
 		})
 	case "callers", "call_chain":
 		if step.BeforeSymbol != "" && !editProbeRenameCensus(body, c, step) {
@@ -259,6 +260,32 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	default:
 		return false
 	}
+}
+
+// editProbeGoTextDeclares reports whether one text-search line holds
+// "func <marker>" with an identifier boundary on each side. A plain substring
+// match also accepts any longer name that starts with the marker, such as the
+// <marker>Before declaration a rename starts from, so the pre-edit line would
+// count as the edit already being visible.
+func editProbeGoTextDeclares(text, marker string) bool {
+	needle := "func " + marker
+	for from := 0; ; {
+		at := strings.Index(text[from:], needle)
+		if at < 0 {
+			return false
+		}
+		start, end := from+at, from+at+len(needle)
+		before, _ := utf8.DecodeLastRuneInString(text[:start])
+		after, _ := utf8.DecodeRuneInString(text[end:])
+		if !editProbeGoIdentifierRune(before) && !editProbeGoIdentifierRune(after) {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+func editProbeGoIdentifierRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // Compact rows prove presence only: the marker, or from the marker's call
