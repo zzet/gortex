@@ -39,7 +39,10 @@ func editProbeReceiptPendingAtWorkloadEnd(record editProbeRecord) bool {
 
 // repollPendingReceipts reads the status of every receipt the workload left
 // pending, once each, concurrently and inside ctx, the restore's deadline. Each
-// read uses the edit's own prober session and the workload's read budget.
+// read uses the edit's fixed editor session (on a routed run, the one the
+// restore writes that checkout through) and the workload's read budget. The
+// prober session is not used: a probe canceled mid-write when the edit ended
+// closes it for good.
 func (r *editProbeRuntime) repollPendingReceipts(ctx context.Context) {
 	records := r.phase.EditProbe.Records
 	polls := make([]*editProbePostWorkloadReceipt, len(records))
@@ -73,10 +76,7 @@ func (r *editProbeRuntime) repollReceipt(ctx context.Context, s *editProbeState,
 		poll.Reason = err.Error()
 		return poll
 	}
-	client := s.client
-	if client == nil {
-		client = r.editorFor(s.step)
-	}
+	client := r.editorFor(s.step)
 	if client == nil || len(r.p.Repos) > 1 && filepath.Clean(client.cwd) != filepath.Clean(repo.Path) {
 		poll.Reason = "no session for the edit's checkout"
 		return poll

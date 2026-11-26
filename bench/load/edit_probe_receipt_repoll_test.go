@@ -172,6 +172,7 @@ func TestEditProbeRestoreRepollsReceiptsPendingAtWorkloadEnd(t *testing.T) {
 			}
 			run.origin = time.Now()
 			phase.EditProbe.Records = nil
+			var linkedProber *socketClient
 			for editor := range p.Repos {
 				var step editProbeStep
 				for _, candidate := range run.plan.Steps {
@@ -191,6 +192,9 @@ func TestEditProbeRestoreRepollsReceiptsPendingAtWorkloadEnd(t *testing.T) {
 				if editor == linked && (record.Outcome != "product_deadline" || record.GraphTerminal || record.Receipt != "linked-1-receipt") {
 					t.Fatalf("linked receipt was not left pending by the workload: %+v", record)
 				}
+				if editor == linked {
+					linkedProber = state.client
+				}
 				phase.EditProbe.Records = append(phase.EditProbe.Records, record)
 			}
 			before := make([]string, len(p.Repos))
@@ -203,6 +207,9 @@ func TestEditProbeRestoreRepollsReceiptsPendingAtWorkloadEnd(t *testing.T) {
 					t.Fatalf("checkout%d was not edited by the workload", i)
 				}
 			}
+			// A probe canceled mid-write when its edit ended closes the edit's
+			// prober session for good, so the read must not depend on it.
+			_ = linkedProber.Close() // it may already be closed that way
 			mu.Lock()
 			workloadOver = true
 			mu.Unlock()

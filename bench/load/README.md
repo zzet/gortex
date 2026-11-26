@@ -599,8 +599,10 @@ Unknown or foreign diagnostics do not stop late-evidence collection.
 Before that cleanup rewrite, the restore reads once more each receipt that was
 not graph-terminal when its edit's deadline ended (batch, move, native-write
 and restart records keep their own evidence). The reads run concurrently, each
-on its edit's own prober session, inside the restore's deadline and the 20 s
-per-read budget (never longer than `--deadline`). The record keeps the answer
+on its edit's fixed editor session (on a routed run, the session the restore
+writes that checkout through), inside the restore's deadline and the 20 s
+per-read budget (never longer than `--deadline`). The prober session is not reused: a probe canceled mid-write
+when its edit ended closes that session. The record keeps the answer
 as `post_workload_receipt`: `state` (`terminal`, `pending` or `unavailable`),
 `reason`, `graph_status`, `mutation_tiers`, `attempts` and `poll_ms`. A
 terminal answer that names the edit's own mutation, and on a linked route its
