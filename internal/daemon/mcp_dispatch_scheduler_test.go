@@ -159,6 +159,138 @@ func TestDispatchSchedulerPriorityAndSessionRoundRobin(t *testing.T) {
 	})
 }
 
+// dispatchFlood drives one pool a freed slot at a time and reports which
+// queued call took each slot.
+type dispatchFlood struct {
+	t       *testing.T
+	pool    *mcpDispatchScheduler
+	waiting []floodWaiter
+	queued  int
+}
+
+type floodWaiter struct {
+	class MCPDispatchClass
+	reply <-chan scheduledReply
+}
+
+func (f *dispatchFlood) queue(class MCPDispatchClass) {
+	f.queued++
+	f.waiting = append(f.waiting, floodWaiter{class, queueScheduled(f.t, f.pool, class, fmt.Sprintf("%s%d", class, f.queued))})
+}
+
+// grant frees held and returns the one queued call admitted into its slot.
+func (f *dispatchFlood) grant(held *mcpScheduledGrant) (MCPDispatchClass, *mcpScheduledGrant) {
+	f.t.Helper()
+	held.complete()
+	deadline := time.Now().Add(time.Second)
+	for {
+		for i, w := range f.waiting {
+			select {
+			case reply := <-w.reply:
+				if reply.err != nil || reply.grant == nil {
+					f.t.Fatalf("queued %s call: %+v", w.class, reply)
+				}
+				f.t.Cleanup(reply.grant.complete)
+				f.waiting = append(f.waiting[:i], f.waiting[i+1:]...)
+				return w.class, reply.grant
+			default:
+			}
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatal("a freed slot admitted no queued call")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A flood of writes and fast reads must not starve the slow lane. Writes
+// keep their priority, but a queued slow call with room in its lane is passed
+// over by at most four grants (docs/mcp.md), and the lane keeps its turns for
+// as long as the flood lasts.
+func TestDispatchSchedulerSlowLaneGetsTurnsUnderAFlood(t *testing.T) {
+	const passBound = 4
+	t.Run("queued writes", func(t *testing.T) {
+		pool := testDispatchPool(8)
+		flood := &dispatchFlood{t: t, pool: pool}
+		var held []*mcpScheduledGrant
+		for i := range 8 {
+			held = append(held, takeScheduled(t, pool, MCPDispatchMutating, fmt.Sprintf("holder%d", i)))
+		}
+		for range 4 {
+			flood.queue(MCPDispatchMutating)
+			flood.queue(MCPDispatchFast)
+		}
+		// Both fit the slow lane's two slots, so every grant that goes to
+		// another lane passes one of them over.
+		flood.queue(MCPDispatchSlow)
+		flood.queue(MCPDispatchSlow)
+		passed, slowGranted := 0, 0
+		for round := 1; slowGranted < 2; round++ {
+			class, grant := flood.grant(held[0])
+			held = append(held[1:], grant)
+			flood.queue(MCPDispatchMutating)
+			flood.queue(MCPDispatchFast)
+			switch class {
+			case MCPDispatchSlow:
+				if passed == 0 {
+					t.Fatalf("grant %d: a slow call went ahead of the queued writes", round)
+				}
+				slowGranted++
+				passed = 0
+			case MCPDispatchMutating:
+				passed++
+				if passed > passBound {
+					t.Fatalf("grant %d: slow call passed over %d times with room in its lane; bound is %d (slow calls granted: %d)", round, passed, passBound, slowGranted)
+				}
+			default:
+				t.Fatalf("grant %d: a fast read went ahead of the queued writes", round)
+			}
+		}
+	})
+	t.Run("reads fill the shared slots", func(t *testing.T) {
+		// Fast reads hold every shared slot. The slow call has room only when a
+		// read finishes; writes finishing in between free reserved slots only,
+		// and those grants must not restart its count.
+		pool := testDispatchPool(8)
+		flood := &dispatchFlood{t: t, pool: pool}
+		var reads, writes []*mcpScheduledGrant
+		for i := range 6 {
+			reads = append(reads, takeScheduled(t, pool, MCPDispatchFast, fmt.Sprintf("reader%d", i)))
+		}
+		for i := range 2 {
+			writes = append(writes, takeScheduled(t, pool, MCPDispatchMutating, fmt.Sprintf("writer%d", i)))
+		}
+		for range 8 {
+			flood.queue(MCPDispatchFast)
+		}
+		flood.queue(MCPDispatchSlow)
+		for passed := 0; ; {
+			class, grant := flood.grant(reads[0])
+			reads = reads[1:]
+			flood.queue(MCPDispatchFast)
+			if class == MCPDispatchSlow {
+				if passed == 0 {
+					t.Fatal("the slow call went ahead of the queued reads")
+				}
+				return
+			}
+			if class != MCPDispatchFast {
+				t.Fatalf("a read's slot went to a %s call", class)
+			}
+			reads = append(reads, grant)
+			if passed++; passed > passBound {
+				t.Fatalf("slow call passed over %d times with room in its lane; bound is %d", passed, passBound)
+			}
+			flood.queue(MCPDispatchMutating)
+			class, grant = flood.grant(writes[0])
+			if class != MCPDispatchMutating {
+				t.Fatalf("a reserved write slot went to a %s call", class)
+			}
+			writes = append(writes[1:], grant)
+		}
+	})
+}
+
 func TestDispatchSchedulerFourHeldLimitOnlyWhileOtherSessionsWait(t *testing.T) {
 	pool := testDispatchPool(8)
 	for range 4 {
