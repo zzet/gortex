@@ -1326,6 +1326,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		}
 		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
 		wait = &editProbeReceiptWait{entered: callCtx.Err() == nil}
+		var settle editProbeAccountingSettle
 		for callCtx.Err() == nil {
 			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
 			s.mu.Lock()
@@ -1391,6 +1392,13 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					coverage := consumersDone && r.gateModeComplete(step)
 					*wait = editProbeReceiptWait{entered: true, observed: true, terminal: terminal, allCorrect: all, coverage: coverage, qualified: qualifiedCandidate, freshTiers: coalescedFreshTiers(qualifiedTiers)}
 					if coverage && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+						break
+					}
+					// A deadline now would be attributed to accounting alone.
+					if settle.unsettled(editProbeDeadlineReason(*wait) == editProbeDeadlineAccounting, accounting) {
+						s.mu.Lock()
+						s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)
+						s.mu.Unlock()
 						break
 					}
 				}

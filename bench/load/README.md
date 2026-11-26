@@ -411,9 +411,12 @@ latest evaluated status: `immediate_readbacks_outstanding`,
 `post_ack_coverage_outstanding`, `qualified_tiers_not_fresh`, or
 `accounting_non_terminal` when the graph was terminal and fresh, every oracle
 was first-correct and every assigned post-ACK witness was present, so only the
-required accounting was outstanding. Relocation and batch cells have no
-reason. `t_graph_terminal_ms` is the client time from edit send to the first
-own status reply that reported the graph terminal. `busy_refusals` counts
+required accounting was outstanding. Unchanged accounting ends that wait
+after eight status cycles (see the native-duplicate paragraph below), so this
+reason means the accounting was still changing, or the deadline came first.
+Relocation and batch cells have no reason. `t_graph_terminal_ms` is the
+client time from edit send to the first own status reply that reported the
+graph terminal. `busy_refusals` counts
 dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
 `readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
 `busy_refusals` totals. None of these changes an outcome, an error or a client
@@ -567,14 +570,16 @@ deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.
 A complete native duplicate P keeps collecting until independent publisher R
 and requested-background B arrive; absent late evidence is not terminal proof
-of missing work. The one-file `edit.batch` collector bounds that wait: once
-the graph is fresh and every first-correct time is measured, it stops after
-eight consecutive status cycles with unchanged accounting. The accounting
-stays unavailable, with a reason naming the stop, and the record keeps its
-evidence instead of filling the per-edit cap. A change in the accounting
-restarts the count, and a missing first-correct time keeps polling. The
-single-edit receipt loop and the multi-file batch collector do not have
-this bound. A validated immutable R phase failure can end failed coverage.
+of missing work. The single-edit receipt loop and the one-file `edit.batch`
+collector bound that wait. Once the graph is fresh, every first-correct time
+is measured and any assigned post-ACK coverage is in, each stops after eight
+consecutive status cycles with unchanged accounting. The accounting stays unavailable, with a reason naming
+the stop, and the record keeps its evidence instead of filling the per-edit
+cap. A change in the accounting restarts the count; a graph that is not yet
+fresh, a missing first-correct time, outstanding coverage or a qualified
+functional candidate keeps polling. The multi-file batch collector does not
+have this bound. A validated immutable R phase failure can end failed
+coverage.
 An original-publication-bound `requested_background_unavailable` is also
 terminal failed coverage, not a measured zero or a successful accounting check.
 Unknown or foreign diagnostics do not stop late-evidence collection.
