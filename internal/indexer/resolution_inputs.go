@@ -37,6 +37,20 @@ type resolutionInputs struct {
 	stats   map[string]resolutionInputStat
 }
 
+// inertResolutionDigest certifies a pass that consumed no resolution inputs:
+// the gate found no JS/TS caller and nothing that could make one. The digest
+// stays a durable completion fence for every language (a refused Go binding
+// write clears it, so a restart re-resolves) without walking for configs
+// nothing reads.
+const inertResolutionDigest = "inert"
+
+func inertResolutionInputs() *resolutionInputs {
+	return &resolutionInputs{reads: map[string]string{}, digest: inertResolutionDigest}
+}
+
+// inert reports the sentinel set: no collections, never a lookup source.
+func (in *resolutionInputs) inert() bool { return in != nil && in.digest == inertResolutionDigest }
+
 // resolutionInputStat is an input's identity when it was read; missing marks
 // an input that did not exist.
 type resolutionInputStat struct {
@@ -349,14 +363,14 @@ func (idx *Indexer) censusResolutionCurrent(root string) bool {
 	} else if prior := idx.appliedResolution.Load(); prior != nil {
 		certified = prior.digest
 	}
-	if certified == "" {
-		// Nothing was certified. Unless something consumes resolution
-		// inputs, nothing can be stale either: a checkout without JS/TS
-		// callers never certifies, and its census must not walk for configs.
-		if needed, err := idx.resolutionPassNeeded(root, false, nil); err == nil && !needed {
-			return true
-		}
-		return false
+	switch certified {
+	case "":
+		return false // a refused write or failed pass cleared the fence
+	case inertResolutionDigest:
+		// The last pass consumed no inputs. It still holds unless something
+		// now consumes them; a walk could never reproduce this digest.
+		needed, err := idx.resolutionPassNeeded(root, false, nil)
+		return err == nil && !needed
 	}
 	current, err := discoverResolutionInputs(root, nil)
 	if err != nil || current.digest != certified {
@@ -395,13 +409,13 @@ func (idx *Indexer) refreshResolutionInputs(root string, points ...string) (*res
 // scope, a known input, or unfinished resolution work, discovery is skipped; a
 // lookup a later parse makes still loads the inputs lazily.
 func (idx *Indexer) resolutionPassNeeded(root string, scopeHasJSTS bool, points []string) (bool, error) {
-	if scopeHasJSTS || idx.appliedResolution.Load() != nil {
+	if applied := idx.appliedResolution.Load(); scopeHasJSTS || applied != nil && !applied.inert() {
 		return true, nil
 	}
 	idx.resolutionMu.Lock()
-	pending := idx.warmResolution != nil
+	pending := idx.warmResolution != nil && !idx.warmResolution.inputs.inert()
 	idx.resolutionMu.Unlock()
-	if pending || idx.resolutionRetry != nil || idx.resolutionInputsChanged {
+	if retry := idx.resolutionRetry; pending || retry != nil && !retry.inputs.inert() || idx.resolutionInputsChanged {
 		return true, nil
 	}
 	cached := cachedResolutionInputs(root)
@@ -448,7 +462,9 @@ func (idx *Indexer) refreshResolutionInputsFor(root string, scopeHasJSTS bool, p
 			return nil, err
 		}
 		if !needed {
-			return nil, nil
+			// Certify the gated pass like any other, so a refused write in it
+			// still clears the fence; lookups stay lazy (no active inputs).
+			return inertResolutionInputs(), nil
 		}
 	}
 	if _, delta := idx.graph.(*graph.DeltaWriter); delta {
@@ -471,6 +487,9 @@ func (idx *Indexer) refreshResolutionInputsFor(root string, scopeHasJSTS bool, p
 	retry := idx.resolutionRetry
 	if retry != nil {
 		prior = retry.inputs
+	}
+	if prior.inert() {
+		prior = nil // nothing was read; compare against the stored digest
 	}
 	idx.resolutionInputsChanged = retry != nil && retry.files == nil
 	current := prior

@@ -607,3 +607,34 @@ export function callReal() { return real() }
 	require.Equal(t, graph.OriginASTResolved, realEdge.Origin)
 	require.Equal(t, "nuxt_auto_import", realEdge.Meta["resolution"])
 }
+
+// Every production path that walks reverse JS module dependencies (a batched
+// save, a deletion, the single-file fallback, and the cold index's staging
+// graph) seeks the store's partial index and never enumerates the call graph.
+func TestJSModuleDependentsNeverScanOnProductionReaders(t *testing.T) {
+	root := t.TempDir()
+	lib := filepath.Join(root, "lib.ts")
+	writeFileMk(t, lib, "export function impl(){}")
+	writeFileMk(t, filepath.Join(root, "barrel.ts"), "export {impl} from './lib'")
+	writeFileMk(t, filepath.Join(root, "page.ts"), "import {impl} from './barrel'; export function run(){impl()}")
+	scans := graph.JSModuleScanFallbacks()
+	idx, store := newSQLiteIndexer(t)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Equal(t, "lib.ts::impl", callTargetForName(t, store, "page.ts", "run"))
+
+	bumpMtime(t, lib, "export function other(){}")
+	_, err = idx.IncrementalReindexPaths(root, []string{lib})
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::impl", callTargetForName(t, store, "page.ts", "run"), "the export change reached the caller")
+
+	bumpMtime(t, lib, "export function impl(){}")
+	require.NoError(t, idx.IndexFile(lib))
+	require.Equal(t, "lib.ts::impl", callTargetForName(t, store, "page.ts", "run"))
+
+	require.NoError(t, os.Remove(lib))
+	_, err = idx.IncrementalReindexPaths(root, []string{lib})
+	require.NoError(t, err)
+	require.Equal(t, "unresolved::impl", callTargetForName(t, store, "page.ts", "run"))
+	require.Equal(t, scans, graph.JSModuleScanFallbacks(), "a production reader enumerated the call graph")
+}

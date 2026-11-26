@@ -380,6 +380,10 @@ type Indexer struct {
 	contractProviderObserved  func(contracts.Contract, []*graph.Node, map[string]any)
 	contractBindingValue      func(*graph.Node, string) (contracts.Binding, bool)
 	contractBindingObserved   func(*graph.Node, string, contracts.Binding)
+	// bindingWriteErr is a refused binding write in this incremental batch:
+	// a caller restub or a deleted file's eviction. Like a refused contract
+	// restatement it stops the batch; batchRefusal reads both.
+	bindingWriteErr error
 	// contractRegistrySeed defers immutable-stack hydration until an edit
 	// actually needs the complete repository registry.
 	contractRegistrySeed           func()
@@ -7418,6 +7422,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	idx.contractDependenciesChanged = false
 	idx.contractSharedInputsChanged = false
 	idx.contractRestatementErr = nil
+	idx.bindingWriteErr = nil
 	idx.contractShortcutReasons = make(map[string]int)
 	idx.contractProjectionTime = 0
 	idx.contractValidationTime = 0
@@ -7434,7 +7439,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			zap.String("repo", idx.repoPrefix), zap.Int64("generation", idx.contractGenerationID), zap.Int("unchanged_files", idx.contractUnchangedFiles),
 			zap.Int("global_registry_loads", idx.contractRegistryLoads), zap.Int("registry_seed_calls", idx.contractRegistrySeedCalls),
 			zap.Duration("local_contract_validation", idx.contractValidationTime), zap.Duration("file_projection", idx.contractProjectionTime), zap.Any("reasons", idx.contractShortcutReasons),
-			zap.Bool("publication_guard", idx.contractInputWitness != nil), zap.Error(idx.contractRestatementErr))
+			zap.Bool("publication_guard", idx.contractInputWitness != nil), zap.Error(idx.contractRestatementErr), zap.NamedError("binding_write", idx.bindingWriteErr))
 		idx.incrementalUnchangedContracts = nil
 		idx.contractDependenciesChanged = false
 		idx.contractSharedInputsChanged = false
@@ -7797,8 +7802,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	invalidation, reparsedFiles, failedFiles, versionChangedFiles := idx.reindexIncrementalFilesBatched(
 		sourceStaleFiles, deletedFiles, markerBatch, mode.surfaceFirstVersionChange,
 	)
-	if idx.contractRestatementErr != nil {
-		return nil, idx.contractRestatementErr
+	if err := idx.batchRefusal(); err != nil {
+		return nil, err
 	}
 	finalizeTiming := idx.startReconcilePhase(idx.logger, idx.repoPrefix, "contracts_and_metadata",
 		zap.Int("manifest_files", len(manifestFiles)), zap.Int("reparsed_files", len(reparsedFiles)))

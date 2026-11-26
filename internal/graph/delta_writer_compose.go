@@ -5,6 +5,7 @@ import (
 	"iter"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Batched reads through the layer stack.
@@ -404,6 +405,14 @@ func (dw *DeltaWriter) composeEdgesByKindOver(s deltaStack, kind EdgeKind) ([]*E
 	return out, true
 }
 
+// jsModuleScanFallbacks counts lookups that enumerate a reader's whole call
+// graph. Production readers (the SQLite store, and a DeltaWriter over it) seek
+// the partial index instead; tests assert this stays zero.
+var jsModuleScanFallbacks atomic.Int64
+
+// JSModuleScanFallbacks reports how many lookups took the enumerating fallback.
+func JSModuleScanFallbacks() int64 { return jsModuleScanFallbacks.Load() }
+
 // JSModuleDependencyLookup returns a reverse lookup for one mutation. The
 // production store seeks its partial index. On a sparse view, project only the
 // small overlay layers; never enumerate the bottom store's entire call graph.
@@ -440,6 +449,7 @@ func JSModuleDependencyLookup(r Reader) func(string) []*Edge {
 			}
 		}
 	}
+	jsModuleScanFallbacks.Add(1)
 	for _, kind := range kinds {
 		for e := range r.EdgesByKind(kind) {
 			add(e)

@@ -43,7 +43,9 @@ func TestResolutionDiscovery_GoOnlyRepositorySkipsWalk(t *testing.T) {
 	require.Zero(t, resolutionDiscoveryWalkCount(abs))
 	digest, err := store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
-	require.Empty(t, digest, "nothing consumed a resolution input, so nothing is certified")
+	require.Equal(t, inertResolutionDigest, digest, "a pass that read no input certifies the inert set")
+	require.True(t, idx.censusResolutionCurrent(abs))
+	require.Zero(t, resolutionDiscoveryWalkCount(abs))
 }
 
 // The first JS/TS files in a Go repository still get alias-directed bindings

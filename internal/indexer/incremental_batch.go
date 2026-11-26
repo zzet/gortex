@@ -170,7 +170,7 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	deletion := markerBatch.publicationStamps().beginPatchLap(patchApply)
 	_, _, parked, err := idx.evictDeletedFilesBatched(deletedFiles, &invalidation, markerBatch)
 	if err != nil {
-		idx.contractRestatementErr = err
+		idx.bindingWriteErr = err
 		return invalidation, nil, deletedFiles, nil
 	}
 	idx.rebindParkedCalls(parked, markerBatch)
@@ -185,7 +185,7 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 		idx.logger.Debug("incremental reindex: failed to index file",
 			zap.String("file", filePath), zap.Error(idx.fileIndexFailureError(filePath)))
 	}
-	if errors.Is(idx.contractRestatementErr, store_sqlite.ErrWarmupWALPressure) {
+	if errors.Is(idx.batchRefusal(), store_sqlite.ErrWarmupWALPressure) {
 		// The reconcile already fails with this error (its caller returns it
 		// before using the result). A retry pass would only meet the same
 		// refusal after a second full wait. The first pass's file-failure
@@ -241,6 +241,15 @@ func (idx *Indexer) reindexIncrementalFilesBatched(
 	return invalidation, reparsed, appendUniqueSorted(permissionFailed, retryFailed...), versionChanged
 }
 
+// batchRefusal is the refusal that stops this incremental batch: a contract
+// restatement or input journal the store refused, or a refused binding write.
+func (idx *Indexer) batchRefusal() error {
+	if idx.contractRestatementErr != nil {
+		return idx.contractRestatementErr
+	}
+	return idx.bindingWriteErr
+}
+
 func (idx *Indexer) reindexIncrementalStalePass(
 	files []string,
 	markerBatch *reparsePendingEnrichmentBatch,
@@ -267,7 +276,7 @@ func (idx *Indexer) reindexIncrementalStalePass(
 		reparsed = append(reparsed, chunkReparsed...)
 		failed = append(failed, chunkFailed...)
 		versionChanged = append(versionChanged, chunkVersionChanged...)
-		if idx.contractRestatementErr != nil {
+		if idx.batchRefusal() != nil {
 			// Stop at the refused chunk: a later chunk would commit and then
 			// be charged with this chunk's failure.
 			failed = append(failed, files[start:]...)
@@ -502,9 +511,9 @@ func (idx *Indexer) reindexIncrementalChunk(
 		zap.Duration("prior_fingerprints", priorFingerprintTime))
 	if len(stages) > 0 {
 		plan.Merge(idx.commitIncrementalStages(stages, markerBatch))
-		if idx.contractRestatementErr != nil {
+		if refused := idx.batchRefusal(); refused != nil {
 			for _, stage := range stages {
-				idx.noteFileIndexFailure(stage.absPath, idx.contractRestatementErr)
+				idx.noteFileIndexFailure(stage.absPath, refused)
 				readFailed = append(readFailed, stage.absPath)
 			}
 			return consumed, plan, nil, readFailed, nil
@@ -934,7 +943,7 @@ func (idx *Indexer) commitIncrementalStages(
 
 	if len(structural) > 0 {
 		idx.commitStructuralIncrementalBatch(structural, view, markerBatch)
-		if idx.contractRestatementErr != nil {
+		if idx.batchRefusal() != nil {
 			return plan
 		}
 	}
@@ -1224,7 +1233,7 @@ func (idx *Indexer) commitStructuralIncrementalBatch(
 	idx.applyLap("prior_bindings")
 	carried, npmConsumers, err := restubIncomingRefsFromView(idx.graph, stages, view, markerBatch)
 	if err != nil {
-		idx.contractRestatementErr = err
+		idx.bindingWriteErr = err
 		return
 	}
 	if markerBatch != nil {
