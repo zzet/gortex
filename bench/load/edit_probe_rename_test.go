@@ -160,3 +160,39 @@ func TestEditProbeRenameRejectsRetainedOldCallerBesideNewEdge(t *testing.T) {
 		})
 	}
 }
+
+// A rename starts from the declaration <marker>Before, and the text query for
+// the marker returns that line before the edit lands. The text oracle must not
+// count a longer name that only starts with the marker, or every rename edit is
+// already "visible" before it is sent.
+func TestEditProbeRenameTextOracleRejectsPreEditName(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			c := editProbeRenameCorpus(t, language, 1)
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step := plan.Steps[0]
+			text := func(name string) map[string]any {
+				line, _, _ := strings.Cut(strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", name)), "\n")
+				return map[string]any{"matches": []any{map[string]any{"path": c.File, "line": json.Number("2"), "text": line}}}
+			}
+			if !editProbeCorrect("text", text(step.Marker), c, step, plan.Callee) {
+				t.Fatal("renamed declaration rejected")
+			}
+			for _, name := range []string{step.Marker + "Before", step.Marker + "_", step.Marker + "2"} {
+				if editProbeCorrect("text", text(name), c, step, plan.Callee) {
+					t.Fatalf("declaration of %s proved %s", name, step.Marker)
+				}
+			}
+			if language == "go" {
+				row := text(step.Marker)["matches"].([]any)[0].(map[string]any)
+				row["text"] = "x" + row["text"].(string)
+				if editProbeCorrect("text", map[string]any{"matches": []any{row}}, c, step, plan.Callee) {
+					t.Fatal("func keyword matched inside a longer identifier")
+				}
+			}
+		})
+	}
+}
