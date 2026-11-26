@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/query"
+	"github.com/zzet/gortex/internal/reach"
 )
 
 // relationFreshnessWait bounds how long a change tool waits for the edits in
@@ -33,6 +34,7 @@ type relationFreshness struct {
 	backgroundMissing bool   // this request could not obtain background admission
 	projected         bool   // current request served an exact file-local projection
 	storeBusy         bool   // selected store sections were unavailable
+	publishing        bool   // a graph publication kept the walk waiting until its deadline
 	fileReason        string // an observed reason the request deferred a file projection
 	scope             string
 	state             string   // Empty is fresh internally; explicit responses may render fresh or unknown.
@@ -347,7 +349,34 @@ func (f relationFreshness) requireFreshError() *mcp.CallToolResult {
 	if f.state == "failed" {
 		message += "; " + mutationFreshnessRecoveryHint()
 	}
+	if f.publishing {
+		message += "; a graph publication held the impact walk's read until its deadline"
+	}
 	return mcp.NewToolResultError(message)
+}
+
+// publicationPending labels an answer whose impact walk a graph publication
+// kept waiting at the topology gate or resolver mutex until the walk's
+// deadline: the walk read nothing behind it, so the answer is a lower bound
+// that is pending whatever its relation scope said, unless that failed.
+func (f relationFreshness) publicationPending() relationFreshness {
+	if f.state == "" || f.state == "fresh" {
+		f.state = "pending"
+	}
+	f.publishing = true
+	return f
+}
+
+// impactWalkContext bounds the coordination waits of the impact walk by the
+// caller's wait_deadline. Without it a publication holding the topology gate
+// keeps the call waiting for the walk's own budget, well past the deadline the
+// caller asked to be answered by. A free gate admits even past the deadline,
+// so the answer only changes while a publication is in flight.
+func impactWalkContext(ctx context.Context, freshness requestFreshness) context.Context {
+	if freshness.err != nil || !freshness.hasDeadline {
+		return ctx
+	}
+	return reach.WithCoordinationDeadline(ctx, freshness.deadline)
 }
 
 // merge folds the label of another scope the same answer read into f: the

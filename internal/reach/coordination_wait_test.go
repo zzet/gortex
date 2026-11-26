@@ -69,6 +69,42 @@ func TestLookupCoordinationWaitKeepsGateAndMutexSeparate(t *testing.T) {
 	}
 }
 
+// The coordination deadline ends a held gate or mutex wait, not the lookup: a
+// free gate and mutex admit it even after the deadline has passed.
+func TestLookupCoordinationDeadlineBoundsOnlyTheWait(t *testing.T) {
+	for _, held := range []string{"gate_wait", "resolve_mutex_wait"} {
+		t.Run(held, func(t *testing.T) {
+			g, ids := newCallChain(t, 3)
+			var release func()
+			if held == "gate_wait" {
+				finish := BeginTopologyMutation(g)
+				release = func() { finish(false) }
+			} else {
+				mu := g.ResolveMutex()
+				mu.Lock()
+				release = mu.Unlock
+			}
+			var once sync.Once
+			unblock := func() { once.Do(release) }
+			t.Cleanup(unblock)
+			ctx := WithCoordinationDeadline(t.Context(), time.Now().Add(50*time.Millisecond))
+			started := time.Now()
+			_, _, _, hit, truncated := LookupContext(ctx, g, ids[2])
+			if elapsed := time.Since(started); elapsed >= lookupTimeout/2 {
+				t.Fatalf("held %s kept the lookup %v, past its coordination deadline", held, elapsed)
+			}
+			if hit || !truncated {
+				t.Fatalf("a lookup cut short at %s must be a bounded miss: hit=%v truncated=%v", held, hit, truncated)
+			}
+			unblock()
+			d1, _, _, hit, truncated := LookupContext(ctx, g, ids[2])
+			if !hit || truncated || len(d1) != 1 {
+				t.Fatalf("a free %s refused a lookup past its coordination deadline: hit=%v truncated=%v d1=%v", held, hit, truncated, d1)
+			}
+		})
+	}
+}
+
 func TestLookupCoordinationWaitReportsDetachedMutexAsNotAttempted(t *testing.T) {
 	store := repoTopologyStore(t)
 	mu := store.ResolveMutex()

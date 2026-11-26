@@ -160,3 +160,50 @@ func TestEditProbeRenameRejectsRetainedOldCallerBesideNewEdge(t *testing.T) {
 		})
 	}
 }
+
+// A rename starts from the declaration <marker>Before, and the text query for
+// the marker returns that line before the edit lands. The text oracle must not
+// count a longer name that only starts with the marker, or every rename edit is
+// already "visible" before it is sent.
+func TestEditProbeRenameTextOracleRejectsPreEditName(t *testing.T) {
+	for _, language := range []string{"go", "typescript", "python"} {
+		t.Run(language, func(t *testing.T) {
+			c := editProbeRenameCorpus(t, language, 1)
+			plan, err := makeEditProbePlan(c, 42, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step := plan.Steps[0]
+			text := func(name string) map[string]any {
+				line, _, _ := strings.Cut(strings.TrimSpace(strings.ReplaceAll(c.EditTemplate, "{{marker}}", name)), "\n")
+				return map[string]any{"matches": []any{map[string]any{"path": c.File, "line": json.Number("2"), "text": line}}}
+			}
+			if !editProbeCorrect("text", text(step.Marker), c, step, plan.Callee) {
+				t.Fatal("renamed declaration rejected")
+			}
+			// An identifier also continues with a non-ASCII letter or digit.
+			for _, name := range []string{step.Marker + "Before", step.Marker + "_", step.Marker + "2", step.Marker + "\u00e9", step.Marker + "\u0663"} {
+				if editProbeCorrect("text", text(name), c, step, plan.Callee) {
+					t.Fatalf("declaration of %s proved %s", name, step.Marker)
+				}
+			}
+			if language == "go" {
+				row := text(step.Marker)["matches"].([]any)[0].(map[string]any)
+				declaration := row["text"].(string)
+				// A type parameter list starts right after the name.
+				generic := strings.Replace(declaration, "func "+step.Marker+"(", "func "+step.Marker+"[T any](", 1)
+				if generic == declaration {
+					t.Fatalf("fixture declaration %q has no parameter list right after the name", declaration)
+				}
+				row["text"] = generic
+				if !editProbeCorrect("text", map[string]any{"matches": []any{row}}, c, step, plan.Callee) {
+					t.Fatalf("generic declaration %q rejected", generic)
+				}
+				row["text"] = "x" + declaration
+				if editProbeCorrect("text", map[string]any{"matches": []any{row}}, c, step, plan.Callee) {
+					t.Fatal("func keyword matched inside a longer identifier")
+				}
+			}
+		})
+	}
+}
