@@ -389,6 +389,9 @@
                       "read_metadata_state": {
                         "type": "string"
                       },
+                      "redial_ns": {
+                        "type": "integer"
+                      },
                       "request_sha256": {
                         "type": "string"
                       },
@@ -2560,6 +2563,9 @@
                               "reads_while_receipt_observed_pending": {
                                 "type": "integer"
                               },
+                              "redial_ns": {
+                                "type": "integer"
+                              },
                               "relation_consumers": {
                                 "additionalProperties": {
                                   "additionalProperties": false,
@@ -4459,6 +4465,9 @@
                           "items": {
                             "additionalProperties": false,
                             "properties": {
+                              "affected_records": {
+                                "type": "integer"
+                              },
                               "failed": {
                                 "type": "integer"
                               },
@@ -4480,7 +4489,8 @@
                               "index",
                               "redials",
                               "failed",
-                              "limit_reached"
+                              "limit_reached",
+                              "affected_records"
                             ],
                             "type": "object"
                           },
