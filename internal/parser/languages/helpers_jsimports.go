@@ -958,6 +958,18 @@ type jsBinding struct {
 type jsScopeCache struct {
 	scopes        map[jsScopeKey]map[string]jsBinding
 	requireShadow map[jsScopeKey]bool
+	// called holds the names of the bare calls stamp will look up. Scope maps
+	// keep only those names: a declaration no call looks up can't shadow one.
+	// Nil keeps every name.
+	called map[string]struct{}
+}
+
+// noteCall records a bare call name before stamping begins.
+func (cache *jsScopeCache) noteCall(name string) {
+	if cache.called == nil {
+		cache.called = map[string]struct{}{}
+	}
+	cache.called[name] = struct{}{}
 }
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
@@ -995,6 +1007,11 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 		names, ok := cache.scopes[key]
 		if !ok {
 			add := func(id string, b jsBinding) {
+				if cache.called != nil {
+					if _, ok := cache.called[id]; !ok {
+						return
+					}
+				}
 				if names == nil {
 					names = map[string]jsBinding{}
 				}
