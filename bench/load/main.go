@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -12,6 +13,10 @@ import (
 func main() {
 	if err := command(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		var status exitStatus
+		if errors.As(err, &status) {
+			os.Exit(status.code)
+		}
 		os.Exit(1)
 	}
 }
@@ -40,6 +45,9 @@ func command(args []string) error {
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(schema)
 	}
+	if len(args) > 0 && args[0] == "consumer-census" {
+		return consumerCensusCommand(args[1:], os.Stdout)
+	}
 	if len(args) == 3 && args[0] == "delta" {
 		before, err := readReport(args[1])
 		if err != nil {
@@ -51,5 +59,5 @@ func command(args []string) error {
 		}
 		return printDelta(os.Stdout, before, after)
 	}
-	return fmt.Errorf("usage: load run [options] | delta <before.json> <after.json> (received %d arguments)", len(args))
+	return fmt.Errorf("usage: load run [options] | delta <before.json> <after.json> | consumer-census [--out census.json] <report.json> (received %d arguments)", len(args))
 }
