@@ -259,6 +259,9 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	}
 	if before.info == nil {
 		if expected != nil && expected.tombstone && liveProjectionForAcknowledgement(expected) {
+			if sameVersion == nil && s.retireCaughtUpProjection(requestCtx, root, idx, expected) {
+				return nil, nil // the graph has published this deletion
+			}
 			return expected, nil
 		}
 		if !tracked && expected == nil {
@@ -341,6 +344,19 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 				return nil, err
 			}
 			if !expected.suspect.Load() {
+				if sameVersion == nil && s.retireCaughtUpProjection(requestCtx, root, idx, expected) {
+					// The graph holds exactly these bytes now: answer as for a
+					// file without a projection whose bytes match the index.
+					if summary != nil && tracked {
+						if current := pendingFileProjections.snap.Load(); current.entries[key] == nil && buildCtx.Err() == nil {
+							*summary = canonicalSummarySource{
+								indexer: idx, root: root, abs: abs, readPath: readPath, key: key,
+								graphPath: graphPath, stamp: after, bytes: raw, registry: current,
+							}
+						}
+					}
+					return nil, nil
+				}
 				return expected, nil
 			}
 			// Reuse the immutable parse only after bounded current-byte checks.
