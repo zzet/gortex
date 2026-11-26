@@ -74,6 +74,10 @@ func TestInjectedLifecycleAllowanceCannotCreateAThirdAttempt(t *testing.T) {
 				// A file read whose allowance is spent reports the typed
 				// retriable refusal, the same shape as its first refusal.
 				requireReadFreshnessContract(t, result, "projection_superseded")
+			} else {
+				// Symbol source keeps the generic untyped error.
+				require.False(t, metadataTransientRefusal(result), resultText(result))
+				require.Equal(t, errProjectedSourceMoved.Error(), resultText(result))
 			}
 		})
 	}
