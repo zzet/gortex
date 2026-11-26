@@ -295,7 +295,7 @@ func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) m
 		}
 		for {
 			if !allowance.claim() {
-				return mcplib.NewToolResultError(errProjectedSourceMoved.Error()), nil
+				return s.projectedReadAllowanceSpent(ctx, req), nil
 			}
 			copy := req
 			copy.Params.Arguments = cloneFreshSymbolArguments(req.GetArguments())
@@ -327,6 +327,16 @@ func (s *Server) retryProjectedSymbolSource(attempt mcpserver.ToolHandlerFunc) m
 			}
 		}
 	}
+}
+
+// A spent allowance ends the read. Summary and editing-context reads keep
+// the typed retriable refusal their first attempt reports for a superseded
+// selection; other reads keep the generic error.
+func (s *Server) projectedReadAllowanceSpent(ctx context.Context, req mcplib.CallToolRequest) *mcplib.CallToolResult {
+	if ctx.Err() == nil && s.metadataReadRetryScope(req) {
+		return metadataTransientResult(ErrCodeProjectionSuperseded, errProjectedSourceMoved.Error(), "")
+	}
+	return mcplib.NewToolResultError(errProjectedSourceMoved.Error())
 }
 
 func runProjectedSourceAttempt(ctx context.Context, req mcplib.CallToolRequest, attempt mcpserver.ToolHandlerFunc) (*mcplib.CallToolResult, error) {
