@@ -62,8 +62,7 @@ func (s *firstSummaryRefusalEvidence) retain(attempt *Attempt, args map[string]a
 		return false
 	}
 	data := attempt.ErrorData
-	if data["error_code"] != "projection_superseded" || data["retry_scope"] != "read_only" ||
-		data["retriable"] != true || data["delivery_unknown"] != false {
+	if !typedProjectionSupersededRefusal(data) {
 		return false
 	}
 	route, err := summaryRefusalRouteHash(s.root, attempt.CWD, args)
@@ -74,6 +73,22 @@ func (s *firstSummaryRefusalEvidence) retain(attempt *Attempt, args map[string]a
 	trace["route_sha256"] = route
 	data[firstSummaryRefusalField] = trace
 	return true
+}
+
+func typedProjectionSupersededRefusal(data map[string]any) bool {
+	return data["error_code"] == "projection_superseded" && data["retry_scope"] == "read_only" &&
+		data["retriable"] == true && data["delivery_unknown"] == false
+}
+
+// The same allowlisted projection, for every immediate edit-probe summary
+// readback refused with the typed read-only projection_superseded shape. The
+// daemon emits the predicate only under its refusal-evidence opt-in; without
+// it the trace says unavailable. Each trace is bounded and holds no source.
+func editProbeSummaryRefusalTrace(kind string, data map[string]any, raw json.RawMessage) map[string]any {
+	if kind != "summary" || !typedProjectionSupersededRefusal(data) {
+		return nil
+	}
+	return summaryRefusalTrace(raw)
 }
 
 func summaryRefusalTrace(raw json.RawMessage) map[string]any {

@@ -1687,6 +1687,7 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 		job.otherActorWaiting = func() bool { return c.otherActorWaiting(a) }
 	}
 	c.linkJob(a, job)
+	job.strictWaiting = func() bool { return c.strict(a) }
 	// Registered after capture succeeds and before the body starts. Returning
 	// cache custody precedes panic recovery; a panic discards its unproven state.
 	returnedCache := false
