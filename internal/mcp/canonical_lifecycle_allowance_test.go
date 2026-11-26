@@ -43,6 +43,23 @@ func TestProjectedReadDefaultAllowanceRemains150Milliseconds(t *testing.T) {
 	}
 }
 
+func TestProjectedReadBudgetInjectionUsesTheRequestOverride(t *testing.T) {
+	s := &Server{}
+	var observed context.Context
+	leaf := func(ctx context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+		observed = ctx
+		return mcplib.NewToolResultText("budget observed"), nil
+	}
+	ctx := context.WithValue(t.Context(), projectedSourceReadBudgetKey{}, 2*time.Second)
+	before := time.Now()
+	_, err := s.withProjectedSourceReadBudget(leaf)(ctx, makeReq("get_symbol_source", map[string]any{}))
+	after := time.Now()
+	require.NoError(t, err)
+	deadline := observed.Value(projectedSourceDeadlineKey{}).(time.Time)
+	require.False(t, deadline.Before(before.Add(2*time.Second)))
+	require.False(t, deadline.After(after.Add(2*time.Second)))
+}
+
 func TestInjectedLifecycleAllowanceCannotCreateAThirdAttempt(t *testing.T) {
 	for _, tool := range []string{"get_symbol_source", "get_file_summary", "get_editing_context"} {
 		t.Run(tool, func(t *testing.T) {

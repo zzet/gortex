@@ -102,6 +102,7 @@ func TestSymbolSourceRetriesByteDriftBeforeProjectionSelection(t *testing.T) {
 	extractor.hold.Store(true)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
+	ctx = context.WithValue(ctx, projectedSourceReadBudgetKey{}, 1500*time.Millisecond)
 	var once sync.Once
 	release := func() { once.Do(func() { close(extractor.release) }) }
 	type reply struct {

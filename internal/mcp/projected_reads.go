@@ -20,6 +20,16 @@ import (
 
 const projectedReadBudget = 150 * time.Millisecond
 
+type projectedSourceReadBudgetKey struct{}
+
+func projectedReadDeadline(ctx context.Context, now time.Time) time.Time {
+	budget := projectedReadBudget
+	if override, ok := ctx.Value(projectedSourceReadBudgetKey{}).(time.Duration); ok && override > 0 {
+		budget = override
+	}
+	return now.Add(budget)
+}
+
 // checkedProjectionReadObserver observes an already physically verified reuse
 // before its live-owner check. It supplies no projection or publication authority.
 // Only request-scoped lifecycle tests install this optional scheduling observer.
@@ -76,7 +86,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	if err := validateRequestProjectionStage(ctx, projectionReadInherited); err != nil {
 		return ctx, err
 	}
-	deadline := time.Now().Add(projectedReadBudget)
+	deadline := projectedReadDeadline(ctx, time.Now())
 	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
 		deadline = original
 	}
