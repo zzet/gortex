@@ -175,6 +175,10 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 				a.Outcome = "busy"
 			} else if retryTyped && remote != nil && remote.retryEditProbe() {
 				a.Outcome = "retryable"
+				if code := editProbeTransientCheckoutRefusal(remote.Message); code != "" && !expired && !editProbeResendFits(callCtx, start, returned, busyBackoff(retry)) {
+					a.Outcome = "error"
+					err = &editProbeResendDeclined{code: code, err: err}
+				}
 			}
 			// A fresh RPC, never internal replay or a new logical deadline. The
 			// explicit scoped contract cannot authorize writes or first-ACK probes.

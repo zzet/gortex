@@ -3,27 +3,37 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+)
+
+// Exact product texts from a linked-checkout smoke run.
+const (
+	refusalRetryCheckout   = "expected-linked-checkout"
+	refusalRetryNotRouted  = `view_building: checkout "` + refusalRetryCheckout + `" is not fully routed yet`
+	refusalRetryRouteMoved = "view_read_only: checkout mutation was not admitted; no files were changed: indexer: checkout mutation view is stale: the selected route moved: checkout route changed; read the current exact view and retry. Native fallback status was not established for this checkout. Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session."
 )
 
 // A linked checkout that is still routing, or whose route moved under an
 // edit, refuses the edit before admission and asks for a retry. LOAD re-sends
 // the edit within the record's own deadline and counts each re-send on the
-// record by refusal code, instead of failing the edit on first sight. Other
-// refusals, and a tool deadline that may have left work running, are never
-// re-sent.
+// record by refusal code, instead of failing the edit on first sight. When the
+// time left cannot cover another attempt as slow as the refused one, the
+// record ends on the product's refusal as a product deadline named by the
+// refusal code. Other refusals, and a tool deadline that may have left work
+// running, are never re-sent.
 func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
-	const checkout = "expected-linked-checkout"
-	// Exact product texts from a linked-checkout smoke run.
-	notRouted := `view_building: checkout "` + checkout + `" is not fully routed yet`
-	routeMoved := "view_read_only: checkout mutation was not admitted; no files were changed: indexer: checkout mutation view is stale: the selected route moved: checkout route changed; read the current exact view and retry. Native fallback status was not established for this checkout. Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session."
+	const checkout = refusalRetryCheckout
+	notRouted, routeMoved := refusalRetryNotRouted, refusalRetryRouteMoved
 	readOnly := "view_read_only: a pinned commit view only supports reads"
 	abandoned := `tool "edit" exceeded its 55.071287166s deadline and was abandoned so the session stays responsive. The work may still complete in the background, so treat any side effect as unknown.`
 	const deadline = 2 * time.Second
@@ -34,11 +44,16 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 		calls   int // edit requests the product saw; 0 means at least two
 		retries map[string]int
 		outcome string
+		reason  string        // deadline_reason when the record ends on a typed refusal
+		hold    time.Duration // each edit reply is due this long after the previous one was due
 	}{
-		{"building_then_moved_then_applied", []string{notRouted, routeMoved}, true, 3, map[string]int{"view_building": 1, "view_read_only": 1}, "complete"},
-		{"building_until_deadline", []string{notRouted}, false, 0, nil, "edit_error"},
-		{"other_read_only_is_terminal", []string{readOnly}, false, 1, nil, "edit_error"},
-		{"abandoned_tool_deadline_is_terminal", []string{abandoned}, false, 1, nil, "edit_error"},
+		{"building_then_moved_then_applied", []string{notRouted, routeMoved}, true, 3, map[string]int{"view_building": 1, "view_read_only": 1}, "complete", "", 0},
+		{"instant_building_until_the_deadline", []string{notRouted}, false, 0, nil, "product_deadline", "view_building", 0},
+		// The first re-send fits in the 55% left; after the second refusal
+		// about 10% is left, less than another 45% wait.
+		{"building_held_45_percent_of_the_deadline", []string{notRouted}, false, 2, map[string]int{"view_building": 1}, "product_deadline", "view_building", deadline * 45 / 100},
+		{"other_read_only_is_terminal", []string{readOnly}, false, 1, nil, "edit_error", "", 0},
+		{"abandoned_tool_deadline_is_terminal", []string{abandoned}, false, 1, nil, "edit_error", "", 0},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -64,6 +79,7 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			var mu sync.Mutex
 			calls := 0
 			mutation := ""
+			var first time.Time
 			p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
 				if frame.Kind == "search_symbols" {
 					return map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": "fixture", "checkout_id": checkout}}, nil
@@ -76,7 +92,12 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 					mu.Lock()
 					call := calls
 					calls++
+					if first.IsZero() {
+						first = time.Now()
+					}
+					due := first.Add(time.Duration(call+1) * cell.hold)
 					mu.Unlock()
+					time.Sleep(time.Until(due))
 					if call < len(cell.refuse) || !cell.apply {
 						text := cell.refuse[min(call, len(cell.refuse)-1)]
 						return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": text}}}, nil
@@ -178,6 +199,109 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			if cell.apply && (!record.GraphTerminal || record.Receipt != "linked-receipt") {
 				t.Fatalf("retried edit lost its receipt: %+v", record)
 			}
+			if record.DeadlineReason != cell.reason {
+				t.Fatalf("deadline reason %q, want %q", record.DeadlineReason, cell.reason)
+			}
+			if cell.reason == "" {
+				return
+			}
+			// The record and the phase both end on the product's refusal, not
+			// on a request still in flight at the deadline.
+			refusal := "RPC -32000: " + cell.refuse[len(cell.refuse)-1]
+			if !slices.Equal(record.Errors, []string{refusal}) {
+				t.Fatalf("record errors %q, want only the typed refusal", record.Errors)
+			}
+			run.mu.Lock()
+			var final Attempt
+			for _, attempt := range phase.Attempts {
+				if attempt.Role == "workload" && attempt.Tool == step.Request.name() {
+					final = attempt
+				}
+			}
+			run.mu.Unlock()
+			if final.Outcome != "error" || final.Error != refusal {
+				t.Fatalf("last edit attempt %q %q, want the typed refusal as an error", final.Outcome, final.Error)
+			}
 		})
 	}
+}
+
+// The product waits for a checkout's route before it refuses, up to about
+// 57 s of its tool deadline, so one typed checkout refusal can take most of a
+// 120 s record. A re-send is made only when the time left exceeds the refused
+// attempt's own time plus the backoff; otherwise the call ends on the
+// product's refusal, a known "no files were changed", instead of a request
+// still in flight at the deadline. The smoke's timings, on a virtual clock.
+func TestEditProbeCheckoutRefusalResendNeedsRoomForAnother(t *testing.T) {
+	type reply struct {
+		after time.Duration
+		text  string // "" applies the edit
+	}
+	for _, cell := range []struct {
+		name     string
+		timeout  time.Duration
+		replies  []reply // the last repeats
+		outcomes []string
+	}{
+		// 63 s left after the first refusal, 6 s after the second.
+		{"view_building_57s_of_120s", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"retryable", "error"}},
+		// Busy refusals had used the rest; 17.5 s left after the refusal.
+		{"view_building_57s_with_17_5s_left", 74500 * time.Millisecond, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"error"}},
+		// 82 s left, then 44 s, then 6 s.
+		{"moved_route_38s_of_120s", 120 * time.Second, []reply{{38 * time.Second, refusalRetryRouteMoved}}, []string{"retryable", "retryable", "error"}},
+		{"route_ready_on_the_resend", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}, {time.Second, ""}}, []string{"retryable", "success"}},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				caller := &scriptedEditCaller{}
+				caller.reply = func(ctx context.Context, call int) (json.RawMessage, error) {
+					r := cell.replies[min(call, len(cell.replies)-1)]
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(r.after):
+					}
+					if r.text == "" {
+						return json.Marshal(stubContent(map[string]any{"status": "applied"}))
+					}
+					return json.Marshal(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": r.text}}})
+				}
+				req := request{Tool: "edit", Operation: "file", Arguments: map[string]any{"operation": "file"}}
+				_, attempts, err := callEditProbeTool(context.Background(), caller, req, req.Arguments, "workload", 0, 0, 0, cell.timeout, editProbeRetrySleep(42, 0, 0))
+				var outcomes []string
+				for _, attempt := range attempts {
+					outcomes = append(outcomes, attempt.Outcome)
+				}
+				if !slices.Equal(outcomes, cell.outcomes) || caller.calls != len(cell.outcomes) {
+					t.Fatalf("attempts %v after %d requests, want %v: %v", outcomes, caller.calls, cell.outcomes, err)
+				}
+				final := cell.replies[min(len(cell.outcomes)-1, len(cell.replies)-1)].text
+				if final == "" {
+					if err != nil {
+						t.Fatalf("applied edit returned %v", err)
+					}
+					return
+				}
+				var remote *rpcError
+				if !errors.As(err, &remote) || remote.Message != final || errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("call did not end on the product's refusal: %v", err)
+				}
+				if last := attempts[len(attempts)-1]; last.LogicalMS >= float64(cell.timeout/time.Millisecond) {
+					t.Fatalf("refusal answered at %.0f ms, not before the %v deadline", last.LogicalMS, cell.timeout)
+				}
+			})
+		})
+	}
+}
+
+// scriptedEditCaller answers each tools/call with reply, by request ordinal.
+type scriptedEditCaller struct {
+	calls int
+	reply func(context.Context, int) (json.RawMessage, error)
+}
+
+func (c *scriptedEditCaller) call(ctx context.Context, _ string, _ any) (json.RawMessage, error) {
+	call := c.calls
+	c.calls++
+	return c.reply(ctx, call)
 }

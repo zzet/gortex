@@ -760,6 +760,12 @@ func editProbeRetrySleep(seed int64, ordinal, stream int) func(context.Context, 
 	}
 }
 
+// editProbeBackoffCeiling is the longest wait editProbeRetrySleep takes for
+// delay: the delay plus at most half again as jitter.
+func editProbeBackoffCeiling(delay time.Duration) time.Duration {
+	return delay + delay/2
+}
+
 func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, error) {
 	data, identity, _, err := r.performObserved(ctx, s, client, req, purpose, role, stream)
 	return data, identity, err
@@ -1133,9 +1139,15 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	if err != nil {
 		s.mu.Lock()
-		s.record.Outcome = "edit_error"
-		if ctx.Err() != nil {
+		switch code := editProbeDeclinedResend(err); {
+		case ctx.Err() != nil:
 			s.record.Outcome = "phase_censored"
+		case code != "":
+			// The product refused the edit and no re-send could be answered
+			// in time: the record ends on that refusal at its deadline.
+			s.record.Outcome, s.record.DeadlineReason = "product_deadline", code
+		default:
+			s.record.Outcome = "edit_error"
 		}
 		s.record.Errors = append(s.record.Errors, err.Error())
 		s.mu.Unlock()
