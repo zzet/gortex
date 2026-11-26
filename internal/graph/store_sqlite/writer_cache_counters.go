@@ -37,6 +37,31 @@ func (s *Store) installWriterCacheCounters() {
 	}
 	f := s.collectWriterCacheCounters
 	s.writeMu.onRelease.Store(&f)
+	// Identify the writer connection before the first write, so a writer
+	// attribution can key that write's hold (writer_attribution.go). Nothing
+	// else uses the connection while the store opens.
+	ctx, cancel := context.WithTimeout(context.Background(), writerTLSSampleWait)
+	defer cancel()
+	if conn, err := s.writerDB.Conn(ctx); err == nil {
+		_ = conn.Raw(func(dc any) error {
+			s.noteWriterTLS(dc)
+			return nil
+		})
+		_ = conn.Close()
+	}
+}
+
+// writerTLSSampleWait bounds the open-time wait for the idle writer
+// connection.
+var writerTLSSampleWait = time.Second
+
+// noteWriterTLS records the writer connection's libc TLS, the key of its VFS
+// calls: process-wide, and on this store's write gate.
+func (s *Store) noteWriterTLS(dc any) {
+	if _, tls, ok := driverConnHandles(dc); ok {
+		vfsWriterTLS.Store(uintptr(unsafe.Pointer(tls)))
+		s.writeMu.writerTLS.Store(uintptr(unsafe.Pointer(tls)))
+	}
 }
 
 func (s *Store) collectWriterCacheCounters() {
@@ -65,9 +90,7 @@ func (s *Store) collectWriterCacheCountersContext(ctx context.Context) {
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.Raw(func(dc any) error {
-		if _, tls, ok := driverConnHandles(dc); ok {
-			vfsWriterTLS.Store(uintptr(unsafe.Pointer(tls)))
-		}
+		s.noteWriterTLS(dc)
 		st, ok := dc.(modernsqlite.DBStatus)
 		if !ok {
 			return nil

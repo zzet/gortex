@@ -14,6 +14,9 @@ func (s *Server) DispatchClass(name string, arguments map[string]any) daemon.MCP
 		return daemon.MCPDispatchSlow
 	}
 	class, _ := daemon.ToolDispatchClass(name)
+	if name == "rename_symbol" && renamePreviewOnly(arguments) {
+		return daemon.MCPDispatchFast
+	}
 	if !isFacadeToolName(name) || s == nil || s.facades == nil {
 		return class
 	}
@@ -33,6 +36,9 @@ func (s *Server) DispatchClass(name string, arguments map[string]any) daemon.MCP
 	}
 	switch spec.Effect {
 	case facadeEffectLocalWrite, facadeEffectControlWrite, facadeEffectExternalWrite:
+		if spec.Legacy == "rename_symbol" && renamePreviewOnly(normalizeFacadeArguments(spec, arguments)) {
+			return daemon.MCPDispatchFast
+		}
 		return daemon.MCPDispatchMutating
 	}
 	class, _ = daemon.ToolDispatchClass(spec.Legacy)
@@ -43,4 +49,16 @@ func (s *Server) DispatchClass(name string, arguments map[string]any) daemon.MCP
 	// change.contract ack=false and analyze.co_change refresh=false. Never
 	// inherit a legacy mutation reservation for that effect-safe operation.
 	return daemon.MCPDispatchFast
+}
+
+// renamePreviewOnly reports whether rename_symbol, given these legacy
+// arguments, runs as a dry run. It reads dry_run exactly as the handler does,
+// so a call admitted as a read is one the handler will not write: a dry run
+// plans and verifies the edits, then returns before any file, receipt or
+// store write. Other dry runs keep their lane until they are shown to write
+// nothing.
+func renamePreviewOnly(arguments map[string]any) bool {
+	req := mcpgo.CallToolRequest{}
+	req.Params.Arguments = arguments
+	return req.GetBool("dry_run", false)
 }

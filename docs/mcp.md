@@ -300,9 +300,15 @@ call as *unknown* and re-read before assuming it did or did not land.
 MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
 lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
 admitted through these lanes. Mutating calls have two reserved slots and can
-also use free shared slots. Slow calls (`outline`, `dead_code`
+also use free shared slots. A dry-run rename (`rename_symbol` or `refactor`
+`rename` with `dry_run: true`) writes nothing and is admitted as a fast read;
+a rename that writes stays mutating. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
-serve queued mutating calls first, then fast, then slow. Sessions take turns
+serve queued mutating calls first, then fast, then slow, with one bound: while
+a queued slow call has room in the slow lane, at most four grants in a row go
+to the other lanes before the slow lane takes the next one. That turn never
+uses the two reserved mutation slots, so writes keep their reservation and a
+flood of writes and fast reads cannot starve the slow lane. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
 session. For small cap overrides, the reservation is `min(2, cap-1)` and the
 slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
@@ -535,6 +541,17 @@ pending until the shared startup resolver has published. File reads still check
 current disk state. CLI verbs print the freshness line on stderr;
 `--require-fresh` exits with code 4 when the requested tier remains pending or
 failed.
+
+`mutation_status` also carries `tier_after_commit_ms`: for `file_graph`,
+`relations` and `derived`, the milliseconds from the disk commit to that tier's
+stamp, on the daemon's clock, or `null` while the tier is unpublished. It is
+the daemon-side publication latency of the edit, read beside the latency a
+caller observes, not a replacement for it. While `graph_status` is pending, the
+receipt's `repository_lane` names what holds the mutation lane of the edit's
+repository (holder kind, since, held time), the callers queued for it, and the
+topology gates the holder takes. Daemon status (`repository_lanes`,
+`reach_topology`) and `index_health` (`repository_lanes`) report the same
+lanes, with past tenures in daemon status.
 
 ## Agent-optimized (token efficiency)
 

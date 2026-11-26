@@ -2237,10 +2237,21 @@ func (w *Watcher) runPointMutation(path string, kind ChangeKind, generation uint
 
 func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generation uint64, retryAttempt int, observation *canonicalPointTimer) (publication *pointPublicationAttempt) {
 	publication = w.beginPointPublicationObserved(path, generation, retryAttempt, observation)
+	var writer *store_sqlite.WriterAttribution
 	if publication != nil && observation != nil {
 		publication.stamps.debounce = observation.debounce // immutable callback-owned pair, exact generation only
 		publication.stamps.startAttemptControl(observation.entered)
+		writer = publication.stamps.openWriterAttribution()
 	}
+	// The observed attempt runs inside its writer attribution: the SQLite
+	// writes its own goroutine makes are this attempt's (writer_write).
+	store_sqlite.AttributeWriterWrites(writer, func() {
+		w.runPointMutationAttempt(path, kind, generation, retryAttempt, publication)
+	})
+	return publication
+}
+
+func (w *Watcher) runPointMutationAttempt(path string, kind ChangeKind, generation uint64, retryAttempt int, publication *pointPublicationAttempt) {
 	if w.pointMutationClaimed != nil {
 		w.pointMutationClaimed(path)
 	}
@@ -2369,7 +2380,6 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 		patchErr = errMutationSuperseded
 		complete = false
 	}
-	return
 }
 
 func (w *Watcher) schedulePointMutationRetry(path string, kind ChangeKind, generation uint64, attempt int) bool {
@@ -3192,6 +3202,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
+	stamps.bindWriterGraph(idx.graph)
 
 	start := time.Now()
 	writes := idx.writeCounterMark()
