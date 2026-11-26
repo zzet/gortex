@@ -355,12 +355,18 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 	for _, tc := range []struct {
 		name string
 		// The transaction read on which the last first-correct time is
-		// measured, or on which the accounting changes (still unsettled).
-		lateAt, changeAt int
+		// measured, on which the accounting changes (still unsettled), or on
+		// which the graph is fresh again after reads reported it pending.
+		lateAt, changeAt, freshAt int
+		// The first transaction read that reports the graph pending.
+		pendingAt int
 	}{
 		{name: "observables_complete"},
 		{name: "first_correct_late", lateAt: 3 * editProbeAccountingSettlePolls},
 		{name: "accounting_changes", changeAt: editProbeAccountingSettlePolls - 1},
+		// Counted cycles before the graph turns pending make the reset
+		// observable: a skipped cycle would keep the count instead.
+		{name: "graph_pending_then_fresh", pendingAt: editProbeAccountingSettlePolls / 2, freshAt: 2 * editProbeAccountingSettlePolls},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := editProbeRepairAccountingFixture()
@@ -382,6 +388,10 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 					state.mu.Unlock()
 				case tc.changeAt:
 					stub.file["requested_background"].(map[string]any)["background_wall_ms"] = json.Number("13")
+				case tc.pendingAt:
+					stub.tx["graph_status"] = "pending"
+				case tc.freshAt:
+					stub.tx["graph_status"] = "fresh"
 				}
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -396,9 +406,10 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 			if ctx.Err() != nil {
 				t.Fatalf("collector polled until the deadline (%d status cycles, %d raw bytes) after every observable was complete", reads, state.rawBytes)
 			}
-			// Reads before the last first-correct time, and before the last
-			// accounting change, do not count toward the bound.
-			if want := max(tc.lateAt, tc.changeAt, 1) + editProbeAccountingSettlePolls - 1; reads != want {
+			// Reads before the last first-correct time, before the last
+			// accounting change, and before the graph is fresh again do not
+			// count toward the bound.
+			if want := max(tc.lateAt, tc.changeAt, tc.freshAt, 1) + editProbeAccountingSettlePolls - 1; reads != want {
 				t.Fatalf("status cycles = %d, want %d", reads, want)
 			}
 			got := state.record.Accounting
