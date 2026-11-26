@@ -44,7 +44,8 @@ func mapKeys(m map[string]any) []string {
 // A linked checkout publishes its own working-tree generation, which holds the
 // edited file's syntax graph and its relations. Its edit ACK and its receipt
 // must carry the same tier evidence a primary edit carries, not the file tier
-// alone.
+// alone. The edit changes a function body, so the checkout owes its clone rows
+// to a follow-up; as on the primary, that does not hold derived back.
 func TestLinkedCheckoutEditReceiptCarriesGraphTierStates(t *testing.T) {
 	f := newRealCheckoutMutationFixture(t)
 	written := f.edit(t, f.worktree, map[string]any{
@@ -75,25 +76,24 @@ func TestLinkedCheckoutEditReceiptCarriesGraphTierStates(t *testing.T) {
 	states := requireTierStateKeys(t, "receipt", status)
 	require.Equal(t, "fresh", states["file_graph"], "a published checkout generation holds the file graph: %+v", status)
 	require.Equal(t, "fresh", states["relations"], "a published checkout generation holds the file's relations: %+v", status)
-	require.Contains(t, []string{"fresh", "partial"}, states["derived"], "a terminal derived tier is fresh or typed partial: %+v", status)
+	require.Equal(t, "fresh", states["derived"], "clone rows owed to a follow-up do not make derived partial: %+v", status)
 
-	// The stamps are the daemon's own publication clock and never reverse.
-	previous := time.Time{}
-	for _, field := range []string{"ack_at", "file_graph_at", "relations_at", "derived_at"} {
+	// The stamps are the daemon's own publication clock: the acknowledgement
+	// precedes the one publication instant all three graph tiers share.
+	stamp := func(field string) time.Time {
 		value, ok := status[field].(string)
-		if !ok {
-			require.Equal(t, "derived_at", field, "only a partial derived tier may lack its stamp: %+v", status)
-			require.Equal(t, "partial", states["derived"])
-			continue
-		}
+		require.True(t, ok, "%s must be stamped: %+v", field, status)
 		at, err := time.Parse(time.RFC3339Nano, value)
 		require.NoError(t, err)
-		require.False(t, at.Before(previous), "%s precedes the tier before it: %+v", field, status)
-		previous = at
+		return at
 	}
+	published := stamp("file_graph_at")
+	require.False(t, published.Before(stamp("ack_at")), "publication precedes the acknowledgement: %+v", status)
+	require.True(t, stamp("relations_at").Equal(published), "relations_at differs from file_graph_at: %+v", status)
+	require.True(t, stamp("derived_at").Equal(published), "derived_at differs from file_graph_at: %+v", status)
 	after, ok := status["tier_after_commit_ms"].(map[string]any)
 	require.True(t, ok, "a published linked edit reports its daemon-side tier latency: %+v", status)
-	for _, tier := range []string{"file_graph", "relations"} {
+	for _, tier := range []string{"file_graph", "relations", "derived"} {
 		ms, ok := after[tier].(float64)
 		require.True(t, ok, "%s latency must be measured once published: %+v", tier, after)
 		require.GreaterOrEqual(t, ms, 0.0)
