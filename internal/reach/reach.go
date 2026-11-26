@@ -189,6 +189,9 @@ type topologyState struct {
 	repoBuild map[string]uint64
 
 	coupling repoCoupling
+	// writers names each mutation that holds or waits for gates, for
+	// Topology; it does not take part in admission.
+	writers map[*topologyWriter]struct{}
 }
 
 var topology = &topologyState{
@@ -476,6 +479,7 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 	t := topology
 	t.mu.Lock()
 	scope, epoch := t.writeScope(g, prefix)
+	writer := t.noteWriter(prefix, scope)
 	t.add(scope, 0, 0, 1)
 	for !t.writable(scope) {
 		t.wait(context.Background())
@@ -484,10 +488,12 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 			// waited.
 			t.add(scope, 0, 0, -1)
 			scope, epoch = t.writeScope(g, prefix)
+			writer.wholeGraph = scope == nil
 			t.add(scope, 0, 0, 1)
 		}
 	}
 	t.add(scope, 0, 1, -1)
+	writer.admit()
 	t.mu.Unlock()
 
 	var once sync.Once
@@ -513,6 +519,7 @@ func beginTopologyWrite(g graph.Store, prefix string) func(changed bool, frontie
 				t.retire(retired)
 			}
 			t.add(scope, 0, -1, 0)
+			delete(t.writers, writer)
 			t.wakeWaiters()
 			t.mu.Unlock()
 		})
@@ -541,14 +548,21 @@ func (t *topologyState) writeScope(g graph.Store, prefix string) ([]string, uint
 // read again. Only one store is tracked; a mutation of another store holds the
 // whole graph until it is read again.
 type repoCoupling struct {
-	store   graph.Store
-	epoch   uint64
+	store graph.Store
+	epoch uint64
+	// resets counts the resets of the coupling. Unlike epoch, it does not move
+	// when a component grows, so a frontier read can tell a coupling that was
+	// forgotten while it ran from one that grew.
+	resets  uint64
 	ready   bool
 	seeding bool
 	missed  bool
 	// pending holds what mutations learned while the read was in flight.
 	pending [][2]string
 	parent  map[string]string
+	// lastRead is the last read of the whole store, or a later read of one
+	// mutation's frontier that missed, for Topology.
+	lastRead couplingRead
 }
 
 // couplingReadBudget bounds each coupling read. A store whose read misses it
@@ -603,9 +617,9 @@ func (c *repoCoupling) component(prefix string) []string {
 // stays missed.
 func (c *repoCoupling) reset(g graph.Store) {
 	if c.store != g {
-		c.missed = false
+		c.missed, c.lastRead = false, couplingRead{}
 	}
-	c.store, c.epoch = g, c.epoch+1
+	c.store, c.epoch, c.resets = g, c.epoch+1, c.resets+1
 	c.ready, c.seeding, c.pending, c.parent = false, false, nil, nil
 }
 
@@ -647,6 +661,7 @@ func ensureRepoCoupling(g graph.Store) {
 // snapshot can miss edges of a mutation that runs beside it; such a mutation
 // learns its own couplings into pending, which the read adds on landing.
 func readRepoCoupling(g graph.Store, source repoCouplingSource, epoch uint64) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
 	pairs, err := source.RepoCouplingPairs(ctx)
 	cancel()
@@ -654,9 +669,14 @@ func readRepoCoupling(g graph.Store, source repoCouplingSource, epoch uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c := &t.coupling
-	if c.store != g || c.epoch != epoch {
+	if c.store != g {
 		return
 	}
+	if c.epoch != epoch {
+		c.lastRead = endCouplingRead(couplingScopeStore, started, nil, true)
+		return
+	}
+	c.lastRead = endCouplingRead(couplingScopeStore, started, err, false)
 	if err != nil {
 		c.miss()
 		return
@@ -678,11 +698,12 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	t := topology
 	t.mu.Lock()
 	c := &t.coupling
-	epoch, wanted := c.epoch, c.store == g && (c.ready || c.seeding)
+	resets, wanted := c.resets, c.store == g && (c.ready || c.seeding)
 	t.mu.Unlock()
 	if !wanted {
 		return
 	}
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), couplingReadBudget)
 	pairs, err := source.RepoCouplingPairsForFiles(ctx, frontier)
 	cancel()
@@ -690,9 +711,11 @@ func learnRepoCoupling(g graph.Store, frontier []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch {
-	case c.store != g || c.epoch != epoch:
-		// Forgotten meanwhile: the next read sees these edges.
+	case c.store != g || c.resets != resets:
+		// Forgotten meanwhile: the next read sees these edges. Another
+		// mutation's union, or the store read landing, only grew it.
 	case err != nil:
+		c.lastRead = endCouplingRead(couplingScopeFrontier, started, err, false)
 		c.miss()
 	case c.seeding:
 		c.pending = append(c.pending, pairs...)

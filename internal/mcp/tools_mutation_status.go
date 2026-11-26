@@ -167,6 +167,9 @@ func (s *Server) graphRefreshReceiptPayload(ctx context.Context, id string) (map
 	attachMutationPhaseTimings(payload, receipt.id, time.Time{}, indexer.PublicationSourceFreshRequest, retained)
 	attachAcknowledgementPayload(payload, acknowledgement, acknowledgementState)
 	attachReceiptTiers(payload, receipt)
+	if outcome.Pending {
+		s.attachPendingRepositoryLane(payload, receipt.repo, receipt.path)
+	}
 	return payload, true
 }
 
@@ -260,14 +263,48 @@ func (s *Server) mutationStatusPayload(record *mutationCommitRecord) map[string]
 	if publicationReceipt == "" {
 		publicationReceipt = snap.publicationReceipt
 	}
+	repo := ""
 	if value, found := s.mutationReceipts.Load(publicationReceipt); found {
 		if receipt, ok := value.(*mutationReceipt); ok {
-			attachReceiptTiers(payload, receipt)
+			if receipt.ticket != nil {
+				tiers := receipt.ticket.TierState()
+				attachMutationTierState(payload, tiers)
+				attachTierAfterCommit(payload, committedAt, tiers)
+			}
+			repo = receipt.repo
 		}
+	}
+	if !graphStatusTerminal(snap.GraphStatus, snap.GraphRecorded) {
+		record.mu.RLock()
+		absPath := record.absPath
+		record.mu.RUnlock()
+		s.attachPendingRepositoryLane(payload, repo, absPath)
 	}
 	record.attachFileProjection(payload)
 	s.attachSharedOwnerAccounting(payload, record, retained)
 	return payload
+}
+
+// attachTierAfterCommit adds how long after the disk commit each tier of the
+// edit was published, in milliseconds on the daemon's monotonic clock, from
+// the same tier snapshot as the *_at stamps: the daemon-side publication
+// latency of this edit, beside whatever latency the caller observes. A tier
+// not yet published is null. Nothing is added without a commit time or a
+// tier snapshot.
+func attachTierAfterCommit(payload map[string]any, committedAt time.Time, tiers indexer.MutationTierState) {
+	delete(payload, "tier_after_commit_ms")
+	if committedAt.IsZero() || tiers.AckAt.IsZero() {
+		return
+	}
+	after := make(map[string]*float64, 3)
+	for name, at := range map[string]time.Time{"file_graph": tiers.FileGraphAt, "relations": tiers.RelationsAt, "derived": tiers.DerivedAt} {
+		after[name] = nil
+		if !at.IsZero() {
+			ms := float64(at.Sub(committedAt).Microseconds()) / 1000
+			after[name] = &ms
+		}
+	}
+	payload["tier_after_commit_ms"] = after
 }
 
 // attachRecordDerivedFanout publishes the bounded-derived-pass completeness

@@ -2,6 +2,7 @@ package reach
 
 import (
 	"context"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,6 +92,16 @@ func TestRepoTopologyMutationsHoldOnlyTheirRepository(t *testing.T) {
 	store := repoTopologyStore(t)
 	awaitRepoCoupling(t, store)
 	finishA := BeginRepoTopologyMutation(store, "a")
+	status := Topology(store, "a", "b")
+	if want := []RepositoryTopologyGate{{Repo: "a", TopologyGate: TopologyGate{Writers: 1}}, {Repo: "b"}}; status.Coupling != "ready" ||
+		status.WholeGraph != (TopologyGate{}) || !reflect.DeepEqual(status.Repositories, want) {
+		finishA(false, nil)
+		t.Fatalf("topology status beside a mutation of a = %+v, want coupling ready, only a's gate held", status)
+	}
+	if got, want := writersOf(status), []TopologyWriter{{Repo: "a", State: "holding"}}; !reflect.DeepEqual(got, want) {
+		finishA(false, nil)
+		t.Fatalf("topology writers beside a mutation of a = %+v, want %+v", status.Writers, want)
+	}
 
 	finishB, ok := admitted(func() func(bool, []string) { return BeginRepoTopologyMutation(store, "b") })
 	if !ok {
@@ -116,6 +127,11 @@ func TestRepoTopologyMutationsHoldOnlyTheirRepository(t *testing.T) {
 	case <-whole:
 		t.Fatal("a whole-graph mutation entered beside a mutation of a")
 	case <-time.After(20 * time.Millisecond):
+	}
+	if got, want := writersOf(Topology(store)), []TopologyWriter{{Repo: "a", State: "holding"}, {WholeGraph: true, State: "waiting"}}; !reflect.DeepEqual(got, want) {
+		finishA(false, nil)
+		(<-whole)(false)
+		t.Fatalf("topology writers with a whole-graph mutation queued behind a = %+v, want %+v", got, want)
 	}
 	finishA(true, []string{"a/a.go"})
 	finishWhole := <-whole
@@ -222,6 +238,9 @@ func TestWholeGraphMutationForgetsRepoCoupling(t *testing.T) {
 func TestRepoTopologyMutationWithoutCouplingHoldsTheWholeGraph(t *testing.T) {
 	g, ids := newCallChain(t, 3)
 	BuildIndex(g)
+	if coupling := Topology(g).Coupling; coupling != "unsupported" {
+		t.Fatalf("coupling of a store without a coupling source = %q, want unsupported", coupling)
+	}
 	BeginRepoTopologyMutation(g, "b")(true, []string{})
 	if _, _, _, hit, _ := LookupCached(g, ids[2]); hit {
 		t.Fatal("a repository mutation of a store without coupling kept unrelated records")
@@ -253,6 +272,10 @@ func TestRepoTopologyMutationDoesNotWaitForTheCouplingRead(t *testing.T) {
 	store := &slowCouplingStore{Store: repoTopologyStore(t), release: make(chan struct{})}
 	started := time.Now()
 	finish := BeginRepoTopologyMutation(store, "b")
+	if status := Topology(store); status.Coupling != "reading" || status.WholeGraph.Writers != 1 || status.LastRead != nil {
+		finish(false, nil)
+		t.Fatalf("topology status while the coupling is read = %+v, want reading, the mutation holding the whole graph", status)
+	}
 	store.AddBatch(nil, []*graph.Edge{{From: seedB, To: seedA, Kind: graph.EdgeReferences, Confidence: 1}})
 	finish(true, []string{"b/b.go"})
 	if waited := time.Since(started); waited > time.Second {
@@ -261,10 +284,151 @@ func TestRepoTopologyMutationDoesNotWaitForTheCouplingRead(t *testing.T) {
 
 	close(store.release)
 	awaitCoupling(t, store, func(c *repoCoupling) bool { return c.ready })
+	if status := Topology(store); status.Coupling != "ready" || status.LastRead == nil ||
+		status.LastRead.Scope != "store" || status.LastRead.Outcome != "ready" || status.LastRead.TookMS < 0 {
+		t.Fatalf("topology status after the read landed = %+v, want ready with the store read recorded", status)
+	}
 	BuildIndex(store)
 	BeginRepoTopologyMutation(store, "b")(true, []string{})
 	if _, _, _, hit, _ := LookupCached(store, seedA); hit {
 		t.Fatal("the coupling lost an edge bound while it was being read")
+	}
+}
+
+// writersOf is status.Writers without their times, which it checks are set.
+func writersOf(status TopologyStatus) []TopologyWriter {
+	var out []TopologyWriter
+	for _, writer := range status.Writers {
+		if writer.SinceUnixMS <= 0 || writer.ForMS < 0 {
+			return nil
+		}
+		writer.SinceUnixMS, writer.ForMS = 0, 0
+		out = append(out, writer)
+	}
+	return out
+}
+
+// Writers that took or began waiting for their gates at the same instant, as
+// two mutations do on a clock too coarse to tell them apart, list the holder
+// before the writer waiting behind it, whatever their repositories.
+func TestTopologyListsHoldersBeforeWaitersAmongEquals(t *testing.T) {
+	store := repoTopologyStore(t)
+	since := time.Now()
+	waiting := &topologyWriter{wholeGraph: true, since: since}
+	holding := &topologyWriter{repo: "a", holding: true, since: since}
+	state := topology
+	state.mu.Lock()
+	if state.writers == nil {
+		state.writers = make(map[*topologyWriter]struct{})
+	}
+	state.writers[waiting], state.writers[holding] = struct{}{}, struct{}{}
+	state.mu.Unlock()
+	t.Cleanup(func() {
+		state.mu.Lock()
+		delete(state.writers, waiting)
+		delete(state.writers, holding)
+		state.mu.Unlock()
+	})
+
+	want := []TopologyWriter{{Repo: "a", State: "holding"}, {WholeGraph: true, State: "waiting"}}
+	if got := writersOf(Topology(store)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("topology writers that started together = %+v, want the holder first: %+v", got, want)
+	}
+}
+
+// heldCouplingStore reads its coupling only once hold is closed, or at once
+// while hold is nil, and gives up when the read's budget ends.
+type heldCouplingStore struct {
+	*store_sqlite.Store
+	hold chan struct{}
+}
+
+func (s *heldCouplingStore) RepoCouplingPairs(ctx context.Context) ([][2]string, error) {
+	if s.hold != nil {
+		select {
+		case <-s.hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.Store.RepoCouplingPairs(ctx)
+}
+
+// Until the coupling is known, a repository mutation holds the whole graph,
+// so a mutation of another, unrelated repository waits for it: while the read
+// is in flight, after a whole-graph mutation forgot the coupling, and for the
+// rest of the process once a read ran past its budget. Topology names the
+// holder and the waiter, which is how a stalled repository can be traced to a
+// mutation of another one.
+func TestRepoMutationsHoldTheWholeGraphUntilTheCouplingIsKnown(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		coupling string
+		prepare  func(t *testing.T, store *heldCouplingStore)
+	}{
+		{
+			name:     "read in flight",
+			coupling: "reading",
+			prepare: func(_ *testing.T, store *heldCouplingStore) {
+				store.hold = make(chan struct{})
+			},
+		},
+		{
+			name:     "forgotten by a whole-graph mutation",
+			coupling: "reading",
+			prepare: func(t *testing.T, store *heldCouplingStore) {
+				awaitRepoCoupling(t, store)
+				store.hold = make(chan struct{})
+				BeginTopologyMutation(store)(true)
+			},
+		},
+		{
+			name:     "read past its budget",
+			coupling: "missed",
+			prepare: func(t *testing.T, store *heldCouplingStore) {
+				store.hold = make(chan struct{})
+				ensureRepoCoupling(store)
+				awaitCoupling(t, store, func(c *repoCoupling) bool { return c.missed })
+				if read := Topology(store).LastRead; read == nil || read.Outcome != "timed_out" || read.TookMS < float64(couplingReadBudget.Milliseconds()) {
+					t.Fatalf("last coupling read = %+v, want one that timed out after its budget", read)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &heldCouplingStore{Store: repoTopologyStore(t)}
+			tc.prepare(t, store)
+			finishA := BeginRepoTopologyMutation(store, "a")
+			queued := make(chan func(bool, []string), 1)
+			go func() { queued <- BeginRepoTopologyMutation(store, "b") }()
+			select {
+			case finishB := <-queued:
+				finishB(false, nil)
+				finishA(false, nil)
+				t.Fatal("a mutation of b entered beside a mutation of a whose coupling is not known")
+			case <-time.After(50 * time.Millisecond):
+			}
+			status := Topology(store)
+			want := []TopologyWriter{{Repo: "a", WholeGraph: true, State: "holding"}, {Repo: "b", WholeGraph: true, State: "waiting"}}
+			if got := writersOf(status); status.Coupling != tc.coupling || status.WholeGraph != (TopologyGate{Writers: 1, WritersWaiting: 1}) || !reflect.DeepEqual(got, want) {
+				finishA(false, nil)
+				(<-queued)(false, nil)
+				t.Fatalf("topology status = %+v, want coupling %s with a holding and b waiting for the whole graph", status, tc.coupling)
+			}
+			finishA(false, nil)
+			select {
+			case finishB := <-queued:
+				finishB(false, nil)
+			case <-time.After(topologyScopeWait):
+				t.Fatal("the mutation of b was not admitted once a finished")
+			}
+			if writers := Topology(store).Writers; len(writers) != 0 {
+				t.Fatalf("finished mutations still listed: %+v", writers)
+			}
+			// Let a read still in flight land before the store closes.
+			close(store.hold)
+			awaitCoupling(t, store, func(c *repoCoupling) bool { return !c.seeding })
+		})
 	}
 }
 
@@ -275,6 +439,10 @@ func TestFailedCouplingReadIsNotRetried(t *testing.T) {
 	BeginRepoTopologyMutation(store, "b")(false, nil)
 	close(store.release)
 	awaitCoupling(t, store, func(c *repoCoupling) bool { return c.missed })
+	if status := Topology(store); status.Coupling != "missed" || status.LastRead == nil ||
+		status.LastRead.Scope != "store" || status.LastRead.Outcome != "timed_out" {
+		t.Fatalf("topology status after a read ran out of budget = %+v, want missed with a timed-out store read", status)
+	}
 
 	BuildIndex(store)
 	BeginRepoTopologyMutation(store, "b")(true, []string{"b/b.go"})
