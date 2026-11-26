@@ -21,7 +21,10 @@ import (
 // The registry refuses a publish over either cap and never evicts a live
 // entry to make room: an evicted entry would silently serve stale code. The
 // byte cap is the feature's whole memory allowance; file sizes vary too much
-// for the file cap alone to bound memory.
+// for the file cap alone to bound memory. Only the change log's key memory
+// sits outside the byte cap: its projectionChangeLog slots each name up to
+// projectionMaxFiles keys (256 x 512 for cohorts and bulk drops), and a slot
+// keeps its key strings alive until it is reused, dropped files included.
 const (
 	projectionMaxFiles = 512
 	projectionMaxBytes = 64 << 20
