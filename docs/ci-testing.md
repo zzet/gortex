@@ -80,6 +80,19 @@ produces an explicit full plan; an unexpected planner failure blocks CI. A
 legitimate zero-package plan is explicit and still gets builds, lint and runtime
 smoke checks. It cannot substitute for a failed plan.
 
+## Test partitions
+
+Every target runs `indexer:1/2`, `indexer:2/2`, `mcp`, `store` and `rest`.
+Each job has a 35-minute internal test budget inside its 45-minute job limit.
+Two more rows have their own budgets: macOS `indexer-race` runs the watcher
+race tests, and Ubuntu `rest-cli-bench` runs `cmd/gortex` and every package
+under `bench/`. With race detection, Ubuntu's other rest packages fill most of
+one budget on their own, so the Ubuntu `rest` job omits the CLI and bench
+packages and a rerun of a failed bench package still has time to finish.
+macOS and Windows keep them in `rest`. The full layout is 17 test jobs.
+`go run ./scripts/ci-test --check-workflow .github/workflows/ci.yml` checks that
+each target covers every group exactly once.
+
 ## What stays enabled
 
 The dynamic matrix omits test partitions with no selected packages. Selected
@@ -122,7 +135,7 @@ first-failure evidence, retry scope, cancellation and owned-child cleanup.
 Run these tests with `go test ./internal/citest ./scripts/ci-result`.
 
 Representative package/job selections on the implementation tree (203 root Go
-packages per target) are shown below. These counts describe planned work, not
+packages per target, when the full layout had 12 test jobs) are shown below. These counts describe planned work, not
 measured speedups; setup and compilation costs remain.
 
 | Changed input | Packages per OS | Test jobs / full 12 |
