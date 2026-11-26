@@ -23,8 +23,9 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		File     string          `json:"file"`
 		Response json.RawMessage `json:"response"`
 		Error    string          `json:"error,omitempty"`
-		// No write was sent: every edit on this checkout was refused before
-		// admission, and the product refuses a rewrite of identical bytes.
+		// No write was sent: the checkout's bytes already equal its admitted
+		// original, as when every edit on it was refused before admission,
+		// and the product refuses a rewrite of identical bytes.
 		Unchanged bool `json:"unchanged,omitempty"`
 	}
 	var rows []restoredRoute

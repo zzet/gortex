@@ -295,3 +295,47 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 		})
 	}
 }
+
+// A single-checkout move whose every edit was refused before admission leaves
+// the source and the destination at their originals. The product refuses a
+// rewrite of identical bytes, so the restore sends nothing and says so.
+func TestEditProbeMoveRestoreSendsNothingWhenEveryEditWasRefused(t *testing.T) {
+	const sourceBefore, targetBefore = "package fixture\n\nfunc Moved() int { return 1 }\n", "package fixture\n"
+	root := t.TempDir()
+	for name, content := range map[string]string{"source.go": sourceBefore, "target.go": targetBefore} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	calls := 0
+	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
+		if frame.Method != "tools/call" {
+			return stubContent(map[string]any{}), nil
+		}
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "old_string and new_string are identical"}}}, nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, err := openMCP(ctx, socket, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	refused := editProbeRecord{Outcome: "edit_error", NotAdmitted: "server_busy"}
+	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Path: root, Prefix: "fixture", Corpus: Corpus{EditDestination: "target.go"}}}}, editors: []*socketClient{client}, plan: editProbePlan{Tool: "refactor.move", File: "source.go"}, original: []byte(sourceBefore), moveOriginal: []byte(targetBefore), requireAccounting: true, phase: &Phase{EditProbe: &editProbeReport{Records: []editProbeRecord{refused, refused}}}}
+	if err := run.restore(ctx); err != nil {
+		t.Fatalf("a move whose every edit was refused failed its restore: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("restore sent %d calls for a source and destination already at their originals", calls)
+	}
+	if got := string(run.phase.EditProbe.Restore); got != `{"status":"unchanged","write_sent":false}` {
+		t.Fatalf("restore evidence %s does not record the unchanged checkout", got)
+	}
+}
