@@ -706,6 +706,7 @@ type jsScopeKey struct {
 	kind       string
 	body       bool
 }
+
 // jsRequireBinding marks a local bound directly by an unshadowed static
 // require(). It ends the scope walk without stamping the call, which keeps
 // the call on the ordinary import tiers.
@@ -718,6 +719,18 @@ type jsBinding struct {
 type jsScopeCache struct {
 	scopes        map[jsScopeKey]map[string]jsBinding
 	requireShadow map[jsScopeKey]bool
+	// called holds the names of the bare calls stamp will look up. Scope maps
+	// keep only those names: a declaration no call looks up can't shadow one.
+	// Nil keeps every name.
+	called map[string]struct{}
+}
+
+// noteCall records a bare call name before stamping begins.
+func (cache *jsScopeCache) noteCall(name string) {
+	if cache.called == nil {
+		cache.called = map[string]struct{}{}
+	}
+	cache.called[name] = struct{}{}
 }
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
@@ -755,6 +768,11 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 		names, ok := cache.scopes[key]
 		if !ok {
 			add := func(id string, b jsBinding) {
+				if cache.called != nil {
+					if _, ok := cache.called[id]; !ok {
+						return
+					}
+				}
 				if names == nil {
 					names = map[string]jsBinding{}
 				}
@@ -839,42 +857,44 @@ func jsLexicalRank(e *graph.Edge) int {
 // colliding edge to the same deterministic least-shadowed binding so last-wins
 // in-memory stores and first-wins SQLite stores agree.
 func clearCollapsedJSShadows(edges []*graph.Edge) {
-	var hasStamped bool
+	// Only a site holding a stamped call can need normalizing, so group just
+	// those sites instead of every call in the file.
+	type site struct {
+		calls, winnerRank int
+	}
+	var sites map[graph.EdgeIdentity]*site
 	for _, e := range edges {
 		if e.Kind == graph.EdgeCalls && e.Meta[graph.JSLexicalBindingMeta] != nil {
-			hasStamped = true
-			break
+			if sites == nil {
+				sites = make(map[graph.EdgeIdentity]*site)
+			}
+			sites[graph.EdgeIdentityFor(e)] = &site{winnerRank: jsLexicalRank(e)}
 		}
 	}
-	if !hasStamped {
+	if sites == nil {
 		return
 	}
-	best := make(map[graph.EdgeIdentity]*graph.Edge)
-	byID := make(map[graph.EdgeIdentity][]*graph.Edge)
 	for _, e := range edges {
 		if e.Kind != graph.EdgeCalls {
 			continue
 		}
-		id := graph.EdgeIdentityFor(e)
-		byID[id] = append(byID[id], e)
-		if cur, ok := best[id]; !ok || jsLexicalRank(e) < jsLexicalRank(cur) {
-			best[id] = e
+		if s := sites[graph.EdgeIdentityFor(e)]; s != nil {
+			s.calls++
+			s.winnerRank = min(s.winnerRank, jsLexicalRank(e))
 		}
 	}
-	for id, group := range byID {
-		if len(group) < 2 {
+	for _, e := range edges {
+		if e.Kind != graph.EdgeCalls || e.Meta[graph.JSLexicalBindingMeta] == nil {
 			continue
 		}
-		winnerRank := jsLexicalRank(best[id])
-		for _, e := range group {
-			if jsLexicalRank(e) <= winnerRank {
-				continue
-			}
-			if winnerRank == 0 {
-				delete(e.Meta, graph.JSLexicalBindingMeta)
-			} else {
-				e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
-			}
+		s := sites[graph.EdgeIdentityFor(e)]
+		if s.calls < 2 || jsLexicalRank(e) <= s.winnerRank {
+			continue
+		}
+		if s.winnerRank == 0 {
+			delete(e.Meta, graph.JSLexicalBindingMeta)
+		} else {
+			e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
 		}
 	}
 }

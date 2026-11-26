@@ -338,6 +338,11 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		})
 	}
 	for _, c := range calls {
+		if !c.isMember {
+			scopes.noteCall(c.name)
+		}
+	}
+	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
 		if callerID == "" {
 			// Module-top-level call, or a call inside an anonymous
