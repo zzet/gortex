@@ -38,9 +38,10 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 
 // A real completed leaf must still refuse a different physical publication.
 // This tests wire classification, never permission to replay that leaf. A
-// summary may answer instead from the peer's verified newer tool commit while
-// the original allowance remains; that answer is pending and never the old
-// bytes, and its predicate keeps the same opt-in and bound.
+// summary or editing context may answer instead from the peer's verified newer
+// tool commit while the original allowance remains; that answer is pending and
+// never the old bytes, and its predicate keeps the same opt-in and bound. The
+// typed refusal remains only once the allowance is exhausted.
 func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 	for _, tc := range []struct {
 		name, legacy, operation string
@@ -72,6 +73,9 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			}
 			held := make(chan selected, 1)
 			release := make(chan struct{})
+			// released carries the time the held first selection returned to
+			// the read, before any recovery decision is taken.
+			released := make(chan time.Time, 1)
 			unblock := sync.OnceFunc(func() { close(release) })
 			var leafCalls atomic.Int32
 			s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -81,6 +85,7 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 				if leafCalls.Add(1) == 1 {
 					held <- selected{ctx, r, e}
 					<-release
+					released <- time.Now()
 				}
 				return r, e
 			})
@@ -128,7 +133,7 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			worker.Wait()
 			require.NoError(t, got.err)
 			t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t", fts, tc.operation, time.Until(deadline), got.result != nil && got.result.IsError)
-			answeredFromNewer := tc.legacy == "get_file_summary" && got.result != nil && !got.result.IsError
+			answeredFromNewer := got.result != nil && !got.result.IsError
 			if answeredFromNewer {
 				require.Contains(t, resultText(got.result), "NeighborAfter", "only the verified newer commit may answer")
 				require.NotContains(t, resultText(got.result), "NeighborBefore", "the refused first selection must not answer")
@@ -138,6 +143,18 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 				require.EqualValues(t, 2, leafCalls.Load(), "the answer comes from a second leaf attempt")
 			} else {
 				requireReadFreshnessContract(t, got.result, "projection_superseded")
+				// A refusal after one attempt is allowed only when the
+				// original allowance had already expired as the first
+				// selection returned; otherwise the second attempt must have
+				// run. The stamp precedes the recovery check, so a slow reply
+				// alone cannot satisfy this.
+				var releasedAt time.Time
+				select {
+				case releasedAt = <-released:
+				case <-time.After(3 * time.Second):
+					t.Fatal("the held first selection never returned")
+				}
+				require.True(t, leafCalls.Load() == 2 || !releasedAt.Before(deadline), "a verified newer commit refuses only once the allowance is exhausted: leaf calls %d, released %s before the deadline", leafCalls.Load(), deadline.Sub(releasedAt))
 			}
 			if tc.capture {
 				require.NotNil(t, got.result.Meta)
