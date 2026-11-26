@@ -498,10 +498,13 @@ from the last receipt status the record observed: the daemon's milliseconds
 from the disk commit to the `file_graph`, `relations` and `derived`
 publication, on its monotonic clock. A tier the daemon had not published by
 that status is `null`. The key is absent when the daemon or the receipt reports
-no figure, and for native writes, batches, relocations and the restart cell,
-which do not run the single-receipt loop. A malformed figure is a record error.
-The client times keep their meaning: `t_relations_ms` is still the client
-relation time, and the daemon figure is reported beside it, not instead of it.
+no figure, and on records that do not run the single-receipt loop: native
+writes, batches, relocations, `edit_expect: "refusal"` cells, the restart cell,
+and the `--search-readback-acceptance` and `--edit-ack-readback-only` profiles,
+which end each edit after its immediate readbacks. A malformed figure on the
+last decoded status is a record error. The client times keep their meaning:
+`t_relations_ms` is still the client relation time, and the daemon figure is
+reported beside it, not instead of it.
 
 Each immediate readback also carries a typed `disposition` that explains its
 result without changing it: `answer` (the reply's freshness state, reason and
@@ -533,9 +536,9 @@ record does not carry, is `not_applicable`. When any record carries
 `tier_after_commit_ms`, the summary adds `tier_after_commit_ms.file_graph`,
 `.relations` and `.derived` beside the client measures. A tier that is `null`
 on a record's final status had not been published yet, so it is censored even
-for a completed edit; a completed record without the figure does not apply. An interval needs at least 2, 20 or
-100 ranked records for p50, p95 or p99 and is unavailable below that. Nothing is
-sampled as zero.
+for a completed edit; a completed record without the figure does not apply.
+An interval needs at least 2, 20 or 100 ranked records for p50, p95 or p99 and
+is unavailable below that. Nothing is sampled as zero.
 
 Beside `stats_before` and `stats_after`, every edit-and-probe report carries
 `projection_before` and `projection_after`: the live
