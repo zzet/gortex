@@ -19,6 +19,9 @@ import (
 	"github.com/zzet/gortex/internal/pathkey"
 )
 
+// projectedByteDriftReadBudget must stay below the test's 2s caller timeout.
+const projectedByteDriftReadBudget = 1500 * time.Millisecond
+
 func TestCachedAcknowledgedSourceSurvivesQueuedStormWithoutParsing(t *testing.T) {
 	for _, mode := range []string{"current", "suspect_same_bytes", "changed_bytes"} {
 		t.Run(mode, func(t *testing.T) {
@@ -102,7 +105,7 @@ func TestSymbolSourceRetriesByteDriftBeforeProjectionSelection(t *testing.T) {
 	extractor.hold.Store(true)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	ctx = context.WithValue(ctx, projectedSourceReadBudgetKey{}, 1500*time.Millisecond)
+	ctx = context.WithValue(ctx, projectedReadBudgetKey{}, projectedByteDriftReadBudget)
 	var once sync.Once
 	release := func() { once.Do(func() { close(extractor.release) }) }
 	type reply struct {

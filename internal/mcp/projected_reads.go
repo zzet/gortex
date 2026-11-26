@@ -20,11 +20,15 @@ import (
 
 const projectedReadBudget = 150 * time.Millisecond
 
-type projectedSourceReadBudgetKey struct{}
+// projectedReadBudgetKey carries a package-internal test override for the
+// per-pass 150ms projection allowance. Only package tests set it. A positive
+// value replaces projectedReadBudget for that pass; an earlier installed
+// deadline still wins.
+type projectedReadBudgetKey struct{}
 
 func projectedReadDeadline(ctx context.Context, now time.Time) time.Time {
 	budget := projectedReadBudget
-	if override, ok := ctx.Value(projectedSourceReadBudgetKey{}).(time.Duration); ok && override > 0 {
+	if override, ok := ctx.Value(projectedReadBudgetKey{}).(time.Duration); ok && override > 0 {
 		budget = override
 	}
 	return now.Add(budget)

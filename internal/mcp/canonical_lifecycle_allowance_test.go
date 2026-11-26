@@ -43,6 +43,30 @@ func TestProjectedReadDefaultAllowanceRemains150Milliseconds(t *testing.T) {
 	}
 }
 
+func TestProjectedReadDeadlineUsesOnlyPositiveOverrides(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name     string
+		override time.Duration
+		set      bool
+		want     time.Duration
+	}{
+		{name: "unset", want: projectedReadBudget},
+		{name: "positive override", override: 2 * time.Second, set: true, want: 2 * time.Second},
+		{name: "zero override", override: 0, set: true, want: projectedReadBudget},
+		{name: "negative override", override: -time.Second, set: true, want: projectedReadBudget},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tt.set {
+				ctx = context.WithValue(ctx, projectedReadBudgetKey{}, tt.override)
+			}
+			require.Equal(t, now.Add(tt.want), projectedReadDeadline(ctx, now))
+		})
+	}
+}
+
 func TestProjectedReadBudgetInjectionUsesTheRequestOverride(t *testing.T) {
 	s := &Server{}
 	var observed context.Context
@@ -50,7 +74,7 @@ func TestProjectedReadBudgetInjectionUsesTheRequestOverride(t *testing.T) {
 		observed = ctx
 		return mcplib.NewToolResultText("budget observed"), nil
 	}
-	ctx := context.WithValue(t.Context(), projectedSourceReadBudgetKey{}, 2*time.Second)
+	ctx := context.WithValue(t.Context(), projectedReadBudgetKey{}, 2*time.Second)
 	before := time.Now()
 	_, err := s.withProjectedSourceReadBudget(leaf)(ctx, makeReq("get_symbol_source", map[string]any{}))
 	after := time.Now()
