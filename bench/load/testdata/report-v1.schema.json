@@ -1537,6 +1537,15 @@
                         "deadline_reason": {
                           "type": "string"
                         },
+                        "edit_refusal_retries": {
+                          "additionalProperties": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "editor": {
                           "type": "integer"
                         },

@@ -106,6 +106,7 @@ type editProbeRecord struct {
 	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
 	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
 	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
+	EditRefusalRetries          map[string]int                      `json:"edit_refusal_retries,omitempty"`
 	Evidence                    string                              `json:"raw_evidence"`
 	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
 	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
@@ -781,6 +782,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	}
 	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
 	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, repo), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
+	s.countRefusalRetries(purpose, attempts)
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()

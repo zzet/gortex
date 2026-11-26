@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // A product deadline keeps its outcome. Its reason names what the receipt
 // loop still awaited when the edit's own context expired, from that loop's
@@ -74,6 +77,55 @@ func (s *editProbeState) countBusy(purpose string, attempts []Attempt) {
 		s.record.BusyRefusals = make(map[string]int)
 	}
 	s.record.BusyRefusals[purpose] += busy
+}
+
+// editProbeRefusalRetries counts, by refusal code, the typed refusals one
+// logical edit call was re-sent after. A refusal whose backoff ended at the
+// call's deadline was not re-sent and is not counted; busy refusals are
+// counted separately.
+func editProbeRefusalRetries(attempts []Attempt) map[string]int {
+	var retries map[string]int
+	for i, attempt := range attempts {
+		if attempt.Outcome != "retryable" || i+1 == len(attempts) {
+			continue
+		}
+		next := attempts[i+1]
+		if next.Code == 0 && next.DurationMS == 0 && strings.HasPrefix(next.Error, "busy backoff ended") {
+			continue
+		}
+		// The wire's error_code, or the code leading a plain-text tool error.
+		code, _ := attempt.ErrorData["error_code"].(string)
+		if code == "" {
+			code, _, _ = strings.Cut(strings.TrimPrefix(attempt.Error, "RPC -32000: "), ": ")
+		}
+		if code == "" || strings.ContainsAny(code, " \n") {
+			code = "retryable"
+		}
+		if retries == nil {
+			retries = make(map[string]int)
+		}
+		retries[code]++
+	}
+	return retries
+}
+
+// The caller does not hold s.mu.
+func (s *editProbeState) countRefusalRetries(purpose string, attempts []Attempt) {
+	if purpose != "edit" {
+		return
+	}
+	retries := editProbeRefusalRetries(attempts)
+	if len(retries) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.record.EditRefusalRetries == nil {
+		s.record.EditRefusalRetries = make(map[string]int)
+	}
+	for code, count := range retries {
+		s.record.EditRefusalRetries[code] += count
+	}
 }
 
 // The caller holds s.mu. Client time from edit send to the first own status
