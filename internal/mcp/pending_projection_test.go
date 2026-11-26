@@ -282,6 +282,21 @@ func TestPendingProjectionOwnerAbsentSinceSeesOnlyItsFile(t *testing.T) {
 	base := p.snap.Load()
 	require.False(t, p.ownerAbsentSince(nil, target.key))
 
+	// An unchanged snapshot answers without the registry mutex, which every
+	// publisher and retirement holds.
+	p.mu.Lock()
+	answered := make(chan bool, 1)
+	go func() { answered <- p.ownerAbsentSince(base, target.key) }()
+	select {
+	case absent := <-answered:
+		p.mu.Unlock()
+		require.True(t, absent, "an unchanged snapshot")
+	case <-time.After(2 * time.Second):
+		p.mu.Unlock()
+		<-answered
+		t.Fatal("an unchanged snapshot waited for the registry mutex")
+	}
+
 	require.NoError(t, p.publish(other))
 	require.NoError(t, p.publishCohort([]projectionCohortMember{{Entry: entry("cohort.go")}}))
 	require.Equal(t, 1, p.dropAll([]*projectionEntry{other}))

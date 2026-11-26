@@ -44,8 +44,10 @@ var pendingFileProjections = newPendingProjections()
 
 // pendingProjections is a copy-on-write map from a file's mutation key to the
 // projection of its latest tool-written bytes. Readers load the snapshot
-// without locking; publishers hold mu only to copy the map and swap it, never
-// while building an entry.
+// without locking and take mu only for fields it guards, such as an entry's
+// sourceEvents or the change log; ownerAbsentSince reads the log only once
+// the snapshot has moved past its base. Publishers hold mu only to copy the
+// map and swap it, never while building an entry.
 type pendingProjections struct {
 	enabled bool
 
@@ -338,12 +340,14 @@ func (p *pendingProjections) ownerAbsentSince(base *projectionSnapshot, key stri
 	if base == nil || base.entries[key] != nil {
 		return false
 	}
+	// Every swap installs a new snapshot, so an unchanged pointer means no
+	// swap since base. That common case stays off the mutex publishers hold.
+	if p.snap.Load() == base {
+		return true
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	current := p.snap.Load()
-	if current == base {
-		return true
-	}
 	if current.entries[key] != nil || current.seq <= base.seq || current.seq-base.seq > projectionChangeLog {
 		return false
 	}
