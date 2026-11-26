@@ -382,7 +382,7 @@ func (r *ContractStuckRepair) awaitBusyBackoff(state *contractRepoRepair) bool {
 		case <-timer.C:
 			return true
 		case <-state.wake:
-			if release, ok := r.options.MultiIndexer.TryRepositoryMutationLanes([]string{state.repo}); ok {
+			if release, ok := r.options.MultiIndexer.TryRepositoryMutationLanesFor(OutputEntryContractRepair, []string{state.repo}); ok {
 				release()
 				return true
 			}
@@ -431,7 +431,7 @@ func (r *ContractStuckRepair) pass(state *contractRepoRepair) {
 	}
 	deadline := time.Now().Add(r.period)
 	for {
-		release, ok := r.options.MultiIndexer.TryRepositoryMutationLanes([]string{state.repo})
+		release, ok := r.options.MultiIndexer.TryRepositoryMutationLanesFor(OutputEntryContractRepair, []string{state.repo})
 		if ok {
 			defer release()
 			r.noteLaneTaken(state)

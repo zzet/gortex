@@ -48,9 +48,22 @@ var mutationDoorNames = map[string]bool{
 	"withOutputGenerationSource":                 true,
 	"withRepositoryOutputGenerationSource":       true,
 	"withRepositoryMutationLanes":                true,
+	"withRepositoryMutationLanesFor":             true,
 	"runExclusive":                               true,
+	"runExclusiveFor":                            true,
 	"runExclusiveLaneOnly":                       true,
+	"runExclusiveLaneOnlyFor":                    true,
 	"runExclusiveMode":                           true,
+}
+
+// mutationDoorHolderArg is the argument position of the lane-tenure holder on
+// the doors that take one. The holder only labels who holds the lane; it binds
+// no output generation. The scan skips it, so a door whose closure stopped
+// naming its entry is still reported even though its holder label remains.
+var mutationDoorHolderArg = map[string]int{
+	"withRepositoryMutationLanesFor": 1,
+	"runExclusiveFor":                1,
+	"runExclusiveLaneOnlyFor":        1,
 }
 
 // authorityPlumbingDoorCount exempts the functions inside the authority's own
@@ -73,9 +86,12 @@ var authorityPlumbingDoorCount = map[string]int{
 	"coordinateRepositoryMutationSource":         1, // same entry forwarded to typed preparation lane
 	"coordinateRepositoryMutationPreparedSource": 2, // runExclusive + withOutputGenerationSource; typed preparation is read/extract only
 	"coordinateRepositoryReindex":                0, // the lane worker holds the receipt
-	"withRepositoryMutationLanes":                1, // lane acquisition; callers name entries
+	"withRepositoryMutationLanes":                1, // forwards with no holder
+	"withRepositoryMutationLanesFor":             1, // lane acquisition; callers name entries
 	"runExclusive":                               1,
+	"runExclusiveFor":                            1,
 	"runExclusiveLaneOnly":                       1,
+	"runExclusiveLaneOnlyFor":                    1,
 	"runExclusiveMode":                           0,
 	"withOutputGeneration":                       1, // entry is a parameter
 	"withOutputGenerationSource":                 0, // entry is a parameter
@@ -159,7 +175,11 @@ func scanMutationDoorsIn(t *testing.T, dir string) []mutationDoor {
 					return true
 				}
 				var entries []string
-				for _, arg := range call.Args {
+				holderArg, hasHolder := mutationDoorHolderArg[callee]
+				for position, arg := range call.Args {
+					if hasHolder && position == holderArg {
+						continue
+					}
 					ast.Inspect(arg, func(inner ast.Node) bool {
 						if ident, isIdent := inner.(*ast.Ident); isIdent &&
 							strings.HasPrefix(ident.Name, "OutputEntry") {
@@ -301,10 +321,10 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 	// receipt on any of them must fail here even if some sibling arm in the
 	// same function still names an entry.
 	required := []mutationDoor{
-		{file: "contract_baseline_reconcile.go", fn: "reconcilePrimaryContractBaseline", door: "withRepositoryMutationLanes", entries: []string{"OutputEntryContractBaseline"}},
-		{file: "multi.go", fn: "IndexRepo", door: "runExclusive", entries: []string{"OutputEntryIndexRepo"}},
-		{file: "multi.go", fn: "incrementalDiscoverRepo", door: "runExclusive", entries: []string{"OutputEntryIncrementalDiscoverRepo"}},
-		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "runExclusiveLaneOnly", entries: []string{"OutputEntryRepositoryTopology"}},
+		{file: "contract_baseline_reconcile.go", fn: "reconcilePrimaryContractBaseline", door: "withRepositoryMutationLanesFor", entries: []string{"OutputEntryContractBaseline"}},
+		{file: "multi.go", fn: "IndexRepo", door: "runExclusiveFor", entries: []string{"OutputEntryIndexRepo"}},
+		{file: "multi.go", fn: "incrementalDiscoverRepo", door: "runExclusiveFor", entries: []string{"OutputEntryIncrementalDiscoverRepo"}},
+		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "runExclusiveLaneOnlyFor", entries: []string{"OutputEntryRepositoryTopology"}},
 		{file: "repository_topology_batch.go", fn: "coordinateRepositoryTopologyMutation", door: "coordinateRepositoryMutation", entries: []string{"OutputEntryRepositoryTopology"}},
 		{file: authorityPlumbingFile, fn: "bindMutationLaneAuthority", door: "withOutputGenerationSource", entries: []string{"OutputEntryRepositoryReconcileLane"}},
 		{file: authorityPlumbingFile, fn: "repositoryMutationCoordinator", door: "withRepositoryOutputGenerationSource", entries: []string{"OutputEntryRepositoryReconcileLane"}},
@@ -346,7 +366,9 @@ func TestEveryProductionMutationEntryPointIsRegistered(t *testing.T) {
 //     topology batch with its lane-only receipt deleted, which a per-FUNCTION
 //     scan would wave through on the strength of the surviving arm.
 //
-// Both must be reported as unnamed doors.
+// Both must be reported as unnamed doors. So must a lane door that names its
+// tenure holder but whose closure binds no output generation: the holder is a
+// label, not a receipt.
 func TestMutationDoorScanCatchesAnUnnamedDoor(t *testing.T) {
 	dir := t.TempDir()
 	source := `package fixture
@@ -365,6 +387,18 @@ func twoArmsOneNamed(idx *stub) error {
 func laneSetWithoutReceipts(mi *stub) error {
 	return mi.withRepositoryMutationLanes(ctx, prefixes, func() error {
 		return mi.writeEveryRepository()
+	})
+}
+
+func holderLabelOnly(c *stub) error {
+	return c.runExclusiveFor(ctx, OutputEntryIndexRepo, func() error {
+		return c.writeRepository()
+	})
+}
+
+func holderAndReceipt(c *stub) error {
+	return c.runExclusiveFor(ctx, OutputEntryIndexRepo, func() error {
+		return c.withOutputGeneration(ctx, OutputEntryIndexRepo, write)
 	})
 }
 `
@@ -387,6 +421,7 @@ func laneSetWithoutReceipts(mi *stub) error {
 	for _, want := range []string{
 		"laneSetWithoutReceipts/withRepositoryMutationLanes",
 		"twoArmsOneNamed/runExclusiveLaneOnly",
+		"holderLabelOnly/runExclusiveFor",
 	} {
 		if !unnamed[want] {
 			t.Errorf("the scan did not report %s as an unnamed mutation door; doors=%v", want, doors)
@@ -397,6 +432,9 @@ func laneSetWithoutReceipts(mi *stub) error {
 	}
 	if !named["twoArmsOneNamed/coordinateRepositoryMutation"] {
 		t.Errorf("the scan lost the named arm of a two-door function; doors=%v", doors)
+	}
+	if !named["holderAndReceipt/runExclusiveFor"] {
+		t.Errorf("the scan did not credit a holder-labelled door whose closure names its entry; doors=%v", doors)
 	}
 }
 

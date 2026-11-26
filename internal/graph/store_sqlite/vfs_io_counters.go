@@ -85,10 +85,17 @@ var vfsOpenWrapper = func(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32
 }
 
 func vfsCell(tls *libc.TLS, pFile uintptr) *vfsIOCounters {
-	kind := vfsFileOther
+	return vfsCellOf(tls, vfsFileKind(pFile))
+}
+
+func vfsFileKind(pFile uintptr) int {
 	if v, ok := vfsFileKinds.Load(pFile); ok {
-		kind = v.(int)
+		return v.(int)
 	}
+	return vfsFileOther
+}
+
+func vfsCellOf(tls *libc.TLS, kind int) *vfsIOCounters {
 	writer := 0
 	if uintptr(unsafe.Pointer(tls)) == vfsWriterTLS.Load() {
 		writer = 1
@@ -96,15 +103,20 @@ func vfsCell(tls *libc.TLS, pFile uintptr) *vfsIOCounters {
 	return &vfsIO[kind][writer]
 }
 
-// noteVFSWrite counts one xWrite (called by the xWrite wrapper).
+// noteVFSWrite counts one xWrite (called by the xWrite wrapper) and adds it to
+// the writer attribution that owns the connection's current hold, if any.
 func noteVFSWrite(tls *libc.TLS, pFile uintptr, n int32, took time.Duration) {
 	if !vfsIOInstalled.Load() {
 		return
 	}
-	c := vfsCell(tls, pFile)
+	kind := vfsFileKind(pFile)
+	c := vfsCellOf(tls, kind)
 	c.writeCalls.Add(1)
 	c.writeNanos.Add(int64(took))
 	c.writeBytes.Add(int64(n))
+	if ownedWriterHoldCount.Load() > 0 {
+		noteOwnedWriterWrite(tls, kind, n, took)
+	}
 }
 
 // installVFSIOCounters wraps xRead of the database files' io_methods table

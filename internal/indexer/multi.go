@@ -2235,7 +2235,7 @@ func (mi *MultiIndexer) IndexRepo(repoPrefix string) (*IndexResult, error) {
 	// not go through Indexer.coordinateRepositoryMutation. It names its output
 	// generation through the same authority, inside the lane.
 	target := legacyOutputTargetFor(outputStoreIdentity(mi.graph), repoPrefix, mi.repoRootPath(repoPrefix), "prefix:"+repoPrefix)
-	err := mi.repositoryMutationCoordinator(repoPrefix).runExclusive(context.Background(), func() error {
+	err := mi.repositoryMutationCoordinator(repoPrefix).runExclusiveFor(context.Background(), OutputEntryIndexRepo, func() error {
 		receipt, receiptErr := mi.outputGenerationAuthority().Begin(
 			context.Background(), OutputEntryIndexRepo, target)
 		if receiptErr != nil {
@@ -2471,7 +2471,7 @@ func (mi *MultiIndexer) incrementalDiscoverRepo(repoPrefix string, paths []strin
 			continue
 		}
 		var result *IndexResult
-		err := coordinator.runExclusive(context.Background(), func() error {
+		err := coordinator.runExclusiveFor(context.Background(), OutputEntryIncrementalDiscoverRepo, func() error {
 			return idx.withOutputGeneration(context.Background(), OutputEntryIncrementalDiscoverRepo, func() error {
 				var rawErr error
 				result, rawErr = mi.incrementalDiscoverRepoRaw(repoPrefix, paths)
