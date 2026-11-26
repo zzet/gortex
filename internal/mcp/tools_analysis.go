@@ -483,9 +483,16 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	impact, err := s.analyzeDiffImpact(ctx, symbolIDs)
+	walkCtx, waits := withImpactCoordinationWaits(impactWalkContext(ctx, freshness))
+	impact, err := s.analyzeDiffImpact(walkCtx, symbolIDs)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if !checkoutScoped && waits.cutShort() && ctx.Err() == nil {
+		label = label.publicationPending()
+		if freshness.requireFresh {
+			return label.requireFreshError(), nil
+		}
 	}
 
 	detectResult := map[string]any{
@@ -554,7 +561,13 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	impactCtx, cancelImpact := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelImpact()
 	communities, processes := s.tryImpactAnalysisSnapshots()
-	impact := analysis.AnalyzeImpactContext(impactCtx, s.readerFor(ctx), ids, communities, processes)
+	impact := analysis.AnalyzeImpactContext(impactWalkContext(impactCtx, freshness), s.readerFor(ctx), ids, communities, processes)
+	if waits.cutShort() && ctx.Err() == nil {
+		label = label.publicationPending()
+		if freshness.requireFresh {
+			return label.requireFreshError(), nil
+		}
+	}
 
 	result := map[string]any{
 		"risk":                 impact.Risk,
