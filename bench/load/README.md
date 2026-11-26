@@ -408,6 +408,18 @@ editor arrival stream and global marker/mutation IDs; a route with no offered
 ordinal is not silently given an extra edit. Implementation and fixture tests
 do not establish a completed live or reference campaign.
 
+`--edit-wait-cochange` adds one setup step to the six-repository,
+six-editor cell, under either `--edit-ack` policy. The daemon's startup
+co-change mine runs once per process and commits graph writes after
+enrichment. After the first root's source preflight and before any analysis
+gate, the run reads public `analyze` `co_change` for that root's pinned file.
+The facade never starts a new mine. While the reply reports
+`mining_in_progress`, the run waits five seconds and reads again inside the
+warm budget. A wrong target, an invalid collection or mining status, a
+failed mine or an expired budget fails setup before any offer. The last
+bounded reply is kept as `<label>.cochange_setup` and the wait as the
+`cochange_setup_seconds` metric. The choice is part of the workload identity.
+
 The six-repository, six-editor report adds `physical_topology_gate_wait_ms`
 and `physical_resolve_mutex_wait_ms` summary measures for accepted physical
 patches bound to the offered receipts. A patch serving multiple receipts

@@ -10,12 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	toon "github.com/toon-format/toon-go"
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
@@ -206,6 +208,14 @@ waitingForReady:
 	s := NewServer(query.NewEngine(store), store, nil, nil, zap.NewNop(), nil, MultiRepoOptions{MultiIndexer: mi, ConfigManager: cm, CheckoutLifecycle: lifecycle})
 	s.SetMaterializer(&graphview.Materializer{Store: store, Catalog: store.Catalog(), Leases: leases})
 	ctx := freshnessLifecycleSession(t, s)
+	// A second client reads the same boundary through the facade surface in
+	// TOON, where the relation state rides as an in-band label line.
+	const facadeSession = "freshness-lifecycle-facade-toon"
+	require.NoError(t, s.ConnectSession(facadeSession, func([]byte) error { return nil }))
+	t.Cleanup(func() { s.DisconnectSession(facadeSession) })
+	facadeCtx := s.WithClientSession(WithSessionID(t.Context(), facadeSession), facadeSession)
+	s.NoteSessionToolPolicy(facadeSession, FacadeSurfaceVersion, "hide")
+	require.NotNil(t, s.MCPServer().HandleMessage(facadeCtx, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"freshness-lifecycle-facade-toon","version":"1"}}}`)))
 	checkLost := func(id int) {
 		t.Helper()
 		// The request serializes its ceiling and the handler parses a
@@ -278,6 +288,7 @@ waitingForReady:
 	require.True(t, mi.RelationsPending())
 	pending := freshnessLifecycleCall(t, s, ctx, 32, "get_callers", map[string]any{"id": "repo/target.go::Target", "format": "json"})
 	require.Equal(t, "pending", freshnessLifecycleTier(t, pending)["graph_freshness"])
+	checkRestartFacadeTOON(t, s, facadeCtx, 2, true)
 	unblock()
 	select {
 	case err := <-completed:
@@ -299,6 +310,71 @@ waitingForReady:
 	require.Empty(t, s.freshnessFor(ctx, "relations", []string{"repo/target.go::Target"}, nil).state)
 	require.NotContains(t, fresh, "freshness")
 	freshnessLifecycleHasCaller(t, fresh, "AfterCrash")
+	checkRestartFacadeTOON(t, s, facadeCtx, 3, false)
 	checkLost(34)
 	t.Logf("ACTUAL_SIGKILL_RESTART old_pid=%d new_pid=%d receipt=%s generation=%.0f same_store=true lost_before_and_during_reconcile=true relations_pending_then_fresh=true", ready.PID, os.Getpid(), ready.Receipt, ready.Generation)
+}
+
+// checkRestartFacadeTOON reads callers through the facade in TOON. While the
+// restarted daemon's relations are pending, the body must carry the pending
+// label line and no fresh claim; once startup resolution completes, the idle
+// reply omits the label and holds the exact post-crash caller edge.
+func checkRestartFacadeTOON(t *testing.T, s *Server, ctx context.Context, id int, pending bool) {
+	t.Helper()
+	const target = "repo/target.go::Target"
+	result, err := externalVersionRegisteredCall(s, ctx, id, "relations", map[string]any{
+		"operation": "callers",
+		"target":    map[string]any{"symbol": target},
+		"output":    map[string]any{"format": "toon", "max_bytes": 0},
+	})
+	require.NoError(t, err)
+	require.False(t, result.IsError, resultText(result))
+	require.Nil(t, result.StructuredContent, "only the requested TOON text is evidence")
+	text, ok := singleTextContent(result)
+	require.True(t, ok)
+	require.NotEmpty(t, text)
+
+	body := text
+	if pending {
+		var label string
+		label, body, ok = strings.Cut(text, "\n")
+		require.True(t, ok, "pending must label the original TOON body")
+		require.Regexp(t, `^relations: pending \([0-9]+ files\)$`, label)
+	} else {
+		require.False(t, strings.HasPrefix(text, "relations: "), "completed default read must preserve idle label omission")
+	}
+	require.False(t, json.Valid([]byte(body)), "requested TOON returned JSON text")
+	decoded, err := toon.Decode([]byte(body), toon.WithStrictMode(true))
+	require.NoError(t, err)
+	payload, ok := decoded.(map[string]any)
+	require.True(t, ok, "TOON relation response must decode as a record")
+	require.Equal(t, false, payload["truncated"])
+	freshnessLifecycleHasCaller(t, payload, "Caller")
+	if pending {
+		rider, _ := payload["freshness"].(map[string]any)
+		var meta map[string]any
+		if result.Meta != nil {
+			meta, _ = result.Meta.AdditionalFields["freshness"].(map[string]any)
+		}
+		for _, fields := range []map[string]any{payload, rider, meta} {
+			require.NotEqual(t, "fresh", fields["graph_freshness"])
+			require.NotEqual(t, true, fields["fresh"])
+		}
+	}
+	edges, ok := payload["edges"].([]any)
+	require.True(t, ok)
+	afterCrashEdges := 0
+	for _, row := range edges {
+		if edge, ok := row.(map[string]any); ok && edge["from"] == "repo/caller.go::AfterCrash" &&
+			edge["to"] == target && edge["kind"] == "calls" {
+			afterCrashEdges++
+		}
+	}
+	if pending {
+		// The reconcile may already have installed the exact edge before its
+		// remaining resolver boundary; the label is what discloses it.
+		require.LessOrEqual(t, afterCrashEdges, 1)
+	} else {
+		require.Equal(t, 1, afterCrashEdges)
+	}
 }

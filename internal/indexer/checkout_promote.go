@@ -254,7 +254,7 @@ func (l *CheckoutLifecycle) publishPromotedCorpus(ctx context.Context, checkout 
 	if !current || lane == nil {
 		return errPrefixOwnerChanged
 	}
-	return lane.runExclusive(ctx, func() error {
+	return lane.runExclusiveFor(ctx, OutputEntryPromotionPublication, func() error {
 		l.mi.mu.RLock()
 		err := l.mi.validatePrefixCleanupOwnerLocked(row.RepoPrefix, &owned)
 		l.mi.mu.RUnlock()

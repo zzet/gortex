@@ -893,6 +893,10 @@ type contractConvergence struct {
 	// fillTurnProven amortizes capture across productive cooperative chunks.
 	// It is job-local scheduling state, never a reusable proof or work clock.
 	fillTurnProven int
+	// fillTurnExtracted is set once the job ran an extraction round. Until
+	// then, a batch of revalidated suspects that proved fewer units than a
+	// cooperative round is the size of the batch, not partial progress.
+	fillTurnExtracted bool
 	// idle counts the unblocked rounds without progress since the last
 	// progress that saw an input move or waited out contractRoundWait (a run
 	// of waited-out rounds only while no unblocked event-woken round came
@@ -3031,7 +3035,23 @@ func (c *contractConvergence) fillContended() bool {
 	return c.fillCanContinue() && c.req.OtherActorWaiting()
 }
 
+// continueFill is the checkpoint question after an extraction round proved
+// proven units.
 func (c *contractConvergence) continueFill(proven int, more bool) error {
+	c.fillTurnExtracted = true
+	return c.checkpointFill(proven, more)
+}
+
+// continueRevalidated is the checkpoint question after a batch of suspects
+// was revalidated. Their proofs count toward the turn, but before the turn's
+// first extraction round a short batch does not end it as partial progress:
+// a turn that starts by revalidating a few suspects goes on to extract
+// instead of handing the slot over having extracted nothing.
+func (c *contractConvergence) continueRevalidated(proven int, more bool) error {
+	return c.checkpointFill(proven, more)
+}
+
+func (c *contractConvergence) checkpointFill(proven int, more bool) error {
 	if err := c.ctx.Err(); err != nil {
 		return err
 	}
@@ -3045,7 +3065,8 @@ func (c *contractConvergence) continueFill(proven int, more bool) error {
 		// progress and foreground demand still hand off immediately. A first
 		// round taken before the competitor arrived can be larger: the turn
 		// then hands off after that one round.
-		if demand || proven < 16 || c.fillTurnProven >= contractRoundFiles {
+		partial := proven < 16 && c.fillTurnExtracted
+		if demand || partial || c.fillTurnProven >= contractRoundFiles {
 			c.req.delta.continued = true
 			return &ContractFillContinued{}
 		}
@@ -3112,7 +3133,7 @@ func (c *contractConvergence) settle(paths []string, pending map[string]string, 
 			return 0, nil, since, err
 		}
 		c.accept(proven, pending)
-		if err := c.continueFill(len(proven), start+size < len(suspects) || len(extract) > 0 || len(pending) > 0 || len(missed) > 0 || len(miss) > 0); err != nil {
+		if err := c.continueRevalidated(len(proven), start+size < len(suspects) || len(extract) > 0 || len(pending) > 0 || len(missed) > 0 || len(miss) > 0); err != nil {
 			return 0, nil, since, err
 		}
 		note(epoch, miss)

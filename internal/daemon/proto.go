@@ -5,9 +5,12 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/zzet/gortex/internal/graph"
 	"io"
 	"time"
+
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/reach"
 )
 
 // ProtocolVersion is the daemon wire-protocol version. Both ends of a
@@ -486,6 +489,17 @@ type StatusResponse struct {
 	// block from Views for the same reason as PublicationPhases: it names a
 	// checkout. Nil on a daemon with no build gate.
 	BuildLane *BuildLaneStatus `json:"build_lane,omitempty"`
+
+	// RepositoryLanes reports every repository's mutation lane, which each
+	// mutation of the repository's graph rows runs on: what holds it and for
+	// how long, the callers queued for it, its last tenure, and totals per
+	// holder kind, so a repository whose publication stalls while the others
+	// publish can be attributed. Empty before any repository has a lane.
+	RepositoryLanes []indexer.RepositoryLaneStatus `json:"repository_lanes,omitempty"`
+	// ReachTopology reports the topology gates a repository mutation takes
+	// after its lane, and what is known of the store's repository coupling:
+	// while it is not ready, each repository mutation holds the whole graph.
+	ReachTopology *reach.TopologyStatus `json:"reach_topology,omitempty"`
 
 	// BinaryStale is true when the file at the daemon's os.Executable()
 	// path no longer matches the image the daemon is running (size or
