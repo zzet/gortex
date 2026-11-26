@@ -30,6 +30,41 @@ type aliasSnapshot struct {
 	collection *tsalias.Collection
 	digest     string
 	inputs     map[string][sha256.Size]byte // absolute config paths; zero hash for unreadable/missing
+	// stats lets a save skip rereading an input whose size and mtime are
+	// unchanged. Guarded by the cache slot's mutex.
+	stats map[string]aliasInputStat
+}
+
+// aliasInputStat is an input's identity at load time; missing marks a probe
+// that did not exist.
+type aliasInputStat struct {
+	size    int64
+	mtime   int64
+	missing bool
+}
+
+func statAliasInput(dir *os.Root, rel string) aliasInputStat {
+	info, err := dir.Stat(rel)
+	if err != nil {
+		return aliasInputStat{missing: true}
+	}
+	return aliasInputStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+}
+
+// recordStats captures each input's stat after a load. A file rewritten
+// between its read and this stat only costs a reread on the next save.
+func (s *aliasSnapshot) recordStats() {
+	s.stats = make(map[string]aliasInputStat, len(s.inputs))
+	dir, err := os.OpenRoot(s.root)
+	if err != nil {
+		return
+	}
+	defer dir.Close()
+	for p := range s.inputs {
+		if rel, err := filepath.Rel(s.root, p); err == nil {
+			s.stats[p] = statAliasInput(dir, rel)
+		}
+	}
 }
 
 // aliasDiscoveryWalks counts working-copy discovery walks per root; tests use
@@ -125,14 +160,23 @@ func (s *aliasSnapshot) needsDiscovery(root string, paths []string) bool {
 	}
 	defer dir.Close()
 	for p, before := range s.inputs {
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return true
+		}
+		stat := statAliasInput(dir, rel)
+		if recorded, ok := s.stats[p]; ok && recorded == stat {
+			continue
+		}
 		var now [sha256.Size]byte
-		if rel, err := filepath.Rel(root, p); err == nil {
-			if data, err := dir.ReadFile(rel); err == nil {
-				now = sha256.Sum256(data)
-			}
+		if data, err := dir.ReadFile(rel); err == nil {
+			now = sha256.Sum256(data)
 		}
 		if now != before {
 			return true
+		}
+		if s.stats != nil {
+			s.stats[p] = stat // touched, not changed
 		}
 	}
 	return false
@@ -163,6 +207,7 @@ func workingAliases(root string, proof *buildContentProof, paths []string) *alia
 		s.inputs[filepath.Join(root, filepath.FromSlash(rel))] = hash
 	})
 	s.digest = s.collection.Digest()
+	s.recordStats()
 	slot.snapshot = s
 	return s
 }
@@ -206,6 +251,7 @@ func restoreAliases(root, digest string, inputs map[string]string) *aliasSnapsho
 	if s.digest != digest {
 		return nil
 	}
+	s.recordStats()
 	slot := aliasSlot(root)
 	slot.mu.Lock()
 	if slot.snapshot == nil {

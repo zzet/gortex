@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -162,4 +163,24 @@ func TestTSConfigPathAlias_RestoreRejectsChangedInputs(t *testing.T) {
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`), 0o644))
 	require.Nil(t, restoreAliases(abs, s.digest, inputs))
 	require.Nil(t, restoreAliases(abs, "other-digest", s.relInputs(abs)))
+}
+
+// A save rereads an input only when its stat moved, and a touch without a
+// content change does not force rediscovery.
+func TestTSConfigPathAlias_SaveRechecksInputsByStat(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	abs := absRootForTest(t, root)
+	invalidateTSAliasCollection(abs)
+	s := workingAliases(abs, nil, []string{abs})
+	caller := filepath.Join(abs, "pages", "index.ts")
+	require.False(t, s.needsDiscovery(abs, []string{caller}))
+
+	later := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(configPath, later, later))
+	require.False(t, s.needsDiscovery(abs, []string{caller}), "a touch keeps the policy")
+	require.Equal(t, later.UnixNano(), s.stats[configPath].mtime, "the new stat is remembered")
+
+	require.NoError(t, os.WriteFile(configPath, []byte(`{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`), 0o644))
+	require.True(t, s.needsDiscovery(abs, []string{caller}))
 }
