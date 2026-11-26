@@ -19,10 +19,13 @@ type phaseMonitor struct {
 	clientBefore map[string]Metric
 	groupBefore  map[string]Metric
 	peaks        map[string]Metric
-	walRaw       []walSampleObservation
-	walSamples   []float64 // every WAL size a sample found, for the p95
-	cancel       context.CancelFunc
-	done         sync.WaitGroup
+	// Linux pressure stall information, host-wide and for the run's cgroup.
+	pressureBefore map[string]map[string]Metric
+	pressurePeaks  map[string]Metric
+	walRaw         []walSampleObservation
+	walSamples     []float64 // every WAL size a sample found, for the p95
+	cancel         context.CancelFunc
+	done           sync.WaitGroup
 }
 
 func startMonitor(p *privateRun, sampler processSampler, group string) *phaseMonitor {
@@ -31,6 +34,7 @@ func startMonitor(p *privateRun, sampler processSampler, group string) *phaseMon
 	if group != "" {
 		m.groupBefore = cgroupMetrics(group, os.Getpagesize())
 	}
+	m.pressureBefore = m.pressure()
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.observe()
@@ -75,6 +79,30 @@ func (m *phaseMonitor) observe() {
 			m.peaks[key] = value
 		}
 	}
+	if m.pressurePeaks == nil {
+		m.pressurePeaks = make(map[string]Metric)
+	}
+	for scope, sample := range m.pressure() {
+		for key, value := range sample {
+			if !strings.HasSuffix(key, "_avg10_pct") {
+				continue
+			}
+			name := scope + "_psi_" + strings.TrimSuffix(key, "_avg10_pct") + "_peak_avg10_pct"
+			if old, exists := m.pressurePeaks[name]; !exists || value.Value != nil && (old.Value == nil || *value.Value > *old.Value) {
+				m.pressurePeaks[name] = value
+			}
+		}
+	}
+}
+
+// The host and, with a Linux cgroup v2 group, the run's own cgroup. Other
+// hosts keep every pressure measure unavailable.
+func (m *phaseMonitor) pressure() map[string]map[string]Metric {
+	out := map[string]map[string]Metric{"host": hostPressure()}
+	if m.group != "" {
+		out["cgroup"] = cgroupPressure(m.group)
+	}
+	return out
 }
 
 func (m *phaseMonitor) finish(phase *Phase) {
@@ -150,6 +178,26 @@ func (m *phaseMonitor) finish(phase *Phase) {
 			phase.Metrics["cgroup_"+key] = unavailable(unit, "no Linux cgroup v2 metrics")
 		} else {
 			phase.Metrics["cgroup_"+key] = counterDelta(m.groupBefore[key], groupAfter[key])
+		}
+	}
+	phase.Metrics["daemon_major_faults"] = counterDelta(m.daemonBefore["major_faults"], after["major_faults"])
+	pressureAfter := m.pressure()
+	for _, scope := range []string{"host", "cgroup"} {
+		for _, resource := range pressureResources {
+			for _, kind := range []string{"some", "full"} {
+				key := resource + "_" + kind
+				reason := "pressure not sampled at phase start"
+				if scope == "cgroup" && m.group == "" {
+					reason = "no Linux cgroup v2 metrics"
+				}
+				stall, peak := unavailable("us", reason), unavailable("%", reason)
+				if before, sampled := m.pressureBefore[scope]; sampled {
+					stall = counterDelta(before[key+"_total_us"], pressureAfter[scope][key+"_total_us"])
+					peak = m.pressurePeaks[scope+"_psi_"+key+"_peak_avg10_pct"]
+				}
+				phase.Metrics[scope+"_psi_"+key+"_stall_us"] = stall
+				phase.Metrics[scope+"_psi_"+key+"_peak_avg10_pct"] = peak
+			}
 		}
 	}
 	for _, key := range []string{"swap_current_bytes", "memory_current_bytes", "memory_peak_bytes"} {

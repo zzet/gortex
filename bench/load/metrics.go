@@ -17,7 +17,26 @@ func absentProcessMetrics(reason string) map[string]Metric {
 		result[name] = unavailable("bytes", reason)
 	}
 	result["cpu_seconds"] = unavailable("s", reason)
+	result["major_faults"] = unavailable("faults", reason)
 	return result
+}
+
+// procStatMajorFaults reads majflt, field 12 of /proc/<pid>/stat. comm may
+// contain spaces and parentheses, so fields are counted after the last ')'.
+func procStatMajorFaults(stat string) Metric {
+	end := strings.LastIndexByte(stat, ')')
+	if end < 0 {
+		return unavailable("faults", "malformed proc stat")
+	}
+	fields := strings.Fields(stat[end+1:])
+	if len(fields) < 10 {
+		return unavailable("faults", "incomplete proc stat")
+	}
+	value, err := strconv.ParseUint(fields[9], 10, 64)
+	if err != nil {
+		return unavailable("faults", "invalid proc major fault counter")
+	}
+	return measured(float64(value), "faults")
 }
 
 func machCPUSeconds(user, system uint64, numer, denom uint32) Metric {
