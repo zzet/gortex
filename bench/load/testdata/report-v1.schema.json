@@ -3561,6 +3561,128 @@
                   "plan_sha256": {
                     "type": "string"
                   },
+                  "projection_after": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "error": {
+                            "type": "string"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "pending_projection": {},
+                          "projection_divergence": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "reason": {
+                                "type": "string"
+                              },
+                              "unit": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "value",
+                              "unit",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "wire_id": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "projection_divergence"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "projection_before": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "error": {
+                            "type": "string"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "pending_projection": {},
+                          "projection_divergence": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "reason": {
+                                "type": "string"
+                              },
+                              "unit": {
+                                "type": "string"
+                              },
+                              "value": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "value",
+                              "unit",
+                              "reason"
+                            ],
+                            "type": "object"
+                          },
+                          "wire_id": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "projection_divergence"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "reads": {
                     "additionalProperties": {
                       "additionalProperties": {

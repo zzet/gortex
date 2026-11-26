@@ -107,6 +107,7 @@ func (c *pairedCoordinator) preparePairedEditProbe() error {
 		if err != nil {
 			return err
 		}
+		state.phase.EditProbe.ProjectionBefore = r.projectionBookend(c.ctx)
 		readbackMethod := "immediate own-ACK readbacks and receipt/status controls are unpaired and excluded from matched latency ratios"
 		if c.options.PairedOwnACKTransactions {
 			readbackMethod = "matched edit-own-ACK-file-source transactions rotate at transaction boundaries; receipt/status controls remain unpaired; independent editor streams remain concurrent"
@@ -137,6 +138,7 @@ func (c *pairedCoordinator) editProbes(ctx context.Context) error {
 		failures = append(failures, r.finish())
 		after, statsErr := r.stats(ctx)
 		state.phase.EditProbe.StatsAfter = after
+		state.phase.EditProbe.ProjectionAfter = r.projectionBookend(ctx)
 		failures = append(failures, statsErr)
 	}
 	return errors.Join(failures...)
