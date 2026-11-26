@@ -234,7 +234,7 @@ func (s *Server) bindPendingSearch(ctx context.Context) (context.Context, error)
 	if len(snapshot.entries) == 0 {
 		return ctx, nil
 	}
-	refreshDeadline := time.Now().Add(projectedReadBudget)
+	refreshDeadline := projectedReadDeadline(ctx, time.Now())
 	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(refreshDeadline) {
 		refreshDeadline = original
 	}

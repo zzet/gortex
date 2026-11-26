@@ -574,6 +574,21 @@ allow full Maven / Gradle import + autobuild for higher-fidelity resolution —
 **opt-in**, because it executes the repository's build tooling. Enable it only
 for repositories you trust.
 
+### Java — heap cap (`jdtls`)
+
+Gortex starts `jdtls` with a 2 GiB maximum heap (`--jvm-arg=-Xmx2G`). Without
+a cap the JVM's heap ceiling is a quarter of physical RAM, and G1 lets the heap
+grow to it before collecting, so one server can hold many gigabytes of garbage.
+Set `GORTEX_LSP_JDTLS_XMX` to change the cap (JVM size syntax, e.g. `4G` or
+`3072m`; at least `1G`, the launcher's fixed `-Xms`) or to `off` to pass none,
+either in the daemon's environment or in the server's `env:` list in
+`.gortex.yaml` (which wins). No cap is added when the configured `jdtls` args
+already size the heap (`-Xmx`, `-XX:MaxHeapSize`, `-XX:MaxRAMPercentage`), or
+when `JDK_JAVA_OPTIONS`, `JAVA_TOOL_OPTIONS` or `_JAVA_OPTIONS` does (in the
+server's `env:` or the daemon's environment) and `GORTEX_LSP_JDTLS_XMX` is
+unset. The chosen value is logged as
+`lsp: jdtls max heap` when the server starts.
+
 ## Troubleshooting
 
 - **`no_lsp_for` error:** the file extension didn't match any

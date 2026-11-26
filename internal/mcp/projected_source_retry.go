@@ -100,7 +100,7 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 				ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, afterFreshness: true, diagnostic: diagnostic})
 				return next(ctx, req)
 			}
-			deadline := time.Now().Add(projectedReadBudget)
+			deadline := projectedReadDeadline(ctx, time.Now())
 			if prior, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && prior.Before(deadline) {
 				deadline = prior
 			}
@@ -129,7 +129,7 @@ func projectedReadBudgetAfterFreshness(ctx context.Context) context.Context {
 	allowance.deadlineMu.Lock()
 	defer allowance.deadlineMu.Unlock()
 	if allowance.deadline.IsZero() {
-		deadline := time.Now().Add(projectedReadBudget)
+		deadline := projectedReadDeadline(ctx, time.Now())
 		for _, key := range []any{projectedSourceDeadlineKey{}, freshSymbolDeadlineKey{}} {
 			if prior, ok := ctx.Value(key).(time.Time); ok && prior.Before(deadline) {
 				deadline = prior
