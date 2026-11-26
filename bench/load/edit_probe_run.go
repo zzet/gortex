@@ -25,6 +25,13 @@ import (
 // in-flight JSONL bytes. It is separate from each CLI call's stdout limit.
 const editProbeRawLimit = 16 << 20
 
+// A configured cap is never below the default nor above the maximum.
+const editProbeMaxRawLimit = 256 << 20
+
+func editProbeKnownRawLimit(limit int) bool {
+	return limit >= editProbeRawLimit && limit <= editProbeMaxRawLimit
+}
+
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
 type editProbeReadback struct {
