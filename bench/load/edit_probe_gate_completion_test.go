@@ -18,7 +18,7 @@ import (
 // edit writes real fixture bytes before its ACK is delivered. Original probes
 // can therefore be correct while still being ineligible post-ACK witnesses.
 func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
-	for _, mode := range []string{"release", "deadline", "cancel", "missing_winner"} {
+	for _, mode := range []string{"release", "deadline", "cancel", "missing_winner", "accounting_deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -88,7 +88,9 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 				}
 				return disk(frame)
 			})
-			run.requireAccounting = terminalStatus != nil
+			// accounting_deadline: graph terminal and fresh, every oracle and
+			// post-ACK witness present, accounting never complete.
+			run.requireAccounting = terminalStatus != nil || mode == "accounting_deadline"
 			run.options.Deadline = 2 * time.Second
 			probeCtx, stopProbes := context.WithCancel(ctx)
 			state := run.activateProbeState(step, stopProbes)
@@ -196,7 +198,7 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 				t.Fatal(ctx.Err())
 			}
 			switch mode {
-			case "release", "missing_winner":
+			case "release", "missing_winner", "accounting_deadline":
 				unblockSummary()
 			case "cancel":
 				cancel()
@@ -213,12 +215,31 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 			state.mu.Lock()
 			outcome := state.record.Outcome
 			state.mu.Unlock()
-			want := map[string]string{"release": "complete", "deadline": "product_deadline", "cancel": "phase_censored", "missing_winner": "diagnostic_failure"}[mode]
+			want := map[string]string{"release": "complete", "deadline": "product_deadline", "cancel": "phase_censored", "missing_winner": "diagnostic_failure", "accounting_deadline": "product_deadline"}[mode]
 			if deadline, ok := callCtx.Deadline(); !ok || deadline != originalDeadline {
 				t.Fatal("collector renewed the original deadline")
 			}
 			if outcome != want {
 				t.Fatalf("outcome=%s, want%s", outcome, want)
+			}
+			// The deadline reason is attribution only: the outcome above and
+			// every client time stay as they were.
+			state.mu.Lock()
+			record := state.record
+			state.mu.Unlock()
+			wantReason := map[string]string{"deadline": editProbeDeadlineCoverage, "accounting_deadline": editProbeDeadlineAccounting}[mode]
+			if record.DeadlineReason != wantReason {
+				t.Fatalf("deadline reason=%q, want %q", record.DeadlineReason, wantReason)
+			}
+			if record.GraphTerminalMS == nil || record.GraphTerminalMS.Value == nil || *record.GraphTerminalMS.Value < 0 {
+				t.Fatalf("first terminal status time missing: %+v", record.GraphTerminalMS)
+			}
+			if mode == "accounting_deadline" {
+				relations := editProbeGroupTime(record.FirstCorrect, "relations")
+				record.groupTimes()
+				if relations.Value == nil || record.Relations.Value == nil || *record.Relations.Value != *relations.Value {
+					t.Fatalf("t_relations changed or unavailable: %+v want %+v", record.Relations, relations)
+				}
 			}
 			if mode == "release" || mode == "missing_winner" {
 				coverage := editProbeOutputCoverage("gate", run.modeCounts)["json"]

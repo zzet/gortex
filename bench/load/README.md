@@ -366,6 +366,21 @@ the summary censors missing or conflicting waits for bound patches.
 Resolve-mutex wait is part of the resolve lap and is never added to it.
 The separate `foreign-impact` command records read-side impact waits.
 
+A `product_deadline` record keeps its outcome and adds `deadline_reason`, what
+the receipt loop still awaited when the edit's own context expired, from its
+latest evaluated status: `immediate_readbacks_outstanding`,
+`receipt_status_unobserved`, `graph_not_terminal`, `oracles_not_correct`,
+`post_ack_coverage_outstanding`, `qualified_tiers_not_fresh`, or
+`accounting_non_terminal` when the graph was terminal and fresh, every oracle
+was first-correct and every assigned post-ACK witness was present, so only the
+required accounting was outstanding. Relocation and batch cells have no
+reason. `t_graph_terminal_ms` is the client time from edit send to the first
+own status reply that reported the graph terminal. `busy_refusals` counts
+dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
+`readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
+`busy_refusals` totals. None of these changes an outcome, an error or a client
+time.
+
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
 record has no ACK, receipt, phases or derived time (each unavailable with its
@@ -670,6 +685,15 @@ peaks are sampled at 500 ms. The post-workload memory sample is explicitly
 labeled after a 2-second settle period, not proof that background work is idle.
 Whole-client CPU is a conservative upper bound on refusal-handling CPU, not
 overlapping per-request CPU attribution.
+
+Linux also records the daemon's major page faults over the phase
+(`daemon_major_faults`, from procfs `majflt`) and pressure stall information
+for cpu, memory and io, both `some` and `full`: host-wide from `/proc/pressure`
+(`host_psi_*`) and for the run's cgroup v2 group (`cgroup_psi_*`). Each has
+`_stall_us`, the delta of the cumulative stall total over the phase, and
+`_peak_avg10_pct`, the highest ten-second average seen by the 500 ms samples.
+macOS, a kernel without pressure files, a missing `full` line and a run
+without a cgroup keep these measures unavailable with a reason, never zero.
 
 Status and `gortex://stats` receipts preserve view-build counters, WAL pending
 frames, checkpoint estimates, reclaim counters, graph size and runtime heap.

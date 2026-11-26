@@ -210,3 +210,59 @@ func cgroupMetrics(root string, pageSize int) map[string]Metric {
 	values["oom_events"] = valueMetric(events, "oom", "events", 1)
 	return values
 }
+
+var pressureResources = []string{"cpu", "memory", "io"}
+
+// parsePressure reads Linux pressure stall information: "some" and "full"
+// lines of avg10/avg60/avg300 percentages and a cumulative total in
+// microseconds. Unknown lines and malformed fields are skipped.
+func parsePressure(data string) map[string]map[string]float64 {
+	out := make(map[string]map[string]float64)
+	for line := range strings.SplitSeq(data, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "some" && fields[0] != "full" {
+			continue
+		}
+		values := make(map[string]float64)
+		for _, field := range fields[1:] {
+			key, raw, ok := strings.Cut(field, "=")
+			value, err := strconv.ParseFloat(raw, 64)
+			if ok && err == nil && value >= 0 {
+				values[key] = value
+			}
+		}
+		out[fields[0]] = values
+	}
+	return out
+}
+
+// pressureMetrics samples cpu, memory and io pressure from the file that
+// file(resource) names: <resource>_<some|full>_total_us (cumulative stall
+// microseconds) and <resource>_<some|full>_avg10_pct. A missing file, line or
+// field stays unavailable, never zero.
+func pressureMetrics(file func(resource string) string) map[string]Metric {
+	out := make(map[string]Metric)
+	for _, resource := range pressureResources {
+		data, err := os.ReadFile(file(resource))
+		lines := parsePressure(string(data))
+		for _, kind := range []string{"some", "full"} {
+			key := resource + "_" + kind
+			if err != nil {
+				out[key+"_total_us"] = unavailable("us", "pressure stall information unavailable")
+				out[key+"_avg10_pct"] = unavailable("%", "pressure stall information unavailable")
+				continue
+			}
+			out[key+"_total_us"] = valueMetric(lines[kind], "total", "us", 1)
+			out[key+"_avg10_pct"] = valueMetric(lines[kind], "avg10", "%", 1)
+		}
+	}
+	return out
+}
+
+func hostPressure() map[string]Metric {
+	return pressureMetrics(func(resource string) string { return filepath.Join("/proc/pressure", resource) })
+}
+
+func cgroupPressure(group string) map[string]Metric {
+	return pressureMetrics(func(resource string) string { return filepath.Join(group, resource+".pressure") })
+}
