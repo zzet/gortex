@@ -266,7 +266,7 @@ func TestWatcherPointRetryRefusedResolutionActuallyReresolves(t *testing.T) {
 
 		// Update tsconfig.json behind the scenes while leaving callerPath unchanged on disk:
 		// pointDuplicateSourceContent(callerPath) is provably true and hasPendingResolutionRetry() is false,
-		// so ONLY watcher.go's retryAttempt > 0 -> receiptChecked=true can bypass the duplicate gate.
+		// so ONLY the retry flag (retryAttempt > 0) can bypass the duplicate gate; receiptChecked stays false.
 		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
 		dup, _ := idx.pointDuplicateSourceContent(context.Background(), callerPath)
 		require.True(t, dup, "callerPath bytes must match persisted file_meta so the duplicate gate is armed")
@@ -402,6 +402,7 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	writeFileMk(t, bPath, "package demo\nfunc Foo() int { return 2 }\n")
 	writeFileMk(t, cPath, "package demo\nfunc Run() int { return Foo() }\n")
 
+	writeAliasPolicyAnchor(t, root)
 	idx, store := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
@@ -421,7 +422,7 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	runCall.To = "a/a.go::Foo"
 	require.True(t, store.ReindexEdgesApplied([]graph.EdgeReindex{{Edge: runCall, OldTo: prevTo}}))
 
-	// Arm an uncertified alias pass (no .ts files exist, so the Go frontier stays exact)
+	// Arm an uncertified alias pass (the TS anchor imports nothing, so the Go frontier stays exact)
 	// and remove Foo from a/a.go; refuse writes during resolveReceiptNamePendings.
 	writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~dummy/*":["v2/*"]}}}`)
 	writeFileMk(t, aPath, "package a\nfunc Bar() int { return 1 }\n")
@@ -460,6 +461,7 @@ func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopolo
 	callerPath := filepath.Join(root, "caller.go")
 	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return 0 }\n")
 
+	writeAliasPolicyAnchor(t, root)
 	idx, store := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
@@ -587,12 +589,13 @@ func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t
 	writeFileMk(t, helperPath, "package demo\n\nfunc Other() int { return 2 }\n")
 	writeFileMk(t, callerPath, "package demo\n\nfunc Run() int { return Calc(1) }\n")
 
+	writeAliasPolicyAnchor(t, root)
 	idx, store := newSQLiteIndexer(t)
 	_, err := idx.Index(root)
 	require.NoError(t, err)
 	require.Equal(t, "def.go::Calc", callTargetForName(t, store, "caller.go", "Run"))
 
-	// Arm an uncertified alias pass (no .ts files exist, so the Go frontier stays exact),
+	// Arm an uncertified alias pass (the TS anchor imports nothing, so the Go frontier stays exact),
 	// change Calc's signature (a genuine contract change putting caller.go into
 	// batch.deferredAffectedPlan().files), AND add an unresolved call to helper.go::Other
 	// in caller.go (untouched by def.go's incoming leg, so ONLY ResolveFilesOutgoing
@@ -773,4 +776,84 @@ func TestIncrementalTopologyChanged_TrueOnChainedRetriedResolutionRefusal(t *tes
 	}), "chained Attempt 2 refusal on an inert reparse must still invalidate reachability topology")
 }
 
+// Vanished receipt names widen the master resolve (the frontier returned is
+// nil) but, with no carried full retry, the cross-repo pass stays scoped to the
+// mutation frontier. Only a carried full retry escalates it to the whole graph.
+func TestMultiIndexer_VanishedNamesKeepCrossRepoPassScoped(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		retryFull bool
+	}{
+		{name: "vanished names only"},
+		{name: "carried full retry", retryFull: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mi, store := newTestMultiIndexerWithRefusingStore(t, nil)
+			idxA := mi.newPerRepoIndexerGuardedWithMode(config.IndexConfig{}, multiIndexerBatchMode{})
+			idxA.SetRepoPrefix("repoA")
+			mi.mu.Lock()
+			mi.indexers["repoA"] = idxA
+			mi.mu.Unlock()
 
+			store.AddBatch([]*graph.Node{
+				{ID: "repoA/b.ts", Kind: graph.KindFile, Name: "b.ts", FilePath: "repoA/b.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+				{ID: "repoA/c.ts", Kind: graph.KindFile, Name: "c.ts", FilePath: "repoA/c.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+				{ID: "repoA/c.ts::run", Kind: graph.KindFunction, Name: "run", FilePath: "repoA/c.ts", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "typescript"},
+				{ID: "repoB/target.ts", Kind: graph.KindFile, Name: "target.ts", FilePath: "repoB/target.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+				{ID: "repoB/target.ts::helper", Kind: graph.KindFunction, Name: "helper", FilePath: "repoB/target.ts", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "typescript"},
+			}, []*graph.Edge{
+				{From: "repoA/c.ts", To: "repoB/target.ts", Kind: graph.EdgeImports, FilePath: "repoA/c.ts", Line: 1, CrossRepo: true},
+				{From: "repoA/c.ts::run", To: "unresolved::helper", Kind: graph.EdgeCalls, FilePath: "repoA/c.ts", Line: 2},
+			})
+			if tc.retryFull {
+				idxA.recordPendingResolutionRetry([]string{"repoA/b.ts"}, true, DerivedInvalidationPlan{Files: []string{"repoA/b.ts"}})
+			}
+
+			var crossRepo [][]string
+			graphPasses := 0
+			idxA.incrementalCatchupHook = func(kind string, files []string) {
+				switch kind {
+				case "cross_repo":
+					crossRepo = append(crossRepo, files)
+				case "cross_repo_graph":
+					graphPasses++
+				}
+			}
+			res := &IndexResult{DerivedInvalidation: DerivedInvalidationPlan{Files: []string{"repoA/b.ts"}}}
+			receipt := &graph.MutationReceipt{
+				Complete:           true,
+				ResolutionRelevant: true,
+				UnresolvedFiles:    []string{"repoA/b.ts"},
+				EvictedNames:       []string{"gone"},
+			}
+			batch := &reparsePendingEnrichmentBatch{deferResolverCatchup: true}
+			returned := mi.resolveIncrementalRepoMutationMode("repoA", res, receipt, batch, false)
+			assert.Nil(t, returned, "a pass that reached past its frontier returns a nil frontier")
+			require.NotEmpty(t, crossRepo)
+
+			var callTarget string
+			for _, e := range store.GetOutEdges("repoA/c.ts::run") {
+				if e.Kind == graph.EdgeCalls {
+					callTarget = e.To
+				}
+			}
+			if tc.retryFull {
+				assert.Equal(t, 1, graphPasses, "a carried full retry runs the whole-graph cross-repo pass")
+				assert.Equal(t, "repoB/target.ts::helper", callTarget)
+				return
+			}
+			assert.Zero(t, graphPasses, "vanished names alone must not run the whole-graph cross-repo pass")
+			assert.Contains(t, crossRepo[0], "repoA/b.ts")
+			assert.Equal(t, "unresolved::helper", callTarget, "a scoped pass must not touch c.ts, which is outside the frontier")
+		})
+	}
+}
+
+// writeAliasPolicyAnchor adds a TS file that imports nothing. Alias discovery
+// runs only for a repository whose full index admitted a JS/TS file, so the Go
+// fixtures above need one before a tsconfig change can leave an uncertified
+// alias pass behind.
+func writeAliasPolicyAnchor(t *testing.T, root string) {
+	t.Helper()
+	writeFileMk(t, filepath.Join(root, "web", "anchor.ts"), "export const anchor = 1\n")
+}

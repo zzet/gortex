@@ -21,11 +21,14 @@ import (
 // opaque callbacks, snapshots, deletes, manifests, custom transforms and unknown
 // admission stay immediately protected by the original raw Begin.
 type watcherPointPreparation struct {
-	watcher             *Watcher
-	path                string
-	kind                ChangeKind
-	generation          uint64
-	receiptChecked      bool
+	watcher        *Watcher
+	path           string
+	kind           ChangeKind
+	generation     uint64
+	receiptChecked bool
+	// retry marks a watcher retry of a failed point attempt; see
+	// patchGraphPointAttempt.
+	retry               bool
 	ctx                 context.Context
 	idx                 *Indexer
 	before              *pointDuplicateState
@@ -89,6 +92,10 @@ func (p *watcherPointPreparation) allowsExtraction(idx *Indexer, language string
 	}
 	policy, _, known := capturePointPreparationPolicy(idx, p.path)
 	return known && policy == p.policy && fmt.Sprintf("%T/%p", extractor, extractor) == p.policy.extractor
+}
+
+func (p *watcherPointPreparation) isRetry() bool {
+	return p != nil && p.retry
 }
 
 func (p *watcherPointPreparation) prepare(ctx context.Context) {

@@ -130,13 +130,13 @@ type MultiIndexer struct {
 	// pendingResolveRetryMu protects refused placeholder repoints and
 	// cross-package guard reverts handed back from short-lived master/cross-repo
 	// resolvers so a retry pass completes them without requiring a file reparse.
-	pendingResolveRetryMu      sync.Mutex
-	pendingMasterRepoints      []graph.PlaceholderRepoint
-	pendingMasterGuardReverts  []resolver.PendingGuardRevert
-	pendingMasterTailRetryAll  bool
-	pendingMasterTailScopes    map[string]struct{}
-	pendingMasterAttribFiles   map[string]struct{}
-	pendingCrossRepoRepoints   []graph.PlaceholderRepoint
+	pendingResolveRetryMu     sync.Mutex
+	pendingMasterRepoints     []graph.PlaceholderRepoint
+	pendingMasterGuardReverts []resolver.PendingGuardRevert
+	pendingMasterTailRetryAll bool
+	pendingMasterTailScopes   map[string]struct{}
+	pendingMasterAttribFiles  map[string]struct{}
+	pendingCrossRepoRepoints  []graph.PlaceholderRepoint
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and

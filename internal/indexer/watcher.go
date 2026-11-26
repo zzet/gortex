@@ -2328,7 +2328,8 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 		// Retry attempts must bypass the pointDuplicateSourceContent fast path:
 		// a prior attempt that failed after persisting file_meta/fileMtimes
 		// (e.g. ErrReindexWriteRefused during resolution) still needs re-resolution.
-		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, retryAttempt > 0, &fanout, publication)
+		// The receipt itself is unchecked, so point preparation stays available.
+		patchErr = w.patchGraphPointAttempt(path, kind, generation, false, retryAttempt > 0, &fanout, publication)
 	}
 	var storageErr *store_sqlite.StorageError
 	if errors.As(patchErr, &storageErr) {
@@ -3085,6 +3086,22 @@ func (w *Watcher) patchGraphWithReceiptStateObserved(
 	fanout *DerivedFanoutCompleteness,
 	publication *pointPublicationAttempt,
 ) error {
+	return w.patchGraphPointAttempt(path, kind, generation, receiptChecked, false, fanout, publication)
+}
+
+// patchGraphPointAttempt runs one point mutation. retry marks a watcher retry
+// of a failed attempt: it skips the duplicate-content gate, because the failed
+// attempt may have persisted the file's metadata before its resolution was
+// refused, but unlike receiptChecked it keeps point preparation.
+func (w *Watcher) patchGraphPointAttempt(
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	receiptChecked bool,
+	retry bool,
+	fanout *DerivedFanoutCompleteness,
+	publication *pointPublicationAttempt,
+) error {
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
@@ -3095,7 +3112,7 @@ func (w *Watcher) patchGraphWithReceiptStateObserved(
 	// the raw patch.
 	laneCtx, cancelLane := w.mutationLaneContext()
 	laneCtx = publication.withContext(laneCtx)
-	preparation := &watcherPointPreparation{watcher: w, path: path, kind: kind, generation: generation, receiptChecked: receiptChecked}
+	preparation := &watcherPointPreparation{watcher: w, path: path, kind: kind, generation: generation, receiptChecked: receiptChecked, retry: retry}
 	err := w.indexer.coordinateRepositoryMutationPreparedSource(laneCtx, OutputEntryWatcherPatchGraph, preparation, func(observe func(*OutputSourceContent)) error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
@@ -3201,9 +3218,10 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	writes := idx.writeCounterMark()
 	kind = w.reconcileKindWithDisk(path, kind)
 	// A startup replay that already checked a receipt still forces its original
-	// exact path. Otherwise the persisted hash/size/version gate identifies a
-	// duplicate; only its checked source proof may restore the prior witness.
-	if kind == ChangeModified && !receiptChecked && !idx.hasPendingResolutionRetry() {
+	// exact path, and a watcher retry re-runs a failed attempt in full.
+	// Otherwise the persisted hash/size/version gate identifies a duplicate;
+	// only its checked source proof may restore the prior witness.
+	if kind == ChangeModified && !receiptChecked && !preparation.isRetry() && !idx.hasPendingResolutionRetry() {
 		duplicate, content := idx.pointDuplicateSourceContent(ctx, path)
 		if duplicate {
 			if observe != nil && content != nil {

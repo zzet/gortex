@@ -707,7 +707,12 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	exactPointSemantic bool,
 ) []string {
 	files, needed, _ := incrementalResolutionFrontier(result, receipt)
-	wide := false
+	// wide reports that the pass reached beyond its file frontier (the return
+	// value and the retry record). retryWide is narrower: only a carried full
+	// retry escalates the cross-repo pass to the whole graph. Vanished receipt
+	// names widen the master resolve but keep the cross-repo pass scoped, as
+	// on main.
+	wide, retryWide := false, false
 	var carriedRetryFiles []string
 	idx := mi.GetIndexer(repoPrefix)
 	if idx != nil {
@@ -724,7 +729,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			if retryFull {
 				needed = true
 				files = nil
-				wide = true
+				wide, retryWide = true, true
 			} else {
 				files = appendUniqueSorted(files, retryFiles...)
 				needed = true
@@ -825,12 +830,15 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
 		}
 		cross := batch.publicationStamps().beginPatchLap(patchResolve)
-		if !wide && len(crossRepoFiles) > 0 {
+		if !retryWide && len(crossRepoFiles) > 0 {
 			if stats := mi.runCrossRepoResolveMutationFrontiersObserved(crossRepoFiles, crossRepoFiles, crossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
 		} else {
 			wide = true
+			if idx != nil {
+				idx.observeIncrementalCatchup("cross_repo_graph", nil)
+			}
 			if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
 				mi.logger.Error("cross-repo resolve", zap.Error(err))
 				if result != nil && result.resolutionErr == nil {
