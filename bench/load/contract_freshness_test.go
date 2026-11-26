@@ -25,6 +25,7 @@ type contractFreshnessStub struct {
 	present   bool     // the identity is already listed before any edit
 	refuse    bool     // refuse every edit
 	warm      []string // answers to the first reads: incomplete, pending or invalid
+	ackDelay  time.Duration
 	edited    map[string]time.Time
 	edits     int
 	reads     int
@@ -36,6 +37,12 @@ type contractFreshnessStub struct {
 func (s *contractFreshnessStub) handle(frame stubFrame) (any, *rpcError) {
 	args, _ := frame.Params["arguments"].(map[string]any)
 	name, _ := frame.Params["name"].(string)
+	if name == "edit" {
+		s.mu.Lock()
+		delay := s.ackDelay
+		s.mu.Unlock()
+		time.Sleep(delay) // the edit applies and acknowledges after delay
+	}
 	if name != "edit" && name != "analyze" {
 		s.mu.Lock()
 		s.readers++
@@ -115,10 +122,13 @@ func startContractFreshnessStub(t *testing.T, plan contractFreshnessPlan, fresh 
 }
 
 func TestContractFreshnessWitnessRecordsFirstFreshAnswer(t *testing.T) {
-	const lag = 120 * time.Millisecond
+	const lag, ackDelay = 120 * time.Millisecond, 60 * time.Millisecond
 	plan := newContractFreshnessPlan(1)
 	plan.ReadIntervalMS = 10
 	stub, socket := startContractFreshnessStub(t, plan, func(since time.Duration) bool { return since >= lag })
+	stub.mu.Lock()
+	stub.ackDelay = ackDelay
+	stub.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := openMCP(ctx, socket, "")
@@ -137,6 +147,12 @@ func TestContractFreshnessWitnessRecordsFirstFreshAnswer(t *testing.T) {
 	freshMS, afterAck, notBefore := *observation.FreshMS.Value, *observation.FreshAfterAckMS.Value, *observation.FreshNotBeforeMS.Value
 	if freshMS < float64(lag/time.Millisecond) || afterAck <= 0 || afterAck > freshMS || notBefore <= 0 || notBefore >= freshMS || *observation.FreshReadMS.Value > freshMS {
 		t.Fatalf("fresh time %.1f ms (after ACK %.1f, not before %.1f) does not bracket the %v lag", freshMS, afterAck, notBefore, lag)
+	}
+	// The comparable figure runs from the edit's dispatch, so it includes
+	// the time the edit took to acknowledge; a figure anchored at the ACK
+	// would not.
+	if freshMS-afterAck < float64(ackDelay/time.Millisecond) {
+		t.Fatalf("fresh time %.1f ms is only %.1f ms past the after-ACK time; the %v acknowledgement is missing from it", freshMS, freshMS-afterAck, ackDelay)
 	}
 	stub.mu.Lock()
 	afterEdit := stub.afterEdit
