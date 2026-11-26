@@ -225,7 +225,7 @@ require (
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/gofrs/flock v0.13.2
-	github.com/gomlx/go-huggingface v0.4.32
+	github.com/gomlx/go-huggingface v0.4.40
 	github.com/google/go-github/v88 v88.0.0
 	github.com/google/renameio v1.0.1
 	github.com/google/uuid v1.6.0
@@ -307,11 +307,11 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
-	github.com/gomlx/compute v0.1.28 // indirect
-	github.com/gomlx/compute-onnx v0.1.28 // indirect
+	github.com/gomlx/compute v0.1.33 // indirect
+	github.com/gomlx/compute-onnx v0.1.33 // indirect
 	github.com/gomlx/exceptions v0.0.3 // indirect
-	github.com/gomlx/go-xla v0.4.28 // indirect
-	github.com/gomlx/gomlx v0.28.34 // indirect
+	github.com/gomlx/go-xla v0.4.33 // indirect
+	github.com/gomlx/gomlx v0.28.39 // indirect
 	github.com/gomlx/onnx-gomlx v0.5.31 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
