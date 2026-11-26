@@ -14,10 +14,11 @@ import (
 
 // A typed refusal that says the product changed no files is a known outcome.
 // The restore proceeds past it, rewrites only checkouts whose bytes moved, and
-// sends nothing for a checkout whose edits were all refused. An abandoned tool
-// deadline, a busy reply whose delivery is unknown, or a request still
-// outstanding at the deadline can still hide a write, so those records keep
-// blocking the restore.
+// sends nothing for a checkout whose edits were all refused. If the bytes of
+// such a checkout moved anyway, the byte-guarded rewrite restores them and its
+// route records the contradiction. An abandoned tool deadline, a busy reply
+// whose delivery is unknown, or a request still outstanding at the deadline
+// can still hide a write, so those records keep blocking the restore.
 func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 	const checkout = "expected-linked-checkout"
 	toolError := func(text string) func() (any, *rpcError) {
@@ -40,19 +41,21 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 		routes  int                       // 2: an applied primary edit beside the refused linked edit
 		replies []func() (any, *rpcError) // refused edit's replies in order; the last repeats
 		refusal string                    // the record's not-admitted refusal; empty means unknown
-		// After the replies, the product admits the edit but replies, and
-		// writes, only after the logical deadline: the request is outstanding
-		// when the call ends.
-		admitLate bool
+		// admitted_late: after the replies, the product admits the edit but
+		// replies, and writes, only after the logical deadline, so the request
+		// is outstanding when the call ends. changed_anyway: the refused reply
+		// still changed the checkout's bytes.
+		effect string
 	}{
-		{"view_read_only_route_moved", 2, []func() (any, *rpcError){routeMoved}, "view_read_only", false},
-		{"view_building_not_routed", 2, []func() (any, *rpcError){notRouted}, "view_building", false},
-		{"busy_then_typed_refusal", 2, []func() (any, *rpcError){busy, notRouted}, "view_building", false},
-		{"busy_until_deadline", 2, []func() (any, *rpcError){busy}, "server_busy", false},
-		{"single_checkout_all_refused", 1, []func() (any, *rpcError){routeMoved}, "view_read_only", false},
-		{"tool_deadline_abandoned", 2, []func() (any, *rpcError){abandoned}, "", false},
-		{"busy_delivery_unknown", 2, []func() (any, *rpcError){unknownBusy}, "", false},
-		{"busy_then_request_outstanding_at_deadline", 2, []func() (any, *rpcError){busy, busy}, "", true},
+		{"view_read_only_route_moved", 2, []func() (any, *rpcError){routeMoved}, "view_read_only", ""},
+		{"view_building_not_routed", 2, []func() (any, *rpcError){notRouted}, "view_building", ""},
+		{"busy_then_typed_refusal", 2, []func() (any, *rpcError){busy, notRouted}, "view_building", ""},
+		{"busy_until_deadline", 2, []func() (any, *rpcError){busy}, "server_busy", ""},
+		{"single_checkout_all_refused", 1, []func() (any, *rpcError){routeMoved}, "view_read_only", ""},
+		{"tool_deadline_abandoned", 2, []func() (any, *rpcError){abandoned}, "", ""},
+		{"busy_delivery_unknown", 2, []func() (any, *rpcError){unknownBusy}, "", ""},
+		{"busy_then_request_outstanding_at_deadline", 2, []func() (any, *rpcError){busy, busy}, "", "admitted_late"},
+		{"refusal_but_bytes_changed", 2, []func() (any, *rpcError){routeMoved}, "view_read_only", "changed_anyway"},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -132,11 +135,16 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 					call := refusedCalls
 					refusedCalls++
 					mu.Unlock()
-					if cell.admitLate && call >= len(cell.replies) {
+					if cell.effect == "admitted_late" && call >= len(cell.replies) {
 						lateOnce.Do(func() { close(lateSent) })
 						<-release // held past the logical deadline, and past the restore
 						defer close(landed)
 						return apply(frame, repo)
+					}
+					if cell.effect == "changed_anyway" {
+						if _, fault := apply(frame, repo); fault != nil {
+							return nil, fault
+						}
 					}
 					return cell.replies[min(call, len(cell.replies)-1)]()
 				case frame.Params["name"] == "edit" && args["operation"] == "file":
@@ -222,10 +230,11 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 				}
 				before[i] = string(data)
 			}
-			if before[refused] != originals[refused] {
-				t.Fatalf("a refused edit changed its checkout: %q", before[refused])
+			changed := cell.effect == "changed_anyway"
+			if (before[refused] != originals[refused]) != changed {
+				t.Fatalf("refused edit changed its checkout %t, want %t: %q", !changed, changed, before[refused])
 			}
-			if cell.admitLate {
+			if cell.effect == "admitted_late" {
 				select {
 				case <-lateSent:
 				default:
@@ -261,7 +270,7 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 				if sent != 0 || refusal != "" {
 					t.Fatalf("a refused restore sent %d rewrites; record names not_admitted %q", sent, refusal)
 				}
-				if cell.admitLate {
+				if cell.effect == "admitted_late" {
 					// The write the restore must not race lands now.
 					releaseOnce.Do(func() { close(release) })
 					select {
@@ -283,11 +292,28 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 					t.Fatalf("checkout%d not at its original after restore: %q %v", i, data, err)
 				}
 			}
-			if refusedBatches != 0 || sent != len(p.Repos)-1 {
-				t.Fatalf("restore rewrote %d checkouts (%d unchanged), want only the applied one", sent, refusedBatches)
+			wantRefused := 0
+			if changed {
+				wantRefused = 1 // the refused checkout's bytes moved, so it is rewritten
 			}
-			if !strings.Contains(string(phase.EditProbe.Restore), "unchanged") {
-				t.Fatalf("restore evidence does not name the unchanged checkout: %s", phase.EditProbe.Restore)
+			if refusedBatches != wantRefused || sent != len(p.Repos)-1+wantRefused {
+				t.Fatalf("restore rewrote %d checkouts (%d refused), want %d refused beside the applied one", sent, refusedBatches, wantRefused)
+			}
+			if strings.Contains(string(phase.EditProbe.Restore), "unchanged") == changed {
+				t.Fatalf("restore evidence names an unchanged checkout %t, want %t: %s", !changed, !changed, phase.EditProbe.Restore)
+			}
+			if cell.routes > 1 {
+				// Recorded, not a failure: every edit on the route was refused
+				// without a receipt, yet its bytes moved.
+				var rows []map[string]any
+				if err := json.Unmarshal(phase.EditProbe.Restore, &rows); err != nil || len(rows) != len(p.Repos) {
+					t.Fatalf("routed restore evidence %s: %v", phase.EditProbe.Restore, err)
+				}
+				for i, row := range rows {
+					if flagged, _ := row["not_admitted_but_changed"].(bool); flagged != (changed && i == refused) {
+						t.Fatalf("route %d records not_admitted_but_changed %t: %s", i, flagged, phase.EditProbe.Restore)
+					}
+				}
 			}
 			if refusal != cell.refusal {
 				t.Fatalf("refused record names not_admitted %q, want %q: %s", refusal, cell.refusal, wire)
