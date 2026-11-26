@@ -448,9 +448,12 @@ type Indexer struct {
 	aliasResolutionChanged bool
 	passAliases            atomic.Pointer[aliasSnapshot]
 	deltaAliases           *aliasSnapshot // private to a single edit-delta builder
-	appliedAliases         string         // fallback for in-memory stores, under the mutation lane
+	// appliedAliases is the certified alias digest (the only copy for
+	// in-memory stores). Read and written only under aliasStateMu.
+	appliedAliases string
 	// A deferred full pass waiting for the shared resolve to certify it.
-	// aliasStateMu serializes that off-lane certification with beginAliasPass.
+	// aliasStateMu serializes that off-lane certification with beginAliasPass
+	// and guards appliedAliases.
 	deferredAliases atomic.Pointer[aliasSnapshot]
 	aliasStateMu    sync.Mutex
 
@@ -2986,9 +2989,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	if err := idx.beginAliasPass(absRoot, []string{absRoot}); err != nil {
-		return nil, err
-	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -3137,6 +3137,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			recordFileOutcome(absRoot, err)
 		}
+		return nil, err
+	}
+	// Pin the alias policy once the walk knows whether it admitted JS/TS, so
+	// a repository without any skips the config discovery walk.
+	scopeHasJSTS := false
+	for i := range files {
+		if closureJSTSPath(files[i].path) {
+			scopeHasJSTS = true
+			break
+		}
+	}
+	if err := idx.beginAliasPass(ctx, absRoot, []string{absRoot}, scopeHasJSTS); err != nil {
 		return nil, err
 	}
 	if skippedLarge > 0 {
@@ -4750,6 +4762,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if coldManifests != nil {
 		coldManifests.registry = contractReg
 	}
+	var fullResolveErr error
 	if idx.deferResolve.Load() {
 		// Multi-repo orchestrator runs these serially after wg.Wait()
 		// to avoid races on the shared graph between this goroutine's
@@ -4768,10 +4781,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		idx.populateCppIncludeDirs(true)
 		resolveStarted := time.Now()
 		resolveStats, resolveErr := idx.resolver.ResolveAllContext(ctx)
-		if resolveErr != nil {
+		switch {
+		case resolveErr != nil && ctx.Err() != nil:
 			return nil, resolveErr
+		case resolveErr != nil:
+			// The index still completes, as it did before resolution was
+			// checked. resolutionErr withholds the alias receipt, so only a
+			// pass whose alias policy is uncertified reports the failure.
+			idx.logger.Error("indexer: full resolution failed", zap.Error(resolveErr))
+			fullResolveErr = resolveErr
+		default:
+			idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 		}
-		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
 		// Lift the dataflow placeholders exactly where the per-save path
 		// does (right after resolution, before the derived passes), so a
 		// whole index and an incremental edit write the same arg_of /
@@ -5011,6 +5032,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
 		DurationMs:       time.Since(start).Milliseconds(),
 		Errors:           errors,
+		resolutionErr:    fullResolveErr,
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// A whole-repo (re-)track that observed files did work: mark the repo for
@@ -7368,7 +7390,7 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	if err := idx.beginAliasPass(absRoot, paths); err != nil {
+	if err := idx.beginAliasPass(context.Background(), absRoot, paths, false); err != nil {
 		return nil, err
 	}
 

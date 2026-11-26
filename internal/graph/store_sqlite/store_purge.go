@@ -45,6 +45,7 @@ var purgeSidecarTables = []string{
 	"file_mtimes",
 	"repo_index_state",
 	"ts_alias_state",
+	"ts_alias_inputs",
 	"symbol_fts_state",
 	"enrichment_state",
 	"enrichment_resume",
@@ -178,6 +179,7 @@ var orphanScanTables = []string{
 	"file_mtimes",
 	"repo_index_state",
 	"ts_alias_state",
+	"ts_alias_inputs",
 	"symbol_fts_state",
 	"enrichment_state",
 	"files",
@@ -256,6 +258,7 @@ var rekeyMoveTables = []string{
 	"files",
 	"repo_index_state",
 	"ts_alias_state",
+	"ts_alias_inputs",
 	"enrichment_state",
 	"contract_state",
 }

@@ -438,6 +438,64 @@ func LoadObserved(repoRoot string, observe func(rel string, data []byte, found b
 	return LoadTree(dirTree{root: repoRoot, dir: dir, observe: observe})
 }
 
+// IsScopeConfig reports whether a repo-relative slash path is a config the
+// discovery walk would load as a scope (rather than read only as a parent).
+func IsScopeConfig(rel string) bool {
+	return IsConfigFileName(path.Base(rel)) && !underSkippedDir(rel)
+}
+
+// LoadFiles is LoadObserved over a known scope list instead of a walk. Given
+// the scope configs a walk of the same tree visited, it returns the same
+// Collection; callers verify that by comparing digests before trusting it.
+func LoadFiles(repoRoot string, rels []string, observe func(rel string, data []byte, found bool)) *Collection {
+	if repoRoot == "" {
+		return nil
+	}
+	dir, err := os.OpenRoot(repoRoot)
+	if err != nil {
+		return nil
+	}
+	defer dir.Close()
+	sorted := append([]string(nil), rels...)
+	// WalkDir's order: scopes with equally long prefixes keep visit order.
+	sort.Slice(sorted, func(i, j int) bool { return walkOrderLess(sorted[i], sorted[j]) })
+	return LoadTree(listedTree{dirTree: dirTree{root: repoRoot, dir: dir, observe: observe}, files: sorted})
+}
+
+// walkOrderLess orders slash paths the way filepath.WalkDir visits them:
+// entries sorted by name within each directory, depth first.
+func walkOrderLess(a, b string) bool {
+	for {
+		ai, bi := strings.IndexByte(a, '/'), strings.IndexByte(b, '/')
+		ah, bh := a, b
+		if ai >= 0 {
+			ah = a[:ai]
+		}
+		if bi >= 0 {
+			bh = b[:bi]
+		}
+		if ah != bh || ai < 0 || bi < 0 {
+			if ah == bh {
+				return ai < 0 && bi >= 0 // impossible for two files; keep total order
+			}
+			return ah < bh
+		}
+		a, b = a[ai+1:], b[bi+1:]
+	}
+}
+
+// listedTree is a working copy whose scope configs are already known.
+type listedTree struct {
+	dirTree
+	files []string
+}
+
+func (t listedTree) Files(visit func(rel string)) {
+	for _, rel := range t.files {
+		visit(rel)
+	}
+}
+
 // dirTree is the working copy at a root: the tree Load reads.
 type dirTree struct {
 	root    string

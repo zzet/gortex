@@ -285,7 +285,7 @@ func mustNoErr(t *testing.T, what string, err error) {
 // user_version 14. The result is a store the shipped v14 build could have
 // written.
 // sidecarAddedAfterV14 names the sidecars a v14 store did not have.
-var sidecarAddedAfterV14 = map[string]bool{"file_index_failures": true, "enrichment_resume": true, "ts_alias_state": true}
+var sidecarAddedAfterV14 = map[string]bool{"file_index_failures": true, "enrichment_resume": true, "ts_alias_state": true, "ts_alias_inputs": true}
 
 func downgradeSidecarsToV14(t *testing.T, db *sql.DB) {
 	t.Helper()

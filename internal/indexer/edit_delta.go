@@ -872,7 +872,9 @@ func (b *SparseGenerationBuilder) runEditDelta(
 			idx.Close()
 			return nil, err
 		}
+		idx.aliasStateMu.Lock()
 		idx.appliedAliases = prior
+		idx.aliasStateMu.Unlock()
 	}
 	idx.contractGenerationID = handle.ViewGeneration()
 	idx.contractProjectionContext = ctx

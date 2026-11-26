@@ -3,6 +3,7 @@ package store_sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 )
 
 // TSAliasDigest is the alias resolution policy applied to this generation's
@@ -20,6 +21,40 @@ func (s *Store) SetTSAliasDigest(repo, digest string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.execActiveWriteLocked(context.Background(), `INSERT OR REPLACE INTO ts_alias_state (view_gen, repo_prefix, digest) VALUES (?, ?, ?)`, s.viewGen, repo, digest)
+	return err
+}
+
+// TSAliasInputs returns the config inputs recorded beside the digest:
+// repo-relative slash paths mapped to a hex content hash, empty for a probe
+// that was missing. Nil means none were recorded. The set is only a hint: a
+// reader must check that it still reproduces TSAliasDigest before trusting it.
+func (s *Store) TSAliasInputs(repo string) (map[string]string, error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT inputs FROM ts_alias_inputs WHERE view_gen=? AND repo_prefix=?`, s.viewGen, repo).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var inputs map[string]string
+	if err := json.Unmarshal([]byte(raw), &inputs); err != nil {
+		return nil, nil // an unreadable hint only costs a rediscovery
+	}
+	return inputs, nil
+}
+
+// SetTSAliasInputs records the config inputs of the digest about to be
+// certified. Callers write it before SetTSAliasDigest; a crash in between
+// leaves the digest cleared, so the stale set is never trusted.
+func (s *Store) SetTSAliasInputs(repo string, inputs map[string]string) error {
+	raw, err := json.Marshal(inputs)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.execActiveWriteLocked(context.Background(), `INSERT OR REPLACE INTO ts_alias_inputs (view_gen, repo_prefix, inputs) VALUES (?, ?, ?)`, s.viewGen, repo, string(raw))
 	return err
 }
 
