@@ -590,6 +590,58 @@
                       }
                     ]
                   },
+                  "consumer_ownership": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "censored": {
+                            "type": "integer"
+                          },
+                          "complete": {
+                            "type": "boolean"
+                          },
+                          "editors": {
+                            "type": "integer"
+                          },
+                          "owned_acks": {
+                            "type": "integer"
+                          },
+                          "plan_bound": {
+                            "type": "boolean"
+                          },
+                          "planned_ordinals": {
+                            "type": "integer"
+                          },
+                          "raw_evidence": {
+                            "type": "integer"
+                          },
+                          "unowned_ordinals": {
+                            "items": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "array",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "editors",
+                          "planned_ordinals",
+                          "plan_bound",
+                          "owned_acks",
+                          "raw_evidence",
+                          "censored",
+                          "complete"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "edits": {
                     "items": {
                       "additionalProperties": false,
@@ -1466,6 +1518,16 @@
                                 "original_accounting_error"
                               ],
                               "type": "object"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "consumer_own_ack": {
+                          "anyOf": [
+                            {
+                              "type": "boolean"
                             },
                             {
                               "type": "null"

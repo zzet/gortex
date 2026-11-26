@@ -281,6 +281,17 @@ unknown/omitted/capped rows and malformed scope evidence grant no coverage. No
 idle freshness field is invented, and pending is never completion. This option
 alone establishes no 1/8/32-agent runtime or all-mode acceptance.
 
+With consumer probes, each gate-mode record keeps `consumer_own_ack`: whether
+its own decoded ACK named the step's mutation, its receipt and commit sequence,
+applied and committed. The report adds `consumer_ownership`, which binds every
+planned ordinal to its planned fixed editor (one editor, or a multi-editor plan
+that assigns ordinals in order and uses every editor), counts owned ACKs,
+retained raw evidence and censored records, and lists unowned ordinals. It is
+`complete` only when every planned ordinal has its own committed ACK and raw
+evidence and none is censored. A consumer census from 8 or 32 editors can claim
+an ordinal's answers only under that binding. The census changes no outcome,
+error or consumer verdict.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
