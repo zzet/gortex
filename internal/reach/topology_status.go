@@ -30,8 +30,8 @@ type TopologyStatus struct {
 	// Repositories lists the repository gates in use, or the gates asked for.
 	Repositories []RepositoryTopologyGate `json:"repositories,omitempty"`
 	// Writers names every mutation that holds or waits for topology gates,
-	// the longest held or waited first, so a wait can be traced to the
-	// mutation it waits behind.
+	// the longest held or waited first and, among equals, holders before
+	// waiters, so a wait can be traced to the mutation it waits behind.
 	Writers []TopologyWriter `json:"writers,omitempty"`
 }
 
@@ -193,6 +193,11 @@ func Topology(g graph.Store, repos ...string) TopologyStatus {
 		a, b := status.Writers[i], status.Writers[j]
 		if a.ForMS != b.ForMS {
 			return a.ForMS > b.ForMS
+		}
+		// Equal times, as a coarse clock gives a mutation and the one that
+		// queued right behind it, still list the holder first.
+		if a.State != b.State {
+			return a.State == "holding"
 		}
 		return a.Repo < b.Repo
 	})

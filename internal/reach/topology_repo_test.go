@@ -308,6 +308,34 @@ func writersOf(status TopologyStatus) []TopologyWriter {
 	return out
 }
 
+// Writers that took or began waiting for their gates at the same instant, as
+// two mutations do on a clock too coarse to tell them apart, list the holder
+// before the writer waiting behind it, whatever their repositories.
+func TestTopologyListsHoldersBeforeWaitersAmongEquals(t *testing.T) {
+	store := repoTopologyStore(t)
+	since := time.Now()
+	waiting := &topologyWriter{wholeGraph: true, since: since}
+	holding := &topologyWriter{repo: "a", holding: true, since: since}
+	state := topology
+	state.mu.Lock()
+	if state.writers == nil {
+		state.writers = make(map[*topologyWriter]struct{})
+	}
+	state.writers[waiting], state.writers[holding] = struct{}{}, struct{}{}
+	state.mu.Unlock()
+	t.Cleanup(func() {
+		state.mu.Lock()
+		delete(state.writers, waiting)
+		delete(state.writers, holding)
+		state.mu.Unlock()
+	})
+
+	want := []TopologyWriter{{Repo: "a", State: "holding"}, {WholeGraph: true, State: "waiting"}}
+	if got := writersOf(Topology(store)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("topology writers that started together = %+v, want the holder first: %+v", got, want)
+	}
+}
+
 // heldCouplingStore reads its coupling only once hold is closed, or at once
 // while hold is nil, and gives up when the read's budget ends.
 type heldCouplingStore struct {
