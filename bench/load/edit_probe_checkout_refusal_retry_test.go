@@ -29,31 +29,48 @@ const (
 // record by refusal code, instead of failing the edit on first sight. When the
 // time left cannot cover another attempt as slow as the refused one, the
 // record ends on the product's refusal as a product deadline named by the
-// refusal code. Other refusals, and a tool deadline that may have left work
-// running, are never re-sent.
+// refusal code. Other refusals, other wordings and wire codes, and a tool
+// deadline that may have left work running, are never re-sent; a re-send
+// after any other retryable refusal is counted under its wire error code,
+// and only the edit call's own re-sends are counted.
 func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 	const checkout = refusalRetryCheckout
 	notRouted, routeMoved := refusalRetryNotRouted, refusalRetryRouteMoved
 	readOnly := "view_read_only: a pinned commit view only supports reads"
 	abandoned := `tool "edit" exceeded its 55.071287166s deadline and was abandoned so the session stays responsive. The work may still complete in the background, so treat any side effect as unknown.`
+	// The same admission refusal for a checkout whose disk changed: the
+	// product asks for a fresh view, which a re-send does not wait for.
+	diskMoved := "view_read_only: checkout mutation was not admitted; no files were changed: indexer: checkout mutation view is stale: checkout disk changed; wait for a fresh view and retry. Native fallback status was not established for this checkout. Wait for a fresh view and retry the Gortex edit, or reconnect the MCP session."
+	otherBuilding := `view_building: checkout "` + checkout + `" has no published commit generation`
+	// Two content items; the reply joins them on a newline.
+	twoItems := routeMoved + "\nNative read/edit is allowed for this checkout until a fresh view is ready."
+	otherWire := &rpcError{Code: -32603, Message: notRouted}
+	// The daemon's JSON-RPC shape: the code is only in the data.
+	loading := &rpcError{Code: -32000, Message: "repository loading: fixture (starting, 0%)", Data: map[string]any{"error_code": "repo_loading", "retryable": true}}
 	const deadline = 2 * time.Second
 	for _, cell := range []struct {
 		name    string
-		refuse  []string // edit replies before the edit applies; the last repeats when apply is false
+		refuse  []any // edit replies before the edit applies, tool error text or JSON-RPC error; the last repeats when apply is false
 		apply   bool
 		calls   int // edit requests the product saw; 0 means at least two
 		retries map[string]int
 		outcome string
 		reason  string        // deadline_reason when the record ends on a typed refusal
 		hold    time.Duration // each edit reply is due this long after the previous one was due
+		status  *rpcError     // the first receipt status read is refused with this, then re-sent
 	}{
-		{"building_then_moved_then_applied", []string{notRouted, routeMoved}, true, 3, map[string]int{"view_building": 1, "view_read_only": 1}, "complete", "", 0},
-		{"instant_building_until_the_deadline", []string{notRouted}, false, 0, nil, "product_deadline", "view_building", 0},
+		{name: "building_then_moved_then_applied", refuse: []any{notRouted, routeMoved}, apply: true, calls: 3, retries: map[string]int{"view_building": 1, "view_read_only": 1}, outcome: "complete"},
+		{name: "instant_building_until_the_deadline", refuse: []any{notRouted}, outcome: "product_deadline", reason: "view_building"},
 		// The first re-send fits in the 55% left; after the second refusal
 		// about 10% is left, less than another 45% wait.
-		{"building_held_45_percent_of_the_deadline", []string{notRouted}, false, 2, map[string]int{"view_building": 1}, "product_deadline", "view_building", deadline * 45 / 100},
-		{"other_read_only_is_terminal", []string{readOnly}, false, 1, nil, "edit_error", "", 0},
-		{"abandoned_tool_deadline_is_terminal", []string{abandoned}, false, 1, nil, "edit_error", "", 0},
+		{name: "building_held_45_percent_of_the_deadline", refuse: []any{notRouted}, calls: 2, retries: map[string]int{"view_building": 1}, outcome: "product_deadline", reason: "view_building", hold: deadline * 45 / 100},
+		{name: "other_read_only_is_terminal", refuse: []any{readOnly}, calls: 1, outcome: "edit_error"},
+		{name: "abandoned_tool_deadline_is_terminal", refuse: []any{abandoned}, calls: 1, outcome: "edit_error"},
+		{name: "disk_moved_is_terminal", refuse: []any{diskMoved}, calls: 1, outcome: "edit_error"},
+		{name: "other_building_wording_is_terminal", refuse: []any{otherBuilding}, calls: 1, outcome: "edit_error"},
+		{name: "multi_content_refusal_is_terminal", refuse: []any{twoItems}, calls: 1, outcome: "edit_error"},
+		{name: "refusal_text_under_another_wire_code_is_terminal", refuse: []any{otherWire}, calls: 1, outcome: "edit_error"},
+		{name: "repo_loading_counted_by_its_error_code", refuse: []any{loading}, apply: true, calls: 2, retries: map[string]int{"repo_loading": 1}, outcome: "complete", status: loading},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -80,6 +97,7 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			calls := 0
 			mutation := ""
 			var first time.Time
+			statusRefused := false
 			p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
 				if frame.Kind == "search_symbols" {
 					return map[string]any{"view": map[string]any{"kind": "worktree", "exact": true, "repo_prefix": "fixture", "checkout_id": checkout}}, nil
@@ -99,8 +117,15 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 					mu.Unlock()
 					time.Sleep(time.Until(due))
 					if call < len(cell.refuse) || !cell.apply {
-						text := cell.refuse[min(call, len(cell.refuse)-1)]
-						return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": text}}}, nil
+						refusal := cell.refuse[min(call, len(cell.refuse)-1)]
+						if wire, ok := refusal.(*rpcError); ok {
+							return nil, wire
+						}
+						var content []any
+						for _, text := range strings.Split(refusal.(string), "\n") {
+							content = append(content, map[string]any{"type": "text", "text": text})
+						}
+						return map[string]any{"isError": true, "content": content}, nil
 					}
 					data, err := os.ReadFile(linked.File)
 					if err != nil {
@@ -125,6 +150,10 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 				if frame.Params["name"] == "change" && args["operation"] == "receipt" {
 					mu.Lock()
 					defer mu.Unlock()
+					if cell.status != nil && !statusRefused {
+						statusRefused = true
+						return nil, cell.status
+					}
 					return stubContent(map[string]any{"found": true, "receipt": "linked-receipt", "mutation_id": mutation, "checkout_id": checkout, "graph_status_terminal": true, "graph_status": "fresh"}), nil
 				}
 				return disk(frame)
@@ -207,7 +236,7 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			}
 			// The record and the phase both end on the product's refusal, not
 			// on a request still in flight at the deadline.
-			refusal := "RPC -32000: " + cell.refuse[len(cell.refuse)-1]
+			refusal := "RPC -32000: " + cell.refuse[len(cell.refuse)-1].(string)
 			if !slices.Equal(record.Errors, []string{refusal}) {
 				t.Fatalf("record errors %q, want only the typed refusal", record.Errors)
 			}
