@@ -20,8 +20,9 @@ func TestEditProbeMultiRootPhaseAdmitsOnlyItsPlannedOwnedCheckouts(t *testing.T)
 	for _, cell := range []struct {
 		name                   string
 		repos, linked, editors int
+		cochange               bool
 	}{
-		{"six_repositories", 6, 0, 6}, {"four_total_worktrees", 1, 3, 4},
+		{"six_repositories", 6, 0, 6, false}, {"six_repositories_after_cochange_setup", 6, 0, 6, true}, {"four_total_worktrees", 1, 3, 4, false},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			t.Setenv("LOAD_DAEMON_FIXTURE", "serve")
@@ -53,7 +54,7 @@ func TestEditProbeMultiRootPhaseAdmitsOnlyItsPlannedOwnedCheckouts(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			o := runOptions{Binary: binary, Profile: "agent", Host: "native", Editors: cell.editors, EditCount: 100, EditRepos: cell.repos, Worktrees: cell.linked, Seed: 42, Duration: time.Second, Deadline: time.Second, WarmTimeout: 10 * time.Second, StopTimeout: 5 * time.Second}
+			o := runOptions{Binary: binary, Profile: "agent", Host: "native", Editors: cell.editors, EditCount: 100, EditRepos: cell.repos, Worktrees: cell.linked, Seed: 42, Duration: time.Second, Deadline: time.Second, WarmTimeout: 10 * time.Second, StopTimeout: 5 * time.Second, EditWaitCoChange: cell.cochange}
 			stop := errors.New("layout admitted; intentional diagnostic stop before edits")
 			called := false
 			o.pairedDriver = func(_ context.Context, p *privateRun, _, _ []*socketClient, phase *Phase) error {
@@ -116,6 +117,7 @@ func TestEditProbeMultiRootPhaseAdmitsOnlyItsPlannedOwnedCheckouts(t *testing.T)
 			if phase.EditProbe == nil || len(phase.EditProbe.Records) != 100 {
 				t.Fatal("diagnostic stop lost offered denominator")
 			}
+			checkCoChangeSetup(t, phase, cell.cochange, corpora[0].File)
 			for _, record := range phase.EditProbe.Records {
 				if record.Outcome != "phase_censored" || record.Ack.Value != nil {
 					t.Fatal("pre-edit layout diagnostic fabricated work", record)
@@ -135,6 +137,45 @@ func TestEditProbeMultiRootPhaseAdmitsOnlyItsPlannedOwnedCheckouts(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+// The process-wide co-change mine is read once, on the first root and before
+// any analysis gate; without the option no setup call is made.
+func checkCoChangeSetup(t *testing.T, phase Phase, selected bool, file string) {
+	t.Helper()
+	setup, firstAnalysis := []int{}, -1
+	for i, attempt := range phase.Attempts {
+		switch attempt.Tool {
+		case "analyze.co_change":
+			setup = append(setup, i)
+		case "analyze.hotspots":
+			if firstAnalysis < 0 {
+				firstAnalysis = i
+			}
+		}
+	}
+	body, recorded := phase.Gate["route-0.cochange_setup"]
+	_, timed := phase.Metrics["cochange_setup_seconds"]
+	if !selected {
+		if len(setup) != 0 || recorded || timed {
+			t.Fatalf("unselected co-change setup ran: calls=%d receipt=%v timed=%v", len(setup), recorded, timed)
+		}
+		return
+	}
+	if len(setup) != 1 || firstAnalysis < 0 || setup[0] > firstAnalysis || phase.Attempts[setup[0]].Outcome != "success" {
+		t.Fatalf("co-change setup must settle once before the first analysis gate: setup=%v analysis=%d", setup, firstAnalysis)
+	}
+	var receipt struct {
+		TargetFile string `json:"target_file"`
+	}
+	if !timed || json.Unmarshal(body, &receipt) != nil || !strings.HasSuffix(receipt.TargetFile, "/"+file) || len(receipt.TargetFile) <= len(file)+1 {
+		t.Fatalf("co-change setup receipt or time missing: timed=%v body=%s", timed, body)
+	}
+	for name := range phase.Gate {
+		if strings.HasSuffix(name, ".cochange_setup") && name != "route-0.cochange_setup" {
+			t.Fatalf("co-change setup repeated for another root: %s", name)
+		}
 	}
 }
 

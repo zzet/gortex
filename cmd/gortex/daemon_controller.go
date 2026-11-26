@@ -1198,6 +1198,11 @@ func (c *realController) status(ctx context.Context, waitForAggregate bool) (dae
 		ToolPresetMode:     agg.toolPresetMode,
 		LearnedTools:       agg.learnedTools,
 	}
+	if c.multiIndexer != nil {
+		resp.RepositoryLanes = c.multiIndexer.RepositoryLanes()
+		topology := c.multiIndexer.ReachTopology()
+		resp.ReachTopology = &topology
+	}
 	if g != nil {
 		applyIndexFailureStatus(&resp, func(prefix string) (int, int, error) {
 			failures, err := indexer.LoadFileIndexFailuresWithError(g, prefix)

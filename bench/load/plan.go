@@ -65,6 +65,7 @@ type request struct {
 type Workload struct {
 	PairedMeasurementUnit string         `json:"paired_measurement_unit,omitempty"`
 	EditACKMode           string         `json:"edit_ack_mode,omitempty"`
+	EditWaitCoChange      bool           `json:"edit_wait_cochange,omitempty"`
 	EditGateSeed          string         `json:"edit_gate_seed,omitempty"`
 	PRSmokeDrain          *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
 	Scenario              string         `json:"scenario"`

@@ -281,6 +281,17 @@ unknown/omitted/capped rows and malformed scope evidence grant no coverage. No
 idle freshness field is invented, and pending is never completion. This option
 alone establishes no 1/8/32-agent runtime or all-mode acceptance.
 
+With consumer probes, each gate-mode record keeps `consumer_own_ack`: whether
+its own decoded ACK named the step's mutation, its receipt and commit sequence,
+applied and committed. The report adds `consumer_ownership`, which binds every
+planned ordinal to its planned fixed editor (one editor, or a multi-editor plan
+that assigns ordinals in order and uses every editor), counts owned ACKs,
+retained raw evidence and censored records, and lists unowned ordinals. It is
+`complete` only when every planned ordinal has its own committed ACK and raw
+evidence and none is censored. A consumer census from 8 or 32 editors can claim
+an ordinal's answers only under that binding. The census changes no outcome,
+error or consumer verdict.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
@@ -335,6 +346,21 @@ and 128 keys. All accepted events and metadata count toward the original
 16 MiB encoded cap. The legacy logical JSONL size is reported separately.
 The live oracles still consume the original response bytes.
 
+In every standalone edit-and-probe run, once an oracle's first-correct time is
+recorded and the receipt has reported the graph terminal, a background probe
+whose one successful attempt returns exactly the bytes of that oracle's
+previous correct answer is folded: instead of its `rpc`, `logical_call` and
+`probe` rows the spool keeps one `repeat_fold` row per run of identical
+answers, with the count, the answer's SHA-256 and size, its output mode and
+freshness claim, and the first and last wire IDs and times. A run ends at the
+first answer that differs, fails, is pending or is not correct, and that
+answer is kept in full. `evidence_folded_repeat_calls` counts folded calls per
+record. Immediate readbacks, the edit ACK, receipt status, CLI probes, relation
+consumer probes and paired runs are never folded, and the record, attempts,
+output-mode counts and stale checks still observe every call. The 16 MiB
+per-edit cap is unchanged; a long accounting wait after every oracle settled
+no longer fills it with repeats.
+
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
 six distinct pinned repositories. Source checkouts that share one Git common
 directory count as one repository. For linked views of one pinned primary,
@@ -358,6 +384,18 @@ editor arrival stream and global marker/mutation IDs; a route with no offered
 ordinal is not silently given an extra edit. Implementation and fixture tests
 do not establish a completed live or reference campaign.
 
+`--edit-wait-cochange` adds one setup step to the six-repository,
+six-editor cell, under either `--edit-ack` policy. The daemon's startup
+co-change mine runs once per process and commits graph writes after
+enrichment. After the first root's source preflight and before any analysis
+gate, the run reads public `analyze` `co_change` for that root's pinned file.
+The facade never starts a new mine. While the reply reports
+`mining_in_progress`, the run waits five seconds and reads again inside the
+warm budget. A wrong target, an invalid collection or mining status, a
+failed mine or an expired budget fails setup before any offer. The last
+bounded reply is kept as `<label>.cochange_setup` and the wait as the
+`cochange_setup_seconds` metric. The choice is part of the workload identity.
+
 The six-repository, six-editor report adds `physical_topology_gate_wait_ms`
 and `physical_resolve_mutex_wait_ms` summary measures for accepted physical
 patches bound to the offered receipts. A patch serving multiple receipts
@@ -365,6 +403,21 @@ contributes once. Phase metrics count edits without a physical binding and
 the summary censors missing or conflicting waits for bound patches.
 Resolve-mutex wait is part of the resolve lap and is never added to it.
 The separate `foreign-impact` command records read-side impact waits.
+
+A `product_deadline` record keeps its outcome and adds `deadline_reason`, what
+the receipt loop still awaited when the edit's own context expired, from its
+latest evaluated status: `immediate_readbacks_outstanding`,
+`receipt_status_unobserved`, `graph_not_terminal`, `oracles_not_correct`,
+`post_ack_coverage_outstanding`, `qualified_tiers_not_fresh`, or
+`accounting_non_terminal` when the graph was terminal and fresh, every oracle
+was first-correct and every assigned post-ACK witness was present, so only the
+required accounting was outstanding. Relocation and batch cells have no
+reason. `t_graph_terminal_ms` is the client time from edit send to the first
+own status reply that reported the graph terminal. `busy_refusals` counts
+dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
+`readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
+`busy_refusals` totals. None of these changes an outcome, an error or a client
+time.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -439,6 +492,23 @@ unavailable. `t_derived_ms` is daemon-clock time from receipt origin to
 `patch_derived_finished` in the record's own terminal publication timeline,
 because no probe observes the derived step; it is not additive with client
 times and stays unavailable for coalesced receipts and relocations.
+
+Each immediate readback also carries a typed `disposition` that explains its
+result without changing it: `answer` (the reply's freshness state, reason and
+completeness, and its node count, when the reply has them), `typed_refusal`
+(the structured `error_code`, `retriable`, `retry_scope` and `reason`),
+`untyped_tool_error`, `rpc_error` (numeric code, with the dispatcher's outcome
+and retryable flag when present), `deadline`, `transport_error`,
+`undecodable_answer` or `expected_absence`. A typed read-only
+`projection_superseded` summary refusal adds the daemon's bounded projection
+predicate, which the daemon emits only under its refusal-evidence opt-in;
+otherwise the predicate is `unavailable`. `concurrent_same_file_commits` lists
+the other edits of the same file whose edit RPC overlapped the readback's wire
+window, with their ACK `commit_seq`, receipt and whether that ACK returned
+inside the window; `none_observed` and `unavailable` stay distinct. Neither
+field changes `correct`, the record's errors or its outcome: a truthful
+pending reply without the edited definition and wrong content both remain
+incorrect, but they are no longer indistinguishable.
 
 The report `summary` covers the complete offered denominator: outcome counts
 and, for every per-record time, each readback, each `phases_ms` lap and each
@@ -670,6 +740,15 @@ peaks are sampled at 500 ms. The post-workload memory sample is explicitly
 labeled after a 2-second settle period, not proof that background work is idle.
 Whole-client CPU is a conservative upper bound on refusal-handling CPU, not
 overlapping per-request CPU attribution.
+
+Linux also records the daemon's major page faults over the phase
+(`daemon_major_faults`, from procfs `majflt`) and pressure stall information
+for cpu, memory and io, both `some` and `full`: host-wide from `/proc/pressure`
+(`host_psi_*`) and for the run's cgroup v2 group (`cgroup_psi_*`). Each has
+`_stall_us`, the delta of the cumulative stall total over the phase, and
+`_peak_avg10_pct`, the highest ten-second average seen by the 500 ms samples.
+macOS, a kernel without pressure files, a missing `full` line and a run
+without a cgroup keep these measures unavailable with a reason, never zero.
 
 Status and `gortex://stats` receipts preserve view-build counters, WAL pending
 frames, checkpoint estimates, reclaim counters, graph size and runtime heap.

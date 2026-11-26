@@ -269,6 +269,9 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	}
 	if before.info == nil {
 		if expected != nil && expected.tombstone && liveProjectionForAcknowledgement(expected) {
+			if sameVersion == nil && s.retireCaughtUpProjection(requestCtx, root, idx, expected) {
+				return nil, nil // the graph has published this deletion
+			}
 			return expected, nil
 		}
 		if !tracked && expected == nil {
@@ -351,6 +354,19 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 				return nil, err
 			}
 			if !expected.suspect.Load() {
+				if sameVersion == nil && s.retireCaughtUpProjection(requestCtx, root, idx, expected) {
+					// The graph holds exactly these bytes now: answer as for a
+					// file without a projection whose bytes match the index.
+					if summary != nil && tracked {
+						if current := pendingFileProjections.snap.Load(); current.entries[key] == nil && buildCtx.Err() == nil {
+							*summary = canonicalSummarySource{
+								indexer: idx, root: root, abs: abs, readPath: readPath, key: key,
+								graphPath: graphPath, stamp: after, bytes: raw, registry: current,
+							}
+						}
+					}
+					return nil, nil
+				}
 				return expected, nil
 			}
 			// Reuse the immutable parse only after bounded current-byte checks.
@@ -446,6 +462,23 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	finalStamp, statErr := statDiskStamp(abs)
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
+	}
+	// A linked checkout's selected view can already hold these verified bytes.
+	// An owner published for them would only be retired by this request, and
+	// a concurrent reader that selected it would then refuse as if the
+	// unchanged file had moved. Read the selected view instead. A proof that
+	// spends the read's budget first publishes nothing either: this request
+	// could neither retire nor serve that owner. Bytes the selected view does
+	// not hold keep the publication path, and an owner that appeared since the
+	// observation still refuses there.
+	if expected == nil {
+		held, err := s.selectedViewHoldsProjection(buildCtx, requestCtx, entry)
+		if err != nil {
+			return nil, err
+		}
+		if held {
+			return nil, nil
+		}
 	}
 	if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
 		return nil, err

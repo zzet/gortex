@@ -652,6 +652,30 @@ func (l *mutationCommitLedger) recentForPath(relPath string) (*mutationCommitRec
 	return nil, false
 }
 
+// publishedProjection reports whether entry is exactly the projection that a
+// recorded physical tool commit published at its own disk-commit sequence.
+func (l *mutationCommitLedger) publishedProjection(entry *projectionEntry) bool {
+	if entry == nil || entry.commitSeq == 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.ordered) - 1; i >= 0; i-- {
+		record := l.ordered[i]
+		if !record.isPhysicalCommit() {
+			continue
+		}
+		record.mu.RLock()
+		match := record.commitSeq == entry.commitSeq && record.disk == mutationDiskCommitted &&
+			record.fileProjection.Value() == entry
+		record.mu.RUnlock()
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *mutationCommitLedger) recent(limit int) []*mutationCommitRecord {
 	l.mu.Lock()
 	defer l.mu.Unlock()

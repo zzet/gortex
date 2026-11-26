@@ -15,9 +15,10 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
-// repoTopologyFixture tracks two Go repositories in one SQLite store with no
-// edge between them: "lib" (module example.org/library) and "app".
-func repoTopologyFixture(t *testing.T) (*MultiIndexer, graph.Store, map[string]string) {
+// repoTopologyFixture tracks Go repositories in one SQLite store with no edge
+// between any two: "lib" (module example.org/library), "app", and one module
+// per extra name, each with a lib.go like lib's.
+func repoTopologyFixture(t *testing.T, extra ...string) (*MultiIndexer, graph.Store, map[string]string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	lib, app := t.TempDir(), t.TempDir()
@@ -25,20 +26,29 @@ func repoTopologyFixture(t *testing.T) (*MultiIndexer, graph.Store, map[string]s
 	writeFile(t, filepath.Join(lib, "lib.go"), "package library\nfunc Hello() {}\nfunc Local() { Hello() }\n")
 	writeFile(t, filepath.Join(app, "go.mod"), "module example.org/app\n")
 	writeFile(t, filepath.Join(app, "main.go"), "package app\nfunc Run() {}\nfunc Start() { Run() }\n")
+	roots := map[string]string{"lib": lib, "app": app}
+	entries := []config.RepoEntry{
+		{Path: lib, Name: "lib", Workspace: "shared"},
+		{Path: app, Name: "app", Workspace: "shared"},
+	}
+	for _, name := range extra {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "go.mod"), "module example.org/"+name+"\n")
+		writeFile(t, filepath.Join(root, "lib.go"), "package "+name+"\nfunc Hello() {}\nfunc Local() { Hello() }\n")
+		roots[name] = root
+		entries = append(entries, config.RepoEntry{Path: root, Name: name, Workspace: "shared"})
+	}
 
 	s, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	mi := NewMultiIndexer(s, newTestRegistry(), search.NewNull(), newTestConfigManager(t), zap.NewNop())
 	t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
-	for _, entry := range []config.RepoEntry{
-		{Path: lib, Name: "lib", Workspace: "shared"},
-		{Path: app, Name: "app", Workspace: "shared"},
-	} {
+	for _, entry := range entries {
 		_, err := mi.TrackRepoCtx(t.Context(), entry)
 		require.NoError(t, err)
 	}
-	return mi, s, map[string]string{"lib": lib, "app": app}
+	return mi, s, roots
 }
 
 func reachIDs(entries []reach.Entry) []string {
