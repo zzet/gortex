@@ -141,7 +141,7 @@ func censusEditConsumers(r Report) editConsumerCensus {
 	}
 	base.PlanSHA256 = probe.PlanHash
 	if !slices.ContainsFunc(probe.Records, func(record editProbeRecord) bool { return record.ConsumerOwnACK != nil }) {
-		return noResult("no edit carries its own-ACK binding (consumer_own_ack); a report written before that binding cannot be scored")
+		return noResult("no edit carries its own-ACK binding (consumer_own_ack): the run writes it only in gate-mode or own-ACK-readback runs, once an edit's ACK decodes, and a report written before that binding has none")
 	}
 	// Answers count only for an ordinal whose acknowledgement is its own.
 	ownership := summarizeEditConsumerOwnership(probe.Plan, r.Workload.EditAgents, probe.Records)
