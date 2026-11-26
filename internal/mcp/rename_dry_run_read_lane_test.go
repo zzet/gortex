@@ -76,7 +76,17 @@ func TestDryRunRenameIsAdmittedAsAReadAndWritesNothing(t *testing.T) {
 			if test.writes {
 				wantClass = daemon.MCPDispatchMutating
 			}
+			// The registered tool gets the spelling plus the output format, so
+			// the lane is checked on that exact map as well as on the spelling.
+			args := map[string]any{"format": "json"}
+			if facade {
+				args = map[string]any{"output": map[string]any{"format": "json"}}
+			}
+			for key, value := range test.args {
+				args[key] = value
+			}
 			require.Equal(t, wantClass, s.DispatchClass(test.tool, test.args), "dispatch lane")
+			require.Equal(t, wantClass, s.DispatchClass(test.tool, args), "dispatch lane of the arguments the tool runs with")
 
 			stat := func(name string) os.FileInfo {
 				info, err := os.Stat(filepath.Join(root, name))
@@ -98,13 +108,6 @@ func TestDryRunRenameIsAdmittedAsAReadAndWritesNothing(t *testing.T) {
 			walBefore := store.WALWriteMark()
 			require.True(t, walBefore.Valid, "the store must expose its WAL position")
 
-			args := map[string]any{"format": "json"}
-			if facade {
-				args = map[string]any{"output": map[string]any{"format": "json"}}
-			}
-			for key, value := range test.args {
-				args[key] = value
-			}
 			result := snapshotRegisteredCall(t, s, ctx, 2, test.tool, args)
 			require.False(t, result.IsError, resultText(result))
 			body := extractTextResult(t, result)
