@@ -12,7 +12,7 @@ func TestPolicyUbuntuCLIHasIndependentPartition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := MatrixRow{"ubuntu-24.04", "rest-cli"}
+	owner := MatrixRow{"ubuntu-24.04", "rest-cli-bench"}
 	full := policy.FullMatrix().Include
 	var cliRows []MatrixRow
 	for _, row := range full {
@@ -36,7 +36,7 @@ func TestPolicyUbuntuCLIHasIndependentPartition(t *testing.T) {
 			t.Fatalf("invalid CLI ownership passed: %v", bad)
 		}
 	}
-	for _, spec := range []string{"rest-cli+rest", "rest+rest-cli", "rest-cli:1/1"} {
+	for _, spec := range []string{"rest-cli-bench+rest", "rest+rest-cli-bench", "rest-cli-bench:1/1", "rest-cli"} {
 		if _, err := ParsePartition(spec, policy); err == nil {
 			t.Fatalf("independent CLI partition joined or sharded: %s", spec)
 		}
@@ -49,16 +49,20 @@ func TestPolicyUbuntuCLISelectionDoesNotAddOtherPlatformJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	module := "example.org/fixture"
-	cli, bench := module+"/cmd/gortex", module+"/bench/load"
+	cli, bench, other := module+"/cmd/gortex", module+"/bench/load", module+"/internal/hooks"
 	for _, row := range []struct {
 		name         string
 		packages     []string
 		ubuntu       []string
 		otherTargets []string
 	}{
-		{"CLI only", []string{cli}, []string{"rest-cli"}, []string{"rest"}},
-		{"non-CLI only", []string{bench}, []string{"rest"}, []string{"rest"}},
-		{"mixed", []string{cli, bench}, []string{"rest", "rest-cli"}, []string{"rest"}},
+		{"CLI only", []string{cli}, []string{"rest-cli-bench"}, []string{"rest"}},
+		{"bench only", []string{bench}, []string{"rest-cli-bench"}, []string{"rest"}},
+		{"CLI and bench", []string{cli, bench}, []string{"rest-cli-bench"}, []string{"rest"}},
+		{"ordinary only", []string{other}, []string{"rest"}, []string{"rest"}},
+		{"mixed", []string{cli, bench, other}, []string{"rest", "rest-cli-bench"}, []string{"rest"}},
+		// A package merely named like the harness is not under bench/.
+		{"bench lookalike", []string{module + "/internal/bench"}, []string{"rest"}, []string{"rest"}},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			selected := map[string][]string{}
@@ -91,7 +95,7 @@ func TestRunnerUbuntuCLISplitRejectsIncompatibleFullSelection(t *testing.T) {
 		t.Fatalf("expected a sealed full selection: %v %v", manifest.Mode, err)
 	}
 	selection := writeManifest(t, f, manifest)
-	for _, partition := range []string{"rest", "rest-cli"} {
+	for _, partition := range []string{"rest", "rest-cli-bench"} {
 		report, err := RunPartition(t.Context(), RunOptions{
 			Root: f.root, Partition: partition, SelectionFile: selection, Target: "ubuntu-24.04",
 			Windows: true, Workers: 1, Env: fixtureEnv(), Output: io.Discard,

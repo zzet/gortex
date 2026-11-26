@@ -73,8 +73,8 @@ jobs:
     if: needs.plan.outputs.has_tests == 'true'
     runs-on: ${{ matrix.os }}
     # Whole selected packages retain the existing census, batching, failure
-    # evidence and platform behavior. Full mode includes independent Ubuntu CLI
-    # and macOS watcher race rows.
+    # evidence and platform behavior. Full mode includes independent Ubuntu
+    # CLI-and-bench and macOS watcher race rows.
     timeout-minutes: 45
     strategy:
       fail-fast: false
