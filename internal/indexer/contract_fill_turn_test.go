@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,6 +28,13 @@ func TestContractFillTurnCoalescesOnlyProductiveCompetition(t *testing.T) {
 		c := newTurn()
 		require.ErrorAs(t, c.continueFill(7, true), new(*ContractFillContinued))
 	})
+	t.Run("revalidated_then_partial", func(t *testing.T) {
+		c := newTurn()
+		require.NoError(t, c.continueRevalidated(3, true), "a few suspects revalidated before any extraction are not partial progress")
+		require.False(t, c.req.delta.continued)
+		require.ErrorAs(t, c.continueFill(7, true), new(*ContractFillContinued), "a partial extraction round still hands off")
+		require.Equal(t, 10, c.fillTurnProven)
+	})
 	t.Run("no_progress", func(t *testing.T) {
 		c := newTurn()
 		require.NoError(t, c.continueFill(0, true))
@@ -49,6 +57,46 @@ func TestContractFillTurnCoalescesOnlyProductiveCompetition(t *testing.T) {
 		require.False(t, c.req.delta.continued)
 		require.Zero(t, c.fillTurnProven)
 	})
+}
+
+// TestContractFillTurnExtractsAfterRevalidatedSuspects: a contended fill turn
+// that starts with suspects revalidates them and goes on to extract before it
+// hands the slot over, rather than ending with nothing extracted; the fill
+// still converges to the cold result.
+func TestContractFillTurnExtractsAfterRevalidatedSuspects(t *testing.T) {
+	files := map[string]string{"routes.go": jobRoutes, "consts.go": jobConsts}
+	// The helpers sort after consts.go and routes.go, so the first turn
+	// proves both.
+	for i := range 80 {
+		files[fmt.Sprintf("zz/helper%02d.go", i)] = fmt.Sprintf("package zz\nfunc Helper%d() int { return %d }\n", i, i)
+	}
+	f := newContractJobFixture(t, files)
+	var cache *contractDeltaCache
+	turn := func() (ContractFollowupReport, error) {
+		f.layers++
+		return runFixtureContractJob(t, f.options, contractFixtureJob{cache: &cache, otherActorWaiting: func() bool { return true }, layer: f.layers, epoch: f.epoch.Load, wait: f.waitPublished})
+	}
+	report, err := turn()
+	require.ErrorAs(t, err, new(*ContractFillContinued))
+	require.Equal(t, contractRoundFiles, report.Files)
+	// consts.go moves without changing the route routes.go reads: the units
+	// the first turn proved become suspects their revalidation proves again.
+	files["consts.go"] = "package fixture\n// moved\nconst RoutePath = \"/before\"\n"
+	f.save("consts.go", files["consts.go"])
+	report, err = turn()
+	require.ErrorAs(t, err, new(*ContractFillContinued))
+	require.Positive(t, report.Revalidated)
+	require.GreaterOrEqual(t, report.Files, 16, "the turn extracts after its suspects (revalidated %d)", report.Revalidated)
+	for range 4 {
+		if err == nil {
+			break
+		}
+		require.ErrorAs(t, err, new(*ContractFillContinued))
+		report, err = turn()
+	}
+	require.NoError(t, err)
+	require.True(t, report.Published)
+	require.Equal(t, contractMeta(coldContracts(t, files)), contractMeta(f.contracts()))
 }
 
 func TestContractFillDemandCheckpointKeepsOverlapAndStrictDecision(t *testing.T) {

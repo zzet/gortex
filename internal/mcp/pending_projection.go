@@ -608,6 +608,33 @@ func (p *pendingProjections) retireCaughtUp(store projectionStore, entry *projec
 	return p.snap.Load().entries[entry.key] == nil
 }
 
+// holdsUnpublished applies retireSelected's evidence to one entry that was
+// never published: the store holds its content hash before and after its
+// nodes are read, and a checked store still validates. The entry stands in
+// for an owner only while its key has none, so a newer owner answers false. A
+// divergent payload is counted and still reported held, since retirement
+// drops it too.
+func (p *pendingProjections) holdsUnpublished(store projectionStore, e *projectionEntry) bool {
+	candidates := storeHolds(store, e.repoPrefix, []*projectionEntry{e})
+	if len(candidates) != 1 {
+		return false
+	}
+	diverged := len(indexer.DiffProjectedNodes(e.layer.FileNodes(e.graphPath), store.GetFileNodes(e.graphPath))) > 0
+	if len(storeHolds(store, e.repoPrefix, candidates)) != 1 {
+		return false
+	}
+	if checked, ok := store.(interface{ validateProjectionRetirement() error }); ok && checked.validateProjectionRetirement() != nil {
+		return false
+	}
+	if p.snap.Load().entries[e.key] != nil {
+		return false
+	}
+	if diverged {
+		p.divergence.Add(1)
+	}
+	return true
+}
+
 func (p *pendingProjections) dropCheckedRetired(entries []*projectionEntry, revisions map[*projectionEntry]uint64) int {
 	if len(entries) == 0 {
 		return 0

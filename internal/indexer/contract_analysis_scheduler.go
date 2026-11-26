@@ -151,7 +151,9 @@ type ContractScheduleRequest struct {
 	PriorityTarget bool
 	// Strict marks a request whose caller waits on this request's promise.
 	// For the rest of the caller's budget, at most the interest TTL, the
-	// actor's jobs start and run outside its linked policy.
+	// actor's jobs start and run outside its linked policy, start ahead of
+	// queued actors no strict request waits on, and its fill keeps the job
+	// slot from them.
 	Strict bool
 }
 
@@ -344,7 +346,8 @@ type contractActor struct {
 	held            bool
 	linkedStartedAt time.Time
 	// strictUntil is when the last strict request's budget ends: until then
-	// no linked policy holds or stops the actor's jobs.
+	// no linked policy holds or stops the actor's jobs, and only another
+	// actor a strict request waits on stops its fill at a checkpoint.
 	strictUntil time.Time
 	// A lost/rejected partial checkpoint must not restart the same prefix forever.
 	fillNeedsCheckpoint bool
@@ -1028,7 +1031,16 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 		}
 	}
 	// Pick the first queued actor its linked policy lets start. A held one
-	// keeps its place, so a primary actor behind it is not held up.
+	// keeps its place, so a primary actor behind it is not held up. The
+	// first queued actor a strict request waits on, which no linked policy
+	// holds, goes ahead of the ones nobody waits on.
+	var strict *contractActor
+	for _, candidate := range ring.queue {
+		if candidate.state == contractActorQueued && now.Before(candidate.strictUntil) {
+			strict = candidate
+			break
+		}
+	}
 	var next *contractActor
 	var unpinned []*ContractCaptureSource
 	for i := 0; i < len(ring.queue) && next == nil; {
@@ -1042,6 +1054,10 @@ func (c *ContractAnalysisCoordinator) dispatchStep(ring *contractRing) (open boo
 			if recheck > 0 && (wait < 0 || recheck < wait) {
 				wait = recheck
 			}
+			i++
+			continue
+		}
+		if strict != nil && candidate != strict {
 			i++
 			continue
 		}
@@ -1763,9 +1779,16 @@ func (c *ContractAnalysisCoordinator) otherActorWaiting(current *contractActor) 
 	return c.otherActorWaitingLocked(current, c.now())
 }
 
+// otherActorWaitingLocked reports whether another actor waits for the job
+// slot, so a running fill stops at its next checkpoint and hands it over.
+// While a strict request's budget for current lasts, only an actor a strict
+// request also waits on counts: the fill a caller waits on does not take
+// turns with one nobody waits on, but still does with another strict actor,
+// primary or linked.
 func (c *ContractAnalysisCoordinator) otherActorWaitingLocked(current *contractActor, now time.Time) bool {
+	strict := now.Before(current.strictUntil)
 	for _, actor := range c.actors {
-		if actor == current {
+		if actor == current || strict && !now.Before(actor.strictUntil) {
 			continue
 		}
 		// A queued actor its linked policy holds cannot take the slot, so
