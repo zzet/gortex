@@ -704,6 +704,8 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				if terminal && tx["graph_status"] != "fresh" || editProbeFinished(terminal, all, r.requireAccounting, accounting) {
 					return
 				}
+				// A failed member status read is evaluated as a missing
+				// member, so it changes the accounting and restarts the count.
 				if settle.unsettled(terminal && all, accounting, batch) {
 					s.mu.Lock()
 					s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)

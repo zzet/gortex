@@ -8,10 +8,12 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"math"
 	"math/big"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -607,8 +609,9 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 			fail("missing B phase " + name)
 		}
 	}
-	for name, value := range pPhases {
-		if value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
+	// In name order, so identical status replies give identical reasons.
+	for _, name := range slices.Sorted(maps.Keys(pPhases)) {
+		if value := pPhases[name]; value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
 			fail("B/P phase mismatch: " + name)
 		}
 	}
@@ -697,7 +700,9 @@ func editProbeAccountingComplete(accounting editProbeAccounting) bool {
 // cycles to become terminal. A native-duplicate physical attempt whose
 // earlier publisher is never reported stays unavailable indefinitely, and
 // repeating identical status reads would only fill the per-edit raw evidence
-// cap.
+// cap. The bound applies to any accounting that is not yet terminal, so late
+// P or B evidence and unknown diagnostics that arrive after it leave an
+// accounting gap.
 const editProbeAccountingSettlePolls = 8
 
 var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
@@ -714,7 +719,11 @@ type editProbeAccountingSettle struct {
 // exit condition other than terminal accounting held on this cycle;
 // accounting is all the accounting the cycle observed. A cycle that is not
 // ready, or whose accounting differs from the last counted one, restarts the
-// count.
+// count. Callers skip a cycle whose transaction, receipt or acknowledgement
+// status read fails, so it neither counts nor resets: the bound counts
+// successful observations, possibly with failed reads between them. (The
+// multi-file batch collector evaluates a failed member read as a missing
+// member instead.)
 func (w *editProbeAccountingSettle) unsettled(ready bool, accounting ...any) bool {
 	switch {
 	case !ready:
