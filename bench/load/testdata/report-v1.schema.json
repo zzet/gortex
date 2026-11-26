@@ -4442,6 +4442,40 @@
                       }
                     ]
                   },
+                  "session_redials": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "failed": {
+                          "type": "integer"
+                        },
+                        "index": {
+                          "type": "integer"
+                        },
+                        "limit_reached": {
+                          "type": "boolean"
+                        },
+                        "redials": {
+                          "type": "integer"
+                        },
+                        "role": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "role",
+                        "index",
+                        "redials",
+                        "failed",
+                        "limit_reached"
+                      ],
+                      "type": "object"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  },
                   "shared_owners": {
                     "anyOf": [
                       {
