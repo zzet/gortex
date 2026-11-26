@@ -70,13 +70,15 @@ func (p *pendingProjections) publishCohort(members []projectionCohortMember) err
 		return refuse(projectionOverFiles)
 	}
 	next := &projectionSnapshot{entries: maps.Clone(current.entries), bytes: bytes}
+	keys := make([]string, 0, len(members))
 	for _, member := range members {
 		if member.Expected != nil && member.Expected.suspect.Load() {
 			member.Entry.suspect.Store(true)
 		}
 		next.entries[member.Entry.key] = member.Entry
+		keys = append(keys, member.Entry.key)
 	}
-	p.snap.Store(next)
+	p.storeLocked(next, keys...)
 	p.published.Add(int64(len(members)))
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,11 @@ const (
 	// BenchmarkProjectionRetainedHeap, for the byte cap.
 	projectionNodeBytes = 1440
 	projectionEdgeBytes = 540
+
+	// projectionChangeLog is how many recent snapshot swaps the registry
+	// remembers by file. A read holds a snapshot for one request budget;
+	// older than this, a per-file question about it is answered "changed".
+	projectionChangeLog = 256
 )
 
 // pendingFileProjections holds the projection of every file a tool wrote
@@ -51,11 +57,22 @@ type pendingProjections struct {
 	retired        atomic.Int64
 	externalWrites atomic.Int64
 	divergence     atomic.Int64
+
+	// changes names the files each recent swap published or dropped, at
+	// the swap's seq modulo the log size. Guarded by mu.
+	changes [projectionChangeLog]projectionChange
 }
 
 type projectionSnapshot struct {
 	entries map[string]*projectionEntry
 	bytes   int64
+	seq     uint64 // swaps of this registry before this snapshot
+}
+
+// projectionChange is one swap's entry in the registry's change log.
+type projectionChange struct {
+	seq  uint64
+	keys []string
 }
 
 // projectionEntry is one file's projection. Payload fields are immutable;
@@ -298,9 +315,45 @@ func (p *pendingProjections) publishLocked(e *projectionEntry) error {
 	if previous := p.snap.Load().entries[e.key]; previous != nil && previous.suspect.Load() {
 		e.suspect.Store(true)
 	}
-	p.snap.Store(next)
+	p.storeLocked(next, e.key)
 	p.published.Add(1)
 	return nil
+}
+
+// storeLocked swaps in next, which published or dropped keys, and logs them.
+// Requires p.mu.
+func (p *pendingProjections) storeLocked(next *projectionSnapshot, keys ...string) {
+	next.seq = p.snap.Load().seq + 1
+	p.changes[next.seq%projectionChangeLog] = projectionChange{seq: next.seq, keys: keys}
+	p.snap.Store(next)
+}
+
+// ownerAbsentSince reports whether key had no live entry at any moment from
+// base until now: neither base nor the current snapshot holds one, and no
+// swap in between published or dropped one. Swaps for other files do not
+// count; the registry is process-wide, so they are every other editor's
+// writes in every repository. A log that no longer reaches back to base
+// answers false.
+func (p *pendingProjections) ownerAbsentSince(base *projectionSnapshot, key string) bool {
+	if base == nil || base.entries[key] != nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.snap.Load()
+	if current == base {
+		return true
+	}
+	if current.entries[key] != nil || current.seq <= base.seq || current.seq-base.seq > projectionChangeLog {
+		return false
+	}
+	for seq := base.seq + 1; seq <= current.seq; seq++ {
+		change := p.changes[seq%projectionChangeLog]
+		if change.seq != seq || slices.Contains(change.keys, key) {
+			return false
+		}
+	}
+	return true
 }
 
 // projectionReplacementLocked applies the common immutable-map/cap checks.
@@ -388,7 +441,7 @@ func (p *pendingProjections) publishReadExpected(e *projectionEntry, observed pr
 	// The fresh bounded bytes observed all events captured before the read;
 	// a later event or changed owner refused above. Keep old pointers suspect.
 	e.readVersionChecked = true
-	p.snap.Store(next)
+	p.storeLocked(next, e.key)
 	p.published.Add(1)
 	return nil
 }
@@ -460,7 +513,7 @@ func (p *pendingProjections) dropAll(entries []*projectionEntry) int {
 func (p *pendingProjections) dropAllLocked(entries []*projectionEntry) int {
 	cur := p.snap.Load()
 	next := &projectionSnapshot{bytes: cur.bytes}
-	dropped := 0
+	var keys []string
 	for _, e := range entries {
 		if cur.entries[e.key] != e {
 			continue
@@ -470,12 +523,12 @@ func (p *pendingProjections) dropAllLocked(entries []*projectionEntry) int {
 		}
 		delete(next.entries, e.key)
 		next.bytes -= e.size
-		dropped++
+		keys = append(keys, e.key)
 	}
-	if dropped > 0 {
-		p.snap.Store(next)
+	if len(keys) > 0 {
+		p.storeLocked(next, keys...)
 	}
-	return dropped
+	return len(keys)
 }
 
 // Invalidation and expected-pointer publication share one linearization
