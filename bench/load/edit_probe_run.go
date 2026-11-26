@@ -775,7 +775,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	}
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
-		budget = min(budget, 20*time.Second)
+		budget = min(budget, editProbeReadBudget)
 	}
 	if end, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(end))
