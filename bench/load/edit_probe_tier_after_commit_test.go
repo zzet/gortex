@@ -62,6 +62,11 @@ func TestEditProbeRecordCopiesTierAfterCommitFromFinalReceipt(t *testing.T) {
 		{name: "unpublished_at_deadline", first: pending, final: pending, outcome: "product_deadline", want: pending},
 		{name: "receipt_without_figure", terminal: true, outcome: "complete"},
 		{name: "malformed", first: pending, final: `{"file_graph":"soon","relations":2,"derived":3}`, terminal: true, outcome: "diagnostic_failure", err: "tier_after_commit_ms"},
+		// Only the last status counts: an earlier malformed figure that a
+		// later valid one replaces is not an error, and a later status
+		// without the key clears an earlier figure.
+		{name: "malformed_then_valid", first: `{"file_graph":"soon","relations":2,"derived":3}`, final: published, terminal: true, outcome: "complete", want: published},
+		{name: "later_status_without_figure", first: pending, terminal: true, outcome: "complete"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
