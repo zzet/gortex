@@ -428,7 +428,7 @@ func (c *socketClient) dialStream(ctx context.Context, old net.Conn, oldDone cha
 // initializeStream runs the MCP initialize exchange that openMCP runs, on a
 // stream that no call uses yet.
 func (c *socketClient) initializeStream(ctx context.Context, conn net.Conn, reader *bufio.Reader, id int64) error {
-	deadline := time.Now().Add(defaultWriteTimeout)
+	deadline := time.Now().Add(c.writeBudget())
 	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
 		deadline = parent
 	}
@@ -479,6 +479,15 @@ func (c *socketClient) send(ctx context.Context, value any, advisory bool) error
 	return c.sendOn(ctx, conn, value, advisory, nil)
 }
 
+// writeBudget bounds one frame write, and the initialize exchange of a
+// re-dialed stream: the client's own write timeout, or defaultWriteTimeout.
+func (c *socketClient) writeBudget() time.Duration {
+	if c.writeTimeout > 0 {
+		return c.writeTimeout
+	}
+	return defaultWriteTimeout
+}
+
 // sendOn writes one frame on conn, the stream its caller registered on. It
 // never writes on a stream that has failed or been replaced.
 func (c *socketClient) sendOn(ctx context.Context, conn net.Conn, value any, advisory bool, observation *wireCallIdentity) error {
@@ -512,11 +521,7 @@ func (c *socketClient) sendOn(ctx context.Context, conn net.Conn, value any, adv
 	if closed != nil {
 		return closed
 	}
-	timeout := c.writeTimeout
-	if timeout <= 0 {
-		timeout = defaultWriteTimeout
-	}
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(c.writeBudget())
 	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
 		deadline = parent
 	}
