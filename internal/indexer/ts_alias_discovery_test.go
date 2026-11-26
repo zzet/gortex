@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,11 +177,36 @@ func TestTSConfigPathAlias_SaveRechecksInputsByStat(t *testing.T) {
 	caller := filepath.Join(abs, "pages", "index.ts")
 	require.False(t, s.needsDiscovery(abs, []string{caller}))
 
-	later := time.Now().Add(time.Hour)
-	require.NoError(t, os.Chtimes(configPath, later, later))
+	earlier := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(configPath, earlier, earlier))
 	require.False(t, s.needsDiscovery(abs, []string{caller}), "a touch keeps the policy")
-	require.Equal(t, later.UnixNano(), s.stats[configPath].mtime, "the new stat is remembered")
+	require.Equal(t, earlier.UnixNano(), s.stats[configPath].mtime, "the new stat is remembered")
 
 	require.NoError(t, os.WriteFile(configPath, []byte(`{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`), 0o644))
+	require.True(t, s.needsDiscovery(abs, []string{caller}))
+}
+
+// A config rewritten after the load read it but before its stat was taken
+// must not be certified by that stat.
+func TestTSConfigPathAlias_RecordStatsSkipsInputsRewrittenAfterRead(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	abs := absRootForTest(t, root)
+	old := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(configPath, old, old))
+	invalidateTSAliasCollection(abs)
+	start := time.Now()
+	s := workingAliases(abs, nil, []string{abs})
+	require.Contains(t, s.stats, configPath, "an input untouched since the load keeps its stat")
+
+	// Same size as the fixture's config, so only the mtime tells them apart.
+	original, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	rewritten := []byte(strings.Replace(string(original), "old/*", "new/*", 1))
+	require.Len(t, rewritten, len(original))
+	require.NoError(t, os.WriteFile(configPath, rewritten, 0o644))
+	s.recordStats(start)
+	require.NotContains(t, s.stats, configPath, "a stat taken after a rewrite must not vouch for the old read")
+	caller := filepath.Join(abs, "pages", "index.ts")
 	require.True(t, s.needsDiscovery(abs, []string{caller}))
 }

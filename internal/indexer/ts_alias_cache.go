@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/parser/tsalias"
@@ -51,19 +52,32 @@ func statAliasInput(dir *os.Root, rel string) aliasInputStat {
 	return aliasInputStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
 }
 
-// recordStats captures each input's stat after a load. A file rewritten
-// between its read and this stat only costs a reread on the next save.
-func (s *aliasSnapshot) recordStats() {
+// racyStatWindow covers file systems whose mtimes are coarser than the clock.
+const racyStatWindow = 2 * time.Second
+
+// recordStats captures each input's stat after a load that began at start.
+// The stat is taken after the read, so an input modified since start, or one
+// whose existence no longer matches its read, may have been rewritten in
+// between: its stat is left out and the next save rereads it.
+func (s *aliasSnapshot) recordStats(start time.Time) {
 	s.stats = make(map[string]aliasInputStat, len(s.inputs))
 	dir, err := os.OpenRoot(s.root)
 	if err != nil {
 		return
 	}
 	defer dir.Close()
-	for p := range s.inputs {
-		if rel, err := filepath.Rel(s.root, p); err == nil {
-			s.stats[p] = statAliasInput(dir, rel)
+	racy := start.Add(-racyStatWindow).UnixNano()
+	var absent [sha256.Size]byte
+	for p, hash := range s.inputs {
+		rel, err := filepath.Rel(s.root, p)
+		if err != nil {
+			continue
 		}
+		stat := statAliasInput(dir, rel)
+		if stat.missing != (hash == absent) || !stat.missing && stat.mtime >= racy {
+			continue
+		}
+		s.stats[p] = stat
 	}
 }
 
@@ -159,6 +173,8 @@ func (s *aliasSnapshot) needsDiscovery(root string, paths []string) bool {
 		return true
 	}
 	defer dir.Close()
+	racy := time.Now().Add(-racyStatWindow).UnixNano()
+	var absent [sha256.Size]byte
 	for p, before := range s.inputs {
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
@@ -175,8 +191,10 @@ func (s *aliasSnapshot) needsDiscovery(root string, paths []string) bool {
 		if now != before {
 			return true
 		}
-		if s.stats != nil {
-			s.stats[p] = stat // touched, not changed
+		// Touched, not changed. A stat inside the racy window could still
+		// match a later same-size rewrite, so it is not remembered.
+		if s.stats != nil && stat.missing == (now == absent) && (stat.missing || stat.mtime < racy) {
+			s.stats[p] = stat
 		}
 	}
 	return false
@@ -198,6 +216,7 @@ func workingAliases(root string, proof *buildContentProof, paths []string) *alia
 	}
 	proof.noteUnboundedReader() // only the actual directory walk needs the full sample
 	noteAliasDiscoveryWalk(root)
+	start := time.Now()
 	s := &aliasSnapshot{root: root, inputs: make(map[string][sha256.Size]byte)}
 	s.collection = tsalias.LoadObserved(root, func(rel string, data []byte, found bool) {
 		var hash [sha256.Size]byte
@@ -207,7 +226,7 @@ func workingAliases(root string, proof *buildContentProof, paths []string) *alia
 		s.inputs[filepath.Join(root, filepath.FromSlash(rel))] = hash
 	})
 	s.digest = s.collection.Digest()
-	s.recordStats()
+	s.recordStats(start)
 	slot.snapshot = s
 	return s
 }
@@ -225,6 +244,7 @@ func restoreAliases(root, digest string, inputs map[string]string) *aliasSnapsho
 		return nil
 	}
 	defer dir.Close()
+	start := time.Now()
 	scopes := make([]string, 0, len(inputs))
 	for rel, want := range inputs {
 		got := ""
@@ -251,7 +271,7 @@ func restoreAliases(root, digest string, inputs map[string]string) *aliasSnapsho
 	if s.digest != digest {
 		return nil
 	}
-	s.recordStats()
+	s.recordStats(start)
 	slot := aliasSlot(root)
 	slot.mu.Lock()
 	if slot.snapshot == nil {
