@@ -230,10 +230,10 @@ func TestCanonicalPromotionFileReadsKeepIndependentDefinitionOracle(t *testing.T
 				borrowed := facts.entries[entry.key]
 				facts.mu.RUnlock()
 				require.Same(t, entry, borrowed)
-				checkedSameBytes := tool == "get_file_summary" && transition == "same_bytes_event"
-				// A summary re-selects a peer's recorded tool commit whose bytes
+				checkedSameBytes := transition == "same_bytes_event"
+				// A file read re-selects a peer's recorded tool commit whose bytes
 				// are still on disk, and answers pending from that owner.
-				newerToolCommit := tool == "get_file_summary" && transition == "peer_same_bytes"
+				newerToolCommit := transition == "peer_same_bytes"
 				if newerToolCommit {
 					current := liveEntry(pendingFileProjections, path)
 					require.NotNil(t, current)

@@ -676,6 +676,43 @@ func (l *mutationCommitLedger) publishedProjection(entry *projectionEntry) bool 
 	return false
 }
 
+// publishedVersion reports whether entry is the projection a recorded physical
+// tool commit published, or a checked read copy of that commit's version: the
+// copy keeps the commit's sequence and its raw-byte SHA-256, and the record is
+// for the same file. A copy is checked against the record itself, because the
+// projection it replaced may already be gone.
+func (l *mutationCommitLedger) publishedVersion(entry *projectionEntry) bool {
+	if entry == nil || entry.sourceCommitSeq == 0 {
+		return false
+	}
+	if entry.commitSeq != 0 {
+		return l.publishedProjection(entry)
+	}
+	if entry.contentSHA256 == "" {
+		return false
+	}
+	matched, absPath := false, ""
+	l.mu.Lock()
+	for i := len(l.ordered) - 1; i >= 0; i-- {
+		record := l.ordered[i]
+		if !record.isPhysicalCommit() {
+			continue
+		}
+		record.mu.RLock()
+		sequence := record.commitSeq
+		if sequence == entry.sourceCommitSeq {
+			matched = record.disk == mutationDiskCommitted && record.contentSHA256 == entry.contentSHA256
+			absPath = record.absPath
+		}
+		record.mu.RUnlock()
+		if sequence == entry.sourceCommitSeq {
+			break
+		}
+	}
+	l.mu.Unlock()
+	return matched && absPath != "" && pathkey.MutationKey(absPath) == entry.key
+}
+
 func (l *mutationCommitLedger) recent(limit int) []*mutationCommitRecord {
 	l.mu.Lock()
 	defer l.mu.Unlock()
