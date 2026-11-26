@@ -51,6 +51,7 @@ type editProbeRecord struct {
 	supersededStatus            *receiptproof.Status
 	coalescedStatus             *receiptproof.Coalesced
 	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
+	tierAfterCommitErr          error
 	FunctionalUnavailable       *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt,omitempty"`
 	CoalescedFunctional         *receiptproof.Coalesced             `json:"coalesced_functional_receipt,omitempty"`
 	SearchACK                   map[string]any                      `json:"search_ack,omitempty"`
@@ -59,6 +60,7 @@ type editProbeRecord struct {
 	SearchTurnReleasedNS        *int64                              `json:"search_turn_released_ns,omitempty"`
 	AdmittedTargetLines         *int                                `json:"admitted_target_lines,omitempty"`
 	MutationTiers               *editProbeLiveTiers                 `json:"mutation_tiers,omitempty"`
+	TierAfterCommit             *editProbeTierAfterCommit           `json:"tier_after_commit_ms,omitempty"`
 	GateReadback                *Metric                             `json:"t_gate_readback_ms,omitempty"`
 	ACKReadbackExact            *bool                               `json:"ack_readback_exact,omitempty"`
 	ACKStatus                   string                              `json:"ack_status,omitempty"`
@@ -289,7 +291,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if required {
 		role = "candidate"
 	}
-	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), ProjectionBefore: unobservedProjectionBookend(), ProjectionAfter: unobservedProjectionBookend(), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
+	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), ProjectionBefore: unobservedProjectionBookend(), ProjectionAfter: unobservedProjectionBookend(), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them", "tier_after_commit_ms is the daemon's own time from the disk commit to each tier's publication, copied from the last receipt status observed (null while unpublished); it is reported beside the client times and replaces none of them"}}
 	if plan.OwnACKReadbackOnly {
 		out.AccountingRequired = false
 		out.Limitations = []string{"local ACK and immediate same-session file/source only; no graph-terminal, visibility or A/P/B phase qualification",
@@ -1360,6 +1362,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					if s.record.MutationTiers != nil && s.record.MutationTiers.State == "invalid" {
 						s.record.Errors = append(s.record.Errors, "invalid live tier observation: "+s.record.MutationTiers.Reason)
 					}
+					// Each status replaces the daemon tier latency, so the record keeps the last one observed.
+					s.record.TierAfterCommit, s.record.tierAfterCommitErr = editProbeStatusTierAfterCommit(status)
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					if s.record.GraphTerminal {
 						r.settlePendingLocked(s)
@@ -1404,6 +1408,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Lock()
 	if !gateComplete {
 		s.record.Errors = append(s.record.Errors, "assigned post-ACK gate coverage unavailable")
+	}
+	if s.record.tierAfterCommitErr != nil {
+		s.record.Errors = append(s.record.Errors, "final receipt status: "+s.record.tierAfterCommitErr.Error())
 	}
 	if s.firstProbeWrite.IsZero() || s.editWrite.IsZero() || !s.firstProbeWrite.Before(s.editWrite) {
 		s.record.Errors = append(s.record.Errors, "no actual prober wire start before edit wire")
