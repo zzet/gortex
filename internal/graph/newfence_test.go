@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/zzet/gortex/internal/testutil/reporoot"
 )
 
 // The in-memory Store is a staging buffer, not a persistence backend. The
@@ -70,10 +72,7 @@ var fenceSkippedDirs = map[string]struct{}{
 }
 
 func TestNewIsFencedToIndexerStaging(t *testing.T) {
-	root, err := findRepoRoot()
-	if err != nil {
-		t.Fatalf("locating repository root: %v", err)
-	}
+	root := reporoot.Path(t)
 
 	declared := append(append([]string{}, stagingCallers...), harnessCallers...)
 	allowed := make(map[string]struct{}, len(declared))

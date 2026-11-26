@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -40,25 +41,49 @@ func init() {
 type repoLoadingError struct {
 	admissionReason string
 	repo            string
-	phase           string
-	percent         int
+	details         repoLoadingDetails
 	// waited is how long the CLI already waited before giving up for now.
 	waited time.Duration
 }
 
+type repoLoadingDetails struct {
+	ErrorCode string `json:"error_code"`
+	Retryable *bool  `json:"retryable,omitempty"`
+	Phase     string `json:"phase,omitempty"`
+	Percent   *int   `json:"percent,omitempty"`
+}
+
+func (e *repoLoadingError) progress() string {
+	if e.details.Percent == nil {
+		return e.details.Phase
+	}
+	if e.details.Phase == "" {
+		return fmt.Sprintf("%d%%", *e.details.Percent)
+	}
+	return fmt.Sprintf("%s, %d%%", e.details.Phase, *e.details.Percent)
+}
+
 func (e *repoLoadingError) Error() string {
-	msg := fmt.Sprintf("the gortex daemon is still loading %s after a restart (%s, %d%%)", e.repo, e.phase, e.percent)
+	msg := fmt.Sprintf("the gortex daemon is still loading %s after a restart", e.repo)
+	guidance := "the repository is already tracked"
+	if e.admissionReason != "" {
+		msg = fmt.Sprintf("the gortex daemon is still resolving graph admission (repo_loading, %s)", e.admissionReason)
+		guidance = "graph admission for this path is not yet established"
+	}
+	if progress := e.progress(); progress != "" {
+		msg += " (" + progress + ")"
+	}
+	if e.details.ErrorCode != "" {
+		msg += " [error_code=" + e.details.ErrorCode
+		if e.details.Retryable != nil {
+			msg += fmt.Sprintf(" retryable=%t", *e.details.Retryable)
+		}
+		msg += "]"
+	}
 	if e.waited > 0 {
 		msg += fmt.Sprintf("; still loading after waiting %s", e.waited.Round(time.Second))
 	}
-	if e.admissionReason != "" {
-		msg = fmt.Sprintf("the gortex daemon is still resolving graph admission (repo_loading, %s)", e.admissionReason)
-		if e.waited > 0 {
-			msg += fmt.Sprintf("; still loading after waiting %s", e.waited.Round(time.Second))
-		}
-		return msg + " — graph admission for this path is not yet established; retry shortly (or pass --loading-wait to wait for it)"
-	}
-	return msg + " — the repository is already tracked; retry shortly (or pass --loading-wait to wait for it)"
+	return msg + " — " + guidance + "; retry shortly (or pass --loading-wait to wait for it)"
 }
 
 // ExitCode implements the process-exit contract execute honours.
@@ -81,24 +106,41 @@ func effectiveLoadingWait() time.Duration {
 // the repository is still loading, retries it until it answers or the wait
 // runs out. Running out is reported as "still loading", never as a failure of
 // the work.
-func callToolWaitingForLoad(exec cliExecutor, tool string, args map[string]any, wait time.Duration) (json.RawMessage, error) {
+func callToolWaitingForLoad(exec cliExecutor, tool string, args map[string]any, wait time.Duration, diagnostics io.Writer) (json.RawMessage, error) {
 	out, err := exec.CallTool(context.Background(), tool, args)
 	var loading *repoLoadingError
 	if !errors.As(err, &loading) || wait <= 0 {
 		return out, err
 	}
-	fmt.Fprintf(os.Stderr, "[gortex] the daemon is still loading %s (%s, %d%%); waiting up to %s\n",
-		loading.repo, loading.phase, loading.percent, wait.Round(time.Second))
+	fmt.Fprintf(diagnostics, "[gortex] the daemon is still loading %s (%s); waiting up to %s\n",
+		loading.repo, loading.progress(), wait.Round(time.Second))
 	start := time.Now()
 	deadline := start.Add(wait)
+	ctx := context.Background()
+	// A timed-out read-only search can safely report the previous loading
+	// refusal. An arbitrary tool may already have changed state after the retry.
+	boundedRetry := tool == "search_symbols"
+	if boundedRetry {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	for time.Now().Before(deadline) {
 		time.Sleep(min(loadingWaitPoll, time.Until(deadline)))
-		out, err = exec.CallTool(context.Background(), tool, args)
-		var still *repoLoadingError
-		if !errors.As(err, &still) {
-			return out, err
+		if boundedRetry && !time.Now().Before(deadline) {
+			break
 		}
-		loading = still
+		out, err = exec.CallTool(ctx, tool, args)
+		var still *repoLoadingError
+		if errors.As(err, &still) {
+			loading = still
+			continue
+		}
+		if boundedRetry && !time.Now().Before(deadline) &&
+			(errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)) {
+			break
+		}
+		return out, err
 	}
 	loading.waited = time.Since(start)
 	return nil, loading

@@ -16,6 +16,7 @@ func parseForeignImpact(args []string) (runOptions, int, error) {
 	f := flag.NewFlagSet("load foreign-impact", flag.ContinueOnError)
 	bindRunFlags(f, &o)
 	edited := f.Int("edited-repo", 0, "zero-based edited repository in the pinned six-root manifest")
+	lossless := f.Bool("lossless-edit-probe-evidence", false, "retain exact edited-repository RPC payloads in bounded lossless evidence")
 	if err := f.Parse(args); err != nil {
 		return o, *edited, err
 	}
@@ -28,6 +29,8 @@ func parseForeignImpact(args []string) (runOptions, int, error) {
 	if o.Scenario != "many" || o.Agents != 6 || o.Editors != 1 || o.Worktrees != 0 || o.EditRepos != 1 || o.EditCount != 100 || o.Seed != 42 || o.Profile != "agent" || o.CPUProfile != 0 || o.PRSmokeDrain != 0 || o.Duration != foreignImpactDuration || o.Deadline != 120*time.Second || o.WarmTimeout != 30*time.Minute || o.StopTimeout != 30*time.Second || *edited < 0 || *edited >= 6 {
 		return o, *edited, errors.New("foreign-impact requires many/6 sessions/1 editor/0 worktrees, seed42,100 edits, agent profile, duration10m, deadline120s, warm30m, stop30s and edited-repo0..5")
 	}
+	// This cell reuses the evidence writer without selecting standalone gate-mode traffic.
+	o.LosslessEditProbeEvidence = *lossless
 	return o, *edited, nil
 }
 

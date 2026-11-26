@@ -91,3 +91,55 @@ func TestEditGateDistinctScopeProofCannotComeFromJSON(t *testing.T) {
 		t.Fatal("JSON forged a typed scope claim")
 	}
 }
+
+func TestEditGateExplicitGraphTierTakesPrecedenceOverWatcherWait(t *testing.T) {
+	for _, mode := range []string{"json", "facade", "toon", "cli"} {
+		for _, graph := range []string{"pending", "unknown", "failed", "fresh"} {
+			t.Run(mode+"/"+graph, func(t *testing.T) {
+				const operation = "read.summary"
+				producer := map[string]any{
+					"nodes": []any{},
+					"freshness": map[string]any{
+						"graph_freshness": graph, "freshness_scope": "relations",
+						"fresh": true, "requested_view": "auto", "waited_ms": 0,
+					},
+				}
+				encode := json.Marshal
+				if mode == "toon" {
+					encode = func(value any) ([]byte, error) { return toon.Marshal(value) }
+				}
+				payload, err := encode(producer)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wire := outputWire(string(payload), nil)
+				switch mode {
+				case "cli":
+					wire = payload
+				case "facade":
+					var response map[string]any
+					if err := json.Unmarshal(wire, &response); err != nil {
+						t.Fatal(err)
+					}
+					response["_meta"] = map[string]any{"gortex_facade": map[string]any{
+						"surface_version": "facade-v1", "facade": "read", "operation": "summary", "canonical_tool": "get_file_summary",
+					}}
+					wire, err = json.Marshal(response)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				body, err := decodeEditProbeOutput(wire, mode, operation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if editProbeClaimsFresh(body) != (graph == "fresh") {
+					t.Fatalf("watcher wait overrode explicit graph state %q: %+v", graph, body)
+				}
+				if editProbeCorrect("summary", body, editProbeCorpus(), editProbeStep{Marker: "Added"}, "Example") {
+					t.Fatal("summary with no own rows received readback credit")
+				}
+			})
+		}
+	}
+}

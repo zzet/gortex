@@ -208,15 +208,21 @@ waitingForReady:
 	ctx := freshnessLifecycleSession(t, s)
 	checkLost := func(id int) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
+		// The request serializes its ceiling and the handler parses a
+		// wall-clock deadline; the slack check below must run in that same
+		// clock domain rather than against a monotonic-bearing time.Now.
+		serialized := time.Now().Add(5 * time.Second).Format(time.RFC3339Nano)
+		deadline, err := time.Parse(time.RFC3339, serialized)
+		require.NoError(t, err)
 		body := freshnessLifecycleCall(t, s, ctx, id, "mutation_status", map[string]any{
 			"receipt": ready.Receipt, "format": "json", "require_fresh": true,
-			"wait_deadline": deadline.Format(time.RFC3339Nano),
+			"wait_deadline": serialized,
 		})
 		require.Equal(t, "lost", body["state"])
 		require.Equal(t, false, body["found"])
 		require.Equal(t, true, body["graph_status_terminal"])
-		require.True(t, time.Now().Before(deadline.Add(-time.Second)), "a lost receipt waited close to its deadline")
+		require.True(t, time.Now().Before(deadline.Add(-time.Second)),
+			"a lost receipt waited close to its serialized deadline %s", serialized)
 	}
 	checkLost(30)
 	// The daemon becomes queryable at onComputeDone, while the actual master

@@ -1,11 +1,16 @@
 package mcp
 
 import (
+	"path/filepath"
 	"testing"
+	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
-
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/indexer"
 )
 
 // TestSymbolSourceSingleRepoWatcherLineShift reads a symbol whose file was
@@ -13,14 +18,40 @@ import (
 // reindexed the file yet. The answer must be the symbol's current body and
 // range, never the old range cut out of the new bytes.
 func TestSymbolSourceSingleRepoWatcherLineShift(t *testing.T) {
+	selectedProjectionRegistry(t)
 	srv, dir := setupTestServer(t)
-	srv.SetWatcher(mutationTestWatcher{})
-	shiftTestServerMain(t, dir)
+	native, err := indexer.NewWatcher(srv.indexer, config.WatchConfig{
+		Enabled: true, DebounceMs: 60_000,
+	}, zap.NewNop())
+	require.NoError(t, err)
+	watcher := &registeredLateStormWatcher{
+		Watcher: native, eventPath: filepath.Join(dir, "main.go"),
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	srv.SetWatcher(watcher)
+	require.NoError(t, watcher.Start([]string{dir}))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	t.Cleanup(func() { close(watcher.release) })
 
-	resp := extractTextResult(t, callTool(t, srv, "get_symbol_source", map[string]any{
+	require.Equal(t, 11, srv.graph.GetNode("main.go::helper").StartLine)
+	// A real OS event establishes that the watcher saw the edit. Hold its
+	// admission at the source callback so it cannot publish during the read.
+	watcher.holdNextSourceEvent()
+	shiftTestServerMain(t, dir)
+	select {
+	case <-watcher.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the running watcher did not observe the native edit")
+	}
+	require.Equal(t, 11, srv.graph.GetNode("main.go::helper").StartLine, "the canonical graph must still have the old range")
+
+	result := callToolByName(t, srv, t.Context(), "get_symbol_source", map[string]any{
 		"id":            "main.go::helper",
 		"context_lines": float64(0),
-	}))
+		"format":        "json",
+	})
+	require.False(t, result.IsError, "%s", resultText(result))
+	resp := extractTextResult(t, result)
 	require.Equal(t, "func helper() {}", resp["source"])
 	require.EqualValues(t, 13, resp["start_line"])
 	require.EqualValues(t, 13, resp["end_line"])

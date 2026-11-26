@@ -257,10 +257,11 @@ func measureIdleStop(ctx context.Context, p *privateRun, clients []*socketClient
 	if closeErr != nil {
 		return closeErr
 	}
-	phase.Started = time.Now().UTC()
+	started := time.Now()
+	phase.Started = started.UTC()
 	monitor := startMonitor(p, sampler, group)
 	err := waitContext(ctx, 2*time.Second)
-	phase.DurationSec = time.Since(phase.Started).Seconds()
+	phase.DurationSec = time.Since(started).Seconds()
 	monitor.finish(phase)
 	data, marshalErr := json.Marshal(map[string]any{"started": phase.Started, "finished": time.Now().UTC(), "closed_mcp_sessions": len(clients), "required_idle_seconds": 2, "complete": err == nil})
 	phase.Gate["idle_stop"] = data

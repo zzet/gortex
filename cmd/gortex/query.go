@@ -4,11 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
 
+	"github.com/zzet/gortex/internal/config"
 	"github.com/zzet/gortex/internal/daemon"
+	"github.com/zzet/gortex/internal/gitstate"
+	"github.com/zzet/gortex/internal/pathkey"
 )
 
 var (
@@ -46,15 +51,15 @@ func init() {
 // does not track the repo, this returns an actionable error rather than
 // silently building a second-class in-process index.
 func requireDaemonTool(repoPath, tool string, args map[string]any) (json.RawMessage, error) {
-	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode)
+	return requireDaemonToolWithSurface(repoPath, tool, args, cliLegacyToolSurface, cliLegacyToolMode, os.Stderr)
 }
 
 // requireDaemonToolWithSurface runs one tool through a per-connection MCP
 // surface without changing daemon-global configuration. It shares the normal
 // daemon-required and repo-not-tracked error behavior.
-func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string) (json.RawMessage, error) {
+func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, tools, toolsMode string, diagnostics io.Writer) (json.RawMessage, error) {
 	args = applyCLIRequireFresh(args)
-	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode)
+	exec, err := resolveExecutorWithToolSurface(repoPath, tools, toolsMode, diagnostics)
 	if err != nil {
 		if errors.Is(err, ErrNoExecutor) {
 			return nil, daemonRequiredErr(repoPath)
@@ -62,7 +67,7 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 		return nil, err
 	}
 	defer exec.Close()
-	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait())
+	out, err := callToolWaitingForLoad(exec, tool, args, effectiveLoadingWait(), diagnostics)
 	if freshnessErr := checkCLIFreshness(rootCmd, out, err); freshnessErr != nil {
 		if _, coded := freshnessErr.(*exitCodeError); coded {
 			return nil, freshnessErr
@@ -77,8 +82,8 @@ func requireDaemonToolWithSurface(repoPath, tool string, args map[string]any, to
 	return out, nil
 }
 
-// daemonRequiredErr explains how to make the daemon able to answer: start
-// it (when none runs) or track the repo (when it runs but does not own it).
+// daemonRequiredErr explains how to make the daemon able to answer. An
+// already configured checkout only needs the daemon to start.
 //
 // A linked git worktree takes neither remedy verbatim — the repository to
 // track is its main checkout — so it is answered separately. That resolution
@@ -89,13 +94,68 @@ func daemonRequiredErr(repoPath string) error {
 	if aerr != nil {
 		abs = repoPath
 	}
+	probeErr := daemon.ProbeAvailability()
+	if errors.Is(probeErr, daemon.ErrDaemonUnavailable) && locallyConfiguredCheckout(abs) {
+		return fmt.Errorf("no gortex daemon is running — start it with `gortex daemon start --detach` to load the configured repository for %s", abs)
+	}
 	if fam, ok := linkedWorktreeAt(abs); ok {
 		return worktreeCWDErr(abs, fam, trackedFamilyRepo(fam))
 	}
-	if !daemon.IsRunning() {
+	if probeErr != nil {
 		return fmt.Errorf("no gortex daemon is running — start it with `gortex daemon start --detach`, then track this repo with `gortex track %s`", abs)
 	}
 	return fmt.Errorf("the gortex daemon does not track %s — add it with `gortex track %s`", abs, abs)
+}
+
+// locallyConfiguredCheckout reads the daemon's usual global roster for offline
+// advice. The declaration supplies no runtime readiness or routing authority.
+func locallyConfiguredCheckout(abs string) bool {
+	gc, err := config.LoadGlobal()
+	if err != nil {
+		return false
+	}
+	cwd, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		return false
+	}
+	main := gitstate.LinkedCheckoutMain(cwd)
+	for _, root := range gc.ConfiguredRepoRoots() {
+		if !filepath.IsAbs(root) {
+			continue
+		}
+		physicalRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		if configuredDirectoryContains(cwd, physicalRoot) || (main != "" && sameConfiguredDirectory(main, physicalRoot)) {
+			return true
+		}
+	}
+	return false
+}
+
+func configuredDirectoryContains(path, root string) bool {
+	for pathkey.HasPathPrefix(path, root) {
+		if pathkey.EqualPaths(path, root) {
+			return sameConfiguredDirectory(path, root)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	return false
+}
+
+// Folded spellings can identify distinct live directories on the same volume.
+func sameConfiguredDirectory(path, root string) bool {
+	actual, actualErr := os.Stat(path)
+	configured, configuredErr := os.Stat(root)
+	return actualErr == nil && configuredErr == nil && actual.IsDir() && os.SameFile(actual, configured)
 }
 
 // emitDaemonJSON re-indents and prints a daemon tool result for the

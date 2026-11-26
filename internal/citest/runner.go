@@ -543,6 +543,14 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if opts.Partition == darwinRacePartition && (runtime.GOOS != "darwin" || opts.Windows) {
 		return report, fmt.Errorf("indexer-race requires native macOS")
 	}
+	split := opts.SelectionFile != "" && policy.ownsUbuntuSplit(opts.Target)
+	if split && (opts.Partition == "rest" || opts.Partition == ubuntuSplitPartition) &&
+		(runtime.GOOS != "linux" || opts.Windows) {
+		return report, fmt.Errorf("selected Ubuntu rest job requires native Linux")
+	}
+	if opts.Partition == ubuntuSplitPartition && !split {
+		return report, fmt.Errorf("%s requires a native Ubuntu selection", ubuntuSplitPartition)
+	}
 	planner := NewPlanner(opts.Root)
 	planner.Env = baseEnv(opts.Env)
 	module, err := planner.exec(ctx, planner.Env, "go", "list", "-m")
@@ -596,7 +604,7 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 	if err != nil {
 		return report, err
 	}
-	j.cliPackage = module + "/cmd/gortex"
+	j.cliPackage = module + cliPackageSuffix
 	defer func() {
 		report = Report{j.scratch, j.failures, j.flaky, j.durations}
 		err = errors.Join(err, j.report())
@@ -615,6 +623,9 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 		if part.Group == "rest" {
 			rest := []string{}
 			for _, pkg := range packages {
+				if split && ubuntuSplitOwns(module, pkg) {
+					continue
+				}
 				if !slices.ContainsFunc([]string{"indexer", "mcp", "store"}, func(group string) bool { return large[group] == pkg }) && (selected == nil || selected.has(pkg)) {
 					rest = append(rest, pkg)
 				}
@@ -623,6 +634,21 @@ func RunPartition(ctx context.Context, opts RunOptions) (report Report, err erro
 				if err := j.runRest(rest); err != nil {
 					return report, err
 				}
+			}
+		} else if part.Group == ubuntuSplitPartition {
+			owned := []string{}
+			for _, pkg := range packages {
+				if ubuntuSplitOwns(module, pkg) && (selected == nil || selected.has(pkg)) {
+					owned = append(owned, pkg)
+				}
+			}
+			if len(owned) == 0 {
+				return report, fmt.Errorf("selected job has none of its Ubuntu CLI or bench packages")
+			}
+			// runRest runs the bench packages first, then the CLI in its own
+			// guarded namespace, both against this job's own budget.
+			if err := j.runRest(owned); err != nil {
+				return report, err
 			}
 		} else if part.Group == darwinRacePartition {
 			// Preserve the all-race override: its normal indexer shards already

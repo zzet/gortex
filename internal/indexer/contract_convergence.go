@@ -853,20 +853,20 @@ type contractConvergenceHooks struct {
 }
 
 type contractConvergence struct {
-	coverage         *contractWorkCoverage
-	fillReadCensus   map[*contractUnit][sha256.Size]byte
-	fillCensusDigest [sha256.Size]byte
-	fillCensusClock  uint64
-	fillCensusKnown  bool
-	ctx              context.Context
-	req              ContractFollowupRequest
-	snap             ContractFollowupSnapshot
-	repos            map[string]bool
-	logger           *zap.Logger
-	files            map[string]ContractFollowupFile
-	live             map[string]bool
-	excluded         map[string]bool
-	units            map[string]*contractUnit
+	coverage          *contractWorkCoverage
+	fillReadCensus    map[*contractUnit][sha256.Size]byte
+	fillCensusDigest  [sha256.Size]byte
+	fillCensusVersion uint64
+	fillCensusKnown   bool
+	ctx               context.Context
+	req               ContractFollowupRequest
+	snap              ContractFollowupSnapshot
+	repos             map[string]bool
+	logger            *zap.Logger
+	files             map[string]ContractFollowupFile
+	live              map[string]bool
+	excluded          map[string]bool
+	units             map[string]*contractUnit
 	// suspect units are kept with their recorded reads but are not proven at
 	// the current clock: an owner or a key they looked up moved, or their own
 	// receipt was rewritten with the same identity. They are revalidated by

@@ -137,6 +137,9 @@ func TestParseCgroupMemoryLimit(t *testing.T) {
 func TestCgroupMemoryLimitFrom(t *testing.T) {
 	// v2 present and capped: used directly, v1 never consulted.
 	got := cgroupMemoryLimitFrom(func(p string) ([]byte, error) {
+		if p == "/proc/self/cgroup" {
+			return nil, os.ErrNotExist
+		}
 		if p == "/sys/fs/cgroup/memory.max" {
 			return []byte("2147483648"), nil
 		}

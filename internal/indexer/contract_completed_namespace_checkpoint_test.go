@@ -126,7 +126,7 @@ func TestContractCompletedNamespaceProofReusesOnlyCurrentGuards(t *testing.T) {
 			case "new_unknown_dependency":
 				work = append(work, graph.ContractWork{Token: "new-unknown", RepoPrefix: "repo", FilePath: "repo/unrelated.go", State: graph.ContractWorkPending, Scope: graph.ContractWorkScope{Causes: []string{"dependency_membership_unknown"}}})
 			case "changed_census":
-				c.clock.lastCensus["repo/new.go"] = true
+				observeContractFillCensusJoin(c, "repo/new.go")
 			case "writing_guard":
 				stamp := c.clock.last["repo/producer.go"]
 				stamp.Writing = true
@@ -318,7 +318,7 @@ func TestContractCompletedDebtRemovalRetainsExactNamespaceAndGuards(t *testing.T
 				stamp.Writing = true
 				c.clock.last["repo/producer.go"] = stamp
 			case "changed_census":
-				c.clock.lastCensus["repo/new.go"] = true
+				observeContractFillCensusJoin(c, "repo/new.go")
 			case "changed_source":
 				stamp := c.clock.last["repo/producer.go"]
 				stamp.SourceFingerprint = "changed"

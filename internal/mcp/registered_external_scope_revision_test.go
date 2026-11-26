@@ -152,7 +152,7 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 					require.NotNil(t, retirement)
 					require.NoError(t, idx.IndexFile(path))
 					retirement.run()
-					require.Nil(t, liveEntry(pendingFileProjections, path), "real canonical publication must retire the selected ACK before this negative")
+					require.Nil(t, liveEntry(pendingFileProjections, path), "real canonical publication must retire the selected ACK before the checked read")
 				} else {
 					expected = []byte(strings.Replace(string(acknowledged), "func Target()", "// independent native edit\n\nfunc Target()", 1))
 					require.NoError(t, os.WriteFile(path+".native", expected, 0600))
@@ -279,6 +279,13 @@ func TestRegisteredExternalScopeRevisionKeepsOnlyCheckedLocalFileRows(t *testing
 						require.Equal(t, "pending", freshness["graph_freshness"])
 						require.Equal(t, false, freshness["complete"])
 					}
+				case "canonical_no_projection":
+					if tool == "get_editing_context" && errors.Is(observed.err, graph.ErrContractProjectionStale) {
+						requireCanonicalDefinitionRows(t, tool, result, expected)
+						requireCanonicalEditingContextPartial(t, result)
+						break
+					}
+					fallthrough
 				default:
 					require.True(t, result.IsError, "unknown scope/source ownership/cancellation cannot gain current data or an invented external-write reason: %s", resultText(result))
 					require.NotContains(t, resultText(result), `"file_reason":"external_write"`)

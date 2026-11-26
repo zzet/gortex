@@ -14,27 +14,41 @@ type FunctionalUnavailable struct {
 }
 
 func (p *FunctionalUnavailable) Matches(receipt, mutationID, rpcID string, requested, applied uint64) bool {
-	if p == nil || receipt == "" || mutationID == "" || rpcID == "" || requested == 0 || applied != requested {
+	if p == nil || receipt == "" || mutationID == "" || rpcID == "" || requested == 0 || applied < requested {
 		return false
 	}
 	s := p.Status
+	missingWinner := applied > requested
+	// A later applied generation is not a claim that an independent winner
+	// was observed. Only the original immutable returned/no-witness refusal
+	// can certify functional results while that indexing owner stays unknown.
+	if missingWinner && (s.Refusal != "serving_attempt_binding_mismatch" || s.BindingPredicate != "direct_physical_window_missing" || s.BackgroundStage != "returned" || s.AcceptedStage != "no_accepted_witness") {
+		return false
+	}
 	unavailable := s.Refusal == "serving_attempt_binding_mismatch" && s.BindingPredicate == "direct_physical_window_missing" && s.BackgroundStage == "returned" && s.AcceptedStage == "no_accepted_witness" ||
 		s.Refusal == "preexisting_path_work" && s.BindingPredicate == "" && s.BackgroundStage == "" && s.AcceptedStage == ""
 	return s.Receipt == receipt && s.MutationID == mutationID && s.RPCID == rpcID && s.Requested == requested && s.Applied == applied &&
 		s.Key != "" && s.Ticket == requested && s.Source == "mcp_edit" && s.Clock == "monotonic" && s.Terminal &&
 		s.PUnavailable && s.BUnavailable && s.CoalescedAbsent && p.PhysicalEvidenceAbsent && p.ReadAssistedAbsent && unavailable &&
 		s.BackgroundRequest == requested && s.BackgroundLast == requested && s.NativeHandoffs != nil && *s.NativeHandoffs == 0 &&
-		s.WireID > 0 && digest(s.SHA256) && functionalUnavailableTimingOnlyError(p.AccountingError, s.Refusal)
+		s.WireID > 0 && digest(s.SHA256) && functionalUnavailableTimingOnlyError(p.AccountingError, s.Refusal, missingWinner)
 }
 
-func functionalUnavailableTimingOnlyError(value, refusal string) bool {
+func functionalUnavailableTimingOnlyError(value, refusal string, missingWinner bool) bool {
 	reasons, ok := strings.CutPrefix(value, "A/P/B accounting unavailable: ")
 	if !ok || reasons == "" {
 		return false
 	}
-	matchedRefusal := false
+	matchedRefusal, matchedMissingWinner := false, false
 	for _, reason := range strings.Split(reasons, "; ") {
 		matchedRefusal = matchedRefusal || reason == "requested B observed unavailable: "+refusal
+		if reason == "independent serving identity mismatch" {
+			if !missingWinner {
+				return false
+			}
+			matchedMissingWinner = true
+			continue
+		}
 		switch reason {
 		case "applicable physical P unavailable", "P: missing duration":
 			continue
@@ -56,7 +70,7 @@ func functionalUnavailableTimingOnlyError(value, refusal string) bool {
 			return false
 		}
 	}
-	return matchedRefusal
+	return matchedRefusal && (!missingWinner || matchedMissingWinner)
 }
 
 // OriginalPhysicalPhases includes optional control/deep fields too, so an

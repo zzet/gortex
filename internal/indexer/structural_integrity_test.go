@@ -5,11 +5,10 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/testutil/reporoot"
 )
 
 func TestIndexerShadowsForwardRejectedAttemptsToDurableOwner(t *testing.T) {
@@ -53,11 +52,7 @@ func TestIndexerShadowsForwardRejectedAttemptsToDurableOwner(t *testing.T) {
 // precise shadow assignments while the behavioral test above covers forwarding
 // and aborted-attempt retention.
 func TestIndexCtxRawUsesIntegrityAwareColdAndStreamingShadows(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test source path")
-	}
-	indexerPath := filepath.Join(filepath.Dir(testFile), "indexer.go")
+	indexerPath := reporoot.Path(t, "internal", "indexer", "indexer.go")
 	source, err := os.ReadFile(indexerPath)
 	if err != nil {
 		t.Fatalf("read indexer source: %v", err)

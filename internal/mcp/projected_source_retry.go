@@ -104,8 +104,15 @@ func (s *Server) withProjectedSourceReadBudget(next mcpserver.ToolHandlerFunc) m
 			if prior, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && prior.Before(deadline) {
 				deadline = prior
 			}
+			allowance := &projectedSourceAllowance{tool: legacy, symbolMetadata: legacy == "get_symbol" && auditedProjectionReadRetry(legacy, req)}
+			if legacy == "get_file_summary" {
+				allowance.diagnostic = newProjectionPredicateTrace()
+				if allowance.diagnostic != nil {
+					allowance.diagnostic.originalDeadline = deadline
+				}
+			}
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
-			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, &projectedSourceAllowance{tool: legacy, symbolMetadata: legacy == "get_symbol" && auditedProjectionReadRetry(legacy, req)})
+			ctx = context.WithValue(ctx, projectedSourceAllowanceKey{}, allowance)
 		}
 		return next(ctx, req)
 	}
@@ -188,6 +195,30 @@ func retryAfterCheckedProjectionChange(ctx context.Context) bool {
 		return false
 	}
 	return checkedProjectionChange(ctx) && ctx.Err() == nil && predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.final_budget")
+}
+
+// A file can retire while its checked bytes or carried edges are being bound,
+// before it enters the retained facts used by checkedProjectionChange. The
+// caller must have observed the missing owner. When selection captured an
+// event revision, it must still match the retired entry.
+func retryAfterCheckedProjectionBindRetirement(ctx context.Context, entry *projectionEntry, sourceEvents *uint64) bool {
+	allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+	if allowance == nil || !allowance.afterFreshness || allowance.tool != "get_callers" || ctx.Err() != nil {
+		return false
+	}
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil && state.replayUnsafe {
+		return false
+	}
+	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
+	if !ok || !predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.bind_entry_budget") {
+		return false
+	}
+	pendingFileProjections.mu.Lock()
+	retired := pendingFileProjections.snap.Load().entries[entry.key] == nil && entry.checkedRetired.Load() && !entry.suspect.Load()
+	retired = retired && (sourceEvents == nil || entry.sourceEvents == *sourceEvents)
+	pendingFileProjections.mu.Unlock()
+	return retired && validateRequestProjections(ctx) == nil && ctx.Err() == nil &&
+		predicateDeadlineBefore(ctx, deadline, time.Now(), "recovery.bind_final_budget")
 }
 
 // Structural ownership proof, independent of permission or time for another attempt.
