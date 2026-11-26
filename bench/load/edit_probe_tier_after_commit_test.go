@@ -61,7 +61,7 @@ func TestEditProbeRecordCopiesTierAfterCommitFromFinalReceipt(t *testing.T) {
 		{name: "published", first: pending, final: published, terminal: true, outcome: "complete", want: published},
 		{name: "unpublished_at_deadline", first: pending, final: pending, outcome: "product_deadline", want: pending},
 		{name: "receipt_without_figure", terminal: true, outcome: "complete"},
-		{name: "malformed", first: pending, final: `{"file_graph":"soon","relations":2,"derived":3}`, terminal: true, outcome: "diagnostic_failure", err: "tier_after_commit_ms"},
+		{name: "malformed", first: pending, final: `{"file_graph":"soon","relations":2,"derived":3}`, terminal: true, outcome: "diagnostic_failure", err: "last decoded receipt status: tier_after_commit_ms file_graph"},
 		// Only the last status counts: an earlier malformed figure that a
 		// later valid one replaces is not an error, and a later status
 		// without the key clears an earlier figure.
@@ -135,14 +135,19 @@ func TestEditProbeRecordCopiesTierAfterCommitFromFinalReceipt(t *testing.T) {
 			if record.Outcome != tc.outcome {
 				t.Fatalf("outcome = %s, want %s: %v", record.Outcome, tc.outcome, record.Errors)
 			}
-			invalid := 0
+			// The error names the last status the loop decoded, which is not
+			// the final poll when that poll failed to decode.
+			invalid, worded := 0, 0
 			for _, message := range record.Errors {
 				if strings.Contains(message, "tier_after_commit_ms") {
 					invalid++
 				}
+				if tc.err != "" && strings.Contains(message, tc.err) {
+					worded++
+				}
 			}
-			if tc.err != "" && invalid != 1 || tc.err == "" && invalid != 0 {
-				t.Errorf("tier_after_commit_ms errors = %d in %v", invalid, record.Errors)
+			if tc.err != "" && (invalid != 1 || worded != 1) || tc.err == "" && invalid != 0 {
+				t.Errorf("tier_after_commit_ms errors = %d (%d matching %q) in %v", invalid, worded, tc.err, record.Errors)
 			}
 			// The client relation time keeps its own definition: the slowest
 			// relation oracle's first-correct time from edit send.

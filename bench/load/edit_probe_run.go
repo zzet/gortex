@@ -1410,7 +1410,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Errors = append(s.record.Errors, "assigned post-ACK gate coverage unavailable")
 	}
 	if s.record.tierAfterCommitErr != nil {
-		s.record.Errors = append(s.record.Errors, "final receipt status: "+s.record.tierAfterCommitErr.Error())
+		// The last status the loop decoded, which is not the final poll when
+		// that poll failed to decode or the call itself failed.
+		s.record.Errors = append(s.record.Errors, "last decoded receipt status: "+s.record.tierAfterCommitErr.Error())
 	}
 	if s.firstProbeWrite.IsZero() || s.editWrite.IsZero() || !s.firstProbeWrite.Before(s.editWrite) {
 		s.record.Errors = append(s.record.Errors, "no actual prober wire start before edit wire")
