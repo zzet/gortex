@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,10 +20,13 @@ import (
 // An unrelated SQL write moves the store revision while a file read holds its
 // checked rows. Both file metadata reads may answer only with definitions
 // proven again from the request's unchanged canonical bytes, and must keep
-// the refusal when those bytes, their checkout or their owner moved.
+// the refusal when those bytes, their checkout or their owner moved. Another
+// file's edit is not a move of this file: the projection registry is
+// process-wide, so under concurrent editing in any repository its snapshot
+// is replaced while nearly every read holds its rows.
 func TestRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T) {
 	for _, tool := range []string{"get_editing_context", "get_file_summary"} {
-		for _, transition := range []string{"same_file", "same_stamp_byte_drift", "foreign_checkout_proof", "new_physical_owner"} {
+		for _, transition := range []string{"same_file", "other_file_owner", "other_file_owner_selecting", "same_stamp_byte_drift", "foreign_checkout_proof", "new_physical_owner", "owner_came_and_went"} {
 			t.Run(tool+"/"+transition, func(t *testing.T) {
 				testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t, tool, transition)
 			})
@@ -37,7 +41,8 @@ func testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T, tool
 	backend := &assemblyRetirementStore{Store: sql}
 	s.graph = backend
 	pending := make(chan indexer.MutationResult)
-	s.SetWatcher(mutationTestWatcher{done: pending})
+	selecting := new(atomic.Pointer[func()])
+	s.SetWatcher(selectionProbeWatcher{mutationTestWatcher: mutationTestWatcher{done: pending}, name: filepath.Base(path), probe: selecting})
 	t.Cleanup(func() {
 		close(pending)
 		s.mutationReceipts.Range(func(_, value any) bool {
@@ -54,6 +59,23 @@ func testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T, tool
 	witness := filepath.Join(root, revisionFile)
 	require.NoError(t, os.WriteFile(witness, []byte("package probe\n\nfunc RevisionWitness() {}\n"), 0600))
 	require.NoError(t, s.indexer.IndexFile(witness))
+	otherFile := "other_owner.go"
+	other := filepath.Join(root, otherFile)
+	editOther := func() {
+		held, release, err := acquireMutationPath(t.Context(), other)
+		require.NoError(t, err)
+		_, editErr := s.commitFileMutation(held, "write_file", "", "", otherFile, other, []byte("package probe\n\nfunc OtherOwner() int { return 2 }\n"), 0600)
+		release()
+		require.NoError(t, editErr)
+		entry := liveEntry(pendingFileProjections, other)
+		require.NotNil(t, entry)
+		require.Positive(t, entry.commitSeq)
+		require.Nil(t, liveEntry(pendingFileProjections, path))
+	}
+	if strings.HasPrefix(transition, "other_file_owner") {
+		require.NoError(t, os.WriteFile(other, []byte("package probe\n\nfunc OtherOwner() {}\n"), 0600))
+		require.NoError(t, s.indexer.IndexFile(other))
+	}
 	target := "main.go"
 	prefix := s.indexer.RepoPrefix()
 	before, err := sql.FileMetasByPaths(prefix, []string{target, revisionFile})
@@ -114,6 +136,21 @@ func testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T, tool
 					require.Equal(t, physical, proof.bytes)
 					proof.root, proof.abs, proof.key, proof.stamp = foreignRoot, foreignPath, pathkey.MutationKey(foreignPath), foreignStamp
 				}
+			case "other_file_owner":
+				// Another editor's tool write publishes its own file's
+				// projection; the requested file has no owner throughout.
+				editOther()
+			case "owner_came_and_went":
+				// An owner of the requested file is published and retired
+				// without touching its bytes. Its absence now is no proof
+				// that nothing owned the file while the rows were read.
+				proof, _ := ctx.Value(canonicalSummarySourceKey{}).(*canonicalSummarySource)
+				require.NotNil(t, proof)
+				entry := newProjectionTombstone(path, target, prefix, 1)
+				require.Equal(t, proof.key, entry.key)
+				require.NoError(t, pendingFileProjections.publish(entry))
+				require.Equal(t, 1, pendingFileProjections.dropAll([]*projectionEntry{entry}))
+				require.Nil(t, liveEntry(pendingFileProjections, path))
 			case "new_physical_owner":
 				held, release, err := acquireMutationPath(t.Context(), path)
 				require.NoError(t, err)
@@ -126,6 +163,18 @@ func testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T, tool
 			}
 			require.True(t, time.Now().Before(deadline), "controlled transition must fit the original allowance")
 		})
+	}
+	selected := 0
+	if transition == "other_file_owner_selecting" {
+		// The same edit lands while the read selects the file, between its
+		// registry sample and its canonical-content proof.
+		probe := func() {
+			owner(func() {
+				selected++
+				editOther()
+			})
+		}
+		selecting.Store(&probe)
 	}
 	backend.armed.Store(true)
 	deadline = time.Now().Add(projectedReadBudget)
@@ -143,14 +192,35 @@ func testRegisteredCanonicalFileReadAfterUnrelatedSQLRevision(t *testing.T, tool
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, callbacks)
+	if transition == "other_file_owner_selecting" {
+		require.Equal(t, 1, selected)
+	}
 	require.NotNil(t, result)
-	if transition != "same_file" {
+	if transition != "same_file" && !strings.HasPrefix(transition, "other_file_owner") {
 		require.True(t, result.IsError, "unproved canonical data must keep the refusal: %s", resultText(result))
 		require.Contains(t, resultText(result), graph.ErrContractProjectionStale.Error())
 		return
 	}
 	requireCanonicalDefinitionRows(t, tool, result, physical)
 	requireCanonicalFileReadPartial(t, tool, result)
+}
+
+// selectionProbeWatcher runs probe once, on the first storm check of a file
+// named name. A read of a file without an owner makes that check after it
+// samples the projection registry and before it proves the canonical bytes.
+type selectionProbeWatcher struct {
+	mutationTestWatcher
+	name  string
+	probe *atomic.Pointer[func()]
+}
+
+func (w selectionProbeWatcher) StormActiveForFile(path string) bool {
+	if filepath.Base(path) == w.name {
+		if probe := w.probe.Swap(nil); probe != nil {
+			(*probe)()
+		}
+	}
+	return false
 }
 
 func requireCanonicalFileReadPartial(t *testing.T, tool string, result *mcplib.CallToolResult) {
