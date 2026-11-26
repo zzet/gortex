@@ -292,8 +292,11 @@ func TestSessionRedialBacksOffAfterAFailedRedial(t *testing.T) {
 	if data, err := c.call(ctx, "after", nil); err != nil || string(data) != `{"method":"after"}` {
 		t.Fatalf("the second re-dial: %s %v", data, err)
 	}
-	if elapsed := time.Since(started); elapsed < redialBackoff(1) {
-		t.Fatalf("the second re-dial came %s after the first failed, before its back-off", elapsed)
+	// A coarse monotonic clock, such as the Windows runner's, both times the
+	// back-off and measures it here, each up to one tick short. Half the
+	// back-off still tells it from none: without one the re-dial is at once.
+	if elapsed := time.Since(started); elapsed < redialBackoff(1)/2 {
+		t.Fatalf("the second re-dial came %s after the first failed, under half its %s back-off", elapsed, redialBackoff(1))
 	}
 	if got := sessions(); got != 3 {
 		t.Fatalf("sessions accepted: %d, want 3", got)
