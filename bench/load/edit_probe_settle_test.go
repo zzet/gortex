@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -224,25 +226,41 @@ func editProbeBatchSetSettleFixture(t *testing.T) (editProbeBatchSetReferences, 
 
 // The multi-file batch collector has its own shared-owner accounting and the
 // same bound: unchanged unsettled accounting ends the poll once the graph is
-// fresh and every first-correct time is measured.
+// fresh and every first-correct time is measured. A change in the batch
+// accounting alone restarts the count, and a cycle in which a member's status
+// read fails neither counts nor resets it.
 func TestEditProbeBatchSetCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) {
 	const n = editProbeAccountingSettlePolls
 	for _, tc := range []struct {
 		name string
 		// The transaction read on which the graph turns fresh, the last
-		// first-correct time is measured, or the accounting changes (still
-		// unsettled).
-		graphAt, lateAt, changeAt int
+		// first-correct time is measured, the accounting changes (still
+		// unsettled), or only the batch accounting changes.
+		graphAt, lateAt, changeAt, batchChangeAt int
+		// The first and last transaction reads whose cycle fails one
+		// member's status read.
+		failFrom, failUntil int
 	}{
 		{name: "observables_complete"},
 		{name: "graph_late", graphAt: 2 * n},
 		{name: "first_correct_late", lateAt: 3 * n},
 		{name: "accounting_changes", changeAt: n - 1},
+		{name: "batch_accounting_changes", batchChangeAt: n - 1},
+		// More failing cycles than the bound, after some counted ones: they
+		// must not stop the poll, and must not reset the count either.
+		{name: "member_read_fails", failFrom: n / 2, failUntil: n/2 + 2*n},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			refs, intents, tx, receipts := editProbeBatchSetSettleFixture(t)
+			member := refs.Files[1].Observation
+			if tc.batchChangeAt > 0 {
+				// This member already fails its observation check, so a new
+				// acknowledgement state changes only its batch entry: the
+				// reason text, and so the overall accounting, stay the same.
+				receipts[member]["writer_return_observed"] = false
+			}
 			statuses := map[string]map[string]any{}
 			for _, file := range refs.Files {
 				statuses[file.Observation] = receipts[file.Observation]
@@ -253,6 +271,15 @@ func TestEditProbeBatchSetCollectorStopsWhenAccountingStaysUnsettled(t *testing.
 			})
 			if fixture.State != "unavailable_shared_owner" || batch.State != "unavailable_batch_shared_owner" || editProbeFinished(true, true, true, fixture) || !proofPending {
 				t.Fatalf("fixture is not the unsettled shared-owner shape: %+v %+v", fixture, batch)
+			}
+			if tc.batchChangeAt > 0 {
+				changed := maps.Clone(statuses)
+				changed[member] = maps.Clone(receipts[member])
+				changed[member]["acknowledgement_state"] = "reference_only_query_mutation_status"
+				after, afterBatch := (&editProbeRuntime{}).accountingForBatchSetStatuses(ctx, changed, receipts[refs.Acknowledgement], refs)
+				if !reflect.DeepEqual(after, fixture) || reflect.DeepEqual(afterBatch, batch) {
+					t.Fatalf("the change is not batch-only: %+v %+v", after, afterBatch)
+				}
 			}
 			if tc.graphAt > 0 {
 				tx["graph_status"] = "pending"
@@ -286,11 +313,16 @@ func TestEditProbeBatchSetCollectorStopsWhenAccountingStaysUnsettled(t *testing.
 						state.record.FirstCorrect["text"] = measured(2, "ms")
 						state.mu.Unlock()
 					case tc.changeAt:
-						receipts[refs.Files[1].Observation]["writer_return_observed"] = false
+						receipts[member]["writer_return_observed"] = false
+					case tc.batchChangeAt:
+						receipts[member]["acknowledgement_state"] = "reference_only_query_mutation_status"
 					}
 					return stubContent(tx), nil
 				}
 				receipt, _ := options["receipt"].(string)
+				if receipt == member && tc.failFrom <= reads && reads <= tc.failUntil {
+					return nil, &rpcError{Code: -32000, Message: "member status unavailable"}
+				}
 				return stubContent(receipts[receipt]), nil
 			})
 			state = run.states[0]
@@ -311,7 +343,13 @@ func TestEditProbeBatchSetCollectorStopsWhenAccountingStaysUnsettled(t *testing.
 			if ctx.Err() != nil {
 				t.Fatalf("batch set collector polled until the deadline (%d status cycles) after every observable was complete", got)
 			}
-			if want := max(tc.graphAt, tc.lateAt, tc.changeAt, 1) + n - 1; got != want {
+			want := max(tc.graphAt, tc.lateAt, tc.changeAt, tc.batchChangeAt, 1) + n - 1
+			if tc.failFrom > 0 {
+				// The cycles before the failures count; the failing ones are
+				// skipped; the count resumes after them.
+				want = n + tc.failUntil - tc.failFrom + 1
+			}
+			if got != want {
 				t.Fatalf("status cycles = %d, want %d", got, want)
 			}
 			accounting := record.Accounting
