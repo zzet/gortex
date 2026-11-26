@@ -453,6 +453,18 @@ record does not carry, is `not_applicable`. An interval needs at least 2, 20 or
 100 ranked records for p50, p95 or p99 and is unavailable below that. Nothing is
 sampled as zero.
 
+Beside `stats_before` and `stats_after`, every edit-and-probe report carries
+`projection_before` and `projection_after`: the live
+`pending_projection.projection_divergence` counter from `gortex://index-health`,
+with the raw `pending_projection` section, the wire ID and the observation
+time. Each bookend is one five-second `resources/read` on the run-level editor
+connection, before the edit origin and after every edit has ended, never
+between an ACK and its immediate readbacks. A daemon that has not yet done any
+projection work omits the section, so a missing or null section, a missing or
+malformed count, or a failed call stays unavailable with its reason; it is
+never reported as zero. A report written before this field existed has no
+bookends, which is also unavailable evidence.
+
 `--agents R` (0 to 32) adds pure readers on their own sessions, running the
 ordinary reading plan with agent pacing. With readers, the phase opens with a
 30 second no-edit window before the edit origin; the offered edit schedule,
