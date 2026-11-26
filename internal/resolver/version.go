@@ -44,7 +44,11 @@ import (
 // Lua/Luau requires bind by path in the Lua pass instead of the generic import
 // cascade, changing import edges for an unchanged corpus.
 // Relative tsconfig extends can change bindings without changing source bytes.
-const ResolutionSemanticsVersion = 8
+// Direct named JS/TS import bindings now disambiguate otherwise competing files,
+// and lexically shadowed bare calls no longer bind by name.
+// A local bound by an unshadowed static JS/TS require() binds against its
+// required module instead of file-wide imports.
+const ResolutionSemanticsVersion = 10
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be

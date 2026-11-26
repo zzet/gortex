@@ -240,14 +240,12 @@ func TestStaleLangsDetection(t *testing.T) {
 				t.Errorf("global policy salt for %s = %q, want %q", path, got, policySalt)
 			}
 		}
-		// Renamed per-binding JavaScript and TypeScript imports now persist
-		// import_alias Meta. Rows extracted before that keyed a renamed
-		// import by its original name, so stored files must re-extract once.
+		// Previous JS/TS rows lack evidence of directly named exports.
 		if got := ExtractorVersionStaleLangs(
-			snapshotJSON(t, map[string]int{"javascript": 1, "typescript": 1})); !reflect.DeepEqual(got, []string{"javascript", "typescript"}) {
-			t.Errorf("snapshot stored before import_alias = %v, want [javascript typescript]", got)
+			snapshotJSON(t, map[string]int{"javascript": 2, "typescript": 3})); !reflect.DeepEqual(got, []string{"javascript", "typescript"}) {
+			t.Errorf("snapshot stored before named export evidence = %v, want [javascript typescript]", got)
 		}
-		for path, want := range map[string]string{"model.js": policySalt + "|javascript@2", "model.ts": policySalt + "|typescript@3"} {
+		for path, want := range map[string]string{"model.js": policySalt + "|javascript@4", "model.ts": policySalt + "|typescript@5"} {
 			if got := merkleSaltFor(path); got != want {
 				t.Errorf("extractor salt for %s = %q, want %q", path, got, want)
 			}

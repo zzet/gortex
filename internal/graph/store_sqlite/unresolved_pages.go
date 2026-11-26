@@ -194,6 +194,18 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 		cond += `)`
 		extra += ` AND ` + cond
 	}
+	if scan.SourceOnly {
+		if fromIn, fromArgs := anchorIn(`from_repo`); fromIn != "" {
+			extra += ` AND (from_repo IS NULL OR ` + fromIn + `)`
+			args = append(args, fromArgs...)
+		}
+	}
+	if len(scan.Kinds) > 0 {
+		extra += ` AND kind IN (` + inPlaceholders(len(scan.Kinds)) + `)`
+		for _, kind := range scan.Kinds {
+			args = append(args, string(kind))
+		}
+	}
 	args = append(args, maxRows)
 	rows, err := s.db.QueryContext(ctx, unresolvedEdgePageSQL(source, generation, extra), args...)
 	if err != nil {

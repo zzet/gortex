@@ -122,6 +122,20 @@ is not scanned as an independent scope. Package-specifier `extends` and project
 When an effective alias changes, reindexing rebinds existing JS/TS callers
 even if their source files have not changed.
 
+### JS/TS import evidence
+
+Bare JS/TS calls can resolve at `ast_resolved` even when the repository has
+only one candidate. An unrenamed named import that matches a directly exported
+declaration takes precedence (`import_binding`). Otherwise, a unique candidate
+in a directly imported file or its barrel re-exports can supply file-level
+evidence (`import_closure`). A same-file declaration blocks import promotion;
+when imports don't settle the call, the usual resolution rules still apply.
+A call whose name is bound by an enclosing parameter, catch clause, block or
+hoisted `var` is not an import call. It binds to a same-file declaration when
+one exists and otherwise stays unresolved. A local initialized from an
+unshadowed static `require("...")` binding resolves only against that required
+module instead of file-wide imports.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`

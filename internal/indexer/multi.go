@@ -126,6 +126,9 @@ type MultiIndexer struct {
 	goModuleRetry        resolver.GoModuleDepRetry
 	npmPackageMu         sync.Mutex
 	npmPackageCache      *npmPackageSnapshot
+	// npmRequireChecked is the package snapshot the last complete
+	// whole-graph require re-check ran against; see npmPackageLookups.
+	npmRequireChecked atomic.Pointer[npmPackageSnapshot]
 
 	// pendingResolveRetryMu protects refused placeholder repoints and
 	// cross-package guard reverts handed back from short-lived master/cross-repo
