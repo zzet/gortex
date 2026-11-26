@@ -108,6 +108,9 @@ type contractAnalysisJob struct {
 	// yield replaces the coordinator's Yield for this job: a linked job the
 	// idle policy governs parks without a progress slice.
 	yield func(context.Context) error
+	// strictWaiting reports whether a strict request waits on the job's
+	// actor now: the job's yield then takes a bounded share of its time.
+	strictWaiting func() bool
 	// linkedPolicy names the policy a linked actor's job ran under, empty
 	// for a primary actor; strict is set when a strict request started it,
 	// and gatedAt is when, on the wall clock, its policy let it start.
@@ -394,10 +397,7 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		zap.String("repo", targets[0].Key.RepoPrefix), zap.String("checkout", targets[0].Key.CheckoutID), zap.Int("targets", len(targets)),
 		zap.String("trigger", job.trigger), zap.Float64("since_trigger_ms", contractMillis(dispatch)),
 		zap.Float64("since_accept_ms", sinceAccept), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedStartFields()...)...)
-	yield := c.options.Yield
-	if job.yield != nil {
-		yield = job.yield
-	}
+	yield := c.jobYield(job)
 	report, err := RunContractFollowupBatch(c.ctx, ContractFollowupBatchRequest{Snapshot: job.snapshot, Targets: targets, RebuildReason: ContractFollowupUnknownInterval, Registry: c.options.Registry, Config: c.options.Config, RepoConfigs: job.snapshot.RepoConfigs, Logger: c.options.Logger, Leases: c.options.Leases, ScratchParent: c.options.ScratchParent, Yield: yield,
 		PublishedEpoch: c.publishedEpoch, WaitPublished: c.waitPublished, OtherActorWaiting: job.otherActorWaiting, checkpointDemand: job.checkpointDemand, delta: job.delta, reservePayload: reservePayload,
 		PriorityRepos: job.priorityRepos, BackgroundCurrent: job.backgroundCurrent,
@@ -450,6 +450,61 @@ func (c *ContractAnalysisCoordinator) execute(job *contractAnalysisJob) string {
 		zap.String("job", job.id), zap.String("checkout", targets[0].Key.CheckoutID), zap.String("trigger", job.trigger),
 		zap.Float64("dispatch_ms", contractMillis(dispatch)), zap.Float64("capture_ms", contractMillis(job.capture))}, job.linkedEndFields(outcome)...)...)
 	return outcome
+}
+
+// jobYield is the yield a job's body runs with: the job's own or the
+// coordinator's, bounded while a strict request waits on the job.
+func (c *ContractAnalysisCoordinator) jobYield(job *contractAnalysisJob) func(context.Context) error {
+	yield := c.options.Yield
+	if job.yield != nil {
+		yield = job.yield
+	}
+	if job.strictWaiting != nil {
+		yield = contractStrictYield(yield, job.strictWaiting, c.now)
+	}
+	return yield
+}
+
+// contractStrictYieldShare is the largest share, in percent, of a job's time
+// since a strict request first waited on it that the job spends in its
+// foreground yield.
+const contractStrictYieldShare = 10
+
+// contractStrictYield bounds yield while strict reports a strict request
+// waiting on the job. Each call of the shared yield waits at most a short
+// slice, but a fill calls it before every file it extracts, so under
+// sustained foreground work the slices could add up to most of the strict
+// caller's budget. Once the time spent in the yield exceeds
+// contractStrictYieldShare of the time since the job's first strict call,
+// the job skips the yield, still reporting cancellation, until its own work
+// has caught up; the first strict call always yields. While no strict request
+// waits, the job yields as before and that time does not count. now is the
+// clock both are measured on.
+func contractStrictYield(yield func(context.Context) error, strict func() bool, now func() time.Time) func(context.Context) error {
+	var mu sync.Mutex
+	var since time.Time
+	var spent time.Duration
+	return func(ctx context.Context) error {
+		if !strict() {
+			return yield(ctx)
+		}
+		start := now()
+		mu.Lock()
+		if since.IsZero() {
+			since = start
+		}
+		skip := spent*100 > start.Sub(since)*contractStrictYieldShare
+		mu.Unlock()
+		if skip {
+			return ctx.Err()
+		}
+		err := yield(ctx)
+		took := now().Sub(start)
+		mu.Lock()
+		spent += took
+		mu.Unlock()
+		return err
+	}
 }
 
 // contractJobOutcome classifies a finished job body for the jobs counter.
