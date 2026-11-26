@@ -8,9 +8,11 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"math"
 	"math/big"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -606,8 +608,9 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 			fail("missing B phase " + name)
 		}
 	}
-	for name, value := range pPhases {
-		if value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
+	// In name order, so identical status replies give identical reasons.
+	for _, name := range slices.Sorted(maps.Keys(pPhases)) {
+		if value := pPhases[name]; value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
 			fail("B/P phase mismatch: " + name)
 		}
 	}

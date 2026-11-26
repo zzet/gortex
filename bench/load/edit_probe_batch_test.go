@@ -352,6 +352,14 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 // duplicate whose earlier publisher is never reported, so the accounting is
 // not terminal however long the collector waits.
 func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) {
+	includes := func(reasons, want []string) bool {
+		for _, reason := range want {
+			if !slices.Contains(reasons, reason) {
+				return false
+			}
+		}
+		return true
+	}
 	for _, tc := range []struct {
 		name string
 		// The transaction read on which the last first-correct time is
@@ -360,6 +368,9 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 		lateAt, changeAt, freshAt int
 		// The first transaction read that reports the graph pending.
 		pendingAt int
+		// Every measured P phase disagrees with its B copy, so the
+		// accounting carries several B/P phase mismatch reasons.
+		mismatches bool
 	}{
 		{name: "observables_complete"},
 		{name: "first_correct_late", lateAt: 3 * editProbeAccountingSettlePolls},
@@ -367,13 +378,29 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 		// Counted cycles before the graph turns pending make the reset
 		// observable: a skipped cycle would keep the count instead.
 		{name: "graph_pending_then_fresh", pendingAt: editProbeAccountingSettlePolls / 2, freshAt: 2 * editProbeAccountingSettlePolls},
+		// Each status read decodes a new phase map, so the mismatches are
+		// found in a different map order on every cycle.
+		{name: "mismatch_reasons_in_any_map_order", mismatches: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := editProbeRepairAccountingFixture()
 			delete(status, "read_assisted_publication")
+			var mismatched []string
+			if tc.mismatches {
+				// The B window stays valid: five laps grow by 1 ms and so
+				// does its wall.
+				background := status["requested_background"].(map[string]any)
+				for _, name := range []string{"attempt_setup", "patch_inspection", "attempt_finalize", "cohort_admission", "lane_wait"} {
+					background["phases_ms"].(map[string]any)[name] = json.Number("2")
+					mismatched = append(mismatched, "B/P phase mismatch: "+name)
+				}
+				background["background_wall_ms"] = json.Number("17")
+			}
 			stub := newEditProbeBatchCollectorStub(t, status)
 			if got := stub.refs.accounting(stub.file, stub.shared); got.State != "unavailable" || !slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || editProbeFinished(true, true, true, got) {
 				t.Fatalf("fixture is not the unsettled duplicate shape: %+v", got)
+			} else if got.B == nil || !includes(got.Reasons, mismatched) {
+				t.Fatalf("fixture lacks a valid B window or its B/P mismatches: %+v", got)
 			}
 			first := measured(1, "ms")
 			if tc.lateAt > 0 {
@@ -416,6 +443,16 @@ func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) 
 			if !state.record.GraphTerminal || got.State != "unavailable" || editProbeAccountingComplete(got) ||
 				!slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || !slices.Contains(got.Reasons, editProbeAccountingUnsettledReason) {
 				t.Fatalf("unsettled accounting was not kept unavailable with its stop reason: %+v", got)
+			}
+			// The mismatch reasons come out in one fixed order.
+			var order []string
+			for _, reason := range got.Reasons {
+				if strings.HasPrefix(reason, "B/P phase mismatch: ") {
+					order = append(order, reason)
+				}
+			}
+			if !includes(order, mismatched) || len(order) != len(mismatched) || !slices.IsSorted(order) {
+				t.Fatalf("B/P mismatch reasons = %q, want %q in sorted order", order, mismatched)
 			}
 			if state.sinkErr != nil || state.rawBytes == 0 {
 				t.Fatalf("raw evidence incomplete or missing: bytes=%d err=%v", state.rawBytes, state.sinkErr)
