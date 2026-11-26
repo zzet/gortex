@@ -124,6 +124,8 @@ type editProbeReport struct {
 	Restore            json.RawMessage              `json:"restore_batch"`
 	StatsBefore        json.RawMessage              `json:"stats_before"`
 	StatsAfter         json.RawMessage              `json:"stats_after"`
+	ProjectionBefore   *editProbeProjectionBookend  `json:"projection_before,omitempty"`
+	ProjectionAfter    *editProbeProjectionBookend  `json:"projection_after,omitempty"`
 	Limitations        []string                     `json:"limitations"`
 }
 
@@ -275,7 +277,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if required {
 		role = "candidate"
 	}
-	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
+	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), ProjectionBefore: unobservedProjectionBookend(), ProjectionAfter: unobservedProjectionBookend(), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
 	if plan.OwnACKReadbackOnly {
 		out.AccountingRequired = false
 		out.Limitations = []string{"local ACK and immediate same-session file/source only; no graph-terminal, visibility or A/P/B phase qualification",
@@ -1277,7 +1279,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break // Foreign terminal/accounting fields cannot settle this edit.
 					}
-					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool)
+					countedNoWait := localFileAcknowledgementMatches(body, status, r.plan.Tool, step.MutationID)
+					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool, countedNoWait)
 					s.mu.Lock()
 					s.record.Accounting = accounting
 					s.record.supersededStatus = supersededStatus(status, raw, statusIdentity.ID)
@@ -1448,8 +1451,7 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		} else {
 			if readErr != nil {
 				back.Error = readErr.Error()
-			}
-			if decodeErr != nil {
+			} else if decodeErr != nil {
 				back.Error = decodeErr.Error()
 			}
 		}
@@ -1495,6 +1497,7 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	if statsErr != nil {
 		return statsErr
 	}
+	r.phase.EditProbe.ProjectionBefore = r.projectionBookend(ctx)
 	// Pure readers start with the phase; the offered edits keep their own
 	// schedule relative to an origin after the no-edit window.
 	r.phase.Started = time.Now()
@@ -1513,6 +1516,7 @@ func (r *editProbeRuntime) run(ctx context.Context) error {
 	finished := r.finish()
 	after, statsErr := r.stats(measuredCtx)
 	r.phase.EditProbe.StatsAfter = after
+	r.phase.EditProbe.ProjectionAfter = r.projectionBookend(ctx)
 	return errors.Join(err, finished, statsErr)
 }
 

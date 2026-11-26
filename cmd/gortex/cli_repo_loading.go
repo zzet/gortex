@@ -116,14 +116,31 @@ func callToolWaitingForLoad(exec cliExecutor, tool string, args map[string]any, 
 		loading.repo, loading.progress(), wait.Round(time.Second))
 	start := time.Now()
 	deadline := start.Add(wait)
+	ctx := context.Background()
+	// A timed-out read-only search can safely report the previous loading
+	// refusal. An arbitrary tool may already have changed state after the retry.
+	boundedRetry := tool == "search_symbols"
+	if boundedRetry {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	for time.Now().Before(deadline) {
 		time.Sleep(min(loadingWaitPoll, time.Until(deadline)))
-		out, err = exec.CallTool(context.Background(), tool, args)
-		var still *repoLoadingError
-		if !errors.As(err, &still) {
-			return out, err
+		if boundedRetry && !time.Now().Before(deadline) {
+			break
 		}
-		loading = still
+		out, err = exec.CallTool(ctx, tool, args)
+		var still *repoLoadingError
+		if errors.As(err, &still) {
+			loading = still
+			continue
+		}
+		if boundedRetry && !time.Now().Before(deadline) &&
+			(errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)) {
+			break
+		}
+		return out, err
 	}
 	loading.waited = time.Since(start)
 	return nil, loading

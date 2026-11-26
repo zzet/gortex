@@ -1090,10 +1090,10 @@ func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP
 	mi.runMasterResolveFilesObserved(files, useLSP, evidence, nil)
 }
 
-func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) {
+func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
-		return
+		return nil
 	}
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
@@ -1105,6 +1105,7 @@ func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP boo
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
 	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
+	return stats
 }
 
 // reconcileRetargetedTestCalls re-runs the scoped test projection over the
@@ -2655,7 +2656,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	mtimes.end()
 
 	if mode.onRelations != nil && len(result.FailedFiles) == 0 {
-		mode.onRelations()
+		mode.onRelations(batch.pointRebindRefused)
 	}
 	idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 	derived := mode.publication.beginDerivedPatchLap()

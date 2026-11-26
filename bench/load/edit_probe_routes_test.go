@@ -11,17 +11,52 @@ import (
 	"time"
 )
 
+// Each fixed writer owns one repository under either ACK policy, and the
+// policy is part of the offered workload identity.
 func TestEditProbeSixRepositoryRoutesAreExplicitAndAffectPlanIdentity(t *testing.T) {
-	args := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--edit-agents", "6", "--worktrees", "0", "--edit-count", "100", "--seed", "42", "--edit-repos", "6"}
-	o, err := parseRun(args)
-	if err != nil {
-		t.Fatalf("explicit six-repository edit cell refused: %v", err)
+	plans := map[string]string{}
+	for _, cell := range []struct {
+		name, ack string
+		extra     []string
+	}{
+		{name: "default_full_ack"},
+		{name: "full_ack", ack: "full", extra: []string{"--edit-ack", "full"}},
+		{name: "local_ack", ack: "local", extra: []string{"--edit-ack", "local"}},
+		{name: "reference_local_ack", ack: "local", extra: []string{"--host", "reference", "--edit-ack", "local"}},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			args := []string{"--binary", "unused", "--manifest", "unused", "--scratch", t.TempDir(), "--scenario", editProbeScenario, "--agents", "0", "--edit-agents", "6", "--worktrees", "0", "--edit-count", "100", "--seed", "42", "--edit-repos", "6"}
+			o, err := parseRun(append(args, cell.extra...))
+			if err != nil {
+				t.Fatalf("explicit six-repository edit cell refused: %v", err)
+			}
+			corpora := editProbeRoutingCorpora()
+			report, err := newRunReport(o, corpora, strings.Repeat("a", 40), Host{}, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Workload.EditACKMode != cell.ack {
+				t.Fatalf("workload identity lost the ACK selection: ack=%q", report.Workload.EditACKMode)
+			}
+			plans[cell.name] = report.RequestPlan
+			checkSixRepositoryRoutes(t, report, corpora)
+			// A secondary repository's pin belongs to the offered workload identity;
+			// it cannot be ignored merely because the primary fixture is unchanged.
+			changed := append([]Corpus(nil), corpora...)
+			changed[3].Commit = strings.Repeat("b", 40)
+			other, err := newRunReport(o, changed, report.GitSHA, Host{}, t.TempDir())
+			if err != nil || other.RequestPlan == report.RequestPlan {
+				t.Fatalf("secondary route pin absent from plan identity: %v", err)
+			}
+		})
 	}
-	corpora := editProbeRoutingCorpora()
-	report, err := newRunReport(o, corpora, strings.Repeat("a", 40), Host{}, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	if plans["full_ack"] == "" || plans["full_ack"] == plans["local_ack"] {
+		t.Error("plan identity does not separate full from local ACKs")
 	}
+}
+
+func checkSixRepositoryRoutes(t *testing.T, report Report, corpora []Corpus) {
+	t.Helper()
 	data, err := json.Marshal(report.Workload.EditProbe)
 	if err != nil {
 		t.Fatal(err)
@@ -72,16 +107,10 @@ func TestEditProbeSixRepositoryRoutesAreExplicitAndAffectPlanIdentity(t *testing
 		}
 		seenRoutes[step.Route], seenMutations[step.MutationID] = true, true
 	}
+	// Routes are a function of the writer, so six distinct routes also mean
+	// six distinct writers: one writer per repository and one repository per writer.
 	if len(seenRoutes) != 6 {
 		t.Fatal("selected repository has no offered edits", seenRoutes)
-	}
-	// A secondary repository's pin belongs to the offered workload identity;
-	// it cannot be ignored merely because the primary fixture is unchanged.
-	changed := append([]Corpus(nil), corpora...)
-	changed[3].Commit = strings.Repeat("b", 40)
-	other, err := newRunReport(o, changed, report.GitSHA, Host{}, t.TempDir())
-	if err != nil || other.RequestPlan == report.RequestPlan {
-		t.Fatalf("secondary route pin absent from plan identity: %v", err)
 	}
 }
 

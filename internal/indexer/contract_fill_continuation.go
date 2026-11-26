@@ -123,6 +123,16 @@ func contractFillCensus(census map[string]bool) [sha256.Size]byte {
 	return contractFillDigest(identities)
 }
 
+// fillCensus shares one fingerprint across scans that observe the same
+// membership. Receipt-only moves still advance the proof clock independently.
+func (c *contractConvergence) fillCensus() [sha256.Size]byte {
+	if !c.fillCensusKnown || c.fillCensusVersion != c.clock.censusChangedAt {
+		c.fillCensusDigest = contractFillCensus(c.clock.lastCensus)
+		c.fillCensusVersion, c.fillCensusKnown = c.clock.censusChangedAt, true
+	}
+	return c.fillCensusDigest
+}
+
 func contractFillNamespaceRead(w *contractWorkCoverage, unit *contractUnit) bool {
 	if w.broad {
 		return true
@@ -157,11 +167,7 @@ func (c *contractConvergence) noteFillRead(unit *contractUnit) {
 	if c.fillReadCensus == nil {
 		c.fillReadCensus = map[*contractUnit][sha256.Size]byte{}
 	}
-	if c.fillCensusClock != c.clock.clock || !c.fillCensusKnown {
-		c.fillCensusDigest = contractFillCensus(c.clock.lastCensus)
-		c.fillCensusClock, c.fillCensusKnown = c.clock.clock, true
-	}
-	c.fillReadCensus[unit] = c.fillCensusDigest
+	c.fillReadCensus[unit] = c.fillCensus()
 }
 
 // Only actual admitted own/read pointers can mint this provenance. A later
@@ -172,7 +178,7 @@ func checkpointContractFill(c *contractConvergence, p *contractDeltaCache, pool 
 	}
 	w := c.coverage
 	rows := newContractFillRows(w.work)
-	proof := &contractFillContinuation{identity: p.identity, barrierRows: contractFillBarrierRows(w.work), allRows: rows.all, census: contractFillCensus(c.clock.lastCensus)}
+	proof := &contractFillContinuation{identity: p.identity, barrierRows: contractFillBarrierRows(w.work), allRows: rows.all, census: c.fillCensus()}
 	proof.barrierMembers, proof.namespaceRows = contractFillBarrierMembers(w.work)
 	type candidate struct {
 		unit   *contractUnit
@@ -289,7 +295,7 @@ func (proof *contractFillContinuation) resume(c *contractConvergence, p *contrac
 	}
 	w.observe(c)
 	rows := newContractFillRows(w.work)
-	census := contractFillCensus(c.clock.lastCensus)
+	census := c.fillCensus()
 	for _, entry := range proof.units {
 		unit := entry.unit
 		if unit == nil || c.units[unit.path] != unit || p.units[unit.path] != unit || !c.live[unit.path] {

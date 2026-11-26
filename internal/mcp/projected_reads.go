@@ -179,7 +179,12 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 			layers = append(layers, layer)
 		}
 	}
-	if err := validateRequestProjectionStage(ctx, projectionReadSelection); err != nil {
+	if guard, err := requestProjectionStageRefusal(ctx, projectionReadSelection); err != nil {
+		allowance, _ := ctx.Value(projectedSourceAllowanceKey{}).(*projectedSourceAllowance)
+		if allowance != nil && allowance.afterFreshness && allowance.tool == "get_callers" &&
+			(guard == projectionOwnerAbsentBefore || guard == projectionOwnerAbsentAfter) && retryAfterCheckedProjectionChange(ctx) {
+			return ctx, errProjectedSourceMoved
+		}
 		return ctx, err
 	}
 	if len(layers) == 0 {
@@ -444,10 +449,11 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 // graph layers retained by each derived context remain immutable snapshots.
 type requestProjectionFactsKey struct{}
 type requestProjectionFacts struct {
-	mu             sync.RWMutex
-	entries        map[string]*projectionEntry
-	deferredFiles  map[string]string   // projection deferral observations, not publication authority
-	storeBusyFiles map[string]struct{} // selected store sections were unavailable
+	mu                sync.RWMutex
+	entries           map[string]*projectionEntry
+	deferredFiles     map[string]string   // projection deferral observations, not publication authority
+	storeBusyFiles    map[string]struct{} // selected store sections were unavailable
+	callChainBoundary callChainFreshnessBoundary
 }
 
 func withRequestProjectionFacts(ctx context.Context) context.Context {
@@ -542,24 +548,29 @@ func validateRequestProjections(ctx context.Context) error {
 }
 
 func validateRequestProjectionStage(ctx context.Context, stage projectionReadStage) error {
+	_, err := requestProjectionStageRefusal(ctx, stage)
+	return err
+}
+
+func requestProjectionStageRefusal(ctx context.Context, stage projectionReadStage) (projectionLivenessGuard, error) {
 	facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts)
 	if !ok {
-		return nil
+		return projectionOwnerLive, nil
 	}
 	facts.mu.RLock()
 	defer facts.mu.RUnlock()
 	if len(facts.entries) == 0 {
-		return nil
+		return projectionOwnerLive, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return projectionOwnerLive, err
 	}
 	for _, entry := range facts.entries {
 		if guard, _ := predicateRefusal(ctx, stage, entry); guard != projectionOwnerLive {
-			return annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
+			return guard, annotateProjectionReadRefusal(stage, guard, projectionSuperseded)
 		}
 	}
-	return nil
+	return projectionOwnerLive, nil
 }
 
 func withProjectedReadToolFacts(ctx context.Context, name string) context.Context {

@@ -211,7 +211,7 @@ func TestContractFillContinuationNamespaceReadsBindAdmittedCensus(t *testing.T) 
 			c.coverage.record(reader, []string{"repo/producer.go", "repo/reader.go"})
 			c.noteFillRead(reader)
 			if changeAfterRead {
-				c.clock.lastCensus["repo/new.go"] = true
+				observeContractFillCensusJoin(c, "repo/new.go")
 			}
 			p.continuation = checkpointContractFill(c, p, &contractProofStrings{})
 			require.NotNil(t, p.continuation)
@@ -227,7 +227,7 @@ func TestContractFillContinuationNamespaceReadsBindAdmittedCensus(t *testing.T) 
 			p.continuation.resume(c, p)
 			require.True(t, c.coverage.readSatisfied(reader))
 			c.coverage.read = map[string]*contractUnit{}
-			c.clock.lastCensus["repo/new.go"] = true
+			observeContractFillCensusJoin(c, "repo/new.go")
 			p.continuation.resume(c, p)
 			require.False(t, c.coverage.readSatisfied(reader), "a census-only join needs actual guarded replay even with unchanged receipts and work")
 		})

@@ -163,11 +163,13 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			a.CWD = session.cwd
 		}
 		var remote *rpcError
+		var retainedSummaryRefusal bool
 		if err != nil {
 			a.Outcome, a.Error = "error", err.Error()
 			if errors.As(err, &remote) {
 				a.Code = remote.Code
 				a.ErrorData = copyRPCErrorData(remote.Data)
+				retainedSummaryRefusal = firstSummaryRefusalFrom(callCtx).retain(&a, args, data)
 			}
 			if remote != nil && remote.Code == -32002 && (!retryTyped || remote.retryEditProbe()) {
 				a.Outcome = "busy"
@@ -202,6 +204,10 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 		}
 		if err := sleep(callCtx, busyBackoff(retry)); err != nil {
 			terminal := a
+			if retainedSummaryRefusal {
+				terminal.ErrorData = copyRPCErrorData(a.ErrorData)
+				delete(terminal.ErrorData, firstSummaryRefusalField)
+			}
 			terminal.Retry++
 			terminal.Started = time.Now()
 			terminal.DurationMS = 0

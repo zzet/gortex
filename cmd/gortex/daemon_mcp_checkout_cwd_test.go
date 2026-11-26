@@ -29,8 +29,9 @@ import (
 // repository and one registered automatic checkout of its family — the shape
 // a git worktree of a tracked repo takes. The worktree root is deliberately
 // OUTSIDE the tracked root: that is what makes it invisible to the repository
-// registry and visible only to the view catalog.
-func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot string) {
+// registry and visible only to the view catalog. When loading is set, the
+// persisted catalog is available before the primary registers.
+func checkoutCWDSetup(t *testing.T, loading bool) (d *mcpDispatcher, primaryRoot, worktreeRoot string) {
 	t.Helper()
 	dir := t.TempDir()
 	primaryRoot = filepath.Join(dir, "repos", "app")
@@ -51,10 +52,20 @@ func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot
 
 	ctx := context.Background()
 	require.NoError(t, os.MkdirAll(primaryRoot, 0o755))
-	require.NoError(t, os.MkdirAll(worktreeRoot, 0o755))
-	res, err := mi.TrackRepoCtx(ctx, config.RepoEntry{Path: primaryRoot})
-	require.NoError(t, err)
-	prefix := res.RepoPrefix
+	entry := config.RepoEntry{Path: primaryRoot}
+	prefix := config.ResolvePrefix(entry)
+	if loading {
+		discoveryScopeRepo(t, primaryRoot)
+		require.NoError(t, os.MkdirAll(filepath.Dir(worktreeRoot), 0o755))
+		guidanceGit(t, primaryRoot, "worktree", "add", "-q", "-b", "feature", worktreeRoot)
+		mi.ExpectRepos([]config.RepoEntry{entry})
+		mi.StartRepoLoad(primaryRoot)
+	} else {
+		require.NoError(t, os.MkdirAll(worktreeRoot, 0o755))
+		res, err := mi.TrackRepoCtx(ctx, entry)
+		require.NoError(t, err)
+		prefix = res.RepoPrefix
+	}
 
 	// The corpus has to carry the prefix: the family list a view lookup walks
 	// is derived from the repo prefixes the indexed graph holds.
@@ -128,7 +139,7 @@ func checkoutCWDSetup(t *testing.T) (d *mcpDispatcher, primaryRoot, worktreeRoot
 // as a second repository.
 func TestDispatcher_RegisteredCheckoutCWDPasses(t *testing.T) {
 	ctx := context.Background()
-	d, _, worktree := checkoutCWDSetup(t)
+	d, _, worktree := checkoutCWDSetup(t, false)
 
 	assert.True(t, d.cwdReachable(ctx, worktree),
 		"a cwd inside a registered automatic checkout must be reachable")
@@ -154,9 +165,59 @@ func TestDispatcher_RegisteredCheckoutCWDPasses(t *testing.T) {
 // admits registered checkouts, not every path that happens to sit beside one.
 func TestDispatcher_UnregisteredWorktreeCWDStillRejected(t *testing.T) {
 	ctx := context.Background()
-	d, _, worktree := checkoutCWDSetup(t)
+	d, _, worktree := checkoutCWDSetup(t, false)
 
 	stranger := filepath.Join(filepath.Dir(worktree), "not-registered")
 	assert.False(t, d.cwdReachable(ctx, stranger),
 		"a sibling directory no checkout owns must stay unreachable")
+}
+
+func TestDispatcher_LoadingLinkedCheckoutFacadeCatalog(t *testing.T) {
+	d, primary, worktree := checkoutCWDSetup(t, true)
+	primary, err := filepath.EvalSymlinks(primary)
+	require.NoError(t, err)
+	sess := &daemon.Session{ID: "loading-linked-catalog", CWD: worktree, ToolSpec: "facade-v1", ToolMode: "hide"}
+	d.SessionStarted(sess, func([]byte) error { return nil })
+	t.Cleanup(func() { d.SessionEnded(sess) })
+	const initialize = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"loading-linked-catalog","version":"1"}}}`
+	require.Contains(t, dispatchJSON(t, d, sess, initialize), "result")
+
+	graph := dispatchJSON(t, d, sess, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace","arguments":{"operation":"graph"}}}`)
+	refusal := errorData(t, graph)
+	require.Equal(t, "repo_loading", refusal["error_code"])
+	require.Equal(t, true, refusal["retryable"])
+	require.Equal(t, primary, refusal["repo_path"])
+	require.Equal(t, string(indexer.RepoLoadRunning), refusal["state"])
+
+	for _, args := range []string{"null", "{}"} {
+		t.Run("catalog "+args, func(t *testing.T) {
+			reply := dispatchJSON(t, d, sess, catalogCallFrame(args))
+			result := toolResultText(t, reply)
+			if assert.NotEqual(t, true, reply["result"].(map[string]any)["isError"], "%s", result) {
+				var catalog struct {
+					Surface string           `json:"surface_version"`
+					Domains []map[string]any `json:"domains"`
+				}
+				require.NoError(t, json.Unmarshal([]byte(result), &catalog))
+				assert.Equal(t, gortexmcp.FacadeSurfaceVersion, catalog.Surface)
+				assert.NotEmpty(t, catalog.Domains)
+				assert.NotContains(t, result, "chk-worktree")
+			}
+		})
+	}
+	for name, args := range map[string]string{
+		"explicit automatic view": `{"view":{"kind":"auto"}}`,
+		"explicit checkout view":  `{"view":{"kind":"worktree","checkout_id":"chk-worktree"}}`,
+		"exact view":              `{"require_exact":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reply := dispatchJSON(t, d, sess, catalogCallFrame(args))
+			assert.Contains(t, toolResultText(t, reply), "selector_out_of_scope")
+			assert.Equal(t, true, reply["result"].(map[string]any)["isError"])
+		})
+	}
+}
+
+func catalogCallFrame(args string) string {
+	return `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capabilities","arguments":` + args + `}}`
 }
