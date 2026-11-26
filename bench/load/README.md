@@ -16,6 +16,7 @@ go run ./bench/load run --binary /private/bin/gortex \
   --manifest /private/corpus.json --scratch /private/load-artifacts \
   --profile agent --scenario read --agents 8 --duration 60s --host native
 go run ./bench/load delta /private/tag.json /private/main.json
+go run ./bench/load consumer-census --out /private/census.json /private/report.json
 go run ./bench/load schema
 ```
 
@@ -291,6 +292,29 @@ retained raw evidence and censored records, and lists unowned ordinals. It is
 evidence and none is censored. A consumer census from 8 or 32 editors can claim
 an ordinal's answers only under that binding. The census changes no outcome,
 error or consumer verdict.
+
+The run keeps its strict consumer rule: an edit fails when any of its consumer
+rows has an error, an unassessed answer or no assessed answer, and `load run`
+then exits 1. That exit does not mean the cell has no result. The report is
+written in full first, and `load consumer-census [--out census.json]
+report.json` scores it offline. For every consumer and requested output mode
+it counts the owned ordinals, the post-ACK answers that were assessed and how
+many of those were silent stale. It discloses everything else: unassessed
+answers, errors (including pre-ACK and unsent calls), the ordinals with no
+assessed answer or with errors, unowned ordinals and any stale answer in them,
+and how many edits failed the run's consumer rule. A compact answer that does
+not show the subject has no freshness claim, so it is unassessed, never
+silent stale or clean. The census reads only the report: the stale count is
+the assessed answers that were neither pending nor showed the subject, and
+counts that do not add up are refused. Its `state` is `clean`,
+`errors_present` (no silent stale among the assessed answers, with errors or
+unassessed answers disclosed), `silent_stale`, or `no_result`, with a reason,
+when the report cannot be read, did not probe consumers, has no observed
+pre-edit baseline or own-ACK binding (reports written before
+`consumer_own_ack` existed), or has no owned, assessed answer. It exits 0 for
+`clean` and `errors_present`, 1 for `silent_stale` and 2 for `no_result`.
+A wrapper that scores consumer cells runs the census on the report instead of
+reading the run's exit 1 as no result. `--out` never overwrites a file.
 
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
