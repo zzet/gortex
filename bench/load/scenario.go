@@ -371,6 +371,19 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			if err := preflightRoot(warmCtx, p, client, repo, worktreeViews && i > 0 || scenario == checkoutDiscoveryScenario && i >= 2, o.Deadline, &phase); err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
+			// The mine is process-wide; one settled answer on the first root covers all six.
+			if i == 0 && o.EditWaitCoChange {
+				started := time.Now()
+				body, attempts, err := warmEditCoChange(warmCtx, client, repo, o.Deadline, waitContext)
+				phase.Attempts = append(phase.Attempts, attempts...)
+				phase.Metrics["cochange_setup_seconds"] = measured(time.Since(started).Seconds(), "s")
+				if body != nil {
+					phase.Gate[repo.Corpus.Label+".cochange_setup"] = body
+				}
+				if err != nil {
+					return phase, nil, artifacts, crashes, version, err
+				}
+			}
 			gate, rows, err := warmAnalysis(warmCtx, client, o.Deadline)
 			phase.Attempts = append(phase.Attempts, rows...)
 			for name, value := range gate {
