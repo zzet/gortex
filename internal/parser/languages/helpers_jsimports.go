@@ -713,6 +713,18 @@ type jsBinding struct {
 type jsScopeCache struct {
 	scopes        map[jsScopeKey]map[string]jsBinding
 	requireShadow map[jsScopeKey]bool
+	// called holds the names of the bare calls stamp will look up. Scope maps
+	// keep only those names: a declaration no call looks up can't shadow one.
+	// Nil keeps every name.
+	called map[string]struct{}
+}
+
+// noteCall records a bare call name before stamping begins.
+func (cache *jsScopeCache) noteCall(name string) {
+	if cache.called == nil {
+		cache.called = map[string]struct{}{}
+	}
+	cache.called[name] = struct{}{}
 }
 
 func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name string, src []byte) {
@@ -750,6 +762,11 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 		names, ok := cache.scopes[key]
 		if !ok {
 			add := func(id string, b jsBinding) {
+				if cache.called != nil {
+					if _, ok := cache.called[id]; !ok {
+						return
+					}
+				}
 				if names == nil {
 					names = map[string]jsBinding{}
 				}
@@ -836,33 +853,39 @@ func jsLexicalRank(e *graph.Edge) int {
 // colliding edge to the same deterministic least-shadowed binding so last-wins
 // in-memory stores and first-wins SQLite stores agree.
 func clearCollapsedJSShadows(edges []*graph.Edge) {
-	var hasStamped bool
+	// Only a site holding a stamped call can need normalizing, so group just
+	// those sites instead of every call in the file.
+	var groups map[graph.EdgeIdentity][]*graph.Edge
 	for _, e := range edges {
 		if e.Kind == graph.EdgeCalls && e.Meta[graph.JSLexicalBindingMeta] != nil {
-			hasStamped = true
-			break
+			if groups == nil {
+				groups = make(map[graph.EdgeIdentity][]*graph.Edge)
+			}
+			groups[graph.EdgeIdentityFor(e)] = nil
 		}
 	}
-	if !hasStamped {
+	if groups == nil {
 		return
 	}
-	best := make(map[graph.EdgeIdentity]*graph.Edge)
-	byID := make(map[graph.EdgeIdentity][]*graph.Edge)
 	for _, e := range edges {
 		if e.Kind != graph.EdgeCalls {
 			continue
 		}
 		id := graph.EdgeIdentityFor(e)
-		byID[id] = append(byID[id], e)
-		if cur, ok := best[id]; !ok || jsLexicalRank(e) < jsLexicalRank(cur) {
-			best[id] = e
+		if group, ok := groups[id]; ok {
+			groups[id] = append(group, e)
 		}
 	}
-	for id, group := range byID {
+	for _, group := range groups {
 		if len(group) < 2 {
 			continue
 		}
-		winner := best[id]
+		winner := group[0]
+		for _, e := range group[1:] {
+			if jsLexicalRank(e) < jsLexicalRank(winner) {
+				winner = e
+			}
+		}
 		winnerRank := jsLexicalRank(winner)
 		if winnerRank == 3 {
 			continue
