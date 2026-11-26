@@ -71,7 +71,7 @@ func TestEditProbeLosslessCellKeepsBurstAboveDefaultRawCap(t *testing.T) {
 			if !cell.whole {
 				reported := strings.Join(record.Errors, "; ")
 				if !errors.Is(emitErr, errEditProbeEvidenceIncomplete) || record.Outcome != "harness_evidence_incomplete" || incomplete != 1 ||
-					!strings.Contains(reported, "per-edit raw evidence limit exceeded") || !strings.Contains(reported, fmt.Sprintf("limit_bytes=%d", cell.limit)) ||
+					!strings.Contains(reported, "per-edit raw evidence limit exceeded") || !strings.Contains(reported, fmt.Sprintf("exceeded: limit_bytes=%d ", cell.limit)) ||
 					finishErr == nil || !strings.Contains(finishErr.Error(), overflowed) {
 					t.Fatalf("overflow not disclosed: emit=%v outcome=%s summary=%d errors=%q", emitErr, record.Outcome, incomplete, reported)
 				}
