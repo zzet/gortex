@@ -16,9 +16,18 @@ var policyJSON []byte
 
 const (
 	darwinRacePartition = "indexer-race"
-	ubuntuCLIPartition  = "rest-cli"
-	cliPackageSuffix    = "/cmd/gortex"
+	// The Ubuntu race rest packages do not fit one job budget. A second
+	// Ubuntu job owns the CLI and the bench harness packages.
+	ubuntuSplitPartition = "rest-cli-bench"
+	cliPackageSuffix     = "/cmd/gortex"
+	benchPackagePrefix   = "/bench/"
 )
+
+// ubuntuSplitOwns reports whether pkg runs in the Ubuntu split job rather
+// than in Ubuntu's ordinary rest job.
+func ubuntuSplitOwns(module, pkg string) bool {
+	return pkg == module+cliPackageSuffix || strings.HasPrefix(pkg, module+benchPackagePrefix)
+}
 
 type Target struct {
 	Runner string `json:"runner"`
@@ -63,7 +72,7 @@ func LoadPolicy() (Policy, error) {
 	}
 	return p, nil
 }
-func (p Policy) ownsUbuntuCLI(runner string) bool {
+func (p Policy) ownsUbuntuSplit(runner string) bool {
 	return slices.ContainsFunc(p.Targets, func(t Target) bool {
 		return t.Runner == runner && t.GOOS == "linux"
 	})
@@ -74,8 +83,8 @@ func (p Policy) FullMatrix() Matrix {
 		for _, part := range p.Partitions {
 			m.Include = append(m.Include, MatrixRow{t.Runner, part})
 		}
-		if p.ownsUbuntuCLI(t.Runner) {
-			m.Include = append(m.Include, MatrixRow{t.Runner, ubuntuCLIPartition})
+		if p.ownsUbuntuSplit(t.Runner) {
+			m.Include = append(m.Include, MatrixRow{t.Runner, ubuntuSplitPartition})
 		}
 		if t.GOOS == "darwin" {
 			m.Include = append(m.Include, MatrixRow{t.Runner, darwinRacePartition})
@@ -95,15 +104,11 @@ func (p Policy) SelectedMatrix(module string, byTarget map[string][]string) Matr
 				groups.add(g)
 			}
 		}
-		if p.ownsUbuntuCLI(t.Runner) {
-			cli := module + cliPackageSuffix
-			large.add(cli)
-			if slices.Contains(byTarget[t.Runner], cli) {
-				groups.add(ubuntuCLIPartition)
-			}
-		}
+		split := p.ownsUbuntuSplit(t.Runner)
 		for _, name := range byTarget[t.Runner] {
-			if !large.has(name) {
+			if split && ubuntuSplitOwns(module, name) {
+				groups.add(ubuntuSplitPartition)
+			} else if !large.has(name) {
 				groups.add("rest")
 			}
 		}
@@ -116,8 +121,8 @@ func (p Policy) SelectedMatrix(module string, byTarget map[string][]string) Matr
 				}
 			}
 		}
-		if groups.has(ubuntuCLIPartition) {
-			m.Include = append(m.Include, MatrixRow{t.Runner, ubuntuCLIPartition})
+		if groups.has(ubuntuSplitPartition) {
+			m.Include = append(m.Include, MatrixRow{t.Runner, ubuntuSplitPartition})
 		}
 		if t.GOOS == "darwin" && groups.has("indexer") {
 			m.Include = append(m.Include, MatrixRow{t.Runner, darwinRacePartition})
@@ -133,7 +138,7 @@ type Partition struct {
 
 func ParsePartition(spec string, p Policy) ([]Partition, error) {
 	// Dedicated owners require independent budgets and cannot use combined aliases.
-	if spec == darwinRacePartition || spec == ubuntuCLIPartition {
+	if spec == darwinRacePartition || spec == ubuntuSplitPartition {
 		return []Partition{{Group: spec, Count: 1}}, nil
 	}
 	var out []Partition
@@ -181,10 +186,10 @@ func CheckLayout(rows []MatrixRow, p Policy) error {
 		} else if len(groups[darwinRacePartition]) != 0 {
 			return fmt.Errorf("%s cannot own the macOS race group", os)
 		}
-		if p.ownsUbuntuCLI(os) {
+		if p.ownsUbuntuSplit(os) {
 			expected++
-		} else if len(groups[ubuntuCLIPartition]) != 0 {
-			return fmt.Errorf("%s cannot own the Ubuntu CLI group", os)
+		} else if len(groups[ubuntuSplitPartition]) != 0 {
+			return fmt.Errorf("%s cannot own the Ubuntu CLI and bench group", os)
 		}
 		if len(groups) != expected {
 			return fmt.Errorf("%s has incomplete CI groups", os)

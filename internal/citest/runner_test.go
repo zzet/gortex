@@ -194,6 +194,7 @@ func writeManifest(t *testing.T, f *fixture, m Manifest) string {
 func TestRunnerRealFullVersusAffectedExecutionAndCoverage(t *testing.T) {
 	f := newFixture(t)
 	f.pkg("cmd/gortex", "func Value() int { return 42 }", "TestCLIFixture")
+	f.pkg("bench/load", "func Value() int { return 42 }", "TestBenchFixture")
 	head := f.change("leaf/value.go")
 	affected := f.plan(head)
 	requireAffected(t, affected)
@@ -220,14 +221,16 @@ func TestRunnerRealFullVersusAffectedExecutionAndCoverage(t *testing.T) {
 				fields := strings.Fields(name)
 				seen.add(fields[len(fields)-1])
 			}
-			const cliTest = "rest example.org/fixture/cmd/gortex TestCLIFixture"
-			_, cliRan := report.Durations[cliTest]
-			cliJob := row.Partition == "rest-cli"
+			// Ubuntu gives the CLI and bench packages their own job budget;
+			// every other target keeps them in its rest job.
+			splitJob := row.Partition == "rest-cli-bench"
 			if target != "ubuntu-24.04" {
-				cliJob = row.Partition == "rest"
+				splitJob = row.Partition == "rest"
 			}
-			if cliRan != cliJob {
-				t.Fatalf("%s %s: CLI execution has the wrong owner: %v", manifest.Mode, row.Partition, report.Durations)
+			for _, owned := range []string{"rest example.org/fixture/cmd/gortex TestCLIFixture", "rest example.org/fixture/bench/load TestBenchFixture"} {
+				if _, ran := report.Durations[owned]; ran != splitJob {
+					t.Fatalf("%s %s: %s has the wrong owner: %v", manifest.Mode, row.Partition, owned, report.Durations)
+				}
 			}
 			files, err := os.ReadDir(filepath.Join(report.Scratch, "logs"))
 			if err != nil || len(files) == 0 {
@@ -242,7 +245,7 @@ func TestRunnerRealFullVersusAffectedExecutionAndCoverage(t *testing.T) {
 		}
 		executed[manifest.Mode] = seen
 	}
-	for _, name := range []string{"TestLeaf", "TestConsumer", "TestIndirect", "TestExternalImport", "TestHelperImport", "TestMCP", "TestRaceConsumer", "TestCLIFixture"} {
+	for _, name := range []string{"TestLeaf", "TestConsumer", "TestIndirect", "TestExternalImport", "TestHelperImport", "TestMCP", "TestRaceConsumer", "TestCLIFixture", "TestBenchFixture"} {
 		if !executed["affected"].has(name) || !executed["full"].has(name) {
 			t.Fatalf("planned test not executed: %s %v", name, executed)
 		}
@@ -372,7 +375,7 @@ func TestRunnerWorkflowRowsSupportDynamicAndLegacyLayouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"rest\"]\n    include: [{os: ubuntu-24.04, partition: rest-cli}, {os: macos-latest, partition: indexer-race}]\n"} {
+	for _, text := range []string{"matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    os: [ubuntu-24.04, macos-latest, windows-latest]\n    partition: [\"indexer:1/2\", \"indexer:2/2\", \"mcp+store\", \"rest\"]\n    include: [{os: ubuntu-24.04, partition: rest-cli-bench}, {os: macos-latest, partition: indexer-race}]\n"} {
 		rows, err := WorkflowRows(text, p)
 		if err != nil {
 			t.Fatal(err)
