@@ -23,6 +23,7 @@ import (
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
+	"github.com/zzet/gortex/internal/platform"
 	"github.com/zzet/gortex/internal/testenv"
 )
 
@@ -184,7 +185,7 @@ func TestMigrationWindowMCPProxyHelper(t *testing.T) {
 				path = filepath.Join(witnessDir, "first.json")
 			}
 			require.NoError(t, os.WriteFile(path+".tmp", body, 0o600))
-			require.NoError(t, os.Rename(path+".tmp", path))
+			require.NoError(t, platform.ReplaceFile(path+".tmp", path))
 		}
 		return running
 	}
@@ -361,9 +362,10 @@ func testMCPStartupWindow(t *testing.T, holdServing bool) {
 	case <-time.After(3 * migrationProxyTestInactivity):
 	}
 	var latest migrationProxyWaitWitness
-	body, err := os.ReadFile(filepath.Join(base, "latest.json"))
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(body, &latest))
+	require.Eventually(t, func() bool {
+		body, readErr := os.ReadFile(filepath.Join(base, "latest.json"))
+		return readErr == nil && json.Unmarshal(body, &latest) == nil
+	}, 5*time.Second, 5*time.Millisecond)
 	require.Greater(t, latest.Checks, first.Checks, "the real contended wait must continue after its initial inactivity budget")
 	require.True(t, latest.LockContended)
 	require.Equal(t, first.State.PID, latest.State.PID)
