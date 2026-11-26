@@ -55,13 +55,75 @@ func (idx *placeholderSourceIndex) ensure(g graph.Store) {
 	}
 }
 
+// beginPass discards the previous pass's site census and per-pass re-target
+// map while keeping any deferred repoints a refused write left unapplied.
+func (idx *placeholderSourceIndex) beginPass() {
+	idx.built = false
+	idx.bySite = nil
+	idx.retargeted = nil
+}
+
+func (idx *placeholderSourceIndex) hasDeferred() bool {
+	return len(idx.deferred) > 0
+}
+
+func (idx *placeholderSourceIndex) retainRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	idx.deferred = append(idx.deferred, repoints...)
+	idx.beginPass()
+}
+
+func (idx *placeholderSourceIndex) takeDeferred() []graph.PlaceholderRepoint {
+	if len(idx.deferred) == 0 {
+		return nil
+	}
+	out := idx.deferred
+	idx.deferred = nil
+	return out
+}
+
+func (idx *placeholderSourceIndex) inheritDeferred(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	idx.deferred = append(idx.deferred, repoints...)
+	idx.beginPass()
+}
+
+// pruneSites removes any deferred placeholder repoint whose destination matches
+// a cross-package guard revert at the same site, preventing a rejected weak-tier
+// binding from moving a dataflow source onto an unimported target on retry.
+func (idx *placeholderSourceIndex) pruneSites(reverts []graph.PlaceholderRepoint) {
+	if len(idx.deferred) == 0 || len(reverts) == 0 {
+		return
+	}
+	rejected := make(map[placeholderSourceSite]struct{}, len(reverts))
+	for _, rev := range reverts {
+		rejected[placeholderSourceSite{from: rev.OldFrom, filePath: rev.FilePath, line: rev.Line}] = struct{}{}
+	}
+	kept := idx.deferred[:0]
+	for _, rp := range idx.deferred {
+		if _, drop := rejected[placeholderSourceSite{from: rp.NewFrom, filePath: rp.FilePath, line: rp.Line}]; drop {
+			continue
+		}
+		kept = append(kept, rp)
+	}
+	if len(kept) == 0 {
+		idx.deferred = nil
+		return
+	}
+	idx.deferred = kept
+}
+
 // filter keeps only repoints whose exact source site exists in the dataflow
 // placeholder census. It is used only by stores without exact identity lookup.
 func (idx *placeholderSourceIndex) filter(repoints []graph.PlaceholderRepoint) []graph.PlaceholderRepoint {
 	if len(idx.bySite) == 0 {
 		return nil
 	}
-	kept := repoints[:0]
+	kept := make([]graph.PlaceholderRepoint, 0, len(repoints))
 	for _, rp := range repoints {
 		site := placeholderSourceSite{from: rp.OldFrom, filePath: rp.FilePath, line: rp.Line}
 		if len(idx.bySite[site]) != 0 {
@@ -170,33 +232,48 @@ func (idx *placeholderSourceIndex) currentIdentity(identity graph.EdgeIdentity) 
 	return identity
 }
 
-// applyDeferred applies the repoints deferRepoints recorded, in page order
-// (first repoint of a site wins, as before), and forgets them.
-func (idx *placeholderSourceIndex) applyDeferred(g graph.Store) int {
-	moved, _ := idx.applyDeferredApplied(g)
-	return moved
-}
-
+// applyDeferredApplied applies the repoints deferRepoints recorded, in page
+// order (first repoint of a site wins, as before), and clears them only once
+// the store confirms every write landed. Every exit resets the pass census so
+// a reused resolver (e.g. an incremental save after startup ResolveAll) never
+// consults a stale or depleted bySite map.
 func (idx *placeholderSourceIndex) applyDeferredApplied(g graph.Store) (int, bool) {
-	repoints := idx.deferred
-	idx.deferred = nil
-	if len(repoints) == 0 {
-		idx.retargeted = nil
+	if len(idx.deferred) == 0 {
+		idx.beginPass()
 		return 0, true
 	}
-	defer func() { idx.retargeted = nil }()
+	idx.ensure(g)
 	if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
-		moves := idx.take(repoints)
+		moves := idx.take(idx.deferred)
 		for i := range moves {
 			moves[i].identity = idx.currentIdentity(moves[i].identity)
 		}
-		return reconcileIndexedPlaceholderSourcesApplied(g, finder, moves)
+		moved, ok := reconcileIndexedPlaceholderSourcesApplied(g, finder, moves)
+		if !ok {
+			// Retain idx.deferred for retry and clear the pass census so the
+			// next pass re-discovers surviving unresolved-from sites with their
+			// current store identities (skipping any pages that already moved).
+			idx.beginPass()
+			return moved, false
+		}
+		idx.deferred = nil
+		idx.beginPass()
+		return moved, true
 	}
-	repoints = idx.filter(repoints)
+	repoints := idx.filter(idx.deferred)
 	if len(repoints) == 0 {
+		idx.deferred = nil
+		idx.beginPass()
 		return 0, true
 	}
-	return graph.ReconcilePlaceholderSourcesApplied(g, repoints)
+	moved, ok := graph.ReconcilePlaceholderSourcesApplied(g, repoints)
+	if !ok {
+		idx.beginPass()
+		return moved, false
+	}
+	idx.deferred = nil
+	idx.beginPass()
+	return moved, true
 }
 
 // reconcileIndexedPlaceholderSourcesApplied exact-refetches only claimed
@@ -272,14 +349,22 @@ func reconcilePlaceholderSourcesApplied(g graph.Store, idx *placeholderSourceInd
 	if idx != nil {
 		idx.ensure(g)
 		if finder, ok := g.(graph.EdgeIdentityBatchFinder); ok {
-			return reconcileIndexedPlaceholderSourcesApplied(g, finder, idx.take(repoints))
+			moved, ok := reconcileIndexedPlaceholderSourcesApplied(g, finder, idx.take(repoints))
+			if !ok {
+				idx.beginPass()
+			}
+			return moved, ok
 		}
 		repoints = idx.filter(repoints)
 		if len(repoints) == 0 {
 			return 0, true
 		}
 	}
-	return graph.ReconcilePlaceholderSourcesApplied(g, repoints)
+	moved, ok := graph.ReconcilePlaceholderSourcesApplied(g, repoints)
+	if !ok && idx != nil {
+		idx.beginPass()
+	}
+	return moved, ok
 }
 
 // RepointPlaceholderSourcesInBatch applies the from-side placeholder

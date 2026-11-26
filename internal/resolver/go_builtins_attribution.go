@@ -268,6 +268,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	if !ok {
 		if r.applyReindexEdges(batch) {
 			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+				r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
 				r.notePassWriteRefused()
 			}
 		}
@@ -284,6 +285,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	if !compactOK {
 		if r.applyReindexEdges(batch) {
 			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+				r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
 				r.notePassWriteRefused()
 			}
 		}
@@ -291,6 +293,7 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	}
 	if r.applyUnresolvedTargetReindexes(targeter, direct) {
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
 			r.notePassWriteRefused()
 		}
 	}
@@ -381,6 +384,7 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 			resolved = append(resolved, graph.EdgeReindex{Edge: edge, OldTo: mutation.Old.To})
 		}
 		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, resolved); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(resolved))
 			r.notePassWriteRefused()
 		}
 	}

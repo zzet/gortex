@@ -395,6 +395,16 @@ func (idx *Indexer) aliasesToCertify(result *IndexResult) (*aliasSnapshot, error
 	return s, nil
 }
 
+func (idx *Indexer) hasUncertifiedAliasPass() bool {
+	s := idx.passAliases.Load()
+	if s == nil {
+		return false
+	}
+	idx.aliasStateMu.Lock()
+	defer idx.aliasStateMu.Unlock()
+	return s.digest != idx.appliedAliases
+}
+
 func (idx *Indexer) finishAliasPass(result *IndexResult) error {
 	idx.aliasStateMu.Lock()
 	defer idx.aliasStateMu.Unlock()

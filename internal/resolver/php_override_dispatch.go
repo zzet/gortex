@@ -186,9 +186,10 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 			} else {
 				phpEnsureMeta(j.edge)["dispatch"] = "scope"
 			}
-			if r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
-				n++
+			if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
+				break
 			}
+			n++
 			continue
 		}
 		oldTo := j.edge.To
@@ -197,7 +198,7 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 		j.edge.Confidence = phpDispatchConfidence
 		phpEnsureMeta(j.edge)["dispatch"] = "override"
 		if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
-			continue
+			break
 		}
 		n++
 		for _, o := range j.others {

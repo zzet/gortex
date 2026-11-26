@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -182,6 +183,38 @@ type CrossRepoResolver struct {
 	// can reconcile their tests projections.
 	retargetedMu            sync.Mutex
 	retargetedTestCallFiles map[string]struct{}
+
+	// takeRetryState / saveRetryState hand off unapplied placeholder repoints
+	// strictly while cr.mu (g.ResolveMutex()) is held, preventing concurrent
+	// short-lived resolvers from stealing another lane's retry queue.
+	takeRetryState func() []graph.PlaceholderRepoint
+	saveRetryState func([]graph.PlaceholderRepoint)
+	// chunkYieldHook is a deterministic inter-chunk interleave seam used by
+	// resolver tests. Nil in production.
+	chunkYieldHook func()
+}
+
+// SetRetryStateBridge installs callbacks invoked strictly while cr.mu
+// (g.ResolveMutex()) is held to inherit and return unapplied placeholder
+// repoints across short-lived CrossRepoResolver instances.
+func (cr *CrossRepoResolver) SetRetryStateBridge(take func() []graph.PlaceholderRepoint, save func([]graph.PlaceholderRepoint)) {
+	cr.takeRetryState = take
+	cr.saveRetryState = save
+}
+
+func (cr *CrossRepoResolver) bridgeRetryStateLocked() func() {
+	if cr.takeRetryState != nil {
+		if repoints := cr.takeRetryState(); len(repoints) > 0 {
+			cr.placeholderSrcIdx.inheritDeferred(repoints)
+		}
+	}
+	return func() {
+		if cr.saveRetryState != nil {
+			if rem := cr.placeholderSrcIdx.takeDeferred(); len(rem) > 0 {
+				cr.saveRetryState(rem)
+			}
+		}
+	}
 }
 
 // noteRetargetedCall mirrors Resolver.noteRetargetedCall for the
@@ -387,7 +420,27 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 // ResolveAllContext is ResolveAll with cancellation propagated through the
 // unresolved-edge pager. The compatibility wrapper above preserves the
 // historical best-effort API for non-lifecycle callers.
-func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoStats, error) {
+// TakePendingPlaceholderRepoints detaches any deferred placeholder dataflow
+// source repoints that a refused write left unapplied so a caller constructing
+// a fresh CrossRepoResolver can hand them to the retry pass.
+func (cr *CrossRepoResolver) TakePendingPlaceholderRepoints() []graph.PlaceholderRepoint {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.placeholderSrcIdx.takeDeferred()
+}
+
+// InheritPendingPlaceholderRepoints attaches unapplied placeholder repoints
+// from a prior refused pass on the same store.
+func (cr *CrossRepoResolver) InheritPendingPlaceholderRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	cr.placeholderSrcIdx.inheritDeferred(repoints)
+}
+
+func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *CrossRepoStats, retErr error) {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	if ctx == nil {
 		ctx = context.Background()
@@ -397,18 +450,42 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
 	if err := cr.retryGoModuleDeps(ctx, stats); err != nil {
 		return stats, err
 	}
-	// Fresh placeholder-source set per pass — same rationale as ResolveAll
-	// on the master resolver.
-	cr.placeholderSrcIdx = placeholderSourceIndex{}
-	// Every exit applies the moves the pass deferred (a no-op after the
-	// normal flush below); it runs before the deferred unlock above.
-	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
+	// Fresh placeholder-source census per pass while retaining any deferred
+	// repoints a prior refused write left unapplied.
+	cr.placeholderSrcIdx.beginPass()
+	// Flush previously queued deferred repoints BEFORE streaming or yielding
+	// cr.mu between chunks; in-pass deferred repoints are handed back across
+	// each inter-chunk yield so concurrent repo lanes never certify on an empty
+	// bridge while their dataflow edges remain unapplied.
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			stats.WriteRefused = true
+			return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+		}
+	}
+	// Flush deferred moves on non-refusal exits (e.g. cancellation after chunk 1
+	// committed), but never fire back into a contended writer gate after a
+	// refusal — keep idx.deferred for retry instead.
+	defer func() {
+		if retErr != nil && (errors.Is(retErr, ErrReindexWriteRefused) || (retStats != nil && retStats.WriteRefused)) {
+			return
+		}
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			if retStats != nil {
+				retStats.WriteRefused = true
+			}
+			if retErr == nil {
+				retErr = fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+			}
+		}
+	}()
 	if err := cr.resolveTrackedNpmImports(ctx, graph.EdgesLightSeq(cr.graph, graph.EdgeImports), stats); err != nil {
 		return stats, err
 	}
@@ -435,6 +512,12 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	pendingLoaded.Store(int64(len(pending)))
 	if len(pending) == 0 && streamDone {
+		if cr.placeholderSrcIdx.hasDeferred() {
+			if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+				stats.WriteRefused = true
+				return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+			}
+		}
 		return stats, nil
 	}
 
@@ -595,18 +678,42 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
+				if cr.saveRetryState != nil {
+					if deferred := cr.placeholderSrcIdx.takeDeferred(); len(deferred) > 0 {
+						cr.saveRetryState(deferred)
+					}
+				}
+				yieldHook := cr.chunkYieldHook
 				cr.mu.Unlock()
+				if yieldHook != nil {
+					yieldHook()
+				}
 				runtime.Gosched()
 				cr.mu.Lock()
-				if err := ctx.Err(); err != nil {
-					return stats, err
-				}
+				mutated := !revKnown
 				if revKnown {
 					if revAfter, _ := loadMutationRevision(cr.graph); revAfter != revBefore {
+						mutated = true
 						// An interleaving writer may have created nodes or
 						// changed name buckets; drop cross-page retention.
 						cr.hotCache.flush()
 					}
+				}
+				if cr.takeRetryState != nil {
+					if deferred := cr.takeRetryState(); len(deferred) > 0 {
+						if mutated {
+							cr.placeholderSrcIdx.inheritDeferred(deferred)
+						} else {
+							cr.placeholderSrcIdx.deferred = append(cr.placeholderSrcIdx.deferred, deferred...)
+						}
+					} else if mutated {
+						cr.placeholderSrcIdx.beginPass()
+					}
+				} else if mutated {
+					cr.placeholderSrcIdx.beginPass()
+				}
+				if err := ctx.Err(); err != nil {
+					return stats, err
 				}
 			}
 		}
@@ -642,6 +749,12 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			return &CrossRepoStats{ByRepo: make(map[string]int), WriteRefused: true}
+		}
+	}
 	// One backend query for every out-edge from this repo's nodes,
 	// instead of GetRepoNodes followed by GetOutEdges per node. On
 	// disk backends (SQLite, DuckDB) the per-node loop
@@ -649,7 +762,9 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 	// of warmup on a multi-repo workspace where this method runs
 	// once per tracked repo.
 	stats := cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
-	DetectCrossRepoEdgesForRepos(cr.graph, []string{repoPrefix})
+	if !stats.WriteRefused {
+		DetectCrossRepoEdgesForRepos(cr.graph, []string{repoPrefix})
+	}
 	return stats
 }
 
@@ -675,6 +790,12 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRepoStats {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			return &CrossRepoStats{ByRepo: make(map[string]int), WriteRefused: true}
+		}
+	}
 	graphPath := relPath
 	if repoPrefix != "" && relPath != repoPrefix && !strings.HasPrefix(relPath, repoPrefix+"/") {
 		graphPath = repoPrefix + "/" + strings.TrimPrefix(relPath, "/")
@@ -694,7 +815,9 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 		edges = append(edges, es...)
 	}
 	stats := cr.resolveScopedLocked(edges)
-	DetectCrossRepoEdgesForFiles(cr.graph, []string{graphPath})
+	if !stats.WriteRefused {
+		DetectCrossRepoEdgesForFiles(cr.graph, []string{graphPath})
+	}
 	return stats
 }
 
@@ -706,6 +829,7 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	if err := cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats); err != nil {
 		stats.WriteRefused = true
+		return stats
 	}
 	pending := make([]*graph.Edge, 0, len(edges))
 	for _, edge := range edges {
@@ -714,6 +838,11 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 		}
 	}
 	if len(pending) == 0 {
+		if cr.placeholderSrcIdx.hasDeferred() {
+			if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+				stats.WriteRefused = true
+			}
+		}
 		return stats
 	}
 
@@ -738,6 +867,12 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 		// nil index: scoped batches are repo- or file-sized, direct
 		// probes beat a whole-graph placeholder-source stream.
 		if _, ok := reconcilePlaceholderSourcesApplied(cr.graph, nil, reindexBatch); !ok {
+			cr.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
+			stats.WriteRefused = true
+		}
+	}
+	if !stats.WriteRefused && cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
 			stats.WriteRefused = true
 		}
 	}
@@ -1278,6 +1413,9 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	if e.To != oldTo {
+		if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+			delete(e.Meta, "guard_reverted")
+		}
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		cr.noteRetargetedCall(e)
 	}

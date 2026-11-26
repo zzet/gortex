@@ -154,7 +154,13 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 			sites = append(sites, graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeImports})
 		}
 		full := cr.graph.GetEdgeCandidates(nil, sites)
+		type npmProjectionUpdate struct {
+			projected *graph.Edge
+			to        string
+			crossRepo bool
+		}
 		var batch []graph.EdgeReindex
+		var projections []npmProjectionUpdate
 		for _, projected := range page {
 			for _, e := range full.Site(projected.From, projected.Line, graph.EdgeImports) {
 				if e.To != projected.To {
@@ -167,22 +173,31 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 				oldTo := e.To
 				if cr.resolveTrackedNpmImport(e, spec, stats, memo) {
 					batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-					projected.To, projected.CrossRepo = e.To, e.CrossRepo
+					projections = append(projections, npmProjectionUpdate{
+						projected: projected, to: e.To, crossRepo: e.CrossRepo,
+					})
 				}
 			}
 		}
 		if len(batch) > 0 {
+			// Restub calls bound through the old import target before committing
+			// the import update: if either write is refused, the old import edge
+			// remains in the store so retry re-derives the restub instead of
+			// seeing an already-updated import and stranding stale cross-repo calls.
+			if err := cr.restubCallsForChangedNpmImports(batch); err != nil {
+				if stats != nil {
+					stats.WriteRefused = true
+				}
+				return err
+			}
 			if !reindexEdgesApplied(cr.graph, batch) {
 				if stats != nil {
 					stats.WriteRefused = true
 				}
 				return fmt.Errorf("%w: %d npm import edge(s)", ErrReindexWriteRefused, len(batch))
 			}
-			if err := cr.restubCallsForChangedNpmImports(batch); err != nil {
-				if stats != nil {
-					stats.WriteRefused = true
-				}
-				return err
+			for _, u := range projections {
+				u.projected.To, u.projected.CrossRepo = u.to, u.crossRepo
 			}
 		}
 	}
@@ -230,11 +245,17 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 			batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
 		}
 	}
-	if len(batch) > 0 {
-		graph.RemoveEdgesExact(cr.graph, obsolete)
-		if !reindexEdgesApplied(cr.graph, batch) {
-			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch))
+	// Chunk below SQLite's 5,000-row reindexChunkSize so each ReindexEdgesApplied
+	// call commits atomically as one transaction and its matching parallel
+	// EdgeCrossRepoCalls are removed immediately after; a refusal on chunk 2+
+	// then cannot orphan chunk 1's parallels.
+	const npmRestubChunkSize = 2048
+	for start := 0; start < len(batch); start += npmRestubChunkSize {
+		end := min(start+npmRestubChunkSize, len(batch))
+		if !reindexEdgesApplied(cr.graph, batch[start:end]) {
+			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch)-start)
 		}
+		graph.RemoveEdgesExact(cr.graph, obsolete[start:end])
 	}
 	return nil
 }

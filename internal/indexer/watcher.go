@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // ChangeKind describes the type of filesystem change.
@@ -336,7 +337,7 @@ func retryableMutationError(err error) bool {
 	if errors.As(err, &committed) && committed.Committed() {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, resolver.ErrReindexWriteRefused)
 }
 
 func mutationRetryBackoff(attempt int) time.Duration {
@@ -2324,7 +2325,10 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 	if w.pointMutationPatch != nil {
 		patchErr = w.pointMutationPatch(path, kind, generation)
 	} else {
-		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, false, &fanout, publication)
+		// Retry attempts must bypass the pointDuplicateSourceContent fast path:
+		// a prior attempt that failed after persisting file_meta/fileMtimes
+		// (e.g. ErrReindexWriteRefused during resolution) still needs re-resolution.
+		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, retryAttempt > 0, &fanout, publication)
 	}
 	var storageErr *store_sqlite.StorageError
 	if errors.As(patchErr, &storageErr) {
@@ -3199,7 +3203,7 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	// A startup replay that already checked a receipt still forces its original
 	// exact path. Otherwise the persisted hash/size/version gate identifies a
 	// duplicate; only its checked source proof may restore the prior witness.
-	if kind == ChangeModified && !receiptChecked {
+	if kind == ChangeModified && !receiptChecked && !idx.hasPendingResolutionRetry() {
 		duplicate, content := idx.pointDuplicateSourceContent(ctx, path)
 		if duplicate {
 			if observe != nil && content != nil {
