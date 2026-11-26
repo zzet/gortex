@@ -20,6 +20,20 @@ import (
 
 const projectedReadBudget = 150 * time.Millisecond
 
+// projectedReadBudgetKey carries a package-internal test override for the
+// per-pass 150ms projection allowance. Only package tests set it. A positive
+// value replaces projectedReadBudget for that pass; an earlier installed
+// deadline still wins.
+type projectedReadBudgetKey struct{}
+
+func projectedReadDeadline(ctx context.Context, now time.Time) time.Time {
+	budget := projectedReadBudget
+	if override, ok := ctx.Value(projectedReadBudgetKey{}).(time.Duration); ok && override > 0 {
+		budget = override
+	}
+	return now.Add(budget)
+}
+
 // checkedProjectionReadObserver observes an already physically verified reuse
 // before its live-owner check. It supplies no projection or publication authority.
 // Only request-scoped lifecycle tests install this optional scheduling observer.
@@ -76,7 +90,7 @@ func (s *Server) ensureProjected(ctx context.Context, paths []string) (context.C
 	if err := validateRequestProjectionStage(ctx, projectionReadInherited); err != nil {
 		return ctx, err
 	}
-	deadline := time.Now().Add(projectedReadBudget)
+	deadline := projectedReadDeadline(ctx, time.Now())
 	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
 		deadline = original
 	}
@@ -389,8 +403,7 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 			return nil, err
 		}
 		if matches {
-			if registry != nil && expected == nil && registry.entries[key] == nil &&
-				pendingFileProjections.snap.Load() == registry && buildCtx.Err() == nil {
+			if registry != nil && expected == nil && pendingFileProjections.ownerAbsentSince(registry, key) && buildCtx.Err() == nil {
 				*summary = canonicalSummarySource{
 					indexer: idx, root: root, abs: abs, readPath: readPath, key: key,
 					graphPath: graphPath, stamp: after, bytes: raw, registry: registry,
@@ -452,6 +465,23 @@ func (s *Server) projectCurrentTrackedFileVersion(buildCtx, requestCtx context.C
 	finalStamp, statErr := statDiskStamp(abs)
 	if readErr != nil || statErr != nil || !latest.matches(finalStamp) || blake3.Sum256(current) != rawHash || pathkey.MutationKey(abs) != key {
 		return nil, errors.Join(readErr, statErr, errProjectionExternalWrite)
+	}
+	// A linked checkout's selected view can already hold these verified bytes.
+	// An owner published for them would only be retired by this request, and
+	// a concurrent reader that selected it would then refuse as if the
+	// unchanged file had moved. Read the selected view instead. A proof that
+	// spends the read's budget first publishes nothing either: this request
+	// could neither retire nor serve that owner. Bytes the selected view does
+	// not hold keep the publication path, and an owner that appeared since the
+	// observation still refuses there.
+	if expected == nil {
+		held, err := s.selectedViewHoldsProjection(buildCtx, requestCtx, entry)
+		if err != nil {
+			return nil, err
+		}
+		if held {
+			return nil, nil
+		}
 	}
 	if err := pendingFileProjections.publishReadExpected(entry, observed); err != nil {
 		return nil, err

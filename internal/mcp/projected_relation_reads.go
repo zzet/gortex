@@ -24,7 +24,7 @@ func (s *Server) bindPendingRelationReads(ctx context.Context) (context.Context,
 	if len(snapshot.entries) == 0 {
 		return ctx, ctx.Err()
 	}
-	deadline := time.Now().Add(projectedReadBudget)
+	deadline := projectedReadDeadline(ctx, time.Now())
 	if original, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time); ok && original.Before(deadline) {
 		deadline = original
 	}

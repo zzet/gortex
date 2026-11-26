@@ -6417,6 +6417,9 @@
                   }
                 ]
               },
+              "edit_wait_cochange": {
+                "type": "boolean"
+              },
               "keep_state": {
                 "type": "boolean"
               },

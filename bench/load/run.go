@@ -49,6 +49,7 @@ type runOptions struct {
 	SearchReadbackAcceptance bool
 	EditGateModes            bool
 	EditConsumerProbes       bool
+	EditWaitCoChange         bool
 	EditGateSeed             string
 	EditRepos                int
 	EditProbeRole            string
@@ -70,6 +71,7 @@ func parseRun(args []string) (runOptions, error) {
 	f.BoolVar(&o.OwnACKReadbackOnly, "edit-ack-readback-only", false, "local ACK and immediate same-session file/source readback with paced readers, without visibility polling")
 	f.BoolVar(&o.LosslessEditProbeEvidence, "lossless-edit-probe-evidence", false, "retain exact RPC payloads in bounded edit-gate evidence")
 	f.BoolVar(&o.RetainReadSourceFailures, "retain-read-source-failures", false, "opt-in private bounded raw wire evidence for failed read.source attempts")
+	f.BoolVar(&o.EditWaitCoChange, "edit-wait-cochange", false, "six-repository edit-and-probe setup: wait for the daemon's startup co-change mine to settle before the analysis gates; either ACK policy")
 	bindMemoryFlags(f, &o)
 	bindChurnFlags(f, &o.Churn)
 	if err := f.Parse(args); err != nil {
@@ -132,6 +134,10 @@ func (o runOptions) editACKPolicy() string {
 }
 
 func validateRunOptions(o runOptions) error {
+	if o.EditWaitCoChange && (o.Scenario != editProbeScenario || o.EditRepos != 6 || o.Editors != 6 ||
+		o.Agents != 0 || o.Worktrees != 0 || o.EditGateModes) {
+		return errors.New("--edit-wait-cochange requires the six-repository edit-and-probe cell with one editor per repository and no readers, linked worktrees or gate modes")
+	}
 	if o.LosslessEditProbeEvidence && (o.Scenario != editProbeScenario || !o.EditGateModes) {
 		return errors.New("--lossless-edit-probe-evidence requires edit-and-probe with --edit-gate-modes")
 	}
@@ -382,6 +388,7 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 	}
 	report.Workload.EditGateSeed = o.EditGateSeed
 	report.Workload.EditACKMode = o.editACKPolicy()
+	report.Workload.EditWaitCoChange = o.EditWaitCoChange
 	report.Workload.Scenario, report.Workload.Agents, report.Workload.EditAgents, report.Workload.LinkedWorktrees = o.Scenario, o.Agents, o.Editors, o.Worktrees
 	report.Workload.DurationSec, report.Workload.DeadlineSec, report.Workload.Seed, report.Workload.Profile = o.Duration.Seconds(), o.Deadline.Seconds(), o.Seed, o.Profile
 	if o.PRSmokeDrain > 0 {

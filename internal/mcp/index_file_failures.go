@@ -277,6 +277,9 @@ func (s *Server) refreshIndexHealthFileFailures(ctx context.Context, baseline ma
 	} else {
 		delete(result, "storage")
 	}
+	if lanes := s.indexHealthRepositoryLanes(); lanes != nil {
+		result["repository_lanes"] = lanes
+	}
 	failures, readErr := s.readIndexFileFailures(ctx, ResolvedScope{})
 	totalDetected, _ := baseline["total_detected"].(int)
 	fileNodes, _ := baseline["file_node_count"].(int)
