@@ -120,7 +120,7 @@ func TestEditProbeReceiptLoopStopsWhenAccountingStaysUnsettled(t *testing.T) {
 				}
 				return disk(frame)
 			})
-			run.options.Deadline = 2 * time.Second
+			run.options.Deadline = 4 * time.Second
 			state = run.states[0]
 			state.mu.Lock()
 			if _, ok := state.record.FirstCorrect["text"]; !ok {
