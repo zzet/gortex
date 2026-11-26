@@ -142,10 +142,24 @@ func dialSocket(ctx context.Context, socket, cwd, mode string) (net.Conn, *bufio
 	return dialSocketSurface(ctx, socket, cwd, mode, loadWireTools, loadWireToolsMode)
 }
 
+// socketDialers replaces the unix-socket dial for the socket paths it holds
+// (string to func(context.Context) (net.Conn, error)). Only tests register
+// one, to serve a stub daemon over net.Pipe: a pipe's write deadline fires
+// the same way on every platform, while a real socket's depends on how the
+// OS buffers an unread stream and interrupts a blocked send.
+var socketDialers sync.Map
+
+func dialUnixSocket(ctx context.Context, socket string) (net.Conn, error) {
+	if dial, ok := socketDialers.Load(socket); ok {
+		return dial.(func(context.Context) (net.Conn, error))(ctx)
+	}
+	return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+}
+
 // dialSocketSurface negotiates the session's tool surface in the handshake,
 // as the CLI does per connection; the load workload always uses the facade.
 func dialSocketSurface(ctx context.Context, socket, cwd, mode, tools, toolsMode string) (net.Conn, *bufio.Reader, string, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	conn, err := dialUnixSocket(ctx, socket)
 	if err != nil {
 		return nil, nil, "", err
 	}

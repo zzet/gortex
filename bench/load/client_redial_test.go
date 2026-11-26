@@ -7,8 +7,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -30,21 +28,16 @@ const (
 // startRedialStub is a newline-framed daemon that answers the handshake and
 // initialize on every connection; behave picks what connection n (from 1)
 // does after that. It returns the socket and the count of accepted sessions.
+//
+// The socket is served over net.Pipe through socketDialers, not a real unix
+// socket. A pipe write blocks until the stub reads it and its deadline fires
+// in Go, so a stalled stream gives the client's write the timeout class on
+// every platform. Over a real socket the OS decides how much an unread stream
+// buffers and whether a blocked send is interrupted at its deadline: on the
+// Windows runner the stalled write never reached the client's write timeout.
 func startRedialStub(t *testing.T, behave func(connection int) stubStream) (string, func() int) {
 	t.Helper()
-	base := os.TempDir()
-	if runtime.GOOS != "windows" {
-		base = "/tmp" // Darwin's long per-user temp path can exceed sun_path.
-	}
-	dir, err := os.MkdirTemp(base, "gl-redial-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	socket := filepath.Join(dir, "d.sock")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	socket := "redial-stub/" + t.Name()
 	var mu sync.Mutex
 	var connections []net.Conn
 	var workers sync.WaitGroup
@@ -90,32 +83,27 @@ func startRedialStub(t *testing.T, behave func(connection int) stubStream) (stri
 			}
 		}
 	}
-	accepted := make(chan struct{})
-	go func() {
-		defer close(accepted)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			connections = append(connections, conn)
-			connection := len(connections)
-			mu.Unlock()
-			workers.Go(func() { serve(conn, connection) })
-		}
-	}()
+	dial := func(context.Context) (net.Conn, error) {
+		client, conn := net.Pipe()
+		mu.Lock()
+		connections = append(connections, conn)
+		connection := len(connections)
+		mu.Unlock()
+		workers.Go(func() { serve(conn, connection) })
+		return client, nil
+	}
+	if _, registered := socketDialers.LoadOrStore(socket, dial); registered {
+		t.Fatalf("stub socket %s is already served", socket)
+	}
 	t.Cleanup(func() {
+		socketDialers.Delete(socket)
 		close(release)
-		_ = listener.Close()
-		<-accepted
 		mu.Lock()
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
 		mu.Unlock()
 		workers.Wait()
-		_ = os.RemoveAll(dir)
 	})
 	return socket, func() int {
 		mu.Lock()
@@ -124,9 +112,9 @@ func startRedialStub(t *testing.T, behave func(connection int) stubStream) (stri
 	}
 }
 
-// A frame far larger than any socket buffer: its write blocks until the
-// client's write deadline when the daemon stops reading.
-var redialLargeParams = map[string]string{"large": strings.Repeat("x", 8<<20)}
+// A frame whose write blocks until the client's write deadline once the stub
+// stops reading. Over a pipe any frame blocks, so its size does not matter.
+var redialLargeParams = map[string]string{"large": strings.Repeat("x", 1<<10)}
 
 func openRedialClient(t *testing.T, ctx context.Context, socket string, limit int) *socketClient {
 	t.Helper()
