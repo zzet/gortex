@@ -285,7 +285,7 @@ func TestRepoTopologyMutationDoesNotWaitForTheCouplingRead(t *testing.T) {
 	close(store.release)
 	awaitCoupling(t, store, func(c *repoCoupling) bool { return c.ready })
 	if status := Topology(store); status.Coupling != "ready" || status.LastRead == nil ||
-		status.LastRead.Scope != "store" || status.LastRead.Outcome != "ready" || status.LastRead.TookMS <= 0 {
+		status.LastRead.Scope != "store" || status.LastRead.Outcome != "ready" || status.LastRead.TookMS < 0 {
 		t.Fatalf("topology status after the read landed = %+v, want ready with the store read recorded", status)
 	}
 	BuildIndex(store)

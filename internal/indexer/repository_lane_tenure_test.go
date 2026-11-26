@@ -40,6 +40,10 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	})
 	batchGate.Unlock()
 	<-entered
+	// The tenure began before fn ran and ends after it returns, so it covers
+	// at least what the test measures between these two readings, on any
+	// clock resolution.
+	heldFrom := time.Now()
 	held := status()
 	require.NotNil(t, held.Holder, "the lane's tenant is not reported")
 	require.Equal(t, string(OutputEntryWatcherPatchGraph), held.Holder.Kind)
@@ -72,6 +76,7 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 	})
 
 	time.Sleep(5 * time.Millisecond)
+	heldFor := float64(time.Since(heldFrom).Microseconds()) / 1000
 	close(release)
 	require.NoError(t, <-patchDone)
 	require.NoError(t, <-reconciled)
@@ -102,7 +107,7 @@ func TestRepositoryLaneTenureAttributesHolderAndWaiters(t *testing.T) {
 		totals[string(OutputEntryRepositoryReconcileLane)].Longest.Batch, "the reconcile pass's scope")
 	require.Nil(t, totals[string(OutputEntryContractRepair)].Longest.Batch, "a tenant other than a reconcile pass carries a batch")
 	patch := totals[string(OutputEntryWatcherPatchGraph)]
-	require.GreaterOrEqual(t, patch.Longest.HeldForMS, float64(5), "the patch's tenure covers its hold")
+	require.GreaterOrEqual(t, patch.Longest.HeldForMS, heldFor, "the patch's tenure covers its hold")
 	require.Equal(t, patch.HeldTotalMS, patch.Longest.HeldForMS)
 	require.Equal(t, held.Holder.SinceUnixMS, patch.Longest.SinceUnixMS)
 }
