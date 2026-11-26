@@ -509,13 +509,13 @@ func LoadFiles(repoRoot string, rels []string, observe func(rel string, data []b
 	defer dir.Close()
 	sorted := append([]string(nil), rels...)
 	// WalkDir's order: scopes with equally long prefixes keep visit order.
-	sort.Slice(sorted, func(i, j int) bool { return walkOrderLess(sorted[i], sorted[j]) })
+	sort.Slice(sorted, func(i, j int) bool { return WalkOrderLess(sorted[i], sorted[j]) })
 	return LoadTree(listedTree{dirTree: dirTree{root: repoRoot, dir: dir, observe: observe}, files: sorted})
 }
 
-// walkOrderLess orders slash paths the way filepath.WalkDir visits them:
+// WalkOrderLess orders slash paths the way filepath.WalkDir visits them:
 // entries sorted by name within each directory, depth first.
-func walkOrderLess(a, b string) bool {
+func WalkOrderLess(a, b string) bool {
 	for {
 		ai, bi := strings.IndexByte(a, '/'), strings.IndexByte(b, '/')
 		ah, bh := a, b
@@ -552,6 +552,26 @@ func (t listedTree) Files(visit func(rel string)) {
 func WorkingTree(root, extra string, scopeFiles ...string) Tree {
 	dir, file := path.Split(extra)
 	return dirTree{root: root, extraDir: strings.TrimSuffix(dir, "/"), extraFile: file, scopeFiles: scopeFiles}
+}
+
+// WorkingTreeVisits reports whether the walk of WorkingTree(root, extra,
+// scopeFiles...) visits the repo-relative slash path rel, whether or not the
+// file exists now. It lets a caller replay a walk from a recorded list.
+func WorkingTreeVisits(rel, extra string, scopeFiles ...string) bool {
+	if !filepath.IsLocal(filepath.FromSlash(rel)) {
+		return false
+	}
+	base := path.Base(rel)
+	if !underSkippedDir(rel) {
+		return IsConfigFileName(base) || slices.Contains(scopeFiles, base)
+	}
+	extraDir, extraFile := path.Split(extra)
+	extraDir = strings.TrimSuffix(extraDir, "/")
+	dir := path.Dir(rel)
+	// The walk visits the extra file only in a pruned directory whose own
+	// ancestors it descended.
+	return extraFile != "" && base == extraFile && path.Base(dir) == extraDir &&
+		SkipDirName(extraDir) && !underSkippedDir(dir)
 }
 
 // dirTree is the working copy at a root: the tree Load reads.

@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/zzet/gortex/internal/gitstate"
 	"github.com/zzet/gortex/internal/graph"
@@ -27,6 +29,45 @@ type resolutionInputs struct {
 	nuxt    *nuxtimports.Collection
 	reads   map[string]string
 	digest  string
+	// stats lets a save skip rereading an input whose size and mtime have not
+	// moved since it was read. Each stat is taken before its read, so a
+	// rewrite after the stat only costs a reread. Shared snapshots are
+	// rechecked concurrently, hence statsMu.
+	statsMu sync.Mutex
+	stats   map[string]resolutionInputStat
+}
+
+// resolutionInputStat is an input's identity when it was read; missing marks
+// an input that did not exist.
+type resolutionInputStat struct {
+	size    int64
+	mtime   int64
+	missing bool
+}
+
+func statResolutionInput(dir *os.Root, rel string) resolutionInputStat {
+	info, err := dir.Stat(filepath.FromSlash(rel))
+	if err != nil {
+		return resolutionInputStat{missing: true}
+	}
+	return resolutionInputStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
+}
+
+// statUnchanged reports whether rel still has the stat recorded with its read.
+func (in *resolutionInputs) statUnchanged(dir *os.Root, rel string) bool {
+	in.statsMu.Lock()
+	defer in.statsMu.Unlock()
+	recorded, ok := in.stats[rel]
+	return ok && recorded == statResolutionInput(dir, rel)
+}
+
+func (in *resolutionInputs) noteStat(rel string, stat resolutionInputStat) {
+	in.statsMu.Lock()
+	defer in.statsMu.Unlock()
+	if in.stats == nil {
+		in.stats = make(map[string]resolutionInputStat)
+	}
+	in.stats[rel] = stat
 }
 
 // Both loaders consume one discovery walk. Only Exists escapes the load (for
@@ -37,6 +78,7 @@ type resolutionTree struct {
 	dir   *os.Root
 	paths []string
 	reads map[string]string
+	stats map[string]resolutionInputStat
 	proof *buildContentProof
 }
 
@@ -47,6 +89,9 @@ func (t *resolutionTree) Files(visit func(string)) {
 }
 
 func (t *resolutionTree) Read(rel string) ([]byte, bool) {
+	if t.dir != nil {
+		t.stats[rel] = statResolutionInput(t.dir, rel)
+	}
 	data, sum := readResolutionInput(t.dir, t.root, rel, t.proof)
 	t.reads[rel] = sum
 	return data, sum != "" && sum != absentContent
@@ -70,10 +115,13 @@ func readResolutionInput(dir *os.Root, root, rel string, proof *buildContentProo
 	return data, sum
 }
 
-// A save of explicit files is not a discovery pass. Recheck every known input
-// by content (not mtime), and check each saved file's ancestors for a newly
-// prepared project or alias scope. A directory event or explicit reconcile
-// still discovers all roots.
+// A save of explicit files is not a discovery pass. Recheck every known input,
+// and check each saved file's ancestors for a newly prepared project or alias
+// scope. A directory event or explicit reconcile still discovers all roots.
+// An input whose size and mtime are unchanged is not reread unless a content
+// proof needs its bytes. A deleted or renamed point needs no walk: it changes
+// resolution only if it was itself a known input, which the recheck catches,
+// and its directory's candidates are checked like any other point's.
 func (in *resolutionInputs) unchangedForPoints(root string, points []string, proof *buildContentProof) bool {
 	if in == nil || len(points) == 0 {
 		return false
@@ -90,7 +138,8 @@ func (in *resolutionInputs) unchangedForPoints(root string, points []string, pro
 		if err != nil || !filepath.IsLocal(rel) {
 			return false
 		}
-		if info, err := os.Stat(point); err != nil || !info.Mode().IsRegular() {
+		info, err := os.Stat(point)
+		if err != nil && !errors.Is(err, os.ErrNotExist) || err == nil && !info.Mode().IsRegular() {
 			return false
 		}
 		rels = append(rels, rel)
@@ -100,10 +149,16 @@ func (in *resolutionInputs) unchangedForPoints(root string, points []string, pro
 		return false
 	}
 	defer confined.Close()
+	byContent := proof.active()
 	for input, prior := range in.reads {
+		if !byContent && prior != "" && in.statUnchanged(confined, input) {
+			continue
+		}
+		stat := statResolutionInput(confined, input)
 		if _, sum := readResolutionInput(confined, root, input, proof); sum == "" || prior != sum {
 			return false
 		}
+		in.noteStat(input, stat) // touched, not changed
 	}
 	tsNames, nuxtNames := tsalias.ConfigFileNames(), nuxtimports.ConfigFileNames()
 	names := append(append(tsNames[:], nuxtNames[:]...), nuxtimports.GeneratedList)
@@ -138,23 +193,117 @@ type aliasStateStore interface {
 	SetTSAliasDigest(repo, digest string) error
 }
 
+// resolutionInputStore persists the inputs behind a certified digest so a
+// warm restart can recheck them instead of walking the checkout.
+type resolutionInputStore interface {
+	TSAliasInputs(repo string) (map[string]string, error)
+	SetTSAliasInputs(repo string, inputs map[string]string) error
+}
+
+// resolutionCallerInventory answers whether a repository may hold JS/TS callers.
+type resolutionCallerInventory interface {
+	MayHaveTSAliasCallers(ctx context.Context, repo string) (bool, error)
+}
+
+// resolutionDiscoveryWalks counts working-copy discovery walks per root; tests
+// use it to prove a pass stayed off the walk.
+var resolutionDiscoveryWalks sync.Map // root -> *atomic.Int64
+
+func resolutionDiscoveryWalkCount(root string) int64 {
+	if counter, ok := resolutionDiscoveryWalks.Load(root); ok {
+		return counter.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
 func discoverResolutionInputs(root string, proof *buildContentProof) (*resolutionInputs, error) {
 	proof.noteUnboundedReader()
+	counter, _ := resolutionDiscoveryWalks.LoadOrStore(root, new(atomic.Int64))
+	counter.(*atomic.Int64).Add(1)
 	dir, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, err
 	}
 	defer dir.Close()
-	t := &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir, reads: make(map[string]string), proof: proof}
+	t := newResolutionTree(root, dir, proof)
 	t.Tree.Files(func(rel string) { t.paths = append(t.paths, rel) })
-	current := &resolutionInputs{aliases: tsalias.LoadTree(t), nuxt: nuxtimports.LoadTree(t), reads: t.reads}
+	return t.load(), nil
+}
+
+func newResolutionTree(root string, dir *os.Root, proof *buildContentProof) *resolutionTree {
+	return &resolutionTree{Tree: nuxtimports.WorkingTree(root), root: root, dir: dir,
+		reads: make(map[string]string), stats: make(map[string]resolutionInputStat), proof: proof}
+}
+
+// load runs both loaders over t.paths and digests every read they made.
+func (t *resolutionTree) load() *resolutionInputs {
+	current := &resolutionInputs{aliases: tsalias.LoadTree(t), nuxt: nuxtimports.LoadTree(t), reads: t.reads, stats: t.stats}
 	h := sha256.New()
 	for _, rel := range slices.Sorted(maps.Keys(current.reads)) {
 		writeFingerprintString(h, rel)
 		writeFingerprintString(h, current.reads[rel])
 	}
 	current.digest = hex.EncodeToString(h.Sum(nil))
-	return current, nil
+	return current
+}
+
+// restoreResolutionInputs rebuilds the inputs recorded beside digest without
+// walking the checkout. It replays the walk over the recorded paths the walk
+// would visit, and returns nil unless every recorded input still has its
+// recorded content and the replay reproduces digest exactly.
+func restoreResolutionInputs(root, digest string, recorded map[string]string) *resolutionInputs {
+	if digest == "" || len(recorded) == 0 {
+		return nil
+	}
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		return nil
+	}
+	defer dir.Close()
+	var visits []string
+	for rel, want := range recorded {
+		if want == "" {
+			return nil // an unreadable input is never proven unchanged
+		}
+		if _, got := readResolutionInput(dir, root, rel, nil); got != want {
+			return nil
+		}
+		if nuxtimports.WorkingTreeVisits(rel) {
+			visits = append(visits, rel)
+		}
+	}
+	// A clean census cannot see an ignored generator output. The walk visits
+	// the generated import list beside every Nuxt config once its directory
+	// exists, so one that appeared since the record forces the walk.
+	nuxtNames := nuxtimports.ConfigFileNames()
+	for rel := range recorded {
+		if !slices.Contains(nuxtNames[:], path.Base(rel)) {
+			continue
+		}
+		candidate := path.Join(path.Dir(rel), nuxtimports.GeneratedList)
+		if _, known := recorded[candidate]; known {
+			continue
+		}
+		if _, err := dir.Stat(filepath.FromSlash(candidate)); !errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
+	slices.SortFunc(visits, func(a, b string) int {
+		switch {
+		case tsalias.WalkOrderLess(a, b):
+			return -1
+		case tsalias.WalkOrderLess(b, a):
+			return 1
+		}
+		return 0
+	})
+	t := newResolutionTree(root, dir, nil)
+	t.paths = visits
+	current := t.load()
+	if current.digest != digest {
+		return nil
+	}
+	return current
 }
 
 type resolutionCompletion struct {
@@ -179,32 +328,128 @@ func (idx *Indexer) resolutionStore() aliasStateStore {
 	return s
 }
 
-// A clean source census does not cover ignored generator outputs.
+// A clean source census does not cover ignored generator outputs. Recheck the
+// inputs recorded beside the digest first, and walk only when that fails.
 func (idx *Indexer) censusResolutionCurrent(root string) bool {
 	if idx.manifestTree().sourced() {
 		return true
 	}
-	current, err := discoverResolutionInputs(root, nil)
-	if err != nil {
-		return false
-	}
-	store := idx.resolutionStore()
-	if store == nil {
-		prior := idx.appliedResolution.Load()
-		return prior != nil && prior.digest == current.digest
-	}
-	stored, err := store.TSAliasDigest(idx.repoPrefix)
-	if err == nil && stored == current.digest {
-		idx.appliedResolution.Store(current)
-		cacheResolutionInputs(root, current)
+	if restored := idx.restoreCertifiedResolution(root); restored != nil {
+		idx.appliedResolution.Store(restored)
+		cacheResolutionInputs(root, restored)
 		return true
 	}
-	return false
+	certified := ""
+	if store := idx.resolutionStore(); store != nil {
+		stored, err := store.TSAliasDigest(idx.repoPrefix)
+		if err != nil {
+			return false
+		}
+		certified = stored
+	} else if prior := idx.appliedResolution.Load(); prior != nil {
+		certified = prior.digest
+	}
+	if certified == "" {
+		// Nothing was certified. Unless something consumes resolution
+		// inputs, nothing can be stale either: a checkout without JS/TS
+		// callers never certifies, and its census must not walk for configs.
+		if needed, err := idx.resolutionPassNeeded(root, false, nil); err == nil && !needed {
+			return true
+		}
+		return false
+	}
+	current, err := discoverResolutionInputs(root, nil)
+	if err != nil || current.digest != certified {
+		return false
+	}
+	idx.appliedResolution.Store(current)
+	cacheResolutionInputs(root, current)
+	return true
+}
+
+// restoreCertifiedResolution rebuilds the certified inputs from the record
+// beside the digest, or returns nil when the store has none or they moved.
+func (idx *Indexer) restoreCertifiedResolution(root string) *resolutionInputs {
+	store := idx.resolutionStore()
+	inputStore, ok := store.(resolutionInputStore)
+	if !ok {
+		return nil
+	}
+	stored, err := store.TSAliasDigest(idx.repoPrefix)
+	if err != nil || stored == "" {
+		return nil
+	}
+	recorded, err := inputStore.TSAliasInputs(idx.repoPrefix)
+	if err != nil {
+		return nil
+	}
+	return restoreResolutionInputs(root, stored, recorded)
 }
 
 func (idx *Indexer) refreshResolutionInputs(root string, points ...string) (*resolutionInputs, error) {
+	return idx.refreshResolutionInputsFor(root, false, points...)
+}
+
+// resolutionPassNeeded reports whether a working-copy mutation can consume or
+// change a resolution input. Without a JS/TS caller, a JS/TS or config path in
+// scope, a known input, or unfinished resolution work, discovery is skipped; a
+// lookup a later parse makes still loads the inputs lazily.
+func (idx *Indexer) resolutionPassNeeded(root string, scopeHasJSTS bool, points []string) (bool, error) {
+	if scopeHasJSTS || idx.appliedResolution.Load() != nil {
+		return true, nil
+	}
+	idx.resolutionMu.Lock()
+	pending := idx.warmResolution != nil
+	idx.resolutionMu.Unlock()
+	if pending || idx.resolutionRetry != nil || idx.resolutionInputsChanged {
+		return true, nil
+	}
+	cached := cachedResolutionInputs(root)
+	for _, p := range points {
+		if p == "" {
+			continue // the full index decides through scopeHasJSTS
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		if closureJSTSPath(p) || resolutionInputName(filepath.Base(p)) {
+			return true, nil
+		}
+		if rel, err := filepath.Rel(root, p); err == nil && cached != nil {
+			if _, known := cached.reads[filepath.ToSlash(rel)]; known {
+				return true, nil
+			}
+		}
+	}
+	if inv, ok := idx.graph.(resolutionCallerInventory); ok {
+		return inv.MayHaveTSAliasCallers(context.Background(), idx.repoPrefix)
+	}
+	return idx.hasResolutionCallers(), nil
+}
+
+// resolutionInputName reports whether a file name can be a resolution input.
+func resolutionInputName(name string) bool {
+	if tsalias.IsConfigFileName(name) || name == path.Base(nuxtimports.GeneratedList) {
+		return true
+	}
+	names := nuxtimports.ConfigFileNames()
+	return slices.Contains(names[:], name)
+}
+
+// refreshResolutionInputsFor is refreshResolutionInputs for a pass that
+// already knows whether its scope admitted a JS/TS file (the full index).
+func (idx *Indexer) refreshResolutionInputsFor(root string, scopeHasJSTS bool, points ...string) (*resolutionInputs, error) {
 	if idx.manifestTree().sourced() {
 		return nil, nil
+	}
+	if _, delta := idx.graph.(*graph.DeltaWriter); !delta {
+		needed, err := idx.resolutionPassNeeded(root, scopeHasJSTS, points)
+		if err != nil {
+			return nil, err
+		}
+		if !needed {
+			return nil, nil
+		}
 	}
 	if _, delta := idx.graph.(*graph.DeltaWriter); delta {
 		// The delta planner pinned the inputs and refused a changed policy.
@@ -294,24 +539,52 @@ func (idx *Indexer) hasResolutionCallers() bool {
 
 var resolutionCache = struct {
 	sync.Mutex
-	byRoot map[string]*resolutionInputs
-}{byRoot: make(map[string]*resolutionInputs)}
+	byRoot  map[string]*resolutionInputs
+	loading map[string]*resolutionLoad
+}{byRoot: make(map[string]*resolutionInputs), loading: make(map[string]*resolutionLoad)}
 
+// resolutionLoad is one in-flight discovery walk; later callers for the same
+// root wait for it instead of walking again.
+type resolutionLoad struct {
+	done   chan struct{}
+	inputs *resolutionInputs
+}
+
+// workingResolutionInputs walks outside the cache lock, so a cold walk of one
+// checkout never stalls lookups or saves in another.
 func workingResolutionInputs(root string, proof *buildContentProof) *resolutionInputs {
 	resolutionCache.Lock()
 	inputs := resolutionCache.byRoot[root]
 	if inputs == nil {
-		var err error
-		inputs, err = discoverResolutionInputs(root, proof)
-		if err != nil {
+		load := resolutionCache.loading[root]
+		if load == nil {
+			load = &resolutionLoad{done: make(chan struct{})}
+			resolutionCache.loading[root] = load
 			resolutionCache.Unlock()
+			discovered, err := discoverResolutionInputs(root, proof)
+			resolutionCache.Lock()
+			if err == nil {
+				load.inputs = discovered
+				if resolutionCache.byRoot[root] == nil {
+					resolutionCache.byRoot[root] = discovered
+				}
+			}
+			delete(resolutionCache.loading, root)
+			resolutionCache.Unlock()
+			close(load.done)
+			if err != nil {
+				return &resolutionInputs{}
+			}
+			return discovered
+		}
+		resolutionCache.Unlock()
+		<-load.done
+		if inputs = load.inputs; inputs == nil {
 			return &resolutionInputs{}
 		}
-		resolutionCache.byRoot[root] = inputs
+	} else {
 		resolutionCache.Unlock()
-		return inputs
 	}
-	resolutionCache.Unlock()
 	if proof.active() {
 		for rel, sum := range inputs.reads {
 			proof.record(filepath.Join(root, filepath.FromSlash(rel)), sum)
@@ -359,6 +632,24 @@ func cacheResolutionInputs(root string, current *resolutionInputs) {
 	resolutionCache.Lock()
 	resolutionCache.byRoot[root] = current
 	resolutionCache.Unlock()
+}
+
+// resolutionCertifiedFor reports whether inputs are the policy the graph was
+// last certified against, in memory or durably. Call it before
+// fenceResolutionWrites clears the in-memory certificate.
+func (idx *Indexer) resolutionCertifiedFor(inputs *resolutionInputs) bool {
+	if inputs == nil || idx.resolutionInputsChanged || idx.resolutionRetry != nil {
+		return false
+	}
+	if applied := idx.appliedResolution.Load(); applied != nil {
+		return applied.digest == inputs.digest
+	}
+	store := idx.resolutionStore()
+	if store == nil {
+		return false
+	}
+	stored, err := store.TSAliasDigest(idx.repoPrefix)
+	return err == nil && stored != "" && stored == inputs.digest
 }
 
 func (idx *Indexer) hasUncertifiedResolutionPass() bool {
@@ -454,8 +745,16 @@ func (idx *Indexer) finishResolutionPass(work resolutionCompletion) (passErr err
 	return nil
 }
 
+// stampResolution certifies inputs. The input record goes first: a crash
+// before the digest write leaves the digest cleared, so the record is never
+// trusted on its own.
 func (idx *Indexer) stampResolution(inputs *resolutionInputs) error {
 	if store := idx.resolutionStore(); store != nil {
+		if inputStore, ok := store.(resolutionInputStore); ok {
+			if err := inputStore.SetTSAliasInputs(idx.repoPrefix, inputs.reads); err != nil {
+				return err
+			}
+		}
 		if err := store.SetTSAliasDigest(idx.repoPrefix, inputs.digest); err != nil {
 			return err
 		}

@@ -667,7 +667,7 @@ func loadIncrementalPriorView(g graph.Store, stages []*incrementalBatchStage) in
 	missingTargets := make(map[string]struct{})
 	for _, edges := range view.outByNode {
 		for _, edge := range edges {
-			if !reusableResolvedEdge(edge) {
+			if !reuseKeyClaimant(edge) {
 				continue
 			}
 			if _, known := view.nodesByID[edge.To]; !known {
@@ -1052,7 +1052,7 @@ func captureIncrementalStateFromView(
 				priorPending = append(priorPending, &prior)
 				continue
 			}
-			if !reusableResolvedEdge(edge) {
+			if !reuseKeyClaimant(edge) {
 				continue
 			}
 			target := nodesByID[edge.To]
@@ -1060,6 +1060,10 @@ func captureIncrementalStateFromView(
 				continue
 			}
 			key := reuseKey{from: edge.From, kind: edge.Kind, recv: edgeReceiverType(edge), name: target.Name}
+			if !reusableResolvedEdge(edge) {
+				reuse[key] = nil // a bound call shares the key -> never reuse
+				continue
+			}
 			if current, seen := reuse[key]; seen {
 				if current != nil && current.to != edge.To {
 					reuse[key] = nil

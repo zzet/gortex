@@ -113,7 +113,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 			continue
 		}
 		for _, e := range byNode[n.ID] {
-			if reusableResolvedEdge(e) {
+			if reuseKeyClaimant(e) {
 				targetIDSet[e.To] = struct{}{}
 			}
 		}
@@ -139,7 +139,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 				priorUnresolved = append(priorUnresolved, &prior)
 				continue
 			}
-			if !reusableResolvedEdge(e) {
+			if !reuseKeyClaimant(e) {
 				continue
 			}
 			tgt := targets[e.To]
@@ -147,6 +147,10 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 				continue
 			}
 			k := reuseKey{from: e.From, kind: e.Kind, recv: edgeReceiverType(e), name: tgt.Name}
+			if !reusableResolvedEdge(e) {
+				reuse[k] = nil // a bound call shares the key -> never reuse
+				continue
+			}
 			if cur, seen := reuse[k]; seen {
 				if cur != nil && cur.to != e.To {
 					reuse[k] = nil // ambiguous -> never reuse
@@ -407,6 +411,15 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 	}
 	idx.observeIncrementalCatchup("resolve", resolveList)
 	batch.recordResolveStats(idx.resolver.ResolveFilesAndIncoming(resolveList))
+}
+
+// reuseKeyClaimant reports a resolved edge whose target name claims its reuse
+// key, reusable or not. reuseKey cannot tell a bare call bound through an
+// import or a lexical scope from a same-named member call, so a bound edge that
+// is not itself reusable must still make its key ambiguous; otherwise the one
+// remaining candidate is copied onto the bound call.
+func reuseKeyClaimant(e *graph.Edge) bool {
+	return e != nil && e.To != "" && !graph.IsUnresolvedTarget(e.To) && !strings.HasPrefix(e.To, "external::")
 }
 
 func reusableResolvedEdge(e *graph.Edge) bool {

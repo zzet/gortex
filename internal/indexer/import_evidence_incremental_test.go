@@ -138,12 +138,14 @@ func TestIncremental_DeletedLocalRequireDoesNotCarryPriorBindingOrMeta(t *testin
 	for _, ext := range []string{".js", ".ts"} {
 		t.Run(ext, func(t *testing.T) {
 			root := t.TempDir()
-			// Poison stage.reuse[run, calls, "", "helper"] by having two unstamped
-			// helper calls in run() with distinct targets (imported helper() ->
-			// libA::helper and untyped method call x.helper() -> box::Box.helper).
-			// That forces applyResolvedOutEdgesFromView to leave all helper calls
-			// unresolved so stagePriorBindings / carry_prior_bindings genuinely
-			// runs (carried > 0) and must refuse the deleted local require's prior
+			// Poison stage.reuse[run, calls, "", "helper"] with two helper calls
+			// in run() that have distinct targets (imported helper() ->
+			// libA::helper, bound exactly, and untyped method call x.helper() ->
+			// box::Box.helper). The exact binding is not reusable but still claims
+			// the key, so applyResolvedOutEdgesFromView leaves all helper calls
+			// unresolved instead of pinning Box.helper onto them, and
+			// stagePriorBindings / carry_prior_bindings genuinely runs (carried >
+			// 0 for .ts) and must refuse the deleted local require's prior
 			// binding and metadata.
 			beforeSrc := "import { helper } from './libA'\nexport function run(x) {\n  const a = helper()\n  const b = x.helper()\n  {\n    const { helper } = require('./libB')\n    return a + b + helper()\n  }\n}\n"
 			afterSrc := "import { helper } from './libA'\nexport function run(x) {\n  const a = helper()\n  const b = x.helper()\n  {\n    // deleted local require\n    return a + b + helper()\n  }\n}\n"
@@ -191,7 +193,14 @@ func TestIncremental_DeletedLocalRequireDoesNotCarryPriorBindingOrMeta(t *testin
 					carried += int(entry.ContextMap()["carried"].(int64))
 				}
 			}
-			require.Positive(t, carried, "expected stagePriorBindings / carry_prior_bindings to run on this reparse")
+			if ext == ".ts" {
+				require.Positive(t, carried, "expected stagePriorBindings / carry_prior_bindings to run on this reparse")
+			} else {
+				// A JS require is part of the file's import fingerprint, so
+				// deleting it drops the stage's reuse and carry: every call
+				// re-resolves, and the binding checks below still apply.
+				require.Zero(t, carried)
+			}
 
 			require.NotContains(t, jsCallTargets(g, runID), libBHelper)
 			require.Contains(t, jsCallTargets(g, runID), libAHelper)

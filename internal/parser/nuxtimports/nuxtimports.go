@@ -43,6 +43,11 @@ func WorkingTree(root string) tsalias.Tree {
 	return tsalias.WorkingTree(root, GeneratedList, configFiles[:]...)
 }
 
+// WorkingTreeVisits reports whether the walk of WorkingTree visits rel.
+func WorkingTreeVisits(rel string) bool {
+	return tsalias.WorkingTreeVisits(rel, GeneratedList, configFiles[:]...)
+}
+
 // Load ignores unprepared projects, packages and files outside the repository.
 func Load(repoRoot string) *Collection {
 	return LoadTree(WorkingTree(repoRoot))

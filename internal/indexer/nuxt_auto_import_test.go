@@ -283,7 +283,8 @@ func TestNuxtResolutionRejectsEscapingExtends(t *testing.T) {
 	}
 	idx, _ := newSQLiteIndexer(t)
 	idx.SetRootPath(root)
-	in, err := idx.refreshResolutionInputs(root, "")
+	// The repository has no JS/TS file yet; declare one so the pass is not gated off.
+	in, err := idx.refreshResolutionInputsFor(root, true, "")
 	require.NoError(t, err)
 	require.Empty(t, idx.resolvePathAliasImport("page.ts", "@secret"))
 	require.Empty(t, in.reads["link/base.json"], "an out-of-root read cannot supply a content hash")

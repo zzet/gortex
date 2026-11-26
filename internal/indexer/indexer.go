@@ -2851,6 +2851,7 @@ func (idx *Indexer) IndexCtx(ctx context.Context, root string) (*IndexResult, er
 // repository mutation lane.
 func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *IndexResult, retErr error) {
 	var inputs *resolutionInputs
+	inputsCertified := false
 	defer func() {
 		work := resolutionCompletion{inputs: inputs, success: retErr == nil && result != nil && len(result.Errors) == 0 && len(result.FailedFiles) == 0, warm: idx.deferResolve.Load()}
 		if retErr == nil && result != nil && len(result.Errors) == 0 {
@@ -2865,7 +2866,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		if retErr == nil && result != nil && result.resolutionErr != nil {
 			resolveErr = result.resolutionErr
 			work.catchupErr = resolveErr
-			reportResolve = inputs != nil && idx.hasUncertifiedResolutionPass()
+			reportResolve = inputs != nil && !inputsCertified
 		}
 		if err := idx.finishResolutionPass(work); err != nil {
 			if resolveErr != nil && !reportResolve && errors.Is(err, resolveErr) {
@@ -3000,13 +3001,6 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
-	inputs, err = idx.refreshResolutionInputs(absRoot, "")
-	if err != nil {
-		return nil, err
-	}
-	if err := idx.fenceResolutionWrites(inputs, true); err != nil {
-		return nil, err
-	}
 	idx.projectName = search.DetectProjectName(absRoot)
 
 	reporter.Report("walking files", 0, 0)
@@ -3155,6 +3149,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			recordFileOutcome(absRoot, err)
 		}
+		return nil, err
+	}
+	// Resolution inputs are prepared after the walk, which writes nothing to
+	// the graph, so the pass knows whether its scope admitted any JS/TS file.
+	// A Go-only checkout with no JS/TS callers then skips discovery entirely.
+	scopeHasJSTS := slices.ContainsFunc(files, func(wf walkedFile) bool { return closureJSTSPath(wf.path) })
+	inputs, err = idx.refreshResolutionInputsFor(absRoot, scopeHasJSTS, "")
+	if err != nil {
+		return nil, err
+	}
+	// The fence below clears the in-memory certificate, so decide now
+	// whether a failed resolve would leave an uncertified policy behind.
+	inputsCertified = idx.resolutionCertifiedFor(inputs)
+	if err := idx.fenceResolutionWrites(inputs, true); err != nil {
 		return nil, err
 	}
 	if skippedLarge > 0 {
