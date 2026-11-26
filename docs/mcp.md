@@ -304,7 +304,11 @@ also use free shared slots. A dry-run rename (`rename_symbol` or `refactor`
 `rename` with `dry_run: true`) writes nothing and is admitted as a fast read;
 a rename that writes stays mutating. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
-serve queued mutating calls first, then fast, then slow. Sessions take turns
+serve queued mutating calls first, then fast, then slow, with one bound: while
+a queued slow call has room in the slow lane, at most four grants in a row go
+to the other lanes before the slow lane takes the next one. That turn never
+uses the two reserved mutation slots, so writes keep their reservation and a
+flood of writes and fast reads cannot starve the slow lane. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
 session. For small cap overrides, the reservation is `min(2, cap-1)` and the
 slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
