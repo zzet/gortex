@@ -1,0 +1,270 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// stubStream says what a redialStub connection does once its session is
+// initialized: answer every request, stop reading (so a large client write
+// blocks until its deadline), or hang up. stubRefuse refuses the handshake.
+type stubStream int
+
+const (
+	stubServe stubStream = iota
+	stubStall
+	stubHangUp
+	stubRefuse
+)
+
+// startRedialStub is a newline-framed daemon that answers the handshake and
+// initialize on every connection; behave picks what connection n (from 1)
+// does after that. It returns the socket and the count of accepted sessions.
+func startRedialStub(t *testing.T, behave func(connection int) stubStream) (string, func() int) {
+	t.Helper()
+	base := os.TempDir()
+	if runtime.GOOS != "windows" {
+		base = "/tmp" // Darwin's long per-user temp path can exceed sun_path.
+	}
+	dir, err := os.MkdirTemp(base, "gl-redial-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "d.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var connections []net.Conn
+	var workers sync.WaitGroup
+	release := make(chan struct{})
+	serve := func(conn net.Conn, connection int) {
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		write := func(value any) { _ = json.NewEncoder(conn).Encode(value) }
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			return
+		}
+		if behave(connection) == stubRefuse {
+			write(map[string]any{"ok": false, "error_msg": "stub refused"})
+			return
+		}
+		write(map[string]any{"ok": true, "daemon_version": "stub-v1"})
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var frame struct {
+				ID     int64  `json:"id"`
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(line, &frame) != nil {
+				return
+			}
+			switch {
+			case frame.Method == "notifications/initialized":
+				switch behave(connection) {
+				case stubStall:
+					<-release
+					return
+				case stubHangUp:
+					return
+				}
+			case frame.ID == 0:
+			case frame.Method == "initialize":
+				write(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "result": map[string]any{}})
+			default:
+				write(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "result": map[string]any{"method": frame.Method}})
+			}
+		}
+	}
+	accepted := make(chan struct{})
+	go func() {
+		defer close(accepted)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			connections = append(connections, conn)
+			connection := len(connections)
+			mu.Unlock()
+			workers.Go(func() { serve(conn, connection) })
+		}
+	}()
+	t.Cleanup(func() {
+		close(release)
+		_ = listener.Close()
+		<-accepted
+		mu.Lock()
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		mu.Unlock()
+		workers.Wait()
+		_ = os.RemoveAll(dir)
+	})
+	return socket, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(connections)
+	}
+}
+
+// A frame far larger than any socket buffer: its write blocks until the
+// client's write deadline when the daemon stops reading.
+var redialLargeParams = map[string]string{"large": strings.Repeat("x", 8<<20)}
+
+func openRedialClient(t *testing.T, ctx context.Context, socket string, limit int) *socketClient {
+	t.Helper()
+	c, err := openMCP(ctx, socket, "/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	c.writeTimeout = 100 * time.Millisecond
+	c.allowRedials(limit)
+	return c
+}
+
+func requireWriteTimeout(t *testing.T, err error, what string) {
+	t.Helper()
+	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("%s: want the write timeout class, got %v", what, err)
+	}
+}
+
+func TestSessionRedialsAfterWriteTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	socket, sessions := startRedialStub(t, func(connection int) stubStream {
+		if connection == 1 {
+			return stubStall
+		}
+		return stubServe
+	})
+	c := openRedialClient(t, ctx, socket, 2)
+	_, err := c.call(ctx, "large", redialLargeParams)
+	requireWriteTimeout(t, err, "the stalled write")
+	for _, method := range []string{"after", "again"} {
+		started := time.Now()
+		data, err := c.call(ctx, method, nil)
+		if err != nil {
+			t.Fatalf("%s failed after %s instead of using a re-dialed session: %v", method, time.Since(started), err)
+		}
+		if string(data) != `{"method":"`+method+`"}` {
+			t.Fatalf("%s: reply %s", method, data)
+		}
+	}
+	if got := sessions(); got != 2 {
+		t.Fatalf("sessions accepted: %d, want the first and one re-dial", got)
+	}
+	if got := c.redialCounts(); got != (sessionRedials{Attempts: 1}) {
+		t.Fatalf("re-dial counts: %+v", got)
+	}
+}
+
+func TestSessionRedialLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	socket, sessions := startRedialStub(t, func(int) stubStream { return stubStall })
+	const limit = 2
+	c := openRedialClient(t, ctx, socket, limit)
+	for i := range limit + 1 {
+		_, err := c.call(ctx, "large", redialLargeParams)
+		requireWriteTimeout(t, err, "a write on the first or a re-dialed session")
+		if got := sessions(); got != i+1 {
+			t.Fatalf("after write %d: %d sessions accepted, want %d", i+1, got, i+1)
+		}
+	}
+	started := time.Now()
+	_, err := c.call(ctx, "after-limit", nil)
+	requireWriteTimeout(t, err, "a call past the re-dial limit")
+	if !strings.Contains(err.Error(), "re-dial limit 2 reached") {
+		t.Fatalf("a call past the limit does not say the session stayed closed: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("a call past the limit waited %s", elapsed)
+	}
+	if got := sessions(); got != limit+1 {
+		t.Fatalf("sessions accepted: %d, want %d", got, limit+1)
+	}
+	if got := c.redialCounts(); got != (sessionRedials{Attempts: limit, LimitReached: true}) {
+		t.Fatalf("re-dial counts: %+v", got)
+	}
+}
+
+// A re-dial that fails keeps the session closed with the original error, and
+// the next one waits out a back-off before it dials again.
+func TestSessionRedialBacksOffAfterAFailedRedial(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	socket, sessions := startRedialStub(t, func(connection int) stubStream {
+		switch connection {
+		case 1:
+			return stubStall
+		case 2:
+			return stubRefuse
+		}
+		return stubServe
+	})
+	c := openRedialClient(t, ctx, socket, 2)
+	_, err := c.call(ctx, "large", redialLargeParams)
+	requireWriteTimeout(t, err, "the stalled write")
+	started := time.Now()
+	_, err = c.call(ctx, "refused", nil)
+	requireWriteTimeout(t, err, "a call whose re-dial was refused")
+	if !strings.Contains(err.Error(), "re-dial 1 of 2 failed: handshake refused: stub refused") {
+		t.Fatalf("a failed re-dial is not named: %v", err)
+	}
+	if data, err := c.call(ctx, "after", nil); err != nil || string(data) != `{"method":"after"}` {
+		t.Fatalf("the second re-dial: %s %v", data, err)
+	}
+	if elapsed := time.Since(started); elapsed < redialBackoff(1) {
+		t.Fatalf("the second re-dial came %s after the first failed, before its back-off", elapsed)
+	}
+	if got := sessions(); got != 3 {
+		t.Fatalf("sessions accepted: %d, want 3", got)
+	}
+	if got := c.redialCounts(); got != (sessionRedials{Attempts: 2, Failed: 1}) {
+		t.Fatalf("re-dial counts: %+v", got)
+	}
+}
+
+// A stream the daemon closed stays closed: only a write this client gave up
+// on is re-dialed, so a killed daemon is never silently replaced.
+func TestSessionClosedByDaemonIsNotRedialed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	socket, sessions := startRedialStub(t, func(int) stubStream { return stubHangUp })
+	c := openRedialClient(t, ctx, socket, 2)
+	select {
+	case <-c.done:
+	case <-ctx.Done():
+		t.Fatal("the client never saw the daemon hang up")
+	}
+	for range 2 {
+		if _, err := c.call(ctx, "after-hangup", nil); err == nil {
+			t.Fatal("a call succeeded on a stream the daemon closed")
+		}
+	}
+	if got := sessions(); got != 1 {
+		t.Fatalf("sessions accepted: %d, want 1", got)
+	}
+	if got := c.redialCounts(); got != (sessionRedials{}) {
+		t.Fatalf("re-dial counts: %+v", got)
+	}
+}

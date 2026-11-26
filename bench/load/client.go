@@ -9,12 +9,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 )
 
 const maxWireBytes = 64 << 20
+
+// A frame write that has not finished by then is given up, unless the call's
+// own context ends sooner.
+const defaultWriteTimeout = 10 * time.Second
 
 const loadWireTools, loadWireToolsMode = "facade-v1", "hide"
 
@@ -71,7 +76,38 @@ type socketClient struct {
 	version                   string
 	cwd                       string // immutable checkout supplied by the successful handshake
 	offeredTools, offeredMode string
+	socket                    string        // set by openMCP; a session without it never re-dials
+	writeTimeout              time.Duration // zero means defaultWriteTimeout
+	redial                    sessionRedial
 }
+
+// sessionRedial is guarded by socketClient.mu; gate serializes re-dials.
+type sessionRedial struct {
+	limit     int       // zero: a closed stream stays closed
+	abandoned bool      // this client gave the current stream up mid-write
+	shut      bool      // Close was called
+	retryAt   time.Time // a failed re-dial delays the next one until then
+	gate      chan struct{}
+	counts    sessionRedials
+}
+
+// redialBackoff spaces re-dials after failures, so calls arriving together
+// on a session whose re-dial failed cannot spend its whole limit at once.
+func redialBackoff(failed int) time.Duration {
+	return min(time.Second, 100*time.Millisecond<<max(0, failed-1))
+}
+
+// sessionRedials counts one session's re-dials.
+type sessionRedials struct {
+	Attempts     int  // re-dials started; each one counts against the limit
+	Failed       int  // re-dials that did not open a new session
+	LimitReached bool // a call found the stream closed with no re-dial left
+}
+
+// errStreamReplaced reports a frame that was not written because its stream
+// failed and the session has since re-dialed. The failure itself reaches the
+// call through its pending reply.
+var errStreamReplaced = errors.New("session stream was replaced before this frame was written")
 
 // Per-call values returned to its caller, never a shared last-ID cache. Times
 // retain monotonic readings until the scenario renders relative nanoseconds.
@@ -150,10 +186,10 @@ func openMCP(ctx context.Context, socket, cwd string) (*socketClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, cwd: cwd, writeGate: make(chan struct{}, 1)}
+	c := &socketClient{conn: conn, reader: reader, pending: make(map[int64]chan wireReply), done: make(chan struct{}), version: version, cwd: cwd, writeGate: make(chan struct{}, 1), socket: socket}
 	c.offeredTools, c.offeredMode = loadWireTools, loadWireToolsMode
 	go c.readLoop()
-	if _, err := c.call(ctx, "initialize", map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "gortex-load", "version": "1"}}); err != nil {
+	if _, err := c.call(ctx, "initialize", mcpInitializeParams()); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -164,38 +200,43 @@ func openMCP(ctx context.Context, socket, cwd string) (*socketClient, error) {
 	return c, nil
 }
 
+func mcpInitializeParams() map[string]any {
+	return map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "gortex-load", "version": "1"}}
+}
+
 func (c *socketClient) readLoop() {
-	defer close(c.done)
+	c.mu.Lock()
+	conn, reader, done := c.conn, c.reader, c.done
+	c.mu.Unlock()
+	c.readStream(conn, reader, done)
+}
+
+// readStream delivers one stream's replies. A failure it reads is the
+// daemon's doing, so it never makes the session re-dial.
+func (c *socketClient) readStream(conn net.Conn, reader *bufio.Reader, done chan struct{}) {
+	defer close(done)
 	for {
-		line, err := readWireLine(c.reader)
+		line, err := readWireLine(reader)
 		if err != nil {
-			c.fail(err)
+			c.failStream(conn, err, false)
 			return
 		}
 		var reply wireReply
 		if err := json.Unmarshal(line, &reply); err != nil {
-			c.fail(fmt.Errorf("invalid daemon JSON: %w", err))
+			c.failStream(conn, fmt.Errorf("invalid daemon JSON: %w", err), false)
 			return
 		}
 		if reply.Method != "" {
-			c.mu.Lock()
-			// Keep invalidation/publication evidence without retaining unbounded
-			// diagnostic notifications throughout a saturation run.
-			if len(c.notifies) < 1000 {
-				c.notifies = append(c.notifies, notificationObservation{Received: time.Now(), Payload: append(json.RawMessage(nil), line...)})
-			} else {
-				c.notifyDropped++
-			}
-			c.mu.Unlock()
+			c.noteNotification(line)
 			continue
 		}
 		id, err := strconv.ParseInt(string(reply.ID), 10, 64)
 		if err != nil {
-			c.fail(errors.New("daemon returned non-integer response ID"))
+			c.failStream(conn, errors.New("daemon returned non-integer response ID"), false)
 			return
 		}
 		if reply.Result == nil && reply.Error == nil {
-			c.fail(errors.New("daemon response has neither result nor error"))
+			c.failStream(conn, errors.New("daemon response has neither result nor error"), false)
 			return
 		}
 		c.mu.Lock()
@@ -216,13 +257,29 @@ func (c *socketClient) readLoop() {
 	}
 }
 
-func (c *socketClient) fail(err error) {
+func (c *socketClient) noteNotification(line []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed != nil {
+	// Keep invalidation/publication evidence without retaining unbounded
+	// diagnostic notifications throughout a saturation run.
+	if len(c.notifies) < 1000 {
+		c.notifies = append(c.notifies, notificationObservation{Received: time.Now(), Payload: append(json.RawMessage(nil), line...)})
+	} else {
+		c.notifyDropped++
+	}
+}
+
+// failStream closes the session's current stream once and fails its pending
+// calls with err. abandoned means this client gave the stream up mid-write
+// (its write deadline or the call's context ended), not that the daemon
+// closed or corrupted it. A failure of an earlier, replaced stream is ignored.
+func (c *socketClient) failStream(conn net.Conn, err error, abandoned bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed != nil || c.conn != conn {
 		return
 	}
-	c.closed = err
+	c.closed, c.redial.abandoned = err, abandoned
 	for id, ch := range c.pending {
 		ch <- wireReply{err: err}
 		delete(c.pending, id)
@@ -231,16 +288,200 @@ func (c *socketClient) fail(err error) {
 }
 
 func (c *socketClient) Close() error {
-	err := c.conn.Close()
-	<-c.done
+	c.mu.Lock()
+	c.redial.shut = true
+	conn, done := c.conn, c.done
+	c.mu.Unlock()
+	err := conn.Close()
+	<-done
 	return err
 }
 
-func (c *socketClient) send(ctx context.Context, value any, advisory bool) error {
-	return c.sendObserved(ctx, value, advisory, nil)
+// allowRedials lets a session opened by openMCP replace a stream it gave up
+// on mid-write with a new session on the same socket and checkout, at most
+// limit times. Without it, that stream stays closed and every later call
+// fails at once with the original error.
+func (c *socketClient) allowRedials(limit int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.socket == "" {
+		return
+	}
+	c.redial.limit = limit
+	if c.redial.gate == nil {
+		c.redial.gate = make(chan struct{}, 1)
+	}
 }
 
-func (c *socketClient) sendObserved(ctx context.Context, value any, advisory bool, observation *wireCallIdentity) error {
+func (c *socketClient) redialCounts() sessionRedials {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.redial.counts
+}
+
+// redialRefusalLocked says why a closed session cannot re-dial now, or nil.
+// The original failure stays first in every message, so its class survives.
+// The caller holds c.mu and has seen c.closed set.
+func (c *socketClient) redialRefusalLocked() error {
+	switch {
+	case c.redial.limit == 0 || c.redial.shut || !c.redial.abandoned:
+		return c.closed
+	case c.redial.counts.Attempts >= c.redial.limit:
+		c.redial.counts.LimitReached = true
+		return fmt.Errorf("%w (session not re-opened: re-dial limit %d reached)", c.closed, c.redial.limit)
+	}
+	return nil
+}
+
+// reopen replaces the closed stream of a session that may re-dial. It
+// returns nil once a stream is open, or the reason the session stays closed.
+func (c *socketClient) reopen(ctx context.Context) error {
+	c.mu.Lock()
+	if c.closed == nil { // another call re-opened it meanwhile
+		c.mu.Unlock()
+		return nil
+	}
+	if err := c.redialRefusalLocked(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	gate := c.redial.gate
+	c.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-gate }()
+	c.mu.Lock()
+	if c.closed == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	if err := c.redialRefusalLocked(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if wait := time.Until(c.redial.retryAt); wait > 0 {
+		// Holding the gate, only Close can change the session meanwhile.
+		c.mu.Unlock()
+		if err := waitContext(ctx, wait); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.redial.shut {
+			err := c.closed
+			c.mu.Unlock()
+			return err
+		}
+	}
+	c.redial.counts.Attempts++
+	attempt, cause, old, oldDone := c.redial.counts.Attempts, c.closed, c.conn, c.done
+	c.next++
+	initialize := c.next
+	c.mu.Unlock()
+	conn, reader, err := c.dialStream(ctx, old, oldDone, initialize)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil && c.redial.shut {
+		err = net.ErrClosed
+		_ = conn.Close()
+	}
+	if err != nil {
+		c.redial.counts.Failed++
+		c.redial.retryAt = time.Now().Add(redialBackoff(c.redial.counts.Failed))
+		return fmt.Errorf("%w (re-dial %d of %d failed: %v)", cause, attempt, c.redial.limit, err)
+	}
+	done := make(chan struct{})
+	c.conn, c.reader, c.done = conn, reader, done
+	c.pending, c.capturePending = make(map[int64]chan wireReply), nil
+	c.closed, c.redial.abandoned = nil, false
+	go c.readStream(conn, reader, done)
+	return nil
+}
+
+// dialStream opens and initializes a new session before any call can see it.
+// The old stream's reader stops first, so it cannot fail the new stream.
+func (c *socketClient) dialStream(ctx context.Context, old net.Conn, oldDone chan struct{}, initialize int64) (net.Conn, *bufio.Reader, error) {
+	_ = old.Close() // The failed writer closed it already.
+	select {
+	case <-oldDone:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	conn, reader, version, err := dialSocketSurface(ctx, c.socket, c.cwd, "mcp", c.offeredTools, c.offeredMode)
+	if err != nil {
+		return nil, nil, err
+	}
+	if version != c.version {
+		err = fmt.Errorf("daemon version changed from %q to %q", c.version, version)
+	} else {
+		err = c.initializeStream(ctx, conn, reader, initialize)
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, reader, nil
+}
+
+// initializeStream runs the MCP initialize exchange that openMCP runs, on a
+// stream that no call uses yet.
+func (c *socketClient) initializeStream(ctx context.Context, conn net.Conn, reader *bufio.Reader, id int64) error {
+	deadline := time.Now().Add(defaultWriteTimeout)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	err := func() error {
+		encoder := json.NewEncoder(conn)
+		if err := encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "method": "initialize", "params": mcpInitializeParams()}); err != nil {
+			return err
+		}
+		for {
+			line, err := readWireLine(reader)
+			if err != nil {
+				return err
+			}
+			var reply wireReply
+			if err := json.Unmarshal(line, &reply); err != nil {
+				return fmt.Errorf("invalid daemon JSON: %w", err)
+			}
+			if reply.Method != "" {
+				c.noteNotification(line)
+				continue
+			}
+			if got, err := strconv.ParseInt(string(reply.ID), 10, 64); err != nil || got != id {
+				return errors.New("daemon answered another request during initialize")
+			}
+			if reply.Error != nil {
+				return reply.Error
+			}
+			return encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+		}
+	}()
+	if !stop() {
+		return ctx.Err()
+	}
+	if err != nil {
+		return err
+	}
+	return conn.SetDeadline(time.Time{})
+}
+
+func (c *socketClient) send(ctx context.Context, value any, advisory bool) error {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	return c.sendOn(ctx, conn, value, advisory, nil)
+}
+
+// sendOn writes one frame on conn, the stream its caller registered on. It
+// never writes on a stream that has failed or been replaced.
+func (c *socketClient) sendOn(ctx context.Context, conn net.Conn, value any, advisory bool, observation *wireCallIdentity) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -262,20 +503,33 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	c.mu.Lock()
+	closed, replaced := c.closed, c.conn != conn
+	c.mu.Unlock()
+	if replaced {
+		return errStreamReplaced
+	}
+	if closed != nil {
+		return closed
+	}
+	timeout := c.writeTimeout
+	if timeout <= 0 {
+		timeout = defaultWriteTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
 		deadline = parent
 	}
-	if err := c.conn.SetWriteDeadline(deadline); err != nil {
-		c.fail(err)
-		_ = c.conn.Close()
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		c.failStream(conn, err, false)
+		_ = conn.Close()
 		return err
 	}
 	interrupted := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		// A canceled partial frame cannot be reused by another request.
-		c.fail(ctx.Err())
-		_ = c.conn.Close()
+		c.failStream(conn, ctx.Err(), true)
+		_ = conn.Close()
 		close(interrupted)
 	})
 	if observation != nil {
@@ -285,7 +539,7 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 		}
 	}
 	frame := append(data, '\n')
-	written, writeErr := io.Copy(c.conn, bytes.NewReader(frame))
+	written, writeErr := io.Copy(conn, bytes.NewReader(frame))
 	err = writeErr
 	if observation != nil && observation.failure != nil {
 		capture := observation.failure
@@ -312,8 +566,11 @@ func (c *socketClient) sendObserved(ctx context.Context, value any, advisory boo
 		err = ctx.Err()
 	}
 	if err != nil {
-		c.fail(err)
-		_ = c.conn.Close()
+		// The frame may be partial, so the stream is closed either way. Only
+		// a write this client gave up on lets the session re-dial; a write the
+		// daemon refused (a reset or broken pipe) does not.
+		c.failStream(conn, err, ctx.Err() != nil || errors.Is(writeErr, os.ErrDeadlineExceeded))
+		_ = conn.Close()
 	}
 	return err
 }
@@ -352,10 +609,18 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 	}
 	c.mu.Lock()
 	if c.closed != nil {
-		err := c.closed
 		c.mu.Unlock()
-		return nil, err
+		if err := c.reopen(ctx); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if c.closed != nil { // the new stream has failed already
+			err := c.closed
+			c.mu.Unlock()
+			return nil, err
+		}
 	}
+	conn := c.conn
 	c.next++
 	id := c.next
 	if observation != nil {
@@ -376,7 +641,16 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 		delete(c.capturePending, id)
 		c.mu.Unlock()
 	}()
-	if err := c.sendObserved(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false, observation); err != nil {
+	if err := c.sendOn(ctx, conn, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, false, observation); err != nil {
+		if errors.Is(err, errStreamReplaced) {
+			select {
+			case reply := <-ch:
+				if reply.err != nil {
+					return nil, reply.err
+				}
+			default:
+			}
+		}
 		return nil, err
 	}
 	select {
@@ -384,7 +658,7 @@ func (c *socketClient) callObserved(ctx context.Context, method string, params a
 		// This is advisory; closing a shared connection here would censor
 		// unrelated burst calls and distort their latency/error samples.
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		_ = c.send(cancelCtx, map[string]any{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": map[string]any{"requestId": id, "reason": ctx.Err().Error()}}, true)
+		_ = c.sendOn(cancelCtx, conn, map[string]any{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": map[string]any{"requestId": id, "reason": ctx.Err().Error()}}, true, nil)
 		cancel()
 		return nil, ctx.Err()
 	case reply := <-ch:
