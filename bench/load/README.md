@@ -412,12 +412,37 @@ latest evaluated status: `immediate_readbacks_outstanding`,
 `accounting_non_terminal` when the graph was terminal and fresh, every oracle
 was first-correct and every assigned post-ACK witness was present, so only the
 required accounting was outstanding. Relocation and batch cells have no
-reason. `t_graph_terminal_ms` is the client time from edit send to the first
-own status reply that reported the graph terminal. `busy_refusals` counts
-dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
-`readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
-`busy_refusals` totals. None of these changes an outcome, an error or a client
-time.
+reason. An edit that ended on a typed checkout refusal it could not re-send in
+time has the refusal code instead (see below). `t_graph_terminal_ms` is the
+client time from edit send to the first own status reply that reported the
+graph terminal. `busy_refusals` counts dispatcher busy refusals (`-32002`) by
+call purpose (`oracle:<name>`, `status`, `readback:<kind>`, `edit`). The
+summary adds `deadline_reasons` and `busy_refusals` totals. None of these
+changes an outcome, an error or a client time.
+
+An edit refused before admission while its linked checkout is still routing,
+or because the checkout's selected route moved, is re-sent with the same
+mutation id. Only two product texts qualify: `view_building: checkout "<id>"
+is not fully routed yet`, and the `view_read_only` admission refusal
+(`checkout mutation was not admitted; no files were changed: ...`) whose cause
+is the selected route moving. Any other wording, a second content item, or
+another JSON-RPC code stays terminal, and so does the admission refusal for a
+checkout whose disk changed. The product waits for the route before it
+refuses, so one refusal can take most of its tool deadline. A re-send is made
+only when the time left before the call's deadline exceeds the refused
+attempt's own time plus the longest backoff wait. Otherwise the call ends on
+the product's refusal: the phase attempt stays an error with that text, and
+the record ends as `product_deadline` with the refusal code (`view_building`
+or `view_read_only`) as `deadline_reason`. There is no other per-record retry
+cap. The post-run restore batch follows the same rule within its own
+deadline. `edit_refusal_retries` counts the edit call's re-sends after a
+retryable typed refusal, by code: the wire `error_code` (such as
+`repo_loading`), else the code that leads a plain-text tool error. Busy
+re-sends stay in `busy_refusals`, and other calls' re-sends are not counted.
+`resent_edit_replayed: true` marks a re-sent edit whose acknowledgement said
+`replayed: true`: the mutation ledger answered from an earlier attempt that
+committed, although that attempt's reply refused the edit. It changes no
+outcome.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -615,7 +640,9 @@ counts may be zero outside edit scenarios. The floor still permits at most four
 total active agents (for example, zero readers plus four combined editors, or
 two plus two). `saturation` is an explicit closed-loop opt-in. Both profiles back
 off on busy refusal `-32002`: 50, 100, 200, 400, 800 ms, then at most 1 second.
-Busy refusals never cause an immediate retry loop.
+Busy refusals never cause an immediate retry loop. Edit-probe calls use the
+same schedule plus up to half again as jitter, also before re-sending after a
+retryable typed refusal (see `edit_refusal_retries`).
 
 Sustained reading uses ten operations: search symbols/text; read source/file/
 editing_context/summary; relations callers/usages; explore context; change
