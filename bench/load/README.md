@@ -711,7 +711,9 @@ reports it not fresh or not complete), `truncated`, `unparsed`, `error` or
 (0 when the first read after the acknowledgement was fresh), so the answer
 turned fresh between it and `fresh_ms`. A complete phase needs every witness
 edit read back fresh. `load delta` compares these distributions like any other
-timing row.
+timing row, and prints `contract_outcomes.<outcome>` for every outcome
+(`fresh`, `never_fresh`, `phase_censored`, `edit_error`, `baseline_error`,
+`identity_preexisting`), zero included, so both arms show the same rows.
 
 ## Startup admission
 

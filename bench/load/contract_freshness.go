@@ -24,6 +24,10 @@ const (
 	contractFreshnessMaxReaders = 16
 )
 
+// contractFreshnessOutcomes is every witness edit outcome. Reports and load
+// delta carry each one, zero or not, so both arms show the same rows.
+var contractFreshnessOutcomes = []string{"fresh", "never_fresh", "phase_censored", "edit_error", "baseline_error", "identity_preexisting"}
+
 // contractFreshnessPlan is the offered witness identity. It is part of the
 // workload and therefore of the request plan hash.
 type contractFreshnessPlan struct {
@@ -380,7 +384,10 @@ func validateContractFreshnessReport(r Report) error {
 }
 
 func (report *contractFreshnessReport) finish() {
-	report.Outcomes = make(map[string]int)
+	report.Outcomes = make(map[string]int, len(contractFreshnessOutcomes))
+	for _, outcome := range contractFreshnessOutcomes {
+		report.Outcomes[outcome] = 0
+	}
 	var acknowledged, fresh, afterAck, read []float64
 	for _, observation := range report.Observations {
 		report.Outcomes[observation.Outcome]++

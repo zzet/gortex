@@ -416,14 +416,38 @@ func TestContractFreshnessReportValidation(t *testing.T) {
 }
 
 func TestContractFreshnessDeltaComparesFreshTimes(t *testing.T) {
+	outcomes := []string{"fresh", "never_fresh", "phase_censored", "edit_error", "baseline_error", "identity_preexisting"}
+	before, after := sampleContractFreshnessReport(t, 40), sampleContractFreshnessReport(t, 50)
+	for _, outcome := range outcomes {
+		if _, ok := after.Phases[0].ContractFreshness.Outcomes[outcome]; !ok {
+			t.Fatalf("witness report omits the %s count: %v", outcome, after.Phases[0].ContractFreshness.Outcomes)
+		}
+	}
+	// A report that names only the outcomes it observed still gets every row.
+	before.Phases[0].ContractFreshness.Outcomes = map[string]int{"fresh": 1}
 	var output strings.Builder
-	if err := printDelta(&output, sampleContractFreshnessReport(t, 40), sampleContractFreshnessReport(t, 50)); err != nil {
+	if err := printDelta(&output, before, after); err != nil {
 		t.Fatal(err)
 	}
 	text := output.String()
-	for _, row := range []string{"contract-freshness.contract_fresh.p95", "contract-freshness.contract_fresh_after_ack.p50", "contract-freshness.contract_acknowledged.p95", "contract-freshness.contract_outcomes.fresh"} {
+	for _, row := range []string{"contract-freshness.contract_fresh.p95", "contract-freshness.contract_fresh_after_ack.p50", "contract-freshness.contract_acknowledged.p95"} {
 		if !strings.Contains(text, row) {
 			t.Fatalf("delta lacks %s:\n%s", row, text)
+		}
+	}
+	rows := make(map[string]string)
+	for _, line := range strings.Split(text, "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 {
+			rows[fields[0]] = strings.Join(fields[1:], " ")
+		}
+	}
+	for _, outcome := range outcomes {
+		want := "0 edits 0 edits n/a"
+		if outcome == "fresh" {
+			want = "1 edits 1 edits +0.00%"
+		}
+		if got := rows["contract-freshness.contract_outcomes."+outcome]; got != want {
+			t.Fatalf("contract_outcomes.%s row is %q, want %q:\n%s", outcome, got, want, text)
 		}
 	}
 	worse := text[strings.Index(text, "more than 15% worse"):]
