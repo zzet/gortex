@@ -159,6 +159,9 @@ type Phase struct {
 	Status           []json.RawMessage          `json:"daemon_status"`
 	Stats            []json.RawMessage          `json:"graph_stats"`
 	Errors           []string                   `json:"errors"`
+
+	// The contract-freshness scenario's witness edits.
+	ContractFreshness *contractFreshnessReport `json:"contract_freshness,omitempty"`
 }
 
 type Report struct {
