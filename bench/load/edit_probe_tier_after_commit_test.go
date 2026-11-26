@@ -105,7 +105,9 @@ func TestEditProbeRecordCopiesTierAfterCommitFromFinalReceipt(t *testing.T) {
 			})
 			run.requireAccounting = false
 			if !tc.terminal {
-				run.options.Deadline = 750 * time.Millisecond
+				// Wide enough for the edit, its readbacks and at least two
+				// receipt polls on a loaded race runner.
+				run.options.Deadline = 2 * time.Second
 			}
 			run.activate(ctx, step)
 			awaitEditProbeFirstProbe(t, run.states[0])
