@@ -509,7 +509,7 @@ verdict; unknown health has `checked:false` and null `errors`.
 
 `readback_exact:true` requires that this write's projection is still live.
 `tier_state.file` describes that physical file view independently of the
-watcher-owned `file_graph`, `relations`, and `derived` stages. A newer write or
+graph's `file_graph`, `relations`, and `derived` stages. A newer write or
 invalidation can make a replay's file view unavailable or historical. Replays
 and `mutation_status` refresh live receipt evidence without parsing or writing
 again. Transactional batches retain journal authority and report per-file
@@ -534,8 +534,12 @@ carries the same fields in its freshness block. An idle fresh answer gains no
 fields. Never classify a symbol as dead while its file is pending.
 
 `mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
-`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
-unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+`derived_at` stamps when a watcher ticket or a linked checkout's publication
+observed them. Missing stamps mean unobserved work. A linked checkout publishes
+an edit's working-tree generation in one step, so its three graph stamps are
+equal. Its `derived` tier reads `partial` while the checkout still owes the
+file deferred enrichment or clone rows, and every graph tier reads `failed`
+when its ticket ends without a publication. Unknown receipt or mutation IDs return `state:"lost"` immediately;
 a lost receipt cannot certify freshness. After restart, relation queries remain
 pending until the shared startup resolver has published. File reads still check
 current disk state. CLI verbs print the freshness line on stderr;
