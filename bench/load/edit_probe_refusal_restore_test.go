@@ -300,7 +300,7 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 				t.Fatalf("restore rewrote %d checkouts (%d refused), want %d refused beside the applied one", sent, refusedBatches, wantRefused)
 			}
 			if strings.Contains(string(phase.EditProbe.Restore), "unchanged") == changed {
-				t.Fatalf("restore evidence names an unchanged checkout %t, want %t: %s", !changed, !changed, phase.EditProbe.Restore)
+				t.Fatalf("restore evidence names an unchanged checkout %t, want %t: %s", changed, !changed, phase.EditProbe.Restore)
 			}
 			if cell.routes > 1 {
 				// Recorded, not a failure: every edit on the route was refused
