@@ -22,8 +22,9 @@ type contractFreshnessStub struct {
 	mu        sync.Mutex
 	plan      contractFreshnessPlan
 	fresh     func(sinceEdit time.Duration) bool
-	present   bool // the identity is already listed before any edit
-	refuse    bool // refuse every edit
+	present   bool     // the identity is already listed before any edit
+	refuse    bool     // refuse every edit
+	warm      []string // answers to the first reads: incomplete, pending or invalid
 	edited    map[string]time.Time
 	edits     int
 	reads     int
@@ -64,6 +65,18 @@ func (s *contractFreshnessStub) handle(frame stubFrame) (any, *rpcError) {
 		return nil, &rpcError{Code: -32602, Message: "invalid_argument: unexpected contract read"}
 	}
 	s.reads++
+	if len(s.warm) > 0 {
+		answer := s.warm[0]
+		s.warm = s.warm[1:]
+		switch answer {
+		case "incomplete":
+			return contractToolError("required_capability_incomplete", "graph.contracts did not become complete within this request: context deadline exceeded; retry after 5s"), nil
+		case "invalid":
+			return contractToolError("invalid_argument", "unknown analyze kind"), nil
+		case "pending":
+			return stubContent(map[string]any{"by_repo": map[string]any{}, "truncated": false, "contract_analysis": map[string]any{"state": "building", "fresh": false}}), nil
+		}
+	}
 	rows := []any{map[string]any{"id": "http::GET::/existing", "type": "http", "role": "provider"}}
 	body := map[string]any{"truncated": false}
 	pending := false
@@ -89,6 +102,11 @@ func (s *contractFreshnessStub) handle(frame stubFrame) (any, *rpcError) {
 	body["total"] = len(rows)
 	body["by_repo"] = map[string]any{"sample": map[string]any{"contracts": map[string]any{"http": rows}, "total": len(rows)}}
 	return stubContent(body), nil
+}
+
+func contractToolError(code, message string) any {
+	body, _ := json.Marshal(map[string]any{"error_code": code, "message": message})
+	return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(body)}}}
 }
 
 func startContractFreshnessStub(t *testing.T, plan contractFreshnessPlan, fresh func(time.Duration) bool) (*contractFreshnessStub, string) {
@@ -395,5 +413,44 @@ func TestContractFreshnessDeltaComparesFreshTimes(t *testing.T) {
 	worse := text[strings.Index(text, "more than 15% worse"):]
 	if !strings.Contains(worse, "contract-freshness.contract_fresh.p95") || strings.Contains(worse, "contract_acknowledged") {
 		t.Fatalf("freshness regression verdict wrong:\n%s", worse)
+	}
+}
+
+func TestContractFreshnessWarmGateWaitsForACompleteAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		warm  []string
+		fails bool
+		reads int
+	}{
+		{name: "first initialization", warm: []string{"incomplete", "incomplete", "pending"}, reads: 4},
+		{name: "already complete", reads: 1},
+		{name: "unsupported request", warm: []string{"invalid", "incomplete"}, fails: true, reads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := newContractFreshnessPlan(1)
+			plan.ReadIntervalMS = 5
+			stub, socket := startContractFreshnessStub(t, plan, func(time.Duration) bool { return false })
+			stub.warm = tc.warm
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := openMCP(ctx, socket, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			gate, rows, err := awaitContractAnswer(ctx, client, plan, privateRepo{Corpus: contractFreshnessCorpus(), Prefix: "sample"}, time.Second)
+			var receipt struct {
+				Reads     int            `json:"reads"`
+				ElapsedMS float64        `json:"elapsed_ms"`
+				Outcomes  map[string]int `json:"outcomes"`
+			}
+			if json.Unmarshal(gate, &receipt) != nil || (err != nil) != tc.fails || receipt.Reads != tc.reads || len(rows) != tc.reads || rows[0].Role != "warm" {
+				t.Fatalf("gate %s rows %d err %v", gate, len(rows), err)
+			}
+			if !tc.fails && (receipt.Outcomes["absent"] != 1 || receipt.Outcomes["incomplete"]+receipt.Outcomes["absent_flagged"] != tc.reads-1) {
+				t.Fatalf("gate outcomes %v", receipt.Outcomes)
+			}
+		})
 	}
 }

@@ -381,6 +381,14 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			}
 		}
 	}
+	if scenario == contractFreshnessScenario {
+		gate, rows, err := awaitContractAnswer(warmCtx, clients[o.Agents], newContractFreshnessPlan(o.ContractFreshnessEdits), p.Repos[0], o.Deadline)
+		phase.Attempts = append(phase.Attempts, rows...)
+		phase.Gate["contract_freshness_warm"] = gate
+		if err != nil {
+			return phase, nil, artifacts, crashes, version, err
+		}
+	}
 	finishStartup()
 	if len(o.smokeMarkers) > 0 {
 		if err := awaitSmokeRestoration(warmCtx, o, p, clients[0], &phase); err != nil {

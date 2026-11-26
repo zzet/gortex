@@ -682,7 +682,14 @@ primary repository's actual prefix as `repo`. Both operations are on the
 compact surface that published releases also advertise, so a release and a
 candidate run identical requests.
 
-One read before the edit must lack the ID; a listed ID ends the run as
+Before the first witness edit, inside the warm budget and untimed, the
+listing must answer complete: an incomplete-capability refusal or an answer the
+product marks pending is retried every 250 ms, and any other refusal fails the
+run. That gate is the primary checkout's first contract initialization; its
+read count and elapsed time are kept as `gate.contract_freshness_warm`, never
+as a witness edit's freshness time.
+
+One read before each edit must lack the ID; a listed ID ends the run as
 `identity_preexisting`. After the acknowledgement, reads repeat 250 ms apart
 until one lists the ID as a contract `id` (an echo in any other field does not
 count) or the `--deadline` budget from the edit's dispatch passes. Each read is

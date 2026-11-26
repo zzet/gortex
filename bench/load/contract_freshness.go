@@ -211,6 +211,50 @@ func contractReadArgs(plan contractFreshnessPlan, repo privateRepo) map[string]a
 
 func milliseconds(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
+// awaitContractAnswer is untimed setup before the first witness edit. The
+// primary checkout's listing must answer complete, without the product
+// marking it pending, so a first contract initialization is reported here and
+// never as a witness edit's freshness time. Only an incomplete-capability
+// refusal or a pending answer is waited out; any other answer fails at once.
+func awaitContractAnswer(ctx context.Context, client toolCaller, plan contractFreshnessPlan, repo privateRepo, deadline time.Duration) (json.RawMessage, []Attempt, error) {
+	started := time.Now()
+	read := plan.readRequest()
+	receipt := struct {
+		Reads     int            `json:"reads"`
+		ElapsedMS float64        `json:"elapsed_ms"`
+		Outcomes  map[string]int `json:"outcomes"`
+	}{Outcomes: make(map[string]int)}
+	var attempts []Attempt
+	for {
+		result, rows, err := callTool(ctx, client, read, contractReadArgs(plan, repo), "warm", 0, 0, receipt.Reads, deadline, waitContext)
+		attempts = append(attempts, rows...)
+		receipt.Reads++
+		outcome := "error"
+		var refusal *rpcError
+		switch {
+		case err == nil:
+			outcome, _ = classifyContractRead(result, plan.witness(0).Identity)
+		case errors.As(err, &refusal) && strings.HasPrefix(refusal.Message, "required_capability_incomplete"):
+			outcome = "incomplete"
+		}
+		receipt.Outcomes[outcome]++
+		receipt.ElapsedMS = milliseconds(time.Since(started))
+		gate, _ := json.Marshal(receipt)
+		switch outcome {
+		case "absent":
+			return gate, attempts, nil
+		case "incomplete", "absent_flagged":
+			if waitContext(ctx, plan.interval()) != nil {
+				return gate, attempts, fmt.Errorf("primary contract listing never answered complete inside the warm budget: %w", ctx.Err())
+			}
+		case "fresh":
+			return gate, attempts, errors.New("contract witness identity listed before any witness edit")
+		default:
+			return gate, attempts, fmt.Errorf("primary contract listing cannot serve the witness (%s): %v", outcome, err)
+		}
+	}
+}
+
 // observeContractFreshness runs one witness edit. A read before the edit must
 // lack the identity. After the acknowledgement, reads repeat every plan
 // interval until one carries the identity or the product deadline, measured
