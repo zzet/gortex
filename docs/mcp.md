@@ -300,7 +300,9 @@ call as *unknown* and re-read before assuming it did or did not land.
 MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
 lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
 admitted through these lanes. Mutating calls have two reserved slots and can
-also use free shared slots. Slow calls (`outline`, `dead_code`
+also use free shared slots. A dry-run rename (`rename_symbol` or `refactor`
+`rename` with `dry_run: true`) writes nothing and is admitted as a fast read;
+a rename that writes stays mutating. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
 serve queued mutating calls first, then fast, then slow. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
