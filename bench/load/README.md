@@ -588,9 +588,8 @@ edit reports an accounting gap, never a passing check. A change in the
 accounting restarts the count; a missing first-correct time, a graph that is
 not yet fresh, outstanding post-ACK coverage, or a qualified functional
 candidate waiting for its live tiers resets it; a cycle whose status read
-fails neither counts nor resets it. In the multi-file collector a failed
-member status read is evaluated as a missing member, so it changes the
-accounting and restarts the count.
+fails neither counts nor resets it. That includes a multi-file cycle in which
+one member's status read fails; the member is still recorded as missing.
 
 Requested B supports ordered native timer handoffs only when each previous
 timer's actual `Stop` succeeds before its callback starts. Watcher, path and

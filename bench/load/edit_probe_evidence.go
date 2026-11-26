@@ -719,11 +719,10 @@ type editProbeAccountingSettle struct {
 // exit condition other than terminal accounting held on this cycle;
 // accounting is all the accounting the cycle observed. A cycle that is not
 // ready, or whose accounting differs from the last counted one, restarts the
-// count. Callers skip a cycle whose transaction, receipt or acknowledgement
-// status read fails, so it neither counts nor resets: the bound counts
-// successful observations, possibly with failed reads between them. (The
-// multi-file batch collector evaluates a failed member read as a missing
-// member instead.)
+// count. Callers do not call it for a cycle in which a transaction, receipt
+// or acknowledgement status read failed, so such a cycle neither counts nor
+// resets: the bound counts successful observations, possibly with failed
+// reads between them.
 func (w *editProbeAccountingSettle) unsettled(ready bool, accounting ...any) bool {
 	switch {
 	case !ready:

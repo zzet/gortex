@@ -669,6 +669,7 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				}
 			}
 			statuses := map[string]map[string]any{}
+			memberReadFailed := false
 			for i, file := range refs.Files {
 				row, rowErr := perform(request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": map[string]any{"receipt": file.Observation}}}, "batch_file_status", 201+i)
 				if errors.Is(rowErr, errEditProbeEvidenceIncomplete) {
@@ -676,6 +677,8 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				}
 				if rowErr == nil {
 					statuses[file.Observation] = row
+				} else {
+					memberReadFailed = true
 				}
 			}
 			ack, ackErr := perform(request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": map[string]any{"receipt": refs.Acknowledgement}}}, "batch_ack_status", 201+len(refs.Files))
@@ -704,9 +707,10 @@ func (r *editProbeRuntime) collectBatchSetEvidence(ctx context.Context, s *editP
 				if terminal && tx["graph_status"] != "fresh" || editProbeFinished(terminal, all, r.requireAccounting, accounting) {
 					return
 				}
-				// A failed member status read is evaluated as a missing
-				// member, so it changes the accounting and restarts the count.
-				if settle.unsettled(terminal && all, accounting, batch) {
+				// A failed member status read still records that member as
+				// missing, but like every other failed read its cycle neither
+				// counts nor resets the bound.
+				if !memberReadFailed && settle.unsettled(terminal && all, accounting, batch) {
 					s.mu.Lock()
 					s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)
 					s.record.BatchAccounting.Reasons = append(slices.Clip(s.record.BatchAccounting.Reasons), editProbeAccountingUnsettledReason)
