@@ -680,7 +680,10 @@ func (l *mutationCommitLedger) publishedProjection(entry *projectionEntry) bool 
 // tool commit published, or a checked read copy of that commit's version: the
 // copy keeps the commit's sequence and its raw-byte SHA-256, and the record is
 // for the same file. A copy is checked against the record itself, because the
-// projection it replaced may already be gone.
+// projection it replaced may already be gone. Matching contentSHA256 proves the
+// copy names the recorded bytes only because an entry's rawHash and
+// contentSHA256 come from the same bytes (see projectionEntry); the caller's
+// disk check against rawHash then ties the file on disk to the record.
 func (l *mutationCommitLedger) publishedVersion(entry *projectionEntry) bool {
 	if entry == nil || entry.sourceCommitSeq == 0 {
 		return false
