@@ -109,6 +109,7 @@ type editProbeRecord struct {
 	EvidenceLogicalBytes        int64                               `json:"evidence_logical_jsonl_bytes,omitempty"`
 	EvidenceBytes               int                                 `json:"evidence_bytes"`
 	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
+	EvidenceFoldedCalls         int                                 `json:"evidence_folded_repeat_calls,omitempty"`
 	Errors                      []string                            `json:"errors"`
 }
 type editProbeReport struct {
@@ -191,6 +192,8 @@ type editProbeState struct {
 	rawLogicalBytes                                   int64
 	losslessEvidence                                  bool
 	payloadHistory                                    editProbePayloadHistory
+	repeatMu                                          sync.Mutex // repeats only; never held with mu or sinkMu
+	repeats                                           editProbeRepeats
 	rawPending                                        []byte
 	rawWake                                           chan struct{}
 	rawClosing                                        bool
@@ -737,7 +740,7 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 			row["expected_symbol"] = expected.symbol
 		}
 	}
-	if evidenceErr := c.state.emit(row); evidenceErr != nil {
+	if evidenceErr := c.state.emitOrHold(ctx, c.purpose, row); evidenceErr != nil {
 		return data, errors.Join(err, evidenceErr)
 	}
 	return data, err
@@ -778,7 +781,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	s.countBusy(purpose, attempts)
-	evidenceErr := s.emit(map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
+	evidenceErr := s.emitOrHold(ctx, purpose, map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
 	}
@@ -805,12 +808,22 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	row, observeErr := r.observeProbeRow(s, oracle, sent, data, identity, err, pending)
+	if observeErr != nil || row == nil {
+		return observeErr
+	}
+	return s.emit(row)
+}
+
+// observeProbeRow updates the record and returns the probe row for the caller
+// to write. A relation consumer writes its own row and returns none.
+func (r *editProbeRuntime) observeProbeRow(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) (map[string]any, error) {
 	if isEditConsumer(oracle.name) {
-		return r.observeConsumer(s, oracle, data, identity, err)
+		return nil, r.observeConsumer(s, oracle, data, identity, err)
 	}
 	repo, routeErr := r.repoFor(s.step)
 	if routeErr != nil {
-		return routeErr
+		return nil, routeErr
 	}
 	ended := identity.Finished
 	if !identity.WriteStarted.IsZero() {
@@ -863,7 +876,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	s.mu.Unlock()
 	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
 	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
-	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
+	return map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending}, nil
 }
 
 func editProbeSummaryOmittedByBudget(body map[string]any, file, marker string) bool {
@@ -938,18 +951,11 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
+			if r.repeatFoldable(s, oracle) {
+				defer func() { _ = s.flushRepeat("oracle:" + oracle.name) }() // A failed write is the spool's own error.
+			}
 			for probeCtx.Err() == nil {
-				sent := time.Now()
-				pending := s.noteProbeStart()
-				var data json.RawMessage
-				var identity wireCallIdentity
-				var err error
-				if r.stepProbeMode(s.step) == "cli" {
-					data, identity, err = r.performCLI(probeCtx, s, oracle.call, "oracle:"+oracle.name, 10+index)
-				} else {
-					data, identity, err = r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
-				}
-				if err := r.observeProbe(s, oracle, sent, data, identity, err, pending); err != nil {
+				if r.probeOnce(probeCtx, s, oracle, 10+index) != nil {
 					cancel()
 					return
 				}
@@ -961,6 +967,46 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 			}
 		})
 	}
+}
+
+func (r *editProbeRuntime) repeatFoldable(s *editProbeState, oracle editProbeOracle) bool {
+	return r.stepProbeMode(s.step) != "cli" && !isEditConsumer(oracle.name)
+}
+
+// probeOnce sends one background probe and records it. An error means its
+// evidence could not be written and the oracle's loop stops.
+func (r *editProbeRuntime) probeOnce(probeCtx context.Context, s *editProbeState, oracle editProbeOracle, stream int) error {
+	purpose := "oracle:" + oracle.name
+	foldable := r.repeatFoldable(s, oracle)
+	sent := time.Now()
+	pending := s.noteProbeStart()
+	callCtx := probeCtx
+	var held *editProbeHeldRows
+	if foldable {
+		var err error
+		if held, err = s.repeatHold(purpose); err != nil {
+			return err
+		}
+		if held != nil {
+			callCtx = context.WithValue(probeCtx, editProbeHeldRowsKey{}, held)
+		}
+	}
+	var data json.RawMessage
+	var identity wireCallIdentity
+	var err error
+	if r.stepProbeMode(s.step) == "cli" {
+		data, identity, err = r.performCLI(callCtx, s, oracle.call, purpose, stream)
+	} else {
+		data, identity, err = r.perform(callCtx, s, s.client, oracle.call, purpose, "probe", stream)
+	}
+	row, observeErr := r.observeProbeRow(s, oracle, sent, data, identity, err, pending)
+	if observeErr != nil || row == nil {
+		return observeErr
+	}
+	if foldable {
+		return s.settleRepeat(held, purpose, data, err, row)
+	}
+	return s.emit(row)
 }
 
 func (s *editProbeState) stopProbes() {
@@ -1549,6 +1595,7 @@ func (r *editProbeRuntime) finish() error {
 	r.finalized = true
 	for _, s := range r.states {
 		s.stopProbes()
+		_ = s.flushRepeats() // A failed write is recorded as the spool's error.
 		s.finishRaw()
 	}
 	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
@@ -1572,6 +1619,7 @@ func (r *editProbeRuntime) finish() error {
 		s.mu.Unlock()
 		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners, r.requireAccounting)
 		record.groupTimes()
+		record.EvidenceFoldedCalls = s.foldedRepeats()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
 		record.EvidenceWriteMS = float64(s.writeNS) / 1e6
