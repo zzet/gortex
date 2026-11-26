@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -61,4 +62,18 @@ func editProbeDeclinedResend(err error) string {
 		return declined.code
 	}
 	return ""
+}
+
+// noteResentReplay flags a re-sent edit whose acknowledgement says replayed:
+// the product's ledger answered its mutation id from an earlier attempt that
+// committed, although every earlier reply refused the edit. The flag changes
+// no outcome. The caller does not hold s.mu.
+func (s *editProbeState) noteResentReplay(ack json.RawMessage, output, tool string) {
+	body, err := decodeEditProbeOutput(ack, output, tool)
+	if replayed, _ := body["replayed"].(bool); err != nil || !replayed {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record.ResentEditReplayed = true
 }

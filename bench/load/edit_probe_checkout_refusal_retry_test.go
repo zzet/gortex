@@ -32,7 +32,9 @@ const (
 // refusal code. Other refusals, other wordings and wire codes, and a tool
 // deadline that may have left work running, are never re-sent; a re-send
 // after any other retryable refusal is counted under its wire error code,
-// and only the edit call's own re-sends are counted.
+// and only the edit call's own re-sends are counted. A re-sent edit whose
+// acknowledgement is a replay of an earlier attempt is flagged: that attempt
+// committed although its reply said no files were changed.
 func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 	const checkout = refusalRetryCheckout
 	notRouted, routeMoved := refusalRetryNotRouted, refusalRetryRouteMoved
@@ -58,6 +60,7 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 		reason  string        // deadline_reason when the record ends on a typed refusal
 		hold    time.Duration // each edit reply is due this long after the previous one was due
 		status  *rpcError     // the first receipt status read is refused with this, then re-sent
+		replay  bool          // the first refusal changed files; the re-send is answered as a replay
 	}{
 		{name: "building_then_moved_then_applied", refuse: []any{notRouted, routeMoved}, apply: true, calls: 3, retries: map[string]int{"view_building": 1, "view_read_only": 1}, outcome: "complete"},
 		{name: "instant_building_until_the_deadline", refuse: []any{notRouted}, outcome: "product_deadline", reason: "view_building"},
@@ -71,6 +74,7 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 		{name: "multi_content_refusal_is_terminal", refuse: []any{twoItems}, calls: 1, outcome: "edit_error"},
 		{name: "refusal_text_under_another_wire_code_is_terminal", refuse: []any{otherWire}, calls: 1, outcome: "edit_error"},
 		{name: "repo_loading_counted_by_its_error_code", refuse: []any{loading}, apply: true, calls: 2, retries: map[string]int{"repo_loading": 1}, outcome: "complete", status: loading},
+		{name: "replayed_resend_is_flagged", refuse: []any{routeMoved}, apply: true, calls: 2, retries: map[string]int{"view_read_only": 1}, outcome: "complete", replay: true},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -116,7 +120,38 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 					due := first.Add(time.Duration(call+1) * cell.hold)
 					mu.Unlock()
 					time.Sleep(time.Until(due))
+					apply := func() *rpcError {
+						data, err := os.ReadFile(linked.File)
+						if err != nil {
+							t.Error(err)
+							return &rpcError{Code: -32000, Message: "read failed"}
+						}
+						match, _ := args["match"].(string)
+						replacement, _ := args["replacement"].(string)
+						if match == "" || strings.Count(string(data), match) != 1 {
+							return &rpcError{Code: -32000, Message: "exact match missing"}
+						}
+						if err := os.WriteFile(linked.File, []byte(strings.Replace(string(data), match, replacement, 1)), 0o600); err != nil {
+							t.Error(err)
+							return &rpcError{Code: -32000, Message: "write failed"}
+						}
+						options, _ := args["options"].(map[string]any)
+						mu.Lock()
+						mutation, _ = options["mutation_id"].(string)
+						mu.Unlock()
+						return nil
+					}
+					if cell.replay && call > 0 {
+						// The ledger answers the same mutation id from the attempt that committed.
+						return stubContent(map[string]any{"mutation_receipt": "linked-receipt", "replayed": true}), nil
+					}
 					if call < len(cell.refuse) || !cell.apply {
+						if cell.replay {
+							// Against the product's contract, this refusal changed files.
+							if fault := apply(); fault != nil {
+								return nil, fault
+							}
+						}
 						refusal := cell.refuse[min(call, len(cell.refuse)-1)]
 						if wire, ok := refusal.(*rpcError); ok {
 							return nil, wire
@@ -127,24 +162,9 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 						}
 						return map[string]any{"isError": true, "content": content}, nil
 					}
-					data, err := os.ReadFile(linked.File)
-					if err != nil {
-						t.Error(err)
-						return nil, &rpcError{Code: -32000, Message: "read failed"}
+					if fault := apply(); fault != nil {
+						return nil, fault
 					}
-					match, _ := args["match"].(string)
-					replacement, _ := args["replacement"].(string)
-					if match == "" || strings.Count(string(data), match) != 1 {
-						return nil, &rpcError{Code: -32000, Message: "exact match missing"}
-					}
-					if err := os.WriteFile(linked.File, []byte(strings.Replace(string(data), match, replacement, 1)), 0o600); err != nil {
-						t.Error(err)
-						return nil, &rpcError{Code: -32000, Message: "write failed"}
-					}
-					options, _ := args["options"].(map[string]any)
-					mu.Lock()
-					mutation, _ = options["mutation_id"].(string)
-					mu.Unlock()
 					return stubContent(map[string]any{"mutation_receipt": "linked-receipt"}), nil
 				}
 				if frame.Params["name"] == "change" && args["operation"] == "receipt" {
@@ -204,7 +224,8 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 				t.Fatal(err)
 			}
 			var fields struct {
-				Retries map[string]int `json:"edit_refusal_retries"`
+				Retries  map[string]int `json:"edit_refusal_retries"`
+				Replayed bool           `json:"resent_edit_replayed"`
 			}
 			if err := json.Unmarshal(wire, &fields); err != nil {
 				t.Fatal(err)
@@ -227,6 +248,9 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			}
 			if cell.apply && (!record.GraphTerminal || record.Receipt != "linked-receipt") {
 				t.Fatalf("retried edit lost its receipt: %+v", record)
+			}
+			if fields.Replayed != cell.replay {
+				t.Fatalf("resent_edit_replayed %v, want %v: %s", fields.Replayed, cell.replay, wire)
 			}
 			if record.DeadlineReason != cell.reason {
 				t.Fatalf("deadline reason %q, want %q", record.DeadlineReason, cell.reason)

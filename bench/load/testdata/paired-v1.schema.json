@@ -2650,6 +2650,9 @@
                                   "null"
                                 ]
                               },
+                              "resent_edit_replayed": {
+                                "type": "boolean"
+                              },
                               "restart": {
                                 "anyOf": [
                                   {
