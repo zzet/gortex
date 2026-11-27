@@ -219,6 +219,7 @@ func seedSidecarRows(t *testing.T, store *Store) {
 		WorkspaceFP: "fp-1", NodeCount: 3, EdgeCount: 0, ExtractorVersions: `{"go":1}`,
 	}))
 	mustNoErr(t, "TS alias policy", store.SetTSAliasDigest(sidecarSeedRepo, "digest"))
+	mustNoErr(t, "TS alias inputs", store.SetTSAliasInputs(sidecarSeedRepo, map[string]string{"tsconfig.json": "hash-tsconfig"}))
 	mustNoErr(t, "enrichment state", store.SetEnrichmentState(graph.EnrichmentState{
 		RepoPrefix: sidecarSeedRepo, Provider: "gopls", IndexedSHA: "sha-1", CompletedAt: 43, Coverage: 0.5,
 	}))
