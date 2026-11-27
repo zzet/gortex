@@ -649,6 +649,13 @@ func (s *Server) awaitSourceMutations(ctx context.Context, admission sourceMutat
 		}
 		if admission.inlinePath == "" {
 			outcome := admission.immediate
+			if outcome.checkoutScoped {
+				// A queued checkout publication is asynchronous: the
+				// acknowledgement never waits on it, as a local ACK does not.
+				lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+				lap.applicable = false
+				lap.finish()
+			}
 			if outcome.Err == nil && outcome.Receipt != "" {
 				outcome.Err = editGateCheckoutACKSeed(ctx, s)
 			}
