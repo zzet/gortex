@@ -168,12 +168,18 @@ func TestCheckoutDerivedOwedFallbacks(t *testing.T) {
 	}
 
 	// A one-file cap truncates the closure of a build that must re-resolve
-	// more than one file.
-	f, c, l := newCheckoutMutationFixtureWith(t, func(b *SparseGenerationBuilder) { b.Config.AffectedByReresolveMax = 1 })
+	// more than one file. core.go calling into two other files does, once a
+	// manifest change sends the build through the sparse closure builder.
+	capOne := func(b *SparseGenerationBuilder) { b.Config.AffectedByReresolveMax = 1 }
+	const coreCallingTwo = "package fixture\n\ntype Options struct{}\n\nfunc Compute(o Options) {\n\tHelper()\n\tIsland()\n}\n"
+	untouchedIn := func(f *coordinatorFixture) *checkoutRefreshRequest {
+		return &checkoutRefreshRequest{ticket: &CheckoutRefreshTicket{
+			Ticket: newMutationTierTicket(filepath.Join(f.worktree, "tiers_untouched.go"), 1, nil),
+		}}
+	}
+	f, c, l := newCheckoutMutationFixtureWith(t, capOne)
 	top := f.route().DirtyGenerationID
-	untouched := &checkoutRefreshRequest{ticket: &CheckoutRefreshTicket{
-		Ticket: newMutationTierTicket(filepath.Join(f.worktree, "tiers_untouched.go"), 1, nil),
-	}}
+	untouched := untouchedIn(f)
 	if c.derivedOwedLookup(t.Context(), top)(untouched) {
 		t.Fatal("a path no layer covers owes nothing")
 	}
@@ -183,9 +189,8 @@ func TestCheckoutDerivedOwedFallbacks(t *testing.T) {
 		t.Fatal("a debt that cannot be read certified derived data")
 	}
 
-	// core.go now calls into two other files, and the manifest change sends
-	// the build through the sparse closure builder, whose closure the cap
-	// truncates. Nothing is owed to a follow-up producer the primary counts.
+	// A truncating edit through the coordinator. Nothing is owed to a
+	// follow-up producer the primary counts.
 	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, f.route().RouteEpoch)
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +200,7 @@ func TestCheckoutDerivedOwedFallbacks(t *testing.T) {
 		t.Fatal(err)
 	}
 	builderWriteFile(t, f.worktree, "tsconfig.json", "{}\n")
-	builderWriteFile(t, f.worktree, "core.go", "package fixture\n\ntype Options struct{}\n\nfunc Compute(o Options) {\n\tHelper()\n\tIsland()\n}\n")
+	builderWriteFile(t, f.worktree, "core.go", coreCallingTwo)
 	truncating, err := m.EnqueueRefresh(t.Context(), filepath.Join(f.worktree, "core.go"))
 	m.Close()
 	if err != nil {
@@ -212,4 +217,19 @@ func TestCheckoutDerivedOwedFallbacks(t *testing.T) {
 		t.Fatalf("no semantic data is owed without a semantic manager: %v", debt)
 	}
 	requireCheckoutDerivedPartial(t, "edit whose affected closure was truncated", truncating.Ticket.TierState())
+
+	// The rows read are the published generation's: a truncated generation
+	// built over a complete one is partial whatever the layer beneath says.
+	g, d, _ := newCheckoutMutationFixtureWith(t, capOne)
+	beneath := g.route().DirtyGenerationID
+	builderWriteFile(t, g.worktree, "tsconfig.json", "{}\n")
+	builderWriteFile(t, g.worktree, "core.go", coreCallingTwo)
+	chained, report := buildDirtyOver(t, g, d, d.builder, beneath, nil, true)
+	if chain := d.dirtyChainMembers(t.Context(), chained); !report.ClosureTruncated ||
+		truncatedClosureProducers(g.store.AtGeneration(beneath)) || len(chain) < 2 || chain[1] != beneath {
+		t.Fatalf("want a truncated generation chained over a complete one: truncated=%v chain=%v beneath=%d", report.ClosureTruncated, chain, beneath)
+	}
+	if !d.derivedOwedLookup(t.Context(), chained)(untouchedIn(g)) {
+		t.Fatal("a truncated generation over a complete one certified derived data")
+	}
 }
