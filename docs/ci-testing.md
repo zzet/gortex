@@ -6,11 +6,14 @@ and external test imports. A test-only edit still selects its complete package
 and reverse dependents. This is a conservative package trial, not test-name
 selection. Pushes to `main` and manual `workflow_dispatch` runs use the full
 cross-platform suite. Manual runs also retain the extended parser stress gate.
+Pull requests run the macOS test partitions only when they need them; see
+[macOS test partitions on pull requests](#macos-test-partitions-on-pull-requests).
 
 ## Force the full suite
 
 - Add the **`ci:full`** label to a PR. Adding or removing it starts a new CI run;
-  the usual opened, synchronize and reopened events remain enabled.
+  the usual opened, synchronize and reopened events remain enabled. It also
+  runs the macOS test partitions.
 - Set the repository Actions variable **`CI_FULL_TESTS`** to **`true`** to roll
   all PRs back to full testing. The default when absent is selective PR testing.
   Remove it or set it to `false` to resume the trial.
@@ -26,6 +29,46 @@ to regenerate an existing run's plan; rerunning only failed jobs reuses the old
 plan. A selective job that detects a changed runner context fails closed; use a
 full override and rerun the entire workflow while the target policy is updated.
 No repository protection or security rules are changed by this trial.
+
+## macOS test partitions on pull requests
+
+macOS runners are the scarcest in the pool, so a pull request leaves the macOS
+test partitions out of its matrix unless one of these holds:
+
+- The PR has the **`ci:macos`** label. Adding or removing it starts a new CI run.
+- The PR changes a macOS-sensitive path:
+  - a Go file with a darwin file suffix (`_darwin.go`, `_darwin_arm64.go`,
+    `_darwin_test.go`);
+  - a Go file whose build constraint names `darwin`, or builds on macOS but not
+    on Linux (`unix && !linux`), read from the file's header so new files are
+    covered without a list;
+  - a Go file with a `"darwin"` runtime check or with `import "C"`;
+  - C, C++ and Objective-C sources outside `testdata/`;
+  - `internal/platform/`, `internal/pathkey/` (path identity and case folding),
+    the file watcher (watcher, storm, realtime and poller sources in
+    `internal/indexer` and the vendored backends under
+    `internal/thirdparty/fswatcher` and `internal/thirdparty/fsnotify`), and the
+    daemon start, launch, socket and process-identity sources in
+    `internal/daemon` and `cmd/gortex`;
+  - `go.mod`, `go.sum`, `go.work` and `go.work.sum` at any depth;
+  - `.github/workflows/`, `scripts/ci-*/` and `internal/citest/`.
+- The PR asks for the full suite (`ci:full` or `CI_FULL_TESTS=true`), is a
+  Dependabot PR, or its changed paths cannot be determined.
+
+Pushes to `main` and manual runs always run the full macOS matrix. The single
+macOS `build-native` compile job runs on every PR either way.
+
+`test-selection.json` records the decision as
+`macos: {selected, reason, label, matched_paths}`, and the job summary lists the
+matched paths. The **CI result** gate gets the decision as a plan output: an
+unselected macOS partition is not required, a selected one that fails fails the
+gate, and a run on any other event must have selected macOS.
+
+Labels other than `ci:macos` and `ci:full` still start a workflow run, because
+GitHub cannot filter label events by name. That run uses its own concurrency
+group, so it does not cancel the PR's CI, and every job in it skips. Its gate
+job is named `CI label event (no work)` rather than `CI result`, so it cannot
+stand in for the result of the PR's real run.
 
 ## Conservative boundaries
 
@@ -89,7 +132,8 @@ race tests, and Ubuntu `rest-cli-bench` runs `cmd/gortex` and every package
 under `bench/`. With race detection, Ubuntu's other rest packages fill most of
 one budget on their own, so the Ubuntu `rest` job omits the CLI and bench
 packages and a rerun of a failed bench package still has time to finish.
-macOS and Windows keep them in `rest`. The full layout is 17 test jobs.
+macOS and Windows keep them in `rest`. The full layout is 17 test jobs, or 11
+on a pull request that leaves macOS out.
 `go run ./scripts/ci-test --check-workflow .github/workflows/ci.yml` checks that
 each target covers every group exactly once.
 
