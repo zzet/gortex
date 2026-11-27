@@ -22,9 +22,12 @@ func main() {
 }
 
 func command(args []string) error {
-	if len(args) > 0 && (args[0] == "run" || args[0] == "paired" || args[0] == "smoke" || args[0] == "foreign-impact") {
+	if len(args) > 0 && (args[0] == "run" || args[0] == "paired" || args[0] == "smoke" || args[0] == "foreign-impact" || args[0] == "worktree-startup") {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
+		if args[0] == "worktree-startup" {
+			return worktreeStartupCommand(ctx, args[1:])
+		}
 		if args[0] == "foreign-impact" {
 			return foreignImpactCommand(ctx, args[1:])
 		}
@@ -59,5 +62,5 @@ func command(args []string) error {
 		}
 		return printDelta(os.Stdout, before, after)
 	}
-	return fmt.Errorf("usage: load run [options] | delta <before.json> <after.json> | consumer-census [--out census.json] <report.json> (received %d arguments)", len(args))
+	return fmt.Errorf("usage: load run [options] | worktree-startup [options] | delta <before.json> <after.json> | consumer-census [--out census.json] <report.json> (received %d arguments)", len(args))
 }

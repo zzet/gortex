@@ -1,5 +1,10 @@
 # Daemon load profiles
 
+For isolated **new linked-checkout admission** (equal HEAD, divergent commit, and
+a HEAD switch during the initial build), see
+[the worktree-startup benchmark](worktree-startup.md). It uses generated fixtures,
+retains every readiness probe and can capture profiles from its private daemon.
+
 This Go command measures a **new private daemon**, using its public socket
 protocol. It never attaches to an existing daemon. A manifest's source roots
 are read-only inputs: each scenario clones the pinned commits into fresh owned
