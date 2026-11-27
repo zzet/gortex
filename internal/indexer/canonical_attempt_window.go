@@ -22,6 +22,10 @@ type canonicalAttemptWindow struct {
 	retry          int
 	ticket         uint64
 	accounting     canonicalAttemptEvidence
+	// checkoutCycle marks the window of the checkout refresh cycle that served
+	// a checkout ticket (checkout_receipt_accounting.go). It holds no patch
+	// laps: the cycle's builder phases are not relabelled as them.
+	checkoutCycle bool
 }
 
 // physicalAttemptGuardDiagnostic contains only scalars frozen under the existing

@@ -361,6 +361,9 @@ func attachMutationRefreshSnapshot(payload map[string]any, snap mutationCommitSn
 	if snap.AppliedGeneration != 0 {
 		payload["applied_generation"] = snap.AppliedGeneration
 	}
+	if snap.DirtyGenerationID != 0 {
+		payload["dirty_generation_id"] = snap.DirtyGenerationID
+	}
 	if snap.CheckoutID != "" {
 		payload["checkout_id"] = snap.CheckoutID
 	}

@@ -283,7 +283,24 @@ func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 				t.Fatalf("rider %d fabricated pre-origin %s: %+v", i, phase, record.Snapshot().Phases)
 			}
 		}
+		// A require_fresh ticket keeps its own accounting: only a committed
+		// write's receipt closes P and B from the cycle that served it.
+		_, refusal := record.CoalescedPublicationEvidence()
+		if window := record.Snapshot().EditTimings().Window; refusal != nil || window.PatchAccounting != nil {
+			t.Fatalf("rider %d took an edit's accounting: B %+v, P %+v", i, refusal, window.PatchAccounting)
+		}
 	}
+	// The edit was owed at the cycle's start, so its P is that cycle, from
+	// the cycle_started instant on its timeline to its completion.
+	edited := editRecord.Snapshot()
+	window := edited.EditTimings().Window
+	offsets := phaseOffsets(edited)
+	started, completed := offsets[PublicationCycleStarted], offsets[PublicationTicketCompleted]
+	if window.PatchAccounting == nil || window.PatchAccounting.ExecutionDisposition != "checkout_refresh_cycle" ||
+		window.PatchWallMS == nil || *window.PatchWallMS != float64(completed-started)/1e6 || started <= offsets[PublicationTicketEnqueued] {
+		t.Fatalf("the edit's P is not its serving cycle: P %+v wall %v, phases %+v", window.PatchAccounting, window.PatchWallMS, edited.Phases)
+	}
+	requireCheckoutBackgroundRefusal(t, "owed edit", editRecord, edit.Ticket.Generation, "physical_window_retained")
 }
 
 func TestCheckoutMutationRefreshReportsTheLaneHolderItWaitedFor(t *testing.T) {

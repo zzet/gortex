@@ -149,6 +149,7 @@ type mutationCommitRecord struct {
 	reindexReceipt      string
 	reindexGeneration   uint64
 	appliedGeneration   uint64
+	dirtyGeneration     uint64 // a checkout's routed generation; appliedGeneration stays in the ticket's domain
 	checkoutID          string
 	checkoutIncarnation string
 	errText             string
@@ -211,6 +212,7 @@ type mutationCommitSnapshot struct {
 	ReindexReceipt      string `json:"reindex_receipt,omitempty"`
 	ReindexGeneration   uint64 `json:"reindex_generation,omitempty"`
 	AppliedGeneration   uint64 `json:"applied_generation,omitempty"`
+	DirtyGenerationID   uint64 `json:"dirty_generation_id,omitempty"`
 	CheckoutID          string `json:"checkout_id,omitempty"`
 	CheckoutIncarnation string `json:"checkout_incarnation,omitempty"`
 	publicationReceipt  string
@@ -242,6 +244,7 @@ func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 		publicationReceipt:  r.publicationReceipt,
 		ReindexGeneration:   r.reindexGeneration,
 		AppliedGeneration:   r.appliedGeneration,
+		DirtyGenerationID:   r.dirtyGeneration,
 		CheckoutID:          r.checkoutID,
 		CheckoutIncarnation: r.checkoutIncarnation,
 	}
@@ -404,7 +407,18 @@ func (r *mutationCommitRecord) recordGraphForReceipt(expectedReceipt string, out
 	}
 	r.reindexReceipt = outcome.Receipt
 	r.reindexGeneration = outcome.Generation
-	r.appliedGeneration = outcome.AppliedGeneration
+	r.appliedGeneration, r.dirtyGeneration = outcome.AppliedGeneration, 0
+	if outcome.checkoutScoped {
+		// A checkout's result names the dirty generation it routed, while
+		// reindex_generation is its ticket's admission sequence. The
+		// coordinator completes a ticket only once the routed generation holds
+		// that ticket's own committed bytes, so in the ticket's domain the
+		// ticket applied itself. Keep both generations in their own domains.
+		r.appliedGeneration, r.dirtyGeneration = 0, outcome.AppliedGeneration
+		if outcome.AppliedGeneration > 0 {
+			r.appliedGeneration = outcome.Generation
+		}
+	}
 	if outcome.checkoutID != "" {
 		r.checkoutID = outcome.checkoutID
 		r.checkoutIncarnation = outcome.checkoutIncarnation

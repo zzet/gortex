@@ -562,6 +562,29 @@ topology gates the holder takes. Daemon status (`repository_lanes`,
 `reach_topology`) and `index_health` (`repository_lanes`) report the same
 lanes, with past tenures in daemon status.
 
+A linked checkout's receipt closes its timing accounting on the same poll that
+first reads it published, as a primary receipt does. A checkout ticket is
+served by one coordinator refresh cycle, not a watcher's debounced attempt:
+
+- **Generations.** `reindex_generation` and `applied_generation` are both in the
+  ticket's admission-sequence domain. The coordinator completes a ticket only
+  once the routed generation holds that ticket's own committed bytes, so the two
+  are equal. `dirty_generation_id` names the routed working-tree generation.
+- **Background.** No measured `requested_background` window exists, because the
+  cycle arms no requested-background timer. The receipt carries the frozen
+  `requested_background_unavailable` refusal instead: `serving_attempt_binding_mismatch`,
+  `binding_predicate: checkout_refresh_cycle`.
+- **Physical attempt.** `phase_timing.patch_wall_ms` and
+  `phase_timing.patch_accounting` describe the cycle that served the ticket, from
+  its `cycle_started` instant to `ticket_completed`, with
+  `execution_disposition: checkout_refresh_cycle`. The builder's phases stay on
+  `publication_phases` and are not relabelled as patch laps, so the patch-lap
+  partition reads `not_observed`. A ticket that rode a cycle already in flight
+  for other tickets has no patch window.
+- **Acknowledgement.** The edit ACK returns before publication, so
+  `acknowledgement` counts `reindex_wait` as `not_applicable`, with a null
+  duration.
+
 ## Agent-optimized (token efficiency)
 
 | Tool | Description |

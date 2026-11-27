@@ -28,6 +28,14 @@ queueing and discarded attempts are not part of this smaller winning-P wall.
 Its `background_coverage` remains `not_established`: it does not establish full
 per-edit background, ACK, actual100-edit or5%/performance acceptance.
 
+`execution_disposition: checkout_refresh_cycle` marks the P of a linked
+checkout ticket: the window of the coordinator refresh cycle that served the
+ticket, owed by that cycle at its start. The cycle's builder phases are timed on
+`publication_phases` and are never patch laps, so every lap and the partition
+read `not_observed`. That receipt's `requested_background_unavailable` refusal
+(`binding_predicate: checkout_refresh_cycle`) says no B window exists or can
+arrive.
+
 `execution_disposition: native_mtime_duplicate` records the actual native
 watcher receipt-match return before executor entry. Only that observed branch
 can mark its unexecuted deep and executor-control laps `not_applicable`, with
@@ -492,7 +500,8 @@ and explicitly unavailable RPC ownership, never an origin borrowed from polling.
 and batch paths. It excludes enqueue/capture, outcome formatting and synchronous
 inline reindex work. The timers, cancellation behavior and dispatch-slot release
 are unchanged. Immediate completed tickets can have a real reached near-zero
-wait; an async checkout admission that never waits has no invented duration.
+wait; an async checkout admission that never waits has no invented duration:
+its `reindex_wait` is counted `not_applicable`, as a local ACK's is.
 
 Batch edit/status JSON or TOON responses carry a response-only
 `acknowledgement_receipt` reference; compact text carries the same reference.
