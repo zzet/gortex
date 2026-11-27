@@ -593,7 +593,7 @@ served by one coordinator refresh cycle, not a watcher's debounced attempt:
 | `smart_context` | Task-aware minimal context — replaces 5-10 exploration calls. The working set is ranked through the full rerank pipeline. Always emits a `blast_radius` block (callers grouped by file + covering tests + a `no covering tests found` warning) and a file-clustered `working_set`; seed count and `token_budget` scale with graph size when unset. `fidelity: "graded"` returns a graph-distance-tiered `context_manifest` (large interchangeable symbol families are skeletonized to one representative) under one `token_budget`; `estimate: true` projects token cost without fetching; `if_none_match` dedups an unchanged pack to `not_modified` |
 | `get_edit_plan` | Dependency-ordered edit sequence for multi-file refactors |
 | `get_test_targets` | Maps changed symbols to test files and run commands |
-| `get_untested_symbols` | Inverse of `get_test_targets` — functions/methods not reached from any test file, ranked by fan-in |
+| `get_untested_symbols` | Inverse of `get_test_targets` — functions/methods not reached from any test (test files and annotation-discovered tests), ranked by fan-in |
 | `suggest_pattern` | Extracts code pattern from an example — source, registration, tests |
 | `export_context` | Portable markdown/JSON context briefing for sharing outside MCP |
 | `feedback` | `action: "record"`: report useful/missing symbols. `action: "query"`: aggregated stats — most useful, most missed, accuracy metrics |

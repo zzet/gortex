@@ -110,7 +110,7 @@ Plus **MCP progress notifications** on long-running indexing / `track_repository
 
 - **Test taxonomy** — functions/methods in test files carry `Meta["is_test"]` + `Meta["test_role"]` (`test` / `benchmark` / `fuzz` / `example`) + `Meta["test_runner"]`. Runner identifier resolved from parser-stamped imports across gotest / pytest / unittest / rspec / minitest / test-unit / jest / vitest / mocha / bun-test / node-test / playwright / cypress.
 - **Stratified test classification** — `tests` edges carry the role so `winnow_symbols` can filter "production functions only" and coverage analyzers can reason per-tier.
-- **Test-coverage gaps (`get_untested_symbols`)** — inverse of `get_test_targets`. Functions/methods not reached from any test file, ranked by fan-in.
+- **Test-coverage gaps (`get_untested_symbols`)** — inverse of `get_test_targets`. Functions/methods not reached from any test (test files and annotation-discovered tests such as Rust `#[test]`), ranked by fan-in.
 - **`get_churn_rate`** — per-symbol commit density from blame.
 - **`find_co_changing_symbols`** — ranked git co-change neighbours over mined cosine-weighted `co_change` edges.
 - **Enrichment CLI** — `gortex enrich blame | coverage | releases | all` hydrates the graph with the metadata `stale_*` / `coverage*` / `ownership` / `releases` analyzers need.

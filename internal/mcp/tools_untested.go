@@ -9,8 +9,8 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// handleGetUntestedSymbols returns functions and methods in non-test files
-// that no test file reaches via the call graph — the inverse of
+// handleGetUntestedSymbols returns non-test functions and methods that no
+// test reaches via the call graph — the inverse of
 // get_test_targets. Coverage follows calls/references in the candidates'
 // ancestor closure, then marks the paths from discovered test functions and
 // methods. Real foreign tests remain evidence; disconnected repositories do
@@ -108,13 +108,14 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 }
 
 // reachableFromTests computes the set of symbol IDs reachable from any
-// symbol defined in a test file, following outgoing `calls` and
+// test function or method, following outgoing `calls` and
 // `references` edges. One pass over the graph at O(V+E) beats
 // per-symbol BFS which would be O(V·(V+E)).
 //
-// Test files are detected via isTestFile so this works across languages
-// (Go _test.go, Python test_*.py, JS .spec.ts, etc.) without per-language
-// special-casing here.
+// Test symbols are classified by graph.NodeIsTest — the indexer's is_test
+// stamp (test-file location or a runner annotation such as Rust #[test]),
+// then the canonical path predicate — so this agrees with every other
+// consumer of that stamp across languages without special-casing here.
 //
 // Seeds the frontier via NodesByKind(function|method) so disk backends
 // only materialise the two kinds rather than the whole node table.
@@ -128,12 +129,12 @@ func (s *Server) handleGetUntestedSymbols(ctx context.Context, req mcp.CallToolR
 // view is one of those, so an overlay-active request walks the
 // buffers edge by edge instead of the backend's index.
 func reachableFromTests(g graph.Reader) map[string]bool {
-	// Seed: every function/method defined in a test file. NodesByKind
-	// pushes the kind filter into the backend; isTestFile stays Go.
+	// Seed: every test function/method (graph.NodeIsTest). NodesByKind
+	// pushes the kind filter into the backend; the test check stays Go.
 	seeds := make([]string, 0)
 	for _, kind := range []graph.NodeKind{graph.KindFunction, graph.KindMethod} {
 		for n := range g.NodesByKind(kind) {
-			if n == nil || !isTestFile(n.FilePath) {
+			if n == nil || !graph.NodeIsTest(g, n) {
 				continue
 			}
 			seeds = append(seeds, n.ID)
