@@ -253,7 +253,10 @@ func TestReleaseReceiptIncludesEntryBuildTimeAndReserve(t *testing.T) {
 	c.Lane = "release"
 	c.HostClass = "reference_linux"
 	c.Manifest = filepath.Join(parent, "manifest.json")
-	c.started = time.Now().Add(-8 * time.Hour)
+	// Start past the eight-hour cap, not on it. A coarse wall clock (Windows)
+	// can return the same instant for this read and the receipt's finish, which
+	// leaves the wall time at exactly eight hours: not over the cap.
+	c.started = time.Now().Add(-8*time.Hour - time.Minute)
 	if err := writeNewJSON(c.Manifest, []map[string]any{{"label": "gortex", "source": source, "commit": strings.Repeat("c", 40)}}); err != nil {
 		t.Fatal(err)
 	}

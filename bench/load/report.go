@@ -103,6 +103,13 @@ type Attempt struct {
 	Error             string                     `json:"error"`
 	ExpectedOutcome   string                     `json:"expected_outcome,omitempty"`
 	Outcome           string                     `json:"outcome"` // success, error, busy, product_deadline, phase_censored
+	// Redialed marks a call that went through a re-dial of its session after
+	// an earlier write on it was given up. RedialNS is the time it spent
+	// doing so, inside duration_ms and logical_ms; it is absent when it
+	// measured zero, as a re-dial quicker than the clock's resolution can.
+	// Both are absent when the call found its stream open.
+	Redialed bool  `json:"redialed,omitempty"`
+	RedialNS int64 `json:"redial_ns,omitempty"`
 }
 
 type ToolMetrics struct {

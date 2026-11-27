@@ -111,6 +111,15 @@ func TestInjectedLifecycleAllowanceCannotCreateAThirdAttempt(t *testing.T) {
 			require.Zero(t, calls)
 			require.EqualValues(t, 2, allowance.attempts.Load())
 			require.NotContains(t, resultText(result), "readback_exact")
+			if tool != "get_symbol_source" {
+				// A file read whose allowance is spent reports the typed
+				// retriable refusal, the same shape as its first refusal.
+				requireReadFreshnessContract(t, result, "projection_superseded")
+			} else {
+				// Symbol source keeps the generic untyped error.
+				require.False(t, metadataTransientRefusal(result), resultText(result))
+				require.Equal(t, errProjectedSourceMoved.Error(), resultText(result))
+			}
 		})
 	}
 }
