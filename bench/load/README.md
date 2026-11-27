@@ -629,14 +629,15 @@ not graph-terminal when its edit's deadline ended (batch, move, native-write
 and restart records keep their own evidence). The reads run concurrently, each
 on its edit's fixed editor session (on a routed run, the session the restore
 writes that checkout through), inside the restore's deadline and the 20 s
-per-read budget (never longer than `--deadline`). The prober session is not reused: a probe canceled mid-write
-when its edit ended closes that session. The record keeps the answer
-as `post_workload_receipt`: `state` (`terminal`, `pending` or `unavailable`),
-`reason`, `graph_status`, `mutation_tiers`, `attempts` and `poll_ms`. A
-terminal answer that names the edit's own mutation, and on a linked route its
-admitted checkout, lets the restore past that record. A pending answer, one
-for another checkout or mutation, or none before the restore deadline keeps
-the rewrite blocked as unknown. The answer is post-workload evidence: the
+per-read budget (never longer than `--deadline`). The prober session is not
+reused: a probe canceled mid-write when its edit ended closes that session.
+The record keeps the answer as `post_workload_receipt`: `state` (`terminal`,
+`pending` or `unavailable`), `reason`, `graph_status`, `mutation_tiers`,
+`attempts` and `poll_ms`. A terminal answer that names the edit's own
+mutation, and on a linked route its admitted checkout, lets the restore past
+that record. A pending answer, one for another checkout or mutation, one that
+is not a JSON object, an RPC error, or no answer before the restore deadline
+keeps the rewrite blocked as unknown. The answer is post-workload evidence: the
 record's outcome, errors, `graph_terminal`, `mutation_tiers` and client times
 keep what the workload observed.
 
