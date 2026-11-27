@@ -62,11 +62,18 @@ func newCheckoutObservationFixture(t testing.TB) (*CheckoutLifecycle, *store_sql
 	return lc, store.Catalog(), primary, tracked.FamilyID, configPath, closeFixture
 }
 
+// checkoutObservationTestWait bounds how long a test waits for discovery work
+// to settle. That work runs Git and may take up to its own work deadline, which
+// a loaded machine (the full package in parallel, CI runners) can approach; a
+// shorter fixed wait fails while the code is within its contract. What the
+// tests assert is that each request returns within its bounded wait.
+var checkoutObservationTestWait = testTimingSlack(checkoutObservationWorkTimeout)
+
 // Slow Git startup may outlive a request's wait budget, but retries must join
 // the same lifecycle-owned work. Only a typed pending outcome is retryable.
 func observeCheckoutUntilSettled(t testing.TB, lc *CheckoutLifecycle, path string, authorize ...func(string) error) (store_sqlite.Checkout, bool, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), checkoutObservationTestWait)
 	defer cancel()
 	for {
 		started := time.Now()
@@ -498,6 +505,10 @@ func TestObserveCheckoutPathJoinedRefusalNamesItsOwnCheckout(t *testing.T) {
 // in a family therefore never hold that family's discovery slots.
 func TestObserveCheckoutPathDeniedDiscoveriesLeaveFamilyCapacity(t *testing.T) {
 	lc, _, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	// The count below needs every denied job still live. Their proofs run one
+	// after another, and on a loaded machine eight of them can outlast a single
+	// job's work budget, so the earliest would expire before they are counted.
+	lc.observationWorkTimeout = time.Minute
 	worktree := filepath.Join(filepath.Dir(primary), "own")
 	builderGit(t, primary, "worktree", "add", "-b", "own", worktree)
 	denied := errors.New("outside authorized workspace")
@@ -601,7 +612,10 @@ func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T
 	if found || !errors.Is(err, ErrCheckoutMutationBusy) {
 		t.Fatalf("blocked inventory retry did not remain pending: found=%v err=%v", found, err)
 	}
-	if checkoutObservationJobForTest(lc, worktree) != firstJob || calls.Load() != 1 {
+	// The job may not have reached the inventory yet (Git resolves the family
+	// first); it must not have entered it twice. The end of the test asserts
+	// exactly one call.
+	if checkoutObservationJobForTest(lc, worktree) != firstJob || calls.Load() > 1 {
 		t.Fatal("retry replaced the in-flight inventory job")
 	}
 	unpark()
@@ -833,7 +847,7 @@ func TestObserveCheckoutPathRejectsBindingChangesWhileProofIsPending(t *testing.
 			}
 			select {
 			case <-job.proofReady:
-			case <-time.After(2 * time.Second):
+			case <-time.After(checkoutObservationTestWait):
 				t.Fatal("read-only proof did not finish")
 			}
 			if job.proofErr != nil || job.proof == nil {
@@ -932,7 +946,7 @@ func completedCheckoutObservationForTest(t *testing.T) (*CheckoutLifecycle, *che
 	}
 	select {
 	case <-job.proofReady:
-	case <-time.After(2 * time.Second):
+	case <-time.After(checkoutObservationTestWait):
 		t.Fatal("observation proof did not finish")
 	}
 	if job.proofErr != nil || job.proof == nil {
@@ -943,7 +957,7 @@ func completedCheckoutObservationForTest(t *testing.T) (*CheckoutLifecycle, *che
 	job.authorizeOnce.Do(func() { close(job.authorized) })
 	select {
 	case <-job.done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(checkoutObservationTestWait):
 		t.Fatal("authorized observation did not finish")
 	}
 	if job.err != nil || !job.found {

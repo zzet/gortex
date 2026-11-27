@@ -592,7 +592,7 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 type providerStart struct {
 	done    chan struct{}
 	err     error
-	waiters int // callers waiting on done; guarded by Router.mu
+	waiters int // callers that waited on this start, for test observability; guarded by Router.mu
 }
 
 // forSpecWorkspace is ForSpecWorkspace with an optional in-use pin. When pin
@@ -766,7 +766,24 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		return nil, errors.Join(errRouterClosed, p.Close())
 	}
 	// This start owns r.inflight[key], so no other provider for the key
-	// can have been published while it initialized.
+	// can have been published while it initialized. Guard the invariant
+	// anyway: overwriting a live entry would orphan its server, so if a
+	// future publish path ever breaks it, close the newcomer instead.
+	if existing, ok := r.providers[key]; ok {
+		existing.lastUsed = time.Now()
+		if pin {
+			existing.inUse++
+		}
+		owner, admitted := r.registerCloseLocked(p, spec.Name, workspace, "duplicate")
+		r.mu.Unlock()
+		r.logger.Warn("LSP router found a provider already published for this server and workspace; closing the new one",
+			zap.String("spec", spec.Name), zap.String("workspace", workspace))
+		if admitted {
+			go r.finishClose(owner)
+		}
+		success = true
+		return existing.provider, nil
+	}
 	newRP := &routedProvider{
 		spec:      spec,
 		workspace: workspace,
@@ -1134,7 +1151,7 @@ type RouterTimingStats struct {
 	StartFailures    uint64        `json:"start_failures"`
 	Evictions        uint64        `json:"evictions"`
 	EvictionDuration time.Duration `json:"eviction_duration"`
-	RaceReuses       uint64        `json:"race_reuses"`
+	RaceReuses       uint64        `json:"race_reuses"` // acquires that waited for a concurrent start of the same key, then reused its provider
 	Closes           uint64        `json:"closes"`
 	CloseFailures    uint64        `json:"close_failures"`
 	AcquireDuration  time.Duration `json:"acquire_duration"`
