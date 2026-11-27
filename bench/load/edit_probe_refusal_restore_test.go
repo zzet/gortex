@@ -36,6 +36,15 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 	unknownBusy := func() (any, *rpcError) {
 		return nil, &rpcError{Code: -32002, Message: "MCP dispatcher is busy", Data: map[string]any{"outcome": "server_busy", "retryable": true, "delivery_unknown": true}}
 	}
+	// A typed checkout refusal is re-sent until no re-send can be answered
+	// before the deadline; the record then ends on it as a product deadline
+	// named by the refusal. Every other refused edit is an edit error.
+	refusedOutcome := func(refusal string) (string, string) {
+		if refusal == "view_read_only" || refusal == "view_building" {
+			return "product_deadline", refusal
+		}
+		return "edit_error", ""
+	}
 	for _, cell := range []struct {
 		name    string
 		routes  int                       // 2: an applied primary edit beside the refused linked edit
@@ -217,8 +226,8 @@ func TestEditProbeRestoreProceedsPastTypedNoMutationRefusals(t *testing.T) {
 					if record.Outcome != "complete" || !record.GraphTerminal {
 						t.Fatalf("applied primary edit did not complete: %+v", record)
 					}
-				} else if record.Outcome != "edit_error" || record.Receipt != "" {
-					t.Fatalf("refused edit gained a receipt or another outcome: %+v", record)
+				} else if outcome, reason := refusedOutcome(cell.refusal); record.Outcome != outcome || record.DeadlineReason != reason || record.Receipt != "" {
+					t.Fatalf("refused edit gained a receipt or another outcome than %s %q: %+v", outcome, reason, record)
 				}
 				phase.EditProbe.Records = append(phase.EditProbe.Records, record)
 			}
