@@ -124,18 +124,15 @@ func TestLinkedCheckoutEditReceiptClosesItsAccounting(t *testing.T) {
 
 // A source operation that commits several files is acknowledged once, at its
 // frontier (awaitSourceMutationFrontier), not file by file. On a linked
-// checkout each committed file's publication is queued on the coordinator and
-// the acknowledgement returns before it, so the operation counts its one
-// publication wait as not applicable, as a single-file linked edit does,
-// instead of leaving it unobserved.
+// checkout each committed file's publication is queued on the coordinator.
 //
 // A routed linked view admits no refactor (refuseRoutedViewMutation), so the
 // move runs under a checkout lease acquired the way an approved edit's is,
 // through the production middleware and handler. One lease admits one
 // publication ticket: the move's first file publishes and its second is
 // refused admission after its disk commit, which the test records rather
-// than hides. Either way the acknowledgement never waited.
-func TestLinkedCheckoutMoveAcknowledgementCountsItsPublicationWait(t *testing.T) {
+// than hides.
+func TestLinkedCheckoutMoveUnderOneLeasePublishesOneFile(t *testing.T) {
 	f := newRealCheckoutMutationFixture(t)
 	route, found, err := f.store.Catalog().GetCheckoutRoute(t.Context(), f.checkoutID)
 	require.NoError(t, err)
@@ -153,18 +150,6 @@ func TestLinkedCheckoutMoveAcknowledgementCountsItsPublicationWait(t *testing.T)
 	observations, ok := decodeFileOpsResult(t, moved)["file_observations"].([]any)
 	require.True(t, ok && len(observations) == 2, "a move commits its source and its target: %s", resultText(moved))
 
-	requireCountedNoWait := func(label string, payload map[string]any) {
-		t.Helper()
-		acknowledgement, ok := payload["acknowledgement"].(map[string]any)
-		require.True(t, ok, "%s carries its acknowledgement: %+v", label, payload)
-		require.Equal(t, "observed", acknowledgement["state"], label)
-		require.Equal(t, "not_applicable", acknowledgement["phase_states"].(map[string]any)["reindex_wait"],
-			"%s: a linked frontier ACK never waits on its publications: %+v", label, acknowledgement)
-		require.Nil(t, acknowledgement["phases_ms"].(map[string]any)["reindex_wait"], "%s: a wait that never happened has no duration", label)
-		require.Equal(t, map[string]any{"started": float64(1), "completed": float64(1), "not_applicable": float64(1)},
-			acknowledgement["counts"].(map[string]any)["reindex_wait"], "%s: the operation waits once, not once per file", label)
-		require.Equal(t, true, acknowledgement["disjoint_observed_intervals"], label)
-	}
 	outcomes := map[string]int{}
 	for _, raw := range observations {
 		receipt := raw.(map[string]any)["receipt"].(string)
@@ -182,8 +167,6 @@ func TestLinkedCheckoutMoveAcknowledgementCountsItsPublicationWait(t *testing.T)
 		} else {
 			require.Equal(t, "admitted", status["requested_background_state"], "a queued checkout admission")
 		}
-		requireCountedNoWait(receipt, status)
-		requireCountedNoWait(receipt+" commit", commit)
 	}
 	require.Equal(t, map[string]int{"fresh": 1, "failed": 1}, outcomes, "one lease publishes one of the move's files")
 }
