@@ -75,6 +75,12 @@ func TestConfig_ActiveCustom_PresetResolution(t *testing.T) {
 		t.Errorf("llm-buzz preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(buzz))
 	}
 
+	lt := Config{Provider: "llmtr"}
+	cp, ok = lt.ActiveCustom()
+	if !ok || cp.BaseURL != "https://llmtr.com/v1" || cp.Model != "qwen/qwen3.8-flash" || cp.APIKeyEnv != "LLMTR_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(lt) != ProfileFrontier {
+		t.Errorf("llmtr preset: %+v ok=%v profile=%v", cp, ok, ProfileFor(lt))
+	}
+
 	opper := Config{Provider: "opper"}
 	cp, ok = opper.ActiveCustom()
 	if !ok || cp.BaseURL != "https://api.opper.ai/v3/compat" || cp.Model != "gpt-6.1-terra" || cp.APIKeyEnv != "OPPER_API_KEY" || cp.SchemaMode != "json_schema" || ProfileFor(opper) != ProfileFrontier {

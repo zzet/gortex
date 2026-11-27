@@ -174,6 +174,7 @@ A gateway preset is a built-in, ready-made custom provider for a well-known Open
 | `cheaperinference` | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini` | `CHEAPER_INFERENCE_API_KEY` | `frontier` |
 | `cloudgpu` | `https://cloudgpu.app/v1` | `deepseek-v4.1-flash` | `CLOUDGPU_API_KEY` | `frontier` |
 | `llm-buzz` | `https://api.llm.buzz/api/v1` | `openai/gpt-5.4-mini` | `LLM_BUZZ_API_KEY` | `frontier` |
+| `llmtr` | `https://llmtr.com/v1` | `qwen/qwen3.8-flash` | `LLMTR_API_KEY` | `frontier` |
 | `opper` | `https://api.opper.ai/v3/compat` | `gpt-6.1-terra` | `OPPER_API_KEY` | `frontier` |
 | `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
 | `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
