@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,7 +130,7 @@ func recordProbeAnswer(answer *daemon.ProbeView) {
 
 // selectProbeView is resolveProbeView's decision, split out so every path
 // through it is counted exactly once.
-func (c *realController) selectProbeView(ctx context.Context, path string) probeView {
+func (c *realController) selectProbeView(ctx context.Context, path string) (selected probeView) {
 	base := probeView{servable: true, release: noopRelease}
 	if c == nil || path == "" || c.lifecycle == nil || c.viewMaterializer == nil {
 		// No view catalog is wired, so there are no composed views to route to
@@ -147,6 +148,30 @@ func (c *realController) selectProbeView(ctx context.Context, path string) probe
 		// passing for the path's own view.
 		base.answer = fallbackProbeView(daemon.ProbeViewBase, "", "", daemon.FallbackCheckoutInaccessible)
 		return base
+	}
+	// Known checkout-root probes need no Git metadata. Descendant and unknown
+	// paths use bounded discovery, including the nested-root check itself.
+	var root string
+	binding, root, err = c.probeCheckoutBinding(ctx, path, binding)
+	if errors.Is(err, errProbeDiscoveryDeferred) && binding.Matched && ctx.Err() == nil {
+		// Capacity or an unresponsive filesystem must not suppress a known
+		// corpus. Until nested-marker discovery finishes it is only a labelled
+		// fallback, never evidence that this is the requested working copy.
+		defer func() {
+			if selected.answer != nil {
+				selected.answer.Exact = false
+				selected.answer.FallbackReason = daemon.FallbackViewBuilding
+			}
+		}()
+		err = nil
+	}
+	if err != nil {
+		reason := daemon.FallbackCheckoutInaccessible
+		if errors.Is(err, indexer.ErrCheckoutMutationBusy) {
+			reason = daemon.FallbackViewBuilding
+		}
+		return probeView{answer: fallbackProbeView(daemon.ProbeViewUnrouted, "", "", reason),
+			root: root, servable: false, release: noopRelease}
 	}
 
 	if binding.Matched && binding.CheckoutState != string(store_sqlite.CheckoutStateReady) {

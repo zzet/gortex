@@ -2693,11 +2693,16 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 	g.recordStructuralRejections(StructuralPathGraphAddBatch, rejected, nodes)
 	// Lazy builtin-sentinel materialization: see BuiltinStubNodes. The
 	// per-store seen-set keeps it one upsert per stub per store lifetime.
+	var builtinFallbacks map[*Node]struct{}
 	if stubs := BuiltinStubNodes(edges); len(stubs) > 0 {
 		var fresh []*Node
 		for _, stub := range stubs {
 			if _, dup := g.builtinSeen.LoadOrStore(stub.ID, struct{}{}); !dup {
 				fresh = append(fresh, stub)
+				if builtinFallbacks == nil {
+					builtinFallbacks = make(map[*Node]struct{})
+				}
+				builtinFallbacks[stub] = struct{}{}
 			}
 		}
 		if len(fresh) > 0 {
@@ -2716,7 +2721,6 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		if n == nil || n.ID == "" {
 			continue
 		}
-		nodeMutation = true
 		i := g.shardIdx(n.ID)
 		nodesByShard[i] = append(nodesByShard[i], n)
 	}
@@ -2740,6 +2744,12 @@ func (g *Graph) AddBatch(nodes []*Node, edges []*Edge) {
 		s.mu.Lock()
 		for _, n := range nodesByShard[i] {
 			old := s.nodes[n.ID]
+			// Fallbacks only fill missing/proxy nodes. Check under the shard
+			// lock so an explicit node in this or a concurrent batch wins.
+			if _, fallback := builtinFallbacks[n]; fallback && old != nil && !IsProxyNode(old) {
+				continue
+			}
+			nodeMutation = true
 			g.addNodeLocked(s, n)
 			if old == nil {
 				addedNodes = append(addedNodes, n)

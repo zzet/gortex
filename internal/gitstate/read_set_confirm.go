@@ -147,7 +147,7 @@ func resolveGitDirsFromDotGit(root string) (gitDir, commonDir string) {
 	case info.IsDir():
 		gitDir = dotGit
 	case info.Mode().IsRegular():
-		raw, err := os.ReadFile(dotGit)
+		raw, err := readWorktreeMarkerBytes(dotGit)
 		if err != nil {
 			return "", ""
 		}
@@ -160,10 +160,14 @@ func resolveGitDirsFromDotGit(root string) (gitDir, commonDir string) {
 		return "", ""
 	}
 	commonDir = gitDir
-	if raw, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
-		if rel := strings.TrimSpace(string(raw)); rel != "" {
-			commonDir = resolveAgainst(gitDir, rel)
+	if raw, err := readWorktreeMarkerBytes(filepath.Join(gitDir, "commondir")); err == nil {
+		rel := strings.TrimSpace(string(raw))
+		if rel == "" {
+			return "", ""
 		}
+		commonDir = resolveAgainst(gitDir, rel)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", ""
 	}
 	return gitDir, commonDir
 }

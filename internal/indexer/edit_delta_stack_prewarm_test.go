@@ -6,10 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/runtimeactivity"
 )
 
 // A pre-warmed stack serves the first delta over it from its caches: the Go
@@ -98,63 +100,80 @@ func TestPrewarmedStackServesTheFirstDelta(t *testing.T) {
 // repository: by the time it reaches them, the likely file's import adjacency
 // is kept.
 func TestPrewarmYieldsToEditsAndWarmsLikelyFilesFirst(t *testing.T) {
-	resetEditDeltaGoInventories()
-	resetEditDeltaProvides()
-	resetEditDeltaDeps()
-	t.Cleanup(resetEditDeltaGoInventories)
-	t.Cleanup(resetEditDeltaProvides)
-	t.Cleanup(resetEditDeltaDeps)
-	f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
-	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
-	coordinatorReconcile(t, c)
-	view := chainMaterialize(t, f)
-	defer view.Close()
-	base := commitLayerBase{Reader: view.Reader, stack: []int64{2000001, 2000002}}
-	key, _ := editDeltaBaseCacheKey(base, c.builder.Store)
-	cache := editDeltaBaseCache(key)
-	likelyPath := c.repoPrefix + "/b/b.go"
+	for _, work := range []string{"edit", "selected_edit_cycle", "same_repo_build"} {
+		t.Run(work, func(t *testing.T) {
+			resetEditDeltaGoInventories()
+			resetEditDeltaProvides()
+			resetEditDeltaDeps()
+			t.Cleanup(resetEditDeltaGoInventories)
+			t.Cleanup(resetEditDeltaProvides)
+			t.Cleanup(resetEditDeltaDeps)
+			f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
+			c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+			coordinatorReconcile(t, c)
+			view := chainMaterialize(t, f)
+			defer view.Close()
+			base := commitLayerBase{Reader: view.Reader, stack: []int64{2000001, 2000002}}
+			key, _ := editDeltaBaseCacheKey(base, c.builder.Store)
+			cache := editDeltaBaseCache(key)
+			likelyPath := c.repoPrefix + "/b/b.go"
 
-	var mu sync.Mutex
-	var steps []string
-	likelyWarmBeforeProvides := false
-	editDeltaPrewarmStep = func(step string) {
-		mu.Lock()
-		steps = append(steps, step)
-		mu.Unlock()
-		if step == "likely_callee_params" {
-			_, before := cache.StackStats()
-			probe := graph.NewDeltaWriter(base, nil)
-			probe.SetBaseProjectionCache(cache)
-			probe.ProjectImportAdjacency([]string{likelyPath})
-			_, after := cache.StackStats()
-			likelyWarmBeforeProvides = after == before
-		}
-	}
-	done := make(chan struct{})
-	editDeltaPrewarmDone = func(string) { close(done) }
-	t.Cleanup(func() { editDeltaPrewarmStep, editDeltaPrewarmDone = nil, nil })
+			var mu sync.Mutex
+			var steps []string
+			likelyWarmBeforeProvides := false
+			editDeltaPrewarmStep = func(step string) {
+				mu.Lock()
+				steps = append(steps, step)
+				mu.Unlock()
+				if step == "likely_callee_params" {
+					_, before := cache.StackStats()
+					probe := graph.NewDeltaWriter(base, nil)
+					probe.SetBaseProjectionCache(cache)
+					probe.ProjectImportAdjacency([]string{likelyPath})
+					_, after := cache.StackStats()
+					likelyWarmBeforeProvides = after == before
+				}
+			}
+			done := make(chan struct{})
+			editDeltaPrewarmDone = func(string) { close(done) }
+			t.Cleanup(func() { editDeltaPrewarmStep, editDeltaPrewarmDone = nil, nil })
 
-	endEdit := editDeltaBegin()
-	go c.builder.PrewarmEditDeltaStack(context.Background(), openFixed(base), c.repoPrefix, c.workspaceID, c.projectID, []string{"b/b.go"})
-	time.Sleep(300 * time.Millisecond)
-	mu.Lock()
-	during := len(steps)
-	mu.Unlock()
-	endEdit()
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		t.Fatal("the pre-warm never finished after the edit ended")
-	}
-	if during != 0 {
-		t.Fatalf("the pre-warm made %d steps while an edit ran", during)
-	}
-	order := strings.Join(steps, ",")
-	if !strings.Contains(order, "likely_packages,likely_callee_params,provides,likely_names,repository_packages") {
-		t.Fatalf("pre-warm order %s", order)
-	}
-	if !likelyWarmBeforeProvides {
-		t.Fatal("the likely file's import adjacency was not kept before the provides scan")
+			var endWork func()
+			switch work {
+			case "selected_edit_cycle":
+				var selected atomic.Bool
+				selected.Store(true)
+				c.builder.EditCycleActive = selected.Load
+				endWork = func() { selected.Store(false) }
+			case "same_repo_build":
+				endWork = prewarmRepoBuildBegin(c.repoPrefix)
+			default:
+				endWork = editDeltaBegin()
+			}
+			endWork = sync.OnceFunc(endWork)
+			t.Cleanup(endWork)
+			go c.builder.PrewarmEditDeltaStack(context.Background(), openFixed(base), c.repoPrefix, c.workspaceID, c.projectID, []string{"b/b.go"})
+			time.Sleep(300 * time.Millisecond)
+			mu.Lock()
+			during := len(steps)
+			mu.Unlock()
+			endWork()
+			select {
+			case <-done:
+			case <-time.After(60 * time.Second):
+				t.Fatal("the pre-warm never finished after the edit ended")
+			}
+			if during != 0 {
+				t.Fatalf("the pre-warm made %d steps while an edit ran", during)
+			}
+			order := strings.Join(steps, ",")
+			if !strings.Contains(order, "likely_packages,likely_callee_params,provides,likely_names,repository_packages") {
+				t.Fatalf("pre-warm order %s", order)
+			}
+			if !likelyWarmBeforeProvides {
+				t.Fatal("the likely file's import adjacency was not kept before the provides scan")
+			}
+		})
 	}
 }
 
@@ -586,5 +605,39 @@ func TestPrewarmKeepsALikelyFilesPriorFingerprints(t *testing.T) {
 	}
 	if fp.derived.declarations != storedDerivedFingerprints(rows).declarations {
 		t.Fatalf("kept fingerprints %+v differ from the rows' own %+v", fp.derived, storedDerivedFingerprints(rows))
+	}
+}
+
+func TestPrewarmProgressesDuringUnrelatedSparseBuild(t *testing.T) {
+	resetEditDeltaGoInventories()
+	resetEditDeltaProvides()
+	resetEditDeltaDeps()
+	t.Cleanup(resetEditDeltaGoInventories)
+	t.Cleanup(resetEditDeltaProvides)
+	t.Cleanup(resetEditDeltaDeps)
+	f := newCoordinatorFixtureWithTree(t, sharedRowsTree())
+	c := f.inertCoordinator(t, CheckoutCoordinatorConfig{})
+	coordinatorReconcile(t, c)
+	view := chainMaterialize(t, f)
+	defer view.Close()
+	base := commitLayerBase{Reader: view.Reader, stack: []int64{9000001, 9000002}}
+	runtimeactivity.Begin(sparseGenerationBuildActivity)
+	defer runtimeactivity.End(sparseGenerationBuildActivity)
+	defer prewarmRepoBuildBegin(c.repoPrefix + "-unrelated")()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	editDeltaPrewarmDone = func(string) { close(done) }
+	defer func() { editDeltaPrewarmDone = nil }()
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		c.builder.PrewarmEditDeltaStack(ctx, openFixed(base), c.repoPrefix, c.workspaceID, c.projectID, []string{"b/b.go"})
+	}()
+	<-joined
+	select {
+	case <-done:
+	default:
+		t.Fatal("unrelated sparse build starved prewarm")
 	}
 }

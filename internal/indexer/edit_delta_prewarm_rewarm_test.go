@@ -184,11 +184,11 @@ func TestOverlappingPrewarmsKeepTheirStandDown(t *testing.T) {
 	endFirst := registerEditCycleSource(b)
 	endSecond := registerEditCycleSource(b)
 	endFirst()
-	if !prewarmStandDown() {
+	if !prewarmStandDown("fixture") {
 		t.Fatal("the second pre-warm lost its stand-down when the first ended")
 	}
 	endSecond()
-	if prewarmStandDown() {
+	if prewarmStandDown("fixture") {
 		t.Fatal("a stand-down outlived both runs")
 	}
 }

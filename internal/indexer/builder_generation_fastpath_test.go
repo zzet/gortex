@@ -208,6 +208,9 @@ func TestSparseGenerationBuilderTracksRuntimeActivityThroughPublish(t *testing.T
 	before := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
 	req.PrePublish = func(context.Context, int64) error {
 		active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+		if !prewarmRepoBuildActive(req.RepoPrefix) || prewarmRepoBuildActive(req.RepoPrefix+"-unrelated") {
+			t.Fatal("build did not scope its prewarm activity to its repository")
+		}
 		if active != before+1 {
 			t.Fatalf("activity during publication = %d, want %d", active, before+1)
 		}
@@ -216,6 +219,9 @@ func TestSparseGenerationBuilderTracksRuntimeActivityThroughPublish(t *testing.T
 
 	if _, _, err := builder.Build(context.Background(), req); err != nil {
 		t.Fatalf("build generation: %v", err)
+	}
+	if prewarmRepoBuildActive(req.RepoPrefix) {
+		t.Fatal("repository activity leaked after build completion")
 	}
 	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
 		t.Fatalf("activity after publication = %d, want baseline %d", active, before)
@@ -229,6 +235,9 @@ func TestSparseGenerationBuilderReleasesRuntimeActivityOnError(t *testing.T) {
 	wantErr := errors.New("reject publication")
 	req.PrePublish = func(context.Context, int64) error {
 		active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]
+		if !prewarmRepoBuildActive(req.RepoPrefix) || prewarmRepoBuildActive(req.RepoPrefix+"-unrelated") {
+			t.Fatal("build did not scope its prewarm activity to its repository")
+		}
 		if active != before+1 {
 			t.Fatalf("activity during failed publication = %d, want %d", active, before+1)
 		}
@@ -237,6 +246,9 @@ func TestSparseGenerationBuilderReleasesRuntimeActivityOnError(t *testing.T) {
 
 	if _, _, err := builder.Build(context.Background(), req); !errors.Is(err, wantErr) {
 		t.Fatalf("build error = %v, want %v", err, wantErr)
+	}
+	if prewarmRepoBuildActive(req.RepoPrefix) {
+		t.Fatal("repository activity leaked after build completion")
 	}
 	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
 		t.Fatalf("activity after failed publication = %d, want baseline %d", active, before)
@@ -258,6 +270,9 @@ func TestSparseGenerationBuilderReleasesRuntimeActivityOnPanic(t *testing.T) {
 		}()
 		_, _, _ = builder.Build(context.Background(), req)
 	}()
+	if prewarmRepoBuildActive(req.RepoPrefix) {
+		t.Fatal("repository activity leaked after build completion")
+	}
 	if active := runtimeactivity.Current().ByKind[sparseGenerationBuildActivity]; active != before {
 		t.Fatalf("activity after panicked publication = %d, want baseline %d", active, before)
 	}

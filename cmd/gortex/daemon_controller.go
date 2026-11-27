@@ -74,6 +74,12 @@ type realController struct {
 	// build-lane block out.
 	buildGate *indexer.ViewBuildGate
 
+	// Probe-only filesystem discovery is coalesced and bounded separately from
+	// the controller lock. A stalled mount must not pin a probe or grow workers.
+	probeDiscoveryMu sync.Mutex
+	probeDiscoveries map[string]*probeCheckoutDiscovery
+	probeGitRoot     func(string) (string, bool)
+
 	// probeNudgeMu guards probeNudgedAt alone. It is deliberately not mu: the
 	// whole point of the nudge is to be raised from the probe path, which
 	// must never queue behind a track / reload / enrichment.

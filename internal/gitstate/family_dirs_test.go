@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,5 +130,48 @@ func BenchmarkResolveFamilyDirs(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestMarkerCommonDirPreservesRejectedMarkerEvidence(t *testing.T) {
+	for _, marker := range []string{".git", "commondir"} {
+		for _, kind := range []string{"oversized", "directory", "empty", "symlink"} {
+			t.Run(marker+"/"+kind, func(t *testing.T) {
+				root := t.TempDir()
+				path := filepath.Join(root, ".git")
+				if marker == "commondir" {
+					if err := os.Mkdir(path, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					path = filepath.Join(path, marker)
+				}
+				switch kind {
+				case "oversized":
+					if err := os.WriteFile(path, []byte(strings.Repeat("x", maxWorktreeMarkerBytes+1)), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				case "directory":
+					// A .git directory is valid; commondir directories are not.
+					if marker == ".git" {
+						t.Skip("valid main-checkout marker")
+					}
+					if err := os.Mkdir(path, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				case "empty":
+					if err := os.WriteFile(path, nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				case "symlink":
+					if err := os.Symlink("missing", path); err != nil {
+						t.Skipf("symlink unavailable: %v", err)
+					}
+				}
+				gotRoot, common, ok := MarkerCommonDir(root)
+				if ok || common != "" || gotRoot != root {
+					t.Fatalf("unsafe marker lost evidence: root=%q common=%q ok=%v", gotRoot, common, ok)
+				}
+			})
+		}
 	}
 }

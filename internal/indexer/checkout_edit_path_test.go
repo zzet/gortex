@@ -295,9 +295,14 @@ func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 	edited := editRecord.Snapshot()
 	window := edited.EditTimings().Window
 	offsets := phaseOffsets(edited)
-	started, completed := offsets[PublicationCycleStarted], offsets[PublicationTicketCompleted]
+	started, hasStart := offsets[PublicationCycleStarted]
+	enqueued, hasEnqueue := offsets[PublicationTicketEnqueued]
+	completed, hasCompletion := offsets[PublicationTicketCompleted]
+	// Enqueue precedes the cycle, but a coarse clock can give both the same
+	// timestamp. Require the events and their order without a positive gap.
 	if window.PatchAccounting == nil || window.PatchAccounting.ExecutionDisposition != "checkout_refresh_cycle" ||
-		window.PatchWallMS == nil || *window.PatchWallMS != float64(completed-started)/1e6 || started <= offsets[PublicationTicketEnqueued] {
+		window.PatchWallMS == nil || *window.PatchWallMS != float64(completed-started)/1e6 ||
+		!hasStart || !hasEnqueue || !hasCompletion || started < enqueued {
 		t.Fatalf("the edit's P is not its serving cycle: P %+v wall %v, phases %+v", window.PatchAccounting, window.PatchWallMS, edited.Phases)
 	}
 	requireCheckoutBackgroundRefusal(t, "owed edit", editRecord, edit.Ticket.Generation, "physical_window_retained")

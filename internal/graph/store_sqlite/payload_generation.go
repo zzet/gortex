@@ -908,6 +908,14 @@ func (s *Store) WriteWanted() bool {
 	return !s.coreless() && s.writeWanted()
 }
 
+// CompetingWriteWanted reports a queued writer or an ordinary announced
+// mutation. A long-lived checkout refresh ticket alone is excluded: it may
+// depend on the initial base being written before it can use the writer.
+// Global WAL/retirement cooperation must continue using WriteWanted.
+func (s *Store) CompetingWriteWanted() bool {
+	return !s.coreless() && s.foldWriteWanted()
+}
+
 // Chunked deletes for the two core tables. The generation predicate is
 // restated as a literal `view_gen > 0` alongside the bound equality because
 // SQLite only uses a partial index when the query's WHERE matches the index's

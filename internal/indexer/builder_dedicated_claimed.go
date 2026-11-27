@@ -272,7 +272,9 @@ func (b *SparseGenerationBuilder) buildClaimedDedicatedBase(ctx context.Context,
 	defer cancelAttempt(nil)
 	ctx = attemptCtx
 	ctx = withKeepReservationOnCancel(ctx)
-	ctx = withInitialDrainCooperation(ctx, b.Store.WriteWanted)
+	// A waiting checkout can require this base before it can write. Yield to
+	// real gate waiters and ordinary mutations, not that dependent ticket.
+	ctx = withInitialDrainCooperation(ctx, b.Store.CompetingWriteWanted)
 
 	// One bracket, both routes. See generationBulkWindow for why it is opened
 	// from inside the payload preparation and closed from out here.

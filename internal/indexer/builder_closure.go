@@ -159,9 +159,10 @@ const (
 // alone. The cap is never RAISED by this path above what the operator asked
 // for, and which of the two fired is recorded on the report.
 //
-// Every other sparse build — commit layers, dirty layers, ref views — reads
-// the configured value directly, because for those the closure IS the write
-// set bound that knob was chosen against.
+// Other sparse builds read an explicitly configured value directly. With no
+// configured value, automatic checkout commits and large dirty batches also
+// use the change-sized bound: truncating them prevents their safe reuse as a
+// parent. Ref views and legacy commit layers retain the flat default.
 func (b *SparseGenerationBuilder) builderClosureCap(req BuildRequest) (int, string) {
 	operator := b.Config.AffectedByReresolveMax
 	if req.Identity.GenerationKind == DedicatedBaseGenerationKind && req.Identity.BaseGenerationID > 0 {
@@ -176,13 +177,14 @@ func (b *SparseGenerationBuilder) builderClosureCap(req BuildRequest) (int, stri
 	if operator > 0 {
 		return operator, ClosureCapFromOperator
 	}
-	// A working-tree build of many changes (a batch of a large working tree)
-	// is sized by its change set like a committed base: under the flat
-	// default its closure truncates, a truncated generation is refused as a
-	// chain parent (closure_truncated_parent), and every later build of that
-	// checkout falls back to the same direct build of the whole dirty set.
-	// A one-file edit's cap is the default either way.
-	if req.Identity.GenerationKind == DirtyLayerGenerationKind {
+	// The flat default can truncate either a checkout's committed delta or
+	// a large working-tree batch. Neither can then be safely used as a chain
+	// parent. The explicit identity checks keep unrelated ref/legacy builds
+	// on their existing default. A one-file edit's cap is unchanged.
+	checkoutCommit := req.Identity.GenerationKind == CommitLayerGenerationKind &&
+		req.Identity.OwnerKind == checkoutLayerOwnerKind &&
+		req.Identity.CheckoutID != "" && req.Identity.BaseGenerationID > 0
+	if req.Identity.GenerationKind == DirtyLayerGenerationKind || checkoutCommit {
 		if sized := builderCommittedBaseClosureCap(len(req.Changes)); sized > defaultAffectedByMax {
 			return sized, ClosureCapFromChangeSized
 		}
