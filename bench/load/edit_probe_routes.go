@@ -23,6 +23,14 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		File     string          `json:"file"`
 		Response json.RawMessage `json:"response"`
 		Error    string          `json:"error,omitempty"`
+		// No write was sent: the checkout's bytes already equal its admitted
+		// original, as when every edit on it was refused before admission,
+		// and the product refuses a rewrite of identical bytes.
+		Unchanged bool `json:"unchanged,omitempty"`
+		// Recorded, not a failure: the product refused every edit on this
+		// checkout before admission and returned no receipt, yet its bytes
+		// moved. The byte-guarded rewrite still restores them.
+		NotAdmittedButChanged bool `json:"not_admitted_but_changed,omitempty"`
 	}
 	var rows []restoredRoute
 	started := time.Now()
@@ -52,10 +60,14 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		if err != nil {
 			return err
 		}
+		if string(current) == string(original) {
+			rows = append(rows, restoredRoute{Route: repo.Corpus.Label, Editor: editor, File: repo.Corpus.File, Unchanged: true})
+			continue
+		}
 		changes := []any{map[string]any{"op": "edit_file", "path": repo.Prefix + "/" + repo.Corpus.File, "old_string": string(current), "new_string": string(original)}}
 		req := request{Tool: "edit", Operation: "batch", Arguments: map[string]any{"operation": "batch", "changes": changes, "options": map[string]any{"transaction_id": fmt.Sprintf("load-restore-%016x-route-%d", uint64(r.options.Seed), ordinal)}, "output": map[string]any{"format": "json", "max_bytes": 0}}}
 		data, _, err := callEditProbeTool(ctx, r.editors[editor], req, req.Arguments, "cleanup", ordinal, len(r.states), 0, r.options.Deadline, editProbeRetrySleep(r.options.Seed, len(r.states), ordinal))
-		row := restoredRoute{Route: repo.Corpus.Label, Editor: editor, File: repo.Corpus.File, Response: data}
+		row := restoredRoute{Route: repo.Corpus.Label, Editor: editor, File: repo.Corpus.File, Response: data, NotAdmittedButChanged: r.everyEditNotAdmitted(repo.Path)}
 		if err == nil {
 			var restored []byte
 			restored, err = os.ReadFile(file)
@@ -72,6 +84,22 @@ func (r *editProbeRuntime) restoreRoutes(ctx context.Context) (resultErr error) 
 		}
 	}
 	return nil
+}
+
+// everyEditNotAdmitted reports whether the checkout at path had edits and the
+// product refused each of them before admission, with no receipt.
+func (r *editProbeRuntime) everyEditNotAdmitted(path string) bool {
+	found := false
+	for _, record := range r.phase.EditProbe.Records {
+		if record.Editor < 0 || record.Editor >= len(r.editors) || r.editors[record.Editor] == nil || filepath.Clean(r.editors[record.Editor].cwd) != filepath.Clean(path) {
+			continue
+		}
+		if record.NotAdmitted == "" || record.Receipt != "" || record.Batch != nil || record.Move != nil {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 // Distinct source repositories are a physical admission check, not a path in

@@ -216,7 +216,7 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			terminal.Started = time.Now()
 			terminal.DurationMS = 0
 			terminal.LogicalMS = float64(time.Since(logicalStart)) / float64(time.Millisecond)
-			terminal.Error = fmt.Sprintf("busy backoff ended: %v", err)
+			terminal.Error = fmt.Sprintf("%s: %v", busyBackoffEnded, err)
 			terminal.Code = 0
 			terminal.Outcome = terminalOutcome()
 			attempts = append(attempts, terminal)

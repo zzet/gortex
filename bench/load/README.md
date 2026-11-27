@@ -16,6 +16,7 @@ go run ./bench/load run --binary /private/bin/gortex \
   --manifest /private/corpus.json --scratch /private/load-artifacts \
   --profile agent --scenario read --agents 8 --duration 60s --host native
 go run ./bench/load delta /private/tag.json /private/main.json
+go run ./bench/load consumer-census --out /private/census.json /private/report.json
 go run ./bench/load schema
 ```
 
@@ -292,6 +293,29 @@ evidence and none is censored. A consumer census from 8 or 32 editors can claim
 an ordinal's answers only under that binding. The census changes no outcome,
 error or consumer verdict.
 
+The run keeps its strict consumer rule: an edit fails when any of its consumer
+rows has an error, an unassessed answer or no assessed answer, and `load run`
+then exits 1. That exit does not mean the cell has no result. The report is
+written in full first, and `load consumer-census [--out census.json]
+report.json` scores it offline. For every consumer and requested output mode
+it counts the owned ordinals, the post-ACK answers that were assessed and how
+many of those were silent stale. It discloses everything else: unassessed
+answers, errors (including pre-ACK and unsent calls), the ordinals with no
+assessed answer or with errors, unowned ordinals and any stale answer in them,
+and how many edits failed the run's consumer rule. A compact answer that does
+not show the subject has no freshness claim, so it is unassessed, never
+silent stale or clean. The census reads only the report: the stale count is
+the assessed answers that were neither pending nor showed the subject, and
+counts that do not add up are refused. Its `state` is `clean`,
+`errors_present` (no silent stale among the assessed answers, with errors or
+unassessed answers disclosed), `silent_stale`, or `no_result`, with a reason,
+when the report cannot be read, did not probe consumers, has no observed
+pre-edit baseline or own-ACK binding (reports written before
+`consumer_own_ack` existed), or has no owned, assessed answer. It exits 0 for
+`clean` and `errors_present`, 1 for `silent_stale` and 2 for `no_result`.
+A wrapper that scores consumer cells runs the census on the report instead of
+reading the run's exit 1 as no result. `--out` never overwrites a file.
+
 `--edit-mean DURATION` explicitly changes the per-editor offered Poisson mean
 for `edit-and-probe`, including paired hot-file offers. The default (or `0`)
 preserves the original 15-second plan and seeding. For example, `250ms` offers
@@ -378,11 +402,17 @@ checkouts require their own exact public view admission even though their
 repository prefix is shared. Linked edit records retain that admitted checkout
 ID; a missing or different receipt checkout ID cannot supply terminal graph
 or accounting evidence. Each route restores its admitted original bytes
-through its own editor and transaction after mutation outcomes settle. The
-source repositories stay read-only. Route steps preserve the original merged
-editor arrival stream and global marker/mutation IDs; a route with no offered
-ordinal is not silently given an extra edit. Implementation and fixture tests
-do not establish a completed live or reference campaign.
+through its own editor and transaction after mutation outcomes settle. A
+checkout whose bytes already equal its admitted original gets no write, and
+its restore row records `"unchanged": true`. If the product refused every edit
+on a route before admission, each record carrying `not_admitted` and no
+receipt, yet the checkout's bytes moved, the byte-guarded rewrite still runs
+and the row records `"not_admitted_but_changed": true`. That flag is recorded
+evidence, not a failure. The source repositories stay read-only. Route steps
+preserve the original merged editor arrival stream and global marker/mutation
+IDs; a route with no offered ordinal is not silently given an extra edit.
+Implementation and fixture tests do not establish a completed live or
+reference campaign.
 
 `--edit-wait-cochange` adds one setup step to the six-repository,
 six-editor cell, under either `--edit-ack` policy. The daemon's startup
@@ -443,6 +473,23 @@ re-sends stay in `busy_refusals`, and other calls' re-sends are not counted.
 `replayed: true`: the mutation ledger answered from an earlier attempt that
 committed, although that attempt's reply refused the edit. It changes no
 outcome.
+
+An edit record adds `not_admitted` when its logical call ended without the
+product admitting any attempt. It names the refusal that ended the call:
+- `view_read_only`: the checkout or byte admission refusal, whose text states
+  that no files were changed;
+- `view_building`: the session checkout gate's refusal of a checkout that is
+  not fully routed yet, which comes before any handler runs;
+- `server_busy`, or a retryable refusal's code such as `repo_loading`: the
+  deadline ended during the backoff after that refusal, with no further
+  request sent.
+
+Every earlier attempt must be a busy or retryable refusal, which LOAD already
+re-sends as not admitted. The exact texts are in
+`edit_probe_refusal_text.go`; any other wording leaves the field absent. So do
+a request still without a reply at the deadline, a tool deadline that
+abandoned running work, and a busy reply whose delivery is unknown: each may
+hide a write. The field does not change an outcome, an error or a client time.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -585,8 +632,13 @@ coalesces small-row bursts without a separate message-count refusal. Exhaustion 
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
 public batch restores the file after the measurement window; unknown/pending
-mutations prevent that cleanup rewrite. The native paired path uses the same
-cell machinery; other cells and reference acceptance remain separate gates.
+mutations prevent that cleanup rewrite. A record with `not_admitted` and no
+receipt is a known no-mutation outcome and does not block it. When the source
+bytes, and a move's destination bytes, already equal their originals, no write
+is sent, since the product refuses a rewrite of identical bytes; the restore
+records `{"status":"unchanged","write_sent":false}`. The native paired path
+uses the same cell machinery; other cells and reference acceptance remain
+separate gates.
 An owner-matching immutable physical return with explicitly missing or invalid
 deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.

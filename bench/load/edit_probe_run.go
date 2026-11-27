@@ -86,6 +86,7 @@ type editProbeRecord struct {
 	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
 	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
 	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	NotAdmitted                 string                              `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
 	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
 	Ack                         Metric                              `json:"t_ack_ms"`
 	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
@@ -797,6 +798,13 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	s.countBusy(purpose, attempts)
+	if purpose == "edit" && err != nil {
+		if refusal := editProbeNotAdmitted(attempts); refusal != "" {
+			s.mu.Lock()
+			s.record.NotAdmitted = refusal
+			s.mu.Unlock()
+		}
+	}
 	evidenceErr := s.emitOrHold(ctx, purpose, map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
@@ -1773,6 +1781,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
+		if record.NotAdmitted != "" && record.Receipt == "" && record.Batch == nil && record.Move == nil {
+			continue // The product refused this edit before admission; no file changed.
+		}
 		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
@@ -1783,6 +1794,24 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	unchanged := string(current) == string(r.original)
+	var currentDestination []byte
+	if r.plan.Tool == "refactor.move" {
+		currentDestination, err = os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
+		if err != nil {
+			return err
+		}
+		unchanged = unchanged && string(currentDestination) == string(r.moveOriginal)
+	}
+	if unchanged {
+		// The source bytes, and a move's destination bytes, already equal
+		// their originals, as when every edit was refused before admission.
+		// The product refuses a rewrite whose old and new bytes match, so
+		// none is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: bytes already equal the original")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"unchanged","write_sent":false}`)
+		return nil
 	}
 	// A terminal batch authorizes restoring only its retained owned after-image.
 	// The public conditional transaction still checks these bytes again at write time.
@@ -1803,10 +1832,6 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {
 		destination := r.p.Repos[0].Corpus.EditDestination
-		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
-		if readErr != nil {
-			return readErr
-		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
 	if err := r.restoreBatch(ctx, changes); err != nil {

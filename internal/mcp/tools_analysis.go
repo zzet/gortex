@@ -363,6 +363,12 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 	if checkoutScoped {
 		pending, freshnessErr = s.mutationFreshnessSummaryForRepos(ctx, repoPrefix)
 	} else {
+		// Read the freshness knobs before git runs. The middleware admitted
+		// a wait_deadline still in the future; one read after a slow diff can
+		// have passed by then, and a passed deadline no longer bounds the
+		// impact walk below, which would then wait its own 3 s budget at a
+		// held topology gate.
+		freshness = takeRequestFreshness(&req)
 		// Diff the files first: they are the relation scope the wait below
 		// is bounded to, so an edit elsewhere in the repository neither
 		// delays nor labels this answer.
@@ -374,7 +380,6 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		for i, file := range files.ChangedFiles {
 			keys[i] = analysis.GraphKey(repoPrefix, file, analysis.RepoRelativePath)
 		}
-		freshness = takeRequestFreshness(&req)
 		deadline = relationWaitDeadline(ctx, freshness)
 		label = s.awaitRelationFreshness(ctx, nil, keys, deadline)
 		if freshness.requireFresh && label.state != "" {
@@ -483,9 +488,16 @@ func (s *Server) handleDetectChanges(ctx context.Context, req mcp.CallToolReques
 		}
 	}
 
-	impact, err := s.analyzeDiffImpact(ctx, symbolIDs)
+	walkCtx, waits := withImpactCoordinationWaits(impactWalkContext(ctx, freshness))
+	impact, err := s.analyzeDiffImpact(walkCtx, symbolIDs)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if !checkoutScoped && waits.cutShort() && ctx.Err() == nil {
+		label = label.publicationPending()
+		if freshness.requireFresh {
+			return label.requireFreshError(), nil
+		}
 	}
 
 	detectResult := map[string]any{
@@ -554,7 +566,13 @@ func (s *Server) handleEnhancedChangeImpact(ctx context.Context, req mcp.CallToo
 	impactCtx, cancelImpact := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelImpact()
 	communities, processes := s.tryImpactAnalysisSnapshots()
-	impact := analysis.AnalyzeImpactContext(impactCtx, s.readerFor(ctx), ids, communities, processes)
+	impact := analysis.AnalyzeImpactContext(impactWalkContext(impactCtx, freshness), s.readerFor(ctx), ids, communities, processes)
+	if waits.cutShort() && ctx.Err() == nil {
+		label = label.publicationPending()
+		if freshness.requireFresh {
+			return label.requireFreshError(), nil
+		}
+	}
 
 	result := map[string]any{
 		"risk":                 impact.Risk,
