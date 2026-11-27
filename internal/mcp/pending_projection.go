@@ -95,6 +95,12 @@ type projectionEntry struct {
 	sourceCommitSeq uint64
 	// hash equals the store's FileMetaRow.ContentHash once the store holds
 	// these bytes; rawHash covers the bytes on disk for the suspect re-check.
+	// Invariant: a non-empty contentSHA256 always describes the same raw
+	// bytes as rawHash. buildFileProjection sets both from one buffer and
+	// committedCopy copies both; newProjectionEntry and tombstones leave
+	// contentSHA256 empty. publishedVersion relies on this pairing to tie a
+	// copy's byte check to the ledger record's SHA-256, so any constructor
+	// that sets contentSHA256 must compute it from the bytes behind rawHash.
 	hash          string
 	rawHash       [32]byte
 	contentSHA256 string
