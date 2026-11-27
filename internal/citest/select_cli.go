@@ -118,5 +118,5 @@ func RunSelect(ctx context.Context, root string, args, env []string, stdout, std
 	if err != nil {
 		return err
 	}
-	return appendFile(envValue(env, "GITHUB_OUTPUT"), fmt.Sprintf("mode=%s\nhas_tests=%t\nempty_ok=%t\nmatrix=%s\n", m.Mode, len(m.Matrix.Include) > 0, m.EmptyOK, matrix))
+	return appendFile(envValue(env, "GITHUB_OUTPUT"), fmt.Sprintf("mode=%s\nhas_tests=%t\nempty_ok=%t\nmacos=%t\nmatrix=%s\n", m.Mode, len(m.Matrix.Include) > 0, m.EmptyOK, m.MacOS.Selected, matrix))
 }

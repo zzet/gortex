@@ -83,7 +83,7 @@ func TestDocumentationUnsafeOwnershipAndContentStayFull(t *testing.T) {
 				f.write("unknown.data", "unclassified input\n")
 			}
 			m := f.plan(f.commit())
-			if m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 17 {
+			if m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != fullRows(t, false) {
 				t.Fatalf("unsafe documentation omitted: %+v", m)
 			}
 		})
@@ -136,7 +136,7 @@ func TestDocumentationOverridesAndUnsafeStatusesRemainFull(t *testing.T) {
 			e.Author = "dependabot[bot]"
 		}
 		m, err := f.planner.Plan(t.Context(), e)
-		if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 17 {
+		if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != fullRows(t, true) {
 			t.Fatalf("%s override ignored: %+v %v", name, m, err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestDocumentationCLIEmitsExplicitEmptyResultGateInputs(t *testing.T) {
 		t.Fatalf("selection CLI: %v: %s", err, &stderr)
 	}
 	data, err := os.ReadFile(output)
-	if err != nil || !strings.Contains(string(data), "mode=affected\nhas_tests=false\nempty_ok=true\n") {
+	if err != nil || !strings.Contains(string(data), "mode=affected\nhas_tests=false\nempty_ok=true\nmacos=false\n") {
 		t.Fatalf("result gate did not receive explicit validated empty outputs: %q %v", data, err)
 	}
 }
