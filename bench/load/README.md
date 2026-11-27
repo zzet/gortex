@@ -398,9 +398,19 @@ Standalone `--edit-gate-modes` runs may opt into `--lossless-edit-probe-evidence
 The `lossless-rpc-payload-v2` JSONL encodes response bytes with their original
 length and SHA-256, using base64, gzip, exact backward references, or 16 KiB
 dictionary chunks. Predecessors are scoped to one edit and bounded at 4 MiB
-and 128 keys. All accepted events and metadata count toward the original
-16 MiB encoded cap. The legacy logical JSONL size is reported separately.
+and 128 keys. All accepted events and metadata count toward the per-edit
+encoded cap, which is 64 MiB in these lossless gate-mode runs and 16 MiB in
+every other run. The legacy logical JSONL size is reported separately.
 The live oracles still consume the original response bytes.
+
+`--edit-probe-raw-limit-mib N` sets the per-edit cap explicitly for any
+edit-and-probe run, from 16 to 256 MiB; it never lowers the 16 MiB default.
+One encoded row is still bounded at 16 MiB under any cap. Each record reports
+its cap as `evidence_limit_bytes` next to `evidence_bytes`. A spool that would
+exceed its cap keeps the rows accepted before the refused one; the record
+becomes `harness_evidence_incomplete` (counted in the summary outcomes), and
+its error names the refused row and `limit_bytes`. A larger cap also means a
+larger worst-case spool: 100 edits at 64 MiB can take 6.4 GB of scratch.
 
 In every standalone edit-and-probe run, once an oracle's first-correct time is
 recorded and the receipt has reported the graph terminal, a background probe
@@ -413,8 +423,8 @@ first answer that differs, fails, is pending or is not correct, and that
 answer is kept in full. `evidence_folded_repeat_calls` counts folded calls per
 record. Immediate readbacks, the edit ACK, receipt status, CLI probes, relation
 consumer probes and paired runs are never folded, and the record, attempts,
-output-mode counts and stale checks still observe every call. The 16 MiB
-per-edit cap is unchanged; a long accounting wait after every oracle settled
+output-mode counts and stale checks still observe every call. Folding applies
+under every per-edit cap; a long accounting wait after every oracle settled
 no longer fills it with repeats.
 
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
@@ -610,8 +620,9 @@ readers.
 The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
 latency; raw JSONL persistence runs on owned per-edit writers with separately
-reported encoding/write overhead. The initial tiny-fixture raw budget is
-8 MiB per edit, shared by accepted pending and in-flight bytes. One wake signal
+reported encoding/write overhead. The raw budget is 16 MiB per edit by default
+(64 MiB in lossless gate-mode runs, see above), shared by accepted pending and
+in-flight bytes. One wake signal
 coalesces small-row bursts without a separate message-count refusal. Exhaustion or persistence failure is
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
@@ -736,6 +747,67 @@ publication. Cold startup polls readiness while the boot-time configured repos
 index; queryability and enrichment are separate observed upper bounds with a
 recorded polling interval. Older daemons without `loaded_roots` retain their
 legacy receipt and must still pass source-backed per-root checks.
+
+## Primary contract freshness
+
+`--scenario contract-freshness` (never part of `all`) measures how long a
+contract change in the primary checkout takes to read back fresh. It requires
+`--contract-freshness-edits N` (1–200), `--edit-agents 1`, `--worktrees 0` and
+one repository; `--agents` (0–16) adds pure readers on the primary checkout
+that stop when the witness finishes. The manifest must hold exactly one entry
+(a longer one is refused), a Go file whose `edit_template` inserts a top-level
+function after its `edit_anchor`.
+
+```sh
+go run ./bench/load run --binary /private/bin/gortex \
+  --manifest /private/corpus.json --scratch /private/load-artifacts \
+  --scenario contract-freshness --agents 0 --edit-agents 1 --worktrees 0 \
+  --contract-freshness-edits 40 --duration 900s --deadline 120s
+```
+
+Each witness edit `N` sends `edit.file` with the anchor plus one function,
+`GortexContractWitnessEN`, that calls
+`http.HandleFunc("GET /gortex-contract-witness/GortexContractWitnessEN", ...)`.
+That registration mints the provider contract ID
+`http::GET::/gortex-contract-witness/GortexContractWitnessEN`, which exists
+nowhere else. The reads are `analyze` with `kind: "contracts"`,
+`action: "list"`, `type: "http"`, `role: "provider"`, limit 10000 and the
+primary repository's actual prefix as `repo`. Both operations are on the
+compact surface that published releases also advertise, so a release and a
+candidate run identical requests.
+
+Before the first witness edit, inside the warm budget and untimed, the
+listing must answer complete: an incomplete-capability refusal or an answer the
+product marks pending is retried every 250 ms, and any other refusal fails the
+run. That gate is the primary checkout's first contract initialization; its
+read count and elapsed time are kept as `gate.contract_freshness_warm`, never
+as a witness edit's freshness time.
+
+One read before each edit must lack the ID; a listed ID ends the run as
+`identity_preexisting`. After the acknowledgement, reads repeat 250 ms apart
+until one lists the ID as a contract `id` (an echo in any other field does not
+count) or the `--deadline` budget from the edit's dispatch passes. Each read is
+`fresh`, `absent`, `absent_flagged` (the product's own `contract_analysis`
+reports it not fresh or not complete), `truncated`, `unparsed`, `error` or
+`deadline`. Releases without that self-report only produce `absent`.
+
+`phases[].contract_freshness` keeps every observation and distributions of:
+
+- `fresh_ms`: edit dispatch to the return of the first fresh read. This is the
+  comparable figure. A release whose acknowledgement waits for the contract
+  refresh and a build whose read waits for it instead spend the same work in
+  different calls.
+- `fresh_after_ack_ms` and `fresh_read_ms`: the part after the
+  acknowledgement, and the fresh read's own latency.
+- `acknowledged_ms`: the edit call itself.
+
+`fresh_not_before_ms` is when the last read that still lacked the ID began
+(0 when the first read after the acknowledgement was fresh), so the answer
+turned fresh between it and `fresh_ms`. A complete phase needs every witness
+edit read back fresh. `load delta` compares these distributions like any other
+timing row, and prints `contract_outcomes.<outcome>` for every outcome
+(`fresh`, `never_fresh`, `phase_censored`, `edit_error`, `baseline_error`,
+`identity_preexisting`), zero included, so both arms show the same rows.
 
 ## Startup admission
 

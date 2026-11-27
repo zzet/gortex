@@ -23,7 +23,18 @@ import (
 
 // This cumulative per-edit artifact allowance includes written, pending and
 // in-flight JSONL bytes. It is separate from each CLI call's stdout limit.
+// It is the default cap and, under any cap, the bound on one encoded row.
 const editProbeRawLimit = 16 << 20
+
+// Lossless gate-mode cells keep a long burst of distinct answers whole before
+// their evidence is incomplete. An explicit cap replaces either default, but
+// is never below the default nor above the maximum.
+const editProbeLosslessRawLimit = 64 << 20
+const editProbeMaxRawLimit = 256 << 20
+
+func editProbeKnownRawLimit(limit int) bool {
+	return limit >= editProbeRawLimit && limit <= editProbeMaxRawLimit
+}
 
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
@@ -265,6 +276,7 @@ type editProbeState struct {
 	rawBytes                                          int
 	rawAccepted                                       int
 	rawLogicalBytes                                   int64
+	rawLimit                                          int // per-edit cap; zero is the default
 	losslessEvidence                                  bool
 	payloadHistory                                    editProbePayloadHistory
 	repeatMu                                          sync.Mutex // repeats only; never held with mu or sinkMu
@@ -592,7 +604,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
-		state := &editProbeState{step: step, record: record, losslessEvidence: o.LosslessEditProbeEvidence}
+		state := &editProbeState{step: step, record: record, losslessEvidence: o.LosslessEditProbeEvidence, rawLimit: o.rawEvidenceLimit()}
 		r.states = append(r.states, state)
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
@@ -654,6 +666,13 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	return r, clients, nil
 }
 
+func (s *editProbeState) rawCap() int {
+	if s.rawLimit > 0 {
+		return s.rawLimit
+	}
+	return editProbeRawLimit
+}
+
 func (s *editProbeState) emit(value any) error {
 	started := time.Now()
 	if s.losslessEvidence {
@@ -683,7 +702,7 @@ func (s *editProbeState) emit(value any) error {
 	if s.rawClosing {
 		return fmt.Errorf("%w: raw writer already closing", errEditProbeEvidenceIncomplete)
 	}
-	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
+	if limit := s.rawCap(); len(data)+1 > editProbeRawLimit || s.rawAccepted+len(data)+1 > limit {
 		// Preserve only first-refusal scalar facts in the existing error path.
 		// The rejected payload is never queued or counted against accepted bytes.
 		row, _ := value.(map[string]any)
@@ -696,10 +715,10 @@ func (s *editProbeState) emit(value any) error {
 		if payload, known := row["payload"].(json.RawMessage); known {
 			payloadBytes = len(payload)
 		}
-		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
+		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: limit_bytes=%d row_limit_bytes=%d accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, limit, editProbeRawLimit, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
 		return s.sinkErr
 	}
-	// Pending and in-flight payloads share the unchanged total byte cap. A
+	// Pending and in-flight payloads share the total per-edit byte cap. A
 	// burst of small rows need not wait for the writer's next timeslice.
 	s.rawPending = append(s.rawPending, data...)
 	s.rawPending = append(s.rawPending, '\n')
@@ -1735,7 +1754,7 @@ func (r *editProbeRuntime) finish() error {
 		sinkErr := s.sinkErr
 		record.EvidenceWriteMS = float64(s.writeNS) / 1e6
 		record.EvidenceEncodeMS = float64(s.encodeNS) / 1e6
-		record.EvidenceBytes, record.EvidenceLimit = s.rawBytes, editProbeRawLimit
+		record.EvidenceBytes, record.EvidenceLimit = s.rawBytes, s.rawCap()
 		if s.losslessEvidence {
 			record.EvidenceCodec = editProbeLosslessCodec
 			record.EvidenceLogicalBytes = s.rawLogicalBytes

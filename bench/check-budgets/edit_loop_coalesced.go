@@ -29,7 +29,7 @@ func sharedFunctionalEditLoopObservations(wire editLoopWire, index int) bool {
 	if !sharedPhysicalEditLoop(wire) || r.Superseded != nil || r.Accounting.A == nil ||
 		r.ACKExact == nil || r.ACKStatus != "applied" || r.ACKDiskStatus != "committed" || r.MutationID == "" || r.ACKMutationID != r.MutationID || r.ACKCommitSeq == 0 ||
 		r.GraphTerminal == nil || !*r.GraphTerminal || r.StaleClaimedFresh == nil || *r.StaleClaimedFresh ||
-		r.EvidenceBytes <= 0 || r.EvidenceBytes > r.EvidenceLimit || r.EvidenceLimit != 8<<20 && r.EvidenceLimit != 16<<20 {
+		r.EvidenceBytes <= 0 || r.EvidenceBytes > r.EvidenceLimit || r.EvidenceLimit != 8<<20 && r.EvidenceLimit != 16<<20 && r.EvidenceLimit != 64<<20 {
 		return false
 	}
 	tiers := r.MutationTiers
