@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -245,7 +246,19 @@ func TestEditProbeBatchPlanKeepsOfferedPrefixAndScheduleAcrossFixtureLanguages(t
 	}
 }
 
-func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) {
+// editProbeBatchCollectorStub serves the three public owners a one-file batch
+// collector reads: the fresh transaction, the file observation built from an
+// ordinary receipt-status fixture, and the shared acknowledgement.
+type editProbeBatchCollectorStub struct {
+	refs             editProbeBatchReferences
+	tx, file, shared map[string]any
+	// onTransaction runs inside the stub, before any later status read is
+	// served, on each transaction status read with its 1-based count.
+	onTransaction func(int)
+}
+
+func newEditProbeBatchCollectorStub(t *testing.T, status map[string]any) *editProbeBatchCollectorStub {
+	t.Helper()
 	refs, err := decodeEditProbeBatchAcknowledgement(editProbeBatchACKFixture(), "transaction-1", editProbeBatchACKAbsPath(), "repo/file.go", editProbeBatchOfferedBytes())
 	if err != nil {
 		t.Fatal(err)
@@ -255,39 +268,48 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 	tx["graph_status"] = "fresh"
 	tx["files"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
 	tx["results"].([]any)[0].(map[string]any)["reindex_generation"] = json.Number("1")
-	file := editProbeAccountingFixture()
-	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": file["acknowledgement"]}
-	delete(file, "acknowledgement")
-	file["found"], file["receipt_kind"], file["receipt"] = true, "batch_file_observation", refs.Observation
-	file["transaction_id"], file["path"], file["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
-	file["after_sha256"], file["publication_receipt"], file["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
-	file["writer_return_observed"], file["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	shared := map[string]any{"found": true, "receipt": refs.Acknowledgement, "receipt_kind": "batch_acknowledgement", "acknowledgement": status["acknowledgement"]}
+	delete(status, "acknowledgement")
+	status["found"], status["receipt_kind"], status["receipt"] = true, "batch_file_observation", refs.Observation
+	status["transaction_id"], status["path"], status["batch_disk_verdict"] = refs.TransactionID, refs.RelativePath, "committed"
+	status["after_sha256"], status["publication_receipt"], status["publication_generation"] = refs.AfterSHA256, refs.GraphReceipt, json.Number("1")
+	status["writer_return_observed"], status["acknowledgement_state"] = true, "not_applicable_shared_transaction_rpc"
+	return &editProbeBatchCollectorStub{refs: refs, tx: tx, file: status, shared: shared}
+}
+
+// collect runs the actual collector against a stub daemon and returns the
+// owner each status read named, in order.
+func (f *editProbeBatchCollectorStub) collect(ctx context.Context, t *testing.T, state *editProbeState) []string {
+	t.Helper()
 	var mu sync.Mutex
 	var owners []string
+	transactions := 0
 	socket := startStub(t, func(frame stubFrame) (any, *rpcError) {
 		args, _ := frame.Params["arguments"].(map[string]any)
 		options, _ := args["options"].(map[string]any)
+		mu.Lock()
+		defer mu.Unlock()
 		var owner string
 		var response map[string]any
 		if frame.Params["name"] == "edit" {
 			owner, _ = options["transaction_id"].(string)
-			response = tx
+			transactions++
+			if f.onTransaction != nil {
+				f.onTransaction(transactions)
+			}
+			response = f.tx
 		} else {
 			owner, _ = options["receipt"].(string)
 			switch owner {
-			case refs.Observation:
-				response = file
-			case refs.Acknowledgement:
-				response = shared
+			case f.refs.Observation:
+				response = f.file
+			case f.refs.Acknowledgement:
+				response = f.shared
 			}
 		}
-		mu.Lock()
 		owners = append(owners, owner)
-		mu.Unlock()
 		return stubContent(response), nil
 	})
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
 	client, err := openMCP(ctx, socket, "")
 	if err != nil {
 		t.Fatal(err)
@@ -298,21 +320,144 @@ func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer sink.Close()
-	state := &editProbeState{client: client, sink: sink, record: editProbeRecord{FirstCorrect: map[string]Metric{"oracle": measured(1, "ms")}}}
+	state.client, state.sink = client, sink
 	state.startRaw()
-	defer state.finishRaw()
 	run := &editProbeRuntime{options: runOptions{Deadline: time.Second}, p: &privateRun{Repos: []privateRepo{{Prefix: "repo"}}}, phase: &Phase{Metrics: map[string]Metric{}}, origin: time.Now(), requireAccounting: true}
-	run.collectBatchEvidence(ctx, state, refs, editProbeBatchOfferedBytes())
+	run.collectBatchEvidence(ctx, state, f.refs, editProbeBatchOfferedBytes())
+	state.finishRaw()
+	mu.Lock()
+	defer mu.Unlock()
+	return owners
+}
+
+func TestEditProbeBatchCollectorReadsThreeIndependentPublicOwners(t *testing.T) {
+	stub := newEditProbeBatchCollectorStub(t, editProbeAccountingFixture())
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	state := &editProbeState{record: editProbeRecord{FirstCorrect: map[string]Metric{"oracle": measured(1, "ms")}}}
+	owners := stub.collect(ctx, t, state)
 	if ctx.Err() != nil || !state.record.GraphTerminal || state.record.Accounting.State != "observed_single_window_checks_pass" {
 		t.Fatalf("actual collector failed: %+v %v", state.record, ctx.Err())
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if !reflect.DeepEqual(owners, []string{refs.TransactionID, refs.Observation, refs.Acknowledgement}) {
+	if refs := stub.refs; !reflect.DeepEqual(owners, []string{refs.TransactionID, refs.Observation, refs.Acknowledgement}) {
 		t.Fatal("owner route mismatch", owners)
 	}
 	if state.record.Receipt != "" {
 		t.Fatal("invented single-file mutation receipt")
+	}
+}
+
+// The fresh batch shape that exhausted the per-edit raw cap: every
+// first-correct time is measured, but the physical attempt is a native
+// duplicate whose earlier publisher is never reported, so the accounting is
+// not terminal however long the collector waits.
+func TestEditProbeBatchCollectorStopsWhenAccountingStaysUnsettled(t *testing.T) {
+	includes := func(reasons, want []string) bool {
+		for _, reason := range want {
+			if !slices.Contains(reasons, reason) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, tc := range []struct {
+		name string
+		// The transaction read on which the last first-correct time is
+		// measured, on which the accounting changes (still unsettled), or on
+		// which the graph is fresh again after reads reported it pending.
+		lateAt, changeAt, freshAt int
+		// The first transaction read that reports the graph pending.
+		pendingAt int
+		// Every measured P phase disagrees with its B copy, so the
+		// accounting carries several B/P phase mismatch reasons.
+		mismatches bool
+	}{
+		{name: "observables_complete"},
+		{name: "first_correct_late", lateAt: 3 * editProbeAccountingSettlePolls},
+		{name: "accounting_changes", changeAt: editProbeAccountingSettlePolls - 1},
+		// Counted cycles before the graph turns pending make the reset
+		// observable: a skipped cycle would keep the count instead.
+		{name: "graph_pending_then_fresh", pendingAt: editProbeAccountingSettlePolls / 2, freshAt: 2 * editProbeAccountingSettlePolls},
+		// Each status read decodes a new phase map, so the mismatches are
+		// found in a different map order on every cycle.
+		{name: "mismatch_reasons_in_any_map_order", mismatches: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := editProbeRepairAccountingFixture()
+			delete(status, "read_assisted_publication")
+			var mismatched []string
+			if tc.mismatches {
+				// The B window stays valid: five laps grow by 1 ms and so
+				// does its wall.
+				background := status["requested_background"].(map[string]any)
+				for _, name := range []string{"attempt_setup", "patch_inspection", "attempt_finalize", "cohort_admission", "lane_wait"} {
+					background["phases_ms"].(map[string]any)[name] = json.Number("2")
+					mismatched = append(mismatched, "B/P phase mismatch: "+name)
+				}
+				background["background_wall_ms"] = json.Number("17")
+			}
+			stub := newEditProbeBatchCollectorStub(t, status)
+			if got := stub.refs.accounting(stub.file, stub.shared); got.State != "unavailable" || !slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || editProbeFinished(true, true, true, got) {
+				t.Fatalf("fixture is not the unsettled duplicate shape: %+v", got)
+			} else if got.B == nil || !includes(got.Reasons, mismatched) {
+				t.Fatalf("fixture lacks a valid B window or its B/P mismatches: %+v", got)
+			}
+			first := measured(1, "ms")
+			if tc.lateAt > 0 {
+				first = unavailable("ms", "not yet observed")
+			}
+			state := &editProbeState{record: editProbeRecord{FirstCorrect: map[string]Metric{"source": measured(1, "ms"), "text": first}}}
+			stub.onTransaction = func(count int) {
+				switch count {
+				case tc.lateAt:
+					state.mu.Lock()
+					state.record.FirstCorrect["text"] = measured(2, "ms")
+					state.mu.Unlock()
+				case tc.changeAt:
+					stub.file["requested_background"].(map[string]any)["background_wall_ms"] = json.Number("13")
+				case tc.pendingAt:
+					stub.tx["graph_status"] = "pending"
+				case tc.freshAt:
+					stub.tx["graph_status"] = "fresh"
+				}
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			owners := stub.collect(ctx, t, state)
+			reads := 0
+			for _, owner := range owners {
+				if owner == stub.refs.TransactionID {
+					reads++
+				}
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("collector polled until the deadline (%d status cycles, %d raw bytes) after every observable was complete", reads, state.rawBytes)
+			}
+			// Reads before the last first-correct time, before the last
+			// accounting change, and before the graph is fresh again do not
+			// count toward the bound.
+			if want := max(tc.lateAt, tc.changeAt, tc.freshAt, 1) + editProbeAccountingSettlePolls - 1; reads != want {
+				t.Fatalf("status cycles = %d, want %d", reads, want)
+			}
+			got := state.record.Accounting
+			if !state.record.GraphTerminal || got.State != "unavailable" || editProbeAccountingComplete(got) ||
+				!slices.Contains(got.Reasons, "actual publisher deep coverage unavailable") || !slices.Contains(got.Reasons, editProbeAccountingUnsettledReason) {
+				t.Fatalf("unsettled accounting was not kept unavailable with its stop reason: %+v", got)
+			}
+			// The mismatch reasons come out in one fixed order.
+			var order []string
+			for _, reason := range got.Reasons {
+				if strings.HasPrefix(reason, "B/P phase mismatch: ") {
+					order = append(order, reason)
+				}
+			}
+			if !includes(order, mismatched) || len(order) != len(mismatched) || !slices.IsSorted(order) {
+				t.Fatalf("B/P mismatch reasons = %q, want %q in sorted order", order, mismatched)
+			}
+			if state.sinkErr != nil || state.rawBytes == 0 {
+				t.Fatalf("raw evidence incomplete or missing: bytes=%d err=%v", state.rawBytes, state.sinkErr)
+			}
+		})
 	}
 }
 

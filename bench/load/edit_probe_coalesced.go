@@ -73,7 +73,7 @@ func sharedFunctionalRecord(record *editProbeRecord, scope *editProbePhysicalWri
 	if record == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 || record.CheckoutID != "" || record.Route != "" || record.Outcome != "diagnostic_failure" ||
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || record.ACKReadbackExact == nil ||
 		!record.GraphTerminal || record.StaleClaimedFresh || !coalescedFreshTiers(record.MutationTiers) || !coalescedMetricObserved(record.Ack) || !coalescedMetricObserved(record.Readback) ||
-		record.EvidenceBytes <= 0 || record.EvidenceLimit != editProbeRawLimit || record.EvidenceBytes > record.EvidenceLimit {
+		record.EvidenceBytes <= 0 || !editProbeKnownRawLimit(record.EvidenceLimit) || record.EvidenceBytes > record.EvidenceLimit {
 		return false
 	}
 	digest, err := hex.DecodeString(record.ACKContentSHA256)

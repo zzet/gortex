@@ -37,11 +37,14 @@ func coalescedEditLoopFixture(t *testing.T) (report, map[string]any, map[string]
 }
 
 func TestEditLoopQualifiedCoalescedFunctionalChecksIndependently(t *testing.T) {
-	for _, mode := range []string{"qualified", "missing_proof", "wrong_rpc", "unknown_scope", "accepted_original", "wrong_ACK", "incorrect_read", "missing_oracle", "false_fresh", "capped", "wrong_winner", "invented_background", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
+	for _, mode := range []string{"qualified", "lossless_cap", "missing_proof", "wrong_rpc", "unknown_scope", "accepted_original", "wrong_ACK", "incorrect_read", "missing_oracle", "false_fresh", "capped", "wrong_winner", "invented_background", "unknown_B_phase", "empty_B_phase", "unknown_mismatch", "empty_mismatch", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
 		t.Run(mode, func(t *testing.T) {
 			r, raw, first := coalescedEditLoopFixture(t)
 			proof := first["coalesced_functional_receipt"].(map[string]any)
 			switch mode {
+			case "lossless_cap":
+				// Complete evidence above the default cap, within a lossless cell's cap.
+				first["evidence_bytes"], first["evidence_limit_bytes"] = 20<<20, 64<<20
 			case "missing_tiers":
 				delete(first, "mutation_tiers")
 			case "pending_tier":
@@ -84,7 +87,7 @@ func TestEditLoopQualifiedCoalescedFunctionalChecksIndependently(t *testing.T) {
 			}
 			r.Phases[0].EditProbe = encoded
 			_, err = decodeEditLoopWire(r.Phases[0])
-			if (err == nil) != (mode == "qualified") {
+			if (err == nil) != (mode == "qualified" || mode == "lossless_cap") {
 				t.Fatalf("mode=%s error=%v", mode, err)
 			}
 		})
