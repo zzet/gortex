@@ -24,9 +24,14 @@ func checkCIResult(needs map[string]ciNeed, event string) error {
 		return err
 	}
 	outputs := needs["plan"].Outputs
-	mode, hasTests := outputs["mode"], outputs["has_tests"]
-	if (mode != "affected" && mode != "full") || (hasTests != "true" && hasTests != "false") {
+	mode, hasTests, macOS := outputs["mode"], outputs["has_tests"], outputs["macos"]
+	if (mode != "affected" && mode != "full") || (hasTests != "true" && hasTests != "false") || (macOS != "true" && macOS != "false") {
 		return fmt.Errorf("planning outputs are missing or invalid")
+	}
+	// Only a pull request may leave the macOS test partitions out. When they
+	// are selected, their rows are part of the test job's result below.
+	if event != "pull_request" && macOS != "true" {
+		return fmt.Errorf("macOS test partitions must run for %s", event)
 	}
 	if hasTests == "false" && (mode != "affected" || outputs["empty_ok"] != "true") {
 		return fmt.Errorf("empty test selection was not explicitly validated")
