@@ -69,6 +69,12 @@ func newCheckoutObservationFixture(t testing.TB) (*CheckoutLifecycle, *store_sql
 // tests assert is that each request returns within its bounded wait.
 var checkoutObservationTestWait = testTimingSlack(checkoutObservationWorkTimeout)
 
+// checkoutObservationTestWorkBudget replaces a job's work budget
+// (observationWorkTimeout) in tests that need their jobs to stay live across
+// several Git-backed steps. On a loaded machine those steps together can
+// outlast the production budget, and the job would expire mid-test.
+const checkoutObservationTestWorkBudget = time.Minute
+
 // Slow Git startup may outlive a request's wait budget, but retries must join
 // the same lifecycle-owned work. Only a typed pending outcome is retryable.
 func observeCheckoutUntilSettled(t testing.TB, lc *CheckoutLifecycle, path string, authorize ...func(string) error) (store_sqlite.Checkout, bool, error) {
@@ -276,6 +282,10 @@ func TestObserveCheckoutPathUnknownFamilyAndDeniedScopeHaveNoSideEffects(t *test
 // path outside every known family never takes a discovery slot.
 func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	lc, _, primary, familyID, _, closeFixture := newCheckoutObservationFixture(t)
+	// Eight sequential admissions each resolve the family through Git before
+	// they block, and the other family's discovery must finish within its own
+	// budget; neither may expire mid-test. The test cancels the stuck jobs itself.
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	const requestCount = 40
 	base := filepath.Dir(primary)
 	other := filepath.Join(base, "other")
@@ -368,7 +378,7 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	// Busy callers alone do not prove occupied slots: their 250ms budget
 	// also includes marker/catalog work before admission. Establish eight
 	// real blocked workers before the remaining burst, without retrying calls.
-	setupDeadline := time.Now().Add(checkoutObservationWorkTimeout)
+	setupDeadline := time.Now().Add(checkoutObservationTestWait)
 	setupCtx, cancelSetup := context.WithDeadline(t.Context(), setupDeadline)
 	defer cancelSetup()
 	for i := range checkoutObservationFamilyCapacity {
@@ -425,7 +435,7 @@ func TestObserveCheckoutPathStuckFamilyLeavesOtherRequestsAlone(t *testing.T) {
 	observeOutside("stuck", len(jobs))
 	// Another family's new worktree may wait for its own discovery only.
 	lateRoot := pathkey.CanonicalExistingRoot(late)
-	for deadline := time.Now().Add(checkoutObservationWorkTimeout); ; {
+	for deadline := time.Now().Add(checkoutObservationTestWait); ; {
 		checkout, found, err := lc.ObserveCheckoutPath(t.Context(), late)
 		var pending *CheckoutDiscoveryPendingError
 		if !errors.As(err, &pending) {
@@ -508,7 +518,7 @@ func TestObserveCheckoutPathDeniedDiscoveriesLeaveFamilyCapacity(t *testing.T) {
 	// The count below needs every denied job still live. Their proofs run one
 	// after another, and on a loaded machine eight of them can outlast a single
 	// job's work budget, so the earliest would expire before they are counted.
-	lc.observationWorkTimeout = time.Minute
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	worktree := filepath.Join(filepath.Dir(primary), "own")
 	builderGit(t, primary, "worktree", "add", "-b", "own", worktree)
 	denied := errors.New("outside authorized workspace")
@@ -584,6 +594,8 @@ func TestObserveCheckoutPathSlowMetadataReturnsRetryableBusy(t *testing.T) {
 
 func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T) {
 	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	// The first job must stay live, parked in the inventory, until it is released.
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	worktree := filepath.Join(filepath.Dir(primary), "slow-inventory")
 	builderGit(t, primary, "worktree", "add", "-b", "slow-inventory", worktree)
 	release := make(chan struct{})
@@ -591,8 +603,11 @@ func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T
 	unpark := func() { once.Do(func() { close(release) }) }
 	defer unpark()
 	var calls atomic.Int32
+	entered := make(chan struct{})
+	var enterOnce sync.Once
 	lc.observationInventory = func(ctx context.Context, path string) (*gitstate.FamilyInventory, error) {
 		calls.Add(1)
+		enterOnce.Do(func() { close(entered) })
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -608,14 +623,18 @@ func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T
 	if firstJob == nil || firstJob.ctx.Err() != nil {
 		t.Fatal("the caller's deadline stopped the shared inventory job")
 	}
+	// Git resolves the family before the inventory; retry only once the job is
+	// parked inside it, so the retry below joins a job blocked in the inventory.
+	select {
+	case <-entered:
+	case <-time.After(checkoutObservationTestWait):
+		t.Fatal("the shared job never reached the inventory")
+	}
 	_, found, err = lc.ObserveCheckoutPath(t.Context(), worktree)
 	if found || !errors.Is(err, ErrCheckoutMutationBusy) {
 		t.Fatalf("blocked inventory retry did not remain pending: found=%v err=%v", found, err)
 	}
-	// The job may not have reached the inventory yet (Git resolves the family
-	// first); it must not have entered it twice. The end of the test asserts
-	// exactly one call.
-	if checkoutObservationJobForTest(lc, worktree) != firstJob || calls.Load() > 1 {
+	if checkoutObservationJobForTest(lc, worktree) != firstJob || calls.Load() != 1 {
 		t.Fatal("retry replaced the in-flight inventory job")
 	}
 	unpark()
@@ -643,6 +662,8 @@ func TestObserveCheckoutPathSlowInventoryMakesProgressAcrossRetries(t *testing.T
 
 func TestObserveCheckoutPathSlowObservationRunsOnceAcrossRetries(t *testing.T) {
 	lc, _, primary, _, _, _ := newCheckoutObservationFixture(t)
+	// The injected 350ms HEAD sample plus slow Git must fit one job's budget.
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	worktree := filepath.Join(filepath.Dir(primary), "slow-observe")
 	builderGit(t, primary, "worktree", "add", "-b", "slow-observe", worktree)
 	var calls atomic.Int32
@@ -839,6 +860,8 @@ func TestObserveCheckoutPathRejectsBindingChangesWhileProofIsPending(t *testing.
 	for _, change := range []string{"root", "git_marker", "commondir_marker", "common_directory"} {
 		t.Run(change, func(t *testing.T) {
 			lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+			// The proof and the later admission share one job; slow Git must not expire it.
+			lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 			worktree := filepath.Join(filepath.Dir(primary), "pending-proof")
 			builderGit(t, primary, "worktree", "add", "-b", "pending-proof", worktree)
 			job, err := lc.checkoutObservation(pathkey.CanonicalExistingRoot(worktree), checkoutObservationTarget{}, true)
@@ -933,6 +956,8 @@ func checkoutObservationJobStateForTest(job *checkoutObservationJob) string {
 func completedCheckoutObservationForTest(t *testing.T) (*CheckoutLifecycle, *checkoutObservationJob, string, *atomic.Int32) {
 	t.Helper()
 	lc, _, primary, _, _, _ := newCheckoutObservationFixture(t)
+	// Callers reuse the completed job after setup; it must not expire first.
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	worktree := filepath.Join(filepath.Dir(primary), "completed")
 	builderGit(t, primary, "worktree", "add", "-b", "completed", worktree)
 	calls := &atomic.Int32{}
