@@ -107,12 +107,10 @@ func (s *Server) awaitSourceMutationFrontier(ctx context.Context, admissions []s
 	defer cancel()
 	outcomes := make([]mutationReindexOutcome, len(admissions))
 	var files []batchTransactionFile
-	queuedCheckout := false
 	for i, admission := range admissions {
 		if admission.receipt == nil {
 			if admission.inlinePath == "" && admission.checkout == nil {
 				outcomes[i] = admission.immediate
-				queuedCheckout = queuedCheckout || outcomes[i].checkoutScoped
 			} else {
 				outcomes[i] = s.awaitSourceMutations(withoutDispatchSlotRelease(waitCtx), admission)
 			}
@@ -123,12 +121,6 @@ func (s *Server) awaitSourceMutationFrontier(ctx context.Context, admissions []s
 	if len(files) == 0 {
 		// A selected checkout fast-ACKs one admitted operation. Even when
 		// it touched many files, the tagged legacy regression waits once.
-		// Its queued publications are asynchronous, so the operation's one
-		// publication wait is counted as not applicable, as a single-file
-		// checkout ACK's is (awaitSourceMutations).
-		if queuedCheckout {
-			s.recordUnwaitedReindex(ctx)
-		}
 		for _, outcome := range outcomes {
 			if outcome.Err == nil && outcome.Receipt != "" {
 				err := editGateCheckoutACKSeed(ctx, s)
