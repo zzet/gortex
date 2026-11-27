@@ -2278,6 +2278,15 @@
                               "deadline_reason": {
                                 "type": "string"
                               },
+                              "edit_refusal_retries": {
+                                "additionalProperties": {
+                                  "type": "integer"
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
                               "editor": {
                                 "type": "integer"
                               },
@@ -3014,6 +3023,9 @@
                                   }
                                 ]
                               },
+                              "not_admitted": {
+                                "type": "string"
+                              },
                               "ordinal": {
                                 "type": "integer"
                               },
@@ -3374,6 +3386,9 @@
                                   "object",
                                   "null"
                                 ]
+                              },
+                              "resent_edit_replayed": {
+                                "type": "boolean"
                               },
                               "restart": {
                                 "anyOf": [

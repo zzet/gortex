@@ -99,6 +99,7 @@ type editProbeRecord struct {
 	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
 	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
 	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	NotAdmitted                 string                              `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
 	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
 	Ack                         Metric                              `json:"t_ack_ms"`
 	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
@@ -121,6 +122,8 @@ type editProbeRecord struct {
 	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
 	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
 	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
+	EditRefusalRetries          map[string]int                      `json:"edit_refusal_retries,omitempty"`
+	ResentEditReplayed          bool                                `json:"resent_edit_replayed,omitempty"` // see noteResentReplay
 	Evidence                    string                              `json:"raw_evidence"`
 	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
 	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
@@ -881,6 +884,12 @@ func editProbeRetrySleep(seed int64, ordinal, stream int) func(context.Context, 
 	}
 }
 
+// editProbeBackoffCeiling is the longest wait editProbeRetrySleep takes for
+// delay: the delay plus at most half again as jitter.
+func editProbeBackoffCeiling(delay time.Duration) time.Duration {
+	return delay + delay/2
+}
+
 func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, error) {
 	data, identity, _, err := r.performObserved(ctx, s, client, req, purpose, role, stream)
 	return data, identity, err
@@ -903,10 +912,21 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	}
 	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
 	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, repo), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
+	s.countRefusalRetries(purpose, attempts)
+	if purpose == "edit" && err == nil && len(attempts) > 1 {
+		s.noteResentReplay(data, editProbeRequestOutput(req), r.plan.Tool)
+	}
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
 	s.countBusy(purpose, attempts)
+	if purpose == "edit" && err != nil {
+		if refusal := editProbeNotAdmitted(attempts); refusal != "" {
+			s.mu.Lock()
+			s.record.NotAdmitted = refusal
+			s.mu.Unlock()
+		}
+	}
 	evidenceErr := s.emitOrHold(ctx, purpose, map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
@@ -1253,9 +1273,15 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	if err != nil {
 		s.mu.Lock()
-		s.record.Outcome = "edit_error"
-		if ctx.Err() != nil {
+		switch code := editProbeDeclinedResend(err); {
+		case ctx.Err() != nil:
 			s.record.Outcome = "phase_censored"
+		case code != "":
+			// The product refused the edit and no re-send could be answered
+			// in time: the record ends on that refusal at its deadline.
+			s.record.Outcome, s.record.DeadlineReason = "product_deadline", code
+		default:
+			s.record.Outcome = "edit_error"
 		}
 		s.record.Errors = append(s.record.Errors, err.Error())
 		s.mu.Unlock()
@@ -1893,6 +1919,9 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
+		if record.NotAdmitted != "" && record.Receipt == "" && record.Batch == nil && record.Move == nil {
+			continue // The product refused this edit before admission; no file changed.
+		}
 		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
@@ -1903,6 +1932,24 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	unchanged := string(current) == string(r.original)
+	var currentDestination []byte
+	if r.plan.Tool == "refactor.move" {
+		currentDestination, err = os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
+		if err != nil {
+			return err
+		}
+		unchanged = unchanged && string(currentDestination) == string(r.moveOriginal)
+	}
+	if unchanged {
+		// The source bytes, and a move's destination bytes, already equal
+		// their originals, as when every edit was refused before admission.
+		// The product refuses a rewrite whose old and new bytes match, so
+		// none is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: bytes already equal the original")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"unchanged","write_sent":false}`)
+		return nil
 	}
 	// A terminal batch authorizes restoring only its retained owned after-image.
 	// The public conditional transaction still checks these bytes again at write time.
@@ -1923,10 +1970,6 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {
 		destination := r.p.Repos[0].Corpus.EditDestination
-		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
-		if readErr != nil {
-			return readErr
-		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
 	if err := r.restoreBatch(ctx, changes); err != nil {

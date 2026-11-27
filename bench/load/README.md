@@ -444,11 +444,17 @@ checkouts require their own exact public view admission even though their
 repository prefix is shared. Linked edit records retain that admitted checkout
 ID; a missing or different receipt checkout ID cannot supply terminal graph
 or accounting evidence. Each route restores its admitted original bytes
-through its own editor and transaction after mutation outcomes settle. The
-source repositories stay read-only. Route steps preserve the original merged
-editor arrival stream and global marker/mutation IDs; a route with no offered
-ordinal is not silently given an extra edit. Implementation and fixture tests
-do not establish a completed live or reference campaign.
+through its own editor and transaction after mutation outcomes settle. A
+checkout whose bytes already equal its admitted original gets no write, and
+its restore row records `"unchanged": true`. If the product refused every edit
+on a route before admission, each record carrying `not_admitted` and no
+receipt, yet the checkout's bytes moved, the byte-guarded rewrite still runs
+and the row records `"not_admitted_but_changed": true`. That flag is recorded
+evidence, not a failure. The source repositories stay read-only. Route steps
+preserve the original merged editor arrival stream and global marker/mutation
+IDs; a route with no offered ordinal is not silently given an extra edit.
+Implementation and fixture tests do not establish a completed live or
+reference campaign.
 
 `--edit-wait-cochange` adds one setup step to the six-repository,
 six-editor cell, under either `--edit-ack` policy. The daemon's startup
@@ -480,13 +486,56 @@ was first-correct and every assigned post-ACK witness was present, so only the
 required accounting was outstanding. Unchanged accounting ends that wait
 after eight status cycles (see the status-cycle bound below), so this
 reason means the accounting was still changing, or the deadline came first.
-Relocation and batch cells have no reason. `t_graph_terminal_ms` is the
+Relocation and batch cells have no reason. An edit that ended on a typed
+checkout refusal it could not re-send in time has the refusal code instead
+(see below). `t_graph_terminal_ms` is the
 client time from edit send to the first own status reply that reported the
 graph terminal. `busy_refusals` counts
 dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
 `readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
 `busy_refusals` totals. None of these changes an outcome, an error or a client
 time.
+
+An edit refused before admission while its linked checkout is still routing,
+or because the checkout's selected route moved, is re-sent with the same
+mutation id. Only two product texts qualify: `view_building: checkout "<id>"
+is not fully routed yet`, and the `view_read_only` admission refusal
+(`checkout mutation was not admitted; no files were changed: ...`) whose cause
+is the selected route moving. Any other wording, a second content item, or
+another JSON-RPC code stays terminal, and so does the admission refusal for a
+checkout whose disk changed. The product waits for the route before it
+refuses, so one refusal can take most of its tool deadline. A re-send is made
+only when the time left before the call's deadline exceeds the refused
+attempt's own time plus the longest backoff wait. Otherwise the call ends on
+the product's refusal: the phase attempt stays an error with that text, and
+the record ends as `product_deadline` with the refusal code (`view_building`
+or `view_read_only`) as `deadline_reason`. There is no other per-record retry
+cap. The post-run restore batch follows the same rule within its own
+deadline. `edit_refusal_retries` counts the edit call's re-sends after a
+retryable typed refusal, by code: the wire `error_code` (such as
+`repo_loading`), else the code that leads a plain-text tool error. Busy
+re-sends stay in `busy_refusals`, and other calls' re-sends are not counted.
+`resent_edit_replayed: true` marks a re-sent edit whose acknowledgement said
+`replayed: true`: the mutation ledger answered from an earlier attempt that
+committed, although that attempt's reply refused the edit. It changes no
+outcome.
+
+An edit record adds `not_admitted` when its logical call ended without the
+product admitting any attempt. It names the refusal that ended the call:
+- `view_read_only`: the checkout or byte admission refusal, whose text states
+  that no files were changed;
+- `view_building`: the session checkout gate's refusal of a checkout that is
+  not fully routed yet, which comes before any handler runs;
+- `server_busy`, or a retryable refusal's code such as `repo_loading`: the
+  deadline ended during the backoff after that refusal, with no further
+  request sent.
+
+Every earlier attempt must be a busy or retryable refusal, which LOAD already
+re-sends as not admitted. The exact texts are in
+`edit_probe_refusal_text.go`; any other wording leaves the field absent. So do
+a request still without a reply at the deadline, a tool deadline that
+abandoned running work, and a busy reply whose delivery is unknown: each may
+hide a write. The field does not change an outcome, an error or a client time.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -647,8 +696,13 @@ coalesces small-row bursts without a separate message-count refusal. Exhaustion 
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
 public batch restores the file after the measurement window; unknown/pending
-mutations prevent that cleanup rewrite. The native paired path uses the same
-cell machinery; other cells and reference acceptance remain separate gates.
+mutations prevent that cleanup rewrite. A record with `not_admitted` and no
+receipt is a known no-mutation outcome and does not block it. When the source
+bytes, and a move's destination bytes, already equal their originals, no write
+is sent, since the product refuses a rewrite of identical bytes; the restore
+records `{"status":"unchanged","write_sent":false}`. The native paired path
+uses the same cell machinery; other cells and reference acceptance remain
+separate gates.
 An owner-matching immutable physical return with explicitly missing or invalid
 deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.
@@ -718,7 +772,9 @@ counts may be zero outside edit scenarios. The floor still permits at most four
 total active agents (for example, zero readers plus four combined editors, or
 two plus two). `saturation` is an explicit closed-loop opt-in. Both profiles back
 off on busy refusal `-32002`: 50, 100, 200, 400, 800 ms, then at most 1 second.
-Busy refusals never cause an immediate retry loop.
+Busy refusals never cause an immediate retry loop. Edit-probe calls use the
+same schedule plus up to half again as jitter, also before re-sending after a
+retryable typed refusal (see `edit_refusal_retries`).
 
 Sustained reading uses ten operations: search symbols/text; read source/file/
 editing_context/summary; relations callers/usages; explore context; change

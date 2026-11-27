@@ -42,6 +42,9 @@ func (e *rpcError) retryEditProbe() bool {
 	if e.Code == -32002 {
 		return true
 	}
+	if e.Code == -32000 && editProbeTransientCheckoutRefusal(e.Message) != "" {
+		return true // a typed checkout refusal before admission; see the classifier
+	}
 	return e.Retriable || e.Code == -32000 && e.Data["error_code"] == "repo_loading" && e.Data["retryable"] == true
 }
 
