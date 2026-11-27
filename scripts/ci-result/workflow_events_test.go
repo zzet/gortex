@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -98,5 +99,70 @@ func TestCodeTriggerChangePreservesPushAndMeasurementBoundaries(t *testing.T) {
 	}
 	if !slices.Equal(request.Branches, []string{"main"}) {
 		t.Fatalf("performance trigger scope changed: %v", request.Branches)
+	}
+}
+
+// ciLabelGate admits every non-label event and the two labels that change the
+// plan. Each job that does work carries it or needs a job that does.
+const (
+	ciLabelGate      = "(github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'"
+	ciUnrelatedLabel = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:macos' && github.event.label.name != 'ci:full'"
+)
+
+type workflowJobs struct {
+	Concurrency struct {
+		Group string `yaml:"group"`
+	} `yaml:"concurrency"`
+	Jobs map[string]struct {
+		Name  string    `yaml:"name"`
+		If    string    `yaml:"if"`
+		Needs yaml.Node `yaml:"needs"`
+		Steps []struct {
+			If string `yaml:"if"`
+		} `yaml:"steps"`
+	} `yaml:"jobs"`
+}
+
+func TestUnrelatedLabelsDoNoCIWorkAndCannotCancelOrMaskTheRun(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow workflowJobs
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated label runs in a group of its own: it neither cancels the
+	// PR's running CI nor replaces its pending run.
+	wantGroup := "${{ github.workflow }}-${{ " + ciUnrelatedLabel + " && format('label-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
+	if workflow.Concurrency.Group != wantGroup {
+		t.Errorf("concurrency group = %q, want %q", workflow.Concurrency.Group, wantGroup)
+	}
+	for name, job := range workflow.Jobs {
+		var needs []string
+		if job.Needs.Kind == yaml.SequenceNode {
+			_ = job.Needs.Decode(&needs)
+		} else if job.Needs.Value != "" {
+			needs = []string{job.Needs.Value}
+		}
+		switch name {
+		case "parser-stress", "ci-result":
+			continue // manual-only, and the gate job checked below
+		}
+		if !strings.Contains(job.If, ciLabelGate) && !slices.Contains(needs, "plan") {
+			t.Errorf("job %s does work for every label: if=%q needs=%v", name, job.If, needs)
+		}
+	}
+	gate := workflow.Jobs["ci-result"]
+	if want := "${{ " + ciUnrelatedLabel + " && 'CI label event (no work)' || 'CI result' }}"; gate.Name != want {
+		t.Errorf("an unrelated label run must not post a CI result check: name=%q", gate.Name)
+	}
+	if gate.If != "always()" || len(gate.Steps) < 2 || gate.Steps[0].If != "${{ !("+ciLabelGate+") }}" {
+		t.Fatalf("gate job must run and announce skipped label runs: %+v", gate)
+	}
+	for i, step := range gate.Steps[1:] {
+		if step.If != ciLabelGate {
+			t.Errorf("gate step %d runs for unrelated labels: if=%q", i+1, step.If)
+		}
 	}
 }
