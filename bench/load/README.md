@@ -398,9 +398,19 @@ Standalone `--edit-gate-modes` runs may opt into `--lossless-edit-probe-evidence
 The `lossless-rpc-payload-v2` JSONL encodes response bytes with their original
 length and SHA-256, using base64, gzip, exact backward references, or 16 KiB
 dictionary chunks. Predecessors are scoped to one edit and bounded at 4 MiB
-and 128 keys. All accepted events and metadata count toward the original
-16 MiB encoded cap. The legacy logical JSONL size is reported separately.
+and 128 keys. All accepted events and metadata count toward the per-edit
+encoded cap, which is 64 MiB in these lossless gate-mode runs and 16 MiB in
+every other run. The legacy logical JSONL size is reported separately.
 The live oracles still consume the original response bytes.
+
+`--edit-probe-raw-limit-mib N` sets the per-edit cap explicitly for any
+edit-and-probe run, from 16 to 256 MiB; it never lowers the 16 MiB default.
+One encoded row is still bounded at 16 MiB under any cap. Each record reports
+its cap as `evidence_limit_bytes` next to `evidence_bytes`. A spool that would
+exceed its cap keeps the rows accepted before the refused one; the record
+becomes `harness_evidence_incomplete` (counted in the summary outcomes), and
+its error names the refused row and `limit_bytes`. A larger cap also means a
+larger worst-case spool: 100 edits at 64 MiB can take 6.4 GB of scratch.
 
 In every standalone edit-and-probe run, once an oracle's first-correct time is
 recorded and the receipt has reported the graph terminal, a background probe
@@ -413,8 +423,8 @@ first answer that differs, fails, is pending or is not correct, and that
 answer is kept in full. `evidence_folded_repeat_calls` counts folded calls per
 record. Immediate readbacks, the edit ACK, receipt status, CLI probes, relation
 consumer probes and paired runs are never folded, and the record, attempts,
-output-mode counts and stale checks still observe every call. The 16 MiB
-per-edit cap is unchanged; a long accounting wait after every oracle settled
+output-mode counts and stale checks still observe every call. Folding applies
+under every per-edit cap; a long accounting wait after every oracle settled
 no longer fills it with repeats.
 
 `--edit-repos 6 --edit-agents 6 --agents 0 --worktrees 0` selects exactly
@@ -610,8 +620,9 @@ readers.
 The report retains raw call identities, independent ACK/physical/requested
 background accounting, and missing evidence. RPC return timestamps delimit
 latency; raw JSONL persistence runs on owned per-edit writers with separately
-reported encoding/write overhead. The initial tiny-fixture raw budget is
-8 MiB per edit, shared by accepted pending and in-flight bytes. One wake signal
+reported encoding/write overhead. The raw budget is 16 MiB per edit by default
+(64 MiB in lossless gate-mode runs, see above), shared by accepted pending and
+in-flight bytes. One wake signal
 coalesces small-row bursts without a separate message-count refusal. Exhaustion or persistence failure is
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed

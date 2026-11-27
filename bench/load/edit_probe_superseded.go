@@ -66,7 +66,7 @@ func classifySupersededRecord(record *editProbeRecord, scope *editProbePhysicalW
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID ||
 		record.ACKReadbackExact == nil || record.ACKCommitSeq == 0 || record.Ack.Value == nil || !record.GraphTerminal ||
 		record.StaleClaimedFresh ||
-		record.EvidenceBytes <= 0 || record.EvidenceLimit != editProbeRawLimit || record.EvidenceBytes > record.EvidenceLimit {
+		record.EvidenceBytes <= 0 || !editProbeKnownRawLimit(record.EvidenceLimit) || record.EvidenceBytes > record.EvidenceLimit {
 		return false
 	}
 	digest, err := hex.DecodeString(record.ACKContentSHA256)
