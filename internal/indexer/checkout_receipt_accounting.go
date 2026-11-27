@@ -22,7 +22,10 @@ import "time"
 //     reads not_observed and the disposition names the checkout refresh
 //     cycle. Only a ticket the cycle owed at its start gets one: a ticket that
 //     rode a cycle already in flight was not what that cycle ran for, as a
-//     watcher's coalesced receipt does not borrow its winner's P.
+//     watcher's coalesced receipt does not borrow its winner's P. A ticket
+//     carried across deferred, rescheduled, or retried cycles gets no P
+//     either: the final cycle's window alone is not the ticket's first-try
+//     physical attempt.
 //   - B, the frozen refusal of a requested-background binding: no measured B
 //     window exists for a checkout ticket, and none can arrive later.
 //
@@ -58,7 +61,14 @@ func (p *PublicationPhaseRecord) recordCheckoutPublication(ticket uint64, cycleS
 		p.attemptWindow != nil || p.background != nil || p.backgroundUnavailable != nil || p.coalescedWinner.Value() != nil {
 		return
 	}
-	if !cycleStarted.IsZero() && !cycleStarted.Before(p.origin) && !completed.Before(cycleStarted) {
+	carried := false
+	for _, mark := range p.marks {
+		if mark.phase == PublicationCycleStarted && mark.at.Before(cycleStarted) {
+			carried = true
+			break
+		}
+	}
+	if !carried && !cycleStarted.IsZero() && !cycleStarted.Before(p.origin) && !completed.Before(cycleStarted) {
 		p.attemptWindow = &canonicalAttemptWindow{
 			startNS: cycleStarted.Sub(p.origin).Nanoseconds(), endNS: completed.Sub(p.origin).Nanoseconds(),
 			ticket: ticket, checkoutCycle: true,
