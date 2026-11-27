@@ -539,12 +539,19 @@ func truncatedClosureProducers(handle *store_sqlite.Store) bool {
 		return true
 	}
 	for _, row := range rows {
-		switch row.Producer {
-		case string(graphview.CapResolutionLocal), string(graphview.CapIncomingEdges):
-			if row.State == store_sqlite.ProducerStateIncomplete {
-				return true
-			}
+		if truncatedClosureRow(row) {
+			return true
 		}
+	}
+	return false
+}
+
+// truncatedClosureRow reports whether row is a resolution or incoming-edge
+// producer declared incomplete, the row a truncated closure leaves.
+func truncatedClosureRow(row store_sqlite.ProducerCompleteness) bool {
+	switch row.Producer {
+	case string(graphview.CapResolutionLocal), string(graphview.CapIncomingEdges):
+		return row.State == store_sqlite.ProducerStateIncomplete
 	}
 	return false
 }
