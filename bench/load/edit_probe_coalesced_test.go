@@ -52,7 +52,7 @@ func coalescedFunctionalRecordFixture(t *testing.T) (editProbeRecord, map[string
 }
 
 func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
-	for _, mode := range []string{"qualified", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
+	for _, mode := range []string{"qualified", "lossless_cap", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
 		t.Run(mode, func(t *testing.T) {
 			record, _ := coalescedFunctionalRecordFixture(t)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
@@ -71,6 +71,9 @@ func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
 				delete(record.FirstCorrect, "call_chain")
 			case "false_fresh":
 				record.StaleClaimedFresh = true
+			case "lossless_cap":
+				// Complete evidence above the default cap, within a lossless cell's cap.
+				record.EvidenceLimit, record.EvidenceBytes = 64<<20, 20<<20
 			case "cap":
 				record.Outcome = "harness_evidence_incomplete"
 			case "deadline":
@@ -96,7 +99,7 @@ func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
 			}
 			p := record.Accounting.P
 			got := classifyCoalescedFunctionalRecord(&record, scope)
-			if got != (mode == "qualified") {
+			if got != (mode == "qualified" || mode == "lossless_cap") {
 				t.Fatalf("mode=%s classified=%v", mode, got)
 			}
 			if got {
