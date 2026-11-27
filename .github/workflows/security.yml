@@ -7,12 +7,12 @@ on:
   schedule:
     - cron: '0 6 * * *'
 
-# One run per PR: a new push cancels the PR's older run. Every other event
-# (pushes to main, schedules) gets its own group from the run ID, so none of
-# those runs is ever cancelled or replaced while pending.
+# One group per PR and one per branch. A new push cancels the PR's older run.
+# On main a running run always finishes; GitHub keeps one pending run per
+# group, so a newer push replaces only the older run that has not started yet.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

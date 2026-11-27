@@ -13,6 +13,10 @@ import (
 type workflowEventContract struct {
 	On          map[string]yaml.Node `yaml:"on"`
 	Permissions map[string]string    `yaml:"permissions"`
+	Concurrency struct {
+		Group  string `yaml:"group"`
+		Cancel string `yaml:"cancel-in-progress"`
+	} `yaml:"concurrency"`
 }
 
 func readWorkflowEvents(t *testing.T, name string) workflowEventContract {
@@ -46,6 +50,21 @@ func TestCodeChecksRunForEveryPullRequestBase(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Pushes to one branch share a group, so a newer push replaces the older
+// pending run instead of queueing another full matrix. Only pull request runs
+// are cancelled while running; a running main run always finishes.
+func TestMainPushRunsShareOneGroupAndFinishOnceStarted(t *testing.T) {
+	for _, name := range []string{"ci.yml", "security.yml"} {
+		workflow := readWorkflowEvents(t, name)
+		if got, want := workflow.Concurrency.Group, "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"; got != want {
+			t.Errorf("%s concurrency group = %q, want %q", name, got, want)
+		}
+		if got, want := workflow.Concurrency.Cancel, "${{ github.event_name == 'pull_request' }}"; got != want {
+			t.Errorf("%s cancel-in-progress = %q, want %q", name, got, want)
+		}
 	}
 }
 
