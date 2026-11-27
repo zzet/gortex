@@ -43,6 +43,12 @@ func newWorktreeMCPServer(t *testing.T, repos ...config.RepoEntry) (*Server, *in
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
+	// A track_repository call changes the tracked set, which hands a rollup
+	// rerun to the lifecycle's analysis lane. That worker outlives the call by
+	// design and, after its quiet interval, reads process-wide state such as
+	// pathkey.CaseInsensitivePaths. Closing the lifecycle joins it, so the
+	// worker cannot run on into a later test that changes that state.
+	t.Cleanup(func() { require.NoError(t, srv.lifecycle.Close()) })
 	return srv, mi
 }
 

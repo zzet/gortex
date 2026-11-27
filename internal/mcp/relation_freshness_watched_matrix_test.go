@@ -74,24 +74,12 @@ type watchedMatrixFixture struct {
 	s         *Server
 	store     *watchedMatrixStore
 	watcher   *indexer.Watcher
-	admission *watchedMatrixWatcher
+	relations *relationGenerationWitness
 	ctx       context.Context
 	path      string
 	file      string
 	facade    bool
 	unblock   func()
-}
-
-// watchedMatrixWatcher counts every publication the server admits, so a test
-// can tell whether a read admitted a catch-up generation of its own.
-type watchedMatrixWatcher struct {
-	sharedReceiptWatcher
-	admitted atomic.Int64
-}
-
-func (w *watchedMatrixWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
-	w.admitted.Add(1)
-	return w.sharedReceiptWatcher.EnqueueToolMutation(ctx, path)
 }
 
 func newWatchedMatrixFixture(t *testing.T, files map[string]string, file string, hold watchedMatrixHold, facade bool) *watchedMatrixFixture {
@@ -122,8 +110,8 @@ func newWatchedMatrixFixture(t *testing.T, files map[string]string, file string,
 	require.NoError(t, err)
 	require.NoError(t, f.watcher.Start([]string{root}))
 	t.Cleanup(func() { f.unblock(); require.NoError(t, f.watcher.Stop()) })
-	f.admission = &watchedMatrixWatcher{sharedReceiptWatcher: sharedReceiptWatcher{f.watcher}}
-	f.s.SetWatcher(f.admission)
+	f.relations = newRelationGenerationWitness(f.path)
+	f.s.SetWatcher(&sharedReceiptWatcher{Watcher: f.watcher, relations: f.relations})
 
 	session := "watched-matrix-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
 	require.NoError(t, f.s.ConnectSession(session, func([]byte) error { return nil }))
@@ -191,24 +179,26 @@ func (f *watchedMatrixFixture) awaitNoGeneration(t *testing.T) {
 
 // recovered reads once the watcher has no admitted generation left for the
 // file, until a reply carries no relation state. read scores the reply's edge
-// set itself and returns its relation state. The edit's projection is retired
-// only after its receipt completes, so a read just after publication can still
-// re-verify that projection and admit a catch-up generation for the same
-// bytes; its reply then truthfully reports that generation as pending. A reply
-// may therefore carry a relation state only when its own read admitted a
-// generation, and the next reply after that generation publishes is scored
-// again.
+// set itself and returns its relation state. A read just after publication can
+// still see a new generation for the same bytes: the edit's projection is
+// retired only after its receipt completes, so the read can re-verify it and
+// admit a catch-up, and FSEvents can deliver the edit's own native event after
+// the edit's ticket has finished. The reply then truthfully reports that
+// generation as pending. A reply may therefore carry a relation state only
+// when the server's own freshness snapshots for that read saw a generation
+// admitted during it, and the next reply after that generation publishes is
+// scored again.
 func (f *watchedMatrixFixture) recovered(t *testing.T, read func(id int) string) {
 	t.Helper()
 	for attempt := range 3 {
 		f.awaitNoGeneration(t)
-		admitted := f.admission.admitted.Load()
+		admitted := f.relations.generation()
 		state := read(10 + attempt)
 		if state == "" {
 			return
 		}
-		require.Greater(t, f.admission.admitted.Load(), admitted,
-			"a reply after publication kept a relation state its read did not cause: %s", state)
+		require.Greater(t, f.relations.generation(), admitted,
+			"a reply after publication kept a relation state no generation admitted during its read explains: %s", state)
 	}
 	t.Fatal("replies after publication kept admitting catch-up generations")
 }
