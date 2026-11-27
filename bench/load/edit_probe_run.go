@@ -1781,10 +1781,21 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if string(current) == string(r.original) && r.plan.Tool != "refactor.move" {
-		// Every edit was refused before admission. The product refuses a
-		// rewrite whose old and new bytes match, so none is sent.
-		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: source bytes equal the original")
+	unchanged := string(current) == string(r.original)
+	var currentDestination []byte
+	if r.plan.Tool == "refactor.move" {
+		currentDestination, err = os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
+		if err != nil {
+			return err
+		}
+		unchanged = unchanged && string(currentDestination) == string(r.moveOriginal)
+	}
+	if unchanged {
+		// The source bytes, and a move's destination bytes, already equal
+		// their originals, as when every edit was refused before admission.
+		// The product refuses a rewrite whose old and new bytes match, so
+		// none is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: bytes already equal the original")
 		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"unchanged","write_sent":false}`)
 		return nil
 	}
@@ -1807,10 +1818,6 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {
 		destination := r.p.Repos[0].Corpus.EditDestination
-		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
-		if readErr != nil {
-			return readErr
-		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
 	if err := r.restoreBatch(ctx, changes); err != nil {

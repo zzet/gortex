@@ -402,11 +402,17 @@ checkouts require their own exact public view admission even though their
 repository prefix is shared. Linked edit records retain that admitted checkout
 ID; a missing or different receipt checkout ID cannot supply terminal graph
 or accounting evidence. Each route restores its admitted original bytes
-through its own editor and transaction after mutation outcomes settle. The
-source repositories stay read-only. Route steps preserve the original merged
-editor arrival stream and global marker/mutation IDs; a route with no offered
-ordinal is not silently given an extra edit. Implementation and fixture tests
-do not establish a completed live or reference campaign.
+through its own editor and transaction after mutation outcomes settle. A
+checkout whose bytes already equal its admitted original gets no write, and
+its restore row records `"unchanged": true`. If the product refused every edit
+on a route before admission, each record carrying `not_admitted` and no
+receipt, yet the checkout's bytes moved, the byte-guarded rewrite still runs
+and the row records `"not_admitted_but_changed": true`. That flag is recorded
+evidence, not a failure. The source repositories stay read-only. Route steps
+preserve the original merged editor arrival stream and global marker/mutation
+IDs; a route with no offered ordinal is not silently given an extra edit.
+Implementation and fixture tests do not establish a completed live or
+reference campaign.
 
 `--edit-wait-cochange` adds one setup step to the six-repository,
 six-editor cell, under either `--edit-ack` policy. The daemon's startup
@@ -442,6 +448,23 @@ dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
 `readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
 `busy_refusals` totals. None of these changes an outcome, an error or a client
 time.
+
+An edit record adds `not_admitted` when its logical call ended without the
+product admitting any attempt. It names the refusal that ended the call:
+- `view_read_only`: the checkout or byte admission refusal, whose text states
+  that no files were changed;
+- `view_building`: the session checkout gate's refusal of a checkout that is
+  not fully routed yet, which comes before any handler runs;
+- `server_busy`, or a retryable refusal's code such as `repo_loading`: the
+  deadline ended during the backoff after that refusal, with no further
+  request sent.
+
+Every earlier attempt must be a busy or retryable refusal, which LOAD already
+re-sends as not admitted. The exact texts are in
+`edit_probe_refusal_text.go`; any other wording leaves the field absent. So do
+a request still without a reply at the deadline, a tool deadline that
+abandoned running work, and a busy reply whose delivery is unknown: each may
+hide a write. The field does not change an outcome, an error or a client time.
 
 `edit_sender` selects a native or lifecycle traffic cell; without it every plan
 is unchanged, and paired runs refuse it. A native write goes around MCP, so its
@@ -584,8 +607,13 @@ coalesces small-row bursts without a separate message-count refusal. Exhaustion 
 `harness_evidence_incomplete`, never product failure or a successful check.
 Reference inputs require a reviewed evidence budget before execution. One timed
 public batch restores the file after the measurement window; unknown/pending
-mutations prevent that cleanup rewrite. The native paired path uses the same
-cell machinery; other cells and reference acceptance remain separate gates.
+mutations prevent that cleanup rewrite. A record with `not_admitted` and no
+receipt is a known no-mutation outcome and does not block it. When the source
+bytes, and a move's destination bytes, already equal their originals, no write
+is sent, since the product refuses a rewrite of identical bytes; the restore
+records `{"status":"unchanged","write_sent":false}`. The native paired path
+uses the same cell machinery; other cells and reference acceptance remain
+separate gates.
 An owner-matching immutable physical return with explicitly missing or invalid
 deep laps ends that edit as failed coverage once its graph and read evidence
 have arrived. Receipt terminality alone still waits for late physical evidence.
