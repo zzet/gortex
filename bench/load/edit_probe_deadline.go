@@ -1,9 +1,6 @@
 package main
 
-import (
-	"strings"
-	"time"
-)
+import "time"
 
 // A product deadline keeps its outcome. Its reason names what the receipt
 // loop still awaited when the edit's own context expired, from that loop's
@@ -86,19 +83,11 @@ func (s *editProbeState) countBusy(purpose string, attempts []Attempt) {
 func editProbeRefusalRetries(attempts []Attempt) map[string]int {
 	var retries map[string]int
 	for i, attempt := range attempts {
-		if attempt.Outcome != "retryable" || i+1 == len(attempts) {
+		if attempt.Outcome != "retryable" || i+1 == len(attempts) || backoffEndedTerminal(attempts[i+1]) {
 			continue
 		}
-		next := attempts[i+1]
-		if next.Code == 0 && next.DurationMS == 0 && strings.HasPrefix(next.Error, "busy backoff ended") {
-			continue
-		}
-		// The wire's error_code, or the code leading a plain-text tool error.
-		code, _ := attempt.ErrorData["error_code"].(string)
+		code := editProbeRefusalCode(attempt)
 		if code == "" {
-			code, _, _ = strings.Cut(strings.TrimPrefix(attempt.Error, "RPC -32000: "), ": ")
-		}
-		if code == "" || strings.ContainsAny(code, " \n") {
 			code = "retryable"
 		}
 		if retries == nil {

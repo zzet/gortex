@@ -264,6 +264,10 @@ func TestEditProbeRetriesTransientCheckoutRefusalsWithinDeadline(t *testing.T) {
 			if !slices.Equal(record.Errors, []string{refusal}) {
 				t.Fatalf("record errors %q, want only the typed refusal", record.Errors)
 			}
+			// So the outcome stays known: the product admitted no attempt.
+			if record.NotAdmitted != cell.reason {
+				t.Fatalf("not_admitted %q, want %q", record.NotAdmitted, cell.reason)
+			}
 			run.mu.Lock()
 			var final Attempt
 			for _, attempt := range phase.Attempts {
@@ -291,18 +295,19 @@ func TestEditProbeCheckoutRefusalResendNeedsRoomForAnother(t *testing.T) {
 		text  string // "" applies the edit
 	}
 	for _, cell := range []struct {
-		name     string
-		timeout  time.Duration
-		replies  []reply // the last repeats
-		outcomes []string
+		name        string
+		timeout     time.Duration
+		replies     []reply // the last repeats
+		outcomes    []string
+		notAdmitted string // editProbeNotAdmitted over the call's attempts
 	}{
 		// 63 s left after the first refusal, 6 s after the second.
-		{"view_building_57s_of_120s", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"retryable", "error"}},
+		{"view_building_57s_of_120s", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"retryable", "error"}, "view_building"},
 		// Busy refusals had used the rest; 17.5 s left after the refusal.
-		{"view_building_57s_with_17_5s_left", 74500 * time.Millisecond, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"error"}},
+		{"view_building_57s_with_17_5s_left", 74500 * time.Millisecond, []reply{{57 * time.Second, refusalRetryNotRouted}}, []string{"error"}, "view_building"},
 		// 82 s left, then 44 s, then 6 s.
-		{"moved_route_38s_of_120s", 120 * time.Second, []reply{{38 * time.Second, refusalRetryRouteMoved}}, []string{"retryable", "retryable", "error"}},
-		{"route_ready_on_the_resend", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}, {time.Second, ""}}, []string{"retryable", "success"}},
+		{"moved_route_38s_of_120s", 120 * time.Second, []reply{{38 * time.Second, refusalRetryRouteMoved}}, []string{"retryable", "retryable", "error"}, "view_read_only"},
+		{"route_ready_on_the_resend", 120 * time.Second, []reply{{57 * time.Second, refusalRetryNotRouted}, {time.Second, ""}}, []string{"retryable", "success"}, ""},
 	} {
 		t.Run(cell.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -327,6 +332,10 @@ func TestEditProbeCheckoutRefusalResendNeedsRoomForAnother(t *testing.T) {
 				}
 				if !slices.Equal(outcomes, cell.outcomes) || caller.calls != len(cell.outcomes) {
 					t.Fatalf("attempts %v after %d requests, want %v: %v", outcomes, caller.calls, cell.outcomes, err)
+				}
+				// The refusal that ended the call keeps the outcome known.
+				if got := editProbeNotAdmitted(attempts); got != cell.notAdmitted {
+					t.Fatalf("not admitted %q, want %q", got, cell.notAdmitted)
 				}
 				final := cell.replies[min(len(cell.outcomes)-1, len(cell.replies)-1)].text
 				if final == "" {

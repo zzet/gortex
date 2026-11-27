@@ -15,17 +15,17 @@ import (
 // checkout's route is not ready; the product's guidance is to retry, with no
 // reconnect. view_read_only on a moved route: the product refused admission,
 // changed no files, and asks for a retry on a fresh view. Both refuse before
-// admission, so re-sending the same edit cannot apply it twice. The texts
-// match the product's messages exactly; any other wording stays terminal.
+// admission, so re-sending the same edit cannot apply it twice. The texts are
+// in edit_probe_refusal_text.go and match the product's messages exactly; any
+// other wording, cause or second content item stays terminal.
 func editProbeTransientCheckoutRefusal(message string) string {
 	if strings.Contains(message, "\n") {
 		return ""
 	}
-	if strings.HasPrefix(message, `view_building: checkout "`) && strings.HasSuffix(message, `" is not fully routed yet`) {
+	if checkoutNotRouted(message) {
 		return "view_building"
 	}
-	if strings.HasPrefix(message, "view_read_only: checkout mutation was not admitted; no files were changed: ") &&
-		strings.Contains(message, ": indexer: checkout mutation view is stale: the selected route moved") {
+	if strings.HasPrefix(message, checkoutNotAdmittedPrefix) && strings.Contains(message, checkoutRouteMovedCause) {
 		return "view_read_only"
 	}
 	return ""
