@@ -1192,7 +1192,7 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 			var freshnessErr error
 			result, freshnessErr = s.decorateToolFreshnessChecked(ctx, spec.Legacy, forwarded, result)
 			if freshnessErr != nil {
-				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, forwarded, freshnessErr) {
+				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateFileReadProjectionChange(ctx, forwarded, freshnessErr) {
 					return nil, errProjectedSourceMoved
 				}
 				result = s.metadataReadError(ctx, forwarded, freshnessErr)

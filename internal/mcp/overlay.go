@@ -503,7 +503,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, err
 					}
 				}
-				if auditedProjectionRead && (retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, freshnessErr)) {
+				if auditedProjectionRead && (retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateFileReadProjectionChange(ctx, req, freshnessErr)) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, freshnessErr)
@@ -524,7 +524,7 @@ func (s *Server) wrapToolHandlerMode(h mcpserver.ToolHandlerFunc, injectOverlay 
 						return pending, pendingErr
 					}
 				}
-				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateSummaryProjectionChange(ctx, req, err) {
+				if retryAfterCheckedProjectionChange(ctx) || s.retryAfterLateFileReadProjectionChange(ctx, req, err) {
 					return nil, errProjectedSourceMoved
 				}
 				res = s.metadataReadError(ctx, req, annotateProjectionReadRefusal(projectionReadFinal, projectionOwnerLive, err))

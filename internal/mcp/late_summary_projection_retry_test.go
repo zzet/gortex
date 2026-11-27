@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/stretchr/testify/require"
 	"github.com/zzet/gortex/internal/indexer"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestLateSummaryProjectionProofKeepsRefusalFences(t *testing.T) {
-	for _, change := range []string{"newer_same_bytes_commit", "different_bytes_same_stamp", "event_during_check", "cancelled", "replay_unsafe", "deadline_expired", "attempts_spent", "foreign_checkout", "unproven_version", "other_tool"} {
+	for _, change := range []string{"newer_same_bytes_commit", "newer_unrecorded_checked_copy", "different_bytes_same_stamp", "event_during_check", "cancelled", "replay_unsafe", "deadline_expired", "attempts_spent", "foreign_checkout", "unproven_version", "other_tool"} {
 		t.Run(change, func(t *testing.T) {
 			selectedProjectionRegistry(t)
 			s, _, path := canonicalPromotionReadFixture(t)
@@ -82,6 +83,13 @@ func TestLateSummaryProjectionProofKeepsRefusalFences(t *testing.T) {
 			case "newer_same_bytes_commit":
 				current = entry.committedCopy(entry.sourceCommitSeq+1, entry.disk)
 				require.NoError(t, pendingFileProjections.publish(current))
+			case "newer_unrecorded_checked_copy":
+				// A checked copy naming a newer sequence that no recorded
+				// tool commit published is not a newer version.
+				current = entry.committedCopy(0, entry.disk)
+				current.sourceCommitSeq = entry.sourceCommitSeq + 1
+				current.suspect.Store(false)
+				require.NoError(t, pendingFileProjections.publishReadExpected(current, pendingFileProjections.captureReadExpectation(entry.key)))
 			case "different_bytes_same_stamp":
 				raw, readErr := os.ReadFile(path)
 				require.NoError(t, readErr)
@@ -109,7 +117,7 @@ func TestLateSummaryProjectionProofKeepsRefusalFences(t *testing.T) {
 				req = makeReq("get_symbol", map[string]any{"id": "main.go::Target", "detail": "full", "format": "json"})
 			}
 			ctx = context.WithValue(ctx, projectedSourceDeadlineKey{}, deadline)
-			require.False(t, s.retryAfterLateSummaryProjectionChange(ctx, req, projectionSuperseded))
+			require.False(t, s.retryAfterLateFileReadProjectionChange(ctx, req, projectionSuperseded))
 			require.Same(t, current, liveEntry(pendingFileProjections, entry.absPath), "failed proof cannot publish changed bytes or replace the current owner")
 			require.True(t, entry.suspect.Load(), "never clear the old invalidation")
 			require.Equal(t, deadline, ctx.Value(projectedSourceDeadlineKey{}))
@@ -122,4 +130,42 @@ func TestLateSummaryProjectionProofKeepsRefusalFences(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A checked read copy of a recorded tool commit's version is accepted from the
+// ledger record alone, even once the projection it replaced is gone. A copy
+// whose sequence, raw-byte SHA-256 or file does not match the record is not.
+func TestPublishedVersionAcceptsOnlyCopiesOfARecordedCommit(t *testing.T) {
+	selectedProjectionRegistry(t)
+	s, _, owner, _ := acknowledgedCanonicalFile(t)
+	require.NotEmpty(t, owner.contentSHA256)
+	require.True(t, s.mutationCommits.publishedVersion(owner))
+	var record *mutationCommitRecord
+	s.mutationCommits.mu.Lock()
+	for _, candidate := range s.mutationCommits.ordered {
+		candidate.mu.Lock()
+		if candidate.commitSeq == owner.commitSeq {
+			record = candidate
+			// The replaced owner may already be collected.
+			candidate.fileProjection = weak.Pointer[projectionEntry]{}
+		}
+		candidate.mu.Unlock()
+	}
+	s.mutationCommits.mu.Unlock()
+	require.NotNil(t, record)
+	require.False(t, s.mutationCommits.publishedProjection(owner), "the record no longer names the owner")
+	copyOf := func(change func(*projectionEntry)) *projectionEntry {
+		entry := owner.committedCopy(0, owner.disk)
+		if change != nil {
+			change(entry)
+		}
+		return entry
+	}
+	require.True(t, s.mutationCommits.publishedVersion(copyOf(nil)))
+	require.False(t, s.mutationCommits.publishedVersion(copyOf(func(e *projectionEntry) { e.sourceCommitSeq++ })), "no recorded commit at that sequence")
+	require.False(t, s.mutationCommits.publishedVersion(copyOf(func(e *projectionEntry) { e.sourceCommitSeq = 0 })), "a version with no commit")
+	require.False(t, s.mutationCommits.publishedVersion(copyOf(func(e *projectionEntry) { e.contentSHA256 = strings.Repeat("0", 64) })), "other bytes than the commit wrote")
+	require.False(t, s.mutationCommits.publishedVersion(copyOf(func(e *projectionEntry) { e.contentSHA256 = "" })), "unknown bytes")
+	other := filepath.Join(t.TempDir(), "main.go")
+	require.False(t, s.mutationCommits.publishedVersion(copyOf(func(e *projectionEntry) { e.absPath, e.key = other, pathkey.MutationKey(other) })), "another file")
 }
