@@ -62,6 +62,7 @@ type runOptions struct {
 	smokeMarkers             []string
 
 	LosslessEditProbeEvidence bool
+	ContractFreshnessEdits    int
 }
 
 func parseRun(args []string) (runOptions, error) {
@@ -96,7 +97,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.StringVar(&o.GitSHA, "git-sha", "", "full binary revision if absent from Go build metadata")
 	f.StringVar(&o.Profile, "profile", "agent", "agent (default) or explicit saturation")
 	f.StringVar(&o.Host, "host", "native", "native, reference, or floor (validated, never provisioned)")
-	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, worktree-discovery, cold, restart, sweep, idle-stop, edit-and-probe, all")
+	f.StringVar(&o.Scenario, "scenario", "read", "read, edit, many, many-edit, worktrees, worktree-discovery, cold, restart, sweep, idle-stop, edit-and-probe, contract-freshness, all")
 	f.IntVar(&o.Agents, "agents", 4, "pure reading agents (may be 0 for edit, many-edit, or edit-and-probe; idle-stop requires 0)")
 	f.IntVar(&o.Editors, "edit-agents", 4, "combined editing/readback/reading agents in edit scenarios, in addition to pure readers")
 	f.IntVar(&o.Worktrees, "worktrees", 4, "linked worktrees in addition to primary")
@@ -121,6 +122,7 @@ func bindRunFlags(f *flag.FlagSet, o *runOptions) {
 	f.BoolVar(&o.EditConsumerProbes, "edit-consumer-probes", false, "opt-in typed rename/verify/dead-code/detect observations; requires an admitted unexported Go callee and actual dead-code baseline")
 	f.StringVar(&o.NightlySeed, "nightly-workload-seed", "", "opt-in measured one-second search delay: search-delay-v1 (edit4), search-delay-read16-v1 (read16)")
 	f.StringVar(&o.EditGateSeed, "edit-gate-seed", "", "explicit gate-only fault: ack-wait or closed-read-gate; requires a seed-tagged binary")
+	f.IntVar(&o.ContractFreshnessEdits, "contract-freshness-edits", 0, "contract-freshness: primary contract edits to witness one after another (1..200, required by that scenario only)")
 	f.StringVar(&o.EditProbeRole, "edit-probe-role", "", "edit-and-probe standalone role: candidate (default; phase accounting required) or baseline (absent phase timings reported unavailable)")
 }
 
@@ -182,6 +184,9 @@ func validateRunOptions(o runOptions) error {
 	if err := validatePRSmokeDrain(o); err != nil {
 		return err
 	}
+	if err := validateContractFreshnessOptions(o); err != nil {
+		return err
+	}
 	if o.Binary == "" || o.Manifest == "" || o.Scratch == "" || o.Worktrees < 0 || o.Duration <= 0 || o.Deadline <= 0 || o.WarmTimeout <= 0 || o.StopTimeout <= 0 || o.CPUProfile < 0 || o.CPUProfile > o.Duration {
 		return errors.New("run requires --binary, --manifest, --scratch and nonnegative counts and positive budgets")
 	}
@@ -219,7 +224,7 @@ func validateRunOptions(o runOptions) error {
 		return errors.New("--cpu-profile requires a whole number of seconds")
 	}
 	activeAgents := o.Agents
-	if o.Scenario == "edit" || o.Scenario == "many-edit" || o.Scenario == "all" || o.Scenario == editProbeScenario {
+	if o.Scenario == "edit" || o.Scenario == "many-edit" || o.Scenario == "all" || o.Scenario == editProbeScenario || o.Scenario == contractFreshnessScenario {
 		activeAgents += o.Editors
 	}
 	activeWorktrees := 1
@@ -249,8 +254,8 @@ func selectedScenarios(o runOptions) ([]string, error) {
 	if o.Scenario == startupScenario {
 		return []string{startupScenario}, nil
 	}
-	if o.Scenario == editProbeScenario {
-		return []string{editProbeScenario}, nil
+	if o.Scenario == editProbeScenario || o.Scenario == contractFreshnessScenario {
+		return []string{o.Scenario}, nil
 	}
 	if o.Scenario == "all" {
 		if o.Host == "floor" {
@@ -381,6 +386,20 @@ func newRunReport(o runOptions, corpora []Corpus, sha string, host Host, outputR
 			return report, err
 		}
 		report.Workload.SessionModel = plan.SessionModel
+	}
+	if o.Scenario == contractFreshnessScenario {
+		// The witness edits one repository; the phase would otherwise use the
+		// first entry and leave the rest out without a word.
+		if len(corpora) != 1 {
+			return report, fmt.Errorf("contract-freshness witnesses one repository, and the manifest lists %d", len(corpora))
+		}
+		plan := newContractFreshnessPlan(o.ContractFreshnessEdits)
+		report.Workload.ContractFreshness = &plan
+		operations, err := contractFreshnessOperations(corpora[0], o)
+		if err != nil {
+			return report, err
+		}
+		report.Workload.Operations = operations
 	}
 	report.NightlySeed = o.NightlySeed
 	if o.PairedOwnACKTransactions {

@@ -723,6 +723,67 @@ index; queryability and enrichment are separate observed upper bounds with a
 recorded polling interval. Older daemons without `loaded_roots` retain their
 legacy receipt and must still pass source-backed per-root checks.
 
+## Primary contract freshness
+
+`--scenario contract-freshness` (never part of `all`) measures how long a
+contract change in the primary checkout takes to read back fresh. It requires
+`--contract-freshness-edits N` (1–200), `--edit-agents 1`, `--worktrees 0` and
+one repository; `--agents` (0–16) adds pure readers on the primary checkout
+that stop when the witness finishes. The manifest must hold exactly one entry
+(a longer one is refused), a Go file whose `edit_template` inserts a top-level
+function after its `edit_anchor`.
+
+```sh
+go run ./bench/load run --binary /private/bin/gortex \
+  --manifest /private/corpus.json --scratch /private/load-artifacts \
+  --scenario contract-freshness --agents 0 --edit-agents 1 --worktrees 0 \
+  --contract-freshness-edits 40 --duration 900s --deadline 120s
+```
+
+Each witness edit `N` sends `edit.file` with the anchor plus one function,
+`GortexContractWitnessEN`, that calls
+`http.HandleFunc("GET /gortex-contract-witness/GortexContractWitnessEN", ...)`.
+That registration mints the provider contract ID
+`http::GET::/gortex-contract-witness/GortexContractWitnessEN`, which exists
+nowhere else. The reads are `analyze` with `kind: "contracts"`,
+`action: "list"`, `type: "http"`, `role: "provider"`, limit 10000 and the
+primary repository's actual prefix as `repo`. Both operations are on the
+compact surface that published releases also advertise, so a release and a
+candidate run identical requests.
+
+Before the first witness edit, inside the warm budget and untimed, the
+listing must answer complete: an incomplete-capability refusal or an answer the
+product marks pending is retried every 250 ms, and any other refusal fails the
+run. That gate is the primary checkout's first contract initialization; its
+read count and elapsed time are kept as `gate.contract_freshness_warm`, never
+as a witness edit's freshness time.
+
+One read before each edit must lack the ID; a listed ID ends the run as
+`identity_preexisting`. After the acknowledgement, reads repeat 250 ms apart
+until one lists the ID as a contract `id` (an echo in any other field does not
+count) or the `--deadline` budget from the edit's dispatch passes. Each read is
+`fresh`, `absent`, `absent_flagged` (the product's own `contract_analysis`
+reports it not fresh or not complete), `truncated`, `unparsed`, `error` or
+`deadline`. Releases without that self-report only produce `absent`.
+
+`phases[].contract_freshness` keeps every observation and distributions of:
+
+- `fresh_ms`: edit dispatch to the return of the first fresh read. This is the
+  comparable figure. A release whose acknowledgement waits for the contract
+  refresh and a build whose read waits for it instead spend the same work in
+  different calls.
+- `fresh_after_ack_ms` and `fresh_read_ms`: the part after the
+  acknowledgement, and the fresh read's own latency.
+- `acknowledged_ms`: the edit call itself.
+
+`fresh_not_before_ms` is when the last read that still lacked the ID began
+(0 when the first read after the acknowledgement was fresh), so the answer
+turned fresh between it and `fresh_ms`. A complete phase needs every witness
+edit read back fresh. `load delta` compares these distributions like any other
+timing row, and prints `contract_outcomes.<outcome>` for every outcome
+(`fresh`, `never_fresh`, `phase_censored`, `edit_error`, `baseline_error`,
+`identity_preexisting`), zero included, so both arms show the same rows.
+
 ## Startup admission
 
 `--scenario startup` (never part of `all`) measures what agents see while a
