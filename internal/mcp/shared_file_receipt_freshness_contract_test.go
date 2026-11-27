@@ -80,7 +80,7 @@ func newSharedReceiptFreshContractFixtureWithRetirement(t *testing.T, autoRetire
 	closeWatcher := sync.OnceFunc(func() { require.NoError(t, watcher.Stop()) })
 	t.Cleanup(closeWatcher)
 	require.NoError(t, watcher.Start([]string{root}))
-	observed := &sharedReceiptFreshContractWatcher{sharedReceiptWatcher: &sharedReceiptWatcher{watcher}, path: filepath.Join(root, "main.go"), pending: make(chan struct{})}
+	observed := &sharedReceiptFreshContractWatcher{sharedReceiptWatcher: &sharedReceiptWatcher{Watcher: watcher}, path: filepath.Join(root, "main.go"), pending: make(chan struct{})}
 	s.SetWatcher(observed)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	f := &sharedReceiptFixture{server: s, root: root}

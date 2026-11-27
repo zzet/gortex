@@ -55,16 +55,15 @@ func (s *readBuiltRetirementStore) validateProjectionRetirement() error {
 	return nil
 }
 
-// readBuiltRetirementWatcher counts every publication the server admits, so
-// the test can tell whether a read admitted a catch-up generation itself.
+// readBuiltRetirementWatcher records the watcher snapshots the server reads,
+// so the test can tell whether a generation was admitted during a read.
 type readBuiltRetirementWatcher struct {
 	*indexer.Watcher
-	admitted atomic.Int64
+	relations *relationGenerationWitness
 }
 
-func (w *readBuiltRetirementWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
-	w.admitted.Add(1)
-	return w.Watcher.EnqueueToolMutation(ctx, path)
+func (w *readBuiltRetirementWatcher) TierPaths() map[string]indexer.MutationTierState {
+	return w.relations.observe(w.Watcher.TierPaths())
 }
 
 const (
@@ -96,8 +95,9 @@ type readBuiltReply struct {
 //   - with the new rows (a reply with the old rows and no pending label would
 //     be silent stale),
 //   - without a refusal, including reads that run at the same time, and
-//   - without a relation state, unless that read admitted a new generation
-//     (scored on sequential reads).
+//   - without a relation state, unless a new generation was admitted for the
+//     file during that read: its own catch-up, or a native event the watcher
+//     delivered late (scored on sequential reads).
 //
 // A projection nobody retires keeps every later read of the file labelled
 // pending until the file changes again.
@@ -234,7 +234,7 @@ func newReadBuiltRetirementFixture(t *testing.T, content string) *readBuiltRetir
 	require.NoError(t, err)
 	require.NoError(t, native.Start([]string{root}))
 	t.Cleanup(func() { store.releaseOnceFunc(); require.NoError(t, native.Stop()) })
-	watcher := &readBuiltRetirementWatcher{Watcher: native}
+	watcher := &readBuiltRetirementWatcher{Watcher: native, relations: newRelationGenerationWitness(path)}
 	s.SetWatcher(watcher)
 
 	const session = "read-built-retirement"
@@ -263,16 +263,18 @@ func (f *readBuiltRetirementFixture) awaitNoGeneration(t *testing.T) {
 }
 
 // recovered reads the file summary until a reply carries no relation state.
-// A reply may carry one only when its own read admitted a generation (a
-// native event can still mark the projection suspect, and its re-check admits
-// a catch-up for the same bytes); the next reply after that generation
-// publishes is scored again. A reply whose store read ran out of time is
-// labelled as such and read again.
+// A reply may carry one only when the server's own freshness snapshots for
+// that read saw a generation admitted during it (a native event can still mark
+// the projection suspect, and its re-check admits a catch-up for the same
+// bytes; FSEvents can also deliver the event late, after the file's last
+// ticket finished, and the watcher admits it as a new generation); the next
+// reply after that generation publishes is scored again. A reply whose store
+// read ran out of time is labelled as such and read again.
 func (f *readBuiltRetirementFixture) recovered(t *testing.T) {
 	t.Helper()
 	for attempt := range 5 {
 		f.awaitNoGeneration(t)
-		admitted := f.watcher.admitted.Load()
+		admitted := f.watcher.relations.generation()
 		reply := f.read(t, 20+attempt, "get_file_summary")
 		require.Empty(t, reply.refusal, "a read after publication was refused")
 		if reply.storeBusy() {
@@ -282,8 +284,8 @@ func (f *readBuiltRetirementFixture) recovered(t *testing.T) {
 		if reply.state == "" {
 			return
 		}
-		require.Greater(t, f.watcher.admitted.Load(), admitted,
-			"a reply after publication kept a relation state its read did not cause: %s", reply.state)
+		require.Greater(t, f.watcher.relations.generation(), admitted,
+			"a reply after publication kept a relation state no generation admitted during its read explains: %s", reply.state)
 	}
 	t.Fatal("replies after publication kept admitting catch-up generations")
 }
