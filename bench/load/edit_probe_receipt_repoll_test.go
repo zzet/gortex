@@ -297,6 +297,233 @@ func TestEditProbeRestoreRepollsReceiptsPendingAtWorkloadEnd(t *testing.T) {
 	}
 }
 
+// On a single-checkout run every pending receipt is read again, not only a
+// linked route's, and the reads run concurrently. Two edits share the one
+// editor session and both leave their receipts pending; the fake daemon holds
+// each post-workload read until both are on the wire. Each record keeps its own
+// answer, and the restore proceeds only when both receipts are terminal.
+func TestEditProbeRestoreRepollsSingleCheckoutReceiptsConcurrently(t *testing.T) {
+	pending := map[string]any{"graph_status_terminal": false, "graph_status": "pending", "tier_state": map[string]any{"file_graph": "fresh", "relations": "pending", "derived": "pending"}}
+	terminal := map[string]any{"graph_status_terminal": true, "graph_status": "fresh", "tier_state": map[string]any{"file_graph": "fresh", "relations": "fresh", "derived": "fresh"}}
+	for _, cell := range []struct {
+		name     string
+		terminal [2]bool // per edit: terminal at the post-workload read
+	}{
+		{"first_terminal_second_pending", [2]bool{true, false}},
+		{"first_pending_second_terminal", [2]bool{false, true}},
+		{"both_terminal", [2]bool{true, true}},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			c := editProbeCorpus()
+			c.Label = "fixture"
+			p := &privateRun{Root: t.TempDir()}
+			root := filepath.Join(p.Root, "fixture")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			original := fmt.Sprintf("package sample\nfunc Example() int { return 1 }\n%s\n", c.EditAnchor)
+			if err := os.WriteFile(filepath.Join(root, c.File), []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p.Repos = []privateRepo{{Path: root, File: filepath.Join(root, c.File), Prefix: "fixture", Corpus: c}}
+			disk := editProbeDiskStub(t, c, root)
+			const deadline = 2 * time.Second
+			var mu sync.Mutex
+			workloadOver := false
+			mutations := make(map[string]string)    // receipt -> mutation
+			terminalAtRead := make(map[string]bool) // mutation -> terminal at the post-workload read
+			reads := make(map[string]int)
+			connections := make(map[int]bool)
+			inFlight, maxInFlight, batches := 0, 0, 0
+			bothSent := make(chan struct{})
+			var bothSentOnce sync.Once
+			p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
+				if frame.Method != "tools/call" {
+					return stubContent(map[string]any{}), nil
+				}
+				args, _ := frame.Params["arguments"].(map[string]any)
+				options, _ := args["options"].(map[string]any)
+				switch {
+				case frame.Params["name"] == "edit" && args["operation"] == "file":
+					data, err := os.ReadFile(p.Repos[0].File)
+					if err != nil {
+						t.Error(err)
+						return nil, &rpcError{Code: -32000, Message: "read failed"}
+					}
+					match, _ := args["match"].(string)
+					replacement, _ := args["replacement"].(string)
+					if match == "" || strings.Count(string(data), match) != 1 {
+						return nil, &rpcError{Code: -32000, Message: "exact match missing"}
+					}
+					if err := os.WriteFile(p.Repos[0].File, []byte(strings.Replace(string(data), match, replacement, 1)), 0o600); err != nil {
+						t.Error(err)
+						return nil, &rpcError{Code: -32000, Message: "write failed"}
+					}
+					mutation, _ := options["mutation_id"].(string)
+					receipt := "receipt-" + mutation
+					mu.Lock()
+					mutations[receipt] = mutation
+					mu.Unlock()
+					return stubContent(map[string]any{"mutation_receipt": receipt}), nil
+				case frame.Params["name"] == "change" && args["operation"] == "receipt":
+					receipt, _ := options["receipt"].(string)
+					mu.Lock()
+					mutation, over := mutations[receipt], workloadOver
+					fields := pending
+					if over && mutation != "" {
+						reads[receipt]++
+						connections[frame.Connection] = true
+						inFlight++
+						maxInFlight = max(maxInFlight, inFlight)
+						if inFlight == 2 {
+							bothSentOnce.Do(func() { close(bothSent) })
+						}
+						if terminalAtRead[mutation] {
+							fields = terminal
+						}
+					}
+					mu.Unlock()
+					if mutation == "" {
+						return nil, &rpcError{Code: -32000, Message: "unknown receipt"}
+					}
+					if over {
+						select {
+						case <-bothSent:
+						case <-time.After(deadline):
+						}
+						mu.Lock()
+						inFlight--
+						mu.Unlock()
+					}
+					status := map[string]any{"found": true, "receipt": receipt, "mutation_id": mutation}
+					for key, value := range fields {
+						status[key] = value
+					}
+					return stubContent(status), nil
+				case frame.Params["name"] == "edit" && args["operation"] == "batch":
+					mu.Lock()
+					batches++
+					mu.Unlock()
+				}
+				return disk(frame)
+			})
+			phase := &Phase{Metrics: map[string]Metric{}, Gate: map[string]json.RawMessage{}}
+			var clients []*socketClient
+			t.Cleanup(func() { closeClients(clients) })
+			client, err := openMCP(ctx, p.Socket, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clients = append(clients, client)
+			run, probers, err := prepareEditProbe(ctx, runOptions{Seed: 42, EditCount: 100, Editors: 1, Deadline: deadline, editProbeBaseline: true}, p, nil, clients, phase)
+			clients = append(clients, probers...)
+			if run != nil {
+				t.Cleanup(func() { _ = run.close() })
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			run.origin = time.Now()
+			phase.EditProbe.Records = nil
+			steps := run.plan.Steps[:2]
+			if steps[0].Editor != steps[1].Editor {
+				t.Fatalf("the two edits do not share one editor: %d and %d", steps[0].Editor, steps[1].Editor)
+			}
+			mu.Lock()
+			for i, step := range steps {
+				terminalAtRead[step.MutationID] = cell.terminal[i]
+			}
+			mu.Unlock()
+			for _, step := range steps {
+				state := run.states[step.Ordinal]
+				run.activate(ctx, step)
+				awaitEditProbeFirstProbe(t, state)
+				run.doEdit(ctx, step)
+				record := state.record
+				if record.Outcome != "product_deadline" || record.GraphTerminal || record.Receipt == "" {
+					t.Fatalf("receipt was not left pending by the workload: %+v", record)
+				}
+				phase.EditProbe.Records = append(phase.EditProbe.Records, record)
+			}
+			edited, err := os.ReadFile(p.Repos[0].File)
+			if err != nil || string(edited) == original {
+				t.Fatalf("the workload did not edit the checkout: %v", err)
+			}
+			mu.Lock()
+			workloadOver = true
+			mu.Unlock()
+			restoreCtx, stop := context.WithTimeout(ctx, deadline)
+			defer stop()
+			restoreErr := run.restore(restoreCtx)
+			mu.Lock()
+			perReceipt := make(map[string]int, len(reads))
+			for receipt, n := range reads {
+				perReceipt[receipt] = n
+			}
+			sessions, together, sent := len(connections), maxInFlight, batches
+			mu.Unlock()
+			if len(perReceipt) != 2 {
+				t.Fatalf("after the workload %d of 2 pending receipts were read: %v", len(perReceipt), perReceipt)
+			}
+			for receipt, n := range perReceipt {
+				if n != 1 {
+					t.Fatalf("receipt %s was read %d times after the workload, want once", receipt, n)
+				}
+			}
+			if sessions != 1 || together != 2 {
+				t.Fatalf("post-workload reads used %d sessions with at most %d in flight; want both at once on the one editor session", sessions, together)
+			}
+			for i, record := range phase.EditProbe.Records {
+				wire, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fields struct {
+					Outcome       string `json:"outcome"`
+					GraphTerminal bool   `json:"graph_terminal"`
+					Post          *struct {
+						State string `json:"state"`
+					} `json:"post_workload_receipt"`
+				}
+				if err := json.Unmarshal(wire, &fields); err != nil {
+					t.Fatal(err)
+				}
+				want := "pending"
+				if cell.terminal[i] {
+					want = "terminal"
+				}
+				if fields.Post == nil || fields.Post.State != want {
+					t.Fatalf("record %d post-workload receipt state is not %q: %s", i, want, wire)
+				}
+				if fields.Outcome != "product_deadline" || fields.GraphTerminal {
+					t.Fatalf("post-workload read changed record %d's workload fields: %s", i, wire)
+				}
+			}
+			now, err := os.ReadFile(p.Repos[0].File)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cell.terminal[0] && cell.terminal[1] {
+				if restoreErr != nil {
+					t.Fatalf("both receipts were terminal at the read and the restore still refused: %v", restoreErr)
+				}
+				if string(now) != original || sent != 1 {
+					t.Fatalf("restore sent %d rewrites, want 1; checkout at its original: %v", sent, string(now) == original)
+				}
+				return
+			}
+			if restoreErr == nil || !strings.Contains(restoreErr.Error(), "unknown/pending") {
+				t.Fatalf("a receipt still pending at the read permitted the restore: %v", restoreErr)
+			}
+			if string(now) != string(edited) || sent != 0 {
+				t.Fatalf("a refused restore sent %d rewrites or changed the checkout", sent)
+			}
+		})
+	}
+}
+
 // The branches the fake daemon above does not send: a primary record has no
 // checkout to match, a terminal reply for another mutation never counts, and
 // any terminal graph state, fresh or not, ends the pending mutation.
