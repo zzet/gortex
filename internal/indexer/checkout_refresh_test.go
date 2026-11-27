@@ -180,6 +180,64 @@ func TestCheckoutRefreshDeferralAndTimeoutRemainPending(t *testing.T) {
 	}
 }
 
+func TestCheckoutRefreshCarriedTicketDoesNotReportFinalCycleAsFirstTry(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	gate := newViewBuildGateWithLimits(0, defaultBackgroundViewBuildQueueLimit)
+	gate.Open()
+	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true})
+	if out := c.reconcile(t.Context()); out.Err != nil || out.DirtyGenerationID == 0 {
+		t.Fatalf("initial reconcile: %+v", out)
+	}
+	l := &CheckoutLifecycle{catalog: f.catalog, store: f.store, coordinators: map[string]*CheckoutCoordinator{f.checkoutID: c}}
+
+	origin := time.Now()
+	record := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("carried-edit-%d", origin.UnixNano()), PublicationSourceMCPEdit, origin)
+	m, err := l.BeginCheckoutMutation(t.Context(), f.checkoutID, f.worktree, f.route().RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Prepare(t.Context()); err != nil {
+		m.Close()
+		t.Fatal(err)
+	}
+	builderWriteFile(t, f.worktree, "helper.go", "package fixture\nfunc CarriedHelper() {}\n")
+	ticket, err := m.EnqueueRefresh(WithPublicationRecord(t.Context(), record), filepath.Join(f.worktree, "helper.go"))
+	if err != nil {
+		m.Close()
+		t.Fatal(err)
+	}
+	m.Close()
+
+	blocker, err := gate.Acquire(t.Context(), ViewBuildBackground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker()
+	var outcomes []CheckoutCycle
+	c.cycleDone = func(out CheckoutCycle) { outcomes = append(outcomes, out) }
+	c.cycle(t.Context())
+	assertCheckoutRefreshPending(t, ticket)
+	if len(outcomes) != 1 || !outcomes[0].Deferred {
+		t.Fatalf("first cycle outcomes = %+v, want one deferred cycle", outcomes)
+	}
+	if _, found := phaseOffsets(record.Snapshot())[PublicationCycleStarted]; !found {
+		t.Fatalf("the deferred cycle did not mark cycle_started: %+v", record.Snapshot().Phases)
+	}
+
+	blocker()
+	c.cycle(t.Context())
+	result := awaitCheckoutRefresh(t, ticket)
+	if result.Err != nil || !result.Reindexed {
+		t.Fatalf("carried ticket did not publish: %+v", result)
+	}
+	snapshot := record.Snapshot()
+	window := snapshot.EditTimings().Window
+	if window.PatchWallMS != nil || window.PatchAccounting != nil {
+		t.Fatalf("the completing cycle was reported as a first-try P: %+v", window)
+	}
+	requireCheckoutBackgroundRefusal(t, "carried ticket", record, ticket.Ticket.Generation, "no_accepted_witness")
+}
+
 type checkoutRefreshTestCodedError int
 
 func (e checkoutRefreshTestCodedError) Error() string { return "injected SQLite error" }

@@ -574,13 +574,15 @@ served by one coordinator refresh cycle, not a watcher's debounced attempt:
   cycle arms no requested-background timer. The receipt carries the frozen
   `requested_background_unavailable` refusal instead: `serving_attempt_binding_mismatch`,
   `binding_predicate: checkout_refresh_cycle`.
-- **Physical attempt.** `phase_timing.patch_wall_ms` and
-  `phase_timing.patch_accounting` describe the cycle that served the ticket, from
-  its `cycle_started` instant to `ticket_completed`, with
+- **Physical attempt.** When the first cycle that owes the ticket completes it,
+  `phase_timing.patch_wall_ms` and `phase_timing.patch_accounting` describe that
+  cycle, from its `cycle_started` instant to `ticket_completed`, with
   `execution_disposition: checkout_refresh_cycle`. The builder's phases stay on
   `publication_phases` and are not relabelled as patch laps, so the patch-lap
   partition reads `not_observed`. A ticket that rode a cycle already in flight
-  for other tickets has no patch window.
+  for other tickets has no patch window. A ticket carried across deferred,
+  rescheduled, or retried cycles has no patch window either: the final serving
+  cycle by itself is not a first-try physical attempt.
 - **Acknowledgement.** The edit ACK returns before publication, so
   `acknowledgement` counts `reindex_wait` as `not_applicable`, with a null
   duration.
