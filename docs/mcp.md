@@ -562,9 +562,13 @@ topology gates the holder takes. Daemon status (`repository_lanes`,
 `reach_topology`) and `index_health` (`repository_lanes`) report the same
 lanes, with past tenures in daemon status.
 
-A linked checkout's receipt closes its timing accounting on the same poll that
-first reads it published, as a primary receipt does. A checkout ticket is
-served by one coordinator refresh cycle, not a watcher's debounced attempt:
+The receipt of a committed single-file linked edit (`edit_file`, `write_file`,
+`edit_symbol`) closes its timing accounting on the same poll that first reads
+it published, as a primary receipt does. Batch tickets (a linked `batch_edit`
+and its journal recovery) and refresh or recovery tickets keep their existing
+accounting: they carry neither the background refusal nor the physical attempt
+below. The edit's checkout ticket is served by one coordinator refresh cycle,
+not a watcher's debounced attempt:
 
 - **Generations.** `reindex_generation` and `applied_generation` are both in the
   ticket's admission-sequence domain. The coordinator completes a ticket only
