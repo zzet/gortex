@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +44,7 @@ type sharedReceiptFollowup struct {
 	Response       json.RawMessage       `json:"later_caller_response,omitempty"`
 	PhysicalSHA256 string                `json:"later_physical_sha256,omitempty"`
 	ExpectedLine   int                   `json:"expected_line,omitempty"`
+	CaughtUp       []uint64              `json:"caught_up_generations,omitempty"`
 	Elapsed        time.Duration         `json:"observation_elapsed_ns"`
 	Error          string                `json:"error,omitempty"`
 	Verified       bool                  `json:"verified"`
@@ -279,13 +282,38 @@ func (f *sharedReceiptFixture) verifyOwnCaller(agent, ordinal int, end time.Time
 		return err
 	}
 	evidence.ExpectedLine = line
-	reply, err := externalVersionRegisteredCall(f.server, ctx, 600+ordinal, "get_callers", sharedReceiptCallersArguments())
-	if err != nil {
-		return err
+	watcher, ok := f.server.currentWatcher().(*sharedReceiptWatcher)
+	if !ok {
+		return fmt.Errorf("follow-up needs the fixture's own watcher")
 	}
-	evidence.Response, err = json.Marshal(reply)
-	if err != nil {
-		return err
+	// Each read starts once the watcher has no admitted generation for the
+	// file. A reply that reports the file's relations pending is read again
+	// only when the server's own freshness snapshots for that read saw a
+	// generation admitted during it; the next reply after that generation
+	// publishes is scored again. The shared deadline bounds every wait.
+	var verdict error
+	for {
+		if err := sharedReceiptAwaitNoGeneration(ctx, watcher.Watcher, path); err != nil {
+			return errors.Join(verdict, err)
+		}
+		admitted := watcher.relations.generation()
+		reply, err := externalVersionRegisteredCall(f.server, ctx, 600+ordinal, "get_callers", sharedReceiptCallersArguments())
+		if err != nil {
+			return err
+		}
+		evidence.Response, err = json.Marshal(reply)
+		if err != nil {
+			return err
+		}
+		verdict = sharedReceiptValidateFollowup(evidence.Response, "main.go::"+want, line)
+		if !errors.Is(verdict, errSharedReceiptFollowupPending) {
+			break
+		}
+		caught := watcher.relations.generation()
+		if caught <= admitted {
+			return fmt.Errorf("%w, and no generation admitted during its read explains it", verdict)
+		}
+		evidence.CaughtUp = append(evidence.CaughtUp, caught)
 	}
 	after, final, err := sharedReceiptFollowupFile(path)
 	if err != nil {
@@ -296,10 +324,23 @@ func (f *sharedReceiptFixture) verifyOwnCaller(agent, ordinal int, end time.Time
 		return fmt.Errorf("physical file changed during follow-up")
 	}
 	evidence.PhysicalSHA256 = fmt.Sprintf("%x", physicalSHA)
-	if err := sharedReceiptValidateFollowup(evidence.Response, "main.go::"+want, line); err != nil {
-		return err
+	if verdict != nil {
+		return verdict
 	}
 	return ctx.Err()
+}
+
+func sharedReceiptAwaitNoGeneration(ctx context.Context, watcher *indexer.Watcher, path string) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for watcher.TierState(path).Generation != 0 {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return fmt.Errorf("the watcher kept an admitted generation for the file: %w", ctx.Err())
+		}
+	}
+	return nil
 }
 
 func sharedReceiptFollowupFile(path string) (diskStamp, []byte, error) {
@@ -350,11 +391,17 @@ func sharedReceiptFollowupLine(raw []byte, symbol string) (int, error) {
 }
 
 type sharedReceiptCallerFreshness struct {
-	Graph        string `json:"graph_freshness"`
-	Complete     *bool  `json:"complete"`
-	Fresh        *bool  `json:"fresh"`
-	PendingCount *int   `json:"pending_file_count"`
+	Graph        string   `json:"graph_freshness"`
+	Scope        string   `json:"freshness_scope"`
+	Complete     *bool    `json:"complete"`
+	Fresh        *bool    `json:"fresh"`
+	PendingCount *int     `json:"pending_file_count"`
+	PendingFiles []string `json:"pending_files"`
 }
+
+// errSharedReceiptFollowupPending marks a reply whose only gap is a pending
+// relations label for the follow-up's own file. It is never final evidence.
+var errSharedReceiptFollowupPending = errors.New("relations pending for main.go")
 
 func sharedReceiptValidateFollowup(raw json.RawMessage, own string, line int) error {
 	var response struct {
@@ -374,6 +421,11 @@ func sharedReceiptValidateFollowup(raw json.RawMessage, own string, line int) er
 	direct, nested := response.sharedReceiptCallerFreshness, response.Freshness
 	if !direct.consistent() || !nested.consistent() || direct.Graph == "" && nested.Graph == "" ||
 		direct.Graph != "" && nested.Graph != "" && direct.Graph != nested.Graph {
+		if direct.pendingOwnFile() && nested.pendingOwnFile() ||
+			direct.pendingOwnFile() && nested.Graph == "" && nested.consistent() ||
+			nested.pendingOwnFile() && direct.Graph == "" && direct.consistent() {
+			return fmt.Errorf("follow-up caller response has an unsupported relations state: %w", errSharedReceiptFollowupPending)
+		}
 		return fmt.Errorf("follow-up caller response has an unsupported relations state")
 	}
 	exact := 0
@@ -389,6 +441,11 @@ func sharedReceiptValidateFollowup(raw json.RawMessage, own string, line int) er
 		return fmt.Errorf("follow-up contains %d exact edges for %s", exact, own)
 	}
 	return nil
+}
+
+func (s sharedReceiptCallerFreshness) pendingOwnFile() bool {
+	return s.Graph == "pending" && s.Scope == "relations" && s.Complete != nil && !*s.Complete &&
+		s.PendingCount != nil && *s.PendingCount == 1 && slices.Equal(s.PendingFiles, []string{"main.go"})
 }
 
 func (s sharedReceiptCallerFreshness) consistent() bool {
@@ -514,25 +571,34 @@ func TestSharedReceiptFollowupVerifiesOriginalReceipt(t *testing.T) {
 	require.NotEqual(t, identity.SHA, evidence.PhysicalSHA256)
 	require.Positive(t, evidence.ExpectedLine)
 	require.ErrorContains(t, sharedReceiptValidateFollowup(evidence.Response, "main.go::Stream0Edit00", evidence.ExpectedLine+1), "differs from the physical source")
-	for _, invalidFreshness := range []map[string]any{
-		{"graph_freshness": "pending", "fresh": true, "complete": false, "pending_file_count": 1},
-		{"graph_freshness": "unknown", "fresh": true, "complete": true, "pending_file_count": 0},
+	for _, invalid := range []struct {
+		freshness map[string]any
+		pending   bool // read again once a generation admitted during the read explains it
+	}{
+		{map[string]any{"graph_freshness": "pending", "fresh": true, "complete": false, "pending_file_count": 1}, false},
+		{map[string]any{"graph_freshness": "unknown", "fresh": true, "complete": true, "pending_file_count": 0}, false},
+		{map[string]any{"graph_freshness": "pending", "fresh": true, "complete": false, "freshness_scope": "relations",
+			"pending_file_count": 1, "pending_files": []string{"main.go"}}, true},
+		{map[string]any{"graph_freshness": "failed", "fresh": true, "complete": false, "freshness_scope": "relations",
+			"pending_file_count": 1, "pending_files": []string{"main.go"}}, false},
 	} {
 		var response sharedReceiptResponse
 		require.NoError(t, json.Unmarshal(evidence.Response, &response))
 		var payload map[string]any
 		require.NoError(t, json.Unmarshal([]byte(response.Content[0].Text), &payload))
-		payload["freshness"] = invalidFreshness
+		payload["freshness"] = invalid.freshness
 		reply, err := json.Marshal(payload)
 		require.NoError(t, err)
 		response.Content[0].Text = string(reply)
 		raw, err := json.Marshal(response)
 		require.NoError(t, err)
-		require.ErrorContains(t, sharedReceiptValidateFollowup(raw, "main.go::Stream0Edit00", evidence.ExpectedLine), "unsupported relations state")
+		err = sharedReceiptValidateFollowup(raw, "main.go::Stream0Edit00", evidence.ExpectedLine)
+		require.ErrorContains(t, err, "unsupported relations state")
+		require.Equal(t, invalid.pending, errors.Is(err, errSharedReceiptFollowupPending), "%v", invalid.freshness)
 	}
 	evidence.Original.Commit = peerIdentity.Commit
 	require.ErrorContains(t, f.verifyOwnCaller(original.agent, original.ordinal, time.Now().Add(freshnessDefaultWait), evidence), "differs from the original receipt")
-	t.Logf("real follow-up status and caller verified original commit %d with latest physical commit %d at line %d", identity.Commit, peerIdentity.Commit, evidence.ExpectedLine)
+	t.Logf("real follow-up status and caller verified original commit %d with latest physical commit %d at line %d; caught-up generations %v", identity.Commit, peerIdentity.Commit, evidence.ExpectedLine, evidence.CaughtUp)
 }
 
 // Hold only this fixture file's projection invalidation notifications. The
