@@ -440,6 +440,13 @@ editor arrival stream and global marker/mutation IDs; a route with no offered
 ordinal is not silently given an extra edit. Implementation and fixture tests
 do not establish a completed live or reference campaign.
 
+A linked full ACK returns before its checkout's queued publication, and its
+receipt counts that wait as one not-applicable `reindex_wait` lap. The A check
+credits that counted lap, as it does for a local ACK, only when the ACK still
+reports `reindex_pending` and both its view and its receipt name the route's
+admitted checkout, for the same mutation, receipt, commit and bytes. A primary
+full ACK must still measure its wait.
+
 `--edit-wait-cochange` adds one setup step to the six-repository,
 six-editor cell, under either `--edit-ack` policy. The daemon's startup
 co-change mine runs once per process and commits graph writes after
