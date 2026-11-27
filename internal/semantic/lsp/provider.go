@@ -2124,6 +2124,7 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 	// ~/Library/Caches/jdtls/<hash>, outside Gortex's cache isolation. Pin it
 	// under the resolved cache home per repo instead.
 	if isJdtlsCommand(p.command) {
+		args = jdtlsDataArgs(args, workspaceRoot)
 		// Bound the JVM heap too: uncapped, it defaults to a quarter of RAM
 		// and fills with garbage before G1 collects (#1536).
 		var heap jdtlsHeapDecision
@@ -2133,15 +2134,19 @@ func (p *Provider) dialOrSpawn(workspaceRoot string) (*Client, error) {
 				p.logger.Warn("lsp: jdtls max heap value ignored; using the default",
 					zap.String("env", JdtlsMaxHeapEnv),
 					zap.String("value", heap.Rejected),
-					zap.String("default", jdtlsDefaultMaxHeap),
+					zap.String("default", heap.MaxHeap),
 					zap.String("reason", "not a JVM size of at least 1G (the launcher's -Xms)"))
+			}
+			if heap.OverriddenBy != "" {
+				p.logger.Warn("lsp: jdtls max heap overridden; the JVM applies this variable after the command line",
+					zap.String("env", heap.OverriddenBy),
+					zap.String("source", heap.Source))
 			}
 			p.logger.Info("lsp: jdtls max heap",
 				zap.String("xmx", heap.MaxHeap),
 				zap.String("source", heap.Source),
 				zap.String("workspace", workspaceRoot))
 		}
-		args = jdtlsDataArgs(args, workspaceRoot)
 	}
 	// Pin the workspace's resolved solution (env or lone root .sln/.slnx)
 	// so the loaded workspace is deterministic and matches the targeted
