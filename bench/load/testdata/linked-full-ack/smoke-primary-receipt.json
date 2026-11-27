@@ -1,0 +1,275 @@
+{
+  "ack_at": "2026-11-27T04:37:04.125735Z",
+  "ack_mode": "full",
+  "acknowledgement": {
+    "ack_unattributed_ms": 0,
+    "actual_finished_after_reply": false,
+    "actual_handler_ms": 454.86975,
+    "actual_handler_state": "measured",
+    "caller_response_outcome": "result",
+    "caller_response_ready_ms": 454.872125,
+    "caller_response_state": "measured",
+    "clock": "monotonic",
+    "combined_ack_patch_sum_state": "not_additive_overlapping_lifetimes",
+    "counts": {
+      "caller_result": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "disk_write": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "edit_control": {
+        "completed": 5,
+        "not_applicable": 0,
+        "started": 5
+      },
+      "middleware": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "parse": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "publish": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "reindex_wait": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "reply_prepare": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      }
+    },
+    "denominator": "bound_tool_entry_to_outer_return_before_transport_serialization",
+    "disjoint_observed_intervals": true,
+    "dispatcher_response_state": "measured",
+    "dispatcher_scope": "queue_and_preamble_precede_bound_call_subtotal",
+    "dispatcher_to_caller_response_ready_ms": 455.263875,
+    "existing_ack_phase_scope": "shared_rpc",
+    "observed_ack_subtotal_ms": 454.872125,
+    "observed_execution_ms": {
+      "caller_result": 0.002375,
+      "disk_write": 0.293042,
+      "edit_control": 5.348041,
+      "middleware": 1.216041,
+      "parse": 0.681917,
+      "publish": 0.040542,
+      "reindex_wait": 447.272875,
+      "reply_prepare": 0.017292
+    },
+    "parse_scope": "source_projection_parse_gate",
+    "phase_states": {
+      "caller_result": "measured",
+      "disk_write": "measured",
+      "dispatcher_preamble": "measured",
+      "dispatcher_queue": "measured",
+      "edit_control": "measured",
+      "middleware": "measured",
+      "parse": "measured",
+      "publish": "measured",
+      "reindex_wait": "measured",
+      "reply_prepare": "measured",
+      "transport": "unavailable_boundary"
+    },
+    "phases_ms": {
+      "caller_result": 0.002375,
+      "disk_write": 0.293042,
+      "dispatcher_preamble": 0.383584,
+      "dispatcher_queue": 0.008166,
+      "edit_control": 5.348041,
+      "middleware": 1.216041,
+      "parse": 0.681917,
+      "publish": 0.040542,
+      "reindex_wait": 447.272875,
+      "reply_prepare": 0.017292,
+      "transport": null
+    },
+    "publication_residual_state": "unavailable_shared_rpc_scope",
+    "rpc_id": "rpc-1",
+    "scope": "shared_rpc_mcp_bound_call",
+    "state": "observed",
+    "sum_state": "partial"
+  },
+  "applied_generation": 1,
+  "bytes_written": 1030,
+  "commit_seq": 1,
+  "committed_at": "2026-11-27T04:37:04.125608Z",
+  "content_sha256": "28ef71445f91c7a4a5e7688f831a85207fb00fcab9f8d39a7c26c61f01c19073",
+  "derived_at": "2026-11-27T04:37:04.572953Z",
+  "derived_fanout_complete": true,
+  "disk_status": "committed",
+  "file_graph_at": "2026-11-27T04:37:04.53921Z",
+  "file_reason": "projection_not_live",
+  "file_view": {
+    "counts": null,
+    "delta_reason": "projection_not_live",
+    "delta_state": "unavailable",
+    "historical": true,
+    "reason": "projection_not_live",
+    "state": "unavailable",
+    "symbols": null,
+    "syntax_health": {
+      "checked": false,
+      "errors": null,
+      "state": "unknown"
+    },
+    "truncated": false
+  },
+  "found": true,
+  "graph_note": "the graph has read these bytes",
+  "graph_status": "fresh",
+  "graph_status_hint": "file readback unavailable; recorded graph status: fresh",
+  "graph_status_terminal": true,
+  "guidance": "the bytes are on disk \u2014 do not re-apply this edit; read graph_status_terminal before waiting on graph_status, because only \"pending\" resolves on its own",
+  "mutation_id": "load-edit-0000000000000001-000",
+  "new_sha": "77e39fdd3e9c5801ab451dc7979d810fec163df5",
+  "path": "gortex/internal/wiki/slug.go",
+  "phase_states": {
+    "apply": "not_observed",
+    "batch_admission": "not_observed",
+    "caller_result": "measured",
+    "cohort_admission": "not_observed",
+    "debounce": "not_observed",
+    "derived": "not_observed",
+    "disk_write": "measured",
+    "dispatcher_queue": "measured",
+    "edit_control": "measured",
+    "gate_wait": "not_observed",
+    "lane_wait": "not_observed",
+    "middleware": "measured",
+    "mtimes": "not_observed",
+    "parse": "measured",
+    "patch_parse": "not_observed",
+    "publish": "measured",
+    "reindex_wait": "measured",
+    "resolve": "not_observed",
+    "search_lap": "not_observed"
+  },
+  "phase_timing": {
+    "ack_wall_ms": 454.872125,
+    "clock": "monotonic",
+    "coverage": "partial",
+    "patch_wall_ms": null,
+    "publication_unattributed_ms": null,
+    "publication_wall_ms": 449.87325
+  },
+  "phases_ms": {
+    "apply": null,
+    "batch_admission": null,
+    "caller_result": 0.002375,
+    "cohort_admission": null,
+    "debounce": null,
+    "derived": null,
+    "disk_write": 0.293042,
+    "dispatcher_queue": 0.008166,
+    "edit_control": 5.348041,
+    "gate_wait": null,
+    "lane_wait": null,
+    "middleware": 1.216041,
+    "mtimes": null,
+    "parse": 0.681917,
+    "patch_parse": null,
+    "publish": 0.040542,
+    "reindex_wait": 447.272875,
+    "resolve": null,
+    "search_lap": null
+  },
+  "publication_phases": {
+    "checkout_id": "",
+    "clock": "monotonic",
+    "key": "mutation-1795753966337074001",
+    "origin_wall": "2026-11-27T04:37:04.123097Z",
+    "phases": [
+      {
+        "offset_ms": 0,
+        "offset_ns": 0,
+        "phase": "received"
+      },
+      {
+        "offset_ms": 1.186,
+        "offset_ns": 1186500,
+        "phase": "view_selected"
+      },
+      {
+        "offset_ms": 1.188,
+        "offset_ns": 1188208,
+        "phase": "view_resolved"
+      },
+      {
+        "offset_ms": 1.193,
+        "offset_ns": 1193958,
+        "phase": "handler_started"
+      },
+      {
+        "offset_ms": 2.142,
+        "offset_ns": 2142625,
+        "phase": "parse_gated"
+      },
+      {
+        "offset_ms": 2.205,
+        "offset_ns": 2205417,
+        "phase": "disk_write_started"
+      },
+      {
+        "offset_ms": 2.511,
+        "offset_ns": 2511125,
+        "phase": "receipt_committed"
+      },
+      {
+        "offset_ms": 2.637,
+        "offset_ns": 2637875,
+        "phase": "ticket_enqueued"
+      },
+      {
+        "offset_ms": 449.873,
+        "offset_ns": 449873250,
+        "phase": "ticket_completed"
+      }
+    ],
+    "source": "mcp_edit",
+    "terminal": true,
+    "ticket": 1
+  },
+  "readback_exact": false,
+  "receipt": "commit-1795753966337424001",
+  "reindex_generation": 1,
+  "relations_at": "2026-11-27T04:37:04.53921Z",
+  "requested_background_unavailable": {
+    "accepted_attempt_stage": "no_accepted_witness",
+    "background_stage": "returned",
+    "binding_predicate": "direct_physical_window_missing",
+    "last_observed_generation": 1,
+    "observed_native_handoffs": 0,
+    "publication_key": "mutation-1795753966337074001",
+    "reason": "serving_attempt_binding_mismatch",
+    "requested_generation": 1,
+    "scope": "requested_background_observation"
+  },
+  "retry_safe": false,
+  "started_at": "2026-11-27T04:37:04.125242Z",
+  "tier_after_commit_ms": {
+    "derived": 447.344,
+    "file_graph": 413.601,
+    "relations": 413.601
+  },
+  "tier_state": {
+    "derived": "fresh",
+    "file": "pending",
+    "file_graph": "fresh",
+    "relations": "fresh"
+  },
+  "tool": "edit_file"
+}

@@ -19,10 +19,14 @@ import (
 //     default full ACK policy, from a live linked-worktree run. It returned
 //     before the checkout's queued publication (reindex_pending, graph_status
 //     pending) and names the checkout in its freshness view.
-//   - pr-linked-receipt.json: the first receipt that read fresh for a linked
-//     edit.file once the linked ACK counts its publication wait as one
-//     not-applicable lap (1/1/1, null). The capture sent no mutation_id;
-//     the one LOAD sends is added.
+//   - smoke-linked-receipt.json: that edit's first receipt that read fresh.
+//     Its ACK block reports reindex_wait unobserved with 0/0/0 counts.
+//   - smoke-primary-ack.json, smoke-primary-receipt.json: the same run's
+//     first primary edit and its first fresh receipt; that ACK waited.
+//   - pr-linked-ack.json, pr-linked-receipt.json: a linked edit.file ACK and
+//     its first fresh receipt once the linked ACK counts its publication
+//     wait as one not-applicable lap (1/1/1, null). The capture sent no
+//     mutation_id; the one LOAD sends is added to both.
 func readLinkedFullACKFixture(t *testing.T, name string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", "linked-full-ack", name))
@@ -177,6 +181,89 @@ func TestEditProbeLinkedFullACKCountedNoWaitAtTheReceiptPoll(t *testing.T) {
 				if strings.HasPrefix(reason, "missing applicable A phase") {
 					t.Fatalf("linked full ACK kept an A reason: %v", got.Reasons)
 				}
+			}
+		})
+	}
+}
+
+// The counted no-wait credit belongs only to the run's own linked full ACK
+// that returned before its publication, and only when the receipt's producer
+// attested the counted lap. The credit removes exactly the missing
+// reindex_wait reason; every other cell keeps the strict reading unchanged.
+func TestEditProbeLinkedFullACKCountedNoWaitIsOwnedAndExact(t *testing.T) {
+	const missing = "missing applicable A phase reindex_wait"
+	type pair struct{ ack, receipt string }
+	pr, smoke := pair{"pr-linked-ack.json", "pr-linked-receipt.json"}, pair{"smoke-linked-ack.json", "smoke-linked-receipt.json"}
+	primary := pair{"smoke-primary-ack.json", "smoke-primary-receipt.json"}
+	other, none := "another-checkout", ""
+	for _, cell := range []struct {
+		name              string
+		pair              pair
+		checkout          *string // the run's admitted view; nil takes the ACK's own
+		tool              string
+		edit              func(ack, status map[string]any)
+		counted, credited bool
+	}{
+		{name: "own pending linked ACK", pair: pr, counted: true, credited: true},
+		{name: "linked ACK before its receipt counted the lap", pair: smoke, counted: true},
+		{name: "primary full ACK that waited", pair: primary},
+		{name: "primary route given a linked ACK", pair: pr, checkout: &none},
+		{name: "primary route with empty checkout claims", pair: pr, checkout: &none, edit: func(ack, status map[string]any) {
+			ack["freshness"].(map[string]any)["checkout_id"], status["checkout_id"] = "", ""
+		}},
+		{name: "another admitted checkout", pair: pr, checkout: &other},
+		{name: "ACK view names another checkout", pair: pr, edit: func(ack, _ map[string]any) { ack["freshness"].(map[string]any)["checkout_id"] = other }},
+		{name: "ACK without its view", pair: pr, edit: func(ack, _ map[string]any) { delete(ack, "freshness") }},
+		{name: "receipt names another checkout", pair: pr, edit: func(_, status map[string]any) { status["checkout_id"] = other }},
+		{name: "full ACK that waited", pair: pr, edit: func(ack, _ map[string]any) { delete(ack, "reindex_pending"); ack["graph_status"] = "fresh" }},
+		{name: "ACK reports no pending publication", pair: pr, edit: func(ack, _ map[string]any) { ack["reindex_pending"] = false }},
+		{name: "receipt reports another ACK policy", pair: pr, edit: func(_, status map[string]any) { status["ack_mode"] = "local" }},
+		{name: "local ACK on a linked route", pair: pr, edit: func(ack, status map[string]any) { ack["ack_mode"], status["ack_mode"] = "local", "local" }, counted: true, credited: true},
+		{name: "refused", pair: pr, edit: func(ack, _ map[string]any) { ack["status"] = "refused" }},
+		{name: "replayed", pair: pr, edit: func(ack, _ map[string]any) { ack["replayed"] = true }},
+		{name: "not committed", pair: pr, edit: func(ack, _ map[string]any) { ack["disk_status"] = "written" }},
+		{name: "foreign receipt", pair: pr, edit: func(_, status map[string]any) { status["receipt"] = "commit-other" }},
+		{name: "foreign mutation", pair: pr, edit: func(_, status map[string]any) { status["mutation_id"] = "load-edit-other" }},
+		{name: "foreign commit", pair: pr, edit: func(_, status map[string]any) { status["commit_seq"] = json.Number("9") }},
+		{name: "foreign content", pair: pr, edit: func(_, status map[string]any) { status["content_sha256"] = "content-other" }},
+		{name: "symbol edit", pair: pr, tool: "edit.symbol"},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			ack, status := readLinkedFullACKFixture(t, cell.pair.ack), readLinkedFullACKFixture(t, cell.pair.receipt)
+			view, _ := ack["freshness"].(map[string]any)
+			checkout, _ := view["checkout_id"].(string)
+			if cell.checkout != nil {
+				checkout = *cell.checkout
+			}
+			if cell.edit != nil {
+				cell.edit(ack, status)
+			}
+			tool := cell.tool
+			if tool == "" {
+				tool = "edit.file"
+			}
+			mutationID, _ := ack["mutation_id"].(string)
+			receipt, _ := ack["mutation_receipt"].(string)
+			counted := editProbeCountedNoWait(ack, status, tool, mutationID, checkout)
+			if counted != cell.counted {
+				t.Fatalf("counted no-wait = %v, want %v", counted, cell.counted)
+			}
+			runtime := &editProbeRuntime{}
+			strict := runtime.accountingForStatus(t.Context(), status, receipt, tool, false)
+			got := runtime.accountingForStatus(t.Context(), status, receipt, tool, counted)
+			want := strict
+			if cell.credited {
+				if !slices.Contains(strict.Reasons, missing) {
+					t.Fatalf("strict reading has no missing reindex_wait reason to credit: %+v", strict)
+				}
+				want.Reasons = slices.DeleteFunc(slices.Clone(strict.Reasons), func(reason string) bool { return reason == missing })
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("accounting = %+v, want %+v", got, want)
+			}
+			if cell.name == "own pending linked ACK" && (got.State != "terminal_unavailable_background" || got.A == nil ||
+				slices.ContainsFunc(got.Reasons, func(reason string) bool { return strings.HasPrefix(reason, "missing applicable A phase") })) {
+				t.Fatalf("own linked full ACK is not terminal with a complete A check: %+v", got)
 			}
 		})
 	}

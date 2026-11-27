@@ -431,15 +431,45 @@ type editProbeAccounting struct {
 	Reasons   []string                  `json:"reasons"`
 }
 
+// editProbeCountedNoWait reports whether the original committed ACK never
+// waited for its publication, so that its retained receipt may count that
+// wait as not applicable: a local ACK, or a linked checkout's full ACK that
+// returned before the checkout's queued publication. checkoutID is the run's
+// own admitted linked view for the edit's route, empty for the primary.
+func editProbeCountedNoWait(ack, status map[string]any, tool, mutationID, checkoutID string) bool {
+	return localFileAcknowledgementMatches(ack, status, tool, mutationID) ||
+		linkedFullAcknowledgementMatches(ack, status, tool, mutationID, checkoutID)
+}
+
 func localFileAcknowledgementMatches(ack, status map[string]any, tool, mutationID string) bool {
+	return committedFileAcknowledgementMatches(ack, status, tool, mutationID, "local")
+}
+
+// A linked checkout's full ACK is served by the checkout's own queued
+// publication, which it does not wait for. Only the run's admitted checkout,
+// named by both the ACK's view and its receipt, with the ACK still reporting
+// its publication pending, makes that ACK eligible. A full ACK that waited,
+// a primary ACK and any other checkout's claim stay strict.
+func linkedFullAcknowledgementMatches(ack, status map[string]any, tool, mutationID, checkoutID string) bool {
+	view, _ := ack["freshness"].(map[string]any)
+	if checkoutID == "" || ack["reindex_pending"] != true || view["checkout_id"] != checkoutID || status["checkout_id"] != checkoutID {
+		return false
+	}
+	return committedFileAcknowledgementMatches(ack, status, tool, mutationID, "full")
+}
+
+// The ACK and its retained receipt name the same applied, committed and
+// unreplayed edit.file mutation under one ACK policy, with the same receipt,
+// commit and bytes.
+func committedFileAcknowledgementMatches(ack, status map[string]any, tool, mutationID, ackMode string) bool {
 	if tool != "edit.file" || mutationID == "" || ack["status"] != "applied" ||
-		ack["ack_mode"] != "local" || ack["disk_status"] != "committed" || ack["mutation_id"] != mutationID {
+		ack["ack_mode"] != ackMode || ack["disk_status"] != "committed" || ack["mutation_id"] != mutationID {
 		return false
 	}
 	if replayed, present := ack["replayed"]; present && replayed != false {
 		return false
 	}
-	if status["found"] != true || status["tool"] != "edit_file" || status["ack_mode"] != "local" ||
+	if status["found"] != true || status["tool"] != "edit_file" || status["ack_mode"] != ackMode ||
 		status["disk_status"] != "committed" || status["mutation_id"] != mutationID {
 		return false
 	}
@@ -474,7 +504,8 @@ func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedFiel
 }
 
 // Callers stay strict unless the original committed ACK and receipt establish
-// local no-wait eligibility. The producer must still attest the skipped phase.
+// no-wait eligibility (editProbeCountedNoWait). The producer must still attest
+// the skipped phase.
 func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }

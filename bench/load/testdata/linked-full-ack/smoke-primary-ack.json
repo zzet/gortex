@@ -1,0 +1,46 @@
+{
+  "ack_at": "2026-11-27T04:37:04.125735Z",
+  "ack_mode": "full",
+  "applied_generation": 1,
+  "bytes_written": 1030,
+  "commit_seq": 1,
+  "content_sha256": "28ef71445f91c7a4a5e7688f831a85207fb00fcab9f8d39a7c26c61f01c19073",
+  "derived_at": "2026-11-27T04:37:04.572953Z",
+  "derived_fanout_complete": true,
+  "disk_status": "committed",
+  "file_graph_at": "2026-11-27T04:37:04.53921Z",
+  "file_reason": "projection_not_live",
+  "file_view": {
+    "counts": null,
+    "delta_reason": "projection_not_live",
+    "delta_state": "unavailable",
+    "historical": true,
+    "reason": "projection_not_live",
+    "state": "unavailable",
+    "symbols": null,
+    "syntax_health": {
+      "checked": false,
+      "errors": null,
+      "state": "unknown"
+    },
+    "truncated": false
+  },
+  "graph_status": "fresh",
+  "graph_status_hint": "file readback unavailable; recorded graph status: fresh",
+  "mutation_id": "load-edit-0000000000000001-000",
+  "mutation_receipt": "commit-1795753966337424001",
+  "new_sha": "77e39fdd3e9c5801ab451dc7979d810fec163df5",
+  "path": "gortex/internal/wiki/slug.go",
+  "readback_exact": false,
+  "reindex_generation": 1,
+  "reindexed": true,
+  "relations_at": "2026-11-27T04:37:04.53921Z",
+  "replacements": 1,
+  "status": "applied",
+  "tier_state": {
+    "derived": "fresh",
+    "file": "pending",
+    "file_graph": "fresh",
+    "relations": "fresh"
+  }
+}
