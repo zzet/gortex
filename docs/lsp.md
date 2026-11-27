@@ -596,7 +596,8 @@ already size the heap with any max-heap or max-RAM flag (`-Xmx`,
 `_JAVA_OPTIONS` does (in the server's `env:` or the daemon's environment) and
 `GORTEX_LSP_JDTLS_XMX` is unset. The chosen value is logged as
 `lsp: jdtls max heap` when the server starts, with a warning when
-`_JAVA_OPTIONS` also sizes the heap, since the JVM applies it last.
+`_JAVA_OPTIONS` sets an explicit max heap (`-Xmx` or `-XX:MaxHeapSize=`),
+which the JVM applies after the command line.
 
 The cap goes through the upstream `jdtls` launcher's `--jvm-arg` option, and
 heap flags in the configured args only count in that form

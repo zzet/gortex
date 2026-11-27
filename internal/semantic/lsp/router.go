@@ -776,6 +776,8 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		}
 		owner, admitted := r.registerCloseLocked(p, spec.Name, workspace, "duplicate")
 		r.mu.Unlock()
+		r.logger.Warn("LSP router found a provider already published for this server and workspace; closing the new one",
+			zap.String("spec", spec.Name), zap.String("workspace", workspace))
 		if admitted {
 			go r.finishClose(owner)
 		}

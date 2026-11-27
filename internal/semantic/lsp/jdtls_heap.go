@@ -52,8 +52,8 @@ type jdtlsHeapDecision struct {
 	// favour of the default.
 	Rejected string
 	// OverriddenBy names _JAVA_OPTIONS when the launch carries a heap cap and
-	// _JAVA_OPTIONS sizes the heap too: the JVM applies it after the command
-	// line, so the logged cap is not in force.
+	// _JAVA_OPTIONS sets an explicit max heap: the JVM applies it after the
+	// command line, so the logged cap is not in force.
 	OverriddenBy string
 }
 
@@ -78,8 +78,11 @@ func jdtlsHeapArgs(baseArgs, env []string) ([]string, jdtlsHeapDecision) {
 			out = append(out, baseArgs...)
 		}
 	}
+	// _JAVA_OPTIONS is applied after the command line, so an explicit max
+	// heap there replaces the cap. Its RAM-derived flags are not counted:
+	// the JVM ignores them once any explicit max is set.
 	capped := decision.MaxHeap != "" || decision.Source == "args"
-	if capped && setsJVMHeap(effectiveEnv(env, "_JAVA_OPTIONS")) {
+	if capped && containsAny(effectiveEnv(env, "_JAVA_OPTIONS"), explicitHeapFlags) {
 		decision.OverriddenBy = "_JAVA_OPTIONS"
 	}
 	return out, decision
@@ -138,8 +141,20 @@ func jdtlsDefaultMaxHeapFor(ram uint64) string {
 // command-line -Xmx would override. -XX:SoftMaxHeapSize is only a target and
 // does not count.
 func setsJVMHeap(opts string) bool {
-	for _, flag := range []string{"-Xmx", "-XX:MaxHeapSize=", "-XX:MaxRAM=", "-XX:MaxRAMPercentage=", "-XX:MaxRAMFraction="} {
-		if strings.Contains(opts, flag) {
+	return containsAny(opts, explicitHeapFlags) || containsAny(opts, ramHeapFlags)
+}
+
+var (
+	// explicitHeapFlags set the max heap directly.
+	explicitHeapFlags = []string{"-Xmx", "-XX:MaxHeapSize="}
+	// ramHeapFlags derive the max heap from RAM; the JVM ignores them when an
+	// explicit max heap is set.
+	ramHeapFlags = []string{"-XX:MaxRAM=", "-XX:MaxRAMPercentage=", "-XX:MaxRAMFraction="}
+)
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
 			return true
 		}
 	}

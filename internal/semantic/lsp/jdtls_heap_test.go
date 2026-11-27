@@ -27,6 +27,7 @@ func TestJdtlsHeapArgs(t *testing.T) {
 		source    string
 		rejected  string
 		overrides string
+		hostRAM   uint64
 	}{
 		{
 			name:   "nothing configured: default cap, ahead of the launcher args",
@@ -107,12 +108,45 @@ func TestJdtlsHeapArgs(t *testing.T) {
 			source:    JdtlsMaxHeapEnv,
 			overrides: "_JAVA_OPTIONS",
 		},
+		{
+			name:      "_JAVA_OPTIONS is reported as overriding a cap from the args",
+			serverEnv: []string{"_JAVA_OPTIONS=-XX:MaxHeapSize=1g"},
+			args:      []string{"--jvm-arg=-Xmx6G"},
+			want:      []string{"--jvm-arg=-Xmx6G"},
+			source:    "args",
+			overrides: "_JAVA_OPTIONS",
+		},
+		{
+			name:      "a RAM-derived flag in _JAVA_OPTIONS does not override an explicit cap",
+			daemonEnv: map[string]string{"_JAVA_OPTIONS": "-XX:MaxRAMPercentage=50", JdtlsMaxHeapEnv: "3G"},
+			want:      []string{"--jvm-arg=-Xmx3G"},
+			source:    JdtlsMaxHeapEnv,
+		},
+		{
+			name:      "precedence: _JAVA_OPTIONS before JDK_JAVA_OPTIONS",
+			daemonEnv: map[string]string{"JDK_JAVA_OPTIONS": "-Xmx6G", "_JAVA_OPTIONS": "-Xmx1g"},
+			source:    "_JAVA_OPTIONS",
+		},
+		{
+			name:      "precedence: JDK_JAVA_OPTIONS before JAVA_TOOL_OPTIONS",
+			daemonEnv: map[string]string{"JAVA_TOOL_OPTIONS": "-Xmx6G", "JDK_JAVA_OPTIONS": "-Xmx1g"},
+			source:    "JDK_JAVA_OPTIONS",
+		},
+		{
+			name:    "small host: the default follows the JVM's own ceiling",
+			hostRAM: 4 << 30,
+			want:    []string{"--jvm-arg=-Xmx1G"},
+			source:  "default",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			clearJVMHeapEnv(t)
 			for k, v := range tt.daemonEnv {
 				t.Setenv(k, v)
+			}
+			if tt.hostRAM != 0 {
+				hostMemoryBytes = func() uint64 { return tt.hostRAM }
 			}
 			args, d := jdtlsHeapArgs(tt.args, tt.serverEnv)
 			assert.Equal(t, tt.want, args)
