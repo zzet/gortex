@@ -389,6 +389,12 @@
                       "read_metadata_state": {
                         "type": "string"
                       },
+                      "redial_ns": {
+                        "type": "integer"
+                      },
+                      "redialed": {
+                        "type": "boolean"
+                      },
                       "request_sha256": {
                         "type": "string"
                       },
@@ -2663,6 +2669,12 @@
                               "reads_while_receipt_observed_pending": {
                                 "type": "integer"
                               },
+                              "redial_ns": {
+                                "type": "integer"
+                              },
+                              "redialed_calls": {
+                                "type": "integer"
+                              },
                               "relation_consumers": {
                                 "additionalProperties": {
                                   "additionalProperties": false,
@@ -4556,6 +4568,44 @@
                             {
                               "type": "null"
                             }
+                          ]
+                        },
+                        "session_redials": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "affected_records": {
+                                "type": "integer"
+                              },
+                              "failed": {
+                                "type": "integer"
+                              },
+                              "index": {
+                                "type": "integer"
+                              },
+                              "limit_reached": {
+                                "type": "boolean"
+                              },
+                              "redials": {
+                                "type": "integer"
+                              },
+                              "role": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "role",
+                              "index",
+                              "redials",
+                              "failed",
+                              "limit_reached",
+                              "affected_records"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "array",
+                            "null"
                           ]
                         },
                         "shared_owners": {

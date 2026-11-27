@@ -99,6 +99,8 @@ type editProbeRecord struct {
 	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
 	Accounting                  editProbeAccounting                 `json:"accounting"`
 	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
+	RedialedCalls               int                                 `json:"redialed_calls,omitempty"` // this edit's calls that went through a re-dial, whatever the clock measured
+	RedialNS                    int64                               `json:"redial_ns,omitempty"`      // their time re-opening the session; inside t_ack, t_readback and probe timings
 	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
 	ProbeErrors                 int                                 `json:"probe_errors"`
 	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
@@ -124,6 +126,7 @@ type editProbeReport struct {
 	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
 	SharedOwners       *editProbeSharedOwnerReport  `json:"shared_owners,omitempty"`
 	SearchReadbacks    *searchReadbackAcceptance    `json:"search_readback_acceptance,omitempty"`
+	SessionRedials     []editProbeSessionRedials    `json:"session_redials,omitempty"` // only sessions that re-dialed
 	Role               string                       `json:"role,omitempty"`
 	Plan               editProbePlan                `json:"plan"`
 	PlanHash           string                       `json:"plan_sha256"`
@@ -139,6 +142,74 @@ type editProbeReport struct {
 	ProjectionBefore   *editProbeProjectionBookend  `json:"projection_before,omitempty"`
 	ProjectionAfter    *editProbeProjectionBookend  `json:"projection_after,omitempty"`
 	Limitations        []string                     `json:"limitations"`
+}
+
+// An editor or prober session that re-dialed after it gave up a write. Index
+// is the editor number, or the edit ordinal that opened the prober session.
+// The re-opened stream is a new daemon session; the calls that failed on the
+// old stream keep their original errors in their attempts and evidence.
+type editProbeSessionRedials struct {
+	Role         string `json:"role"`
+	Index        int    `json:"index"`
+	Redials      int    `json:"redials"`
+	Failed       int    `json:"failed"`        // re-dials that did not open a session
+	LimitReached bool   `json:"limit_reached"` // later calls failed with the stream closed
+	// Edit records with a call on this session that went through a re-dial
+	// (their redialed_calls). A re-dial absorbed outside an edit's calls, such
+	// as a setup read, counts in redials but marks no record.
+	AffectedRecords int `json:"affected_records"`
+}
+
+// How often one editor or prober session may re-dial. Without a re-dial, one
+// write that reaches its deadline fails every later call on the session at
+// once; each further such write on a re-opened stream costs another re-dial.
+const editProbeSessionRedialLimit = 4
+
+type editProbeSession struct {
+	role   string
+	index  int
+	client *socketClient
+}
+
+// watchSession lets an editor or prober session re-dial after a write it gave
+// up on and keeps it for the report's re-dial rows.
+func (r *editProbeRuntime) watchSession(role string, index int, client *socketClient) {
+	if client == nil {
+		return
+	}
+	client.allowRedials(editProbeSessionRedialLimit)
+	r.sessions = append(r.sessions, editProbeSession{role: role, index: index, client: client})
+}
+
+// noteRedialedRecord marks the edit record ordinal as holding a call on
+// client that went through a re-dial.
+func (r *editProbeRuntime) noteRedialedRecord(client *socketClient, ordinal int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.redialedRecords == nil {
+		r.redialedRecords = make(map[*socketClient]map[int]bool)
+	}
+	if r.redialedRecords[client] == nil {
+		r.redialedRecords[client] = make(map[int]bool)
+	}
+	r.redialedRecords[client][ordinal] = true
+}
+
+// finishSessionRedials ends re-dialing with the measured workload, so the
+// report holds every re-dial, and returns the sessions that re-dialed. The
+// restore batch and closing receipts that follow run without re-dialing.
+func (r *editProbeRuntime) finishSessionRedials() []editProbeSessionRedials {
+	var rows []editProbeSessionRedials
+	for _, session := range r.sessions {
+		session.client.allowRedials(0)
+		if counts := session.client.redialCounts(); counts.Attempts != 0 || counts.LimitReached {
+			r.mu.Lock()
+			affected := len(r.redialedRecords[session.client])
+			r.mu.Unlock()
+			rows = append(rows, editProbeSessionRedials{Role: session.role, Index: session.index, Redials: counts.Attempts, Failed: counts.Failed, LimitReached: counts.LimitReached, AffectedRecords: affected})
+		}
+	}
+	return rows
 }
 
 type editProbePhysicalWriteScope struct {
@@ -239,11 +310,14 @@ type editProbeRuntime struct {
 	checkoutIDs       map[string]string // linked checkout path -> exact admitted public view identity
 	moveOriginal      []byte
 	origin            time.Time
-	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
+	mu                sync.Mutex // Phase.Attempts, reads, mode counts and re-dial marks only; request lifetimes are never serialized
 	requireAccounting bool
 	finalized         bool
 	restarter         editProbeRestarter // restart cell only
 	restarted         []*socketClient    // sessions reopened after a restart; closed by close
+	sessions          []editProbeSession // editor and prober sessions that may re-dial
+	// Per session, the edit records whose calls went through a re-dial; under mu.
+	redialedRecords map[*socketClient]map[int]bool
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
@@ -404,6 +478,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
 	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance && !plan.OwnACKReadbackOnly}
+	for i, editor := range editors {
+		r.watchSession("editor", i, editor)
+	}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -544,6 +621,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 				return r, clients, err
 			}
 			clients = append(clients, state.client)
+			r.watchSession("prober", state.step.Ordinal, state.client)
 		}
 		// A file created during the run proves its own presence before the
 		// paired delete is sent; it cannot be admitted here.
@@ -709,6 +787,16 @@ type editProbeCaller struct {
 
 func (c *editProbeCaller) responseReturnedAt() time.Time { return c.last.Finished }
 
+// lastCallRedial is the re-dial time and mark of the caller's latest call,
+// when that call started at or after since, so an attempt never takes an
+// earlier attempt's mark.
+func (c *editProbeCaller) lastCallRedial(since time.Time) (time.Duration, bool) {
+	if c.last.Started.Before(since) {
+		return 0, false
+	}
+	return c.last.Redial, c.last.Redialed
+}
+
 func (c *editProbeCaller) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	var onWriteStart func(time.Time)
 	if c.purpose == "edit" {
@@ -732,13 +820,26 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 	if strings.HasPrefix(c.purpose, "oracle:") && !identity.WriteStarted.IsZero() && (c.state.firstProbeWrite.IsZero() || identity.WriteStarted.Before(c.state.firstProbeWrite)) {
 		c.state.firstProbeWrite = identity.WriteStarted
 	}
+	if identity.Redialed {
+		c.state.record.RedialedCalls++
+		c.state.record.RedialNS += identity.Redial.Nanoseconds()
+	}
 	c.state.mu.Unlock()
+	if identity.Redialed {
+		c.runtime.noteRedialedRecord(c.client, c.state.step.Ordinal)
+	}
 	if err == nil {
 		if expected := c.expectedAbsence(data, identity); expected != nil {
 			err = expected
 		}
 	}
 	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "output_mode": editProbeRequestOutput(c.request), "payload": data}
+	if identity.Redialed {
+		row["redialed"] = true
+		if identity.Redial > 0 {
+			row["redial_ns"] = identity.Redial.Nanoseconds()
+		}
+	}
 	if err != nil {
 		row["error"] = err.Error()
 		if expected, ok := err.(*editProbeExpectedAbsence); ok {
@@ -1684,6 +1785,7 @@ func (r *editProbeRuntime) finish() error {
 		appendEditProbeTopologyWaits(r.phase, r.plan.Seed)
 	}
 	r.phase.EditProbe.SearchReadbacks = summarizeSearchReadbacks(r.plan, r.phase.EditProbe.Records)
+	r.phase.EditProbe.SessionRedials = r.finishSessionRedials()
 	if r.phase.EditProbe.SearchReadbacks != nil && !r.phase.EditProbe.SearchReadbacks.Pass {
 		failures = append(failures, errors.New("immediate search readback acceptance incomplete or incorrect"))
 	}
