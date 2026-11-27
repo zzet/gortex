@@ -15,6 +15,10 @@ const (
 	checkoutNotAdmittedPrefix = "view_read_only: checkout mutation was not admitted; no files were changed: "
 	byteNotAdmittedPrefix     = "view_read_only: byte mutation admission refused; no files were changed: "
 
+	// The checkout admission refusal's cause when the checkout's selected
+	// route moved under the edit: the one cause a re-send waits out.
+	checkoutRouteMovedCause = ": indexer: checkout mutation view is stale: the selected route moved"
+
 	// The session checkout gate refuses a mutation while the checkout's route
 	// is not ready, before any handler runs.
 	checkoutNotRoutedPrefix = `view_building: checkout "`

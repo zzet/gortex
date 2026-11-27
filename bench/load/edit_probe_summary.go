@@ -225,6 +225,7 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 	for name, m := range values {
 		out.Measures[name] = editProbeQuantilesOf(m.observed, m.censored, len(records)-len(m.observed)-m.censored, "ms", seed, name)
 	}
+	summarizeEditProbeTierAfterCommit(out, records, seed)
 	summarizeEditProbeAttribution(out, records)
 	return out
 }

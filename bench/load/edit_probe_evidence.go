@@ -8,9 +8,12 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"math"
 	"math/big"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -633,8 +636,9 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 			fail("missing B phase " + name)
 		}
 	}
-	for name, value := range pPhases {
-		if value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
+	// In name order, so identical status replies give identical reasons.
+	for _, name := range slices.Sorted(maps.Keys(pPhases)) {
+		if value := pPhases[name]; value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
 			fail("B/P phase mismatch: " + name)
 		}
 	}
@@ -715,6 +719,47 @@ func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accoun
 
 func editProbeAccountingComplete(accounting editProbeAccounting) bool {
 	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
+}
+
+// Once a status loop awaits nothing but terminal accounting (the graph is
+// fresh, every first-correct time is measured, and any assigned post-ACK
+// coverage is in), the accounting gets this many consecutive unchanged status
+// cycles to become terminal. A native-duplicate physical attempt whose
+// earlier publisher is never reported stays unavailable indefinitely, and
+// repeating identical status reads would only fill the per-edit raw evidence
+// cap. The bound applies to any accounting that is not yet terminal, so late
+// P or B evidence and unknown diagnostics that arrive after it leave an
+// accounting gap.
+const editProbeAccountingSettlePolls = 8
+
+var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
+
+// editProbeAccountingSettle counts one status loop's consecutive evaluated
+// cycles that await only terminal accounting and see it unchanged.
+type editProbeAccountingSettle struct {
+	last      []any
+	unchanged int
+}
+
+// unsettled records one evaluated status cycle and reports whether the loop
+// should stop with its accounting still unavailable. ready says that every
+// exit condition other than terminal accounting held on this cycle;
+// accounting is all the accounting the cycle observed. A cycle that is not
+// ready, or whose accounting differs from the last counted one, restarts the
+// count. Callers do not call it for a cycle in which a transaction, receipt
+// or acknowledgement status read failed, so such a cycle neither counts nor
+// resets: the bound counts successful observations, possibly with failed
+// reads between them.
+func (w *editProbeAccountingSettle) unsettled(ready bool, accounting ...any) bool {
+	switch {
+	case !ready:
+		w.unchanged = 0
+	case w.unchanged == 0 || !reflect.DeepEqual(w.last, accounting):
+		w.last, w.unchanged = accounting, 1
+	default:
+		w.unchanged++
+	}
+	return w.unchanged >= editProbeAccountingSettlePolls
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {

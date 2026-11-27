@@ -117,9 +117,11 @@ func (r *editProbeRuntime) doRestartEdit(ctx context.Context, step editProbeStep
 	killedOutstanding := !answered && edit.err != nil && callCtx.Err() == nil
 	if edit.err != nil && !killedOutstanding {
 		s.mu.Lock()
-		switch {
+		switch code := editProbeDeclinedResend(edit.err); {
 		case ctx.Err() != nil:
 			s.record.Outcome = "phase_censored"
+		case code != "":
+			s.record.Outcome, s.record.DeadlineReason = "product_deadline", code
 		case callCtx.Err() != nil:
 			s.record.Outcome = "product_deadline"
 		default:
