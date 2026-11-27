@@ -440,6 +440,728 @@
                     "null"
                   ]
                 },
+                "contract_freshness": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "acknowledged_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "count": {
+                              "type": "integer"
+                            },
+                            "max": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p50": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p95": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p99": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "count",
+                            "p50",
+                            "p95",
+                            "p99",
+                            "max"
+                          ],
+                          "type": "object"
+                        },
+                        "fresh_after_ack_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "count": {
+                              "type": "integer"
+                            },
+                            "max": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p50": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p95": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p99": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "count",
+                            "p50",
+                            "p95",
+                            "p99",
+                            "max"
+                          ],
+                          "type": "object"
+                        },
+                        "fresh_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "count": {
+                              "type": "integer"
+                            },
+                            "max": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p50": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p95": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p99": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "count",
+                            "p50",
+                            "p95",
+                            "p99",
+                            "max"
+                          ],
+                          "type": "object"
+                        },
+                        "fresh_read_ms": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "count": {
+                              "type": "integer"
+                            },
+                            "max": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p50": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p95": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "p99": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "unit": {
+                                  "type": "string"
+                                },
+                                "value": {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "value",
+                                "unit",
+                                "reason"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "count",
+                            "p50",
+                            "p95",
+                            "p99",
+                            "max"
+                          ],
+                          "type": "object"
+                        },
+                        "observations": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "acknowledged_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "acknowledgement": {},
+                              "baseline": {
+                                "type": "string"
+                              },
+                              "fresh_after_ack_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "fresh_contract_analysis": {},
+                              "fresh_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "fresh_not_before_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "fresh_read_ms": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "reason": {
+                                    "type": "string"
+                                  },
+                                  "unit": {
+                                    "type": "string"
+                                  },
+                                  "value": {
+                                    "anyOf": [
+                                      {
+                                        "type": "number"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "value",
+                                  "unit",
+                                  "reason"
+                                ],
+                                "type": "object"
+                              },
+                              "identity": {
+                                "type": "string"
+                              },
+                              "ordinal": {
+                                "type": "integer"
+                              },
+                              "outcome": {
+                                "type": "string"
+                              },
+                              "read_outcomes": {
+                                "additionalProperties": {
+                                  "type": "integer"
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
+                              "reads": {
+                                "type": "integer"
+                              },
+                              "started": {
+                                "format": "date-time",
+                                "type": "string"
+                              },
+                              "symbol": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "ordinal",
+                              "identity",
+                              "symbol",
+                              "baseline",
+                              "outcome",
+                              "started",
+                              "acknowledged_ms",
+                              "fresh_ms",
+                              "fresh_after_ack_ms",
+                              "fresh_not_before_ms",
+                              "fresh_read_ms",
+                              "reads",
+                              "read_outcomes",
+                              "acknowledgement"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "outcomes": {
+                          "additionalProperties": {
+                            "type": "integer"
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "observations",
+                        "outcomes",
+                        "acknowledged_ms",
+                        "fresh_ms",
+                        "fresh_after_ack_ms",
+                        "fresh_read_ms"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "daemon_status": {
                   "items": {},
                   "type": [
@@ -6114,6 +6836,41 @@
             "properties": {
               "agents": {
                 "type": "integer"
+              },
+              "contract_freshness": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "edits": {
+                        "type": "integer"
+                      },
+                      "list_limit": {
+                        "type": "integer"
+                      },
+                      "read_interval_ms": {
+                        "type": "number"
+                      },
+                      "route_prefix": {
+                        "type": "string"
+                      },
+                      "version": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "version",
+                      "edits",
+                      "read_interval_ms",
+                      "list_limit",
+                      "route_prefix"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "cpu_profile_seconds": {
                 "type": "number"

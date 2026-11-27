@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -286,5 +287,21 @@ func TestEditProbeLosslessStandaloneProfileValidation(t *testing.T) {
 		if validateRunOptions(bad) == nil {
 			t.Fatal("unsupported lossless profile accepted")
 		}
+	}
+	// An explicit per-edit raw cap may only raise the default, within a bound.
+	for _, mib := range []string{"16", "256"} {
+		if _, err := parseRun(append(slices.Clone(args), "--edit-probe-raw-limit-mib", mib)); err != nil {
+			t.Fatalf("raw cap %s MiB: %v", mib, err)
+		}
+	}
+	for _, mib := range []string{"-1", "8", "257"} {
+		if _, err := parseRun(append(slices.Clone(args), "--edit-probe-raw-limit-mib", mib)); err == nil {
+			t.Fatalf("raw cap %s MiB accepted", mib)
+		}
+	}
+	bad := o
+	bad.Scenario, bad.EditGateModes, bad.LosslessEditProbeEvidence, bad.EditProbeRawLimitMiB = "read", false, false, 64
+	if validateRunOptions(bad) == nil {
+		t.Fatal("raw cap accepted outside edit-and-probe")
 	}
 }

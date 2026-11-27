@@ -91,16 +91,21 @@ func supersededRecordFixture(t *testing.T) (editProbeRecord, *receiptproof.Super
 }
 
 func TestEditProbeProvenSupersededPreservesUnavailableTimingsAndRefusal(t *testing.T) {
-	record, proof := supersededRecordFixture(t)
-	scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
-	if !classifySupersededRecord(&record, scope, proof) {
-		t.Fatal("exact proven shared receipt was not classified")
-	}
-	if record.Outcome != receiptproof.SupersededOutcome || len(record.Errors) != 0 {
-		t.Fatalf("classification=%+v", record)
-	}
-	if record.Accounting.P != nil || record.Accounting.B != nil || record.Accounting.State != "terminal_unavailable_background" || len(record.Accounting.Reasons) == 0 {
-		t.Fatal("classification invented or erased indexing evidence")
+	// Complete evidence within the default cap, and above it within a lossless cell's cap.
+	for _, limit := range []int{16 << 20, 64 << 20} {
+		record, proof := supersededRecordFixture(t)
+		record.EvidenceLimit = limit
+		record.EvidenceBytes = limit - 1<<20
+		scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
+		if !classifySupersededRecord(&record, scope, proof) {
+			t.Fatalf("exact proven shared receipt was not classified under a %d-byte cap", limit)
+		}
+		if record.Outcome != receiptproof.SupersededOutcome || len(record.Errors) != 0 {
+			t.Fatalf("classification=%+v", record)
+		}
+		if record.Accounting.P != nil || record.Accounting.B != nil || record.Accounting.State != "terminal_unavailable_background" || len(record.Accounting.Reasons) == 0 {
+			t.Fatal("classification invented or erased indexing evidence")
+		}
 	}
 }
 
