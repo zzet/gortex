@@ -98,6 +98,15 @@ func TestRegisteredMetadataReadRefusalEvidenceIsOptIn(t *testing.T) {
 					if readErr == nil && result != nil && !result.IsError && calls == 1 {
 						selected = ctx
 						peer, peerErr = externalVersionRegisteredCall(s, base, 30, "edit_symbol", map[string]any{"id": "main.go::NeighborBefore", "old_source": "func NeighborBefore() int { return 2 }", "new_source": "func NeighborBefore() int { return 3 }", "dry_run": false})
+						if tool == "get_editing_context" && peerErr == nil {
+							// The editing context absorbs a verified newer tool
+							// commit; a same-stamp byte change after it keeps the
+							// physical refusal this evidence describes.
+							peerErr = errors.New("peer commit has no live owner")
+							if owner := liveEntry(pendingFileProjections, path); owner != nil {
+								peerErr = rewriteKeepingStamp(path, owner.disk, "return 3", "return 4")
+							}
+						}
 						selectedErr = validateRequestProjections(ctx)
 						remaining = time.Until(ctx.Value(projectedSourceDeadlineKey{}).(time.Time))
 					}

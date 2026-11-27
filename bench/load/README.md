@@ -342,6 +342,38 @@ not depend on order. The 1-edit diagnostic and
 the default paired no-regression cell stay one editor. The explicit paired
 own-ACK transaction method below admits four or eight editor streams.
 
+Editor and prober sessions re-dial after the harness gives up a write. A frame
+write that reaches its 10 second deadline, or whose call's context ends
+mid-frame, may leave a partial frame, so that stream is closed. The next call
+on the session then opens a new daemon session on the same socket and checkout
+instead of failing at once with the closed stream's error. A session re-dials
+at most four times; after that, its calls fail at once with the original error
+followed by `session not re-opened: re-dial limit 4 reached`. The call that
+gave up its write, and any call still waiting on that stream, keep their
+original error (for example `i/o timeout`) in their attempts and raw evidence.
+A stream the daemon closed or corrupted is never re-dialed. `session_redials`
+lists each session that re-dialed: its role (`editor` or `prober`), its editor
+number or the edit ordinal that opened it, its re-dials, the re-dials that
+failed, and whether it reached the limit. The list is absent when no session
+re-dialed. Re-dialing ends with the measured workload, so the restore batch
+and the closing receipts run without it. A re-opened stream is a new daemon
+session, so a subscription made on the old one is not renewed. Reader sessions,
+sessions the restart cell reopens, and the sessions of other scenarios do not
+re-dial: one given-up write closes them for good.
+
+Re-dials are recorded per call. A call that re-opens its session, or waits
+for another call's re-dial, carries `redialed: true` and its re-dial time
+`redial_ns` in its attempt and in its raw `rpc` evidence row: the wait, the
+old reader's exit, the dial, handshake and initialize, and any back-off after
+a failed re-dial. That time is inside the call's `duration_ms`. `redial_ns` is
+absent when it measured zero, which a re-dial quicker than the clock's
+resolution can, so `redialed` alone says that a re-dial happened. An edit
+record counts its calls that re-dialed in `redialed_calls` and sums their time
+in `redial_ns`, which is inside its `t_ack_ms`, `t_readback_ms` and probe
+timings, and each `session_redials` row counts the edit records it marked in
+`affected_records`. A call on an open stream, and a call refused without a
+re-dial, carries neither.
+
 A full gate record may use outcome `proven_superseded` only in an admitted
 shared physical worktree. Its optional `superseded_receipt` joins the latest
 terminal receipt status (receipt, mutation, RPC, generation and publication

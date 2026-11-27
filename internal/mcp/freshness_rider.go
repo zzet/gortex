@@ -1180,6 +1180,8 @@ func (f relationFreshness) apply(result map[string]any) {
 	}
 	if f.state == "pending" && f.storeBusy {
 		result["reason"] = "store_busy"
+	} else if f.state == "pending" && f.publishing {
+		result["reason"] = "publication_in_flight"
 	}
 	scope := f.scope
 	if scope == "" {
