@@ -145,6 +145,20 @@ func reindexEdgesApplied(g graph.Store, batch []graph.EdgeReindex) bool {
 	return true
 }
 
+func reindexEdgesAppliedWithWindow(g graph.Store, batch []graph.EdgeReindex, maxWait time.Duration) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	if maxWait > 0 {
+		if writer, ok := g.(interface {
+			ReindexEdgesTryApplied([]graph.EdgeReindex, time.Duration) bool
+		}); ok {
+			return writer.ReindexEdgesTryApplied(batch, maxWait)
+		}
+	}
+	return reindexEdgesApplied(g, batch)
+}
+
 func reindexUnresolvedTargetsApplied(
 	targeter graph.UnresolvedEdgeTargetBatchReindexer,
 	batch []graph.UnresolvedEdgeTargetReindex,
@@ -526,9 +540,14 @@ type Resolver struct {
 	// separate repo lanes cannot dequeue another lane's pending retry items.
 	// retryBridgeGraph pins the bridge to the store installed alongside it so a
 	// temporary SetGraph(inMemShadow) cold build never touches durable retry state.
-	takeRetryState   func() MasterRetryState
-	saveRetryState   func(MasterRetryState)
-	retryBridgeGraph graph.Store
+	takeRetryState       func(RetryTakeOpts) (MasterRetryState, uint64)
+	saveRetryState       func(MasterRetryState, RetryBridgeSaveMeta)
+	hasPendingBridgeRepo func(string) bool
+	knownBridgePrefixes  func() []string
+	retryRepoPrefix      string
+	retryBridgeGraph     graph.Store
+	passReindexMaxWait   time.Duration
+	beforeResolveLock    func()
 
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
@@ -879,6 +898,27 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	}
 }
 
+// RetryTakeOpts scopes which per-repository retry buckets a resolver pass
+// dequeues from its retry bridge.
+type RetryTakeOpts struct {
+	Repos       map[string]struct{} // specific repo prefixes when !AllRepos
+	AllRepos    bool                // true only for unscoped ResolveAllContext (and empty-prefix ResolveIncomingForNames)
+	TakeTailAll bool                // true ONLY for unscoped ResolveAllContext (takes & clears mi.pendingMasterTailRetryAll)
+	PeekTailAll bool                // true ONLY for scoped ResolveAllContext (copies mi.pendingMasterTailRetryAll read-only so scoped tail still runs)
+	HasMaxEpoch bool                // false at pass start; true on post-yield re-absorption (avoids MaxEpoch==0 sentinel collision)
+	MaxEpoch    uint64              // passEpoch when HasMaxEpoch == true (skips repos cleared > MaxEpoch)
+}
+
+// RetryBridgeSaveMeta carries pass-level accounting and untrack-epoch metadata
+// back to the bridge owner when saving remaining retry state.
+type RetryBridgeSaveMeta struct {
+	TakenRepos   map[string]int // net pre-existing per-repo item count owned by this pass (0-count keys deleted)
+	TakenTailAll bool           // true when pass took a pre-existing pendingMasterTailRetryAll == true (and did not leave it yielded)
+	TakeEpoch    uint64         // epoch captured ONCE at pass start (never overwritten on post-yield re-absorb)
+	IsYield      bool           // true during ResolveAllContext inter-chunk yields (suppresses Warn spam)
+	Refused      bool           // live refusal status evaluated via refused() closure at defer exit
+}
+
 // MasterRetryState bundles unapplied refused-write state that short-lived
 // Resolvers hand off strictly under g.ResolveMutex().
 type MasterRetryState struct {
@@ -887,6 +927,83 @@ type MasterRetryState struct {
 	TailRetryAll        bool
 	TailRetryScopes     []string
 	AttributionFiles    []string
+
+	DefaultRepoPrefix string
+	TakenRepos        map[string]int
+	NeedsDedup        bool
+	GuardPruned       bool
+	HasUniformRepo    bool
+	UniformRepo       string
+	HeadDropped       int
+}
+
+// CrossRepoRetryState bundles unapplied cross-repo placeholder repoints and
+// O(1) handoff metadata across short-lived CrossRepoResolver instances.
+type CrossRepoRetryState struct {
+	Repoints          []graph.PlaceholderRepoint
+	DefaultRepoPrefix string
+	TakenRepos        map[string]int
+	NeedsDedup        bool
+	HasUniformRepo    bool
+	UniformRepo       string
+	HeadDropped       int
+}
+
+// PendingRetryStats reports the in-memory refused-write retry backlog retained
+// directly on a standalone Resolver.
+type PendingRetryStats struct {
+	PlaceholderRepoints int
+	GuardReverts        int
+	TailRetryAll        bool
+	TailRetryScopes     int
+	AttributionFiles    int
+}
+
+// RepoForFilePath maps a graph file path to its tracked repository prefix
+// using the known prefix set, falling back to defaultPrefix when unprefixed or
+// unknown (preserving TrackRepoCtx/ReconcileRepoCtx before mi.repos install).
+func RepoForFilePath(fp string, known map[string]struct{}, defaultPrefix string) string {
+	p := graph.RepoPrefixOfID(fp)
+	if p != "" {
+		if _, ok := known[p]; ok || p == defaultPrefix {
+			return p
+		}
+	}
+	return defaultPrefix
+}
+
+// repoForFilePath is the package-internal alias for RepoForFilePath.
+func repoForFilePath(fp string, known map[string]struct{}, defaultPrefix string) string {
+	return RepoForFilePath(fp, known, defaultPrefix)
+}
+
+// PendingRetryStats snapshots the standalone in-memory retry backlog on r.
+func (r *Resolver) PendingRetryStats() PendingRetryStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	guardItems := 0
+	for i := range r.pendingGuardReverts {
+		guardItems += r.pendingGuardReverts[i].ItemCount()
+	}
+	return PendingRetryStats{
+		PlaceholderRepoints: len(r.placeholderSrcIdx.deferred),
+		GuardReverts:        guardItems,
+		TailRetryAll:        r.pendingTailRetryAll,
+		TailRetryScopes:     len(r.pendingTailRetryScopes),
+		AttributionFiles:    len(r.pendingAttribFiles),
+	}
+}
+
+// SetRetryBridgeRepoPrefix tags single-repository passes on r with their known
+// repository prefix so incremental retry bridging avoids RepoPrefixes() SQL.
+func (r *Resolver) SetRetryBridgeRepoPrefix(prefix string) {
+	r.retryRepoPrefix = prefix
+}
+
+// SetBeforeResolveLockForTest installs a deterministic hook invoked
+// immediately before r.mu.Lock() in resolveFilesAndIncoming.
+func (r *Resolver) SetBeforeResolveLockForTest(fn func()) {
+	r.beforeResolveLock = fn
 }
 
 // SetRetryStateBridge installs callbacks invoked strictly while r.mu
@@ -894,9 +1011,16 @@ type MasterRetryState struct {
 // repository lanes cannot steal another lane's pending retry items. The bridge
 // is pinned to the graph store currently attached to r so temporary cold shadow
 // swaps (SetGraph(inMemShadow)) leave durable retry state untouched.
-func (r *Resolver) SetRetryStateBridge(take func() MasterRetryState, save func(MasterRetryState)) {
+func (r *Resolver) SetRetryStateBridge(
+	take func(RetryTakeOpts) (MasterRetryState, uint64),
+	save func(MasterRetryState, RetryBridgeSaveMeta),
+	hasPendingRepo func(string) bool,
+	knownPrefixes func() []string,
+) {
 	r.takeRetryState = take
 	r.saveRetryState = save
+	r.hasPendingBridgeRepo = hasPendingRepo
+	r.knownBridgePrefixes = knownPrefixes
 	if take != nil || save != nil {
 		r.retryBridgeGraph = r.graph
 	} else {
@@ -908,12 +1032,191 @@ func (r *Resolver) retryBridgeActiveLocked() bool {
 	return r.retryBridgeGraph != nil && r.graph == r.retryBridgeGraph
 }
 
+func (r *Resolver) knownRepoPrefixes() []string {
+	if r.knownBridgePrefixes != nil && r.retryBridgeActiveLocked() {
+		return r.knownBridgePrefixes()
+	}
+	if r.graph == nil {
+		return nil
+	}
+	return r.graph.RepoPrefixes()
+}
+
+func (r *Resolver) knownRepoPrefixesSet() map[string]struct{} {
+	prefixes := r.knownRepoPrefixes()
+	if len(prefixes) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(prefixes))
+	for _, p := range prefixes {
+		if p != "" {
+			out[p] = struct{}{}
+		}
+	}
+	return out
+}
+
+// inMemoryRepoForEdge resolves an edge caller's RepoPrefix strictly from
+// already-hydrated in-memory maps (never firing store point lookups).
+func (r *Resolver) inMemoryRepoForEdge(e *graph.Edge) string {
+	if e != nil && e.From != "" {
+		if r.nodeByID != nil {
+			if n := r.nodeByID[e.From]; n != nil && n.RepoPrefix != "" {
+				return n.RepoPrefix
+			}
+		}
+		if n, ok := r.hotCache.peekNode(e.From); ok && n != nil && n.RepoPrefix != "" {
+			return n.RepoPrefix
+		}
+	}
+	return r.retryRepoPrefix
+}
+
+func (r *Resolver) retryOptsForFilesLocked(filePaths []string) RetryTakeOpts {
+	noLocalPending := len(r.placeholderSrcIdx.deferred) == 0 &&
+		len(r.pendingGuardReverts) == 0 &&
+		!r.pendingTailRetryAll &&
+		len(r.pendingTailRetryScopes) == 0 &&
+		len(r.pendingAttribFiles) == 0
+	if r.retryRepoPrefix != "" {
+		if r.hasPendingBridgeRepo != nil && r.retryBridgeActiveLocked() &&
+			!r.hasPendingBridgeRepo(r.retryRepoPrefix) && noLocalPending {
+			return RetryTakeOpts{}
+		}
+		return RetryTakeOpts{Repos: map[string]struct{}{r.retryRepoPrefix: {}}}
+	}
+	known := r.knownRepoPrefixesSet()
+	repos := make(map[string]struct{}, 1)
+	if len(known) > 0 {
+		for _, fp := range filePaths {
+			p := graph.RepoPrefixOfID(fp)
+			if _, ok := known[p]; ok {
+				repos[p] = struct{}{}
+			} else {
+				repos[""] = struct{}{}
+			}
+		}
+	} else if !r.retryBridgeActiveLocked() {
+		repos[""] = struct{}{}
+	} else {
+		repos[""] = struct{}{}
+		for _, fp := range filePaths {
+			if p := graph.RepoPrefixOfID(fp); p != "" {
+				repos[p] = struct{}{}
+			}
+		}
+	}
+	if r.hasPendingBridgeRepo != nil && r.retryBridgeActiveLocked() && noLocalPending {
+		anyPending := false
+		for repo := range repos {
+			if r.hasPendingBridgeRepo(repo) {
+				anyPending = true
+				break
+			}
+		}
+		if !anyPending {
+			return RetryTakeOpts{}
+		}
+	}
+	return RetryTakeOpts{Repos: repos}
+}
+
+func (r *Resolver) retryOptsForNamesLocked(repoPrefixes []string) RetryTakeOpts {
+	var repos map[string]struct{}
+	for _, p := range repoPrefixes {
+		if p == "" {
+			continue
+		}
+		if repos == nil {
+			repos = make(map[string]struct{}, len(repoPrefixes))
+		}
+		repos[p] = struct{}{}
+	}
+	if len(repos) == 0 {
+		if r.retryRepoPrefix != "" {
+			repos = map[string]struct{}{r.retryRepoPrefix: {}}
+		} else {
+			return RetryTakeOpts{AllRepos: true, TakeTailAll: false}
+		}
+	}
+	if r.hasPendingBridgeRepo != nil && r.retryBridgeActiveLocked() &&
+		len(r.placeholderSrcIdx.deferred) == 0 &&
+		len(r.pendingGuardReverts) == 0 &&
+		!r.pendingTailRetryAll &&
+		len(r.pendingTailRetryScopes) == 0 &&
+		len(r.pendingAttribFiles) == 0 {
+		anyPending := false
+		for repo := range repos {
+			if r.hasPendingBridgeRepo(repo) {
+				anyPending = true
+				break
+			}
+		}
+		if !anyPending {
+			return RetryTakeOpts{}
+		}
+	}
+	return RetryTakeOpts{Repos: repos, AllRepos: false, TakeTailAll: false}
+}
+
+func (r *Resolver) allowedRepoFuncForOptsLocked(opts RetryTakeOpts) func(string) bool {
+	if opts.AllRepos {
+		return nil
+	}
+	if len(opts.Repos) == 0 {
+		prefix := r.retryRepoPrefix
+		return func(repo string) bool { return repo == prefix }
+	}
+	repos := opts.Repos
+	return func(repo string) bool {
+		_, ok := repos[repo]
+		return ok
+	}
+}
+
+func (r *Resolver) allowedRepointFuncForOptsLocked(opts RetryTakeOpts, allowedRepo func(string) bool) func(graph.PlaceholderRepoint) bool {
+	if allowedRepo == nil {
+		return nil
+	}
+	var known map[string]struct{}
+	knownLoaded := false
+	return func(rp graph.PlaceholderRepoint) bool {
+		if rp.RepoPrefix != "" {
+			return allowedRepo(rp.RepoPrefix)
+		}
+		if !knownLoaded {
+			known = r.knownRepoPrefixesSet()
+			knownLoaded = true
+		}
+		if len(known) > 0 {
+			return allowedRepo(RepoForFilePath(rp.FilePath, known, r.retryRepoPrefix))
+		}
+		return allowedRepo("")
+	}
+}
+
 func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
+	wasEmpty := len(r.placeholderSrcIdx.deferred) == 0 && len(r.pendingGuardReverts) == 0
 	if len(state.PlaceholderRepoints) > 0 {
-		r.placeholderSrcIdx.inheritDeferred(state.PlaceholderRepoints)
+		r.placeholderSrcIdx.adoptOwnedDeferred(
+			state.PlaceholderRepoints,
+			state.NeedsDedup,
+			state.GuardPruned && wasEmpty,
+			state.UniformRepo,
+			state.HasUniformRepo,
+			state.HeadDropped,
+		)
+	} else if wasEmpty {
+		r.placeholderSrcIdx.guardPruned = state.GuardPruned
 	}
 	if len(state.GuardReverts) > 0 {
-		r.pendingGuardReverts = append(r.pendingGuardReverts, state.GuardReverts...)
+		if len(r.pendingGuardReverts) == 0 {
+			r.pendingGuardReverts = state.GuardReverts
+		} else {
+			for _, rev := range state.GuardReverts {
+				r.appendPendingGuardRevertLocked(rev)
+			}
+		}
 	}
 	if state.TailRetryAll {
 		r.pendingTailRetryAll = true
@@ -933,21 +1236,109 @@ func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
 	}
 }
 
-// releaseNonInFlightRetryStateLocked returns queued tail/attribution retry
-// demands to saveRetryState before an inter-chunk r.mu.Unlock() yield so a
-// concurrent repository retry can observe and drain its own pending files
-// instead of falsely certifying on an empty bridge.
-func (r *Resolver) releaseNonInFlightRetryStateLocked() {
-	if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
+func (r *Resolver) countMasterStateByRepoLocked(state MasterRetryState) map[string]int {
+	if len(state.PlaceholderRepoints) == 0 && len(state.GuardReverts) == 0 && len(state.TailRetryScopes) == 0 && len(state.AttributionFiles) == 0 {
+		return nil
+	}
+	var known map[string]struct{}
+	knownLoaded := false
+	resolveRepo := func(explicit, fp string) string {
+		if explicit != "" {
+			return explicit
+		}
+		if !knownLoaded {
+			known = r.knownRepoPrefixesSet()
+			knownLoaded = true
+		}
+		return RepoForFilePath(fp, known, r.retryRepoPrefix)
+	}
+	counts := make(map[string]int, 2)
+	for _, rp := range state.PlaceholderRepoints {
+		counts[resolveRepo(rp.RepoPrefix, rp.FilePath)]++
+	}
+	for i := range state.GuardReverts {
+		rev := &state.GuardReverts[i]
+		n := rev.ItemCount()
+		if n == 0 {
+			continue
+		}
+		fp := ""
+		if len(rev.Reindexes) > 0 && rev.Reindexes[0].Edge != nil {
+			fp = rev.Reindexes[0].Edge.FilePath
+		} else if len(rev.SourceReverts) > 0 {
+			fp = rev.SourceReverts[0].FilePath
+		}
+		counts[resolveRepo(rev.RepoPrefix, fp)] += n
+	}
+	for _, s := range state.TailRetryScopes {
+		if s != "" {
+			counts[s]++
+		}
+	}
+	for _, fp := range state.AttributionFiles {
+		if fp != "" {
+			counts[resolveRepo("", fp)]++
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
+}
+
+type retryBridgeSession struct {
+	r              *Resolver
+	active         bool
+	opts           RetryTakeOpts
+	refused        func() bool
+	passEpoch      uint64
+	takenRepos     map[string]int
+	takenTailAll   bool
+	yielded        map[string]int
+	yieldedTailAll bool
+}
+
+func (r *Resolver) beginRetryBridgeLocked(opts RetryTakeOpts, refused func() bool) retryBridgeSession {
+	s := retryBridgeSession{
+		r:       r,
+		opts:    opts,
+		refused: refused,
+	}
+	if !r.retryBridgeActiveLocked() {
+		return s
+	}
+	s.active = true
+	if r.takeRetryState != nil {
+		initial, ep := r.takeRetryState(opts)
+		s.passEpoch = ep
+		if len(initial.TakenRepos) > 0 {
+			s.takenRepos = initial.TakenRepos
+		} else if len(initial.PlaceholderRepoints) > 0 || len(initial.GuardReverts) > 0 || len(initial.TailRetryScopes) > 0 || len(initial.AttributionFiles) > 0 {
+			s.takenRepos = r.countMasterStateByRepoLocked(initial)
+		}
+		s.takenTailAll = opts.TakeTailAll && initial.TailRetryAll
+		r.adoptRetryStateLocked(initial)
+	}
+	return s
+}
+
+// releaseForYield returns non-in-flight tail/attribution retry demands to
+// saveRetryState before an inter-chunk r.mu.Unlock() yield so a concurrent
+// repository retry can observe and drain its own pending files instead of
+// falsely certifying on an empty bridge.
+func (s *retryBridgeSession) releaseForYield() {
+	if !s.active || s.r.saveRetryState == nil || !s.r.retryBridgeActiveLocked() {
 		return
 	}
+	r := s.r
 	var out MasterRetryState
-	out.TailRetryAll = r.pendingTailRetryAll
+	out.DefaultRepoPrefix = r.retryRepoPrefix
+	out.TailRetryAll = s.opts.TakeTailAll && r.pendingTailRetryAll
 	r.pendingTailRetryAll = false
 	if len(r.pendingTailRetryScopes) > 0 {
 		out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
-		for s := range r.pendingTailRetryScopes {
-			out.TailRetryScopes = append(out.TailRetryScopes, s)
+		for sc := range r.pendingTailRetryScopes {
+			out.TailRetryScopes = append(out.TailRetryScopes, sc)
 		}
 		r.pendingTailRetryScopes = nil
 	}
@@ -958,47 +1349,143 @@ func (r *Resolver) releaseNonInFlightRetryStateLocked() {
 		}
 		r.pendingAttribFiles = nil
 	}
-	if out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
-		r.saveRetryState(out)
+	if !out.TailRetryAll && len(out.TailRetryScopes) == 0 && len(out.AttributionFiles) == 0 {
+		return
 	}
+	if out.TailRetryAll {
+		s.yieldedTailAll = true
+	}
+	if counts := r.countMasterStateByRepoLocked(out); len(counts) > 0 {
+		if s.yielded == nil {
+			s.yielded = make(map[string]int, len(counts))
+		}
+		for repo, n := range counts {
+			s.yielded[repo] += n
+		}
+	}
+	r.saveRetryState(out, RetryBridgeSaveMeta{
+		TakeEpoch: s.passEpoch,
+		IsYield:   true,
+	})
 }
 
-func (r *Resolver) bridgeRetryStateLocked() func() {
-	if !r.retryBridgeActiveLocked() {
-		return func() {}
+func (s *retryBridgeSession) reabsorb(opts RetryTakeOpts) {
+	if !s.active || s.r.takeRetryState == nil || !s.r.retryBridgeActiveLocked() {
+		return
 	}
-	if r.takeRetryState != nil {
-		r.adoptRetryStateLocked(r.takeRetryState())
+	opts.HasMaxEpoch = true
+	opts.MaxEpoch = s.passEpoch
+	reabsorbed, _ := s.r.takeRetryState(opts)
+	reabCounts := reabsorbed.TakenRepos
+	if len(reabCounts) == 0 && (len(reabsorbed.PlaceholderRepoints) > 0 || len(reabsorbed.GuardReverts) > 0 || len(reabsorbed.TailRetryScopes) > 0 || len(reabsorbed.AttributionFiles) > 0) {
+		reabCounts = s.r.countMasterStateByRepoLocked(reabsorbed)
 	}
-	return func() {
-		if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
-			return
-		}
-		var out MasterRetryState
-		out.PlaceholderRepoints = r.placeholderSrcIdx.takeDeferred()
-		if len(r.pendingGuardReverts) > 0 {
-			out.GuardReverts = r.pendingGuardReverts
-			r.pendingGuardReverts = nil
-		}
-		out.TailRetryAll = r.pendingTailRetryAll
-		r.pendingTailRetryAll = false
-		if len(r.pendingTailRetryScopes) > 0 {
-			out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
-			for s := range r.pendingTailRetryScopes {
-				out.TailRetryScopes = append(out.TailRetryScopes, s)
+	if len(reabCounts) > 0 || len(s.yielded) > 0 {
+		// Update net takenRepos across the union of reabCounts and s.yielded
+		// keys so repos drained to 0 by an interleaver during yield drop cleanly.
+		for repo, add := range reabCounts {
+			net := s.takenRepos[repo] + add - s.yielded[repo]
+			if net <= 0 {
+				delete(s.takenRepos, repo)
+			} else {
+				if s.takenRepos == nil {
+					s.takenRepos = make(map[string]int, len(reabCounts))
+				}
+				s.takenRepos[repo] = net
 			}
-			r.pendingTailRetryScopes = nil
 		}
-		if len(r.pendingAttribFiles) > 0 {
-			out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
-			for p := range r.pendingAttribFiles {
-				out.AttributionFiles = append(out.AttributionFiles, p)
+		for repo, sub := range s.yielded {
+			if _, handled := reabCounts[repo]; handled {
+				continue
 			}
-			r.pendingAttribFiles = nil
+			net := s.takenRepos[repo] - sub
+			if net <= 0 {
+				delete(s.takenRepos, repo)
+			} else {
+				s.takenRepos[repo] = net
+			}
 		}
-		if len(out.PlaceholderRepoints) > 0 || len(out.GuardReverts) > 0 || out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
-			r.saveRetryState(out)
+		if len(s.takenRepos) == 0 {
+			s.takenRepos = nil
 		}
+	}
+	s.takenTailAll = (s.takenTailAll && !s.yieldedTailAll) || (s.opts.TakeTailAll && reabsorbed.TailRetryAll)
+	s.yielded = nil
+	s.yieldedTailAll = false
+	s.r.adoptRetryStateLocked(reabsorbed)
+}
+
+func (s *retryBridgeSession) finish() {
+	r := s.r
+	if !s.active || r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
+		if !s.active && s.refused != nil && s.refused() && r.logger != nil {
+			if r.placeholderSrcIdx.hasDeferred() || r.hasPendingGuardReverts() || r.pendingTailRetryAll || len(r.pendingTailRetryScopes) > 0 || len(r.pendingAttribFiles) > 0 {
+				guardItems := 0
+				for i := range r.pendingGuardReverts {
+					guardItems += r.pendingGuardReverts[i].ItemCount()
+				}
+				r.logger.Warn("resolver: standalone retry backlog retained after refused write",
+					zap.Int("placeholder_repoints", len(r.placeholderSrcIdx.deferred)),
+					zap.Int("guard_reverts", guardItems),
+					zap.Bool("tail_retry_all", r.pendingTailRetryAll),
+					zap.Int("tail_retry_scopes", len(r.pendingTailRetryScopes)),
+					zap.Int("attrib_files", len(r.pendingAttribFiles)))
+			}
+		}
+		return
+	}
+	snap := r.placeholderSrcIdx.takeDeferredSnapshot()
+	out := MasterRetryState{
+		PlaceholderRepoints: snap.repoints,
+		DefaultRepoPrefix:   r.retryRepoPrefix,
+		NeedsDedup:          snap.needsDedup,
+		GuardPruned:         snap.guardPruned,
+		HasUniformRepo:      snap.hasUniformRepo,
+		UniformRepo:         snap.uniformRepo,
+		HeadDropped:         snap.headDropped,
+	}
+	if len(r.pendingGuardReverts) > 0 {
+		out.GuardReverts = r.pendingGuardReverts
+		r.pendingGuardReverts = nil
+	}
+	out.TailRetryAll = s.opts.TakeTailAll && r.pendingTailRetryAll
+	r.pendingTailRetryAll = false
+	if len(r.pendingTailRetryScopes) > 0 {
+		out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
+		for sc := range r.pendingTailRetryScopes {
+			out.TailRetryScopes = append(out.TailRetryScopes, sc)
+		}
+		r.pendingTailRetryScopes = nil
+	}
+	if len(r.pendingAttribFiles) > 0 {
+		out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
+		for p := range r.pendingAttribFiles {
+			out.AttributionFiles = append(out.AttributionFiles, p)
+		}
+		r.pendingAttribFiles = nil
+	}
+	for repo, sub := range s.yielded {
+		net := s.takenRepos[repo] - sub
+		if net <= 0 {
+			delete(s.takenRepos, repo)
+		} else {
+			s.takenRepos[repo] = net
+		}
+	}
+	if len(s.takenRepos) == 0 {
+		s.takenRepos = nil
+	}
+	finalTakenTailAll := s.takenTailAll && !s.yieldedTailAll
+	hasOut := len(out.PlaceholderRepoints) > 0 || len(out.GuardReverts) > 0 || out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0
+	if hasOut || len(s.takenRepos) > 0 || finalTakenTailAll {
+		isRefused := s.refused != nil && s.refused()
+		r.saveRetryState(out, RetryBridgeSaveMeta{
+			TakenRepos:   s.takenRepos,
+			TakenTailAll: finalTakenTailAll,
+			TakeEpoch:    s.passEpoch,
+			IsYield:      false,
+			Refused:      isRefused,
+		})
 	}
 }
 
@@ -1062,21 +1549,169 @@ func (r *Resolver) clearPendingTailRetryForScopeLocked() {
 	}
 }
 
-// flushPendingRetryWritesLocked drains any deferred placeholder repoints first
-// and any queued cross-package guard reverts second (matching ResolveAll's
-// order so guard SourceReverts undo any placeholder move for a rejected call,
-// never vice versa). Caller holds r.mu.
-func (r *Resolver) flushPendingRetryWritesLocked() (int, bool) {
+// flushPendingRetryWritesForScopeLocked drains deferred placeholder repoints
+// first (after pruning against pending guard reverts) and queued cross-package
+// guard reverts second for ResolveAllContext's scope. Caller holds r.mu.
+func (r *Resolver) flushPendingRetryWritesForScopeLocked(
+	allowedRepo func(string) bool,
+	allowedRepoint func(graph.PlaceholderRepoint) bool,
+) (int, bool) {
+	r.pruneDeferredAgainstPendingGuardsLocked()
 	if r.placeholderSrcIdx.hasDeferred() {
-		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+		if _, ok := r.placeholderSrcIdx.applyDeferredForScopeApplied(r.graph, allowedRepoint); !ok {
 			r.notePassWriteRefused()
 			return 0, false
 		}
 	}
 	if r.hasPendingGuardReverts() {
-		return r.flushPendingGuardRevertsLocked()
+		return r.flushPendingGuardRevertsLocked(allowedRepo)
 	}
 	return 0, true
+}
+
+func (r *Resolver) declaredStubNamesForFilesLocked(filePaths []string) func(string) bool {
+	if !r.hasPendingGuardReverts() || len(filePaths) == 0 || r.graph == nil {
+		return nil
+	}
+	nodesByFile := r.graph.GetFileNodesByPaths(filePaths)
+	var names map[string]struct{}
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if names == nil {
+			names = make(map[string]struct{})
+		}
+		names[name] = struct{}{}
+	}
+	for _, path := range filePaths {
+		for _, node := range nodesByFile[path] {
+			if node == nil || node.Name == "" || !graph.IsReferenceableSymbol(node.Kind) {
+				continue
+			}
+			add(node.Name)
+			for _, key := range graph.UnresolvedNameCandidateIDs(node) {
+				add(unresolvedBareSymbolName(key))
+			}
+		}
+	}
+	for _, key := range r.vanishedDeclarationKeys(filePaths, nodesByFile) {
+		add(unresolvedBareSymbolName(key))
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return func(sym string) bool {
+		_, ok := names[sym]
+		return ok
+	}
+}
+
+// flushFrontierRetryWritesLocked executes Step 1 of an incremental save:
+// fail-closed direct-probe flushing of deferred repoints and guard reverts
+// belonging strictly to this save's frontier (and declared/vanished symbol
+// names for incoming passes). Unrelated backlog is left untouched for Step 3.
+func (r *Resolver) flushFrontierRetryWritesLocked(
+	filePaths []string,
+	matchStubName func(string) bool,
+	allowedRepo func(string) bool,
+) bool {
+	if !r.placeholderSrcIdx.hasDeferred() && !r.hasPendingGuardReverts() {
+		return true
+	}
+	r.pruneDeferredAgainstPendingGuardsLocked()
+	var matchFile func(string) bool
+	if len(filePaths) == 1 {
+		target := filePaths[0]
+		matchFile = func(fp string) bool { return fp == target }
+	} else if len(filePaths) > 1 {
+		fileSet := make(map[string]struct{}, len(filePaths))
+		for _, fp := range filePaths {
+			if fp != "" {
+				fileSet[fp] = struct{}{}
+			}
+		}
+		matchFile = func(fp string) bool {
+			_, ok := fileSet[fp]
+			return ok
+		}
+	}
+	if r.placeholderSrcIdx.hasDeferred() {
+		var matchRepoint func(graph.PlaceholderRepoint) bool
+		if matchFile != nil {
+			matchRepoint = func(rp graph.PlaceholderRepoint) bool {
+				return matchFile(rp.FilePath)
+			}
+		} else if matchStubName != nil {
+			allowedRepoint := r.allowedRepointFuncForOptsLocked(RetryTakeOpts{}, allowedRepo)
+			if allowedRepo == nil {
+				allowedRepoint = nil
+			}
+			matchRepoint = func(rp graph.PlaceholderRepoint) bool {
+				if allowedRepoint != nil && !allowedRepoint(rp) {
+					return false
+				}
+				return matchStubName(unresolvedBareSymbolName(rp.OldFrom))
+			}
+		}
+		if matchRepoint != nil {
+			if _, ok := r.placeholderSrcIdx.flushMatchingDirectApplied(r.graph, matchRepoint, r.passReindexMaxWait); !ok {
+				r.notePassWriteRefused()
+				return false
+			}
+		}
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushFrontierGuardRevertsLocked(matchFile, matchStubName, allowedRepo, r.passReindexMaxWait); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// drainNonFrontierRetryWritesLocked executes Step 3 of a clean incremental
+// save: opportunistically drains up to 64 same-repo repoints and 64 probed
+// same-repo guard reverts using a 50ms contention budget under an isolated
+// local drainRefused flag so unrelated backlog never fails this save.
+func (r *Resolver) drainNonFrontierRetryWritesLocked(
+	allowedRepo func(string) bool,
+	allowedRepoint func(graph.PlaceholderRepoint) bool,
+	drainRefused *bool,
+) {
+	if !r.placeholderSrcIdx.hasDeferred() && !r.hasPendingGuardReverts() {
+		return
+	}
+	restore := r.trackPassWriteRefused(drainRefused)
+	defer restore()
+	r.pruneDeferredAgainstPendingGuardsLocked()
+	if r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.flushBoundedDirectApplied(
+			r.graph,
+			incrementalFlushRepointBudget,
+			allowedRepoint,
+			opportunisticDrainWriteTimeout,
+		); !ok {
+			*drainRefused = true
+		}
+	}
+	if !*drainRefused && r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsBoundedLocked(
+			incrementalFlushGuardRevertBudget,
+			allowedRepo,
+			opportunisticDrainWriteTimeout,
+		); !ok {
+			*drainRefused = true
+		}
+	}
+	if *drainRefused && !r.retryBridgeActiveLocked() && r.logger != nil {
+		guardItems := 0
+		for i := range r.pendingGuardReverts {
+			guardItems += r.pendingGuardReverts[i].ItemCount()
+		}
+		r.logger.Warn("resolver: opportunistic retry drain refused under contention; keeping tail queued",
+			zap.Int("remaining_repoints", len(r.placeholderSrcIdx.deferred)),
+			zap.Int("remaining_guard_reverts", guardItems))
+	}
 }
 
 func (r *Resolver) notePendingAttributionFilesLocked(paths []string) {
@@ -1154,7 +1789,11 @@ func (r *Resolver) notePassWriteRefused() {
 }
 
 func (r *Resolver) applyReindexEdges(batch []graph.EdgeReindex) bool {
-	applied := reindexEdgesApplied(r.graph, batch)
+	return r.applyReindexEdgesWithWindow(batch, r.passReindexMaxWait)
+}
+
+func (r *Resolver) applyReindexEdgesWithWindow(batch []graph.EdgeReindex, maxWait time.Duration) bool {
+	applied := reindexEdgesAppliedWithWindow(r.graph, batch, maxWait)
 	if !applied {
 		r.notePassWriteRefused()
 	}
@@ -1201,7 +1840,7 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 // to the failure and does not publish compute readiness or run refinement
 // tails. ResolveAll retains the historical best-effort API for callers that do
 // not own a lifecycle context.
-func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error) {
+func (r *Resolver) ResolveAllContext(ctx context.Context) (retStats *ResolveStats, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1210,7 +1849,18 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
+	retryOpts := RetryTakeOpts{
+		Repos:       r.scope,
+		AllRepos:    len(r.scope) == 0,
+		TakeTailAll: len(r.scope) == 0,
+		PeekTailAll: len(r.scope) > 0,
+	}
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool {
+		return (retStats != nil && retStats.WriteRefused) || errors.Is(retErr, ErrReindexWriteRefused)
+	})
+	defer bridge.finish()
 	r.refreshGoModules()
 	if err := ctx.Err(); err != nil {
 		return &ResolveStats{}, err
@@ -1235,7 +1885,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	var startWriteRefused bool
 	if r.placeholderSrcIdx.hasDeferred() || r.hasPendingGuardReverts() {
 		restoreRefused := r.trackPassWriteRefused(&startWriteRefused)
-		_, ok := r.flushPendingRetryWritesLocked()
+		_, ok := r.flushPendingRetryWritesForScopeLocked(allowedRepo, allowedRepoint)
 		restoreRefused()
 		if !ok || startWriteRefused {
 			r.notePendingTailRetryLocked()
@@ -1456,7 +2106,8 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		if !errors.Is(err, ErrReindexWriteRefused) && !total.WriteRefused {
 			// Moves the pass deferred belong to references it already bound; an
 			// interrupted (non-refusal) pass flushes them immediately.
-			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			r.pruneDeferredAgainstPendingGuardsLocked()
+			if _, ok := r.placeholderSrcIdx.applyDeferredForScopeApplied(r.graph, allowedRepoint); !ok {
 				total.WriteRefused = true
 			}
 		}
@@ -1712,7 +2363,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
 				// applying them per page made the result depend on the paging.
-				r.placeholderSrcIdx.deferRepoints(r.graph, reindexBatch)
+				r.placeholderSrcIdx.deferRepoints(r.graph, reindexBatch, r.inMemoryRepoForEdge)
 				applyPlaceholderElapsed += time.Since(placeholderStart)
 				for _, ri := range reindexBatch {
 					r.noteRetargetedCall(ri.Edge)
@@ -1763,7 +2414,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			// drain its own pending files instead of falsely certifying.
 			if r.validateLiveness && (hi < len(pending) || !streamDone) {
 				r.bulkMode = false
-				r.releaseNonInFlightRetryStateLocked()
+				bridge.releaseForYield()
 				yielded = true
 				yieldHook := r.chunkYieldHook
 				r.mu.Unlock()
@@ -1815,14 +2466,15 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		}
 	}
 	defer r.trackPassWriteRefused(&tailWriteRefused)()
-	if yielded && r.takeRetryState != nil && r.retryBridgeActiveLocked() {
+	if yielded {
 		// Re-absorb any remaining bridged retry state now that no further
 		// r.mu yields will occur so pending repoints/reverts are flushed before
 		// the tail runs and only this pass's scope is cleared on completion.
-		r.adoptRetryStateLocked(r.takeRetryState())
+		bridge.reabsorb(retryOpts)
 	}
 	placeholderFlushStart := time.Now()
-	_, placeholderOK := r.placeholderSrcIdx.applyDeferredApplied(r.graph)
+	r.pruneDeferredAgainstPendingGuardsLocked()
+	_, placeholderOK := r.placeholderSrcIdx.applyDeferredForScopeApplied(r.graph, allowedRepoint)
 	applyPlaceholderElapsed += time.Since(placeholderFlushStart)
 	stopProgress()
 	loopElapsed := time.Since(passStart) - warmElapsed
@@ -1831,7 +2483,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		return resolveError(fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused))
 	}
 	if r.hasPendingGuardReverts() {
-		if _, ok := r.flushPendingGuardRevertsLocked(); !ok || tailWriteRefused {
+		if _, ok := r.flushPendingGuardRevertsLocked(allowedRepo); !ok || tailWriteRefused {
 			total.WriteRefused = true
 			return resolveError(fmt.Errorf("%w: pending guard reverts", ErrReindexWriteRefused))
 		}
@@ -3167,12 +3819,17 @@ func (r *Resolver) buildPassIndexesForPending(pending []*graph.Edge) (clear func
 func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
 	stats := &ResolveStats{}
+	retryOpts := r.retryOptsForFilesLocked([]string{filePath})
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
 	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
-	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+	if !r.flushFrontierRetryWritesLocked([]string{filePath}, nil, allowedRepo) {
 		r.notePendingAttributionFilesLocked([]string{filePath})
 		return stats
 	}
@@ -3181,6 +3838,11 @@ func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	defer clear()
 
 	r.resolveFileLocked(filePath, stats)
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return stats
+	}
+	r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 	return stats
 }
 
@@ -3194,14 +3856,20 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
 	stats := &ResolveStats{}
+	retryOpts := r.retryOptsForFilesLocked([]string{filePath})
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
 	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	// The edited file may have (re)stamped global usings — reconcile the
 	// persistent index instead of paying the workspace rescan per save.
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
-	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+	matchStub := r.declaredStubNamesForFilesLocked([]string{filePath})
+	if !r.flushFrontierRetryWritesLocked([]string{filePath}, matchStub, allowedRepo) {
 		r.notePendingAttributionFilesLocked([]string{filePath})
 		return stats
 	}
@@ -3242,6 +3910,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 			if !stats.IncomingAdmissionRefused {
 				r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 			}
+			r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 			return stats
 		}
 		r.attributeFrontierGoBuiltins(frontier)
@@ -3252,6 +3921,7 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 		if !stats.IncomingAdmissionRefused {
 			r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 		}
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 
@@ -3297,6 +3967,9 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	incomingDuration := time.Since(incomingStarted)
 	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked([]string{filePath})
+	}
+	if !stats.WriteRefused {
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 	}
 	if elapsed := time.Since(started); elapsed >= time.Second {
 		r.logger.Info("resolver: incremental file phases",
@@ -3620,7 +4293,7 @@ func collectIncrementalFileFrontierKeys(
 // uses this: calling ResolveFileAndIncoming per file would rebuild the
 // four pass indexes and re-run the whole-graph attribution sweeps once
 // per file, turning a bounded fan-out into N whole-graph passes.
-func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(started, acquired time.Time)) *ResolveStats {
+func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(started, acquired time.Time), maxWait time.Duration) *ResolveStats {
 	stats := &ResolveStats{}
 	if len(filePaths) == 0 {
 		return stats
@@ -3668,12 +4341,23 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	if observe != nil {
 		mutexStarted = time.Now()
 	}
+	if hook := r.beforeResolveLock; hook != nil {
+		hook()
+	}
 	r.mu.Lock()
 	if observe != nil {
 		mutexAcquired = time.Now()
 	}
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
+	prevMaxWait := r.passReindexMaxWait
+	r.passReindexMaxWait = maxWait
+	defer func() { r.passReindexMaxWait = prevMaxWait }()
+	retryOpts := r.retryOptsForFilesLocked(filePaths)
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
 	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	if observe != nil {
 		observe(mutexStarted, mutexAcquired)
@@ -3685,10 +4369,11 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	finish = r.startIncrementalPhase(logger, "visibility")
 	r.scopedCSharpVisibilityInvalidate(filePaths)
 	visibilityDuration = finish()
-	// Flush prior refused placeholder repoints (first) and guard reverts
-	// (second) BEFORE collecting the frontier so frontier.outByNode and
-	// frontier.pending observe reverted unresolved::* rows cleanly.
-	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+	// Step 1: Flush prior refused placeholder repoints and guard reverts
+	// belonging to this save's frontier BEFORE collecting the frontier so
+	// frontier.outByNode and frontier.pending observe reverted rows cleanly.
+	matchStub := r.declaredStubNamesForFilesLocked(filePaths)
+	if !r.flushFrontierRetryWritesLocked(filePaths, matchStub, allowedRepo) {
 		r.notePendingAttributionFilesLocked(filePaths)
 		outcome = "write_refused"
 		return stats
@@ -3725,6 +4410,9 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		defer func() {
 			if batch, jobs := r.takeCarriedReindexes(); len(batch) > 0 {
 				r.applyIncrementalReindexesLocked(batch, jobs, stats)
+				if stats.WriteRefused {
+					r.notePendingAttributionFilesLocked(frontier.paths)
+				}
 			}
 		}()
 	}
@@ -3746,6 +4434,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 			if !stats.IncomingAdmissionRefused {
 				r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 			}
+			r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 			outcome = "complete"
 			return stats
 		}
@@ -3759,6 +4448,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		if !stats.IncomingAdmissionRefused {
 			r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 		}
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 	// The pass indexes cover the carried edges too (the attribution passes
@@ -3826,6 +4516,7 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	if !stats.IncomingAdmissionRefused {
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	}
+	r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 	outcome = "complete"
 	return stats
 }
@@ -4095,8 +4786,8 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 		}
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
-		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, reindexBatch); !ok {
-			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
+		if _, ok := reconcilePlaceholderSourcesWithWindow(r.graph, nil, reindexBatch, r.passReindexMaxWait); !ok {
+			r.placeholderSrcIdx.retainRepoints(repointsFromReindexes(reindexBatch, r.inMemoryRepoForEdge))
 			stats.WriteRefused = true
 			recordRefusedRebindFiles()
 			r.notePassWriteRefused()
@@ -4288,12 +4979,18 @@ func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
 	stats := &ResolveStats{}
+	retryOpts := r.retryOptsForFilesLocked([]string{filePath})
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
 	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
-	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+	matchStub := r.declaredStubNamesForFilesLocked([]string{filePath})
+	if !r.flushFrontierRetryWritesLocked([]string{filePath}, matchStub, allowedRepo) {
 		return stats
 	}
 
@@ -4301,6 +4998,9 @@ func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	defer clear()
 
 	r.resolveIncomingLocked(filePath, stats)
+	if !stats.WriteRefused {
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
+	}
 	return stats
 }
 
@@ -4321,10 +5021,30 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	defer r.bridgeRetryStateLocked()()
+	retryOpts := r.retryOptsForNamesLocked(repoPrefixes)
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
 	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
-	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+	var matchStub func(string) bool
+	if r.placeholderSrcIdx.hasDeferred() || r.hasPendingGuardReverts() {
+		nameSet := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			if n != "" {
+				nameSet[n] = struct{}{}
+			}
+		}
+		if len(nameSet) > 0 {
+			matchStub = func(sym string) bool {
+				_, ok := nameSet[sym]
+				return ok
+			}
+		}
+	}
+	if !r.flushFrontierRetryWritesLocked(nil, matchStub, allowedRepo) {
 		return stats
 	}
 
@@ -4351,6 +5071,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 		}
 	}
 	if len(stubKeys) == 0 {
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 	// Probe the pending buckets before paying for the pass indexes: the
@@ -4369,6 +5090,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	recordIncomingAdmission(stats, stubKeys, fact, err)
 	if err != nil {
 		logIncomingAdmissionRefusal(r.logger, "names_probe", len(stubKeys), fact, err)
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 	var pending []*graph.Edge
@@ -4380,6 +5102,7 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 		}
 	}
 	if len(pending) == 0 {
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 	// The pass indexes for exactly these references (their repositories and
@@ -4389,6 +5112,9 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	clear := r.buildPassIndexesForPending(pending)
 	defer clear()
 	r.resolveIncomingStubEdgesLocked(stubKeys, inByStub, stats)
+	if !stats.WriteRefused {
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
+	}
 	return stats
 }
 

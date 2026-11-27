@@ -242,6 +242,7 @@ func (mi *MultiIndexer) untrackRepoWithOwner(
 			state.nodesRemoved = removedNodes
 			state.edgesRemoved = removedEdges
 			state.payloadPurged = true
+			mi.clearPendingRetryForRepo(repoPrefix)
 			topologyChanged = true
 		}
 		if !state.vectorPublished {

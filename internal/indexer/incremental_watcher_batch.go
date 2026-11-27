@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -13,6 +15,11 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/reach"
 	"github.com/zzet/gortex/internal/resolver"
+)
+
+const (
+	maxOpportunisticRetryFiles       = 16
+	opportunisticRetryResolveTimeout = 50 * time.Millisecond
 )
 
 // watcherBatchReindex is the common large-change entry point used by both the
@@ -196,7 +203,7 @@ func (idx *Indexer) observeIncrementalCatchup(kind string, files []string) {
 func (idx *Indexer) runIncrementalResolutionCatchup(
 	files []string,
 	batch *reparsePendingEnrichmentBatch,
-	resolveFiles func([]string),
+	resolveFiles func([]string) bool,
 ) ([]string, bool) {
 	files = appendUniqueSorted(nil, files...)
 	if len(files) == 0 {
@@ -204,8 +211,15 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 	}
 	idx.observeIncrementalCatchup("resolve", files)
 	resolve := batch.publicationStamps().beginPatchLap(patchResolve)
-	idx.resolveWithDeferredEvidence(batch, func() { resolveFiles(files) })
+	resolveRefused := false
+	idx.resolveWithDeferredEvidence(batch, func() { resolveRefused = resolveFiles(files) })
 	resolve.end()
+
+	affected := batch.deferredAffectedPlan()
+	factFiles := appendUniqueSorted(files, affected.files...)
+	if resolveRefused {
+		return factFiles, true
+	}
 
 	// Measure this concrete follow-up block, not a gap inferred between two
 	// resolver laps. The attempt's existing ordered collector rejects overlap.
@@ -213,13 +227,11 @@ func (idx *Indexer) runIncrementalResolutionCatchup(
 	idx.observeIncrementalCatchup("dataflow", files)
 	idx.materializeDataflowParamsForFiles(files)
 
-	affected := batch.deferredAffectedPlan()
 	writeRefused := idx.executeAffectedByPlan(affected)
 
 	// Facts are rebuilt once, after both resolver frontiers are current. This
 	// avoids one delete/set transaction per structural chunk and also ensures an
 	// affected caller that degraded to a stub drops its stale durable fact.
-	factFiles := appendUniqueSorted(files, affected.files...)
 	idx.observeIncrementalCatchup("ref_facts", factFiles)
 	idx.persistRefFactsForFiles(factFiles)
 	bookkeeping.end()
@@ -336,24 +348,51 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
 	files, needed, exact := incrementalResolutionFrontier(result, nil)
+	resolutionRefused := false
+	retryFull := false
+	var factFiles []string
 	if needed && len(files) > 0 {
-		_, _ = idx.runIncrementalResolutionCatchup(files, eviction.batch, func(frontier []string) {
+		var affectedWriteRefused bool
+		factFiles, affectedWriteRefused = idx.runIncrementalResolutionCatchup(files, eviction.batch, func(frontier []string) bool {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
-				return
+				return false
 			}
-			idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver())
+			if stats := idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused {
+				resolutionRefused = true
+				return true
+			}
+			return false
 		})
+		if affectedWriteRefused {
+			resolutionRefused = true
+		}
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
-		idx.ResolveAll()
+		if resolveErr := idx.resolveAll(); resolveErr != nil {
+			idx.logger.Error("indexer: full resolution failed", zap.Error(resolveErr))
+			if errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+				resolutionRefused = true
+				retryFull = true
+			}
+		}
+	}
+	if resolutionRefused {
+		retrySaveFiles := appendUniqueSorted(files, factFiles...)
+		var derived DerivedInvalidationPlan
+		if result != nil {
+			derived = result.DerivedInvalidation
+		}
+		idx.recordPendingResolutionRetry(retrySaveFiles, retryFull || !exact || len(retrySaveFiles) == 0, derived)
 	}
 	if evictedGlobals {
 		idx.reresolveCSharpGlobalUsingDependents(
 			[]string{graphPath}, map[string]struct{}{graphPath: {}})
 	}
 	if result != nil && result.DeletedFileCount > 0 {
-		idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		if !resolutionRefused {
+			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		}
 		idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 		idx.runStandaloneIncrementalDerivedPasses(result.DerivedInvalidation)
 	}
@@ -377,12 +416,138 @@ func (idx *Indexer) incrementalPointWatcherPathObserved(root, path string, stamp
 	})
 }
 
+func cloneDerivedInvalidationPlan(p DerivedInvalidationPlan) DerivedInvalidationPlan {
+	out := p
+	if len(p.Files) > 0 {
+		out.Files = append([]string(nil), p.Files...)
+	}
+	if len(p.TypeIDs) > 0 {
+		out.TypeIDs = append([]string(nil), p.TypeIDs...)
+	}
+	if len(p.ContractGroups) > 0 {
+		out.ContractGroups = append([]ContractGroupFrontier(nil), p.ContractGroups...)
+	}
+	if len(p.ContractSymbolIDs) > 0 {
+		out.ContractSymbolIDs = append([]string(nil), p.ContractSymbolIDs...)
+	}
+	if len(p.ContractBridgeNodeIDs) > 0 {
+		out.ContractBridgeNodeIDs = append([]string(nil), p.ContractBridgeNodeIDs...)
+	}
+	if len(p.HierarchyUnchanged) > 0 {
+		out.HierarchyUnchanged = append([]string(nil), p.HierarchyUnchanged...)
+	}
+	if len(p.structuralFiles) > 0 {
+		out.structuralFiles = append([]string(nil), p.structuralFiles...)
+	}
+	return out
+}
+
+func pruneDerivedFiles(p DerivedInvalidationPlan, resolved []string) DerivedInvalidationPlan {
+	out := cloneDerivedInvalidationPlan(p)
+	if len(resolved) == 0 || (len(out.Files) == 0 && len(out.structuralFiles) == 0) {
+		return out
+	}
+	drop := make(map[string]struct{}, len(resolved))
+	for _, f := range resolved {
+		drop[f] = struct{}{}
+	}
+	if len(out.Files) > 0 {
+		kept := make([]string, 0, len(out.Files))
+		for _, f := range out.Files {
+			if _, ok := drop[f]; !ok {
+				kept = append(kept, f)
+			}
+		}
+		out.Files = kept
+	}
+	if len(out.structuralFiles) > 0 {
+		kept := make([]string, 0, len(out.structuralFiles))
+		for _, f := range out.structuralFiles {
+			if _, ok := drop[f]; !ok {
+				kept = append(kept, f)
+			}
+		}
+		out.structuralFiles = kept
+	}
+	return out
+}
+
+func mergeDerivedNonFiles(dst *DerivedInvalidationPlan, src DerivedInvalidationPlan) {
+	if dst == nil {
+		return
+	}
+	nonFiles := src
+	nonFiles.Files = nil
+	nonFiles.structuralFiles = nil
+	nonFiles.InertFiles = 0
+	nonFiles.BodyOnlyFiles = 0
+	nonFiles.MetadataOnlyFiles = 0
+	nonFiles.HierarchyUnchanged = nil
+	dst.Merge(nonFiles)
+}
+
+func (idx *Indexer) partitionCarriedRetryFiles(
+	carried []string,
+	ownFiles []string,
+	batch *reparsePendingEnrichmentBatch,
+) (ownRetry []string, otherRetry []string) {
+	if len(carried) == 0 {
+		return nil, nil
+	}
+	if batch != nil && batch.requestedFullRoot {
+		return append([]string(nil), carried...), nil
+	}
+	ownSet := make(map[string]struct{}, len(ownFiles))
+	for _, f := range ownFiles {
+		ownSet[f] = struct{}{}
+	}
+	var scopeRels map[string]bool
+	if batch != nil {
+		scopeRels = batch.requestedScopeRels
+	}
+	for _, gp := range carried {
+		if _, ok := ownSet[gp]; ok {
+			ownRetry = append(ownRetry, gp)
+			continue
+		}
+		if idx != nil && len(scopeRels) > 0 {
+			if rel, owned := idx.graphPathRelKey(gp); owned && relPathInScope(rel, scopeRels) {
+				ownRetry = append(ownRetry, gp)
+				continue
+			}
+		}
+		otherRetry = append(otherRetry, gp)
+	}
+	return ownRetry, otherRetry
+}
+
+func (idx *Indexer) excludeFailedGraphPaths(graphPaths []string, failedAbs []string) []string {
+	if len(graphPaths) == 0 || len(failedAbs) == 0 || idx == nil {
+		return graphPaths
+	}
+	failedGraph := make(map[string]struct{}, len(failedAbs))
+	for _, p := range failedAbs {
+		if p == "" {
+			continue
+		}
+		failedGraph[idx.prefixPath(idx.relKey(p))] = struct{}{}
+		failedGraph[filepath.ToSlash(p)] = struct{}{}
+	}
+	out := make([]string, 0, len(graphPaths))
+	for _, gp := range graphPaths {
+		if _, failed := failedGraph[gp]; !failed {
+			out = append(out, gp)
+		}
+	}
+	return out
+}
+
 func (idx *Indexer) recordPendingResolutionRetry(files []string, full bool, derived DerivedInvalidationPlan) {
 	if idx == nil {
 		return
 	}
+	refusals := idx.pendingResolutionRefusals.Add(1)
 	idx.pendingResolutionMu.Lock()
-	defer idx.pendingResolutionMu.Unlock()
 	if full {
 		idx.pendingResolutionFull = true
 	}
@@ -403,6 +568,16 @@ func (idx *Indexer) recordPendingResolutionRetry(files []string, full bool, deri
 	derived.MetadataOnlyFiles = 0
 	derived.HierarchyUnchanged = nil
 	idx.pendingResolutionDerived.Merge(derived)
+	queuedFiles := len(idx.pendingResolutionFiles)
+	queuedFull := idx.pendingResolutionFull
+	idx.pendingResolutionMu.Unlock()
+	if idx.logger != nil {
+		idx.logger.Warn("indexer: queued pending resolution retry after refused write",
+			zap.String("repo", idx.repoPrefix),
+			zap.Int("queued_files", queuedFiles),
+			zap.Bool("full", queuedFull),
+			zap.Uint64("refusals", refusals))
+	}
 }
 
 func (idx *Indexer) takePendingResolutionRetry() ([]string, bool, DerivedInvalidationPlan) {
@@ -453,23 +628,58 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	}
 	files, needed, exact := incrementalResolutionFrontier(result, receipt)
 	var carriedRetryFiles []string
+	var ownRetryFiles []string
+	var otherRetryFiles []string
+	var retryDerivedCopy DerivedInvalidationPlan
+	hadCarriedRetry := false
+	carriedRetryFull := false
 	if retryFiles, retryFull, retryDerived := idx.takePendingResolutionRetry(); retryFull || len(retryFiles) > 0 {
+		hadCarriedRetry = true
+		carriedRetryFull = retryFull
 		carriedRetryFiles = retryFiles
-		if result != nil {
-			result.retriedResolution = true
-			result.DerivedInvalidation.Merge(retryDerived)
-			result.DerivedInvalidation.HierarchyUnchanged = nil
-			result.capabilityPrior = nil
-			result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
-			result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
-		}
+		retryDerivedCopy = cloneDerivedInvalidationPlan(retryDerived)
 		if retryFull {
+			if result != nil {
+				result.retriedResolution = true
+				result.DerivedInvalidation.Merge(retryDerivedCopy)
+				result.DerivedInvalidation.HierarchyUnchanged = nil
+				result.capabilityPrior = nil
+				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
+				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+			}
 			needed = true
 			exact = false
 			files = nil
-		} else {
+		} else if idx.hasUncertifiedAliasPass() {
+			ownRetryFiles = append([]string(nil), retryFiles...)
+			if result != nil {
+				result.retriedResolution = true
+				result.DerivedInvalidation.Merge(retryDerivedCopy)
+				result.DerivedInvalidation.HierarchyUnchanged = nil
+				result.capabilityPrior = nil
+				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
+				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+			}
 			files = appendUniqueSorted(files, retryFiles...)
 			needed = true
+		} else {
+			ownRetryFiles, otherRetryFiles = idx.partitionCarriedRetryFiles(retryFiles, files, batch)
+			if len(ownRetryFiles) > 0 {
+				if result != nil {
+					result.retriedResolution = true
+					if len(otherRetryFiles) == 0 {
+						result.DerivedInvalidation.Merge(retryDerivedCopy)
+					} else {
+						mergeDerivedNonFiles(&result.DerivedInvalidation, retryDerivedCopy)
+					}
+					result.DerivedInvalidation.HierarchyUnchanged = nil
+					result.capabilityPrior = nil
+					result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, ownRetryFiles...)
+					result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+				}
+				files = appendUniqueSorted(files, ownRetryFiles...)
+				needed = true
+			}
 		}
 	}
 	if result == nil || result.DeletedFileCount > 0 {
@@ -482,28 +692,38 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	namesWriteRefused := false
 	if needed && len(files) > 0 {
 		var affectedWriteRefused bool
-		factFiles, affectedWriteRefused = idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
+		factFiles, affectedWriteRefused = idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) bool {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
-				return
+				return false
 			}
 			stats := idx.resolver.ResolveFilesAndIncomingObserved(frontier, batch.publicationStamps().mutationResolveMutexObserver())
 			idx.observePointRebind(batch, stats)
-			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
-				result.resolutionErr = resolver.ErrReindexWriteRefused
+			if stats != nil && stats.WriteRefused {
+				if result != nil && result.resolutionErr == nil {
+					result.resolutionErr = resolver.ErrReindexWriteRefused
+				}
+				return true
 			}
+			return false
 		})
 		if affectedWriteRefused && result != nil && result.resolutionErr == nil {
 			result.resolutionErr = resolver.ErrReindexWriteRefused
 		}
-		names := mode.publication.beginPatchLap(patchResolve)
-		if stats := idx.resolveReceiptNamePendings(receipt); stats != nil && stats.WriteRefused {
-			namesWriteRefused = true
-			if result != nil && result.resolutionErr == nil {
-				result.resolutionErr = resolver.ErrReindexWriteRefused
+		if result != nil && result.resolutionErr != nil {
+			if receipt != nil && receipt.Complete && len(vanishedReceiptNames(idx.graph, receipt)) > 0 {
+				namesWriteRefused = true
 			}
+		} else {
+			names := mode.publication.beginPatchLap(patchResolve)
+			if stats := idx.resolveReceiptNamePendings(receipt); stats != nil && stats.WriteRefused {
+				namesWriteRefused = true
+				if result != nil && result.resolutionErr == nil {
+					result.resolutionErr = resolver.ErrReindexWriteRefused
+				}
+			}
+			names.end()
 		}
-		names.end()
 	} else if needed && !exact {
 		idx.observeIncrementalCatchup("resolve", nil)
 		resolve := mode.publication.beginPatchLap(patchResolve)
@@ -515,15 +735,84 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		}
 		resolve.end()
 	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) && (idx.hasUncertifiedAliasPass() || result.retriedResolution) {
+	var repairedFiles []string
+	repairedAll := false
+	if result == nil || result.resolutionErr == nil {
+		if carriedRetryFull {
+			repairedAll = true
+		} else if len(ownRetryFiles) > 0 {
+			var failedAbs []string
+			if result != nil {
+				failedAbs = result.FailedFiles
+			}
+			repairedFiles = appendUniqueSorted(repairedFiles, idx.excludeFailedGraphPaths(ownRetryFiles, failedAbs)...)
+		}
+	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
 		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, factFiles...), carriedRetryFiles...)
-		idx.recordPendingResolutionRetry(retrySaveFiles, !exact || len(retrySaveFiles) == 0 || namesWriteRefused, result.DerivedInvalidation)
+		retryDerivedSave := cloneDerivedInvalidationPlan(result.DerivedInvalidation)
+		if hadCarriedRetry {
+			retryDerivedSave.Merge(retryDerivedCopy)
+		}
+		idx.recordPendingResolutionRetry(retrySaveFiles, !exact || len(retrySaveFiles) == 0 || namesWriteRefused, retryDerivedSave)
+	}
+	if (result == nil || result.resolutionErr == nil) && len(otherRetryFiles) > 0 {
+		limit := len(otherRetryFiles)
+		if limit > maxOpportunisticRetryFiles {
+			limit = maxOpportunisticRetryFiles
+		}
+		selectedOther := otherRetryFiles[:limit]
+		overflow := otherRetryFiles[limit:]
+		otherRefused := false
+		idx.observeIncrementalCatchup("resolve", selectedOther)
+		if idx.incrementalResolveFilesHook != nil {
+			idx.incrementalResolveFilesHook(selectedOther)
+		} else if stats := idx.resolver.ResolveFilesAndIncomingObservedWithTimeout(selectedOther, nil, opportunisticRetryResolveTimeout); stats != nil && stats.WriteRefused {
+			otherRefused = true
+		}
+		if otherRefused {
+			pruned := pruneDerivedFiles(retryDerivedCopy, ownRetryFiles)
+			idx.recordPendingResolutionRetry(otherRetryFiles, false, pruned)
+		} else {
+			idx.observeIncrementalCatchup("dataflow", selectedOther)
+			idx.materializeDataflowParamsForFiles(selectedOther)
+			idx.observeIncrementalCatchup("ref_facts", selectedOther)
+			idx.persistRefFactsForFiles(selectedOther)
+			repairedFiles = appendUniqueSorted(repairedFiles, selectedOther...)
+			if result != nil {
+				result.retriedResolution = true
+				if len(overflow) == 0 {
+					result.DerivedInvalidation.Merge(cloneDerivedInvalidationPlan(retryDerivedCopy))
+				} else {
+					result.DerivedInvalidation.Merge(pruneDerivedFiles(retryDerivedCopy, overflow))
+				}
+				result.DerivedInvalidation.HierarchyUnchanged = nil
+				result.capabilityPrior = nil
+				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, selectedOther...)
+				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+			}
+			if len(overflow) > 0 {
+				pruned := pruneDerivedFiles(retryDerivedCopy, appendUniqueSorted(ownRetryFiles, selectedOther...))
+				idx.recordPendingResolutionRetry(overflow, false, pruned)
+			}
+		}
 	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
-		if mode.exactPointSemantic {
-			idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
-		} else {
-			idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+		if result == nil || result.resolutionErr == nil {
+			if mode.exactPointSemantic {
+				idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
+			} else {
+				if repairedAll {
+					if result != nil && len(result.DerivedInvalidation.Files) > 0 {
+						idx.markPendingEnrichFiles(result.DerivedInvalidation.Files)
+					} else {
+						idx.markPendingEnrichFull()
+					}
+				} else if len(repairedFiles) > 0 {
+					idx.markPendingEnrichFiles(repairedFiles)
+				}
+				idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
+			}
 		}
 		if mode.onRelations != nil && len(result.FailedFiles) == 0 {
 			mode.onRelations(batch.pointRebindRefused || result.resolutionErr != nil)
@@ -532,10 +821,16 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		derived := mode.publication.beginDerivedPatchLap()
 		idx.runStandaloneIncrementalDerivedPassesWithPrior(result.DerivedInvalidation, result.capabilityPrior)
 		derived.endDerived()
+		if mode.onRepairedFiles != nil && (result == nil || result.resolutionErr == nil) && (repairedAll || len(repairedFiles) > 0) {
+			mode.onRepairedFiles(idx.absPathsForGraphPaths(repairedFiles), repairedAll)
+		}
 	}
 	topologyChanged = incrementalTopologyChanged(result)
 	if err := idx.finishAliasPass(result); err != nil {
 		return result, err
+	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		return result, result.resolutionErr
 	}
 	return result, nil
 }
@@ -635,7 +930,9 @@ func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, front
 				if !refused {
 					w.markRelationsFrontier(frontier)
 				}
-			}}
+			},
+			onRepairedFiles: w.markRepairedFailedPaths,
+		}
 		var err error
 		stamps.switchAttemptControlAt(patchExecutorControl, markPointPublication(ctx, PublicationPatchExecutionStarted))
 		if owner := idx.repositoryMutationOwner; owner != nil && idx.repoPrefix != "" {
@@ -696,7 +993,8 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
 ) []string {
-	return mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
+	frontier, _, _ := mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
+	return frontier
 }
 
 func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
@@ -705,96 +1003,162 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	receipt *graph.MutationReceipt,
 	batch *reparsePendingEnrichmentBatch,
 	exactPointSemantic bool,
-) []string {
-	files, needed, _ := incrementalResolutionFrontier(result, receipt)
+) (crossRepoFrontier []string, repairedFiles []string, repairedAll bool) {
+	files, needed, exact := incrementalResolutionFrontier(result, receipt)
 	// wide reports that the pass reached beyond its file frontier (the return
-	// value and the retry record). retryWide is narrower: only a carried full
-	// retry escalates the cross-repo pass to the whole graph. Vanished receipt
-	// names widen the master resolve but keep the cross-repo pass scoped, as
-	// on main.
+	// value). retryWide is narrower: only a carried full retry escalates the
+	// cross-repo pass to the whole graph. Vanished receipt names widen the
+	// master resolve but keep the cross-repo pass scoped, as on main.
 	wide, retryWide := false, false
+	namesWriteRefused, wholeGraphRun := false, false
+	ownCrossRepoFiles := appendUniqueSorted(nil, files...)
+	if batch != nil {
+		ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, batch.npmConsumerFiles...)
+	}
+	if result != nil {
+		ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, result.DerivedInvalidation.Files...)
+	}
 	var carriedRetryFiles []string
+	var ownRetryFiles []string
+	var otherRetryFiles []string
+	var retryDerivedCopy DerivedInvalidationPlan
+	hadCarriedRetry := false
+	carriedRetryFull := false
 	idx := mi.GetIndexer(repoPrefix)
 	if idx != nil {
 		if retryFiles, retryFull, retryDerived := idx.takePendingResolutionRetry(); retryFull || len(retryFiles) > 0 {
+			hadCarriedRetry = true
+			carriedRetryFull = retryFull
 			carriedRetryFiles = retryFiles
-			if result != nil {
-				result.retriedResolution = true
-				result.DerivedInvalidation.Merge(retryDerived)
-				result.DerivedInvalidation.HierarchyUnchanged = nil
-				result.capabilityPrior = nil
-				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
-				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
-			}
+			retryDerivedCopy = cloneDerivedInvalidationPlan(retryDerived)
 			if retryFull {
+				if result != nil {
+					result.retriedResolution = true
+					result.DerivedInvalidation.Merge(retryDerivedCopy)
+					result.DerivedInvalidation.HierarchyUnchanged = nil
+					result.capabilityPrior = nil
+					result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
+					result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+				}
 				needed = true
 				files = nil
 				wide, retryWide = true, true
-			} else {
+			} else if idx.hasUncertifiedAliasPass() {
+				ownRetryFiles = append([]string(nil), retryFiles...)
+				if result != nil {
+					result.retriedResolution = true
+					result.DerivedInvalidation.Merge(retryDerivedCopy)
+					result.DerivedInvalidation.HierarchyUnchanged = nil
+					result.capabilityPrior = nil
+					result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, retryFiles...)
+					result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+				}
 				files = appendUniqueSorted(files, retryFiles...)
+				ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, retryFiles...)
+				if result != nil {
+					ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, result.DerivedInvalidation.Files...)
+				}
 				needed = true
+			} else {
+				ownRetryFiles, otherRetryFiles = idx.partitionCarriedRetryFiles(retryFiles, files, batch)
+				if len(ownRetryFiles) > 0 {
+					if result != nil {
+						result.retriedResolution = true
+						if len(otherRetryFiles) == 0 {
+							result.DerivedInvalidation.Merge(retryDerivedCopy)
+						} else {
+							mergeDerivedNonFiles(&result.DerivedInvalidation, retryDerivedCopy)
+						}
+						result.DerivedInvalidation.HierarchyUnchanged = nil
+						result.capabilityPrior = nil
+						result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, ownRetryFiles...)
+						result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+					}
+					files = appendUniqueSorted(files, ownRetryFiles...)
+					ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, ownRetryFiles...)
+					if len(otherRetryFiles) == 0 && result != nil {
+						ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, result.DerivedInvalidation.Files...)
+					}
+					needed = true
+				}
 			}
 		}
 	}
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
-	crossRepoFiles := appendUniqueSorted(nil, files...)
-	if batch != nil {
-		crossRepoFiles = appendUniqueSorted(crossRepoFiles, batch.npmConsumerFiles...)
-	}
-	if result != nil {
-		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
-	}
 	if !needed || len(files) == 0 || idx == nil {
 		batch.publicationStamps().markSharedOptionalDisposition("patch_analysis", "resolution_catchup_not_entered")
 	}
 	if needed && len(files) > 0 && idx != nil {
-		resolvedFiles, affectedWriteRefused := idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) {
+		resolvedFiles, affectedWriteRefused := idx.runIncrementalResolutionCatchup(files, batch, func(frontier []string) bool {
 			if idx.incrementalResolveFilesHook != nil {
 				idx.incrementalResolveFilesHook(frontier)
-				return
+				return false
 			}
-			stats := mi.runMasterResolveFilesObserved(frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
+			stats := mi.runMasterResolveFilesForRepoObserved(repoPrefix, frontier, false, idx.resolver, batch.publicationStamps().mutationResolveMutexObserver())
 			idx.observePointRebind(batch, stats)
-			if stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
-				result.resolutionErr = resolver.ErrReindexWriteRefused
+			if stats != nil && stats.WriteRefused {
+				if result != nil && result.resolutionErr == nil {
+					result.resolutionErr = resolver.ErrReindexWriteRefused
+				}
+				return true
 			}
+			return false
 		})
 		if affectedWriteRefused && result != nil && result.resolutionErr == nil {
 			result.resolutionErr = resolver.ErrReindexWriteRefused
 		}
-		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
+		ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, resolvedFiles...)
 		if receipt != nil && receipt.Complete {
-			names := batch.publicationStamps().beginPatchLap(patchResolve)
 			vanished := vanishedReceiptNames(mi.graph, receipt)
 			if len(vanished) > 0 {
 				wide = true
 			}
-			if stats := mi.runMasterResolveNames(vanished); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
-				result.resolutionErr = resolver.ErrReindexWriteRefused
+			if result != nil && result.resolutionErr != nil {
+				if len(vanished) > 0 {
+					namesWriteRefused = true
+				}
+			} else if len(vanished) > 0 {
+				names := batch.publicationStamps().beginPatchLap(patchResolve)
+				if stats := mi.runMasterResolveNamesForRepo(repoPrefix, vanished); stats != nil && stats.WriteRefused {
+					namesWriteRefused = true
+					if result != nil && result.resolutionErr == nil {
+						result.resolutionErr = resolver.ErrReindexWriteRefused
+					}
+				}
+				names.end()
 			}
-			names.end()
 		}
 	} else if needed && len(files) > 0 {
 		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
-		if stats := mi.runMasterResolveFilesObserved(files, false, nil, batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
+		if stats := mi.runMasterResolveFilesForRepoObserved(repoPrefix, files, false, nil, batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 			result.resolutionErr = resolver.ErrReindexWriteRefused
 		}
 		resolve.end()
 		if receipt != nil && receipt.Complete {
-			names := batch.publicationStamps().beginPatchLap(patchResolve)
 			vanished := vanishedReceiptNames(mi.graph, receipt)
 			if len(vanished) > 0 {
 				wide = true
 			}
-			if stats := mi.runMasterResolveNames(vanished); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
-				result.resolutionErr = resolver.ErrReindexWriteRefused
+			if result != nil && result.resolutionErr != nil {
+				if len(vanished) > 0 {
+					namesWriteRefused = true
+				}
+			} else if len(vanished) > 0 {
+				names := batch.publicationStamps().beginPatchLap(patchResolve)
+				if stats := mi.runMasterResolveNamesForRepo(repoPrefix, vanished); stats != nil && stats.WriteRefused {
+					namesWriteRefused = true
+					if result != nil && result.resolutionErr == nil {
+						result.resolutionErr = resolver.ErrReindexWriteRefused
+					}
+				}
+				names.end()
 			}
-			names.end()
 		}
 	} else if needed {
 		wide = true
+		wholeGraphRun = true
 		scope := map[string]struct{}{repoPrefix: {}}
 		if repoPrefix == "" {
 			scope = nil
@@ -808,7 +1172,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		// second graph-wide dataflow or durable-fact scan.
 		if idx != nil && result != nil {
 			known := appendUniqueSorted(appendUniqueSorted(nil, result.DerivedInvalidation.Files...), carriedRetryFiles...)
-			crossRepoFiles = appendUniqueSorted(crossRepoFiles, known...)
+			ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, known...)
 			idx.observeIncrementalCatchup("dataflow", known)
 			idx.materializeDataflowParamsForFiles(known)
 			idx.observeIncrementalCatchup("ref_facts", known)
@@ -816,26 +1180,37 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 	}
 
+	masterFailed := result != nil && result.resolutionErr != nil
 	var semanticFiles []string
-	if idx != nil && result != nil {
+	if !masterFailed && idx != nil && result != nil {
 		if exactPointSemantic {
 			semanticFiles = idx.runIncrementalPointSemantic(result.DerivedInvalidation.Files)
 		} else {
+			if carriedRetryFull {
+				if len(result.DerivedInvalidation.Files) > 0 {
+					idx.markPendingEnrichFiles(result.DerivedInvalidation.Files)
+				} else {
+					idx.markPendingEnrichFull()
+				}
+			} else if len(ownRetryFiles) > 0 {
+				idx.markPendingEnrichFiles(result.DerivedInvalidation.Files)
+			}
 			semanticFiles = idx.runIncrementalWatcherSemantic(result.DerivedInvalidation.Files)
 		}
-		crossRepoFiles = appendUniqueSorted(crossRepoFiles, semanticFiles...)
+		ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, semanticFiles...)
 	}
-	if needed || len(semanticFiles) > 0 || batch != nil && len(batch.npmConsumerFiles) > 0 {
+	if !masterFailed && (needed || len(semanticFiles) > 0 || (batch != nil && len(batch.npmConsumerFiles) > 0)) {
 		if idx != nil {
-			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
+			idx.observeIncrementalCatchup("cross_repo", ownCrossRepoFiles)
 		}
 		cross := batch.publicationStamps().beginPatchLap(patchResolve)
-		if !retryWide && len(crossRepoFiles) > 0 {
-			if stats := mi.runCrossRepoResolveMutationFrontiersObserved(crossRepoFiles, crossRepoFiles, crossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
+		if !retryWide && len(ownCrossRepoFiles) > 0 {
+			if stats := mi.runCrossRepoResolveMutationFrontiersObserved(ownCrossRepoFiles, ownCrossRepoFiles, ownCrossRepoFiles, batch.publicationStamps().mutationResolveMutexObserver()); stats != nil && stats.WriteRefused && result != nil && result.resolutionErr == nil {
 				result.resolutionErr = resolver.ErrReindexWriteRefused
 			}
 		} else {
 			wide = true
+			wholeGraphRun = true
 			if idx != nil {
 				idx.observeIncrementalCatchup("cross_repo_graph", nil)
 			}
@@ -848,12 +1223,81 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		cross.end()
 	}
-	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) && (idx.hasUncertifiedAliasPass() || result.retriedResolution) {
-		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, crossRepoFiles...), carriedRetryFiles...)
-		idx.recordPendingResolutionRetry(retrySaveFiles, wide || len(retrySaveFiles) == 0, result.DerivedInvalidation)
+	if result == nil || result.resolutionErr == nil {
+		if carriedRetryFull {
+			repairedAll = true
+		} else if len(ownRetryFiles) > 0 && idx != nil {
+			var failedAbs []string
+			if result != nil {
+				failedAbs = result.FailedFiles
+			}
+			repairedFiles = appendUniqueSorted(repairedFiles, idx.excludeFailedGraphPaths(ownRetryFiles, failedAbs)...)
+		}
+	}
+	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, ownCrossRepoFiles...), carriedRetryFiles...)
+		retryDerivedSave := cloneDerivedInvalidationPlan(result.DerivedInvalidation)
+		if hadCarriedRetry {
+			retryDerivedSave.Merge(retryDerivedCopy)
+		}
+		retryFullFlag := !exact || retryWide || namesWriteRefused || wholeGraphRun || len(retrySaveFiles) == 0
+		idx.recordPendingResolutionRetry(retrySaveFiles, retryFullFlag, retryDerivedSave)
+	}
+	if idx != nil && (result == nil || result.resolutionErr == nil) && len(otherRetryFiles) > 0 {
+		limit := len(otherRetryFiles)
+		if limit > maxOpportunisticRetryFiles {
+			limit = maxOpportunisticRetryFiles
+		}
+		selectedOther := otherRetryFiles[:limit]
+		overflow := otherRetryFiles[limit:]
+		otherRefused := false
+		idx.observeIncrementalCatchup("resolve", selectedOther)
+		if idx.incrementalResolveFilesHook != nil {
+			idx.incrementalResolveFilesHook(selectedOther)
+		} else if stats := mi.runMasterResolveFilesForRepoObservedWithTimeout(repoPrefix, selectedOther, false, nil, nil, opportunisticRetryResolveTimeout); stats != nil && stats.WriteRefused {
+			otherRefused = true
+		}
+		var otherSemanticFiles []string
+		if !otherRefused {
+			idx.observeIncrementalCatchup("dataflow", selectedOther)
+			idx.materializeDataflowParamsForFiles(selectedOther)
+			idx.observeIncrementalCatchup("ref_facts", selectedOther)
+			idx.persistRefFactsForFiles(selectedOther)
+			idx.markPendingEnrichFiles(selectedOther)
+			otherSemanticFiles = idx.runIncrementalWatcherSemantic(selectedOther)
+			otherCrossFiles := appendUniqueSorted(selectedOther, otherSemanticFiles...)
+			idx.observeIncrementalCatchup("cross_repo", otherCrossFiles)
+			if stats := mi.runCrossRepoResolveMutationFrontiersObservedWithTimeout(otherCrossFiles, otherCrossFiles, otherCrossFiles, nil, opportunisticRetryResolveTimeout); stats != nil && stats.WriteRefused {
+				otherRefused = true
+			}
+		}
+		if otherRefused {
+			pruned := pruneDerivedFiles(retryDerivedCopy, ownRetryFiles)
+			idx.recordPendingResolutionRetry(otherRetryFiles, false, pruned)
+		} else {
+			ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, selectedOther...)
+			ownCrossRepoFiles = appendUniqueSorted(ownCrossRepoFiles, otherSemanticFiles...)
+			repairedFiles = appendUniqueSorted(repairedFiles, selectedOther...)
+			if result != nil {
+				result.retriedResolution = true
+				if len(overflow) == 0 {
+					result.DerivedInvalidation.Merge(cloneDerivedInvalidationPlan(retryDerivedCopy))
+				} else {
+					result.DerivedInvalidation.Merge(pruneDerivedFiles(retryDerivedCopy, overflow))
+				}
+				result.DerivedInvalidation.HierarchyUnchanged = nil
+				result.capabilityPrior = nil
+				result.DerivedInvalidation.Files = appendUniqueSorted(result.DerivedInvalidation.Files, selectedOther...)
+				result.DerivedInvalidation.Flags |= DerivedInvalidatesImports | DerivedInvalidatesTests | DerivedInvalidatesContracts
+			}
+			if len(overflow) > 0 {
+				pruned := pruneDerivedFiles(retryDerivedCopy, appendUniqueSorted(ownRetryFiles, selectedOther...))
+				idx.recordPendingResolutionRetry(overflow, false, pruned)
+			}
+		}
 	}
 	if wide {
-		return nil
+		return nil, repairedFiles, repairedAll
 	}
-	return crossRepoFiles
+	return ownCrossRepoFiles, repairedFiles, repairedAll
 }

@@ -76,7 +76,7 @@ func (cr *CrossRepoResolver) retryGoModuleDeps(ctx context.Context, stats *Cross
 	seedBindings := !state.complete
 	if seedBindings && len(cr.goModules) == 0 {
 		seedBindings = false
-		for _, repo := range cr.graph.RepoPrefixes() {
+		for _, repo := range cr.knownRepoPrefixes() {
 			if len(graph.ReadRepoFilePaths(cr.graph, repo, "", []string{"go"}, nil)) > 0 {
 				seedBindings = true // persisted bindings survive removal of every go.mod
 				break
@@ -124,8 +124,11 @@ func (cr *CrossRepoResolver) retryGoModuleDeps(ctx context.Context, stats *Cross
 	repos := make(map[string]goModuleRepoFacts)
 	flush := func() {
 		if len(batch) > 0 {
-			if !cr.applyGoModuleReindexes(batch) {
+			if !cr.applyGoModuleReindexes(batch, stats) {
 				cr.logger.Warn("Go module terminal batch dropped; queued for a later module pass")
+				if cr.passReindexMaxWait > 0 && stats != nil {
+					stats.WriteRefused = true
+				}
 				if state.pending == nil {
 					state.pending = make(map[graph.EdgeIdentity]*graph.Edge)
 				}
@@ -308,11 +311,11 @@ func (cr *CrossRepoResolver) goModuleIncomingEdgesBounded(nodesByFile map[string
 }
 
 // applyGoModuleReindexes never publishes derived work for a dropped batch.
-func (cr *CrossRepoResolver) applyGoModuleReindexes(batch []graph.EdgeReindex) bool {
+func (cr *CrossRepoResolver) applyGoModuleReindexes(batch []graph.EdgeReindex, stats *CrossRepoStats) bool {
 	if len(batch) == 0 {
 		return true
 	}
-	if !reindexEdgesApplied(cr.graph, batch) {
+	if !cr.applyReindexEdges(batch) {
 		return false
 	}
 	cr.removeRetargetedGoModuleParallels(batch)
@@ -331,7 +334,12 @@ func (cr *CrossRepoResolver) applyGoModuleReindexes(batch []graph.EdgeReindex) b
 			})
 		}
 	}
-	reconcilePlaceholderSources(cr.graph, nil, sourceReindexes)
+	if _, ok := reconcilePlaceholderSourcesWithWindow(cr.graph, nil, sourceReindexes, cr.passReindexMaxWait); !ok {
+		cr.placeholderSrcIdx.retainRepoints(repointsFromReindexes(sourceReindexes, cr.inMemoryRepoForEdge))
+		if stats != nil {
+			stats.WriteRefused = true
+		}
+	}
 	for _, row := range batch {
 		cr.noteRetargetedCall(row.Edge)
 		cr.noteDemotedGoModuleCall(row.Edge)
@@ -451,8 +459,11 @@ func (cr *CrossRepoResolver) resolveGoModuleEdgesLocked(edges []*graph.Edge, sta
 		batch = append(batch, graph.EdgeReindex{Edge: &copy, OldTo: e.To, RefreshIdentity: true, OldFilePath: e.FilePath, OldLine: e.Line})
 	}
 	batch = cr.filterLiveReindex(batch)
-	if !cr.applyGoModuleReindexes(batch) {
+	if !cr.applyGoModuleReindexes(batch, stats) {
 		cr.logger.Warn("Go module rebind batch dropped; queued for a later module pass")
+		if cr.passReindexMaxWait > 0 && stats != nil {
+			stats.WriteRefused = true
+		}
 		if cr.goModuleRetry == nil {
 			cr.goModuleRetry = &GoModuleDepRetry{}
 		}
@@ -544,7 +555,7 @@ func (cr *CrossRepoResolver) recheckGoModuleBindings(ctx context.Context, previo
 	}
 	var repos []string
 	if previous == nil {
-		repos = cr.graph.RepoPrefixes()
+		repos = cr.knownRepoPrefixes()
 	}
 	for repo, module := range previous {
 		for path := range changed {

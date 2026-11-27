@@ -59,10 +59,10 @@ func (cr *CrossRepoResolver) ResolveMutationFrontiers(resolutionFiles, edgeSourc
 // files' own outgoing edges, and its CrossRepoStats — which count exactly that
 // — would otherwise read as a complete pass.
 func (cr *CrossRepoResolver) ResolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string) (*CrossRepoStats, CrossRepoIncomingAdmission) {
-	return cr.resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+	return cr.resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles, nil, 0)
 }
 
-func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) (*CrossRepoStats, CrossRepoIncomingAdmission) {
+func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time), maxWait time.Duration) (*CrossRepoStats, CrossRepoIncomingAdmission) {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	var admission CrossRepoIncomingAdmission
 	if cr == nil || cr.graph == nil || len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
@@ -78,16 +78,18 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		acquired = time.Now()
 	}
 	defer cr.mu.Unlock()
-	defer cr.bridgeRetryStateLocked()()
+	prevMaxWait := cr.passReindexMaxWait
+	cr.passReindexMaxWait = maxWait
+	defer func() { cr.passReindexMaxWait = prevMaxWait }()
+	retryOpts := cr.retryOptsForFilesLocked(resolutionFiles, edgeSourceFiles, definitionFiles)
+	allowedRepoint := cr.allowedRepointFuncForOptsLocked(retryOpts)
+	var drainRefused bool
+	bridge := cr.beginRetryBridgeLocked(retryOpts, func() bool {
+		return (stats != nil && stats.WriteRefused) || drainRefused
+	})
+	defer bridge.finish()
 	if observe != nil {
 		observe(started, acquired)
-	}
-
-	if cr.placeholderSrcIdx.hasDeferred() {
-		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
-			stats.WriteRefused = true
-			return stats, admission
-		}
 	}
 
 	if len(resolutionFiles) > 0 {
@@ -150,12 +152,60 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 	}
 	// A newly tracked module also makes old dep/stdlib terminals eligible.
 	// This indexed sweep runs at most once per module/config revision.
-	if !admission.Refused {
+	if !admission.Refused && !stats.WriteRefused {
 		if err := cr.retryGoModuleDeps(context.Background(), stats); err != nil {
 			cr.logger.Error("cross-repo resolve: retry Go module terminals", zap.Error(err))
 		}
 	}
+	if stats.WriteRefused {
+		return stats, admission
+	}
 	DetectCrossRepoEdgesForMutationFiles(cr.graph, edgeSourceFiles, definitionFiles)
+
+	// Step 2: Fail-closed direct-probe flush of deferred repoints matching this
+	// pass's frontier (resolutionFiles ∪ edgeSourceFiles ∪ definitionFiles).
+	if cr.placeholderSrcIdx.hasDeferred() {
+		frontierSet := make(map[string]struct{}, len(resolutionFiles)+len(edgeSourceFiles)+len(definitionFiles))
+		for _, fp := range resolutionFiles {
+			if fp != "" {
+				frontierSet[fp] = struct{}{}
+			}
+		}
+		for _, fp := range edgeSourceFiles {
+			if fp != "" {
+				frontierSet[fp] = struct{}{}
+			}
+		}
+		for _, fp := range definitionFiles {
+			if fp != "" {
+				frontierSet[fp] = struct{}{}
+			}
+		}
+		if _, ok := cr.placeholderSrcIdx.flushMatchingDirectApplied(
+			cr.graph,
+			func(rp graph.PlaceholderRepoint) bool {
+				_, ok := frontierSet[rp.FilePath]
+				return ok
+			},
+			cr.passReindexMaxWait,
+		); !ok {
+			stats.WriteRefused = true
+			return stats, admission
+		}
+	}
+
+	// Step 3: Opportunistic bounded non-frontier same-repo drain under isolated
+	// local drainRefused (50ms fast-fail) so unrelated backlog never fails this save.
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.flushBoundedDirectApplied(
+			cr.graph,
+			incrementalFlushRepointBudget,
+			allowedRepoint,
+			opportunisticDrainWriteTimeout,
+		); !ok {
+			drainRefused = true
+		}
+	}
 	return stats, admission
 }
 

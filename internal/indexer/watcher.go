@@ -330,6 +330,7 @@ const (
 	maxHistory             = 1000
 	mutationRetryBaseDelay = 100 * time.Millisecond
 	mutationRetryMaxDelay  = 5 * time.Second
+	maxPointRebindRetries  = 2
 )
 
 func retryableMutationError(err error) bool {
@@ -2359,6 +2360,14 @@ func (w *Watcher) runPointMutationObserved(path string, kind ChangeKind, generat
 	if !retryableMutationError(patchErr) {
 		return
 	}
+	if errors.Is(patchErr, resolver.ErrReindexWriteRefused) && retryAttempt >= maxPointRebindRetries {
+		if w.pointMutationPatch == nil {
+			w.markRefusedRelationTiers(path, generation, false)
+			patchErr = nil
+		}
+		w.finishGeneration(path, generation)
+		return
+	}
 	if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
 		complete = false
 		return
@@ -2836,10 +2845,29 @@ func (w *Watcher) drainStormObserved(timer *mutationSetTimerObservation) (finish
 		drained(len(batch))
 	}
 	if retryableMutationError(err) {
-		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
-			return
+		if errors.Is(err, resolver.ErrReindexWriteRefused) && retryAttempt >= maxPointRebindRetries {
+			if result != nil {
+				var failedSet map[string]struct{}
+				if len(result.FailedFiles) > 0 {
+					failedSet = make(map[string]struct{}, len(result.FailedFiles))
+					for _, f := range result.FailedFiles {
+						failedSet[filepath.Clean(f)] = struct{}{}
+					}
+				}
+				for p, gen := range generations {
+					if _, failed := failedSet[filepath.Clean(p)]; failed {
+						continue
+					}
+					w.markRefusedRelationTiers(p, gen, false)
+				}
+				err = nil
+			}
+		} else {
+			if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
+				return
+			}
+			err = errWatcherStopped
 		}
-		err = errWatcherStopped
 	}
 	w.completeStormMutationWaiters(generations, result, err, fanout)
 	completed = err == nil && result != nil
@@ -3279,6 +3307,9 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	result, err := w.reindexPointPathRaw(idx, path, generation, PublicationStampsFrom(ctx), preparation)
 	stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
 	observed := observation.close()
+	if result != nil && len(result.FailedFiles) > 0 && (err == nil || errors.Is(err, resolver.ErrReindexWriteRefused)) {
+		return fmt.Errorf("watcher: exact-path reindex failed for %s", strings.Join(result.FailedFiles, ", "))
+	}
 	if err != nil {
 		// A failed patch publishes no fan-out verdict. Whatever the bounded
 		// pass did before the failure, the mutation the caller asked for did

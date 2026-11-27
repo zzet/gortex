@@ -1,6 +1,9 @@
 package graph
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // From-side placeholder reconciliation.
 //
@@ -20,12 +23,15 @@ import "strings"
 // pass that resolves their own site.
 
 // PlaceholderRepoint names one eligible rewrite: dataflow edges from
-// OldFrom at (FilePath, Line) move to NewFrom.
+// OldFrom at (FilePath, Line) move to NewFrom. RepoPrefix optionally tags the
+// owning repository when constructed by a resolver with repository context so
+// multi-repo retry state stays partitioned per repository.
 type PlaceholderRepoint struct {
-	OldFrom  string
-	FilePath string
-	Line     int
-	NewFrom  string
+	OldFrom    string
+	FilePath   string
+	Line       int
+	NewFrom    string
+	RepoPrefix string
 }
 
 // PlaceholderSourceKind reports whether kind participates in from-side
@@ -84,10 +90,26 @@ func ReconcilePlaceholderSources(g Store, repoints []PlaceholderRepoint) int {
 	return moved
 }
 
+// placeholderReconcileWriteChunkSize stays strictly below SQLite's 5,000-row
+// reindexChunkSize so each placeholder-source chunk commits atomically in a
+// single transaction and a partial refusal leaves earlier chunks intact.
+const placeholderReconcileWriteChunkSize = 2048
+
 // ReconcilePlaceholderSourcesApplied is ReconcilePlaceholderSources with
 // checked writer-gate reporting when the backing store supports
 // ReindexEdgesApplied.
 func ReconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint) (int, bool) {
+	return reconcilePlaceholderSourcesApplied(g, repoints, 0)
+}
+
+// ReconcilePlaceholderSourcesTryApplied is ReconcilePlaceholderSourcesApplied
+// with a bounded contention wait window for opportunistic drains when the
+// backing store supports ReindexEdgesTryApplied.
+func ReconcilePlaceholderSourcesTryApplied(g Store, repoints []PlaceholderRepoint, maxWait time.Duration) (int, bool) {
+	return reconcilePlaceholderSourcesApplied(g, repoints, maxWait)
+}
+
+func reconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint, maxWait time.Duration) (int, bool) {
 	if g == nil || len(repoints) == 0 {
 		return 0, true
 	}
@@ -111,6 +133,8 @@ func ReconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint) 
 		return 0, true
 	}
 	candidates := LookupEdgeCandidates(g, nil, sites)
+	var claimed map[EdgeIdentity]struct{}
+	var clones []Edge
 	var batch []EdgeReindex
 	for _, rp := range repoints {
 		if rp.OldFrom == "" || rp.NewFrom == "" || rp.OldFrom == rp.NewFrom {
@@ -121,25 +145,36 @@ func ReconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint) 
 				if e == nil || !PlaceholderSourceKind(e.Kind) {
 					continue
 				}
-				// A duplicate repoint (two references at one site resolving in
-				// the same batch) must not double-move an edge the first
-				// repoint already claimed.
 				if e.From != rp.OldFrom {
 					continue
 				}
 				if e.FilePath != rp.FilePath || e.Line != rp.Line {
 					continue
 				}
-				oldTo, oldKind := e.To, e.Kind
-				e.From = rp.NewFrom
+				// A duplicate repoint (two references at one site resolving in
+				// the same batch) must not double-move an edge the first
+				// repoint already claimed. Clone into a slab instead of
+				// mutating live stored *Edge pointers before the write commits.
+				id := EdgeIdentityFor(e)
+				if claimed != nil {
+					if _, dup := claimed[id]; dup {
+						continue
+					}
+				} else {
+					claimed = make(map[EdgeIdentity]struct{})
+				}
+				claimed[id] = struct{}{}
+				updated := *e
+				updated.From = rp.NewFrom
+				clones = append(clones, updated)
 				// RefreshIdentity routes both backends through their from-aware
 				// identity repair — the default reindex path only handles
-				// target moves.
+				// target moves. Edge pointers are attached once clones finishes
+				// growing so every pointer stays valid.
 				batch = append(batch, EdgeReindex{
-					Edge:            e,
 					OldFrom:         rp.OldFrom,
-					OldTo:           oldTo,
-					OldKind:         oldKind,
+					OldTo:           e.To,
+					OldKind:         e.Kind,
 					OldFilePath:     e.FilePath,
 					OldLine:         e.Line,
 					RefreshIdentity: true,
@@ -150,14 +185,32 @@ func ReconcilePlaceholderSourcesApplied(g Store, repoints []PlaceholderRepoint) 
 	if len(batch) == 0 {
 		return 0, true
 	}
-	if writer, ok := g.(interface {
-		ReindexEdgesApplied([]EdgeReindex) bool
-	}); ok {
-		if !writer.ReindexEdgesApplied(batch) {
-			return 0, false
-		}
-		return len(batch), true
+	for i := range batch {
+		batch[i].Edge = &clones[i]
 	}
-	g.ReindexEdges(batch)
-	return len(batch), true
+	applyChunk := func(chunk []EdgeReindex) bool {
+		if maxWait > 0 {
+			if writer, ok := g.(interface {
+				ReindexEdgesTryApplied([]EdgeReindex, time.Duration) bool
+			}); ok {
+				return writer.ReindexEdgesTryApplied(chunk, maxWait)
+			}
+		}
+		if writer, ok := g.(interface {
+			ReindexEdgesApplied([]EdgeReindex) bool
+		}); ok {
+			return writer.ReindexEdgesApplied(chunk)
+		}
+		g.ReindexEdges(chunk)
+		return true
+	}
+	moved := 0
+	for start := 0; start < len(batch); start += placeholderReconcileWriteChunkSize {
+		end := min(start+placeholderReconcileWriteChunkSize, len(batch))
+		if !applyChunk(batch[start:end]) {
+			return moved, false
+		}
+		moved += end - start
+	}
+	return moved, true
 }

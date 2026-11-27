@@ -465,10 +465,11 @@ type Indexer struct {
 	// writes were refused under SQLite writer-gate contention so a Watcher
 	// retry (whose reparse sees identical bytes and an empty receipt) still
 	// re-runs resolution instead of short-circuiting as a duplicate no-op.
-	pendingResolutionMu      sync.Mutex
-	pendingResolutionFiles   map[string]struct{}
-	pendingResolutionFull    bool
-	pendingResolutionDerived DerivedInvalidationPlan
+	pendingResolutionMu       sync.Mutex
+	pendingResolutionFiles    map[string]struct{}
+	pendingResolutionFull     bool
+	pendingResolutionDerived  DerivedInvalidationPlan
+	pendingResolutionRefusals atomic.Uint64
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -1885,6 +1886,9 @@ func (idx *Indexer) RelKey(absPath string) string { return idx.relKey(absPath) }
 // When non-empty, all node IDs and file paths are prefixed with "<repoPrefix>/".
 func (idx *Indexer) SetRepoPrefix(prefix string) {
 	idx.repoPrefix = prefix
+	if idx.resolver != nil {
+		idx.resolver.SetRetryBridgeRepoPrefix(prefix)
+	}
 	if idx.repositoryMutationOwner != nil && prefix != "" {
 		idx.attachRepositoryMutationCoordinator(idx.repositoryMutationOwner.repositoryMutationCoordinator(prefix))
 	}
@@ -7263,10 +7267,11 @@ type incrementalPathMode struct {
 	// publication carries only a canonical point attempt's local collector.
 	// Existing batch/reconcile/direct callers leave it nil. No live receipt or
 	// mutable Indexer tracing state is installed by this per-call observation.
-	publication   *PublicationStamps
-	readRepair    *ReadRepairObservation
-	relationsRead *relationsReadFrontier // optional point-only validated read coverage
-	onRelations   func(bool)             // file publication complete; true means the owned rebind was refused
+	publication     *PublicationStamps
+	readRepair      *ReadRepairObservation
+	relationsRead   *relationsReadFrontier // optional point-only validated read coverage
+	onRelations     func(bool)             // file publication complete; true means the owned rebind was refused
+	onRepairedFiles func(absPaths []string, all bool)
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
@@ -7334,6 +7339,25 @@ func (idx *Indexer) graphPathRelKey(graphPath string) (relPath string, owned boo
 	// slash contract (or arrives through another spelling) still matches
 	// diskFiles and fileMtimes.
 	return pathkey.Normalize(filepath.ToSlash(rel)), true
+}
+
+func (idx *Indexer) absPathsForGraphPaths(gps []string) []string {
+	if idx == nil || len(gps) == 0 {
+		return nil
+	}
+	root := idx.RootPath()
+	if root == "" {
+		return nil
+	}
+	out := make([]string, 0, len(gps))
+	for _, gp := range gps {
+		rel, owned := idx.graphPathRelKey(gp)
+		if !owned {
+			continue
+		}
+		out = append(out, filepath.Clean(filepath.Join(root, filepath.FromSlash(rel))))
+	}
+	return out
 }
 
 func (idx *Indexer) incrementalPathOwned(absPath string) bool {
@@ -7530,6 +7554,10 @@ func (idx *Indexer) incrementalReindexPathsMode(
 			(!merkleMode && (idx.IsStale(relPath) || extractorLangStale(extractorStaleLangs, relPath))) {
 			staleFiles = append(staleFiles, absPath)
 		}
+	}
+	if len(markerBatches) > 0 && markerBatches[0] != nil {
+		markerBatches[0].requestedScopeRels = scopeRels
+		markerBatches[0].requestedFullRoot = fullRoot
 	}
 
 	staleFiles = append(staleFiles, idx.legacyFileCandidates(diskFiles)...)

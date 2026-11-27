@@ -33,8 +33,40 @@ func (w *Watcher) markRelations(path string, generation, repairedGeneration uint
 	for ordinal, waiter := range w.mutationWaiters[path] {
 		if ordinal <= generation && waiter.ticket != nil {
 			waiter.ticket.tierMu.Lock()
+			if repairedGeneration != 0 && ordinal <= repairedGeneration && waiter.ticket.tiers.rebindRefused {
+				waiter.ticket.tiers.rebindRefused = false
+				waiter.ticket.tiers.Partial = false
+			}
 			stampRelations(&waiter.ticket.tiers, time.Now())
 			waiter.ticket.tierMu.Unlock()
+		}
+	}
+}
+
+func (w *Watcher) markRepairedFailedPaths(absPaths []string, all bool) {
+	if w == nil || (!all && len(absPaths) == 0) {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.failedPaths) == 0 {
+		return
+	}
+	if all {
+		for p, prior := range w.failedPaths {
+			if prior.rebindRefused && len(w.mutationWaiters[p]) == 0 {
+				delete(w.failedPaths, p)
+			}
+		}
+		return
+	}
+	for _, p := range absPaths {
+		if p == "" {
+			continue
+		}
+		clean := filepath.Clean(p)
+		if prior, ok := w.failedPaths[clean]; ok && prior.rebindRefused && len(w.mutationWaiters[clean]) == 0 {
+			delete(w.failedPaths, clean)
 		}
 	}
 }
@@ -60,7 +92,7 @@ func (w *Watcher) mutationTierFrontier(paths []string) map[string]uint64 {
 
 func (w *Watcher) markRelationsFrontier(frontier map[string]uint64) {
 	for path, generation := range frontier {
-		w.markRelations(path, generation, 0)
+		w.markRelations(path, generation, generation)
 	}
 }
 

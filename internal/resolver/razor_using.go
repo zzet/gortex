@@ -147,6 +147,7 @@ func (r *Resolver) resolveRazorUsings() {
 		if e.Meta == nil {
 			e.Meta = map[string]any{}
 		}
+		delete(e.Meta, "guard_reverted")
 		e.Meta["resolved_via"] = "razor_using"
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 	}

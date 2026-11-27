@@ -500,7 +500,12 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	cr.SetNpmPackageLookup(mi.npmPackageLookup())
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
-	cr.SetRetryStateBridge(mi.takePendingCrossRepoRepoints, mi.savePendingCrossRepoRepoints)
+	cr.SetRetryStateBridge(
+		mi.takePendingCrossRepoRepoints,
+		mi.savePendingCrossRepoRepoints,
+		mi.hasPendingCrossRepoForRepo,
+		mi.knownRepoPrefixes,
+	)
 	mi.applyRemoteStitch(cr)
 	return cr
 }
@@ -560,6 +565,10 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, ed
 }
 
 func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles, observe, 0)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time), maxWait time.Duration) *resolver.CrossRepoStats {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
 		return nil
 	}
@@ -567,7 +576,10 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionF
 	if cr == nil {
 		return nil
 	}
-	stats := cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	stats := cr.ResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles, observe, maxWait)
+	if maxWait > 0 && stats != nil && stats.WriteRefused {
+		return stats
+	}
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
 	return stats

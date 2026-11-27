@@ -71,13 +71,26 @@ func (s *Store) withSQLiteBusyRetry(
 	operation string,
 	fn func(context.Context) error,
 ) error {
+	return s.withSQLiteBusyRetryWithWindow(parent, operation, 0, false, fn)
+}
+
+func (s *Store) withSQLiteBusyRetryWithWindow(
+	parent context.Context,
+	operation string,
+	window time.Duration,
+	suppressLog bool,
+	fn func(context.Context) error,
+) error {
 	// Keep the callback on the caller's context. In particular, a successful
 	// sql.BeginTx owns that context until Commit/Rollback; canceling an internal
 	// retry context on return would make the transaction roll itself back. The
 	// local deadline bounds only repeated BUSY/LOCKED recovery, while ordinary
 	// successful work may take longer than the contention window.
+	if window <= 0 {
+		window = s.sqliteBusyRetryWindow()
+	}
 	started := time.Now()
-	retryDeadline := started.Add(s.sqliteBusyRetryWindow())
+	retryDeadline := started.Add(window)
 	delay := sqliteBusyRetryBaseDelay
 	retries := 0
 	var lastBusy error
@@ -87,7 +100,7 @@ func (s *Store) withSQLiteBusyRetry(
 		}
 		err := fn(parent)
 		if err == nil {
-			if retries > 0 {
+			if retries > 0 && !suppressLog {
 				log.Printf("store_sqlite: sqlite busy recovered operation=%s retries=%d elapsed=%s", operation, retries, time.Since(started))
 			}
 			return nil
@@ -102,7 +115,9 @@ func (s *Store) withSQLiteBusyRetry(
 
 		remaining := time.Until(retryDeadline)
 		if remaining <= 0 {
-			log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
+			if !suppressLog {
+				log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
+			}
 			return fmt.Errorf("%s: %w", operation, errors.Join(errSQLiteBusyRetryExhausted, lastBusy, context.DeadlineExceeded))
 		}
 
@@ -115,7 +130,9 @@ func (s *Store) withSQLiteBusyRetry(
 			if !timer.Stop() {
 				<-timer.C
 			}
-			log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
+			if !suppressLog {
+				log.Printf("store_sqlite: sqlite busy exhausted operation=%s retries=%d elapsed=%s error=%q", operation, retries, time.Since(started), lastBusy)
+			}
 			return fmt.Errorf("%s: %w", operation, errors.Join(errSQLiteBusyRetryExhausted, lastBusy, parent.Err()))
 		}
 		if delay *= 2; delay > sqliteBusyRetryMaxDelay {

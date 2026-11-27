@@ -263,12 +263,30 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	if len(batch) == 0 {
 		return
 	}
+	repoForSourceEdge := func(e *graph.Edge) string {
+		if e != nil {
+			if n := sourceNodes[e.From]; n != nil && n.RepoPrefix != "" {
+				return n.RepoPrefix
+			}
+			if owner := enclosingFunctionForBinding(e.From); owner != "" {
+				if n := sourceNodes[owner]; n != nil && n.RepoPrefix != "" {
+					return n.RepoPrefix
+				}
+			}
+			if e.FilePath != "" {
+				if n := sourceNodes[e.FilePath]; n != nil && n.RepoPrefix != "" {
+					return n.RepoPrefix
+				}
+			}
+		}
+		return r.inMemoryRepoForEdge(e)
+	}
 	r.noteImportEdgeReindexes(batch)
 	targeter, ok := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
-	if !ok {
+	if !ok || r.passReindexMaxWait > 0 {
 		if r.applyReindexEdges(batch) {
-			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
-				r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
+			if _, ok := reconcilePlaceholderSourcesWithWindow(r.graph, nil, batch, r.passReindexMaxWait); !ok {
+				r.placeholderSrcIdx.retainRepoints(repointsFromReindexes(batch, repoForSourceEdge))
 				r.notePassWriteRefused()
 			}
 		}
@@ -284,16 +302,16 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	direct, compactOK := compactGoBuiltinTargetReindexes(batch)
 	if !compactOK {
 		if r.applyReindexEdges(batch) {
-			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
-				r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
+			if _, ok := reconcilePlaceholderSourcesWithWindow(r.graph, nil, batch, r.passReindexMaxWait); !ok {
+				r.placeholderSrcIdx.retainRepoints(repointsFromReindexes(batch, repoForSourceEdge))
 				r.notePassWriteRefused()
 			}
 		}
 		return
 	}
 	if r.applyUnresolvedTargetReindexes(targeter, direct) {
-		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
-			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(batch))
+		if _, ok := reconcilePlaceholderSourcesWithWindow(r.graph, nil, batch, r.passReindexMaxWait); !ok {
+			r.placeholderSrcIdx.retainRepoints(repointsFromReindexes(batch, repoForSourceEdge))
 			r.notePassWriteRefused()
 		}
 	}
@@ -383,8 +401,26 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 			edge := &graph.Edge{From: mutation.Old.From, To: mutation.NewTo, Kind: mutation.Old.Kind, FilePath: mutation.Old.FilePath, Line: mutation.Old.Line}
 			resolved = append(resolved, graph.EdgeReindex{Edge: edge, OldTo: mutation.Old.To})
 		}
-		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, resolved); !ok {
-			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(resolved))
+		if _, ok := reconcilePlaceholderSourcesWithWindow(r.graph, nil, resolved, r.passReindexMaxWait); !ok {
+			repoForSourceEdge := func(e *graph.Edge) string {
+				if e != nil {
+					if n := sourceNodes[e.From]; n != nil && n.RepoPrefix != "" {
+						return n.RepoPrefix
+					}
+					if owner := enclosingFunctionForBinding(e.From); owner != "" {
+						if n := sourceNodes[owner]; n != nil && n.RepoPrefix != "" {
+							return n.RepoPrefix
+						}
+					}
+					if e.FilePath != "" {
+						if n := sourceNodes[e.FilePath]; n != nil && n.RepoPrefix != "" {
+							return n.RepoPrefix
+						}
+					}
+				}
+				return r.inMemoryRepoForEdge(e)
+			}
+			r.placeholderSrcIdx.retainRepoints(repointsFromReindexes(resolved, repoForSourceEdge))
 			r.notePassWriteRefused()
 		}
 	}

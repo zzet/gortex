@@ -78,5 +78,6 @@ func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *Pub
 			}
 			w.markRelations(path, max(generation, read.covered), generation)
 		},
+		onRepairedFiles: w.markRepairedFailedPaths,
 	}
 }

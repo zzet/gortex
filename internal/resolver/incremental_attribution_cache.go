@@ -68,11 +68,13 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 	readsBefore, readWallBefore := fileNodeReadStats(r.graph)
 	rebindStarted := time.Now()
 	rebound := false
-	if rebinder, ok := r.graph.(graph.GoMethodReceiverBatchRebinder); ok {
-		if _, err := rebinder.RebindGoMethodReceiversForFiles(frontier.paths); err == nil {
-			rebound = true
-		} else {
-			r.logger.Warn("resolver: backend batch Go receiver rebind failed; using cached fallback", zap.Error(err))
+	if r.passReindexMaxWait == 0 {
+		if rebinder, ok := r.graph.(graph.GoMethodReceiverBatchRebinder); ok {
+			if _, err := rebinder.RebindGoMethodReceiversForFiles(frontier.paths); err == nil {
+				rebound = true
+			} else {
+				r.logger.Warn("resolver: backend batch Go receiver rebind failed; using cached fallback", zap.Error(err))
+			}
 		}
 	}
 	if !rebound {

@@ -36,6 +36,10 @@ func (s *gateHoldingReindexStore) ReindexEdges(batch []graph.EdgeReindex) {
 }
 
 func (s *gateHoldingReindexStore) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
+	return s.ReindexEdgesTryApplied(batch, 0)
+}
+
+func (s *gateHoldingReindexStore) ReindexEdgesTryApplied(batch []graph.EdgeReindex, maxWait time.Duration) bool {
 	var release func()
 	s.holdOnce.Do(func() {
 		var err error
@@ -47,7 +51,7 @@ func (s *gateHoldingReindexStore) ReindexEdgesApplied(batch []graph.EdgeReindex)
 	if release != nil {
 		defer release()
 	}
-	applied := s.Store.ReindexEdgesApplied(batch)
+	applied := s.Store.ReindexEdgesTryApplied(batch, maxWait)
 	if !applied {
 		s.dropped.Add(1)
 		s.droppedEdges.Add(int32(len(batch)))

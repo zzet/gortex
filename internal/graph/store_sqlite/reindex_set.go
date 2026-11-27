@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 	"unicode/utf8"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -96,13 +97,17 @@ func (s *sqliteReindexSetStats) add(other sqliteReindexSetStats) {
 }
 
 func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReindexSetStats, error) {
+	return s.reindexEdgesSetOrientedWithWindow(batch, 0)
+}
+
+func (s *Store) reindexEdgesSetOrientedWithWindow(batch []graph.EdgeReindex, maxWait time.Duration) (sqliteReindexSetStats, error) {
 	var stats sqliteReindexSetStats
 	for txStart := 0; txStart < len(batch); txStart += reindexChunkSize {
 		txEnd := minInt(txStart+reindexChunkSize, len(batch))
-		txStats, err := s.reindexEdgesSetChunk(batch[txStart:txEnd])
+		txStats, err := s.reindexEdgesSetChunkWithWindow(batch[txStart:txEnd], maxWait)
 		stats.add(txStats)
 		if err != nil {
-			if txStart > 0 && errors.Is(err, errReindexWriterGateContended) {
+			if txStart > 0 && (errors.Is(err, errReindexWriterGateContended) || (maxWait > 0 && errors.Is(err, errSQLiteBusyRetryExhausted))) {
 				// Earlier chunks committed on their own; say how far the batch got
 				// so the dropped remainder is not mistaken for the whole batch.
 				return stats, fmt.Errorf("%w (applied %d of %d rebinds)", err, txStart, len(batch))
@@ -113,16 +118,24 @@ func (s *Store) reindexEdgesSetOriented(batch []graph.EdgeReindex) (sqliteReinde
 	return stats, nil
 }
 
-// reindexEdgesSetChunk applies one bounded transaction of a reindex batch
-// under its own writer-gate hold. The gate is released between chunks so a
-// large rebind (a sparse generation build hands over hundreds of thousands)
+// reindexEdgesSetChunkWithWindow applies one bounded transaction of a reindex
+// batch under its own writer-gate hold. The gate is released between chunks so
+// a large rebind (a sparse generation build hands over hundreds of thousands)
 // never starves the edge drain, the reconcile janitor or any other writer for
 // longer than one chunk: chunks were already committed independently, so no
 // caller could observe the batch as atomic, and each chunk re-reads the rows
 // it rewrites inside its own transaction.
-func (s *Store) reindexEdgesSetChunk(chunk []graph.EdgeReindex) (sqliteReindexSetStats, error) {
+func (s *Store) reindexEdgesSetChunkWithWindow(chunk []graph.EdgeReindex, maxWait time.Duration) (sqliteReindexSetStats, error) {
 	var stats sqliteReindexSetStats
-	gateCtx, cancelGate := context.WithTimeout(context.Background(), s.sqliteBusyRetryWindow())
+	window := s.sqliteBusyRetryWindow()
+	suppressLog := false
+	if maxWait > 0 {
+		suppressLog = true
+		if maxWait < window {
+			window = maxWait
+		}
+	}
+	gateCtx, cancelGate := context.WithTimeout(context.Background(), window)
 	gateErr := s.writeMu.LockContext(gateCtx)
 	cancelGate()
 	if gateErr != nil {
@@ -139,13 +152,18 @@ func (s *Store) reindexEdgesSetChunk(chunk []graph.EdgeReindex) (sqliteReindexSe
 		invalidatedAnalysis bool
 		receipt             *sqliteReindexReceipt
 	)
-	err := s.withSQLiteBusyRetry(context.Background(), "reindex_edges", func(ctx context.Context) error {
+	err := s.withSQLiteBusyRetryWithWindow(context.Background(), "reindex_edges", window, suppressLog, func(ctx context.Context) error {
 		var txErr error
 		stats, changed, invalidatedAnalysis, receipt, txErr = s.reindexEdgesSetTransactionLocked(ctx, chunk)
 		return txErr
 	})
 	if err != nil {
 		return sqliteReindexSetStats{}, err
+	}
+	for _, r := range chunk {
+		if r.Edge != nil && graph.IsUnresolvedTarget(r.Edge.To) {
+			s.unresolvedInserts.Add(1)
+		}
 	}
 	if invalidatedAnalysis {
 		s.analysisGenerationPresent = s.analysisLatchRemaining

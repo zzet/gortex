@@ -206,6 +206,8 @@ type reparsePendingEnrichmentBatch struct {
 	readRepair         *ReadRepairObservation
 	relationsRead      *relationsReadFrontier
 	pointRebindRefused bool
+	requestedScopeRels map[string]bool
+	requestedFullRoot  bool
 	// npmConsumerFiles are unchanged importers parked by this mutation.
 	npmConsumerFiles      []string
 	byFile                map[string]bool

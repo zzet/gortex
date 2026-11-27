@@ -127,16 +127,21 @@ type MultiIndexer struct {
 	npmPackageMu         sync.Mutex
 	npmPackageCache      *npmPackageSnapshot
 
-	// pendingResolveRetryMu protects refused placeholder repoints and
-	// cross-package guard reverts handed back from short-lived master/cross-repo
-	// resolvers so a retry pass completes them without requiring a file reparse.
+	// pendingResolveRetryMu protects per-repository refused placeholder repoints
+	// and cross-package guard reverts handed back from short-lived master and
+	// cross-repo resolvers so a retry pass completes them without requiring a
+	// file reparse, while isolating sibling repositories.
 	pendingResolveRetryMu     sync.Mutex
-	pendingMasterRepoints     []graph.PlaceholderRepoint
-	pendingMasterGuardReverts []resolver.PendingGuardRevert
+	pendingMasterByRepo       map[string]*repoMasterRetryState
 	pendingMasterTailRetryAll bool
-	pendingMasterTailScopes   map[string]struct{}
-	pendingMasterAttribFiles  map[string]struct{}
-	pendingCrossRepoRepoints  []graph.PlaceholderRepoint
+	pendingCrossRepoByRepo    map[string]*repoCrossRepoRetryState
+	repoClearedEpoch          map[string]uint64
+	retryClearEpoch           atomic.Uint64
+	hasPendingMasterRepoRetry atomic.Bool
+	hasPendingCrossRepoRetry  atomic.Bool
+	backlogGrowthEvents       atomic.Uint64
+	backlogDrainEvents        atomic.Uint64
+	beforeMasterResolveLock   func()
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and
@@ -426,7 +431,12 @@ func (mi *MultiIndexer) newPerRepoIndexerGuardedWithMode(
 	idx.repositoryMutationOwner = mi
 	idx.installGoResolverContext()
 	if idx.resolver != nil {
-		idx.resolver.SetRetryStateBridge(mi.takePendingMasterRetry, mi.savePendingMasterRetry)
+		idx.resolver.SetRetryStateBridge(
+			mi.takePendingMasterRetry,
+			mi.savePendingMasterRetry,
+			mi.hasPendingMasterForRepo,
+			mi.knownRepoPrefixes,
+		)
 	}
 	idx.search = mi.search
 	if mi.embedder != nil {
@@ -998,86 +1008,947 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 	return fullFallback(fallbackScope, "mutation_receipt_unavailable")
 }
 
-func (mi *MultiIndexer) takePendingMasterRetry() resolver.MasterRetryState {
-	mi.pendingResolveRetryMu.Lock()
-	defer mi.pendingResolveRetryMu.Unlock()
-	state := resolver.MasterRetryState{
-		PlaceholderRepoints: mi.pendingMasterRepoints,
-		GuardReverts:        mi.pendingMasterGuardReverts,
-		TailRetryAll:        mi.pendingMasterTailRetryAll,
-	}
-	mi.pendingMasterRepoints = nil
-	mi.pendingMasterGuardReverts = nil
-	mi.pendingMasterTailRetryAll = false
-	if len(mi.pendingMasterTailScopes) > 0 {
-		state.TailRetryScopes = make([]string, 0, len(mi.pendingMasterTailScopes))
-		for s := range mi.pendingMasterTailScopes {
-			state.TailRetryScopes = append(state.TailRetryScopes, s)
-		}
-		mi.pendingMasterTailScopes = nil
-	}
-	if len(mi.pendingMasterAttribFiles) > 0 {
-		state.AttributionFiles = make([]string, 0, len(mi.pendingMasterAttribFiles))
-		for p := range mi.pendingMasterAttribFiles {
-			state.AttributionFiles = append(state.AttributionFiles, p)
-		}
-		mi.pendingMasterAttribFiles = nil
-	}
-	return state
+type repoMasterRetryState struct {
+	repoints       []graph.PlaceholderRepoint
+	repointsDedup  bool // false once deduped; true only on yield-skipped saves
+	headDropped    int  // tracks head-popped prefix for half-dropped compaction
+	guardReverts   []resolver.PendingGuardRevert
+	guardPruned    bool // fail-safe: true only after pruneSitesMulti with no subsequent appends
+	tailRetryScope bool
+	attribFiles    map[string]struct{}
 }
 
-func (mi *MultiIndexer) savePendingMasterRetry(state resolver.MasterRetryState) {
-	if len(state.PlaceholderRepoints) == 0 && len(state.GuardReverts) == 0 && !state.TailRetryAll && len(state.TailRetryScopes) == 0 && len(state.AttributionFiles) == 0 {
+func (b *repoMasterRetryState) guardItemCount() int {
+	if b == nil {
+		return 0
+	}
+	n := 0
+	for i := range b.guardReverts {
+		n += b.guardReverts[i].ItemCount()
+	}
+	return n
+}
+
+func (b *repoMasterRetryState) itemCount() int {
+	if b == nil {
+		return 0
+	}
+	n := len(b.repoints) + b.guardItemCount() + len(b.attribFiles)
+	if b.tailRetryScope {
+		n++
+	}
+	return n
+}
+
+func (b *repoMasterRetryState) empty() bool {
+	return b == nil || (len(b.repoints) == 0 && len(b.guardReverts) == 0 && !b.tailRetryScope && len(b.attribFiles) == 0)
+}
+
+type repoCrossRepoRetryState struct {
+	repoints    []graph.PlaceholderRepoint
+	needsDedup  bool
+	headDropped int
+}
+
+// RepoRetryBacklogStats reports the retained refused-write retry backlog for
+// one repository bucket in MultiIndexer.
+type RepoRetryBacklogStats struct {
+	PlaceholderRepoints int
+	GuardReverts        int
+	AttributionFiles    int
+	TailRetryScope      bool
+	CrossRepoRepoints   int
+}
+
+// MultiRetryBacklogStats snapshots the aggregate and per-repository
+// refused-write retry backlog held by MultiIndexer, along with monotonic
+// observability counters.
+type MultiRetryBacklogStats struct {
+	PlaceholderRepoints int
+	GuardReverts        int
+	AttributionFiles    int
+	TailRetryScopes     int
+	TailRetryAll        bool
+	CrossRepoRepoints   int
+	ByRepo              map[string]RepoRetryBacklogStats
+	BacklogGrowthEvents uint64
+	BacklogDrainEvents  uint64
+}
+
+type retryBacklogLogEvent struct {
+	layer  string
+	repo   string
+	before int
+	taken  int
+	after  int
+	warn   bool
+}
+
+func (mi *MultiIndexer) knownRepoPrefixes() []string {
+	if mi == nil {
+		return nil
+	}
+	mi.mu.RLock()
+	seen := make(map[string]struct{}, len(mi.repos)+len(mi.indexers))
+	for p := range mi.repos {
+		if p != "" {
+			seen[p] = struct{}{}
+		}
+	}
+	for p := range mi.indexers {
+		if p != "" {
+			seen[p] = struct{}{}
+		}
+	}
+	mi.mu.RUnlock()
+	if len(seen) == 0 {
+		if mi.graph == nil {
+			return nil
+		}
+		return mi.graph.RepoPrefixes()
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (mi *MultiIndexer) refreshHasPendingMasterLocked() {
+	mi.hasPendingMasterRepoRetry.Store(len(mi.pendingMasterByRepo) > 0)
+}
+
+func (mi *MultiIndexer) refreshHasPendingCrossRepoLocked() {
+	mi.hasPendingCrossRepoRetry.Store(len(mi.pendingCrossRepoByRepo) > 0)
+}
+
+func (mi *MultiIndexer) hasPendingMasterForRepo(repo string) bool {
+	if mi == nil || !mi.hasPendingMasterRepoRetry.Load() {
+		return false
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	return mi.pendingMasterByRepo[repo] != nil
+}
+
+func (mi *MultiIndexer) hasPendingCrossRepoForRepo(repo string) bool {
+	if mi == nil || !mi.hasPendingCrossRepoRetry.Load() {
+		return false
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	return mi.pendingCrossRepoByRepo[repo] != nil
+}
+
+func (mi *MultiIndexer) clearPendingRetryForRepo(repoPrefix string) {
+	if mi == nil || repoPrefix == "" {
 		return
 	}
 	mi.pendingResolveRetryMu.Lock()
-	defer mi.pendingResolveRetryMu.Unlock()
-	if len(state.PlaceholderRepoints) > 0 {
-		mi.pendingMasterRepoints = append(mi.pendingMasterRepoints, state.PlaceholderRepoints...)
+	newEpoch := mi.retryClearEpoch.Load() + 1
+	if mi.repoClearedEpoch == nil {
+		mi.repoClearedEpoch = make(map[string]uint64)
 	}
+	mi.repoClearedEpoch[repoPrefix] = newEpoch
+	delete(mi.pendingMasterByRepo, repoPrefix)
+	delete(mi.pendingCrossRepoByRepo, repoPrefix)
+	mi.refreshHasPendingMasterLocked()
+	mi.refreshHasPendingCrossRepoLocked()
+	mi.retryClearEpoch.Store(newEpoch)
+	mi.pendingResolveRetryMu.Unlock()
+}
+
+// PendingRetryBacklogStats snapshots the retained refused-write retry backlog
+// and observability counters for diagnostics and tests.
+func (mi *MultiIndexer) PendingRetryBacklogStats() MultiRetryBacklogStats {
+	stats := MultiRetryBacklogStats{
+		BacklogGrowthEvents: mi.backlogGrowthEvents.Load(),
+		BacklogDrainEvents:  mi.backlogDrainEvents.Load(),
+	}
+	if mi == nil {
+		return stats
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	stats.TailRetryAll = mi.pendingMasterTailRetryAll
+	if len(mi.pendingMasterByRepo) > 0 || len(mi.pendingCrossRepoByRepo) > 0 {
+		stats.ByRepo = make(map[string]RepoRetryBacklogStats, len(mi.pendingMasterByRepo)+len(mi.pendingCrossRepoByRepo))
+	}
+	for repo, b := range mi.pendingMasterByRepo {
+		if b.empty() {
+			continue
+		}
+		gCount := b.guardItemCount()
+		rs := stats.ByRepo[repo]
+		rs.PlaceholderRepoints = len(b.repoints)
+		rs.GuardReverts = gCount
+		rs.AttributionFiles = len(b.attribFiles)
+		rs.TailRetryScope = b.tailRetryScope
+		stats.ByRepo[repo] = rs
+		stats.PlaceholderRepoints += len(b.repoints)
+		stats.GuardReverts += gCount
+		stats.AttributionFiles += len(b.attribFiles)
+		if b.tailRetryScope {
+			stats.TailRetryScopes++
+		}
+	}
+	for repo, b := range mi.pendingCrossRepoByRepo {
+		if b == nil || len(b.repoints) == 0 {
+			continue
+		}
+		rs := stats.ByRepo[repo]
+		rs.CrossRepoRepoints = len(b.repoints)
+		stats.ByRepo[repo] = rs
+		stats.CrossRepoRepoints += len(b.repoints)
+	}
+	return stats
+}
+
+func (mi *MultiIndexer) emitRetryBacklogEvents(events []retryBacklogLogEvent, warnTailAll, infoTailAll bool) {
+	emittedWarn := false
+	emittedDrain := false
+	for _, ev := range events {
+		if ev.warn {
+			emittedWarn = true
+			mi.backlogGrowthEvents.Add(1)
+			if mi.logger != nil {
+				mi.logger.Warn("indexer: resolver retry backlog grew or refused",
+					zap.String("layer", ev.layer),
+					zap.String("repo", ev.repo),
+					zap.Int("before", ev.before),
+					zap.Int("taken", ev.taken),
+					zap.Int("after", ev.after),
+					zap.Bool("tail_retry_all", warnTailAll))
+			}
+		} else {
+			emittedDrain = true
+			mi.backlogDrainEvents.Add(1)
+			if mi.logger != nil {
+				mi.logger.Info("indexer: resolver retry backlog drained",
+					zap.String("layer", ev.layer),
+					zap.String("repo", ev.repo),
+					zap.Int("drained", ev.taken),
+					zap.Bool("tail_retry_all", infoTailAll))
+			}
+		}
+	}
+	if warnTailAll && !emittedWarn {
+		mi.backlogGrowthEvents.Add(1)
+		if mi.logger != nil {
+			mi.logger.Warn("indexer: resolver retry backlog grew or refused",
+				zap.String("layer", "master"),
+				zap.Bool("tail_retry_all", true))
+		}
+	} else if infoTailAll && !emittedDrain {
+		mi.backlogDrainEvents.Add(1)
+		if mi.logger != nil {
+			mi.logger.Info("indexer: resolver retry backlog drained",
+				zap.String("layer", "master"),
+				zap.Bool("tail_retry_all", true))
+		}
+	}
+}
+
+func (mi *MultiIndexer) takePendingMasterRetry(opts resolver.RetryTakeOpts) (resolver.MasterRetryState, uint64) {
+	if mi == nil {
+		return resolver.MasterRetryState{}, 0
+	}
+	if !opts.AllRepos && !opts.TakeTailAll && !opts.PeekTailAll && len(opts.Repos) == 0 {
+		return resolver.MasterRetryState{}, mi.retryClearEpoch.Load()
+	}
+	mi.pendingResolveRetryMu.Lock()
+	defer mi.pendingResolveRetryMu.Unlock()
+	epoch := mi.retryClearEpoch.Load()
+	var state resolver.MasterRetryState
+	if opts.TakeTailAll {
+		state.TailRetryAll = mi.pendingMasterTailRetryAll
+		mi.pendingMasterTailRetryAll = false
+	} else if opts.PeekTailAll {
+		state.TailRetryAll = mi.pendingMasterTailRetryAll
+	}
+	if len(mi.pendingMasterByRepo) == 0 {
+		state.GuardPruned = true
+		return state, epoch
+	}
+
+	var selected []string
+	if opts.AllRepos {
+		selected = make([]string, 0, len(mi.pendingMasterByRepo))
+		for repo, b := range mi.pendingMasterByRepo {
+			if b.empty() {
+				continue
+			}
+			if opts.HasMaxEpoch && mi.repoClearedEpoch[repo] > opts.MaxEpoch {
+				continue
+			}
+			selected = append(selected, repo)
+		}
+	} else if len(opts.Repos) > 0 {
+		selected = make([]string, 0, len(opts.Repos))
+		for repo := range opts.Repos {
+			b := mi.pendingMasterByRepo[repo]
+			if b.empty() {
+				continue
+			}
+			if opts.HasMaxEpoch && mi.repoClearedEpoch[repo] > opts.MaxEpoch {
+				continue
+			}
+			selected = append(selected, repo)
+		}
+	}
+
+	switch len(selected) {
+	case 0:
+		state.GuardPruned = true
+		return state, epoch
+	case 1:
+		repo := selected[0]
+		b := mi.pendingMasterByRepo[repo]
+		delete(mi.pendingMasterByRepo, repo)
+		state.PlaceholderRepoints = b.repoints
+		state.GuardReverts = b.guardReverts
+		state.NeedsDedup = b.repointsDedup
+		state.GuardPruned = b.guardPruned
+		state.HasUniformRepo = true
+		state.UniformRepo = repo
+		state.DefaultRepoPrefix = repo
+		state.HeadDropped = b.headDropped
+		if b.tailRetryScope {
+			state.TailRetryScopes = []string{repo}
+		}
+		if len(b.attribFiles) > 0 {
+			state.AttributionFiles = make([]string, 0, len(b.attribFiles))
+			for fp := range b.attribFiles {
+				state.AttributionFiles = append(state.AttributionFiles, fp)
+			}
+		}
+		state.TakenRepos = map[string]int{repo: b.itemCount()}
+		mi.refreshHasPendingMasterLocked()
+		return state, epoch
+	default:
+		sort.Strings(selected)
+		allGuardPruned := true
+		state.TakenRepos = make(map[string]int, len(selected))
+		for _, repo := range selected {
+			b := mi.pendingMasterByRepo[repo]
+			delete(mi.pendingMasterByRepo, repo)
+			state.TakenRepos[repo] = b.itemCount()
+			if len(b.repoints) > 0 {
+				state.PlaceholderRepoints = append(state.PlaceholderRepoints, b.repoints...)
+				if b.repointsDedup {
+					state.NeedsDedup = true
+				}
+			}
+			if len(b.guardReverts) > 0 {
+				state.GuardReverts = append(state.GuardReverts, b.guardReverts...)
+			}
+			if !b.guardPruned {
+				allGuardPruned = false
+			}
+			if b.tailRetryScope {
+				state.TailRetryScopes = append(state.TailRetryScopes, repo)
+			}
+			for fp := range b.attribFiles {
+				state.AttributionFiles = append(state.AttributionFiles, fp)
+			}
+		}
+		state.GuardPruned = allGuardPruned
+		mi.refreshHasPendingMasterLocked()
+		return state, epoch
+	}
+}
+
+func (mi *MultiIndexer) savePendingMasterRetry(state resolver.MasterRetryState, meta resolver.RetryBridgeSaveMeta) {
+	if mi == nil {
+		return
+	}
+	emptyState := len(state.PlaceholderRepoints) == 0 &&
+		len(state.GuardReverts) == 0 &&
+		!state.TailRetryAll &&
+		len(state.TailRetryScopes) == 0 &&
+		len(state.AttributionFiles) == 0
+	if emptyState {
+		if meta.IsYield || (len(meta.TakenRepos) == 0 && !meta.TakenTailAll) {
+			return
+		}
+		var events []retryBacklogLogEvent
+		infoTailAll := false
+		mi.pendingResolveRetryMu.Lock()
+		for repo, taken := range meta.TakenRepos {
+			if taken <= 0 || mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+				continue
+			}
+			if mi.pendingMasterByRepo[repo].empty() {
+				events = append(events, retryBacklogLogEvent{layer: "master", repo: repo, taken: taken})
+			}
+		}
+		if meta.TakenTailAll && !mi.pendingMasterTailRetryAll {
+			infoTailAll = true
+		}
+		mi.refreshHasPendingMasterLocked()
+		mi.pendingResolveRetryMu.Unlock()
+		mi.emitRetryBacklogEvents(events, false, infoTailAll)
+		return
+	}
+
+	// Strict O(1) single-repo drain fast path (0 allocs, 0 knownRepoPrefixes calls).
+	// Intentionally allows meta.Refused == true: HasUniformRepo && !NeedsDedup proves
+	// no new repoints were appended during this pass (contended Step 3 drain stays O(1)).
+	if !meta.IsYield && !state.NeedsDedup && !state.TailRetryAll && len(state.AttributionFiles) == 0 {
+		singleOK := false
+		singleRepo := ""
+		if len(state.PlaceholderRepoints) > 0 {
+			if state.HasUniformRepo {
+				singleOK = true
+				singleRepo = state.UniformRepo
+			}
+		} else if len(state.GuardReverts) > 0 {
+			if r0 := state.GuardReverts[0].RepoPrefix; r0 != "" {
+				singleOK = true
+				singleRepo = r0
+			}
+		} else if len(state.TailRetryScopes) == 1 && state.TailRetryScopes[0] != "" {
+			singleOK = true
+			singleRepo = state.TailRetryScopes[0]
+		}
+		if singleOK && len(state.GuardReverts) > 0 {
+			if singleRepo == "" && !state.GuardPruned {
+				singleOK = false
+			}
+			for i := range state.GuardReverts {
+				if state.GuardReverts[i].RepoPrefix != singleRepo {
+					singleOK = false
+					break
+				}
+			}
+		}
+		if singleOK && len(state.TailRetryScopes) > 0 {
+			if len(state.TailRetryScopes) != 1 || state.TailRetryScopes[0] != singleRepo {
+				singleOK = false
+			}
+		}
+		if singleOK {
+			var events []retryBacklogLogEvent
+			infoTailAll := false
+			mi.pendingResolveRetryMu.Lock()
+			beforeSingle := mi.pendingMasterByRepo[singleRepo].itemCount()
+			var otherTaken map[string]int
+			for repo, taken := range meta.TakenRepos {
+				if repo == singleRepo || taken <= 0 {
+					continue
+				}
+				if otherTaken == nil {
+					otherTaken = make(map[string]int, len(meta.TakenRepos))
+				}
+				otherTaken[repo] = taken
+			}
+			if mi.repoClearedEpoch[singleRepo] <= meta.TakeEpoch {
+				bucket := mi.pendingMasterByRepo[singleRepo]
+				if bucket == nil {
+					bucket = &repoMasterRetryState{}
+					if mi.pendingMasterByRepo == nil {
+						mi.pendingMasterByRepo = make(map[string]*repoMasterRetryState)
+					}
+					mi.pendingMasterByRepo[singleRepo] = bucket
+				}
+				existingTail := bucket.tailRetryScope
+				if len(bucket.repoints) == 0 && len(bucket.guardReverts) == 0 {
+					bucket.repoints = state.PlaceholderRepoints
+					bucket.headDropped = state.HeadDropped
+					bucket.repointsDedup = false
+					bucket.guardReverts = state.GuardReverts
+					bucket.guardPruned = state.GuardPruned
+					bucket.tailRetryScope = existingTail || len(state.TailRetryScopes) > 0
+				} else {
+					if len(state.PlaceholderRepoints) > 0 {
+						bucket.repoints = resolver.DedupPlaceholderRepoints(append(bucket.repoints, state.PlaceholderRepoints...))
+						bucket.repointsDedup = false
+						bucket.headDropped = 0
+					}
+					for i := range state.GuardReverts {
+						bucket.guardReverts = resolver.AppendCoalescedGuardRevert(bucket.guardReverts, state.GuardReverts[i])
+					}
+					bucket.guardPruned = false
+					bucket.tailRetryScope = existingTail || len(state.TailRetryScopes) > 0
+				}
+				if bucket.empty() {
+					delete(mi.pendingMasterByRepo, singleRepo)
+				}
+				afterSingle := mi.pendingMasterByRepo[singleRepo].itemCount()
+				takenSingle := meta.TakenRepos[singleRepo]
+				if afterSingle > 0 && (afterSingle > beforeSingle+takenSingle || meta.Refused) {
+					events = append(events, retryBacklogLogEvent{
+						layer: "master", repo: singleRepo, before: beforeSingle, taken: takenSingle, after: afterSingle, warn: true,
+					})
+				} else if takenSingle > 0 && afterSingle == 0 {
+					events = append(events, retryBacklogLogEvent{
+						layer: "master", repo: singleRepo, taken: takenSingle,
+					})
+				}
+			}
+			for repo, taken := range otherTaken {
+				if mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+					continue
+				}
+				if mi.pendingMasterByRepo[repo].empty() {
+					events = append(events, retryBacklogLogEvent{layer: "master", repo: repo, taken: taken})
+				}
+			}
+			if meta.TakenTailAll && !mi.pendingMasterTailRetryAll {
+				infoTailAll = true
+			}
+			mi.refreshHasPendingMasterLocked()
+			mi.pendingResolveRetryMu.Unlock()
+			mi.emitRetryBacklogEvents(events, false, infoTailAll)
+			return
+		}
+	}
+
+	// General merge / multi-repo / untagged / yield path.
+	// Resolve knownRepoPrefixes BEFORE acquiring pendingResolveRetryMu to keep
+	// lock ordering strictly acyclic (r.mu -> mi.mu.RLock -> pendingResolveRetryMu).
+	needKnown := len(state.AttributionFiles) > 0
+	if !needKnown {
+		for i := range state.PlaceholderRepoints {
+			if state.PlaceholderRepoints[i].RepoPrefix == "" {
+				needKnown = true
+				break
+			}
+		}
+	}
+	if !needKnown {
+		for i := range state.GuardReverts {
+			if state.GuardReverts[i].RepoPrefix == "" {
+				needKnown = true
+				break
+			}
+		}
+	}
+	var knownSet map[string]struct{}
+	if needKnown {
+		if prefixes := mi.knownRepoPrefixes(); len(prefixes) > 0 {
+			knownSet = make(map[string]struct{}, len(prefixes))
+			for _, p := range prefixes {
+				knownSet[p] = struct{}{}
+			}
+		}
+	}
+	resolveRepo := func(fp string) string {
+		return resolver.RepoForFilePath(fp, knownSet, state.DefaultRepoPrefix)
+	}
+
+	var repointsByRepo map[string][]graph.PlaceholderRepoint
+	if len(state.PlaceholderRepoints) > 0 {
+		repointsByRepo = make(map[string][]graph.PlaceholderRepoint)
+		for _, rp := range state.PlaceholderRepoints {
+			repo := rp.RepoPrefix
+			if repo == "" {
+				repo = resolveRepo(rp.FilePath)
+				rp.RepoPrefix = repo
+			}
+			repointsByRepo[repo] = append(repointsByRepo[repo], rp)
+		}
+	}
+	var guardsByRepo map[string][]resolver.PendingGuardRevert
 	if len(state.GuardReverts) > 0 {
-		mi.pendingMasterGuardReverts = append(mi.pendingMasterGuardReverts, state.GuardReverts...)
+		guardsByRepo = make(map[string][]resolver.PendingGuardRevert)
+		for _, gr := range state.GuardReverts {
+			if gr.ItemCount() == 0 {
+				continue
+			}
+			if gr.RepoPrefix != "" {
+				guardsByRepo[gr.RepoPrefix] = append(guardsByRepo[gr.RepoPrefix], gr)
+				continue
+			}
+			if len(knownSet) > 0 {
+				for _, part := range resolver.SplitPendingGuardRevertByRepo(gr, resolveRepo) {
+					guardsByRepo[part.RepoPrefix] = append(guardsByRepo[part.RepoPrefix], part)
+				}
+				continue
+			}
+			gr.RepoPrefix = state.DefaultRepoPrefix
+			for i := range gr.SourceReverts {
+				if gr.SourceReverts[i].RepoPrefix == "" {
+					gr.SourceReverts[i].RepoPrefix = gr.RepoPrefix
+				}
+			}
+			guardsByRepo[gr.RepoPrefix] = append(guardsByRepo[gr.RepoPrefix], gr)
+		}
+	}
+	var tailScopeSet map[string]struct{}
+	if len(state.TailRetryScopes) > 0 {
+		tailScopeSet = make(map[string]struct{}, len(state.TailRetryScopes))
+		for _, s := range state.TailRetryScopes {
+			if s != "" {
+				tailScopeSet[s] = struct{}{}
+			}
+		}
+	}
+	var attribByRepo map[string][]string
+	if len(state.AttributionFiles) > 0 {
+		attribByRepo = make(map[string][]string)
+		for _, fp := range state.AttributionFiles {
+			if fp == "" {
+				continue
+			}
+			repo := resolveRepo(fp)
+			attribByRepo[repo] = append(attribByRepo[repo], fp)
+		}
+	}
+
+	incomingRepos := make(map[string]struct{}, len(repointsByRepo)+len(guardsByRepo)+len(tailScopeSet)+len(attribByRepo))
+	for r := range repointsByRepo {
+		incomingRepos[r] = struct{}{}
+	}
+	for r := range guardsByRepo {
+		incomingRepos[r] = struct{}{}
+	}
+	for r := range tailScopeSet {
+		incomingRepos[r] = struct{}{}
+	}
+	for r := range attribByRepo {
+		incomingRepos[r] = struct{}{}
+	}
+
+	var events []retryBacklogLogEvent
+	warnTailAll := false
+	infoTailAll := false
+	mi.pendingResolveRetryMu.Lock()
+	beforeTailAll := mi.pendingMasterTailRetryAll
+	beforeCounts := make(map[string]int, len(incomingRepos)+len(meta.TakenRepos))
+	for repo := range incomingRepos {
+		beforeCounts[repo] = mi.pendingMasterByRepo[repo].itemCount()
+	}
+	for repo := range meta.TakenRepos {
+		if _, ok := beforeCounts[repo]; !ok {
+			beforeCounts[repo] = mi.pendingMasterByRepo[repo].itemCount()
+		}
 	}
 	if state.TailRetryAll {
 		mi.pendingMasterTailRetryAll = true
 	}
-	if len(state.TailRetryScopes) > 0 {
-		if mi.pendingMasterTailScopes == nil {
-			mi.pendingMasterTailScopes = make(map[string]struct{}, len(state.TailRetryScopes))
+	for repo := range incomingRepos {
+		if mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+			continue
 		}
-		for _, s := range state.TailRetryScopes {
-			if s != "" {
-				mi.pendingMasterTailScopes[s] = struct{}{}
+		bucket := mi.pendingMasterByRepo[repo]
+		if bucket == nil {
+			bucket = &repoMasterRetryState{}
+			if mi.pendingMasterByRepo == nil {
+				mi.pendingMasterByRepo = make(map[string]*repoMasterRetryState)
+			}
+			mi.pendingMasterByRepo[repo] = bucket
+		}
+		hadExisting := len(bucket.repoints) > 0 || len(bucket.guardReverts) > 0
+		if rps := repointsByRepo[repo]; len(rps) > 0 {
+			wasEmpty := len(bucket.repoints) == 0
+			if wasEmpty {
+				bucket.repoints = rps
+			} else {
+				bucket.repoints = append(bucket.repoints, rps...)
+			}
+			bucket.headDropped = 0
+			if meta.IsYield {
+				bucket.repointsDedup = true
+			} else if !wasEmpty || meta.Refused || state.NeedsDedup || bucket.repointsDedup {
+				bucket.repoints = resolver.DedupPlaceholderRepoints(bucket.repoints)
+				bucket.repointsDedup = false
 			}
 		}
-	}
-	if len(state.AttributionFiles) > 0 {
-		if mi.pendingMasterAttribFiles == nil {
-			mi.pendingMasterAttribFiles = make(map[string]struct{}, len(state.AttributionFiles))
-		}
-		for _, p := range state.AttributionFiles {
-			if p != "" {
-				mi.pendingMasterAttribFiles[p] = struct{}{}
+		if grs := guardsByRepo[repo]; len(grs) > 0 {
+			for i := range grs {
+				bucket.guardReverts = resolver.AppendCoalescedGuardRevert(bucket.guardReverts, grs[i])
 			}
 		}
+		if !hadExisting {
+			bucket.guardPruned = state.GuardPruned
+		} else {
+			bucket.guardPruned = false
+		}
+		if _, ok := tailScopeSet[repo]; ok {
+			bucket.tailRetryScope = true
+		}
+		if afs := attribByRepo[repo]; len(afs) > 0 {
+			if bucket.attribFiles == nil {
+				bucket.attribFiles = make(map[string]struct{}, len(afs))
+			}
+			for _, fp := range afs {
+				bucket.attribFiles[fp] = struct{}{}
+			}
+		}
+		if bucket.empty() {
+			delete(mi.pendingMasterByRepo, repo)
+		}
 	}
+	mi.refreshHasPendingMasterLocked()
+	if !meta.IsYield {
+		for repo, before := range beforeCounts {
+			if mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+				continue
+			}
+			after := mi.pendingMasterByRepo[repo].itemCount()
+			taken := meta.TakenRepos[repo]
+			if after > 0 && (after > before+taken || meta.Refused) {
+				events = append(events, retryBacklogLogEvent{
+					layer: "master", repo: repo, before: before, taken: taken, after: after, warn: true,
+				})
+			} else if taken > 0 && after == 0 {
+				events = append(events, retryBacklogLogEvent{
+					layer: "master", repo: repo, taken: taken,
+				})
+			}
+		}
+		if state.TailRetryAll && ((!beforeTailAll && !meta.TakenTailAll) || meta.Refused) {
+			warnTailAll = true
+		} else if meta.TakenTailAll && !mi.pendingMasterTailRetryAll {
+			infoTailAll = true
+		}
+	}
+	mi.pendingResolveRetryMu.Unlock()
+	mi.emitRetryBacklogEvents(events, warnTailAll, infoTailAll)
 }
 
-func (mi *MultiIndexer) takePendingCrossRepoRepoints() []graph.PlaceholderRepoint {
+func (mi *MultiIndexer) takePendingCrossRepoRepoints(opts resolver.RetryTakeOpts) (resolver.CrossRepoRetryState, uint64) {
+	if mi == nil {
+		return resolver.CrossRepoRetryState{}, 0
+	}
+	if !opts.AllRepos && len(opts.Repos) == 0 {
+		return resolver.CrossRepoRetryState{}, mi.retryClearEpoch.Load()
+	}
 	mi.pendingResolveRetryMu.Lock()
 	defer mi.pendingResolveRetryMu.Unlock()
-	repoints := mi.pendingCrossRepoRepoints
-	mi.pendingCrossRepoRepoints = nil
-	return repoints
+	epoch := mi.retryClearEpoch.Load()
+	if len(mi.pendingCrossRepoByRepo) == 0 {
+		return resolver.CrossRepoRetryState{}, epoch
+	}
+	var selected []string
+	if opts.AllRepos {
+		selected = make([]string, 0, len(mi.pendingCrossRepoByRepo))
+		for repo, b := range mi.pendingCrossRepoByRepo {
+			if b == nil || len(b.repoints) == 0 {
+				continue
+			}
+			if opts.HasMaxEpoch && mi.repoClearedEpoch[repo] > opts.MaxEpoch {
+				continue
+			}
+			selected = append(selected, repo)
+		}
+	} else {
+		selected = make([]string, 0, len(opts.Repos))
+		for repo := range opts.Repos {
+			b := mi.pendingCrossRepoByRepo[repo]
+			if b == nil || len(b.repoints) == 0 {
+				continue
+			}
+			if opts.HasMaxEpoch && mi.repoClearedEpoch[repo] > opts.MaxEpoch {
+				continue
+			}
+			selected = append(selected, repo)
+		}
+	}
+	var state resolver.CrossRepoRetryState
+	switch len(selected) {
+	case 0:
+		return state, epoch
+	case 1:
+		repo := selected[0]
+		b := mi.pendingCrossRepoByRepo[repo]
+		delete(mi.pendingCrossRepoByRepo, repo)
+		state.Repoints = b.repoints
+		state.NeedsDedup = b.needsDedup
+		state.HasUniformRepo = true
+		state.UniformRepo = repo
+		state.DefaultRepoPrefix = repo
+		state.HeadDropped = b.headDropped
+		state.TakenRepos = map[string]int{repo: len(b.repoints)}
+		mi.refreshHasPendingCrossRepoLocked()
+		return state, epoch
+	default:
+		sort.Strings(selected)
+		state.TakenRepos = make(map[string]int, len(selected))
+		for _, repo := range selected {
+			b := mi.pendingCrossRepoByRepo[repo]
+			delete(mi.pendingCrossRepoByRepo, repo)
+			state.TakenRepos[repo] = len(b.repoints)
+			state.Repoints = append(state.Repoints, b.repoints...)
+			if b.needsDedup {
+				state.NeedsDedup = true
+			}
+		}
+		mi.refreshHasPendingCrossRepoLocked()
+		return state, epoch
+	}
 }
 
-func (mi *MultiIndexer) savePendingCrossRepoRepoints(repoints []graph.PlaceholderRepoint) {
-	if len(repoints) == 0 {
+func (mi *MultiIndexer) savePendingCrossRepoRepoints(state resolver.CrossRepoRetryState, meta resolver.RetryBridgeSaveMeta) {
+	if mi == nil {
 		return
 	}
+	if len(state.Repoints) == 0 {
+		if meta.IsYield || len(meta.TakenRepos) == 0 {
+			return
+		}
+		var events []retryBacklogLogEvent
+		mi.pendingResolveRetryMu.Lock()
+		for repo, taken := range meta.TakenRepos {
+			if taken <= 0 || mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+				continue
+			}
+			if b := mi.pendingCrossRepoByRepo[repo]; b == nil || len(b.repoints) == 0 {
+				events = append(events, retryBacklogLogEvent{layer: "cross_repo", repo: repo, taken: taken})
+			}
+		}
+		mi.refreshHasPendingCrossRepoLocked()
+		mi.pendingResolveRetryMu.Unlock()
+		mi.emitRetryBacklogEvents(events, false, false)
+		return
+	}
+
+	// Strict O(1) single-repo drain fast path.
+	if !meta.IsYield && !state.NeedsDedup && state.HasUniformRepo {
+		singleRepo := state.UniformRepo
+		var events []retryBacklogLogEvent
+		mi.pendingResolveRetryMu.Lock()
+		beforeSingle := 0
+		if b := mi.pendingCrossRepoByRepo[singleRepo]; b != nil {
+			beforeSingle = len(b.repoints)
+		}
+		if mi.repoClearedEpoch[singleRepo] <= meta.TakeEpoch {
+			bucket := mi.pendingCrossRepoByRepo[singleRepo]
+			if bucket == nil {
+				bucket = &repoCrossRepoRetryState{}
+				if mi.pendingCrossRepoByRepo == nil {
+					mi.pendingCrossRepoByRepo = make(map[string]*repoCrossRepoRetryState)
+				}
+				mi.pendingCrossRepoByRepo[singleRepo] = bucket
+			}
+			if len(bucket.repoints) == 0 {
+				bucket.repoints = state.Repoints
+				bucket.headDropped = state.HeadDropped
+				bucket.needsDedup = false
+			} else {
+				bucket.repoints = resolver.DedupPlaceholderRepoints(append(bucket.repoints, state.Repoints...))
+				bucket.needsDedup = false
+				bucket.headDropped = 0
+			}
+			afterSingle := len(bucket.repoints)
+			takenSingle := meta.TakenRepos[singleRepo]
+			if afterSingle > 0 && (afterSingle > beforeSingle+takenSingle || meta.Refused) {
+				events = append(events, retryBacklogLogEvent{
+					layer: "cross_repo", repo: singleRepo, before: beforeSingle, taken: takenSingle, after: afterSingle, warn: true,
+				})
+			} else if takenSingle > 0 && afterSingle == 0 {
+				events = append(events, retryBacklogLogEvent{layer: "cross_repo", repo: singleRepo, taken: takenSingle})
+			}
+		}
+		for repo, taken := range meta.TakenRepos {
+			if repo == singleRepo || taken <= 0 || mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+				continue
+			}
+			if b := mi.pendingCrossRepoByRepo[repo]; b == nil || len(b.repoints) == 0 {
+				events = append(events, retryBacklogLogEvent{layer: "cross_repo", repo: repo, taken: taken})
+			}
+		}
+		mi.refreshHasPendingCrossRepoLocked()
+		mi.pendingResolveRetryMu.Unlock()
+		mi.emitRetryBacklogEvents(events, false, false)
+		return
+	}
+
+	needKnown := false
+	for i := range state.Repoints {
+		if state.Repoints[i].RepoPrefix == "" {
+			needKnown = true
+			break
+		}
+	}
+	var knownSet map[string]struct{}
+	if needKnown {
+		if prefixes := mi.knownRepoPrefixes(); len(prefixes) > 0 {
+			knownSet = make(map[string]struct{}, len(prefixes))
+			for _, p := range prefixes {
+				knownSet[p] = struct{}{}
+			}
+		}
+	}
+	repointsByRepo := make(map[string][]graph.PlaceholderRepoint)
+	for _, rp := range state.Repoints {
+		repo := rp.RepoPrefix
+		if repo == "" {
+			repo = resolver.RepoForFilePath(rp.FilePath, knownSet, state.DefaultRepoPrefix)
+			rp.RepoPrefix = repo
+		}
+		repointsByRepo[repo] = append(repointsByRepo[repo], rp)
+	}
+
+	var events []retryBacklogLogEvent
 	mi.pendingResolveRetryMu.Lock()
-	defer mi.pendingResolveRetryMu.Unlock()
-	mi.pendingCrossRepoRepoints = append(mi.pendingCrossRepoRepoints, repoints...)
+	beforeCounts := make(map[string]int, len(repointsByRepo)+len(meta.TakenRepos))
+	for repo := range repointsByRepo {
+		if b := mi.pendingCrossRepoByRepo[repo]; b != nil {
+			beforeCounts[repo] = len(b.repoints)
+		} else {
+			beforeCounts[repo] = 0
+		}
+	}
+	for repo := range meta.TakenRepos {
+		if _, ok := beforeCounts[repo]; !ok {
+			if b := mi.pendingCrossRepoByRepo[repo]; b != nil {
+				beforeCounts[repo] = len(b.repoints)
+			} else {
+				beforeCounts[repo] = 0
+			}
+		}
+	}
+	for repo, rps := range repointsByRepo {
+		if mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+			continue
+		}
+		bucket := mi.pendingCrossRepoByRepo[repo]
+		if bucket == nil {
+			bucket = &repoCrossRepoRetryState{}
+			if mi.pendingCrossRepoByRepo == nil {
+				mi.pendingCrossRepoByRepo = make(map[string]*repoCrossRepoRetryState)
+			}
+			mi.pendingCrossRepoByRepo[repo] = bucket
+		}
+		wasEmpty := len(bucket.repoints) == 0
+		if wasEmpty {
+			bucket.repoints = rps
+		} else {
+			bucket.repoints = append(bucket.repoints, rps...)
+		}
+		bucket.headDropped = 0
+		if meta.IsYield {
+			bucket.needsDedup = true
+		} else if !wasEmpty || meta.Refused || state.NeedsDedup || bucket.needsDedup {
+			bucket.repoints = resolver.DedupPlaceholderRepoints(bucket.repoints)
+			bucket.needsDedup = false
+		}
+	}
+	mi.refreshHasPendingCrossRepoLocked()
+	if !meta.IsYield {
+		for repo, before := range beforeCounts {
+			if mi.repoClearedEpoch[repo] > meta.TakeEpoch {
+				continue
+			}
+			after := 0
+			if b := mi.pendingCrossRepoByRepo[repo]; b != nil {
+				after = len(b.repoints)
+			}
+			taken := meta.TakenRepos[repo]
+			if after > 0 && (after > before+taken || meta.Refused) {
+				events = append(events, retryBacklogLogEvent{
+					layer: "cross_repo", repo: repo, before: before, taken: taken, after: after, warn: true,
+				})
+			} else if taken > 0 && after == 0 {
+				events = append(events, retryBacklogLogEvent{layer: "cross_repo", repo: repo, taken: taken})
+			}
+		}
+	}
+	mi.pendingResolveRetryMu.Unlock()
+	mi.emitRetryBacklogEvents(events, false, false)
 }
 
 // runMasterResolve runs one same-repo resolver over the whole shared graph,
@@ -1114,7 +1985,15 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	master.SetGoModules(mi.trackedGoModules())
 	master.SetGoModuleReplacementLookup(mi.trackedGoModuleReplacements)
 	master.SetCrossWorkspaceDepLookup(mi.crossWorkspacePassLookup())
-	master.SetRetryStateBridge(mi.takePendingMasterRetry, mi.savePendingMasterRetry)
+	master.SetRetryStateBridge(
+		mi.takePendingMasterRetry,
+		mi.savePendingMasterRetry,
+		mi.hasPendingMasterForRepo,
+		mi.knownRepoPrefixes,
+	)
+	if mi.beforeMasterResolveLock != nil {
+		master.SetBeforeResolveLockForTest(mi.beforeMasterResolveLock)
+	}
 	return master
 }
 
@@ -1196,19 +2075,33 @@ func (mi *MultiIndexer) runMasterResolveFilesWithEvidence(files []string, useLSP
 }
 
 func (mi *MultiIndexer) runMasterResolveFilesObserved(files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
+	return mi.runMasterResolveFilesForRepoObserved("", files, useLSP, evidence, observe)
+}
+
+func (mi *MultiIndexer) runMasterResolveFilesForRepoObserved(repoPrefix string, files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time)) *resolver.ResolveStats {
+	return mi.runMasterResolveFilesForRepoObservedWithTimeout(repoPrefix, files, useLSP, evidence, observe, 0)
+}
+
+func (mi *MultiIndexer) runMasterResolveFilesForRepoObservedWithTimeout(repoPrefix string, files []string, useLSP bool, evidence *resolver.Resolver, observe func(time.Time, time.Time), maxWait time.Duration) *resolver.ResolveStats {
 	master := mi.newMasterResolver(useLSP)
 	if master == nil {
 		return nil
 	}
+	if repoPrefix != "" {
+		master.SetRetryBridgeRepoPrefix(repoPrefix)
+	}
 	master.InheritIncrementalEvidence(evidence)
 	mt := time.Now()
-	stats := master.ResolveFilesAndIncomingObserved(files, observe)
+	stats := master.ResolveFilesAndIncomingObservedWithTimeout(files, observe, maxWait)
 	mi.logger.Info("DEFERRED-TIMING master.ResolveFilesAndIncoming",
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Bool("lsp_enabled", useLSP && mi.resolverLSPHelper != nil),
 		zap.Int("files", len(files)),
 		zap.Int("pending_scanned", stats.PendingBefore),
 		zap.Int("pending_admitted", stats.PendingAfter))
+	if maxWait > 0 && stats != nil && stats.WriteRefused {
+		return stats
+	}
 	mi.reconcileRetargetedTestCalls(master.TakeRetargetedTestCallFiles())
 	return stats
 }
@@ -1235,6 +2128,28 @@ func (mi *MultiIndexer) reconcileRetargetedTestCallsContext(ctx context.Context,
 		zap.Int("edges", emitted),
 		zap.Error(err))
 	return err
+}
+
+func (mi *MultiIndexer) runMasterResolveNamesForRepo(repoPrefix string, names []string) *resolver.ResolveStats {
+	if len(names) == 0 {
+		return nil
+	}
+	if repoPrefix == "" {
+		return mi.runMasterResolveNames(names)
+	}
+	master := mi.newMasterResolver(false)
+	if master == nil {
+		return nil
+	}
+	master.SetRetryBridgeRepoPrefix(repoPrefix)
+	mt := time.Now()
+	stats := master.ResolveIncomingForNames(names, []string{repoPrefix})
+	mi.logger.Info("DEFERRED-TIMING master.ResolveIncomingForNames",
+		zap.Duration("elapsed", time.Since(mt)),
+		zap.String("repo", repoPrefix),
+		zap.Int("names", len(names)),
+		zap.Int("resolved", stats.Resolved))
+	return stats
 }
 
 // runMasterResolveNames rebinds pending references parked under the given
@@ -2738,7 +3653,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	// changed/definition file frontier; only an incomplete receipt falls back to
 	// conservative scoped-global resolution. Derived invalidations run once
 	// below after both binding layers are current.
-	frontier := mi.resolveIncrementalRepoMutationMode(
+	frontier, repairedFiles, repairedAll := mi.resolveIncrementalRepoMutationMode(
 		repoPrefix, result, receipt, batch, mode.exactPointSemantic,
 	)
 	// Module changes and full retracks may rebind edges outside the frontier.
@@ -2779,10 +3694,16 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 		repoPrefix: result.DerivedInvalidation,
 	}, result.capabilityPrior)
 	derived.endDerived()
+	if mode.onRepairedFiles != nil && (result == nil || result.resolutionErr == nil) && (repairedAll || len(repairedFiles) > 0) {
+		mode.onRepairedFiles(idx.absPathsForGraphPaths(repairedFiles), repairedAll)
+	}
 
 	topologyChanged = incrementalTopologyChanged(result)
 	if err := idx.finishAliasPass(result); err != nil {
 		return result, err
+	}
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		return result, result.resolutionErr
 	}
 	return result, nil
 }
@@ -3548,14 +4469,17 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// pipeline and only needs the existing cross-repository contract reconcile.
 		if !result.FullRetrack && !batchMode.deferResolve {
 			mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
-			if err := idx.finishAliasPass(result); err != nil {
-				return err
-			}
 			if !batchMode.deferGlobalPasses {
 				idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 				mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{
 					prefix: result.DerivedInvalidation,
 				})
+			}
+			if err := idx.finishAliasPass(result); err != nil {
+				return err
+			}
+			if errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+				return result.resolutionErr
 			}
 		} else if result.FullRetrack {
 			if !batchMode.deferResolve {

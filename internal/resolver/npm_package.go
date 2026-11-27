@@ -190,7 +190,7 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 				}
 				return err
 			}
-			if !reindexEdgesApplied(cr.graph, batch) {
+			if !cr.applyReindexEdges(batch) {
 				if stats != nil {
 					stats.WriteRefused = true
 				}
@@ -252,7 +252,7 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 	const npmRestubChunkSize = 2048
 	for start := 0; start < len(batch); start += npmRestubChunkSize {
 		end := min(start+npmRestubChunkSize, len(batch))
-		if !reindexEdgesApplied(cr.graph, batch[start:end]) {
+		if !cr.applyReindexEdges(batch[start:end]) {
 			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch)-start)
 		}
 		graph.RemoveEdgesExact(cr.graph, obsolete[start:end])
