@@ -10,10 +10,75 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 )
+
+func TestInitialClaimedDrainDoesNotWaitForItsCheckoutTicket(t *testing.T) {
+	builder, request, claim := privateClaimedDedicatedFixture(t)
+	// A checkout keeps this announcement while waiting for its committed
+	// base. No actual writer is queued and no ordinary mutation is announced.
+	release := builder.Store.AnnounceCheckoutRefresh()
+	defer release()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	previousRows := drainYieldRows
+	drainYieldRows = 1
+	defer func() { drainYieldRows = previousRows }()
+	core, _ := observer.New(zap.InfoLevel)
+	var deadline *time.Timer
+	builder.Logger = zap.New(core, zap.Hooks(func(e zapcore.Entry) error {
+		if e.Message == "indexer: drain start (shadow → disk)" {
+			// Start the guard at the drain, excluding Git/source preparation.
+			// With one row per slice the old self-demand wait exhausts this
+			// deadline; writing this tiny fixture takes only a few milliseconds.
+			deadline = time.AfterFunc(3*time.Second, cancel)
+		}
+		return nil
+	}))
+	id, _, err := builder.BuildClaimedDedicatedBase(ctx, ClaimedDedicatedBaseRequest{
+		Claim: claim, RootPath: request.RootPath, WorkspaceID: request.WorkspaceID, ProjectID: request.ProjectID,
+		PrePublish: func(ctx context.Context, _ int64) error {
+			// Observe the callback the real builder installed, rather than
+			// testing a separately injected predicate. Always-false must not
+			// satisfy the checkout-only regression while dropping writer priority.
+			wanted := initialDrainDemand(ctx)
+			if wanted == nil || wanted() {
+				return fmt.Errorf("initial drain did not preserve checkout-only demand semantics")
+			}
+			releaseOrdinary := builder.Store.AnnounceWrite()
+			defer releaseOrdinary()
+			if !wanted() {
+				return fmt.Errorf("initial drain ignored an ordinary announced write")
+			}
+			releaseOrdinary()
+			if wanted() {
+				return fmt.Errorf("initial drain retained released ordinary write demand")
+			}
+			return nil
+		},
+	})
+	if deadline == nil {
+		t.Fatal("fixture did not exercise an initial reparse drain")
+	}
+	deadline.Stop()
+	if err != nil {
+		t.Fatalf("checkout ticket prevented its prerequisite base from publishing: %v", err)
+	}
+	if !builder.Store.WriteWanted() {
+		t.Fatal("base build consumed the checkout's global demand announcement")
+	}
+	row, found, err := builder.Store.Catalog().GetViewGeneration(t.Context(), id)
+	if err != nil || !found || !servableGeneration(row.State) {
+		t.Fatalf("initial base not ready: %+v, %v", row, err)
+	}
+}
 
 type initialDrainRecordingStore struct {
 	*graph.Graph

@@ -58,7 +58,11 @@ func editDeltaBegin() func() {
 // the contract registry, the Go inventory, the dependency contracts, the
 // provides scan — keep running: a delta that needs one would otherwise
 // start it over.)
-func prewarmStandDown() bool { return editDeltaActive.Load() > 0 || editCycleHoldsLane() }
+func prewarmStandDown(repoPrefix string) bool {
+	// Yield to builds in this repository and selected edit work. An unrelated
+	// repository's background builds must not starve this stack's caches.
+	return editDeltaActive.Load() > 0 || prewarmRepoBuildActive(repoPrefix) || editCycleHoldsLane()
+}
 
 // editCycleSources are the edit-cycle predicates of the pre-warm runs in
 // flight (SparseGenerationBuilder.EditCycleActive: the edit-cycle predicate, the build
@@ -92,9 +96,9 @@ func editCycleHoldsLane() bool {
 }
 
 // prewarmYield waits while a per-file delta runs, and reports how long.
-func prewarmYield(ctx context.Context) time.Duration {
+func prewarmYield(ctx context.Context, repoPrefix string) time.Duration {
 	started := time.Now()
-	for prewarmStandDown() && ctx.Err() == nil {
+	for prewarmStandDown(repoPrefix) && ctx.Err() == nil {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return time.Since(started)
@@ -123,11 +127,11 @@ var (
 
 // prewarmScanRow runs the scan-row hook, when set, and reports whether the
 // scan stands down.
-func prewarmScanRow(scan string) bool {
+func prewarmScanRow(scan, repoPrefix string) bool {
 	if hook := editDeltaPrewarmScanRow; hook != nil {
 		hook(scan)
 	}
-	return prewarmStandDown()
+	return prewarmStandDown(repoPrefix)
 }
 
 // editDeltaInflight single-flights the whole-repository reads the pre-warm
@@ -196,7 +200,7 @@ func (c *CheckoutCoordinator) prewarmEditDeltaStackOnce(commitGeneration int64) 
 		}
 		// The key is computed over an opened view of the stack: that open
 		// stands down for an edit cycle like every unit of the warm.
-		prewarmYield(ctx)
+		prewarmYield(ctx, c.repoPrefix)
 		if ctx.Err() != nil {
 			return
 		}
@@ -378,7 +382,7 @@ func (b *SparseGenerationBuilder) prewarmEditDeltaStack(ctx context.Context, ope
 	// with runs fn over a freshly opened view of the stack and releases it.
 	lowPriority := false
 	with := func(fn func(v prewarmView)) bool {
-		yielded += prewarmYield(ctx)
+		yielded += prewarmYield(ctx, repoPrefix)
 		if lowPriority && editDeltaPrewarmLowPriorityPause > 0 {
 			select {
 			case <-ctx.Done():
@@ -453,7 +457,7 @@ func (b *SparseGenerationBuilder) prewarmEditDeltaStack(ctx context.Context, ope
 		files = files[:0]
 		with(func(v prewarmView) {
 			for row := range v.dw.FileNodeIdentitiesSeq([]string{repoPrefix}) {
-				if prewarmScanRow("directory_index") {
+				if prewarmScanRow("directory_index", repoPrefix) {
 					stoodDown = true
 					return
 				}
@@ -598,7 +602,7 @@ func (b *SparseGenerationBuilder) prewarmEditDeltaStack(ctx context.Context, ope
 		stoodDown := false
 		with(func(v prewarmView) {
 			for range v.dw.FileNodeIdentitiesSeq(nil) {
-				if prewarmScanRow("directory_index_all") {
+				if prewarmScanRow("directory_index_all", repoPrefix) {
 					stoodDown = true
 					return
 				}
@@ -713,7 +717,7 @@ var editDeltaPrewarmLowPriorityPause = 50 * time.Millisecond
 // references of the files that reference the file's declarations. Past
 // deadline (when set) it stops between reads.
 func warmLikelyNames(dw *graph.DeltaWriter, repoPrefix, file string, deadline time.Time) {
-	past := func() bool { return prewarmStandDown() || (!deadline.IsZero() && time.Now().After(deadline)) }
+	past := func() bool { return prewarmStandDown(repoPrefix) || (!deadline.IsZero() && time.Now().After(deadline)) }
 	nodes := dw.GetFileNodes(file)
 	ids := make([]string, 0, len(nodes))
 	declared := make(map[string]struct{})
@@ -806,7 +810,7 @@ const editDeltaPrewarmReferrerChunk = 16
 //   - the parameter tables of those files' callees (the dataflow pass
 //     re-derives the referrers' argument edges), when params is set.
 func warmLikelyReferrers(dw *graph.DeltaWriter, repoPrefix, file string, deadline time.Time, params *editDeltaParamIndex) {
-	past := func() bool { return prewarmStandDown() || (!deadline.IsZero() && time.Now().After(deadline)) }
+	past := func() bool { return prewarmStandDown(repoPrefix) || (!deadline.IsZero() && time.Now().After(deadline)) }
 	if past() {
 		return
 	}

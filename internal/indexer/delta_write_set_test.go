@@ -630,6 +630,12 @@ func TestCommittedBaseClosureCapIsSizedOffTheChangeSet(t *testing.T) {
 		}
 		return out
 	}
+	checkout := func(n int) BuildRequest {
+		return BuildRequest{
+			Identity: GenerationIdentity{OwnerKind: checkoutLayerOwnerKind, CheckoutID: "checkout", GenerationKind: CommitLayerGenerationKind, BaseGenerationID: 7},
+			Changes:  changes(n),
+		}
+	}
 	committed := func(n int) BuildRequest {
 		return BuildRequest{
 			Identity: GenerationIdentity{GenerationKind: DedicatedBaseGenerationKind, BaseGenerationID: 7},
@@ -652,6 +658,24 @@ func TestCommittedBaseClosureCapIsSizedOffTheChangeSet(t *testing.T) {
 			17, ClosureCapFromOperator},
 		{"an unset knob leaves a commit layer on the built-in default", 0,
 			BuildRequest{Identity: GenerationIdentity{GenerationKind: "commit", BaseGenerationID: 7}, Changes: changes(50)},
+			200, ClosureCapFromDefault},
+
+		// Automatic checkout commits grow only their unset default. Ref and
+		// legacy identities above retain the flat default.
+		{"an empty checkout delta keeps the default", 0, checkout(0), 200, ClosureCapFromDefault},
+		{"a one-file checkout delta keeps the default", 0, checkout(1), 200, ClosureCapFromDefault},
+		{"a twenty-six-file checkout delta grows the default", 0, checkout(26), 832, ClosureCapFromChangeSized},
+		{"a huge checkout delta stops at the ceiling", 0, checkout(100000), 4096, ClosureCapFromChangeSized},
+		{"a checkout keeps a low operator cap", 17, checkout(26), 17, ClosureCapFromOperator},
+		{"a checkout keeps an operator cap above the computed ceiling", 100000, checkout(26), 100000, ClosureCapFromOperator},
+		{"a checkout without a base keeps the default", 0,
+			BuildRequest{Identity: GenerationIdentity{OwnerKind: checkoutLayerOwnerKind, CheckoutID: "checkout", GenerationKind: CommitLayerGenerationKind}, Changes: changes(26)},
+			200, ClosureCapFromDefault},
+		{"a commit without a checkout keeps the default", 0,
+			BuildRequest{Identity: GenerationIdentity{OwnerKind: checkoutLayerOwnerKind, GenerationKind: CommitLayerGenerationKind, BaseGenerationID: 7}, Changes: changes(26)},
+			200, ClosureCapFromDefault},
+		{"a ref commit keeps the default even with a checkout id", 0,
+			BuildRequest{Identity: GenerationIdentity{OwnerKind: refViewOwnerKind, CheckoutID: "checkout", GenerationKind: CommitLayerGenerationKind, BaseGenerationID: 7}, Changes: changes(26)},
 			200, ClosureCapFromDefault},
 
 		// A committed base with no knob set: the computed cap, clamped.

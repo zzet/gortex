@@ -2425,7 +2425,7 @@ func (s *Store) AddNode(n *graph.Node) {
 }
 
 func (s *Store) insertNodeLocked(stmt *sql.Stmt, n *graph.Node) (bool, error) {
-	p, blobMeta := extractPromotedMeta(stripCloneShingles(n.Meta))
+	p, blobMeta := extractPromotedMeta(WithoutCloneTransportMeta(n.Meta))
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
 		return false, err

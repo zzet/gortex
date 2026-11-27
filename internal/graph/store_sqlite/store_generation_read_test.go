@@ -2335,6 +2335,7 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.ScopedIncomingSourceReader)(nil), probe: "FindIncomingSourcesScoped"},
 		{iface: (*graph.ScopedProjectionSequencer)(nil), probe: "EdgesInScopeSeq"},
 		{iface: (*graph.ScopedSymbolBundleSearcher)(nil), probe: "SearchSymbolBundles"},
+		{iface: (*graph.SemanticBindingFileReader)(nil), skip: skipSidecar},
 		{iface: (*graph.SemanticBindingTypeStore)(nil), skip: skipSidecar},
 		{iface: (*graph.SemanticNodeStampWriter)(nil), skip: skipWrite, writeFence: writerFamilyFence("semantic_node_stamps")},
 		{iface: (*graph.StructuralIntegrityAuditor)(nil), probe: "AuditStructuralIntegrity"},

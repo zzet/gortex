@@ -8,6 +8,38 @@ import (
 
 var _ graph.OverlayLayerSemanticBindingTypeReader = (*GenerationLayer)(nil)
 
+func (l *GenerationLayer) LayerSemanticBindingTypesForFiles(repo string, files []string) (map[graph.SemanticBindingSite]string, error) {
+	ctx := context.Background()
+	if err := l.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	var owned []string
+	var keys []graph.ConstantFileKey
+	for _, file := range files {
+		if l.HasFile(file) && !l.IsTombstone(file) {
+			owned = append(owned, file)
+			keys = append(keys, graph.ConstantFileKey{RepoPrefix: repo, FilePath: file})
+		}
+	}
+	inventory, err := l.LayerConstantValueProjectionContext(ctx, nil, keys)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		if _, ok := inventory.Files[key]; !ok {
+			return nil, graph.ErrSemanticBindingProjectionIncomplete
+		}
+	}
+	rows, err := l.handle.SemanticBindingTypesForFiles(repo, owned)
+	if err != nil {
+		return nil, err
+	}
+	if err := l.checkContractInputRevision(ctx); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func (l *GenerationLayer) LayerSemanticBindingTypes(sites []graph.SemanticBindingSite) (map[graph.SemanticBindingSite]string, error) {
 	ctx := context.Background()
 	if err := l.checkContractInputRevision(ctx); err != nil {

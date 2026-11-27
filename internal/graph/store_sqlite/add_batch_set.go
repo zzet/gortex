@@ -193,7 +193,7 @@ func lowerBatchVariableLimit(variableLimit *int, paramsPerRow, failedRows int) i
 }
 
 func appendNodeInsertArgs(args []any, viewGen int64, n *graph.Node) ([]any, error) {
-	promoted, blobMeta := extractPromotedMeta(stripCloneShingles(n.Meta))
+	promoted, blobMeta := extractPromotedMeta(WithoutCloneTransportMeta(n.Meta))
 	metaBlob, err := encodeMeta(blobMeta)
 	if err != nil {
 		return nil, err

@@ -122,3 +122,31 @@ func TestTrackerKindEpochCountsTransitionsOfItsKind(t *testing.T) {
 		t.Fatalf("zero-value tracker epoch after Begin = %d, want 1", got)
 	}
 }
+
+func TestTrackerKindActiveBalancesConcurrentUnits(t *testing.T) {
+	var tracker Tracker
+	if tracker.KindActive("build") {
+		t.Fatal("zero-value tracker reports work")
+	}
+	tracker.Begin("build")
+	tracker.Begin("build")
+	tracker.Begin("other")
+	tracker.End("build")
+	if !tracker.KindActive("build") || !tracker.KindActive("other") {
+		t.Fatal("ending one unit hid another unit")
+	}
+	tracker.End("build")
+	if tracker.KindActive("build") || !tracker.KindActive("other") {
+		t.Fatal("activity leaked between kinds")
+	}
+	tracker.End("other")
+	tracker.Begin("")
+	if !tracker.KindActive("") || !tracker.KindActive("unspecified") {
+		t.Fatal("unnamed work was not normalized")
+	}
+	tracker.End("")
+	var absent *Tracker
+	if absent.KindActive("build") {
+		t.Fatal("nil tracker reports work")
+	}
+}
