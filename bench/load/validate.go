@@ -73,7 +73,7 @@ func validateReport(data []byte, r Report) error {
 	}
 	if r.Host.Profile == "floor" {
 		activeAgents := r.Workload.Agents
-		if r.Workload.Scenario == "edit" || r.Workload.Scenario == "many-edit" || r.Workload.Scenario == "all" {
+		if r.Workload.Scenario == "edit" || r.Workload.Scenario == "many-edit" || r.Workload.Scenario == "all" || r.Workload.Scenario == contractFreshnessScenario {
 			activeAgents += r.Workload.EditAgents
 		}
 		checkouts := 1
@@ -158,6 +158,9 @@ func validateReport(data []byte, r Report) error {
 		if err := validDistribution(phase.Visibility); err != nil {
 			return err
 		}
+	}
+	if err := validateContractFreshnessReport(r); err != nil {
+		return err
 	}
 	return validatePRDrainObservation(r)
 }
