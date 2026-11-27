@@ -300,9 +300,15 @@ call as *unknown* and re-read before assuming it did or did not land.
 MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
 lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
 admitted through these lanes. Mutating calls have two reserved slots and can
-also use free shared slots. Slow calls (`outline`, `dead_code`
+also use free shared slots. A dry-run rename (`rename_symbol` or `refactor`
+`rename` with `dry_run: true`) writes nothing and is admitted as a fast read;
+a rename that writes stays mutating. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
-serve queued mutating calls first, then fast, then slow. Sessions take turns
+serve queued mutating calls first, then fast, then slow, with one bound: while
+a queued slow call has room in the slow lane, at most four grants in a row go
+to the other lanes before the slow lane takes the next one. That turn never
+uses the two reserved mutation slots, so writes keep their reservation and a
+flood of writes and fast reads cannot starve the slow lane. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
 session. For small cap overrides, the reservation is `min(2, cap-1)` and the
 slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
@@ -587,7 +593,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `search_artifacts` | Full-text search over the context-artifacts manifest — DB schemas, API specs, infra configs, ADRs registered via `.gortex.yaml::artifacts` |
 | `get_artifact` | Fetch one context artifact by id, with its content and the symbols it references |
 
-`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
+`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. `wait_deadline` also bounds the impact walk's wait for a graph publication in flight: a walk still waiting at the deadline (or at its own 3 s budget when none is given) answers with what it read, `complete:false`, `graph_freshness:pending` and `reason:publication_in_flight`, or with an error under `require_fresh:true`. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
 
 ## Proactive safety
 

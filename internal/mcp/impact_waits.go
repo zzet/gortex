@@ -48,6 +48,14 @@ func (w *impactCoordinationWaits) observe(wait reach.CoordinationWait) {
 	}
 }
 
+// cutShort reports whether a lookup's coordination wait ended unadmitted, so
+// the walk read nothing behind that gate or mutex.
+func (w *impactCoordinationWaits) cutShort() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.gate.attempted > w.gate.acquired || w.resolve.attempted > w.resolve.acquired
+}
+
 func impactWaitFields(phase impactWaitPhase) map[string]any {
 	state := "not_observed"
 	var ms any

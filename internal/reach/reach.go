@@ -393,7 +393,9 @@ func lockResolve(ctx context.Context, g graph.Store) (unlock func(), ok bool) {
 		started = time.Now()
 	}
 	mu := g.ResolveMutex()
-	ok = lockContext(ctx, mu)
+	waitCtx, cancel := coordinationWaitContext(ctx)
+	ok = lockContext(waitCtx, mu)
+	cancel()
 	if observer != nil {
 		observer(CoordinationWait{Phase: "resolve_mutex_wait", Duration: time.Since(started), Attempted: true, Acquired: ok})
 	}

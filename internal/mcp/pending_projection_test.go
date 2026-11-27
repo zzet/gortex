@@ -269,6 +269,54 @@ func TestPendingProjectionCapsRefuseWithoutEviction(t *testing.T) {
 	require.Nil(t, liveEntry(p, filepath.Join(dir, "over.go")))
 }
 
+// A question about one file since an older snapshot sees only that file's
+// swaps, whichever publish or drop made them, and answers "changed" once the
+// change log no longer reaches back to the snapshot.
+func TestPendingProjectionOwnerAbsentSinceSeesOnlyItsFile(t *testing.T) {
+	dir := t.TempDir()
+	entry := func(name string) *projectionEntry {
+		return syntheticProjectionEntry(filepath.Join(dir, name), name, "h", 1, diskStamp{}, nil)
+	}
+	p := newPendingProjections()
+	target, other := entry("target.go"), entry("other.go")
+	base := p.snap.Load()
+	require.False(t, p.ownerAbsentSince(nil, target.key))
+
+	// An unchanged snapshot answers without the registry mutex, which every
+	// publisher and retirement holds.
+	p.mu.Lock()
+	answered := make(chan bool, 1)
+	go func() { answered <- p.ownerAbsentSince(base, target.key) }()
+	select {
+	case absent := <-answered:
+		p.mu.Unlock()
+		require.True(t, absent, "an unchanged snapshot")
+	case <-time.After(2 * time.Second):
+		p.mu.Unlock()
+		<-answered
+		t.Fatal("an unchanged snapshot waited for the registry mutex")
+	}
+
+	require.NoError(t, p.publish(other))
+	require.NoError(t, p.publishCohort([]projectionCohortMember{{Entry: entry("cohort.go")}}))
+	require.Equal(t, 1, p.dropAll([]*projectionEntry{other}))
+	require.True(t, p.ownerAbsentSince(base, target.key), "other files' swaps are not this file's")
+
+	require.NoError(t, p.publishCohort([]projectionCohortMember{{Entry: entry("peer.go")}, {Entry: target}}))
+	require.False(t, p.ownerAbsentSince(base, target.key), "a live owner")
+	require.False(t, p.ownerAbsentSince(p.snap.Load(), target.key), "a snapshot holding an owner")
+	require.Equal(t, 2, p.dropAll([]*projectionEntry{liveEntry(p, filepath.Join(dir, "peer.go")), target}))
+	require.False(t, p.ownerAbsentSince(base, target.key), "an owner that came and went in a cohort and a multi-file drop")
+
+	base = p.snap.Load()
+	for range projectionChangeLog {
+		require.NoError(t, p.publish(other))
+	}
+	require.True(t, p.ownerAbsentSince(base, target.key), "the whole log still reaches back")
+	require.NoError(t, p.publish(other))
+	require.False(t, p.ownerAbsentSince(base, target.key), "the log no longer reaches back")
+}
+
 func TestPendingProjectionKillSwitch(t *testing.T) {
 	t.Setenv("GORTEX_PROJECTION", "0")
 	p := newPendingProjections()
