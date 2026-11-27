@@ -578,6 +578,23 @@ func (l *CheckoutLifecycle) dedicatedBaseAdopted(event store_sqlite.DedicatedBas
 	if l == nil || !event.Advanced() {
 		return
 	}
+	// The family's own committed base is now published: admit its builds even
+	// while the global warmup latch is closed. This fires the admission channel
+	// any deferred coordinator in the family is waiting on, so a worktree whose
+	// base just landed is served without waiting for unrelated families.
+	//
+	// Only the family's CURRENT primary base makes its base servable. A
+	// secondary graph can adopt first (a configured secondary checkout queued
+	// ahead of its unpublished primary); marking the whole family ready on that
+	// event would let a worktree compose over the primary's generation-zero
+	// fallback and serve another checkout's uncommitted content. Gate the mark
+	// on the adopted graph being the primary base, matching the catalog seed.
+	// The epoch is read before the catalog: if SetPrimary replaces the primary
+	// after this read, its reset bumps the epoch and the stale mark is refused.
+	epoch := l.buildGate().FamilyReadinessEpoch(event.FamilyID)
+	if graph, found, err := l.catalog.GetDedicatedGraph(context.Background(), event.GraphID); err == nil && found && graph.IsPrimaryBase {
+		l.buildGate().MarkFamilyReady(event.FamilyID, epoch)
+	}
 	reason := fmt.Sprintf("committed base of %s advanced to generation %d",
 		event.GraphID, event.Adoption.GenerationID)
 	woken := l.PropagateBaseAdvance(event.FamilyID, event.Owner.CheckoutID,

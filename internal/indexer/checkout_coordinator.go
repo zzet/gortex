@@ -533,6 +533,10 @@ type CheckoutCoordinator struct {
 	// recovery is built for exactly that — while a 15 s poll over a family
 	// whose publication keeps failing must not re-enter it every 15 s.
 	lastBaseDemand time.Time
+	// admissionDeferred is set by a cycle that lost build admission after the
+	// loop admitted it (a primary move revoked the family's readiness), so the
+	// loop carries the claim to the gate's wake instead of dropping it.
+	admissionDeferred atomic.Bool
 
 	quiet           time.Duration
 	poll            time.Duration
@@ -1175,6 +1179,20 @@ func (c *CheckoutCoordinator) run() {
 	// by a stream of signals is not extended past the coalesce cap, so a
 	// tree that never stops changing still gets a cycle.
 	var armedSince time.Time
+	runCycle := func() {
+		c.cycle(lifetime)
+		if !c.admissionDeferred.Swap(false) {
+			return
+		}
+		// The cycle lost admission after the loop granted it: keep the claim
+		// for the gate's wake, or retry at once if admission is back.
+		admitted = c.admissionWait()
+		if admitted != nil {
+			claimed = true
+			return
+		}
+		c.Signal("build admission restored")
+	}
 	for {
 		select {
 		case <-c.stop:
@@ -1207,12 +1225,16 @@ func (c *CheckoutCoordinator) run() {
 			// cycle samples after every claim the window was coalescing.
 			stopTimer(quiet)
 			armed = nil
+			// Re-check admission on every wake: readiness can be revoked (a
+			// primary move) after the loop was admitted, and a transient
+			// catalog read failure can have missed a published base.
+			admitted = c.admissionWait()
 			if admitted != nil {
 				claimed = true
 				c.deferCycle()
 				continue
 			}
-			c.cycle(lifetime)
+			runCycle()
 		case <-pollC:
 			// Absence is not removal evidence. Keep the coordinator available
 			// for explicit demand and leave clocks, routes and leases to the
@@ -1231,19 +1253,26 @@ func (c *CheckoutCoordinator) run() {
 			pollTimer.Reset(pollDelay)
 		case <-armed:
 			armed = nil
+			// Re-check admission on the coalesced wake (signals and polls both
+			// arm it), for the same two reasons as on demand.
+			admitted = c.admissionWait()
 			if admitted != nil {
 				claimed = true
 				c.deferCycle()
 				continue
 			}
-			c.cycle(lifetime)
+			runCycle()
 		case <-admitted:
-			admitted = nil
-			if !claimed {
+			// The channel also fires on a readiness reset (a primary replaced),
+			// which revokes eligibility: re-check and re-arm, keeping the
+			// deferred claim, rather than entering a cycle that would park on
+			// the gate while holding the coordinator's only loop.
+			admitted = c.admissionWait()
+			if admitted != nil || !claimed {
 				continue
 			}
 			claimed = false
-			c.cycle(lifetime)
+			runCycle()
 		}
 	}
 }
@@ -1251,10 +1280,45 @@ func (c *CheckoutCoordinator) run() {
 // admissionWait is the channel the loop waits for build admission on, nil when
 // builds are already admitted.
 func (c *CheckoutCoordinator) admissionWait() <-chan struct{} {
-	if c.gate.Admitted() {
+	if c.gate.AdmittedForFamily(c.familyID) {
 		return nil
 	}
-	return c.gate.Opened()
+	// A base published before this coordinator existed never sent it an
+	// adoption event, so seed readiness from the catalog: a servable committed
+	// generation means the family is ready now, without waiting for the latch.
+	// The wake is taken before the epoch, and the epoch before the catalog
+	// read: a mark refused because a primary move fenced or reset the family
+	// parks on the wake, which that move's reset closes, and the loop re-seeds.
+	wake := c.gate.FamilyOpened(c.familyID)
+	epoch := c.gate.FamilyReadinessEpoch(c.familyID)
+	if c.familyBasePublished() && c.gate.MarkFamilyReady(c.familyID, epoch) {
+		return nil
+	}
+	return wake
+}
+
+// familyBasePublished reports whether the family's primary dedicated graph has
+// a servable published committed base (graphBase's positive arm). It is a pure
+// catalog read — no base demand — used only to seed admission readiness.
+// It runs on the coordinator loop, so the reads are bound to the lifetime:
+// Close cancels them instead of waiting behind a slow catalog.
+func (c *CheckoutCoordinator) familyBasePublished() bool {
+	if c == nil || c.catalog == nil || c.familyID == "" {
+		return false
+	}
+	ctx := c.lifetimeContext()
+	graphs, err := c.catalog.ListDedicatedGraphs(ctx, c.familyID)
+	if err != nil {
+		return false
+	}
+	for _, dedicated := range graphs {
+		if !dedicated.IsPrimaryBase {
+			continue
+		}
+		base, err := graphBase(ctx, c.catalog, dedicated)
+		return err == nil && base.generationID > 0
+	}
+	return false
 }
 
 // deferCycle records a cycle the warmup gate held back. Nothing is read and
@@ -1431,8 +1495,16 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	earlyImport := priority == ViewBuildBackground && c.importPreparationHint(ctx)
 	laneQueued := time.Now()
 	laneBefore := c.gate.Stats()
-	release, err := c.gate.AcquireRanked(ctx, priority, c.selectionRequests(), c.ticketDemand.Load)
+	release, err := c.gate.AcquireAdmittedForFamily(ctx, priority, c.selectionRequests(), c.ticketDemand.Load, c.familyID)
 	if err != nil {
+		if errors.Is(err, ErrFamilyNotAdmitted) {
+			// Readiness was revoked after the loop admitted this cycle. Parking
+			// on the closed latch here would hold the cycle lock and the loop.
+			c.admissionDeferred.Store(true)
+			viewmetrics.Count(viewmetrics.CoordinatorCycleTotal, viewmetrics.OutcomeDeferred)
+			c.reportCheckoutCycle(ctx, through, CheckoutCycle{Deferred: true})
+			return
+		}
 		if errors.Is(err, ErrViewBuildQueueFull) {
 			c.logger.Debug("checkout coordinator: build deferred by admission capacity",
 				zap.String("checkout", c.checkoutID),
@@ -1502,8 +1574,11 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 				return true
 			},
 			resume: func(ctx context.Context, yieldable bool) (context.Context, error) {
-				next, err := c.gate.AcquireRanked(ctx, ViewBuildBackground, c.selectionRequests(), c.ticketDemand.Load)
+				next, err := c.gate.AcquireAdmittedForFamily(ctx, ViewBuildBackground, c.selectionRequests(), c.ticketDemand.Load, c.familyID)
 				if err != nil {
+					if errors.Is(err, ErrFamilyNotAdmitted) {
+						c.admissionDeferred.Store(true)
+					}
 					return ctx, err
 				}
 				withdraw := c.gate.NoteHolder(ViewBuildLaneHolder{
@@ -1553,6 +1628,11 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 		return
 	}
 	out := c.reconcile(ctx)
+	if errors.Is(out.Err, ErrFamilyNotAdmitted) {
+		// A detached import's re-queue found readiness revoked: a deferral the
+		// loop carries (admissionDeferred), not a failure to back off from.
+		out = CheckoutCycle{Deferred: true}
+	}
 	out.cycleStarted = cycleStarted
 	out.Admission = admission
 	// The stack a working-tree delta over the routed commit generation reads
@@ -1889,6 +1969,19 @@ func (c *CheckoutCoordinator) reconcile(ctx context.Context) CheckoutCycle {
 	base, err := c.primaryBase(ctx)
 	if err != nil {
 		out.Err = err
+		return out
+	}
+	if base.generationID == 0 && !c.gate.IsOpen() {
+		// Only a published base earns admission before warmup. A lane granted
+		// before a primary move can find the replacement still unpublished:
+		// defer rather than compose over generation zero early. Checking here,
+		// at base selection, is enough without a second check at publication: a
+		// cycle that selected a published base composes over committed content
+		// even if the primary moves mid-cycle, and baseMovedUnderCycle already
+		// refuses to publish over a base that moved. The claim is dropped, not
+		// carried to the latch: the replacement's adoption signals this checkout
+		// again, and the poll covers a lost signal.
+		out.Deferred = true
 		return out
 	}
 	lap("primary_base")
@@ -2407,7 +2500,7 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	}
 	defer c.cycleMu.Unlock()
 	c.cancelDirtyChainCompaction("checkout transition")
-	release, err := c.gate.Acquire(ctx, ViewBuildInteractive)
+	release, err := c.gate.AcquireForFamily(ctx, ViewBuildInteractive, c.familyID)
 	if err != nil {
 		return out, fmt.Errorf("indexer: wait for checkout build admission: %w", err)
 	}
@@ -2436,6 +2529,10 @@ func (c *CheckoutCoordinator) RehomeTo(ctx context.Context, graphID string) (Che
 	base, err := graphBase(ctx, c.catalog, dedicated)
 	if err != nil {
 		return out, err
+	}
+	if base.generationID == 0 && !c.gate.IsOpen() {
+		// As in reconcile: before warmup, only a published base may be built over.
+		return out, fmt.Errorf("%w: dedicated graph %s", errUnpublishedBaseBeforeWarmup, graphID)
 	}
 	head, err := gitstate.SampleHEAD(ctx, c.root)
 	if err != nil {
@@ -2591,6 +2688,10 @@ func (c *CheckoutCoordinator) primaryBase(ctx context.Context) (primaryBase, err
 	}
 	return base, err
 }
+
+// errUnpublishedBaseBeforeWarmup refuses a build over a primary that has
+// published no committed base while the warmup latch is still closed.
+var errUnpublishedBaseBeforeWarmup = errors.New("indexer: primary has no published base before warmup")
 
 // dedicatedBaseDemandInterval bounds how often one coordinator re-asks for its
 // family's committed base. See CheckoutCoordinator.lastBaseDemand.
