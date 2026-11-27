@@ -477,9 +477,12 @@ latest evaluated status: `immediate_readbacks_outstanding`,
 `post_ack_coverage_outstanding`, `qualified_tiers_not_fresh`, or
 `accounting_non_terminal` when the graph was terminal and fresh, every oracle
 was first-correct and every assigned post-ACK witness was present, so only the
-required accounting was outstanding. Relocation and batch cells have no
-reason. `t_graph_terminal_ms` is the client time from edit send to the first
-own status reply that reported the graph terminal. `busy_refusals` counts
+required accounting was outstanding. Unchanged accounting ends that wait
+after eight status cycles (see the status-cycle bound below), so this
+reason means the accounting was still changing, or the deadline came first.
+Relocation and batch cells have no reason. `t_graph_terminal_ms` is the
+client time from edit send to the first own status reply that reported the
+graph terminal. `busy_refusals` counts
 dispatcher busy refusals (`-32002`) by call purpose (`oracle:<name>`, `status`,
 `readback:<kind>`, `edit`). The summary adds `deadline_reasons` and
 `busy_refusals` totals. None of these changes an outcome, an error or a client
@@ -559,6 +562,19 @@ unavailable. `t_derived_ms` is daemon-clock time from receipt origin to
 because no probe observes the derived step; it is not additive with client
 times and stays unavailable for coalesced receipts and relocations.
 
+Beside the client times, each record carries `tier_after_commit_ms`, copied
+from the last receipt status the record observed: the daemon's milliseconds
+from the disk commit to the `file_graph`, `relations` and `derived`
+publication, on its monotonic clock. A tier the daemon had not published by
+that status is `null`. The key is absent when the daemon or the receipt reports
+no figure, and on records that do not run the single-receipt loop: native
+writes, batches, relocations, `edit_expect: "refusal"` cells, the restart cell,
+and the `--search-readback-acceptance` and `--edit-ack-readback-only` profiles,
+which end each edit after its immediate readbacks. A malformed figure on the
+last decoded status is a record error. The client times keep their meaning:
+`t_relations_ms` is still the client relation time, and the daemon figure is
+reported beside it, not instead of it.
+
 Each immediate readback also carries a typed `disposition` that explains its
 result without changing it: `answer` (the reply's freshness state, reason and
 completeness, and its node count, when the reply has them), `typed_refusal`
@@ -585,9 +601,13 @@ run end or failure) is `censored`: the record ranks above every observed value,
 so a quantile or interval bound whose nearest rank falls among censored records
 is unavailable rather than understated. A value missing from a completed record
 (a native write's ACK, a coalesced receipt's derived time), or a measure the
-record does not carry, is `not_applicable`. An interval needs at least 2, 20 or
-100 ranked records for p50, p95 or p99 and is unavailable below that. Nothing is
-sampled as zero.
+record does not carry, is `not_applicable`. When any record carries
+`tier_after_commit_ms`, the summary adds `tier_after_commit_ms.file_graph`,
+`.relations` and `.derived` beside the client measures. A tier that is `null`
+on a record's final status had not been published yet, so it is censored even
+for a completed edit; a completed record without the figure does not apply.
+An interval needs at least 2, 20 or 100 ranked records for p50, p95 or p99 and
+is unavailable below that. Nothing is sampled as zero.
 
 Beside `stats_before` and `stats_after`, every edit-and-probe report carries
 `projection_before` and `projection_after`: the live
@@ -638,6 +658,22 @@ of missing work. A validated immutable R phase failure can end failed coverage.
 An original-publication-bound `requested_background_unavailable` is also
 terminal failed coverage, not a measured zero or a successful accounting check.
 Unknown or foreign diagnostics do not stop late-evidence collection.
+
+The single-edit receipt loop and the one-file and multi-file `edit.batch`
+collectors bound all of these waits. Once the graph is fresh, every
+first-correct time is measured and any assigned post-ACK coverage is in, each
+stops after eight consecutive status cycles with unchanged accounting, about
+0.25 to 0.5 s. The bound applies to any accounting that is not yet terminal:
+a native duplicate P without its publisher R, late P or B evidence, and
+unknown or foreign diagnostics. The accounting stays unavailable, with a
+reason naming the stop, and the record keeps its evidence instead of filling
+the per-edit cap. Evidence that would arrive later is not awaited, so that
+edit reports an accounting gap, never a passing check. A change in the
+accounting restarts the count; a missing first-correct time, a graph that is
+not yet fresh, outstanding post-ACK coverage, or a qualified functional
+candidate waiting for its live tiers resets it; a cycle whose status read
+fails neither counts nor resets it. That includes a multi-file cycle in which
+one member's status read fails; the member is still recorded as missing.
 
 Requested B supports ordered native timer handoffs only when each previous
 timer's actual `Stop` succeeds before its callback starts. Watcher, path and
