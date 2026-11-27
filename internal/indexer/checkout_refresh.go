@@ -737,24 +737,32 @@ func (c *CheckoutCoordinator) completeCheckoutRefreshTickets(ctx context.Context
 			continue
 		}
 
-		if request.record != nil && request.ticket.Ticket.Generation > through {
-			// Association follows verification, not admission. Keep the real
-			// cycle timestamps even when publication preceded ticket enqueue;
-			// events before this request's origin are naturally omitted.
-			request.record.Absorb(PublicationStampsFrom(ctx))
+		// The cycle ran for the tickets it owed at its start; a rider was
+		// not what it ran for, so the rider's receipt names no P of it.
+		served := out.cycleStarted
+		if request.ticket.Ticket.Generation > through {
+			served = time.Time{}
+			if request.record != nil {
+				// Association follows verification, not admission. Keep the real
+				// cycle timestamps even when publication preceded ticket enqueue;
+				// events before this request's origin are naturally omitted.
+				request.record.Absorb(PublicationStampsFrom(ctx))
+			}
 		}
-		c.finishCheckoutRefreshTiered(request, uint64(out.DirtyGenerationID), nil, derivedOwed(request))
+		c.finishCheckoutRefreshTiered(request, uint64(out.DirtyGenerationID), nil, derivedOwed(request), served)
 	}
 }
 
 func (c *CheckoutCoordinator) finishCheckoutRefresh(request *checkoutRefreshRequest, generation uint64, err error) {
-	c.finishCheckoutRefreshTiered(request, generation, err, false)
+	c.finishCheckoutRefreshTiered(request, generation, err, false, time.Time{})
 }
 
 // finishCheckoutRefreshTiered is finishCheckoutRefresh for a verified
 // publication that knows whether the ticket's derived tier is partial
-// (checkout_refresh_tiers.go).
-func (c *CheckoutCoordinator) finishCheckoutRefreshTiered(request *checkoutRefreshRequest, generation uint64, err error, derivedOwed bool) {
+// (checkout_refresh_tiers.go), and when the cycle that served the ticket
+// started (zero when it did not run for the ticket), for its receipt's
+// accounting (checkout_receipt_accounting.go).
+func (c *CheckoutCoordinator) finishCheckoutRefreshTiered(request *checkoutRefreshRequest, generation uint64, err error, derivedOwed bool, served time.Time) {
 	c.refreshMu.Lock()
 	sequence := request.ticket.Ticket.Generation
 	if c.refreshWaiters[sequence] != request {
@@ -772,8 +780,12 @@ func (c *CheckoutCoordinator) finishCheckoutRefreshTiered(request *checkoutRefre
 	// the caller to mark: ticket_failed is terminal, and a caller may retry a
 	// superseded ticket on the same record.
 	if request.record != nil && err == nil {
+		completed := time.Now()
 		request.record.SetGeneration(int64(generation))
-		request.record.Mark(PublicationTicketCompleted)
+		if request.accountsCheckoutPublication() {
+			request.record.recordCheckoutPublication(sequence, served, completed)
+		}
+		request.record.MarkAt(PublicationTicketCompleted, completed)
 	}
 	stampCheckoutPublicationTiers(request.ticket.Ticket, err, derivedOwed)
 	request.done <- MutationResult{RequestedGeneration: sequence, AppliedGeneration: generation, Reindexed: err == nil, Err: err}

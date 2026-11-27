@@ -302,5 +302,8 @@ func (w canonicalAttemptWindow) executionDisposition() string {
 	if w.accounting.nativeMtimeDuplicate {
 		return "native_mtime_duplicate"
 	}
+	if w.checkoutCycle {
+		return checkoutRefreshCycle
+	}
 	return "not_observed"
 }
