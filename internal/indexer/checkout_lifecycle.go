@@ -202,6 +202,9 @@ type CheckoutLifecycle struct {
 	observationClosed bool
 	// observationInventory is a test-only latency seam; set before any jobs.
 	observationInventory func(context.Context, string) (*gitstate.FamilyInventory, error)
+	// observationWorkTimeout is a test-only seam for a discovery's work budget;
+	// zero means checkoutObservationWorkTimeout. Set before any jobs.
+	observationWorkTimeout time.Duration
 
 	// retryMu owns one deadline timer per family. Filesystem events start the
 	// grace; these timers guarantee its expiry is reconciled even when Git is
