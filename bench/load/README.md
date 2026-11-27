@@ -729,6 +729,23 @@ candidate waiting for its live tiers resets it; a cycle whose status read
 fails neither counts nor resets it. That includes a multi-file cycle in which
 one member's status read fails; the member is still recorded as missing.
 
+Before that cleanup rewrite, the restore reads once more each receipt that was
+not graph-terminal when its edit's deadline ended (batch, move, native-write
+and restart records keep their own evidence). The reads run concurrently, each
+on its edit's fixed editor session (on a routed run, the session the restore
+writes that checkout through), inside the restore's deadline and the 20 s
+per-read budget (never longer than `--deadline`). The prober session is not
+reused: a probe canceled mid-write when its edit ended closes that session.
+The record keeps the answer as `post_workload_receipt`: `state` (`terminal`,
+`pending` or `unavailable`), `reason`, `graph_status`, `mutation_tiers`,
+`attempts` and `poll_ms`. A terminal answer that names the edit's own
+mutation, and on a linked route its admitted checkout, lets the restore past
+that record. A pending answer, one for another checkout or mutation, one that
+is not a JSON object, an RPC error, or no answer before the restore deadline
+keeps the rewrite blocked as unknown. The answer is post-workload evidence: the
+record's outcome, errors, `graph_terminal`, `mutation_tiers` and client times
+keep what the workload observed.
+
 Requested B supports ordered native timer handoffs only when each previous
 timer's actual `Stop` succeeds before its callback starts. Watcher, path and
 actual generation bind each handoff; generation gaps never infer event counts.

@@ -120,6 +120,7 @@ type editProbeRecord struct {
 	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
 	GraphTerminal               bool                                `json:"graph_terminal"`
 	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
+	PostWorkloadReceipt         *editProbePostWorkloadReceipt       `json:"post_workload_receipt,omitempty"`
 	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
 	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
 	EditRefusalRetries          map[string]int                      `json:"edit_refusal_retries,omitempty"`
@@ -905,7 +906,7 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	}
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
-		budget = min(budget, 20*time.Second)
+		budget = min(budget, editProbeReadBudget)
 	}
 	if end, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(end))
@@ -1912,6 +1913,8 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		return r.restoreCreatedFiles(ctx)
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
+	// A receipt the workload left pending is read once more first.
+	r.repollPendingReceipts(ctx)
 	for _, record := range r.phase.EditProbe.Records {
 		if record.BatchSet != nil {
 			return errors.New("multi-file batch restore unsupported: complete original baselines are not retained")
@@ -1922,7 +1925,8 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if record.NotAdmitted != "" && record.Receipt == "" && record.Batch == nil && record.Move == nil {
 			continue // The product refused this edit before admission; no file changed.
 		}
-		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
+		terminal := record.GraphTerminal || record.PostWorkloadReceipt.terminal()
+		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!terminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}
