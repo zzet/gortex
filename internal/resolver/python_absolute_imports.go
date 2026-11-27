@@ -25,6 +25,18 @@ func isPythonSourcePath(path string) bool {
 	return strings.HasSuffix(path, ".py") || strings.HasSuffix(path, ".pyi")
 }
 
+// pythonObjectReceiverCall reports whether e is a Python attribute call the
+// extractor marked as made on an object rather than a module
+// (py_object_receiver). Such a call can only reach a method, or a callable
+// attribute no static pass can see, never a module-level function: the
+// name-only fallbacks of both resolvers use it to keep `d.get()` off a free
+// `get`. Unmarked edges (module-qualified calls, synthesized placeholders such
+// as Celery's) keep the existing fallbacks.
+func pythonObjectReceiverCall(e *graph.Edge) bool {
+	v, _ := e.Meta["py_object_receiver"].(bool)
+	return v
+}
+
 // isDottedPythonModule reports whether importPath is shaped like a Python
 // module path (dotted identifiers, no slashes).
 func isDottedPythonModule(importPath string) bool {

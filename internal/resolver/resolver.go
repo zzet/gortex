@@ -5405,6 +5405,9 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 	// whole graph but a choice within the caller's import closure.
 	var sameDirMethod, sameDirFunc, anyMethod, anyFunc *graph.Node
 	methodCount := 0
+	// A Python attribute call on an object never lands on a free function
+	// (see pythonObjectReceiverCall); only a module-qualified call may.
+	pyObjectReceiver := pythonObjectReceiverCall(e)
 	for _, c := range candidates {
 		// Extension methods are bound only by the type-directed extension
 		// rule above; a locality guess must never pick one, which would
@@ -5429,6 +5432,9 @@ func (r *Resolver) resolveMethodCall(e *graph.Edge, methodName string, stats *Re
 				anyMethod = c
 			}
 		case graph.KindFunction:
+			if pyObjectReceiver {
+				continue
+			}
 			if r.dirFor(c.FilePath) == callerDir && sameDirFunc == nil {
 				sameDirFunc = c
 			}
