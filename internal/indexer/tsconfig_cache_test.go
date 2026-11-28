@@ -339,9 +339,11 @@ func TestTSConfigPathAlias_RefusedFullResolveWriteIsNotCertified(t *testing.T) {
 	defer restoreTimeout()
 	contended := &gateHoldingReindexStore{Store: store}
 	idx.resolver.SetGraph(contended)
-	_, err = idx.Index(root)
+	res, err := idx.Index(root)
 	idx.resolver.SetGraph(store)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err, "a refused resolver write during full index must still publish the graph")
+	require.NotNil(t, res)
+	require.True(t, res.ResolutionWriteRefused)
 	require.Equal(t, int32(1), contended.dropped.Load(), "SQLite must have dropped the contended rebind batch")
 	require.Positive(t, contended.droppedEdges.Load())
 	require.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
@@ -350,8 +352,10 @@ func TestTSConfigPathAlias_RefusedFullResolveWriteIsNotCertified(t *testing.T) {
 	require.Empty(t, digest, "a refused resolver write must not certify the new alias digest")
 	require.Empty(t, idx.appliedAliases)
 
-	_, err = idx.Index(root)
+	res, err = idx.Index(root)
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.ResolutionWriteRefused)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 	digest, err = store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
@@ -436,4 +440,128 @@ func TestTSConfigPathAlias_RefusedDeferredSharedResolveWriteIsNotCertified(t *te
 	require.NoError(t, err)
 	require.NotEmpty(t, digest)
 	require.Nil(t, idx.deferredAliases.Load())
+}
+
+func TestTSConfigPathAlias_TrackRepoPublishesMetadataOnRefusedFullResolveWrite(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0")
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{entry}}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+	seed, store := newSQLiteIndexer(t)
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	contended := &gateHoldingReindexStore{Store: store}
+	invalidateTSAliasCollection(root)
+	mi := NewMultiIndexer(contended, seed.registry, search.NewNull(), cm, zap.NewNop())
+
+	res, err := mi.TrackRepoCtx(t.Context(), entry)
+	require.NoError(t, err, "TrackRepoCtx must complete and publish metadata when resolution hits a refused write")
+	require.NotNil(t, res)
+	require.True(t, res.ResolutionWriteRefused)
+	require.Equal(t, int32(1), contended.dropped.Load())
+	digest, err := store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "alias digest must be withheld when a full resolve write was refused")
+	meta := mi.GetMetadata("repo")
+	require.NotNil(t, meta, "RepoMetadata must be published on refused resolve write")
+	require.Positive(t, meta.FileCount)
+	require.NotEmpty(t, mi.FileMtimes("repo"), "FileMtimes must be published on refused resolve write")
+}
+
+func TestTSConfigPathAlias_FullIndexFailedTSFileDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	locked := filepath.Join(root, "pages/locked.ts")
+	writeFileMk(t, locked, "import { useRedirect } from '~/auth'\nexport function other() { return useRedirect() }\n")
+	restore := denyFileRead(t, locked)
+
+	idx, store := newSQLiteIndexer(t)
+	result, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, locked)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest, "retryable file failure during full index must still certify the alias policy")
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{locked})
+	require.NoError(t, err)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/locked.ts", "other"))
+}
+
+func TestTSConfigPathAlias_FullIndexFailedGoFileInMixedRepoDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	lockedGo := filepath.Join(root, "broken.go")
+	writeFileMk(t, lockedGo, "package p\nfunc Helper() {}\n")
+	restore := denyFileRead(t, lockedGo)
+
+	idx, store := newSQLiteIndexer(t)
+	result, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, lockedGo)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest, "a retryable non-JS/TS file failure during full index must still certify the alias policy")
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{lockedGo})
+	require.NoError(t, err)
+	require.NotEmpty(t, fnNodeID(t, store, "broken.go", "Helper"))
+}
+
+func TestIndexerResolveAllRunsDerivedPassesOnRefusedWrite(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "iface.go"), `package p
+type Runner interface {
+	Run()
+}
+type Worker struct{}
+func (Worker) Run() {}
+func invoke() { missingHelper() }
+func missingHelper() {}
+`)
+	idx, store := newSQLiteIndexer(t)
+	idx.SetDeferResolve(true)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	idx.SetDeferResolve(false)
+
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	contended := &gateHoldingReindexStore{Store: store}
+	idx.resolver.SetGraph(contended)
+	err = idx.resolveAll()
+	idx.resolver.SetGraph(store)
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.Equal(t, int32(1), contended.dropped.Load())
+
+	var sawImplements bool
+	for e := range store.EdgesByKind(graph.EdgeImplements) {
+		if e.From == "iface.go::Worker" && e.To == "iface.go::Runner" {
+			sawImplements = true
+			break
+		}
+	}
+	require.True(t, sawImplements, "derived InferImplements pass must still run when ResolveAllContext returns ErrReindexWriteRefused")
 }

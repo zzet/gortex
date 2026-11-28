@@ -567,22 +567,57 @@ func (idx *Indexer) restoredAliasCaller(root string, mtimes map[string]int64) (s
 }
 
 // The direct full pass upserts raw extraction rows and resolves after every
-// worker has finished. Remove this caller's old outgoing rows only once its
+// worker has finished. Remove each caller's old outgoing rows only once its
 // replacement is ready. EvictFile would also remove other files' incoming
 // edges, including ones already written by another worker.
 func (idx *Indexer) removePriorAliasEdges(file string) {
-	nodes := idx.graph.GetFileNodes(file)
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		ids = append(ids, n.ID)
+	if file == "" {
+		return
+	}
+	removePriorAliasEdgesBatch(idx.graph, []string{file})
+}
+
+func removePriorAliasEdgesBatch(store graph.Store, files []string) {
+	if store == nil || len(files) == 0 {
+		return
+	}
+	var ids []string
+	var nodeFiles map[string]string
+	{
+		fileNodes := store.GetFileNodesByPaths(files)
+		if len(fileNodes) == 0 {
+			return
+		}
+		nodeFiles = make(map[string]string)
+		for file, nodes := range fileNodes {
+			if file == "" {
+				continue
+			}
+			for _, n := range nodes {
+				if n == nil || n.ID == "" {
+					continue
+				}
+				if _, seen := nodeFiles[n.ID]; !seen {
+					ids = append(ids, n.ID)
+					nodeFiles[n.ID] = file
+				}
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return
 	}
 	var prior []*graph.Edge
-	for _, edges := range idx.graph.GetOutEdgesByNodeIDs(ids) {
+	for fromID, edges := range store.GetOutEdgesByNodeIDs(ids) {
+		file := nodeFiles[fromID]
+		if file == "" {
+			continue
+		}
 		for _, e := range edges {
-			if e.FilePath == file {
+			if e != nil && e.FilePath == file {
 				prior = append(prior, e)
 			}
 		}
 	}
-	graph.RemoveEdgesExact(idx.graph, prior)
+	graph.RemoveEdgesExact(store, prior)
 }

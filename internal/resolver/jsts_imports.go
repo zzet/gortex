@@ -232,6 +232,11 @@ func jsTSExt(p string) string {
 // it emits carry the host .vue path as FilePath. Rejecting them here left
 // every relative import from a .vue script as an external stub, and calls
 // into the imported .ts symbol lost reachability and got reverted.
+//
+// Keep this extension list in sync with indexer.closureJSTSPath
+// (internal/indexer/builder_closure.go) and
+// store_sqlite.(*Store).MayHaveTSAliasCallers
+// (internal/graph/store_sqlite/store_ts_alias_state.go).
 func isJSTSPath(p string) bool {
 	switch jsTSExt(p) {
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",

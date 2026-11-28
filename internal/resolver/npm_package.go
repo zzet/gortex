@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"maps"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -154,6 +155,7 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 			sites = append(sites, graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeImports})
 		}
 		full := cr.graph.GetEdgeCandidates(nil, sites)
+		pageStats := &CrossRepoStats{ByRepo: make(map[string]int)}
 		type npmProjectionUpdate struct {
 			projected *graph.Edge
 			to        string
@@ -171,10 +173,12 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 					continue // A non-npm cross-repo import keeps its semantics.
 				}
 				oldTo := e.To
-				if cr.resolveTrackedNpmImport(e, spec, stats, memo) {
-					batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
+				c := *e
+				c.Meta = maps.Clone(e.Meta)
+				if cr.resolveTrackedNpmImport(&c, spec, pageStats, memo) {
+					batch = append(batch, graph.EdgeReindex{Edge: &c, OldTo: oldTo})
 					projections = append(projections, npmProjectionUpdate{
-						projected: projected, to: e.To, crossRepo: e.CrossRepo,
+						projected: projected, to: c.To, crossRepo: c.CrossRepo,
 					})
 				}
 			}
@@ -198,6 +202,16 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 			}
 			for _, u := range projections {
 				u.projected.To, u.projected.CrossRepo = u.to, u.crossRepo
+			}
+			if stats != nil {
+				stats.Resolved += pageStats.Resolved
+				stats.CrossRepoEdges += pageStats.CrossRepoEdges
+				if len(pageStats.ByRepo) > 0 && stats.ByRepo == nil {
+					stats.ByRepo = make(map[string]int, len(pageStats.ByRepo))
+				}
+				for repo, n := range pageStats.ByRepo {
+					stats.ByRepo[repo] += n
+				}
 			}
 		}
 	}
@@ -239,10 +253,12 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 			parallel := *call
 			parallel.Kind = graph.EdgeCrossRepoCalls
 			obsolete = append(obsolete, &parallel)
-			graph.StashRestubProvenance(call)
-			call.To = graph.UnresolvedMarker + name
-			call.CrossRepo, call.ConfidenceLabel = false, ""
-			batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
+			c := *call
+			c.Meta = maps.Clone(call.Meta)
+			graph.StashRestubProvenance(&c)
+			c.To = graph.UnresolvedMarker + name
+			c.CrossRepo, c.ConfidenceLabel = false, ""
+			batch = append(batch, graph.EdgeReindex{Edge: &c, OldTo: target})
 		}
 	}
 	// Chunk below SQLite's 5,000-row reindexChunkSize so each ReindexEdgesApplied

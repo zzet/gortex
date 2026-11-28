@@ -13,6 +13,8 @@ type recordingParseGraphStore struct {
 
 	mu           sync.Mutex
 	batchCalls   int
+	removeCalls  int
+	removedCount int
 	nodeCount    int
 	edgeCount    int
 	maxBatchNode int
@@ -44,6 +46,19 @@ func (s *recordingParseGraphStore) AddBatch(nodes []*graph.Node, edges []*graph.
 	s.events = append(s.events, "batch")
 	s.mu.Unlock()
 	s.Store.AddBatch(nodes, edges)
+}
+
+func (s *recordingParseGraphStore) RemoveEdgesExact(edges []*graph.Edge) int {
+	if len(edges) == 0 {
+		return 0
+	}
+	removed := graph.RemoveEdgesExact(s.Store, edges)
+	s.mu.Lock()
+	s.removeCalls++
+	s.removedCount += removed
+	s.events = append(s.events, "remove")
+	s.mu.Unlock()
+	return removed
 }
 
 func (s *recordingParseGraphStore) BulkSetFileMtimes(string, map[string]int64) error {
@@ -223,5 +238,104 @@ func TestParseGraphBatchFlushClearsStagedPointers(t *testing.T) {
 func TestNewParseGraphBatchFallsBackWithoutDurableStore(t *testing.T) {
 	if batch := newParseGraphBatch(graph.New()); batch != nil {
 		t.Fatal("in-memory store unexpectedly enabled direct-disk graph batching")
+	}
+}
+
+func TestParseGraphBatchPriorAliasRemovalBatchesBeforeCommit(t *testing.T) {
+	store := newRecordingParseGraphStore()
+	// Seed prior graph rows for two JS/TS files, plus:
+	// - an incoming cross-file edge targeting pages/a.ts::runA (must survive)
+	// - a sibling-owned edge from pages/a.ts::runA whose FilePath is pages/b.ts
+	//   (must survive even though both files are in the same batch, proving
+	//   removal enforces e.FilePath == nodeFiles[fromID]).
+	store.Store.AddBatch([]*graph.Node{
+		{ID: "pages/a.ts::runA", Kind: graph.KindFunction, Name: "runA", FilePath: "pages/a.ts"},
+		{ID: "pages/b.ts::runB", Kind: graph.KindFunction, Name: "runB", FilePath: "pages/b.ts"},
+		{ID: "other/caller.ts::callA", Kind: graph.KindFunction, Name: "callA", FilePath: "other/caller.ts"},
+	}, []*graph.Edge{
+		{From: "pages/a.ts::runA", To: "old/auth.ts::fn", Kind: graph.EdgeCalls, FilePath: "pages/a.ts", Line: 2},
+		{From: "pages/b.ts::runB", To: "old/auth.ts::fn", Kind: graph.EdgeCalls, FilePath: "pages/b.ts", Line: 2},
+		{From: "other/caller.ts::callA", To: "pages/a.ts::runA", Kind: graph.EdgeCalls, FilePath: "other/caller.ts", Line: 5},
+		{From: "pages/a.ts::runA", To: "sibling/target.ts::fn", Kind: graph.EdgeCalls, FilePath: "pages/b.ts", Line: 9},
+	})
+
+	batch := newParseGraphBatchWithLimits(store, parseGraphBatchLimits{
+		files: 4, nodes: 100, edges: 100, bytes: 1 << 20,
+	})
+	batch.addWithPriorAlias(
+		[]*graph.Node{{ID: "pages/a.ts::runA", Kind: graph.KindFunction, Name: "runA", FilePath: "pages/a.ts"}},
+		[]*graph.Edge{{From: "pages/a.ts::runA", To: "unresolved::fn", Kind: graph.EdgeCalls, FilePath: "pages/a.ts", Line: 2}},
+		"pages/a.ts",
+		func() { store.recordEvent("durable-a") },
+	)
+	batch.addWithPriorAlias(
+		[]*graph.Node{{ID: "pages/b.ts::runB", Kind: graph.KindFunction, Name: "runB", FilePath: "pages/b.ts"}},
+		[]*graph.Edge{{From: "pages/b.ts::runB", To: "unresolved::fn", Kind: graph.EdgeCalls, FilePath: "pages/b.ts", Line: 2}},
+		"pages/b.ts",
+		func() { store.recordEvent("durable-b") },
+	)
+	if len(store.events) != 0 {
+		t.Fatalf("writes or callbacks ran before flush: %v", store.events)
+	}
+
+	batch.flush()
+
+	if store.removeCalls != 1 || store.removedCount != 2 || store.batchCalls != 1 {
+		t.Fatalf("removeCalls/removedCount/batchCalls = %d/%d/%d, want 1/2/1",
+			store.removeCalls, store.removedCount, store.batchCalls)
+	}
+	wantEvents := []string{"remove", "batch", "durable-a", "durable-b"}
+	if len(store.events) != len(wantEvents) {
+		t.Fatalf("events = %v, want %v", store.events, wantEvents)
+	}
+	for i := range wantEvents {
+		if store.events[i] != wantEvents[i] {
+			t.Fatalf("events = %v, want %v", store.events, wantEvents)
+		}
+	}
+
+	var sawNewA, sawSiblingA bool
+	for _, e := range store.GetOutEdges("pages/a.ts::runA") {
+		if e.To == "old/auth.ts::fn" {
+			t.Fatalf("stale prior alias edge survived on pages/a.ts: %+v", e)
+		}
+		if e.To == "unresolved::fn" && e.FilePath == "pages/a.ts" {
+			sawNewA = true
+		}
+		if e.To == "sibling/target.ts::fn" && e.FilePath == "pages/b.ts" {
+			sawSiblingA = true
+		}
+	}
+	if !sawNewA || !sawSiblingA {
+		t.Fatalf("pages/a.ts edges unexpected: sawNewA=%v sawSiblingA=%v", sawNewA, sawSiblingA)
+	}
+
+	var sawNewB bool
+	for _, e := range store.GetOutEdges("pages/b.ts::runB") {
+		if e.To == "old/auth.ts::fn" {
+			t.Fatalf("stale prior alias edge survived on pages/b.ts: %+v", e)
+		}
+		if e.To == "unresolved::fn" && e.FilePath == "pages/b.ts" {
+			sawNewB = true
+		}
+	}
+	if !sawNewB {
+		t.Fatalf("replacement edge missing on pages/b.ts")
+	}
+
+	var sawIncoming bool
+	for _, e := range store.GetOutEdges("other/caller.ts::callA") {
+		if e.To == "pages/a.ts::runA" {
+			sawIncoming = true
+		}
+	}
+	if !sawIncoming {
+		t.Fatal("cross-file incoming edge from other/caller.ts was unexpectedly deleted")
+	}
+
+	for i, entry := range batch.pending[:cap(batch.pending)] {
+		if entry.priorAliasFile != "" || entry.nodes != nil || entry.edges != nil || entry.onDurable != nil {
+			t.Fatalf("pending backing entry %d retained state after flush: %+v", i, entry)
+		}
 	}
 }

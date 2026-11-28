@@ -61,6 +61,11 @@ func (s *Store) SetTSAliasInputs(repo string, inputs map[string]string) error {
 // MayHaveTSAliasCallers includes every generation: a hit in a masked or
 // unrelated layer only causes extra config discovery. A miss proves no
 // named JS/TS caller in this repository can inherit a different binding.
+//
+// Keep this SQL language list in sync with indexer.closureJSTSPath
+// (internal/indexer/builder_closure.go) and resolver.isJSTSPath
+// (internal/resolver/jsts_imports.go); drift is guarded by
+// TestTSAliasDiscovery_MayHaveCallersMatchesClosureJSTSPath.
 func (s *Store) MayHaveTSAliasCallers(ctx context.Context, repo string) (bool, error) {
 	var present bool
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes

@@ -2032,7 +2032,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	}
 	mt := time.Now()
 	stats, err := master.ResolveAllContext(ctx)
-	if err == nil && ctx.Err() == nil {
+	if (err == nil || errors.Is(err, resolver.ErrReindexWriteRefused)) && ctx.Err() == nil {
 		// The dataflow placeholders are lifted after every whole resolve,
 		// as a single-repository whole index and the per-save path do.
 		materializeDataflowParamsInGraph(mi.graph)
