@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -124,5 +125,34 @@ func TestEditProbeBaselineRoleReportsNoAccountingError(t *testing.T) {
 	_, _, report := finishLinkedReadbackRun(t, got)
 	if !report.Complete {
 		t.Fatalf("baseline report incomplete: %v", report.Errors)
+	}
+}
+
+// TestSummarizeEditProbeAccountingStatesCountsEveryState: the state census
+// counts every record that has a state, not only those with a background
+// refusal, and the refusal census counts only the refusal.
+func TestSummarizeEditProbeAccountingStatesCountsEveryState(t *testing.T) {
+	var records []editProbeRecord
+	for i, state := range []string{"observed_single_window_checks_pass", "terminal_partial_physical", "unavailable", "terminal_unavailable_background"} {
+		row := fmt.Sprintf(`{"ordinal":%d,"outcome":"complete","readbacks":[],"accounting":{"state":%q,"reasons":[]}}`, i, state)
+		var record editProbeRecord
+		if err := json.Unmarshal([]byte(row), &record); err != nil {
+			t.Fatal(err)
+		}
+		if state == "terminal_unavailable_background" {
+			record.Accounting.BackgroundRefusal = &editProbeBackgroundRefusal{Reason: "serving_attempt_binding_mismatch", BindingPredicate: "checkout_refresh_cycle"}
+		}
+		records = append(records, record)
+	}
+	summary := encodeForTest(t, summarizeEditProbe(records, 42))
+	states, _ := summary["accounting_states"].(map[string]any)
+	unavailable, _ := summary["accounting_unavailable"].(map[string]any)
+	for _, state := range []string{"observed_single_window_checks_pass", "terminal_partial_physical", "unavailable", "terminal_unavailable_background"} {
+		if states[state] != float64(1) {
+			t.Fatalf("accounting_states[%s] = %v, want 1 (all: %v)", state, states[state], states)
+		}
+	}
+	if len(states) != 4 || len(unavailable) != 1 || unavailable["serving_attempt_binding_mismatch|checkout_refresh_cycle"] != float64(1) {
+		t.Fatalf("accounting_states = %v accounting_unavailable = %v", states, unavailable)
 	}
 }
