@@ -8,15 +8,16 @@ import (
 // MutationTierState is the publication evidence for one admitted path. An
 // absent timestamp is unobserved, rather than evidence of a fresh tier.
 type MutationTierState struct {
-	Generation    uint64    `json:"generation"`
-	AckAt         time.Time `json:"ack_at"`
-	FileGraphAt   time.Time `json:"file_graph_at,omitempty"`
-	RelationsAt   time.Time `json:"relations_at,omitempty"`
-	DerivedAt     time.Time `json:"derived_at,omitempty"`
-	Failed        bool      `json:"failed,omitempty"`
-	Partial       bool      `json:"partial,omitempty"`
-	failedAt      time.Time
-	rebindRefused bool
+	Generation        uint64    `json:"generation"`
+	AckAt             time.Time `json:"ack_at"`
+	FileGraphAt       time.Time `json:"file_graph_at,omitempty"`
+	RelationsAt       time.Time `json:"relations_at,omitempty"`
+	DerivedAt         time.Time `json:"derived_at,omitempty"`
+	Failed            bool      `json:"failed,omitempty"`
+	Partial           bool      `json:"partial,omitempty"`
+	failedAt          time.Time
+	rebindRefused     bool
+	nonRefusalPartial bool
 }
 
 func newMutationTierTicket(path string, generation uint64, done <-chan MutationResult) *MutationTicket {
@@ -24,17 +25,68 @@ func newMutationTierTicket(path string, generation uint64, done <-chan MutationR
 		tiers: MutationTierState{Generation: generation, AckAt: time.Now()}}
 }
 
+func (w *Watcher) clearRefusedFailedPathLocked(path string, at time.Time) {
+	prior, ok := w.failedPaths[path]
+	if !ok || !prior.rebindRefused {
+		return
+	}
+	if !prior.Failed && !prior.nonRefusalPartial {
+		delete(w.failedPaths, path)
+		return
+	}
+	prior.rebindRefused = false
+	prior.Partial = prior.nonRefusalPartial
+	if !prior.Failed {
+		stampRelations(&prior, at)
+	}
+	w.failedPaths[path] = prior
+}
+
 func (w *Watcher) markRelations(path string, generation, repairedGeneration uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if prior := w.failedPaths[path]; repairedGeneration != 0 && prior.rebindRefused && prior.Generation <= repairedGeneration {
-		delete(w.failedPaths, path)
+	at := time.Now()
+	if repairedGeneration != 0 && w.failedPaths[path].Generation <= repairedGeneration {
+		w.clearRefusedFailedPathLocked(path, at)
 	}
 	for ordinal, waiter := range w.mutationWaiters[path] {
 		if ordinal <= generation && waiter.ticket != nil {
 			waiter.ticket.tierMu.Lock()
-			stampRelations(&waiter.ticket.tiers, time.Now())
+			if repairedGeneration != 0 && ordinal <= repairedGeneration && waiter.ticket.tiers.rebindRefused {
+				waiter.ticket.tiers.rebindRefused = false
+				waiter.ticket.tiers.Partial = waiter.ticket.tiers.nonRefusalPartial
+			}
+			stampRelations(&waiter.ticket.tiers, at)
 			waiter.ticket.tierMu.Unlock()
+		}
+	}
+}
+
+func (w *Watcher) markRepairedFailedPaths(absPaths []string, all bool) {
+	if w == nil || (!all && len(absPaths) == 0) {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.failedPaths) == 0 {
+		return
+	}
+	at := time.Now()
+	if all {
+		for p, prior := range w.failedPaths {
+			if prior.rebindRefused && len(w.mutationWaiters[p]) == 0 {
+				w.clearRefusedFailedPathLocked(p, at)
+			}
+		}
+		return
+	}
+	for _, p := range absPaths {
+		if p == "" {
+			continue
+		}
+		clean := filepath.Clean(p)
+		if prior, ok := w.failedPaths[clean]; ok && prior.rebindRefused && len(w.mutationWaiters[clean]) == 0 {
+			w.clearRefusedFailedPathLocked(clean, at)
 		}
 	}
 }
@@ -60,15 +112,16 @@ func (w *Watcher) mutationTierFrontier(paths []string) map[string]uint64 {
 
 func (w *Watcher) markRelationsFrontier(frontier map[string]uint64) {
 	for path, generation := range frontier {
-		w.markRelations(path, generation, 0)
+		w.markRelations(path, generation, generation)
 	}
 }
 
 // finishMutationTierLocked runs before removing a waiter or delivering Done.
 // Successful paths retain no watcher history; the caller's ticket owns stamps.
-func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, err error, fanout DerivedFanoutCompleteness) {
+// It returns true when the ticket completed cleanly (err == nil && !Partial).
+func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, err error, fanout DerivedFanoutCompleteness) bool {
 	if ticket == nil {
-		return
+		return false
 	}
 	ticket.tierMu.Lock()
 	defer ticket.tierMu.Unlock()
@@ -77,7 +130,7 @@ func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, 
 		state.Failed = true
 		state.failedAt = time.Now()
 		w.retainMutationTierFailureLocked(path, *state)
-		return
+		return false
 	}
 	at := time.Now()
 	deferred := state.Partial
@@ -87,13 +140,19 @@ func (w *Watcher) finishMutationTierLocked(path string, ticket *MutationTicket, 
 	} else if state.FileGraphAt.IsZero() {
 		state.FileGraphAt = at
 	}
-	state.Partial = deferred || fanout.Observed && !fanout.Complete
+	if fanout.Observed && !fanout.Complete {
+		state.nonRefusalPartial = true
+	}
+	state.Partial = deferred || state.nonRefusalPartial
 	if state.Partial {
 		state.failedAt = at
 		w.retainMutationTierFailureLocked(path, *state)
-	} else if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= state.Generation {
+		return false
+	}
+	if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= state.Generation {
 		delete(w.failedPaths, path)
 	}
+	return true
 }
 
 func (w *Watcher) retainMutationTierFailureLocked(path string, state MutationTierState) {
@@ -166,7 +225,14 @@ func (w *Watcher) CaptureTierRepair(path string) func() {
 	return func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		if w.failedPaths[path] == observed {
+		current, ok := w.failedPaths[path]
+		if !ok {
+			return
+		}
+		if observed.rebindRefused && !current.rebindRefused {
+			current.rebindRefused = true
+		}
+		if current == observed {
 			delete(w.failedPaths, path)
 		}
 	}
@@ -252,6 +318,7 @@ func (w *Watcher) markDeferredMutationTiers(frontier map[string]uint64) {
 		for ordinal, waiter := range w.mutationWaiters[path] {
 			if ordinal <= generation && waiter.ticket != nil {
 				waiter.ticket.tierMu.Lock()
+				waiter.ticket.tiers.nonRefusalPartial = true
 				waiter.ticket.tiers.Partial = true
 				waiter.ticket.tierMu.Unlock()
 			}
@@ -264,18 +331,21 @@ func (w *Watcher) markDeferredMutationTiers(frontier map[string]uint64) {
 func (w *Watcher) markRefusedRelationTiers(path string, generation uint64, duplicate bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	prior := w.failedPaths[path]
 	if duplicate {
-		prior := w.failedPaths[path]
 		if !prior.rebindRefused || prior.Generation > generation {
 			return
 		}
 	}
 	at := time.Now()
-	latest := w.failedPaths[path]
+	latest := prior
 	for ordinal, waiter := range w.mutationWaiters[path] {
 		if ordinal <= generation && waiter.ticket != nil {
 			waiter.ticket.tierMu.Lock()
 			state := &waiter.ticket.tiers
+			if duplicate {
+				state.nonRefusalPartial = state.nonRefusalPartial || prior.nonRefusalPartial
+			}
 			state.rebindRefused = true
 			state.Partial = true
 			state.RelationsAt = time.Time{}

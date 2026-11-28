@@ -44,13 +44,53 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	}()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	retryOpts := r.retryOptsForFilesLocked(filePaths)
+	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
+	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)
+	var drainRefused bool
+	bridge := r.beginRetryBridgeLocked(retryOpts, func() bool { return stats.WriteRefused || drainRefused })
+	defer bridge.finish()
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate(filePaths)
+	// Step 1: Flush prior refused placeholder repoints and guard reverts
+	// belonging to this save's frontier BEFORE collecting the frontier so
+	// frontier.outByNode and frontier.pending observe reverted rows cleanly.
+	if !r.flushFrontierRetryWritesLocked(filePaths, nil, allowedRepo) {
+		r.notePendingAttributionFilesLocked(filePaths)
+		outcome = "write_refused"
+		return stats
+	}
 	frontier = collectOutgoingFileFrontier(r.graph, filePaths, r.incrementalSkipped)
 	if len(frontier.pending) == 0 {
+		if r.hasPendingAttributionFilesLocked(frontier.paths) {
+			r.buildDirIndexes()
+			defer r.clearDirIndexes()
+			finish := r.startIncrementalPhase(logger, "outgoing_attribution")
+			r.prepareIncrementalAttributionCache(frontier)
+			r.runFileAttributionPassesForFilesLocked(frontier)
+			r.clearIncrementalAttributionCache()
+			attributionDuration = finish()
+			if stats.WriteRefused {
+				r.notePendingAttributionFilesLocked(frontier.paths)
+				outcome = "write_refused"
+				return stats
+			}
+			r.clearPendingAttributionFilesLocked(frontier.paths)
+			r.restoreIncrementalTerminalStampsLocked(frontier.paths)
+			r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
+			outcome = "complete"
+			return stats
+		}
 		outcome = "no_pending"
 		r.attributeFrontierGoBuiltins(frontier)
+		if stats.WriteRefused {
+			r.notePendingAttributionFilesLocked(frontier.paths)
+			outcome = "write_refused"
+			return stats
+		}
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
+		r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 		return stats
 	}
 	finish := r.startIncrementalPhase(logger, "outgoing_build_indexes")
@@ -71,12 +111,24 @@ func (r *Resolver) ResolveFilesOutgoing(filePaths []string) *ResolveStats {
 	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats, frontier.detached...)
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
+		outcome = "write_refused"
+		return stats
+	}
 	finish = r.startIncrementalPhase(logger, "outgoing_attribution")
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
-	r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	attributionDuration = finish()
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
+		outcome = "write_refused"
+		return stats
+	}
+	r.clearPendingAttributionFilesLocked(frontier.paths)
+	r.restoreIncrementalTerminalStampsLocked(frontier.paths)
+	r.drainNonFrontierRetryWritesLocked(allowedRepo, allowedRepoint, &drainRefused)
 	outcome = "complete"
 	return stats
 }

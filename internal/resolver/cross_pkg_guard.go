@@ -2,8 +2,10 @@ package resolver
 
 import (
 	"os"
+	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -36,6 +38,886 @@ import (
 // at ast_resolved or above are out of scope — those carry structural or
 // compiler-grade evidence the name-only fallback never had.
 
+// PendingGuardRevert retains a cross-package guard revert whose reindex or
+// dataflow source revert write was refused under writer-gate contention so a
+// subsequent resolve pass can finish reverting the weak-tier binding without
+// requiring a full file reparse.
+type PendingGuardRevert struct {
+	RepoPrefix       string
+	Reindexes        []graph.EdgeReindex
+	SourceReverts    []graph.PlaceholderRepoint
+	reindexesApplied bool
+	spoolReverts     []lspSpoolRevert
+	headDropped      int
+}
+
+// ItemCount returns the number of logical guard-revert items retained in p.
+func (p PendingGuardRevert) ItemCount() int {
+	return max(len(p.Reindexes), max(len(p.SourceReverts), len(p.spoolReverts)))
+}
+
+// AppendCoalescedGuardRevert appends entry to dst, coalescing onto an existing
+// entry with identical (RepoPrefix, reindexesApplied) whenever their pairing
+// invariants match so repeated single-file refusals stay bounded to at most 2
+// paired entries per repository. Unpaired synthetic entries stay standalone.
+func AppendCoalescedGuardRevert(dst []PendingGuardRevert, entry PendingGuardRevert) []PendingGuardRevert {
+	if entry.ItemCount() == 0 {
+		return dst
+	}
+	for i := range dst {
+		target := &dst[i]
+		if target.RepoPrefix != entry.RepoPrefix || target.reindexesApplied != entry.reindexesApplied {
+			continue
+		}
+		if !entry.reindexesApplied {
+			if len(target.Reindexes) == 0 || len(entry.Reindexes) == 0 {
+				continue
+			}
+			srcPaired := len(target.SourceReverts) == len(target.Reindexes) && len(entry.SourceReverts) == len(entry.Reindexes)
+			srcEmpty := len(target.SourceReverts) == 0 && len(entry.SourceReverts) == 0
+			if !srcPaired && !srcEmpty {
+				continue
+			}
+			spoolPaired := len(target.spoolReverts) == len(target.Reindexes) && len(entry.spoolReverts) == len(entry.Reindexes)
+			spoolEmpty := len(target.spoolReverts) == 0 && len(entry.spoolReverts) == 0
+			if !spoolPaired && !spoolEmpty {
+				continue
+			}
+			oldReindexes := target.Reindexes
+			target.Reindexes = append(target.Reindexes, entry.Reindexes...)
+			if len(oldReindexes) == 0 || &target.Reindexes[0] != &oldReindexes[0] {
+				target.headDropped = 0
+			}
+			if srcPaired {
+				target.SourceReverts = append(target.SourceReverts, entry.SourceReverts...)
+			}
+			if spoolPaired {
+				target.spoolReverts = append(target.spoolReverts, entry.spoolReverts...)
+			}
+			return dst
+		}
+		if len(target.Reindexes) != 0 || len(entry.Reindexes) != 0 {
+			continue
+		}
+		if len(target.SourceReverts) > 0 && len(entry.SourceReverts) > 0 {
+			spoolPaired := len(target.spoolReverts) == len(target.SourceReverts) && len(entry.spoolReverts) == len(entry.SourceReverts)
+			spoolEmpty := len(target.spoolReverts) == 0 && len(entry.spoolReverts) == 0
+			if !spoolPaired && !spoolEmpty {
+				continue
+			}
+			oldSources := target.SourceReverts
+			target.SourceReverts = append(target.SourceReverts, entry.SourceReverts...)
+			if len(oldSources) == 0 || &target.SourceReverts[0] != &oldSources[0] {
+				target.headDropped = 0
+			}
+			if spoolPaired {
+				target.spoolReverts = append(target.spoolReverts, entry.spoolReverts...)
+			}
+			return dst
+		}
+		if len(target.SourceReverts) == 0 && len(entry.SourceReverts) == 0 {
+			oldSpool := target.spoolReverts
+			target.spoolReverts = append(target.spoolReverts, entry.spoolReverts...)
+			if len(oldSpool) == 0 || &target.spoolReverts[0] != &oldSpool[0] {
+				target.headDropped = 0
+			}
+			return dst
+		}
+	}
+	return append(dst, entry)
+}
+
+// SplitPendingGuardRevertByRepo partitions an untagged PendingGuardRevert into
+// per-repository entries using repoForFile, preserving pairing invariants and
+// stamping RepoPrefix on every resulting entry and SourceRevert.
+func SplitPendingGuardRevertByRepo(entry PendingGuardRevert, repoForFile func(string) string) []PendingGuardRevert {
+	if entry.ItemCount() == 0 {
+		return nil
+	}
+	if entry.RepoPrefix != "" || repoForFile == nil {
+		if entry.RepoPrefix != "" {
+			for i := range entry.SourceReverts {
+				if entry.SourceReverts[i].RepoPrefix == "" {
+					entry.SourceReverts[i].RepoPrefix = entry.RepoPrefix
+				}
+			}
+		}
+		return []PendingGuardRevert{entry}
+	}
+	byRepo := make(map[string]*PendingGuardRevert)
+	var order []string
+	bucketFor := func(repo string) *PendingGuardRevert {
+		b := byRepo[repo]
+		if b == nil {
+			b = &PendingGuardRevert{RepoPrefix: repo, reindexesApplied: entry.reindexesApplied}
+			byRepo[repo] = b
+			order = append(order, repo)
+		}
+		return b
+	}
+	if !entry.reindexesApplied && len(entry.Reindexes) > 0 {
+		pairedSrc := len(entry.SourceReverts) == len(entry.Reindexes)
+		pairedSpool := len(entry.spoolReverts) == len(entry.Reindexes)
+		for i, ri := range entry.Reindexes {
+			fp := ""
+			if ri.Edge != nil {
+				fp = ri.Edge.FilePath
+			}
+			repo := repoForFile(fp)
+			b := bucketFor(repo)
+			b.Reindexes = append(b.Reindexes, ri)
+			if pairedSrc {
+				sr := entry.SourceReverts[i]
+				if sr.RepoPrefix == "" {
+					sr.RepoPrefix = repo
+				}
+				b.SourceReverts = append(b.SourceReverts, sr)
+			}
+			if pairedSpool {
+				b.spoolReverts = append(b.spoolReverts, entry.spoolReverts[i])
+			}
+		}
+		if !pairedSrc {
+			for _, sr := range entry.SourceReverts {
+				repo := sr.RepoPrefix
+				if repo == "" {
+					repo = repoForFile(sr.FilePath)
+					sr.RepoPrefix = repo
+				}
+				b := bucketFor(repo)
+				b.SourceReverts = append(b.SourceReverts, sr)
+			}
+		}
+		if !pairedSpool {
+			for _, sp := range entry.spoolReverts {
+				fp := ""
+				if sp.edge != nil {
+					fp = sp.edge.FilePath
+				}
+				b := bucketFor(repoForFile(fp))
+				b.spoolReverts = append(b.spoolReverts, sp)
+			}
+		}
+	} else if len(entry.SourceReverts) > 0 {
+		pairedSpool := len(entry.spoolReverts) == len(entry.SourceReverts)
+		for i, sr := range entry.SourceReverts {
+			repo := sr.RepoPrefix
+			if repo == "" {
+				repo = repoForFile(sr.FilePath)
+				sr.RepoPrefix = repo
+			}
+			b := bucketFor(repo)
+			b.reindexesApplied = true
+			b.SourceReverts = append(b.SourceReverts, sr)
+			if pairedSpool {
+				b.spoolReverts = append(b.spoolReverts, entry.spoolReverts[i])
+			}
+		}
+		if !pairedSpool {
+			for _, sp := range entry.spoolReverts {
+				fp := ""
+				if sp.edge != nil {
+					fp = sp.edge.FilePath
+				}
+				b := bucketFor(repoForFile(fp))
+				b.reindexesApplied = true
+				b.spoolReverts = append(b.spoolReverts, sp)
+			}
+		}
+	} else {
+		for _, sp := range entry.spoolReverts {
+			fp := ""
+			if sp.edge != nil {
+				fp = sp.edge.FilePath
+			}
+			b := bucketFor(repoForFile(fp))
+			b.reindexesApplied = true
+			b.spoolReverts = append(b.spoolReverts, sp)
+		}
+	}
+	out := make([]PendingGuardRevert, 0, len(order))
+	for _, repo := range order {
+		out = append(out, *byRepo[repo])
+	}
+	return out
+}
+
+func (r *Resolver) hasPendingGuardReverts() bool {
+	return len(r.pendingGuardReverts) > 0
+}
+
+func (r *Resolver) appendPendingGuardRevertLocked(entry PendingGuardRevert) {
+	if entry.ItemCount() == 0 {
+		return
+	}
+	r.placeholderSrcIdx.guardPruned = false
+	r.pendingGuardReverts = AppendCoalescedGuardRevert(r.pendingGuardReverts, entry)
+}
+
+func (r *Resolver) pruneDeferredAgainstPendingGuardsLocked() {
+	if r.placeholderSrcIdx.guardPruned {
+		return
+	}
+	r.placeholderSrcIdx.pruneSitesMulti(r.pendingGuardReverts)
+}
+
+// TakePendingGuardReverts detaches any unapplied guard reverts carried across a
+// refused write so coordinated callers (e.g. MultiIndexer) can hand them to the
+// retry resolver instance.
+func (r *Resolver) TakePendingGuardReverts() []PendingGuardRevert {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pendingGuardReverts) == 0 {
+		return nil
+	}
+	out := r.pendingGuardReverts
+	r.pendingGuardReverts = nil
+	return out
+}
+
+// InheritPendingGuardReverts attaches unapplied guard reverts from a prior
+// refused pass on the same store so the next pass completes them.
+func (r *Resolver) InheritPendingGuardReverts(reverts []PendingGuardRevert) {
+	if len(reverts) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rev := range reverts {
+		r.appendPendingGuardRevertLocked(rev)
+	}
+}
+
+// guardRevertChunkSize stays strictly below SQLite's 5,000-row reindexChunkSize
+// so each guard revert batch commits in one atomic transaction paired with its
+// exact SourceReverts and spoolReverts.
+const (
+	guardRevertChunkSize              = 2048
+	incrementalFlushGuardRevertBudget = 64
+)
+
+func (r *Resolver) flushPendingGuardRevertsLocked(allowedRepo func(string) bool) (int, bool) {
+	return r.flushPendingGuardRevertsBoundedLocked(0, allowedRepo, 0)
+}
+
+func (r *Resolver) guardEntryScopePartition(
+	entry PendingGuardRevert,
+	allowedRepo func(string) bool,
+	knownSet func() map[string]struct{},
+) (eligible PendingGuardRevert, skipped PendingGuardRevert, hasEligible bool) {
+	if allowedRepo == nil {
+		return entry, PendingGuardRevert{}, entry.ItemCount() > 0
+	}
+	if entry.RepoPrefix != "" {
+		if allowedRepo(entry.RepoPrefix) {
+			return entry, PendingGuardRevert{}, entry.ItemCount() > 0
+		}
+		return PendingGuardRevert{}, entry, false
+	}
+	known := knownSet()
+	if len(known) == 0 {
+		if allowedRepo("") {
+			return entry, PendingGuardRevert{}, entry.ItemCount() > 0
+		}
+		return PendingGuardRevert{}, entry, false
+	}
+	matchFile := func(fp string) bool {
+		return allowedRepo(repoForFilePath(fp, known, r.retryRepoPrefix))
+	}
+	return partitionGuardRevertEntry(entry, matchFile, nil)
+}
+
+func partitionGuardRevertEntry(
+	entry PendingGuardRevert,
+	matchFile func(string) bool,
+	matchStubName func(string) bool,
+) (matched PendingGuardRevert, unmatched PendingGuardRevert, hasMatched bool) {
+	if entry.ItemCount() == 0 {
+		return PendingGuardRevert{}, PendingGuardRevert{}, false
+	}
+	itemMatches := func(fp, sym string) bool {
+		if matchFile != nil && matchFile(fp) {
+			return true
+		}
+		if matchStubName != nil && sym != "" && matchStubName(sym) {
+			return true
+		}
+		return false
+	}
+	if !entry.reindexesApplied && len(entry.Reindexes) > 0 {
+		matchCount := 0
+		for _, ri := range entry.Reindexes {
+			if ri.Edge == nil {
+				continue
+			}
+			if itemMatches(ri.Edge.FilePath, unresolvedBareSymbolName(ri.Edge.To)) {
+				matchCount++
+			}
+		}
+		if matchCount == 0 {
+			return PendingGuardRevert{}, entry, false
+		}
+		if matchCount == len(entry.Reindexes) {
+			return entry, PendingGuardRevert{}, true
+		}
+		pairedSrc := len(entry.SourceReverts) == len(entry.Reindexes)
+		pairedSpool := len(entry.spoolReverts) == len(entry.Reindexes)
+		matched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix}
+		unmatched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix}
+		var matchedSites map[placeholderSourceSite]struct{}
+		if !pairedSrc || !pairedSpool {
+			matchedSites = make(map[placeholderSourceSite]struct{}, matchCount)
+		}
+		for i, ri := range entry.Reindexes {
+			isMatch := ri.Edge != nil && itemMatches(ri.Edge.FilePath, unresolvedBareSymbolName(ri.Edge.To))
+			if isMatch {
+				matched.Reindexes = append(matched.Reindexes, ri)
+				if pairedSrc {
+					matched.SourceReverts = append(matched.SourceReverts, entry.SourceReverts[i])
+				}
+				if pairedSpool {
+					matched.spoolReverts = append(matched.spoolReverts, entry.spoolReverts[i])
+				}
+				if matchedSites != nil {
+					matchedSites[placeholderSourceSite{from: ri.OldTo, filePath: ri.Edge.FilePath, line: ri.Edge.Line}] = struct{}{}
+				}
+			} else {
+				unmatched.Reindexes = append(unmatched.Reindexes, ri)
+				if pairedSrc {
+					unmatched.SourceReverts = append(unmatched.SourceReverts, entry.SourceReverts[i])
+				}
+				if pairedSpool {
+					unmatched.spoolReverts = append(unmatched.spoolReverts, entry.spoolReverts[i])
+				}
+			}
+		}
+		if !pairedSrc {
+			for _, sr := range entry.SourceReverts {
+				if _, ok := matchedSites[placeholderSourceSite{from: sr.OldFrom, filePath: sr.FilePath, line: sr.Line}]; ok {
+					matched.SourceReverts = append(matched.SourceReverts, sr)
+				} else {
+					unmatched.SourceReverts = append(unmatched.SourceReverts, sr)
+				}
+			}
+		}
+		if !pairedSpool {
+			for _, sp := range entry.spoolReverts {
+				if sp.edge != nil {
+					if _, ok := matchedSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; ok {
+						matched.spoolReverts = append(matched.spoolReverts, sp)
+						continue
+					}
+				}
+				unmatched.spoolReverts = append(unmatched.spoolReverts, sp)
+			}
+		}
+		return matched, unmatched, true
+	}
+
+	if len(entry.SourceReverts) > 0 {
+		matchCount := 0
+		for _, sr := range entry.SourceReverts {
+			if itemMatches(sr.FilePath, unresolvedBareSymbolName(sr.NewFrom)) {
+				matchCount++
+			}
+		}
+		if matchCount == 0 {
+			return PendingGuardRevert{}, entry, false
+		}
+		if matchCount == len(entry.SourceReverts) {
+			return entry, PendingGuardRevert{}, true
+		}
+		pairedSpool := len(entry.spoolReverts) == len(entry.SourceReverts)
+		matched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix, reindexesApplied: true}
+		unmatched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix, reindexesApplied: true}
+		var matchedSites map[placeholderSourceSite]struct{}
+		if !pairedSpool && len(entry.spoolReverts) > 0 {
+			matchedSites = make(map[placeholderSourceSite]struct{}, matchCount)
+		}
+		for i, sr := range entry.SourceReverts {
+			if itemMatches(sr.FilePath, unresolvedBareSymbolName(sr.NewFrom)) {
+				matched.SourceReverts = append(matched.SourceReverts, sr)
+				if pairedSpool {
+					matched.spoolReverts = append(matched.spoolReverts, entry.spoolReverts[i])
+				}
+				if matchedSites != nil {
+					matchedSites[placeholderSourceSite{from: sr.OldFrom, filePath: sr.FilePath, line: sr.Line}] = struct{}{}
+				}
+			} else {
+				unmatched.SourceReverts = append(unmatched.SourceReverts, sr)
+				if pairedSpool {
+					unmatched.spoolReverts = append(unmatched.spoolReverts, entry.spoolReverts[i])
+				}
+			}
+		}
+		if !pairedSpool {
+			for _, sp := range entry.spoolReverts {
+				if sp.edge != nil {
+					if _, ok := matchedSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; ok {
+						matched.spoolReverts = append(matched.spoolReverts, sp)
+						continue
+					}
+				}
+				unmatched.spoolReverts = append(unmatched.spoolReverts, sp)
+			}
+		}
+		return matched, unmatched, true
+	}
+
+	// Only spoolReverts remain.
+	matchCount := 0
+	for _, sp := range entry.spoolReverts {
+		if sp.edge != nil && itemMatches(sp.edge.FilePath, unresolvedBareSymbolName(sp.edge.To)) {
+			matchCount++
+		}
+	}
+	if matchCount == 0 {
+		return PendingGuardRevert{}, entry, false
+	}
+	if matchCount == len(entry.spoolReverts) {
+		return entry, PendingGuardRevert{}, true
+	}
+	matched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix, reindexesApplied: true}
+	unmatched = PendingGuardRevert{RepoPrefix: entry.RepoPrefix, reindexesApplied: true}
+	for _, sp := range entry.spoolReverts {
+		if sp.edge != nil && itemMatches(sp.edge.FilePath, unresolvedBareSymbolName(sp.edge.To)) {
+			matched.spoolReverts = append(matched.spoolReverts, sp)
+		} else {
+			unmatched.spoolReverts = append(unmatched.spoolReverts, sp)
+		}
+	}
+	return matched, unmatched, true
+}
+
+func (r *Resolver) flushGuardRevertEntryLocked(
+	entry PendingGuardRevert,
+	maxItems int,
+	remainingBudget *int,
+	maxWait time.Duration,
+) (reverted int, remainders []PendingGuardRevert, ok bool) {
+	if entry.ItemCount() == 0 {
+		return 0, nil, true
+	}
+	if !entry.reindexesApplied && len(entry.Reindexes) > 0 {
+		take := len(entry.Reindexes)
+		if maxItems > 0 && take > *remainingBudget {
+			take = *remainingBudget
+		}
+		if maxItems > 0 {
+			*remainingBudget -= take
+		}
+		paired := len(entry.SourceReverts) == len(entry.Reindexes)
+		pairedSpool := len(entry.spoolReverts) == len(entry.Reindexes)
+		headReindexes := entry.Reindexes[:take]
+
+		sites := make([]graph.EdgeSite, 0, len(headReindexes))
+		for _, ri := range headReindexes {
+			if ri.Edge == nil {
+				continue
+			}
+			sites = append(sites, graph.EdgeSite{From: ri.Edge.From, Line: ri.Edge.Line, Kind: ri.Edge.Kind})
+		}
+		candidates := r.graph.GetEdgeCandidates(nil, sites)
+		var live []graph.EdgeReindex
+		var liveSources []graph.PlaceholderRepoint
+		var liveSpool []lspSpoolRevert
+		liveSites := make(map[placeholderSourceSite]struct{}, len(headReindexes))
+		for idx, ri := range headReindexes {
+			if ri.Edge == nil {
+				continue
+			}
+			for _, cur := range candidates.Site(ri.Edge.From, ri.Edge.Line, ri.Edge.Kind) {
+				if cur == nil || cur.To != ri.OldTo || cur.FilePath != ri.Edge.FilePath {
+					continue
+				}
+				// Never clobber an edge that was promoted to LSP or AST-resolved
+				// since the weak-tier revert was queued.
+				origin := cur.Origin
+				if origin == "" {
+					origin = graph.DefaultOriginFor(cur.Kind, cur.Confidence, "")
+				}
+				if origin != graph.OriginTextMatched && origin != graph.OriginASTInferred {
+					continue
+				}
+				live = append(live, ri)
+				if paired {
+					liveSources = append(liveSources, entry.SourceReverts[idx])
+				}
+				if pairedSpool {
+					liveSpool = append(liveSpool, entry.spoolReverts[idx])
+				}
+				liveSites[placeholderSourceSite{from: ri.OldTo, filePath: ri.Edge.FilePath, line: ri.Edge.Line}] = struct{}{}
+				break
+			}
+		}
+
+		var tailReindexes []graph.EdgeReindex
+		var tailSources []graph.PlaceholderRepoint
+		var tailSpool []lspSpoolRevert
+		nextHeadDropped := 0
+		if take < len(entry.Reindexes) {
+			clear(entry.Reindexes[:take])
+			tailReindexes = entry.Reindexes[take:]
+			nextHeadDropped = entry.headDropped + take
+			if paired {
+				clear(entry.SourceReverts[:take])
+				tailSources = entry.SourceReverts[take:]
+			} else if len(live) == 0 {
+				tailSources = entry.SourceReverts
+			} else {
+				for _, sr := range entry.SourceReverts {
+					if _, matched := liveSites[placeholderSourceSite{from: sr.OldFrom, filePath: sr.FilePath, line: sr.Line}]; matched {
+						liveSources = append(liveSources, sr)
+					} else {
+						tailSources = append(tailSources, sr)
+					}
+				}
+			}
+			if pairedSpool {
+				clear(entry.spoolReverts[:take])
+				tailSpool = entry.spoolReverts[take:]
+			} else if len(live) == 0 {
+				tailSpool = entry.spoolReverts
+			} else {
+				for _, sp := range entry.spoolReverts {
+					if sp.edge != nil {
+						if _, matched := liveSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; matched {
+							liveSpool = append(liveSpool, sp)
+							continue
+						}
+					}
+					tailSpool = append(tailSpool, sp)
+				}
+			}
+			if nextHeadDropped >= 256 && nextHeadDropped >= len(tailReindexes) {
+				tailReindexes = slices.Clone(tailReindexes)
+				if paired {
+					tailSources = slices.Clone(tailSources)
+				}
+				if pairedSpool {
+					tailSpool = slices.Clone(tailSpool)
+				}
+				nextHeadDropped = 0
+			}
+		} else {
+			if !paired && len(live) > 0 {
+				for _, sr := range entry.SourceReverts {
+					if _, matched := liveSites[placeholderSourceSite{from: sr.OldFrom, filePath: sr.FilePath, line: sr.Line}]; matched {
+						liveSources = append(liveSources, sr)
+					}
+				}
+			}
+			if !pairedSpool && len(live) > 0 {
+				for _, sp := range entry.spoolReverts {
+					if sp.edge == nil {
+						continue
+					}
+					if _, matched := liveSites[placeholderSourceSite{from: sp.oldBoundTo, filePath: sp.edge.FilePath, line: sp.edge.Line}]; matched {
+						liveSpool = append(liveSpool, sp)
+					}
+				}
+			}
+		}
+
+		appendTail := func(dst []PendingGuardRevert) []PendingGuardRevert {
+			if len(tailReindexes) == 0 && len(tailSources) == 0 && len(tailSpool) == 0 {
+				return dst
+			}
+			return append(dst, PendingGuardRevert{
+				RepoPrefix:       entry.RepoPrefix,
+				Reindexes:        tailReindexes,
+				SourceReverts:    tailSources,
+				reindexesApplied: len(tailReindexes) == 0,
+				spoolReverts:     tailSpool,
+				headDropped:      nextHeadDropped,
+			})
+		}
+
+		for start := 0; start < len(live); start += guardRevertChunkSize {
+			end := min(start+guardRevertChunkSize, len(live))
+			if !r.applyReindexEdgesWithWindow(live[start:end], maxWait) {
+				rem := PendingGuardRevert{
+					RepoPrefix: entry.RepoPrefix,
+					Reindexes:  slices.Clip(live[start:]),
+				}
+				if len(liveSources) == len(live) {
+					rem.SourceReverts = slices.Clip(liveSources[start:])
+				} else {
+					rem.SourceReverts = slices.Clip(liveSources)
+				}
+				if len(liveSpool) == len(live) {
+					rem.spoolReverts = slices.Clip(liveSpool[start:])
+				} else {
+					rem.spoolReverts = slices.Clip(liveSpool)
+				}
+				remainders = append(remainders, rem)
+				remainders = appendTail(remainders)
+				return reverted, remainders, false
+			}
+			reverted += end - start
+			var chunkSources []graph.PlaceholderRepoint
+			if len(liveSources) == len(live) {
+				chunkSources = slices.Clip(liveSources[start:end])
+			} else if end == len(live) {
+				chunkSources = slices.Clip(liveSources)
+			}
+			var chunkSpool []lspSpoolRevert
+			if len(liveSpool) == len(live) {
+				chunkSpool = slices.Clip(liveSpool[start:end])
+			} else if end == len(live) {
+				chunkSpool = slices.Clip(liveSpool)
+			}
+			if len(chunkSources) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
+				if _, applied := graph.ReconcilePlaceholderSourcesTryApplied(r.graph, chunkSources, maxWait); !applied {
+					r.notePassWriteRefused()
+					remainders = append(remainders, PendingGuardRevert{
+						RepoPrefix:       entry.RepoPrefix,
+						SourceReverts:    chunkSources,
+						spoolReverts:     chunkSpool,
+						reindexesApplied: true,
+					})
+					if end < len(live) {
+						rem := PendingGuardRevert{
+							RepoPrefix: entry.RepoPrefix,
+							Reindexes:  slices.Clip(live[end:]),
+						}
+						if len(liveSources) == len(live) {
+							rem.SourceReverts = slices.Clip(liveSources[end:])
+						}
+						if len(liveSpool) == len(live) {
+							rem.spoolReverts = slices.Clip(liveSpool[end:])
+						}
+						remainders = append(remainders, rem)
+					}
+					remainders = appendTail(remainders)
+					return reverted, remainders, false
+				}
+			}
+			if len(chunkSpool) > 0 && r.lspDeferredSpool != nil {
+				if err := r.lspDeferredSpool.refreshRevertedEdges(chunkSpool); err != nil {
+					r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+				}
+			}
+		}
+		remainders = appendTail(remainders)
+		return reverted, remainders, true
+	}
+
+	// reindexesApplied == true (or !reindexesApplied with len(Reindexes) == 0).
+	if len(entry.SourceReverts) == 0 || os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") == "0" {
+		if len(entry.spoolReverts) > 0 && r.lspDeferredSpool != nil {
+			if err := r.lspDeferredSpool.refreshRevertedEdges(entry.spoolReverts); err != nil {
+				r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+			}
+		}
+		return 0, nil, true
+	}
+
+	take := len(entry.SourceReverts)
+	if maxItems > 0 && take > *remainingBudget {
+		take = *remainingBudget
+	}
+	if maxItems > 0 {
+		*remainingBudget -= take
+	}
+	pairedSpool := len(entry.spoolReverts) == len(entry.SourceReverts)
+	if _, applied := graph.ReconcilePlaceholderSourcesTryApplied(r.graph, entry.SourceReverts[:take], maxWait); !applied {
+		r.notePassWriteRefused()
+		entry.reindexesApplied = true
+		return 0, []PendingGuardRevert{entry}, false
+	}
+	var tailSpool []lspSpoolRevert
+	if pairedSpool {
+		if r.lspDeferredSpool != nil {
+			if err := r.lspDeferredSpool.refreshRevertedEdges(entry.spoolReverts[:take]); err != nil {
+				r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+			}
+		}
+		clear(entry.spoolReverts[:take])
+		tailSpool = entry.spoolReverts[take:]
+	} else if take == len(entry.SourceReverts) {
+		if len(entry.spoolReverts) > 0 && r.lspDeferredSpool != nil {
+			if err := r.lspDeferredSpool.refreshRevertedEdges(entry.spoolReverts); err != nil {
+				r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+			}
+		}
+	} else {
+		tailSpool = entry.spoolReverts
+	}
+	clear(entry.SourceReverts[:take])
+	tailSources := entry.SourceReverts[take:]
+	if len(tailSources) == 0 {
+		return 0, nil, true
+	}
+	nextHeadDropped := entry.headDropped + take
+	if nextHeadDropped >= 256 && nextHeadDropped >= len(tailSources) {
+		tailSources = slices.Clone(tailSources)
+		if pairedSpool {
+			tailSpool = slices.Clone(tailSpool)
+		}
+		nextHeadDropped = 0
+	}
+	return 0, []PendingGuardRevert{{
+		RepoPrefix:       entry.RepoPrefix,
+		SourceReverts:    tailSources,
+		spoolReverts:     tailSpool,
+		reindexesApplied: true,
+		headDropped:      nextHeadDropped,
+	}}, true
+}
+
+func (r *Resolver) flushFrontierGuardRevertsLocked(
+	matchFile func(string) bool,
+	matchStubName func(string) bool,
+	allowedRepo func(string) bool,
+	maxWait time.Duration,
+) (int, bool) {
+	if len(r.pendingGuardReverts) == 0 {
+		return 0, true
+	}
+	var cachedKnown map[string]struct{}
+	knownLoaded := false
+	knownSet := func() map[string]struct{} {
+		if !knownLoaded {
+			cachedKnown = r.knownRepoPrefixesSet()
+			knownLoaded = true
+		}
+		return cachedKnown
+	}
+
+	reverted := 0
+	var kept []PendingGuardRevert
+	for i := range r.pendingGuardReverts {
+		entry := r.pendingGuardReverts[i]
+		eligible, skipped, hasEligible := r.guardEntryScopePartition(entry, allowedRepo, knownSet)
+		if !hasEligible {
+			if skipped.ItemCount() > 0 {
+				kept = append(kept, skipped)
+			}
+			continue
+		}
+		matched, unmatched, hasMatched := partitionGuardRevertEntry(eligible, matchFile, matchStubName)
+		if !hasMatched {
+			kept = append(kept, entry)
+			continue
+		}
+		if skipped.ItemCount() > 0 {
+			kept = append(kept, skipped)
+		}
+		var unusedBudget int
+		n, remainders, ok := r.flushGuardRevertEntryLocked(matched, 0, &unusedBudget, maxWait)
+		reverted += n
+		if !ok {
+			kept = append(kept, remainders...)
+			if unmatched.ItemCount() > 0 {
+				kept = append(kept, unmatched)
+			}
+			kept = append(kept, r.pendingGuardReverts[i+1:]...)
+			r.pendingGuardReverts = kept
+			return reverted, false
+		}
+		if unmatched.ItemCount() > 0 {
+			kept = append(kept, unmatched)
+		}
+	}
+	if len(kept) == 0 {
+		r.pendingGuardReverts = nil
+	} else {
+		r.pendingGuardReverts = kept
+	}
+	return reverted, true
+}
+
+func (r *Resolver) flushPendingGuardRevertsBoundedLocked(
+	maxItems int,
+	allowedRepo func(string) bool,
+	maxWait time.Duration,
+) (int, bool) {
+	if len(r.pendingGuardReverts) == 0 {
+		return 0, true
+	}
+	var cachedKnown map[string]struct{}
+	knownLoaded := false
+	knownSet := func() map[string]struct{} {
+		if !knownLoaded {
+			cachedKnown = r.knownRepoPrefixesSet()
+			knownLoaded = true
+		}
+		return cachedKnown
+	}
+
+	reverted := 0
+	remainingBudget := maxItems
+	var kept []PendingGuardRevert
+	for i := range r.pendingGuardReverts {
+		if maxItems > 0 && remainingBudget <= 0 {
+			kept = append(kept, r.pendingGuardReverts[i:]...)
+			break
+		}
+		entry := r.pendingGuardReverts[i]
+		eligible, skipped, hasEligible := r.guardEntryScopePartition(entry, allowedRepo, knownSet)
+		if !hasEligible {
+			if skipped.ItemCount() > 0 {
+				kept = append(kept, skipped)
+			}
+			continue
+		}
+		if skipped.ItemCount() > 0 {
+			kept = append(kept, skipped)
+		}
+		n, remainders, ok := r.flushGuardRevertEntryLocked(eligible, maxItems, &remainingBudget, maxWait)
+		reverted += n
+		if !ok {
+			kept = append(kept, remainders...)
+			kept = append(kept, r.pendingGuardReverts[i+1:]...)
+			r.pendingGuardReverts = kept
+			return reverted, false
+		}
+		kept = append(kept, remainders...)
+	}
+	if len(kept) == 0 {
+		r.pendingGuardReverts = nil
+	} else {
+		r.pendingGuardReverts = kept
+	}
+	return reverted, true
+}
+
+// drainGuardSpoolToPendingLocked evaluates committed weak-tier jobs already
+// spooled during a ResolveAll pass that is aborting early on write refusal.
+// It runs read-only (zero store writes) and queues every unreachable revert
+// onto r.pendingGuardReverts so retry finishes guarding them before they vanish
+// from the unresolved stream. Caller holds r.mu.
+func (r *Resolver) drainGuardSpoolToPendingLocked(guardSpool *resolveGuardSpool, guardRepos map[string]struct{}) {
+	if guardSpool == nil || guardSpool.count == 0 || guardSpool.readAt >= guardSpool.count {
+		return
+	}
+	var guardClosure map[string]map[string]struct{}
+	if len(r.scope) == 0 {
+		guardClosure = r.buildImportClosure()
+	} else {
+		guardClosure = r.buildImportClosureFiltered(guardRepos)
+	}
+	if len(guardClosure) == 0 {
+		return
+	}
+	refused := true
+	defer r.trackPassWriteRefused(&refused)()
+	for done := false; !done; {
+		records, exhausted, err := guardSpool.nextPage(resolvePendingPageRows)
+		if err != nil {
+			r.logger.Error("resolver: drain guard spool on write refusal", zap.Error(err))
+			break
+		}
+		jobs := guardJobsFromRecords(r.graph, records)
+		r.clearLookupCache()
+		r.warmGuardLookupCache(jobs)
+		r.guardCrossPackageCallEdges(jobs, guardClosure)
+		r.clearLookupCache()
+		done = exhausted
+	}
+}
+
 // guardCrossPackageCallEdges inspects the edges mutated by the just-
 // completed resolution pass and reverts any weak-tier call/reference
 // edge whose resolved target is not import-reachable from the caller.
@@ -64,6 +946,7 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 	var reindexBatch []graph.EdgeReindex
 	var spoolReverts []lspSpoolRevert
 	var sourceReverts []graph.PlaceholderRepoint
+	var repoPrefixes []string
 	for i := range jobs {
 		j := &jobs[i]
 		// A concurrent edit during a chunked ResolveAll yield may have evicted
@@ -160,12 +1043,18 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// leave that guessed producer bound. Restore the caller's source
 		// namespace, as applyRepoPrefix does, without touching other sites that
 		// legitimately use the same definition.
+		repoPrefix := r.retryRepoPrefix
+		if callerNode != nil && callerNode.RepoPrefix != "" {
+			repoPrefix = callerNode.RepoPrefix
+		} else if repoPrefix == "" && target.RepoPrefix != "" {
+			repoPrefix = target.RepoPrefix
+		}
 		placeholder := j.oldTo
 		if callerNode != nil && callerNode.RepoPrefix != "" {
 			placeholder = callerNode.RepoPrefix + "/" + placeholder
 		}
 		sourceReverts = append(sourceReverts, graph.PlaceholderRepoint{
-			OldFrom: oldResolved, FilePath: j.edge.FilePath, Line: j.edge.Line, NewFrom: placeholder,
+			OldFrom: oldResolved, FilePath: j.edge.FilePath, Line: j.edge.Line, NewFrom: placeholder, RepoPrefix: repoPrefix,
 		})
 		provBatch = append(provBatch, graph.EdgeProvenanceUpdate{Edge: j.edge, NewOrigin: ""})
 		j.edge.To = j.oldTo
@@ -174,10 +1063,12 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		// unresolved edge advertising the abandoned bind's EXTRACTED label
 		// would out-rank evidence that actually survived.
 		j.edge.ConfidenceLabel = ""
-		// Durable revert stamp: the guard's verdicts are otherwise invisible
-		// after the provenance drop, which blocks any selective replay — a
-		// future pass cannot learn which speculative shapes never survive
-		// scrutiny. The stamp rides the reindex write it already pays for.
+		// Revert stamp: persists on the reverted unresolved edge across passes
+		// so CrossRepoResolver never resurrects an unimported same-repo Go
+		// decoy and guard verdicts remain visible while the edge stays
+		// unresolved. Binding the edge to a concrete target clears the stamp,
+		// and the guard re-stamps it if a later restub triggers another
+		// unreachable guess.
 		if j.edge.Meta == nil {
 			j.edge.Meta = map[string]any{}
 		}
@@ -189,18 +1080,15 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 		delete(j.edge.Meta, "resolution")
 		reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: oldResolved})
 		spoolReverts = append(spoolReverts, lspSpoolRevert{edge: j.edge, oldBoundTo: oldResolved})
+		repoPrefixes = append(repoPrefixes, repoPrefix)
 	}
-	if len(provBatch) > 0 {
-		r.graph.SetEdgeProvenanceBatch(provBatch)
-		// The reindex below persists each edge struct as it stands. The
-		// in-memory store's SetEdgeProvenance clears Origin on this very
-		// pointer, but a store that answers reads with copies (the per-file
-		// delta writer) may leave the caller's copy untouched, and the
-		// reverted row would then keep the abandoned bind's origin — a row a
-		// whole index (which reverts in memory) never writes. Apply the same
-		// clear to the struct, with SetEdgeProvenance's Tier rule; on the
-		// in-memory store it is already done.
-		for _, u := range provBatch {
+	if len(sourceReverts) > 0 {
+		// Drop any unapplied deferred placeholder move targeting the binding
+		// this guard just rejected so retry never lifts From onto it.
+		r.placeholderSrcIdx.pruneSites(sourceReverts)
+	}
+	clearInMemoryProvenance := func(updates []graph.EdgeProvenanceUpdate) {
+		for _, u := range updates {
 			if u.Edge == nil || u.Edge.Origin == u.NewOrigin {
 				continue
 			}
@@ -210,23 +1098,122 @@ func (r *Resolver) guardCrossPackageCallEdges(jobs []reindexJob, closure map[str
 			}
 		}
 	}
-	if len(reindexBatch) > 0 {
-		r.graph.ReindexEdges(reindexBatch)
-	}
-	if len(sourceReverts) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
-		graph.ReconcilePlaceholderSources(r.graph, sourceReverts)
-	}
-	// A reverted edge may still hold a deferred LSP verify-record spooled
-	// while it was heuristically bound. Re-snapshot those records to the
-	// post-revert edge state (after both batches, so the struct fields are
-	// authoritative on either backend) — otherwise the next pass's exact
-	// liveness matching declares them stale and deletes the queued retry.
-	if len(spoolReverts) > 0 && r.lspDeferredSpool != nil {
-		if err := r.lspDeferredSpool.refreshRevertedEdges(spoolReverts); err != nil {
-			r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+	queueGuardRevertsByRepo := func(
+		reindexes []graph.EdgeReindex,
+		sources []graph.PlaceholderRepoint,
+		spools []lspSpoolRevert,
+		repos []string,
+		reindexesApplied bool,
+	) {
+		n := len(repos)
+		if n == 0 {
+			return
+		}
+		uniform := true
+		first := repos[0]
+		for _, p := range repos[1:] {
+			if p != first {
+				uniform = false
+				break
+			}
+		}
+		if uniform {
+			r.appendPendingGuardRevertLocked(PendingGuardRevert{
+				RepoPrefix:       first,
+				Reindexes:        slices.Clip(reindexes),
+				SourceReverts:    slices.Clip(sources),
+				reindexesApplied: reindexesApplied,
+				spoolReverts:     slices.Clip(spools),
+			})
+			return
+		}
+		byRepo := make(map[string]*PendingGuardRevert)
+		var order []string
+		for idx, repo := range repos {
+			b := byRepo[repo]
+			if b == nil {
+				b = &PendingGuardRevert{RepoPrefix: repo, reindexesApplied: reindexesApplied}
+				byRepo[repo] = b
+				order = append(order, repo)
+			}
+			if !reindexesApplied && idx < len(reindexes) {
+				b.Reindexes = append(b.Reindexes, reindexes[idx])
+			}
+			if idx < len(sources) {
+				b.SourceReverts = append(b.SourceReverts, sources[idx])
+			}
+			if idx < len(spools) {
+				b.spoolReverts = append(b.spoolReverts, spools[idx])
+			}
+		}
+		for _, repo := range order {
+			r.appendPendingGuardRevertLocked(*byRepo[repo])
 		}
 	}
-	return len(reindexBatch)
+	if r.writeRefused() {
+		// An earlier write in this pass was already refused under writer-gate
+		// contention. Clear in-memory provenance and queue this revert batch
+		// without firing another write into the contended gate.
+		clearInMemoryProvenance(provBatch)
+		if len(reindexBatch) > 0 || len(sourceReverts) > 0 {
+			queueGuardRevertsByRepo(reindexBatch, sourceReverts, spoolReverts, repoPrefixes, false)
+		}
+		return 0
+	}
+	reverted := 0
+	for start := 0; start < len(reindexBatch); start += guardRevertChunkSize {
+		end := min(start+guardRevertChunkSize, len(reindexBatch))
+		if end <= len(provBatch) && start < end {
+			if r.passReindexMaxWait <= 0 {
+				r.graph.SetEdgeProvenanceBatch(provBatch[start:end])
+			}
+			// The reindex below persists each edge struct as it stands. The
+			// in-memory store's SetEdgeProvenance clears Origin on this very
+			// pointer, but a store that answers reads with copies (the per-file
+			// delta writer) may leave the caller's copy untouched, and the
+			// reverted row would then keep the abandoned bind's origin — a row a
+			// whole index (which reverts in memory) never writes. Apply the same
+			// clear to the struct, with SetEdgeProvenance's Tier rule; on the
+			// in-memory store it is already done (and on bounded opportunistic
+			// passes it avoids an unbounded provenance write).
+			clearInMemoryProvenance(provBatch[start:end])
+		}
+		if !r.applyReindexEdges(reindexBatch[start:end]) {
+			if end < len(provBatch) {
+				clearInMemoryProvenance(provBatch[end:])
+			}
+			queueGuardRevertsByRepo(reindexBatch[start:], sourceReverts[start:], spoolReverts[start:], repoPrefixes[start:], false)
+			return reverted
+		}
+		reverted += end - start
+		chunkSources := slices.Clip(sourceReverts[start:end])
+		chunkSpool := slices.Clip(spoolReverts[start:end])
+		chunkRepos := repoPrefixes[start:end]
+		if len(chunkSources) > 0 && os.Getenv("GORTEX_RESOLVE_FROM_RECONCILE") != "0" {
+			if _, ok := graph.ReconcilePlaceholderSourcesTryApplied(r.graph, chunkSources, r.passReindexMaxWait); !ok {
+				r.notePassWriteRefused()
+				if end < len(provBatch) {
+					clearInMemoryProvenance(provBatch[end:])
+				}
+				queueGuardRevertsByRepo(nil, chunkSources, chunkSpool, chunkRepos, true)
+				if end < len(reindexBatch) {
+					queueGuardRevertsByRepo(reindexBatch[end:], sourceReverts[end:], spoolReverts[end:], repoPrefixes[end:], false)
+				}
+				return reverted
+			}
+		}
+		// A reverted edge may still hold a deferred LSP verify-record spooled
+		// while it was heuristically bound. Re-snapshot those records to the
+		// post-revert edge state (after both batches, so the struct fields are
+		// authoritative on either backend) — otherwise the next pass's exact
+		// liveness matching declares them stale and deletes the queued retry.
+		if len(chunkSpool) > 0 && r.lspDeferredSpool != nil {
+			if err := r.lspDeferredSpool.refreshRevertedEdges(chunkSpool); err != nil {
+				r.logger.Error("resolver: refresh reverted LSP spool records", zap.Error(err))
+			}
+		}
+	}
+	return reverted
 }
 
 // isBareNameCallTarget reports whether an unresolved edge target is a

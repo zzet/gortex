@@ -2,6 +2,8 @@ package resolver
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"slices"
@@ -23,6 +25,7 @@ type CrossRepoStats struct {
 	Unresolved      int            `json:"unresolved"`
 	CrossRepoEdges  int            `json:"cross_repo_edges"`
 	ByRepo          map[string]int `json:"by_repo"`
+	WriteRefused    bool           `json:"write_refused,omitempty"`
 	peakPendingPage int
 	peakLookupKeys  int
 }
@@ -180,6 +183,354 @@ type CrossRepoResolver struct {
 	// can reconcile their tests projections.
 	retargetedMu            sync.Mutex
 	retargetedTestCallFiles map[string]struct{}
+
+	// takeRetryState / saveRetryState hand off unapplied placeholder repoints
+	// strictly while cr.mu (g.ResolveMutex()) is held, preventing concurrent
+	// short-lived resolvers from stealing another lane's retry queue.
+	takeRetryState       func(RetryTakeOpts) (CrossRepoRetryState, uint64)
+	saveRetryState       func(CrossRepoRetryState, RetryBridgeSaveMeta)
+	hasPendingBridgeRepo func(string) bool
+	knownBridgePrefixes  func() []string
+	passReindexMaxWait   time.Duration
+	// chunkYieldHook is a deterministic inter-chunk interleave seam used by
+	// resolver tests. Nil in production.
+	chunkYieldHook func()
+}
+
+// SetRetryStateBridge installs callbacks invoked strictly while cr.mu
+// (g.ResolveMutex()) is held to inherit and return unapplied placeholder
+// repoints across short-lived CrossRepoResolver instances.
+func (cr *CrossRepoResolver) SetRetryStateBridge(
+	take func(RetryTakeOpts) (CrossRepoRetryState, uint64),
+	save func(CrossRepoRetryState, RetryBridgeSaveMeta),
+	hasPending func(string) bool,
+	knownPrefixes func() []string,
+) {
+	cr.takeRetryState = take
+	cr.saveRetryState = save
+	cr.hasPendingBridgeRepo = hasPending
+	cr.knownBridgePrefixes = knownPrefixes
+}
+
+func (cr *CrossRepoResolver) applyReindexEdges(batch []graph.EdgeReindex) bool {
+	return reindexEdgesAppliedWithWindow(cr.graph, batch, cr.passReindexMaxWait)
+}
+
+func (cr *CrossRepoResolver) knownRepoPrefixes() []string {
+	if cr.knownBridgePrefixes != nil {
+		return cr.knownBridgePrefixes()
+	}
+	if cr.graph == nil {
+		return nil
+	}
+	return cr.graph.RepoPrefixes()
+}
+
+func (cr *CrossRepoResolver) knownRepoPrefixesSet() map[string]struct{} {
+	prefixes := cr.knownRepoPrefixes()
+	if len(prefixes) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(prefixes))
+	for _, p := range prefixes {
+		if p != "" {
+			out[p] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (cr *CrossRepoResolver) inMemoryRepoForEdge(e *graph.Edge) string {
+	if e != nil && e.From != "" {
+		if cr.nodeByID != nil {
+			if n := cr.nodeByID[e.From]; n != nil && n.RepoPrefix != "" {
+				return n.RepoPrefix
+			}
+		}
+		if n, ok := cr.hotCache.peekNode(e.From); ok && n != nil && n.RepoPrefix != "" {
+			return n.RepoPrefix
+		}
+	}
+	return ""
+}
+
+func (cr *CrossRepoResolver) retryOptsForFilesLocked(fileSlices ...[]string) RetryTakeOpts {
+	known := cr.knownRepoPrefixesSet()
+	repos := make(map[string]struct{}, 1)
+	if len(known) > 0 {
+		for _, slice := range fileSlices {
+			for _, fp := range slice {
+				if fp == "" {
+					continue
+				}
+				p := graph.RepoPrefixOfID(fp)
+				if _, ok := known[p]; ok {
+					repos[p] = struct{}{}
+				} else {
+					repos[""] = struct{}{}
+				}
+			}
+		}
+	} else if cr.takeRetryState == nil && cr.saveRetryState == nil {
+		repos[""] = struct{}{}
+	} else {
+		repos[""] = struct{}{}
+		for _, slice := range fileSlices {
+			for _, fp := range slice {
+				if p := graph.RepoPrefixOfID(fp); p != "" {
+					repos[p] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(repos) == 0 {
+		return RetryTakeOpts{}
+	}
+	if cr.hasPendingBridgeRepo != nil && len(cr.placeholderSrcIdx.deferred) == 0 {
+		anyPending := false
+		for repo := range repos {
+			if cr.hasPendingBridgeRepo(repo) {
+				anyPending = true
+				break
+			}
+		}
+		if !anyPending {
+			return RetryTakeOpts{}
+		}
+	}
+	return RetryTakeOpts{Repos: repos}
+}
+
+func (cr *CrossRepoResolver) retryOptsForRepoLocked(repoPrefix string) RetryTakeOpts {
+	if repoPrefix == "" {
+		return RetryTakeOpts{AllRepos: true}
+	}
+	if cr.hasPendingBridgeRepo != nil && !cr.hasPendingBridgeRepo(repoPrefix) && len(cr.placeholderSrcIdx.deferred) == 0 {
+		return RetryTakeOpts{}
+	}
+	return RetryTakeOpts{Repos: map[string]struct{}{repoPrefix: {}}}
+}
+
+func (cr *CrossRepoResolver) allowedRepointFuncForOptsLocked(opts RetryTakeOpts) func(graph.PlaceholderRepoint) bool {
+	if opts.AllRepos {
+		return nil
+	}
+	repos := opts.Repos
+	var known map[string]struct{}
+	knownLoaded := false
+	return func(rp graph.PlaceholderRepoint) bool {
+		if len(repos) == 0 {
+			return false
+		}
+		if rp.RepoPrefix != "" {
+			_, ok := repos[rp.RepoPrefix]
+			return ok
+		}
+		if !knownLoaded {
+			known = cr.knownRepoPrefixesSet()
+			knownLoaded = true
+		}
+		if len(known) > 0 {
+			_, ok := repos[RepoForFilePath(rp.FilePath, known, "")]
+			return ok
+		}
+		_, ok := repos[""]
+		return ok
+	}
+}
+
+func (cr *CrossRepoResolver) countRepointsByRepoLocked(repoints []graph.PlaceholderRepoint) map[string]int {
+	if len(repoints) == 0 {
+		return nil
+	}
+	var known map[string]struct{}
+	knownLoaded := false
+	counts := make(map[string]int, 2)
+	for _, rp := range repoints {
+		repo := rp.RepoPrefix
+		if repo == "" {
+			if !knownLoaded {
+				known = cr.knownRepoPrefixesSet()
+				knownLoaded = true
+			}
+			repo = RepoForFilePath(rp.FilePath, known, "")
+		}
+		counts[repo]++
+	}
+	return counts
+}
+
+type crossRepoBridgeSession struct {
+	cr         *CrossRepoResolver
+	active     bool
+	refused    func() bool
+	passEpoch  uint64
+	takenRepos map[string]int
+	yielded    map[string]int
+}
+
+func (cr *CrossRepoResolver) beginRetryBridgeLocked(opts RetryTakeOpts, refused func() bool) crossRepoBridgeSession {
+	s := crossRepoBridgeSession{cr: cr, refused: refused}
+	if cr.takeRetryState == nil && cr.saveRetryState == nil {
+		return s
+	}
+	s.active = true
+	if cr.takeRetryState != nil {
+		initial, ep := cr.takeRetryState(opts)
+		s.passEpoch = ep
+		if len(initial.TakenRepos) > 0 {
+			s.takenRepos = initial.TakenRepos
+		} else if len(initial.Repoints) > 0 {
+			s.takenRepos = cr.countRepointsByRepoLocked(initial.Repoints)
+		}
+		if len(initial.Repoints) > 0 {
+			cr.placeholderSrcIdx.adoptOwnedDeferred(
+				initial.Repoints,
+				initial.NeedsDedup,
+				true,
+				initial.UniformRepo,
+				initial.HasUniformRepo,
+				initial.HeadDropped,
+			)
+		}
+	}
+	return s
+}
+
+func (s *crossRepoBridgeSession) releaseForYield() {
+	if !s.active || s.cr.saveRetryState == nil {
+		return
+	}
+	snap := s.cr.placeholderSrcIdx.takeDeferredSnapshot()
+	if len(snap.repoints) == 0 {
+		return
+	}
+	if counts := s.cr.countRepointsByRepoLocked(snap.repoints); len(counts) > 0 {
+		if s.yielded == nil {
+			s.yielded = make(map[string]int, len(counts))
+		}
+		for repo, n := range counts {
+			s.yielded[repo] += n
+		}
+	}
+	s.cr.saveRetryState(CrossRepoRetryState{
+		Repoints:       snap.repoints,
+		NeedsDedup:     snap.needsDedup,
+		HasUniformRepo: snap.hasUniformRepo,
+		UniformRepo:    snap.uniformRepo,
+		HeadDropped:    snap.headDropped,
+	}, RetryBridgeSaveMeta{
+		TakeEpoch: s.passEpoch,
+		IsYield:   true,
+	})
+}
+
+func (s *crossRepoBridgeSession) reabsorb(opts RetryTakeOpts, mutated bool) {
+	if !s.active || s.cr.takeRetryState == nil {
+		if mutated {
+			s.cr.placeholderSrcIdx.beginPass()
+		}
+		return
+	}
+	opts.HasMaxEpoch = true
+	opts.MaxEpoch = s.passEpoch
+	taken, _ := s.cr.takeRetryState(opts)
+	reabCounts := taken.TakenRepos
+	if len(reabCounts) == 0 && len(taken.Repoints) > 0 {
+		reabCounts = s.cr.countRepointsByRepoLocked(taken.Repoints)
+	}
+	if len(reabCounts) > 0 || len(s.yielded) > 0 {
+		for repo, add := range reabCounts {
+			net := s.takenRepos[repo] + add - s.yielded[repo]
+			if net <= 0 {
+				delete(s.takenRepos, repo)
+			} else {
+				if s.takenRepos == nil {
+					s.takenRepos = make(map[string]int, len(reabCounts))
+				}
+				s.takenRepos[repo] = net
+			}
+		}
+		for repo, sub := range s.yielded {
+			if _, handled := reabCounts[repo]; handled {
+				continue
+			}
+			net := s.takenRepos[repo] - sub
+			if net <= 0 {
+				delete(s.takenRepos, repo)
+			} else {
+				s.takenRepos[repo] = net
+			}
+		}
+		if len(s.takenRepos) == 0 {
+			s.takenRepos = nil
+		}
+	}
+	s.yielded = nil
+	if len(taken.Repoints) > 0 {
+		if mutated {
+			s.cr.placeholderSrcIdx.adoptOwnedDeferred(
+				taken.Repoints,
+				taken.NeedsDedup,
+				true,
+				taken.UniformRepo,
+				taken.HasUniformRepo,
+				taken.HeadDropped,
+			)
+		} else if len(s.cr.placeholderSrcIdx.deferred) == 0 {
+			// Preserve the live pass census without calling beginPass() when
+			// no interleaving mutation occurred during the yield.
+			s.cr.placeholderSrcIdx.deferred = taken.Repoints
+			s.cr.placeholderSrcIdx.needsDedup = taken.NeedsDedup
+			s.cr.placeholderSrcIdx.hasUniformRepo = taken.HasUniformRepo
+			s.cr.placeholderSrcIdx.uniformRepo = taken.UniformRepo
+			s.cr.placeholderSrcIdx.headDropped = taken.HeadDropped
+		} else {
+			old := s.cr.placeholderSrcIdx.deferred
+			s.cr.placeholderSrcIdx.deferred = append(s.cr.placeholderSrcIdx.deferred, taken.Repoints...)
+			if len(old) == 0 || &s.cr.placeholderSrcIdx.deferred[0] != &old[0] {
+				s.cr.placeholderSrcIdx.headDropped = 0
+			}
+			s.cr.placeholderSrcIdx.needsDedup = true
+			s.cr.placeholderSrcIdx.hasUniformRepo = false
+			s.cr.placeholderSrcIdx.uniformRepo = ""
+		}
+	} else if mutated {
+		s.cr.placeholderSrcIdx.beginPass()
+	}
+}
+
+func (s *crossRepoBridgeSession) finish() {
+	if !s.active || s.cr.saveRetryState == nil {
+		return
+	}
+	snap := s.cr.placeholderSrcIdx.takeDeferredSnapshot()
+	for repo, sub := range s.yielded {
+		net := s.takenRepos[repo] - sub
+		if net <= 0 {
+			delete(s.takenRepos, repo)
+		} else {
+			s.takenRepos[repo] = net
+		}
+	}
+	if len(s.takenRepos) == 0 {
+		s.takenRepos = nil
+	}
+	if len(snap.repoints) > 0 || len(s.takenRepos) > 0 {
+		isRefused := s.refused != nil && s.refused()
+		s.cr.saveRetryState(CrossRepoRetryState{
+			Repoints:       snap.repoints,
+			NeedsDedup:     snap.needsDedup,
+			HasUniformRepo: snap.hasUniformRepo,
+			UniformRepo:    snap.uniformRepo,
+			HeadDropped:    snap.headDropped,
+		}, RetryBridgeSaveMeta{
+			TakenRepos: s.takenRepos,
+			TakeEpoch:  s.passEpoch,
+			IsYield:    false,
+			Refused:    isRefused,
+		})
+	}
 }
 
 // noteRetargetedCall mirrors Resolver.noteRetargetedCall for the
@@ -385,7 +736,27 @@ func (cr *CrossRepoResolver) ResolveAll() *CrossRepoStats {
 // ResolveAllContext is ResolveAll with cancellation propagated through the
 // unresolved-edge pager. The compatibility wrapper above preserves the
 // historical best-effort API for non-lifecycle callers.
-func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoStats, error) {
+// TakePendingPlaceholderRepoints detaches any deferred placeholder dataflow
+// source repoints that a refused write left unapplied so a caller constructing
+// a fresh CrossRepoResolver can hand them to the retry pass.
+func (cr *CrossRepoResolver) TakePendingPlaceholderRepoints() []graph.PlaceholderRepoint {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	return cr.placeholderSrcIdx.takeDeferred()
+}
+
+// InheritPendingPlaceholderRepoints attaches unapplied placeholder repoints
+// from a prior refused pass on the same store.
+func (cr *CrossRepoResolver) InheritPendingPlaceholderRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	cr.placeholderSrcIdx.inheritDeferred(repoints)
+}
+
+func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (retStats *CrossRepoStats, retErr error) {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	if ctx == nil {
 		ctx = context.Background()
@@ -395,18 +766,45 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	bridge := cr.beginRetryBridgeLocked(RetryTakeOpts{AllRepos: true}, func() bool {
+		return (retStats != nil && retStats.WriteRefused) || errors.Is(retErr, ErrReindexWriteRefused)
+	})
+	defer bridge.finish()
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
 	if err := cr.retryGoModuleDeps(ctx, stats); err != nil {
 		return stats, err
 	}
-	// Fresh placeholder-source set per pass — same rationale as ResolveAll
-	// on the master resolver.
-	cr.placeholderSrcIdx = placeholderSourceIndex{}
-	// Every exit applies the moves the pass deferred (a no-op after the
-	// normal flush below); it runs before the deferred unlock above.
-	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
+	// Fresh placeholder-source census per pass while retaining any deferred
+	// repoints a prior refused write left unapplied.
+	cr.placeholderSrcIdx.beginPass()
+	// Flush previously queued deferred repoints BEFORE streaming or yielding
+	// cr.mu between chunks; in-pass deferred repoints are handed back across
+	// each inter-chunk yield so concurrent repo lanes never certify on an empty
+	// bridge while their dataflow edges remain unapplied.
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			stats.WriteRefused = true
+			return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+		}
+	}
+	// Flush deferred moves on non-refusal exits (e.g. cancellation after chunk 1
+	// committed), but never fire back into a contended writer gate after a
+	// refusal — keep idx.deferred for retry instead.
+	defer func() {
+		if errors.Is(retErr, ErrReindexWriteRefused) || (retStats != nil && retStats.WriteRefused) {
+			return
+		}
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			if retStats != nil {
+				retStats.WriteRefused = true
+			}
+			if retErr == nil {
+				retErr = fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+			}
+		}
+	}()
 	if err := cr.resolveTrackedNpmImports(ctx, graph.EdgesLightSeq(cr.graph, graph.EdgeImports), stats); err != nil {
 		return stats, err
 	}
@@ -433,6 +831,12 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	pendingLoaded.Store(int64(len(pending)))
 	if len(pending) == 0 && streamDone {
+		if cr.placeholderSrcIdx.hasDeferred() {
+			if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+				stats.WriteRefused = true
+				return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+			}
+		}
 		return stats, nil
 	}
 
@@ -579,27 +983,40 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 				if cr.validateLiveness {
 					scBatch = cr.filterLiveReindex(scBatch)
 				}
-				cr.graph.ReindexEdges(scBatch)
-				// Moves wait for the last page, as in ResolveAll
-				// (placeholderSourceIndex.deferRepoints).
-				cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
-				reindexTotal += len(scBatch)
-				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+				if len(scBatch) > 0 {
+					if !cr.applyReindexEdges(scBatch) {
+						stats.WriteRefused = true
+						return stats, fmt.Errorf("%w: %d cross-repo edge(s)", ErrReindexWriteRefused, len(scBatch))
+					}
+					// Moves wait for the last page, as in ResolveAll
+					// (placeholderSourceIndex.deferRepoints).
+					cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch, cr.inMemoryRepoForEdge)
+					reindexTotal += len(scBatch)
+					DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+				}
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
+				bridge.releaseForYield()
+				yieldHook := cr.chunkYieldHook
 				cr.mu.Unlock()
+				if yieldHook != nil {
+					yieldHook()
+				}
 				runtime.Gosched()
 				cr.mu.Lock()
-				if err := ctx.Err(); err != nil {
-					return stats, err
-				}
+				mutated := !revKnown
 				if revKnown {
 					if revAfter, _ := loadMutationRevision(cr.graph); revAfter != revBefore {
+						mutated = true
 						// An interleaving writer may have created nodes or
 						// changed name buckets; drop cross-page retention.
 						cr.hotCache.flush()
 					}
+				}
+				bridge.reabsorb(RetryTakeOpts{AllRepos: true}, mutated)
+				if err := ctx.Err(); err != nil {
+					return stats, err
 				}
 			}
 		}
@@ -617,7 +1034,10 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 		}
 		pendingLoaded.Add(int64(len(pending)))
 	}
-	cr.placeholderSrcIdx.applyDeferred(cr.graph)
+	if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+		stats.WriteRefused = true
+		return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
+	}
 	stopProgress()
 	cr.logger.Info("cross-repo resolve: compute done",
 		zap.Int64("pending", pendingLoaded.Load()),
@@ -630,16 +1050,28 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 // ResolveForRepo resolves only unresolved edges originating from nodes
 // in the specified repository.
 func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
+	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	retryOpts := cr.retryOptsForRepoLocked(repoPrefix)
+	allowedRepoint := cr.allowedRepointFuncForOptsLocked(retryOpts)
+	bridge := cr.beginRetryBridgeLocked(retryOpts, func() bool { return stats != nil && stats.WriteRefused })
+	defer bridge.finish()
 	// One backend query for every out-edge from this repo's nodes,
 	// instead of GetRepoNodes followed by GetOutEdges per node. On
 	// disk backends (SQLite, DuckDB) the per-node loop
 	// was O(repo_nodes) round-trips per pass — single-digit minutes
 	// of warmup on a multi-repo workspace where this method runs
 	// once per tracked repo.
-	stats := cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
-	DetectCrossRepoEdgesForRepos(cr.graph, []string{repoPrefix})
+	stats = cr.resolveScopedLocked(cr.graph.GetRepoEdges(repoPrefix))
+	if !stats.WriteRefused && cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredForScopeApplied(cr.graph, allowedRepoint); !ok {
+			stats.WriteRefused = true
+		}
+	}
+	if !stats.WriteRefused {
+		DetectCrossRepoEdgesForRepos(cr.graph, []string{repoPrefix})
+	}
 	return stats
 }
 
@@ -663,29 +1095,76 @@ func (cr *CrossRepoResolver) ResolveForRepo(repoPrefix string) *CrossRepoStats {
 // that point at symbols newly defined by the changed files. ResolveForRepo
 // remains for callers that explicitly request a repository-wide recompute.
 func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRepoStats {
+	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	graphPath := relPath
 	if repoPrefix != "" && relPath != repoPrefix && !strings.HasPrefix(relPath, repoPrefix+"/") {
 		graphPath = repoPrefix + "/" + strings.TrimPrefix(relPath, "/")
 	}
-	nodes := cr.graph.GetFileNodes(graphPath)
-	if len(nodes) == 0 {
-		return &CrossRepoStats{ByRepo: make(map[string]int)}
+	var retryOpts RetryTakeOpts
+	if repoPrefix != "" {
+		retryOpts = cr.retryOptsForRepoLocked(repoPrefix)
+	} else {
+		retryOpts = cr.retryOptsForFilesLocked([]string{graphPath})
 	}
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		if n != nil {
-			ids = append(ids, n.ID)
+	allowedRepoint := cr.allowedRepointFuncForOptsLocked(retryOpts)
+	var drainRefused bool
+	bridge := cr.beginRetryBridgeLocked(retryOpts, func() bool { return (stats != nil && stats.WriteRefused) || drainRefused })
+	defer bridge.finish()
+	nodes := cr.graph.GetFileNodes(graphPath)
+	if len(nodes) > 0 {
+		ids := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n != nil {
+				ids = append(ids, n.ID)
+			}
+		}
+		var edges []*graph.Edge
+		for _, es := range cr.graph.GetOutEdgesByNodeIDs(ids) {
+			edges = append(edges, es...)
+		}
+		stats = cr.resolveScopedLocked(edges)
+		if !stats.WriteRefused {
+			DetectCrossRepoEdgesForFiles(cr.graph, []string{graphPath})
 		}
 	}
-	var edges []*graph.Edge
-	for _, es := range cr.graph.GetOutEdgesByNodeIDs(ids) {
-		edges = append(edges, es...)
+	if !stats.WriteRefused && cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.flushMatchingDirectApplied(
+			cr.graph,
+			func(rp graph.PlaceholderRepoint) bool { return rp.FilePath == graphPath },
+			cr.passReindexMaxWait,
+		); !ok {
+			stats.WriteRefused = true
+		}
 	}
-	stats := cr.resolveScopedLocked(edges)
-	DetectCrossRepoEdgesForFiles(cr.graph, []string{graphPath})
+	if !stats.WriteRefused {
+		cr.drainNonFrontierRepointsLocked(allowedRepoint, &drainRefused)
+	}
 	return stats
+}
+
+func (cr *CrossRepoResolver) drainNonFrontierRepointsLocked(allowedRepoint func(graph.PlaceholderRepoint) bool, drainRefused *bool) {
+	if !cr.placeholderSrcIdx.hasDeferred() {
+		return
+	}
+	if _, ok := cr.placeholderSrcIdx.flushBoundedDirectApplied(
+		cr.graph,
+		incrementalFlushRepointBudget,
+		allowedRepoint,
+		opportunisticDrainWriteTimeout,
+	); !ok {
+		*drainRefused = true
+	}
+	if *drainRefused && cr.logger != nil {
+		if cr.takeRetryState == nil && cr.saveRetryState == nil {
+			cr.logger.Warn("cross-repo resolver: opportunistic retry drain refused under contention; keeping tail queued",
+				zap.Int("remaining_repoints", len(cr.placeholderSrcIdx.deferred)))
+		} else {
+			cr.logger.Info("cross-repo resolver: opportunistic retry drain deferred under contention",
+				zap.Int("remaining_repoints", len(cr.placeholderSrcIdx.deferred)))
+		}
+	}
 }
 
 // resolveScopedLocked lifts every unresolved target among edges to its
@@ -694,7 +1173,10 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 // scopes. Caller holds cr.mu.
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	_ = cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats)
+	if err := cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats); err != nil {
+		stats.WriteRefused = true
+		return stats
+	}
 	pending := make([]*graph.Edge, 0, len(edges))
 	for _, edge := range edges {
 		if edge != nil && graph.IsUnresolvedTarget(edge.To) {
@@ -719,10 +1201,16 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 		cr.resolveEdge(edge, stats, &reindexBatch)
 	}
 	if len(reindexBatch) > 0 {
-		cr.graph.ReindexEdges(reindexBatch)
+		if !cr.applyReindexEdges(reindexBatch) {
+			stats.WriteRefused = true
+			return stats
+		}
 		// nil index: scoped batches are repo- or file-sized, direct
 		// probes beat a whole-graph placeholder-source stream.
-		reconcilePlaceholderSources(cr.graph, nil, reindexBatch)
+		if _, ok := reconcilePlaceholderSourcesWithWindow(cr.graph, nil, reindexBatch, cr.passReindexMaxWait); !ok {
+			cr.placeholderSrcIdx.retainRepoints(repointsFromReindexes(reindexBatch, cr.inMemoryRepoForEdge))
+			stats.WriteRefused = true
+		}
 	}
 	return stats
 }
@@ -1262,6 +1750,9 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 	}
 
 	if e.To != oldTo {
+		if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+			delete(e.Meta, "guard_reverted")
+		}
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		cr.noteRetargetedCall(e)
 	}

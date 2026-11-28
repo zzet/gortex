@@ -68,15 +68,20 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 	readsBefore, readWallBefore := fileNodeReadStats(r.graph)
 	rebindStarted := time.Now()
 	rebound := false
-	if rebinder, ok := r.graph.(graph.GoMethodReceiverBatchRebinder); ok {
-		if _, err := rebinder.RebindGoMethodReceiversForFiles(frontier.paths); err == nil {
-			rebound = true
-		} else {
-			r.logger.Warn("resolver: backend batch Go receiver rebind failed; using cached fallback", zap.Error(err))
+	if r.passReindexMaxWait == 0 {
+		if rebinder, ok := r.graph.(graph.GoMethodReceiverBatchRebinder); ok {
+			if _, err := rebinder.RebindGoMethodReceiversForFiles(frontier.paths); err == nil {
+				rebound = true
+			} else {
+				r.logger.Warn("resolver: backend batch Go receiver rebind failed; using cached fallback", zap.Error(err))
+			}
 		}
 	}
 	if !rebound {
 		for _, path := range frontier.paths {
+			if r.writeRefused() {
+				return
+			}
 			r.rebindGoMethodReceiversForFile(path)
 		}
 	}
@@ -91,15 +96,33 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 			zap.Duration("rebind_receivers_file_node_read_wall", readWall),
 			zap.Duration("rebind_receivers_outside_file_node_reads", wall-readWall))
 	}
+	if r.writeRefused() {
+		return
+	}
 	for _, path := range frontier.paths {
+		if r.writeRefused() {
+			return
+		}
 		r.bindBareNameScopeRefsForFile(path)
 	}
 	legs.lap("bare_name_scope")
+	if r.writeRefused() {
+		return
+	}
 	for _, path := range frontier.paths {
+		if r.writeRefused() {
+			return
+		}
 		r.bindDataflowCalleeRefsForFile(path)
 	}
 	legs.lap("dataflow_callee")
+	if r.writeRefused() {
+		return
+	}
 	for _, path := range frontier.paths {
+		if r.writeRefused() {
+			return
+		}
 		r.bindGenericParamRefsForFile(path)
 	}
 	legs.lap("generic_params")
@@ -107,6 +130,9 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 	// before the builtin and external materialisation passes inspect them.
 	r.flushIncrementalAttributionReindexes()
 	legs.lap("flush")
+	if r.writeRefused() {
+		return
+	}
 
 	if !r.graphHasLanguage("go") {
 		return
@@ -115,6 +141,9 @@ func (r *Resolver) runFileAttributionPassesForFilesLocked(frontier incrementalFi
 	legs.lap("out_edges")
 	r.attributeGoBuiltinCandidates(candidates)
 	legs.lap("builtin")
+	if r.writeRefused() {
+		return
+	}
 	seen := make(map[extKey]struct{})
 	for _, edge := range candidates {
 		collectGoExternalTarget(edge, seen)
@@ -128,13 +157,18 @@ func (r *Resolver) flushIncrementalAttributionReindexes() {
 	// Release the resolver-owned backing array before entering the store. Every
 	// emitted chunk is still referenced by batch until its write completes.
 	r.incrementalAttributionReindex = nil
+	if len(batch) == 0 || r.writeRefused() {
+		return
+	}
 	r.noteImportEdgeReindexes(batch)
 	for len(batch) > 0 {
 		n := attributionReindexBatchSize
 		if len(batch) < n {
 			n = len(batch)
 		}
-		r.graph.ReindexEdges(batch[:n])
+		if !r.applyReindexEdges(batch[:n]) {
+			return
+		}
 		batch = batch[n:]
 	}
 }
@@ -147,7 +181,7 @@ func (r *Resolver) clearIncrementalAttributionCache() {
 }
 
 func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
-	if len(batch) == 0 {
+	if len(batch) == 0 || r.writeRefused() {
 		return
 	}
 	r.noteImportEdgeReindexes(batch)
@@ -157,7 +191,9 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 			if len(batch) < n {
 				n = len(batch)
 			}
-			r.graph.ReindexEdges(batch[:n])
+			if !r.applyReindexEdges(batch[:n]) {
+				return
+			}
 			batch = batch[n:]
 		}
 		return
@@ -166,6 +202,9 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 	for len(batch) > 0 {
 		if len(r.incrementalAttributionReindex) >= attributionReindexBatchSize {
 			r.flushIncrementalAttributionReindexes()
+			if r.writeRefused() {
+				return
+			}
 		}
 		room := attributionReindexBatchSize - len(r.incrementalAttributionReindex)
 		n := room
@@ -176,6 +215,9 @@ func (r *Resolver) persistAttributionReindexes(batch []graph.EdgeReindex) {
 		batch = batch[n:]
 		if len(r.incrementalAttributionReindex) == attributionReindexBatchSize {
 			r.flushIncrementalAttributionReindexes()
+			if r.writeRefused() {
+				return
+			}
 		}
 	}
 }

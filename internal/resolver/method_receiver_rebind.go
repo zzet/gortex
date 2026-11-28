@@ -81,12 +81,14 @@ func (r *Resolver) rebindGoMethodReceivers() {
 // dominant per-edit cost on a large graph). dirIndex (built by
 // buildPassIndexes before this runs) supplies the package's files.
 func (r *Resolver) rebindGoMethodReceiversForFile(filePath string) {
-	if rebinder, ok := r.graph.(graph.GoMethodReceiverRebinder); ok {
-		if _, err := rebinder.RebindGoMethodReceivers(filePath); err == nil {
-			return
-		} else {
-			r.logger.Warn("resolver: backend scoped Go receiver rebind failed; using graph fallback",
-				zap.String("file", filePath), zap.Error(err))
+	if r.passReindexMaxWait == 0 {
+		if rebinder, ok := r.graph.(graph.GoMethodReceiverRebinder); ok {
+			if _, err := rebinder.RebindGoMethodReceivers(filePath); err == nil {
+				return
+			} else {
+				r.logger.Warn("resolver: backend scoped Go receiver rebind failed; using graph fallback",
+					zap.String("file", filePath), zap.Error(err))
+			}
 		}
 	}
 

@@ -75,9 +75,12 @@ func (r *Resolver) resolveJavaOverrideDispatchCandidates(candidates overrideDisp
 		if j.edge.Meta == nil {
 			j.edge.Meta = map[string]any{}
 		}
+		delete(j.edge.Meta, "guard_reverted")
 		j.edge.Meta[graph.MetaSpeculative] = true
 		j.edge.Meta["dispatch"] = "override"
-		g.ReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}})
+		if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
+			break
+		}
 		n++
 		for _, o := range j.others {
 			g.AddEdge(&graph.Edge{

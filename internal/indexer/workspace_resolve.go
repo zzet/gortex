@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -500,6 +501,12 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	cr.SetNpmPackageLookup(mi.npmPackageLookup())
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	cr.SetRetryStateBridge(
+		mi.takePendingCrossRepoRepoints,
+		mi.savePendingCrossRepoRepoints,
+		mi.hasPendingCrossRepoForRepo,
+		mi.knownRepoPrefixes,
+	)
 	mi.applyRemoteStitch(cr)
 	return cr
 }
@@ -528,8 +535,14 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 		}
 		mi.synthesizeDeferredGoModuleCalls(idx, edges)
 	}
-	if _, err := cr.ResolveAllContext(ctx); err != nil {
-		return err
+	_, resolveErr := cr.ResolveAllContext(ctx)
+	if resolveErr != nil && !errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+		return resolveErr
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
@@ -538,7 +551,7 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	// fallback lane runs with no global test-edges pass behind it.
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
-	return nil
+	return resolveErr
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
@@ -546,29 +559,37 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 // and the topology-writer gates of every repository the mutation can affect, so
 // the graph cannot expose a half-resolved batch between same-repo, semantic,
 // and cross-repository phases.
-func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
-	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
+func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles, observe, 0)
+}
+
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time), maxWait time.Duration) *resolver.CrossRepoStats {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
-		return
+		return nil
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
-		return
+		return nil
 	}
-	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	stats := cr.ResolveMutationFrontiersObservedWithTimeout(resolutionFiles, edgeSourceFiles, definitionFiles, observe, maxWait)
+	if maxWait > 0 && stats != nil && stats.WriteRefused {
+		return stats
+	}
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return stats
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

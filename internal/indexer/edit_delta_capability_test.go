@@ -34,21 +34,27 @@ var _ graph.FileIdentityBatchEvicter = (*graph.DeltaWriter)(nil)
 // deliberately does not implement, with the reason. The reason names what
 // the engine does instead.
 var editDeltaAbsentCapabilities = map[string]string{
+	"indexer.aliasStateStore":        "the delta pins the build's alias snapshot and checks the base digest when available; a per-file delta cannot certify a repository-wide rebind or write a receipt to its base",
+	"indexer.aliasInputStore":        "config inputs are persisted only beside a certified digest, which a per-file delta never writes; the delta reuses the snapshot the build pinned",
+	"indexer.tsAliasCallerInventory": "beginAliasPass returns before the gate for a DeltaWriter; deltaMayUseAliases asks the base store for the same inventory",
+
 	"graph.FoldedNameCandidateReader": "handler-only coherent candidate/payload snapshot; mutable DeltaWriter owns neither a physical read transaction nor a frozen delta layer, so the name-only handler refuses unsupported composition instead of forwarding base-only complete absence",
 	"anonymous{DBStats}":              "physical durable-store file-size telemetry; full-shadow drain samples a real store, whereas DeltaWriter stages per-file changes without owning a database or WAL file",
 
 	"anonymous{BulkLoadWindow}":        "physical durable-store full-shadow window telemetry; DeltaWriter stages per-file changes and does not own a cold or generation bulk window",
 	"anonymous{RecordFirstIndexDrain}": "physical durable-store full-shadow completion telemetry; a per-file DeltaWriter has no full-shadow drain to record and must not forward writes to its base",
 
-	"graph.BFSAdmissionReader":            "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
-	"graph.FilteredBFSAdmissionReader":    "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
-	"graph.KindAdjacencyReader":           "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",
-	"graph.CallAncestorReader":            "optional native recursive closure; CallAncestorsOf walks the delta's composed incoming adjacency and hydrates selected source identities",
-	"graph.ScopedOutlineNodeReader":       "optional indexed scoped names/membership; the scoped-name helper keeps composed FindNodesByName and intersects NodeScope without reaching a physical store",
-	"graph.ExternalCallCandidateIterator": "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
-	"anonymous{ReindexEdgesApplied}":      "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
-	"anonymous{AddBatchChecked}":          "checked durable publication: DeltaWriter stages non-failing writes in its local work graph through AddBatch; its owner checks final layer publication, and forwarding this capability would bypass the delta",
-	"anonymous{WriteMark}":                "process/store write telemetry, not a graph capability: the per-save indexer and resolver receive the underlying store handle's sampler explicitly; a MultiIndexer without this optional sampler falls back to process-wide counters",
+	"graph.BFSAdmissionReader":                       "optional selected-reader traversal snapshot; the query engine retains its composed point-walk admission when a delta has no snapshot accelerator",
+	"graph.FilteredBFSAdmissionReader":               "physical indexed scoped traversal; forwarding it would discard delta ownership, so the engine keeps composed Go admission instead",
+	"graph.KindAdjacencyReader":                      "optional typed adjacency accelerator; ReadKindAdjacency filters the delta's composed point reads instead of forwarding physical rows past delta ownership",
+	"graph.CallAncestorReader":                       "optional native recursive closure; CallAncestorsOf walks the delta's composed incoming adjacency and hydrates selected source identities",
+	"graph.ScopedOutlineNodeReader":                  "optional indexed scoped names/membership; the scoped-name helper keeps composed FindNodesByName and intersects NodeScope without reaching a physical store",
+	"graph.ExternalCallCandidateIterator":            "read accelerator: external-call candidates fall back to the composed edge-kind scan, preserving delta masks",
+	"anonymous{ReindexEdgesApplied}":                 "batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+	"anonymous{ReindexEdgesTryApplied}":              "bounded-wait batch-drop receipt for persistent stores; DeltaWriter applies its reindexes locally and unconditionally through ReindexEdges",
+	"anonymous{ReindexUnresolvedEdgeTargetsApplied}": "batch-drop receipt for persistent stores implementing graph.UnresolvedEdgeTargetBatchReindexer; DeltaWriter omits that optional capability so callers fall back to ReindexEdges locally and unconditionally",
+	"anonymous{AddBatchChecked}":                     "checked durable publication: DeltaWriter stages non-failing writes in its local work graph through AddBatch; its owner checks final layer publication, and forwarding this capability would bypass the delta",
+	"anonymous{WriteMark}":                           "process/store write telemetry, not a graph capability: the per-save indexer and resolver receive the underlying store handle's sampler explicitly; a MultiIndexer without this optional sampler falls back to process-wide counters",
 
 	"graph.ContractExtractionEdgeReader":                   "physical checked extraction adjacency; outgoingMetadataContext dispatches the composed DeltaWriter through its selected view rather than forwarding base-only rows",
 	"graph.OverlayLayerContractExtractionEdgeReader":       "physical ancestry-layer projection, not the composed delta; outgoingMetadataContext applies each selected layer and its masks explicitly",

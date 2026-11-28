@@ -147,7 +147,8 @@ type storeCore struct {
 	// busyRetryTimeout is the whole-transaction contention budget. The zero
 	// value selects defaultSQLiteBusyRetryTimeout; tests shorten it to exercise
 	// persistent-lock exhaustion deterministically.
-	busyRetryTimeout time.Duration
+	busyRetryTimeout         time.Duration
+	busyRetryTimeoutOverride atomic.Int64
 
 	// passiveCheckpointTimeout bounds one periodic PASSIVE checkpoint. The zero
 	// value selects walPassiveCheckpointTimeout; tests shorten it to exercise
@@ -2895,14 +2896,23 @@ func (s *Store) ReindexEdges(batch []graph.EdgeReindex) {
 // ReindexEdgesApplied reports a dropped writer-gate batch to retry-aware callers.
 // Fatal store failures retain ReindexEdges' existing panic contract.
 func (s *Store) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
-	for _, r := range batch {
-		if r.Edge != nil && graph.IsUnresolvedTarget(r.Edge.To) {
-			s.unresolvedInserts.Add(1)
-		}
-	}
-	if _, err := s.reindexEdgesSetOriented(batch); err != nil {
-		if errors.Is(err, errReindexWriterGateContended) {
-			log.Printf("store_sqlite: reindex writer gate contended, dropping %d rebind(s) — a later resolve pass rebinds them: %v", len(batch), err)
+	return s.reindexEdgesAppliedWithWindow(batch, 0)
+}
+
+// ReindexEdgesTryApplied applies batch using a bounded contention wait window
+// (clamped to the store's configured busy retry window) for opportunistic
+// background drains. Both writer-gate contention and SQLite busy exhaustion
+// return false quietly without escalating to panicOnFatal.
+func (s *Store) ReindexEdgesTryApplied(batch []graph.EdgeReindex, maxWait time.Duration) bool {
+	return s.reindexEdgesAppliedWithWindow(batch, maxWait)
+}
+
+func (s *Store) reindexEdgesAppliedWithWindow(batch []graph.EdgeReindex, maxWait time.Duration) bool {
+	if _, err := s.reindexEdgesSetOrientedWithWindow(batch, maxWait); err != nil {
+		if errors.Is(err, errReindexWriterGateContended) || (maxWait > 0 && errors.Is(err, errSQLiteBusyRetryExhausted)) {
+			if maxWait <= 0 {
+				log.Printf("store_sqlite: reindex writer gate contended, dropping %d rebind(s) — a later resolve pass rebinds them: %v", len(batch), err)
+			}
 			return false
 		}
 		panicOnFatal(err)

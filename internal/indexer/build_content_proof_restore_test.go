@@ -486,8 +486,8 @@ func TestACodeownersMovedAndRestoredTearsTheBuild(t *testing.T) {
 // indexed). What differs is only the wall-clock second the index ran at.
 //
 // The index also leaves one thing behind outside the store: the process-wide
-// alias-scope cache entry for the checkout's root (tsAliasCache, never
-// invalidated), which a later build resolves through instead of scanning the
+// alias-scope cache entry for the checkout's root, which a later build
+// resolves through instead of scanning the
 // working copy — a different proof path. checkout loads that entry at the
 // same point the index would have, so the builds take the same path.
 type sideInputBase struct {

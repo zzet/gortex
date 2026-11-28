@@ -24,6 +24,7 @@ import (
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
 	"github.com/zzet/gortex/internal/pathguard"
 	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/resolver"
 )
 
 // ChangeKind describes the type of filesystem change.
@@ -329,6 +330,7 @@ const (
 	maxHistory             = 1000
 	mutationRetryBaseDelay = 100 * time.Millisecond
 	mutationRetryMaxDelay  = 5 * time.Second
+	maxPointRebindRetries  = 2
 )
 
 func retryableMutationError(err error) bool {
@@ -336,7 +338,7 @@ func retryableMutationError(err error) bool {
 	if errors.As(err, &committed) && committed.Committed() {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, resolver.ErrReindexWriteRefused)
 }
 
 func mutationRetryBackoff(attempt int) time.Duration {
@@ -2335,7 +2337,11 @@ func (w *Watcher) runPointMutationAttempt(path string, kind ChangeKind, generati
 	if w.pointMutationPatch != nil {
 		patchErr = w.pointMutationPatch(path, kind, generation)
 	} else {
-		patchErr = w.patchGraphWithReceiptStateObserved(path, kind, generation, false, &fanout, publication)
+		// Retry attempts must bypass the pointDuplicateSourceContent fast path:
+		// a prior attempt that failed after persisting file_meta/fileMtimes
+		// (e.g. ErrReindexWriteRefused during resolution) still needs re-resolution.
+		// The receipt itself is unchecked, so point preparation stays available.
+		patchErr = w.patchGraphPointAttempt(path, kind, generation, false, retryAttempt > 0, &fanout, publication)
 	}
 	var storageErr *store_sqlite.StorageError
 	if errors.As(patchErr, &storageErr) {
@@ -2363,6 +2369,14 @@ func (w *Watcher) runPointMutationAttempt(path string, kind ChangeKind, generati
 		return
 	}
 	if !retryableMutationError(patchErr) {
+		return
+	}
+	if errors.Is(patchErr, resolver.ErrReindexWriteRefused) && retryAttempt >= maxPointRebindRetries {
+		if w.pointMutationPatch == nil {
+			w.markRefusedRelationTiers(path, generation, false)
+			patchErr = nil
+		}
+		w.finishGeneration(path, generation)
 		return
 	}
 	if w.schedulePointMutationRetry(path, kind, generation, retryAttempt+1) {
@@ -2468,9 +2482,12 @@ func (w *Watcher) completeMutationWaitersObserved(
 	}
 	var completions []completion
 	var accepted *PublicationPhaseRecord
+	var cleanGen uint64
 	for generation, waiter := range w.mutationWaiters[path] {
 		if generation <= appliedGeneration {
-			w.finishMutationTierLocked(path, waiter.ticket, err, fanout)
+			if w.finishMutationTierLocked(path, waiter.ticket, err, fanout) && generation > cleanGen {
+				cleanGen = generation
+			}
 			if err == nil && generation < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2483,6 +2500,11 @@ func (w *Watcher) completeMutationWaitersObserved(
 			}
 			completions = append(completions, completion{requested: generation, done: waiter.done, publication: waiter.publication})
 			delete(w.mutationWaiters[path], generation)
+		}
+	}
+	if cleanGen > 0 {
+		if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= cleanGen {
+			delete(w.failedPaths, path)
 		}
 	}
 	if len(w.mutationWaiters[path]) == 0 {
@@ -2841,10 +2863,29 @@ func (w *Watcher) drainStormObserved(timer *mutationSetTimerObservation) (finish
 		drained(len(batch))
 	}
 	if retryableMutationError(err) {
-		if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
-			return
+		if errors.Is(err, resolver.ErrReindexWriteRefused) && retryAttempt >= maxPointRebindRetries {
+			if result != nil {
+				var failedSet map[string]struct{}
+				if len(result.FailedFiles) > 0 {
+					failedSet = make(map[string]struct{}, len(result.FailedFiles))
+					for _, f := range result.FailedFiles {
+						failedSet[filepath.Clean(f)] = struct{}{}
+					}
+				}
+				for p, gen := range generations {
+					if _, failed := failedSet[filepath.Clean(p)]; failed {
+						continue
+					}
+					w.markRefusedRelationTiers(p, gen, false)
+				}
+				err = nil
+			}
+		} else {
+			if w.scheduleStormMutationRetry(batch, generations, retryAttempt+1, explicit) {
+				return
+			}
+			err = errWatcherStopped
 		}
-		err = errWatcherStopped
 	}
 	w.completeStormMutationWaiters(generations, result, err, fanout)
 	completed = err == nil && result != nil
@@ -2944,11 +2985,14 @@ func (w *Watcher) completeStormMutationWaiters(
 		if pathErr != nil {
 			pathFanout = DerivedFanoutCompleteness{}
 		}
+		var cleanGen uint64
 		for requestedGeneration, waiter := range w.mutationWaiters[path] {
 			if requestedGeneration > appliedGeneration {
 				continue
 			}
-			w.finishMutationTierLocked(path, waiter.ticket, pathErr, pathFanout)
+			if w.finishMutationTierLocked(path, waiter.ticket, pathErr, pathFanout) && requestedGeneration > cleanGen {
+				cleanGen = requestedGeneration
+			}
 			if pathErr == nil && requestedGeneration < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2963,6 +3007,11 @@ func (w *Watcher) completeStormMutationWaiters(
 				},
 			})
 			delete(w.mutationWaiters[path], requestedGeneration)
+		}
+		if cleanGen > 0 {
+			if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= cleanGen {
+				delete(w.failedPaths, path)
+			}
 		}
 		if len(w.mutationWaiters[path]) == 0 {
 			delete(w.mutationWaiters, path)
@@ -3091,6 +3140,22 @@ func (w *Watcher) patchGraphWithReceiptStateObserved(
 	fanout *DerivedFanoutCompleteness,
 	publication *pointPublicationAttempt,
 ) error {
+	return w.patchGraphPointAttempt(path, kind, generation, receiptChecked, false, fanout, publication)
+}
+
+// patchGraphPointAttempt runs one point mutation. retry marks a watcher retry
+// of a failed attempt: it skips the duplicate-content gate, because the failed
+// attempt may have persisted the file's metadata before its resolution was
+// refused, but unlike receiptChecked it keeps point preparation.
+func (w *Watcher) patchGraphPointAttempt(
+	path string,
+	kind ChangeKind,
+	generation uint64,
+	receiptChecked bool,
+	retry bool,
+	fanout *DerivedFanoutCompleteness,
+	publication *pointPublicationAttempt,
+) error {
 	if !w.generationCurrent(path, generation) {
 		return errMutationSuperseded
 	}
@@ -3101,7 +3166,7 @@ func (w *Watcher) patchGraphWithReceiptStateObserved(
 	// the raw patch.
 	laneCtx, cancelLane := w.mutationLaneContext()
 	laneCtx = publication.withContext(laneCtx)
-	preparation := &watcherPointPreparation{watcher: w, path: path, kind: kind, generation: generation, receiptChecked: receiptChecked}
+	preparation := &watcherPointPreparation{watcher: w, path: path, kind: kind, generation: generation, receiptChecked: receiptChecked, retry: retry}
 	err := w.indexer.coordinateRepositoryMutationPreparedSource(laneCtx, OutputEntryWatcherPatchGraph, preparation, func(observe func(*OutputSourceContent)) error {
 		idx := w.currentMutationIndexer()
 		if idx == nil {
@@ -3208,9 +3273,10 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	writes := idx.writeCounterMark()
 	kind = w.reconcileKindWithDisk(path, kind)
 	// A startup replay that already checked a receipt still forces its original
-	// exact path. Otherwise the persisted hash/size/version gate identifies a
-	// duplicate; only its checked source proof may restore the prior witness.
-	if kind == ChangeModified && !receiptChecked {
+	// exact path, and a watcher retry re-runs a failed attempt in full.
+	// Otherwise the persisted hash/size/version gate identifies a duplicate;
+	// only its checked source proof may restore the prior witness.
+	if kind == ChangeModified && !receiptChecked && !preparation.isRetry() && !idx.hasPendingResolutionRetry() {
 		duplicate, content := idx.pointDuplicateSourceContent(ctx, path)
 		if duplicate {
 			if observe != nil && content != nil {
@@ -3268,6 +3334,9 @@ func (w *Watcher) patchGraphWithReceiptStateRawSource(
 	result, err := w.reindexPointPathRaw(idx, path, generation, PublicationStampsFrom(ctx), preparation)
 	stamps.switchAttemptControlAt(patchAttemptFinalize, markPointPublication(ctx, PublicationPatchExecutionFinished))
 	observed := observation.close()
+	if result != nil && len(result.FailedFiles) > 0 && (err == nil || errors.Is(err, resolver.ErrReindexWriteRefused)) {
+		return fmt.Errorf("watcher: exact-path reindex failed for %s", strings.Join(result.FailedFiles, ", "))
+	}
 	if err != nil {
 		// A failed patch publishes no fan-out verdict. Whatever the bounded
 		// pass did before the failure, the mutation the caller asked for did

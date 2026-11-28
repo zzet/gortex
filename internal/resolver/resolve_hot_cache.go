@@ -154,6 +154,24 @@ func (c *resolveHotCache) getNode(id string) (*graph.Node, bool) {
 	return nil, false
 }
 
+// peekNode returns a cached node without updating hit/miss counters or mutating
+// rotation state. Used for read-only metadata lookups (such as RepoPrefix) on
+// serial apply paths.
+func (c *resolveHotCache) peekNode(id string) (*graph.Node, bool) {
+	if c == nil || id == "" {
+		return nil, false
+	}
+	if n, ok := c.cur.nodes[id]; ok {
+		return n, true
+	}
+	if c.prev != nil {
+		if n, ok := c.prev.nodes[id]; ok {
+			return n, true
+		}
+	}
+	return nil, false
+}
+
 // putNode caches a positive node row. Negatives stay page-local: the caller's
 // authoritative-negative machinery already bounds their lifetime.
 func (c *resolveHotCache) putNode(n *graph.Node) {

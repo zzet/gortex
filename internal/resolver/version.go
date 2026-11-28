@@ -45,7 +45,8 @@ import (
 // cascade, changing import edges for an unchanged corpus.
 // Direct named JS/TS import bindings now disambiguate otherwise competing files,
 // and lexically shadowed bare calls no longer bind by name.
-const ResolutionSemanticsVersion = 9
+// Relative tsconfig extends can change bindings without changing source bytes.
+const ResolutionSemanticsVersion = 10
 
 // resolverVersionDomain versions the ENCODING below, not the contract. Two
 // fingerprints that disagree about how the preimage is rendered must not be
