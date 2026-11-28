@@ -153,7 +153,8 @@ func TestSelectionReverseImportsTestsRacePlatformsAndReplaceBridge(t *testing.T)
 			t.Errorf("%s selected %v, want %v", target, names, want)
 		}
 	}
-	if len(m.Matrix.Include) != 6 {
+	// mcp and rest on Linux and Windows; the change is not macOS-sensitive.
+	if len(m.Matrix.Include) != 4 || len(macOSRows(m)) != 0 {
 		t.Fatalf("matrix = %v", m.Matrix)
 	}
 	if f.read("go.mod") != original {
@@ -196,8 +197,11 @@ func TestSelectionResourcesDependenciesAndCIAlwaysFull(t *testing.T) {
 			}
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != 17 {
-				t.Fatalf("fallback %s %s", m.Mode, m.Reason)
+			// Module files, workflows and the CI planner can change macOS
+			// behavior; other full-suite fallbacks leave macOS out.
+			macOS := macOSPathRule(path) != ""
+			if m.Mode != "full" || !strings.Contains(m.Reason, path) || len(m.Matrix.Include) != fullRows(t, macOS) || m.MacOS.Selected != macOS {
+				t.Fatalf("fallback %s %s, macOS %+v", m.Mode, m.Reason, m.MacOS)
 			}
 		})
 	}
@@ -236,8 +240,9 @@ func TestSelectionNestedCgoGeneratedAndUnsupportedInputs(t *testing.T) {
 			f.git("reset", "--hard", f.base)
 			f.write(path, text)
 			m := f.plan(f.commit())
-			if m.Mode != "full" || len(m.Matrix.Include) != 17 {
-				t.Fatalf("unsafe input optimized: %s", m.Reason)
+			macOS := path == "leaf/cgo.go"
+			if m.Mode != "full" || len(m.Matrix.Include) != fullRows(t, macOS) || m.MacOS.Selected != macOS {
+				t.Fatalf("unsafe input optimized: %s, macOS %+v", m.Reason, m.MacOS)
 			}
 		})
 	}
@@ -288,7 +293,7 @@ func TestSelectionMainManualOverridesDependabotAndExplicitEmpty(t *testing.T) {
 		event.Base = f.base
 		event.Head = head
 		m, err := f.planner.Plan(t.Context(), event)
-		if err != nil || m.Mode != "full" {
+		if err != nil || m.Mode != "full" || !m.MacOS.Selected || len(m.Matrix.Include) != fullRows(t, true) {
 			t.Fatalf("override %+v: %+v %v", event, m, err)
 		}
 	}
@@ -298,7 +303,7 @@ func TestSelectionMainManualOverridesDependabotAndExplicitEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireAffected(t, m)
-	if !m.EmptyOK || len(m.Matrix.Include) != 0 {
+	if !m.EmptyOK || len(m.Matrix.Include) != 0 || m.MacOS.Selected {
 		t.Fatal(m)
 	}
 }
@@ -376,20 +381,6 @@ func TestManifestRejectsStaleCorruptIncompleteAndContextMismatch(t *testing.T) {
 	data, _ = json.Marshal(fields)
 	if _, err := DecodeManifest(data); err == nil {
 		t.Fatal("incomplete manifest decoded")
-	}
-}
-func TestSelectionDarwinIndexerKeepsWatcherRaceOwner(t *testing.T) {
-	f := newFixture(t)
-	m := f.plan(f.change("internal/indexer/value.go"))
-	requireAffected(t, m)
-	var mac []string
-	for _, row := range m.Matrix.Include {
-		if row.OS == "macos-latest" {
-			mac = append(mac, row.Partition)
-		}
-	}
-	if !slices.Equal(mac, []string{"indexer:1/2", "indexer:2/2", "indexer-race"}) {
-		t.Fatal(mac)
 	}
 }
 func TestPlannerCancellationAndInvalidMetadataDoNotBecomeEmptySuccess(t *testing.T) {

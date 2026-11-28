@@ -44,6 +44,7 @@ type Manifest struct {
 	Census    map[string][]string `json:"census"`
 	Targets   []Target            `json:"targets"`
 	Matrix    Matrix              `json:"matrix"`
+	MacOS     MacOSSelection      `json:"macos"`
 	SHA256    string              `json:"sha256,omitempty"`
 }
 
@@ -59,7 +60,7 @@ func DecodeManifest(data []byte) (Manifest, error) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return m, err
 	}
-	keys := []string{"schema", "head", "base", "mode", "reason", "empty_ok", "toolchain", "module", "packages", "census", "targets", "matrix", "sha256"}
+	keys := []string{"schema", "head", "base", "mode", "reason", "empty_ok", "toolchain", "module", "packages", "census", "targets", "matrix", "macos", "sha256"}
 	if len(fields) != len(keys) {
 		return m, fmt.Errorf("incomplete test selection manifest")
 	}
@@ -454,6 +455,8 @@ func (p *Planner) Plan(ctx context.Context, event Event) (Manifest, error) {
 	}
 	m := Manifest{Schema: 1, Head: event.Head, Base: event.Base, Mode: "full", Packages: map[string][]string{}, Census: map[string][]string{}, Targets: policy.Targets, Matrix: policy.FullMatrix()}
 	var changes []Change
+	var comparisonBase string
+	changesKnown := false
 	switch {
 	case event.Name != "pull_request":
 		m.Reason = "full suite for " + event.Name
@@ -462,11 +465,11 @@ func (p *Planner) Plan(ctx context.Context, event Event) (Manifest, error) {
 	case event.Author == "dependabot[bot]":
 		m.Reason = "full suite for Dependabot dependency updates"
 	default:
-		var comparisonBase string
 		comparisonBase, err = p.testedMergeBase(ctx, event)
 		if err == nil {
 			m.Base = comparisonBase
 			changes, err = p.Changes(ctx, comparisonBase, event.Head)
+			changesKnown = err == nil
 		}
 		if err == nil {
 			for _, c := range changes {
@@ -515,6 +518,16 @@ func (p *Planner) Plan(ctx context.Context, event Event) (Manifest, error) {
 			m.Reason = err.Error()
 		}
 	}
+	m.MacOS = p.planMacOS(ctx, event, comparisonBase, changes, changesKnown)
+	planned := m.Matrix
+	m.Matrix = policy.planMatrix(planned, m.MacOS.Selected)
+	if len(m.Matrix.Include) == 0 && len(planned.Include) > 0 {
+		// Every selected package builds only on macOS: running nothing would
+		// pass a change that no job tested.
+		m.MacOS.Selected = true
+		m.MacOS.Reason = "selected packages have test jobs only on macOS; " + m.MacOS.Reason
+		m.Matrix = planned
+	}
 	if err := ctx.Err(); err != nil {
 		return Manifest{}, err
 	}
@@ -529,7 +542,7 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 	if m.SHA256 != m.Seal() {
 		return nil, fmt.Errorf("test selection integrity check failed")
 	}
-	if m.Schema != 1 || (m.Mode != "full" && m.Mode != "affected") || m.Reason == "" {
+	if m.Schema != 1 || (m.Mode != "full" && m.Mode != "affected") || m.Reason == "" || m.MacOS.Reason == "" {
 		return nil, fmt.Errorf("invalid test selection manifest")
 	}
 	if !slices.Equal(m.Targets, policy.Targets) {
@@ -543,7 +556,7 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 		return nil, fmt.Errorf("stale test selection revision")
 	}
 	if m.Mode == "full" {
-		if m.EmptyOK || len(m.Packages) != 0 || len(m.Census) != 0 || m.Module != "" || m.Toolchain != "" || !slices.Equal(m.Matrix.Include, policy.FullMatrix().Include) {
+		if m.EmptyOK || len(m.Packages) != 0 || len(m.Census) != 0 || m.Module != "" || m.Toolchain != "" || !slices.Equal(m.Matrix.Include, policy.planMatrix(policy.FullMatrix(), m.MacOS.Selected).Include) {
 			return nil, fmt.Errorf("incomplete full-suite manifest")
 		}
 		return nil, nil
@@ -604,8 +617,11 @@ func (p *Planner) Validate(ctx context.Context, m Manifest, target string, packa
 	if !slices.Equal(actualPackages, m.Census[target]) {
 		return nil, fmt.Errorf("native package census changed; refusing incomplete selection")
 	}
-	if !reflect.DeepEqual(m.Matrix, policy.SelectedMatrix(m.Module, m.Packages)) {
+	if !reflect.DeepEqual(m.Matrix, policy.planMatrix(policy.SelectedMatrix(m.Module, m.Packages), m.MacOS.Selected)) {
 		return nil, fmt.Errorf("selected matrix does not cover selected packages")
+	}
+	if len(m.Matrix.Include) == 0 && hasSelected {
+		return nil, fmt.Errorf("selected packages have no test jobs")
 	}
 	return append([]string{}, m.Packages[target]...), nil
 }
@@ -628,6 +644,21 @@ func (m Manifest) Summary() string {
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteString("Full lint, builds and security checks remain enabled.\nAffected-run coverage is partial and is not uploaded as whole-repository coverage.\n")
+	macOS := "omitted"
+	if m.MacOS.Selected {
+		macOS = "selected"
+	}
+	fmt.Fprintf(&b, "macOS test partitions: **%s** (%s)\n\n", macOS, m.MacOS.Reason)
+	for i, match := range m.MacOS.Matched {
+		if i == 20 {
+			fmt.Fprintf(&b, "- ... %d more in test-selection.json\n", len(m.MacOS.Matched)-i)
+			break
+		}
+		fmt.Fprintf(&b, "- `%s`: %s\n", match.Path, match.Rule)
+	}
+	if len(m.MacOS.Matched) > 0 {
+		b.WriteByte('\n')
+	}
+	b.WriteString("Full lint, builds, the macOS build and security checks remain enabled.\nAffected-run coverage is partial and is not uploaded as whole-repository coverage.\n")
 	return b.String()
 }

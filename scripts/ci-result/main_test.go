@@ -14,10 +14,11 @@ import (
 
 // This is one concrete, valid affected-PR receipt. Other scenarios alter the
 // receipt and invoke the production CLI path, rather than reimplement its rules.
+// The PR touches nothing macOS-sensitive, so its plan leaves macOS out.
 func affectedPRNeeds() map[string]ciNeed {
 	return map[string]ciNeed{
 		"plan": {Result: "success", Outputs: map[string]string{
-			"mode": "affected", "has_tests": "true", "empty_ok": "false",
+			"mode": "affected", "has_tests": "true", "empty_ok": "false", "macos": "false",
 		}},
 		"test":               {Result: "success"},
 		"smoke":              {Result: "success"},
@@ -55,15 +56,16 @@ func TestCIResultGateAcceptsValidReceipts(t *testing.T) {
 		outputs     map[string]string
 		results     map[string]string
 	}{
-		{name: "affected PR", event: "pull_request"},
+		{name: "affected PR without macOS", event: "pull_request"},
+		{name: "affected PR with macOS", event: "pull_request", outputs: map[string]string{"macos": "true"}},
 		{name: "explicit empty PR", event: "pull_request",
 			outputs: map[string]string{"has_tests": "false", "empty_ok": "true"},
 			results: map[string]string{"test": "skipped"}},
 		{name: "full PR", event: "pull_request", outputs: map[string]string{"mode": "full"},
 			results: map[string]string{"smoke": "skipped"}},
-		{name: "full main", event: "push", outputs: map[string]string{"mode": "full"},
+		{name: "full main", event: "push", outputs: map[string]string{"mode": "full", "macos": "true"},
 			results: map[string]string{"smoke": "skipped", "benchmark": "skipped"}},
-		{name: "full manual", event: "workflow_dispatch", outputs: map[string]string{"mode": "full"},
+		{name: "full manual", event: "workflow_dispatch", outputs: map[string]string{"mode": "full", "macos": "true"},
 			results: map[string]string{"smoke": "skipped", "benchmark": "skipped", "parser-stress": "success"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -96,18 +98,40 @@ func TestCIResultGateRejectsFailedCancelledOrUnexpectedlySkippedJobs(t *testing.
 	}
 }
 
+// The test job's result covers every matrix row, so a selected macOS
+// partition that fails fails the gate; an unselected one has no row at all.
+func TestCIResultGateRequiresSelectedMacOSPartitions(t *testing.T) {
+	needs := affectedPRNeeds()
+	needs["plan"].Outputs["macos"] = "true"
+	needs["test"] = ciNeed{Result: "failure"}
+	runCIGate(t, "pull_request", needs, "test must be success")
+
+	for _, event := range []string{"push", "workflow_dispatch"} {
+		needs := affectedPRNeeds()
+		needs["plan"].Outputs["mode"] = "full"
+		needs["smoke"] = ciNeed{Result: "skipped"}
+		needs["benchmark"] = ciNeed{Result: "skipped"}
+		if event == "workflow_dispatch" {
+			needs["parser-stress"] = ciNeed{Result: "success"}
+		}
+		runCIGate(t, event, needs, "macOS test partitions must run for "+event)
+	}
+}
+
 func TestCIResultGateRejectsInvalidPlanningOutputs(t *testing.T) {
 	for _, tc := range []struct {
 		name, wantError string
 		outputs         map[string]string
 	}{
 		{name: "unvalidated empty", wantError: "empty test selection was not explicitly validated",
-			outputs: map[string]string{"mode": "affected", "has_tests": "false", "empty_ok": "false"}},
+			outputs: map[string]string{"mode": "affected", "has_tests": "false", "empty_ok": "false", "macos": "false"}},
 		{name: "missing outputs", wantError: "planning outputs are missing or invalid", outputs: map[string]string{}},
 		{name: "invalid has_tests", wantError: "planning outputs are missing or invalid",
-			outputs: map[string]string{"mode": "affected", "has_tests": "oops"}},
+			outputs: map[string]string{"mode": "affected", "has_tests": "oops", "macos": "false"}},
+		{name: "missing macOS decision", wantError: "planning outputs are missing or invalid",
+			outputs: map[string]string{"mode": "affected", "has_tests": "true", "empty_ok": "false"}},
 		{name: "empty full suite", wantError: "empty test selection was not explicitly validated",
-			outputs: map[string]string{"mode": "full", "has_tests": "false", "empty_ok": "true"}},
+			outputs: map[string]string{"mode": "full", "has_tests": "false", "empty_ok": "true", "macos": "false"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			needs := affectedPRNeeds()
@@ -152,7 +176,7 @@ func assertCIWorkflowWiring(t *testing.T, input string) {
 		"CI_FULL_TESTS: ${{ vars.CI_FULL_TESTS }}",
 		"CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}",
 		"fetch-depth: 0", "--selection test-selection.json",
-		"needs.plan.outputs.mode == 'full'", "name: affected-coverage-",
+		"needs.plan.outputs.mode == 'full'", "name: affected-coverage-", "macos: ${{ steps.select.outputs.macos }}",
 		"  build-native:\n", "  lint:\n", "  build-linux-static:\n", "  build-onnx:\n", "  ci-result:\n",
 		"if: always()", "go test -count=1 ./scripts/ci-result", "run: go run ./scripts/ci-result",
 		"go test -count=1 ./internal/citest", "go run ./scripts/ci-select --output test-selection.json",

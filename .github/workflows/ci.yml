@@ -11,8 +11,12 @@ on:
 # One group per PR and one per branch. A new push cancels the PR's older run.
 # On main a running run always finishes; GitHub keeps one pending run per
 # group, so a newer push replaces only the older run that has not started yet.
+#
+# Label events start a run because ci:macos and ci:full change the plan. Any
+# other label gets its own group, so it cannot cancel or replace the PR's
+# run, and every job below skips it (see the label gate on each job).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:macos' && github.event.label.name != 'ci:full' && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Match the release builds, including dependency grammars and C++ scanners (#821).
@@ -39,6 +43,9 @@ jobs:
         run: go test -race -count=50 -timeout=50m ./internal/parser/...
 
   plan:
+    # Label gate: on a label event, only ci:macos and ci:full do work. The
+    # test and smoke jobs need this job, so they skip with it.
+    if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -46,6 +53,7 @@ jobs:
       mode: ${{ steps.select.outputs.mode }}
       has_tests: ${{ steps.select.outputs.has_tests }}
       empty_ok: ${{ steps.select.outputs.empty_ok }}
+      macos: ${{ steps.select.outputs.macos }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,6 +128,8 @@ jobs:
 
   build-native:
     # build-onnx already builds default Linux; always build the other OSes.
+    # The macOS build runs on every PR, even when the macOS tests do not.
+    if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -162,6 +172,7 @@ jobs:
     # Ubuntu 24.04 uses the same GCC 13 generation as goreleaser-cross,
     # so it reproduces the same GLIBCXX floor the
     # dynamic build used to inherit — without pulling that multi-GB image.
+    if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -203,6 +214,7 @@ jobs:
           done
 
   lint:
+    if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -249,6 +261,7 @@ jobs:
           fi
 
   build-onnx:
+    if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -294,7 +307,7 @@ jobs:
 
   benchmark:
     runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -306,17 +319,26 @@ jobs:
         run: go test -run '^$' -bench=. -benchmem -count=1 -benchtime=1x -timeout=20m ./internal/parser/languages/ ./internal/query/ ./internal/graph/
 
   ci-result:
-    name: CI result
+    # A label unrelated to CI starts a run in which every other job skips.
+    # Its gate takes another name, so that run never posts a "CI result"
+    # check over the result of the PR's real run.
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:macos' && github.event.label.name != 'ci:full' && 'CI label event (no work)' || 'CI result' }}
     if: always()
     needs: [plan, test, smoke, build-native, lint, build-linux-static, build-onnx, benchmark, parser-stress]
     runs-on: ubuntu-24.04
     steps:
+      - name: Skip a label that does not change CI
+        if: ${{ !((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full') }}
+        run: echo "This label does not change CI. The pull request's CI result comes from its push or ci:* label run."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
         with:
           go-version-file: go.mod
           cache: false # This small tool needs only the standard library.
       - name: Require the planned tests and all unchanged CI gates
+        if: (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'ci:macos' || github.event.label.name == 'ci:full'
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: go run ./scripts/ci-result
