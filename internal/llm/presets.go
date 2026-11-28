@@ -70,6 +70,15 @@ var gatewayPresets = map[string]CustomProvider{
 		SchemaMode:    "json_schema",
 		PromptProfile: "frontier",
 	},
+	// LLMTR (https://llmtr.com) is an OpenAI-compatible gateway; model
+	// ids carry a vendor prefix (list: GET /v1/models).
+	"llmtr": {
+		BaseURL:       "https://llmtr.com/v1",
+		Model:         "qwen/qwen3.8-flash",
+		APIKeyEnv:     "LLMTR_API_KEY",
+		SchemaMode:    "json_schema",
+		PromptProfile: "frontier",
+	},
 	// Opper (https://docs.opper.ai) is an EU-hosted OpenAI-compatible
 	// gateway at /v3/compat (no /v1); model ids are bare pool names, and a
 	// "provider/model" id such as "azure/gpt-5.5" pins one route.
