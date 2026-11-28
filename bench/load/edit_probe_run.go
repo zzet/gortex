@@ -23,7 +23,18 @@ import (
 
 // This cumulative per-edit artifact allowance includes written, pending and
 // in-flight JSONL bytes. It is separate from each CLI call's stdout limit.
+// It is the default cap and, under any cap, the bound on one encoded row.
 const editProbeRawLimit = 16 << 20
+
+// Lossless gate-mode cells keep a long burst of distinct answers whole before
+// their evidence is incomplete. An explicit cap replaces either default, but
+// is never below the default nor above the maximum.
+const editProbeLosslessRawLimit = 64 << 20
+const editProbeMaxRawLimit = 256 << 20
+
+func editProbeKnownRawLimit(limit int) bool {
+	return limit >= editProbeRawLimit && limit <= editProbeMaxRawLimit
+}
 
 var errEditProbeEvidenceIncomplete = errors.New("harness evidence incomplete")
 
@@ -38,14 +49,20 @@ type editProbeReadback struct {
 	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 	Refusal         string `json:"refusal,omitempty"`
 	ObservationOnly bool   `json:"observation_only,omitempty"`
+	// Attribution only: neither field changes Correct, errors or outcomes.
+	Disposition       *editProbeReadbackDisposition `json:"disposition,omitempty"`
+	ConcurrentCommits *editProbeCommitWitness       `json:"concurrent_same_file_commits,omitempty"`
+	sent, received    time.Time                     // this readback's wire window
 }
 type editProbeRecord struct {
 	patchWaits                  *editProbePatchWaits
 	Consumers                   map[string]editConsumerObservation `json:"relation_consumers,omitempty"`
+	ConsumerOwnACK              *bool                              `json:"consumer_own_ack,omitempty"`
 	Superseded                  *receiptproof.Superseded           `json:"superseded_receipt,omitempty"`
 	supersededStatus            *receiptproof.Status
 	coalescedStatus             *receiptproof.Coalesced
 	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
+	tierAfterCommitErr          error
 	FunctionalUnavailable       *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt,omitempty"`
 	CoalescedFunctional         *receiptproof.Coalesced             `json:"coalesced_functional_receipt,omitempty"`
 	SearchACK                   map[string]any                      `json:"search_ack,omitempty"`
@@ -54,6 +71,7 @@ type editProbeRecord struct {
 	SearchTurnReleasedNS        *int64                              `json:"search_turn_released_ns,omitempty"`
 	AdmittedTargetLines         *int                                `json:"admitted_target_lines,omitempty"`
 	MutationTiers               *editProbeLiveTiers                 `json:"mutation_tiers,omitempty"`
+	TierAfterCommit             *editProbeTierAfterCommit           `json:"tier_after_commit_ms,omitempty"`
 	GateReadback                *Metric                             `json:"t_gate_readback_ms,omitempty"`
 	ACKReadbackExact            *bool                               `json:"ack_readback_exact,omitempty"`
 	ACKStatus                   string                              `json:"ack_status,omitempty"`
@@ -81,6 +99,7 @@ type editProbeRecord struct {
 	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
 	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
 	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
+	NotAdmitted                 string                              `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
 	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
 	Ack                         Metric                              `json:"t_ack_ms"`
 	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
@@ -93,11 +112,19 @@ type editProbeRecord struct {
 	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
 	Accounting                  editProbeAccounting                 `json:"accounting"`
 	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
+	RedialedCalls               int                                 `json:"redialed_calls,omitempty"` // this edit's calls that went through a re-dial, whatever the clock measured
+	RedialNS                    int64                               `json:"redial_ns,omitempty"`      // their time re-opening the session; inside t_ack, t_readback and probe timings
 	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
 	ProbeErrors                 int                                 `json:"probe_errors"`
 	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
 	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
 	GraphTerminal               bool                                `json:"graph_terminal"`
+	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
+	PostWorkloadReceipt         *editProbePostWorkloadReceipt       `json:"post_workload_receipt,omitempty"`
+	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
+	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
+	EditRefusalRetries          map[string]int                      `json:"edit_refusal_retries,omitempty"`
+	ResentEditReplayed          bool                                `json:"resent_edit_replayed,omitempty"` // see noteResentReplay
 	Evidence                    string                              `json:"raw_evidence"`
 	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
 	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
@@ -105,13 +132,16 @@ type editProbeRecord struct {
 	EvidenceLogicalBytes        int64                               `json:"evidence_logical_jsonl_bytes,omitempty"`
 	EvidenceBytes               int                                 `json:"evidence_bytes"`
 	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
+	EvidenceFoldedCalls         int                                 `json:"evidence_folded_repeat_calls,omitempty"`
 	Errors                      []string                            `json:"errors"`
 }
 type editProbeReport struct {
 	ConsumerBaseline   *editConsumerBaseline        `json:"consumer_baseline,omitempty"`
+	ConsumerOwnership  *editConsumerOwnership       `json:"consumer_ownership,omitempty"`
 	PhysicalWriteScope *editProbePhysicalWriteScope `json:"physical_write_scope,omitempty"`
 	SharedOwners       *editProbeSharedOwnerReport  `json:"shared_owners,omitempty"`
 	SearchReadbacks    *searchReadbackAcceptance    `json:"search_readback_acceptance,omitempty"`
+	SessionRedials     []editProbeSessionRedials    `json:"session_redials,omitempty"` // only sessions that re-dialed
 	Role               string                       `json:"role,omitempty"`
 	Plan               editProbePlan                `json:"plan"`
 	PlanHash           string                       `json:"plan_sha256"`
@@ -127,6 +157,74 @@ type editProbeReport struct {
 	ProjectionBefore   *editProbeProjectionBookend  `json:"projection_before,omitempty"`
 	ProjectionAfter    *editProbeProjectionBookend  `json:"projection_after,omitempty"`
 	Limitations        []string                     `json:"limitations"`
+}
+
+// An editor or prober session that re-dialed after it gave up a write. Index
+// is the editor number, or the edit ordinal that opened the prober session.
+// The re-opened stream is a new daemon session; the calls that failed on the
+// old stream keep their original errors in their attempts and evidence.
+type editProbeSessionRedials struct {
+	Role         string `json:"role"`
+	Index        int    `json:"index"`
+	Redials      int    `json:"redials"`
+	Failed       int    `json:"failed"`        // re-dials that did not open a session
+	LimitReached bool   `json:"limit_reached"` // later calls failed with the stream closed
+	// Edit records with a call on this session that went through a re-dial
+	// (their redialed_calls). A re-dial absorbed outside an edit's calls, such
+	// as a setup read, counts in redials but marks no record.
+	AffectedRecords int `json:"affected_records"`
+}
+
+// How often one editor or prober session may re-dial. Without a re-dial, one
+// write that reaches its deadline fails every later call on the session at
+// once; each further such write on a re-opened stream costs another re-dial.
+const editProbeSessionRedialLimit = 4
+
+type editProbeSession struct {
+	role   string
+	index  int
+	client *socketClient
+}
+
+// watchSession lets an editor or prober session re-dial after a write it gave
+// up on and keeps it for the report's re-dial rows.
+func (r *editProbeRuntime) watchSession(role string, index int, client *socketClient) {
+	if client == nil {
+		return
+	}
+	client.allowRedials(editProbeSessionRedialLimit)
+	r.sessions = append(r.sessions, editProbeSession{role: role, index: index, client: client})
+}
+
+// noteRedialedRecord marks the edit record ordinal as holding a call on
+// client that went through a re-dial.
+func (r *editProbeRuntime) noteRedialedRecord(client *socketClient, ordinal int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.redialedRecords == nil {
+		r.redialedRecords = make(map[*socketClient]map[int]bool)
+	}
+	if r.redialedRecords[client] == nil {
+		r.redialedRecords[client] = make(map[int]bool)
+	}
+	r.redialedRecords[client][ordinal] = true
+}
+
+// finishSessionRedials ends re-dialing with the measured workload, so the
+// report holds every re-dial, and returns the sessions that re-dialed. The
+// restore batch and closing receipts that follow run without re-dialing.
+func (r *editProbeRuntime) finishSessionRedials() []editProbeSessionRedials {
+	var rows []editProbeSessionRedials
+	for _, session := range r.sessions {
+		session.client.allowRedials(0)
+		if counts := session.client.redialCounts(); counts.Attempts != 0 || counts.LimitReached {
+			r.mu.Lock()
+			affected := len(r.redialedRecords[session.client])
+			r.mu.Unlock()
+			rows = append(rows, editProbeSessionRedials{Role: session.role, Index: session.index, Redials: counts.Attempts, Failed: counts.Failed, LimitReached: counts.LimitReached, AffectedRecords: affected})
+		}
+	}
+	return rows
 }
 
 type editProbePhysicalWriteScope struct {
@@ -184,8 +282,11 @@ type editProbeState struct {
 	rawBytes                                          int
 	rawAccepted                                       int
 	rawLogicalBytes                                   int64
+	rawLimit                                          int // per-edit cap; zero is the default
 	losslessEvidence                                  bool
 	payloadHistory                                    editProbePayloadHistory
+	repeatMu                                          sync.Mutex // repeats only; never held with mu or sinkMu
+	repeats                                           editProbeRepeats
 	rawPending                                        []byte
 	rawWake                                           chan struct{}
 	rawClosing                                        bool
@@ -225,11 +326,14 @@ type editProbeRuntime struct {
 	checkoutIDs       map[string]string // linked checkout path -> exact admitted public view identity
 	moveOriginal      []byte
 	origin            time.Time
-	mu                sync.Mutex // Phase.Attempts, reads and mode counts only; request lifetimes are never serialized
+	mu                sync.Mutex // Phase.Attempts, reads, mode counts and re-dial marks only; request lifetimes are never serialized
 	requireAccounting bool
 	finalized         bool
 	restarter         editProbeRestarter // restart cell only
 	restarted         []*socketClient    // sessions reopened after a restart; closed by close
+	sessions          []editProbeSession // editor and prober sessions that may re-dial
+	// Per session, the edit records whose calls went through a re-dial; under mu.
+	redialedRecords map[*socketClient]map[int]bool
 }
 
 func newEditProbeRecord(c Corpus, step editProbeStep) editProbeRecord {
@@ -277,7 +381,7 @@ func newEditProbeReport(plan editProbePlan, c Corpus, required bool) *editProbeR
 	if required {
 		role = "candidate"
 	}
-	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), ProjectionBefore: unobservedProjectionBookend(), ProjectionAfter: unobservedProjectionBookend(), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them"}}
+	out := &editProbeReport{Role: role, Plan: plan, PlanHash: hash, AccountingRequired: required, RestoreMS: unavailable("ms", "post-window batch not performed"), ProjectionBefore: unobservedProjectionBookend(), ProjectionAfter: unobservedProjectionBookend(), Limitations: []string{fmt.Sprintf("one %s/%s/%s/%s cell only", language, plan.Kind, plan.Tool, strings.ToUpper(plan.Mode)), "per-window numeric checks do not establish 100-edit/reference acceptance", "missing/unsupported B stays in the complete offered denominator", "t_readback/file_graph/relations/search are client times from edit send; t_derived is daemon-clock time from receipt origin and is not additive with them", "tier_after_commit_ms is the daemon's own time from the disk commit to each tier's publication, copied from the last receipt status observed (null while unpublished); it is reported beside the client times and replaces none of them"}}
 	if plan.OwnACKReadbackOnly {
 		out.AccountingRequired = false
 		out.Limitations = []string{"local ACK and immediate same-session file/source only; no graph-terminal, visibility or A/P/B phase qualification",
@@ -390,6 +494,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		return nil, nil, fmt.Errorf("edit-and-probe plan has %d fixed editors and %d readers but %d editor and %d reader sessions", max(1, plan.Editors), plan.Readers, len(editors), len(readers))
 	}
 	r := &editProbeRuntime{options: o, p: p, phase: phase, plan: plan, editors: editors, readers: readers, requireAccounting: !o.editProbeBaseline && !plan.SearchReadbackAcceptance && !plan.OwnACKReadbackOnly}
+	for i, editor := range editors {
+		r.watchSession("editor", i, editor)
+	}
 	original, err := os.ReadFile(filepath.Join(p.Repos[0].Path, filepath.FromSlash(plan.File)))
 	if err != nil {
 		return nil, nil, err
@@ -503,7 +610,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 		record.CheckoutID = r.checkoutIDs[repo.Path]
 		record.Outcome = "not_started"
 		record.Errors = nil
-		state := &editProbeState{step: step, record: record, losslessEvidence: o.LosslessEditProbeEvidence}
+		state := &editProbeState{step: step, record: record, losslessEvidence: o.LosslessEditProbeEvidence, rawLimit: o.rawEvidenceLimit()}
 		r.states = append(r.states, state)
 		state.record.Evidence = filepath.Join(dir, fmt.Sprintf("edit-%03d.jsonl", step.Ordinal))
 	}
@@ -530,6 +637,7 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 				return r, clients, err
 			}
 			clients = append(clients, state.client)
+			r.watchSession("prober", state.step.Ordinal, state.client)
 		}
 		// A file created during the run proves its own presence before the
 		// paired delete is sent; it cannot be admitted here.
@@ -564,6 +672,13 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	return r, clients, nil
 }
 
+func (s *editProbeState) rawCap() int {
+	if s.rawLimit > 0 {
+		return s.rawLimit
+	}
+	return editProbeRawLimit
+}
+
 func (s *editProbeState) emit(value any) error {
 	started := time.Now()
 	if s.losslessEvidence {
@@ -593,7 +708,7 @@ func (s *editProbeState) emit(value any) error {
 	if s.rawClosing {
 		return fmt.Errorf("%w: raw writer already closing", errEditProbeEvidenceIncomplete)
 	}
-	if s.rawAccepted+len(data)+1 > editProbeRawLimit {
+	if limit := s.rawCap(); len(data)+1 > editProbeRawLimit || s.rawAccepted+len(data)+1 > limit {
 		// Preserve only first-refusal scalar facts in the existing error path.
 		// The rejected payload is never queued or counted against accepted bytes.
 		row, _ := value.(map[string]any)
@@ -606,10 +721,10 @@ func (s *editProbeState) emit(value any) error {
 		if payload, known := row["payload"].(json.RawMessage); known {
 			payloadBytes = len(payload)
 		}
-		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
+		s.sinkErr = fmt.Errorf("%w: per-edit raw evidence limit exceeded: limit_bytes=%d row_limit_bytes=%d accepted_bytes=%d written_bytes=%d queued_bytes=%d attempted_encoded_bytes=%d payload_bytes=%d event=%q purpose=%q wire_id=%s", errEditProbeEvidenceIncomplete, limit, editProbeRawLimit, s.rawAccepted, s.rawBytes, len(s.rawPending), len(data)+1, payloadBytes, event, purpose, wireID)
 		return s.sinkErr
 	}
-	// Pending and in-flight payloads share the unchanged total byte cap. A
+	// Pending and in-flight payloads share the total per-edit byte cap. A
 	// burst of small rows need not wait for the writer's next timeslice.
 	s.rawPending = append(s.rawPending, data...)
 	s.rawPending = append(s.rawPending, '\n')
@@ -695,6 +810,16 @@ type editProbeCaller struct {
 
 func (c *editProbeCaller) responseReturnedAt() time.Time { return c.last.Finished }
 
+// lastCallRedial is the re-dial time and mark of the caller's latest call,
+// when that call started at or after since, so an attempt never takes an
+// earlier attempt's mark.
+func (c *editProbeCaller) lastCallRedial(since time.Time) (time.Duration, bool) {
+	if c.last.Started.Before(since) {
+		return 0, false
+	}
+	return c.last.Redial, c.last.Redialed
+}
+
 func (c *editProbeCaller) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	var onWriteStart func(time.Time)
 	if c.purpose == "edit" {
@@ -718,13 +843,26 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 	if strings.HasPrefix(c.purpose, "oracle:") && !identity.WriteStarted.IsZero() && (c.state.firstProbeWrite.IsZero() || identity.WriteStarted.Before(c.state.firstProbeWrite)) {
 		c.state.firstProbeWrite = identity.WriteStarted
 	}
+	if identity.Redialed {
+		c.state.record.RedialedCalls++
+		c.state.record.RedialNS += identity.Redial.Nanoseconds()
+	}
 	c.state.mu.Unlock()
+	if identity.Redialed {
+		c.runtime.noteRedialedRecord(c.client, c.state.step.Ordinal)
+	}
 	if err == nil {
 		if expected := c.expectedAbsence(data, identity); expected != nil {
 			err = expected
 		}
 	}
 	row := map[string]any{"event": "rpc", "purpose": c.purpose, "tool": c.request.name(), "wire_id": identity.ID, "call_start_ns": editProbeOffset(identity.Started, c.runtime.origin), "write_start_ns": editProbeOffset(identity.WriteStarted, c.runtime.origin), "write_end_ns": editProbeOffset(identity.WriteFinished, c.runtime.origin), "reply_delivered_ns": editProbeOffset(identity.ReplyDelivered, c.runtime.origin), "call_end_ns": editProbeOffset(identity.Finished, c.runtime.origin), "output_mode": editProbeRequestOutput(c.request), "payload": data}
+	if identity.Redialed {
+		row["redialed"] = true
+		if identity.Redial > 0 {
+			row["redial_ns"] = identity.Redial.Nanoseconds()
+		}
+	}
 	if err != nil {
 		row["error"] = err.Error()
 		if expected, ok := err.(*editProbeExpectedAbsence); ok {
@@ -732,7 +870,7 @@ func (c *editProbeCaller) call(ctx context.Context, method string, params any) (
 			row["expected_symbol"] = expected.symbol
 		}
 	}
-	if evidenceErr := c.state.emit(row); evidenceErr != nil {
+	if evidenceErr := c.state.emitOrHold(ctx, c.purpose, row); evidenceErr != nil {
 		return data, errors.Join(err, evidenceErr)
 	}
 	return data, err
@@ -745,6 +883,12 @@ func editProbeRetrySleep(seed int64, ordinal, stream int) func(context.Context, 
 		jitter := time.Duration(rng.Int64N(int64(delay/2) + 1))
 		return waitContext(ctx, delay+jitter)
 	}
+}
+
+// editProbeBackoffCeiling is the longest wait editProbeRetrySleep takes for
+// delay: the delay plus at most half again as jitter.
+func editProbeBackoffCeiling(delay time.Duration) time.Duration {
+	return delay + delay/2
 }
 
 func (r *editProbeRuntime) perform(ctx context.Context, s *editProbeState, client *socketClient, req request, purpose, role string, stream int) (json.RawMessage, wireCallIdentity, error) {
@@ -762,17 +906,29 @@ func (r *editProbeRuntime) performObserved(ctx context.Context, s *editProbeStat
 	}
 	budget := r.options.Deadline
 	if strings.HasPrefix(purpose, "oracle:") || purpose == "status" {
-		budget = min(budget, 20*time.Second)
+		budget = min(budget, editProbeReadBudget)
 	}
 	if end, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(end))
 	}
 	caller := &editProbeCaller{runtime: r, state: s, client: client, purpose: purpose, request: req, role: role}
 	data, attempts, err := callEditProbeTool(ctx, caller, req, dispatchArgs(req, repo), role, 0, s.step.Ordinal, stream, budget, editProbeRetrySleep(r.options.Seed, s.step.Ordinal, stream))
+	s.countRefusalRetries(purpose, attempts)
+	if purpose == "edit" && err == nil && len(attempts) > 1 {
+		s.noteResentReplay(data, editProbeRequestOutput(req), r.plan.Tool)
+	}
 	r.mu.Lock()
 	r.phase.Attempts = append(r.phase.Attempts, attempts...)
 	r.mu.Unlock()
-	evidenceErr := s.emit(map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
+	s.countBusy(purpose, attempts)
+	if purpose == "edit" && err != nil {
+		if refusal := editProbeNotAdmitted(attempts); refusal != "" {
+			s.mu.Lock()
+			s.record.NotAdmitted = refusal
+			s.mu.Unlock()
+		}
+	}
+	evidenceErr := s.emitOrHold(ctx, purpose, map[string]any{"event": "logical_call", "purpose": purpose, "tool": req.name(), "attempts": attempts})
 	if evidenceErr != nil {
 		return data, caller.last, attempts, errors.Join(err, evidenceErr)
 	}
@@ -799,12 +955,22 @@ func (r *editProbeRuntime) activateProbeState(step editProbeStep, cancel context
 }
 
 func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) error {
+	row, observeErr := r.observeProbeRow(s, oracle, sent, data, identity, err, pending)
+	if observeErr != nil || row == nil {
+		return observeErr
+	}
+	return s.emit(row)
+}
+
+// observeProbeRow updates the record and returns the probe row for the caller
+// to write. A relation consumer writes its own row and returns none.
+func (r *editProbeRuntime) observeProbeRow(s *editProbeState, oracle editProbeOracle, sent time.Time, data json.RawMessage, identity wireCallIdentity, err error, pending bool) (map[string]any, error) {
 	if isEditConsumer(oracle.name) {
-		return r.observeConsumer(s, oracle, data, identity, err)
+		return nil, r.observeConsumer(s, oracle, data, identity, err)
 	}
 	repo, routeErr := r.repoFor(s.step)
 	if routeErr != nil {
-		return routeErr
+		return nil, routeErr
 	}
 	ended := identity.Finished
 	if !identity.WriteStarted.IsZero() {
@@ -857,7 +1023,7 @@ func (r *editProbeRuntime) observeProbe(s *editProbeState, oracle editProbeOracl
 	s.mu.Unlock()
 	r.countMode(r.probeOutput(oracle, s.step), err == nil || expectedAbsence, err != nil || decodeErr == nil, fresh, stale, precommit)
 	r.countGateMode(s.step, r.probeOutput(oracle, s.step), oracle.call.name(), err == nil || expectedAbsence, decodeErr == nil, fresh, stale, precommit, correct, postACK)
-	return s.emit(map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending})
+	return map[string]any{"event": "probe", "oracle": oracle.name, "requested_mode": r.stepProbeMode(s.step), "output_mode": r.probeOutput(oracle, s.step), "start_ns": editProbeOffset(sent, r.origin), "end_ns": editProbeOffset(ended, r.origin), "correct": correct, "claims_fresh": fresh, "receipt_observed_pending": pending}, nil
 }
 
 func editProbeSummaryOmittedByBudget(body map[string]any, file, marker string) bool {
@@ -932,18 +1098,11 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 		s.probes.Go(func() {
 			ticker := time.NewTicker(editProbePeriod)
 			defer ticker.Stop()
+			if r.repeatFoldable(s, oracle) {
+				defer func() { _ = s.flushRepeat("oracle:" + oracle.name) }() // A failed write is the spool's own error.
+			}
 			for probeCtx.Err() == nil {
-				sent := time.Now()
-				pending := s.noteProbeStart()
-				var data json.RawMessage
-				var identity wireCallIdentity
-				var err error
-				if r.stepProbeMode(s.step) == "cli" {
-					data, identity, err = r.performCLI(probeCtx, s, oracle.call, "oracle:"+oracle.name, 10+index)
-				} else {
-					data, identity, err = r.perform(probeCtx, s, s.client, oracle.call, "oracle:"+oracle.name, "probe", 10+index)
-				}
-				if err := r.observeProbe(s, oracle, sent, data, identity, err, pending); err != nil {
+				if r.probeOnce(probeCtx, s, oracle, 10+index) != nil {
 					cancel()
 					return
 				}
@@ -955,6 +1114,46 @@ func (r *editProbeRuntime) probe(probeCtx context.Context, cancel context.Cancel
 			}
 		})
 	}
+}
+
+func (r *editProbeRuntime) repeatFoldable(s *editProbeState, oracle editProbeOracle) bool {
+	return r.stepProbeMode(s.step) != "cli" && !isEditConsumer(oracle.name)
+}
+
+// probeOnce sends one background probe and records it. An error means its
+// evidence could not be written and the oracle's loop stops.
+func (r *editProbeRuntime) probeOnce(probeCtx context.Context, s *editProbeState, oracle editProbeOracle, stream int) error {
+	purpose := "oracle:" + oracle.name
+	foldable := r.repeatFoldable(s, oracle)
+	sent := time.Now()
+	pending := s.noteProbeStart()
+	callCtx := probeCtx
+	var held *editProbeHeldRows
+	if foldable {
+		var err error
+		if held, err = s.repeatHold(purpose); err != nil {
+			return err
+		}
+		if held != nil {
+			callCtx = context.WithValue(probeCtx, editProbeHeldRowsKey{}, held)
+		}
+	}
+	var data json.RawMessage
+	var identity wireCallIdentity
+	var err error
+	if r.stepProbeMode(s.step) == "cli" {
+		data, identity, err = r.performCLI(callCtx, s, oracle.call, purpose, stream)
+	} else {
+		data, identity, err = r.perform(callCtx, s, s.client, oracle.call, purpose, "probe", stream)
+	}
+	row, observeErr := r.observeProbeRow(s, oracle, sent, data, identity, err, pending)
+	if observeErr != nil || row == nil {
+		return observeErr
+	}
+	if foldable {
+		return s.settleRepeat(held, purpose, data, err, row)
+	}
+	return s.emit(row)
 }
 
 func (s *editProbeState) stopProbes() {
@@ -1075,9 +1274,15 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	}
 	if err != nil {
 		s.mu.Lock()
-		s.record.Outcome = "edit_error"
-		if ctx.Err() != nil {
+		switch code := editProbeDeclinedResend(err); {
+		case ctx.Err() != nil:
 			s.record.Outcome = "phase_censored"
+		case code != "":
+			// The product refused the edit and no re-send could be answered
+			// in time: the record ends on that refusal at its deadline.
+			s.record.Outcome, s.record.DeadlineReason = "product_deadline", code
+		default:
+			s.record.Outcome = "edit_error"
 		}
 		s.record.Errors = append(s.record.Errors, err.Error())
 		s.mu.Unlock()
@@ -1101,6 +1306,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.ACKMutationID, _ = body["mutation_id"].(string)
 		s.record.ACKCommitSeq, _ = strconvEditProbeUint(body["commit_seq"])
 		s.record.ACKContentSHA256, _ = body["content_sha256"].(string)
+		if r.plan.ConsumerProbes {
+			acknowledged := s.record
+			acknowledged.Receipt, _ = body["mutation_receipt"].(string)
+			own := editConsumerOwnedACK(step, acknowledged, body)
+			s.record.ConsumerOwnACK = &own
+		}
 		s.mu.Unlock()
 	}
 	receipt, _ := body["mutation_receipt"].(string)
@@ -1240,6 +1451,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			s.record.Outcome = "phase_censored"
 		} else if callCtx.Err() != nil {
 			s.record.Outcome = "product_deadline"
+			s.record.DeadlineReason = editProbeDeadlineReadbacks
 		} else if readbacksCorrect && len(s.record.Errors) == 0 {
 			s.record.Outcome = "complete"
 		} else {
@@ -1249,6 +1461,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		return
 	}
 	s.mu.Unlock()
+	var wait *editProbeReceiptWait // only the ordinary receipt loop attributes its deadline
 	if move != nil {
 		r.collectMoveEvidence(callCtx, s, *move, identity.ID)
 	} else if batchSet != nil {
@@ -1261,6 +1474,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 			options = map[string]any{"receipt": receipt}
 		}
 		statusReq := request{Tool: "change", Operation: "receipt", Arguments: map[string]any{"operation": "receipt", "options": options}}
+		wait = &editProbeReceiptWait{entered: callCtx.Err() == nil}
+		var settle editProbeAccountingSettle
 		for callCtx.Err() == nil {
 			raw, statusIdentity, statusErr := r.perform(callCtx, s, s.client, statusReq, "status", "probe", 200)
 			s.mu.Lock()
@@ -1279,7 +1494,7 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break // Foreign terminal/accounting fields cannot settle this edit.
 					}
-					countedNoWait := localFileAcknowledgementMatches(body, status, r.plan.Tool, step.MutationID)
+					countedNoWait := editProbeCountedNoWait(body, status, r.plan.Tool, step.MutationID, s.record.CheckoutID)
 					accounting := r.accountingForStatus(callCtx, status, receipt, r.plan.Tool, countedNoWait)
 					s.mu.Lock()
 					s.record.Accounting = accounting
@@ -1295,9 +1510,12 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 					if s.record.MutationTiers != nil && s.record.MutationTiers.State == "invalid" {
 						s.record.Errors = append(s.record.Errors, "invalid live tier observation: "+s.record.MutationTiers.Reason)
 					}
+					// Each status replaces the daemon tier latency, so the record keeps the last one observed.
+					s.record.TierAfterCommit, s.record.tierAfterCommitErr = editProbeStatusTierAfterCommit(status)
 					s.record.GraphTerminal = status["graph_status_terminal"] == true
 					if s.record.GraphTerminal {
 						r.settlePendingLocked(s)
+						s.noteGraphTerminalLocked(statusIdentity.Finished)
 					}
 					all := true
 					for _, value := range s.record.FirstCorrect {
@@ -1322,7 +1540,16 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 						s.mu.Unlock()
 						break
 					}
-					if consumersDone && r.gateModeComplete(step) && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+					coverage := consumersDone && r.gateModeComplete(step)
+					*wait = editProbeReceiptWait{entered: true, observed: true, terminal: terminal, allCorrect: all, coverage: coverage, qualified: qualifiedCandidate, freshTiers: coalescedFreshTiers(qualifiedTiers)}
+					if coverage && editProbeFinishedWithQualification(terminal, all, r.requireAccounting, accounting, qualifiedCandidate, qualifiedTiers) {
+						break
+					}
+					// A deadline now would be attributed to accounting alone.
+					if settle.unsettled(editProbeDeadlineReason(*wait) == editProbeDeadlineAccounting, accounting) {
+						s.mu.Lock()
+						s.record.Accounting.Reasons = append(slices.Clip(s.record.Accounting.Reasons), editProbeAccountingUnsettledReason)
+						s.mu.Unlock()
 						break
 					}
 				}
@@ -1336,6 +1563,11 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	s.mu.Lock()
 	if !gateComplete {
 		s.record.Errors = append(s.record.Errors, "assigned post-ACK gate coverage unavailable")
+	}
+	if s.record.tierAfterCommitErr != nil {
+		// The last status the loop decoded, which is not the final poll when
+		// that poll failed to decode or the call itself failed.
+		s.record.Errors = append(s.record.Errors, "last decoded receipt status: "+s.record.tierAfterCommitErr.Error())
 	}
 	if s.firstProbeWrite.IsZero() || s.editWrite.IsZero() || !s.firstProbeWrite.Before(s.editWrite) {
 		s.record.Errors = append(s.record.Errors, "no actual prober wire start before edit wire")
@@ -1361,6 +1593,9 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 		s.record.Outcome = "phase_censored"
 	} else if callCtx.Err() != nil {
 		s.record.Outcome = "product_deadline"
+		if wait != nil {
+			s.record.DeadlineReason = editProbeDeadlineReason(*wait)
+		}
 	} else if len(s.record.Errors) == 0 {
 		s.record.Outcome = "complete"
 	} else {
@@ -1442,6 +1677,11 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 		}
 		if !identity.Finished.IsZero() {
 			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
+		}
+		back.Disposition = editProbeReadbackDispositionOf(kind, raw, payload, readErr, decodeErr)
+		back.sent, back.received = identity.WriteStarted, identity.Finished
+		if back.sent.IsZero() && !back.received.IsZero() {
+			back.sent = begin
 		}
 		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
 		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
@@ -1528,9 +1768,11 @@ func (r *editProbeRuntime) finish() error {
 	r.finalized = true
 	for _, s := range r.states {
 		s.stopProbes()
+		_ = s.flushRepeats() // A failed write is recorded as the spool's error.
 		s.finishRaw()
 	}
 	r.phase.EditProbe.SharedOwners = r.finishSharedOwners()
+	r.attributeConcurrentCommits()
 	r.phase.EditProbe.Records = nil
 	guards := r.supersededGuards()
 	for _, s := range r.states {
@@ -1551,11 +1793,12 @@ func (r *editProbeRuntime) finish() error {
 		s.mu.Unlock()
 		invalidateSharedAccounting(&record, r.phase.EditProbe.SharedOwners, r.requireAccounting)
 		record.groupTimes()
+		record.EvidenceFoldedCalls = s.foldedRepeats()
 		s.sinkMu.Lock()
 		sinkErr := s.sinkErr
 		record.EvidenceWriteMS = float64(s.writeNS) / 1e6
 		record.EvidenceEncodeMS = float64(s.encodeNS) / 1e6
-		record.EvidenceBytes, record.EvidenceLimit = s.rawBytes, editProbeRawLimit
+		record.EvidenceBytes, record.EvidenceLimit = s.rawBytes, s.rawCap()
 		if s.losslessEvidence {
 			record.EvidenceCodec = editProbeLosslessCodec
 			record.EvidenceLogicalBytes = s.rawLogicalBytes
@@ -1591,10 +1834,12 @@ func (r *editProbeRuntime) finish() error {
 	}
 	finishEditProbeMetrics(r.phase)
 	r.phase.EditProbe.Summary = summarizeEditProbe(r.phase.EditProbe.Records, r.plan.Seed)
+	r.phase.EditProbe.ConsumerOwnership = summarizeEditConsumerOwnership(r.plan, max(1, len(r.editors)), r.phase.EditProbe.Records)
 	if r.plan.sixRepoTopology() {
 		appendEditProbeTopologyWaits(r.phase, r.plan.Seed)
 	}
 	r.phase.EditProbe.SearchReadbacks = summarizeSearchReadbacks(r.plan, r.phase.EditProbe.Records)
+	r.phase.EditProbe.SessionRedials = r.finishSessionRedials()
 	if r.phase.EditProbe.SearchReadbacks != nil && !r.phase.EditProbe.SearchReadbacks.Pass {
 		failures = append(failures, errors.New("immediate search readback acceptance incomplete or incorrect"))
 	}
@@ -1668,6 +1913,8 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		return r.restoreCreatedFiles(ctx)
 	}
 	// Do not race unknown/uncompleted source effects with a cleanup rewrite.
+	// A receipt the workload left pending is read once more first.
+	r.repollPendingReceipts(ctx)
 	for _, record := range r.phase.EditProbe.Records {
 		if record.BatchSet != nil {
 			return errors.New("multi-file batch restore unsupported: complete original baselines are not retained")
@@ -1675,7 +1922,11 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 		if record.NativeWrite != nil || record.Restart != nil && record.Restart.DiskHasMarker {
 			continue // A native write ended before its record did; a killed daemon's committed write is on disk.
 		}
-		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!record.GraphTerminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
+		if record.NotAdmitted != "" && record.Receipt == "" && record.Batch == nil && record.Move == nil {
+			continue // The product refused this edit before admission; no file changed.
+		}
+		terminal := record.GraphTerminal || record.PostWorkloadReceipt.terminal()
+		if (record.Receipt == "" && record.Batch == nil && record.BatchSet == nil && record.Move == nil) || (!terminal && (record.Move == nil || r.requireAccounting || !movePublicFactsComplete(record))) {
 			return errors.New("restore batch unavailable while mutation outcome is unknown/pending")
 		}
 	}
@@ -1685,6 +1936,24 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	current, err := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.plan.File)))
 	if err != nil {
 		return err
+	}
+	unchanged := string(current) == string(r.original)
+	var currentDestination []byte
+	if r.plan.Tool == "refactor.move" {
+		currentDestination, err = os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(r.p.Repos[0].Corpus.EditDestination)))
+		if err != nil {
+			return err
+		}
+		unchanged = unchanged && string(currentDestination) == string(r.moveOriginal)
+	}
+	if unchanged {
+		// The source bytes, and a move's destination bytes, already equal
+		// their originals, as when every edit was refused before admission.
+		// The product refuses a rewrite whose old and new bytes match, so
+		// none is sent.
+		r.phase.EditProbe.RestoreMS = unavailable("ms", "no restore write: bytes already equal the original")
+		r.phase.EditProbe.Restore = json.RawMessage(`{"status":"unchanged","write_sent":false}`)
+		return nil
 	}
 	// A terminal batch authorizes restoring only its retained owned after-image.
 	// The public conditional transaction still checks these bytes again at write time.
@@ -1705,10 +1974,6 @@ func (r *editProbeRuntime) restore(ctx context.Context) error {
 	changes := []any{map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + r.plan.File, "old_string": string(current), "new_string": string(r.original)}}
 	if r.plan.Tool == "refactor.move" {
 		destination := r.p.Repos[0].Corpus.EditDestination
-		currentDestination, readErr := os.ReadFile(filepath.Join(r.p.Repos[0].Path, filepath.FromSlash(destination)))
-		if readErr != nil {
-			return readErr
-		}
 		changes = append(changes, map[string]any{"op": "edit_file", "path": r.p.Repos[0].Prefix + "/" + destination, "old_string": string(currentDestination), "new_string": string(r.moveOriginal)})
 	}
 	if err := r.restoreBatch(ctx, changes); err != nil {

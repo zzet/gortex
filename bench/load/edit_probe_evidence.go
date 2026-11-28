@@ -8,10 +8,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"math"
 	"math/big"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type editProbeOracle struct {
@@ -217,7 +222,6 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			path, _ := row["path"].(string)
 			text, _ := row["text"].(string)
 			line, err := strconvEditProbeUint(row["line"])
-			prefix := "func "
 			if filepath.Ext(c.File) == ".ts" {
 				textCallee := callee
 				if c.EditKind == "append_leaf" {
@@ -229,7 +233,7 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 			if filepath.Ext(c.File) == ".py" {
 				return err == nil && line > 0 && editProbeFixturePath(path, c.File) && strings.TrimSuffix(text, "\r") == "def "+step.Marker+"():"
 			}
-			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && strings.Contains(text, prefix+step.Marker)
+			return err == nil && line > 0 && (path == c.File || strings.HasSuffix(path, "/"+c.File)) && editProbeGoTextDeclares(text, step.Marker)
 		})
 	case "callers", "call_chain":
 		if step.BeforeSymbol != "" && !editProbeRenameCensus(body, c, step) {
@@ -256,6 +260,32 @@ func editProbeCorrect(oracle string, body map[string]any, c Corpus, step editPro
 	default:
 		return false
 	}
+}
+
+// editProbeGoTextDeclares reports whether one text-search line holds
+// "func <marker>" with an identifier boundary on each side. A plain substring
+// match also accepts any longer name that starts with the marker, such as the
+// <marker>Before declaration a rename starts from, so the pre-edit line would
+// count as the edit already being visible.
+func editProbeGoTextDeclares(text, marker string) bool {
+	needle := "func " + marker
+	for from := 0; ; {
+		at := strings.Index(text[from:], needle)
+		if at < 0 {
+			return false
+		}
+		start, end := from+at, from+at+len(needle)
+		before, _ := utf8.DecodeLastRuneInString(text[:start])
+		after, _ := utf8.DecodeRuneInString(text[end:])
+		if !editProbeGoIdentifierRune(before) && !editProbeGoIdentifierRune(after) {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+func editProbeGoIdentifierRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // Compact rows prove presence only: the marker, or from the marker's call
@@ -404,15 +434,45 @@ type editProbeAccounting struct {
 	Reasons   []string                  `json:"reasons"`
 }
 
+// editProbeCountedNoWait reports whether the original committed ACK never
+// waited for its publication, so that its retained receipt may count that
+// wait as not applicable: a local ACK, or a linked checkout's full ACK that
+// returned before the checkout's queued publication. checkoutID is the run's
+// own admitted linked view for the edit's route, empty for the primary.
+func editProbeCountedNoWait(ack, status map[string]any, tool, mutationID, checkoutID string) bool {
+	return localFileAcknowledgementMatches(ack, status, tool, mutationID) ||
+		linkedFullAcknowledgementMatches(ack, status, tool, mutationID, checkoutID)
+}
+
 func localFileAcknowledgementMatches(ack, status map[string]any, tool, mutationID string) bool {
+	return committedFileAcknowledgementMatches(ack, status, tool, mutationID, "local")
+}
+
+// A linked checkout's full ACK is served by the checkout's own queued
+// publication, which it does not wait for. Only the run's admitted checkout,
+// named by both the ACK's view and its receipt, with the ACK still reporting
+// its publication pending, makes that ACK eligible. A full ACK that waited,
+// a primary ACK and any other checkout's claim stay strict.
+func linkedFullAcknowledgementMatches(ack, status map[string]any, tool, mutationID, checkoutID string) bool {
+	view, _ := ack["freshness"].(map[string]any)
+	if checkoutID == "" || ack["reindex_pending"] != true || view["checkout_id"] != checkoutID || status["checkout_id"] != checkoutID {
+		return false
+	}
+	return committedFileAcknowledgementMatches(ack, status, tool, mutationID, "full")
+}
+
+// The ACK and its retained receipt name the same applied, committed and
+// unreplayed edit.file mutation under one ACK policy, with the same receipt,
+// commit and bytes.
+func committedFileAcknowledgementMatches(ack, status map[string]any, tool, mutationID, ackMode string) bool {
 	if tool != "edit.file" || mutationID == "" || ack["status"] != "applied" ||
-		ack["ack_mode"] != "local" || ack["disk_status"] != "committed" || ack["mutation_id"] != mutationID {
+		ack["ack_mode"] != ackMode || ack["disk_status"] != "committed" || ack["mutation_id"] != mutationID {
 		return false
 	}
 	if replayed, present := ack["replayed"]; present && replayed != false {
 		return false
 	}
-	if status["found"] != true || status["tool"] != "edit_file" || status["ack_mode"] != "local" ||
+	if status["found"] != true || status["tool"] != "edit_file" || status["ack_mode"] != ackMode ||
 		status["disk_status"] != "committed" || status["mutation_id"] != mutationID {
 		return false
 	}
@@ -447,7 +507,8 @@ func checkEditProbeAcknowledgement(status map[string]any, receipt, requestedFiel
 }
 
 // Callers stay strict unless the original committed ACK and receipt establish
-// local no-wait eligibility. The producer must still attest the skipped phase.
+// no-wait eligibility (editProbeCountedNoWait). The producer must still attest
+// the skipped phase.
 func checkEditProbeAcknowledgementWithWaitDisposition(status map[string]any, receipt, requestedField string, sharedAcknowledgement map[string]any, parseMayBeInapplicable, countedNoWait bool) editProbeAccounting {
 	out := editProbeAccounting{State: "unavailable"}
 	fail := func(reason string) { out.Reasons = append(out.Reasons, reason) }
@@ -606,8 +667,9 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 			fail("missing B phase " + name)
 		}
 	}
-	for name, value := range pPhases {
-		if value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
+	// In name order, so identical status replies give identical reasons.
+	for _, name := range slices.Sorted(maps.Keys(pPhases)) {
+		if value := pPhases[name]; value != nil && fmt.Sprint(value) != fmt.Sprint(bPhases[name]) {
 			fail("B/P phase mismatch: " + name)
 		}
 	}
@@ -688,6 +750,47 @@ func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accoun
 
 func editProbeAccountingComplete(accounting editProbeAccounting) bool {
 	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
+}
+
+// Once a status loop awaits nothing but terminal accounting (the graph is
+// fresh, every first-correct time is measured, and any assigned post-ACK
+// coverage is in), the accounting gets this many consecutive unchanged status
+// cycles to become terminal. A native-duplicate physical attempt whose
+// earlier publisher is never reported stays unavailable indefinitely, and
+// repeating identical status reads would only fill the per-edit raw evidence
+// cap. The bound applies to any accounting that is not yet terminal, so late
+// P or B evidence and unknown diagnostics that arrive after it leave an
+// accounting gap.
+const editProbeAccountingSettlePolls = 8
+
+var editProbeAccountingUnsettledReason = fmt.Sprintf("accounting not terminal after %d unchanged status cycles with the graph fresh and every first-correct time measured", editProbeAccountingSettlePolls)
+
+// editProbeAccountingSettle counts one status loop's consecutive evaluated
+// cycles that await only terminal accounting and see it unchanged.
+type editProbeAccountingSettle struct {
+	last      []any
+	unchanged int
+}
+
+// unsettled records one evaluated status cycle and reports whether the loop
+// should stop with its accounting still unavailable. ready says that every
+// exit condition other than terminal accounting held on this cycle;
+// accounting is all the accounting the cycle observed. A cycle that is not
+// ready, or whose accounting differs from the last counted one, restarts the
+// count. Callers do not call it for a cycle in which a transaction, receipt
+// or acknowledgement status read failed, so such a cycle neither counts nor
+// resets: the bound counts successful observations, possibly with failed
+// reads between them.
+func (w *editProbeAccountingSettle) unsettled(ready bool, accounting ...any) bool {
+	switch {
+	case !ready:
+		w.unchanged = 0
+	case w.unchanged == 0 || !reflect.DeepEqual(w.last, accounting):
+		w.last, w.unchanged = accounting, 1
+	default:
+		w.unchanged++
+	}
+	return w.unchanged >= editProbeAccountingSettlePolls
 }
 
 func editProbeSupportedBackgroundCoverage(background map[string]any) bool {

@@ -1,8 +1,10 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -283,7 +285,190 @@ func TestFreshRequestsDuringAnEditBuildRideItsPublication(t *testing.T) {
 				t.Fatalf("rider %d fabricated pre-origin %s: %+v", i, phase, record.Snapshot().Phases)
 			}
 		}
+		// A require_fresh ticket keeps its own accounting: only a committed
+		// write's receipt closes P and B from the cycle that served it.
+		_, refusal := record.CoalescedPublicationEvidence()
+		if window := record.Snapshot().EditTimings().Window; refusal != nil || window.PatchAccounting != nil {
+			t.Fatalf("rider %d took an edit's accounting: B %+v, P %+v", i, refusal, window.PatchAccounting)
+		}
 	}
+	// The edit was owed at the cycle's start, so its P is that cycle, from
+	// the cycle_started instant on its timeline to its completion.
+	edited := editRecord.Snapshot()
+	if why := owedCycleWindowRefusal(edited); why != "" {
+		window := edited.EditTimings().Window
+		t.Fatalf("the edit's P is not its serving cycle (%s): P %+v wall %v, phases %+v", why, window.PatchAccounting, window.PatchWallMS, edited.Phases)
+	}
+	requireCheckoutBackgroundRefusal(t, "owed edit", editRecord, edit.Ticket.Generation, "physical_window_retained")
+}
+
+// owedCycleWindowRefusal reports why a committed edit's P is not the window of
+// the cycle that owed its ticket, or "" when it is: the timeline holds the
+// ticket's enqueue, the cycle's start and the ticket's completion, P names the
+// checkout refresh cycle and spans cycle_started..ticket_completed, and the
+// cycle did not start before the ticket was enqueued.
+//
+// The cycle reads the tickets it owes and only then takes its start instant,
+// so the start may equal the enqueue: on a clock that advances in ticks (on
+// Windows, Go's monotonic reading too), both can read the same tick.
+func owedCycleWindowRefusal(snapshot PublicationPhaseSnapshot) string {
+	offsets := phaseOffsets(snapshot)
+	enqueued, okE := offsets[PublicationTicketEnqueued]
+	started, okS := offsets[PublicationCycleStarted]
+	completed, okC := offsets[PublicationTicketCompleted]
+	window := snapshot.EditTimings().Window
+	switch {
+	case !okE || !okS || !okC:
+		return "the timeline lacks ticket_enqueued, cycle_started or ticket_completed"
+	case window.PatchAccounting == nil || window.PatchAccounting.ExecutionDisposition != "checkout_refresh_cycle":
+		return "P does not name the checkout refresh cycle"
+	case window.PatchWallMS == nil || *window.PatchWallMS != float64(completed-started)/1e6:
+		return "P does not span cycle_started..ticket_completed"
+	case started < enqueued:
+		return "the cycle started before the ticket was enqueued"
+	}
+	return ""
+}
+
+// windowsClockTick is how far a Windows clock advances at its default timer
+// resolution (64 Hz).
+const windowsClockTick = 15625 * time.Microsecond
+
+// An owed edit's P on a clock that steps in Windows ticks. The cycle that
+// serves the edit takes its start instant right after it reads the tickets it
+// owes, so the edit's enqueue and the cycle's start can share a tick; that is
+// still the owed cycle's P. A cycle that started a tick before the enqueue, a
+// P that is not the marked cycle's window, a timeline without the cycle's
+// start, a ticket without P, and a ticket carried from an earlier cycle are
+// refused on the same clock. Marks are first-wins, so cycle_started is the
+// first cycle that owed the ticket; one served by a later cycle was carried
+// and records no P.
+func TestOwedEditCycleWindowOnACoarseClock(t *testing.T) {
+	base := time.Now()
+	read := func(elapsed time.Duration) time.Time { return base.Add(elapsed.Truncate(windowsClockTick)) }
+	const ms = time.Millisecond
+	for _, tc := range []struct {
+		name                         string
+		enqueued, started, completed time.Duration
+		served                       time.Duration // the cycle start P is recorded from
+		rider, unmarkedCycle         bool          // rider: the cycle did not run for the ticket
+		want                         string        // the refusal, "" for the owed cycle's P
+	}{
+		{name: "enqueue and cycle start share a tick", enqueued: 17 * ms, started: 18 * ms, served: 18 * ms, completed: 70 * ms},
+		{name: "enqueue, cycle start and origin share a tick", enqueued: 3 * ms, started: 4 * ms, served: 4 * ms, completed: 70 * ms},
+		{name: "cycle starts a tick after the enqueue", enqueued: 17 * ms, started: 33 * ms, served: 33 * ms, completed: 70 * ms},
+		{name: "cycle starts a tick before the enqueue", enqueued: 17 * ms, started: 3 * ms, served: 3 * ms, completed: 70 * ms,
+			want: "the cycle started before the ticket was enqueued"},
+		{name: "P is not the marked cycle's window", enqueued: 3 * ms, started: 18 * ms, served: 4 * ms, completed: 70 * ms,
+			want: "P does not span cycle_started..ticket_completed"},
+		{name: "ticket carried from a cycle a tick earlier", enqueued: 17 * ms, started: 18 * ms, served: 40 * ms, completed: 70 * ms,
+			want: "P does not name the checkout refresh cycle"},
+		{name: "cycle start unmarked", enqueued: 3 * ms, served: 4 * ms, completed: 70 * ms, unmarkedCycle: true,
+			want: "the timeline lacks ticket_enqueued, cycle_started or ticket_completed"},
+		{name: "ticket rode a cycle in flight", enqueued: 17 * ms, started: 18 * ms, completed: 70 * ms, rider: true,
+			want: "P does not name the checkout refresh cycle"},
+	} {
+		recorder := NewPublicationPhaseRecorder(0, 0)
+		record := recorder.Begin("checkout", "owed-edit", PublicationSourceMCPEdit, read(0))
+		record.BindTicket(1)
+		record.MarkAt(PublicationTicketEnqueued, read(tc.enqueued))
+		if !tc.unmarkedCycle {
+			record.MarkAt(PublicationCycleStarted, read(tc.started))
+		}
+		completed, served := read(tc.completed), read(tc.served)
+		if tc.rider {
+			served = time.Time{}
+		}
+		record.recordCheckoutPublication(1, served, completed)
+		record.MarkAt(PublicationTicketCompleted, completed)
+		// The record holds its recorder only weakly, and records no P once the
+		// recorder is gone.
+		runtime.KeepAlive(recorder)
+		snapshot := record.Snapshot()
+		if why := owedCycleWindowRefusal(snapshot); why != tc.want {
+			t.Errorf("%s: refusal %q, want %q; phases %+v", tc.name, why, tc.want, snapshot.Phases)
+		}
+	}
+}
+
+// An edit whose ticket is admitted after a cycle has fixed what it owes rides
+// that cycle's publication. The cycle did not run for it, so the edit's receipt
+// names no P of that cycle, even though the edit was received before the cycle
+// started, as a watcher's coalesced receipt does not borrow its winner's P. Its
+// B is still the frozen refusal.
+func TestCheckoutEditRidingACycleBorrowsNoPatchWindow(t *testing.T) {
+	f, c, l := newCheckoutMutationFixture(t)
+	ctx := t.Context()
+	origin := time.Now()
+	record := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("riding-edit-%d", origin.UnixNano()), PublicationSourceMCPEdit, origin)
+	m, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	builderWriteFile(t, f.worktree, "helper.go", chainHelperEdit)
+
+	// While the edit holds its lease, a cycle starts for a require_fresh
+	// ticket and fixes what it owes before the edit's ticket exists.
+	owed, err := l.RequestBoundCheckoutRefresh(ctx, f.checkoutID, f.worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	c.cyclePreflight = func(context.Context) (CheckoutCycle, bool) {
+		close(entered)
+		<-release
+		return CheckoutCycle{}, false
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		c.cycle(ctx)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cycle never started")
+	}
+	edit, err := m.EnqueueRefresh(WithPublicationRecord(ctx, record), filepath.Join(f.worktree, "helper.go"))
+	m.Close()
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cycle never finished")
+	}
+	c.cyclePreflight = nil
+
+	for name, ticket := range map[string]*CheckoutRefreshTicket{"owed": owed, "riding edit": edit} {
+		select {
+		case result := <-ticket.Ticket.Done:
+			if result.Err != nil || !result.Reindexed {
+				t.Fatalf("%s ticket = %+v", name, result)
+			}
+		default:
+			t.Fatalf("the %s ticket was not served by the cycle in flight", name)
+		}
+	}
+	if edit.Ticket.Generation <= owed.Ticket.Generation {
+		t.Fatalf("the edit's ticket %d must follow the cycle's owed ticket %d", edit.Ticket.Generation, owed.Ticket.Generation)
+	}
+	snapshot := record.Snapshot()
+	// The cycle started after the edit was received, so only the rider rule,
+	// not the record's origin, keeps the cycle's window off the receipt.
+	if _, found := phaseOffsets(snapshot)[PublicationCycleStarted]; !found {
+		t.Fatalf("the riding edit's record lacks the cycle that published it: %+v", snapshot.Phases)
+	}
+	if window := snapshot.EditTimings().Window; window.PatchWallMS != nil || window.PatchAccounting != nil {
+		t.Fatalf("a riding edit borrowed its cycle's P: %+v", window)
+	}
+	requireCheckoutBackgroundRefusal(t, "riding edit", record, edit.Ticket.Generation, "no_accepted_witness")
 }
 
 func TestCheckoutMutationRefreshReportsTheLaneHolderItWaitedFor(t *testing.T) {

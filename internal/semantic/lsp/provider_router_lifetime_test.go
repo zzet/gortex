@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -280,7 +281,7 @@ func TestRouterCloseOwnsInitializingProviderAndRefusesLatePublish(t *testing.T) 
 }
 
 func TestRouterCloseJoinsDetachedEvictionAndReaperOwners(t *testing.T) {
-	for _, mode := range []string{"lru", "reaper", "duplicate"} {
+	for _, mode := range []string{"lru", "reaper"} {
 		t.Run(mode, func(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
 			var blocked sync.Once
@@ -296,61 +297,19 @@ func TestRouterCloseJoinsDetachedEvictionAndReaperOwners(t *testing.T) {
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			t.Cleanup(func() { unblock(); _ = r.Close() })
 			var providers []*Provider
-			if mode == "duplicate" {
-				spec, h := lifetimeSpec(t, "duplicate", helperLSPInitBarrier)
-				results := make(chan *Provider, 2)
-				errs := make(chan error, 2)
-				for range 2 {
-					go func() { p, err := r.ForSpecWorkspace(spec, r.defaultWorkspace); results <- p; errs <- err }()
-				}
-				require.Eventually(t, func() bool {
-					r.mu.Lock()
-					pending := make([]*Provider, 0, len(r.starting))
-					for p := range r.starting {
-						pending = append(pending, p)
-					}
-					r.mu.Unlock()
-					if len(pending) != 2 {
-						return false
-					}
-					for _, p := range pending {
-						p.lifetimeMu.Lock()
-						ready := p.starting != nil && p.starting.client != nil
-						p.lifetimeMu.Unlock()
-						if !ready {
-							return false
-						}
-					}
-					providers = pending
-					return true
-				}, 3*time.Second, time.Millisecond)
-				require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
-				var published []*Provider
-				for range 2 {
-					select {
-					case p := <-results:
-						published = append(published, p)
-					case <-time.After(3 * time.Second):
-						t.Fatal("duplicate constructor did not complete")
-					}
-					require.NoError(t, <-errs)
-				}
-				require.Same(t, published[0], published[1])
-			} else {
-				spec, _ := lifetimeSpec(t, "first", helperLSPGraceful)
-				first, err := r.ForSpecWorkspace(spec, r.defaultWorkspace)
+			spec, _ := lifetimeSpec(t, "first", helperLSPGraceful)
+			first, err := r.ForSpecWorkspace(spec, r.defaultWorkspace)
+			require.NoError(t, err)
+			providers = append(providers, first)
+			if mode == "lru" {
+				r.SetMaxAlive(1)
+				other, _ := lifetimeSpec(t, "second", helperLSPGraceful)
+				second, err := r.ForSpecWorkspace(other, r.defaultWorkspace)
 				require.NoError(t, err)
-				providers = append(providers, first)
-				if mode == "lru" {
-					r.SetMaxAlive(1)
-					other, _ := lifetimeSpec(t, "second", helperLSPGraceful)
-					second, err := r.ForSpecWorkspace(other, r.defaultWorkspace)
-					require.NoError(t, err)
-					providers = append(providers, second)
-				} else {
-					r.idleTimeout = time.Nanosecond
-					r.WithReaperInterval(time.Millisecond)
-				}
+				providers = append(providers, second)
+			} else {
+				r.idleTimeout = time.Nanosecond
+				r.WithReaperInterval(time.Millisecond)
 			}
 			var clients []*Client
 			for _, p := range providers {
@@ -379,5 +338,114 @@ func TestRouterCloseJoinsDetachedEvictionAndReaperOwners(t *testing.T) {
 			require.Empty(t, r.closeOwners)
 			r.mu.Unlock()
 		})
+	}
+}
+
+// awaitStartWaiters waits until n callers are parked on the in-flight start of
+// spec's default-workspace key.
+func awaitStartWaiters(t *testing.T, r *Router, spec *ServerSpec, n int) {
+	t.Helper()
+	key := providerKey{specName: spec.Name, workspace: absWorkspace(r.defaultWorkspace)}
+	require.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		start := r.inflight[key]
+		return start != nil && start.waiters == n && len(r.starting) == 1
+	}, 3*time.Second, time.Millisecond)
+}
+
+// Concurrent first acquires of one (spec, workspace) start one server and
+// share it, instead of starting a duplicate and closing it again (#1536).
+func TestRouterConcurrentFirstAcquireStartsOneServer(t *testing.T) {
+	spec, h := lifetimeSpec(t, "single-start", helperLSPInitBarrier)
+	r := NewRouter(t.TempDir(), zap.NewNop())
+	t.Cleanup(func() { _ = r.Close() })
+	results := make(chan *Provider, 2)
+	for range 2 {
+		go func() {
+			p, err := r.ForSpecWorkspace(spec, r.defaultWorkspace)
+			assert.NoError(t, err)
+			results <- p
+		}()
+	}
+	awaitLifetimeFile(t, h.entered)
+	awaitStartWaiters(t, r, spec, 1)
+	require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
+	first, second := receiveWithin(t, results), receiveWithin(t, results)
+	require.NotNil(t, first)
+	require.Same(t, first, second)
+	methods, err := os.ReadFile(h.trace)
+	require.NoError(t, err)
+	require.Equal(t, 1, strings.Count(string(methods), "initialize\n"))
+	require.Equal(t, uint64(1), r.TimingStats().RaceReuses)
+}
+
+// A waiter takes the outcome of the start it waited for: when that start
+// fails, the waiter returns its error rather than starting a server itself.
+func TestRouterFailedStartIsSharedWithWaiters(t *testing.T) {
+	spec, h := lifetimeSpec(t, "failed-start", helperLSPInitBarrier)
+	r := NewRouter(t.TempDir(), zap.NewNop())
+	t.Cleanup(func() { _ = r.Close() })
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := r.ForSpecWorkspace(spec, r.defaultWorkspace); errs <- err }()
+	}
+	awaitLifetimeFile(t, h.entered)
+	awaitStartWaiters(t, r, spec, 1)
+	// Fail the start with the router still open, so a waiter that retried
+	// would be free to start a second server.
+	r.mu.Lock()
+	var starting *Provider
+	for p := range r.starting {
+		starting = p
+	}
+	r.mu.Unlock()
+	require.NoError(t, ownedLifetimeClient(t, starting).transport.(*SpawnTransport).cmd.Process.Kill())
+	first, second := receiveWithin(t, errs), receiveWithin(t, errs)
+	require.Error(t, first)
+	require.Equal(t, first.Error(), second.Error(), "the waiter returns the failed start's error")
+	methods, err := os.ReadFile(h.trace)
+	require.NoError(t, err)
+	require.Equal(t, 1, strings.Count(string(methods), "initialize\n"))
+	require.Equal(t, uint64(1), r.TimingStats().Starts)
+}
+
+// A pinned waiter pins the provider it reuses: two pinned first acquires
+// hold two pins, and each release drops one.
+func TestRouterConcurrentPinnedAcquiresEachHoldAPin(t *testing.T) {
+	spec, h := lifetimeSpec(t, "pinned-start", helperLSPInitBarrier)
+	r := NewRouter(t.TempDir(), zap.NewNop())
+	t.Cleanup(func() { _ = r.Close() })
+	r.RegisterSpec(spec)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := r.ProviderForSpecWorkspace(spec.Name, r.defaultWorkspace); errs <- err }()
+	}
+	awaitLifetimeFile(t, h.entered)
+	awaitStartWaiters(t, r, spec, 1)
+	require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
+	require.NoError(t, receiveWithin(t, errs))
+	require.NoError(t, receiveWithin(t, errs))
+	inUse := func() int {
+		stats := r.Stats()
+		require.Len(t, stats, 1)
+		return stats[0].InUse
+	}
+	require.Equal(t, 2, inUse())
+	r.ReleaseSpecWorkspace(spec.Name, r.defaultWorkspace)
+	require.Equal(t, 1, inUse())
+	r.ReleaseSpecWorkspace(spec.Name, r.defaultWorkspace)
+	require.Equal(t, 0, inUse())
+}
+
+func receiveWithin[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(3 * time.Second):
+		t.Fatal("acquire did not return")
+		var zero T
+		return zero
 	}
 }

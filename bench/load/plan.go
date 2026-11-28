@@ -65,6 +65,7 @@ type request struct {
 type Workload struct {
 	PairedMeasurementUnit string         `json:"paired_measurement_unit,omitempty"`
 	EditACKMode           string         `json:"edit_ack_mode,omitempty"`
+	EditWaitCoChange      bool           `json:"edit_wait_cochange,omitempty"`
 	EditGateSeed          string         `json:"edit_gate_seed,omitempty"`
 	PRSmokeDrain          *PRSmokeDrain  `json:"pr_smoke_drain,omitempty"`
 	Scenario              string         `json:"scenario"`
@@ -84,6 +85,9 @@ type Workload struct {
 	SweepRepetitions      int            `json:"sweep_repetitions"`
 	SweepBudgetSec        float64        `json:"sweep_budget_seconds"`
 	EditProbe             *editProbePlan `json:"edit_probe,omitempty"`
+	// Present only for the contract-freshness scenario, so every other
+	// scenario keeps its request plan hash.
+	ContractFreshness *contractFreshnessPlan `json:"contract_freshness,omitempty"`
 }
 
 func (r request) name() string {
@@ -202,6 +206,10 @@ func validateAgentCounts(scenario string, readers, editors int) error {
 	case "all":
 		if readers < 1 || editors < 1 {
 			return errors.New("all scenarios require at least one pure reader and one combined edit/readback agent")
+		}
+	case contractFreshnessScenario:
+		if readers > contractFreshnessMaxReaders || editors != 1 {
+			return fmt.Errorf("contract-freshness has one witness editor and 0..%d pure readers", contractFreshnessMaxReaders)
 		}
 	case checkoutDiscoveryScenario:
 		if readers+editors < 2 {

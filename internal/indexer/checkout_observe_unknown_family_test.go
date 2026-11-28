@@ -17,6 +17,9 @@ import (
 
 func TestObserveCheckoutPathTrackedNonGitUnknownAncestorSkipsInventory(t *testing.T) {
 	lc, catalog, primary, familyID, _, _ := newCheckoutObservationFixture(t)
+	// The known-family proof and admission at the end share one job; slow Git
+	// must not expire it. Negative jobs end on their own, not by expiry.
+	lc.observationWorkTimeout = checkoutObservationTestWorkBudget
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	ancestor := filepath.Join(filepath.Dir(primary), "unknown-ancestor")

@@ -19,12 +19,24 @@ import (
 
 func newCheckoutMutationFixture(t testing.TB) (*coordinatorFixture, *CheckoutCoordinator, *CheckoutLifecycle) {
 	t.Helper()
+	return newCheckoutMutationFixtureWith(t, nil)
+}
+
+// newCheckoutMutationFixtureWith is newCheckoutMutationFixture over a builder
+// configure adjusts before the coordinator starts (nil: the default builder).
+func newCheckoutMutationFixtureWith(t testing.TB, configure func(*SparseGenerationBuilder)) (*coordinatorFixture, *CheckoutCoordinator, *CheckoutLifecycle) {
+	t.Helper()
 	f := newCoordinatorFixture(t)
 	gate := NewViewBuildGate()
 	gate.Open()
 	// The hour-long window parks the loop so every cycle is driven by hand;
 	// refresh tickets' demand wakes take the same window here.
-	c := f.coordinator(t, CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true})
+	cfg := CheckoutCoordinatorConfig{Gate: gate, Debounce: time.Hour, debounceDemand: true}
+	if configure != nil {
+		cfg.Builder = builderNewBuilder(f.store)
+		configure(cfg.Builder)
+	}
+	c := f.coordinator(t, cfg)
 	if out := c.reconcile(context.Background()); out.Err != nil || out.DirtyGenerationID == 0 {
 		t.Fatalf("initial reconcile: %+v", out)
 	}

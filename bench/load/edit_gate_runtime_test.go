@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,20 +98,44 @@ func TestEditGateRuntimeReadsEveryRequiredKindAndRetainsLiveTiers(t *testing.T) 
 }
 
 func TestEditGateImmediateSummaryPreservesReadError(t *testing.T) {
+	retriable, incomplete, complete, empty, one := true, false, true, 0, 1
 	for _, tc := range []struct {
-		name string
-		wire json.RawMessage
-		want string
+		name        string
+		wire        json.RawMessage
+		want        string
+		disposition editProbeReadbackDisposition
 	}{
 		{
-			name: "projection_superseded",
-			wire: json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"{\"error_code\":\"projection_superseded\",\"message\":\"projection not published: superseded\",\"retriable\":true,\"data\":{\"retry_scope\":\"read_only\",\"delivery_unknown\":false}}"}]}`),
-			want: "RPC -32000: projection_superseded: projection not published: superseded",
+			name:        "projection_superseded",
+			wire:        json.RawMessage(`{"isError":true,"_meta":{"gortex_projection_predicate":{"first_refusal":{"site":"retain","decision":"owner_before","attempt":1,"selected_source_seq":12,"current_source_seq":13},"recovery_samples":[],"overflow":false}},"content":[{"type":"text","text":"{\"error_code\":\"projection_superseded\",\"message\":\"projection not published: superseded\",\"retriable\":true,\"data\":{\"retry_scope\":\"read_only\",\"delivery_unknown\":false}}"}]}`),
+			want:        "RPC -32000: projection_superseded: projection not published: superseded",
+			disposition: editProbeReadbackDisposition{Kind: editProbeReadbackTypedRefusal, ErrorCode: "projection_superseded", Retriable: &retriable, RetryScope: "read_only", ProjectionPredicate: map[string]any{"state": "observed", "first_refusal": map[string]any{"site": "retain", "decision": "owner_before", "attempt": 1, "selected_source_seq": int64(12), "current_source_seq": int64(13)}}},
 		},
 		{
-			name: "malformed_success",
-			wire: json.RawMessage(`{"content":[]}`),
-			want: "output requires one successful payload and only known auxiliary notes",
+			name:        "untyped_contract_error",
+			wire:        json.RawMessage(`{"isError":true,"content":[{"type":"text","text":"get_file_summary: contract layer ownership revision changed"}]}`),
+			want:        "RPC -32000: get_file_summary: contract layer ownership revision changed",
+			disposition: editProbeReadbackDisposition{Kind: editProbeReadbackUntypedError},
+		},
+		{
+			// A truthful pending reply without the edited definition is not
+			// correct, but it is a different miss from wrong content.
+			name:        "pending_empty_success",
+			wire:        json.RawMessage(`{"content":[{"type":"text","text":"{\"nodes\":[],\"edges\":[],\"total_edges\":0,\"freshness\":{\"graph_freshness\":\"pending\",\"reason\":\"store_busy\",\"complete\":false}}"}]}`),
+			disposition: editProbeReadbackDisposition{Kind: editProbeReadbackAnswer, FreshnessState: "pending", FreshnessReason: "store_busy", FreshnessComplete: &incomplete, NodeCount: &empty},
+		},
+		{
+			// Wrong content that claims to be fresh keeps the same empty
+			// diagnostic, and only its disposition tells it from pending.
+			name:        "fresh_without_edit_success",
+			wire:        json.RawMessage(`{"content":[{"type":"text","text":"{\"nodes\":[{\"id\":\"fixture/sample.go::Example\",\"kind\":\"function\"}],\"edges\":[],\"total_edges\":0,\"freshness\":{\"graph_freshness\":\"fresh\",\"complete\":true}}"}]}`),
+			disposition: editProbeReadbackDisposition{Kind: editProbeReadbackAnswer, FreshnessState: "fresh", FreshnessComplete: &complete, NodeCount: &one},
+		},
+		{
+			name:        "malformed_success",
+			wire:        json.RawMessage(`{"content":[]}`),
+			want:        "output requires one successful payload and only known auxiliary notes",
+			disposition: editProbeReadbackDisposition{Kind: editProbeReadbackUndecodable},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,6 +174,15 @@ func TestEditGateImmediateSummaryPreservesReadError(t *testing.T) {
 			}
 			if got := state.record.Readbacks[0].Error; got != tc.want {
 				t.Errorf("readback diagnostic = %q, want %q", got, tc.want)
+			}
+			if got := state.record.Readbacks[0].Disposition; got == nil || !reflect.DeepEqual(*got, tc.disposition) {
+				t.Errorf("readback disposition = %+v, want %+v", got, tc.disposition)
+			}
+			// The read's own wire window reaches the witness; no other edit overlapped it.
+			run.states = []*editProbeState{state}
+			run.attributeConcurrentCommits()
+			if got := state.record.Readbacks[0].ConcurrentCommits; got == nil || got.State != "none_observed" || len(got.Commits) != 0 {
+				t.Errorf("concurrent commit witness = %+v, want none_observed", got)
 			}
 			if len(run.phase.Attempts) != 1 || run.phase.Attempts[0].Tool != "read.summary" {
 				t.Fatalf("immediate summary retried or changed calls: %+v", run.phase.Attempts)

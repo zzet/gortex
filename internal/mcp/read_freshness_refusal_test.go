@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,11 @@ func requireReadFreshnessContract(t *testing.T, result *mcplib.CallToolResult, c
 }
 
 // A real completed leaf must still refuse a different physical publication.
-// This tests wire classification, never permission to replay that leaf.
+// This tests wire classification, never permission to replay that leaf. A
+// summary or editing context may answer instead from the peer's verified newer
+// tool commit while the original allowance remains; that answer is pending and
+// never the old bytes, and its predicate keeps the same opt-in and bound. The
+// typed refusal remains only once the allowance is exhausted.
 func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 	for _, tc := range []struct {
 		name, legacy, operation string
@@ -68,11 +73,20 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			}
 			held := make(chan selected, 1)
 			release := make(chan struct{})
+			// released carries the time the held first selection returned to
+			// the read, before any recovery decision is taken.
+			released := make(chan time.Time, 1)
 			unblock := sync.OnceFunc(func() { close(release) })
+			var leafCalls atomic.Int32
 			s.facades.capture(leaf.tool, func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 				r, e := leaf.handler(ctx, req)
-				held <- selected{ctx, r, e}
-				<-release
+				// Only the first selection is held. A summary's second attempt
+				// and the later fresh read run straight through.
+				if leafCalls.Add(1) == 1 {
+					held <- selected{ctx, r, e}
+					<-release
+					released <- time.Now()
+				}
 				return r, e
 			})
 			type answer struct {
@@ -119,7 +133,29 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 			worker.Wait()
 			require.NoError(t, got.err)
 			t.Logf("CAUSAL_PEER_ACK_POSTLEAF_VERIFIED nativeFTS=%d operation=%s original_remaining=%s oldfacts_invalid=true actual_refusal=%t", fts, tc.operation, time.Until(deadline), got.result != nil && got.result.IsError)
-			requireReadFreshnessContract(t, got.result, "projection_superseded")
+			answeredFromNewer := got.result != nil && !got.result.IsError
+			if answeredFromNewer {
+				require.Contains(t, resultText(got.result), "NeighborAfter", "only the verified newer commit may answer")
+				require.NotContains(t, resultText(got.result), "NeighborBefore", "the refused first selection must not answer")
+				freshness, ok := resultJSON(t, got.result)["freshness"].(map[string]any)
+				require.True(t, ok, "the answer from a newer commit must carry freshness")
+				require.Equal(t, "pending", freshness["graph_freshness"])
+				require.EqualValues(t, 2, leafCalls.Load(), "the answer comes from a second leaf attempt")
+			} else {
+				requireReadFreshnessContract(t, got.result, "projection_superseded")
+				// A refusal after one attempt is allowed only when the
+				// original allowance had already expired as the first
+				// selection returned; otherwise the second attempt must have
+				// run. The stamp precedes the recovery check, so a slow reply
+				// alone cannot satisfy this.
+				var releasedAt time.Time
+				select {
+				case releasedAt = <-released:
+				case <-time.After(3 * time.Second):
+					t.Fatal("the held first selection never returned")
+				}
+				require.True(t, leafCalls.Load() == 2 || !releasedAt.Before(deadline), "a verified newer commit refuses only once the allowance is exhausted: leaf calls %d, released %s before the deadline", leafCalls.Load(), deadline.Sub(releasedAt))
+			}
 			if tc.capture {
 				require.NotNil(t, got.result.Meta)
 				trace, ok := got.result.Meta.AdditionalFields["gortex_projection_predicate"].(map[string]any)
@@ -131,6 +167,17 @@ func TestRegisteredReadFreshnessRefusalCarriesTypedReason(t *testing.T) {
 				require.NotEqual(t, first["selected_id"], first["current_id"])
 				require.Greater(t, first["current_source_seq"], first["selected_source_seq"])
 				wire, err := json.Marshal(got.result)
+				if answeredFromNewer {
+					samples, ok := trace["recovery_samples"].([]any)
+					require.True(t, ok, "recovery samples must be present: %v", trace["recovery_samples"])
+					granted := false
+					for _, row := range samples {
+						sample, ok := row.(map[string]any)
+						granted = granted || ok && sample["site"] == "recovery.newer_tool_commit" && sample["decision"] == "newer_tool_commit"
+					}
+					require.True(t, granted, "the second attempt must be explained by the newer tool commit")
+					wire, err = json.Marshal(trace)
+				}
 				require.NoError(t, err)
 				require.LessOrEqual(t, len(wire), 4096)
 				require.NotContains(t, string(wire), path)

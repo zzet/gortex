@@ -138,7 +138,8 @@ func TestSelectionUnverifiedMergeMetadataFallsBackBeforeGoDiscovery(t *testing.T
 			e.PullRequest = &pr
 			edit(&e)
 			m, err := f.planner.Plan(t.Context(), e)
-			if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != 17 || len(m.Packages) != 0 {
+			// Unverified metadata leaves the changed paths unknown, so macOS stays in.
+			if err != nil || m.Mode != "full" || m.EmptyOK || len(m.Matrix.Include) != fullRows(t, true) || !m.MacOS.Selected || len(m.Packages) != 0 {
 				t.Fatalf("unsafe event selected partial tests: %+v %v", m, err)
 			}
 		})

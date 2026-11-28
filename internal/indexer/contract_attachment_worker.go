@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zzet/gortex/internal/config"
@@ -226,6 +227,12 @@ type ContractFollowupReport struct {
 	NeedSum        time.Duration
 	NeedIterations int
 	WindowGaps     []time.Duration
+	// Yields counts the batch's calls into its foreground yield, before each
+	// file it extracts and at other unit boundaries, and YieldDuration is the
+	// time spent in them. Like the extraction, they are the batch's, shared
+	// by its targets; the time overlaps the phase durations above.
+	Yields        int
+	YieldDuration time.Duration
 }
 
 // ContractFollowupTarget reserves one independently published repository payload.
@@ -305,6 +312,16 @@ func RunContractFollowupBatch(ctx context.Context, req ContractFollowupBatchRequ
 	}
 	if len(req.Targets) == 0 || req.Snapshot.Release == nil || req.Leases == nil {
 		return batch, fmt.Errorf("contract followup batch: incomplete target handoff")
+	}
+	if req.Yield != nil {
+		var yields contractYieldMeter
+		req.Yield = yields.wrap(req.Yield)
+		defer func() {
+			yields.record(&batch.Cohort)
+			for i := range batch.Targets {
+				yields.record(&batch.Targets[i].Report)
+			}
+		}()
 	}
 	seen := make(map[graph.ContractAttachmentKey]bool)
 	payloads := make(map[int64]bool)
@@ -466,6 +483,28 @@ func RunContractFollowupBatch(ctx context.Context, req ContractFollowupBatchRequ
 
 	batch.Cohort = prepared.report
 	return batch, nil
+}
+
+// contractYieldMeter counts a batch's calls into its foreground yield and the
+// time spent in them.
+type contractYieldMeter struct {
+	calls, wait atomic.Int64
+}
+
+// wrap returns yield, measured by the meter.
+func (m *contractYieldMeter) wrap(yield func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		start := time.Now()
+		err := yield(ctx)
+		m.wait.Add(int64(time.Since(start)))
+		m.calls.Add(1)
+		return err
+	}
+}
+
+// record copies the meter's totals into report.
+func (m *contractYieldMeter) record(report *ContractFollowupReport) {
+	report.Yields, report.YieldDuration = int(m.calls.Load()), time.Duration(m.wait.Load())
 }
 
 // RunContractFollowup performs no ordinary core indexing or route publication.

@@ -146,6 +146,13 @@ See [CI test selection](docs/ci-testing.md) for full-suite fallbacks, the
 `ci:full` PR label, and the `CI_FULL_TESTS=true` repository rollback switch.
 CI/dependency changes and Dependabot PRs always run the full suite.
 
+On pull requests the macOS test partitions run only when the PR changes a
+macOS-sensitive path (darwin-specific or cgo Go files, `internal/platform`,
+path keys, the file watcher, daemon start and socket code, native sources,
+`go.mod`/`go.sum`, or the CI workflows and scripts) or carries the `ci:macos`
+label. The macOS build runs on every PR, and pushes to `main` always run the
+full macOS matrix. Other labels do not start CI work.
+
 Additional workflows cover security scanning, the install script, init smoke
 tests, and skill drift.
 

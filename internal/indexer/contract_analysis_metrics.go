@@ -104,6 +104,8 @@ func logContractJob(logger *zap.Logger, mode, outcome string, elapsed time.Durat
 		zap.Int("window_n", len(cohort.WindowGaps)),
 	}
 	fields = append(fields, phases.fields()...)
+	// The time the job handed to foreground work overlaps its phases.
+	fields = append(fields, zap.Int("yields", cohort.Yields), zap.Duration("yield", cohort.YieldDuration))
 	fields = append(fields, extra...)
 	logger.Info("contract analysis job", fields...)
 }

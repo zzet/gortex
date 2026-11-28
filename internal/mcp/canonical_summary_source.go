@@ -24,10 +24,11 @@ type canonicalSummarySource struct {
 	registry                            *projectionSnapshot
 }
 
-// canonicalSummaryDefinitions supplies only file definitions after a checked
-// store timeout. It uses the original request deadline and leaves the store
-// failure pending. The immutable registry revision excludes even an owner
-// that came and went while SQLite was unavailable.
+// canonicalSummaryDefinitions supplies only file definitions when a checked
+// store read of the file timed out or saw the store revision move. It uses
+// the original request deadline and leaves the store failure pending. The
+// registry's change log for this file excludes even an owner that came and
+// went while SQLite was unavailable; other files' owners do not move it.
 func (s *Server) canonicalSummaryDefinitions(ctx context.Context, graphPath string, proof *canonicalSummarySource) *query.SubGraph {
 	deadline, ok := ctx.Value(projectedSourceDeadlineKey{}).(time.Time)
 	if !ok || proof.registry == nil || proof.graphPath != graphPath || requestDeferredProjectionFiles(ctx)[graphPath] != "" {
@@ -35,7 +36,7 @@ func (s *Server) canonicalSummaryDefinitions(ctx context.Context, graphPath stri
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if ctx.Err() != nil || pendingFileProjections.snap.Load() != proof.registry {
+	if ctx.Err() != nil || !pendingFileProjections.ownerAbsentSince(proof.registry, proof.key) {
 		return nil
 	}
 	idx, rel := s.indexerForRel(graphPath)
@@ -69,7 +70,7 @@ func (s *Server) canonicalSummaryDefinitions(ctx context.Context, graphPath stri
 	}
 	after, err := statDiskStamp(abs)
 	if err != nil || !proof.stamp.matches(after) || pathkey.MutationKey(abs) != key ||
-		s.projectionStormActive(abs) || pendingFileProjections.snap.Load() != proof.registry || ctx.Err() != nil {
+		s.projectionStormActive(abs) || !pendingFileProjections.ownerAbsentSince(proof.registry, proof.key) || ctx.Err() != nil {
 		return nil
 	}
 	return &query.SubGraph{Nodes: projection.Nodes}

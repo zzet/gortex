@@ -269,7 +269,11 @@ func (l *CheckoutLifecycle) checkoutObservation(path string, target checkoutObse
 	if l.observationJobs == nil {
 		l.observationJobs = make(map[string]*checkoutObservationJob)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), checkoutObservationWorkTimeout)
+	workTimeout := checkoutObservationWorkTimeout
+	if l.observationWorkTimeout > 0 {
+		workTimeout = l.observationWorkTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), workTimeout)
 	job := &checkoutObservationJob{checkoutObservationTarget: target, ctx: ctx, cancel: cancel, proofReady: make(chan struct{}), authorized: make(chan struct{}), done: make(chan struct{})}
 	l.observationJobs[path] = job
 	l.observationWG.Add(1)

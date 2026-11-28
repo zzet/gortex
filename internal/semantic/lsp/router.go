@@ -132,10 +132,15 @@ type Router struct {
 	// override wins over both.
 	enrichMaxParallel int
 
-	mu           sync.Mutex
-	closed       bool
-	starting     map[*Provider]*routedProvider
-	starts       sync.WaitGroup
+	mu       sync.Mutex
+	closed   bool
+	starting map[*Provider]*routedProvider
+	starts   sync.WaitGroup
+	// inflight holds the one start in progress per (spec, workspace).
+	// Concurrent first acquires of a key wait for it instead of spawning a
+	// second server for the same workspace (#1536): a duplicate is wasted
+	// startup at best, and two jdtls on one -data workspace contend for it.
+	inflight     map[providerKey]*providerStart
 	closeOwners  map[*Provider]routerCloseOwner
 	closeWorkers sync.WaitGroup
 	reapers      sync.WaitGroup
@@ -582,12 +587,22 @@ func (r *Router) ForSpecWorkspace(spec *ServerSpec, workspace string) (*Provider
 	return r.forSpecWorkspace(spec, workspace, false)
 }
 
+// providerStart is a provider start in progress for one providerKey. done
+// closes once the start has published its provider or failed with err.
+type providerStart struct {
+	done    chan struct{}
+	err     error
+	waiters int // callers that waited on this start, for test observability; guarded by Router.mu
+}
+
 // forSpecWorkspace is ForSpecWorkspace with an optional in-use pin. When pin
 // is true the returned provider's inUse count is incremented in the SAME
 // locked section that looks it up or publishes it — so a concurrent spawn's
 // LRU eviction can never Close a freshly-returned-but-not-yet-pinned provider
 // (the spawn→pin TOCTOU). A pinned fetch MUST be paired with ReleaseSpecWorkspace.
-func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) (*Provider, error) {
+// Concurrent first acquires of one (spec, workspace) share a single start: the
+// first registers it in r.inflight and the others wait for its outcome.
+func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) (_ *Provider, retErr error) {
 	acquireStarted := time.Now()
 	success, reused := false, false
 	r.timing.acquires.Add(1)
@@ -621,36 +636,76 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	workspace = absWorkspace(workspace)
 	key := providerKey{specName: spec.Name, workspace: workspace}
 
-	lockStarted := time.Now()
-	r.mu.Lock()
-	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
-	if r.closed {
-		r.mu.Unlock()
-		return nil, errRouterClosed
-	}
-	rp, ok := r.providers[key]
-	if ok {
-		rp.lastUsed = time.Now()
-		if pin {
-			rp.inUse++
+	var start *providerStart
+	waited, validated := false, false
+	for start == nil {
+		lockStarted := time.Now()
+		r.mu.Lock()
+		r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
+		if r.closed {
+			r.mu.Unlock()
+			return nil, errRouterClosed
 		}
+		if rp, ok := r.providers[key]; ok {
+			rp.lastUsed = time.Now()
+			if pin {
+				rp.inUse++
+			}
+			r.mu.Unlock()
+			success = true
+			if waited {
+				r.timing.raceReuses.Add(1)
+			} else {
+				reused = true
+			}
+			return rp.provider, nil
+		}
+		if !validated {
+			// The workspace becomes the subprocess's working directory, so
+			// validate it before spawning or waiting on a spawn. A caller that
+			// handed us a path anchored on the daemon's launch cwd instead of on
+			// the tracked repo's own root would otherwise fail deep inside exec
+			// with a bare chdir error — and would take the spec down for every
+			// repo via markSpawnFailed. Each caller checks what it asked for, so
+			// the fault stays local to the one bad caller and never reaches the
+			// others waiting on the same key.
+			r.mu.Unlock()
+			if err := validateWorkspaceRoot(spec.Name, requested, workspace); err != nil {
+				return nil, err
+			}
+			validated = true
+			continue
+		}
+		if pending, ok := r.inflight[key]; ok {
+			// Another caller is starting this server. Wait for its outcome
+			// and look again: its provider is normally published by then.
+			pending.waiters++
+			r.mu.Unlock()
+			<-pending.done
+			if pending.err != nil {
+				return nil, pending.err
+			}
+			// Revalidate if the provider is gone by the next look and this
+			// caller has to start it: the directory may have changed meanwhile.
+			waited, validated = true, false
+			continue
+		}
+		start = &providerStart{done: make(chan struct{})}
+		if r.inflight == nil {
+			r.inflight = make(map[providerKey]*providerStart)
+		}
+		r.inflight[key] = start
+		r.starts.Add(1)
 		r.mu.Unlock()
-		success, reused = true, true
-		return rp.provider, nil
 	}
-	r.starts.Add(1)
-	r.mu.Unlock()
 	defer r.starts.Done()
-
-	// The workspace becomes the subprocess's working directory, so validate
-	// it before spawning. A caller that handed us a path anchored on the
-	// daemon's launch cwd instead of on the tracked repo's own root would
-	// otherwise fail deep inside exec with a bare chdir error — and would
-	// take the spec down for every repo via markSpawnFailed. Failing here
-	// keeps the fault local to the one bad workspace.
-	if err := validateWorkspaceRoot(spec.Name, requested, workspace); err != nil {
-		return nil, err
-	}
+	defer func() {
+		r.mu.Lock()
+		delete(r.inflight, key)
+		r.mu.Unlock()
+		start.err = retErr
+		close(start.done)
+	}()
 
 	// Spawn outside the lock — initialize() blocks on stdio I/O.
 	constructStarted := time.Now()
@@ -703,15 +758,17 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 	// burst some servers emit during workspace warmup.
 	r.attachDiagnosticsHook(spec.Name, p)
 
-	lockStarted = time.Now()
+	lockStarted := time.Now()
 	r.mu.Lock()
 	r.timing.waitNanos.Add(int64(time.Since(lockStarted)))
 	if r.closed {
 		r.mu.Unlock()
 		return nil, errors.Join(errRouterClosed, p.Close())
 	}
-	// Race: another goroutine may have spawned it while we were
-	// initializing. Prefer the existing one and shut down our duplicate.
+	// This start owns r.inflight[key], so no other provider for the key
+	// can have been published while it initialized. Guard the invariant
+	// anyway: overwriting a live entry would orphan its server, so if a
+	// future publish path ever breaks it, close the newcomer instead.
 	if existing, ok := r.providers[key]; ok {
 		existing.lastUsed = time.Now()
 		if pin {
@@ -719,10 +776,11 @@ func (r *Router) forSpecWorkspace(spec *ServerSpec, workspace string, pin bool) 
 		}
 		owner, admitted := r.registerCloseLocked(p, spec.Name, workspace, "duplicate")
 		r.mu.Unlock()
+		r.logger.Warn("LSP router found a provider already published for this server and workspace; closing the new one",
+			zap.String("spec", spec.Name), zap.String("workspace", workspace))
 		if admitted {
 			go r.finishClose(owner)
 		}
-		r.timing.raceReuses.Add(1)
 		success = true
 		return existing.provider, nil
 	}
@@ -1093,7 +1151,7 @@ type RouterTimingStats struct {
 	StartFailures    uint64        `json:"start_failures"`
 	Evictions        uint64        `json:"evictions"`
 	EvictionDuration time.Duration `json:"eviction_duration"`
-	RaceReuses       uint64        `json:"race_reuses"`
+	RaceReuses       uint64        `json:"race_reuses"` // acquires that waited for a concurrent start of the same key, then reused its provider
 	Closes           uint64        `json:"closes"`
 	CloseFailures    uint64        `json:"close_failures"`
 	AcquireDuration  time.Duration `json:"acquire_duration"`

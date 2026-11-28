@@ -15,28 +15,61 @@ import (
 // to consult canonical inventory. Keep its lease until the exact-pointer COW
 // drop finishes; no I/O or layer check runs under the registry mutex.
 func (s *Server) retireSelectedProjection(ctx, requestCtx context.Context, entry *projectionEntry) bool {
+	adapter, release := s.selectedProjectionAdapter(ctx, requestCtx, entry)
+	if adapter == nil {
+		return false
+	}
+	defer release()
+	return pendingFileProjections.retireSelected(adapter, map[string]struct{}{entry.key: {}}) == 1
+}
+
+// selectedViewHoldsProjection reports whether retireSelectedProjection would
+// drop this read-built entry as soon as it was published. It publishes and
+// retires nothing. The error is ctx's when the proof ran out of it before the
+// selected view answered that it holds other content.
+func (s *Server) selectedViewHoldsProjection(ctx, requestCtx context.Context, entry *projectionEntry) (bool, error) {
+	if entry == nil || entry.tombstone || entry.layer == nil {
+		return false, nil
+	}
+	adapter, release := s.selectedProjectionAdapter(ctx, requestCtx, entry)
+	if adapter == nil {
+		return false, nil
+	}
+	defer release()
+	if pendingFileProjections.holdsUnpublished(adapter, entry) {
+		return true, nil
+	}
+	if row, ok := adapter.initial[entry.graphPath]; adapter.initial != nil && (!ok || row.ContentHash != entry.hash) {
+		return false, nil // the selected view holds other content
+	}
+	return false, ctx.Err()
+}
+
+// selectedProjectionAdapter binds entry to the request's leased selected
+// reader. A nil adapter means that reader cannot supply checked evidence.
+func (s *Server) selectedProjectionAdapter(ctx, requestCtx context.Context, entry *projectionEntry) (*selectedProjectionStore, func()) {
 	view := requestViewFromContext(requestCtx)
 	if view == nil || view.materialized == nil || view.reader == nil || !requestViewPathRoot(requestCtx).contains(entry.absPath) || viewRepoPrefix(view) != entry.repoPrefix {
-		return false
+		return nil, nil
 	}
 	abs, err := s.resolveGraphPath(requestCtx, entry.graphPath)
 	if err != nil || pathkey.MutationKey(abs) != entry.key {
-		return false
+		return nil, nil
 	}
 	handoff := view.materialized.Handoff()
 	if handoff == nil {
-		return false
+		return nil, nil
 	}
-	defer handoff.Close()
 	if !reflect.ValueOf(view.reader).Comparable() || view.reader != handoff.Reader {
-		return false
+		handoff.Close()
+		return nil, nil
 	}
 	checked, ok := handoff.Reader.(graph.ConstantValueProjectionReader)
 	if !ok {
-		return false
+		handoff.Close()
+		return nil, nil
 	}
-	adapter := &selectedProjectionStore{ctx: ctx, reader: handoff.Reader, checked: checked, sources: handoff.GenerationSources(), entry: entry}
-	return pendingFileProjections.retireSelected(adapter, map[string]struct{}{entry.key: {}}) == 1
+	return &selectedProjectionStore{ctx: ctx, reader: handoff.Reader, checked: checked, sources: handoff.GenerationSources(), entry: entry}, handoff.Close
 }
 
 // This private adapter supplies the legacy retirement algorithm only checked
