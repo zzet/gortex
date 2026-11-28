@@ -2482,9 +2482,12 @@ func (w *Watcher) completeMutationWaitersObserved(
 	}
 	var completions []completion
 	var accepted *PublicationPhaseRecord
+	var cleanGen uint64
 	for generation, waiter := range w.mutationWaiters[path] {
 		if generation <= appliedGeneration {
-			w.finishMutationTierLocked(path, waiter.ticket, err, fanout)
+			if w.finishMutationTierLocked(path, waiter.ticket, err, fanout) && generation > cleanGen {
+				cleanGen = generation
+			}
 			if err == nil && generation < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2497,6 +2500,11 @@ func (w *Watcher) completeMutationWaitersObserved(
 			}
 			completions = append(completions, completion{requested: generation, done: waiter.done, publication: waiter.publication})
 			delete(w.mutationWaiters[path], generation)
+		}
+	}
+	if cleanGen > 0 {
+		if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= cleanGen {
+			delete(w.failedPaths, path)
 		}
 	}
 	if len(w.mutationWaiters[path]) == 0 {
@@ -2977,11 +2985,14 @@ func (w *Watcher) completeStormMutationWaiters(
 		if pathErr != nil {
 			pathFanout = DerivedFanoutCompleteness{}
 		}
+		var cleanGen uint64
 		for requestedGeneration, waiter := range w.mutationWaiters[path] {
 			if requestedGeneration > appliedGeneration {
 				continue
 			}
-			w.finishMutationTierLocked(path, waiter.ticket, pathErr, pathFanout)
+			if w.finishMutationTierLocked(path, waiter.ticket, pathErr, pathFanout) && requestedGeneration > cleanGen {
+				cleanGen = requestedGeneration
+			}
 			if pathErr == nil && requestedGeneration < appliedGeneration {
 				w.mutationWaitersLater++
 			}
@@ -2996,6 +3007,11 @@ func (w *Watcher) completeStormMutationWaiters(
 				},
 			})
 			delete(w.mutationWaiters[path], requestedGeneration)
+		}
+		if cleanGen > 0 {
+			if prior := w.failedPaths[path]; !prior.rebindRefused && prior.Generation <= cleanGen {
+				delete(w.failedPaths, path)
+			}
 		}
 		if len(w.mutationWaiters[path]) == 0 {
 			delete(w.mutationWaiters, path)

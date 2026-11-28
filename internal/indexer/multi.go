@@ -1162,12 +1162,12 @@ func (mi *MultiIndexer) clearPendingRetryForRepo(repoPrefix string) {
 // PendingRetryBacklogStats snapshots the retained refused-write retry backlog
 // and observability counters for diagnostics and tests.
 func (mi *MultiIndexer) PendingRetryBacklogStats() MultiRetryBacklogStats {
+	if mi == nil {
+		return MultiRetryBacklogStats{}
+	}
 	stats := MultiRetryBacklogStats{
 		BacklogGrowthEvents: mi.backlogGrowthEvents.Load(),
 		BacklogDrainEvents:  mi.backlogDrainEvents.Load(),
-	}
-	if mi == nil {
-		return stats
 	}
 	mi.pendingResolveRetryMu.Lock()
 	defer mi.pendingResolveRetryMu.Unlock()
@@ -3702,7 +3702,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	if err := idx.finishAliasPass(result); err != nil {
 		return result, err
 	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+	if mode.returnResolutionRefusal && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
 		return result, result.resolutionErr
 	}
 	return result, nil
@@ -4477,9 +4477,6 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			}
 			if err := idx.finishAliasPass(result); err != nil {
 				return err
-			}
-			if errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
-				return result.resolutionErr
 			}
 		} else if result.FullRetrack {
 			if !batchMode.deferResolve {

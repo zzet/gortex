@@ -1693,14 +1693,20 @@ func (r *Resolver) drainNonFrontierRetryWritesLocked(
 			*drainRefused = true
 		}
 	}
-	if *drainRefused && !r.retryBridgeActiveLocked() && r.logger != nil {
+	if *drainRefused && r.logger != nil {
 		guardItems := 0
 		for i := range r.pendingGuardReverts {
 			guardItems += r.pendingGuardReverts[i].ItemCount()
 		}
-		r.logger.Warn("resolver: opportunistic retry drain refused under contention; keeping tail queued",
-			zap.Int("remaining_repoints", len(r.placeholderSrcIdx.deferred)),
-			zap.Int("remaining_guard_reverts", guardItems))
+		if r.retryBridgeActiveLocked() {
+			r.logger.Info("resolver: opportunistic retry drain deferred under contention",
+				zap.Int("remaining_repoints", len(r.placeholderSrcIdx.deferred)),
+				zap.Int("remaining_guard_reverts", guardItems))
+		} else {
+			r.logger.Warn("resolver: opportunistic retry drain refused under contention; keeping tail queued",
+				zap.Int("remaining_repoints", len(r.placeholderSrcIdx.deferred)),
+				zap.Int("remaining_guard_reverts", guardItems))
+		}
 	}
 }
 
@@ -4338,7 +4344,12 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	defer r.mu.Unlock()
 	prevMaxWait := r.passReindexMaxWait
 	r.passReindexMaxWait = maxWait
-	defer func() { r.passReindexMaxWait = prevMaxWait }()
+	defer func() {
+		r.passReindexMaxWait = prevMaxWait
+		if maxWait > 0 && stats != nil && stats.WriteRefused && r.logger != nil {
+			r.logger.Info("resolver: bounded incremental pass deferred under contention")
+		}
+	}()
 	retryOpts := r.retryOptsForFilesLocked(filePaths)
 	allowedRepo := r.allowedRepoFuncForOptsLocked(retryOpts)
 	allowedRepoint := r.allowedRepointFuncForOptsLocked(retryOpts, allowedRepo)

@@ -69,7 +69,7 @@ func (w *Watcher) pointRelationsMode(path string, generation uint64, stamps *Pub
 		return admitted
 	}}
 	return incrementalPathMode{
-		detectDeletions: true, forceExplicitFiles: true, publication: stamps,
+		detectDeletions: true, forceExplicitFiles: true, returnResolutionRefusal: true, publication: stamps,
 		relationsRead: read,
 		onRelations: func(refused bool) {
 			if refused {

@@ -14,6 +14,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graph/store_sqlite"
@@ -1985,7 +1988,9 @@ func TestStep3OpportunisticDrainFastFailsUnderSQLiteWriterContention(t *testing.
 		{From: "old.go::Caller", To: "decoy.go::Decoy", Kind: graph.EdgeCalls, FilePath: "old.go", Line: 8, Confidence: 0.4, Origin: graph.OriginTextMatched},
 	})
 
+	core, recorded := observer.New(zapcore.InfoLevel)
 	r := New(store)
+	r.SetLogger(zap.New(core))
 	r.InheritPendingPlaceholderRepoints([]graph.PlaceholderRepoint{
 		{OldFrom: "unresolved::Target", FilePath: "old.go", Line: 5, NewFrom: "target.go::Target"},
 	})
@@ -1997,6 +2002,7 @@ func TestStep3OpportunisticDrainFastFailsUnderSQLiteWriterContention(t *testing.
 	}})
 
 	// Hold the real SQLite writer gate with default 15s busy timeout intact.
+	// Unbridged Resolver Step 3 fast-fail emits 1 Warn and 0 bridged Info logs.
 	release, err := store.HoldWriteGate(context.Background())
 	require.NoError(t, err)
 	start := time.Now()
@@ -2008,6 +2014,63 @@ func TestStep3OpportunisticDrainFastFailsUnderSQLiteWriterContention(t *testing.
 	assert.False(t, stats.WriteRefused, "clean zero-pending save must not report WriteRefused when Step 3 fast-fails")
 	assert.Equal(t, 1, r.PendingRetryStats().PlaceholderRepoints, "Step 3 fast-fail must preserve queued repoints")
 	assert.Equal(t, 1, r.PendingRetryStats().GuardReverts, "Step 3 fast-fail must preserve queued guard reverts")
+	assert.Equal(t, 1, recorded.FilterLevelExact(zapcore.WarnLevel).FilterMessage("resolver: opportunistic retry drain refused under contention; keeping tail queued").Len())
+	assert.Zero(t, recorded.FilterMessage("resolver: opportunistic retry drain deferred under contention").Len())
+	assert.Zero(t, recorded.FilterMessage("resolver: bounded incremental pass deferred under contention").Len())
+
+	// Bridged Resolver Step 3 fast-fail emits 1 Info and 0 Warn logs.
+	recorded.TakeAll()
+	bridgedState := MasterRetryState{
+		PlaceholderRepoints: []graph.PlaceholderRepoint{
+			{OldFrom: "unresolved::Target", FilePath: "old.go", Line: 5, NewFrom: "target.go::Target"},
+		},
+		GuardReverts: []PendingGuardRevert{{
+			Reindexes: []graph.EdgeReindex{{
+				Edge:  &graph.Edge{From: "old.go::Caller", To: "unresolved::Decoy", Kind: graph.EdgeCalls, FilePath: "old.go", Line: 8, Meta: map[string]any{"guard_reverted": true}},
+				OldTo: "decoy.go::Decoy",
+			}},
+		}},
+	}
+	rBridged := New(store)
+	rBridged.SetLogger(zap.New(core))
+	rBridged.SetRetryStateBridge(
+		func(_ RetryTakeOpts) (MasterRetryState, uint64) {
+			taken := bridgedState
+			bridgedState = MasterRetryState{}
+			return taken, 1
+		},
+		func(st MasterRetryState, _ RetryBridgeSaveMeta) { bridgedState = st },
+		nil,
+		nil,
+	)
+	release, err = store.HoldWriteGate(context.Background())
+	require.NoError(t, err)
+	statsBridged := rBridged.ResolveFilesAndIncoming([]string{"other.go"})
+	release()
+	assert.False(t, statsBridged.WriteRefused)
+	assert.Len(t, bridgedState.PlaceholderRepoints, 1)
+	assert.Equal(t, 1, recorded.FilterLevelExact(zapcore.InfoLevel).FilterMessage("resolver: opportunistic retry drain deferred under contention").Len())
+	assert.Zero(t, recorded.FilterLevelExact(zapcore.WarnLevel).Len())
+	assert.Zero(t, recorded.FilterMessage("resolver: bounded incremental pass deferred under contention").Len())
+
+	// Bounded Resolver WithTimeout pass emits 1 Info on WriteRefused and 0 Step 3 logs.
+	store.AddBatch([]*graph.Node{
+		{ID: "bounded.go", Kind: graph.KindFile, Name: "bounded.go", FilePath: "bounded.go", Language: "go"},
+		{ID: "bounded.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "bounded.go", Language: "go"},
+	}, []*graph.Edge{
+		{From: "bounded.go::Run", To: "unresolved::Target", Kind: graph.EdgeCalls, FilePath: "bounded.go", Line: 3},
+	})
+	recorded.TakeAll()
+	rBounded := New(store)
+	rBounded.SetLogger(zap.New(core))
+	release, err = store.HoldWriteGate(context.Background())
+	require.NoError(t, err)
+	statsBounded := rBounded.ResolveFilesAndIncomingObservedWithTimeout([]string{"bounded.go"}, nil, 50*time.Millisecond)
+	release()
+	assert.True(t, statsBounded.WriteRefused)
+	assert.Equal(t, 1, recorded.FilterLevelExact(zapcore.InfoLevel).FilterMessage("resolver: bounded incremental pass deferred under contention").Len())
+	assert.Zero(t, recorded.FilterMessage("resolver: opportunistic retry drain deferred under contention").Len())
+	assert.Zero(t, recorded.FilterMessage("resolver: opportunistic retry drain refused under contention; keeping tail queued").Len())
 
 	// Once contention clears, a clean save drains both.
 	stats = r.ResolveFilesAndIncoming([]string{"other.go"})
@@ -2016,6 +2079,81 @@ func TestStep3OpportunisticDrainFastFailsUnderSQLiteWriterContention(t *testing.
 	assert.Equal(t, 0, r.PendingRetryStats().GuardReverts)
 	assert.Empty(t, store.GetOutEdges("unresolved::Target"))
 	assert.Len(t, store.GetOutEdges("target.go::Target"), 1)
+
+	t.Run("cross_repo_resolver_logging", func(t *testing.T) {
+		crStore, crErr := store_sqlite.Open(filepath.Join(t.TempDir(), "step3-cross-repo.sqlite"))
+		require.NoError(t, crErr)
+		t.Cleanup(func() { require.NoError(t, crStore.Close()) })
+
+		crStore.AddBatch([]*graph.Node{
+			{ID: "repoA/old.go", Kind: graph.KindFile, Name: "old.go", FilePath: "repoA/old.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/old.go::OldCaller", Kind: graph.KindFunction, Name: "OldCaller", FilePath: "repoA/old.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/other.go", Kind: graph.KindFile, Name: "other.go", FilePath: "repoA/other.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/caller.go", Kind: graph.KindFile, Name: "caller.go", FilePath: "repoA/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoA/caller.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "repoA/caller.go", RepoPrefix: "repoA", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/lib.go", Kind: graph.KindFile, Name: "lib.go", FilePath: "repoB/lib.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/lib.go::OldTarget", Kind: graph.KindFunction, Name: "OldTarget", FilePath: "repoB/lib.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+			{ID: "repoB/lib.go::CrossTarget", Kind: graph.KindFunction, Name: "CrossTarget", FilePath: "repoB/lib.go", RepoPrefix: "repoB", WorkspaceID: "ws", Language: "go"},
+		}, []*graph.Edge{
+			{From: "repoA/unresolved::OldTarget", To: "repoA/old.go::OldCaller", Kind: graph.EdgeArgOf, FilePath: "repoA/old.go", Line: 5},
+			{From: "repoA/caller.go", To: "repoB/lib.go", Kind: graph.EdgeImports, FilePath: "repoA/caller.go", Line: 1, CrossRepo: true},
+			{From: "repoA/caller.go::Run", To: "unresolved::CrossTarget", Kind: graph.EdgeCalls, FilePath: "repoA/caller.go", Line: 4},
+		})
+
+		crCore, crRecorded := observer.New(zapcore.InfoLevel)
+		crRepoint := graph.PlaceholderRepoint{
+			OldFrom: "repoA/unresolved::OldTarget", FilePath: "repoA/old.go", Line: 5, NewFrom: "repoB/lib.go::OldTarget", RepoPrefix: "repoA",
+		}
+
+		// 1. Unbridged CrossRepoResolver Step 3 fast-fail emits 1 Warn.
+		crUnbridged := NewCrossRepo(crStore)
+		crUnbridged.SetLogger(zap.New(crCore))
+		crUnbridged.InheritPendingPlaceholderRepoints([]graph.PlaceholderRepoint{crRepoint})
+		rel, holdErr := crStore.HoldWriteGate(context.Background())
+		require.NoError(t, holdErr)
+		crStats := crUnbridged.ResolveMutationFrontiers([]string{"repoA/other.go"}, []string{"repoA/other.go"}, []string{"repoA/other.go"})
+		rel()
+		assert.False(t, crStats.WriteRefused)
+		assert.Equal(t, 1, crRecorded.FilterLevelExact(zapcore.WarnLevel).FilterMessage("cross-repo resolver: opportunistic retry drain refused under contention; keeping tail queued").Len())
+		assert.Zero(t, crRecorded.FilterMessage("cross-repo resolver: opportunistic retry drain deferred under contention").Len())
+
+		// 2. Bridged CrossRepoResolver Step 3 fast-fail emits 1 Info and 0 Warn.
+		crRecorded.TakeAll()
+		savedCR := CrossRepoRetryState{Repoints: []graph.PlaceholderRepoint{crRepoint}}
+		crBridged := NewCrossRepo(crStore)
+		crBridged.SetLogger(zap.New(crCore))
+		crBridged.SetRetryStateBridge(
+			func(_ RetryTakeOpts) (CrossRepoRetryState, uint64) {
+				taken := savedCR
+				savedCR = CrossRepoRetryState{}
+				return taken, 1
+			},
+			func(st CrossRepoRetryState, _ RetryBridgeSaveMeta) { savedCR = st },
+			nil,
+			func() []string { return []string{"repoA", "repoB"} },
+		)
+		rel, holdErr = crStore.HoldWriteGate(context.Background())
+		require.NoError(t, holdErr)
+		crStatsBridged := crBridged.ResolveMutationFrontiers([]string{"repoA/other.go"}, []string{"repoA/other.go"}, []string{"repoA/other.go"})
+		rel()
+		assert.False(t, crStatsBridged.WriteRefused)
+		assert.Len(t, savedCR.Repoints, 1)
+		assert.Equal(t, 1, crRecorded.FilterLevelExact(zapcore.InfoLevel).FilterMessage("cross-repo resolver: opportunistic retry drain deferred under contention").Len())
+		assert.Zero(t, crRecorded.FilterLevelExact(zapcore.WarnLevel).Len())
+
+		// 3. Bounded CrossRepoResolver WithTimeout pass emits 1 Info on WriteRefused and 0 Step 3 logs.
+		crRecorded.TakeAll()
+		crBounded := NewCrossRepo(crStore)
+		crBounded.SetLogger(zap.New(crCore))
+		rel, holdErr = crStore.HoldWriteGate(context.Background())
+		require.NoError(t, holdErr)
+		crStatsBounded := crBounded.ResolveMutationFrontiersObservedWithTimeout([]string{"repoA/caller.go"}, []string{"repoA/caller.go"}, []string{"repoA/caller.go"}, nil, 50*time.Millisecond)
+		rel()
+		assert.True(t, crStatsBounded.WriteRefused)
+		assert.Equal(t, 1, crRecorded.FilterLevelExact(zapcore.InfoLevel).FilterMessage("cross-repo resolver: bounded incremental pass deferred under contention").Len())
+		assert.Zero(t, crRecorded.FilterMessage("cross-repo resolver: opportunistic retry drain deferred under contention").Len())
+		assert.Zero(t, crRecorded.FilterMessage("cross-repo resolver: opportunistic retry drain refused under contention; keeping tail queued").Len())
+	})
 }
 
 func TestFrontierGuardRevertMatchesWildcardAndSlashPrefixedRepoints(t *testing.T) {

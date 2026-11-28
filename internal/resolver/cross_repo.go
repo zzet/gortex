@@ -1138,17 +1138,33 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 			stats.WriteRefused = true
 		}
 	}
-	if !stats.WriteRefused && cr.placeholderSrcIdx.hasDeferred() {
-		if _, ok := cr.placeholderSrcIdx.flushBoundedDirectApplied(
-			cr.graph,
-			incrementalFlushRepointBudget,
-			allowedRepoint,
-			opportunisticDrainWriteTimeout,
-		); !ok {
-			drainRefused = true
-		}
+	if !stats.WriteRefused {
+		cr.drainNonFrontierRepointsLocked(allowedRepoint, &drainRefused)
 	}
 	return stats
+}
+
+func (cr *CrossRepoResolver) drainNonFrontierRepointsLocked(allowedRepoint func(graph.PlaceholderRepoint) bool, drainRefused *bool) {
+	if !cr.placeholderSrcIdx.hasDeferred() {
+		return
+	}
+	if _, ok := cr.placeholderSrcIdx.flushBoundedDirectApplied(
+		cr.graph,
+		incrementalFlushRepointBudget,
+		allowedRepoint,
+		opportunisticDrainWriteTimeout,
+	); !ok {
+		*drainRefused = true
+	}
+	if *drainRefused && cr.logger != nil {
+		if cr.takeRetryState == nil && cr.saveRetryState == nil {
+			cr.logger.Warn("cross-repo resolver: opportunistic retry drain refused under contention; keeping tail queued",
+				zap.Int("remaining_repoints", len(cr.placeholderSrcIdx.deferred)))
+		} else {
+			cr.logger.Info("cross-repo resolver: opportunistic retry drain deferred under contention",
+				zap.Int("remaining_repoints", len(cr.placeholderSrcIdx.deferred)))
+		}
+	}
 }
 
 // resolveScopedLocked lifts every unresolved target among edges to its

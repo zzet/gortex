@@ -135,10 +135,13 @@ type IndexResult struct {
 	// CrossRepoResolveFiles contains parked consumers outside this repository's
 	// derived frontier. Batch callers must include them in cross-repo resolution.
 	CrossRepoResolveFiles []string `json:"cross_repo_resolve_files,omitempty"`
-	// ResolutionWriteRefused reports that whole-graph resolution encountered a
-	// refused store write (e.g. a timed-out SQLite writer gate). The index still
-	// publishes its replacement graph and metadata while withholding alias
-	// policy certification so a subsequent pass retries the unbound edges.
+	// ResolutionWriteRefused reports that whole-graph or incremental post-parse
+	// edge resolution encountered a refused store write (e.g. a timed-out SQLite
+	// writer gate) and queued an internal retry. Callers that treat reindex
+	// errors as hard parse/I/O failures still observe a nil error (except when
+	// an uncertified alias pass withholds certification or a watcher caller
+	// explicitly opts into refusal errors) while remaining able to inspect this
+	// flag.
 	ResolutionWriteRefused bool `json:"resolution_write_refused,omitempty"`
 
 	// mutationErr carries a point-operation compatibility error through the
@@ -7291,6 +7294,7 @@ type incrementalPathMode struct {
 	forceExplicitFiles        bool
 	surfaceFirstVersionChange bool
 	exactPointSemantic        bool
+	returnResolutionRefusal   bool
 	// publication carries only a canonical point attempt's local collector.
 	// Existing batch/reconcile/direct callers leave it nil. No live receipt or
 	// mutable Indexer tracing state is installed by this per-call observation.

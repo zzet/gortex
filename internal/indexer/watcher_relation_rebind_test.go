@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -324,4 +325,197 @@ func TestWatcherStormMutation_SustainedReindexRefusalDegradesCleanly(t *testing.
 	watcher.stormMu.Unlock()
 	require.False(t, stormStillActive, "stormActive must be false after graceful degradation")
 	require.True(t, idx.hasPendingResolutionRetry(), "degraded storm must retain pendingResolutionRetry for later recovery")
+}
+
+func TestMutationTiers_MarkRelationsPreservesNonRefusalPartial(t *testing.T) {
+	t.Run("deferred_and_refused_preserves_partial_and_stamps_relations", func(t *testing.T) {
+		path := filepath.Clean("/repo/deferred.go")
+		tk := newMutationTierTicket(path, 1, make(chan MutationResult, 1))
+		w := &Watcher{
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {1: {ticket: tk, done: make(chan MutationResult, 1)}},
+			},
+		}
+		w.markDeferredMutationTiers(map[string]uint64{path: 1})
+		w.markRefusedRelationTiers(path, 1, false)
+		require.True(t, w.failedPaths[path].rebindRefused)
+		require.True(t, w.failedPaths[path].nonRefusalPartial)
+		require.True(t, w.failedPaths[path].RelationsAt.IsZero())
+
+		w.markRelations(path, 1, 1)
+
+		waiterState := tk.TierState()
+		require.True(t, waiterState.Partial, "non-refusal deferral must keep Partial=true after refusal heals")
+		require.False(t, waiterState.rebindRefused)
+		require.True(t, waiterState.DerivedAt.IsZero())
+		require.False(t, waiterState.RelationsAt.IsZero(), "healed refusal must stamp RelationsAt")
+
+		failedState, exists := w.failedPaths[path]
+		require.True(t, exists, "non-refusal Partial entry must remain in failedPaths")
+		require.True(t, failedState.Partial)
+		require.False(t, failedState.rebindRefused)
+		require.True(t, failedState.DerivedAt.IsZero())
+		require.False(t, failedState.RelationsAt.IsZero(), "retained non-failed entry must stamp RelationsAt")
+	})
+
+	t.Run("refusal_only_clears_partial_and_failed_path", func(t *testing.T) {
+		path := filepath.Clean("/repo/refusal_only.go")
+		tk := newMutationTierTicket(path, 1, make(chan MutationResult, 1))
+		w := &Watcher{
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {1: {ticket: tk, done: make(chan MutationResult, 1)}},
+			},
+		}
+		w.markRefusedRelationTiers(path, 1, false)
+		w.markRelations(path, 1, 1)
+
+		waiterState := tk.TierState()
+		require.False(t, waiterState.Partial)
+		require.False(t, waiterState.rebindRefused)
+		require.False(t, waiterState.RelationsAt.IsZero())
+		_, exists := w.failedPaths[path]
+		require.False(t, exists, "refusal-only entry must retire from failedPaths once repaired")
+	})
+}
+
+func TestMutationTiers_MarkRepairedFailedPathsInterleavesWithCaptureTierRepair(t *testing.T) {
+	t.Run("newer_parse_failure_interleaves_with_capture_tier_repair", func(t *testing.T) {
+		path := filepath.Clean("/repo/parse_fail.go")
+		tk1 := newMutationTierTicket(path, 1, nil)
+		w := &Watcher{
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {1: {ticket: tk1}},
+			},
+		}
+		w.markRefusedRelationTiers(path, 1, false)
+		delete(w.mutationWaiters, path)
+
+		tk2 := newMutationTierTicket(path, 2, nil)
+		w.mu.Lock()
+		clean := w.finishMutationTierLocked(path, tk2, errors.New("parse failed"), DerivedFanoutCompleteness{})
+		w.mu.Unlock()
+		require.False(t, clean)
+		require.True(t, w.failedPaths[path].Failed)
+		require.False(t, w.failedPaths[path].Partial)
+		require.True(t, w.failedPaths[path].rebindRefused)
+
+		repair := w.CaptureTierRepair(path)
+		require.NotNil(t, repair)
+
+		w.markRepairedFailedPaths([]string{path}, false)
+		st, exists := w.failedPaths[path]
+		require.True(t, exists, "markRepairedFailedPaths must not delete a Failed entry")
+		require.True(t, st.Failed)
+		require.False(t, st.rebindRefused)
+		require.True(t, st.RelationsAt.IsZero(), "Failed entry must not be stamped with RelationsAt")
+
+		repair()
+		_, exists = w.failedPaths[path]
+		require.False(t, exists, "CaptureTierRepair closure must clear Failed entry despite concurrent rebindRefused clear")
+	})
+
+	t.Run("attempt0_refused_then_attempt1_parse_failed", func(t *testing.T) {
+		path := filepath.Clean("/repo/retry_parse_fail.go")
+		tk := newMutationTierTicket(path, 1, nil)
+		w := &Watcher{
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {1: {ticket: tk}},
+			},
+		}
+		w.markRefusedRelationTiers(path, 1, false)
+		w.mu.Lock()
+		clean := w.finishMutationTierLocked(path, tk, errors.New("parse failed on retry"), DerivedFanoutCompleteness{})
+		delete(w.mutationWaiters, path)
+		w.mu.Unlock()
+		require.False(t, clean)
+
+		st := w.failedPaths[path]
+		require.True(t, st.Failed)
+		require.True(t, st.Partial)
+		require.True(t, st.rebindRefused)
+		require.False(t, st.nonRefusalPartial)
+		require.Nil(t, w.CaptureTierRepair(path), "CaptureTierRepair must return nil while Partial is true")
+
+		w.markRepairedFailedPaths(nil, true)
+		st, exists := w.failedPaths[path]
+		require.True(t, exists)
+		require.True(t, st.Failed)
+		require.False(t, st.rebindRefused)
+		require.False(t, st.Partial, "clearing refusal-only Partial must unblock CaptureTierRepair")
+
+		repair := w.CaptureTierRepair(path)
+		require.NotNil(t, repair)
+		repair()
+		_, exists = w.failedPaths[path]
+		require.False(t, exists)
+	})
+}
+
+func TestMutationTiers_MarkRefusedRelationTiersDuplicatePreservesNonRefusalPartial(t *testing.T) {
+	path := filepath.Clean("/repo/dup.go")
+	tk1 := newMutationTierTicket(path, 1, nil)
+	w := &Watcher{
+		mutationWaiters: map[string]map[uint64]mutationWaiter{
+			path: {1: {ticket: tk1}},
+		},
+	}
+	w.markDeferredMutationTiers(map[string]uint64{path: 1})
+	w.markRefusedRelationTiers(path, 1, false)
+	delete(w.mutationWaiters, path)
+	require.True(t, w.failedPaths[path].nonRefusalPartial)
+
+	tk2 := newMutationTierTicket(path, 2, nil)
+	w.mutationWaiters[path] = map[uint64]mutationWaiter{2: {ticket: tk2}}
+	w.markRefusedRelationTiers(path, 2, true)
+	require.True(t, tk2.TierState().nonRefusalPartial)
+	require.True(t, w.failedPaths[path].nonRefusalPartial)
+
+	w.markRelations(path, 2, 2)
+	require.True(t, tk2.TierState().Partial)
+	require.False(t, tk2.TierState().RelationsAt.IsZero())
+	require.True(t, w.failedPaths[path].Partial)
+	require.False(t, w.failedPaths[path].RelationsAt.IsZero())
+}
+
+func TestMutationTiers_CoalescedCleanGenRetiresOlderNonRefusalPartial(t *testing.T) {
+	path := filepath.Clean("/repo/coalesce.go")
+	fanout := DerivedFanoutCompleteness{Observed: true, Complete: true}
+	for i := 0; i < 32; i++ {
+		tk1 := newMutationTierTicket(path, 1, nil)
+		tk1.tiers.Partial = true
+		tk1.tiers.nonRefusalPartial = true
+		tk2 := newMutationTierTicket(path, 2, nil)
+		w := &Watcher{
+			pendingGeneration:          map[string]uint64{path: 2},
+			observedMutationGeneration: map[string]uint64{path: 2},
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {
+					1: {ticket: tk1, done: make(chan MutationResult, 1)},
+					2: {ticket: tk2, done: make(chan MutationResult, 1)},
+				},
+			},
+		}
+		ok, _ := w.completeMutationWaitersObserved(path, 2, nil, fanout, false, nil)
+		require.True(t, ok)
+		_, exists := w.failedPaths[path]
+		require.False(t, exists, "point completion iteration %d: clean Gen 2 must deterministically retire Gen 1 nonRefusalPartial", i)
+
+		tkStorm1 := newMutationTierTicket(path, 1, nil)
+		tkStorm1.tiers.Partial = true
+		tkStorm1.tiers.nonRefusalPartial = true
+		tkStorm2 := newMutationTierTicket(path, 2, nil)
+		wStorm := &Watcher{
+			pendingGeneration:          map[string]uint64{path: 2},
+			observedMutationGeneration: map[string]uint64{path: 2},
+			mutationWaiters: map[string]map[uint64]mutationWaiter{
+				path: {
+					1: {ticket: tkStorm1, done: make(chan MutationResult, 1)},
+					2: {ticket: tkStorm2, done: make(chan MutationResult, 1)},
+				},
+			},
+		}
+		wStorm.completeStormMutationWaiters(map[string]uint64{path: 2}, &IndexResult{}, nil, fanout)
+		_, exists = wStorm.failedPaths[path]
+		require.False(t, exists, "storm completion iteration %d: clean Gen 2 must deterministically retire Gen 1 nonRefusalPartial", i)
+	}
 }

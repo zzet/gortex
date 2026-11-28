@@ -512,12 +512,14 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 		refuseFunc: refuseOnceMatching(batchHasCallTo("b.go::Foo")),
 	}
 	idx.resolver.SetGraph(refusing)
-	_, err = idx.incrementalWatcherPaths(root, []string{aPath}, incrementalPathMode{
+	res1, err := idx.incrementalWatcherPaths(root, []string{aPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
 	idx.resolver.SetGraph(store)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused)
 	assert.Equal(t, 1, refusing.refusedCount())
 	assert.Equal(t, "unresolved::Foo", callTargetForName(t, store, "c.go", "Run"))
 
@@ -528,6 +530,7 @@ func TestIncrementalWatcherPaths_VanishedNameRefusalRetriesToFullResolution(t *t
 	})
 	require.NoError(t, err)
 	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	assert.True(t, incrementalTopologyChanged(res), "inert retry pass that completed resolution must signal topologyChanged")
 	assert.Equal(t, "b.go::Foo", callTargetForName(t, store, "c.go", "Run"))
@@ -548,12 +551,14 @@ func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopolo
 	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
 	defer restoreTimeout()
 	idx.resolver.SetGraph(&gateHoldingReindexStore{Store: store})
-	_, err = idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
+	res1, err := idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
 	idx.resolver.SetGraph(store)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused)
 
 	var derivedFiles []string
 	idx.incrementalCatchupHook = func(kind string, files []string) {
@@ -569,6 +574,7 @@ func TestIncrementalWatcherPaths_InertRetryPreservesDerivedInvalidationAndTopolo
 	})
 	require.NoError(t, err)
 	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	assert.True(t, incrementalTopologyChanged(res), "successful inert retry must invalidate reachability topology")
 	assert.Contains(t, res.DerivedInvalidation.Files, "caller.go")
@@ -690,13 +696,15 @@ func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t
 		refuseFunc: refuseOnceMatching(batchHasCallTo("helper.go::Other")),
 	}
 	idx.resolver.SetGraph(refusing)
-	_, err = idx.incrementalWatcherPaths(root, []string{defPath}, incrementalPathMode{
+	res1, err := idx.incrementalWatcherPaths(root, []string{defPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
 	idx.resolver.SetGraph(store)
 	require.NotEmpty(t, observedAffected, "signature change must enqueue caller.go in affected_by plan")
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused)
 	assert.Equal(t, 1, refusing.refusedCount())
 
 	// Attempt 2 on unchanged def.go (inert reparse): affected_by plan is now empty,
@@ -708,6 +716,7 @@ func TestIncrementalWatcherPaths_AffectedByRefusalRetainsAffectedFilesForRetry(t
 	})
 	require.NoError(t, err)
 	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	var line99Target string
 	for _, e := range store.GetOutEdges("caller.go::Run") {
@@ -939,12 +948,14 @@ func TestIncrementalWatcherPaths_CertifiedAliasRepoStillRetriesRefusedWrite(t *t
 		refuseFunc: refuseOnceMatching(batchHasCallTo("old/auth.ts::useRedirect")),
 	}
 	idx.resolver.SetGraph(refusing)
-	_, err = idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
+	res1, err := idx.incrementalWatcherPaths(root, []string{callerPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
 	idx.resolver.SetGraph(store)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused, "certified alias repo must still surface ErrReindexWriteRefused")
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused, "certified alias repo must flag ResolutionWriteRefused")
 	assert.Equal(t, 1, refusing.refusedCount())
 	assert.True(t, idx.hasPendingResolutionRetry())
 	assert.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run2"))
@@ -955,6 +966,8 @@ func TestIncrementalWatcherPaths_CertifiedAliasRepoStillRetriesRefusedWrite(t *t
 		forceExplicitFiles: true,
 	})
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	assert.False(t, idx.hasPendingResolutionRetry())
 	assert.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run2"))
@@ -973,14 +986,29 @@ func TestMultiIndexer_GoOnlyIncrementalRefusalRetriesWithoutAliasChange(t *testi
 
 	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return Helper() }\n")
 	store.setRefuseFunc(refuseOnceMatching(batchHasCallTo("repo/lib.go::Helper")))
-	_, err = mi.incrementalReindexRepoRawMode("repo", []string{callerPath}, incrementalPathMode{
+	res1, err := mi.incrementalReindexRepoRawMode("repo", []string{callerPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused)
 	assert.Equal(t, 1, store.refusedCount())
 	assert.True(t, mi.GetIndexer("repo").hasPendingResolutionRetry())
 	assert.Equal(t, "unresolved::Helper", callTargetForName(t, store, "repo/caller.go", "Run"))
+
+	// Opt-in returnResolutionRefusal mode (used by Watcher point/storm retries) surfaces ErrReindexWriteRefused.
+	store.setRefuseFunc(refuseOnceMatching(batchHasCallTo("repo/lib.go::Helper")))
+	resOptIn, err := mi.incrementalReindexRepoRawMode("repo", []string{callerPath}, incrementalPathMode{
+		detectDeletions:         true,
+		forceExplicitFiles:      true,
+		returnResolutionRefusal: true,
+	})
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NotNil(t, resOptIn)
+	assert.True(t, resOptIn.ResolutionWriteRefused)
+	assert.Equal(t, 2, store.refusedCount())
+	assert.True(t, mi.GetIndexer("repo").hasPendingResolutionRetry())
 
 	store.setRefuseFunc(nil)
 	res, err := mi.incrementalReindexRepoRawMode("repo", []string{callerPath}, incrementalPathMode{
@@ -988,6 +1016,8 @@ func TestMultiIndexer_GoOnlyIncrementalRefusalRetriesWithoutAliasChange(t *testi
 		forceExplicitFiles: true,
 	})
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	assert.False(t, mi.GetIndexer("repo").hasPendingResolutionRetry())
 	assert.Equal(t, "repo/lib.go::Helper", callTargetForName(t, store, "repo/caller.go", "Run"))
@@ -1102,12 +1132,14 @@ func TestIndexer_RetainedFullPassBacklogAndRefusedNewFileSaveStillRecordsAndReso
 	newPath := filepath.Join(root, "new.go")
 	writeFileMk(t, newPath, "package demo\nfunc NewCaller() int { return NewHelper() }\n")
 	refusing.setRefuseFunc(refuseOnceMatching(batchHasCallTo("new_target.go::NewHelper")))
-	_, err = idx.incrementalWatcherPaths(root, []string{newPath}, incrementalPathMode{
+	res1, err := idx.incrementalWatcherPaths(root, []string{newPath}, incrementalPathMode{
 		detectDeletions:    true,
 		forceExplicitFiles: true,
 	})
 	refusing.setRefuseFunc(nil)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err)
+	require.NotNil(t, res1)
+	assert.True(t, res1.ResolutionWriteRefused)
 	assert.Equal(t, 1, refusing.refusedCount())
 	assert.True(t, idx.hasPendingResolutionRetry())
 	assert.Equal(t, "unresolved::NewHelper", callTargetForName(t, store, "new.go", "NewCaller"))
@@ -1119,6 +1151,8 @@ func TestIndexer_RetainedFullPassBacklogAndRefusedNewFileSaveStillRecordsAndReso
 		forceExplicitFiles: true,
 	})
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.False(t, res.ResolutionWriteRefused)
 	assert.True(t, res.retriedResolution)
 	assert.False(t, idx.hasPendingResolutionRetry())
 	assert.Equal(t, "new_target.go::NewHelper", callTargetForName(t, store, "new.go", "NewCaller"))
@@ -1432,6 +1466,8 @@ func TestMultiIndexer_RefusedMasterResolveSkipsCrossRepoForRestubbedGoCall(t *te
 }
 
 func TestMultiIndexer_RetryBacklogCountersAndLogsOnGrowthAndDrain(t *testing.T) {
+	assert.Zero(t, (*MultiIndexer)(nil).PendingRetryBacklogStats())
+
 	t.Setenv("GORTEX_RESOLVE_CHUNK", "1")
 	t.Setenv("GORTEX_RESOLVE_CHUNK_SIZE", "1")
 
@@ -1474,6 +1510,59 @@ func TestMultiIndexer_RetryBacklogCountersAndLogsOnGrowthAndDrain(t *testing.T) 
 	assert.Equal(t, uint64(1), stats.BacklogDrainEvents)
 	assert.Zero(t, recorded.FilterMessage("indexer: resolver retry backlog grew or refused").Len(), "healthy yield/drain must emit zero Warn spam")
 	assert.Equal(t, 1, recorded.FilterMessage("indexer: resolver retry backlog drained").Len())
+}
+
+func TestReconcileRepoCtx_RefusedResolutionReturnsResultFlaggedAndRecovers(t *testing.T) {
+	root := t.TempDir()
+	libPath := filepath.Join(root, "lib.go")
+	callerPath := filepath.Join(root, "caller.go")
+	extraPath := filepath.Join(root, "extra.go")
+	writeFileMk(t, libPath, "package demo\nfunc Helper() int { return 1 }\n")
+	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return 0 }\n")
+	writeFileMk(t, extraPath, "package demo\nfunc Extra() int { return 2 }\n")
+
+	seed, baseStore := newSQLiteIndexer(t)
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	mi1 := NewMultiIndexer(baseStore, seed.registry, search.NewNull(), cm, zap.NewNop())
+	_, err = mi1.TrackRepoCtx(context.Background(), entry)
+	require.NoError(t, err)
+	prior := mi1.FileMtimes("repo")
+	require.NotZero(t, prior["caller.go"])
+
+	// Mutate 1 of 3 files (33% <= 40%) and bump mtime explicitly so ReconcileRepoCtx
+	// takes the scoped incremental route (!FullRetrack) deterministically.
+	writeFileMk(t, callerPath, "package demo\nfunc Run() int { return Helper() }\n")
+	bumped := time.Unix(0, prior["caller.go"]).Add(2 * time.Second)
+	require.NoError(t, os.Chtimes(callerPath, bumped, bumped))
+
+	refusing := &countingRefuseReindexStore{
+		Store:      baseStore,
+		refuseFunc: refuseOnceMatching(batchHasCallTo("repo/lib.go::Helper")),
+	}
+	mi2 := NewMultiIndexer(refusing, seed.registry, search.NewNull(), cm, zap.NewNop())
+	res, err := mi2.ReconcileRepoCtx(context.Background(), entry, prior)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.False(t, res.FullRetrack)
+	assert.True(t, res.ResolutionWriteRefused)
+	assert.Equal(t, 1, refusing.refusedCount())
+	assert.True(t, mi2.GetIndexer("repo").hasPendingResolutionRetry())
+	assert.Equal(t, "unresolved::Helper", callTargetForName(t, baseStore, "repo/caller.go", "Run"))
+
+	refusing.setRefuseFunc(nil)
+	res2, err := mi2.IncrementalReindexRepo("repo", nil)
+	require.NoError(t, err)
+	require.NotNil(t, res2)
+	assert.False(t, res2.ResolutionWriteRefused)
+	assert.False(t, mi2.GetIndexer("repo").hasPendingResolutionRetry())
+	assert.Equal(t, "repo/lib.go::Helper", callTargetForName(t, baseStore, "repo/caller.go", "Run"))
 }
 
 func copyBenchmarkDBFile(b *testing.B, src, dst string) {

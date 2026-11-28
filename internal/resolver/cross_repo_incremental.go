@@ -80,7 +80,12 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 	defer cr.mu.Unlock()
 	prevMaxWait := cr.passReindexMaxWait
 	cr.passReindexMaxWait = maxWait
-	defer func() { cr.passReindexMaxWait = prevMaxWait }()
+	defer func() {
+		cr.passReindexMaxWait = prevMaxWait
+		if maxWait > 0 && stats != nil && stats.WriteRefused && cr.logger != nil {
+			cr.logger.Info("cross-repo resolver: bounded incremental pass deferred under contention")
+		}
+	}()
 	retryOpts := cr.retryOptsForFilesLocked(resolutionFiles, edgeSourceFiles, definitionFiles)
 	allowedRepoint := cr.allowedRepointFuncForOptsLocked(retryOpts)
 	var drainRefused bool
@@ -196,16 +201,7 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 
 	// Step 3: Opportunistic bounded non-frontier same-repo drain under isolated
 	// local drainRefused (50ms fast-fail) so unrelated backlog never fails this save.
-	if cr.placeholderSrcIdx.hasDeferred() {
-		if _, ok := cr.placeholderSrcIdx.flushBoundedDirectApplied(
-			cr.graph,
-			incrementalFlushRepointBudget,
-			allowedRepoint,
-			opportunisticDrainWriteTimeout,
-		); !ok {
-			drainRefused = true
-		}
-	}
+	cr.drainNonFrontierRepointsLocked(allowedRepoint, &drainRefused)
 	return stats, admission
 }
 

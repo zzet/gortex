@@ -749,6 +749,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		}
 	}
 	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		result.ResolutionWriteRefused = true
 		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, factFiles...), carriedRetryFiles...)
 		retryDerivedSave := cloneDerivedInvalidationPlan(result.DerivedInvalidation)
 		if hadCarriedRetry {
@@ -829,7 +830,7 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 	if err := idx.finishAliasPass(result); err != nil {
 		return result, err
 	}
-	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+	if mode.returnResolutionRefusal && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
 		return result, result.resolutionErr
 	}
 	return result, nil
@@ -925,7 +926,7 @@ func (w *Watcher) reindexMutationPathsObserved(paths []string, force bool, front
 		if !force && idx.deferGlobalPasses.Load() {
 			w.markDeferredMutationTiers(frontier)
 		}
-		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, publication: stamps,
+		mode := incrementalPathMode{detectDeletions: true, forceExplicitFiles: force, returnResolutionRefusal: true, publication: stamps,
 			onRelations: func(refused bool) {
 				if !refused {
 					w.markRelationsFrontier(frontier)
@@ -1234,14 +1235,17 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			repairedFiles = appendUniqueSorted(repairedFiles, idx.excludeFailedGraphPaths(ownRetryFiles, failedAbs)...)
 		}
 	}
-	if idx != nil && result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
-		retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, ownCrossRepoFiles...), carriedRetryFiles...)
-		retryDerivedSave := cloneDerivedInvalidationPlan(result.DerivedInvalidation)
-		if hadCarriedRetry {
-			retryDerivedSave.Merge(retryDerivedCopy)
+	if result != nil && errors.Is(result.resolutionErr, resolver.ErrReindexWriteRefused) {
+		result.ResolutionWriteRefused = true
+		if idx != nil {
+			retrySaveFiles := appendUniqueSorted(appendUniqueSorted(files, ownCrossRepoFiles...), carriedRetryFiles...)
+			retryDerivedSave := cloneDerivedInvalidationPlan(result.DerivedInvalidation)
+			if hadCarriedRetry {
+				retryDerivedSave.Merge(retryDerivedCopy)
+			}
+			retryFullFlag := !exact || retryWide || namesWriteRefused || wholeGraphRun || len(retrySaveFiles) == 0
+			idx.recordPendingResolutionRetry(retrySaveFiles, retryFullFlag, retryDerivedSave)
 		}
-		retryFullFlag := !exact || retryWide || namesWriteRefused || wholeGraphRun || len(retrySaveFiles) == 0
-		idx.recordPendingResolutionRetry(retrySaveFiles, retryFullFlag, retryDerivedSave)
 	}
 	if idx != nil && (result == nil || result.resolutionErr == nil) && len(otherRetryFiles) > 0 {
 		limit := len(otherRetryFiles)
