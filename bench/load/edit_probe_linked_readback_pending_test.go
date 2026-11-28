@@ -537,3 +537,114 @@ func TestSummarizeEditProbeReadbackPendingCensus(t *testing.T) {
 		t.Fatalf("readback_pending.source = %v, want three pending records, nine re-reads and first_exact_ms ranked", source)
 	}
 }
+
+func linkedReadbackNotFoundFor(frame stubFrame, rider map[string]any) (any, *rpcError) {
+	args, _ := frame.Params["arguments"].(map[string]any)
+	target, _ := args["target"].(map[string]any)
+	symbol, _ := target["symbol"].(string)
+	return linkedReadbackNotFound(symbol, rider), nil
+}
+
+// TestEditProbeLinkedCorrectReplyUnderPendingRiderIsNotPending: a reply the oracle accepted, even under a pending rider, is correct
+// at once: not pending, not re-read, no census.
+func TestEditProbeLinkedCorrectReplyUnderPendingRiderIsNotPending(t *testing.T) {
+	correctInexact := func(n int, frame stubFrame, disk func(stubFrame) (any, *rpcError)) (any, *rpcError) {
+		reply, fault := disk(frame)
+		return withLinkedReadbackRider(reply, linkedReadbackPendingRider()), fault
+	}
+	got := runLinkedReadbackCell(t, linkedReadbackCell{fallbacks: 0, source: correctInexact})
+	if got.record.Outcome != "complete" || len(got.record.Errors) != 0 {
+		t.Fatalf("correct inexact reply = %s %v", got.record.Outcome, got.record.Errors)
+	}
+	rows := linkedReadbackRows(t, got.json, "source")
+	if got.reads["source"] != 1 || len(rows) != 1 || rows[0]["correct"] != true || rows[0]["pending"] == true {
+		t.Fatalf("correct inexact reply was pending or re-read: reads=%d rows=%v", got.reads["source"], rows)
+	}
+	if _, present := got.json["readback_pending"]; present {
+		t.Fatalf("pending census present for a correct reply: %v", got.json["readback_pending"])
+	}
+}
+
+// TestEditProbeLinkedRereadLeavingThePendingContractFails: a re-read whose rider leaves the pending contract is a record error,
+// not another pending reply.
+func TestEditProbeLinkedRereadLeavingThePendingContractFails(t *testing.T) {
+	for _, cell := range []struct {
+		name  string
+		rider func() map[string]any
+	}{
+		{name: "route moved", rider: func() map[string]any {
+			r := linkedReadbackPendingRider()
+			r["fallback_reason"] = "route_moved"
+			return r
+		}},
+		{name: "another view", rider: func() map[string]any {
+			r := linkedReadbackPendingRider()
+			r["requested_view"] = "worktree:other"
+			return r
+		}},
+		{name: "no rider", rider: func() map[string]any { return nil }},
+	} {
+		t.Run(cell.name, func(t *testing.T) {
+			departing := func(n int, frame stubFrame, _ func(stubFrame) (any, *rpcError)) (any, *rpcError) {
+				if n <= 2 {
+					return linkedReadbackNotFoundFor(frame, linkedReadbackPendingRider())
+				}
+				return linkedReadbackNotFoundFor(frame, cell.rider())
+			}
+			got := runLinkedReadbackCell(t, linkedReadbackCell{fallbacks: -1, source: departing, deadline: time.Second})
+			joined := strings.Join(got.record.Errors, "; ")
+			if got.record.Outcome != "diagnostic_failure" || !strings.Contains(joined, "source readback left the pending contract") {
+				t.Fatalf("departure = %s %v, want diagnostic_failure with the departure error", got.record.Outcome, got.record.Errors)
+			}
+			if got.reads["source"] != 3 {
+				t.Fatalf("source reads = %d, want the re-read to stop at the departure", got.reads["source"])
+			}
+		})
+	}
+}
+
+// TestEditProbeLinkedUncommittedACKEarnsNoPendingReadback: an ACK that is applied but not disk-committed documents no pending
+// publication; the fallback stays incorrect and is not re-read.
+func TestEditProbeLinkedUncommittedACKEarnsNoPendingReadback(t *testing.T) {
+	got := runLinkedReadbackCell(t, linkedReadbackCell{fallbacks: 3, ack: func(a map[string]any) { a["disk_status"] = "staged" }})
+	if got.record.Outcome == "complete" || got.reads["source"] != 1 {
+		t.Fatalf("uncommitted ACK: outcome %s, source reads %d, errors %v", got.record.Outcome, got.reads["source"], got.record.Errors)
+	}
+	for _, row := range linkedReadbackRows(t, got.json, "source") {
+		if row["pending"] == true {
+			t.Fatalf("readback was pending after an uncommitted ACK: %v", row)
+		}
+	}
+}
+
+// TestEditProbeLinkedExactRereadRowIsMarkedReread: the exact re-read row is marked reread, so readback_ms.<kind> keeps
+// one immediate attempt per record.
+func TestEditProbeLinkedExactRereadRowIsMarkedReread(t *testing.T) {
+	got := runLinkedReadbackCell(t, linkedReadbackCell{fallbacks: 2})
+	rows := linkedReadbackRows(t, got.json, "source")
+	if len(rows) != 2 || rows[1]["reread"] != true || rows[0]["reread"] == true {
+		t.Fatalf("source rows = %v, want the exact row marked reread and the immediate row not", rows)
+	}
+	data, err := json.Marshal(summarizeEditProbe([]editProbeRecord{got.record}, 42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(data, &summary); err != nil {
+		t.Fatal(err)
+	}
+	measures, _ := summary["measures"].(map[string]any)
+	source, _ := measures["readback_ms.source"].(map[string]any)
+	if source["count"] != float64(1) {
+		t.Fatalf("readback_ms.source = %v, want one immediate attempt", source)
+	}
+}
+
+// A re-read that fails below the answer level names why, not only that the
+// rider is missing.
+func TestEditProbeRiderDepartureNamesTheFailedReply(t *testing.T) {
+	back := editProbeReadback{Disposition: &editProbeReadbackDisposition{Kind: editProbeReadbackTransportError}, Error: "connection reset"}
+	if got := editProbeRiderDeparture(back); got != "no freshness rider; disposition transport_error: connection reset" {
+		t.Fatalf("departure = %q", got)
+	}
+}
