@@ -135,6 +135,11 @@ type IndexResult struct {
 	// CrossRepoResolveFiles contains parked consumers outside this repository's
 	// derived frontier. Batch callers must include them in cross-repo resolution.
 	CrossRepoResolveFiles []string `json:"cross_repo_resolve_files,omitempty"`
+	// ResolutionWriteRefused reports that whole-graph resolution encountered a
+	// refused store write (e.g. a timed-out SQLite writer gate). The index still
+	// publishes its replacement graph and metadata while withholding alias
+	// policy certification so a subsequent pass retries the unbound edges.
+	ResolutionWriteRefused bool `json:"resolution_write_refused,omitempty"`
 
 	// mutationErr carries a point-operation compatibility error through the
 	// resolver/semantic/derived tail. It is intentionally unexported and never
@@ -147,6 +152,10 @@ type IndexResult struct {
 	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
 	// receipt so the next pass rebinds the callers this one left unresolved.
 	resolutionErr error
+}
+
+func isReindexWriteRefused(err error) bool {
+	return errors.Is(err, resolver.ErrReindexWriteRefused)
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -2867,14 +2876,20 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 	}
+	walkDirFailed := false
 	defer func() {
 		defer idx.clearAliasPass()
+		if retErr == nil && result != nil {
+			result.failuresRetryable = !walkDirFailed && idx.failedFilesSafelyRetryable(result.FailedFiles)
+		}
 		switch {
 		case retErr != nil:
 		case idx.deferResolve.Load():
 			retErr = idx.holdAliasPass(result)
 		default:
-			retErr = idx.finishAliasPass(result)
+			if err := idx.finishAliasPass(result); err != nil && !errors.Is(err, resolver.ErrReindexWriteRefused) {
+				retErr = err
+			}
 		}
 	}()
 	// Registered before the failed-file report below, so it runs after that
@@ -3080,6 +3095,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		err = idx.walkDisk(absRoot, absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+					walkDirFailed = true
 					recordFileOutcome(path, err)
 					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: err.Error()})
 				}
@@ -4412,6 +4428,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						}
 					}
 
+					priorAliasFile := ""
+					if diskTarget == nil && idx.aliasResolutionChanged && closureJSTSPath(path) && !skipped {
+						priorAliasFile = idx.prefixPath(relPath)
+					}
+
 					// Stream this file's content (data_class=content) section
 					// bodies into the dedicated content index and lean the
 					// nodes to a snippet BEFORE AddBatch, so the bulk text
@@ -4419,6 +4440,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// materialising code passes.
 					contentHandled := false
 					if contentBatch != nil {
+						if priorAliasFile != "" && firstContentFilePath(result.Nodes) != "" {
+							idx.removePriorAliasEdges(priorAliasFile)
+							priorAliasFile = ""
+						}
 						durablePath, durableMtime := path, wf.mtimeNano
 						contentHandled = contentBatch.add(result.Nodes, result.Edges, func() {
 							recordStreamedMtime(durablePath, durableMtime)
@@ -4438,15 +4463,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// AddBatch. Direct SQLite writes enter a bounded cross-file
 					// accumulator, amortising transaction/statement setup without
 					// retaining a repository-sized graph in Go memory.
-					if diskTarget == nil && idx.aliasResolutionChanged && closureJSTSPath(path) && !skipped {
-						idx.removePriorAliasEdges(idx.prefixPath(relPath))
-					}
 					if !contentHandled {
 						batchStart := time.Now()
 						durablePath, durableMtime := path, wf.mtimeNano
-						if !graphBatch.add(result.Nodes, result.Edges, func() {
+						if !graphBatch.addWithPriorAlias(result.Nodes, result.Edges, priorAliasFile, func() {
 							recordStreamedMtime(durablePath, durableMtime)
 						}) {
+							if priorAliasFile != "" {
+								idx.removePriorAliasEdges(priorAliasFile)
+							}
 							idx.graph.AddBatch(result.Nodes, result.Edges)
 							recordStreamedMtime(durablePath, durableMtime)
 						}
@@ -5025,14 +5050,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		graph.MaybeEnsurePlannerStatsFresh(ctx, idx.indexStateTarget(nil))
 	}
 	result = &IndexResult{
-		NodeCount:        nodes,
-		EdgeCount:        edges,
-		FileCount:        int(fileCount),
-		QuarantinedFiles: quarantine.Len(),
-		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
-		DurationMs:       time.Since(start).Milliseconds(),
-		Errors:           errors,
-		resolutionErr:    fullResolveErr,
+		NodeCount:              nodes,
+		EdgeCount:              edges,
+		FileCount:              int(fileCount),
+		QuarantinedFiles:       quarantine.Len(),
+		SkippedFiles:           len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
+		DurationMs:             time.Since(start).Milliseconds(),
+		Errors:                 errors,
+		ResolutionWriteRefused: isReindexWriteRefused(fullResolveErr),
+		resolutionErr:          fullResolveErr,
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// A whole-repo (re-)track that observed files did work: mark the repo for
@@ -6026,8 +6052,9 @@ func (idx *Indexer) ResolveAll() {
 
 func (idx *Indexer) resolveAll() error {
 	idx.populateCppIncludeDirs(true)
-	if _, err := idx.resolver.ResolveAllContext(context.Background()); err != nil {
-		return err
+	_, resolveErr := idx.resolver.ResolveAllContext(context.Background())
+	if resolveErr != nil && !errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+		return resolveErr
 	}
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
@@ -6050,7 +6077,7 @@ func (idx *Indexer) resolveAll() error {
 	// Seed the durable reference-facts sidecar from the fully-resolved graph
 	// (no-op on the in-memory backend).
 	idx.persistAllRefFacts()
-	return nil
+	return resolveErr
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.

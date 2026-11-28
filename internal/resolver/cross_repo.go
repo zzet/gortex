@@ -2,7 +2,9 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
 	"slices"
@@ -410,7 +412,10 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	// normal flush below); it runs before the deferred unlock above.
 	defer cr.placeholderSrcIdx.applyDeferred(cr.graph)
 	if err := cr.resolveTrackedNpmImports(ctx, graph.EdgesLightSeq(cr.graph, graph.EdgeImports), stats); err != nil {
-		return stats, err
+		if !errors.Is(err, ErrReindexWriteRefused) {
+			return stats, err
+		}
+		stats.WriteRefused = true
 	}
 	// Share the master resolver's stable high-water/keyset stream. The cold
 	// residual can exceed 200k edges; retaining it plus the cross-repo name,
@@ -435,6 +440,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	pendingLoaded.Store(int64(len(pending)))
 	if len(pending) == 0 && streamDone {
+		if stats.WriteRefused {
+			return stats, fmt.Errorf("%w: cross-repo resolve had refused write(s)", ErrReindexWriteRefused)
+		}
 		return stats, nil
 	}
 
@@ -550,7 +558,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 						if ctx.Err() != nil {
 							break
 						}
-						cr.resolveEdge(edge, ws, &batch)
+						c := *edge
+						c.Meta = maps.Clone(edge.Meta)
+						cr.resolveEdge(&c, ws, &batch)
 						processed.Add(1)
 					}
 					perWorkerStats[idx] = ws
@@ -566,32 +576,41 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			for i := range perWorkerBatch {
 				scBatch = append(scBatch, perWorkerBatch[i]...)
 			}
-			for _, ws := range perWorkerStats {
-				if ws == nil {
-					continue
-				}
-				stats.Resolved += ws.Resolved
-				stats.Unresolved += ws.Unresolved
-				stats.CrossRepoEdges += ws.CrossRepoEdges
-				for repo, n := range ws.ByRepo {
-					stats.ByRepo[repo] += n
-				}
-			}
+			applied := true
 			if len(scBatch) > 0 {
 				if cr.validateLiveness {
 					scBatch = cr.filterLiveReindex(scBatch)
 				}
 				if len(scBatch) > 0 {
-					if !reindexEdgesApplied(cr.graph, scBatch) {
+					applied = reindexEdgesApplied(cr.graph, scBatch)
+					if applied {
+						// Moves wait for the last page, as in ResolveAll
+						// (placeholderSourceIndex.deferRepoints).
+						cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
+						for _, ri := range scBatch {
+							cr.noteRetargetedCall(ri.Edge)
+						}
+						reindexTotal += len(scBatch)
+						DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+					} else {
 						stats.WriteRefused = true
-						return stats, fmt.Errorf("%w: %d cross-repo edge(s)", ErrReindexWriteRefused, len(scBatch))
 					}
-					// Moves wait for the last page, as in ResolveAll
-					// (placeholderSourceIndex.deferRepoints).
-					cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
-					reindexTotal += len(scBatch)
-					DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
 				}
+			}
+			if applied {
+				for _, ws := range perWorkerStats {
+					if ws == nil {
+						continue
+					}
+					stats.Resolved += ws.Resolved
+					stats.Unresolved += ws.Unresolved
+					stats.CrossRepoEdges += ws.CrossRepoEdges
+					for repo, n := range ws.ByRepo {
+						stats.ByRepo[repo] += n
+					}
+				}
+			} else {
+				stats.Unresolved += len(sc)
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
@@ -626,7 +645,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
 		stats.WriteRefused = true
-		return stats, fmt.Errorf("%w: cross-repo placeholder sources", ErrReindexWriteRefused)
 	}
 	stopProgress()
 	cr.logger.Info("cross-repo resolve: compute done",
@@ -634,6 +652,9 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 		zap.Int("reindex_batch", reindexTotal),
 		zap.Int("super_chunk", superChunk),
 		zap.Duration("elapsed", time.Since(passStart)))
+	if stats.WriteRefused {
+		return stats, fmt.Errorf("%w: cross-repo resolve had refused write(s)", ErrReindexWriteRefused)
+	}
 	return stats, nil
 }
 
@@ -728,12 +749,17 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 
 	var reindexBatch []graph.EdgeReindex
 	for _, edge := range pending {
-		cr.resolveEdge(edge, stats, &reindexBatch)
+		c := *edge
+		c.Meta = maps.Clone(edge.Meta)
+		cr.resolveEdge(&c, stats, &reindexBatch)
 	}
 	if len(reindexBatch) > 0 {
 		if !reindexEdgesApplied(cr.graph, reindexBatch) {
 			stats.WriteRefused = true
 			return stats
+		}
+		for _, ri := range reindexBatch {
+			cr.noteRetargetedCall(ri.Edge)
 		}
 		// nil index: scoped batches are repo- or file-sized, direct
 		// probes beat a whole-graph placeholder-source stream.
@@ -1280,7 +1306,6 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 
 	if e.To != oldTo {
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-		cr.noteRetargetedCall(e)
 	}
 }
 

@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -528,8 +529,14 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 		}
 		mi.synthesizeDeferredGoModuleCalls(idx, edges)
 	}
-	if _, err := cr.ResolveAllContext(ctx); err != nil {
-		return err
+	_, resolveErr := cr.ResolveAllContext(ctx)
+	if resolveErr != nil && !errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+		return resolveErr
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
@@ -538,7 +545,7 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	// fallback lane runs with no global test-edges pass behind it.
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
-	return nil
+	return resolveErr
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges

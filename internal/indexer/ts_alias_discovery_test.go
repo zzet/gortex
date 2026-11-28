@@ -12,6 +12,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/config"
+	"github.com/zzet/gortex/internal/graph"
+	"github.com/zzet/gortex/internal/parser"
+	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
 )
@@ -209,4 +212,78 @@ func TestTSConfigPathAlias_RecordStatsSkipsInputsRewrittenAfterRead(t *testing.T
 	require.NotContains(t, s.stats, configPath, "a stat taken after a rewrite must not vouch for the old read")
 	caller := filepath.Join(abs, "pages", "index.ts")
 	require.True(t, s.needsDiscovery(abs, []string{caller}))
+}
+
+// MayHaveTSAliasCallers (SQL language filter) and closureJSTSPath (extension
+// list) must agree across every registered parser language/extension, modulo
+// SAP HANA XSJS files which reuse the JS extractor for syntax but do not
+// participate in Node/TypeScript path-alias resolution.
+func TestTSAliasDiscovery_MayHaveCallersMatchesClosureJSTSPath(t *testing.T) {
+	reg := parser.NewRegistry()
+	languages.RegisterAll(reg)
+
+	// Explicitly allowlisted extensions that route to the JavaScript extractor
+	// for syntax extraction but are intentionally excluded from JS/TS path-alias
+	// resolution.
+	xsjsAllowlist := map[string]bool{
+		".xsjs":    true,
+		".xsjslib": true,
+	}
+
+	_, store := newSQLiteIndexer(t)
+	checkLang := func(t *testing.T, repo, lang string) bool {
+		t.Helper()
+		store.AddNode(&graph.Node{
+			ID:         repo + "/sample",
+			Kind:       graph.KindFile,
+			Name:       "sample",
+			FilePath:   repo + "/sample",
+			RepoPrefix: repo,
+			Language:   lang,
+		})
+		has, err := store.MayHaveTSAliasCallers(t.Context(), repo)
+		require.NoError(t, err)
+		return has
+	}
+
+	// Bidirectional check across every extension registered in the parser registry.
+	for _, lang := range reg.SupportedLanguages() {
+		ext, ok := reg.GetByLanguage(lang)
+		require.True(t, ok)
+		for _, suffix := range ext.Extensions() {
+			if !strings.HasPrefix(suffix, ".") {
+				continue
+			}
+			sample := "sample" + suffix
+			detected, ok := reg.DetectLanguage(sample)
+			if !ok || detected != lang {
+				continue
+			}
+			repo := "ext_" + strings.TrimPrefix(strings.ToLower(suffix), ".") + "_" + lang
+			sqlHit := checkLang(t, repo, detected)
+			pathHit := closureJSTSPath(sample)
+			if pathHit {
+				require.Truef(t, sqlHit, "closureJSTSPath(%q) is true (lang=%q) but MayHaveTSAliasCallers returned false", sample, detected)
+			}
+			if sqlHit && !xsjsAllowlist[strings.ToLower(suffix)] {
+				require.Truef(t, pathHit, "MayHaveTSAliasCallers returned true for %q (lang=%q) but closureJSTSPath returned false", sample, detected)
+			}
+		}
+	}
+
+	// Forward check: every extension closureJSTSPath accepts is registered and
+	// produces a language matched by MayHaveTSAliasCallers.
+	for _, suffix := range []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".vue", ".svelte", ".astro"} {
+		sample := "dir/file" + suffix
+		require.Truef(t, closureJSTSPath(sample), "expected closureJSTSPath(%q) to be true", sample)
+		detected, ok := reg.DetectLanguage(sample)
+		require.Truef(t, ok, "expected registry to detect language for %q", sample)
+		require.Truef(t, checkLang(t, "jsts_"+strings.TrimPrefix(suffix, "."), detected),
+			"MayHaveTSAliasCallers must match detected language %q for %q", detected, sample)
+	}
+
+	// Verify emitted node-level language tags (including jsx/tsx) all match SQL.
+	for _, lang := range []string{"javascript", "typescript", "jsx", "tsx", "vue", "svelte", "astro"} {
+		require.Truef(t, checkLang(t, "tag_"+lang, lang), "MayHaveTSAliasCallers must match language %q", lang)
+	}
 }

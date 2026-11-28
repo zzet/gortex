@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -891,10 +892,13 @@ func (r *Resolver) ResolveAll() *ResolveStats {
 }
 
 // ResolveAllContext is ResolveAll with cancellation propagated through the
-// native unresolved-edge pager. On error it returns the counts accumulated up
-// to the failure and does not publish compute readiness or run refinement
-// tails. ResolveAll retains the historical best-effort API for callers that do
-// not own a lifecycle context.
+// native unresolved-edge pager. On cancellation or hard store errors it returns
+// early with the counts accumulated up to the failure and does not publish
+// compute readiness or run refinement tails. On ErrReindexWriteRefused it
+// continues remaining pages and refinement tails while still withholding
+// compute readiness (OnComputeDone) and terminal stamping, returning
+// ErrReindexWriteRefused at the end. ResolveAll retains the historical
+// best-effort API for callers that do not own a lifecycle context.
 func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1322,92 +1326,118 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 				applyLivenessElapsed += time.Since(livenessStart)
 			}
-			reindexBatch := make([]graph.EdgeReindex, 0, resolveJobCount(perWorkerJobs))
+			jobCount := resolveJobCount(perWorkerJobs)
+			clones := make([]graph.Edge, 0, jobCount)
+			reindexBatch := make([]graph.EdgeReindex, 0, jobCount)
 			for i := range perWorkerJobs {
 				kept := perWorkerJobs[i][:0]
 				for _, j := range perWorkerJobs[i] {
 					if validateLiveJobs && !liveJobs.contains(j) {
 						continue
 					}
-					j.edge.To = j.newTo
-					j.edge.Kind = j.kind
-					j.edge.CrossRepo = j.crossRepo
-					j.edge.Confidence = j.confidence
-					j.edge.Origin = j.origin
-					j.edge.Meta = j.meta
+					c := *j.edge
+					c.To = j.newTo
+					c.Kind = j.kind
+					c.CrossRepo = j.crossRepo
+					c.Confidence = j.confidence
+					c.Origin = j.origin
+					c.Meta = j.meta
 					if j.hasModuleLabel {
-						j.edge.ConfidenceLabel = j.moduleLabel
+						c.ConfidenceLabel = j.moduleLabel
 					}
-					reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: j.edge, OldTo: j.oldTo, OldKind: j.oldKind})
-					if graph.IsUnresolvedTarget(j.oldTo) && !graph.IsUnresolvedTarget(j.newTo) {
-						reindexConversions++
-					} else {
-						reindexChurn++
-						switch churnShape(j.oldTo, j.newTo, j.oldKind, j.kind) {
-						case churnShapeRetarget:
-							churnRetargeted++
-						case churnShapeKind:
-							churnKindPromoted++
-						default:
-							churnAttrsOnly++
-						}
-					}
+					clones = append(clones, c)
+					reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: &clones[len(clones)-1], OldTo: j.oldTo, OldKind: j.oldKind})
 					kept = append(kept, j)
 				}
 				perWorkerJobs[i] = kept
 			}
+			applied := true
 			if len(reindexBatch) > 0 {
-				noteStart := time.Now()
-				r.noteImportEdgeReindexes(reindexBatch)
-				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				applied := reindexEdgesApplied(r.graph, reindexBatch)
+				applied = reindexEdgesApplied(r.graph, reindexBatch)
 				applyStoreElapsed += time.Since(storeStart)
-				if !applied {
+				if applied {
+					for i := range perWorkerJobs {
+						for _, j := range perWorkerJobs[i] {
+							j.edge.To = j.newTo
+							j.edge.Kind = j.kind
+							j.edge.CrossRepo = j.crossRepo
+							j.edge.Confidence = j.confidence
+							j.edge.Origin = j.origin
+							j.edge.Meta = j.meta
+							if j.hasModuleLabel {
+								j.edge.ConfidenceLabel = j.moduleLabel
+							}
+							if graph.IsUnresolvedTarget(j.oldTo) && !graph.IsUnresolvedTarget(j.newTo) {
+								reindexConversions++
+							} else {
+								reindexChurn++
+								switch churnShape(j.oldTo, j.newTo, j.oldKind, j.kind) {
+								case churnShapeRetarget:
+									churnRetargeted++
+								case churnShapeKind:
+									churnKindPromoted++
+								default:
+									churnAttrsOnly++
+								}
+							}
+						}
+					}
+					noteStart := time.Now()
+					r.noteImportEdgeReindexes(reindexBatch)
+					applyNoteElapsed += time.Since(noteStart)
+					placeholderStart := time.Now()
+					// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
+					// applying them per page made the result depend on the paging.
+					r.placeholderSrcIdx.deferRepoints(r.graph, reindexBatch)
+					applyPlaceholderElapsed += time.Since(placeholderStart)
+					for _, ri := range reindexBatch {
+						r.noteRetargetedCall(ri.Edge)
+					}
+					// Without a cold shadow this pass can bind straight into another
+					// tracked repository; give those calls their parallel here.
+					DetectCrossRepoEdgesForReindexes(r.graph, crossRepoReindexes(reindexBatch))
+					reindexTotal += len(reindexBatch)
+					if pageRevisionKnown {
+						// Ignore this pass's own committed mutations. A later delta
+						// can then only come from work that ran while mu was yielded.
+						pageRevision, _ = loadEdgeMutationRevision(r.graph)
+					}
+					if pageMutationRevisionKnown {
+						pageMutationRevision, _ = loadMutationRevision(r.graph)
+					}
+				} else {
 					total.WriteRefused = true
-					return resolveError(fmt.Errorf("%w: %d edge(s)", ErrReindexWriteRefused, len(reindexBatch)))
-				}
-				placeholderStart := time.Now()
-				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
-				// applying them per page made the result depend on the paging.
-				r.placeholderSrcIdx.deferRepoints(r.graph, reindexBatch)
-				applyPlaceholderElapsed += time.Since(placeholderStart)
-				for _, ri := range reindexBatch {
-					r.noteRetargetedCall(ri.Edge)
-				}
-				// Without a cold shadow this pass can bind straight into another
-				// tracked repository; give those calls their parallel here.
-				DetectCrossRepoEdgesForReindexes(r.graph, crossRepoReindexes(reindexBatch))
-				reindexTotal += len(reindexBatch)
-				if pageRevisionKnown {
-					// Ignore this pass's own committed mutations. A later delta
-					// can then only come from work that ran while mu was yielded.
-					pageRevision, _ = loadEdgeMutationRevision(r.graph)
-				}
-				if pageMutationRevisionKnown {
-					pageMutationRevision, _ = loadMutationRevision(r.graph)
 				}
 			}
-			if guardSpoolErr == nil {
-				spoolStart := time.Now()
-				guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
-				applyGuardSpoolElapsed += time.Since(spoolStart)
-				if guardSpoolErr != nil {
-					r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
+			if applied {
+				if guardSpoolErr == nil {
+					spoolStart := time.Now()
+					guardSpoolErr = guardSpool.appendJobs(perWorkerJobs)
+					applyGuardSpoolElapsed += time.Since(spoolStart)
+					if guardSpoolErr != nil {
+						r.logger.Error("resolver: append guard spool", zap.Error(guardSpoolErr))
+					}
 				}
-			}
-			for i := range perWorkerJobs {
-				for j := range perWorkerJobs[i] {
-					if guardCandidateJob(&perWorkerJobs[i][j]) {
-						guardRepos[graph.RepoPrefixOfID(perWorkerJobs[i][j].edge.From)] = struct{}{}
+				for i := range perWorkerJobs {
+					for j := range perWorkerJobs[i] {
+						if guardCandidateJob(&perWorkerJobs[i][j]) {
+							guardRepos[graph.RepoPrefixOfID(perWorkerJobs[i][j].edge.From)] = struct{}{}
+						}
 					}
 				}
 			}
 			applyElapsed += time.Since(applyStart)
-			for i := range perWorkerStats {
-				total.Resolved += perWorkerStats[i].Resolved
-				total.Unresolved += perWorkerStats[i].Unresolved
-				total.External += perWorkerStats[i].External
+			if applied {
+				for i := range perWorkerStats {
+					total.Resolved += perWorkerStats[i].Resolved
+					total.Unresolved += perWorkerStats[i].Unresolved
+					total.External += perWorkerStats[i].External
+				}
+			} else {
+				for i := range perWorkerStats {
+					total.Unresolved += perWorkerStats[i].Unresolved + perWorkerStats[i].Resolved + perWorkerStats[i].External
+				}
 			}
 			for i := range perWorkerDeferred {
 				pageDeferredLSP = append(pageDeferredLSP, perWorkerDeferred[i]...)
@@ -1476,7 +1506,6 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	loopElapsed := time.Since(passStart) - warmElapsed
 	if !placeholderOK {
 		total.WriteRefused = true
-		return resolveError(fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused))
 	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
@@ -1488,7 +1517,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// a cold pass — it has no business inside the time-to-queryable window.
 	// Like the guard and cross-repo tails that already run after this hook,
 	// its rewrites land on an already-queryable graph.
-	if r.OnComputeDone != nil {
+	if r.OnComputeDone != nil && !total.WriteRefused {
 		r.OnComputeDone()
 	}
 
@@ -1698,10 +1727,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				}
 				break
 			}
+			origKeys := make([]deferredLSPWorkKey, len(edges))
+			for i, edge := range edges {
+				origKeys[i] = deferredLSPWorkKeyFor(edge)
+			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
 			if pageResult.writeRefused {
 				total.WriteRefused = true
-				return resolveError(fmt.Errorf("%w: deferred LSP batch", ErrReindexWriteRefused))
 			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
@@ -1730,28 +1762,38 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			// higher-quality LSP work queued. Clear any prior full-pass stamp in
 			// one batch; successful heuristic resolutions already cleared it.
 			terminalClears := make([]graph.EdgeReindex, 0, len(pageResult.retry))
-			for _, edge := range edges {
-				key := deferredLSPWorkKeyFor(edge)
+			termClones := make([]graph.Edge, 0, len(edges))
+			origTerm := make([]*graph.Edge, 0, len(pageResult.retry))
+			for i, edge := range edges {
+				key := origKeys[i]
 				if _, retry := pageResult.retry[key]; !retry || edge.edge == nil || !edgeTerminalFlag(edge.edge) {
 					continue
 				}
-				oldTo := edge.edge.To
-				clearEdgeTerminal(edge.edge)
-				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: edge.edge, OldTo: oldTo})
+				c := *edge.edge
+				c.Meta = maps.Clone(edge.edge.Meta)
+				clearEdgeTerminal(&c)
+				termClones = append(termClones, c)
+				origTerm = append(origTerm, edge.edge)
+				terminalClears = append(terminalClears, graph.EdgeReindex{Edge: &termClones[len(termClones)-1], OldTo: edge.edge.To})
 			}
 			if len(terminalClears) > 0 {
-				r.noteImportEdgeReindexes(terminalClears)
-				if !r.applyReindexEdges(terminalClears) {
+				if r.applyReindexEdges(terminalClears) {
+					for i, orig := range origTerm {
+						orig.Meta = termClones[i].Meta
+					}
+					r.noteImportEdgeReindexes(terminalClears)
+				} else {
 					total.WriteRefused = true
-					return resolveError(fmt.Errorf("%w: %d terminal clear(s)", ErrReindexWriteRefused, len(terminalClears)))
 				}
 			}
 
 			completed := append([]deferredLSPWorkKey(nil), stale...)
-			carried := make([]deferredLSPWorkKey, 0, len(pageResult.retry))
-			for _, edge := range edges {
-				key := deferredLSPWorkKeyFor(edge)
-				if _, retry := pageResult.retry[key]; retry {
+			carried := make([]deferredLSPWorkKey, 0, len(pageResult.retry)+len(pageResult.refused))
+			for i, edge := range edges {
+				key := origKeys[i]
+				if _, refused := pageResult.refused[key]; refused {
+					carried = append(carried, key)
+				} else if _, retry := pageResult.retry[key]; retry {
 					if edge.edge != nil && graph.IsUnresolvedTarget(edge.edge.To) {
 						// The graph's normal pending set is already the durable
 						// retry queue for an unresolved edge.
@@ -1887,7 +1929,6 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			r.clearLookupCache()
 			if tailWriteRefused {
 				total.WriteRefused = true
-				return resolveError(fmt.Errorf("%w: cross-package guard", ErrReindexWriteRefused))
 			}
 			guardPages++
 			guardJobs += len(jobs)
@@ -2060,11 +2101,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// left the entire unresolved residual unstamped, so every subsequent
 	// full pass re-paged ~300k edges that the first pass had already proven
 	// unbindable.
-	if tailWriteRefused {
-		total.WriteRefused = true
-		return resolveError(fmt.Errorf("%w: post-resolution tail", ErrReindexWriteRefused))
-	}
-	if r.stampTerminal && len(r.scope) == 0 {
+	if r.stampTerminal && len(r.scope) == 0 && !total.WriteRefused && !tailWriteRefused {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
 		}
@@ -2144,6 +2181,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	total.LSPBudgetExhausted = lspResult.budgetExhausted
 	total.PendingBefore = pendingBefore
 	total.PendingAfter = pendingAfter
+	if total.WriteRefused || tailWriteRefused {
+		total.WriteRefused = true
+		return total, fmt.Errorf("%w: whole-graph resolve had refused write(s)", ErrReindexWriteRefused)
+	}
 	return total, nil
 }
 

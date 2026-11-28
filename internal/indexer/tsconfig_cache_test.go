@@ -27,6 +27,7 @@ import (
 type gateHoldingReindexStore struct {
 	*store_sqlite.Store
 	holdOnce     sync.Once
+	holdAll      bool
 	dropped      atomic.Int32
 	droppedEdges atomic.Int32
 }
@@ -37,13 +38,18 @@ func (s *gateHoldingReindexStore) ReindexEdges(batch []graph.EdgeReindex) {
 
 func (s *gateHoldingReindexStore) ReindexEdgesApplied(batch []graph.EdgeReindex) bool {
 	var release func()
-	s.holdOnce.Do(func() {
+	hold := func() {
 		var err error
 		release, err = s.HoldWriteGate(context.Background())
 		if err != nil {
 			panic(err)
 		}
-	})
+	}
+	if s.holdAll {
+		hold()
+	} else {
+		s.holdOnce.Do(hold)
+	}
 	if release != nil {
 		defer release()
 	}
@@ -335,9 +341,11 @@ func TestTSConfigPathAlias_RefusedFullResolveWriteIsNotCertified(t *testing.T) {
 	defer restoreTimeout()
 	contended := &gateHoldingReindexStore{Store: store}
 	idx.resolver.SetGraph(contended)
-	_, err = idx.Index(root)
+	res, err := idx.Index(root)
 	idx.resolver.SetGraph(store)
-	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.NoError(t, err, "a refused resolver write during full index must still publish the graph")
+	require.NotNil(t, res)
+	require.True(t, res.ResolutionWriteRefused)
 	require.Equal(t, int32(1), contended.dropped.Load(), "SQLite must have dropped the contended rebind batch")
 	require.Positive(t, contended.droppedEdges.Load())
 	require.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
@@ -346,8 +354,10 @@ func TestTSConfigPathAlias_RefusedFullResolveWriteIsNotCertified(t *testing.T) {
 	require.Empty(t, digest, "a refused resolver write must not certify the new alias digest")
 	require.Empty(t, idx.appliedAliases)
 
-	_, err = idx.Index(root)
+	res, err = idx.Index(root)
 	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.ResolutionWriteRefused)
 	require.Equal(t, "new/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
 	digest, err = store.TSAliasDigest(idx.repoPrefix)
 	require.NoError(t, err)
@@ -414,12 +424,12 @@ func TestTSConfigPathAlias_RefusedDeferredSharedResolveWriteIsNotCertified(t *te
 
 	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
 	defer restoreTimeout()
-	contended := &gateHoldingReindexStore{Store: store}
+	contended := &gateHoldingReindexStore{Store: store, holdAll: true}
 	mi.graph = contended
 	err = mi.RunPreEnrichResolve(t.Context(), nil, nil)
 	mi.graph = store
 	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
-	require.Equal(t, int32(1), contended.dropped.Load())
+	require.GreaterOrEqual(t, contended.dropped.Load(), int32(1))
 	require.Equal(t, "unresolved::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
 	digest, err := store.TSAliasDigest("repo")
 	require.NoError(t, err)
@@ -432,4 +442,243 @@ func TestTSConfigPathAlias_RefusedDeferredSharedResolveWriteIsNotCertified(t *te
 	require.NoError(t, err)
 	require.NotEmpty(t, digest)
 	require.Nil(t, idx.deferredAliases.Load())
+}
+
+func TestTSConfigPathAlias_TrackRepoPublishesMetadataOnRefusedFullResolveWrite(t *testing.T) {
+	t.Setenv("GORTEX_SHADOW_MAX_FILES", "0")
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{entry}}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+	seed, store := newSQLiteIndexer(t)
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	contended := &gateHoldingReindexStore{Store: store}
+	invalidateTSAliasCollection(root)
+	mi := NewMultiIndexer(contended, seed.registry, search.NewNull(), cm, zap.NewNop())
+
+	res, err := mi.TrackRepoCtx(t.Context(), entry)
+	require.NoError(t, err, "TrackRepoCtx must complete and publish metadata when resolution hits a refused write")
+	require.NotNil(t, res)
+	require.True(t, res.ResolutionWriteRefused)
+	require.Equal(t, int32(1), contended.dropped.Load())
+	digest, err := store.TSAliasDigest("repo")
+	require.NoError(t, err)
+	require.Empty(t, digest, "alias digest must be withheld when a full resolve write was refused")
+	meta := mi.GetMetadata("repo")
+	require.NotNil(t, meta, "RepoMetadata must be published on refused resolve write")
+	require.Positive(t, meta.FileCount)
+	require.NotEmpty(t, mi.FileMtimes("repo"), "FileMtimes must be published on refused resolve write")
+}
+
+func TestTSConfigPathAlias_FullIndexFailedTSFileDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	locked := filepath.Join(root, "pages/locked.ts")
+	writeFileMk(t, locked, "import { useRedirect } from '~/auth'\nexport function other() { return useRedirect() }\n")
+	restore := denyFileRead(t, locked)
+
+	idx, store := newSQLiteIndexer(t)
+	result, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, locked)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest, "retryable file failure during full index must still certify the alias policy")
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{locked})
+	require.NoError(t, err)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/locked.ts", "other"))
+}
+
+func TestTSConfigPathAlias_FullIndexFailedGoFileInMixedRepoDoesNotWidenLaterSaves(t *testing.T) {
+	root := t.TempDir()
+	aliasRebindFixture(t, root)
+	lockedGo := filepath.Join(root, "broken.go")
+	writeFileMk(t, lockedGo, "package p\nfunc Helper() {}\n")
+	restore := denyFileRead(t, lockedGo)
+
+	idx, store := newSQLiteIndexer(t)
+	result, err := idx.Index(root)
+	require.NoError(t, err)
+	require.Contains(t, result.FailedFiles, lockedGo)
+	require.Equal(t, "old/auth.ts::useRedirect", callTargetForName(t, store, "pages/index.ts", "run"))
+	digest, err := store.TSAliasDigest(idx.repoPrefix)
+	require.NoError(t, err)
+	require.NotEmpty(t, digest, "a retryable non-JS/TS file failure during full index must still certify the alias policy")
+
+	caller := filepath.Join(root, "pages/index.ts")
+	bumpMtime(t, caller, "import { useRedirect } from '~/auth'\nexport function run() { useRedirect(); return useRedirect() }\n")
+	result, err = idx.IncrementalReindexPaths(root, []string{caller})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.StaleFileCount, "a save must restage only itself")
+
+	restore()
+	_, err = idx.IncrementalReindexPaths(root, []string{lockedGo})
+	require.NoError(t, err)
+	require.NotEmpty(t, fnNodeID(t, store, "broken.go", "Helper"))
+}
+
+func TestIndexerResolveAllRunsDerivedPassesOnRefusedWrite(t *testing.T) {
+	root := t.TempDir()
+	writeFileMk(t, filepath.Join(root, "iface.go"), `package p
+type Runner interface {
+	Run()
+}
+type Worker struct{}
+func (Worker) Run() {}
+func invoke() { missingHelper() }
+func missingHelper() {}
+`)
+	idx, store := newSQLiteIndexer(t)
+	idx.SetDeferResolve(true)
+	_, err := idx.Index(root)
+	require.NoError(t, err)
+	idx.SetDeferResolve(false)
+
+	restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+	defer restoreTimeout()
+	contended := &gateHoldingReindexStore{Store: store}
+	idx.resolver.SetGraph(contended)
+	err = idx.resolveAll()
+	idx.resolver.SetGraph(store)
+	require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+	require.Equal(t, int32(1), contended.dropped.Load())
+
+	var sawImplements bool
+	for e := range store.EdgesByKind(graph.EdgeImplements) {
+		if e.From == "iface.go::Worker" && e.To == "iface.go::Runner" {
+			sawImplements = true
+			break
+		}
+	}
+	require.True(t, sawImplements, "derived InferImplements pass must still run when ResolveAllContext returns ErrReindexWriteRefused")
+}
+
+// failNthPendingScanStore wraps a store, refusing the first ReindexEdgesApplied
+// call (master resolve) and optionally injecting a non-refusal scan error on a
+// later BeginUnresolvedEdgeScan call (cross-repo resolve).
+type failNthPendingScanStore struct {
+	*gateHoldingReindexStore
+	failScanAt int
+	scans      atomic.Int32
+	scanErr    error
+}
+
+func (s *failNthPendingScanStore) BeginUnresolvedEdgeScan(ctx context.Context) (graph.UnresolvedEdgeScan, error) {
+	if s.failScanAt > 0 && int(s.scans.Add(1)) == s.failScanAt {
+		return graph.UnresolvedEdgeScan{}, s.scanErr
+	}
+	return s.Store.BeginUnresolvedEdgeScan(ctx)
+}
+
+func TestMultiIndexerRunPreEnrichResolveContinuesAndPrecedenceOnRefusedWrite(t *testing.T) {
+	setup := func(t *testing.T) (*MultiIndexer, *store_sqlite.Store, *Indexer) {
+		t.Helper()
+		appRoot := t.TempDir()
+		libRoot := t.TempDir()
+		configPath := aliasRebindFixture(t, appRoot)
+		writeFileMk(t, filepath.Join(libRoot, "lib.ts"), "export function sharedHelper() { return 42 }\n")
+
+		appEntry := config.RepoEntry{Path: appRoot, Name: "app", Workspace: "ws"}
+		libEntry := config.RepoEntry{Path: libRoot, Name: "lib", Workspace: "ws"}
+		configFile := filepath.Join(t.TempDir(), "config.yaml")
+		gc := &config.GlobalConfig{Repos: []config.RepoEntry{appEntry, libEntry}}
+		gc.SetConfigPath(configFile)
+		require.NoError(t, gc.Save())
+		cm, err := config.NewConfigManager(configFile)
+		require.NoError(t, err)
+
+		seed, store := newSQLiteIndexer(t)
+		invalidateTSAliasCollection(appRoot)
+		invalidateTSAliasCollection(libRoot)
+		mi := NewMultiIndexer(store, seed.registry, search.NewNull(), cm, zap.NewNop())
+		_, err = mi.TrackRepoCtx(t.Context(), libEntry)
+		require.NoError(t, err)
+		_, err = mi.TrackRepoCtx(t.Context(), appEntry)
+		require.NoError(t, err)
+
+		// Trigger a deferred alias pass in app that also adds a cross-repo unresolved call.
+		writeFileMk(t, configPath, `{"compilerOptions":{"paths":{"~/*":["new/*"]}}}`)
+		idx := mi.GetIndexer("app")
+		idx.SetDeferResolve(true)
+		_, err = idx.IndexCtx(t.Context(), appRoot)
+		require.NoError(t, err)
+
+		// Add a legacy node without WorkspaceID to prove BackfillWorkspaceSlugs runs,
+		// plus a cross-repo call edge that only CrossRepoResolver resolves.
+		store.AddBatch([]*graph.Node{
+			{ID: "app/legacy.ts", Kind: graph.KindFile, Name: "legacy.ts", FilePath: "app/legacy.ts", RepoPrefix: "app", Language: "typescript"},
+			{ID: "app/legacy.ts::caller", Kind: graph.KindFunction, Name: "caller", FilePath: "app/legacy.ts", RepoPrefix: "app", Language: "typescript"},
+		}, []*graph.Edge{
+			{From: "app/legacy.ts", To: "lib/lib.ts", Kind: graph.EdgeImports, FilePath: "app/legacy.ts", Line: 1, CrossRepo: true},
+			{From: "app/legacy.ts::caller", To: "unresolved::sharedHelper", Kind: graph.EdgeCalls, FilePath: "app/legacy.ts", Line: 2},
+		})
+		return mi, store, idx
+	}
+
+	t.Run("continues_through_backfill_and_cross_repo_and_withholds_certification", func(t *testing.T) {
+		mi, store, idx := setup(t)
+		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+		defer restoreTimeout()
+		contended := &gateHoldingReindexStore{Store: store}
+		mi.graph = contended
+		err := mi.RunPreEnrichResolve(t.Context(), nil, nil)
+		mi.graph = store
+
+		require.ErrorIs(t, err, resolver.ErrReindexWriteRefused)
+		require.Equal(t, int32(1), contended.dropped.Load())
+
+		legacy := store.GetNode("app/legacy.ts")
+		require.NotNil(t, legacy)
+		require.Equal(t, "ws", legacy.WorkspaceID, "BackfillWorkspaceSlugs must run after master ErrReindexWriteRefused")
+
+		var sawCrossBound bool
+		for _, e := range store.GetOutEdges("app/legacy.ts::caller") {
+			if e.Kind == graph.EdgeCalls && e.To == "lib/lib.ts::sharedHelper" {
+				sawCrossBound = true
+			}
+		}
+		require.True(t, sawCrossBound, "CrossRepoResolver must still run after master ErrReindexWriteRefused")
+
+		digest, err := store.TSAliasDigest("app")
+		require.NoError(t, err)
+		require.Empty(t, digest, "deferred alias certification must be withheld on master refusal")
+		require.NotNil(t, idx.deferredAliases.Load())
+	})
+
+	t.Run("non_refusal_cross_repo_error_takes_precedence_over_master_refusal", func(t *testing.T) {
+		mi, store, idx := setup(t)
+		restoreTimeout := store.SetBusyRetryTimeoutForTest(40 * time.Millisecond)
+		defer restoreTimeout()
+		errCrossBoom := errors.New("injected cross-repo failure")
+		wrapped := &failNthPendingScanStore{
+			gateHoldingReindexStore: &gateHoldingReindexStore{Store: store},
+			failScanAt:              2, // scan 1 = master, scan 2 = cross-repo
+			scanErr:                 errCrossBoom,
+		}
+		mi.graph = wrapped
+		err := mi.RunPreEnrichResolve(t.Context(), nil, nil)
+		mi.graph = store
+
+		require.ErrorIs(t, err, errCrossBoom, "non-refusal cross-repo error must take precedence over master ErrReindexWriteRefused")
+		require.Equal(t, int32(1), wrapped.dropped.Load())
+		digest, err := store.TSAliasDigest("app")
+		require.NoError(t, err)
+		require.Empty(t, digest)
+		require.NotNil(t, idx.deferredAliases.Load())
+	})
 }

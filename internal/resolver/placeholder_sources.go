@@ -209,6 +209,7 @@ func reconcileIndexedPlaceholderSourcesApplied(
 	moves []placeholderSourceMove,
 ) (int, bool) {
 	moved := 0
+	allApplied := true
 	for start := 0; start < len(moves); start += placeholderSourceReindexBatchSize {
 		end := start + placeholderSourceReindexBatchSize
 		if end > len(moves) {
@@ -220,15 +221,19 @@ func reconcileIndexedPlaceholderSourcesApplied(
 			identities[i] = page[i].identity
 		}
 		current := finder.FindEdgesByIdentities(identities)
+		clones := make([]graph.Edge, 0, len(page))
 		batch := make([]graph.EdgeReindex, 0, len(page))
 		for _, move := range page {
 			e := current[move.identity]
 			if e == nil || graph.EdgeIdentityFor(e) != move.identity {
 				continue
 			}
-			e.From = move.newFrom
+			delete(current, move.identity)
+			c := *e
+			c.From = move.newFrom
+			clones = append(clones, c)
 			batch = append(batch, graph.EdgeReindex{
-				Edge:            e,
+				Edge:            &clones[len(clones)-1],
 				OldFrom:         move.identity.From,
 				OldTo:           move.identity.To,
 				OldKind:         move.identity.Kind,
@@ -241,11 +246,12 @@ func reconcileIndexedPlaceholderSourcesApplied(
 			continue
 		}
 		if !reindexEdgesApplied(g, batch) {
-			return moved, false
+			allApplied = false
+			continue
 		}
 		moved += len(batch)
 	}
-	return moved, true
+	return moved, allApplied
 }
 
 // reconcilePlaceholderSources re-points dataflow edges keyed FROM an

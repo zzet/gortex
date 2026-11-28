@@ -1934,8 +1934,12 @@ func closureBareJSTSImport(importPath string, callers []string) bool {
 	return true
 }
 
-// closureJSTSPath mirrors resolver.isJSTSPath — the importer languages whose
-// specifiers the JS/TS module loader's rules describe.
+// closureJSTSPath mirrors resolver.isJSTSPath (internal/resolver/jsts_imports.go)
+// and the SQL language filter in store_sqlite.(*Store).MayHaveTSAliasCallers
+// (internal/graph/store_sqlite/store_ts_alias_state.go) — the importer
+// languages whose specifiers the JS/TS module loader's rules describe.
+// Keep all three in sync (guarded by
+// TestTSAliasDiscovery_MayHaveCallersMatchesClosureJSTSPath).
 func closureJSTSPath(p string) bool {
 	switch strings.ToLower(path.Ext(p)) {
 	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs",

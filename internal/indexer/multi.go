@@ -921,15 +921,24 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
 				zap.String("reason", reason))
 		}
-		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil); err != nil {
-			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(err))
-			return deferredResolveFailed, false
+		masterErr := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil)
+		if masterErr != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(masterErr))
+			if !errors.Is(masterErr, resolver.ErrReindexWriteRefused) {
+				return deferredResolveFailed, false
+			}
 		}
-		if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
-			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(err))
-			return deferredResolveFailed, false
+		crossErr := mi.runCrossRepoResolveContext(context.Background(), false)
+		if crossErr != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(crossErr))
+			if !errors.Is(crossErr, resolver.ErrReindexWriteRefused) {
+				return deferredResolveFailed, false
+			}
 		}
 		resolver.DetectCrossRepoEdges(mi.graph)
+		if masterErr != nil || crossErr != nil {
+			return deferredResolveFailed, false
+		}
 		return deferredResolveFallback, true
 	}
 
@@ -1047,7 +1056,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	}
 	mt := time.Now()
 	stats, err := master.ResolveAllContext(ctx)
-	if err == nil && ctx.Err() == nil {
+	if (err == nil || errors.Is(err, resolver.ErrReindexWriteRefused)) && ctx.Err() == nil {
 		// The dataflow placeholders are lifted after every whole resolve,
 		// as a single-repository whole index and the per-save path do.
 		materializeDataflowParamsInGraph(mi.graph)
@@ -1199,8 +1208,14 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) *resolver.ResolveS
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
 	pendingAliases := mi.deferredAliasPasses(scope)
 	mi.runDeferredGoModAll()
-	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
-		return err
+	masterErr := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone)
+	if masterErr != nil && !errors.Is(masterErr, resolver.ErrReindexWriteRefused) {
+		return masterErr
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	// Stamp legacy nodes after master resolution so synthetic nodes created by
 	// attribution participate in the cross-workspace boundary check below.
@@ -1208,8 +1223,15 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	if err := mi.runCrossRepoResolveContext(ctx, false); err != nil {
-		return err
+	crossErr := mi.runCrossRepoResolveContext(ctx, false)
+	if crossErr != nil && !errors.Is(crossErr, resolver.ErrReindexWriteRefused) {
+		return crossErr
+	}
+	if masterErr != nil {
+		return masterErr
+	}
+	if crossErr != nil {
+		return crossErr
 	}
 	return certifyDeferredAliases(pendingAliases)
 }
