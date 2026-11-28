@@ -219,7 +219,7 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/charmbracelet/x/ansi v0.11.9
+	github.com/charmbracelet/x/ansi v0.11.10
 	github.com/coder/hnsw v0.6.1
 	github.com/davalillo/tree-sitter-mql5 v0.2.0
 	github.com/fwcd/tree-sitter-kotlin v0.0.0-20260411204054-55622a49bd59
@@ -238,10 +238,10 @@ require (
 	github.com/gortexhq/tree-sitter-sql v0.1.0
 	github.com/gortexhq/tree-sitter-swift v0.1.1-0.20260424235305-8dde3a3327dd
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/jedib0t/go-pretty/v6 v6.9.1
+	github.com/jedib0t/go-pretty/v6 v6.9.2
 	github.com/knights-analytics/hugot v0.8.6
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
-	github.com/mark3labs/mcp-go v1.5.0
+	github.com/mark3labs/mcp-go v1.6.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -260,7 +260,7 @@ require (
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-bash v0.25.1
 	github.com/tree-sitter/tree-sitter-c v0.24.2
-	github.com/tree-sitter/tree-sitter-c-sharp v0.23.5
+	github.com/tree-sitter/tree-sitter-c-sharp v0.24.0
 	github.com/tree-sitter/tree-sitter-cpp v0.23.4
 	github.com/tree-sitter/tree-sitter-css v0.25.0
 	github.com/tree-sitter/tree-sitter-elixir v0.3.5
@@ -269,11 +269,11 @@ require (
 	github.com/tree-sitter/tree-sitter-java v0.23.5
 	github.com/tree-sitter/tree-sitter-javascript v0.25.0
 	github.com/tree-sitter/tree-sitter-ocaml v0.26.0
-	github.com/tree-sitter/tree-sitter-php v0.25.1
+	github.com/tree-sitter/tree-sitter-php v0.25.2
 	github.com/tree-sitter/tree-sitter-python v0.25.0
 	github.com/tree-sitter/tree-sitter-ruby v0.23.1
 	github.com/tree-sitter/tree-sitter-rust v0.24.2
-	github.com/tree-sitter/tree-sitter-scala v0.26.12
+	github.com/tree-sitter/tree-sitter-scala v0.26.13
 	github.com/tree-sitter/tree-sitter-typescript v0.23.2
 	github.com/yalue/onnxruntime_go v1.38.0
 	github.com/zeebo/blake3 v0.2.4
@@ -284,7 +284,7 @@ require (
 	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.48.0
 	golang.org/x/text v0.44.0
-	golang.org/x/tools v0.52.1-0.20261106145633-d407941a339a
+	golang.org/x/tools v0.53.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/libc v1.81.0
