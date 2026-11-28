@@ -537,6 +537,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	// the separate edit gate's full phase accounting. Binary role is unchanged.
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
 	phase.EditProbe.AccountingRequired = r.requireAccounting
+	if r.requireAccounting {
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "a typed terminal accounting state (terminal_unavailable_background, terminal_partial_physical, terminal_unavailable_shared_owner) is disclosed in summary.accounting_states / accounting_unavailable, not failed; only accounting that never became terminal fails a record")
+	}
 	phase.EditProbe.PhysicalWriteScope = sharedEditProbePhysicalScope(p, plan, editors)
 	if plan.LinkedWorktrees > 0 {
 		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "linked immediate graph read-backs may be answered by the labelled base fallback while the checkout republishes (reindex_pending ACK); those are typed pending, re-read on the same session until exact, never counted as incorrect; t_readback_ms then measures the first exact answer; the pending census is in summary.readback_pending")
@@ -1596,8 +1599,8 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if r.requireAccounting && move != nil && (s.record.MoveAccounting == nil || !editProbeMoveAccountingComplete(*s.record.MoveAccounting)) {
 		s.record.Errors = append(s.record.Errors, "move shared A/per-file write/direct accounting unavailable")
 	}
-	if r.requireAccounting && move == nil && !editProbeAccountingComplete(s.record.Accounting) {
-		s.record.Errors = append(s.record.Errors, "A/P/B accounting unavailable: "+strings.Join(s.record.Accounting.Reasons, "; "))
+	if message, failed := editProbeAccountingRecordError(s.record.Accounting); r.requireAccounting && move == nil && failed {
+		s.record.Errors = append(s.record.Errors, message)
 	}
 	if s.record.StaleClaimedFresh {
 		s.record.Errors = append(s.record.Errors, "stale answer explicitly claimed fresh after acknowledgement")

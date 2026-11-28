@@ -121,6 +121,12 @@ type editProbeSummary struct {
 	// Linked immediate readbacks answered by the labelled fallback while the
 	// checkout republished, per kind; omitted when none was pending.
 	ReadbackPending map[string]editProbePendingCensus `json:"readback_pending,omitempty"`
+	// Records per accounting state, and per typed background refusal
+	// (reason|binding_predicate) for records that ended
+	// terminal_unavailable_background. A typed terminal state is disclosed
+	// here rather than failed.
+	AccountingStates      map[string]int `json:"accounting_states,omitempty"`
+	AccountingUnavailable map[string]int `json:"accounting_unavailable,omitempty"`
 }
 
 // One pending kind across the run: how many records were pending, how many
@@ -243,7 +249,25 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 	summarizeEditProbeTierAfterCommit(out, records, seed)
 	summarizeEditProbeAttribution(out, records)
 	summarizeEditProbeReadbackPending(out, records, seed)
+	summarizeEditProbeAccounting(out, records)
 	return out
+}
+
+func summarizeEditProbeAccounting(out *editProbeSummary, records []editProbeRecord) {
+	for _, record := range records {
+		if state := record.Accounting.State; state != "" {
+			if out.AccountingStates == nil {
+				out.AccountingStates = make(map[string]int)
+			}
+			out.AccountingStates[state]++
+		}
+		if refusal := record.Accounting.BackgroundRefusal; refusal != nil {
+			if out.AccountingUnavailable == nil {
+				out.AccountingUnavailable = make(map[string]int)
+			}
+			out.AccountingUnavailable[refusal.Reason+"|"+refusal.BindingPredicate]++
+		}
+	}
 }
 
 func summarizeEditProbeReadbackPending(out *editProbeSummary, records []editProbeRecord, seed int64) {

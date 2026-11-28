@@ -1411,6 +1411,45 @@
                             "applied_generation": {
                               "type": "integer"
                             },
+                            "background_refusal": {
+                              "anyOf": [
+                                {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "accepted_attempt_stage": {
+                                      "type": "string"
+                                    },
+                                    "background_stage": {
+                                      "type": "string"
+                                    },
+                                    "binding_predicate": {
+                                      "type": "string"
+                                    },
+                                    "last_observed_generation": {
+                                      "type": "integer"
+                                    },
+                                    "reason": {
+                                      "type": "string"
+                                    },
+                                    "requested_generation": {
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "reason",
+                                    "binding_predicate",
+                                    "background_stage",
+                                    "accepted_attempt_stage",
+                                    "requested_generation",
+                                    "last_observed_generation"
+                                  ],
+                                  "type": "object"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "bound_rpc_id": {
                               "type": "string"
                             },
@@ -5886,6 +5925,24 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "accounting_states": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "accounting_unavailable": {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
                           "busy_refusals": {
                             "additionalProperties": {
                               "type": "integer"

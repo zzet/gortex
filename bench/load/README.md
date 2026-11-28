@@ -632,7 +632,20 @@ touch only the registered fixture file, or the step's own created file.
 Each edit-and-probe report names its `role`. A standalone run is the candidate
 unless `--edit-probe-role baseline` is given; the paired command assigns roles
 by build order and refuses the flag. A candidate still fails any record whose
-phase accounting is missing. Every record carries `phases_ms` for each ACK and
+accounting does not reach a terminal state; a typed terminal unavailable state
+(`terminal_unavailable_background`, `terminal_partial_physical`,
+`terminal_unavailable_shared_owner`) is disclosed in the summary censuses and
+does not fail the record. Only required accounting that never became terminal
+(the status-cycle bound, a deadline or a malformed receipt) is the record error
+`A/P/B accounting not terminal: <reasons>`. A record that ended
+`terminal_unavailable_background` carries `accounting.background_refusal`
+(the receipt's typed `reason`, `binding_predicate`, `background_stage`,
+`accepted_attempt_stage`, `requested_generation` and
+`last_observed_generation`); `summary.accounting_states` counts records per
+accounting state and `summary.accounting_unavailable` counts those refusals per
+`reason|binding_predicate`. The coalesced, functional-unavailable and
+superseded qualifiers still rewrite a record whose only shortfall is its
+accounting to their own outcome, and never one with any other error. Every record carries `phases_ms` for each ACK and
 patch lap the daemon names, taken from the record's own latest receipt status
 (the per-file observation status for batches). A build without `phases_ms`
 reports each lap unavailable with that reason, a producer null keeps the

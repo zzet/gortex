@@ -78,7 +78,7 @@ func supersededRecordFixture(t *testing.T) (editProbeRecord, *receiptproof.Super
 		t.Fatal(err)
 	}
 	exact := false
-	record := editProbeRecord{Ordinal: 1, Editor: 2, Outcome: "diagnostic_failure", Receipt: "commit-a", MutationID: "edit-a", ACKMutationID: "edit-a", ACKStatus: "applied", ACKDiskStatus: "committed", ACKCommitSeq: 2, ACKContentSHA256: strings.Repeat("d", 64), ACKReadbackExact: &exact, GraphTerminal: true, Ack: measured(45, "ms"), FirstCorrect: map[string]Metric{"source": measured(1, "ms")}, EvidenceBytes: 98839, EvidenceLimit: editProbeRawLimit}
+	record := editProbeRecord{Ordinal: 1, Editor: 2, Outcome: "complete", Receipt: "commit-a", MutationID: "edit-a", ACKMutationID: "edit-a", ACKStatus: "applied", ACKDiskStatus: "committed", ACKCommitSeq: 2, ACKContentSHA256: strings.Repeat("d", 64), ACKReadbackExact: &exact, GraphTerminal: true, Ack: measured(45, "ms"), FirstCorrect: map[string]Metric{"source": measured(1, "ms")}, EvidenceBytes: 98839, EvidenceLimit: editProbeRawLimit}
 	record.Accounting = editProbeAccounting{State: "terminal_unavailable_background", RPCID: "rpc-2", Requested: 3, Applied: 3, A: &editProbeWindow{WallNS: 8, SumNS: 8, WithinFivePercent: true}, Reasons: strings.Split(strings.TrimPrefix(proof.AccountingError, "A/P/B accounting unavailable: "), "; ")}
 	for _, name := range []string{"source", "summary", "editing_context", "callers", "call_chain", "search_visible", "text"} {
 		record.FirstCorrect[name] = measured(1, "ms")
@@ -86,7 +86,6 @@ func supersededRecordFixture(t *testing.T) (editProbeRecord, *receiptproof.Super
 	for _, name := range []string{"source", "file", "summary", "search_visible", "text"} {
 		record.Readbacks = append(record.Readbacks, editProbeReadback{Kind: name, Correct: true, Latency: measured(1, "ms")})
 	}
-	record.Errors = []string{proof.AccountingError}
 	return record, &proof
 }
 
@@ -110,7 +109,7 @@ func TestEditProbeProvenSupersededPreservesUnavailableTimingsAndRefusal(t *testi
 }
 
 func TestEditProbeSupersededNeverMasksOtherFailures(t *testing.T) {
-	for _, mode := range []string{"unknown_scope", "single_writer", "wrong_ACK", "stale", "incorrect_read", "missing_first_correct", "missing_immediate_file", "missing_call_chain", "read_error", "capped", "deadline", "accepted_timing", "foreign_guard"} {
+	for _, mode := range []string{"unknown_scope", "single_writer", "wrong_ACK", "stale", "incorrect_read", "missing_first_correct", "missing_immediate_file", "missing_call_chain", "read_error", "capped", "deadline", "accepted_timing", "foreign_guard", "another_error"} {
 		t.Run(mode, func(t *testing.T) {
 			record, proof := supersededRecordFixture(t)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
@@ -141,6 +140,9 @@ func TestEditProbeSupersededNeverMasksOtherFailures(t *testing.T) {
 				record.Accounting.P = &editProbeWindow{WallNS: 1}
 			case "foreign_guard":
 				proof.Guard.Key = "foreign"
+			case "another_error":
+				// The accounting is typed terminal, but another check failed.
+				record.Outcome, record.Errors = "diagnostic_failure", []string{"immediate file readback incorrect"}
 			}
 			if classifySupersededRecord(&record, scope, proof) {
 				t.Fatal("unproven or failed record classified")
@@ -222,7 +224,7 @@ func TestEditProbeSupersededLatestStatusDiscardsEarlierProof(t *testing.T) {
 }
 
 func TestEditProbeSupersededFinishJoinsRealLogsAfterEvidenceSettles(t *testing.T) {
-	for _, mode := range []string{"proven", "missing_guard", "ambiguous_guard", "sink_error", "cap", "incorrect_read", "missing_file", "missing_call_chain", "read_error", "stale", "ack_error", "late_invalid_status", "accepted"} {
+	for _, mode := range []string{"proven", "missing_guard", "ambiguous_guard", "sink_error", "cap", "incorrect_read", "missing_file", "missing_call_chain", "read_error", "stale", "ack_error", "late_invalid_status", "accepted", "another_error"} {
 		t.Run(mode, func(t *testing.T) {
 			record, proof := supersededRecordFixture(t)
 			root := t.TempDir()
@@ -248,12 +250,17 @@ func TestEditProbeSupersededFinishJoinsRealLogsAfterEvidenceSettles(t *testing.T
 				t.Fatal(err)
 			}
 			record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-			record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+			onlyAccountingShortfall(&record)
 			record.supersededStatus = supersededStatus(decoded, raw, 34)
 			if record.Accounting.A == nil || record.Accounting.State != "terminal_unavailable_background" || record.supersededStatus == nil {
 				t.Fatalf("invalid real status/accounting fixture: %+v", record.Accounting)
 			}
 			state := &editProbeState{record: record, rawBytes: 98839}
+			// A failure the edit's own loop detects is a record error; the
+			// qualifier must not rewrite such a record.
+			fail := func(message string) {
+				state.record.Outcome, state.record.Errors = "diagnostic_failure", append(state.record.Errors, message)
+			}
 			switch mode {
 			case "sink_error":
 				state.sinkErr = errors.New("raw sink write failed")
@@ -261,31 +268,43 @@ func TestEditProbeSupersededFinishJoinsRealLogsAfterEvidenceSettles(t *testing.T
 				state.sinkErr = errEditProbeEvidenceIncomplete
 			case "incorrect_read":
 				state.record.Readbacks[0].Correct = false
+				fail("immediate source readback incorrect")
 			case "missing_file":
 				state.record.Readbacks = append(state.record.Readbacks[:1], state.record.Readbacks[2:]...)
 			case "missing_call_chain":
 				delete(state.record.FirstCorrect, "call_chain")
+				fail("first-correct oracle unavailable: call_chain")
 			case "read_error":
 				state.record.Readbacks[0].Error = "readback failed"
+				fail("immediate source readback incorrect")
 			case "stale":
 				state.record.StaleClaimedFresh = true
+				fail("stale answer explicitly claimed fresh after acknowledgement")
 			case "ack_error":
 				state.record.Accounting.Reasons = append(state.record.Accounting.Reasons, "missing A phase disk_write")
-				state.record.Errors[0] += "; missing A phase disk_write"
 			case "late_invalid_status":
 				state.record.supersededStatus = supersededStatus(nil, nil, 35)
 			case "accepted":
 				state.record.Accounting.P = &editProbeWindow{WallNS: 1}
+			case "another_error":
+				fail("immediate file readback incorrect")
 			}
 			phase := &Phase{Metrics: make(map[string]Metric), EditProbe: &editProbeReport{PhysicalWriteScope: &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}}}
 			runtime := &editProbeRuntime{p: &privateRun{Root: root, Repos: []privateRepo{{Prefix: "repo"}}}, phase: phase, states: []*editProbeState{state}, plan: editProbePlan{Steps: []editProbeStep{{Ordinal: 1}}, Seed: 1}, requireAccounting: true}
 			err = runtime.finish()
-			if (err == nil) != (mode == "proven") {
+			// Without a proof, a record whose only shortfall is its typed
+			// terminal accounting stays complete and unclassified; a record
+			// error or lost evidence still fails the run.
+			unclassifiedComplete := map[string]bool{"missing_guard": true, "ambiguous_guard": true, "missing_file": true, "ack_error": true, "late_invalid_status": true, "accepted": true}[mode]
+			if (err == nil) != (mode == "proven" || unclassifiedComplete) {
 				t.Fatalf("finish error=%v mode=%s", err, mode)
 			}
 			got := phase.EditProbe.Records[0]
+			if unclassifiedComplete && (got.Outcome != "complete" || got.Superseded != nil) {
+				t.Fatalf("mode=%s outcome=%s superseded=%v, want complete and unclassified", mode, got.Outcome, got.Superseded)
+			}
 			if mode == "proven" {
-				if got.Outcome != receiptproof.SupersededOutcome || got.Superseded == nil || got.Superseded.AccountingError != record.Errors[0] || got.Accounting.P != nil || got.Accounting.B != nil || len(got.Accounting.Reasons) == 0 || phase.EditProbe.Summary.Outcomes[receiptproof.SupersededOutcome] != 1 {
+				if got.Outcome != receiptproof.SupersededOutcome || got.Superseded == nil || got.Superseded.AccountingError != editProbeAccountingGap(record.Accounting) || got.Accounting.P != nil || got.Accounting.B != nil || len(got.Accounting.Reasons) == 0 || phase.EditProbe.Summary.Outcomes[receiptproof.SupersededOutcome] != 1 {
 					t.Fatalf("finish erased refusal/count: %+v", got)
 				}
 				data, err := json.Marshal(got)

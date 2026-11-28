@@ -54,7 +54,7 @@ func coalescedFunctionalStatus(status map[string]any, raw json.RawMessage, wireI
 }
 
 func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {
-	if !sharedFunctionalRecord(record, scope) || record.coalescedStatus == nil || record.Superseded != nil || record.FunctionalUnavailable != nil || len(record.Errors) != 1 || record.Errors[0] != record.coalescedStatus.AccountingError ||
+	if !sharedFunctionalRecord(record, scope) || record.coalescedStatus == nil || record.Superseded != nil || record.FunctionalUnavailable != nil || !editProbeOnlyAccountingShortfall(record) || record.coalescedStatus.AccountingError != editProbeAccountingGap(record.Accounting) ||
 		!qualifiedFunctionalAccounting(record.Accounting, record.coalescedStatus) {
 		return false
 	}
@@ -70,7 +70,7 @@ func classifyCoalescedFunctionalRecord(record *editProbeRecord, scope *editProbe
 }
 
 func sharedFunctionalRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {
-	if record == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 || record.CheckoutID != "" || record.Route != "" || record.Outcome != "diagnostic_failure" ||
+	if record == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 || record.CheckoutID != "" || record.Route != "" ||
 		record.ACKStatus != "applied" || record.ACKDiskStatus != "committed" || record.MutationID == "" || record.ACKMutationID != record.MutationID || record.ACKCommitSeq == 0 || record.ACKReadbackExact == nil ||
 		!record.GraphTerminal || record.StaleClaimedFresh || !coalescedFreshTiers(record.MutationTiers) || !coalescedMetricObserved(record.Ack) || !coalescedMetricObserved(record.Readback) ||
 		record.EvidenceBytes <= 0 || !editProbeKnownRawLimit(record.EvidenceLimit) || record.EvidenceBytes > record.EvidenceLimit {

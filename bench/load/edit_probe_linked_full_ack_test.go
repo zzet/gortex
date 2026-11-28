@@ -156,9 +156,9 @@ func TestEditProbeLinkedFullACKCountedNoWaitAtTheReceiptPoll(t *testing.T) {
 			record := state.record
 			got := record.Accounting
 			// Collection ends on the published receipt. Its typed B refusal is
-			// terminal failed coverage, the record's only error.
-			if !record.GraphTerminal || record.Outcome != "diagnostic_failure" || !slices.Equal(record.Errors, []string{"A/P/B accounting unavailable: " + strings.Join(got.Reasons, "; ")}) {
-				t.Fatalf("published edit did not end on its receipt's accounting alone: %+v", record)
+			// terminal: the record completes and discloses the refusal.
+			if !record.GraphTerminal || record.Outcome != "complete" || len(record.Errors) != 0 || got.BackgroundRefusal == nil || got.BackgroundRefusal.Reason != "serving_attempt_binding_mismatch" {
+				t.Fatalf("published edit did not complete on its receipt's typed terminal accounting: %+v", record)
 			}
 			strict := checkEditProbeAccountingForTool(status, receipt, "edit.file")
 			if strict.State != "terminal_unavailable_background" || !slices.Contains(strict.Reasons, "missing applicable A phase reindex_wait") {

@@ -432,6 +432,31 @@ type editProbeAccounting struct {
 	B         *editProbeWindow          `json:"requested_background"`
 	R         *editProbeWindow          `json:"read_assisted_publisher,omitempty"`
 	Reasons   []string                  `json:"reasons"`
+	// The receipt's own typed B refusal when the accounting ended
+	// terminal_unavailable_background; reported in the summary census.
+	BackgroundRefusal *editProbeBackgroundRefusal `json:"background_refusal,omitempty"`
+}
+
+// The fields of a terminal receipt's requested_background_unavailable that
+// editProbeOwnedBackgroundRefusal validated.
+type editProbeBackgroundRefusal struct {
+	Reason                 string `json:"reason"`
+	BindingPredicate       string `json:"binding_predicate"`
+	BackgroundStage        string `json:"background_stage"`
+	AcceptedAttemptStage   string `json:"accepted_attempt_stage"`
+	RequestedGeneration    uint64 `json:"requested_generation"`
+	LastObservedGeneration uint64 `json:"last_observed_generation"`
+}
+
+func editProbeBackgroundRefusalOf(status map[string]any, reason string) *editProbeBackgroundRefusal {
+	diagnostic, _ := status["requested_background_unavailable"].(map[string]any)
+	out := &editProbeBackgroundRefusal{Reason: reason}
+	out.BindingPredicate, _ = diagnostic["binding_predicate"].(string)
+	out.BackgroundStage, _ = diagnostic["background_stage"].(string)
+	out.AcceptedAttemptStage, _ = diagnostic["accepted_attempt_stage"].(string)
+	out.RequestedGeneration, _ = strconvEditProbeUint(diagnostic["requested_generation"])
+	out.LastObservedGeneration, _ = strconvEditProbeUint(diagnostic["last_observed_generation"])
+	return out
 }
 
 // editProbeCountedNoWait reports whether the original committed ACK never
@@ -683,6 +708,7 @@ func checkEditProbeAccountingWithWaitDisposition(status map[string]any, receipt,
 		out.State = "observed_single_window_checks_pass"
 	} else if ownerKnown && backgroundUnavailable {
 		out.State = "terminal_unavailable_background"
+		out.BackgroundRefusal = editProbeBackgroundRefusalOf(status, refusal)
 	} else if ownerKnown && (editProbeImmutablePartialPhysical(physical, publication, applied) ||
 		duplicate && editProbeImmutablePartialReadRepair(status["read_assisted_publication"], status, receipt, requested)) {
 		out.State = "terminal_partial_physical"
@@ -745,11 +771,59 @@ func editProbeObservedDuplicatePhysical(physical, publication map[string]any, ap
 }
 
 func editProbeFinished(graphTerminal, allCorrect, requireAccounting bool, accounting editProbeAccounting) bool {
-	return graphTerminal && allCorrect && (!requireAccounting || editProbeAccountingComplete(accounting) || accounting.State == "terminal_partial_physical" || accounting.State == "terminal_unavailable_background" || accounting.State == "terminal_unavailable_shared_owner")
+	return graphTerminal && allCorrect && (!requireAccounting || editProbeAccountingTerminal(accounting))
 }
 
 func editProbeAccountingComplete(accounting editProbeAccounting) bool {
 	return accounting.State == "observed_single_window_checks_pass" || accounting.State == "observed_shared_owner_windows_checks_pass"
+}
+
+// The typed terminal accounting states: the receipt says the missing window
+// cannot arrive, and why. Collection ends on them, and a record that ends on
+// one is not failed for its accounting; the state is reported in the summary
+// censuses instead.
+var editProbeTypedTerminalAccountingStates = map[string]bool{
+	"terminal_unavailable_background":   true,
+	"terminal_partial_physical":         true,
+	"terminal_unavailable_shared_owner": true,
+}
+
+// One terminality predicate for the receipt loop's exit and the record rule,
+// so the two cannot drift: accounting observed complete, or a typed terminal
+// state.
+func editProbeAccountingTerminal(accounting editProbeAccounting) bool {
+	return editProbeAccountingComplete(accounting) || editProbeTypedTerminalAccountingStates[accounting.State]
+}
+
+// The record error for required accounting that never became terminal (the
+// status-cycle bound, a deadline or a malformed receipt).
+func editProbeAccountingNotTerminalError(accounting editProbeAccounting) string {
+	return "A/P/B accounting not terminal: " + strings.Join(accounting.Reasons, "; ")
+}
+
+// The record rule under required accounting: an error only when the
+// accounting is not terminal. A typed terminal state appends nothing.
+func editProbeAccountingRecordError(accounting editProbeAccounting) (string, bool) {
+	if editProbeAccountingTerminal(accounting) {
+		return "", false
+	}
+	return editProbeAccountingNotTerminalError(accounting), true
+}
+
+// The accounting gap a receipt proof retains as its original accounting error.
+func editProbeAccountingGap(accounting editProbeAccounting) string {
+	return "A/P/B accounting unavailable: " + strings.Join(accounting.Reasons, "; ")
+}
+
+// A qualifier rewrites a record whose only shortfall is its accounting: a
+// complete record with no error under a typed terminal state, or a record
+// whose one error is that its accounting never became terminal. Any other
+// failure blocks it.
+func editProbeOnlyAccountingShortfall(record *editProbeRecord) bool {
+	if editProbeAccountingTerminal(record.Accounting) {
+		return record.Outcome == "complete" && len(record.Errors) == 0
+	}
+	return record.Outcome == "diagnostic_failure" && len(record.Errors) == 1 && record.Errors[0] == editProbeAccountingNotTerminalError(record.Accounting)
 }
 
 // Once a status loop awaits nothing but terminal accounting (the graph is

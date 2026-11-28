@@ -62,6 +62,11 @@ type linkedReadbackCell struct {
 	// The candidate role requires A/P/B accounting; the default baseline role
 	// isolates the readback contract from it.
 	candidate bool
+	// The ACK and receipt wire fixtures (testdata/linked-full-ack), by
+	// default the linked smoke ACK and the fixed linked receipt; receipt
+	// edits the receipt after it is bound to the ACK's identity.
+	ackFixture, statusFixture string
+	receipt                   func(status map[string]any)
 }
 
 type linkedReadbackResult struct {
@@ -109,18 +114,33 @@ func runLinkedReadbackCell(t *testing.T, cell linkedReadbackCell) linkedReadback
 	}
 	target := p.Repos[editor]
 	disk := editProbeDiskStub(t, c, target.Path)
-	ack := readLinkedFullACKFixture(t, "smoke-linked-ack.json")
+	ackFixture, statusFixture := cell.ackFixture, cell.statusFixture
+	if ackFixture == "" {
+		ackFixture = "smoke-linked-ack.json"
+	}
+	if statusFixture == "" {
+		statusFixture = "pr-linked-receipt.json"
+	}
+	ack := readLinkedFullACKFixture(t, ackFixture)
 	ack["mutation_id"] = selected.MutationID
-	ack["freshness"].(map[string]any)["checkout_id"] = linkedReadbackCheckout
+	if view, ok := ack["freshness"].(map[string]any); ok && !cell.primary {
+		view["checkout_id"] = linkedReadbackCheckout
+	}
 	if cell.ack != nil {
 		cell.ack(ack)
 	}
 	receipt, _ := ack["mutation_receipt"].(string)
-	status := readLinkedFullACKFixture(t, "pr-linked-receipt.json")
+	status := readLinkedFullACKFixture(t, statusFixture)
 	for _, field := range []string{"mutation_id", "commit_seq", "content_sha256"} {
 		status[field] = ack[field]
 	}
-	status["receipt"], status["checkout_id"] = receipt, linkedReadbackCheckout
+	status["receipt"] = receipt
+	if !cell.primary {
+		status["checkout_id"] = linkedReadbackCheckout
+	}
+	if cell.receipt != nil {
+		cell.receipt(status)
+	}
 	rider := linkedReadbackPendingRider()
 	if cell.rider != nil {
 		cell.rider(rider)
