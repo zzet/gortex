@@ -197,15 +197,35 @@ func (l *CheckoutLifecycle) SetPrimary(ctx context.Context, graphID string) (Set
 	for _, dependent := range preview.Dependents {
 		l.dropCoordinator(dependent.ID)
 	}
-
-	err = l.catalog.SetPrimaryDedicatedGraph(ctx, store_sqlite.SetPrimaryDedicatedGraphRequest{
-		FamilyID:             preview.FamilyID,
-		GraphID:              graphID,
-		ExpectedPrimaryEpoch: preview.PrimaryEpoch,
-		LastSeen:             l.clock().Unix(),
-	})
+	// Fence the family for the move: readiness is revoked and no mark is
+	// accepted until the swap has committed or failed, since until then the
+	// catalog still names the incumbent and a seed would re-admit the family
+	// over the unpublished replacement.
+	gate := l.buildGate()
+	func() {
+		gate.BeginFamilyTurnover(preview.FamilyID)
+		defer gate.EndFamilyTurnover(preview.FamilyID)
+		err = l.catalog.SetPrimaryDedicatedGraph(ctx, store_sqlite.SetPrimaryDedicatedGraphRequest{
+			FamilyID:             preview.FamilyID,
+			GraphID:              graphID,
+			ExpectedPrimaryEpoch: preview.PrimaryEpoch,
+			LastSeen:             l.clock().Unix(),
+		})
+	}()
 	if err != nil {
 		return out, err
+	}
+
+	// If the replacement primary already has a servable committed base (it may
+	// have published while still a secondary), no new adoption event will fire for
+	// it, so re-mark readiness now — otherwise a rehome waits for the global latch.
+	// The epoch is read after the fence lifted and before the catalog read, so a
+	// later move refuses this mark.
+	epoch := gate.FamilyReadinessEpoch(preview.FamilyID)
+	if graph, found, err := l.catalog.GetDedicatedGraph(ctx, graphID); err == nil && found && graph.IsPrimaryBase {
+		if base, baseErr := graphBase(ctx, l.catalog, graph); baseErr == nil && base.generationID > 0 {
+			gate.MarkFamilyReady(preview.FamilyID, epoch)
+		}
 	}
 
 	for _, dependent := range preview.Dependents {

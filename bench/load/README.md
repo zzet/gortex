@@ -960,6 +960,53 @@ counts, `startup_restart_ready_to_first_ok_p95_ms`,
 Restart figures are unavailable unless every restart produced them, and
 `delta` compares two startup reports like any other.
 
+## Worktree admission during startup
+
+`go run ./bench/load startup-admission` is a separate command, not a
+`--scenario`. `--scenario startup` above watches what agents see while a whole
+daemon starts. This command asks a narrower question: does a new linked
+worktree of a family whose base is already published get exact answers while
+an unrelated, larger family is still warming up?
+
+Each trial builds two synthetic families in a fresh temporary directory under
+`--scratch`: a small family A and a large family B. It boots a private daemon
+and records t0, the later of boot start and A's own base becoming servable. The
+trial measures t0 to the first exact answer for A's worktree. That answer must
+be a search response bound to the worktree's catalog checkout ID that also
+contains the fixture marker. It must arrive before B's base publishes and
+before the global build gate opens. Right after it, the trial checks that B is
+still unpublished and the gate still closed. After the gate opens, a fresh
+worktree is discovered as the settled control.
+
+Two modes cover how A's base comes to exist:
+
+- `--prepare` (the default): an unmeasured preparation boot publishes A's base
+  from a separate checkout and must shut down cleanly. The measured boot then
+  discovers the worktree fresh, and t0 is boot start.
+- `--prepare=false`: A's base is published during the measured boot, and t0 is
+  its adoption, read from the catalog.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--binary` | required | Daemon binary under test |
+| `--scratch` | required | Artifact root, outside every fixture source |
+| `--repeats` | 10 | Isolated trials |
+| `--a-files` / `--b-files` | 24 / 6000 | Family A and family B corpus sizes |
+| `--functions` / `--calls` | 6 / 3 | Functions per file, callee edges per function |
+| `--timeout` | 200s | Wall-clock bound per trial |
+| `--hold-min` | 60s | Minimum time B must keep holding startup past t0 |
+| `--budget` | 10s | Maximum t0 to first exact answer |
+| `--prepare` | true | Publish A's base in a preparation boot |
+| `--keep-state` | false | Keep each trial's directory, including the fixtures |
+
+The JSON report goes to stdout, with one line per trial on stderr. Each trial
+records `t0_to_first_exact_ms`, `t0_to_b_base_ready_ms`, `t0_to_gate_open_ms`,
+`boot_to_gate_open_ms` (to compare warmup length between binaries regardless of
+t0) and `settled_control_exact_ms`. Its `outcome` is `ready` or the first
+failure found: `error`, `no_own_base`, `no_exact`, `over_budget`,
+`no_gate_open`, `no_hold_witness`, `not_during_hold`, `hold_too_short` or
+`no_settled_control`. Any trial that is not `ready` fails the command.
+
 ## Measurements and artifacts
 
 One JSON file contains per-operation successful p50/p95/p99/max, successful
