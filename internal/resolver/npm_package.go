@@ -2,7 +2,9 @@ package resolver
 
 import (
 	"context"
+	"fmt"
 	"iter"
+	"maps"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -143,6 +145,7 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 	memo := &npmImportMemo{probes: map[npmProbeKey]*graph.Node{}, nodes: map[string]*graph.Node{}}
 	// Close the light-edge cursor before reading or writing full edges. Hydrate
 	// only one bounded page at a time; metadata never accumulates across pages.
+	writeRefused := false
 	for start := 0; start < len(eligible); start += resolvePendingPageRows {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -153,7 +156,14 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 			sites = append(sites, graph.EdgeSite{From: e.From, Line: e.Line, Kind: graph.EdgeImports})
 		}
 		full := cr.graph.GetEdgeCandidates(nil, sites)
+		pageStats := &CrossRepoStats{ByRepo: make(map[string]int)}
+		type projectedUpdate struct {
+			projected *graph.Edge
+			to        string
+			crossRepo bool
+		}
 		var batch []graph.EdgeReindex
+		var projectedUpdates []projectedUpdate
 		for _, projected := range page {
 			for _, e := range full.Site(projected.From, projected.Line, graph.EdgeImports) {
 				if e.To != projected.To {
@@ -164,22 +174,59 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImports(ctx context.Context, edges
 					continue // A non-npm cross-repo import keeps its semantics.
 				}
 				oldTo := e.To
-				if cr.resolveTrackedNpmImport(e, spec, stats, memo) {
-					batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-					projected.To, projected.CrossRepo = e.To, e.CrossRepo
+				c := *e
+				c.Meta = maps.Clone(e.Meta)
+				if cr.resolveTrackedNpmImport(&c, spec, pageStats, memo) {
+					batch = append(batch, graph.EdgeReindex{Edge: &c, OldTo: oldTo})
+					projectedUpdates = append(projectedUpdates, projectedUpdate{
+						projected: projected,
+						to:        c.To,
+						crossRepo: c.CrossRepo,
+					})
 				}
 			}
 		}
 		if len(batch) > 0 {
-			cr.graph.ReindexEdges(batch)
-			cr.restubCallsForChangedNpmImports(batch)
+			if err := cr.restubCallsForChangedNpmImports(batch); err != nil {
+				if stats != nil {
+					stats.WriteRefused = true
+				}
+				writeRefused = true
+				continue
+			}
+			if !reindexEdgesApplied(cr.graph, batch) {
+				if stats != nil {
+					stats.WriteRefused = true
+				}
+				writeRefused = true
+				continue
+			}
+			for _, upd := range projectedUpdates {
+				upd.projected.To, upd.projected.CrossRepo = upd.to, upd.crossRepo
+			}
+			if stats != nil {
+				stats.Resolved += pageStats.Resolved
+				stats.CrossRepoEdges += pageStats.CrossRepoEdges
+				if len(pageStats.ByRepo) > 0 && stats.ByRepo == nil {
+					stats.ByRepo = make(map[string]int, len(pageStats.ByRepo))
+				}
+				for repo, n := range pageStats.ByRepo {
+					stats.ByRepo[repo] += n
+				}
+			}
 		}
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if writeRefused {
+		return fmt.Errorf("%w: npm imports", ErrReindexWriteRefused)
+	}
+	return nil
 }
 
 // A call resolved through a binding cannot outlive that binding's target.
-func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex) {
+func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.EdgeReindex) error {
 	callers := make(map[string]map[string]string)
 	var ids []string
 	for _, change := range changes {
@@ -197,7 +244,7 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 		callers[change.OldTo][change.Edge.From] = name
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	var batch []graph.EdgeReindex
 	var obsolete []*graph.Edge
@@ -213,16 +260,21 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 			parallel := *call
 			parallel.Kind = graph.EdgeCrossRepoCalls
 			obsolete = append(obsolete, &parallel)
-			graph.StashRestubProvenance(call)
-			call.To = graph.UnresolvedMarker + name
-			call.CrossRepo, call.ConfidenceLabel = false, ""
-			batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
+			c := *call
+			c.Meta = maps.Clone(call.Meta)
+			graph.StashRestubProvenance(&c)
+			c.To = graph.UnresolvedMarker + name
+			c.CrossRepo, c.ConfidenceLabel = false, ""
+			batch = append(batch, graph.EdgeReindex{Edge: &c, OldTo: target})
 		}
 	}
 	if len(batch) > 0 {
+		if !reindexEdgesApplied(cr.graph, batch) {
+			return fmt.Errorf("%w: %d npm call restub(s)", ErrReindexWriteRefused, len(batch))
+		}
 		graph.RemoveEdgesExact(cr.graph, obsolete)
-		cr.graph.ReindexEdges(batch)
 	}
+	return nil
 }
 
 func trackedNpmImportSpec(e *graph.Edge) string {

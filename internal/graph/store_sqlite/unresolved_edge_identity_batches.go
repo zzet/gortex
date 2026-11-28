@@ -145,13 +145,21 @@ func (s sqliteUnresolvedTargetReindexStats) writeStatements() int {
 // compact unresolved-edge census. Full confidence, provenance, and metadata
 // payloads remain in SQLite and are never decoded by this path.
 func (s *Store) ReindexUnresolvedEdgeTargets(batch []graph.UnresolvedEdgeTargetReindex) {
+	s.ReindexUnresolvedEdgeTargetsApplied(batch)
+}
+
+// ReindexUnresolvedEdgeTargetsApplied reports a dropped writer-gate batch to
+// retry-aware callers. Fatal store failures retain the existing panic contract.
+func (s *Store) ReindexUnresolvedEdgeTargetsApplied(batch []graph.UnresolvedEdgeTargetReindex) bool {
 	if _, err := s.reindexUnresolvedEdgeTargetsOriented(batch); err != nil {
 		if errors.Is(err, errReindexWriterGateContended) {
 			log.Printf("store_sqlite: unresolved target writer gate contended, dropping %d rebind(s) — a later resolve pass rebinds them: %v", len(batch), err)
-			return
+			return false
 		}
 		panicOnFatal(err)
+		return false
 	}
+	return true
 }
 
 func (s *Store) reindexUnresolvedEdgeTargetsOriented(

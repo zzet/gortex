@@ -921,15 +921,24 @@ func (mi *MultiIndexer) resolveDeferredMutations(receipt *graph.MutationReceipt,
 			mi.logger.Info("DEFERRED-TIMING unresolved-target counter unchanged; retaining fallback for definitions and resolved cross-repo edges",
 				zap.String("reason", reason))
 		}
-		if err := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil); err != nil {
-			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(err))
-			return deferredResolveFailed, false
+		masterErr := mi.runMasterResolveHookedContext(context.Background(), masterScope, false, nil)
+		if masterErr != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback master resolve failed", zap.Error(masterErr))
+			if !errors.Is(masterErr, resolver.ErrReindexWriteRefused) {
+				return deferredResolveFailed, false
+			}
 		}
-		if err := mi.runCrossRepoResolveContext(context.Background(), false); err != nil {
-			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(err))
-			return deferredResolveFailed, false
+		crossErr := mi.runCrossRepoResolveContext(context.Background(), false)
+		if crossErr != nil {
+			mi.logger.Error("DEFERRED-TIMING fallback cross-repo resolve failed", zap.Error(crossErr))
+			if !errors.Is(crossErr, resolver.ErrReindexWriteRefused) {
+				return deferredResolveFailed, false
+			}
 		}
 		resolver.DetectCrossRepoEdges(mi.graph)
+		if masterErr != nil || crossErr != nil {
+			return deferredResolveFailed, false
+		}
 		return deferredResolveFallback, true
 	}
 
@@ -1012,18 +1021,17 @@ func (mi *MultiIndexer) newMasterResolver(useLSP bool) *resolver.Resolver {
 	return master
 }
 
-func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) {
-	mi.runMasterResolveHooked(scope, useLSP, nil)
-}
-
-// runMasterResolveHooked is runMasterResolve with an optional compute-done
-// hook threaded into the resolver (see Resolver.OnComputeDone).
-func (mi *MultiIndexer) runMasterResolveHooked(scope map[string]struct{}, useLSP bool, onComputeDone func()) {
-	if err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, onComputeDone); err != nil {
+func (mi *MultiIndexer) runMasterResolve(scope map[string]struct{}, useLSP bool) error {
+	err := mi.runMasterResolveHookedContext(context.Background(), scope, useLSP, nil)
+	if err != nil {
 		mi.logger.Error("DEFERRED-TIMING master.ResolveAll", zap.Error(err))
 	}
+	return err
 }
 
+// runMasterResolveHookedContext is runMasterResolve with cancellation and an
+// optional compute-done hook threaded into the resolver (see
+// Resolver.OnComputeDone).
 func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope map[string]struct{}, useLSP bool, onComputeDone func()) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1048,7 +1056,7 @@ func (mi *MultiIndexer) runMasterResolveHookedContext(ctx context.Context, scope
 	}
 	mt := time.Now()
 	stats, err := master.ResolveAllContext(ctx)
-	if err == nil && ctx.Err() == nil {
+	if (err == nil || errors.Is(err, resolver.ErrReindexWriteRefused)) && ctx.Err() == nil {
 		// The dataflow placeholders are lifted after every whole resolve,
 		// as a single-repository whole index and the per-save path do.
 		materializeDataflowParamsInGraph(mi.graph)
@@ -1137,13 +1145,13 @@ func (mi *MultiIndexer) reconcileRetargetedTestCallsContext(ctx context.Context,
 // bare single-repo form. Companion to runMasterResolveFiles for the
 // receipt-exact path: an evicted definition's pending references are reachable
 // by name only, never by file frontier.
-func (mi *MultiIndexer) runMasterResolveNames(names []string) {
+func (mi *MultiIndexer) runMasterResolveNames(names []string) *resolver.ResolveStats {
 	if len(names) == 0 {
-		return
+		return nil
 	}
 	master := mi.newMasterResolver(false)
 	if master == nil {
-		return
+		return nil
 	}
 	// Snapshot the prefixes under the registry lock and release it before
 	// resolver work: the deferred receipt tail runs concurrently with
@@ -1165,6 +1173,7 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 		zap.Duration("elapsed", time.Since(mt)),
 		zap.Int("names", len(names)),
 		zap.Int("resolved", stats.Resolved))
+	return stats
 }
 
 // RunPreEnrichResolve runs the resolution stage that makes references queryable
@@ -1197,9 +1206,16 @@ func (mi *MultiIndexer) runMasterResolveNames(names []string) {
 // cross-repo passes starved cross-repo to a standstill (measured: 1,049s for
 // a pass that runs in ~38s uncontended on the same workspace).
 func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[string]struct{}, onComputeDone func()) error {
+	pendingAliases := mi.deferredAliasPasses(scope)
 	mi.runDeferredGoModAll()
-	if err := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone); err != nil {
-		return err
+	masterErr := mi.runMasterResolveHookedContext(ctx, scope, true, onComputeDone)
+	if masterErr != nil && !errors.Is(masterErr, resolver.ErrReindexWriteRefused) {
+		return masterErr
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	// Stamp legacy nodes after master resolution so synthetic nodes created by
 	// attribution participate in the cross-workspace boundary check below.
@@ -1207,7 +1223,17 @@ func (mi *MultiIndexer) RunPreEnrichResolve(ctx context.Context, scope map[strin
 	// Cross-repo references resolve here so a multi-repo workspace is fully
 	// resolved, not just within each repo. Whole-graph so inbound references
 	// from unchanged repos into the changed repos bind too.
-	return mi.runCrossRepoResolveContext(ctx, false)
+	crossErr := mi.runCrossRepoResolveContext(ctx, false)
+	if crossErr != nil && !errors.Is(crossErr, resolver.ErrReindexWriteRefused) {
+		return crossErr
+	}
+	if masterErr != nil {
+		return masterErr
+	}
+	if crossErr != nil {
+		return crossErr
+	}
+	return certifyDeferredAliases(pendingAliases)
 }
 
 // RunPreEnrichResolveFiles preserves an exact warm-reconcile frontier through
@@ -2613,6 +2639,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 			break
 		}
 	}
+	defer idx.clearAliasPass()
 	result, receipt, batch, err := idx.incrementalReindexPathsWithReceiptMode(meta.RootPath, paths, mode)
 	if err != nil {
 		return nil, fmt.Errorf("reindexing %s: %w", meta.RootPath, err)
@@ -2666,7 +2693,7 @@ func (mi *MultiIndexer) incrementalReindexRepoRawMode(repoPrefix string, paths [
 	derived.endDerived()
 
 	topologyChanged = incrementalTopologyChanged(result)
-	return result, nil
+	return result, idx.finishAliasPass(result)
 }
 
 // PrefixCollisionError reports a prefix already owned by another repository.
@@ -3307,6 +3334,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			zap.Int("changed_files", len(changed)), zap.Int("deleted_files", len(deleted)),
 			zap.Bool("force_full", forceFull), zap.Bool("census_failed", censusErr != nil))
 		defer applyTiming.abort()
+		defer idx.clearAliasPass()
 		switch {
 		case censusErr != nil:
 			// A partial filesystem census cannot safely authorize replacement:
@@ -3318,8 +3346,17 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			route = "full_retrack"
 			result, err = fullRetrack()
 		case churn == 0 && !idx.merkleEnabled() && len(idx.extractorVersionStaleLangSet()) == 0:
-			route = "census_noop"
-			result, err = idx.cleanCensusResult(ctx, detected, start)
+			caller, aliasErr := idx.restoredAliasCaller(absPath, priorMtimes)
+			if aliasErr != nil {
+				return aliasErr
+			}
+			if caller != "" {
+				route = "scoped"
+				result, receipt, batch, err = idx.incrementalReindexPathsWithReceipt(absPath, []string{caller}, false)
+			} else {
+				route = "census_noop"
+				result, err = idx.cleanCensusResult(ctx, detected, start)
+			}
 		case churn == 0:
 			// The mtime census cannot prove a Merkle-enabled repository clean:
 			// a missing baseline or extractor-salt change still requires the
@@ -3420,6 +3457,9 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 		// pipeline and only needs the existing cross-repository contract reconcile.
 		if !result.FullRetrack && !batchMode.deferResolve {
 			mi.resolveIncrementalRepoMutation(prefix, result, receipt, batch)
+			if err := idx.finishAliasPass(result); err != nil {
+				return err
+			}
 			if !batchMode.deferGlobalPasses {
 				idx.observeIncrementalCatchup("derived", result.DerivedInvalidation.Files)
 				mi.runIncrementalDerivedPassesTopologyHeld(context.Background(), map[string]DerivedInvalidationPlan{

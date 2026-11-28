@@ -28,9 +28,10 @@ var defaultParseGraphBatchLimits = parseGraphBatchLimits{
 }
 
 type stagedParseGraph struct {
-	nodes     []*graph.Node
-	edges     []*graph.Edge
-	onDurable func()
+	nodes          []*graph.Node
+	edges          []*graph.Edge
+	priorAliasFile string
+	onDurable      func()
 }
 
 // parseGraphBatch amortises direct-to-SQLite parse writes without building a
@@ -73,6 +74,10 @@ func newParseGraphBatchWithLimits(store graph.Store, limits parseGraphBatchLimit
 }
 
 func (b *parseGraphBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurable func()) bool {
+	return b.addWithPriorAlias(nodes, edges, "", onDurable)
+}
+
+func (b *parseGraphBatch) addWithPriorAlias(nodes []*graph.Node, edges []*graph.Edge, priorAliasFile string, onDurable func()) bool {
 	if b == nil {
 		return false
 	}
@@ -83,7 +88,7 @@ func (b *parseGraphBatch) add(nodes []*graph.Node, edges []*graph.Edge, onDurabl
 		b.flushLocked()
 	}
 	b.pending = append(b.pending, stagedParseGraph{
-		nodes: nodes, edges: edges, onDurable: onDurable,
+		nodes: nodes, edges: edges, priorAliasFile: priorAliasFile, onDurable: onDurable,
 	})
 	b.nodeCount += len(nodes)
 	b.edgeCount += len(edges)
@@ -121,11 +126,18 @@ func (b *parseGraphBatch) flushLocked() {
 	if len(b.pending) == 0 {
 		return
 	}
+	var priorFiles []string
 	nodes := make([]*graph.Node, 0, b.nodeCount)
 	edges := make([]*graph.Edge, 0, b.edgeCount)
 	for _, entry := range b.pending {
+		if entry.priorAliasFile != "" {
+			priorFiles = append(priorFiles, entry.priorAliasFile)
+		}
 		nodes = append(nodes, entry.nodes...)
 		edges = append(edges, entry.edges...)
+	}
+	if len(priorFiles) > 0 {
+		removePriorAliasEdgesBatch(b.store, priorFiles)
 	}
 	b.store.AddBatch(nodes, edges)
 	for _, entry := range b.pending {

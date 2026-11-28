@@ -82,3 +82,41 @@ func TestReconcileRepoCtx_Sqlite_FullRetrackFlag(t *testing.T) {
 	assert.Equal(t, 0, result2.StaleFileCount,
 		"an unchanged disk-backed repo must report zero stale files")
 }
+
+func TestTSConfigPathAlias_WarmRestartChecksInheritedConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := aliasRebindFixture(t, root)
+	parent := filepath.Join(root, ".nuxt", "aliases.json")
+	writeFileMk(t, configPath, `{"extends":"./.nuxt/aliases.json"}`)
+	writeFileMk(t, parent, `{"compilerOptions":{"paths":{"~/*":["../old/*"]}}}`)
+
+	entry := config.RepoEntry{Path: root, Name: "repo"}
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{entry}}
+	gc.SetConfigPath(configFile)
+	require.NoError(t, gc.Save())
+	cm, err := config.NewConfigManager(configFile)
+	require.NoError(t, err)
+	idx, store := newSQLiteIndexer(t)
+	start := func() *MultiIndexer {
+		invalidateTSAliasCollection(root)
+		return NewMultiIndexer(store, idx.registry, search.NewNull(), cm, zap.NewNop())
+	}
+	first := start()
+	_, err = first.TrackRepoCtx(t.Context(), entry)
+	require.NoError(t, err)
+	require.Equal(t, "repo/old/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+	mtimes := first.FileMtimes("repo")
+	stamp, err := os.Stat(parent)
+	require.NoError(t, err)
+	writeFileMk(t, parent, `{"compilerOptions":{"paths":{"~/*":["../new/*"]}}}`)
+	require.NoError(t, os.Chtimes(parent, stamp.ModTime(), stamp.ModTime()))
+
+	second := start()
+	_, err = second.ReconcileRepoCtx(t.Context(), entry, mtimes)
+	require.NoError(t, err)
+	require.Equal(t, "repo/new/auth.ts::useRedirect", callTargetForName(t, store, "repo/pages/index.ts", "run"))
+	unchanged, err := start().ReconcileRepoCtx(t.Context(), entry, second.FileMtimes("repo"))
+	require.NoError(t, err)
+	require.Zero(t, unchanged.StaleFileCount, "a cold lookup cache alone must not reparse unchanged callers")
+}

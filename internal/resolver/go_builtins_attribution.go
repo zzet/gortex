@@ -266,8 +266,11 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	r.noteImportEdgeReindexes(batch)
 	targeter, ok := r.graph.(graph.UnresolvedEdgeTargetBatchReindexer)
 	if !ok {
-		r.graph.ReindexEdges(batch)
-		reconcilePlaceholderSources(r.graph, nil, batch)
+		if r.applyReindexEdges(batch) {
+			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+				r.notePassWriteRefused()
+			}
+		}
 		return
 	}
 
@@ -279,12 +282,18 @@ func (r *Resolver) attributeGoBuiltinCandidates(candidates []*graph.Edge) {
 	// partial application across two independent write windows.
 	direct, compactOK := compactGoBuiltinTargetReindexes(batch)
 	if !compactOK {
-		r.graph.ReindexEdges(batch)
-		reconcilePlaceholderSources(r.graph, nil, batch)
+		if r.applyReindexEdges(batch) {
+			if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+				r.notePassWriteRefused()
+			}
+		}
 		return
 	}
-	targeter.ReindexUnresolvedEdgeTargets(direct)
-	reconcilePlaceholderSources(r.graph, nil, batch)
+	if r.applyUnresolvedTargetReindexes(targeter, direct) {
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, batch); !ok {
+			r.notePassWriteRefused()
+		}
+	}
 }
 
 // attributeGoBuiltinIdentityCandidates evaluates compact logical rows and, when
@@ -360,7 +369,9 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 	}
 	if len(direct) > 0 {
 		r.noteImportTargetReindexes(direct)
-		targeter.ReindexUnresolvedEdgeTargets(direct)
+		if !r.applyUnresolvedTargetReindexes(targeter, direct) {
+			return true
+		}
 		// The main resolver's placeholder reconciliation has already finished
 		// before this attribution tail. Reconcile these newly bound builtins at
 		// the same exact recording sites as an ordinary resolution batch.
@@ -369,7 +380,9 @@ func (r *Resolver) attributeGoBuiltinIdentityCandidates(
 			edge := &graph.Edge{From: mutation.Old.From, To: mutation.NewTo, Kind: mutation.Old.Kind, FilePath: mutation.Old.FilePath, Line: mutation.Old.Line}
 			resolved = append(resolved, graph.EdgeReindex{Edge: edge, OldTo: mutation.Old.To})
 		}
-		reconcilePlaceholderSources(r.graph, nil, resolved)
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, resolved); !ok {
+			r.notePassWriteRefused()
+		}
 	}
 	return true
 }

@@ -124,6 +124,18 @@ one exists and otherwise stays unresolved. A local initialized from an
 unshadowed static `require("...")` is not treated as a shadow: the call keeps
 the ordinary import tiers.
 
+### TypeScript path aliases
+
+`tsconfig.json` and `jsconfig.json` accept JSONC comments and trailing commas.
+Relative `extends` chains, including TypeScript 5 arrays, inherit `baseUrl` and
+replace (not merge) `paths`. Targets without a `baseUrl` remain relative to the
+config that declares them, while the child config determines the caller scope.
+Generated `.nuxt` configs are read only when explicitly extended; the directory
+is not scanned as an independent scope. Package-specifier `extends` and project
+`references` are not traversed. Cycles and chains deeper than 32 configs stop.
+When an effective alias changes, reindexing rebinds existing JS/TS callers
+even if their source files have not changed.
+
 ### Julia specifics
 
 `module` / `baremodule` index as `KindType` nodes (the graph's `KindModule`

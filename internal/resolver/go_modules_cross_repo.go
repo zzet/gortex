@@ -312,14 +312,8 @@ func (cr *CrossRepoResolver) applyGoModuleReindexes(batch []graph.EdgeReindex) b
 	if len(batch) == 0 {
 		return true
 	}
-	if writer, ok := cr.graph.(interface {
-		ReindexEdgesApplied([]graph.EdgeReindex) bool
-	}); ok {
-		if !writer.ReindexEdgesApplied(batch) {
-			return false
-		}
-	} else {
-		cr.graph.ReindexEdges(batch)
+	if !reindexEdgesApplied(cr.graph, batch) {
+		return false
 	}
 	cr.removeRetargetedGoModuleParallels(batch)
 	DetectCrossRepoEdgesForReindexes(cr.graph, batch)

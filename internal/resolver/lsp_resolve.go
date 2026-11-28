@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"errors"
+	"maps"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -190,6 +191,9 @@ type deferredLSPBatchResult struct {
 	attempted           int
 	skipped             int
 	budgetExhausted     bool
+	writeRefused        bool
+	reindexRefused      bool
+	refused             map[deferredLSPWorkKey]struct{}
 	terminalityExcluded map[deferredLSPWorkKey]struct{}
 	livenessDur         time.Duration
 	attemptsDur         time.Duration
@@ -400,6 +404,8 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	}
 
 	var stats ResolveStats
+	clones := make([]graph.Edge, 0, len(edges))
+	origDeferred := make([]deferredLSPEdge, 0, len(edges))
 	reindexBatch := make([]graph.EdgeReindex, 0, len(edges))
 	stopped := false
 	cursorRecorded := false
@@ -471,28 +477,58 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		oldKind := e.Kind
 		wasUnresolved := graph.IsUnresolvedTarget(oldTo)
 		result.attempted++
+		clone := *e
+		clone.Meta = maps.Clone(e.Meta)
 		attemptStart := time.Now()
-		resolvedViaLSP := r.tryResolveViaLSP(e, de.target, &stats)
+		resolvedViaLSP := r.tryResolveViaLSP(&clone, de.target, &stats)
 		result.attemptsDur += time.Since(attemptStart)
 		if resolvedViaLSP {
 			result.resolved++
-			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
+			clones = append(clones, clone)
+			origDeferred = append(origDeferred, de)
+			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: &clones[len(clones)-1], OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {
 				result.newlyResolved++
 			}
 		}
 	}
-	if result.skipped == 0 {
-		r.lspDeferredCursor = deferredLSPWorkKey{}
-		r.lspDeferredCursorSet = false
-	}
 	if len(reindexBatch) > 0 {
+		if !r.applyReindexEdges(reindexBatch) {
+			result.resolved = 0
+			result.newlyResolved = 0
+			result.reindexRefused = true
+			result.writeRefused = true
+			result.refused = make(map[deferredLSPWorkKey]struct{}, len(origDeferred))
+			if result.terminalityExcluded == nil {
+				result.terminalityExcluded = make(map[deferredLSPWorkKey]struct{}, len(origDeferred))
+			}
+			for _, de := range origDeferred {
+				workKey := deferredLSPWorkKeyFor(de)
+				result.refused[workKey] = struct{}{}
+				result.terminalityExcluded[workKey] = struct{}{}
+			}
+			return result
+		}
+		for i, de := range origDeferred {
+			de.edge.To = clones[i].To
+			de.edge.Kind = clones[i].Kind
+			de.edge.CrossRepo = clones[i].CrossRepo
+			de.edge.Confidence = clones[i].Confidence
+			de.edge.Origin = clones[i].Origin
+			de.edge.Meta = clones[i].Meta
+		}
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
-		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, &r.placeholderSrcIdx, reindexBatch); !ok {
+			r.notePassWriteRefused()
+			result.writeRefused = true
+		}
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}
+	}
+	if result.skipped == 0 && !result.reindexRefused {
+		r.lspDeferredCursor = deferredLSPWorkKey{}
+		r.lspDeferredCursorSet = false
 	}
 	return result
 }

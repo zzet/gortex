@@ -193,6 +193,9 @@ type BuildRequest struct {
 	// parsed (buildContentProof); its PrePublish confirms by them. A build
 	// that leaves the delta path disables it.
 	contentProof *buildContentProof
+	// deltaAliases pins the working-copy config inputs for the whole delta.
+	// Nil when neither the base nor the change set has an alias caller.
+	deltaAliases *aliasSnapshot
 	// semanticMotion brackets only the actual unbounded enrichment call.
 	semanticMotion func() func(error)
 

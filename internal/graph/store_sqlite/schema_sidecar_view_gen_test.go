@@ -218,6 +218,8 @@ func seedSidecarRows(t *testing.T, store *Store) {
 		RepoPrefix: sidecarSeedRepo, IndexedSHA: "sha-1", Dirty: true, IndexedAt: 42,
 		WorkspaceFP: "fp-1", NodeCount: 3, EdgeCount: 0, ExtractorVersions: `{"go":1}`,
 	}))
+	mustNoErr(t, "TS alias policy", store.SetTSAliasDigest(sidecarSeedRepo, "digest"))
+	mustNoErr(t, "TS alias inputs", store.SetTSAliasInputs(sidecarSeedRepo, map[string]string{"tsconfig.json": "hash-tsconfig"}))
 	mustNoErr(t, "enrichment state", store.SetEnrichmentState(graph.EnrichmentState{
 		RepoPrefix: sidecarSeedRepo, Provider: "gopls", IndexedSHA: "sha-1", CompletedAt: 43, Coverage: 0.5,
 	}))
@@ -284,7 +286,7 @@ func mustNoErr(t *testing.T, what string, err error) {
 // user_version 14. The result is a store the shipped v14 build could have
 // written.
 // sidecarAddedAfterV14 names the sidecars a v14 store did not have.
-var sidecarAddedAfterV14 = map[string]bool{"file_index_failures": true, "enrichment_resume": true}
+var sidecarAddedAfterV14 = map[string]bool{"file_index_failures": true, "enrichment_resume": true, "ts_alias_state": true, "ts_alias_inputs": true}
 
 func downgradeSidecarsToV14(t *testing.T, db *sql.DB) {
 	t.Helper()

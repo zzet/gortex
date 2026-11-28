@@ -135,12 +135,27 @@ type IndexResult struct {
 	// CrossRepoResolveFiles contains parked consumers outside this repository's
 	// derived frontier. Batch callers must include them in cross-repo resolution.
 	CrossRepoResolveFiles []string `json:"cross_repo_resolve_files,omitempty"`
+	// ResolutionWriteRefused reports that whole-graph resolution encountered a
+	// refused store write (e.g. a timed-out SQLite writer gate). The index still
+	// publishes its replacement graph and metadata while withholding alias
+	// policy certification so a subsequent pass retries the unbound edges.
+	ResolutionWriteRefused bool `json:"resolution_write_refused,omitempty"`
 
 	// mutationErr carries a point-operation compatibility error through the
 	// resolver/semantic/derived tail. It is intentionally unexported and never
 	// serialized: coordinated callers surface it only after the committed graph
 	// has reached a coherent post-mutation state.
 	mutationErr error
+	// failuresRetryable: every failed file is in the persisted failure ledger,
+	// which retries it, and no directory walk failed.
+	failuresRetryable bool
+	// resolutionErr is a failed whole-graph catch-up. It withholds the alias
+	// receipt so the next pass rebinds the callers this one left unresolved.
+	resolutionErr error
+}
+
+func isReindexWriteRefused(err error) bool {
+	return errors.Is(err, resolver.ErrReindexWriteRefused)
 }
 
 // EdgeSanityViolated reports the post-reindex sanity-check failure: an
@@ -436,6 +451,20 @@ type Indexer struct {
 	// handle is disqualified, because nothing would then bound what the drain
 	// writes.
 	passCorpusFilter func(*graph.Graph) error
+
+	// Set only while the repository mutation lane is held. Alias changes
+	// invalidate source-shape resolution reuse, including unchanged callers.
+	aliasResolutionChanged bool
+	passAliases            atomic.Pointer[aliasSnapshot]
+	deltaAliases           *aliasSnapshot // private to a single edit-delta builder
+	// appliedAliases is the certified alias digest (the only copy for
+	// in-memory stores). Read and written only under aliasStateMu.
+	appliedAliases string
+	// A deferred full pass waiting for the shared resolve to certify it.
+	// aliasStateMu serializes that off-lane certification with beginAliasPass
+	// and guards appliedAliases.
+	deferredAliases atomic.Pointer[aliasSnapshot]
+	aliasStateMu    sync.Mutex
 
 	// embedChunkOpts tunes the AST sub-chunking applied while preparing a
 	// vector publication plan. The zero value makes the chunker fall back to
@@ -849,6 +878,9 @@ func (idx *Indexer) manifestTreeWithRef() (manifestTree, *contentSourceRef) {
 func (idx *Indexer) tsAliasCollection() *tsalias.Collection {
 	tree, ref := idx.manifestTreeWithRef()
 	if ref == nil {
+		if s := idx.passAliases.Load(); s != nil {
+			return s.collection
+		}
 		return tsAliasCollectionForTree(tree)
 	}
 	idx.tsAliasMu.Lock()
@@ -2844,6 +2876,22 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 			}
 		}
 	}
+	walkDirFailed := false
+	defer func() {
+		defer idx.clearAliasPass()
+		if retErr == nil && result != nil {
+			result.failuresRetryable = !walkDirFailed && idx.failedFilesSafelyRetryable(result.FailedFiles)
+		}
+		switch {
+		case retErr != nil:
+		case idx.deferResolve.Load():
+			retErr = idx.holdAliasPass(result)
+		default:
+			if err := idx.finishAliasPass(result); err != nil && !errors.Is(err, resolver.ErrReindexWriteRefused) {
+				retErr = err
+			}
+		}
+	}()
 	// Registered before the failed-file report below, so it runs after that
 	// report is complete: every failed file of this cold pass is staged as a
 	// failure envelope before the door accepts the namespace.
@@ -3047,6 +3095,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		err = idx.walkDisk(absRoot, absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				if !os.IsNotExist(err) && !idx.shouldExclude(path, absRoot, d != nil && d.IsDir()) {
+					walkDirFailed = true
 					recordFileOutcome(path, err)
 					walkFailures = append(walkFailures, IndexError{FilePath: path, Error: err.Error()})
 				}
@@ -3104,6 +3153,18 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			recordFileOutcome(absRoot, err)
 		}
+		return nil, err
+	}
+	// Pin the alias policy once the walk knows whether it admitted JS/TS, so
+	// a repository without any skips the config discovery walk.
+	scopeHasJSTS := false
+	for i := range files {
+		if closureJSTSPath(files[i].path) {
+			scopeHasJSTS = true
+			break
+		}
+	}
+	if err := idx.beginAliasPass(ctx, absRoot, []string{absRoot}, scopeHasJSTS); err != nil {
 		return nil, err
 	}
 	if skippedLarge > 0 {
@@ -4367,6 +4428,11 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 						}
 					}
 
+					priorAliasFile := ""
+					if diskTarget == nil && idx.aliasResolutionChanged && closureJSTSPath(path) && !skipped {
+						priorAliasFile = idx.prefixPath(relPath)
+					}
+
 					// Stream this file's content (data_class=content) section
 					// bodies into the dedicated content index and lean the
 					// nodes to a snippet BEFORE AddBatch, so the bulk text
@@ -4374,6 +4440,10 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					// materialising code passes.
 					contentHandled := false
 					if contentBatch != nil {
+						if priorAliasFile != "" && firstContentFilePath(result.Nodes) != "" {
+							idx.removePriorAliasEdges(priorAliasFile)
+							priorAliasFile = ""
+						}
 						durablePath, durableMtime := path, wf.mtimeNano
 						contentHandled = contentBatch.add(result.Nodes, result.Edges, func() {
 							recordStreamedMtime(durablePath, durableMtime)
@@ -4396,9 +4466,12 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 					if !contentHandled {
 						batchStart := time.Now()
 						durablePath, durableMtime := path, wf.mtimeNano
-						if !graphBatch.add(result.Nodes, result.Edges, func() {
+						if !graphBatch.addWithPriorAlias(result.Nodes, result.Edges, priorAliasFile, func() {
 							recordStreamedMtime(durablePath, durableMtime)
 						}) {
+							if priorAliasFile != "" {
+								idx.removePriorAliasEdges(priorAliasFile)
+							}
 							idx.graph.AddBatch(result.Nodes, result.Edges)
 							recordStreamedMtime(durablePath, durableMtime)
 						}
@@ -4714,6 +4787,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 	if coldManifests != nil {
 		coldManifests.registry = contractReg
 	}
+	var fullResolveErr error
 	if idx.deferResolve.Load() {
 		// Multi-repo orchestrator runs these serially after wg.Wait()
 		// to avoid races on the shared graph between this goroutine's
@@ -4731,8 +4805,19 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// Resolve cross-file references.
 		idx.populateCppIncludeDirs(true)
 		resolveStarted := time.Now()
-		resolveStats := idx.resolver.ResolveAll()
-		idx.logResolvePass(resolveStats, time.Since(resolveStarted))
+		resolveStats, resolveErr := idx.resolver.ResolveAllContext(ctx)
+		switch {
+		case resolveErr != nil && ctx.Err() != nil:
+			return nil, resolveErr
+		case resolveErr != nil:
+			// The index still completes, as it did before resolution was
+			// checked. resolutionErr withholds the alias receipt, so only a
+			// pass whose alias policy is uncertified reports the failure.
+			idx.logger.Error("indexer: full resolution failed", zap.Error(resolveErr))
+			fullResolveErr = resolveErr
+		default:
+			idx.logResolvePass(resolveStats, time.Since(resolveStarted))
+		}
 		// Lift the dataflow placeholders exactly where the per-save path
 		// does (right after resolution, before the derived passes), so a
 		// whole index and an incremental edit write the same arg_of /
@@ -4965,13 +5050,15 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		graph.MaybeEnsurePlannerStatsFresh(ctx, idx.indexStateTarget(nil))
 	}
 	result = &IndexResult{
-		NodeCount:        nodes,
-		EdgeCount:        edges,
-		FileCount:        int(fileCount),
-		QuarantinedFiles: quarantine.Len(),
-		SkippedFiles:     len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
-		DurationMs:       time.Since(start).Milliseconds(),
-		Errors:           errors,
+		NodeCount:              nodes,
+		EdgeCount:              edges,
+		FileCount:              int(fileCount),
+		QuarantinedFiles:       quarantine.Len(),
+		SkippedFiles:           len(skippedBySize) + len(skippedByContent) + int(skippedByTimeout) + int(skippedByMinified) + int(skippedByBinary),
+		DurationMs:             time.Since(start).Milliseconds(),
+		Errors:                 errors,
+		ResolutionWriteRefused: isReindexWriteRefused(fullResolveErr),
+		resolutionErr:          fullResolveErr,
 	}
 	idx.warnIfEdgeSanityViolated(result)
 	// A whole-repo (re-)track that observed files did work: mark the repo for
@@ -5512,6 +5599,9 @@ func (idx *Indexer) indexFile(
 		visCaptured = true
 		snapshotDuration = time.Since(snapshotStarted)
 	}
+	if idx.forceReparseDropsResolutions(absPath) {
+		reuseIdx, priorUnresolved = nil, nil
+	}
 
 	// We hold a usable result: evict the old state now, then add the
 	// new — the window where the file has no nodes is just this gap.
@@ -5955,8 +6045,17 @@ func isStructuralKind(k graph.NodeKind) bool {
 // interface-implementation inference. Exposed for batch paths that
 // defer per-file resolver work until the end of a batch.
 func (idx *Indexer) ResolveAll() {
+	if err := idx.resolveAll(); err != nil {
+		idx.logger.Error("indexer: full resolution failed", zap.Error(err))
+	}
+}
+
+func (idx *Indexer) resolveAll() error {
 	idx.populateCppIncludeDirs(true)
-	idx.resolver.ResolveAll()
+	_, resolveErr := idx.resolver.ResolveAllContext(context.Background())
+	if resolveErr != nil && !errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+		return resolveErr
+	}
 	idx.resolver.InferImplements()
 	idx.resolver.InferOverrides()
 	// Framework dynamic-dispatch synthesis (gRPC / Temporal / event
@@ -5978,6 +6077,7 @@ func (idx *Indexer) ResolveAll() {
 	// Seed the durable reference-facts sidecar from the fully-resolved graph
 	// (no-op on the in-memory backend).
 	idx.persistAllRefFacts()
+	return resolveErr
 }
 
 // EvictFile removes all nodes and edges belonging to filePath.
@@ -7140,8 +7240,8 @@ func (idx *Indexer) SetRootPath(root string) {
 	idx.storeRootPath(abs)
 }
 
-// IncrementalReindexPaths re-indexes only the files reachable from the
-// supplied paths, instead of walking the whole repository root.
+// IncrementalReindexPaths reconciles the supplied paths. An effective alias
+// change also refreshes existing JS/TS callers, without widening deletion scope.
 //
 // Each path may be absolute or relative to root, and may be a file or a
 // directory; directories are walked recursively with the same
@@ -7317,6 +7417,9 @@ func (idx *Indexer) incrementalReindexPathsMode(
 		return nil, err
 	}
 	idx.storeRootPath(absRoot)
+	if err := idx.beginAliasPass(context.Background(), absRoot, paths, false); err != nil {
+		return nil, err
+	}
 
 	// Reconcile the complete durable corpus before any scoped mutation writes
 	// rows with this process's normalization mode. Doing this after a partial
@@ -7482,6 +7585,32 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	for _, graphPath := range idx.fileIndexFailurePaths() {
 		if relPath, ok := idx.graphPathRelKey(graphPath); ok && diskFiles[relPath] {
 			staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(relPath)))
+		}
+	}
+	if idx.aliasResolutionChanged {
+		// Rebind surviving callers without widening the requested deletion,
+		// mtime, or Merkle scope. In-scope files have already been admitted.
+		for rel := range diskFiles {
+			if closureJSTSPath(rel) {
+				staleFiles = append(staleFiles, filepath.Join(absRoot, filepath.FromSlash(rel)))
+			}
+		}
+		if !fullRoot {
+			for _, p := range graph.ReadRepoFilePaths(idx.graph, idx.repoPrefix, "", nil, nil) {
+				rel, owned := idx.graphPathRelKey(p)
+				if !owned || diskFiles[rel] || !closureJSTSPath(rel) {
+					continue
+				}
+				abs := filepath.Join(absRoot, filepath.FromSlash(rel))
+				if idx.shouldExclude(abs, absRoot, false) {
+					continue
+				}
+				if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+					staleFiles = append(staleFiles, abs)
+				} else if err != nil && !os.IsNotExist(err) {
+					return nil, err
+				}
+			}
 		}
 	}
 	staleFiles = appendUniqueSorted(nil, staleFiles...)
@@ -7719,8 +7848,8 @@ func (idx *Indexer) incrementalReindexPathsMode(
 	// restage successful files of the same language forever. Discovery failures
 	// can hide an entire subtree, and torn passes cannot attest a completed
 	// restage. Keep the language-wide fence for either, or for an unsafe ledger.
-	if len(extractorStaleLangs) > 0 && len(discoveryFailed) == 0 && result.mutationErr == nil &&
-		idx.failedFilesSafelyRetryable(failedFiles) {
+	result.failuresRetryable = len(discoveryFailed) == 0 && idx.failedFilesSafelyRetryable(failedFiles)
+	if len(extractorStaleLangs) > 0 && result.mutationErr == nil && result.failuresRetryable {
 		idx.reconcileRepoIndexState(context.Background(), absRoot)
 	}
 	idx.warnIfEdgeSanityViolated(result)

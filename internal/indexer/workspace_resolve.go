@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -528,8 +529,14 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 		}
 		mi.synthesizeDeferredGoModuleCalls(idx, edges)
 	}
-	if _, err := cr.ResolveAllContext(ctx); err != nil {
-		return err
+	_, resolveErr := cr.ResolveAllContext(ctx)
+	if resolveErr != nil && !errors.Is(resolveErr, resolver.ErrReindexWriteRefused) {
+		return resolveErr
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	if reconcileContracts {
 		mi.ReconcileContractEdges()
@@ -538,7 +545,7 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 	// fallback lane runs with no global test-edges pass behind it.
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
-	return nil
+	return resolveErr
 }
 
 // runCrossRepoResolveFiles binds both outgoing and incoming unresolved edges
@@ -558,17 +565,18 @@ func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, ed
 	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) *resolver.CrossRepoStats {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
-		return
+		return nil
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
-		return
+		return nil
 	}
-	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	stats := cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return stats
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from
