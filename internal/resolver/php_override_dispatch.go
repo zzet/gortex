@@ -186,7 +186,9 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 			} else {
 				phpEnsureMeta(j.edge)["dispatch"] = "scope"
 			}
-			g.ReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}})
+			if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
+				break
+			}
 			n++
 			continue
 		}
@@ -195,7 +197,9 @@ func (r *Resolver) resolvePHPOverrideDispatchCandidates(candidates overrideDispa
 		j.edge.Origin = graph.OriginASTInferred
 		j.edge.Confidence = phpDispatchConfidence
 		phpEnsureMeta(j.edge)["dispatch"] = "override"
-		g.ReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}})
+		if !r.applyReindexEdges([]graph.EdgeReindex{{Edge: j.edge, OldTo: oldTo}}) {
+			break
+		}
 		n++
 		for _, o := range j.others {
 			if phpEdgeExists(g, j.edge.From, o.ID) {

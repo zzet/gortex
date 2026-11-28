@@ -113,7 +113,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 			continue
 		}
 		for _, e := range byNode[n.ID] {
-			if reusableResolvedEdge(e) {
+			if reuseKeyClaimant(e) {
 				targetIDSet[e.To] = struct{}{}
 			}
 		}
@@ -139,7 +139,7 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 				priorUnresolved = append(priorUnresolved, &prior)
 				continue
 			}
-			if !reusableResolvedEdge(e) {
+			if !reuseKeyClaimant(e) {
 				continue
 			}
 			tgt := targets[e.To]
@@ -147,6 +147,10 @@ func captureIncrementalState(g graph.Store, graphPath string) (reuse map[reuseKe
 				continue
 			}
 			k := reuseKey{from: e.From, kind: e.Kind, recv: edgeReceiverType(e), name: tgt.Name}
+			if !reusableResolvedEdge(e) {
+				reuse[k] = nil // a bound call shares the key -> never reuse
+				continue
+			}
 			if cur, seen := reuse[k]; seen {
 				if cur != nil && cur.to != e.To {
 					reuse[k] = nil // ambiguous -> never reuse
@@ -189,7 +193,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 	// to be re-added and deliberately do not need a store lookup.
 	targetIDSet := make(map[string]struct{})
 	for _, e := range edges {
-		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil || e.Meta[graph.JSAmbientShadowMeta] != nil {
 			continue
 		}
 		name := reuseIdentifier(graph.UnresolvedName(e.To))
@@ -214,7 +218,7 @@ func applyResolvedOutEdges(g graph.Store, edges []*graph.Edge, idx map[reuseKey]
 	}
 	reused := 0
 	for _, e := range edges {
-		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil {
+		if e == nil || !graph.IsUnresolvedTarget(e.To) || e.Meta[graph.JSLexicalBindingMeta] != nil || e.Meta[graph.JSAmbientShadowMeta] != nil {
 			continue
 		}
 		name := reuseIdentifier(graph.UnresolvedName(e.To))
@@ -314,7 +318,7 @@ func csharpVisibilityStampForNodes(nodes []*graph.Node) csharpVisibilityStamp {
 // `global using static` until its file is next edited or the store is
 // rebuilt. The edges keep their receiver stamps and the tag, which
 // routes them straight back through their rule.
-func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
+func (idx *Indexer) restubCSharpExtensionBinds(files []string) []string {
 	var batch []graph.EdgeReindex
 	for _, f := range files {
 		nodes := idx.graph.GetFileNodes(f)
@@ -364,10 +368,7 @@ func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
 	}
-	if len(batch) > 0 {
-		idx.graph.ReindexEdges(batch)
-	}
-	return len(batch)
+	return graph.ApplyEdgeReindexes(idx.graph, batch)
 }
 
 // reresolveCSharpGlobalUsingDependents re-resolves the files a
@@ -376,7 +377,7 @@ func (idx *Indexer) restubCSharpExtensionBinds(files []string) int {
 // without touching the files themselves — nothing else re-prices their
 // extension binds. Rare by nature (a Usings.cs edit), so the unit-wide
 // re-resolve is the correctness cost, not a hot path.
-func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclude map[string]struct{}) {
+func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclude map[string]struct{}, batch *reparsePendingEnrichmentBatch) {
 	if len(changed) == 0 {
 		return
 	}
@@ -396,7 +397,7 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 		deps = append(deps, dep)
 	}
 	sort.Strings(deps)
-	idx.restubCSharpExtensionBinds(deps)
+	batch.recordDropped(idx.restubCSharpExtensionBinds(deps))
 	// The changed files ride along so the resolve entry reconciles THEIR
 	// stamps before the dependents re-narrow. On a non-deferred save
 	// their pending edges were already resolved and they hit the
@@ -409,19 +410,34 @@ func (idx *Indexer) reresolveCSharpGlobalUsingDependents(changed []string, exclu
 		}
 	}
 	idx.observeIncrementalCatchup("resolve", resolveList)
-	idx.resolver.ResolveFilesAndIncoming(resolveList)
+	batch.recordResolveStats(idx.resolver.ResolveFilesAndIncoming(resolveList))
+}
+
+// reuseKeyClaimant reports a resolved edge whose target name claims its reuse
+// key, reusable or not. reuseKey cannot tell a bare call bound through an
+// import or a lexical scope from a same-named member call, so a bound edge that
+// is not itself reusable must still make its key ambiguous; otherwise the one
+// remaining candidate is copied onto the bound call.
+func reuseKeyClaimant(e *graph.Edge) bool {
+	return e != nil && e.To != "" && !graph.IsUnresolvedTarget(e.To) && !strings.HasPrefix(e.To, "external::")
 }
 
 func reusableResolvedEdge(e *graph.Edge) bool {
 	if e == nil || e.To == "" {
 		return false
 	}
+	if _, exact := e.Meta[graph.JSBindingNameMeta]; exact {
+		return false // the reuse key names the implementation, not the caller's binding
+	}
+	if e.Meta[graph.JSBindingModuleMeta] != nil {
+		return false // recompute an import's reverse module key along with its target
+	}
 	if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 		return false
 	}
-	// Lexical shadows depend on enclosing-scope declarations that reuseKey
-	// does not encode; always re-resolve them.
-	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+	// Lexical shadows, module shadows, and local require() bindings depend on
+	// enclosing-scope declarations that reuseKey does not encode; always re-resolve them.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil || e.Meta[graph.JSAmbientShadowMeta] != nil {
 		return false
 	}
 	return true

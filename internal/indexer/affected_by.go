@@ -843,21 +843,22 @@ func (idx *Indexer) affectedFilesFor(changedPath string, deltaKeys []string, sna
 // external-call placeholders, and re-persists that file's reference
 // facts — so an edge that degraded to an unresolved stub also drops its
 // stale persisted fact, and a rebound edge records its new resolution.
-func (idx *Indexer) reresolveAffectedBy(changedPath string, snap *affectedBySnapshot, newNodes []*graph.Node) {
+func (idx *Indexer) reresolveAffectedBy(changedPath string, snap *affectedBySnapshot, newNodes []*graph.Node) []string {
 	if snap == nil {
-		return
+		return nil
 	}
 	delta := affectedByDelta(idx.graph, snap, newNodes)
 	if len(delta) == 0 {
-		return // body-only edit: no contract change, no fan-out
+		return nil // body-only edit: no contract change, no fan-out
 	}
 	files := idx.affectedFilesFor(changedPath, delta, snap)
 	if len(files) == 0 {
-		return
+		return nil
 	}
 	files, truncation := boundAffectedByFiles(files, idx.affectedByMaxFiles())
 	idx.reportAffectedByTruncation(changedPath, truncation)
-	idx.resolver.ResolveFilesAndIncoming(files)
+	stats := idx.resolver.ResolveFilesAndIncoming(files)
 	resolver.SynthesizeExternalCallsForFiles(idx.graph, idx.externalCallSynthesisEnabled(), files)
 	idx.persistRefFactsForFiles(files)
+	return stats.DroppedFiles
 }

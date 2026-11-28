@@ -126,11 +126,52 @@ func (s *unresolvedEdgeStream) nextPage() ([]*graph.Edge, bool, error) {
 // so only the first full resolve pass is profiled.
 var resolveProfileStarted atomic.Bool
 
+// ErrReindexWriteRefused reports that the backing store refused or dropped an
+// edge reindex batch (for example because the SQLite writer gate stayed
+// contended past its bounded retry window). Callers that certify durable policy
+// state must leave it uncertified until a subsequent pass applies the rebinds.
+var ErrReindexWriteRefused = errors.New("resolver: edge reindex batch refused")
+
+func reindexEdgesApplied(g graph.Store, batch []graph.EdgeReindex) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	if writer, ok := g.(interface {
+		ReindexEdgesApplied([]graph.EdgeReindex) bool
+	}); ok {
+		return writer.ReindexEdgesApplied(batch)
+	}
+	g.ReindexEdges(batch)
+	return true
+}
+
+func reindexUnresolvedTargetsApplied(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	batch []graph.UnresolvedEdgeTargetReindex,
+) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	if writer, ok := targeter.(interface {
+		ReindexUnresolvedEdgeTargetsApplied([]graph.UnresolvedEdgeTargetReindex) bool
+	}); ok {
+		return writer.ReindexUnresolvedEdgeTargetsApplied(batch)
+	}
+	targeter.ReindexUnresolvedEdgeTargets(batch)
+	return true
+}
+
 // ResolveStats holds counts from a resolution pass.
 type ResolveStats struct {
 	Resolved   int `json:"resolved"`
 	Unresolved int `json:"unresolved"`
 	External   int `json:"external"`
+	// DroppedFiles must be re-extracted before certifying incremental resolution.
+	DroppedFiles []string `json:"-"`
+	// WriteRefused reports that the backing store refused or dropped at least
+	// one edge reindex batch during this pass. Callers that certify durable
+	// policy state must not certify a pass whose writes were refused.
+	WriteRefused bool `json:"write_refused,omitempty"`
 	// RefusedRebindFiles names sources whose incremental rebind batch the
 	// store could not confirm. Only stores with a checked apply report it.
 	RefusedRebindFiles map[string]struct{} `json:"-"`
@@ -456,6 +497,41 @@ type Resolver struct {
 	// validateLiveness; never set on any single-file path.
 	bulkMode bool
 
+	// passWriteRefused points at the active non-yielding locked pass's
+	// refused-write flag, guarded by r.mu. Any sub-pass write that SQLite drops
+	// under writer-gate contention flips it so the enclosing pass refuses to
+	// report a clean apply. Never held across an r.mu yield.
+	passWriteRefused *bool
+
+	// pendingGuardReverts retains cross-package guard reverts whose write was
+	// refused under writer-gate contention so a subsequent resolve pass finishes
+	// reverting the weak-tier edges even when they are no longer unresolved.
+	pendingGuardReverts []PendingGuardRevert
+
+	// pendingTailRetryAll marks that an unscoped ResolveAllContext pass aborted
+	// on a refused write so a subsequent unscoped retry does not short-circuit
+	// on len(pending) == 0 before completing tail passes and terminal stamping.
+	pendingTailRetryAll bool
+
+	// pendingTailRetryScopes tracks per-repo scopes whose ResolveAllContext
+	// pass aborted on a refused write so a scoped pass for another repo cannot
+	// clear pending tail work belonging to this scope or an unscoped pass.
+	pendingTailRetryScopes map[string]struct{}
+
+	// pendingAttribFiles remembers incremental file frontiers whose attribution
+	// pass was refused so a retry with len(pending) == 0 still runs full
+	// per-file attribution instead of taking the no_pending fast path.
+	pendingAttribFiles map[string]struct{}
+
+	// takeRetryState / saveRetryState hand off MasterRetryState strictly while
+	// r.mu (g.ResolveMutex()) is held so concurrent short-lived resolvers on
+	// separate repo lanes cannot dequeue another lane's pending retry items.
+	// retryBridgeGraph pins the bridge to the store installed alongside it so a
+	// temporary SetGraph(inMemShadow) cold build never touches durable retry state.
+	takeRetryState   func() MasterRetryState
+	saveRetryState   func(MasterRetryState)
+	retryBridgeGraph graph.Store
+
 	// lookupCache holds per-pass batched results from GetNodesByIDs /
 	// FindNodesByNames. Populated by ResolveAll/ResolveFile before
 	// the worker fan-out and cleared on return. Workers consult these
@@ -658,6 +734,8 @@ type Resolver struct {
 	// contract. Set via SetPathAliasResolver before ResolveAll runs.
 	pathAlias PathAliasResolver
 
+	nuxtAutoImport NuxtAutoImportResolver
+
 	// workspaceMembers, when non-nil, maps a file path to the
 	// package-manager workspace it belongs to. Used to break a
 	// same-named import collision in favour of the candidate that
@@ -785,9 +863,307 @@ func (r *Resolver) SetGraph(g graph.Store) {
 	}
 	r.lspDeferredCursor = deferredLSPWorkKey{}
 	r.lspDeferredCursorSet = false
+	r.placeholderSrcIdx = placeholderSourceIndex{}
+	r.pendingGuardReverts = nil
+	r.pendingTailRetryAll = false
+	r.pendingTailRetryScopes = nil
+	r.pendingAttribFiles = nil
 	if oldMu != nil {
 		oldMu.Unlock()
 	}
+}
+
+// MasterRetryState bundles unapplied refused-write state that short-lived
+// Resolvers hand off strictly under g.ResolveMutex().
+type MasterRetryState struct {
+	PlaceholderRepoints []graph.PlaceholderRepoint
+	GuardReverts        []PendingGuardRevert
+	TailRetryAll        bool
+	TailRetryScopes     []string
+	AttributionFiles    []string
+}
+
+// SetRetryStateBridge installs callbacks invoked strictly while r.mu
+// (g.ResolveMutex()) is held so concurrent short-lived resolvers on separate
+// repository lanes cannot steal another lane's pending retry items. The bridge
+// is pinned to the graph store currently attached to r so temporary cold shadow
+// swaps (SetGraph(inMemShadow)) leave durable retry state untouched.
+func (r *Resolver) SetRetryStateBridge(take func() MasterRetryState, save func(MasterRetryState)) {
+	r.takeRetryState = take
+	r.saveRetryState = save
+	if take != nil || save != nil {
+		r.retryBridgeGraph = r.graph
+	} else {
+		r.retryBridgeGraph = nil
+	}
+}
+
+func (r *Resolver) retryBridgeActiveLocked() bool {
+	return r.retryBridgeGraph != nil && r.graph == r.retryBridgeGraph
+}
+
+func (r *Resolver) adoptRetryStateLocked(state MasterRetryState) {
+	if len(state.PlaceholderRepoints) > 0 {
+		r.placeholderSrcIdx.inheritDeferred(state.PlaceholderRepoints)
+	}
+	if len(state.GuardReverts) > 0 {
+		r.pendingGuardReverts = append(r.pendingGuardReverts, state.GuardReverts...)
+	}
+	if state.TailRetryAll {
+		r.pendingTailRetryAll = true
+	}
+	if len(state.TailRetryScopes) > 0 {
+		if r.pendingTailRetryScopes == nil {
+			r.pendingTailRetryScopes = make(map[string]struct{}, len(state.TailRetryScopes))
+		}
+		for _, s := range state.TailRetryScopes {
+			if s != "" {
+				r.pendingTailRetryScopes[s] = struct{}{}
+			}
+		}
+	}
+	if len(state.AttributionFiles) > 0 {
+		r.notePendingAttributionFilesLocked(state.AttributionFiles)
+	}
+}
+
+// releaseNonInFlightRetryStateLocked returns queued tail/attribution retry
+// demands to saveRetryState before an inter-chunk r.mu.Unlock() yield so a
+// concurrent repository retry can observe and drain its own pending files
+// instead of falsely certifying on an empty bridge.
+func (r *Resolver) releaseNonInFlightRetryStateLocked() {
+	if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
+		return
+	}
+	var out MasterRetryState
+	out.TailRetryAll = r.pendingTailRetryAll
+	r.pendingTailRetryAll = false
+	if len(r.pendingTailRetryScopes) > 0 {
+		out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
+		for s := range r.pendingTailRetryScopes {
+			out.TailRetryScopes = append(out.TailRetryScopes, s)
+		}
+		r.pendingTailRetryScopes = nil
+	}
+	if len(r.pendingAttribFiles) > 0 {
+		out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
+		for p := range r.pendingAttribFiles {
+			out.AttributionFiles = append(out.AttributionFiles, p)
+		}
+		r.pendingAttribFiles = nil
+	}
+	if out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
+		r.saveRetryState(out)
+	}
+}
+
+func (r *Resolver) bridgeRetryStateLocked() func() {
+	if !r.retryBridgeActiveLocked() {
+		return func() {}
+	}
+	if r.takeRetryState != nil {
+		r.adoptRetryStateLocked(r.takeRetryState())
+	}
+	return func() {
+		if r.saveRetryState == nil || !r.retryBridgeActiveLocked() {
+			return
+		}
+		var out MasterRetryState
+		out.PlaceholderRepoints = r.placeholderSrcIdx.takeDeferred()
+		if len(r.pendingGuardReverts) > 0 {
+			out.GuardReverts = r.pendingGuardReverts
+			r.pendingGuardReverts = nil
+		}
+		out.TailRetryAll = r.pendingTailRetryAll
+		r.pendingTailRetryAll = false
+		if len(r.pendingTailRetryScopes) > 0 {
+			out.TailRetryScopes = make([]string, 0, len(r.pendingTailRetryScopes))
+			for s := range r.pendingTailRetryScopes {
+				out.TailRetryScopes = append(out.TailRetryScopes, s)
+			}
+			r.pendingTailRetryScopes = nil
+		}
+		if len(r.pendingAttribFiles) > 0 {
+			out.AttributionFiles = make([]string, 0, len(r.pendingAttribFiles))
+			for p := range r.pendingAttribFiles {
+				out.AttributionFiles = append(out.AttributionFiles, p)
+			}
+			r.pendingAttribFiles = nil
+		}
+		if len(out.PlaceholderRepoints) > 0 || len(out.GuardReverts) > 0 || out.TailRetryAll || len(out.TailRetryScopes) > 0 || len(out.AttributionFiles) > 0 {
+			r.saveRetryState(out)
+		}
+	}
+}
+
+func (r *Resolver) notePendingTailRetryLocked() {
+	if len(r.scope) == 0 {
+		r.pendingTailRetryAll = true
+		return
+	}
+	if r.pendingTailRetryScopes == nil {
+		r.pendingTailRetryScopes = make(map[string]struct{}, len(r.scope))
+	}
+	for prefix := range r.scope {
+		if prefix != "" {
+			r.pendingTailRetryScopes[prefix] = struct{}{}
+		}
+	}
+}
+
+func (r *Resolver) hasPendingTailWorkForScopeLocked() bool {
+	if len(r.scope) == 0 {
+		return r.pendingTailRetryAll || len(r.pendingTailRetryScopes) > 0 || len(r.pendingAttribFiles) > 0
+	}
+	if r.pendingTailRetryAll {
+		return true
+	}
+	for prefix := range r.scope {
+		if _, ok := r.pendingTailRetryScopes[prefix]; ok {
+			return true
+		}
+	}
+	for fp := range r.pendingAttribFiles {
+		if _, ok := r.scope[graph.RepoPrefixOfID(fp)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) clearPendingTailRetryForScopeLocked() {
+	if len(r.scope) == 0 {
+		r.pendingTailRetryAll = false
+		r.pendingTailRetryScopes = nil
+		r.pendingAttribFiles = nil
+		return
+	}
+	for prefix := range r.scope {
+		delete(r.pendingTailRetryScopes, prefix)
+	}
+	if len(r.pendingTailRetryScopes) == 0 {
+		r.pendingTailRetryScopes = nil
+	}
+	if len(r.pendingAttribFiles) > 0 {
+		for fp := range r.pendingAttribFiles {
+			if _, ok := r.scope[graph.RepoPrefixOfID(fp)]; ok {
+				delete(r.pendingAttribFiles, fp)
+			}
+		}
+		if len(r.pendingAttribFiles) == 0 {
+			r.pendingAttribFiles = nil
+		}
+	}
+}
+
+// flushPendingRetryWritesLocked drains any deferred placeholder repoints first
+// and any queued cross-package guard reverts second (matching ResolveAll's
+// order so guard SourceReverts undo any placeholder move for a rejected call,
+// never vice versa). Caller holds r.mu.
+func (r *Resolver) flushPendingRetryWritesLocked() (int, bool) {
+	if r.placeholderSrcIdx.hasDeferred() {
+		if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+			r.notePassWriteRefused()
+			return 0, false
+		}
+	}
+	if r.hasPendingGuardReverts() {
+		return r.flushPendingGuardRevertsLocked()
+	}
+	return 0, true
+}
+
+func (r *Resolver) notePendingAttributionFilesLocked(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	if r.pendingAttribFiles == nil {
+		r.pendingAttribFiles = make(map[string]struct{}, len(paths))
+	}
+	for _, p := range paths {
+		if p != "" {
+			r.pendingAttribFiles[p] = struct{}{}
+		}
+	}
+}
+
+func (r *Resolver) hasPendingAttributionFilesLocked(paths []string) bool {
+	if len(r.pendingAttribFiles) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		if _, ok := r.pendingAttribFiles[p]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) clearPendingAttributionFilesLocked(paths []string) {
+	if len(r.pendingAttribFiles) == 0 {
+		return
+	}
+	for _, p := range paths {
+		delete(r.pendingAttribFiles, p)
+	}
+	if len(r.pendingAttribFiles) == 0 {
+		r.pendingAttribFiles = nil
+	}
+}
+
+// TakePendingPlaceholderRepoints detaches any deferred placeholder dataflow
+// source repoints that a refused write left unapplied so a caller constructing
+// a fresh Resolver can hand them to the retry pass.
+func (r *Resolver) TakePendingPlaceholderRepoints() []graph.PlaceholderRepoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.placeholderSrcIdx.takeDeferred()
+}
+
+// InheritPendingPlaceholderRepoints attaches unapplied placeholder repoints
+// from a prior refused pass on the same store.
+func (r *Resolver) InheritPendingPlaceholderRepoints(repoints []graph.PlaceholderRepoint) {
+	if len(repoints) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.placeholderSrcIdx.inheritDeferred(repoints)
+}
+
+func (r *Resolver) trackPassWriteRefused(flag *bool) func() {
+	prev := r.passWriteRefused
+	r.passWriteRefused = flag
+	return func() { r.passWriteRefused = prev }
+}
+
+func (r *Resolver) writeRefused() bool {
+	return r.passWriteRefused != nil && *r.passWriteRefused
+}
+
+func (r *Resolver) notePassWriteRefused() {
+	if r.passWriteRefused != nil {
+		*r.passWriteRefused = true
+	}
+}
+
+func (r *Resolver) applyReindexEdges(batch []graph.EdgeReindex) bool {
+	applied := reindexEdgesApplied(r.graph, batch)
+	if !applied {
+		r.notePassWriteRefused()
+	}
+	return applied
+}
+
+func (r *Resolver) applyUnresolvedTargetReindexes(
+	targeter graph.UnresolvedEdgeTargetBatchReindexer,
+	batch []graph.UnresolvedEdgeTargetReindex,
+) bool {
+	applied := reindexUnresolvedTargetsApplied(targeter, batch)
+	if !applied {
+		r.notePassWriteRefused()
+	}
+	return applied
 }
 
 // ResolveAll resolves all unresolved edges in the graph.
@@ -828,6 +1204,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
 	r.refreshGoModules()
 	if err := ctx.Err(); err != nil {
 		return &ResolveStats{}, err
@@ -841,9 +1218,24 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// from scratch. Scoped resolves maintain it incrementally instead.
 	r.clearCSharpVisibilityCaches()
 
-	// Fresh placeholder-source set per pass: dataflow edges indexed since the
-	// previous pass must be visible, and a moved source must not linger.
-	r.placeholderSrcIdx = placeholderSourceIndex{}
+	// Fresh placeholder-source census per pass while retaining any deferred
+	// repoints a prior refused write left unapplied.
+	r.placeholderSrcIdx.beginPass()
+
+	// Drain any prior refused placeholder repoints (first) and cross-package
+	// guard reverts (second) BEFORE scanning pending edges or running deferred
+	// LSP so reverted weak-tier edges never clobber LSP/AST upgrades and are
+	// visible to attribution/tail passes.
+	var startWriteRefused bool
+	if r.placeholderSrcIdx.hasDeferred() || r.hasPendingGuardReverts() {
+		restoreRefused := r.trackPassWriteRefused(&startWriteRefused)
+		_, ok := r.flushPendingRetryWritesLocked()
+		restoreRefused()
+		if !ok || startWriteRefused {
+			r.notePendingTailRetryLocked()
+			return &ResolveStats{WriteRefused: true}, fmt.Errorf("%w: pending retry writes", ErrReindexWriteRefused)
+		}
+	}
 
 	// Keep the unresolved corpus disk-resident. SQLite captures a rowid
 	// high-water mark and keyset-pages beneath it; legacy stores are consumed
@@ -924,7 +1316,7 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	if pendingErr != nil {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, pendingErr
 	}
-	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() {
+	if len(pending) == 0 && streamDone && !r.hasDeferredLSPRetryForScope() && !r.hasPendingTailWorkForScopeLocked() {
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, nil
 	}
 
@@ -1046,13 +1438,36 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 		return &ResolveStats{PendingBefore: pendingBefore, PendingAfter: pendingAfter}, guardSpoolErr
 	}
 	defer guardSpool.close()
+	guardDrained := false
 	guardRepos := make(map[string]struct{})
+	var tailWriteRefused bool
+	yielded := false
 	total := &ResolveStats{}
+	// A refused LSP correction fails the pass only after the guard has run, so
+	// unrelated name-only bindings are still reverted.
+	var lspWriteErr error
 	resolveError := func(err error) (*ResolveStats, error) {
-		// Moves the pass deferred belong to references it already bound; an
-		// interrupted pass must not strand them (no later pass re-derives a
-		// repoint once its reference is resolved).
-		r.placeholderSrcIdx.applyDeferred(r.graph)
+		if tailWriteRefused {
+			total.WriteRefused = true
+		}
+		if !errors.Is(err, ErrReindexWriteRefused) && !total.WriteRefused {
+			// Moves the pass deferred belong to references it already bound; an
+			// interrupted (non-refusal) pass flushes them immediately.
+			if _, ok := r.placeholderSrcIdx.applyDeferredApplied(r.graph); !ok {
+				total.WriteRefused = true
+			}
+		}
+		if errors.Is(err, ErrReindexWriteRefused) || total.WriteRefused {
+			// Retain tail completion demand so a retry with len(pending) == 0
+			// still runs non-unresolved attribution/tail passes, and evaluate
+			// any already-spooled weak-tier guard jobs read-only so committed
+			// chunks are never left permanently unguarded.
+			r.notePendingTailRetryLocked()
+			if guardSpoolErr == nil && guardSpool.count > 0 && !guardDrained {
+				guardDrained = true
+				r.drainGuardSpoolToPendingLocked(guardSpool, guardRepos)
+			}
+		}
 		total.PendingBefore = pendingBefore
 		total.PendingAfter = pendingAfter
 		return total, err
@@ -1285,8 +1700,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				r.noteImportEdgeReindexes(reindexBatch)
 				applyNoteElapsed += time.Since(noteStart)
 				storeStart := time.Now()
-				r.graph.ReindexEdges(reindexBatch)
+				applied := total.applyReindexes(r.graph, reindexBatch)
 				applyStoreElapsed += time.Since(storeStart)
+				if !applied {
+					return resolveError(total.bindingWriteError())
+				}
 				placeholderStart := time.Now()
 				// Moves wait for the last page (placeholderSourceIndex.deferRepoints):
 				// applying them per page made the result depend on the paging.
@@ -1336,8 +1754,13 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			// Hand the resolve mutex to any waiting interactive edit before the
 			// next chunk. Drop bulk mode across the hand-off so an interleaving
 			// single-file ResolveFile on a shared instance resolves LSP-first.
+			// Return non-in-flight tail/attribution retry demands to the bridge
+			// before unlocking so a concurrent repository retry can see and
+			// drain its own pending files instead of falsely certifying.
 			if r.validateLiveness && (hi < len(pending) || !streamDone) {
 				r.bulkMode = false
+				r.releaseNonInFlightRetryStateLocked()
+				yielded = true
 				yieldHook := r.chunkYieldHook
 				r.mu.Unlock()
 				if yieldHook != nil {
@@ -1387,11 +1810,28 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			return resolveError(err)
 		}
 	}
+	defer r.trackPassWriteRefused(&tailWriteRefused)()
+	if yielded && r.takeRetryState != nil && r.retryBridgeActiveLocked() {
+		// Re-absorb any remaining bridged retry state now that no further
+		// r.mu yields will occur so pending repoints/reverts are flushed before
+		// the tail runs and only this pass's scope is cleared on completion.
+		r.adoptRetryStateLocked(r.takeRetryState())
+	}
 	placeholderFlushStart := time.Now()
-	r.placeholderSrcIdx.applyDeferred(r.graph)
+	_, placeholderOK := r.placeholderSrcIdx.applyDeferredApplied(r.graph)
 	applyPlaceholderElapsed += time.Since(placeholderFlushStart)
 	stopProgress()
 	loopElapsed := time.Since(passStart) - warmElapsed
+	if !placeholderOK {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: deferred placeholder sources", ErrReindexWriteRefused))
+	}
+	if r.hasPendingGuardReverts() {
+		if _, ok := r.flushPendingGuardRevertsLocked(); !ok || tailWriteRefused {
+			total.WriteRefused = true
+			return resolveError(fmt.Errorf("%w: pending guard reverts", ErrReindexWriteRefused))
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1613,6 +2053,12 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				break
 			}
 			pageResult := r.resolveDeferredLSPWithPassBudget(lspCtx, edges, lspPassBudget)
+			if len(pageResult.dropped) != 0 || pageResult.writeRefused {
+				total.WriteRefused = true
+				total.DroppedFiles = append(total.DroppedFiles, pageResult.dropped...)
+				lspWriteErr = total.bindingWriteError()
+				break // leave this spool page pending
+			}
 			if pageResult.budgetExhausted && pageResult.skipped > 0 {
 				// resolveDeferredLSPWithPassBudget pinned the resume cursor
 				// to its first skipped key.
@@ -1651,7 +2097,9 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			if len(terminalClears) > 0 {
 				r.noteImportEdgeReindexes(terminalClears)
-				r.graph.ReindexEdges(terminalClears)
+				if !total.applyReindexes(r.graph, terminalClears) {
+					return resolveError(total.bindingWriteError())
+				}
 			}
 
 			completed := append([]deferredLSPWorkKey(nil), stale...)
@@ -1803,10 +2251,19 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 			}
 			done = exhausted
 		}
+		guardDrained = true
+		if tailWriteRefused {
+			total.WriteRefused = true
+			return resolveError(total.bindingWriteError())
+		}
 	}
+	guardDrained = true
 	tAfterGuard := time.Now()
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
+	}
+	if lspWriteErr != nil {
+		return resolveError(total.bindingWriteError())
 	}
 
 	// Post-resolution Go attribution passes: method-receiver rebind, bare-name
@@ -1867,9 +2324,16 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				return resolveError(err)
 			}
 			r.runFileAttributionPassesForFileLocked(fp)
+			if tailWriteRefused {
+				break
+			}
 		}
 	}
 	tAfterAttrib := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: go attribution", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1881,6 +2345,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	ldStart := time.Now()
 	r.resolveRelativeImports()
 	ld1 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: relative imports", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1889,11 +2357,19 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// imports above; resolveRelativeImports never touches Lua, so this lands
 	// the Lua module/instance requires onto their indexed file nodes.
 	r.resolveLuaRequires()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: lua requires", ErrReindexWriteRefused))
+	}
 	// Godot `res://` binding — scene `[ext_resource]` references and
 	// GDScript `preload(...)`. Same settle window and the same path-suffix
 	// net as the Lua requires above.
 	r.resolveGodotResPaths()
 	ld2 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: godot res paths", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1902,6 +2378,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// binds simple-type references reachable only via an imported namespace.
 	r.resolveRazorUsings()
 	ld3 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: razor usings", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1912,6 +2392,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// dep-module bridge has had its chance.
 	r.attributeNonGoModuleImports()
 	ld4 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: non-go module imports", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1925,6 +2409,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	overrideDispatchCandidates := r.collectOverrideDispatchCandidates()
 	r.resolveJavaOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld5 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: java override dispatch", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1935,6 +2423,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// every implementation. Same post-guard placement as the Java pass.
 	r.resolvePHPOverrideDispatchCandidates(overrideDispatchCandidates)
 	ld6 := time.Now()
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: php override dispatch", ErrReindexWriteRefused))
+	}
 	if err := ctx.Err(); err != nil {
 		return resolveError(err)
 	}
@@ -1963,6 +2455,10 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 	// left the entire unresolved residual unstamped, so every subsequent
 	// full pass re-paged ~300k edges that the first pass had already proven
 	// unbindable.
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: post-resolution tail", ErrReindexWriteRefused))
+	}
 	if r.stampTerminal && len(r.scope) == 0 {
 		if err := ctx.Err(); err != nil {
 			return resolveError(err)
@@ -1975,6 +2471,11 @@ func (r *Resolver) ResolveAllContext(ctx context.Context) (*ResolveStats, error)
 				zap.Int("unstamped", unstamped))
 		}
 	}
+	if tailWriteRefused {
+		total.WriteRefused = true
+		return resolveError(fmt.Errorf("%w: terminal stamping", ErrReindexWriteRefused))
+	}
+	r.clearPendingTailRetryForScopeLocked()
 	// Unresolved skipped work is already represented by the graph's pending
 	// set; retain explicit pointers only for skipped edges a heuristic or tail
 	// pass resolved, since those would otherwise vanish from the next pass.
@@ -2663,13 +3164,19 @@ func (r *Resolver) buildPassIndexesForPending(pending []*graph.Edge) (clear func
 func (r *Resolver) ResolveFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
+	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return stats
+	}
 
 	clear := r.buildPassIndexes()
 	defer clear()
 
-	stats := &ResolveStats{}
 	r.resolveFileLocked(filePath, stats)
 	return stats
 }
@@ -2684,10 +3191,17 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	started := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	// The edited file may have (re)stamped global usings — reconcile the
 	// persistent index instead of paying the workspace rescan per save.
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
+	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return stats
+	}
 
 	// Establish whether this edit left any work before building the four
 	// graph-wide pass indexes. Generated assets and source saves that carry
@@ -2702,7 +3216,6 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	defer func() { r.incomingCarried = nil }()
 	pending := frontier.pending
 	pendingDuration := time.Since(pendingStarted)
-	stats := &ResolveStats{}
 	// The bound is a fact about THIS save before it is anything else. A refused
 	// incoming leg contributes zero entries to pending, so a changed file with
 	// no outgoing work of its own — the ordinary shape for a widely referenced
@@ -2714,7 +3227,25 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	// survives for them.
 	recordFrontierIncomingAdmission(r.logger, stats, frontier, "preparation")
 	if len(pending) == 0 {
+		if r.hasPendingAttributionFilesLocked([]string{filePath}) {
+			r.buildDirIndexes()
+			defer r.clearDirIndexes()
+			r.runFileAttributionPassesForFileLocked(filePath)
+			if stats.WriteRefused {
+				r.notePendingAttributionFilesLocked([]string{filePath})
+				return stats
+			}
+			r.clearPendingAttributionFilesLocked([]string{filePath})
+			if !stats.IncomingAdmissionRefused {
+				r.restoreIncrementalTerminalStampsLocked([]string{filePath})
+			}
+			return stats
+		}
 		r.attributeFrontierGoBuiltins(frontier)
+		if stats.WriteRefused {
+			r.notePendingAttributionFilesLocked([]string{filePath})
+			return stats
+		}
 		if !stats.IncomingAdmissionRefused {
 			r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 		}
@@ -2746,13 +3277,22 @@ func (r *Resolver) ResolveFileAndIncoming(filePath string) *ResolveStats {
 	forwardStarted := time.Now()
 	r.resolveFileEdgesLocked(filePath, stats)
 	forwardDuration := time.Since(forwardStarted)
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return stats
+	}
 	attributionStarted := time.Now()
 	r.runFileAttributionPassesForFileLocked(filePath)
 	attributionDuration := time.Since(attributionStarted)
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return stats
+	}
+	r.clearPendingAttributionFilesLocked([]string{filePath})
 	incomingStarted := time.Now()
 	r.resolveIncomingLocked(filePath, stats)
 	incomingDuration := time.Since(incomingStarted)
-	if !stats.IncomingAdmissionRefused {
+	if !stats.IncomingAdmissionRefused && !stats.WriteRefused {
 		r.restoreIncrementalTerminalStampsLocked([]string{filePath})
 	}
 	if elapsed := time.Since(started); elapsed >= time.Second {
@@ -3130,6 +3670,8 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		mutexAcquired = time.Now()
 	}
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	if observe != nil {
 		observe(mutexStarted, mutexAcquired)
 	}
@@ -3140,6 +3682,14 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	finish = r.startIncrementalPhase(logger, "visibility")
 	r.scopedCSharpVisibilityInvalidate(filePaths)
 	visibilityDuration = finish()
+	// Flush prior refused placeholder repoints (first) and guard reverts
+	// (second) BEFORE collecting the frontier so frontier.outByNode and
+	// frontier.pending observe reverted unresolved::* rows cleanly.
+	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		r.notePendingAttributionFilesLocked(filePaths)
+		outcome = "write_refused"
+		return stats
+	}
 
 	finish = r.startIncrementalPhase(logger, "pending_collect")
 	frontier = r.collectIncrementalFileFrontier(filePaths)
@@ -3176,8 +3726,33 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		}()
 	}
 	if len(frontier.pending) == 0 && len(carried) == 0 {
+		if r.hasPendingAttributionFilesLocked(frontier.paths) {
+			r.buildDirIndexes()
+			defer r.clearDirIndexes()
+			finish = r.startIncrementalPhase(logger, "attribution")
+			r.prepareIncrementalAttributionCache(frontier)
+			r.runFileAttributionPassesForFilesLocked(frontier)
+			r.clearIncrementalAttributionCache()
+			attributionDuration = finish()
+			if stats.WriteRefused {
+				r.notePendingAttributionFilesLocked(frontier.paths)
+				outcome = "write_refused"
+				return stats
+			}
+			r.clearPendingAttributionFilesLocked(frontier.paths)
+			if !stats.IncomingAdmissionRefused {
+				r.restoreIncrementalTerminalStampsLocked(frontier.paths)
+			}
+			outcome = "complete"
+			return stats
+		}
 		outcome = "no_pending"
 		r.attributeFrontierGoBuiltins(frontier)
+		if stats.WriteRefused {
+			r.notePendingAttributionFilesLocked(frontier.paths)
+			outcome = "write_refused"
+			return stats
+		}
 		if !stats.IncomingAdmissionRefused {
 			r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 		}
@@ -3217,6 +3792,11 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 	r.resolvePreparedFileEdgesLocked(frontier.paths, frontier.nodesByFile, frontier.outByNode, stats, frontier.detached...)
 	outgoingDuration = finish(
 		zap.Int("resolved", stats.Resolved), zap.Int("unresolved", stats.Unresolved), zap.Int("external", stats.External))
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
+		outcome = "write_refused"
+		return stats
+	}
 	beforeIncoming := *stats
 	finish = r.startIncrementalPhase(logger, "resolve_incoming")
 	r.resolveIncomingStubKeysLocked(frontier.incomingKeys(), stats)
@@ -3224,14 +3804,25 @@ func (r *Resolver) resolveFilesAndIncoming(filePaths []string, observe func(star
 		zap.Int("resolved", stats.Resolved-beforeIncoming.Resolved),
 		zap.Int("unresolved", stats.Unresolved-beforeIncoming.Unresolved),
 		zap.Int("external", stats.External-beforeIncoming.External))
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
+		outcome = "write_refused"
+		return stats
+	}
 	finish = r.startIncrementalPhase(logger, "attribution")
 	r.prepareIncrementalAttributionCache(frontier)
 	r.runFileAttributionPassesForFilesLocked(frontier)
 	r.clearIncrementalAttributionCache()
+	attributionDuration = finish()
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked(frontier.paths)
+		outcome = "write_refused"
+		return stats
+	}
+	r.clearPendingAttributionFilesLocked(frontier.paths)
 	if !stats.IncomingAdmissionRefused {
 		r.restoreIncrementalTerminalStampsLocked(frontier.paths)
 	}
-	attributionDuration = finish()
 	outcome = "complete"
 	return stats
 }
@@ -3337,7 +3928,16 @@ func (r *Resolver) startIncrementalPhase(logger *zap.Logger, phase string) func(
 // has built the per-pass indexes.
 func (r *Resolver) resolveFileLocked(filePath string, stats *ResolveStats) {
 	r.resolveFileEdgesLocked(filePath, stats)
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return
+	}
 	r.runFileAttributionPassesForFileLocked(filePath)
+	if stats.WriteRefused {
+		r.notePendingAttributionFilesLocked([]string{filePath})
+		return
+	}
+	r.clearPendingAttributionFilesLocked([]string{filePath})
 }
 
 // fileOutEdges returns every outgoing edge of every node defined in
@@ -3462,6 +4062,23 @@ func (r *Resolver) resolvePreparedFileEdgesLocked(
 	r.applyIncrementalReindexesLocked(reindexBatch, jobs, stats)
 }
 
+func (stats *ResolveStats) applyReindexes(g graph.Store, batch []graph.EdgeReindex) bool {
+	dropped := graph.ApplyEdgeReindexes(g, batch)
+	if len(dropped) == 0 {
+		return true
+	}
+	stats.WriteRefused = true
+	stats.DroppedFiles = append(stats.DroppedFiles, dropped...)
+	return false
+}
+
+func (stats *ResolveStats) bindingWriteError() error {
+	if len(stats.DroppedFiles) == 0 && !stats.WriteRefused {
+		return nil
+	}
+	return fmt.Errorf("%w: binding write did not apply; %d caller edges need retry", ErrReindexWriteRefused, len(stats.DroppedFiles))
+}
+
 func (r *Resolver) applyIncrementalReindexesLocked(
 	reindexBatch []graph.EdgeReindex,
 	jobs []reindexJob,
@@ -3470,29 +4087,35 @@ func (r *Resolver) applyIncrementalReindexesLocked(
 	legs := r.applyLegs
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		if checked, ok := r.graph.(interface {
-			ReindexEdgesApplied([]graph.EdgeReindex) bool
-		}); ok {
-			if !checked.ReindexEdgesApplied(reindexBatch) {
-				if stats.RefusedRebindFiles == nil {
-					stats.RefusedRebindFiles = make(map[string]struct{})
+		applied := stats.applyReindexes(r.graph, reindexBatch)
+		legs.lap("reindex")
+		recordRefusedRebindFiles := func() {
+			if stats.RefusedRebindFiles == nil {
+				stats.RefusedRebindFiles = make(map[string]struct{})
+			}
+			for _, rebind := range reindexBatch {
+				if rebind.Edge == nil {
+					continue
 				}
-				for _, rebind := range reindexBatch {
-					if rebind.Edge == nil {
-						continue
-					}
-					if file := r.edgeCallerFile(rebind.Edge); file != "" {
-						stats.RefusedRebindFiles[file] = struct{}{}
-					}
+				if file := r.edgeCallerFile(rebind.Edge); file != "" {
+					stats.RefusedRebindFiles[file] = struct{}{}
 				}
 			}
-		} else {
-			r.graph.ReindexEdges(reindexBatch)
 		}
-		legs.lap("reindex")
+		if !applied {
+			stats.WriteRefused = true
+			recordRefusedRebindFiles()
+			r.notePassWriteRefused()
+			return
+		}
 		// nil index: incremental batches are file-sized, direct probes
 		// stay under the single-save latency budget.
-		reconcilePlaceholderSources(r.graph, nil, reindexBatch)
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, nil, reindexBatch); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
+			stats.WriteRefused = true
+			recordRefusedRebindFiles()
+			r.notePassWriteRefused()
+		}
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}
@@ -3543,9 +4166,15 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	t0 := time.Now()
 	sub("rebind_go_method_receivers")
 	r.rebindGoMethodReceivers()
+	if r.writeRefused() {
+		return
+	}
 	t1 := time.Now()
 	sub("bind_bare_name_scope_refs")
 	r.bindBareNameScopeRefs()
+	if r.writeRefused() {
+		return
+	}
 	t2 := time.Now()
 	sub("shared_dataflow_generic_census")
 	census, censusStats := r.buildPostBareAttributionCensus(defaultAttributionCensusLimits)
@@ -3573,6 +4202,9 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	} else {
 		r.bindDataflowCalleeRefs()
 	}
+	if r.writeRefused() {
+		return
+	}
 	t3 := time.Now()
 	sub("bind_generic_param_refs")
 	if census != nil {
@@ -3581,12 +4213,21 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 	} else {
 		r.bindGenericParamRefs()
 	}
+	if r.writeRefused() {
+		return
+	}
 	t4 := time.Now()
 	sub("attribute_go_builtins")
 	r.attributeGoBuiltins()
+	if r.writeRefused() {
+		return
+	}
 	t5 := time.Now()
 	sub("attribute_go_external_calls")
 	r.attributeGoExternalCalls()
+	if r.writeRefused() {
+		return
+	}
 	t6 := time.Now()
 	// Last, so refs the passes above just bound to a partial fragment are
 	// folded onto the canonical node in the same sweep.
@@ -3621,11 +4262,29 @@ func (r *Resolver) runFileAttributionPassesLocked() {
 // builtin attribution so a local named `len` shadows the builtin.
 func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 	r.rebindGoMethodReceiversForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindBareNameScopeRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindDataflowCalleeRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.bindGenericParamRefsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.attributeGoBuiltinsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.attributeGoExternalCallsForFile(filePath)
+	if r.writeRefused() {
+		return
+	}
 	r.mergeCSharpPartialTypesForFile(filePath)
 }
 
@@ -3644,13 +4303,18 @@ func (r *Resolver) runFileAttributionPassesForFileLocked(filePath string) {
 func (r *Resolver) ResolveIncomingForFile(filePath string) *ResolveStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
+	stats := &ResolveStats{}
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
 	r.scopedCSharpVisibilityInvalidate([]string{filePath})
+	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		return stats
+	}
 
 	clear := r.buildPassIndexes()
 	defer clear()
 
-	stats := &ResolveStats{}
 	r.resolveIncomingLocked(filePath, stats)
 	return stats
 }
@@ -3672,7 +4336,12 @@ func (r *Resolver) ResolveIncomingForNames(names, repoPrefixes []string) *Resolv
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.bridgeRetryStateLocked()()
+	defer r.trackPassWriteRefused(&stats.WriteRefused)()
 	r.refreshGoModules()
+	if _, ok := r.flushPendingRetryWritesLocked(); !ok {
+		return stats
+	}
 
 	seen := make(map[string]struct{}, len(names))
 	var stubKeys []string
@@ -3999,6 +4668,14 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	if resolutionExempt(e) {
 		return oldTo, false
 	}
+	priorBinding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	delete(e.Meta, graph.JSPendingBindingMeta)
+	priorModule, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	if e.Meta[graph.JSImportSourceMeta] != nil && (e.Kind == graph.EdgeReExports || e.Meta[graph.JSForwardsImportMeta] == true) {
+		if stem, _ := r.jsBindingSource(e); stem != "" {
+			e.Meta[graph.JSBindingModuleMeta] = graph.JSModuleStem(stem)
+		}
+	}
 	// graph.UnresolvedName handles both `unresolved::Name` (legacy)
 	// and `<repoPrefix>::unresolved::Name` (multi-repo COPY rewrite).
 	// strings.TrimPrefix only stripped the bare form, leaving every
@@ -4031,6 +4708,9 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 	// override this inline branch gives single-file paths, where bulkMode is
 	// false and an interactive edit still resolves LSP-first.
 	if !r.bulkMode && r.tryResolveViaLSP(e, target, stats) {
+		if e.To != oldTo && !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+			delete(e.Meta, "guard_reverted")
+		}
 		return oldTo, e.To != oldTo
 	}
 
@@ -4158,7 +4838,12 @@ func (r *Resolver) resolveEdge(e *graph.Edge, stats *ResolveStats) (oldTo string
 		}
 	}
 
-	return oldTo, e.To != oldTo
+	if e.To != oldTo && !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+		delete(e.Meta, "guard_reverted")
+	}
+	binding, _ := e.Meta[graph.JSPendingBindingMeta].(string)
+	module, _ := e.Meta[graph.JSBindingModuleMeta].(string)
+	return oldTo, e.To != oldTo || binding != priorBinding || module != priorModule
 }
 
 // resolveExtern handles "extern::<importPath>::<symbol>" targets produced
@@ -4384,7 +5069,15 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+	to, aliasStem := jstsImportTargetAndAliasStem(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath)
+	if aliasStem != "" {
+		if e.Meta == nil {
+			e.Meta = make(map[string]any)
+		}
+		e.Meta[graph.JSImportSourceMeta] = importPath
+		e.Meta[graph.JSBindingModuleMeta] = aliasStem
+	}
+	if to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -4658,8 +5351,34 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
-	if r.handleJSLexicalBinding(e, funcName, candidates, stats) {
-		return
+	if e.Kind == graph.EdgeCalls && isJSTSPath(e.FilePath) {
+		lexical, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
+		switch lexical {
+		case graph.JSPendingParameter:
+			parkJSBinding(e, graph.JSPendingParameter, stats)
+			return
+		case graph.JSLexicalRequire:
+			if pick, trackedNpmSpec := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
+				bindImportCall(e, pick, "import_closure", stats)
+				if trackedNpmSpec != "" {
+					e.Meta[NpmImportSpecifierMeta] = trackedNpmSpec
+				} else {
+					delete(e.Meta, NpmImportSpecifierMeta)
+				}
+				return
+			}
+			stats.Unresolved++
+			return
+		case graph.JSLexicalLocal:
+			if !hasSameFileValue(e.FilePath, candidates) {
+				parkJSBinding(e, graph.JSPendingParameter, stats)
+				return
+			}
+		case "":
+			if !strings.Contains(funcName, ".") && r.tryResolveUnshadowedBinding(e, funcName, candidates, stats) {
+				return
+			}
+		}
 	}
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
@@ -4779,16 +5498,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Check JS/TS import evidence before directory locality (see import_evidence.go).
-	if pick, reason := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
-		e.To = pick.ID
-		e.Origin = graph.OriginASTResolved
-		e.Confidence = 0.9
-		if e.Meta == nil {
-			e.Meta = map[string]any{}
-		}
-		e.Meta["resolution"] = reason
-		stats.Resolved++
+	// Only file-level evidence remains after the explicit and generated binding tiers.
+	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
+		bindImportCall(e, pick, "import_closure", stats)
 		return
 	}
 

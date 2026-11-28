@@ -1325,6 +1325,29 @@ var viewGenSidecars = []viewGenSidecar{
 		columns: `repo_prefix, indexed_sha, dirty, indexed_at, workspace_fp,
 node_count, edge_count, extractor_versions`,
 	},
+	{
+		table: "ts_alias_state",
+		body: ` (
+    view_gen INTEGER NOT NULL DEFAULT 0,
+    repo_prefix TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY (view_gen, repo_prefix)
+) WITHOUT ROWID`,
+		columns: `repo_prefix, digest`,
+	},
+	// ts_alias_inputs records the config files (repo-relative path -> content
+	// hash, empty for a missing probe) that produced the alias digest above,
+	// so a warm restart can recheck them instead of walking the checkout.
+	{
+		table: "ts_alias_inputs",
+		body: ` (
+    view_gen INTEGER NOT NULL DEFAULT 0,
+    repo_prefix TEXT NOT NULL,
+    inputs TEXT NOT NULL,
+    PRIMARY KEY (view_gen, repo_prefix)
+) WITHOUT ROWID`,
+		columns: `repo_prefix, inputs`,
+	},
 	// enrichment_state records, per (repo, semantic provider), the git revision
 	// the graph was enriched at plus the coverage that pass reached. Enrichment
 	// completion otherwise lives only in an in-memory map, so a restart forgets

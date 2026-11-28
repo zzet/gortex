@@ -185,11 +185,13 @@ func deferredLSPWorkKeyForEdge(e *graph.Edge) deferredLSPWorkKey {
 }
 
 type deferredLSPBatchResult struct {
+	dropped             []string
 	newlyResolved       int
 	resolved            int
 	attempted           int
 	skipped             int
 	budgetExhausted     bool
+	writeRefused        bool
 	terminalityExcluded map[deferredLSPWorkKey]struct{}
 	livenessDur         time.Duration
 	attemptsDur         time.Duration
@@ -475,6 +477,9 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 		resolvedViaLSP := r.tryResolveViaLSP(e, de.target, &stats)
 		result.attemptsDur += time.Since(attemptStart)
 		if resolvedViaLSP {
+			if !graph.IsUnresolvedTarget(e.To) && e.Meta != nil {
+				delete(e.Meta, "guard_reverted")
+			}
 			result.resolved++
 			reindexBatch = append(reindexBatch, graph.EdgeReindex{Edge: e, OldTo: oldTo, OldKind: oldKind})
 			if wasUnresolved {
@@ -488,8 +493,16 @@ func (r *Resolver) resolveDeferredLSPWithPassBudget(
 	}
 	if len(reindexBatch) > 0 {
 		r.noteImportEdgeReindexes(reindexBatch)
-		r.graph.ReindexEdges(reindexBatch)
-		reconcilePlaceholderSources(r.graph, &r.placeholderSrcIdx, reindexBatch)
+		if !stats.applyReindexes(r.graph, reindexBatch) {
+			result.dropped = stats.DroppedFiles
+			result.writeRefused = true
+			result.resolved, result.newlyResolved = 0, 0
+			return result
+		}
+		if _, ok := reconcilePlaceholderSourcesApplied(r.graph, &r.placeholderSrcIdx, reindexBatch); !ok {
+			r.placeholderSrcIdx.retainRepoints(graph.PlaceholderSourceRepoints(reindexBatch))
+			result.writeRefused = true
+		}
 		for _, ri := range reindexBatch {
 			r.noteRetargetedCall(ri.Edge)
 		}

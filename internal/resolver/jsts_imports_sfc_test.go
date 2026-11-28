@@ -48,12 +48,12 @@ func TestProbeJSTSFileAcceptsExplicitSFC(t *testing.T) {
 		return nil
 	}
 	for _, stem := range []string{"src/Foo.vue", "src/Bar.svelte", "src/Baz.astro"} {
-		if got := probeJSTSFile(getNode, stem); got != stem {
-			t.Errorf("probeJSTSFile(%q) = %q, want verbatim", stem, got)
+		if got := probeJSTSFile(getNode, stem); got == nil || got.ID != stem {
+			t.Errorf("probeJSTSFile(%q) = %v, want verbatim", stem, got)
 		}
 	}
 	// No probing: `./Foo` never picks up Foo.vue.
-	if got := probeJSTSFile(getNode, "src/Foo"); got != "" {
-		t.Errorf("probeJSTSFile(src/Foo) = %q, want \"\"", got)
+	if got := probeJSTSFile(getNode, "src/Foo"); got != nil {
+		t.Errorf("probeJSTSFile(src/Foo) = %v, want nil", got)
 	}
 }

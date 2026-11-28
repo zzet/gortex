@@ -31,22 +31,26 @@ func TestTrackedNpmImportsSurviveEviction(t *testing.T) {
 					{ID: "lib/index.ts::f", Kind: graph.KindFunction, Name: "f", FilePath: "lib/index.ts", RepoPrefix: "lib"},
 				}
 				g.AddBatch(nodes, []*graph.Edge{
-					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p"}},
+					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p", graph.JSImportSourceMeta: "p"}},
 					{From: "app/a.ts", To: "lib/index.ts::f", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 1, CrossRepo: true, Meta: map[string]any{"npm_import": "p::f"}},
 					{From: "app/a.ts", To: "lib/index.ts", Kind: graph.EdgeImports, FilePath: "app/a.ts", Line: 2},
 				})
 				switch mode {
 				case "file":
 					idx := New(g, newTestRegistry(), config.IndexConfig{}, zap.NewNop())
-					assert.Equal(t, []string{"app/a.ts"}, idx.restubIncomingRefs("lib/index.ts"))
+					consumers, err := idx.restubIncomingRefs("lib/index.ts")
+					require.NoError(t, err)
+					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "batch":
 					stages := []*incrementalBatchStage{{graphPath: "lib/index.ts", priorNodes: nodes}}
-					_, consumers := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages))
+					_, consumers, err := restubIncomingRefsFromView(g, stages, loadIncrementalPriorView(g, stages), nil)
+					require.NoError(t, err)
 					assert.Equal(t, []string{"app/a.ts"}, consumers)
 					g.EvictFile("lib/index.ts")
 				case "replace":
-					evictRepoCurrentGeneration(g, "lib")
+					_, _, err := evictRepoCurrentGeneration(g, "lib")
+					require.NoError(t, err)
 				case "untrack":
 					mi := &MultiIndexer{graph: g}
 					_, _, err := mi.purgeRepositoryPayload("lib", nil)
@@ -78,7 +82,8 @@ func TestTrackedNpmRepoParkingIsScoped(t *testing.T) {
 			g.AddEdge(&graph.Edge{From: "app/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeCalls, FilePath: "app/a.ts", CrossRepo: true})
 			g.AddEdge(&graph.Edge{From: "other/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeCalls, FilePath: "other/a.ts", CrossRepo: true})
 			g.AddEdge(&graph.Edge{From: "app/a.ts::run", To: "lib/index.ts::f", Kind: graph.EdgeReferences, FilePath: "app/a.ts", CrossRepo: true})
-			evictRepoCurrentGeneration(g, "lib")
+			_, _, err := evictRepoCurrentGeneration(g, "lib")
+			require.NoError(t, err)
 			assert.Empty(t, g.GetOutEdges("other/a.ts::run"))
 			calls := g.GetOutEdges("app/a.ts::run")
 			if marked {
@@ -117,7 +122,8 @@ func TestNonNpmEvictionDoesNotHydrateIncoming(t *testing.T) {
 			if withImport {
 				g.AddEdge(&graph.Edge{From: "other/a.go", To: "lib/a.go", Kind: graph.EdgeImports, CrossRepo: true})
 			}
-			evictRepoCurrentGeneration(g, "lib")
+			_, _, err := evictRepoCurrentGeneration(g, "lib")
+			require.NoError(t, err)
 			assert.Zero(t, g.incomingReads, "non-npm eviction must not hydrate incoming adjacency")
 			assert.Empty(t, g.GetOutEdges("other/a.go::run"))
 		})
@@ -162,8 +168,19 @@ func TestTrackedNpmConsumersResolveWithoutRelevantReceipt(t *testing.T) {
 				return calls[0]
 			}
 			require.Equal(t, "lib/index.ts::f", call().To)
-			consumers := restubTrackedNpmImportsFromView(g, nil,
+			if db, ok := g.(*store_sqlite.Store); ok {
+				idx := mi.indexers["lib"]
+				idx.graph = refuseBindingInvalidation{db}
+				_, _, err := idx.incrementalEvictWatcherPath("index.ts")
+				idx.graph = db
+				require.ErrorContains(t, err, "refusing provider eviction")
+				require.NotNil(t, g.GetNode("lib/index.ts::f"))
+				require.Equal(t, "lib/index.ts::f", call().To)
+				require.False(t, idx.censusResolutionCurrent(provider))
+			}
+			consumers, err := restubTrackedNpmImportsFromView(g, nil,
 				g.GetInEdgesByNodeIDs([]string{"lib/index.ts", "lib/index.ts::f"}))
+			require.NoError(t, err)
 			require.Equal(t, []string{"app/app.ts"}, consumers)
 			require.Equal(t, "unresolved::f", call().To)
 

@@ -84,3 +84,19 @@ func TestDeltaWriterRefreshIdentityPreservesMovingSiblings(t *testing.T) {
 		})
 	}
 }
+
+func TestJSModuleDependenciesAcrossDelta(t *testing.T) {
+	base := New()
+	e := &Edge{From: "page.ts::run", To: "lib.ts::old", FilePath: "page.ts", Kind: EdgeCalls, Meta: map[string]any{JSBindingModuleMeta: "barrel"}}
+	base.AddEdge(e)
+	dw := NewDeltaWriter(base, nil)
+	found := JSModuleDependencyLookup(dw)("barrel")
+	require.Len(t, found, 1)
+	found[0].To = "other.ts::new"
+	found[0].Meta[JSBindingModuleMeta] = "other"
+	dw.ReindexEdges([]EdgeReindex{{Edge: found[0], OldTo: e.To}})
+	next := JSModuleDependencyLookup(dw)
+	require.Empty(t, next("barrel"))
+	require.Equal(t, "other.ts::new", next("other")[0].To)
+	require.Equal(t, "lib.ts::old", JSModuleDependencyLookup(base)("barrel")[0].To)
+}

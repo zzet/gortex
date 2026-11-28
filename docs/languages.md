@@ -110,19 +110,71 @@ language, so a missing definition is not a missing implementation.
 
 Recent extraction refinements (each covered by a per-feature CI golden): Java `@interface` annotation types index as interfaces and participate in implementation matching; Java `new T(){…}` and C# `new { … }` anonymous classes/types become synthetic type nodes with an `extends` edge (to the instantiated type, or to `object` for C#); JS/TS arrow-valued class fields (`x = () => {…}`) are emitted as callable methods; JS/TS named imports emit one `imports` edge per binding (alias-aware via `Edge.Alias`) and barrel re-exports emit `re_exports` edges; JS/TS cross-file imports resolve onto the target file/symbol for relative specifiers (`./x`, `../x`) and for `tsconfig.json` / `jsconfig.json` `compilerOptions.paths` / `baseUrl` path aliases (`@/lib/x`), so callers / usages / blast-radius span aliased imports the same as relative ones; chained / factory-call receivers (`New().Build()`) carry an inferred `receiver_type`. See [features.md](features.md) and [architecture.md](architecture.md) for the edge semantics.
 
-### JS/TS import evidence
+### TypeScript path aliases
 
-Bare JS/TS calls can resolve at `ast_resolved` even when the repository has
-only one candidate. An unrenamed named import that matches a directly exported
-declaration takes precedence (`import_binding`). Otherwise, a unique candidate
-in a directly imported file or its barrel re-exports can supply file-level
-evidence (`import_closure`). A same-file declaration blocks import promotion;
-when imports don't settle the call, the usual resolution rules still apply.
+`tsconfig.json` and `jsconfig.json` accept JSONC comments and trailing commas.
+Relative `extends` chains, including TypeScript 5 arrays, inherit `baseUrl` and
+replace (not merge) `paths`. Targets without a `baseUrl` remain relative to the
+config that declares them, while the child config determines the caller scope.
+Generated `.nuxt` configs are read only when explicitly extended; the directory
+is not scanned as an independent scope. Package-specifier `extends` and project
+`references` are not traversed. Cycles and chains deeper than 32 configs stop.
+When an effective alias changes, reindexing rebinds existing JS/TS callers
+even if their source files have not changed.
+Relative parents are tried as written before the `.json` fallback.
+
+### JS/TS call resolution
+
+Bare JS/TS calls with import evidence resolve at `ast_resolved`, including when
+the repository has only one definition. A named import of the defining symbol
+outranks file-level closure evidence; otherwise a unique directly imported or
+barrel-re-exported defining file supplies the binding. Same-file declarations
+still win, and ambiguous import evidence does not promote a guessed target.
 A call whose name is bound by an enclosing parameter, catch clause, block or
 hoisted `var` is not an import call. It binds to a same-file declaration when
 one exists and otherwise stays unresolved. A local initialized from an
-unshadowed static `require("...")` is not treated as a shadow: the call keeps
-the ordinary import tiers.
+unshadowed static `require("...")` binding resolves only against that required
+module instead of file-wide imports.
+Import statement evidence is batch-loaded per resolver page and cleared after
+interleaved mutations, so promotion does not add per-call adjacency queries.
+For CommonJS, a default import binds `module.exports`. When the final export
+object is marked `__esModule`, as TypeScript and Babel emit, its top-level
+`.default` is the compiled-interop target. `.mjs` and `.mts` consumers are
+native ESM and always take `module.exports`; `.cjs` and `.cts` consumers take
+`.default`. Other extensions depend on package `type`, compiler module settings
+or a bundler, so when `__esModule` is set they bind only when both modes name
+the same value — an absent callable in either mode is disagreement and stays
+unresolved instead of guessing.
+Named imports follow top-level property assignments and deletes on
+`module.exports` or its attached `exports` alias; `delete module.exports`
+clears them all. Conditional and function-body
+writes are not treated as guaranteed exports.
+Normal Vue `<script>` blocks can export or re-export names; `<script setup>`
+locals are not module exports. A watcher rechecks fallback bindings when a
+preferred tsconfig target appears. If that target is a declaration file,
+an exported `declare function` signature can be the call target.
+
+### Nuxt app auto-imports
+
+Prepared Nuxt projects supply their own binding evidence in `.nuxt/imports.d.ts`.
+Relative named exports into the repository, including `original as local`
+renames, resolve bare JS/TS and SFC calls at `ast_resolved` with
+`resolution: nuxt_auto_import`. A generated binding beats an unrelated import
+from a file with a same-named export, but never an explicit local value binding
+or a visible local value, including a captured parameter. Named and star barrel
+exports resolve to the implementation; private helpers are not exports.
+Explicit module extensions are tried verbatim. A known binding without an
+indexed implementation stays unresolved. Adding the implementation or changing
+a forwarded or default export rebinds both explicit and generated callers.
+
+Package imports, `#app` specifiers, conflicting generated names, and paths
+outside the repository are ignored. An unprepared nested application does not
+inherit outer globals; a config in `layers/<name>/` belongs to the parent app.
+The app list excludes config and generated files and the project's or a layer's
+Nitro `server/`, not ordinary app paths such as `app/pages/server/`. SQLite records
+the applied input digest after resolver catch-up. A dropped binding write leaves
+the digest invalid and queues the affected callers for re-extraction. A restart
+can therefore detect incomplete bindings even when source mtimes have not changed.
 
 ### Julia specifics
 

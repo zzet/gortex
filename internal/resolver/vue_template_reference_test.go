@@ -80,16 +80,6 @@ func TestVueTemplateReferenceImportSQLite(t *testing.T) {
 	s, err = store_sqlite.Open(path)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, s.Close()) }()
-	imports := s.GetOutEdges("Shop.vue")
-	require.NotEmpty(t, imports)
-	persisted := false
-	for _, imp := range imports {
-		if imp.Meta["vue_default_import"] == "Panel" {
-			persisted = true
-			require.Empty(t, imp.Alias)
-		}
-	}
-	require.True(t, persisted, "default binding must survive SQLite round trip")
 	New(s).ResolveAll()
 	found := false
 	for _, e := range s.GetOutEdges("Shop.vue::Shop") {

@@ -464,21 +464,16 @@ func TestTheManifestTreeOfAProvenBuildRecordsItsReads(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "src", "missing.c")); err != nil {
 		t.Fatal(err)
 	}
-	tsAliasCacheMu.Lock()
-	delete(tsAliasCache, root)
-	tsAliasCacheMu.Unlock()
-	tsAliasCollectionForTree(tree)
+	invalidateResolutionInputs(root)
+	resolutionInputsForTree(tree)
 	if !proof.isUnbounded() || proof.proven() != nil {
 		t.Fatal("a whole-tree config scan left the proof bounded")
 	}
 }
 
-// A build whose tsconfig / jsconfig alias scopes the process-wide cache
-// answers reads no config itself, so its proof stays bounded; but its payload
-// is built on what those configs said, so each config a cached scope came
-// from joins the read set, held to its change stamp: one moved and restored
-// during the build refuses it.
-func TestACachedAliasScopeHoldsItsConfigsToTheirStamps(t *testing.T) {
+// Replaying cached inputs must use the bytes that supplied the collection,
+// not the bytes that happen to be on disk at replay time.
+func TestCachedAliasScopeProvesOriginalConfigBytes(t *testing.T) {
 	builderIsolateGit(t)
 	root := builderTempDir(t, "checkout")
 	builderGit(t, root, "init", "--initial-branch=main")
@@ -501,16 +496,14 @@ func TestACachedAliasScopeHoldsItsConfigsToTheirStamps(t *testing.T) {
 		t.Skip("the checkout's filesystem gives no change stamps")
 	}
 	t.Cleanup(func() {
-		tsAliasCacheMu.Lock()
-		delete(tsAliasCache, root)
-		tsAliasCacheMu.Unlock()
+		invalidateResolutionInputs(root)
 	})
-	if loadTSAliasCollection(root) == nil { // an earlier build's scan
+	if workingResolutionInputs(root, nil).aliases == nil { // an earlier build's scan
 		t.Fatal("the fixture's configs gave no alias scopes")
 	}
 	proof := newBuildContentProof(root, before)
 	tree := provenManifestTree{diskManifestTree: newDiskManifestTree(root), proof: proof}
-	if tsAliasCollectionForTree(tree) == nil {
+	if resolutionInputsForTree(tree).aliases == nil {
 		t.Fatal("the cache answered no alias scopes")
 	}
 	if proof.isUnbounded() {
@@ -521,26 +514,20 @@ func TestACachedAliasScopeHoldsItsConfigsToTheirStamps(t *testing.T) {
 		proof.mu.Lock()
 		held, read := proof.parsed[rel]
 		proof.mu.Unlock()
-		if !read || held.sha256 != "" || !slices.Contains(set.files, rel) {
-			t.Errorf("config %s behind a cached scope: recorded %v (%+v), in read set %v; want it held as a read of unknown bytes", rel, read, held, slices.Contains(set.files, rel))
+		if !read || held.sha256 == "" || !slices.Contains(set.files, rel) {
+			t.Errorf("config %s behind a cached scope: recorded %v (%+v), in read set %v; want its content identity", rel, read, held, slices.Contains(set.files, rel))
 		}
 	}
-	if moved, err := proof.unrecordedMoved(context.Background(), sampler, before); err != nil || moved != "" {
-		t.Fatalf("nothing moved, yet unrecordedMoved = %q, %v", moved, err)
-	}
-	config := filepath.Join(root, "web", "jsconfig.json")
-	held, err := os.ReadFile(config)
+	rel := "web/jsconfig.json"
+	original, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, []byte("{}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(config, held, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if moved, err := proof.unrecordedMoved(context.Background(), sampler, before); err != nil || moved != "web/jsconfig.json" {
-		t.Fatalf("a config behind a cached scope moved and restored during the build = %q, %v; want web/jsconfig.json held to its stamp", moved, err)
+	builderWriteFile(t, root, rel, "{}\n")
+	later := newBuildContentProof(root, before)
+	resolutionInputsForTree(provenManifestTree{diskManifestTree: newDiskManifestTree(root), proof: later})
+	if got := later.parsed[rel].sha256; got != gitstate.BlobSHA256(original) {
+		t.Fatalf("cache hit after an unprocessed config edit recorded %q, want the prior input digest", got)
 	}
 }
 

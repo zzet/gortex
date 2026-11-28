@@ -7,10 +7,11 @@ import (
 )
 
 func TestSvelteExtractor(t *testing.T) {
-	const svelte = `<script lang="ts">
+	const svelte = `<script data-note="x > y" lang=ts>
   import { onMount } from 'svelte'
   let count = 0
-  function increment() { count += 1 }
+  function increment(): void { count += 1 }
+  interface Props { label: string }
 </script>
 
 <button on:click={increment}>{count}</button>
@@ -20,8 +21,13 @@ func TestSvelteExtractor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var comp, incr *graph.Node
+	// Only the TypeScript extractor emits an interface: the quoted ">" and the
+	// unquoted lang=ts must both survive script-tag parsing.
+	var comp, incr, props *graph.Node
 	for _, n := range res.Nodes {
+		if n.Kind == graph.KindInterface && n.Name == "Props" {
+			props = n
+		}
 		if n.Kind == graph.KindType && n.Name == "Counter" {
 			comp = n
 		}
@@ -37,6 +43,9 @@ func TestSvelteExtractor(t *testing.T) {
 	}
 	if incr == nil {
 		t.Fatalf("delegated function 'increment' was not extracted from <script>")
+	}
+	if props == nil {
+		t.Fatalf("interface 'Props' missing: <script lang=ts> was not delegated to TypeScript")
 	}
 	if incr.Language != "svelte" || incr.Meta["inline_script"] != true {
 		t.Errorf("delegated symbol lang=%q meta=%v, want svelte + inline_script", incr.Language, incr.Meta)

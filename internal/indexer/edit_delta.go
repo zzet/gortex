@@ -67,6 +67,29 @@ const (
 	editDeltaFallbackRefused  = "delta_refused"
 )
 
+// A cold lookup walks the checkout and forces a full publication sample.
+// Avoid it when neither the edit nor any stored caller could consume an alias.
+func deltaMayUseAliases(ctx context.Context, req *BuildRequest) (bool, error) {
+	if len(req.Changes) == 0 {
+		return false, nil
+	}
+	for _, change := range req.Changes {
+		if closureJSTSPath(change.Path) {
+			return true, nil
+		}
+	}
+	switch base := req.Base.(type) {
+	case *store_sqlite.Store:
+		return base.MayHaveTSAliasCallers(ctx, req.RepoPrefix)
+	case commitLayerBase:
+		// The coordinator's materialized ancestry shares one database.
+		if len(base.facts.handles) != 0 {
+			return base.facts.handles[0].MayHaveTSAliasCallers(ctx, req.RepoPrefix)
+		}
+	}
+	return true, nil // no complete inventory for this reader
+}
+
 // buildWorkingTreeLayer builds one working-tree generation through the delta
 // path, falling back to the sparse closure builder for a manifest change and
 // for a delta the DeltaWriter refused.
@@ -130,8 +153,27 @@ func (b *SparseGenerationBuilder) buildWorkingTreeLayer(ctx context.Context, req
 	if req.importBatch {
 		req.contentProof.disable()
 	}
+	mayUseAliases, err := deltaMayUseAliases(ctx, &req)
+	if err != nil {
+		return 0, BuildReport{}, err
+	}
 	for _, change := range req.Changes {
-		if dependencyManifestPath(change.Path) {
+		manifest := dependencyManifestPath(change.Path)
+		if !manifest && mayUseAliases {
+			if req.deltaResolution == nil {
+				paths := make([]string, len(req.Changes))
+				for i, c := range req.Changes {
+					paths[i] = c.Path
+				}
+				req.deltaResolution, err = checkoutResolutionInputs(req.RootPath, req.contentProof, paths)
+				if err != nil {
+					return 0, BuildReport{}, err
+				}
+			}
+			// An inherited config can have any name or extension.
+			_, manifest = req.deltaResolution.reads[filepath.ToSlash(change.Path)]
+		}
+		if manifest {
 			req.contentProof.disable()
 			if req.followup && b.Config.Coverage.IsEnabled("clones") {
 				return 0, BuildReport{}, fmt.Errorf("indexer: clone follow-up cannot use the sparse manifest path: %s", change.Path)
@@ -826,6 +868,18 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	}
 	chainTouched := dw.ChainTouchedPaths()
 	idx := New(dw, b.Registry, b.Config, b.Logger)
+	idx.deltaResolution = req.deltaResolution
+	if base, ok := req.Base.(aliasStateStore); ok && idx.deltaResolution != nil {
+		prior, err := base.TSAliasDigest(req.RepoPrefix)
+		if err != nil {
+			idx.Close()
+			return nil, err
+		}
+		if prior != "" && prior != idx.deltaResolution.digest {
+			idx.Close()
+			return nil, &editDeltaRefusedError{reason: "resolution inputs changed"}
+		}
+	}
 	idx.contractGenerationID = handle.ViewGeneration()
 	idx.contractProjectionContext = ctx
 	idx.contractProjectionNeedsWitness = true
@@ -955,13 +1009,14 @@ func (b *SparseGenerationBuilder) runEditDelta(
 	// content hash among them), which an inert save leaves unwritten.
 	// The resolver catch-up is the engine's largest phase with no log of its
 	// own; the delta times it and counts the pages it brings in.
-	idx.incrementalResolveFilesHook = func(frontier []string) {
+	idx.incrementalResolveFilesHook = func(frontier []string) []string {
 		started, io := time.Now(), editDeltaProcessIO()
-		idx.resolver.ResolveFilesAndIncoming(frontier)
+		stats := idx.resolver.ResolveFilesAndIncoming(frontier)
 		used := editDeltaProcessIO().since(io)
 		out.ResolveFrontier += len(frontier)
 		out.ResolveDuration += time.Since(started)
 		out.ResolveFaults += used.majorFaults
+		return stats.DroppedFiles
 	}
 	// Each engine pass is split into the stages the engine announces
 	// (observeIncrementalCatchup): the reconcile before the resolver, then

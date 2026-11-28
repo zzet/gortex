@@ -497,9 +497,12 @@ func (mi *MultiIndexer) newCrossRepoResolver() *resolver.CrossRepoResolver {
 	cr.SetGoModuleDepRetry(&mi.goModuleRetry, revision)
 	cr.SetNpmAliasResolver(mi.npmAliasResolver())
 	cr.SetNpmDependencyLookup(mi.npmDependencyLookup())
-	cr.SetNpmPackageLookup(mi.npmPackageLookup())
+	lookup, recheck := mi.npmPackageLookups()
+	cr.SetNpmPackageLookup(lookup)
+	cr.SetNpmRequireRecheck(recheck)
 	cr.SetPathAliasResolver(mi.pathAliasResolver())
 	cr.SetWorkspaceMembership(mi.workspaceMembershipResolver())
+	cr.SetRetryStateBridge(mi.takePendingCrossRepoRepoints, mi.savePendingCrossRepoRepoints)
 	mi.applyRemoteStitch(cr)
 	return cr
 }
@@ -546,29 +549,30 @@ func (mi *MultiIndexer) runCrossRepoResolveContext(ctx context.Context, reconcil
 // and the topology-writer gates of every repository the mutation can affect, so
 // the graph cannot expose a half-resolved batch between same-repo, semantic,
 // and cross-repository phases.
-func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) {
-	mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
+func (mi *MultiIndexer) runCrossRepoResolveFiles(filePaths []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFiles(filePaths, filePaths)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFiles(resolutionFiles, materializationFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiers(resolutionFiles, materializationFiles, materializationFiles)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) {
-	mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiers(resolutionFiles, edgeSourceFiles, definitionFiles []string) *resolver.CrossRepoStats {
+	return mi.runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, nil)
 }
 
-func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) {
+func (mi *MultiIndexer) runCrossRepoResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles []string, observe func(time.Time, time.Time)) *resolver.CrossRepoStats {
 	if len(resolutionFiles) == 0 && len(edgeSourceFiles) == 0 && len(definitionFiles) == 0 {
-		return
+		return nil
 	}
 	cr := mi.newCrossRepoResolver()
 	if cr == nil {
-		return
+		return nil
 	}
-	cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
+	stats := cr.ResolveMutationFrontiersObserved(resolutionFiles, edgeSourceFiles, definitionFiles, observe)
 	mi.finishGoModuleCalls(cr)
 	mi.reconcileRetargetedTestCalls(cr.TakeRetargetedTestCallFiles())
+	return stats
 }
 
 // crossWorkspaceLookup builds a resolver.CrossWorkspaceDepLookup from

@@ -45,7 +45,7 @@ func (r *Resolver) bindGenericParamRefs() {
 		}
 	}
 	if len(batch) > 0 {
-		r.graph.ReindexEdges(batch)
+		r.applyReindexEdges(batch)
 	}
 }
 

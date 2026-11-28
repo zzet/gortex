@@ -233,8 +233,8 @@ function setup(): unknown {
 		if e.Origin != graph.OriginASTResolved {
 			t.Errorf("origin = %q, want %q", e.Origin, graph.OriginASTResolved)
 		}
-		if e.Meta == nil || e.Meta["resolution"] != "import_closure" {
-			t.Errorf("meta resolution = %v, want import_closure", e.Meta)
+		if e.Meta == nil || e.Meta["resolution"] != "import_binding" {
+			t.Errorf("meta resolution = %v, want import_binding", e.Meta)
 		}
 		return
 	}
@@ -253,10 +253,10 @@ func TestPickImportEvidenceCallee_LanguageGate(t *testing.T) {
 		{ID: "pkgA/b.go::helper", Kind: graph.KindFunction, FilePath: "pkgA/b.go", Name: "helper"},
 		{ID: "pkgB/c.go::helper", Kind: graph.KindFunction, FilePath: "pkgB/c.go", Name: "helper"},
 	}
-	if pick, _ := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
+	if pick := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
 		t.Errorf("go caller: pick = %v, want nil (language gate)", pick.ID)
 	}
-	if pick, _ := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
+	if pick := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
 		t.Errorf("python caller: pick = %v, want nil (language gate)", pick.ID)
 	}
 }

@@ -78,8 +78,16 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		acquired = time.Now()
 	}
 	defer cr.mu.Unlock()
+	defer cr.bridgeRetryStateLocked()()
 	if observe != nil {
 		observe(started, acquired)
+	}
+
+	if cr.placeholderSrcIdx.hasDeferred() {
+		if _, ok := cr.placeholderSrcIdx.applyDeferredApplied(cr.graph); !ok {
+			stats.WriteRefused = true
+			return stats, admission
+		}
 	}
 
 	if len(resolutionFiles) > 0 {
@@ -95,7 +103,7 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		if cr.npmPackages != nil {
 			for _, edges := range frontier.outByNode {
 				for _, edge := range edges {
-					if trackedNpmImportSpec(edge) != "" {
+					if trackedNpmImportSpec(edge) != "" || trackedNpmRequireCall(edge) {
 						frontier.pending = append(frontier.pending, edge)
 					}
 				}
@@ -104,7 +112,7 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		pending := make([]*graph.Edge, 0, len(frontier.pending))
 		seen := make(map[graph.EdgeIdentity]struct{}, len(frontier.pending))
 		for _, edge := range frontier.pending {
-			if edge == nil || !graph.IsUnresolvedTarget(edge.To) && trackedNpmImportSpec(edge) == "" {
+			if edge == nil || !graph.IsUnresolvedTarget(edge.To) && trackedNpmImportSpec(edge) == "" && !trackedNpmRequireCall(edge) {
 				continue
 			}
 			identity := graph.EdgeIdentityFor(edge)
@@ -116,6 +124,9 @@ func (cr *CrossRepoResolver) resolveMutationFrontiersBounded(resolutionFiles, ed
 		}
 		if len(pending) > 0 {
 			stats = cr.resolveScopedLocked(pending)
+			if stats.WriteRefused {
+				return stats, admission
+			}
 		}
 	}
 	if len(definitionFiles) > 0 && len(cr.goModules) > 0 && !admission.Refused {

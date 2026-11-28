@@ -1,6 +1,8 @@
 package graph
 
 import (
+	"iter"
+	"path"
 	"strings"
 	"time"
 )
@@ -307,13 +309,106 @@ var validNodeKinds = map[NodeKind]bool{
 	KindMacro:     true, KindAgent: true, KindContractBridge: true,
 }
 
-// Persisted lexical evidence on bare JS/TS call edges: the name is bound by an
-// enclosing scope, so a module import of that name cannot be the callee.
+// Persisted JS/TS binding evidence shared by extraction, resolution and restubbing.
 const (
-	JSLexicalBindingMeta = "js_lexical_binding"
-	JSLexicalLocal       = "local"
-	JSPendingParameter   = "parameter"
+	DefaultExportMeta        = "default_export"
+	ImportBindingsMeta       = "import_bindings"
+	StarReExportMeta         = "star_reexport"
+	JSBindingNameMeta        = "js_binding_name"   // caller spelling on exact calls only
+	JSBindingModuleMeta      = "js_binding_module" // reverse lookup key for calls and forwarding modules
+	JSImportSourceMeta       = "js_import_source"
+	JSLocalExportsMeta       = "js_local_exports"
+	JSExportScopeMeta        = "js_export_scope" // virtual ID suffix of a Vue normal script
+	JSForwardsImportMeta     = "js_forwards_import"
+	JSLexicalBindingMeta     = "js_lexical_binding"
+	JSLexicalLocal           = "local"
+	JSLexicalRequire         = "require"
+	JSLexicalRequireSpecMeta = "js_lexical_require"
+	JSAmbientShadowMeta      = "js_ambient_shadow" // a local hides generated globals but is not an import shadow
+	JSShadowModule           = "module"            // module-scope declaration
+	JSPendingBindingMeta     = "pending_js_binding"
+	JSPendingImport          = "import"
+	JSPendingGenerated       = "nuxt"
+	JSPendingParameter       = "parameter"
+	JSDefaultBinding         = "default"
+	JSInteropDefaultBinding  = ".default"    // compiled CommonJS default, distinct from module.exports
+	JSInteropMarkerBinding   = ".__esModule" // marks a CommonJS module with __esModule = true
+	JSNamespaceBinding       = "*"
 )
+
+// AppendJSBinding encodes one identifier pair. Unrenamed bindings need only
+// one identifier; JS identifiers cannot contain whitespace or a colon.
+func AppendJSBinding(b *strings.Builder, local, original string) {
+	if b.Len() != 0 {
+		b.WriteByte(' ')
+	}
+	b.WriteString(local)
+	if local != original {
+		b.WriteByte(':')
+		b.WriteString(original)
+	}
+}
+
+func JSBinding(bindings, local string) string {
+	for name, orig := range JSBindingPairs(bindings) {
+		if name == local {
+			return orig
+		}
+	}
+	return ""
+}
+
+// JSBindingPairs yields each encoded local name with its original name.
+func JSBindingPairs(bindings string) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for pair := range strings.FieldsSeq(bindings) {
+			name, orig, renamed := strings.Cut(pair, ":")
+			if !renamed {
+				orig = name
+			}
+			if !yield(name, orig) {
+				return
+			}
+		}
+	}
+}
+
+// JSExportsImport reports whether a local export names a value in this import.
+func JSExportsImport(exports, defaultLocal, imports string) bool {
+	if defaultLocal != "" && JSBinding(imports, defaultLocal) != "" {
+		return true
+	}
+	for pair := range strings.FieldsSeq(exports) {
+		_, local, renamed := strings.Cut(pair, ":")
+		if !renamed {
+			local = pair
+		}
+		if JSBinding(imports, local) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// JSExportID qualifies a module symbol in its normal script, if embedded.
+func JSExportID(file *Node, name string) string {
+	scope, _ := file.Meta[JSExportScopeMeta].(string)
+	return file.ID + scope + "::" + name
+}
+
+// JSModuleStem is a conservative reverse-lookup key, not a forward resolver.
+func JSModuleStem(file string) string {
+	for _, ext := range [...]string{".d.ts", ".d.cts", ".d.mts"} {
+		if strings.HasSuffix(file, ext) {
+			return strings.TrimSuffix(file, ext)
+		}
+	}
+	switch ext := path.Ext(file); ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs":
+		return strings.TrimSuffix(file, ext)
+	}
+	return file
+}
 
 type Node struct {
 	ID        string   `json:"id"`
@@ -330,8 +425,8 @@ type Node struct {
 	StartColumn int            `json:"start_column,omitempty"`
 	EndColumn   int            `json:"end_column,omitempty"`
 	Language    string         `json:"language"`
-	Meta       map[string]any `json:"meta,omitempty"`
-	RepoPrefix string         `json:"repo_prefix,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+	RepoPrefix  string         `json:"repo_prefix,omitempty"`
 	// WorkspaceID is the hard graph boundary slug. Two nodes with
 	// different WorkspaceIDs are not allowed to be matched as contract
 	// provider/consumer pairs and queries scope by it by default.
