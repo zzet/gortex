@@ -93,24 +93,21 @@ function setup(): unknown {
 			wantUnresolved: true,
 		},
 		{
-			// Both candidates' files are imported (one for an unrelated
-			// binding): the import statement alone cannot arbitrate, so
-			// the pick refuses exactly like the no-import case.
-			// Alias-cast exports (KindVariable) keep today's behaviour
-			// deterministic: the value-callee fallback refuses on
-			// repo-wide ambiguity.
-			name: "multiple imported candidates still refuse",
+			// No named binding selects either candidate. Importing both
+			// modules for unrelated helpers leaves file evidence ambiguous.
+			name: "ambiguous file closure still refuses",
 			files: map[string]string{
 				"a/one.ts": `type MakeA = () => unknown;
 const implA = () => ({ a: true });
 export const createStore = implA as MakeA;
+export const other = () => 1;
 `,
 				"b/two.ts": `type MakeB = () => unknown;
 const implB = () => ({ b: true });
 export const createStore = implB as MakeB;
 export const helper = () => 1;
 `,
-				"app/main.ts": `import { createStore } from '../a/one';
+				"app/main.ts": `import { other } from '../a/one';
 import { helper } from '../b/two';
 function run(): unknown {
   helper();
@@ -217,7 +214,8 @@ func TestImportEvidence_ResolvedEdgeStampsProvenance(t *testing.T) {
 `,
 		"tests/util.ts": `export function createStore(): unknown { return { helper: true }; }
 `,
-		"tests/a.test.ts": `import { createStore } from '../src/vanilla';
+		"src/index.ts": `export * from './vanilla'`,
+		"tests/a.test.ts": `import { createStore } from '../src/index';
 function setup(): unknown {
   return createStore({});
 }
@@ -255,10 +253,10 @@ func TestPickImportEvidenceCallee_LanguageGate(t *testing.T) {
 		{ID: "pkgA/b.go::helper", Kind: graph.KindFunction, FilePath: "pkgA/b.go", Name: "helper"},
 		{ID: "pkgB/c.go::helper", Kind: graph.KindFunction, FilePath: "pkgB/c.go", Name: "helper"},
 	}
-	if pick := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
+	if pick, _ := r.pickImportEvidenceCallee("pkgA/a.go", "helper", candidates); pick != nil {
 		t.Errorf("go caller: pick = %v, want nil (language gate)", pick.ID)
 	}
-	if pick := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
+	if pick, _ := r.pickImportEvidenceCallee("app/mod.py", "helper", candidates); pick != nil {
 		t.Errorf("python caller: pick = %v, want nil (language gate)", pick.ID)
 	}
 }

@@ -18,13 +18,15 @@ type canonicalAttemptEvidence struct {
 	nativeMtimeDuplicate                                             bool
 	executorStart, executorEnd, derivedStart, derivedEnd             int64
 	hasExecutorStart, hasExecutorEnd, hasDerivedStart, hasDerivedEnd bool
+	writer                                                           canonicalWriterEvidence
 }
 
 // New immutable evidence is copied at actual return, never into an already
 // exposed early snapshot. Caller holds the collector lock.
 func (s *PublicationStamps) freezeAttemptEvidence(origin time.Time) canonicalAttemptEvidence {
 	p := s.patchLaps
-	out := canonicalAttemptEvidence{observed: p.controlObserved && p.controlFinished, invalid: p.invalid || p.active != 0, nativeMtimeDuplicate: p.nativeMtimeDuplicate}
+	out := canonicalAttemptEvidence{observed: p.controlObserved && p.controlFinished, invalid: p.invalid || p.active != 0, nativeMtimeDuplicate: p.nativeMtimeDuplicate,
+		writer: p.freezeWriterEvidence(origin)}
 	if !p.attemptStarted.IsZero() {
 		out.startNS = p.attemptStarted.Sub(origin).Nanoseconds()
 	}
@@ -231,6 +233,7 @@ type EditPatchAccounting struct {
 	PhaseStates          map[string]string   `json:"phase_states"`
 	SubtotalMS           *float64            `json:"observed_subtotal_ms"`
 	UnattributedMS       *float64            `json:"unattributed_ms"`
+	WriterWrite          EditWriterWrite     `json:"writer_write"`
 }
 
 func (w canonicalAttemptWindow) projectAccounting() *EditPatchAccounting {
@@ -242,6 +245,7 @@ func (w canonicalAttemptWindow) projectAccountingScope(directShared bool) *EditP
 	out := &EditPatchAccounting{AttemptTicket: w.ticket, AttemptRetry: w.retry, Scope: "accepted_winning_physical_attempt", BackgroundCoverage: "not_established", SumState: p.state, PartitionComplete: p.complete,
 		PhasesMS: make(map[string]*float64, canonicalPatchLapCount), PhaseStates: make(map[string]string, canonicalPatchLapCount)}
 	out.ExecutionDisposition = w.executionDisposition()
+	out.WriterWrite = w.projectWriterWrite()
 	for i, name := range canonicalAttemptLapNames {
 		out.PhasesMS[name], out.PhaseStates[name] = nil, p.states[i]
 		if p.states[i] == "measured" {
@@ -276,12 +280,30 @@ func (w canonicalAttemptWindow) MarshalLogObject(enc zapcore.ObjectEncoder) erro
 		enc.AddFloat64("observed_subtotal_ms", float64(p.sumNS)/1e6)
 		enc.AddFloat64("unattributed_ms", float64(w.endNS-w.startNS-p.sumNS)/1e6)
 	}
+	writer := w.projectWriterWrite()
+	enc.AddString("writer_write_state", writer.State)
+	if writer.Reason != nil {
+		enc.AddString("writer_write_reason", *writer.Reason)
+	}
+	if writer.State == "measured" {
+		enc.AddFloat64("writer_xwrite_ms", *writer.XWriteMS)
+		enc.AddInt64("writer_xwrite_bytes", *writer.XWriteBytes)
+		enc.AddInt64("writer_holds", *writer.Holds)
+		enc.AddFloat64("writer_hold_ms", *writer.HoldMS)
+		enc.AddInt64("writer_unowned_store_holds", *writer.UnownedStoreHolds)
+		if writer.BeforeDerivedXWriteMS != nil {
+			enc.AddFloat64("writer_before_derived_xwrite_ms", *writer.BeforeDerivedXWriteMS)
+		}
+	}
 	return nil
 }
 
 func (w canonicalAttemptWindow) executionDisposition() string {
 	if w.accounting.nativeMtimeDuplicate {
 		return "native_mtime_duplicate"
+	}
+	if w.checkoutCycle {
+		return checkoutRefreshCycle
 	}
 	return "not_observed"
 }

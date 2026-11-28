@@ -178,9 +178,10 @@ A gateway preset is a built-in, ready-made custom provider for a well-known Open
 | `requesty` | `https://router.requesty.ai/v1` (EU: `https://router.eu.requesty.ai/v1`) | `openai/gpt-4o-mini` | `REQUESTY_API_KEY` | `frontier` |
 | `runcrate` | `https://api.runcrate.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash` | `RUNCRATE_API_KEY` | `frontier` |
 | `standardcompute` | `https://api.stdcmpt.com/v1` (US: `https://us.stdcmpt.com/v1`) | `deepseek/deepseek-v4-flash` | `STANDARDCOMPUTE_API_KEY` | `frontier` |
+| `teamorouter` | `https://api.teamorouter.com/v1` | `deepseek-v4-flash` | `TEAMOROUTER_API_KEY` | `frontier` |
 | `uberllm` | `https://api.uberllm.dev/v1` | `deepseek/deepseek-v4-flash` | `UBERLLM_API_KEY` | `frontier` |
 
-The `cheapaimodel` preset also sends `reasoning_effort: none`: its default model reasons by default, and the reasoning can use up the small output budget of the `assist` passes before any JSON is written. Kimi models accept `none` too. GLM models always reason: with `none` they returned HTTP 400 or an empty answer, and with the default effort they used up the 192-token expand budget, so they are not a good fit for `assist`.
+The `cheapaimodel` and `teamorouter` presets also send `reasoning_effort: none`: their default models reason by default, and the reasoning can use up the small output budget of the `assist` passes before any JSON is written. Kimi models accept `none` too. GLM models always reason: with `none` they returned HTTP 400 or an empty answer, and with the default effort they used up the 192-token expand budget, so they are not a good fit for `assist`.
 
 When `llm.provider` names `X`, gortex resolves it in this order: a true built-in provider `X` → your custom provider `X` (global `providers.json`, the opt-in repo-local one, or inline `llm.custom.X`) → the preset `X`. Your own entry always wins over a same-named preset, as a whole — no preset field leaks into it. `GORTEX_LLM_MODEL` / `GORTEX_LLM_EFFORT` apply on top of whichever entry is resolved.
 

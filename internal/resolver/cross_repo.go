@@ -1271,8 +1271,9 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 		// Last-resort cross-daemon proxy-edge stitch: only when local
 		// resolution left the edge unresolved, proxy-edge minting is on,
 		// and a prober is wired. The evidence gate inside tryRemoteStitch
-		// refuses to probe on a bare name.
-		if e.To == oldTo && cr.edgesEnabled && cr.prober != nil {
+		// refuses to probe on a bare name. Never stitch a lexically shadowed
+		// JS/TS call.
+		if e.To == oldTo && cr.edgesEnabled && cr.prober != nil && e.Meta[graph.JSLexicalBindingMeta] == nil {
 			cr.tryRemoteStitch(e, target, stats)
 		}
 	}
@@ -1405,6 +1406,11 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
+	// A lexically shadowed JS/TS call (parameter or local) has no cross-repo callee.
+	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+		stats.Unresolved++
+		return
+	}
 	file := cr.callerFileID(e)
 	if target := cr.jsTSBindingsByFile[file][funcName]; target != "" {
 		if imported := cr.cachedGetNode(target); imported != nil && (imported.Kind == graph.KindFunction || imported.Kind == graph.KindMethod) {

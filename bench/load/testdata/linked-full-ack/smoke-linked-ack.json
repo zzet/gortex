@@ -1,0 +1,54 @@
+{
+  "ack_at": "2026-11-27T04:37:07.261289Z",
+  "ack_mode": "full",
+  "bytes_written": 1030,
+  "commit_seq": 2,
+  "content_sha256": "d5d688399434e171482e29033bf399745607794d16b744bb8313885d1f4698d2",
+  "disk_status": "committed",
+  "file_view": {
+    "counts": null,
+    "delta_reason": "baseline_metadata_unsupported",
+    "delta_state": "unavailable",
+    "state": "projected",
+    "symbols": null,
+    "syntax_health": {
+      "checked": true,
+      "errors": 0,
+      "language": "go",
+      "state": "checked"
+    },
+    "truncated": false
+  },
+  "freshness": {
+    "actual_view": "worktree:01a21b46-fcc3-722d-95a9-1c0410076432",
+    "checkout_id": "01a21b46-fcc3-722d-95a9-1c0410076432",
+    "checkout_incarnation": "01a21b46-fcc3-7245-9be9-5fee3fab0933",
+    "commit_generation_id": 2,
+    "dirty_generation_id": 3,
+    "exact": true,
+    "graph_id": "graph-b54bb040c8c8d551ccafd6e20748ec0e",
+    "requested_view": "worktree:01a21b46-fcc3-722d-95a9-1c0410076432",
+    "route_epoch": 2,
+    "source_fingerprint": "9f60eb6503e0301234efda7ad2c8d829e6e80ae325563a019a9165cde5d45e24",
+    "view_fingerprint": "d938bc066ac2ee4087e0da19710bde18f1f4cc164f6d9f4eba92422c5667a9f4"
+  },
+  "graph_status": "pending",
+  "graph_status_hint": "file current; recorded graph status: pending",
+  "mutation_id": "load-edit-0000000000000001-001",
+  "mutation_receipt": "commit-1795753966337424002",
+  "new_sha": "b835dc4107a35128436b9474d6beaa7ecc51b6d3",
+  "path": "gortex/internal/wiki/slug.go",
+  "readback_exact": true,
+  "reindex_generation": 1,
+  "reindex_pending": true,
+  "reindex_receipt": "mutation-1795753966337074002",
+  "reindexed": false,
+  "replacements": 1,
+  "status": "applied",
+  "tier_state": {
+    "derived": "pending",
+    "file": "fresh",
+    "file_graph": "pending",
+    "relations": "pending"
+  }
+}

@@ -1,0 +1,449 @@
+{
+  "ack_at": "2026-11-27T06:27:51.781564Z",
+  "ack_mode": "full",
+  "acknowledgement": {
+    "ack_unattributed_ms": 0,
+    "actual_finished_after_reply": false,
+    "actual_handler_ms": 41.4105,
+    "actual_handler_state": "measured",
+    "caller_response_outcome": "result",
+    "caller_response_ready_ms": 41.429583,
+    "caller_response_state": "measured",
+    "clock": "monotonic",
+    "combined_ack_patch_sum_state": "not_additive_overlapping_lifetimes",
+    "counts": {
+      "caller_result": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "disk_write": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "edit_control": {
+        "completed": 6,
+        "not_applicable": 0,
+        "started": 6
+      },
+      "middleware": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "parse": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "publish": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      },
+      "reindex_wait": {
+        "completed": 1,
+        "not_applicable": 1,
+        "started": 1
+      },
+      "reply_prepare": {
+        "completed": 1,
+        "not_applicable": 0,
+        "started": 1
+      }
+    },
+    "denominator": "bound_tool_entry_to_outer_return_before_transport_serialization",
+    "disjoint_observed_intervals": true,
+    "dispatcher_response_state": "unavailable_dispatcher_interface",
+    "dispatcher_scope": "queue_and_preamble_precede_bound_call_subtotal",
+    "dispatcher_to_caller_response_ready_ms": null,
+    "existing_ack_phase_scope": "shared_rpc",
+    "observed_ack_subtotal_ms": 41.429583,
+    "observed_execution_ms": {
+      "caller_result": 0.019083,
+      "disk_write": 0.2935,
+      "edit_control": 38.491499,
+      "middleware": 1.954208,
+      "parse": 0.139084,
+      "publish": 0.2195,
+      "reindex_wait": null,
+      "reply_prepare": 0.312709
+    },
+    "parse_scope": "source_projection_parse_gate",
+    "phase_states": {
+      "caller_result": "measured",
+      "disk_write": "measured",
+      "dispatcher_preamble": "unavailable_dispatcher_interface",
+      "dispatcher_queue": "unavailable_dispatcher_interface",
+      "edit_control": "measured",
+      "middleware": "measured",
+      "parse": "measured",
+      "publish": "measured",
+      "reindex_wait": "not_applicable",
+      "reply_prepare": "measured",
+      "transport": "unavailable_boundary"
+    },
+    "phases_ms": {
+      "caller_result": 0.019083,
+      "disk_write": 0.2935,
+      "dispatcher_preamble": null,
+      "dispatcher_queue": null,
+      "edit_control": 38.491499,
+      "middleware": 1.954208,
+      "parse": 0.139084,
+      "publish": 0.2195,
+      "reindex_wait": null,
+      "reply_prepare": 0.312709,
+      "transport": null
+    },
+    "publication_residual_state": "unavailable_shared_rpc_scope",
+    "rpc_id": "rpc-1",
+    "scope": "shared_rpc_mcp_bound_call",
+    "state": "observed",
+    "sum_state": "partial"
+  },
+  "applied_generation": 1,
+  "bytes_written": 42,
+  "checkout_id": "01a21bb0-582b-79f7-8842-7947658e7bfd",
+  "checkout_incarnation": "01a21bb0-582b-7a0c-847c-a5202d1ce285",
+  "commit_seq": 1,
+  "committed_at": "2026-11-27T06:27:51.781226Z",
+  "content_sha256": "5bd319ded3dfb74736868c4c6633e9f4764ad4a2ab4d20c2c5c376a47c26946e",
+  "derived_at": "2026-11-27T06:27:51.855291Z",
+  "dirty_generation_id": 3,
+  "disk_status": "committed",
+  "file_graph_at": "2026-11-27T06:27:51.855291Z",
+  "file_view": {
+    "counts": {
+      "added": 1,
+      "after": 1,
+      "before": 1,
+      "changed": 0,
+      "removed": 1,
+      "total_changes": 2
+    },
+    "delta_state": "available",
+    "state": "projected",
+    "symbols": [
+      {
+        "change": "added",
+        "end_line": 3,
+        "id": "repo/edit.go::LinkedAccounting0",
+        "kind": "function",
+        "signature": "func LinkedAccounting0()",
+        "start_line": 3
+      },
+      {
+        "change": "removed",
+        "end_line": 3,
+        "id": "repo/edit.go::New",
+        "kind": "function",
+        "signature": "func New()",
+        "start_line": 3
+      }
+    ],
+    "syntax_health": {
+      "checked": true,
+      "errors": 0,
+      "language": "go",
+      "state": "checked"
+    },
+    "truncated": false
+  },
+  "found": true,
+  "graph_note": "the graph has read these bytes",
+  "graph_status": "fresh",
+  "graph_status_hint": "file current; recorded graph status: fresh",
+  "graph_status_terminal": true,
+  "guidance": "the bytes are on disk \u2014 do not re-apply this edit; read graph_status_terminal before waiting on graph_status, because only \"pending\" resolves on its own",
+  "mutation_id": "load-edit-0000000000000001-001",
+  "new_sha": "75e82930e2c01273f0d23a764a5a222f4e3a886c",
+  "path": "repo/edit.go",
+  "phase_states": {
+    "apply": "not_observed",
+    "batch_admission": "not_observed",
+    "caller_result": "measured",
+    "cohort_admission": "not_observed",
+    "debounce": "not_observed",
+    "derived": "not_observed",
+    "disk_write": "measured",
+    "dispatcher_queue": "unavailable_dispatcher_interface",
+    "edit_control": "measured",
+    "gate_wait": "not_observed",
+    "lane_wait": "not_observed",
+    "middleware": "measured",
+    "mtimes": "not_observed",
+    "parse": "measured",
+    "patch_parse": "not_observed",
+    "publish": "measured",
+    "reindex_wait": "not_applicable",
+    "resolve": "not_observed",
+    "search_lap": "not_observed"
+  },
+  "phase_timing": {
+    "ack_wall_ms": 41.429583,
+    "clock": "monotonic",
+    "coverage": "partial",
+    "patch_accounting": {
+      "attempt_retry": 0,
+      "attempt_ticket": 1,
+      "background_coverage": "not_established",
+      "execution_disposition": "checkout_refresh_cycle",
+      "observed_partition_complete": false,
+      "observed_subtotal_ms": null,
+      "phase_states": {
+        "apply": "not_observed",
+        "attempt_finalize": "not_observed",
+        "attempt_setup": "not_observed",
+        "batch_admission": "not_observed",
+        "cohort_admission": "not_observed",
+        "derived": "not_observed",
+        "executor_control": "not_observed",
+        "gate_wait": "not_observed",
+        "lane_wait": "not_observed",
+        "mtimes": "not_observed",
+        "patch_analysis": "not_observed",
+        "patch_inspection": "not_observed",
+        "patch_parse": "not_observed",
+        "resolve": "not_observed",
+        "search_lap": "not_observed"
+      },
+      "phases_ms": {
+        "apply": null,
+        "attempt_finalize": null,
+        "attempt_setup": null,
+        "batch_admission": null,
+        "cohort_admission": null,
+        "derived": null,
+        "executor_control": null,
+        "gate_wait": null,
+        "lane_wait": null,
+        "mtimes": null,
+        "patch_analysis": null,
+        "patch_inspection": null,
+        "patch_parse": null,
+        "resolve": null,
+        "search_lap": null
+      },
+      "scope": "accepted_winning_physical_attempt",
+      "sum_state": "not_observed",
+      "unattributed_ms": null,
+      "writer_write": {
+        "before_derived_hold_ms": null,
+        "before_derived_xwrite_ms": null,
+        "clock": "monotonic",
+        "derived_cut": "unavailable",
+        "first_hold_start_offset_ms": null,
+        "hold_ms": null,
+        "holds": null,
+        "last_hold_end_offset_ms": null,
+        "main_xwrite_ms": null,
+        "reason": "attempt_not_attributed",
+        "scope": "write_gate_holds_acquired_by_attempt_goroutine",
+        "state": "not_observed",
+        "unowned_store_holds": null,
+        "wal_xwrite_ms": null,
+        "xwrite_bytes": null,
+        "xwrite_calls": null,
+        "xwrite_ms": null
+      }
+    },
+    "patch_wall_ms": 73.698583,
+    "publication_unattributed_ms": null,
+    "publication_wall_ms": 114.226583
+  },
+  "phases_ms": {
+    "apply": null,
+    "batch_admission": null,
+    "caller_result": 0.019083,
+    "cohort_admission": null,
+    "debounce": null,
+    "derived": null,
+    "disk_write": 0.2935,
+    "dispatcher_queue": null,
+    "edit_control": 38.491499,
+    "gate_wait": null,
+    "lane_wait": null,
+    "middleware": 1.954208,
+    "mtimes": null,
+    "parse": 0.139084,
+    "patch_parse": null,
+    "publish": 0.2195,
+    "reindex_wait": null,
+    "resolve": null,
+    "search_lap": null
+  },
+  "publication_phases": {
+    "checkout_id": "01a21bb0-582b-79f7-8842-7947658e7bfd",
+    "clock": "monotonic",
+    "dirty_generation_id": 3,
+    "key": "mutation-1795760870887659001",
+    "origin_wall": "2026-11-27T06:27:51.741061Z",
+    "phases": [
+      {
+        "offset_ms": 0,
+        "offset_ns": 0,
+        "phase": "received"
+      },
+      {
+        "offset_ms": 0.902,
+        "offset_ns": 902292,
+        "phase": "view_checkout_resolved"
+      },
+      {
+        "offset_ms": 0.913,
+        "offset_ns": 913917,
+        "phase": "view_use_noted"
+      },
+      {
+        "offset_ms": 1.227,
+        "offset_ns": 1227667,
+        "phase": "view_materialized"
+      },
+      {
+        "offset_ms": 1.271,
+        "offset_ns": 1271042,
+        "phase": "view_selected"
+      },
+      {
+        "offset_ms": 1.285,
+        "offset_ns": 1285625,
+        "phase": "view_resolved"
+      },
+      {
+        "offset_ms": 1.346,
+        "offset_ns": 1346667,
+        "phase": "mutation_locked"
+      },
+      {
+        "offset_ms": 1.509,
+        "offset_ns": 1509042,
+        "phase": "mutation_admitted"
+      },
+      {
+        "offset_ms": 1.646,
+        "offset_ns": 1646292,
+        "phase": "handler_started"
+      },
+      {
+        "offset_ms": 2.223,
+        "offset_ns": 2223417,
+        "phase": "parse_gated"
+      },
+      {
+        "offset_ms": 13.074,
+        "offset_ns": 13074750,
+        "phase": "write_sampled"
+      },
+      {
+        "offset_ms": 13.296,
+        "offset_ns": 13296875,
+        "phase": "write_validated"
+      },
+      {
+        "offset_ms": 39.823,
+        "offset_ns": 39823125,
+        "phase": "route_withdrawn"
+      },
+      {
+        "offset_ms": 39.868,
+        "offset_ns": 39868458,
+        "phase": "disk_write_started"
+      },
+      {
+        "offset_ms": 40.165,
+        "offset_ns": 40165167,
+        "phase": "receipt_committed"
+      },
+      {
+        "offset_ms": 40.506,
+        "offset_ns": 40506083,
+        "phase": "ticket_captured"
+      },
+      {
+        "offset_ms": 40.506,
+        "offset_ns": 40506458,
+        "phase": "ticket_enqueued"
+      },
+      {
+        "offset_ms": 40.528,
+        "offset_ns": 40528000,
+        "phase": "cycle_started"
+      },
+      {
+        "offset_ms": 58.797,
+        "offset_ns": 58797458,
+        "phase": "admitted"
+      },
+      {
+        "offset_ms": 60.526,
+        "offset_ns": 60526000,
+        "phase": "planned"
+      },
+      {
+        "offset_ms": 68.488,
+        "offset_ns": 68488167,
+        "phase": "extracted"
+      },
+      {
+        "offset_ms": 68.493,
+        "offset_ns": 68493000,
+        "phase": "semantic_done"
+      },
+      {
+        "offset_ms": 87.567,
+        "offset_ns": 87567208,
+        "phase": "payload_flushed"
+      },
+      {
+        "offset_ms": 87.979,
+        "offset_ns": 87979458,
+        "phase": "published"
+      },
+      {
+        "offset_ms": 88.082,
+        "offset_ns": 88082542,
+        "phase": "route_flipped"
+      },
+      {
+        "offset_ms": 114.226,
+        "offset_ns": 114226583,
+        "phase": "ticket_completed"
+      }
+    ],
+    "source": "mcp_edit",
+    "terminal": true,
+    "ticket": 1
+  },
+  "readback_exact": true,
+  "receipt": "commit-1795760870887889001",
+  "reindex_generation": 1,
+  "reindex_receipt": "mutation-1795760870887659001",
+  "relations_at": "2026-11-27T06:27:51.855291Z",
+  "requested_background_unavailable": {
+    "accepted_attempt_stage": "physical_window_retained",
+    "background_stage": "returned",
+    "binding_predicate": "checkout_refresh_cycle",
+    "last_observed_generation": 1,
+    "observed_native_handoffs": 0,
+    "publication_key": "mutation-1795760870887659001",
+    "reason": "serving_attempt_binding_mismatch",
+    "requested_generation": 1,
+    "scope": "requested_background_observation"
+  },
+  "retry_safe": false,
+  "started_at": "2026-11-27T06:27:51.743287Z",
+  "tier_after_commit_ms": {
+    "derived": 74.064,
+    "file_graph": 74.064,
+    "relations": 74.064
+  },
+  "tier_state": {
+    "derived": "fresh",
+    "file": "fresh",
+    "file_graph": "fresh",
+    "relations": "fresh"
+  },
+  "tool": "edit_file"
+}

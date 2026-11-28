@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,7 +44,8 @@ func contractCounter(key string) int64 {
 
 // TestContractAnalysisCountsRequestsAndJobs pins the job and request series
 // at their call sites: an admitted request, the attached answer once the attachment exists,
-// one published cold job with its body time, and the job's Info line.
+// one published cold job with its body time, and the job's Info line, which
+// counts the job's calls into its foreground yield and the time they took.
 func TestContractAnalysisCountsRequestsAndJobs(t *testing.T) {
 	f := newContractWorkerFixture(t)
 	a := f.request(t, "repo-a", "metrics-a")
@@ -56,7 +58,15 @@ func TestContractAnalysisCountsRequestsAndJobs(t *testing.T) {
 		return snapshot, []ContractFollowupTarget{{Key: a.Snapshot.Key, Work: a.Snapshot.Work, Catalog: f.store}}, nil
 	}
 	core, logs := observer.New(zapcore.InfoLevel)
-	c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg, Capture: capture, Logger: zap.New(core), Yield: func(ctx context.Context) error { return ctx.Err() }})
+	// Each yield waits as one under foreground work would.
+	const yieldWait = 2 * time.Millisecond
+	var yields atomic.Int64
+	yield := func(ctx context.Context) error {
+		yields.Add(1)
+		time.Sleep(yieldWait)
+		return ctx.Err()
+	}
+	c, err := NewContractAnalysisCoordinator(ContractAnalysisCoordinatorOptions{Store: f.store, Leases: f.leases, Registry: f.registry, Config: f.cfg, Capture: capture, Logger: zap.New(core), Yield: yield})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
@@ -129,6 +139,11 @@ func TestContractAnalysisCountsRequestsAndJobs(t *testing.T) {
 	}
 	require.EqualValues(t, 1, fields["pp_runs"])
 	require.EqualValues(t, 0, fields["pp_reruns"])
+	require.Positive(t, yields.Load(), "the job yields to foreground work")
+	require.EqualValues(t, yields.Load(), fields["yields"], "the job line counts every call into the job's yield")
+	waited, ok := fields["yield"].(time.Duration)
+	require.True(t, ok, "the job line times the yield: %v", fields["yield"])
+	require.GreaterOrEqual(t, waited, time.Duration(yields.Load())*yieldWait, "the job line sums the time spent in the yield")
 }
 
 // Publication is one physical transaction even though each target retains

@@ -149,6 +149,7 @@ type mutationCommitRecord struct {
 	reindexReceipt      string
 	reindexGeneration   uint64
 	appliedGeneration   uint64
+	dirtyGeneration     uint64 // a checkout's routed generation; appliedGeneration stays in the ticket's domain
 	checkoutID          string
 	checkoutIncarnation string
 	errText             string
@@ -211,6 +212,7 @@ type mutationCommitSnapshot struct {
 	ReindexReceipt      string `json:"reindex_receipt,omitempty"`
 	ReindexGeneration   uint64 `json:"reindex_generation,omitempty"`
 	AppliedGeneration   uint64 `json:"applied_generation,omitempty"`
+	DirtyGenerationID   uint64 `json:"dirty_generation_id,omitempty"`
 	CheckoutID          string `json:"checkout_id,omitempty"`
 	CheckoutIncarnation string `json:"checkout_incarnation,omitempty"`
 	publicationReceipt  string
@@ -242,6 +244,7 @@ func (r *mutationCommitRecord) snapshot() mutationCommitSnapshot {
 		publicationReceipt:  r.publicationReceipt,
 		ReindexGeneration:   r.reindexGeneration,
 		AppliedGeneration:   r.appliedGeneration,
+		DirtyGenerationID:   r.dirtyGeneration,
 		CheckoutID:          r.checkoutID,
 		CheckoutIncarnation: r.checkoutIncarnation,
 	}
@@ -404,7 +407,18 @@ func (r *mutationCommitRecord) recordGraphForReceipt(expectedReceipt string, out
 	}
 	r.reindexReceipt = outcome.Receipt
 	r.reindexGeneration = outcome.Generation
-	r.appliedGeneration = outcome.AppliedGeneration
+	r.appliedGeneration, r.dirtyGeneration = outcome.AppliedGeneration, 0
+	if outcome.checkoutScoped {
+		// A checkout's result names the dirty generation it routed, while
+		// reindex_generation is its ticket's admission sequence. The
+		// coordinator completes a ticket only once the routed generation holds
+		// that ticket's own committed bytes, so in the ticket's domain the
+		// ticket applied itself. Keep both generations in their own domains.
+		r.appliedGeneration, r.dirtyGeneration = 0, outcome.AppliedGeneration
+		if outcome.AppliedGeneration > 0 {
+			r.appliedGeneration = outcome.Generation
+		}
+	}
 	if outcome.checkoutID != "" {
 		r.checkoutID = outcome.checkoutID
 		r.checkoutIncarnation = outcome.checkoutIncarnation
@@ -650,6 +664,70 @@ func (l *mutationCommitLedger) recentForPath(relPath string) (*mutationCommitRec
 		}
 	}
 	return nil, false
+}
+
+// publishedProjection reports whether entry is exactly the projection that a
+// recorded physical tool commit published at its own disk-commit sequence.
+func (l *mutationCommitLedger) publishedProjection(entry *projectionEntry) bool {
+	if entry == nil || entry.commitSeq == 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(l.ordered) - 1; i >= 0; i-- {
+		record := l.ordered[i]
+		if !record.isPhysicalCommit() {
+			continue
+		}
+		record.mu.RLock()
+		match := record.commitSeq == entry.commitSeq && record.disk == mutationDiskCommitted &&
+			record.fileProjection.Value() == entry
+		record.mu.RUnlock()
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// publishedVersion reports whether entry is the projection a recorded physical
+// tool commit published, or a checked read copy of that commit's version: the
+// copy keeps the commit's sequence and its raw-byte SHA-256, and the record is
+// for the same file. A copy is checked against the record itself, because the
+// projection it replaced may already be gone. Matching contentSHA256 proves the
+// copy names the recorded bytes only because an entry's rawHash and
+// contentSHA256 come from the same bytes (see projectionEntry); the caller's
+// disk check against rawHash then ties the file on disk to the record.
+func (l *mutationCommitLedger) publishedVersion(entry *projectionEntry) bool {
+	if entry == nil || entry.sourceCommitSeq == 0 {
+		return false
+	}
+	if entry.commitSeq != 0 {
+		return l.publishedProjection(entry)
+	}
+	if entry.contentSHA256 == "" {
+		return false
+	}
+	matched, absPath := false, ""
+	l.mu.Lock()
+	for i := len(l.ordered) - 1; i >= 0; i-- {
+		record := l.ordered[i]
+		if !record.isPhysicalCommit() {
+			continue
+		}
+		record.mu.RLock()
+		sequence := record.commitSeq
+		if sequence == entry.sourceCommitSeq {
+			matched = record.disk == mutationDiskCommitted && record.contentSHA256 == entry.contentSHA256
+			absPath = record.absPath
+		}
+		record.mu.RUnlock()
+		if sequence == entry.sourceCommitSeq {
+			break
+		}
+	}
+	l.mu.Unlock()
+	return matched && absPath != "" && pathkey.MutationKey(absPath) == entry.key
 }
 
 func (l *mutationCommitLedger) recent(limit int) []*mutationCommitRecord {

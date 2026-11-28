@@ -40,7 +40,7 @@ func (r *editProbeRuntime) performCLI(ctx context.Context, s *editProbeState, re
 	if err != nil {
 		return nil, wireCallIdentity{}, err
 	}
-	budget := min(r.options.Deadline, 20*time.Second)
+	budget := min(r.options.Deadline, editProbeReadBudget)
 	callCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	args, err := json.Marshal(dispatchArgs(req, repo))

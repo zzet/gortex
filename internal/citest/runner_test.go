@@ -196,7 +196,8 @@ func TestRunnerRealFullVersusAffectedExecutionAndCoverage(t *testing.T) {
 	f.pkg("cmd/gortex", "func Value() int { return 42 }", "TestCLIFixture")
 	f.pkg("bench/load", "func Value() int { return 42 }", "TestBenchFixture")
 	head := f.change("leaf/value.go")
-	affected := f.plan(head)
+	// The label keeps the macOS rows, so a macOS host also runs the plan.
+	affected := f.planWith(head, macOSLabel)
 	requireAffected(t, affected)
 	full, err := f.planner.Plan(t.Context(), Event{Name: "pull_request", Head: affected.Head, Base: f.base, Full: true})
 	if err != nil {
@@ -272,7 +273,7 @@ func TestRunnerDarwinSelectedIndexerKeepsIndependentWatcherRace(t *testing.T) {
 		t.Skip("native macOS watcher-race contract")
 	}
 	f := newFixture(t)
-	m := f.plan(f.change("internal/indexer/value.go"))
+	m := f.planWith(f.change("internal/indexer/value.go"), macOSLabel)
 	var out bytes.Buffer
 	report, err := RunPartition(t.Context(), RunOptions{Root: f.root, Partition: "indexer-race", SelectionFile: writeManifest(t, f, m), Target: nativeTarget(t), Workers: 2, Env: fixtureEnv(), Output: &out})
 	if err != nil {
@@ -286,7 +287,7 @@ func TestRunnerCancellationReapsOwnedGoTestChildAndRetainsLogs(t *testing.T) {
 	f := newFixture(t)
 	f.pkg("hang", "func Value()int{return 42}", "TestValue")
 	f.write("hang/heartbeat_test.go", "package hang\nimport(\"os\";\"testing\";\"time\")\nfunc TestHeartbeat(t *testing.T){for { _=os.WriteFile(os.Getenv(\"CI_HEARTBEAT\"),[]byte(time.Now().Format(time.RFC3339Nano)),0600);time.Sleep(10*time.Millisecond)}}\n")
-	m := f.plan(f.commit())
+	m := f.planWith(f.commit(), macOSLabel) // runs on a macOS host too
 	requireAffected(t, m)
 	heartbeat := filepath.Join(f.root, "heartbeat")
 	env := withEnv(fixtureEnv(), map[string]string{"CI_HEARTBEAT": heartbeat})

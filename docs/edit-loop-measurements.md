@@ -28,6 +28,14 @@ queueing and discarded attempts are not part of this smaller winning-P wall.
 Its `background_coverage` remains `not_established`: it does not establish full
 per-edit background, ACK, actual100-edit or5%/performance acceptance.
 
+`execution_disposition: checkout_refresh_cycle` marks the P of a linked
+checkout ticket: the window of the coordinator refresh cycle that served the
+ticket, owed by that cycle at its start. The cycle's builder phases are timed on
+`publication_phases` and are never patch laps, so every lap and the partition
+read `not_observed`. That receipt's `requested_background_unavailable` refusal
+(`binding_predicate: checkout_refresh_cycle`) says no B window exists or can
+arrive.
+
 `execution_disposition: native_mtime_duplicate` records the actual native
 watcher receipt-match return before executor entry. Only that observed branch
 can mark its unexecuted deep and executor-control laps `not_applicable`, with
@@ -35,6 +43,42 @@ null durations. Contradictory execution evidence is invalid; an unknown branch
 still requires the requested deep evidence. A complete partition of this small
 no-op P does not measure the earlier graph publisher. Independent read-assisted
 publication R remains non-additive, and its missing deep coverage stays missing.
+
+`patch_accounting.writer_write` is the SQLite writer time of that same accepted
+attempt P: the `xWrite` calls of the store's writer connection, to the main
+database file and the log, made under the write-gate holds that P's own
+goroutine acquired. Ownership is decided per hold when the gate is taken, so
+holds of other editors' attempts and acknowledgements, maintenance, or
+goroutines P starts are never counted, and attempts open at the same time keep
+their own holds. The gate is exclusive, so owned holds never overlap.
+
+- `state`: `measured`, `unavailable` (with `reason`, e.g. `not_a_sqlite_store`,
+  `no_dedicated_writer_connection`, `vfs_write_hooks_unavailable`,
+  `owned_hold_open_at_attempt_return`), `not_observed` (`attempt_not_attributed`:
+  shared multi-file sets and read-assisted publications are not attributed) or
+  `invalid_order`. Every number is null unless `state` is `measured`; a measured
+  zero means P took no write-gate hold.
+- `xwrite_ms`, `main_xwrite_ms`, `wal_xwrite_ms`, `xwrite_calls`,
+  `xwrite_bytes`: owned write time, together and per file, with counts. Main
+  file writes can include checkpoint pages SQLite copies when a commit triggers
+  its automatic checkpoint.
+- `holds`, `hold_ms`: owned holds and their summed acquisition-to-release wall,
+  the commit windows the write time lies in.
+- `first_hold_start_offset_ms`, `last_hold_end_offset_ms`: offsets from P's
+  start, inside `patch_wall_ms`.
+- `derived_cut`, `before_derived_xwrite_ms`, `before_derived_hold_ms`: the
+  same, completed before P's derived lap began (`derived_lap_started`), or all
+  of it when P entered none (`derived_lap_not_entered`).
+- `unowned_store_holds`: holds of the same store's gate completed while P
+  patched that P did not own. Zero means P's holds were the store's only writes
+  meanwhile. A positive count means other writers shared the store; it cannot
+  tell them apart from goroutines P started, whose writes are not counted.
+
+A coalesced receipt reads its serving winner's object under
+`coalesced_publication.timings.phase_timing.patch_accounting.writer_write`.
+This is a per-attempt daemon measurement only: it does not compute any share of
+a client-observed latency, and `before_derived_*` is a daemon-side boundary,
+not the time a client first observed correct relations.
 
 An accepted `read_assisted_publication` can carry its own `phase_accounting`.
 Its window keeps the actual coordinator execution start and return, after
@@ -456,7 +500,8 @@ and explicitly unavailable RPC ownership, never an origin borrowed from polling.
 and batch paths. It excludes enqueue/capture, outcome formatting and synchronous
 inline reindex work. The timers, cancellation behavior and dispatch-slot release
 are unchanged. Immediate completed tickets can have a real reached near-zero
-wait; an async checkout admission that never waits has no invented duration.
+wait; an async checkout admission that never waits has no invented duration:
+its `reindex_wait` is counted `not_applicable`, as a local ACK's is.
 
 Batch edit/status JSON or TOON responses carry a response-only
 `acknowledgement_receipt` reference; compact text carries the same reference.

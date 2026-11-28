@@ -91,8 +91,13 @@ func TestCheckoutMutationReceiptRemainsPendingUntilPublication(t *testing.T) {
 	done <- indexer.MutationResult{RequestedGeneration: 7, AppliedGeneration: 29, Reindexed: true}
 	waitCheckoutReceipt(t, s, outcome.Receipt)
 	payload = s.mutationStatusPayload(record)
-	if payload["graph_status"] != mutationGraphFresh || payload["graph_status_terminal"] != true || payload["applied_generation"] != uint64(29) {
+	if payload["graph_status"] != mutationGraphFresh || payload["graph_status_terminal"] != true {
 		t.Fatalf("published generation did not resolve receipt: %#v", payload)
+	}
+	// The ticket applied itself in its own domain; the routed dirty
+	// generation keeps its own field.
+	if payload["reindex_generation"] != uint64(7) || payload["applied_generation"] != uint64(7) || payload["dirty_generation_id"] != uint64(29) {
+		t.Fatalf("receipt mixed generation domains: %#v", payload)
 	}
 	if payload["new_sha"] != "written-sha" || payload["retry_safe"] != false {
 		t.Fatalf("graph publication changed disk evidence: %#v", payload)

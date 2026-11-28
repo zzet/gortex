@@ -113,10 +113,15 @@ func withPublicationTarget(ctx context.Context, checkoutID string, through uint6
 // background compaction). A cycle also collects the same event instants for
 // tickets that may later prove they rode its publication.
 func markPublicationPhase(ctx context.Context, phase PublicationPhase) {
+	markPublicationPhaseAt(ctx, phase, time.Now())
+}
+
+// markPublicationPhaseAt is markPublicationPhase at a known instant, which must
+// come from time.Now() in this process.
+func markPublicationPhaseAt(ctx context.Context, phase PublicationPhase, at time.Time) {
 	if ctx == nil {
 		return
 	}
-	at := time.Now()
 	PublicationStampsFrom(ctx).markAt(phase, at)
 	if record := phaseRecordFrom(ctx); record != nil {
 		record.MarkAt(phase, at)

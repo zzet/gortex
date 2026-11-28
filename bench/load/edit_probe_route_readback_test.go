@@ -51,6 +51,7 @@ func TestEditProbeRoutedReadbacksAndRestoreKeepEachCheckoutOriginal(t *testing.T
 	}
 	var mu sync.Mutex
 	receipts := make(map[string]string)
+	pendingCheckout := "" // a checkout whose receipt the product still reports pending
 	p.Socket = startStub(t, func(frame stubFrame) (any, *rpcError) {
 		repo := -1
 		for i, r := range p.Repos {
@@ -93,10 +94,13 @@ func TestEditProbeRoutedReadbacksAndRestoreKeepEachCheckoutOriginal(t *testing.T
 		if frame.Params["name"] == "change" && args["operation"] == "receipt" {
 			receipt, _ := options["receipt"].(string)
 			mu.Lock()
-			mutation := receipts[frame.Cwd+"|"+receipt]
+			mutation, pending := receipts[frame.Cwd+"|"+receipt], frame.Cwd == pendingCheckout
 			mu.Unlock()
 			if mutation == "" {
 				return nil, &rpcError{Code: -32000, Message: "receipt belongs to another checkout"}
+			}
+			if pending {
+				return stubContent(map[string]any{"graph_status_terminal": false, "graph_status": "pending", "mutation_id": mutation}), nil
 			}
 			return stubContent(map[string]any{"graph_status_terminal": true, "graph_status": "fresh", "mutation_id": mutation}), nil
 		}
@@ -173,6 +177,10 @@ func TestEditProbeRoutedReadbacksAndRestoreKeepEachCheckoutOriginal(t *testing.T
 			t.Fatal(err)
 		}
 	}
+	// The restore reads that receipt again, and the product still reports it pending.
+	mu.Lock()
+	pendingCheckout = p.Repos[1].Path
+	mu.Unlock()
 	phase.EditProbe.Records[1].GraphTerminal = false
 	if err := run.restore(ctx); err == nil {
 		t.Fatal("pending route permitted unsafe cleanup")
@@ -183,6 +191,9 @@ func TestEditProbeRoutedReadbacksAndRestoreKeepEachCheckoutOriginal(t *testing.T
 			t.Fatalf("pending cleanup changed checkout%d: %v", i, err)
 		}
 	}
+	mu.Lock()
+	pendingCheckout = ""
+	mu.Unlock()
 	phase.EditProbe.Records[1].GraphTerminal = true
 	if err := run.restore(ctx); err != nil {
 		t.Fatal(err)

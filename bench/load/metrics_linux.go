@@ -24,6 +24,7 @@ func (s linuxProcessSampler) sample(pid int) map[string]Metric {
 	root := fmt.Sprintf("/proc/%d/", pid)
 	if data, err := os.ReadFile(root + "stat"); err == nil {
 		metrics["cpu_seconds"] = linuxCPU(string(data), s.ticksPerSecond)
+		metrics["major_faults"] = procStatMajorFaults(string(data))
 	}
 	if data, err := os.ReadFile(root + "status"); err == nil {
 		values := parseKeyValues(string(data))

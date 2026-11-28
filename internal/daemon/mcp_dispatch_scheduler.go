@@ -15,6 +15,10 @@ const (
 	mcpDispatchSessionLimit    = 4
 	mcpDispatchDrainLimit      = 4
 	mcpDispatchDeadlineReserve = 100 * time.Millisecond
+	// mcpDispatchSlowPassLimit bounds class priority for the slow lane: while
+	// a queued slow call has room, at most this many grants in a row go to the
+	// mutating and fast lanes before the slow lane is served first.
+	mcpDispatchSlowPassLimit = 4
 )
 
 // One short mutex owns admission and lease accounting, including the process
@@ -45,6 +49,9 @@ type mcpDispatchScheduler struct {
 	protocolWaiting    int
 	held               map[string]int
 	lanes              [3]mcpDispatchLane
+	// slowPasses counts the grants in a row that went to another lane while
+	// a queued slow call could have used the slot.
+	slowPasses int
 }
 
 type mcpDispatchLane struct {
@@ -174,12 +181,29 @@ func (s *mcpDispatchScheduler) grantLocked(class MCPDispatchClass, session strin
 	return &mcpScheduledGrant{pool: s, class: class, session: session, occupant: occupant}
 }
 
+// slowRunnableLocked reports whether some queued slow call could take a free
+// slot now.
+func (s *mcpDispatchScheduler) slowRunnableLocked() bool {
+	for _, q := range s.lanes[MCPDispatchSlow].sessions {
+		if s.eligibleLocked(MCPDispatchSlow, q.session) {
+			return true
+		}
+	}
+	return false
+}
+
 // scheduleLocked honors class priority and rotates whole sessions within each
 // class. A temporarily ineligible session cannot block another class/session.
+// Priority is bounded for the slow lane: after mcpDispatchSlowPassLimit grants
+// in a row passed over a runnable slow call, the slow lane is tried first.
 func (s *mcpDispatchScheduler) scheduleLocked() {
 	for {
 		admitted := false
-		for _, class := range [...]MCPDispatchClass{MCPDispatchMutating, MCPDispatchFast, MCPDispatchSlow} {
+		order := [...]MCPDispatchClass{MCPDispatchMutating, MCPDispatchFast, MCPDispatchSlow}
+		if s.slowPasses >= mcpDispatchSlowPassLimit {
+			order = [...]MCPDispatchClass{MCPDispatchSlow, MCPDispatchMutating, MCPDispatchFast}
+		}
+		for _, class := range order {
 			lane := &s.lanes[class]
 			for offset := 0; offset < len(lane.sessions); offset++ {
 				index := (lane.next + offset) % len(lane.sessions)
@@ -208,9 +232,15 @@ func (s *mcpDispatchScheduler) scheduleLocked() {
 				if !s.eligibleLocked(class, q.session) {
 					continue
 				}
+				passesSlow := class != MCPDispatchSlow && s.slowRunnableLocked()
 				grant := s.grantLocked(class, q.session, waiter.occupant)
 				if grant == nil {
 					return
+				}
+				if class == MCPDispatchSlow {
+					s.slowPasses = 0
+				} else if passesSlow {
+					s.slowPasses++
 				}
 				waiter = s.popLocked(class, index)
 				s.observeQueuedWaitLocked(waiter, mcpWaitAdmitted, now)
@@ -238,6 +268,9 @@ func (s *mcpDispatchScheduler) popLocked(class MCPDispatchClass, index int) *mcp
 	q.requests[0] = nil
 	q.requests = q.requests[1:]
 	lane.queued--
+	if class == MCPDispatchSlow && lane.queued == 0 {
+		s.slowPasses = 0 // the next queued slow call starts a fresh count
+	}
 	viewmetrics.AddGauge(viewmetrics.MCPDispatchQueueDepth, -1, class.String())
 	if len(q.requests) == 0 {
 		copy(lane.sessions[index:], lane.sessions[index+1:])
@@ -283,6 +316,9 @@ func (s *mcpDispatchScheduler) removeLocked(waiter *mcpDispatchWaiter) {
 			q.requests[len(q.requests)-1] = nil
 			q.requests = q.requests[:len(q.requests)-1]
 			lane.queued--
+			if waiter.class == MCPDispatchSlow && lane.queued == 0 {
+				s.slowPasses = 0
+			}
 			viewmetrics.AddGauge(viewmetrics.MCPDispatchQueueDepth, -1, waiter.class.String())
 			if len(q.requests) == 0 {
 				copy(lane.sessions[index:], lane.sessions[index+1:])

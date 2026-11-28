@@ -300,9 +300,15 @@ call as *unknown* and re-read before assuming it did or did not land.
 MCP tool calls to the daemon, over its socket or `/mcp`, share three admission
 lanes. REST `/v1/tools/<name>` calls run their handlers directly and are not
 admitted through these lanes. Mutating calls have two reserved slots and can
-also use free shared slots. Slow calls (`outline`, `dead_code`
+also use free shared slots. A dry-run rename (`rename_symbol` or `refactor`
+`rename` with `dry_run: true`) writes nothing and is admitted as a fast read;
+a rename that writes stays mutating. Slow calls (`outline`, `dead_code`
 and analysis) hold at most two slots; other calls use the fast lane. Free slots
-serve queued mutating calls first, then fast, then slow. Sessions take turns
+serve queued mutating calls first, then fast, then slow, with one bound: while
+a queued slow call has room in the slow lane, at most four grants in a row go
+to the other lanes before the slow lane takes the next one. That turn never
+uses the two reserved mutation slots, so writes keep their reservation and a
+flood of writes and fast reads cannot starve the slow lane. Sessions take turns
 within each lane; a session holding four slots yields to another waiting
 session. For small cap overrides, the reservation is `min(2, cap-1)` and the
 slow limit is `min(2, cap-reservation)`, so cap 1 remains usable.
@@ -503,7 +509,7 @@ verdict; unknown health has `checked:false` and null `errors`.
 
 `readback_exact:true` requires that this write's projection is still live.
 `tier_state.file` describes that physical file view independently of the
-watcher-owned `file_graph`, `relations`, and `derived` stages. A newer write or
+graph's `file_graph`, `relations`, and `derived` stages. A newer write or
 invalidation can make a replay's file view unavailable or historical. Replays
 and `mutation_status` refresh live receipt evidence without parsing or writing
 again. Transactional batches retain journal authority and report per-file
@@ -528,13 +534,62 @@ carries the same fields in its freshness block. An idle fresh answer gains no
 fields. Never classify a symbol as dead while its file is pending.
 
 `mutation_status` reads live `ack_at`, `file_graph_at`, `relations_at`, and
-`derived_at` stamps when a watcher ticket observed them. Missing stamps mean
-unobserved work. Unknown receipt or mutation IDs return `state:"lost"` immediately;
+`derived_at` stamps when a watcher ticket or a linked checkout's publication
+observed them. Missing stamps mean unobserved work. A linked checkout publishes
+an edit's working-tree generation in one step: `file_graph_at` equals
+`relations_at`, and the three graph stamps are equal only when `derived` is
+fresh. Its `derived` tier means what the primary's does. It reads `partial`,
+with no `derived_at`, when the publication still owes the edited files
+deferred semantic enrichment or the edit's affected closure was truncated;
+clone rows still to be recomputed do not make it partial. `partial` is
+terminal on the receipt: it does not turn `fresh` when a later follow-up
+lands. Every graph tier reads `failed` when its ticket ends without a
+publication. Unknown receipt or mutation IDs return `state:"lost"` immediately;
 a lost receipt cannot certify freshness. After restart, relation queries remain
 pending until the shared startup resolver has published. File reads still check
 current disk state. CLI verbs print the freshness line on stderr;
 `--require-fresh` exits with code 4 when the requested tier remains pending or
 failed.
+
+`mutation_status` also carries `tier_after_commit_ms`: for `file_graph`,
+`relations` and `derived`, the milliseconds from the disk commit to that tier's
+stamp, on the daemon's clock, or `null` while the tier is unpublished. It is
+the daemon-side publication latency of the edit, read beside the latency a
+caller observes, not a replacement for it. While `graph_status` is pending, the
+receipt's `repository_lane` names what holds the mutation lane of the edit's
+repository (holder kind, since, held time), the callers queued for it, and the
+topology gates the holder takes. Daemon status (`repository_lanes`,
+`reach_topology`) and `index_health` (`repository_lanes`) report the same
+lanes, with past tenures in daemon status.
+
+The receipt of a committed single-file linked edit (`edit_file`, `write_file`,
+`edit_symbol`) closes its timing accounting on the same poll that first reads
+it published, as a primary receipt does. Batch tickets (a linked `batch_edit`
+and its journal recovery) and refresh or recovery tickets keep their existing
+accounting: they carry neither the background refusal nor the physical attempt
+below. The edit's checkout ticket is served by one coordinator refresh cycle,
+not a watcher's debounced attempt:
+
+- **Generations.** `reindex_generation` and `applied_generation` are both in the
+  ticket's admission-sequence domain. The coordinator completes a ticket only
+  once the routed generation holds that ticket's own committed bytes, so the two
+  are equal. `dirty_generation_id` names the routed working-tree generation.
+- **Background.** No measured `requested_background` window exists, because the
+  cycle arms no requested-background timer. The receipt carries the frozen
+  `requested_background_unavailable` refusal instead: `serving_attempt_binding_mismatch`,
+  `binding_predicate: checkout_refresh_cycle`.
+- **Physical attempt.** When the first cycle that owes the ticket completes it,
+  `phase_timing.patch_wall_ms` and `phase_timing.patch_accounting` describe that
+  cycle, from its `cycle_started` instant to `ticket_completed`, with
+  `execution_disposition: checkout_refresh_cycle`. The builder's phases stay on
+  `publication_phases` and are not relabelled as patch laps, so the patch-lap
+  partition reads `not_observed`. A ticket that rode a cycle already in flight
+  for other tickets has no patch window. A ticket carried across deferred,
+  rescheduled, or retried cycles has no patch window either: the final serving
+  cycle by itself is not a first-try physical attempt.
+- **Acknowledgement.** The edit ACK returns before publication, so
+  `acknowledgement` counts `reindex_wait` as `not_applicable`, with a null
+  duration.
 
 ## Agent-optimized (token efficiency)
 
@@ -576,7 +631,7 @@ Gortex captures every large tool response into a bounded per-session ring; these
 | `search_artifacts` | Full-text search over the context-artifacts manifest — DB schemas, API specs, infra configs, ADRs registered via `.gortex.yaml::artifacts` |
 | `get_artifact` | Fetch one context artifact by id, with its content and the symbols it references |
 
-`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
+`detect_changes` and `explain_change_impact` wait up to 250 ms for edits in the answer's relation scope: the symbols' files, their callers, files naming the symbols, and the diff's changed files. Edits outside that scope do not delay the answer. Pending or failed edits return the usual analysis with `complete:false`, `graph_freshness:pending|failed`, `freshness_scope:relations`, `pending_files` (at most 16), and `pending_file_count`; failures include a recovery hint. Every answer reports `barrier_wait_ms`. An earlier `wait_deadline` shortens the wait; `require_fresh:true` instead waits until its request deadline and returns an error if the scope is still lagging. `wait_deadline` also bounds the impact walk's wait for a graph publication in flight: a walk still waiting at the deadline (or at its own 3 s budget when none is given) answers with what it read, `complete:false`, `graph_freshness:pending` and `reason:publication_in_flight`, or with an error under `require_fresh:true`. Text answers begin with `relations: pending|failed (N files)`; GCX preserves `GCX1` on line 1 and puts the relations comment on line 2. Stop and post-edit briefings bound detection to 300 ms and report pending relations instead of silently omitting the briefing.
 
 ## Proactive safety
 

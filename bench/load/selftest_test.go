@@ -229,6 +229,10 @@ func fixtureDaemon(mode string) int {
 							result = stubContent(map[string]any{"status": "loading", "phase": "starting", "percent": 0,
 								"repos": []map[string]string{{"path": config.Repos[0].Path, "state": "running"}}})
 						}
+					case frame.Params["name"] == "analyze" && arguments["kind"] == "co_change":
+						// The settled mine has no co-change rows for the pinned target.
+						target, _ := arguments["target"].(map[string]any)
+						result = stubContent(map[string]any{"target_file": target["file"], "co_changing": []any{}, "total": 0, "truncated": false})
 					case frame.Params["name"] == "analyze":
 						result = stubContent(map[string]any{"hotspots": []any{}, "total": 0})
 					case frame.Params["name"] == "session" && arguments["channel"] == "daemon_health" && arguments["operation"] == "subscribe":

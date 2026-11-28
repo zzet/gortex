@@ -1303,7 +1303,9 @@ func (c *CheckoutCoordinator) cycle(ctx context.Context) {
 	ctx = context.WithValue(ctx, publicationStampsKey{}, &PublicationStamps{})
 	ctx = withCycleStart(ctx, cycleStarted)
 	ctx = withPublicationTarget(ctx, c.checkoutID, through)
-	markPublicationPhase(ctx, PublicationCycleStarted)
+	// The same instant a served ticket's receipt times its P from
+	// (checkout_receipt_accounting.go).
+	markPublicationPhaseAt(ctx, PublicationCycleStarted, cycleStarted)
 	defer c.guardCheckoutRefreshCycle(ctx, through)
 	// A cycle that serves a ticket or builds a working tree is foreground
 	// work: its end is what the ready-time warm-up's idle rule measures from

@@ -162,6 +162,12 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 		if session, ok := client.(*socketClient); ok {
 			a.CWD = session.cwd
 		}
+		if redial, ok := client.(interface {
+			lastCallRedial(since time.Time) (time.Duration, bool)
+		}); ok {
+			took, redialed := redial.lastCallRedial(start)
+			a.Redialed, a.RedialNS = redialed, took.Nanoseconds()
+		}
 		var remote *rpcError
 		var retainedSummaryRefusal bool
 		if err != nil {
@@ -175,6 +181,10 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 				a.Outcome = "busy"
 			} else if retryTyped && remote != nil && remote.retryEditProbe() {
 				a.Outcome = "retryable"
+				if code := editProbeTransientCheckoutRefusal(remote.Message); code != "" && !expired && !editProbeResendFits(callCtx, start, returned, busyBackoff(retry)) {
+					a.Outcome = "error"
+					err = &editProbeResendDeclined{code: code, err: err}
+				}
 			}
 			// A fresh RPC, never internal replay or a new logical deadline. The
 			// explicit scoped contract cannot authorize writes or first-ACK probes.
@@ -212,7 +222,7 @@ func callToolPolicy(ctx context.Context, client toolCaller, r request, args map[
 			terminal.Started = time.Now()
 			terminal.DurationMS = 0
 			terminal.LogicalMS = float64(time.Since(logicalStart)) / float64(time.Millisecond)
-			terminal.Error = fmt.Sprintf("busy backoff ended: %v", err)
+			terminal.Error = fmt.Sprintf("%s: %v", busyBackoffEnded, err)
 			terminal.Code = 0
 			terminal.Outcome = terminalOutcome()
 			attempts = append(attempts, terminal)

@@ -227,3 +227,43 @@ func TestEditProbeRestartRequiresObservedPendingReceipt(t *testing.T) {
 		}
 	}
 }
+
+// A typed checkout refusal that LOAD does not re-send, because no re-send
+// could be answered before the deadline, ends the restart cell's record as it
+// ends any edit's: on the product's refusal, as a product deadline named by
+// the refusal code. Nothing was committed, so the daemon is never killed.
+func TestEditProbeRestartEndsOnADeclinedCheckoutRefusal(t *testing.T) {
+	c := editProbeCorpus()
+	c.EditSender = editProbeRestart
+	plan, err := makeEditProbePlan(c, 42, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, c.File), []byte("package sample\n\nfunc Example() int { return 1 }\n\n"+c.EditAnchor+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var restarted atomic.Bool
+	base := editProbeRestartStub(t, c, dir, false, &restarted)
+	refusal := `view_building: checkout "primary" is not fully routed yet`
+	run := newEditProbeStubRun(t, ctx, c, plan, dir, 1, func(frame stubFrame) (any, *rpcError) {
+		if args, _ := frame.Params["arguments"].(map[string]any); frame.Params["name"] == "edit" && args["operation"] == "file" {
+			return map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": refusal}}}, nil
+		}
+		return base(frame)
+	})
+	fake := &editProbeFakeRestarter{onStart: func() { restarted.Store(true) }}
+	run.restarter = fake
+	run.activate(ctx, plan.Steps[0])
+	awaitEditProbeFirstProbe(t, run.states[0])
+	run.doEdit(ctx, plan.Steps[0])
+	record := run.states[0].record
+	if record.Outcome != "product_deadline" || record.DeadlineReason != "view_building" || !slices.Equal(record.Errors, []string{"RPC -32000: " + refusal}) {
+		t.Fatalf("restart record did not end on the declined refusal: %q %q %q", record.Outcome, record.DeadlineReason, record.Errors)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("daemon restarted without a committed edit: %v", fake.calls)
+	}
+}

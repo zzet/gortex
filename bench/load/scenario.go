@@ -127,6 +127,14 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			phase.Operations = append(phase.Operations, editRequest(corpus, "{{marker}}"))
 		}
 	}
+	if scenario == contractFreshnessScenario {
+		if err := validateContractFreshnessCorpus(selected[0]); err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+		if phase.Operations, err = contractFreshnessOperations(selected[0], o); err != nil {
+			return phase, nil, artifacts, crashes, "", err
+		}
+	}
 	if editing {
 		for _, corpus := range selected {
 			if corpus.EditAnchor == "" || strings.Count(corpus.EditTemplate, "{{marker}}") != 1 {
@@ -344,7 +352,7 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 		}
 	}()
 	count := o.Agents
-	if editing {
+	if editing || scenario == contractFreshnessScenario {
 		count += o.Editors
 	}
 	if scenario == "sweep" || scenario == "cold" || scenario == "restart" {
@@ -363,6 +371,19 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			if err := preflightRoot(warmCtx, p, client, repo, worktreeViews && i > 0 || scenario == checkoutDiscoveryScenario && i >= 2, o.Deadline, &phase); err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
+			// The mine is process-wide; one settled answer on the first root covers all six.
+			if i == 0 && o.EditWaitCoChange {
+				started := time.Now()
+				body, attempts, err := warmEditCoChange(warmCtx, client, repo, o.Deadline, waitContext)
+				phase.Attempts = append(phase.Attempts, attempts...)
+				phase.Metrics["cochange_setup_seconds"] = measured(time.Since(started).Seconds(), "s")
+				if body != nil {
+					phase.Gate[repo.Corpus.Label+".cochange_setup"] = body
+				}
+				if err != nil {
+					return phase, nil, artifacts, crashes, version, err
+				}
+			}
 			gate, rows, err := warmAnalysis(warmCtx, client, o.Deadline)
 			phase.Attempts = append(phase.Attempts, rows...)
 			for name, value := range gate {
@@ -371,6 +392,14 @@ func runPhase(ctx context.Context, o runOptions, scenario string, corpora []Corp
 			if err != nil {
 				return phase, nil, artifacts, crashes, version, err
 			}
+		}
+	}
+	if scenario == contractFreshnessScenario {
+		gate, rows, err := awaitContractAnswer(warmCtx, clients[o.Agents], newContractFreshnessPlan(o.ContractFreshnessEdits), p.Repos[0], o.Deadline)
+		phase.Attempts = append(phase.Attempts, rows...)
+		phase.Gate["contract_freshness_warm"] = gate
+		if err != nil {
+			return phase, nil, artifacts, crashes, version, err
 		}
 	}
 	finishStartup()
@@ -534,6 +563,8 @@ func measureStandalone(ctx context.Context, o runOptions, p *privateRun, clients
 		err = runSweep(sweepCtx, o, sweepClients, p.Repos[0], sweepRequests, sweep, phase, waitContext)
 	} else if phase.Name == checkoutDiscoveryScenario {
 		err = measureCheckoutDiscovery(ctx, o, p, clients, phase)
+	} else if phase.Name == contractFreshnessScenario {
+		err = measureContractFreshness(ctx, o, p, clients, phase)
 	} else if phase.Name != "cold" && phase.Name != "restart" {
 		err = runAgents(ctx, o, p, clients, phase.Name == "edit" || phase.Name == "many-edit", phase)
 	}

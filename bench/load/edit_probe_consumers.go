@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // Consumer observations have their own denominator. In particular, a truthful
@@ -270,7 +269,7 @@ func editConsumerFresh(body map[string]any) bool {
 }
 
 func (r *editProbeRuntime) admitConsumerBaseline(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, min(r.options.Deadline, 20*time.Second))
+	ctx, cancel := context.WithTimeout(ctx, min(r.options.Deadline, editProbeReadBudget))
 	defer cancel()
 	s := r.states[0]
 	repo, err := r.repoFor(s.step)
