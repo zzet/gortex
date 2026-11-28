@@ -417,6 +417,12 @@ func TestUntrackDemotesADedicatedWorktree(t *testing.T) {
 	assert.True(t, result.Demoted)
 	assert.Equal(t, UntrackPlanDemote, result.Plan)
 	assert.Equal(t, []string{string(TrackSourceCLI)}, result.Revoked)
+	// The mode flip is committed, but a reader or producer still holding the
+	// dedicated corpus leaves its retirement pending; finish it before
+	// asserting the graph is gone.
+	if result.Pending {
+		finishRepositoryCleanup(t, f.lc, tracked.Prefix)
+	}
 
 	demoted, found, err := f.catalog.GetCheckout(ctx, tracked.CheckoutID)
 	require.NoError(t, err)
