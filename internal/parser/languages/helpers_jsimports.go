@@ -1,6 +1,7 @@
 package languages
 
 import (
+	"bytes"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -436,16 +437,16 @@ func visitJSAllHoistedVars(n *sitter.Node, src []byte, visit func(string)) {
 	}
 }
 
-func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, local func(string), required func(string, string)) {
+func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, local func(string), required func(string, string, string)) {
 	for i := 0; i < int(pat.NamedChildCount()); i++ {
 		c := pat.NamedChild(i)
 		switch c.Type() {
 		case "shorthand_property_identifier_pattern":
-			required(c.Content(src), spec)
+			required(c.Content(src), spec, "")
 		case "object_assignment_pattern":
 			left := c.ChildByFieldName("left")
 			if left != nil && left.Type() == "shorthand_property_identifier_pattern" {
-				required(left.Content(src), spec)
+				required(left.Content(src), spec, "")
 			} else {
 				visitJSPattern(left, src, local)
 			}
@@ -465,8 +466,13 @@ func visitJSRequireObjectPattern(pat *sitter.Node, spec string, src []byte, loca
 					keyName = jsSingleStringContent(key, src)
 				}
 			}
-			if keyName != "" && target != nil && target.Type() == "identifier" && target.Content(src) == keyName {
-				required(keyName, spec)
+			if keyName != "" && target != nil && target.Type() == "identifier" {
+				localName := target.Content(src)
+				sym := ""
+				if keyName != localName {
+					sym = keyName
+				}
+				required(localName, spec, sym)
 			} else {
 				visitJSPattern(val, src, local)
 			}
@@ -591,7 +597,7 @@ func (cache *jsScopeCache) staticRequireSpec(call *sitter.Node, src []byte) stri
 	return spec
 }
 
-func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, local func(string), required func(string, string)) {
+func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, local func(string), required func(string, string, string)) {
 	if name == nil {
 		return
 	}
@@ -601,7 +607,7 @@ func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, lo
 			if spec := cache.staticRequireSpec(value, src); spec != "" {
 				switch name.Type() {
 				case "identifier":
-					required(name.Content(src), spec)
+					required(name.Content(src), spec, "")
 					return
 				case "object_pattern":
 					visitJSRequireObjectPattern(name, spec, src, local, required)
@@ -610,9 +616,15 @@ func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, lo
 			}
 		case "member_expression":
 			prop := value.ChildByFieldName("property")
-			if name.Type() == "identifier" && prop != nil && prop.Type() == "property_identifier" && name.Content(src) == prop.Content(src) {
+			if name.Type() == "identifier" && prop != nil && prop.Type() == "property_identifier" {
 				if spec := cache.staticRequireSpec(value.ChildByFieldName("object"), src); spec != "" {
-					required(name.Content(src), spec)
+					localName := name.Content(src)
+					propName := prop.Content(src)
+					sym := ""
+					if propName != localName {
+						sym = propName
+					}
+					required(localName, spec, sym)
 					return
 				}
 			}
@@ -621,11 +633,11 @@ func (cache *jsScopeCache) visitBinding(name, value *sitter.Node, src []byte, lo
 	visitJSPattern(name, src, local)
 }
 
-func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string)) {
+func (cache *jsScopeCache) visitDeclarator(v *sitter.Node, src []byte, local func(string), required func(string, string, string)) {
 	cache.visitBinding(v.ChildByFieldName("name"), v.ChildByFieldName("value"), src, local, required)
 }
 
-func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
+func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string, string)) {
 	if n == nil {
 		return
 	}
@@ -668,7 +680,7 @@ func (cache *jsScopeCache) visitDeclaration(n *sitter.Node, src []byte, local fu
 // var crosses statement-block boundaries but not function or class boundaries.
 // Only descend through statement containers: expressions cannot introduce a
 // var in this scope, even when they contain an entire function expression.
-func (cache *jsScopeCache) visitHoistedVars(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
+func (cache *jsScopeCache) visitHoistedVars(n *sitter.Node, src []byte, local func(string), required func(string, string, string)) {
 	if n == nil {
 		return
 	}
@@ -691,7 +703,7 @@ func (cache *jsScopeCache) visitHoistedVars(n *sitter.Node, src []byte, local fu
 	}
 }
 
-func (cache *jsScopeCache) visitBlockDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string)) {
+func (cache *jsScopeCache) visitBlockDeclaration(n *sitter.Node, src []byte, local func(string), required func(string, string, string)) {
 	if n != nil && n.Type() != "variable_declaration" {
 		cache.visitDeclaration(n, src, local, required)
 	}
@@ -707,8 +719,9 @@ type jsScopeKey struct {
 	body       bool
 }
 type jsBinding struct {
-	kind string
-	spec string
+	kind   string
+	spec   string
+	symbol string
 }
 type jsScopeCache struct {
 	scopes        map[jsScopeKey]map[string]jsBinding
@@ -782,7 +795,9 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				names[id] = b
 			}
 			local := func(id string) { add(id, jsBinding{kind: graph.JSLexicalLocal}) }
-			required := func(id, spec string) { add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec}) }
+			required := func(id, spec, sym string) {
+				add(id, jsBinding{kind: graph.JSLexicalRequire, spec: spec, symbol: sym})
+			}
 			switch kind {
 			case "statement_block":
 				// Class static blocks and TS namespaces are their own var scopes.
@@ -827,8 +842,14 @@ func (cache *jsScopeCache) stamp(edge *graph.Edge, expr *sitter.Node, name strin
 				edge.Meta = map[string]any{}
 			}
 			edge.Meta[graph.JSLexicalBindingMeta] = binding.kind
-			if binding.spec != "" {
-				edge.Meta[graph.JSLexicalRequireSpecMeta] = binding.spec
+			if binding.kind == graph.JSLexicalRequire {
+				edge.Meta[graph.JSLexicalRequireLocalMeta] = name
+				if binding.spec != "" {
+					edge.Meta[graph.JSLexicalRequireSpecMeta] = binding.spec
+				}
+				if binding.symbol != "" {
+					edge.Meta[graph.JSLexicalRequireSymbolMeta] = binding.symbol
+				}
 			}
 			return
 		}
@@ -891,27 +912,33 @@ func clearCollapsedJSShadows(edges []*graph.Edge) {
 			continue
 		}
 		// Two colliding local require() calls on one line that disagree on
-		// their module specifier cannot pick one deterministically across
-		// stores; downgrade the whole group to JSLexicalLocal.
+		// their module specifier or imported symbol cannot pick one
+		// deterministically across stores; downgrade the whole group to
+		// JSLexicalLocal.
 		if winnerRank == 1 {
 			spec, _ := winner.Meta[graph.JSLexicalRequireSpecMeta].(string)
-			ambiguousSpec := false
+			sym, _ := winner.Meta[graph.JSLexicalRequireSymbolMeta].(string)
+			ambiguousRequire := false
 			for _, e := range group {
 				if jsLexicalRank(e) != 1 {
 					continue
 				}
-				if s, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string); s != spec {
-					ambiguousSpec = true
+				s, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string)
+				sm, _ := e.Meta[graph.JSLexicalRequireSymbolMeta].(string)
+				if s != spec || sm != sym {
+					ambiguousRequire = true
 					break
 				}
 			}
-			if ambiguousSpec {
+			if ambiguousRequire {
 				for _, e := range group {
 					if e.Meta == nil {
 						e.Meta = map[string]any{}
 					}
 					e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
 					delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+					delete(e.Meta, graph.JSLexicalRequireSymbolMeta)
+					delete(e.Meta, graph.JSLexicalRequireLocalMeta)
 				}
 				continue
 			}
@@ -924,12 +951,26 @@ func clearCollapsedJSShadows(edges []*graph.Edge) {
 			case 0:
 				delete(e.Meta, graph.JSLexicalBindingMeta)
 				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+				delete(e.Meta, graph.JSLexicalRequireSymbolMeta)
+				delete(e.Meta, graph.JSLexicalRequireLocalMeta)
 			case 1:
 				e.Meta[graph.JSLexicalBindingMeta] = winner.Meta[graph.JSLexicalBindingMeta]
 				e.Meta[graph.JSLexicalRequireSpecMeta] = winner.Meta[graph.JSLexicalRequireSpecMeta]
+				if local, ok := winner.Meta[graph.JSLexicalRequireLocalMeta].(string); ok && local != "" {
+					e.Meta[graph.JSLexicalRequireLocalMeta] = local
+				} else {
+					delete(e.Meta, graph.JSLexicalRequireLocalMeta)
+				}
+				if sym, ok := winner.Meta[graph.JSLexicalRequireSymbolMeta].(string); ok && sym != "" {
+					e.Meta[graph.JSLexicalRequireSymbolMeta] = sym
+				} else {
+					delete(e.Meta, graph.JSLexicalRequireSymbolMeta)
+				}
 			case 2:
 				e.Meta[graph.JSLexicalBindingMeta] = graph.JSLexicalLocal
 				delete(e.Meta, graph.JSLexicalRequireSpecMeta)
+				delete(e.Meta, graph.JSLexicalRequireSymbolMeta)
+				delete(e.Meta, graph.JSLexicalRequireLocalMeta)
 			}
 		}
 	}
@@ -1073,20 +1114,53 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 		}
 		stmtTypeOnly := tsExportStatementTypeOnly(exportNode, src)
 		mintedNode := map[string]bool{}
+		type reExportFileKey struct {
+			orig string
+			line int
+		}
+		fileEdges := make(map[reExportFileKey]*graph.Edge, len(specs))
 		for _, sp := range specs {
 			orig, alias := jsSpecifierNames(sp, src)
 			if orig == "" {
 				continue
 			}
 			specLine := int(sp.StartPoint().Row) + 1
-			edge := &graph.Edge{
-				From: fileID, To: "unresolved::import::" + importPath + "::" + orig,
-				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+			publicName := orig
+			if alias != "" {
+				publicName = alias
 			}
-			if alias != "" && alias != orig {
-				edge.Alias = alias
+			key := reExportFileKey{orig: orig, line: specLine}
+			if existing, dup := fileEdges[key]; dup {
+				bindings, _ := existing.Meta["reexport_bindings"].(map[string]any)
+				if bindings == nil {
+					priorPub := existing.Alias
+					if priorPub == "" {
+						priorPub, _ = existing.Meta["import_alias"].(string)
+					}
+					if priorPub == "" {
+						priorPub = orig
+					}
+					bindings = map[string]any{priorPub: orig}
+					existing.Meta["reexport_bindings"] = bindings
+					delete(existing.Meta, "reexport_original")
+					delete(existing.Meta, "import_alias")
+					existing.Alias = ""
+				}
+				bindings[publicName] = orig
+			} else {
+				edgeMeta := map[string]any{"reexport_original": orig}
+				edge := &graph.Edge{
+					From: fileID, To: "unresolved::import::" + importPath + "::" + orig,
+					Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+					Meta: edgeMeta,
+				}
+				if alias != "" && alias != orig {
+					edge.Alias = alias
+					edgeMeta["import_alias"] = alias
+				}
+				fileEdges[key] = edge
+				result.Edges = append(result.Edges, edge)
 			}
-			result.Edges = append(result.Edges, edge)
 
 			// A type-only re-export (`export type { X } from` or
 			// `export { type X } from`) names a type, not a value — it is
@@ -1094,12 +1168,6 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			// no value node is minted for it.
 			if stmtTypeOnly || tsSpecifierTypeOnly(sp, src) {
 				continue
-			}
-			// The public binding name is the alias when renamed, else the
-			// original — that is the name a consumer imports.
-			publicName := orig
-			if alias != "" {
-				publicName = alias
 			}
 			nodeID := fileID + "::" + publicName
 			if mintedNode[nodeID] {
@@ -1128,12 +1196,15 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 			// sourced from the node, gives the barrel binding a direct link
 			// to the declaration it forwards once the resolver rewrites the
 			// unresolved target. find_usages walks it to delegate.
+			forwardMeta := map[string]any{"reexport_original": orig}
 			forward := &graph.Edge{
 				From: nodeID, To: "unresolved::import::" + importPath + "::" + orig,
 				Kind: graph.EdgeReExports, FilePath: filePath, Line: specLine,
+				Meta: forwardMeta,
 			}
 			if publicName != orig {
 				forward.Alias = publicName
+				forwardMeta["import_alias"] = publicName
 			}
 			result.Edges = append(result.Edges, forward)
 		}
@@ -1147,8 +1218,671 @@ func emitJSReExport(exportNode *sitter.Node, importPath, fileID, filePath, lang 
 	// `export * as ns from "mod"` — record the namespace alias.
 	if ns := findChildByType(exportNode, "namespace_export"); ns != nil {
 		if id := findChildByType(ns, "identifier"); id != nil {
-			edge.Alias = id.Content(src)
+			nsName := id.Content(src)
+			edge.Alias = nsName
+			edge.Meta = map[string]any{
+				"import_alias":       nsName,
+				"reexport_namespace": true,
+			}
 		}
 	}
 	result.Edges = append(result.Edges, edge)
+}
+
+type cjsReqRef struct {
+	spec string
+	prop string
+}
+
+type cjsReExportEntry struct {
+	spec       string
+	orig       string
+	publicName string
+	wildcard   bool
+	line       int
+}
+
+func unwrapJSExportExpr(n *sitter.Node, src []byte) *sitter.Node {
+	for n != nil {
+		switch n.Type() {
+		case "parenthesized_expression":
+			n = firstNonCommentNamedChild(n)
+		case "as_expression", "satisfies_expression", "non_null_expression":
+			n = firstNonCommentNamedChild(n)
+		case "type_assertion":
+			expr := n.ChildByFieldName("expression")
+			if expr == nil {
+				seen := 0
+				for i := 0; i < int(n.NamedChildCount()); i++ {
+					if c := n.NamedChild(i); c != nil && c.Type() != "comment" {
+						seen++
+						if seen == 2 {
+							expr = c
+							break
+						}
+					}
+				}
+			}
+			n = expr
+		case "call_expression":
+			if !jsIsObjectMethodCall(n, "freeze", src) {
+				return n
+			}
+			arg := jsSingleCallArg(n)
+			if arg == nil {
+				return n
+			}
+			n = arg
+		default:
+			return n
+		}
+	}
+	return nil
+}
+
+func jsIsObjectMethodCall(call *sitter.Node, method string, src []byte) bool {
+	if call == nil || call.Type() != "call_expression" {
+		return false
+	}
+	fn := call.ChildByFieldName("function")
+	if fn == nil || fn.Type() != "member_expression" {
+		return false
+	}
+	obj := fn.ChildByFieldName("object")
+	prop := fn.ChildByFieldName("property")
+	return obj != nil && obj.Type() == "identifier" && obj.Content(src) == "Object" &&
+		prop != nil && prop.Type() == "property_identifier" && prop.Content(src) == method
+}
+
+func jsSingleCallArg(call *sitter.Node) *sitter.Node {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	var arg *sitter.Node
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		c := args.NamedChild(i)
+		if c == nil || c.Type() == "comment" {
+			continue
+		}
+		if arg != nil {
+			return nil
+		}
+		arg = c
+	}
+	return arg
+}
+
+func jsCallArgs(call *sitter.Node) []*sitter.Node {
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	var out []*sitter.Node
+	for i := 0; i < int(args.NamedChildCount()); i++ {
+		if c := args.NamedChild(i); c != nil && c.Type() != "comment" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func jsPropertyKeyName(key *sitter.Node, src []byte) string {
+	if key == nil {
+		return ""
+	}
+	switch key.Type() {
+	case "property_identifier", "identifier":
+		return key.Content(src)
+	case "string":
+		return jsSingleStringContent(key, src)
+	}
+	return ""
+}
+
+func jsIsModuleExports(n *sitter.Node, src []byte) bool {
+	if n == nil || n.Type() != "member_expression" {
+		return false
+	}
+	obj := n.ChildByFieldName("object")
+	prop := n.ChildByFieldName("property")
+	return obj != nil && obj.Type() == "identifier" && obj.Content(src) == "module" &&
+		prop != nil && prop.Type() == "property_identifier" && prop.Content(src) == "exports"
+}
+
+func tsExportAssignmentValue(stmt *sitter.Node) *sitter.Node {
+	if stmt == nil || stmt.Type() != "export_statement" {
+		return nil
+	}
+	seenEq := false
+	for i := 0; i < int(stmt.ChildCount()); i++ {
+		c := stmt.Child(i)
+		if c == nil || c.Type() == "comment" {
+			continue
+		}
+		if !seenEq {
+			if !c.IsNamed() && c.Type() == "=" {
+				seenEq = true
+			}
+			continue
+		}
+		if c.IsNamed() {
+			return c
+		}
+	}
+	return nil
+}
+
+// emitJSCJSReExports extracts CommonJS barrel re-exports (`module.exports = ...`,
+// `exports.<k> = ...`, `module.exports.<k> = ...`, `Object.assign(exports, ...)`,
+// TS `export = ...`) as file-level EdgeReExports edges without leaking
+// internal-only `require(...)` calls.
+func emitJSCJSReExports(root *sitter.Node, fileID, filePath string, src []byte, scopes *jsScopeCache, result *parser.ExtractionResult) {
+	if root == nil || !bytes.Contains(src, []byte("require")) || !bytes.Contains(src, []byte("export")) {
+		return
+	}
+
+	var moduleShadowed, exportsShadowed bool
+	checkShadow := func(id string) {
+		switch id {
+		case "module":
+			moduleShadowed = true
+		case "exports":
+			exportsShadowed = true
+		}
+	}
+	visitJSAllHoistedVars(root, src, checkShadow)
+	for i := 0; i < int(root.NamedChildCount()); i++ {
+		s := root.NamedChild(i)
+		if s == nil {
+			continue
+		}
+		if s.Type() == "import_statement" {
+			visitJSImportBindings(s, src, checkShadow)
+			continue
+		}
+		if s.Type() != "variable_declaration" {
+			visitJSAllDeclarations(s, src, false, checkShadow)
+		}
+	}
+
+	var reqBindings map[string]cjsReqRef
+	setBinding := func(name string, ref cjsReqRef) {
+		if name == "" || ref.spec == "" {
+			return
+		}
+		if reqBindings == nil {
+			reqBindings = make(map[string]cjsReqRef)
+		}
+		reqBindings[name] = ref
+	}
+	clearBinding := func(name string) {
+		if reqBindings != nil {
+			delete(reqBindings, name)
+		}
+	}
+
+	extractRef := func(expr *sitter.Node) (ref cjsReqRef, localVar string, ok bool) {
+		expr = unwrapJSExportExpr(expr, src)
+		if expr == nil {
+			return cjsReqRef{}, "", false
+		}
+		switch expr.Type() {
+		case "call_expression":
+			if spec := jsStaticRequireCall(expr, src); spec != "" && !scopes.isRequireShadowed(expr, src) {
+				return cjsReqRef{spec: spec}, "", true
+			}
+		case "member_expression":
+			prop := expr.ChildByFieldName("property")
+			if prop == nil || prop.Type() != "property_identifier" {
+				return cjsReqRef{}, "", false
+			}
+			propName := prop.Content(src)
+			if propName == "" {
+				return cjsReqRef{}, "", false
+			}
+			obj := unwrapJSExportExpr(expr.ChildByFieldName("object"), src)
+			if obj == nil {
+				return cjsReqRef{}, "", false
+			}
+			switch obj.Type() {
+			case "call_expression":
+				if spec := jsStaticRequireCall(obj, src); spec != "" && !scopes.isRequireShadowed(obj, src) {
+					return cjsReqRef{spec: spec, prop: propName}, "", true
+				}
+			case "identifier":
+				varName := obj.Content(src)
+				if b, exists := reqBindings[varName]; exists && b.spec != "" && b.prop == "" {
+					return cjsReqRef{spec: b.spec, prop: propName}, varName, true
+				}
+			}
+		case "identifier":
+			varName := expr.Content(src)
+			if b, exists := reqBindings[varName]; exists && b.spec != "" {
+				return b, varName, true
+			}
+		}
+		return cjsReqRef{}, "", false
+	}
+
+	var entries []cjsReExportEntry
+	var reexportedVars map[string]bool
+	markReExportedVar := func(varName string) {
+		if varName == "" {
+			return
+		}
+		if reexportedVars == nil {
+			reexportedVars = make(map[string]bool)
+		}
+		reexportedVars[varName] = true
+	}
+
+	processObjectLiteral := func(obj *sitter.Node) {
+		for i := 0; i < int(obj.NamedChildCount()); i++ {
+			c := obj.NamedChild(i)
+			if c == nil {
+				continue
+			}
+			propLine := int(c.StartPoint().Row) + 1
+			switch c.Type() {
+			case "pair":
+				key := jsPropertyKeyName(c.ChildByFieldName("key"), src)
+				if key == "" {
+					continue
+				}
+				if ref, varName, ok := extractRef(c.ChildByFieldName("value")); ok {
+					orig := ref.prop
+					if orig == "" {
+						orig = key
+					}
+					entries = append(entries, cjsReExportEntry{
+						spec:       ref.spec,
+						orig:       orig,
+						publicName: key,
+						line:       propLine,
+					})
+					markReExportedVar(varName)
+				}
+			case "shorthand_property_identifier":
+				key := c.Content(src)
+				if b, exists := reqBindings[key]; exists && b.spec != "" {
+					orig := b.prop
+					if orig == "" {
+						orig = key
+					}
+					entries = append(entries, cjsReExportEntry{
+						spec:       b.spec,
+						orig:       orig,
+						publicName: key,
+						line:       propLine,
+					})
+					markReExportedVar(key)
+				}
+			case "spread_element":
+				if ref, varName, ok := extractRef(firstNonCommentNamedChild(c)); ok && ref.prop == "" {
+					entries = append(entries, cjsReExportEntry{
+						spec:     ref.spec,
+						wildcard: true,
+						line:     propLine,
+					})
+					markReExportedVar(varName)
+				}
+			}
+		}
+	}
+
+	processAssignSources := func(args []*sitter.Node) {
+		for _, arg := range args {
+			a := unwrapJSExportExpr(arg, src)
+			if a == nil {
+				continue
+			}
+			if a.Type() == "object" {
+				processObjectLiteral(a)
+				continue
+			}
+			if ref, varName, ok := extractRef(a); ok && ref.prop == "" {
+				entries = append(entries, cjsReExportEntry{
+					spec:     ref.spec,
+					wildcard: true,
+					line:     int(a.StartPoint().Row) + 1,
+				})
+				markReExportedVar(varName)
+			}
+		}
+	}
+
+	processWholeExports := func(rhs *sitter.Node) {
+		r := unwrapJSExportExpr(rhs, src)
+		if r == nil {
+			return
+		}
+		if r.Type() == "object" {
+			processObjectLiteral(r)
+			return
+		}
+		if jsIsObjectMethodCall(r, "assign", src) {
+			args := jsCallArgs(r)
+			if len(args) > 0 {
+				if first := unwrapJSExportExpr(args[0], src); first != nil && first.Type() == "object" {
+					processAssignSources(args)
+					return
+				}
+			}
+		}
+		if ref, varName, ok := extractRef(r); ok {
+			entryLine := int(r.StartPoint().Row) + 1
+			if ref.prop != "" {
+				entries = append(entries, cjsReExportEntry{
+					spec:       ref.spec,
+					orig:       ref.prop,
+					publicName: ref.prop,
+					line:       entryLine,
+				})
+			} else {
+				entries = append(entries, cjsReExportEntry{
+					spec:     ref.spec,
+					wildcard: true,
+					line:     entryLine,
+				})
+			}
+			markReExportedVar(varName)
+		}
+	}
+
+	processDeclarator := func(name, value *sitter.Node) {
+		if name == nil {
+			return
+		}
+		visitJSPattern(name, src, clearBinding)
+		if value == nil {
+			return
+		}
+		val := unwrapJSExportExpr(value, src)
+		if val == nil {
+			return
+		}
+		switch name.Type() {
+		case "identifier":
+			if ref, _, ok := extractRef(val); ok {
+				setBinding(name.Content(src), ref)
+			}
+		case "object_pattern":
+			if ref, _, ok := extractRef(val); ok && ref.prop == "" {
+				for i := 0; i < int(name.NamedChildCount()); i++ {
+					c := name.NamedChild(i)
+					if c == nil {
+						continue
+					}
+					switch c.Type() {
+					case "shorthand_property_identifier_pattern":
+						id := c.Content(src)
+						setBinding(id, cjsReqRef{spec: ref.spec, prop: id})
+					case "object_assignment_pattern":
+						left := c.ChildByFieldName("left")
+						if left != nil && left.Type() == "shorthand_property_identifier_pattern" {
+							id := left.Content(src)
+							setBinding(id, cjsReqRef{spec: ref.spec, prop: id})
+						}
+					case "pair_pattern":
+						key := jsPropertyKeyName(c.ChildByFieldName("key"), src)
+						target := c.ChildByFieldName("value")
+						if target != nil && target.Type() == "assignment_pattern" {
+							target = target.ChildByFieldName("left")
+						}
+						if key != "" && target != nil && target.Type() == "identifier" {
+							setBinding(target.Content(src), cjsReqRef{spec: ref.spec, prop: key})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var walkStmt func(stmt *sitter.Node)
+	walkStmt = func(stmt *sitter.Node) {
+		if stmt == nil {
+			return
+		}
+		switch stmt.Type() {
+		case "program", "statement_block", "if_statement", "else_clause",
+			"try_statement", "catch_clause", "finally_clause",
+			"switch_statement", "switch_body", "switch_case", "switch_default",
+			"labeled_statement":
+			for i := 0; i < int(stmt.NamedChildCount()); i++ {
+				walkStmt(stmt.NamedChild(i))
+			}
+		case "export_statement":
+			if decl := stmt.ChildByFieldName("declaration"); decl != nil {
+				walkStmt(decl)
+			} else if rhs := tsExportAssignmentValue(stmt); rhs != nil {
+				processWholeExports(rhs)
+			}
+		case "import_statement":
+			if reqClause := findChildByType(stmt, "import_require_clause"); reqClause != nil {
+				id := findChildByType(reqClause, "identifier")
+				srcNode := reqClause.ChildByFieldName("source")
+				if srcNode == nil {
+					srcNode = findChildByType(reqClause, "string")
+				}
+				if id != nil {
+					clearBinding(id.Content(src))
+					if spec := jsSingleStringContent(srcNode, src); spec != "" {
+						setBinding(id.Content(src), cjsReqRef{spec: spec})
+					}
+				}
+				return
+			}
+			visitJSImportBindings(stmt, src, clearBinding)
+		case "lexical_declaration", "variable_declaration", "using_declaration":
+			for i := 0; i < int(stmt.NamedChildCount()); i++ {
+				v := stmt.NamedChild(i)
+				if v != nil && v.Type() == "variable_declarator" {
+					processDeclarator(v.ChildByFieldName("name"), v.ChildByFieldName("value"))
+				}
+			}
+		case "function_declaration", "generator_function_declaration",
+			"class_declaration", "abstract_class_declaration", "enum_declaration":
+			visitJSPattern(stmt.ChildByFieldName("name"), src, clearBinding)
+		case "expression_statement":
+			expr := firstNonCommentNamedChild(stmt)
+			if expr == nil {
+				return
+			}
+			switch expr.Type() {
+			case "assignment_expression":
+				left := expr.ChildByFieldName("left")
+				right := expr.ChildByFieldName("right")
+				if left == nil || right == nil {
+					return
+				}
+				if !moduleShadowed && jsIsModuleExports(left, src) {
+					processWholeExports(right)
+					return
+				}
+				if left.Type() == "member_expression" {
+					prop := left.ChildByFieldName("property")
+					obj := left.ChildByFieldName("object")
+					if prop != nil && prop.Type() == "property_identifier" && obj != nil {
+						isExportsProp := (!exportsShadowed && obj.Type() == "identifier" && obj.Content(src) == "exports") ||
+							(!moduleShadowed && jsIsModuleExports(obj, src))
+						if isExportsProp {
+							key := prop.Content(src)
+							if key != "" {
+								if ref, varName, ok := extractRef(right); ok {
+									orig := ref.prop
+									if orig == "" {
+										orig = key
+									}
+									entries = append(entries, cjsReExportEntry{
+										spec:       ref.spec,
+										orig:       orig,
+										publicName: key,
+										line:       int(expr.StartPoint().Row) + 1,
+									})
+									markReExportedVar(varName)
+								}
+							}
+							return
+						}
+					}
+				}
+				if left.Type() == "identifier" {
+					clearBinding(left.Content(src))
+				}
+			case "call_expression":
+				if !jsIsObjectMethodCall(expr, "assign", src) {
+					return
+				}
+				args := jsCallArgs(expr)
+				if len(args) < 2 {
+					return
+				}
+				target := unwrapJSExportExpr(args[0], src)
+				if target == nil {
+					return
+				}
+				isTargetExports := (!exportsShadowed && target.Type() == "identifier" && target.Content(src) == "exports") ||
+					(!moduleShadowed && jsIsModuleExports(target, src))
+				if isTargetExports {
+					processAssignSources(args[1:])
+				}
+			}
+		}
+	}
+
+	walkStmt(root)
+	if len(entries) == 0 {
+		return
+	}
+
+	// Count distinct named bindings per specifier to enforce jsImportBindingCap.
+	namedPerSpec := make(map[string]map[string]struct{})
+	minLinePerSpec := make(map[string]int)
+	for _, entry := range entries {
+		if prev, ok := minLinePerSpec[entry.spec]; !ok || entry.line < prev {
+			minLinePerSpec[entry.spec] = entry.line
+		}
+		if entry.wildcard {
+			continue
+		}
+		set := namedPerSpec[entry.spec]
+		if set == nil {
+			set = make(map[string]struct{})
+			namedPerSpec[entry.spec] = set
+		}
+		set[entry.publicName] = struct{}{}
+	}
+
+	collapsedSpec := make(map[string]bool)
+	for spec, set := range namedPerSpec {
+		if len(set) > jsImportBindingCap {
+			collapsedSpec[spec] = true
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     fileID,
+				To:       "unresolved::import::" + spec,
+				Kind:     graph.EdgeReExports,
+				FilePath: filePath,
+				Line:     minLinePerSpec[spec],
+			})
+		}
+	}
+
+	type groupKey struct {
+		spec string
+		line int
+	}
+	type groupVal struct {
+		hasWildcard bool
+		namedOrder  []string
+		namedOrig   map[string]string
+	}
+	var groupKeys []groupKey
+	groups := make(map[groupKey]*groupVal)
+	for _, entry := range entries {
+		if collapsedSpec[entry.spec] {
+			continue
+		}
+		gk := groupKey{spec: entry.spec, line: entry.line}
+		gv := groups[gk]
+		if gv == nil {
+			gv = &groupVal{}
+			groups[gk] = gv
+			groupKeys = append(groupKeys, gk)
+		}
+		if entry.wildcard {
+			gv.hasWildcard = true
+			continue
+		}
+		if gv.namedOrig == nil {
+			gv.namedOrig = make(map[string]string)
+		}
+		if _, exists := gv.namedOrig[entry.publicName]; !exists {
+			gv.namedOrder = append(gv.namedOrder, entry.publicName)
+		}
+		gv.namedOrig[entry.publicName] = entry.orig
+	}
+
+	for _, gk := range groupKeys {
+		gv := groups[gk]
+		switch {
+		case gv.hasWildcard && len(gv.namedOrder) == 0:
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     fileID,
+				To:       "unresolved::import::" + gk.spec,
+				Kind:     graph.EdgeReExports,
+				FilePath: filePath,
+				Line:     gk.line,
+			})
+		case !gv.hasWildcard && len(gv.namedOrder) == 1:
+			pub := gv.namedOrder[0]
+			orig := gv.namedOrig[pub]
+			meta := map[string]any{"reexport_original": orig}
+			edge := &graph.Edge{
+				From:     fileID,
+				To:       "unresolved::import::" + gk.spec + "::" + orig,
+				Kind:     graph.EdgeReExports,
+				FilePath: filePath,
+				Line:     gk.line,
+				Meta:     meta,
+			}
+			if pub != "" && pub != orig {
+				edge.Alias = pub
+				meta["import_alias"] = pub
+			}
+			result.Edges = append(result.Edges, edge)
+		default:
+			bindings := make(map[string]any, len(gv.namedOrder))
+			for _, pub := range gv.namedOrder {
+				bindings[pub] = gv.namedOrig[pub]
+			}
+			meta := map[string]any{"reexport_bindings": bindings}
+			if gv.hasWildcard {
+				meta["reexport_wildcard"] = true
+			}
+			result.Edges = append(result.Edges, &graph.Edge{
+				From:     fileID,
+				To:       "unresolved::import::" + gk.spec,
+				Kind:     graph.EdgeReExports,
+				FilePath: filePath,
+				Line:     gk.line,
+				Meta:     meta,
+			})
+		}
+	}
+
+	if len(reexportedVars) > 0 {
+		prefix := filePath + "::"
+		for _, node := range result.Nodes {
+			if node == nil || node.Kind != graph.KindVariable {
+				continue
+			}
+			if varName, ok := strings.CutPrefix(node.ID, prefix); ok && reexportedVars[varName] {
+				if node.Meta == nil {
+					node.Meta = map[string]any{}
+				}
+				node.Meta["js_cjs_reexport_binding"] = true
+			}
+		}
+	}
 }

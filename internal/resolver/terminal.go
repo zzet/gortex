@@ -86,12 +86,17 @@ func clearEdgeTerminal(e *graph.Edge) {
 // in-graph candidate — same-language (candidate_out_of_scope /
 // ambiguous_multi_match) or a different language family (cross_language_only) —
 // is genuinely pending and NEVER stamped, so more evidence can still bind it.
+func (r *Resolver) terminalClassificationExempt(e *graph.Edge) bool {
+	return r.pendingGoModuleExtern(e) ||
+		(e != nil && e.Meta != nil && e.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire)
+}
+
 func (r *Resolver) classifyTerminal(e *graph.Edge) (reason string, terminal bool) {
 	if e == nil || !graph.IsUnresolvedTarget(e.To) {
 		return "", false
 	}
 	target := graph.UnresolvedName(e.To)
-	if r.pendingGoModuleExtern(e) {
+	if r.terminalClassificationExempt(e) {
 		return "", false
 	}
 
@@ -315,7 +320,7 @@ func (r *Resolver) reconcileTerminalStampsExcluding(excluded map[deferredLSPWork
 func (r *Resolver) classifyTerminalBulk(pending []*graph.Edge, counter graph.NodeNameClassCounter) (reasons []string, terminals []bool) {
 	names := make(map[string]struct{})
 	for _, e := range pending {
-		if e.Kind == graph.EdgeImports || r.pendingGoModuleExtern(e) {
+		if e.Kind == graph.EdgeImports || r.terminalClassificationExempt(e) {
 			continue
 		}
 		if name := identifierFromTarget(graph.UnresolvedName(e.To)); name != "" {
@@ -332,7 +337,7 @@ func (r *Resolver) classifyTerminalBulk(pending []*graph.Edge, counter graph.Nod
 	terminals = make([]bool, len(pending))
 	for i, e := range pending {
 		switch {
-		case r.pendingGoModuleExtern(e):
+		case r.terminalClassificationExempt(e):
 			continue
 		case e.Kind == graph.EdgeImports:
 			reasons[i], terminals[i] = r.classifyTerminal(e)

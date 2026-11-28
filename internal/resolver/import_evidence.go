@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"maps"
 	"strings"
 	"sync"
 
@@ -33,6 +34,41 @@ import (
 // Same-file declarations block both import tiers. Restrict these rules to
 // JS/TS: importing a package does not put its bare names in scope in Go.
 
+func jsLexicalCallBinding(e *graph.Edge, target string) string {
+	if e == nil || e.Kind != graph.EdgeCalls || e.Meta == nil {
+		return ""
+	}
+	if strings.HasPrefix(target, "*.") || strings.HasPrefix(target, "import::") || strings.HasPrefix(target, "extern::") {
+		return ""
+	}
+	b, _ := e.Meta[graph.JSLexicalBindingMeta].(string)
+	return b
+}
+
+// handleJSLexicalRequire resolves a bare JS/TS call bound to an unshadowed
+// static require(spec) strictly against spec (and its ES/CJS barrel re-exports)
+// using O(1) point lookups without eager FindNodesByName seeding.
+func (r *Resolver) handleJSLexicalRequire(e *graph.Edge, funcName, callerRepo string, stats *ResolveStats) {
+	if pick, trackedNpmSpec := r.resolveJSRequireCallee(e, funcName, callerRepo); pick != nil {
+		e.To = pick.ID
+		e.Origin = graph.OriginASTResolved
+		e.Confidence = 0.9
+		if e.Meta == nil {
+			e.Meta = map[string]any{}
+		}
+		clearEdgeTerminal(e)
+		e.Meta["resolution"] = "import_closure"
+		if trackedNpmSpec != "" {
+			e.Meta[NpmImportSpecifierMeta] = trackedNpmSpec
+		} else {
+			delete(e.Meta, NpmImportSpecifierMeta)
+		}
+		stats.Resolved++
+		return
+	}
+	stats.Unresolved++
+}
+
 // handleJSLexicalBinding handles a bare JS/TS call whose name is bound in an
 // enclosing scope. A parameter always stays unresolved; a local with a
 // same-file callable/value candidate continues to the generic cascade (and
@@ -58,46 +94,44 @@ func (r *Resolver) handleJSLexicalBinding(e *graph.Edge, funcName string, candid
 		stats.Unresolved++
 		return true
 	case graph.JSLexicalRequire:
-		if pick, trackedNpmSpec := r.resolveJSRequireCallee(e, funcName, candidates); pick != nil {
-			e.To = pick.ID
-			e.Origin = graph.OriginASTResolved
-			e.Confidence = 0.9
-			if e.Meta == nil {
-				e.Meta = map[string]any{}
-			}
-			e.Meta["resolution"] = "import_closure"
-			if trackedNpmSpec != "" {
-				e.Meta[NpmImportSpecifierMeta] = trackedNpmSpec
-			} else {
-				delete(e.Meta, NpmImportSpecifierMeta)
-			}
-			stats.Resolved++
-			return true
-		}
-		stats.Unresolved++
+		r.handleJSLexicalRequire(e, funcName, r.callerRepoPrefix(e), stats)
 		return true
 	}
 	return false
 }
 
-func (r *Resolver) resolveJSRequireCallee(e *graph.Edge, funcName string, candidates []*graph.Node) (*graph.Node, string) {
+func (r *Resolver) resolveJSRequireCallee(e *graph.Edge, funcName, callerRepo string) (*graph.Node, string) {
 	spec, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string)
 	callerFile := e.FilePath
-	if spec == "" || callerFile == "" || !isJSTSPath(callerFile) || len(candidates) == 0 {
+	if spec == "" || callerFile == "" || !isJSTSPath(callerFile) {
+		return nil, ""
+	}
+	lookupName, _ := e.Meta[graph.JSLexicalRequireSymbolMeta].(string)
+	if lookupName == "" {
+		lookupName = funcName
+	}
+	if lookupName == "" {
 		return nil, ""
 	}
 	target, trackedNpmSpec := r.resolveJSRequireTarget(e, spec)
-	if target == "" {
+	targetFile := nodeFilePathWith(r.requireGetNode, target)
+	if targetFile == "" {
 		return nil, ""
 	}
-	targetFile := r.nodeFilePath(target)
-	if pick, ambiguous := pickDirectNamedExportCandidate(targetFile, funcName, candidates); ambiguous || pick != nil {
-		return pick, trackedNpmSpec
+	env := jsRequireEnv{
+		getNode:  r.requireGetNode,
+		outEdges: r.callerOutEdges,
+		resolveReExport: func(re *graph.Edge) (string, string) {
+			return r.importedTargetOf(re), ""
+		},
+		eligible: func(n *graph.Node) bool {
+			return n != nil && (callerRepo == "" || n.RepoPrefix == callerRepo)
+		},
+		fetchCandidates: func(name string) []*graph.Node {
+			return withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(name, callerRepo, e))
+		},
 	}
-	// Pass "" as excludeFile so explicit self-require (`require('./self')`)
-	// and circular barrel re-exports back into callerFile still resolve.
-	files := r.importClosureFiles("", map[string]bool{target: true})
-	return pickRequireClosureCandidate(files, funcName, candidates), trackedNpmSpec
+	return resolveJSRequireFromTargetFile(env, targetFile, lookupName, trackedNpmSpec)
 }
 
 func jsBareDirMatches(file graph.FileNodeIdentity, importPath string) bool {
@@ -146,7 +180,9 @@ func (r *Resolver) resolveJSRequireTarget(e *graph.Edge, spec string) (string, s
 	}
 	// Node always loads a core module for a bare specifier, never a
 	// same-named local directory.
-	if !isJSTSBareSpecifier(callerFile, rewritten) || isNodeCoreModule(rewritten) || declaresExternalNpmDep(r.npmDep, callerFile, rewritten) {
+	if !isJSTSBareSpecifier(callerFile, rewritten) || isNodeCoreModule(rewritten) ||
+		declaresExternalNpmDep(r.npmDep, callerFile, spec) ||
+		declaresExternalNpmDep(r.npmDep, callerFile, rewritten) {
 		return "", ""
 	}
 	return r.resolveJSBareDirTarget(e, callerFile, rewritten), ""
@@ -159,7 +195,7 @@ func (r *Resolver) resolveJSRequireTarget(e *graph.Edge, spec string) (string, s
 func (r *Resolver) resolveJSBareDirTarget(e *graph.Edge, callerFile, importPath string) string {
 	callerRepo := r.callerRepoPrefix(e)
 	callerLanguage := ""
-	if source := r.cachedGetNode(callerFile); source != nil {
+	if source := r.requireGetNode(callerFile); source != nil {
 		callerLanguage = source.Language
 	}
 	collectAll := r.workspaceMembers != nil
@@ -250,16 +286,633 @@ func (r *Resolver) resolveJSBareDirTarget(e *graph.Edge, callerFile, importPath 
 	return sameRepo.ID
 }
 
+// --- Shared Steps 1-5 require() + ES/CJS barrel resolution -----------------
+
+type jsRequireEnv struct {
+	getNode         func(id string) *graph.Node
+	outEdges        func(nodeID string) []*graph.Edge
+	resolveReExport func(e *graph.Edge) (target string, trackedNpmSpec string)
+	eligible        func(n *graph.Node) bool
+	fetchCandidates func(name string) []*graph.Node
+}
+
+type reExportTier uint8
+
+const (
+	tierNone reExportTier = iota
+	tierBinding
+	tierFallback
+	tierExact
+)
+
+type reExportVisitKey struct {
+	file string
+	name string
+}
+
+type reExportMemoEntry struct {
+	pick           *graph.Node
+	trackedNpmSpec string
+	tier           reExportTier
+	ambiguous      bool
+	hasReExports   bool
+}
+
+type reExportWalkState struct {
+	inStack map[reExportVisitKey]bool
+	memo    map[reExportVisitKey]reExportMemoEntry
+	visits  int
+}
+
+type reExportResult struct {
+	pick           *graph.Node
+	trackedNpmSpec string
+	tier           reExportTier
+	ambiguous      bool
+	hasReExports   bool
+	cycleHit       bool
+	depthTruncated bool
+}
+
+func reExportAlias(e *graph.Edge) string {
+	if e == nil {
+		return ""
+	}
+	if e.Alias != "" {
+		return e.Alias
+	}
+	if e.Meta != nil {
+		if alias, _ := e.Meta["import_alias"].(string); alias != "" {
+			return alias
+		}
+	}
+	return ""
+}
+
+func reExportOriginal(e *graph.Edge) string {
+	if e == nil {
+		return ""
+	}
+	if e.Meta != nil {
+		if orig, _ := e.Meta["reexport_original"].(string); orig != "" {
+			return orig
+		}
+	}
+	to := e.To
+	if graph.IsUnresolvedTarget(to) {
+		if payload, ok := strings.CutPrefix(graph.UnresolvedName(to), "import::"); ok {
+			_, orig := splitImportSpecSymbol(payload)
+			return orig
+		}
+		return ""
+	}
+	if strings.HasPrefix(to, "external::") {
+		_, orig := splitImportSpecSymbol(strings.TrimPrefix(to, "external::"))
+		return orig
+	}
+	if strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
+		return ""
+	}
+	_, sym := splitImportSpecSymbol(to)
+	return sym
+}
+
+func reExportBindings(e *graph.Edge) map[string]any {
+	if e == nil || e.Meta == nil {
+		return nil
+	}
+	b, _ := e.Meta["reexport_bindings"].(map[string]any)
+	return b
+}
+
+func isReExportWildcardFlag(e *graph.Edge) bool {
+	if e == nil || e.Meta == nil {
+		return false
+	}
+	v, _ := e.Meta["reexport_wildcard"].(bool)
+	return v
+}
+
+func isNamespaceReExport(e *graph.Edge) bool {
+	if e == nil {
+		return false
+	}
+	if e.Meta != nil {
+		if ns, _ := e.Meta["reexport_namespace"].(bool); ns {
+			return true
+		}
+	}
+	if len(reExportBindings(e)) > 0 {
+		return false
+	}
+	return reExportOriginal(e) == "" && reExportAlias(e) != ""
+}
+
+func nodeFilePathWith(getNode func(string) *graph.Node, id string) string {
+	if id == "" {
+		return ""
+	}
+	n := getNode(id)
+	if n == nil {
+		return ""
+	}
+	if n.FilePath != "" {
+		return n.FilePath
+	}
+	if n.Kind == graph.KindFile {
+		return n.ID
+	}
+	return ""
+}
+
+func resolveJSRequireFromTargetFile(env jsRequireEnv, targetFile, lookupName, initialTrackedNpmSpec string) (*graph.Node, string) {
+	if targetFile == "" || lookupName == "" {
+		return nil, ""
+	}
+	// Step 1: Direct ES named export fast path (depth == 0).
+	if n := env.getNode(targetFile + "::" + lookupName); n != nil &&
+		isImportableCallee(n, lookupName) &&
+		!graph.IsReExportNode(n) &&
+		n.Meta["js_cjs_reexport_binding"] != true &&
+		n.Meta["js_named_export"] == true &&
+		env.eligible(n) {
+		return n, initialTrackedNpmSpec
+	}
+
+	// Step 2: Unified precedence-aware ES/CJS barrel walk.
+	res := pickDirectReExportCandidate(env, targetFile, lookupName, 0, &reExportWalkState{})
+
+	// Step 3: Accept unambiguous hit (tierExact beats dead truncated branches).
+	if res.ambiguous {
+		return nil, ""
+	}
+	if res.pick != nil && (res.tier == tierExact || !res.depthTruncated) {
+		spec := res.trackedNpmSpec
+		if spec == "" {
+			spec = initialTrackedNpmSpec
+		}
+		return res.pick, spec
+	}
+
+	// Step 4: Zero-alloc leaf fast path when targetFile has no re-exports.
+	if !res.hasReExports {
+		if n := env.getNode(targetFile + "::" + lookupName); n != nil &&
+			isImportableCallee(n, lookupName) &&
+			!graph.IsReExportNode(n) &&
+			env.eligible(n) {
+			return n, initialTrackedNpmSpec
+		}
+		return nil, ""
+	}
+
+	// Step 5: Depth/visit-truncated fallback only (0% of normal graphs).
+	if res.depthTruncated && env.fetchCandidates != nil {
+		files, npmSpecByFile := requireClosureFiles(env, targetFile, lookupName)
+		candidates := env.fetchCandidates(lookupName)
+		if pick := pickRequireClosureCandidate(files, lookupName, candidates); pick != nil {
+			spec := npmSpecByFile[pick.FilePath]
+			if spec == "" {
+				spec = initialTrackedNpmSpec
+			}
+			return pick, spec
+		}
+		if res.pick != nil {
+			spec := res.trackedNpmSpec
+			if spec == "" {
+				spec = initialTrackedNpmSpec
+			}
+			return res.pick, spec
+		}
+	}
+	return nil, ""
+}
+
+func pickDirectReExportCandidate(env jsRequireEnv, file, exportedName string, depth int, state *reExportWalkState) reExportResult {
+	if file == "" || exportedName == "" {
+		return reExportResult{}
+	}
+	if depth > 8 || state.visits >= 256 {
+		return reExportResult{depthTruncated: true}
+	}
+
+	fileOut := env.outEdges(file)
+	hasFileReExports := false
+	for _, e := range fileOut {
+		if e != nil && e.Kind == graph.EdgeReExports && !isNamespaceReExport(e) {
+			hasFileReExports = true
+			break
+		}
+	}
+	fwd := env.getNode(file + "::" + exportedName)
+	hasFwd := fwd != nil && graph.IsReExportNode(fwd)
+	hasReExports := hasFileReExports || hasFwd
+	if depth == 0 && !hasReExports {
+		return reExportResult{}
+	}
+
+	key := reExportVisitKey{file: file, name: exportedName}
+	if state.inStack[key] {
+		return reExportResult{hasReExports: hasReExports, cycleHit: true}
+	}
+	if state.memo != nil {
+		if entry, ok := state.memo[key]; ok {
+			return reExportResult{
+				pick:           entry.pick,
+				trackedNpmSpec: entry.trackedNpmSpec,
+				tier:           entry.tier,
+				ambiguous:      entry.ambiguous,
+				hasReExports:   entry.hasReExports,
+			}
+		}
+	}
+	if state.inStack == nil {
+		state.inStack = make(map[reExportVisitKey]bool)
+	}
+	state.inStack[key] = true
+	defer delete(state.inStack, key)
+	state.visits++
+
+	finish := func(res reExportResult) reExportResult {
+		res.hasReExports = res.hasReExports || hasReExports
+		if !res.cycleHit && !res.depthTruncated {
+			if state.memo == nil {
+				state.memo = make(map[reExportVisitKey]reExportMemoEntry)
+			}
+			state.memo[key] = reExportMemoEntry{
+				pick:           res.pick,
+				trackedNpmSpec: res.trackedNpmSpec,
+				tier:           res.tier,
+				ambiguous:      res.ambiguous,
+				hasReExports:   res.hasReExports,
+			}
+		}
+		return res
+	}
+
+	// Direct exported leaf at depth > 0.
+	if depth > 0 {
+		if n := env.getNode(file + "::" + exportedName); n != nil &&
+			isImportableCallee(n, exportedName) &&
+			!graph.IsReExportNode(n) &&
+			n.Meta["js_cjs_reexport_binding"] != true &&
+			n.Meta["js_named_export"] == true &&
+			env.eligible(n) {
+			return finish(reExportResult{pick: n, tier: tierExact})
+		}
+	}
+
+	innerSpec := func(childSpec, hopSpec string) string {
+		if childSpec != "" {
+			return childSpec
+		}
+		return hopSpec
+	}
+
+	type bucket struct {
+		pick      *graph.Node
+		npmSpec   string
+		ambiguous bool
+	}
+	mergeBucket := func(b *bucket, cand *graph.Node, spec string, amb bool) {
+		if amb {
+			b.pick = nil
+			b.npmSpec = ""
+			b.ambiguous = true
+			return
+		}
+		if cand == nil || b.ambiguous {
+			return
+		}
+		if b.pick == nil {
+			b.pick = cand
+			b.npmSpec = spec
+			return
+		}
+		if b.pick.ID == cand.ID {
+			if spec != "" && (b.npmSpec == "" || spec < b.npmSpec) {
+				b.npmSpec = spec
+			}
+			return
+		}
+		b.pick = nil
+		b.npmSpec = ""
+		b.ambiguous = true
+	}
+
+	// Phase 1: Explicit named EdgeReExports + minted ES reexport node.
+	var phase1 bucket
+	var phase1Cycle, phase1Truncated bool
+
+	handlePhase1Target := func(target, hopNpmSpec, orig string) {
+		if target == "" {
+			return
+		}
+		n := env.getNode(target)
+		if n == nil {
+			return
+		}
+		if n.Kind == graph.KindFile {
+			sub := pickDirectReExportCandidate(env, n.ID, orig, depth+1, state)
+			if sub.cycleHit {
+				phase1Cycle = true
+			}
+			if sub.depthTruncated {
+				phase1Truncated = true
+			}
+			if sub.ambiguous {
+				mergeBucket(&phase1, nil, "", true)
+			} else if sub.pick != nil {
+				mergeBucket(&phase1, sub.pick, innerSpec(sub.trackedNpmSpec, hopNpmSpec), false)
+			}
+			return
+		}
+		if graph.IsReExportNode(n) {
+			sub := pickDirectReExportCandidate(env, n.FilePath, n.Name, depth+1, state)
+			if sub.cycleHit {
+				phase1Cycle = true
+			}
+			if sub.depthTruncated {
+				phase1Truncated = true
+			}
+			if sub.ambiguous {
+				mergeBucket(&phase1, nil, "", true)
+			} else if sub.pick != nil {
+				mergeBucket(&phase1, sub.pick, innerSpec(sub.trackedNpmSpec, hopNpmSpec), false)
+			}
+			return
+		}
+		if n.Meta["js_cjs_reexport_binding"] == true {
+			sub := pickDirectReExportCandidate(env, n.FilePath, orig, depth+1, state)
+			if sub.cycleHit {
+				phase1Cycle = true
+			}
+			if sub.depthTruncated {
+				phase1Truncated = true
+			}
+			if sub.ambiguous {
+				mergeBucket(&phase1, nil, "", true)
+			} else if sub.pick != nil {
+				mergeBucket(&phase1, sub.pick, innerSpec(sub.trackedNpmSpec, hopNpmSpec), false)
+			} else if !sub.cycleHit && !sub.depthTruncated && isImportableCallee(n, n.Name) && env.eligible(n) {
+				mergeBucket(&phase1, n, hopNpmSpec, false)
+			}
+			return
+		}
+		if isImportableCallee(n, n.Name) && env.eligible(n) {
+			mergeBucket(&phase1, n, hopNpmSpec, false)
+		}
+	}
+
+	if hasFwd {
+		for _, e := range env.outEdges(fwd.ID) {
+			if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
+				continue
+			}
+			orig := reExportOriginal(e)
+			if orig == "" {
+				orig, _ = fwd.Meta["reexport_original"].(string)
+			}
+			if orig == "" {
+				orig = exportedName
+			}
+			target, hopNpmSpec := env.resolveReExport(e)
+			handlePhase1Target(target, hopNpmSpec, orig)
+		}
+	}
+
+	for _, e := range fileOut {
+		if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
+			continue
+		}
+		if bindings := reExportBindings(e); len(bindings) > 0 {
+			if orig, ok := bindings[exportedName].(string); ok && orig != "" {
+				target, hopNpmSpec := env.resolveReExport(e)
+				handlePhase1Target(target, hopNpmSpec, orig)
+			}
+			continue
+		}
+		orig := reExportOriginal(e)
+		if orig == "" {
+			continue
+		}
+		pub := reExportAlias(e)
+		if pub == "" {
+			pub = orig
+		}
+		if pub != exportedName {
+			continue
+		}
+		target, hopNpmSpec := env.resolveReExport(e)
+		handlePhase1Target(target, hopNpmSpec, orig)
+	}
+
+	if phase1.ambiguous {
+		return finish(reExportResult{
+			tier:           tierExact,
+			ambiguous:      true,
+			cycleHit:       phase1Cycle,
+			depthTruncated: phase1Truncated,
+		})
+	}
+	if phase1.pick != nil {
+		return finish(reExportResult{
+			pick:           phase1.pick,
+			trackedNpmSpec: phase1.npmSpec,
+			tier:           tierExact,
+			cycleHit:       phase1Cycle,
+			depthTruncated: phase1Truncated,
+		})
+	}
+
+	// Phase 2: Wildcard EdgeReExports on file.
+	var exactB, fallbackB, bindingB bucket
+	anyCycle := phase1Cycle
+	anyTruncated := phase1Truncated
+	for _, e := range fileOut {
+		if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
+			continue
+		}
+		isWildcard := false
+		if bindings := reExportBindings(e); len(bindings) > 0 {
+			isWildcard = isReExportWildcardFlag(e)
+		} else {
+			isWildcard = reExportOriginal(e) == "" && reExportAlias(e) == ""
+		}
+		if !isWildcard {
+			continue
+		}
+		target, hopNpmSpec := env.resolveReExport(e)
+		targetFile := nodeFilePathWith(env.getNode, target)
+		if targetFile == "" {
+			continue
+		}
+		sub := pickDirectReExportCandidate(env, targetFile, exportedName, depth+1, state)
+		if sub.cycleHit {
+			anyCycle = true
+		}
+		if sub.depthTruncated {
+			anyTruncated = true
+		}
+		spec := innerSpec(sub.trackedNpmSpec, hopNpmSpec)
+		switch {
+		case sub.ambiguous:
+			switch sub.tier {
+			case tierFallback:
+				mergeBucket(&fallbackB, nil, "", true)
+			case tierBinding:
+				mergeBucket(&bindingB, nil, "", true)
+			default:
+				mergeBucket(&exactB, nil, "", true)
+			}
+		case sub.pick != nil:
+			switch sub.tier {
+			case tierExact:
+				mergeBucket(&exactB, sub.pick, spec, false)
+			case tierFallback:
+				mergeBucket(&fallbackB, sub.pick, spec, false)
+			case tierBinding:
+				mergeBucket(&bindingB, sub.pick, spec, false)
+			}
+		}
+	}
+
+	if exactB.ambiguous {
+		return finish(reExportResult{
+			tier:           tierExact,
+			ambiguous:      true,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+	if exactB.pick != nil {
+		return finish(reExportResult{
+			pick:           exactB.pick,
+			trackedNpmSpec: exactB.npmSpec,
+			tier:           tierExact,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+
+	// Unmarked leaf fallback (both depth == 0 when hasReExports and depth > 0).
+	if n := env.getNode(file + "::" + exportedName); n != nil &&
+		isImportableCallee(n, exportedName) &&
+		!graph.IsReExportNode(n) &&
+		n.Meta["js_named_export"] != true &&
+		env.eligible(n) {
+		if n.Meta["js_cjs_reexport_binding"] == true {
+			if !anyCycle && !anyTruncated {
+				mergeBucket(&bindingB, n, "", false)
+			}
+		} else {
+			mergeBucket(&fallbackB, n, "", false)
+		}
+	}
+
+	if fallbackB.ambiguous {
+		return finish(reExportResult{
+			tier:           tierFallback,
+			ambiguous:      true,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+	if fallbackB.pick != nil {
+		return finish(reExportResult{
+			pick:           fallbackB.pick,
+			trackedNpmSpec: fallbackB.npmSpec,
+			tier:           tierFallback,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+	if bindingB.ambiguous {
+		return finish(reExportResult{
+			tier:           tierBinding,
+			ambiguous:      true,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+	if bindingB.pick != nil {
+		return finish(reExportResult{
+			pick:           bindingB.pick,
+			trackedNpmSpec: bindingB.npmSpec,
+			tier:           tierBinding,
+			cycleHit:       anyCycle,
+			depthTruncated: anyTruncated,
+		})
+	}
+	return finish(reExportResult{
+		cycleHit:       anyCycle,
+		depthTruncated: anyTruncated,
+	})
+}
+
+func requireClosureFiles(env jsRequireEnv, targetFile, lookupName string) (map[string]struct{}, map[string]string) {
+	files := map[string]struct{}{targetFile: {}}
+	npmSpecByFile := make(map[string]string)
+	pending := []string{targetFile}
+	for len(pending) > 0 {
+		f := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		parentSpec := npmSpecByFile[f]
+		for _, e := range env.outEdges(f) {
+			if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
+				continue
+			}
+			if bindings := reExportBindings(e); len(bindings) > 0 {
+				_, hasNamed := bindings[lookupName].(string)
+				if !hasNamed && !isReExportWildcardFlag(e) {
+					continue
+				}
+			} else if orig := reExportOriginal(e); orig != "" {
+				pub := reExportAlias(e)
+				if pub == "" {
+					pub = orig
+				}
+				if pub != lookupName {
+					continue
+				}
+			}
+			target, hopNpmSpec := env.resolveReExport(e)
+			nextFile := nodeFilePathWith(env.getNode, target)
+			if nextFile == "" {
+				continue
+			}
+			nextSpec := hopNpmSpec
+			if nextSpec == "" {
+				nextSpec = parentSpec
+			}
+			if _, seen := files[nextFile]; !seen {
+				files[nextFile] = struct{}{}
+				if nextSpec != "" {
+					npmSpecByFile[nextFile] = nextSpec
+				}
+				pending = append(pending, nextFile)
+			} else if nextSpec != "" {
+				if cur := npmSpecByFile[nextFile]; cur == "" || nextSpec < cur {
+					npmSpecByFile[nextFile] = nextSpec
+				}
+			}
+		}
+	}
+	return files, npmSpecByFile
+}
+
 // pickDirectNamedExportCandidate selects a unique directly named export on
-// targetFile. Unexported declarations on targetFile are deliberately not
-// preferred here so a private helper in a barrel cannot shadow `export * from`.
+// targetFile. Unexported declarations and re-export forwarders/CJS re-export
+// bindings on targetFile are skipped so private helpers and 2-step barrels
+// cannot shadow canonical targets.
 func pickDirectNamedExportCandidate(targetFile, funcName string, candidates []*graph.Node) (*graph.Node, bool) {
 	if targetFile == "" {
 		return nil, false
 	}
 	var pick *graph.Node
 	for _, c := range candidates {
-		if c.FilePath != targetFile || c.Meta["js_named_export"] != true || !isImportableCallee(c, funcName) {
+		if c.FilePath != targetFile || c.Meta["js_named_export"] != true ||
+			graph.IsReExportNode(c) || c.Meta["js_cjs_reexport_binding"] == true ||
+			!isImportableCallee(c, funcName) {
 			continue
 		}
 		if pick != nil && pick.ID != c.ID {
@@ -272,14 +925,17 @@ func pickDirectNamedExportCandidate(targetFile, funcName string, candidates []*g
 
 // pickRequireClosureCandidate prefers a unique directly named export across
 // the required barrel closure, falling back to any unique importable symbol
-// only when the closure has no directly named export (e.g. pure CJS modules).
+// (preferring canonical symbols over 2-step CJS re-export bindings) only when
+// the closure has no directly named export (e.g. pure CJS modules).
 func pickRequireClosureCandidate(files map[string]struct{}, funcName string, candidates []*graph.Node) *graph.Node {
 	if len(files) == 0 {
 		return nil
 	}
 	var exported *graph.Node
 	for _, c := range candidates {
-		if c.Meta["js_named_export"] != true || !isImportableCallee(c, funcName) {
+		if c.Meta["js_named_export"] != true ||
+			graph.IsReExportNode(c) || c.Meta["js_cjs_reexport_binding"] == true ||
+			!isImportableCallee(c, funcName) {
 			continue
 		}
 		if _, ok := files[c.FilePath]; !ok {
@@ -301,6 +957,63 @@ type jsRequireTarget struct {
 	trackedNpmSpec string
 }
 
+func (cr *CrossRepoResolver) requireGetNode(id string) *graph.Node {
+	if id == "" {
+		return nil
+	}
+	if cr.nodeByID != nil {
+		if n, ok := cr.nodeByID[id]; ok && n != nil {
+			return n
+		}
+	}
+	cr.requireCacheMu.RLock()
+	n, ok := cr.requireNodeByID[id]
+	cr.requireCacheMu.RUnlock()
+	if ok {
+		return n
+	}
+	loaded := cr.graph.GetNode(id)
+	cr.requireCacheMu.Lock()
+	if cr.requireNodeByID == nil {
+		cr.requireNodeByID = make(map[string]*graph.Node)
+	}
+	if existing, exists := cr.requireNodeByID[id]; exists {
+		loaded = existing
+	} else {
+		cr.requireNodeByID[id] = loaded
+	}
+	cr.requireCacheMu.Unlock()
+	return loaded
+}
+
+func (cr *CrossRepoResolver) jsRequireEnvWith(callerRepo, callerWS string, getNode func(string) *graph.Node) jsRequireEnv {
+	return cr.jsRequireEnvMemo(callerRepo, callerWS, nil, getNode)
+}
+
+func (cr *CrossRepoResolver) jsRequireEnvMemo(callerRepo, callerWS string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireEnv {
+	return jsRequireEnv{
+		getNode:  getNode,
+		outEdges: cr.cachedOutEdges,
+		resolveReExport: func(re *graph.Edge) (string, string) {
+			return cr.importedTargetOfMemo(re, memo, getNode)
+		},
+		eligible: func(n *graph.Node) bool {
+			return n != nil && (!isCrossRepoHop(callerRepo, n.RepoPrefix) || cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(n), ""))
+		},
+		fetchCandidates: func(name string) []*graph.Node {
+			raw := withoutReExportForwarders(cr.cachedFindNodesByName(name))
+			out := make([]*graph.Node, 0, len(raw))
+			for _, c := range raw {
+				if isCrossRepoHop(callerRepo, c.RepoPrefix) && !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
+					continue
+				}
+				out = append(out, c)
+			}
+			return out
+		},
+	}
+}
+
 func (cr *CrossRepoResolver) resolveJSRequireCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
 	spec, _ := e.Meta[graph.JSLexicalRequireSpecMeta].(string)
 	callerFile := e.FilePath
@@ -308,41 +1021,24 @@ func (cr *CrossRepoResolver) resolveJSRequireCall(e *graph.Edge, funcName string
 		stats.Unresolved++
 		return
 	}
+	lookupName, _ := e.Meta[graph.JSLexicalRequireSymbolMeta].(string)
+	if lookupName == "" {
+		lookupName = funcName
+	}
+	if lookupName == "" {
+		stats.Unresolved++
+		return
+	}
 	callerRepo := cr.callerRepoPrefix(e)
 	callerWS := cr.callerWorkspaceID(e)
-	resolved := cr.resolveJSRequireTarget(e, callerFile, callerRepo, callerWS, spec)
-	if resolved.target == "" {
+	resolved := cr.resolveJSRequireTargetWith(e, callerFile, callerRepo, callerWS, spec, cr.requireGetNode)
+	targetFile := nodeFilePathWith(cr.requireGetNode, resolved.target)
+	if targetFile == "" {
 		stats.Unresolved++
 		return
 	}
-	// Use cachedFindNodesByName rather than scopedCandidates: tracked npm
-	// providers are intentionally omitted from reachableReposByFile, while
-	// target + barrel closure + workspace checks below enforce exact reachability.
-	rawCandidates := withoutReExportForwarders(cr.cachedFindNodesByName(funcName))
-	if len(rawCandidates) == 0 {
-		stats.Unresolved++
-		return
-	}
-	candidates := make([]*graph.Node, 0, len(rawCandidates))
-	for _, c := range rawCandidates {
-		if isCrossRepoHop(callerRepo, c.RepoPrefix) && !cr.crossWorkspaceEligible(callerWS, candidateWorkspaceID(c), "") {
-			continue
-		}
-		candidates = append(candidates, c)
-	}
-	if len(candidates) == 0 {
-		stats.Unresolved++
-		return
-	}
-	pick, ambiguous := pickDirectNamedExportCandidate(cr.nodeFilePath(resolved.target), funcName, candidates)
-	if ambiguous {
-		stats.Unresolved++
-		return
-	}
-	if pick == nil {
-		files := cr.importClosureFiles(resolved.target)
-		pick = pickRequireClosureCandidate(files, funcName, candidates)
-	}
+	env := cr.jsRequireEnvWith(callerRepo, callerWS, cr.requireGetNode)
+	pick, npmSpec := resolveJSRequireFromTargetFile(env, targetFile, lookupName, resolved.trackedNpmSpec)
 	if pick == nil {
 		stats.Unresolved++
 		return
@@ -352,10 +1048,13 @@ func (cr *CrossRepoResolver) resolveJSRequireCall(e *graph.Edge, funcName string
 	e.Confidence = 0.9
 	if e.Meta == nil {
 		e.Meta = map[string]any{}
+	} else {
+		e.Meta = maps.Clone(e.Meta)
 	}
+	clearEdgeTerminal(e)
 	e.Meta["resolution"] = "import_closure"
-	if resolved.trackedNpmSpec != "" {
-		e.Meta[NpmImportSpecifierMeta] = resolved.trackedNpmSpec
+	if npmSpec != "" {
+		e.Meta[NpmImportSpecifierMeta] = npmSpec
 	} else {
 		delete(e.Meta, NpmImportSpecifierMeta)
 	}
@@ -388,14 +1087,22 @@ func (cr *CrossRepoResolver) cachedOutEdges(file string) []*graph.Edge {
 }
 
 func (cr *CrossRepoResolver) resolveJSRequireTarget(e *graph.Edge, callerFile, callerRepo, callerWS, spec string) jsRequireTarget {
-	cacheKey := callerFile + "\x00" + spec
+	return cr.resolveJSRequireTargetWith(e, callerFile, callerRepo, callerWS, spec, cr.requireGetNode)
+}
+
+func (cr *CrossRepoResolver) resolveJSRequireTargetWith(e *graph.Edge, callerFile, callerRepo, callerWS, spec string, getNode func(string) *graph.Node) jsRequireTarget {
+	return cr.resolveJSRequireTargetMemo(e, callerFile, callerRepo, callerWS, spec, nil, getNode)
+}
+
+func (cr *CrossRepoResolver) resolveJSRequireTargetMemo(e *graph.Edge, callerFile, callerRepo, callerWS, spec string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireTarget {
+	cacheKey := "req\x00" + callerFile + "\x00" + spec
 	cr.requireCacheMu.RLock()
 	cached, ok := cr.requireTargetCache[cacheKey]
 	cr.requireCacheMu.RUnlock()
 	if ok {
 		return cached
 	}
-	target := cr.resolveJSRequireTargetUncached(e, callerFile, callerRepo, callerWS, spec)
+	target := cr.resolveJSRequireTargetUncached(e, callerFile, callerRepo, callerWS, spec, memo, getNode)
 	cr.requireCacheMu.Lock()
 	if cr.requireTargetCache == nil {
 		cr.requireTargetCache = make(map[string]jsRequireTarget)
@@ -405,22 +1112,20 @@ func (cr *CrossRepoResolver) resolveJSRequireTarget(e *graph.Edge, callerFile, c
 	return target
 }
 
-func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, callerFile, callerRepo, callerWS, spec string) jsRequireTarget {
-	if to := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, callerFile, spec); to != "" {
+func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, callerFile, callerRepo, callerWS, spec string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireTarget {
+	if to := resolveJSTSImportTarget(getNode, cr.pathAlias, callerFile, spec); to != "" {
 		return jsRequireTarget{target: to}
 	}
 	rewritten, npmAliased := rewriteNpmAliasImport(cr.npmAlias, callerFile, spec)
 	if npmAliased {
-		if to := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, callerFile, rewritten); to != "" {
+		if to := resolveJSTSImportTarget(getNode, cr.pathAlias, callerFile, rewritten); to != "" {
 			return jsRequireTarget{target: to}
 		}
 	}
+	triedTrackedNpm := false
 	if cr.npmPackages != nil && cr.eligibleTrackedNpmImport(e, spec) {
-		memo := &npmImportMemo{
-			probes: make(map[npmProbeKey]*graph.Node),
-			nodes:  make(map[string]*graph.Node),
-		}
-		if node := cr.trackedNpmImport(callerRepo, callerWS, spec, memo); node != nil {
+		triedTrackedNpm = true
+		if node := cr.trackedNpmImportWith(callerRepo, callerWS, spec, memo, getNode); node != nil {
 			return jsRequireTarget{target: node.ID, trackedNpmSpec: spec}
 		}
 	}
@@ -436,7 +1141,7 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 		if marked != spec && marked != rewritten && mod != spec && mod != rewritten {
 			continue
 		}
-		if to := cr.importedTargetOf(imp); to != "" {
+		if to, _ := cr.importedTargetOfMemo(imp, memo, getNode); to != "" {
 			trackedSpec := ""
 			if cr.eligibleTrackedNpmImport(e, mod) {
 				trackedSpec = mod
@@ -444,10 +1149,50 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 			return jsRequireTarget{target: to, trackedNpmSpec: trackedSpec}
 		}
 	}
+	if triedTrackedNpm {
+		return jsRequireTarget{}
+	}
+	return cr.resolveJSBareOrTrackedNpmTargetMemo(e, callerFile, callerRepo, callerWS, spec, memo, getNode)
+}
+
+func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTarget(e *graph.Edge, callerFile, callerRepo, callerWS, mod string, getNode func(string) *graph.Node) jsRequireTarget {
+	return cr.resolveJSBareOrTrackedNpmTargetMemo(e, callerFile, callerRepo, callerWS, mod, nil, getNode)
+}
+
+func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTargetMemo(e *graph.Edge, callerFile, callerRepo, callerWS, mod string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireTarget {
+	cacheKey := "bare\x00" + callerFile + "\x00" + mod
+	cr.requireCacheMu.RLock()
+	cached, ok := cr.requireTargetCache[cacheKey]
+	cr.requireCacheMu.RUnlock()
+	if ok {
+		return cached
+	}
+	result := cr.resolveJSBareOrTrackedNpmTargetUncached(e, callerFile, callerRepo, callerWS, mod, memo, getNode)
+	cr.requireCacheMu.Lock()
+	if cr.requireTargetCache == nil {
+		cr.requireTargetCache = make(map[string]jsRequireTarget)
+	}
+	cr.requireTargetCache[cacheKey] = result
+	cr.requireCacheMu.Unlock()
+	return result
+}
+
+func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTargetUncached(e *graph.Edge, callerFile, callerRepo, callerWS, mod string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireTarget {
+	if cr.npmPackages != nil && cr.eligibleTrackedNpmImport(e, mod) {
+		if node := cr.trackedNpmImportWith(callerRepo, callerWS, mod, memo, getNode); node != nil {
+			return jsRequireTarget{target: node.ID, trackedNpmSpec: mod}
+		}
+	}
+	rewritten, _ := rewriteNpmAliasImport(cr.npmAlias, callerFile, mod)
 	// Node always loads a core module for a bare specifier, never a
 	// same-named local directory.
-	if !isJSTSBareSpecifier(callerFile, rewritten) || isNodeCoreModule(rewritten) || declaresExternalNpmDep(cr.npmDep, callerFile, rewritten) {
+	if !isJSTSBareSpecifier(callerFile, rewritten) || isNodeCoreModule(rewritten) ||
+		declaresExternalNpmDep(cr.npmDep, callerFile, mod) ||
+		declaresExternalNpmDep(cr.npmDep, callerFile, rewritten) {
 		return jsRequireTarget{}
+	}
+	if cr.dirIndex == nil {
+		cr.buildDirIndexes()
 	}
 	collectAll := cr.workspaceMembers != nil
 	var sameRepo graph.FileNodeIdentity
@@ -474,29 +1219,17 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 		}
 	}
 	stop := func() bool { return sameRepoFound && !collectAll }
-	if cr.dirIndex != nil {
-		for _, file := range cr.dirIndex[rewritten] {
+	for _, file := range cr.dirIndex[rewritten] {
+		consider(file)
+		if stop() {
+			break
+		}
+	}
+	if !sameRepoFound || collectAll {
+		for _, file := range cr.lastDirIndex[lastPathComponent(rewritten)] {
 			consider(file)
 			if stop() {
 				break
-			}
-		}
-		if !sameRepoFound || collectAll {
-			for _, file := range cr.lastDirIndex[lastPathComponent(rewritten)] {
-				consider(file)
-				if stop() {
-					break
-				}
-			}
-		}
-	} else {
-		for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
-			dir := filePathDir(file.FilePath)
-			if strings.HasSuffix(dir, lastPathComponent(rewritten)) || dir == rewritten {
-				consider(file)
-				if stop() {
-					break
-				}
 			}
 		}
 	}
@@ -513,48 +1246,96 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 }
 
 func (cr *CrossRepoResolver) nodeFilePath(id string) string {
-	if id == "" {
-		return ""
-	}
-	n := cr.cachedGetNode(id)
-	if n == nil {
-		return ""
-	}
-	if n.FilePath != "" {
-		return n.FilePath
-	}
-	if n.Kind == graph.KindFile {
-		return n.ID
-	}
-	return ""
+	return nodeFilePathWith(cr.requireGetNode, id)
 }
 
 func (cr *CrossRepoResolver) importedTargetOf(e *graph.Edge) string {
+	to, _ := cr.importedTargetOfWith(e, cr.requireGetNode)
+	return to
+}
+
+func (cr *CrossRepoResolver) importedTargetOfWith(e *graph.Edge, getNode func(string) *graph.Node) (string, string) {
+	return cr.importedTargetOfMemo(e, nil, getNode)
+}
+
+func (cr *CrossRepoResolver) importedTargetOfMemo(e *graph.Edge, memo *npmImportMemo, getNode func(string) *graph.Node) (string, string) {
 	to := e.To
 	if to == "" {
-		return ""
+		return "", ""
 	}
 	if graph.IsUnresolvedTarget(to) {
 		payload, ok := strings.CutPrefix(graph.UnresolvedName(to), "import::")
 		if !ok || payload == "" {
-			return ""
+			return "", ""
 		}
 		callerFile := jsTSImportCallerFile(e)
-		target := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, callerFile, payload)
+		target := resolveJSTSImportTarget(getNode, cr.pathAlias, callerFile, payload)
 		if target == "" {
-			if rewritten, aliased := rewriteNpmAliasImport(cr.npmAlias, e.FilePath, payload); aliased {
-				target = resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, callerFile, rewritten)
+			if rewritten, aliased := rewriteNpmAliasImport(cr.npmAlias, callerFile, payload); aliased {
+				target = resolveJSTSImportTarget(getNode, cr.pathAlias, callerFile, rewritten)
 			}
 		}
-		return target
+		if target != "" {
+			return target, ""
+		}
+		if e.Kind == graph.EdgeReExports {
+			mod, _ := splitImportSpecSymbol(payload)
+			from := getNode(callerFile)
+			callerRepo := graph.RepoPrefixOfID(callerFile)
+			if from != nil && from.RepoPrefix != "" {
+				callerRepo = from.RepoPrefix
+			}
+			callerWS := candidateWorkspaceID(from)
+			if callerWS == "" {
+				callerWS = callerRepo
+			}
+			res := cr.resolveJSBareOrTrackedNpmTargetMemo(e, callerFile, callerRepo, callerWS, mod, memo, getNode)
+			return res.target, res.trackedNpmSpec
+		}
+		return "", ""
 	}
-	if strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
-		return ""
+	if strings.HasPrefix(to, "external::") {
+		if e.Kind == graph.EdgeReExports && cr.npmPackages != nil {
+			mod, _ := splitImportSpecSymbol(strings.TrimPrefix(to, "external::"))
+			if mod != "" && cr.eligibleTrackedNpmImport(e, mod) {
+				callerFile := jsTSImportCallerFile(e)
+				from := getNode(callerFile)
+				callerRepo := graph.RepoPrefixOfID(callerFile)
+				if from != nil && from.RepoPrefix != "" {
+					callerRepo = from.RepoPrefix
+				}
+				callerWS := candidateWorkspaceID(from)
+				if callerWS == "" {
+					callerWS = callerRepo
+				}
+				if node := cr.trackedNpmImportWith(callerRepo, callerWS, mod, memo, getNode); node != nil {
+					return node.ID, mod
+				}
+			}
+		}
+		return "", ""
 	}
-	return to
+	if strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
+		return "", ""
+	}
+	if e.Kind == graph.EdgeReExports && e.Meta != nil {
+		if marked, _ := e.Meta[NpmImportSpecifierMeta].(string); marked != "" {
+			mod, _ := splitImportSpecSymbol(marked)
+			return to, mod
+		}
+	}
+	return to, ""
 }
 
 func (cr *CrossRepoResolver) importClosureFiles(target string) map[string]struct{} {
+	return cr.importClosureFilesMemo(target, nil, cr.requireGetNode)
+}
+
+func (cr *CrossRepoResolver) importClosureFilesWith(target string, getNode func(string) *graph.Node) map[string]struct{} {
+	return cr.importClosureFilesMemo(target, nil, getNode)
+}
+
+func (cr *CrossRepoResolver) importClosureFilesMemo(target string, memo *npmImportMemo, getNode func(string) *graph.Node) map[string]struct{} {
 	files := make(map[string]struct{})
 	var pendingBarrels []string
 	addTarget := func(f string) {
@@ -567,27 +1348,30 @@ func (cr *CrossRepoResolver) importClosureFiles(target string) map[string]struct
 		files[f] = struct{}{}
 		pendingBarrels = append(pendingBarrels, f)
 	}
-	addTarget(cr.nodeFilePath(target))
+	addTarget(nodeFilePathWith(getNode, target))
 	for len(pendingBarrels) > 0 {
 		f := pendingBarrels[len(pendingBarrels)-1]
 		pendingBarrels = pendingBarrels[:len(pendingBarrels)-1]
 		for _, e := range cr.cachedOutEdges(f) {
-			if e == nil || e.Kind != graph.EdgeReExports {
+			if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
 				continue
 			}
-			addTarget(cr.nodeFilePath(cr.importedTargetOf(e)))
+			to, _ := cr.importedTargetOfMemo(e, memo, getNode)
+			addTarget(nodeFilePathWith(getNode, to))
 		}
 	}
 	return files
 }
 
 // pickUniqueFileCandidate returns the only importable candidate defined in
-// files, or nil when none or several are.
+// files, preferring canonical symbols over 2-step CJS re-export bindings, or
+// nil when none or several are.
 func pickUniqueFileCandidate(files map[string]struct{}, funcName string, candidates []*graph.Node) *graph.Node {
 	if len(files) == 0 {
 		return nil
 	}
-	var pick *graph.Node
+	var canonical, binding *graph.Node
+	canonicalAmbig, bindingAmbig := false, false
 	for _, c := range candidates {
 		if !isImportableCallee(c, funcName) {
 			continue
@@ -595,16 +1379,34 @@ func pickUniqueFileCandidate(files map[string]struct{}, funcName string, candida
 		if _, ok := files[c.FilePath]; !ok {
 			continue
 		}
-		if pick != nil {
+		if c.Meta["js_cjs_reexport_binding"] == true {
+			if binding != nil && binding.ID != c.ID {
+				bindingAmbig = true
+			} else {
+				binding = c
+			}
+			continue
+		}
+		if canonical != nil && canonical.ID != c.ID {
 			// Two imported files (or one file with two same-named
 			// top-level symbols) both define the name — the import
 			// statement alone cannot arbitrate. Refuse, exactly like
 			// the no-import case.
-			return nil
+			canonicalAmbig = true
+		} else {
+			canonical = c
 		}
-		pick = c
 	}
-	return pick
+	if canonicalAmbig {
+		return nil
+	}
+	if canonical != nil {
+		return canonical
+	}
+	if bindingAmbig {
+		return nil
+	}
+	return binding
 }
 
 func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candidates []*graph.Node) (*graph.Node, string) {
@@ -633,7 +1435,9 @@ func (r *Resolver) pickImportEvidenceCallee(callerFile, funcName string, candida
 	imports := r.importEvidenceFor(callerFile)
 	var symbolPick *graph.Node
 	for _, c := range candidates {
-		if !imports.direct[c.ID] || c.Meta["js_named_export"] != true || !isImportableCallee(c, funcName) {
+		if !imports.direct[c.ID] || c.Meta["js_named_export"] != true ||
+			graph.IsReExportNode(c) || c.Meta["js_cjs_reexport_binding"] == true ||
+			!isImportableCallee(c, funcName) {
 			continue
 		}
 		if symbolPick != nil && symbolPick.ID != c.ID {
@@ -685,7 +1489,40 @@ func (r *Resolver) clearImportEvidence() {
 	r.importFilesMu.Lock()
 	r.importsByCaller = nil
 	r.importOutByFile = nil
+	r.requireNodeByID = nil
 	r.importFilesMu.Unlock()
+}
+
+func (r *Resolver) requireGetNode(id string) *graph.Node {
+	if id == "" {
+		return nil
+	}
+	if r.nodeByID != nil {
+		if n, ok := r.nodeByID[id]; ok && n != nil {
+			return n
+		}
+	}
+	if _, missing := r.missingNodeByID[id]; missing {
+		return nil
+	}
+	r.importFilesMu.RLock()
+	n, ok := r.requireNodeByID[id]
+	r.importFilesMu.RUnlock()
+	if ok {
+		return n
+	}
+	loaded := r.graph.GetNode(id)
+	r.importFilesMu.Lock()
+	if r.requireNodeByID == nil {
+		r.requireNodeByID = make(map[string]*graph.Node)
+	}
+	if existing, exists := r.requireNodeByID[id]; exists {
+		loaded = existing
+	} else {
+		r.requireNodeByID[id] = loaded
+	}
+	r.importFilesMu.Unlock()
+	return loaded
 }
 
 func (r *Resolver) importEvidenceFor(callerFile string) *callerImportEvidence {
@@ -751,7 +1588,7 @@ func (r *Resolver) importClosureFiles(excludeFile string, direct map[string]bool
 		f := pendingBarrels[len(pendingBarrels)-1]
 		pendingBarrels = pendingBarrels[:len(pendingBarrels)-1]
 		for _, e := range r.callerOutEdges(f) {
-			if e.Kind != graph.EdgeReExports {
+			if e == nil || e.Kind != graph.EdgeReExports || isNamespaceReExport(e) {
 				continue
 			}
 			addTarget(r.nodeFilePath(r.importedTargetOf(e)))
@@ -765,10 +1602,10 @@ func (r *Resolver) resolveJSTSSpecTarget(e *graph.Edge, payload string) string {
 	// Same expansion, same precedence as resolveImport: tsconfig
 	// paths / relative join first, npm-alias rewrite second.
 	callerFile := jsTSImportCallerFile(e)
-	target := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, payload)
+	target := resolveJSTSImportTarget(r.requireGetNode, r.pathAlias, callerFile, payload)
 	if target == "" {
-		if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, payload); aliased {
-			target = resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, rewritten)
+		if rewritten, aliased := rewriteNpmAliasImport(r.npmAlias, callerFile, payload); aliased {
+			target = resolveJSTSImportTarget(r.requireGetNode, r.pathAlias, callerFile, rewritten)
 		}
 	}
 	return target
@@ -786,7 +1623,20 @@ func (r *Resolver) importedTargetOf(e *graph.Edge) string {
 		if !ok || payload == "" {
 			return ""
 		}
-		return r.resolveJSTSSpecTarget(e, payload)
+		if target := r.resolveJSTSSpecTarget(e, payload); target != "" {
+			return target
+		}
+		if e.Kind == graph.EdgeReExports {
+			callerFile := jsTSImportCallerFile(e)
+			mod, _ := splitImportSpecSymbol(payload)
+			rewritten, _ := rewriteNpmAliasImport(r.npmAlias, callerFile, mod)
+			if isJSTSBareSpecifier(callerFile, rewritten) && !isNodeCoreModule(rewritten) &&
+				!declaresExternalNpmDep(r.npmDep, callerFile, mod) &&
+				!declaresExternalNpmDep(r.npmDep, callerFile, rewritten) {
+				return r.resolveJSBareDirTarget(e, callerFile, rewritten)
+			}
+		}
+		return ""
 	}
 	if strings.HasPrefix(to, "external::") || strings.HasPrefix(to, "dep::") || graph.IsStdlibStub(to) {
 		return ""
@@ -798,20 +1648,7 @@ func (r *Resolver) importedTargetOf(e *graph.Edge) string {
 // path for a file node, its defining file for a symbol node (a per-binding
 // import edge resolves to the exported symbol when it exists).
 func (r *Resolver) nodeFilePath(id string) string {
-	if id == "" {
-		return ""
-	}
-	n := r.cachedGetNode(id)
-	if n == nil {
-		return ""
-	}
-	if n.FilePath != "" {
-		return n.FilePath
-	}
-	if n.Kind == graph.KindFile {
-		return n.ID
-	}
-	return ""
+	return nodeFilePathWith(r.requireGetNode, id)
 }
 
 // callerOutEdges returns a caller file's outgoing edges from the pass

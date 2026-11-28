@@ -311,11 +311,13 @@ var validNodeKinds = map[NodeKind]bool{
 // enclosing scope, so a module import of that name cannot be the callee unless
 // the binding came from an unshadowed static require() of a specific module.
 const (
-	JSLexicalBindingMeta     = "js_lexical_binding"
-	JSLexicalLocal           = "local"
-	JSPendingParameter       = "parameter"
-	JSLexicalRequire         = "require"
-	JSLexicalRequireSpecMeta = "js_lexical_require"
+	JSLexicalBindingMeta       = "js_lexical_binding"
+	JSLexicalLocal             = "local"
+	JSPendingParameter         = "parameter"
+	JSLexicalRequire           = "require"
+	JSLexicalRequireSpecMeta   = "js_lexical_require"
+	JSLexicalRequireSymbolMeta = "js_lexical_require_symbol"
+	JSLexicalRequireLocalMeta  = "js_lexical_require_local"
 )
 
 type Node struct {

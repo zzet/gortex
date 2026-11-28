@@ -86,6 +86,11 @@ type UnresolvedEdgeScan struct {
 	SourceOnly bool
 	// Kinds, when non-empty, keeps only rows of these edge kinds.
 	Kinds []EdgeKind
+	// MetaContains, when non-empty, restricts the scan to rows whose raw
+	// persisted meta bytes contain MetaContains as a substring (not promoted
+	// columns). Backends without raw-meta pushdown may ignore it; the caller's
+	// Go filter remains the semantic authority.
+	MetaContains string
 }
 
 // UnresolvedEdgePage is one bounded keyset page from an UnresolvedEdgeScan.
@@ -160,6 +165,14 @@ type AllGenerationsRepoEvicter interface {
 // instead of converting them to empty counts or a process panic.
 type CheckedAllGenerationsRepoEvicter interface {
 	EvictRepoAllGenerationsChecked(repoPrefix string) (nodesRemoved, edgesRemoved int, err error)
+}
+
+// CheckedEdgeCandidateLookup is the error-returning, context-aware sibling of
+// Store.GetEdgeCandidates. Callers that must distinguish an empty candidate
+// set from a teardown race, storage failure, or context cancellation use this
+// capability so a failed read is never mistaken for absence.
+type CheckedEdgeCandidateLookup interface {
+	GetEdgeCandidatesErr(ctx context.Context, endpoints []EdgeEndpoint, sites []EdgeSite) (EdgeCandidateSet, error)
 }
 
 type Store interface {

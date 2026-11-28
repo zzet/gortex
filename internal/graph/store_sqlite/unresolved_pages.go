@@ -136,7 +136,11 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 		lowerBound = floor
 	}
 
-	source, generation := s.unresolvedScanSource(unresolvedPageBaseSource)
+	baseSource := unresolvedPageBaseSource
+	if s.viewGen == baseViewGeneration && (scan.MetaContains != "" || len(scan.Kinds) > 0 || scan.SourceOnly) {
+		baseSource = unresolvedHighWaterBaseSource
+	}
+	source, generation := s.unresolvedScanSource(baseSource)
 	extra := ""
 	args := []any{s.viewGen, lowerBound, scan.HighWaterID}
 	anchorIn := func(column string) (string, []any) {
@@ -205,6 +209,10 @@ func (s *Store) ReadUnresolvedEdgePage(ctx context.Context, scan graph.Unresolve
 		for _, kind := range scan.Kinds {
 			args = append(args, string(kind))
 		}
+	}
+	if scan.MetaContains != "" {
+		extra += ` AND meta IS NOT NULL AND instr(CAST(meta AS BLOB), CAST(? AS BLOB)) > 0`
+		args = append(args, []byte(scan.MetaContains))
 	}
 	args = append(args, maxRows)
 	rows, err := s.db.QueryContext(ctx, unresolvedEdgePageSQL(source, generation, extra), args...)

@@ -1,6 +1,9 @@
 package graph
 
-import "iter"
+import (
+	"context"
+	"iter"
+)
 
 // AnalysisPageBinder provides bounded read snapshots for whole-store analysis.
 // Pages can observe different revisions; callers must validate generation and
@@ -32,6 +35,13 @@ type NodeLightSequencer interface {
 // discard most of them in Go.
 type LightEdgeSequencer interface {
 	EdgesLightSeq(kinds ...EdgeKind) iter.Seq[*Edge]
+}
+
+// CheckedLightEdgeSequencer is the error-returning, context-aware sibling of
+// LightEdgeSequencer. The returned error function reports any query, scan,
+// close, or context cancellation failure encountered while streaming.
+type CheckedLightEdgeSequencer interface {
+	EdgesLightSeqErr(ctx context.Context, kinds ...EdgeKind) (iter.Seq[*Edge], func() error)
 }
 
 // NodesByKindsSequencer streams full nodes for a fixed kind set. Process

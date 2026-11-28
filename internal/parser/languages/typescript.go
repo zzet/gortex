@@ -607,6 +607,7 @@ func (e *TypeScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			FilePath: filePath, Line: v.startLn + 1,
 		})
 	}
+	emitJSCJSReExports(root, fileID, filePath, src, &scopes, result)
 
 	// --- Event pub/sub edges ---
 	var pubsubEvents []pubsubEvent

@@ -119,6 +119,9 @@ func (r *Resolver) warmRepoLanguageNameCache(pending []*graph.Edge) (groupCount 
 			repo = graph.RepoPrefixOfID(edge.From)
 		}
 		target := graph.UnresolvedName(edge.To)
+		if b := jsLexicalCallBinding(edge, target); b == graph.JSPendingParameter || b == graph.JSLexicalRequire {
+			continue
+		}
 		name := identifierFromTarget(target)
 		if strings.HasPrefix(target, "extern::") {
 			if name != "" {

@@ -34,7 +34,7 @@ func (r *Resolver) restoreIncrementalTerminalStampsLocked(files []string) {
 	}
 	keys := make([]graph.EdgeIdentity, 0, len(r.incrementalTerminals))
 	for key, old := range r.incrementalTerminals {
-		if !allowed[key.FilePath] || old.Kind == graph.EdgeImports {
+		if !allowed[key.FilePath] || old.Kind == graph.EdgeImports || r.terminalClassificationExempt(old) {
 			continue
 		}
 		// A supported LSP path can have an outstanding/failed definition lookup.
@@ -52,7 +52,7 @@ func (r *Resolver) restoreIncrementalTerminalStampsLocked(files []string) {
 	names := map[string]graph.NodeNameClassCount{}
 	for _, key := range keys {
 		edge := current[key]
-		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || !sameTerminalCarryPayload(r.incrementalTerminals[key], edge) {
+		if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.terminalClassificationExempt(edge) || !sameTerminalCarryPayload(r.incrementalTerminals[key], edge) {
 			continue
 		}
 		name := identifierFromTarget(graph.UnresolvedName(edge.To))

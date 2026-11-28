@@ -60,6 +60,56 @@ func materializeDataflowParamsInGraph(g graph.Store) {
 	})
 }
 
+// materializeDataflowParamsForFilesInGraph materializes arg_of / returns_to
+// edges recorded in graphPaths against g without requiring a repository
+// Indexer. It acquires g.ResolveMutex() to serialize writes on shared stores
+// and releases it before returning.
+func materializeDataflowParamsForFilesInGraph(g graph.Store, graphPaths []string) {
+	if g == nil {
+		return
+	}
+	graphPaths = appendUniqueSorted(nil, graphPaths...)
+	if len(graphPaths) == 0 {
+		return
+	}
+	g.ResolveMutex().Lock()
+	defer g.ResolveMutex().Unlock()
+	for start := 0; start < len(graphPaths); start += deletedBatchFiles {
+		end := min(start+deletedBatchFiles, len(graphPaths))
+		paths := graphPaths[start:end]
+		nodesByFile := g.GetFileNodesByPaths(paths)
+		fromSet := make(map[string]struct{})
+		fileSet := make(map[string]struct{}, len(paths))
+		for _, graphPath := range paths {
+			fileSet[graphPath] = struct{}{}
+			for _, node := range nodesByFile[graphPath] {
+				if node != nil && node.ID != "" {
+					fromSet[node.ID] = struct{}{}
+				}
+			}
+		}
+		if len(fromSet) == 0 {
+			continue
+		}
+		froms := make([]string, 0, len(fromSet))
+		for id := range fromSet {
+			froms = append(froms, id)
+		}
+		var edges []*graph.Edge
+		for _, rows := range g.GetOutEdgesByNodeIDs(froms) {
+			for _, edge := range rows {
+				if edge == nil || (edge.Kind != graph.EdgeArgOf && edge.Kind != graph.EdgeReturnsTo) {
+					continue
+				}
+				if _, changedFile := fileSet[edge.FilePath]; changedFile {
+					edges = append(edges, edge)
+				}
+			}
+		}
+		rewriteDataflowBatchLegs(g, edges, nil, nil)
+	}
+}
+
 func forEachDataflowEdgeBatch(g graph.Store, batchSize int, yield func([]*graph.Edge) bool) {
 	graph.ScanEdgesByKindsBatched(
 		g,
@@ -241,9 +291,10 @@ func rewriteDataflowBatchLegs(g graph.Store, edges []*graph.Edge, legs *refFactL
 		}
 		oldFrom, oldTo := edge.From, edge.To
 		oldFilePath, oldLine := edge.FilePath, edge.Line
-		edge.To = paramID
+		updated := *edge
+		updated.To = paramID
 		reindexes = append(reindexes, graph.EdgeReindex{
-			Edge: edge, OldFrom: oldFrom, OldTo: oldTo,
+			Edge: &updated, OldFrom: oldFrom, OldTo: oldTo,
 			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
 		})
 	}
@@ -259,9 +310,10 @@ func rewriteDataflowBatchLegs(g graph.Store, edges []*graph.Edge, legs *refFactL
 		}
 		oldFrom, oldTo := edge.From, edge.To
 		oldFilePath, oldLine := edge.FilePath, edge.Line
-		edge.From = resolvedCallee
+		updated := *edge
+		updated.From = resolvedCallee
 		reindexes = append(reindexes, graph.EdgeReindex{
-			Edge: edge, OldFrom: oldFrom, OldTo: oldTo,
+			Edge: &updated, OldFrom: oldFrom, OldTo: oldTo,
 			RefreshIdentity: true, OldFilePath: oldFilePath, OldLine: oldLine,
 		})
 	}

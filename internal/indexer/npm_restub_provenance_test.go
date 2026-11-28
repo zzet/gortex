@@ -15,13 +15,14 @@ import (
 	"github.com/zzet/gortex/internal/search"
 )
 
-// A provider save parks its tracked-npm consumers without restub provenance,
-// so the consumer file goes through the forward pass again. An unrelated
-// function of the same name in the consumer repository must not capture the
-// call: it binds what a cold index binds. In another directory that is the
-// provider. In the caller's own directory main's locality tier already wins
-// on a cold index (the per-repo pass sees only an external import); the save
-// must not change that either way.
+// A provider save parks ES-import tracked-npm consumers with restub provenance
+// (keeping unchanged ES-import consumer files out of receipt.UnresolvedFiles),
+// while the provider's npmConsumerFiles list triggers the cross-repo re-bind.
+// An unrelated function of the same name in the consumer repository must not
+// capture the call: it binds what a cold index binds. In another directory that
+// is the provider. In the caller's own directory main's locality tier already
+// wins on a cold index (the per-repo pass sees only an external import); the
+// save must not change that either way.
 func TestTrackedNpmCallReturnsToProviderPastSameNamedConsumerFunction(t *testing.T) {
 	for _, backend := range []string{"memory", "sqlite"} {
 		for _, layout := range []string{"same directory", "other directory"} {
@@ -73,8 +74,22 @@ func TestTrackedNpmCallReturnsToProviderPastSameNamedConsumerFunction(t *testing
 				}
 
 				bumpMtime(t, providerFile, "export function f() { return 43; }\n")
-				_, err := mi.IncrementalReindexRepo("lib", []string{providerFile})
-				require.NoError(t, err)
+				var receipt graph.MutationReceipt
+				var hasReceipt bool
+				if rs, ok := g.(graph.MutationReceiptStore); ok {
+					tok := rs.BeginMutationReceipt()
+					_, err := mi.IncrementalReindexRepo("lib", []string{providerFile})
+					receipt = rs.EndMutationReceipt(tok)
+					hasReceipt = true
+					require.NoError(t, err)
+				} else {
+					_, err := mi.IncrementalReindexRepo("lib", []string{providerFile})
+					require.NoError(t, err)
+				}
+				if hasReceipt && layout == "other directory" {
+					require.NotContains(t, receipt.UnresolvedFiles, "app/app.ts",
+						"ES-import consumer must retain restub provenance and stay out of receipt.UnresolvedFiles")
+				}
 				require.Equal(t, cold, target(), "a provider save rebinds what a cold index binds")
 			})
 		}

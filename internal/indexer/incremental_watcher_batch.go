@@ -331,6 +331,15 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 	eviction := idx.evictFileIncrementalRaw(path)
 	result := eviction.result
 	files, needed, exact := incrementalResolutionFrontier(result, nil)
+	fallbackWholeRepo := needed && len(files) == 0 && !exact
+	var renamedCallers []string
+	if eviction.batch != nil && len(eviction.batch.renamedRequireCallers) > 0 {
+		renamedCallers = filterSameRepoPaths(idx.repoPrefix, eviction.batch.renamedRequireCallers)
+	}
+	if !fallbackWholeRepo && len(renamedCallers) > 0 {
+		files = appendUniqueSorted(files, renamedCallers...)
+		needed = true
+	}
 	if needed && len(files) > 0 {
 		idx.runIncrementalResolutionCatchup(files, eviction.batch, func(frontier []string) {
 			if idx.incrementalResolveFilesHook != nil {
@@ -339,9 +348,15 @@ func (idx *Indexer) incrementalEvictWatcherPath(path string) (nodesRemoved, edge
 			}
 			idx.resolver.ResolveFilesAndIncomingObserved(frontier, eviction.batch.publicationStamps().mutationResolveMutexObserver())
 		})
-	} else if needed && !exact {
+	} else if fallbackWholeRepo {
 		idx.observeIncrementalCatchup("resolve", nil)
 		idx.ResolveAll()
+		if len(renamedCallers) > 0 {
+			idx.observeIncrementalCatchup("dataflow", renamedCallers)
+			idx.materializeDataflowParamsForFiles(renamedCallers)
+			idx.observeIncrementalCatchup("ref_facts", renamedCallers)
+			idx.persistRefFactsForFiles(renamedCallers)
+		}
 	}
 	if evictedGlobals {
 		idx.reresolveCSharpGlobalUsingDependents(
@@ -387,6 +402,15 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		return result, err
 	}
 	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	fallbackWholeRepo := needed && len(files) == 0 && !exact
+	var renamedCallers []string
+	if batch != nil && len(batch.renamedRequireCallers) > 0 {
+		renamedCallers = filterSameRepoPaths(idx.repoPrefix, batch.renamedRequireCallers)
+	}
+	if !fallbackWholeRepo && len(renamedCallers) > 0 {
+		files = appendUniqueSorted(files, renamedCallers...)
+		needed = true
+	}
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
@@ -405,11 +429,17 @@ func (idx *Indexer) incrementalWatcherPaths(root string, paths []string, mode in
 		names := mode.publication.beginPatchLap(patchResolve)
 		idx.resolveReceiptNamePendings(receipt)
 		names.end()
-	} else if needed && !exact {
+	} else if fallbackWholeRepo {
 		idx.observeIncrementalCatchup("resolve", nil)
 		resolve := mode.publication.beginPatchLap(patchResolve)
 		idx.ResolveAll()
 		resolve.end()
+		if len(renamedCallers) > 0 {
+			idx.observeIncrementalCatchup("dataflow", renamedCallers)
+			idx.materializeDataflowParamsForFiles(renamedCallers)
+			idx.observeIncrementalCatchup("ref_facts", renamedCallers)
+			idx.persistRefFactsForFiles(renamedCallers)
+		}
 	}
 	if mode.forceExplicitFiles || !idx.deferGlobalPasses.Load() {
 		if mode.exactPointSemantic {
@@ -584,6 +614,22 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutation(
 	return mi.resolveIncrementalRepoMutationMode(repoPrefix, result, receipt, batch, false)
 }
 
+func filterSameRepoPaths(repoPrefix string, paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	if repoPrefix == "" {
+		return appendUniqueSorted(nil, paths...)
+	}
+	var out []string
+	for _, p := range paths {
+		if p != "" && graph.RepoPrefixOfID(p) == repoPrefix {
+			out = append(out, p)
+		}
+	}
+	return appendUniqueSorted(nil, out...)
+}
+
 func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	repoPrefix string,
 	result *IndexResult,
@@ -591,17 +637,39 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 	batch *reparsePendingEnrichmentBatch,
 	exactPointSemantic bool,
 ) []string {
-	files, needed, _ := incrementalResolutionFrontier(result, receipt)
+	files, needed, exact := incrementalResolutionFrontier(result, receipt)
+	fallbackWholeRepo := needed && len(files) == 0 && !exact
 	wide := false
 	if result == nil || result.DeletedFileCount > 0 {
 		batch.dropDeferredPriorBindings()
 	}
 	crossRepoFiles := appendUniqueSorted(nil, files...)
+	var sameRepoRenamed, foreignRepoRenamed []string
 	if batch != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, batch.npmConsumerFiles...)
+		crossRepoFiles = appendUniqueSorted(crossRepoFiles, batch.renamedRequireCallers...)
+		for _, f := range batch.renamedRequireCallers {
+			if f == "" {
+				continue
+			}
+			if repoPrefix == "" || graph.RepoPrefixOfID(f) == repoPrefix {
+				sameRepoRenamed = append(sameRepoRenamed, f)
+			} else {
+				foreignRepoRenamed = append(foreignRepoRenamed, f)
+			}
+		}
+		sameRepoRenamed = appendUniqueSorted(nil, sameRepoRenamed...)
+		foreignRepoRenamed = appendUniqueSorted(nil, foreignRepoRenamed...)
 	}
 	if result != nil {
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, result.DerivedInvalidation.Files...)
+	}
+	if repoPrefix != "" && len(files) > 0 {
+		files = filterSameRepoPaths(repoPrefix, files)
+	}
+	if !fallbackWholeRepo && len(sameRepoRenamed) > 0 {
+		files = appendUniqueSorted(files, sameRepoRenamed...)
+		needed = true
 	}
 	idx := mi.GetIndexer(repoPrefix)
 	if !needed || len(files) == 0 || idx == nil {
@@ -617,25 +685,11 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			idx.observePointRebind(batch, stats)
 		})
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, resolvedFiles...)
-		if receipt != nil && receipt.Complete {
-			names := batch.publicationStamps().beginPatchLap(patchResolve)
-			vanished := vanishedReceiptNames(mi.graph, receipt)
-			wide = len(vanished) > 0
-			mi.runMasterResolveNames(vanished)
-			names.end()
-		}
 	} else if needed && len(files) > 0 {
 		resolve := batch.publicationStamps().beginPatchLap(patchResolve)
 		mi.runMasterResolveFilesObserved(files, false, nil, batch.publicationStamps().mutationResolveMutexObserver())
 		resolve.end()
-		if receipt != nil && receipt.Complete {
-			names := batch.publicationStamps().beginPatchLap(patchResolve)
-			vanished := vanishedReceiptNames(mi.graph, receipt)
-			wide = len(vanished) > 0
-			mi.runMasterResolveNames(vanished)
-			names.end()
-		}
-	} else if needed {
+	} else if fallbackWholeRepo {
 		wide = true
 		scope := map[string]struct{}{repoPrefix: {}}
 		if repoPrefix == "" {
@@ -646,14 +700,27 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		resolve.end()
 		// No scoped frontier survived. Refresh any known files without adding a
 		// second graph-wide dataflow or durable-fact scan.
-		if idx != nil && result != nil {
-			known := appendUniqueSorted(nil, result.DerivedInvalidation.Files...)
+		if idx != nil && (result != nil || len(sameRepoRenamed) > 0) {
+			var known []string
+			if result != nil {
+				known = appendUniqueSorted(known, result.DerivedInvalidation.Files...)
+			}
+			known = appendUniqueSorted(known, sameRepoRenamed...)
 			crossRepoFiles = appendUniqueSorted(crossRepoFiles, known...)
-			idx.observeIncrementalCatchup("dataflow", known)
-			idx.materializeDataflowParamsForFiles(known)
-			idx.observeIncrementalCatchup("ref_facts", known)
-			idx.persistRefFactsForFiles(known)
+			if len(known) > 0 {
+				idx.observeIncrementalCatchup("dataflow", known)
+				idx.materializeDataflowParamsForFiles(known)
+				idx.observeIncrementalCatchup("ref_facts", known)
+				idx.persistRefFactsForFiles(known)
+			}
 		}
+	}
+	if needed && !fallbackWholeRepo && receipt != nil && receipt.Complete && len(receipt.EvictedNames) > 0 {
+		names := batch.publicationStamps().beginPatchLap(patchResolve)
+		vanished := vanishedReceiptNames(mi.graph, receipt)
+		wide = wide || len(vanished) > 0
+		mi.runMasterResolveNames(vanished)
+		names.end()
 	}
 
 	var semanticFiles []string
@@ -665,7 +732,7 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 		}
 		crossRepoFiles = appendUniqueSorted(crossRepoFiles, semanticFiles...)
 	}
-	if needed || len(semanticFiles) > 0 || batch != nil && len(batch.npmConsumerFiles) > 0 {
+	if needed || len(semanticFiles) > 0 || (batch != nil && (len(batch.npmConsumerFiles) > 0 || len(batch.renamedRequireCallers) > 0)) {
 		if idx != nil {
 			idx.observeIncrementalCatchup("cross_repo", crossRepoFiles)
 		}
@@ -677,6 +744,23 @@ func (mi *MultiIndexer) resolveIncrementalRepoMutationMode(
 			mi.runCrossRepoResolve(false)
 		}
 		cross.end()
+		if len(foreignRepoRenamed) > 0 {
+			byOwner := make(map[string][]string)
+			var owners []string
+			for _, f := range foreignRepoRenamed {
+				owner := graph.RepoPrefixOfID(f)
+				if _, exists := byOwner[owner]; !exists {
+					owners = append(owners, owner)
+				}
+				byOwner[owner] = append(byOwner[owner], f)
+			}
+			sort.Strings(owners)
+			for _, owner := range owners {
+				ownerFiles := byOwner[owner]
+				materializeDataflowParamsForFilesInGraph(mi.graph, ownerFiles)
+				persistRefFactsForFilesInGraph(mi.graph, owner, ownerFiles, mi.logger)
+			}
+		}
 	}
 	if wide {
 		return nil

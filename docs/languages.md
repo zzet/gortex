@@ -120,9 +120,13 @@ evidence (`import_closure`). A same-file declaration blocks import promotion;
 when imports don't settle the call, the usual resolution rules still apply.
 A call whose name is bound by an enclosing parameter, catch clause, block or
 hoisted `var` is not an import call. It binds to a same-file declaration when
-one exists and otherwise stays unresolved. A local initialized from an
-unshadowed static `require("...")` binding resolves only against that required
-module instead of file-wide imports.
+one exists and otherwise stays unresolved. A function- or block-scoped local
+initialized from an unshadowed static `require("...")` binding resolves only
+against that required module and its ES or CommonJS barrel re-exports
+(including renamed destructuring and property reads) instead of file-wide
+imports, and stays unresolved when the required module does not define or
+re-export the name. Module-scope `require("...")` bindings keep the ordinary
+resolution tiers.
 
 ### Julia specifics
 

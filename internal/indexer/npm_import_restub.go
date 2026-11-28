@@ -3,11 +3,20 @@ package indexer
 import (
 	"context"
 	"iter"
+	"sort"
 	"strings"
+
+	"go.uber.org/zap"
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/resolver"
 )
+
+func jstsNodeFilePath(id string) string {
+	before, _, _ := strings.Cut(id, "::")
+	before, _, _ = strings.Cut(before, "#")
+	return before
+}
 
 // Park only npm-linked incoming imports and their calls before replacing or
 // removing a provider. Other references keep their existing eviction rules.
@@ -20,46 +29,113 @@ func restubTrackedNpmRepoIncoming(g graph.Store, repo string) {
 	var ids []string
 	flush := func() {
 		identities := graph.InEdgeIdentitiesByNodeIDs(g, ids)
-		var sites []graph.EdgeSite
+		// Stage 1: hydrate only cross-repo EdgeImports sites; any target
+		// already marked via a tracked-npm EdgeImports does not need its
+		// EdgeCalls sites hydrated separately because restubTrackedNpmImportsFromView
+		// inspects all incoming edges (both ES-import and require calls) of every
+		// marked target.
+		var importSites []graph.EdgeSite
+		importSiteSeen := make(map[graph.EdgeSite]struct{})
 		for _, edges := range identities {
 			for _, edge := range edges {
-				if (edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeCalls) && graph.RepoPrefixOfID(edge.From) != repo {
-					sites = append(sites, graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: edge.Kind})
+				if edge.Kind == graph.EdgeImports && graph.RepoPrefixOfID(edge.From) != repo {
+					site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: edge.Kind}
+					if _, dup := importSiteSeen[site]; !dup {
+						importSiteSeen[site] = struct{}{}
+						importSites = append(importSites, site)
+					}
 				}
 			}
 		}
-		if len(sites) == 0 {
-			ids = ids[:0]
-			return
-		}
-		hydrated := g.GetEdgeCandidates(nil, sites)
-		var targets []string
-		for target, edges := range identities {
-			marked := false
-			for _, edge := range edges {
-				if (edge.Kind != graph.EdgeImports && edge.Kind != graph.EdgeCalls) || graph.RepoPrefixOfID(edge.From) == repo {
-					continue
-				}
-				for _, candidate := range hydrated.Site(edge.From, edge.Line, edge.Kind) {
-					if candidate.To != target {
+		markedTargets := make(map[string]struct{})
+		if len(importSites) > 0 {
+			hydrated := g.GetEdgeCandidates(nil, importSites)
+			for target, edges := range identities {
+				for _, edge := range edges {
+					if edge.Kind != graph.EdgeImports || graph.RepoPrefixOfID(edge.From) == repo {
 						continue
 					}
-					if edge.Kind == graph.EdgeImports {
-						if spec, _ := candidate.Meta[resolver.NpmImportSpecifierMeta].(string); spec != "" {
-							marked = true
+					for _, candidate := range hydrated.Site(edge.From, edge.Line, edge.Kind) {
+						if candidate.To != target {
+							continue
 						}
-					} else if candidate.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
 						if spec, _ := candidate.Meta[resolver.NpmImportSpecifierMeta].(string); spec != "" {
-							marked = true
+							markedTargets[target] = struct{}{}
+							break
 						}
+					}
+					if _, marked := markedTargets[target]; marked {
+						break
 					}
 				}
 			}
-			if marked {
-				targets = append(targets, target)
+		}
+		// Stage 2: only for unmarked JS/TS symbol targets (e.g. symbols reached
+		// solely via function-scoped require() with no incoming EdgeImports),
+		// hydrate cross-repo JS/TS EdgeCalls sites.
+		var callSites []graph.EdgeSite
+		callSiteSeen := make(map[graph.EdgeSite]struct{})
+		var unmarkedJSTSTargets []string
+		for target, edges := range identities {
+			if _, marked := markedTargets[target]; marked {
+				continue
+			}
+			if !strings.Contains(target, "::") || !isJSTSNpmPath(jstsNodeFilePath(target)) {
+				continue
+			}
+			addedTarget := false
+			for _, edge := range edges {
+				if edge.Kind != graph.EdgeCalls || graph.RepoPrefixOfID(edge.From) == repo {
+					continue
+				}
+				callerPath := jstsNodeFilePath(edge.FilePath)
+				if callerPath == "" {
+					callerPath = jstsNodeFilePath(edge.From)
+				}
+				if !isJSTSNpmPath(callerPath) {
+					continue
+				}
+				if !addedTarget {
+					unmarkedJSTSTargets = append(unmarkedJSTSTargets, target)
+					addedTarget = true
+				}
+				site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: edge.Kind}
+				if _, dup := callSiteSeen[site]; !dup {
+					callSiteSeen[site] = struct{}{}
+					callSites = append(callSites, site)
+				}
 			}
 		}
-		if len(targets) > 0 {
+		if len(callSites) > 0 {
+			hydrated := g.GetEdgeCandidates(nil, callSites)
+			for _, target := range unmarkedJSTSTargets {
+				for _, edge := range identities[target] {
+					if edge.Kind != graph.EdgeCalls || graph.RepoPrefixOfID(edge.From) == repo {
+						continue
+					}
+					for _, candidate := range hydrated.Site(edge.From, edge.Line, edge.Kind) {
+						if candidate.To != target {
+							continue
+						}
+						if candidate.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+							if spec, _ := candidate.Meta[resolver.NpmImportSpecifierMeta].(string); spec != "" {
+								markedTargets[target] = struct{}{}
+								break
+							}
+						}
+					}
+					if _, marked := markedTargets[target]; marked {
+						break
+					}
+				}
+			}
+		}
+		if len(markedTargets) > 0 {
+			targets := make([]string, 0, len(markedTargets))
+			for target := range markedTargets {
+				targets = append(targets, target)
+			}
+			sort.Strings(targets)
 			incoming := g.GetInEdgesByNodeIDs(targets)
 			evicted := make(map[string]struct{})
 			for _, edges := range incoming {
@@ -123,6 +199,8 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 	resetNpmCall := func(edge *graph.Edge, name string) {
 		delete(edge.Meta, resolver.NpmImportSpecifierMeta)
 		delete(edge.Meta, "resolution")
+		delete(edge.Meta, graph.EdgeMetaResolveTerminal)
+		delete(edge.Meta, graph.EdgeMetaResolveTerminalReason)
 		edge.To = graph.UnresolvedMarker + name
 		edge.CrossRepo = false
 		edge.Origin, edge.Tier, edge.Confidence, edge.ConfidenceLabel = "", "", 0, ""
@@ -148,7 +226,11 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 			parallel := *edge
 			parallel.Kind = graph.EdgeCrossRepoCalls
 			obsolete = append(obsolete, &parallel)
-			resetNpmCall(edge, name)
+			// Preserve restub provenance for ES-import calls so unchanged
+			// consumer files do not enter receipt.UnresolvedFiles on provider save.
+			graph.StashRestubProvenance(edge)
+			edge.To = graph.UnresolvedMarker + name
+			edge.CrossRepo, edge.ConfidenceLabel = false, ""
 			batch = append(batch, graph.EdgeReindex{Edge: edge, OldTo: target})
 		}
 	}
@@ -168,9 +250,13 @@ func restubTrackedNpmImportsFromView(g graph.Store, evicted map[string]struct{},
 			if _, done := restubbed[id]; done {
 				continue
 			}
-			_, name, hasSym := strings.Cut(target, "::")
-			if !hasSym || name == "" {
-				continue
+			name, _ := edge.Meta[graph.JSLexicalRequireLocalMeta].(string)
+			if name == "" {
+				var hasSym bool
+				_, name, hasSym = strings.Cut(target, "::")
+				if !hasSym || name == "" {
+					continue
+				}
 			}
 			restubbed[id] = struct{}{}
 			if edge.FilePath != "" {
@@ -210,6 +296,13 @@ func isJSTSNpmPath(path string) bool {
 // provider. Used after a full index or track; incremental saves carry exact
 // consumer files from the restub step.
 func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
+	return mi.npmConsumerFilesForRepoContext(context.Background(), repo)
+}
+
+func (mi *MultiIndexer) npmConsumerFilesForRepoContext(ctx context.Context, repo string) []string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	snap := mi.loadNpmPackageSnapshot()
 	if snap == nil || snap.lookup == nil || len(snap.repoPackages) == 0 {
 		return nil
@@ -217,33 +310,55 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 	lookup := snap.lookup
 	declaredByRepo := snap.repoPackages[repo]
 	isProvider := len(declaredByRepo) > 0
+	var competingProviderRepos map[string]bool
+	if isProvider {
+		for pkgName := range declaredByRepo {
+			for dir := range lookup(pkgName) {
+				otherRepo, _, _ := strings.Cut(dir, "/")
+				if otherRepo != "" && otherRepo != repo {
+					if competingProviderRepos == nil {
+						competingProviderRepos = make(map[string]bool)
+					}
+					competingProviderRepos[otherRepo] = true
+				}
+			}
+		}
+	}
 	files := make(map[string]struct{})
 	claims := make(map[string]map[string]resolver.NpmPackageTarget)
-	checkSpec := func(spec, ownerFile string) {
-		if spec == "" || ownerFile == "" {
-			return
-		}
-		ownerInRepo := graph.RepoPrefixOfID(ownerFile) == repo
-		if !ownerInRepo {
-			if !isProvider {
-				return
-			}
-			pkgName, _ := splitPackageSpecifier(spec)
-			if _, owned := declaredByRepo[pkgName]; !owned {
-				return
-			}
+	lookupCached := func(spec string) map[string]resolver.NpmPackageTarget {
+		if spec == "" {
+			return nil
 		}
 		providers, known := claims[spec]
 		if !known {
 			providers = lookup(spec)
 			claims[spec] = providers
 		}
+		return providers
+	}
+	checkSpec := func(spec, ownerFile string) bool {
+		if spec == "" || ownerFile == "" {
+			return false
+		}
+		ownerInRepo := graph.RepoPrefixOfID(ownerFile) == repo
+		if !ownerInRepo {
+			if !isProvider {
+				return false
+			}
+			pkgName, _ := splitPackageSpecifier(spec)
+			if _, owned := declaredByRepo[pkgName]; !owned {
+				return false
+			}
+		}
+		providers := lookupCached(spec)
 		for dir := range providers {
 			if dir == repo || strings.HasPrefix(dir, repo+"/") || ownerInRepo {
 				files[ownerFile] = struct{}{}
-				break
+				return true
 			}
 		}
+		return false
 	}
 	var resolvedImportSites []graph.EdgeSite
 	importSiteSeen := make(map[graph.EdgeSite]struct{})
@@ -257,10 +372,13 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 			continue
 		}
 		if isProvider && edge.CrossRepo && isJSTSNpmPath(edge.From) {
-			site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeImports}
-			if _, dup := importSiteSeen[site]; !dup {
-				importSiteSeen[site] = struct{}{}
-				resolvedImportSites = append(resolvedImportSites, site)
+			targetRepo := graph.RepoPrefixOfID(edge.To)
+			if targetRepo == repo || competingProviderRepos[targetRepo] {
+				site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeImports}
+				if _, dup := importSiteSeen[site]; !dup {
+					importSiteSeen[site] = struct{}{}
+					resolvedImportSites = append(resolvedImportSites, site)
+				}
 			}
 		}
 	}
@@ -289,6 +407,13 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 			if !isJSTSNpmPath(edge.FilePath) {
 				continue
 			}
+			if edge.Origin != graph.OriginASTResolved && edge.Origin != graph.OriginLSPResolved {
+				continue
+			}
+			targetRepo := graph.RepoPrefixOfID(edge.To)
+			if targetRepo != repo && !competingProviderRepos[targetRepo] {
+				continue
+			}
 			site := graph.EdgeSite{From: edge.From, Line: edge.Line, Kind: graph.EdgeCalls}
 			if _, dup := callSiteSeen[site]; !dup {
 				callSiteSeen[site] = struct{}{}
@@ -313,53 +438,259 @@ func (mi *MultiIndexer) npmConsumerFilesForRepo(repo string) []string {
 			}
 		}
 	}
-	sourceRepo := repo
-	if isProvider {
-		sourceRepo = ""
+
+	// For non-provider repos, collect this repo's unresolved require() calls
+	// first via index-pinned SourceOnly + MetaContains scan (0 rows on non-JS/TS
+	// repos) so barrel discovery only walks foreign barrels when needed.
+	var repoReqEdges []*graph.Edge
+	if !isProvider {
+		for edge := range unresolvedRequireCalls(ctx, mi.graph, repo, mi.logger) {
+			repoReqEdges = append(repoReqEdges, edge)
+		}
 	}
-	for edge := range unresolvedRequireCalls(mi.graph, sourceRepo) {
+
+	// Discover local, cross-repo, and chained tracked-npm barrel files across
+	// all repository track orders.
+	type trackedExtReExport struct {
+		ownerFile string
+		spec      string
+	}
+	npmBarrels := make(map[string]struct{})
+	var trackedExtReExports []trackedExtReExport
+	for edge := range graph.EdgesLightSeq(mi.graph, graph.EdgeReExports) {
+		ownerFile := edge.FilePath
+		if ownerFile == "" {
+			ownerFile, _, _ = strings.Cut(edge.From, "::")
+		}
+		if ownerFile == "" {
+			continue
+		}
+		ownerInRepo := graph.RepoPrefixOfID(ownerFile) == repo
+		var rawSpec string
+		switch {
+		case strings.HasPrefix(edge.To, "external::"):
+			rawSpec = strings.TrimPrefix(edge.To, "external::")
+		case graph.IsUnresolvedTarget(edge.To):
+			u := graph.UnresolvedName(edge.To)
+			if !strings.HasPrefix(u, "import::") {
+				continue
+			}
+			rawSpec = strings.TrimPrefix(u, "import::")
+		default:
+			targetRepo := graph.RepoPrefixOfID(edge.To)
+			if isProvider {
+				if edge.CrossRepo && (targetRepo == repo || competingProviderRepos[targetRepo]) {
+					npmBarrels[ownerFile] = struct{}{}
+					files[ownerFile] = struct{}{}
+				}
+			} else if len(repoReqEdges) > 0 && len(snap.repoPackages[targetRepo]) > 0 {
+				npmBarrels[ownerFile] = struct{}{}
+			}
+			continue
+		}
+		spec, _, _ := strings.Cut(rawSpec, "::")
+		if spec == "" {
+			continue
+		}
+		seeded := false
+		if isProvider || ownerInRepo {
+			if checkSpec(spec, ownerFile) {
+				npmBarrels[ownerFile] = struct{}{}
+				seeded = true
+			}
+		} else if len(repoReqEdges) > 0 && len(lookupCached(spec)) > 0 {
+			npmBarrels[ownerFile] = struct{}{}
+			seeded = true
+		}
+		if !seeded && len(lookupCached(spec)) > 0 {
+			trackedExtReExports = append(trackedExtReExports, trackedExtReExport{
+				ownerFile: ownerFile,
+				spec:      spec,
+			})
+		}
+	}
+
+	var transitiveNpmBarrels map[string]struct{}
+	if len(npmBarrels) > 0 {
+		transitiveNpmBarrels = make(map[string]struct{}, len(npmBarrels))
+		newFiles := make([]string, 0, len(npmBarrels))
+		for f := range npmBarrels {
+			transitiveNpmBarrels[f] = struct{}{}
+			newFiles = append(newFiles, f)
+		}
+		sort.Strings(newFiles)
+		for len(newFiles) > 0 {
+			newFileSet := make(map[string]struct{}, len(newFiles))
+			for _, f := range newFiles {
+				newFileSet[f] = struct{}{}
+			}
+			nodesByFile := mi.graph.GetFileNodesByPaths(newFiles)
+			frontier := make([]string, 0, len(newFiles)*2)
+			for _, f := range newFiles {
+				frontier = append(frontier, f)
+				for _, n := range nodesByFile[f] {
+					if n != nil && n.ID != "" && n.ID != f {
+						frontier = append(frontier, n.ID)
+					}
+				}
+			}
+			nextSet := make(map[string]struct{})
+			for _, edges := range graph.InEdgeIdentitiesByNodeIDs(mi.graph, frontier) {
+				for _, id := range edges {
+					if id.Kind != graph.EdgeReExports && id.Kind != graph.EdgeImports {
+						continue
+					}
+					ownerFile := id.FilePath
+					if ownerFile == "" {
+						ownerFile, _, _ = strings.Cut(id.From, "::")
+					}
+					if ownerFile == "" {
+						continue
+					}
+					if isProvider || graph.RepoPrefixOfID(ownerFile) == repo {
+						files[ownerFile] = struct{}{}
+					}
+					if id.Kind == graph.EdgeReExports {
+						if _, seen := transitiveNpmBarrels[ownerFile]; !seen {
+							transitiveNpmBarrels[ownerFile] = struct{}{}
+							nextSet[ownerFile] = struct{}{}
+						}
+					}
+				}
+			}
+			for _, ext := range trackedExtReExports {
+				if _, seen := transitiveNpmBarrels[ext.ownerFile]; seen {
+					continue
+				}
+				matched := false
+				for _, target := range lookupCached(ext.spec) {
+					for _, stem := range target.Entries {
+						if stem != "" && resolver.ProbeJSTSFileInSet(newFileSet, stem) != "" {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+				if isProvider || graph.RepoPrefixOfID(ext.ownerFile) == repo {
+					files[ext.ownerFile] = struct{}{}
+				}
+				transitiveNpmBarrels[ext.ownerFile] = struct{}{}
+				nextSet[ext.ownerFile] = struct{}{}
+			}
+			newFiles = newFiles[:0]
+			for f := range nextSet {
+				newFiles = append(newFiles, f)
+			}
+			sort.Strings(newFiles)
+		}
+	}
+
+	var (
+		aliasInit bool
+		pathAlias resolver.PathAliasResolver
+		npmAlias  resolver.NpmAliasResolver
+	)
+	matchReq := func(edge *graph.Edge) {
 		spec, _ := edge.Meta[graph.JSLexicalRequireSpecMeta].(string)
 		mod, _, _ := strings.Cut(spec, "::")
-		checkSpec(mod, edge.FilePath)
+		if checkSpec(mod, edge.FilePath) {
+			return
+		}
+		if len(transitiveNpmBarrels) == 0 || mod == "" || edge.FilePath == "" {
+			return
+		}
+		if !aliasInit {
+			pathAlias = mi.pathAliasResolver()
+			npmAlias = mi.npmAliasResolver()
+			aliasInit = true
+		}
+		if resolver.MatchesJSTSFileSet(transitiveNpmBarrels, pathAlias, npmAlias, edge.FilePath, mod) {
+			files[edge.FilePath] = struct{}{}
+			return
+		}
+		for _, target := range lookupCached(mod) {
+			for _, stem := range target.Entries {
+				if stem != "" && resolver.ProbeJSTSFileInSet(transitiveNpmBarrels, stem) != "" {
+					files[edge.FilePath] = struct{}{}
+					return
+				}
+			}
+		}
+	}
+	if !isProvider {
+		for _, edge := range repoReqEdges {
+			matchReq(edge)
+		}
+	} else {
+		for edge := range unresolvedRequireCalls(ctx, mi.graph, "", mi.logger) {
+			matchReq(edge)
+		}
 	}
 	return sortedStringKeys(files)
 }
 
 // unresolvedRequireCalls streams unresolved call edges whose callee is a local
 // bound by a static require(). A non-empty sourceRepo keeps only calls whose
-// file lives in that repository. A paging store filters on kind and source
-// repository before it hydrates a row, so tracking a repository does not load
-// every unresolved edge of the workspace; the exact checks still run here.
-func unresolvedRequireCalls(store graph.Store, sourceRepo string) iter.Seq[*graph.Edge] {
+// file lives in that repository. A paging store filters on kind, source
+// repository, and raw MetaContains substring before it hydrates a row, so
+// tracking a repository does not load every unresolved edge of the workspace;
+// the exact checks still run here.
+func unresolvedRequireCalls(ctx context.Context, store graph.Store, sourceRepo string, logger *zap.Logger) iter.Seq[*graph.Edge] {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	keep := func(edge *graph.Edge) bool {
 		return edge != nil && edge.Kind == graph.EdgeCalls &&
 			edge.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire &&
 			(sourceRepo == "" || graph.RepoPrefixOfID(edge.FilePath) == sourceRepo)
 	}
 	return func(yield func(*graph.Edge) bool) {
+		if ctx.Err() != nil {
+			return
+		}
 		pager, ok := store.(graph.UnresolvedEdgePager)
 		if !ok {
 			for edge := range store.EdgesWithUnresolvedTarget() {
+				if ctx.Err() != nil {
+					return
+				}
 				if keep(edge) && !yield(edge) {
 					return
 				}
 			}
 			return
 		}
-		ctx := context.Background()
 		scan, err := pager.BeginUnresolvedEdgeScan(ctx)
 		if err != nil {
+			if logger != nil {
+				logger.Debug("npm consumer scan: begin unresolved edge scan failed",
+					zap.String("source_repo", sourceRepo), zap.Error(err))
+			}
 			return
 		}
 		scan.Kinds = []graph.EdgeKind{graph.EdgeCalls}
+		scan.MetaContains = graph.JSLexicalRequireSpecMeta
 		if sourceRepo != "" {
 			scan.ScopeAnchors = []string{sourceRepo}
 			scan.SourceOnly = true
 		}
 		var afterID int64
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			page, err := pager.ReadUnresolvedEdgePage(ctx, scan, afterID, 2048, 16<<20)
 			if err != nil {
+				if logger != nil {
+					logger.Debug("npm consumer scan: read unresolved edge page failed",
+						zap.String("source_repo", sourceRepo), zap.Int64("after_id", afterID), zap.Error(err))
+				}
 				return
 			}
 			for _, edge := range page.Edges {

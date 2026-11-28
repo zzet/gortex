@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,7 +25,7 @@ func extractRawSources(t *testing.T, files map[string]string) ([]*graph.Node, []
 	var nodes []*graph.Node
 	var edges []*graph.Edge
 	for path, src := range files {
-		if strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".tsx") {
+		if strings.HasSuffix(path, ".ts") || strings.HasSuffix(path, ".tsx") || strings.HasSuffix(path, ".mts") || strings.HasSuffix(path, ".cts") {
 			r, err := ts.Extract(path, []byte(src))
 			require.NoError(t, err, "ts extract %s", path)
 			nodes = append(nodes, r.Nodes...)
@@ -1046,7 +1047,7 @@ func TestImportEvidence_CrossRepoMixedAliasedImportAndLocalRequire(t *testing.T)
 			cr.ResolveAll()
 			require.Empty(t, callsInto(store, "provB/index.ts::work"))
 			esCall := unresolvedCall(t, store, "app/main.ts::viaES", "aliased")
-			require.False(t, graph.HasRestubProvenance(esCall))
+			require.True(t, graph.HasRestubProvenance(esCall))
 			reqCall := unresolvedCall(t, store, "app/main.ts::viaReq", "work")
 			require.Nil(t, findCallEdge(store, "app/main.ts::viaReq", graph.UnresolvedMarker+"aliased"))
 			require.False(t, graph.HasRestubProvenance(reqCall))
@@ -1137,6 +1138,35 @@ func (s *cancelAfterPagesStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint
 	return res
 }
 
+func (s *cancelAfterPagesStore) GetEdgeCandidatesErr(ctx context.Context, endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) (graph.EdgeCandidateSet, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return graph.EdgeCandidateSet{}, ctx.Err()
+	}
+	var (
+		res graph.EdgeCandidateSet
+		err error
+	)
+	if checked, ok := s.Store.(graph.CheckedEdgeCandidateLookup); ok {
+		res, err = checked.GetEdgeCandidatesErr(ctx, endpoints, sites)
+	} else {
+		res = s.Store.GetEdgeCandidates(endpoints, sites)
+	}
+	if err != nil {
+		return res, err
+	}
+	s.pages++
+	s.sitesHydrated += len(sites)
+	for _, site := range sites {
+		if site.Kind == graph.EdgeImports {
+			s.importSites++
+		}
+	}
+	if s.cancel != nil && s.pages >= s.cancelAfter {
+		s.cancel()
+	}
+	return res, nil
+}
+
 func (s *cancelAfterPagesStore) ReindexEdges(batch []graph.EdgeReindex) {
 	for _, item := range batch {
 		if item.Edge != nil {
@@ -1170,7 +1200,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 					nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("run%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
 					call := &graph.Edge{
 						From: fnID, To: "provA/index.ts::work", Kind: graph.EdgeCalls,
-						FilePath: "app/main.ts", Line: i + 1, CrossRepo: true,
+						FilePath: "app/main.ts", Line: i + 1, CrossRepo: true, Origin: graph.OriginASTResolved,
 						Meta: map[string]any{
 							graph.JSLexicalBindingMeta:     graph.JSLexicalRequire,
 							graph.JSLexicalRequireSpecMeta: "p",
@@ -1234,7 +1264,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 			nodes = append(nodes, &graph.Node{ID: fnID, Kind: graph.KindFunction, Name: fmt.Sprintf("pad%d", i), FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app", WorkspaceID: "shared"})
 			call := &graph.Edge{
 				From: fnID, To: "provA/index.ts::workA", Kind: graph.EdgeCalls,
-				FilePath: "app/main.ts", Line: i + 10, CrossRepo: true,
+				FilePath: "app/main.ts", Line: i + 10, CrossRepo: true, Origin: graph.OriginASTResolved,
 				Meta: map[string]any{graph.JSLexicalBindingMeta: graph.JSLexicalRequire, graph.JSLexicalRequireSpecMeta: "p", NpmImportSpecifierMeta: "p"},
 			}
 			xcall := *call
@@ -1247,7 +1277,7 @@ func TestImportEvidence_CrossRepoRestubRequirePaginationAndCancel(t *testing.T) 
 		for _, target := range []string{"provA/index.ts::workA", "provA/index.ts::workB"} {
 			call := &graph.Edge{
 				From: "app/main.ts::shared", To: target, Kind: graph.EdgeCalls,
-				FilePath: "app/main.ts", Line: 1, CrossRepo: true,
+				FilePath: "app/main.ts", Line: 1, CrossRepo: true, Origin: graph.OriginASTResolved,
 				Meta: map[string]any{graph.JSLexicalBindingMeta: graph.JSLexicalRequire, graph.JSLexicalRequireSpecMeta: "p", NpmImportSpecifierMeta: "p"},
 			}
 			xcall := *call
@@ -1826,4 +1856,890 @@ func TestImportEvidence_ShadowedCallSkipsCrossRepoImport(t *testing.T) {
 			require.NotNil(t, findCallEdge(g, "app/main.ts::run", tc.want))
 		})
 	}
+}
+
+func buildRawStore(t *testing.T, backend string, files map[string]string, prefixRepo func(filePath string) (repo, ws string)) graph.Store {
+	t.Helper()
+	var store graph.Store = graph.New()
+	if backend == "sqlite" {
+		sq, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sq.Close() })
+		store = sq
+	}
+	nodes, edges := extractRawSources(t, files)
+	if prefixRepo != nil {
+		for _, n := range nodes {
+			if n != nil {
+				repo, ws := prefixRepo(n.FilePath)
+				n.RepoPrefix = repo
+				n.WorkspaceID = ws
+			}
+		}
+	}
+	store.AddBatch(nodes, edges)
+	return store
+}
+
+func TestImportEvidence_LocalRequireCommonJSBarrels(t *testing.T) {
+	t.Run("three review shapes and negative controls", func(t *testing.T) {
+		shapes := map[string]struct {
+			barrel string
+			target string
+		}{
+			"object_literal_require": {
+				barrel: "module.exports = { foo: require('./foo') }\n",
+				target: "lib/foo$EXT::foo",
+			},
+			"exports_prop_require_member": {
+				barrel: "exports.foo = require('./foo').foo\n",
+				target: "lib/foo$EXT::foo",
+			},
+			"module_exports_direct_require": {
+				barrel: "module.exports = require('./impl')\n",
+				target: "lib/impl$EXT::foo",
+			},
+		}
+		for name, tc := range shapes {
+			for _, ext := range []string{".js", ".ts"} {
+				for _, backend := range []string{"memory", "sqlite"} {
+					t.Run(name+"/"+ext+"/"+backend, func(t *testing.T) {
+						files := map[string]string{
+							"aaa/foo" + ext:   "export function foo() { return 1 }\n",
+							"zzz/foo" + ext:   "export function foo() { return 2 }\n",
+							"app/foo" + ext:   "export function foo() { return 3 }\n",
+							"lib/foo" + ext:   "function foo() { return 4 }\nmodule.exports = { foo }\n",
+							"lib/impl" + ext:  "function foo() { return 5 }\nmodule.exports = { foo }\n",
+							"lib/index" + ext: tc.barrel,
+							"app/main" + ext:  "function foo() { return 99 }\nexport function run() { const { foo } = require('../lib'); return foo() }\n",
+						}
+						store := buildRawStore(t, backend, files, nil)
+						New(store).ResolveAll()
+						want := strings.ReplaceAll(tc.target, "$EXT", ext)
+						calls := callsInto(store, want)
+						require.Len(t, calls, 1, "must bind through barrel to %s", want)
+						require.Equal(t, "app/main"+ext+"::run", calls[0].From)
+						require.Equal(t, graph.OriginASTResolved, calls[0].Origin)
+						require.Empty(t, callsInto(store, "aaa/foo"+ext+"::foo"))
+						require.Empty(t, callsInto(store, "zzz/foo"+ext+"::foo"))
+						require.Empty(t, callsInto(store, "app/foo"+ext+"::foo"))
+						require.Empty(t, callsInto(store, "app/main"+ext+"::foo"))
+					})
+				}
+			}
+		}
+
+		// Negative controls: internal-only require and shadowed module/exports must NOT re-export.
+		negatives := map[string]string{
+			"internal_only_require": "const helper = require('./impl')\nexport function other() { return helper.foo() }\n",
+			"shadowed_module":       "const module = { exports: {} }\nmodule.exports = require('./impl')\n",
+			"shadowed_exports":      "const exports = {}\nexports.foo = require('./impl').foo\n",
+		}
+		for name, barrelSrc := range negatives {
+			t.Run("negative/"+name, func(t *testing.T) {
+				store := buildRawStore(t, "memory", map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": barrelSrc,
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				}, nil)
+				New(store).ResolveAll()
+				require.Nil(t, findCallEdge(store, "app/main.js::run", "lib/impl.js::foo"))
+				unresolvedCall(t, store, "app/main.js::run", "foo")
+			})
+		}
+	})
+
+	t.Run("two-step CJS barrels, hybrid ESM+CJS, spread, Object.assign, freeze, conditional, TS export=", func(t *testing.T) {
+		cases := map[string]struct {
+			files map[string]string
+			from  string
+			want  string
+		}{
+			"const_2step_nested_cjs": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/mid.js":   "const foo = require('./impl').foo\nmodule.exports = { foo }\n",
+					"lib/index.js": "const { foo } = require('./mid')\nmodule.exports = { foo }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"let_var_2step_direct_mid": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/mid.js":   "module.exports = require('./impl')\n",
+					"lib/index.js": "var m = require('./mid')\nlet foo = m.foo\nmodule.exports = { foo }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"cts_ts_2step": {
+				files: map[string]string{
+					"lib/impl.cts":  "export function foo() { return 1 }\n",
+					"lib/index.cts": "const impl = require('./impl')\nmodule.exports = { foo: impl.foo }\n",
+					"app/main.cts":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.cts::run", want: "lib/impl.cts::foo",
+			},
+			"cjs_wrapping_es_barrel": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/es.js":    "export { foo } from './impl'\n",
+					"lib/index.js": "const { foo } = require('./es')\nmodule.exports = { foo }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"hybrid_esm_cjs_2step": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "export const foo = require('./impl').foo\nmodule.exports = { foo }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"es_barrel_over_aliased_cjs_barrel": {
+				files: map[string]string{
+					"lib/deep.js":       "export function baz() { return 1 }\n",
+					"lib/cjs_barrel.js": "module.exports = require('./deep')\n",
+					"lib/index.js":      "export { baz as foo } from './cjs_barrel'\n",
+					"app/main.js":       "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/deep.js::baz",
+			},
+			"module_exports_direct_member_no_empty_alias": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "const impl = require('./impl')\nmodule.exports = impl.foo\n",
+					"app/main.js":  "export function run() { const foo = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"module_exports_direct_require_member": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "module.exports = require('./impl').foo\n",
+					"app/main.js":  "export function run() { const foo = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"module_exports_prop": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "module.exports.foo = require('./impl').foo\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"spread_require": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "module.exports = { ...require('./impl') }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"object_assign_exports": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "Object.assign(exports, require('./impl'))\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"object_freeze_exports": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "module.exports = Object.freeze({ foo: require('./impl').foo })\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"conditional_exports": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "if (process.env.A) { module.exports = require('./impl') }\n",
+					"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+			"ts_export_equals_direct": {
+				files: map[string]string{
+					"lib/impl.ts":  "export function foo() { return 1 }\n",
+					"lib/index.ts": "export = require('./impl')\n",
+					"app/main.ts":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.ts::run", want: "lib/impl.ts::foo",
+			},
+			"ts_import_require_export_equals": {
+				files: map[string]string{
+					"lib/impl.ts":  "export function foo() { return 1 }\n",
+					"lib/index.ts": "import impl = require('./impl')\nexport = impl\n",
+					"app/main.ts":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+				},
+				from: "app/main.ts::run", want: "lib/impl.ts::foo",
+			},
+			"es_import_and_module_require_parity": {
+				files: map[string]string{
+					"lib/impl.js":  "export function foo() { return 1 }\n",
+					"lib/index.js": "const foo = require('./impl').foo\nmodule.exports = { foo }\n",
+					"app/main.js":  "import { foo } from '../lib'\nexport function run() { return foo() }\n",
+				},
+				from: "app/main.js::run", want: "lib/impl.js::foo",
+			},
+		}
+		for name, tc := range cases {
+			t.Run(name, func(t *testing.T) {
+				store := buildRawStore(t, "memory", tc.files, nil)
+				New(store).ResolveAll()
+				calls := callsInto(store, tc.want)
+				require.Len(t, calls, 1, "expected binding to %s", tc.want)
+				require.Equal(t, tc.from, calls[0].From)
+				// Ensure no EdgeReExports carries an empty import_alias key.
+				for _, e := range store.GetOutEdges("lib/index.js") {
+					if e.Kind == graph.EdgeReExports {
+						if a, ok := e.Meta["import_alias"]; ok {
+							require.NotEmpty(t, a)
+						}
+					}
+				}
+			})
+		}
+
+		// Same-file call inside a 2-step CJS barrel must not bind to an unrelated same-dir symbol.
+		t.Run("same_file_call_inside_2step_cjs_barrel", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/other.js": "export function foo() { return 99 }\n",
+				"lib/foo.js":   "export function foo() { return 1 }\n",
+				"lib/index.js": "const foo = require('./foo')\nfunction bar() { return foo() }\nmodule.exports = { foo, bar }\n",
+			}, nil)
+			New(store).ResolveAll()
+			require.Empty(t, callsInto(store, "lib/other.js::foo"))
+		})
+
+		// Anonymous-default / external CJS re-export falls back to the barrel's KindVariable binding.
+		t.Run("external_cjs_fallback_to_binding_node", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/index.js": "const ext = require('unindexed-ext')\nmodule.exports = { ext }\n",
+				"app/main.js":  "export function run() { const { ext } = require('../lib'); return ext() }\n",
+			}, nil)
+			New(store).ResolveAll()
+			calls := callsInto(store, "lib/index.js::ext")
+			require.Len(t, calls, 1)
+			require.Equal(t, "app/main.js::run", calls[0].From)
+		})
+	})
+
+	t.Run("same-line multi-binding reexport_bindings and 3-node ES forwarder cycle", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				files := map[string]string{
+					"lib/impl.js":        "export function foo() { return 1 }\nexport function bar() { return 2 }\n",
+					"lib/cjs_barrel.js":  "const m = require('./impl'); module.exports = { foo: m.foo, bar: m.bar }\n",
+					"lib/es_multi.js":    "export { foo, bar } from './cjs_barrel'\n",
+					"lib/es_dupalias.js": "export { foo as a, foo as b } from './impl'\n",
+					"lib/cjs_dupalias.js": "const m = require('./impl'); module.exports = { a: m.foo, b: m.foo }\n",
+					"lib/cjs_mix.js":     "module.exports = { ...require('./cjs_barrel'), a: require('./cjs_barrel').foo }\n",
+					"lib/cyc_a.js":       "export { foo } from './cyc_b'\n",
+					"lib/cyc_b.js":       "export { foo } from './cyc_c'\n",
+					"lib/cyc_c.js":       "export { foo } from './cyc_b'\n",
+					"app/main.js": strings.Join([]string{
+						"export function r1() { const { foo, bar } = require('../lib/es_multi'); return foo() + bar() }",
+						"export function r2() {",
+						"  const { a, b } = require('../lib/es_dupalias')",
+						"  const x = a()",
+						"  return x + b()",
+						"}",
+						"export function r3() {",
+						"  const { a, b } = require('../lib/cjs_dupalias')",
+						"  const x = a()",
+						"  return x + b()",
+						"}",
+						"export function r4() { const { a, bar } = require('../lib/cjs_mix'); return a() + bar() }",
+						"export function r5() { const { foo } = require('../lib/cyc_a'); return foo() }",
+					}, "\n") + "\n",
+				}
+				store := buildRawStore(t, backend, files, nil)
+				New(store).ResolveAll()
+				require.NotNil(t, findCallEdge(store, "app/main.js::r1", "lib/impl.js::foo"))
+				require.NotNil(t, findCallEdge(store, "app/main.js::r1", "lib/impl.js::bar"))
+				require.Len(t, findAllCallsTo(store, "app/main.js::r2", "lib/impl.js::foo"), 2)
+				require.Len(t, findAllCallsTo(store, "app/main.js::r3", "lib/impl.js::foo"), 2)
+				require.NotNil(t, findCallEdge(store, "app/main.js::r4", "lib/impl.js::foo"))
+				require.NotNil(t, findCallEdge(store, "app/main.js::r4", "lib/impl.js::bar"))
+				unresolvedCall(t, store, "app/main.js::r5", "foo")
+				rCycle := New(store)
+				cycRes := pickDirectReExportCandidate(jsRequireEnv{
+					getNode:         rCycle.requireGetNode,
+					outEdges:        rCycle.callerOutEdges,
+					resolveReExport: func(re *graph.Edge) (string, string) { return rCycle.importedTargetOf(re), "" },
+					eligible:        func(n *graph.Node) bool { return n != nil },
+				}, "lib/cyc_a.js", "foo", 0, &reExportWalkState{})
+				require.Nil(t, cycRes.pick, "3-node ES forwarder cycle must return nil pick")
+				require.True(t, cycRes.cycleHit, "3-node ES forwarder cycle must terminate via inStack cycleHit")
+				require.False(t, cycRes.depthTruncated, "3-node ES forwarder cycle must not hit depth-8 truncation")
+			})
+		}
+	})
+
+	t.Run("precedence and diamond topologies", func(t *testing.T) {
+		// Wildcard siblings: private helper in a.js vs exported foo in b.js -> binds b.js::foo.
+		t.Run("wildcard_siblings_exported_beats_private", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/a.js":     "function foo() { return 1 }\n",
+				"lib/b.js":     "export function foo() { return 2 }\n",
+				"lib/index.js": "export * from './a'\nexport * from './b'\n",
+				"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+			}, nil)
+			New(store).ResolveAll()
+			require.Len(t, callsInto(store, "lib/b.js::foo"), 1)
+			require.Empty(t, callsInto(store, "lib/a.js::foo"))
+		})
+
+		// Nested barrel private helper must not shadow `export * from './impl'`.
+		t.Run("nested_barrel_private_helper_does_not_shadow_wildcard", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/impl.js":  "export function init() { return 1 }\n",
+				"lib/mid.js":   "function init() { return 2 }\nexport * from './impl'\n",
+				"lib/index.js": "export * from './mid'\n",
+				"app/main.js":  "export function run() { const { init } = require('../lib'); return init() }\n",
+			}, nil)
+			New(store).ResolveAll()
+			require.Len(t, callsInto(store, "lib/impl.js::init"), 1)
+			require.Empty(t, callsInto(store, "lib/mid.js::init"))
+		})
+
+		// Mixed CJS leaf + wildcard spread where both define unmarked foo -> ambiguous/unresolved.
+		t.Run("mixed_cjs_leaf_plus_spread_ambiguous", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/bar.js":   "function foo() { return 1 }\n",
+				"lib/index.js": "function foo() { return 2 }\nmodule.exports = { foo, ...require('./bar') }\n",
+				"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+			}, nil)
+			New(store).ResolveAll()
+			unresolvedCall(t, store, "app/main.js::run", "foo")
+		})
+
+		// Diamond barrel + 2-step CJS inner-barrel diamond + wildcard+named exact promotion diamond.
+		t.Run("diamonds_converge_to_single_canonical", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/impl.js":   "export function foo() { return 1 }\n",
+				"lib/a.js":      "export * from './impl'\n",
+				"lib/b.js":      "export * from './impl'\n",
+				"lib/diam.js":   "export * from './a'\nexport * from './b'\n",
+				"lib/mid.js":    "const foo = require('./impl').foo\nmodule.exports = { foo }\n",
+				"lib/ca.js":     "module.exports = require('./mid')\n",
+				"lib/cb.js":     "exports.foo = require('./mid').foo\n",
+				"lib/cdiam.js":  "module.exports = { ...require('./ca'), ...require('./cb') }\n",
+				"lib/priv.js":   "function foo() { return 99 }\n",
+				"lib/wa.js":     "export * from './impl'\n",
+				"lib/wb.js":     "exports.foo = require('./impl').foo\n",
+				"lib/wdiam.js":  "module.exports = { ...require('./wa'), ...require('./wb'), ...require('./priv') }\n",
+				"app/main.js": strings.Join([]string{
+					"export function r1() { const { foo } = require('../lib/diam'); return foo() }",
+					"export function r2() { const { foo } = require('../lib/cdiam'); return foo() }",
+					"export function r3() { const { foo } = require('../lib/wdiam'); return foo() }",
+				}, "\n") + "\n",
+			}, nil)
+			New(store).ResolveAll()
+			require.NotNil(t, findCallEdge(store, "app/main.js::r1", "lib/impl.js::foo"))
+			require.NotNil(t, findCallEdge(store, "app/main.js::r2", "lib/impl.js::foo"))
+			require.NotNil(t, findCallEdge(store, "app/main.js::r3", "lib/impl.js::foo"))
+		})
+
+		// Multi-name aliased diamond pointing to two distinct symbols -> ambiguous.
+		t.Run("multi_name_aliased_diamond_ambiguous", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/mid.js":   "export function a() { return 1 }\nexport function b() { return 2 }\n",
+				"lib/p1.js":    "export { a as x } from './mid'\n",
+				"lib/p2.js":    "export { b as x } from './mid'\n",
+				"lib/index.js": "export * from './p1'\nexport * from './p2'\n",
+				"app/main.js":  "export function run() { const { x } = require('../lib'); return x() }\n",
+			}, nil)
+			New(store).ResolveAll()
+			unresolvedCall(t, store, "app/main.js::run", "x")
+		})
+	})
+
+	t.Run("aliased re-exports, export * as ns, cross-repo bare-dir, npm-alias, innermost npm spec, staleness", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run("aliased_and_namespace/"+backend, func(t *testing.T) {
+				files := map[string]string{
+					"lib/impl.js":     "export function foo() { return 1 }\n",
+					"lib/mid.js":      "exports.bar = require('./impl').foo\n",
+					"lib/es_alias.js": "export { foo as bar } from './impl'\n",
+					"lib/wild.js":     "module.exports = require('./mid')\n",
+					"lib/ns.js":       "export * as ns from './impl'\n",
+					"app/main.js": strings.Join([]string{
+						"export function r1() { const { bar } = require('../lib/mid'); return bar() }",
+						"export function r2() { const { bar } = require('../lib/es_alias'); return bar() }",
+						"export function r3() { const { bar } = require('../lib/wild'); return bar() }",
+						"export function r4() { const { foo } = require('../lib/ns'); return foo() }",
+					}, "\n") + "\n",
+				}
+				store := buildRawStore(t, backend, files, nil)
+				New(store).ResolveAll()
+				require.NotNil(t, findCallEdge(store, "app/main.js::r1", "lib/impl.js::foo"))
+				require.NotNil(t, findCallEdge(store, "app/main.js::r2", "lib/impl.js::foo"))
+				require.NotNil(t, findCallEdge(store, "app/main.js::r3", "lib/impl.js::foo"))
+				unresolvedCall(t, store, "app/main.js::r4", "foo")
+			})
+		}
+
+		// Cross-repo chained tracked-npm barrel (app -> @acme/shared -> prov("p")):
+		// innermost "p" is stamped in NpmImportSpecifierMeta, zero churn on pass 2,
+		// and aliased barrel export retarget/removal restubs cleanly.
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run("chained_tracked_npm_innermost_spec_and_staleness/"+backend, func(t *testing.T) {
+				files := map[string]string{
+					"prov/index.js":   "export function foo() { return 1 }\nexport function qux() { return 2 }\nexport function other() { return 3 }\n",
+					"shared/index.js": "exports.bar = require('p').foo\nexports.other = require('p').other\n",
+					"app/main.js":     "export function run() { const { bar: baz } = require('@acme/shared'); return baz() }\n",
+				}
+				store := buildRawStore(t, backend, files, func(fp string) (string, string) {
+					repo, _, _ := strings.Cut(fp, "/")
+					return repo, "ws"
+				})
+				npmDep := func(file, spec string) bool {
+					if strings.HasPrefix(file, "shared/") {
+						return spec == "p"
+					}
+					if strings.HasPrefix(file, "app/") {
+						return spec == "@acme/shared"
+					}
+					return false
+				}
+				r := New(store)
+				r.SetNpmDependencyLookup(npmDep)
+				r.ResolveAll()
+
+				cr := NewCrossRepo(store)
+				cr.SetNpmDependencyLookup(npmDep)
+				cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+					switch spec {
+					case "p":
+						return map[string]NpmPackageTarget{"prov": {WorkspaceID: "ws", Entries: []string{"prov/index.js"}}}
+					case "@acme/shared":
+						return map[string]NpmPackageTarget{"shared": {WorkspaceID: "ws", Entries: []string{"shared/index.js"}}}
+					}
+					return nil
+				})
+				cr.ResolveAll()
+
+				call := findCallEdge(store, "app/main.js::run", "prov/index.js::foo")
+				require.NotNil(t, call, "chained tracked-npm barrel must resolve to prov/index.js::foo")
+				require.Equal(t, "p", call.Meta[NpmImportSpecifierMeta], "innermost terminal package spec must be stamped")
+
+				// Second pass must have zero churn.
+				stats2 := cr.ResolveAll()
+				require.Zero(t, stats2.Resolved)
+				require.NotNil(t, findCallEdge(store, "app/main.js::run", "prov/index.js::foo"))
+
+				// Now retarget shared/index.js's exports.bar from foo -> qux (leaving exports.other -> other).
+				store.EvictFile("shared/index.js")
+				sNodes, sEdges := extractRawSources(t, map[string]string{
+					"shared/index.js": "exports.bar = require('p').qux\nexports.other = require('p').other\n",
+				})
+				for _, n := range sNodes {
+					n.RepoPrefix = "shared"
+					n.WorkspaceID = "ws"
+				}
+				store.AddBatch(sNodes, sEdges)
+				cr.ResolveAll()
+				require.NotNil(t, findCallEdge(store, "app/main.js::run", "prov/index.js::qux"),
+					"stale check must restub and rebind to prov/index.js::qux")
+
+				// Now remove exports.bar completely while keeping exports.other -> other: must restub to unresolved::baz.
+				store.EvictFile("shared/index.js")
+				sNodes2, sEdges2 := extractRawSources(t, map[string]string{
+					"shared/index.js": "exports.other = require('p').other\n",
+				})
+				for _, n := range sNodes2 {
+					n.RepoPrefix = "shared"
+					n.WorkspaceID = "ws"
+				}
+				store.AddBatch(sNodes2, sEdges2)
+				cr.ResolveAll()
+				unresolvedCall(t, store, "app/main.js::run", "baz")
+			})
+		}
+
+		// Cross-repo bare-dir named EdgeReExports in same-chunk / 2-phase resolveScopedLocked on SQLite:
+		// barrel, ES caller, and require() caller all live in repo "app" so Phase 1 resolves
+		// importPending (EdgeReExports + EdgeImports), flushes & clears require cache, and Phase 2
+		// rebuilds reachableReposByFile and resolves restPending in the same scoped call.
+		t.Run("cross_repo_bare_dir_reexport_2phase_scoped_sqlite", func(t *testing.T) {
+			files := map[string]string{
+				"shared_pkg/index.js": "export function foo() { return 1 }\n",
+				"app/barrel.js":       "exports.foo = require('shared_pkg').foo\n",
+				"app/es_caller.js":    "import { foo } from 'shared_pkg'\nexport function esRun() { return foo() }\n",
+				"app/main.js":         "export function run() { const { foo } = require('./barrel'); return foo() }\n",
+			}
+			store := buildRawStore(t, "sqlite", files, func(fp string) (string, string) {
+				repo, _, _ := strings.Cut(fp, "/")
+				return repo, "ws"
+			})
+			cr := NewCrossRepo(store)
+			cr.ResolveForRepo("app")
+			foundResolvedReExport := false
+			for _, e := range store.GetOutEdges("app/barrel.js") {
+				if e != nil && e.Kind == graph.EdgeReExports && e.To == "shared_pkg/index.js::foo" {
+					foundResolvedReExport = true
+				}
+			}
+			require.True(t, foundResolvedReExport, "Phase 1 must resolve app/barrel.js EdgeReExports to shared_pkg/index.js::foo")
+			require.NotNil(t, findCallEdge(store, "app/main.js::run", "shared_pkg/index.js::foo"),
+				"Phase 2 must resolve app/main.js require('./barrel') after Phase 1 flush & cache clear")
+			require.NotNil(t, findCallEdge(store, "app/es_caller.js::esRun", "shared_pkg/index.js::foo"),
+				"Phase 2 must build reachableReposByFile seeing Phase 1 resolved EdgeImports")
+		})
+
+		// npm-aliased dep ("p-alias" -> "p") must NOT misbind to local .../p/index.js.
+		t.Run("npm_alias_dep_never_misbinds_local_dir", func(t *testing.T) {
+			files := map[string]string{
+				"app/p/index.js": "export function foo() { return 1 }\n",
+				"app/main.js":    "import { foo as impFoo } from 'p-alias'\nexport { foo } from 'p-alias'\nexport function run() { const { foo } = require('p-alias'); return foo() + impFoo() }\n",
+			}
+			store := buildRawStore(t, "memory", files, func(string) (string, string) { return "app", "ws" })
+			npmDep := func(_, spec string) bool { return spec == "p-alias" }
+			npmAlias := func(_, spec string) string {
+				if spec == "p-alias" {
+					return "p"
+				}
+				return ""
+			}
+			assertExternalOnly := func(phase string) {
+				t.Helper()
+				require.Empty(t, callsInto(store, "app/p/index.js::foo"), "%s: call must not bind local app/p/index.js::foo", phase)
+				foundExtReExport := false
+				foundExtImport := false
+				for _, e := range store.GetOutEdges("app/main.js") {
+					if e == nil {
+						continue
+					}
+					if e.Kind == graph.EdgeImports || e.Kind == graph.EdgeReExports {
+						require.NotEqual(t, "app/p/index.js", e.To, "%s: %s must not misbind to local app/p/index.js", phase, e.Kind)
+						require.NotEqual(t, "app/p/index.js::foo", e.To, "%s: %s must not misbind to local app/p/index.js::foo", phase, e.Kind)
+					}
+					if e.Kind == graph.EdgeReExports && e.To == "external::p-alias::foo" {
+						foundExtReExport = true
+					}
+					if e.Kind == graph.EdgeImports && (e.To == "external::p-alias" || e.To == "external::p-alias::foo") {
+						foundExtImport = true
+					}
+				}
+				require.True(t, foundExtReExport, "%s: EdgeReExports must target external::p-alias::foo", phase)
+				require.True(t, foundExtImport, "%s: EdgeImports must target external::p-alias", phase)
+			}
+			r := New(store)
+			r.SetNpmDependencyLookup(npmDep)
+			r.SetNpmAliasResolver(npmAlias)
+			r.ResolveAll()
+			assertExternalOnly("per-repo Resolver")
+
+			cr := NewCrossRepo(store)
+			cr.SetNpmDependencyLookup(npmDep)
+			cr.SetNpmAliasResolver(npmAlias)
+			cr.ResolveAll()
+			assertExternalOnly("CrossRepoResolver")
+		})
+	})
+
+	t.Run("single-repo cross-repo guard, pass-cache hygiene, and JSLexicalRequire terminal parity", func(t *testing.T) {
+		// Single-repo Resolver must not steal a cross-repo tracked-npm require with CrossRepo = false.
+		t.Run("single_repo_resolver_cross_repo_guard", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"prov/index.js": "export function foo() { return 1 }\n",
+				"app/main.js":   "export function run() { const { foo } = require('../prov'); return foo() }\n",
+			}, func(fp string) (string, string) {
+				repo, _, _ := strings.Cut(fp, "/")
+				return repo, "ws"
+			})
+			New(store).ResolveAll()
+			require.Empty(t, callsInto(store, "prov/index.js::foo"), "single-repo Resolver must not bind cross-repo require()")
+		})
+
+		// Reused Resolver clears import evidence caches between ResolveIncomingForNames and ResolveFilesOutgoing.
+		t.Run("reused_resolver_pass_cache_hygiene", func(t *testing.T) {
+			store := buildRawStore(t, "memory", map[string]string{
+				"lib/index.js": "export function other() { return 1 }\n",
+				"app/main.js":  "export function run() { const { foo } = require('../lib'); return foo() }\n",
+			}, nil)
+			r := New(store)
+			// Visit unresolved::foo so requireNodeByID caches negative nil for lib/index.js::foo;
+			// clearPassIndexes() must flush clearImportEvidence() before ResolveFilesOutgoing runs.
+			r.ResolveIncomingForNames([]string{"foo"}, nil)
+			// Add foo to lib/index.js after the first pass.
+			store.AddNode(&graph.Node{ID: "lib/index.js::foo", Kind: graph.KindFunction, Name: "foo", FilePath: "lib/index.js", Language: "javascript", Meta: map[string]any{"visibility": "public"}})
+			r.ResolveFilesOutgoing([]string{"app/main.js"})
+			require.NotNil(t, findCallEdge(store, "app/main.js::run", "lib/index.js::foo"))
+		})
+
+		// JSLexicalRequire terminal-classification parity across memory + SQLite.
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run("terminal_parity/"+backend, func(t *testing.T) {
+				store := buildRawStore(t, backend, map[string]string{
+					"app/main.js": "export function run() { const { missing } = require('future-pkg'); return missing() }\n",
+				}, nil)
+				r := New(store)
+				r.SetStampTerminal(true)
+				r.ResolveAll()
+				call := unresolvedCall(t, store, "app/main.js::run", "missing")
+				require.False(t, edgeTerminalFlag(call), "JSLexicalRequire must never be stamped terminal by ResolveAll")
+
+				reason, term := r.classifyTerminal(call)
+				require.False(t, term)
+				require.Empty(t, reason)
+
+				stamped, _ := r.reconcileTerminalStamps()
+				require.Zero(t, stamped)
+				call = unresolvedCall(t, store, "app/main.js::run", "missing")
+				require.False(t, edgeTerminalFlag(call), "reconcileTerminalStamps must never stamp JSLexicalRequire")
+			})
+		}
+	})
+}
+
+func findAllCallsTo(g graph.Store, from, to string) []*graph.Edge {
+	var out []*graph.Edge
+	for _, e := range g.GetOutEdges(from) {
+		if e != nil && e.Kind == graph.EdgeCalls && e.To == to {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestImportEvidence_LocalRequireRenamedDestructuringAndMember(t *testing.T) {
+	for _, backend := range []string{"memory", "sqlite"} {
+		t.Run("local_shapes/"+backend, func(t *testing.T) {
+			files := map[string]string{
+				"lib/foo.js":   "export function foo() { return 1 }\n",
+				"lib/index.js": "exports.foo = require('./foo').foo\n",
+				"app/main.js": strings.Join([]string{
+					"export function r1() { const { foo: bar } = require('../lib/foo'); return bar() }",
+					"export function r2() { const { foo: bar = () => 0 } = require('../lib/foo'); return bar() }",
+					"export function r3() { const { \"foo\": bar } = require('../lib/foo'); return bar() }",
+					"export function r4() { const bar = require('../lib/foo').foo; return bar() }",
+					"export function r5() { const { foo: bar } = require('../lib'); return bar() }",
+					"export function r6() { const bar = require('../lib').foo; return bar() }",
+				}, "\n") + "\n",
+			}
+			store := buildRawStore(t, backend, files, nil)
+			New(store).ResolveAll()
+			for _, fn := range []string{"r1", "r2", "r3", "r4", "r5", "r6"} {
+				call := findCallEdge(store, "app/main.js::"+fn, "lib/foo.js::foo")
+				require.NotNil(t, call, "expected %s to bind lib/foo.js::foo", fn)
+				require.Equal(t, "bar", call.Meta[graph.JSLexicalRequireLocalMeta])
+				require.Equal(t, "foo", call.Meta[graph.JSLexicalRequireSymbolMeta])
+			}
+		})
+
+		t.Run("tracked_npm_retarget_and_ambiguity_restub_to_local_name/"+backend, func(t *testing.T) {
+			files := map[string]string{
+				"provA/index.ts": "export function foo() { return 1 }\n",
+				"provB/index.ts": "export function foo() { return 2 }\n",
+				"app/main.ts":    "export function run() { const { foo: bar } = require('p'); return bar() }\n",
+			}
+			store := buildRawStore(t, backend, files, func(fp string) (string, string) {
+				repo, _, _ := strings.Cut(fp, "/")
+				return repo, "ws"
+			})
+			providers := map[string]NpmPackageTarget{
+				"provA": {WorkspaceID: "ws", Entries: []string{"provA/index.ts"}},
+			}
+			cr := NewCrossRepo(store)
+			cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "p" })
+			cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+				if spec != "p" {
+					return nil
+				}
+				return providers
+			})
+			cr.ResolveAll()
+			call := findCallEdge(store, "app/main.ts::run", "provA/index.ts::foo")
+			require.NotNil(t, call)
+
+			// Make ambiguous -> must restub to unresolved::bar (the local name), NOT unresolved::foo.
+			providers["provB"] = NpmPackageTarget{WorkspaceID: "ws", Entries: []string{"provB/index.ts"}}
+			cr.ResolveAll()
+			restubbed := unresolvedCall(t, store, "app/main.ts::run", "bar")
+			require.Nil(t, findCallEdge(store, "app/main.ts::run", graph.UnresolvedMarker+"foo"))
+			require.NotContains(t, restubbed.Meta, NpmImportSpecifierMeta)
+
+			// Remove provA -> rebinds to provB/index.ts::foo.
+			delete(providers, "provA")
+			cr.ResolveAll()
+			require.NotNil(t, findCallEdge(store, "app/main.ts::run", "provB/index.ts::foo"))
+		})
+	}
+}
+
+type cancelInChunkStore struct {
+	graph.Store
+	cancel     context.CancelFunc
+	cancelOnce atomic.Bool
+	evictID    string
+	evictOnce  atomic.Bool
+}
+
+func (s *cancelInChunkStore) GetNode(id string) *graph.Node {
+	if s.cancel != nil && strings.HasPrefix(id, "prov/") && s.cancelOnce.CompareAndSwap(false, true) {
+		s.cancel()
+	}
+	return s.Store.GetNode(id)
+}
+
+func (s *cancelInChunkStore) GetNodesByIDs(ids []string) map[string]*graph.Node {
+	if s.evictID != "" && slices.Contains(ids, s.evictID) && s.evictOnce.CompareAndSwap(false, true) {
+		// Simulate target eviction right before liveness validation.
+		out := s.Store.GetNodesByIDs(ids)
+		delete(out, s.evictID)
+		return out
+	}
+	return s.Store.GetNodesByIDs(ids)
+}
+
+func TestCrossRepoResolveAllMidChunkCancelRevertsInMemory(t *testing.T) {
+	t.Run("mid_chunk_cancel_lossless_revert_and_zero_side_effect_leak", func(t *testing.T) {
+		g := graph.New()
+		g.AddBatch([]*graph.Node{
+			{ID: "app/main.js", Kind: graph.KindFile, Name: "main.js", FilePath: "app/main.js", Language: "javascript", RepoPrefix: "app", WorkspaceID: "ws"},
+			{ID: "app/main.js::run", Kind: graph.KindFunction, Name: "run", FilePath: "app/main.js", Language: "javascript", RepoPrefix: "app", WorkspaceID: "ws"},
+			{ID: "prov/index.js", Kind: graph.KindFile, Name: "index.js", FilePath: "prov/index.js", Language: "javascript", RepoPrefix: "prov", WorkspaceID: "ws"},
+			{ID: "prov/index.js::foo", Kind: graph.KindFunction, Name: "foo", FilePath: "prov/index.js", Language: "javascript", RepoPrefix: "prov", WorkspaceID: "ws", Meta: map[string]any{"visibility": "public"}},
+			{ID: "goapp/a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "goapp/a.go", Language: "go", RepoPrefix: "goapp"},
+			{ID: "goapp/a.go::Fn", Kind: graph.KindFunction, Name: "Fn", FilePath: "goapp/a.go", Language: "go", RepoPrefix: "goapp"},
+		}, []*graph.Edge{
+			{
+				From: "app/main.js::run", To: graph.UnresolvedMarker + "foo", Kind: graph.EdgeCalls,
+				FilePath: "app/main.js", Line: 1,
+				Meta: map[string]any{
+					graph.JSLexicalBindingMeta:      graph.JSLexicalRequire,
+					graph.JSLexicalRequireSpecMeta:  "p",
+					graph.JSLexicalRequireLocalMeta: "foo",
+					"keep":                          "orig",
+				},
+			},
+			{
+				From: "goapp/a.go::Fn", To: "unresolved::extern::example.com/missing::Bar", Kind: graph.EdgeCalls,
+				FilePath: "goapp/a.go", Line: 2,
+				Meta: map[string]any{"go_import": "example.com/missing", "orig_key": "v1"},
+			},
+			{
+				From: "goapp/a.go::Fn", To: "unresolved::extern::example.com/cold::Baz", Kind: graph.EdgeCalls,
+				FilePath: "goapp/a.go", Line: 3,
+				Meta: map[string]any{"orig_cold": "v2"},
+			},
+		})
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		wrapped := &cancelInChunkStore{Store: g, cancel: cancel}
+		cr := NewCrossRepo(wrapped)
+		cr.SetNpmDependencyLookup(func(_, spec string) bool { return spec == "p" })
+		cr.SetNpmPackageLookup(func(spec string) map[string]NpmPackageTarget {
+			if spec != "p" {
+				return nil
+			}
+			return map[string]NpmPackageTarget{"prov": {WorkspaceID: "ws", Entries: []string{"prov/index.js"}}}
+		})
+		_, err := cr.ResolveAllContext(ctx)
+		require.ErrorIs(t, err, context.Canceled)
+
+		// All in-memory edges must be losslessly restored to their pre-chunk state.
+		reqEdge := findCallEdge(g, "app/main.js::run", graph.UnresolvedMarker+"foo")
+		require.NotNil(t, reqEdge, "require edge must revert to unresolved::foo")
+		require.Equal(t, "orig", reqEdge.Meta["keep"])
+		require.NotContains(t, reqEdge.Meta, NpmImportSpecifierMeta)
+		require.Empty(t, callsInto(g, "prov/index.js::foo"))
+
+		goEdge1 := findCallEdge(g, "goapp/a.go::Fn", "unresolved::extern::example.com/missing::Bar")
+		require.NotNil(t, goEdge1)
+		require.Equal(t, "example.com/missing", goEdge1.Meta["go_import"])
+		require.Equal(t, "v1", goEdge1.Meta["orig_key"])
+
+		goEdge2 := findCallEdge(g, "goapp/a.go::Fn", "unresolved::extern::example.com/cold::Baz")
+		require.NotNil(t, goEdge2)
+		require.Equal(t, "v2", goEdge2.Meta["orig_cold"])
+
+		require.Empty(t, cr.TakeDemotedGoModuleCallFiles(), "cancelled chunk must not leak goModuleDemotedFiles")
+		require.Empty(t, cr.TakeRetargetedTestCallFiles(), "cancelled chunk must not leak retargetedTestCallFiles")
+	})
+
+	t.Run("filterLiveReindex_target_eviction_reverts_both_cloned_and_uncloned_live_edges", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			evictID string
+		}{
+			{name: "uncloned_call_edge", evictID: "lib/index.js::foo"},
+			{name: "cloned_import_edge", evictID: "lib/index.js"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				g := graph.New()
+				g.AddBatch([]*graph.Node{
+					{ID: "app/main.js", Kind: graph.KindFile, Name: "main.js", FilePath: "app/main.js", Language: "javascript", RepoPrefix: "app", WorkspaceID: "ws"},
+					{ID: "app/main.js::run", Kind: graph.KindFunction, Name: "run", FilePath: "app/main.js", Language: "javascript", RepoPrefix: "app", WorkspaceID: "ws"},
+					{ID: "lib/index.js", Kind: graph.KindFile, Name: "index.js", FilePath: "lib/index.js", Language: "javascript", RepoPrefix: "lib", WorkspaceID: "ws"},
+					{ID: "lib/index.js::foo", Kind: graph.KindFunction, Name: "foo", FilePath: "lib/index.js", Language: "javascript", RepoPrefix: "lib", WorkspaceID: "ws", Meta: map[string]any{"visibility": "public"}},
+				}, []*graph.Edge{
+					{
+						From: "app/main.js", To: "unresolved::import::lib", Kind: graph.EdgeImports,
+						FilePath: "app/main.js", Line: 1,
+						Meta: map[string]any{"orig_imp": true},
+					},
+					{
+						From: "app/main.js::run", To: graph.UnresolvedMarker + "foo", Kind: graph.EdgeCalls,
+						FilePath: "app/main.js", Line: 2,
+						Meta: map[string]any{
+							graph.JSLexicalBindingMeta:      graph.JSLexicalRequire,
+							graph.JSLexicalRequireSpecMeta:  "lib",
+							graph.JSLexicalRequireLocalMeta: "foo",
+							"orig_call":                     true,
+						},
+					},
+				})
+
+				wrapped := &cancelInChunkStore{Store: g, evictID: tc.evictID}
+				cr := NewCrossRepo(wrapped)
+				cr.ResolveAll()
+
+				if tc.evictID == "lib/index.js::foo" {
+					call := findCallEdge(g, "app/main.js::run", graph.UnresolvedMarker+"foo")
+					require.NotNil(t, call, "rejected live call edge must revert to unresolved::foo")
+					require.Equal(t, true, call.Meta["orig_call"])
+					require.False(t, call.CrossRepo)
+					require.Empty(t, call.Origin)
+					require.Empty(t, callsInto(g, "lib/index.js::foo"))
+				} else {
+					var imp *graph.Edge
+					for _, e := range g.GetOutEdges("app/main.js") {
+						if e.Kind == graph.EdgeImports {
+							imp = e
+						}
+					}
+					require.NotNil(t, imp)
+					require.Equal(t, "unresolved::import::lib", imp.To, "rejected live cloned import edge must revert to unresolved::import::lib")
+					require.Equal(t, true, imp.Meta["orig_imp"])
+					require.False(t, imp.CrossRepo)
+				}
+			})
+		}
+	})
+
+	t.Run("cold_go_extern_without_go_import_does_not_mark_demoted_file", func(t *testing.T) {
+		g := graph.New()
+		g.AddBatch([]*graph.Node{
+			{ID: "goapp/a.go", Kind: graph.KindFile, Name: "a.go", FilePath: "goapp/a.go", Language: "go", RepoPrefix: "goapp"},
+			{ID: "goapp/a.go::Fn", Kind: graph.KindFunction, Name: "Fn", FilePath: "goapp/a.go", Language: "go", RepoPrefix: "goapp"},
+		}, []*graph.Edge{
+			{
+				From: "goapp/a.go::Fn", To: "unresolved::extern::example.com/cold::Baz", Kind: graph.EdgeCalls,
+				FilePath: "goapp/a.go", Line: 3,
+			},
+		})
+		cr := NewCrossRepo(g)
+		cr.ResolveAll()
+		require.Empty(t, cr.TakeDemotedGoModuleCallFiles(), "cold extern without go_import must not mark demoted file")
+	})
 }

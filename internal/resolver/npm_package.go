@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/zzet/gortex/internal/graph"
 )
 
@@ -59,12 +61,18 @@ func (m *npmImportMemo) getNode(cr *CrossRepoResolver, id string) *graph.Node {
 	if node, seen := m.nodes[id]; seen {
 		return node
 	}
-	node := cr.cachedGetNode(id)
+	node := cr.requireGetNode(id)
 	m.nodes[id] = node
 	return node
 }
 
 func (cr *CrossRepoResolver) trackedNpmImport(callerRepo, callerWS, importPath string, memo *npmImportMemo) *graph.Node {
+	return cr.trackedNpmImportWith(callerRepo, callerWS, importPath, memo, func(id string) *graph.Node {
+		return memo.getNode(cr, id)
+	})
+}
+
+func (cr *CrossRepoResolver) trackedNpmImportWith(callerRepo, callerWS, importPath string, memo *npmImportMemo, getNode func(string) *graph.Node) *graph.Node {
 	spec, symbol := splitImportSpecSymbol(importPath)
 	packages := cr.npmPackages(spec)
 	// Manifest ownership, not a successful probe, blocks linking a monorepo
@@ -96,21 +104,38 @@ func (cr *CrossRepoResolver) trackedNpmImport(callerRepo, callerWS, importPath s
 	}
 	dir := candidates[0]
 	key := npmProbeKey{dir: dir, spec: spec}
-	node, seen := memo.probes[key]
+	var node *graph.Node
+	var seen bool
+	if memo != nil {
+		node, seen = memo.probes[key]
+	} else {
+		cr.requireCacheMu.RLock()
+		node, seen = cr.npmProbeCache[key]
+		cr.requireCacheMu.RUnlock()
+	}
 	if !seen {
 		for _, stem := range packages[dir].Entries {
-			if file := probeJSTSFile(cr.cachedGetNode, stem); file != "" {
-				node = cr.cachedGetNode(file)
+			if file := probeJSTSFile(getNode, stem); file != "" {
+				node = getNode(file)
 				break
 			}
 		}
-		memo.probes[key] = node
+		if memo != nil {
+			memo.probes[key] = node
+		} else {
+			cr.requireCacheMu.Lock()
+			if cr.npmProbeCache == nil {
+				cr.npmProbeCache = make(map[npmProbeKey]*graph.Node)
+			}
+			cr.npmProbeCache[key] = node
+			cr.requireCacheMu.Unlock()
+		}
 	}
 	if node == nil {
 		return nil
 	}
 	if symbol != "" {
-		exported := memo.getNode(cr, node.ID+"::"+symbol)
+		exported := getNode(node.ID + "::" + symbol)
 		if exported == nil || exported.Meta["visibility"] != "public" {
 			return nil
 		}
@@ -131,6 +156,7 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsScoped(ctx context.Context,
 }
 
 func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, edges iter.Seq[*graph.Edge], scopedEdges []*graph.Edge, scoped bool, stats *CrossRepoStats) ([]*graph.Edge, error) {
+	defer cr.clearRequireCache()
 	if cr.npmPackages == nil {
 		return nil, ctx.Err()
 	}
@@ -224,9 +250,26 @@ func (cr *CrossRepoResolver) resolveTrackedNpmImportsPass(ctx context.Context, e
 func resetRestubbedNpmCall(call *graph.Edge, name string) {
 	delete(call.Meta, NpmImportSpecifierMeta)
 	delete(call.Meta, "resolution")
+	clearEdgeTerminal(call)
 	call.To = graph.UnresolvedMarker + name
 	call.CrossRepo = false
 	call.Origin, call.Tier, call.Confidence, call.ConfidenceLabel = "", "", 0, ""
+}
+
+func requireRestubLocalName(call *graph.Edge, getNode func(string) *graph.Node) string {
+	if call == nil {
+		return ""
+	}
+	if local, _ := call.Meta[graph.JSLexicalRequireLocalMeta].(string); local != "" {
+		return local
+	}
+	_, name, hasSym := strings.Cut(call.To, "::")
+	if (!hasSym || name == "") && getNode != nil {
+		if n := getNode(call.To); n != nil {
+			name = n.Name
+		}
+	}
+	return name
 }
 
 func (cr *CrossRepoResolver) staleTrackedNpmRequireCallName(call *graph.Edge, memo *npmImportMemo) (string, bool) {
@@ -234,31 +277,79 @@ func (cr *CrossRepoResolver) staleTrackedNpmRequireCallName(call *graph.Edge, me
 		return "", false
 	}
 	marked, _ := call.Meta[NpmImportSpecifierMeta].(string)
+	reqSpec, _ := call.Meta[graph.JSLexicalRequireSpecMeta].(string)
 	spec := marked
 	if spec == "" {
-		spec, _ = call.Meta[graph.JSLexicalRequireSpecMeta].(string)
+		spec = reqSpec
 	}
 	if spec == "" {
 		return "", false
 	}
-	eligible := cr.eligibleTrackedNpmImport(call, spec)
-	if marked == "" && !eligible {
-		return "", false
+	memoGetNode := func(id string) *graph.Node {
+		return memo.getNode(cr, id)
 	}
-	stillValid := false
-	if eligible {
-		from := memo.getNode(cr, call.From)
-		callerRepo := ""
-		if from != nil {
-			callerRepo = from.RepoPrefix
+	from := memoGetNode(call.From)
+	callerRepo := ""
+	if from != nil {
+		callerRepo = from.RepoPrefix
+	}
+	callerWS := candidateWorkspaceID(from)
+	localName, _ := call.Meta[graph.JSLexicalRequireLocalMeta].(string)
+	lookupName, _ := call.Meta[graph.JSLexicalRequireSymbolMeta].(string)
+	if lookupName == "" {
+		lookupName = localName
+	}
+	if lookupName == "" {
+		_, sym, hasSym := strings.Cut(call.To, "::")
+		if hasSym && sym != "" {
+			lookupName = sym
+		} else if n := memoGetNode(call.To); n != nil {
+			lookupName = n.Name
 		}
-		if picked := cr.trackedNpmImport(callerRepo, candidateWorkspaceID(from), spec, memo); picked != nil {
-			targetFile := cr.nodeFilePath(call.To)
-			if targetFile != "" {
-				if targetFile == cr.nodeFilePath(picked.ID) {
-					stillValid = true
-				} else {
-					_, stillValid = cr.importClosureFiles(picked.ID)[targetFile]
+	}
+
+	stillValid := false
+	if reqSpec != "" && marked != "" && reqSpec != marked {
+		// Indirect require (local barrel, chained tracked-npm barrel, or
+		// npm-aliased dependency): bypass eligibleTrackedNpmImport(call, marked)
+		// on call.FilePath, re-evaluate reqSpec from call.FilePath, and run the
+		// shared Steps 1-5 resolution with innermost-hop trackedNpmSpec.
+		callerFile := call.FilePath
+		if callerFile == "" && from != nil {
+			callerFile = from.FilePath
+		}
+		resolved := cr.resolveJSRequireTargetMemo(call, callerFile, callerRepo, callerWS, reqSpec, memo, memoGetNode)
+		if pickedFile := nodeFilePathWith(memoGetNode, resolved.target); pickedFile != "" && lookupName != "" {
+			env := cr.jsRequireEnvMemo(callerRepo, callerWS, memo, memoGetNode)
+			pick, resolvedNpmSpec := resolveJSRequireFromTargetFile(env, pickedFile, lookupName, resolved.trackedNpmSpec)
+			if pick != nil && pick.ID == call.To && resolvedNpmSpec == marked {
+				stillValid = true
+			}
+		}
+	} else {
+		eligible := cr.eligibleTrackedNpmImport(call, spec)
+		if marked == "" && !eligible {
+			return "", false
+		}
+		if eligible {
+			if picked := cr.trackedNpmImportWith(callerRepo, callerWS, spec, memo, memoGetNode); picked != nil {
+				if pickedFile := nodeFilePathWith(memoGetNode, picked.ID); pickedFile != "" {
+					if localName != "" {
+						env := cr.jsRequireEnvMemo(callerRepo, callerWS, memo, memoGetNode)
+						pick, resolvedNpmSpec := resolveJSRequireFromTargetFile(env, pickedFile, lookupName, spec)
+						if pick != nil && pick.ID == call.To && (marked == "" || resolvedNpmSpec == marked) {
+							stillValid = true
+						}
+					} else {
+						targetFile := nodeFilePathWith(memoGetNode, call.To)
+						if targetFile != "" {
+							if targetFile == pickedFile {
+								stillValid = true
+							} else {
+								_, stillValid = cr.importClosureFilesMemo(picked.ID, memo, memoGetNode)[targetFile]
+							}
+						}
+					}
 				}
 			}
 		}
@@ -266,12 +357,7 @@ func (cr *CrossRepoResolver) staleTrackedNpmRequireCallName(call *graph.Edge, me
 	if stillValid {
 		return "", false
 	}
-	_, name, hasSym := strings.Cut(call.To, "::")
-	if !hasSym || name == "" {
-		if n := memo.getNode(cr, call.To); n != nil {
-			name = n.Name
-		}
-	}
+	name := requireRestubLocalName(call, memoGetNode)
 	if name == "" {
 		return "", false
 	}
@@ -340,11 +426,27 @@ func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsAll(ctx context.Co
 	if cr.npmRequireRecheck != nil {
 		targetRepos, done = cr.npmRequireRecheck()
 	}
+	if targetRepos != nil && len(targetRepos) == 0 {
+		if done != nil && ctx.Err() == nil {
+			done()
+		}
+		return
+	}
+	var lightSeq iter.Seq[*graph.Edge]
+	var lightErr func() error
+	if checked, ok := cr.graph.(graph.CheckedLightEdgeSequencer); ok {
+		lightSeq, lightErr = checked.EdgesLightSeqErr(ctx, graph.EdgeCrossRepoCalls)
+	} else {
+		lightSeq = graph.EdgesLightSeq(cr.graph, graph.EdgeCrossRepoCalls)
+	}
 	var sites []graph.EdgeSite
 	siteSeen := make(map[graph.EdgeSite]struct{})
-	for e := range graph.EdgesLightSeq(cr.graph, graph.EdgeCrossRepoCalls) {
+	for e := range lightSeq {
 		if ctx.Err() != nil {
 			return
+		}
+		if e == nil || (e.Origin != graph.OriginASTResolved && e.Origin != graph.OriginLSPResolved) {
+			continue
 		}
 		if !isJSTSPath(e.FilePath) || (targetRepos != nil && !idInRepos(e.To, targetRepos)) {
 			continue
@@ -356,13 +458,67 @@ func (cr *CrossRepoResolver) restubStaleTrackedNpmRequireCallsAll(ctx context.Co
 		siteSeen[site] = struct{}{}
 		sites = append(sites, site)
 	}
+	if lightErr != nil {
+		if err := lightErr(); err != nil {
+			if cr.logger != nil {
+				cr.logger.Debug("cross-repo resolve: require re-check aborted", zap.Error(err))
+			}
+			return
+		}
+	}
+	checkedCandidates, hasCheckedCandidates := cr.graph.(graph.CheckedEdgeCandidateLookup)
 	seen := make(map[graph.EdgeIdentity]struct{})
 	for start := 0; start < len(sites); start += resolvePendingPageRows {
 		if ctx.Err() != nil {
 			return
 		}
 		page := sites[start:min(start+resolvePendingPageRows, len(sites))]
-		full := cr.graph.GetEdgeCandidates(nil, page)
+		var full graph.EdgeCandidateSet
+		if hasCheckedCandidates {
+			var err error
+			full, err = checkedCandidates.GetEdgeCandidatesErr(ctx, nil, page)
+			if err != nil {
+				if cr.logger != nil {
+					cr.logger.Debug("cross-repo resolve: require re-check aborted", zap.Error(err))
+				}
+				return
+			}
+		} else {
+			full = cr.graph.GetEdgeCandidates(nil, page)
+		}
+		// Batch-warm caller, target, and file nodes for require() calls on this
+		// page in one store query instead of N point GetNode calls.
+		var warmIDs []string
+		warmSeen := make(map[string]struct{})
+		addWarm := func(id string) {
+			if id == "" {
+				return
+			}
+			if _, ok := memo.nodes[id]; ok {
+				return
+			}
+			if _, dup := warmSeen[id]; dup {
+				return
+			}
+			warmSeen[id] = struct{}{}
+			warmIDs = append(warmIDs, id)
+		}
+		for _, site := range page {
+			for _, call := range full.Site(site.From, site.Line, graph.EdgeCalls) {
+				if call == nil || !call.CrossRepo || call.Meta[graph.JSLexicalBindingMeta] != graph.JSLexicalRequire {
+					continue
+				}
+				addWarm(call.From)
+				addWarm(call.To)
+				addWarm(call.FilePath)
+			}
+		}
+		if len(warmIDs) > 0 {
+			loaded := cr.graph.GetNodesByIDs(warmIDs)
+			for _, id := range warmIDs {
+				memo.nodes[id] = loaded[id]
+			}
+		}
 		var batch []graph.EdgeReindex
 		var obsolete []*graph.Edge
 		for _, site := range page {
@@ -465,7 +621,9 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 				parallel := *call
 				parallel.Kind = graph.EdgeCrossRepoCalls
 				obsolete = append(obsolete, &parallel)
-				resetRestubbedNpmCall(call, name)
+				graph.StashRestubProvenance(call)
+				call.To = graph.UnresolvedMarker + name
+				call.CrossRepo, call.ConfidenceLabel = false, ""
 				batch = append(batch, graph.EdgeReindex{Edge: call, OldTo: target})
 				restubbedList = append(restubbedList, call)
 			}
@@ -498,12 +656,7 @@ func (cr *CrossRepoResolver) restubCallsForChangedNpmImports(changes []graph.Edg
 					continue
 				}
 				oldTo := call.To
-				_, name, hasSym := strings.Cut(oldTo, "::")
-				if !hasSym || name == "" {
-					if n := cr.cachedGetNode(oldTo); n != nil {
-						name = n.Name
-					}
-				}
+				name := requireRestubLocalName(call, cr.requireGetNode)
 				if name == "" {
 					continue
 				}

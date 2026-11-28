@@ -3,8 +3,12 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"iter"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -383,8 +387,8 @@ func TestTrackedNpmLocalRequireSurvivesEvictionAndRebinds(t *testing.T) {
 				esCalls := g.GetOutEdges("app/a.ts::viaES")
 				require.Len(t, esCalls, 1)
 				assert.Equal(t, graph.UnresolvedMarker+"aliased", esCalls[0].To)
-				assert.False(t, graph.HasRestubProvenance(esCalls[0]))
-				assert.NotContains(t, esCalls[0].Meta, "resolution")
+				assert.True(t, graph.HasRestubProvenance(esCalls[0]))
+				assert.Contains(t, esCalls[0].Meta, "resolution")
 
 				reqCalls := g.GetOutEdges("app/a.ts::viaReq")
 				require.Len(t, reqCalls, 1)
@@ -624,4 +628,573 @@ type candidateCountingStore struct {
 func (s *candidateCountingStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
 	s.candidateCalls++
 	return s.Store.GetEdgeCandidates(endpoints, sites)
+}
+
+type siteKindCountingStore struct {
+	graph.Store
+	repoNodeScans int
+	importSites   int
+	callSites     int
+	seenCallSites []graph.EdgeSite
+}
+
+func (s *siteKindCountingStore) RepoNodeIdentitiesSeq(repos []string, kinds ...graph.NodeKind) iter.Seq[graph.RepoNodeIdentity] {
+	s.repoNodeScans++
+	return graph.RepoNodeIdentitiesSeq(s.Store, repos, kinds...)
+}
+
+func (s *siteKindCountingStore) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
+	for _, site := range sites {
+		switch site.Kind {
+		case graph.EdgeImports:
+			s.importSites++
+		case graph.EdgeCalls:
+			s.callSites++
+			s.seenCallSites = append(s.seenCallSites, site)
+		}
+	}
+	return s.Store.GetEdgeCandidates(endpoints, sites)
+}
+
+func TestNpmConsumerFilesForRepoSkipsCrossRepoCallScanForSoleProvider(t *testing.T) {
+	t.Run("sole provider skips unrelated hydrations and finds monorepo competing provider", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			t.Run(backend, func(t *testing.T) {
+				var base graph.Store = graph.New()
+				if backend == "sqlite" {
+					db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, db.Close()) })
+					base = db
+				}
+				counting := &siteKindCountingStore{Store: base}
+				otherProv, otherApp, prov, app, monoA, provB := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+				writePackageJSON(t, otherProv, `{"name":"other-pkg","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, otherProv, "index.ts", "export function g() { return 1 }\n")
+				writePackageJSON(t, otherApp, `{"name":"other-app","dependencies":{"other-pkg":"^1"}}`)
+				writeWorkspaceFile(t, otherApp, "main.ts", "import { g } from 'other-pkg'\nexport function run() { return g() }\nexport function reqRun() { const { g } = require('other-pkg'); return g() }\n")
+
+				writePackageJSON(t, prov, `{"name":"sole-pkg","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, prov, "index.ts", "export function f() { return 2 }\n")
+				writePackageJSON(t, app, `{"name":"app","dependencies":{"sole-pkg":"^1"}}`)
+				writeWorkspaceFile(t, app, "main.ts", "export function run() { const { f } = require('sole-pkg'); return f() }\n")
+
+				// Monorepo workspace member providing competing package "comp-pkg".
+				writePackageJSON(t, monoA, `{"private":true,"workspaces":["packages/*"]}`)
+				writePackageJSON(t, filepath.Join(monoA, "packages", "pkg-p"), `{"name":"comp-pkg","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, monoA, "packages/pkg-p/index.ts", "export function h() { return 3 }\n")
+				writePackageJSON(t, provB, `{"name":"comp-pkg","exports":"./index.ts"}`)
+				writeWorkspaceFile(t, provB, "index.ts", "export function h() { return 4 }\n")
+				compApp := t.TempDir()
+				writePackageJSON(t, compApp, `{"name":"comp-app","dependencies":{"comp-pkg":"^1"}}`)
+				writeWorkspaceFile(t, compApp, "main.ts", "export function run() { const { h } = require('comp-pkg'); return h() }\n")
+
+				reg := newTestRegistry()
+				reg.Register(languages.NewJavaScriptExtractor())
+				reg.Register(languages.NewTypeScriptExtractor())
+				mi := NewMultiIndexer(counting, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+				t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+				_, err := mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "otherProv", Path: otherProv, Workspace: "ws"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "otherApp", Path: otherApp, Workspace: "ws"})
+				require.NoError(t, err)
+
+				// Initial track of sole provider prov: otherApp targets otherProv (NOT prov and NOT competing),
+				// so npmConsumerFilesForRepo("prov") must do ZERO EdgeImports & EdgeCalls hydrations.
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "prov", Path: prov, Workspace: "ws"})
+				require.NoError(t, err)
+				counting.importSites, counting.callSites, counting.seenCallSites = 0, 0, nil
+				assert.Empty(t, mi.npmConsumerFilesForRepo("prov"))
+				assert.Zero(t, counting.importSites, "sole provider must not hydrate unrelated EdgeImports")
+				assert.Zero(t, counting.callSites, "sole provider must not hydrate unrelated EdgeCalls: %+v", counting.seenCallSites)
+
+				// Track app (already-resolved TS require consumer into sole provider prov): must be discovered.
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "app", Path: app, Workspace: "ws"})
+				require.NoError(t, err)
+				assert.Equal(t, []string{"app/main.ts"}, mi.npmConsumerFilesForRepo("prov"))
+
+				// Monorepo competing provider discovery: monoA/packages/pkg-p vs provB.
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "monoA", Path: monoA, Workspace: "ws"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "compApp", Path: compApp, Workspace: "ws"})
+				require.NoError(t, err)
+				_, err = mi.TrackRepoCtx(t.Context(), config.RepoEntry{Name: "provB", Path: provB, Workspace: "ws"})
+				require.NoError(t, err)
+				assert.Contains(t, mi.npmConsumerFilesForRepo("provB"), "compApp/main.ts",
+					"competing provider must discover consumer resolved to monorepo workspace member")
+			})
+		}
+	})
+
+	t.Run("barrel discovery across all track orders and chained tracked-npm barrels", func(t *testing.T) {
+		orders := []struct {
+			name  string
+			order []string
+		}{
+			{name: "prov_shared_app", order: []string{"prov", "shared", "app"}},
+			{name: "shared_app_prov", order: []string{"shared", "app", "prov"}},
+			{name: "app_shared_prov", order: []string{"app", "shared", "prov"}},
+			{name: "prov_app_shared", order: []string{"prov", "app", "shared"}},
+		}
+		for _, ord := range orders {
+			for _, backend := range []string{"memory", "sqlite"} {
+				t.Run(ord.name+"/"+backend, func(t *testing.T) {
+					var g graph.Store = graph.New()
+					if backend == "sqlite" {
+						db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+						require.NoError(t, err)
+						t.Cleanup(func() { require.NoError(t, db.Close()) })
+						g = db
+					}
+					prov, shared, app := t.TempDir(), t.TempDir(), t.TempDir()
+					writePackageJSON(t, prov, `{"name":"p","exports":"./index.js"}`)
+					writeWorkspaceFile(t, prov, "index.js", "export function foo() { return 42 }\n")
+
+					writePackageJSON(t, shared, `{"name":"@acme/shared","exports":"./index.js","dependencies":{"p":"^1"}}`)
+					writeWorkspaceFile(t, shared, "index.js", "export { foo } from 'p'\n")
+
+					writePackageJSON(t, app, `{"name":"app","dependencies":{"@acme/shared":"^1","p":"^1"}}`)
+					writeWorkspaceFile(t, app, "local_barrel.js", "module.exports = require('p')\n")
+					writeWorkspaceFile(t, app, "main.js", strings.Join([]string{
+						"export function viaChained() { const { foo } = require('@acme/shared'); return foo() }",
+						"export function viaLocal() { const { foo } = require('./local_barrel'); return foo() }",
+					}, "\n")+"\n")
+
+					entries := map[string]config.RepoEntry{
+						"prov":   {Name: "prov", Path: prov, Workspace: "ws"},
+						"shared": {Name: "shared", Path: shared, Workspace: "ws"},
+						"app":    {Name: "app", Path: app, Workspace: "ws"},
+					}
+
+					reg := newTestRegistry()
+					reg.Register(languages.NewJavaScriptExtractor())
+					reg.Register(languages.NewTypeScriptExtractor())
+					mi := NewMultiIndexer(g, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+					t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+					for _, name := range ord.order {
+						_, err := mi.TrackRepoCtx(t.Context(), entries[name])
+						require.NoError(t, err)
+					}
+
+					assertCall := func(fnID, wantTo string) {
+						t.Helper()
+						var found *graph.Edge
+						for _, e := range g.GetOutEdges(fnID) {
+							if e != nil && e.Kind == graph.EdgeCalls && e.To == wantTo {
+								found = e
+								break
+							}
+						}
+						require.NotNil(t, found, "%s must bind to %s (order=%s)", fnID, wantTo, ord.name)
+						require.Equal(t, "p", found.Meta[resolver.NpmImportSpecifierMeta], "innermost package spec must be stamped")
+					}
+					assertCall("app/main.js::viaChained", "prov/index.js::foo")
+					assertCall("app/main.js::viaLocal", "prov/index.js::foo")
+
+					// Untrack prov -> calls restub instead of disappearing -> re-track prov -> re-links cleanly!
+					_, _ = mi.UntrackRepo("prov")
+					for _, fnID := range []string{"app/main.js::viaChained", "app/main.js::viaLocal"} {
+						var hasUnresolved bool
+						for _, e := range g.GetOutEdges(fnID) {
+							if e != nil && e.Kind == graph.EdgeCalls && e.To == graph.UnresolvedMarker+"foo" {
+								hasUnresolved = true
+							}
+						}
+						require.True(t, hasUnresolved, "%s must restub on provider untrack", fnID)
+					}
+					_, err := mi.TrackRepoCtx(t.Context(), entries["prov"])
+					require.NoError(t, err)
+					assertCall("app/main.js::viaChained", "prov/index.js::foo")
+					assertCall("app/main.js::viaLocal", "prov/index.js::foo")
+				})
+			}
+		}
+	})
+}
+
+func TestRestubTrackedNpmRepoIncomingSkipsCallsForMarkedTargets(t *testing.T) {
+	t.Run("ES-import-only provider untrack does 1 scan and 0 EdgeCalls hydrations", func(t *testing.T) {
+		g := graph.New()
+		g.AddBatch([]*graph.Node{
+			{ID: "prov/index.ts", Kind: graph.KindFile, Name: "index.ts", FilePath: "prov/index.ts", Language: "typescript", RepoPrefix: "prov"},
+			{ID: "prov/index.ts::foo", Kind: graph.KindFunction, Name: "foo", FilePath: "prov/index.ts", Language: "typescript", RepoPrefix: "prov"},
+			{ID: "prov/util.go", Kind: graph.KindFile, Name: "util.go", FilePath: "prov/util.go", Language: "go", RepoPrefix: "prov"},
+			{ID: "prov/util.go::GoFn", Kind: graph.KindFunction, Name: "GoFn", FilePath: "prov/util.go", Language: "go", RepoPrefix: "prov"},
+			{ID: "app/main.ts", Kind: graph.KindFile, Name: "main.ts", FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app"},
+			{ID: "app/main.ts::viaES", Kind: graph.KindFunction, Name: "viaES", FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app"},
+			{ID: "app/main.ts::viaReq", Kind: graph.KindFunction, Name: "viaReq", FilePath: "app/main.ts", Language: "typescript", RepoPrefix: "app"},
+			{ID: "goapp/main.go::Run", Kind: graph.KindFunction, Name: "Run", FilePath: "goapp/main.go", Language: "go", RepoPrefix: "goapp"},
+		}, []*graph.Edge{
+			{From: "app/main.ts", To: "prov/index.ts::foo", Kind: graph.EdgeImports, FilePath: "app/main.ts", Line: 1, CrossRepo: true, Meta: map[string]any{resolver.NpmImportSpecifierMeta: "p::foo"}},
+			{From: "app/main.ts::viaES", To: "prov/index.ts::foo", Kind: graph.EdgeCalls, FilePath: "app/main.ts", Line: 2, CrossRepo: true, Origin: graph.OriginASTResolved},
+			{From: "app/main.ts::viaReq", To: "prov/index.ts::foo", Kind: graph.EdgeCalls, FilePath: "app/main.ts", Line: 3, CrossRepo: true, Origin: graph.OriginASTResolved, Meta: map[string]any{graph.JSLexicalBindingMeta: graph.JSLexicalRequire, graph.JSLexicalRequireSpecMeta: "p", resolver.NpmImportSpecifierMeta: "p"}},
+			{From: "goapp/main.go::Run", To: "prov/util.go::GoFn", Kind: graph.EdgeCalls, FilePath: "goapp/main.go", Line: 4, CrossRepo: true},
+		})
+		counting := &siteKindCountingStore{Store: g}
+		restubTrackedNpmRepoIncoming(counting, "prov")
+		assert.Equal(t, 1, counting.repoNodeScans, "must perform exactly one RepoNodeIdentitiesSeq pass")
+		assert.Zero(t, counting.callSites, "Stage 2 must issue 0 EdgeCalls hydrations when target is marked by Stage 1 or non-JSTS")
+
+		// Both ES-import and require calls into prov/index.ts::foo were restubbed; Go call untouched.
+		require.Equal(t, graph.UnresolvedMarker+"foo", g.GetOutEdges("app/main.ts::viaES")[0].To)
+		require.Equal(t, graph.UnresolvedMarker+"foo", g.GetOutEdges("app/main.ts::viaReq")[0].To)
+		require.Equal(t, "prov/util.go::GoFn", g.GetOutEdges("goapp/main.go::Run")[0].To)
+	})
+
+	t.Run("Vue SFC script require call without EdgeImports is restubbed via Stage 2", func(t *testing.T) {
+		g := graph.New()
+		g.AddBatch([]*graph.Node{
+			{ID: "prov/index.ts", Kind: graph.KindFile, Name: "index.ts", FilePath: "prov/index.ts", Language: "typescript", RepoPrefix: "prov"},
+			{ID: "prov/index.ts::foo", Kind: graph.KindFunction, Name: "foo", FilePath: "prov/index.ts", Language: "typescript", RepoPrefix: "prov"},
+			{ID: "app/App.vue#script:5::run", Kind: graph.KindFunction, Name: "run", FilePath: "app/App.vue", Language: "typescript", RepoPrefix: "app"},
+		}, []*graph.Edge{
+			{
+				From: "app/App.vue#script:5::run", To: "prov/index.ts::foo", Kind: graph.EdgeCalls,
+				FilePath: "app/App.vue", Line: 6, CrossRepo: true, Origin: graph.OriginASTResolved,
+				Meta: map[string]any{
+					graph.JSLexicalBindingMeta:      graph.JSLexicalRequire,
+					graph.JSLexicalRequireSpecMeta:  "p",
+					graph.JSLexicalRequireLocalMeta: "myFoo",
+					resolver.NpmImportSpecifierMeta: "p",
+				},
+			},
+		})
+		restubTrackedNpmRepoIncoming(g, "prov")
+		out := g.GetOutEdges("app/App.vue#script:5::run")
+		require.Len(t, out, 1)
+		require.Equal(t, graph.UnresolvedMarker+"myFoo", out[0].To)
+		require.False(t, out[0].CrossRepo)
+	})
+}
+
+func TestImportEvidence_LocalRequireRenamedDestructuringAndMember(t *testing.T) {
+	findCalls := func(g graph.Store, from string) []string {
+		var out []string
+		for _, e := range g.GetOutEdges(from) {
+			if e != nil && e.Kind == graph.EdgeCalls {
+				out = append(out, e.To)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	countCallsTo := func(g graph.Store, from, target string) int {
+		n := 0
+		for _, to := range findCalls(g, from) {
+			if to == target {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("same-repo target edit, skip, barrel edit, multi-symbol carry-merge, deletion and ref_facts parity", func(t *testing.T) {
+		for _, backend := range []string{"memory", "sqlite"} {
+			for _, mode := range []string{"IndexFile", "IncrementalReindexPaths"} {
+				t.Run(backend+"/"+mode, func(t *testing.T) {
+					var g graph.Store = graph.New()
+					if backend == "sqlite" {
+						db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "graph.sqlite"))
+						require.NoError(t, err)
+						t.Cleanup(func() { require.NoError(t, db.Close()) })
+						g = db
+					}
+					root := t.TempDir()
+					builderWriteTree(t, root, map[string]string{
+						"src/lib/impl.js":     "export function foo(x) { return x + 1 }\nexport function bar(y) { return y + 2 }\n",
+						"src/lib/mid.js":      "export { foo, bar } from './impl'\n",
+						"src/lib/dupalias.js": "export { foo as a, foo as b } from './impl'; export { bar } from './impl'\n",
+						"src/lib/nsmix.js":    "export * as ns from './impl'; export { foo } from './impl'\n",
+						"src/lib/index.js":    "exports.aliased = require('./mid').foo\nexports.bar = require('./mid').bar\n",
+						"src/app/caller.js": strings.Join([]string{
+							"export function viaRename(v) { const { foo: myFoo } = require('../lib/impl'); return myFoo(v) }",
+							"export function viaMember(v) { const mFoo = require('../lib/impl').foo; return mFoo(v) }",
+							"export function viaBarrel(v) { const { aliased } = require('../lib'); return aliased(v) }",
+							"export function viaBoth() { const { foo, bar } = require('../lib/mid'); foo(1); bar(2) }",
+							"export function viaNsMix() { const { foo } = require('../lib/nsmix'); return foo(3) }",
+							"export function viaDupAlias() {",
+							"  const { a, b } = require('../lib/dupalias')",
+							"  const x = a(1)",
+							"  return x + b(2)",
+							"}",
+							"export function viaDupPhantom() { const { foo } = require('../lib/dupalias'); return foo(3) }",
+						}, "\n") + "\n",
+					})
+
+					cfg := config.Default().Index
+					cfg.Workers = 1
+					idx := New(g, builderRegistry(), cfg, zap.NewNop())
+					idx.SetRepoPrefix(builderRepoPrefix)
+					_, err := idx.Index(root)
+					require.NoError(t, err)
+
+					p := func(rel string) string { return builderRepoPrefix + "/" + rel }
+					implPath := filepath.Join(root, "src", "lib", "impl.js")
+					midPath := filepath.Join(root, "src", "lib", "mid.js")
+
+					reparse := func(filePath, src string) {
+						bumpMtime(t, filePath, src)
+						if mode == "IndexFile" {
+							require.NoError(t, idx.IndexFile(filePath))
+						} else {
+							_, err := idx.IncrementalReindexPaths(root, []string{filePath})
+							require.NoError(t, err)
+						}
+					}
+
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaRename")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaMember")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBarrel")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaNsMix")), p("src/lib/impl.js::foo"))
+
+					// 1. Signature edit on impl.js while barrel.js & mid.js are untouched -> all callers rebind cleanly.
+					reparse(implPath, "export function foo(x, extra) { return x + extra }\nexport function bar(y) { return y + 2 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaRename")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaMember")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBarrel")), p("src/lib/impl.js::foo"))
+
+					// 2. Edit pure barrel mid.js (zero non-reexport symbols) -> index.js re-export survives.
+					reparse(midPath, "// edited comment\nexport { foo, bar } from './impl'\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBarrel")), p("src/lib/impl.js::foo"))
+
+					// 3. Delete BOTH foo and bar in one edit (tests identity-keyed carry-merge on mid.js & nsmix.js) -> restub to local names.
+					reparse(implPath, "export function unrelated() { return 0 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaRename")), graph.UnresolvedMarker+"myFoo")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaMember")), graph.UnresolvedMarker+"mFoo")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBarrel")), graph.UnresolvedMarker+"aliased")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaNsMix")), graph.UnresolvedMarker+"foo")
+
+					// 4. Re-add foo first, then bar (tests two-edit staggered carry-merge recovery on mid.js and nsmix.js).
+					reparse(implPath, "export function foo(x) { return x + 10 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaNsMix")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::foo"))
+
+					reparse(implPath, "export function foo(x) { return x + 10 }\nexport function bar(y) { return y + 20 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::bar"))
+
+					// Re-resolve renamed callers (which were parked at unresolved::myFoo while foo was absent in step 3)
+					// so step 4b & step 5 test from a resolved state.
+					idx.ResolveAll()
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaRename")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaMember")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBarrel")), p("src/lib/impl.js::foo"))
+					require.Equal(t, 2, countCallsTo(g, p("src/app/caller.js::viaDupAlias"), p("src/lib/impl.js::foo")))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaDupPhantom")), graph.UnresolvedMarker+"foo")
+
+					// 4b. Two-edit staggered deletion carry-merge: delete ONLY foo in edit 1, then delete bar in edit 2,
+					// then re-add both. Verifies mergeCarriedReExports merges across two edits AND repointReExportToFile
+					// never injects a phantom `reexport_original: "foo"` onto grouped `reexport_bindings` (`dupalias.js`).
+					reparse(implPath, "export function bar(y) { return y + 20 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::bar"))
+					reparse(implPath, "export function unrelated() { return 0 }\n")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), graph.UnresolvedMarker+"foo")
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), graph.UnresolvedMarker+"bar")
+					reparse(implPath, "export function foo(x) { return x + 30 }\nexport function bar(y) { return y + 40 }\n")
+					idx.ResolveAll()
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::foo"))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaBoth")), p("src/lib/impl.js::bar"))
+					require.Equal(t, 2, countCallsTo(g, p("src/app/caller.js::viaDupAlias"), p("src/lib/impl.js::foo")))
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaDupPhantom")), graph.UnresolvedMarker+"foo",
+						"carry-merge on grouped reexport_bindings must never mint a phantom unexported 'foo' binding")
+
+					// 5. Delete impl.js completely on disk -> renamed callers park on local unresolved stub.
+					require.NoError(t, os.Remove(implPath))
+					if mode == "IndexFile" {
+						_, _, err := idx.incrementalEvictWatcherPath("src/lib/impl.js")
+						require.NoError(t, err)
+					} else {
+						_, err := idx.IncrementalReindexPaths(root, []string{implPath})
+						require.NoError(t, err)
+					}
+					require.Contains(t, findCalls(g, p("src/app/caller.js::viaRename")), graph.UnresolvedMarker+"myFoo")
+					for _, e := range g.GetOutEdges(p("src/app/caller.js::viaRename")) {
+						if e.Kind == graph.EdgeCalls {
+							require.False(t, e.CrossRepo)
+						}
+					}
+
+					// Verify SQLite ref_facts dropped stale rows for caller.js when impl.js disappeared.
+					if sq, ok := g.(*store_sqlite.Store); ok {
+						facts, err := sq.LoadRefFactsByFiles(builderRepoPrefix, []string{p("src/app/caller.js")})
+						require.NoError(t, err)
+						for _, f := range facts {
+							require.NotEqual(t, p("src/lib/impl.js::foo"), f.ToID, "stale ref_fact must be removed")
+						}
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("IndexFile size-cap skip flushes renamed require callers", func(t *testing.T) {
+		root := t.TempDir()
+		builderWriteTree(t, root, map[string]string{
+			"src/lib/foo.js":    "export function foo() { return 1 }\n",
+			"src/app/caller.js": "export function run() { const { foo: bar } = require('../lib/foo'); return bar() }\n",
+		})
+		g := graph.New()
+		cfg := config.Default().Index
+		cfg.Workers = 1
+		cfg.MaxFileSize = 256
+		idx := New(g, builderRegistry(), cfg, zap.NewNop())
+		_, err := idx.Index(root)
+		require.NoError(t, err)
+		require.Contains(t, findCalls(g, "src/app/caller.js::run"), "src/lib/foo.js::foo")
+
+		fooPath := filepath.Join(root, "src", "lib", "foo.js")
+		big := "export function foo() { return 1 }\n// " + strings.Repeat("x", 300) + "\n"
+		bumpMtime(t, fooPath, big)
+		require.NoError(t, idx.IndexFile(fooPath))
+		require.Contains(t, findCalls(g, "src/app/caller.js::run"), graph.UnresolvedMarker+"bar")
+	})
+
+	t.Run("delete+add unmasking and dataflow EdgeArgOf parity", func(t *testing.T) {
+		root := t.TempDir()
+		builderWriteTree(t, root, map[string]string{
+			"src/lib/foo.js":    "export function foo(x) { return x + 1 }\n",
+			"src/app/caller.js": "export function run(v) { const { foo: bar } = require('../lib/foo'); return bar(v) }\n",
+		})
+		g := graph.New()
+		cfg := config.Default().Index
+		cfg.Workers = 1
+		idx := New(g, builderRegistry(), cfg, zap.NewNop())
+		_, err := idx.Index(root)
+		require.NoError(t, err)
+
+		require.Contains(t, findCalls(g, "src/app/caller.js::run"), "src/lib/foo.js::foo")
+
+		// In one non-deferred batch: delete src/lib/foo.js and add src/lib/foo/index.js
+		// so require('../lib/foo') unmasks to src/lib/foo/index.js cleanly.
+		fooFile := filepath.Join(root, "src", "lib", "foo.js")
+		fooIndex := filepath.Join(root, "src", "lib", "foo", "index.js")
+		require.NoError(t, os.Remove(fooFile))
+		builderWriteTree(t, root, map[string]string{
+			"src/lib/foo/index.js": "export function foo(x) { return x + 2 }\n",
+		})
+		_, err = idx.IncrementalReindexPaths(root, []string{fooFile, fooIndex})
+		require.NoError(t, err)
+
+		require.Contains(t, findCalls(g, "src/app/caller.js::run"), "src/lib/foo/index.js::foo")
+		require.NotContains(t, findCalls(g, "src/app/caller.js::run"), "src/lib/foo.js::foo")
+
+		// Verify stateless dataflow materialization rewrites EdgeArgOf against the unmasked callee's param node.
+		const (
+			paramID = "src/lib/foo/index.js::foo#param:0"
+			argFrom = "src/app/caller.js::run#param:0"
+		)
+		g.AddBatch(
+			[]*graph.Node{
+				{ID: paramID, Kind: graph.KindParam, Name: "x", FilePath: "src/lib/foo/index.js", Meta: map[string]any{"position": 0}},
+				{ID: argFrom, Kind: graph.KindParam, Name: "v", FilePath: "src/app/caller.js", Meta: map[string]any{"position": 0}},
+			},
+			[]*graph.Edge{
+				{From: paramID, To: "src/lib/foo/index.js::foo", Kind: graph.EdgeParamOf, FilePath: "src/lib/foo/index.js"},
+				{From: argFrom, To: "src/lib/foo/index.js::foo", Kind: graph.EdgeArgOf, FilePath: "src/app/caller.js", Line: 1, Meta: map[string]any{"arg_position": 0}},
+			},
+		)
+		materializeDataflowParamsForFilesInGraph(g, []string{"src/app/caller.js"})
+		var gotArgOf []string
+		for _, e := range g.GetOutEdges(argFrom) {
+			if e != nil && e.Kind == graph.EdgeArgOf {
+				gotArgOf = append(gotArgOf, e.To)
+			}
+		}
+		require.Contains(t, gotArgOf, paramID)
+		require.NotContains(t, gotArgOf, "src/lib/foo/index.js::foo")
+	})
+
+	t.Run("cross-repo bare-dir renamed require rebind and stateless SQLite ref_facts + concurrent lanes", func(t *testing.T) {
+		db, err := store_sqlite.Open(filepath.Join(t.TempDir(), "multi.sqlite"))
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+		libDir, app1Dir, app2Dir := t.TempDir(), t.TempDir(), t.TempDir()
+		writeWorkspaceFile(t, libDir, "shared_mod/index.ts", "export function foo(a: number): number { return a + 1 }\n")
+		writeWorkspaceFile(t, app1Dir, "main.ts", "export function run(x: number) { const { foo: bar } = require('lib/shared_mod'); return bar(x) }\n")
+		writeWorkspaceFile(t, app2Dir, "main.ts", "export function run(x: number) { const { foo: baz } = require('lib/shared_mod'); return baz(x) }\n")
+
+		reg := newTestRegistry()
+		reg.Register(languages.NewJavaScriptExtractor())
+		reg.Register(languages.NewTypeScriptExtractor())
+		mi := NewMultiIndexer(db, reg, search.NewNull(), newTestConfigManager(t), zap.NewNop())
+		t.Cleanup(func() { require.NoError(t, mi.Close(context.Background())) })
+
+		for _, entry := range []config.RepoEntry{
+			{Name: "lib", Path: libDir, Workspace: "ws"},
+			{Name: "app1", Path: app1Dir, Workspace: "ws"},
+			{Name: "app2", Path: app2Dir, Workspace: "ws"},
+		} {
+			_, err := mi.TrackRepoCtx(t.Context(), entry)
+			require.NoError(t, err)
+		}
+		mi.runCrossRepoResolve(false)
+		require.Contains(t, findCalls(db, "app1/main.ts::run"), "lib/shared_mod/index.ts::foo")
+		require.Contains(t, findCalls(db, "app2/main.ts::run"), "lib/shared_mod/index.ts::foo")
+
+		// Seed unmaterialized EdgeReturnsTo placeholders in app1/main.ts and app2/main.ts
+		// so IncrementalReindexRepo("lib", ...) proves the post-cross-repo foreignRepoRenamed
+		// stateless materializeDataflowParamsForFilesInGraph pass rewrites them live.
+		for _, repo := range []string{"app1", "app2"} {
+			db.AddBatch(
+				[]*graph.Node{
+					{ID: repo + "/main.ts::run#local:res", Kind: graph.KindLocal, Name: "res", FilePath: repo + "/main.ts", RepoPrefix: repo},
+				},
+				[]*graph.Edge{
+					{
+						From: repo + "/main.ts::run", To: repo + "/main.ts::run#local:res",
+						Kind: graph.EdgeReturnsTo, FilePath: repo + "/main.ts", Line: 1,
+						Meta: map[string]any{"returns_to_call": true, "call_line": 1, "callee_target": "foo"},
+					},
+				},
+			)
+		}
+
+		// Concurrent multi-repo edits + signature change on lib/shared_mod/index.ts must be race-free
+		// and refresh foreign consumers' SQLite ref_facts and dataflow under each consumer's own repo_prefix.
+		libFile := filepath.Join(libDir, "shared_mod", "index.ts")
+		app2Extra := filepath.Join(app2Dir, "extra.ts")
+		writeWorkspaceFile(t, app2Dir, "extra.ts", "export function extra() { return 1 }\n")
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			bumpMtime(t, libFile, "export function foo(a: number, b: string): string { return b + a }\n")
+			_, err := mi.IncrementalReindexRepo("lib", []string{libFile})
+			assert.NoError(t, err)
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := mi.IncrementalReindexRepo("app2", []string{app2Extra})
+			assert.NoError(t, err)
+		}()
+		wg.Wait()
+
+		require.Contains(t, findCalls(db, "app1/main.ts::run"), "lib/shared_mod/index.ts::foo")
+		require.Contains(t, findCalls(db, "app2/main.ts::run"), "lib/shared_mod/index.ts::foo")
+		for _, repo := range []string{"app1", "app2"} {
+			facts, err := db.LoadRefFactsByFiles(repo, []string{repo + "/main.ts"})
+			require.NoError(t, err)
+			foundFact := false
+			for _, f := range facts {
+				if f.FromID == repo+"/main.ts::run" && f.ToID == "lib/shared_mod/index.ts::foo" {
+					foundFact = true
+				}
+			}
+			require.True(t, foundFact, "stateless ref_facts refresh must keep %s's cross-repo fact under repo_prefix=%s", repo, repo)
+			foundReturnsTo := false
+			for _, e := range db.GetInEdges(repo + "/main.ts::run#local:res") {
+				if e != nil && e.Kind == graph.EdgeReturnsTo && e.From == "lib/shared_mod/index.ts::foo" {
+					foundReturnsTo = true
+				}
+			}
+			require.True(t, foundReturnsTo, "stateless dataflow refresh must rewrite %s's EdgeReturnsTo from lib/shared_mod/index.ts::foo", repo)
+		}
+
+		// Verify nil-logger fallback on persistRefFactsForFilesInGraph never panics.
+		persistRefFactsForFilesInGraph(db, "app1", []string{"app1/main.ts"}, nil)
+	})
 }
