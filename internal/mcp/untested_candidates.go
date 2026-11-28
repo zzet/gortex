@@ -6,6 +6,7 @@ import (
 
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphpath"
+	"github.com/zzet/gortex/internal/testpath"
 )
 
 func untestedCandidates(ctx context.Context, reader graph.Reader, scope graph.NodeScope, filePrefix string) ([]*graph.Node, error) {
@@ -21,7 +22,7 @@ func untestedCandidates(ctx context.Context, reader graph.Reader, scope graph.No
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			if node != nil && scope.Allows(node) && !isTestFile(node.FilePath) && graphpath.HasPrefix(node.FilePath, filePrefix) {
+			if node != nil && scope.Allows(node) && !graph.NodeIsTest(reader, node) && graphpath.HasPrefix(node.FilePath, filePrefix) {
 				out = append(out, node)
 			}
 		}
@@ -50,7 +51,8 @@ func candidateTestCoverage(ctx context.Context, reader graph.Reader, candidates 
 	}
 	fanIn = make(map[string]int, len(candidates))
 	forward := make(map[string][]string)
-	var tests []string
+	var tests, unstamped []string
+	stampChecked := make(map[string]bool)
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -59,8 +61,30 @@ func candidateTestCoverage(ctx context.Context, reader graph.Reader, candidates 
 			fanIn[row.To]++
 		}
 		forward[row.From] = append(forward[row.From], row.To)
-		if (row.FromKind == graph.KindFunction || row.FromKind == graph.KindMethod) && isTestFile(row.FromFile) {
+		if row.FromKind != graph.KindFunction && row.FromKind != graph.KindMethod {
+			continue
+		}
+		if testpath.IsTestFile(row.FromFile) {
 			tests = append(tests, row.From)
+		} else if !candidateIDs[row.From] && !stampChecked[row.From] {
+			stampChecked[row.From] = true
+			unstamped = append(unstamped, row.From)
+		}
+	}
+	// The path check above is a fast path: the indexer stamps every function
+	// in a test path is_test, and graph.NodeIsTest falls back to the same path
+	// predicate. A runner that discovers tests by annotation (Rust #[test], JVM
+	// @Test) lets a test live in a production path, where only the stamp says
+	// so. Candidates were already classified by it, so only the remaining
+	// sources need it, in one batched lookup.
+	if len(unstamped) > 0 {
+		for id, node := range reader.GetNodesByIDs(unstamped) {
+			if graph.NodeIsTest(reader, node) {
+				tests = append(tests, id)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
 		}
 	}
 	covered = make(map[string]bool, len(tests))

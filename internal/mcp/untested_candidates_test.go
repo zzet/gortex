@@ -52,7 +52,10 @@ func TestUntestedCandidateClosureScopedMatchesWholeGraphOracle(t *testing.T) {
 		{ID: "b/foreign_test.go::Test", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/foreign_test.go"},
 		{ID: "b/helper.go::Helper", Kind: graph.KindFunction, RepoPrefix: "b", FilePath: "b/helper.go"},
 		{ID: "contract", Kind: graph.KindContract, FilePath: "contract_test.go"},
+		{ID: "a/inline.go::Annotated", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/inline.go", Meta: map[string]any{"is_test": true}},
+		{ID: "a/inline.go::Target", Kind: graph.KindFunction, RepoPrefix: "a", FilePath: "a/inline.go"},
 	}, []*graph.Edge{
+		{From: "a/inline.go::Annotated", To: "a/inline.go::Target", Kind: graph.EdgeCalls},
 		{From: "b/foreign_test.go::Test", To: "b/helper.go::Helper", Kind: graph.EdgeCalls},
 		{From: "b/helper.go::Helper", To: "a/live.go::Live", Kind: graph.EdgeReferences},
 		{From: "b/foreign_test.go::Test", To: "a/bean.go::Bean", Kind: graph.EdgeCalls, Meta: map[string]any{"via": "spring.Bean"}},
@@ -70,13 +73,14 @@ func TestUntestedCandidateClosureScopedMatchesWholeGraphOracle(t *testing.T) {
 		scope := graph.NodeScope{RepoAllow: map[string]bool{"a": true}}
 		candidates, err := untestedCandidates(t.Context(), reader, scope, "a/")
 		require.NoError(t, err)
-		require.Len(t, candidates, 6)
+		require.Len(t, candidates, 7, "an is_test-stamped function is test code wherever it lives")
 		covered, counts, err := candidateTestCoverage(t.Context(), reader, candidates)
 		require.NoError(t, err)
 		require.Equal(t, 1, spy.ancestorQueries, "one indexed closure statement replaces per-ancestor point reads")
 		require.Zero(t, spy.queries)
 		require.True(t, covered["a/live.go::Live"], "a real foreign test path still proves coverage")
 		require.True(t, covered["a/dangling.go::Dangling"], "the original forward walk follows missing intermediate identities")
+		require.True(t, covered["a/inline.go::Target"], "an annotation-stamped test in a production path proves coverage")
 		require.False(t, covered["a/dead.go::Dead"])
 		require.False(t, covered["a/bean.go::Bean"])
 		require.False(t, covered["a/cycle.go::Cycle1"])

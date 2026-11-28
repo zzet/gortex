@@ -178,3 +178,62 @@ func TestGetUntestedSymbols_FilePrefix(t *testing.T) {
 	assert.Equal(t, 0, resp.TotalUncovered)
 	assert.Empty(t, resp.Untested)
 }
+
+// Test code is classified the way the indexer classifies it (graph.NodeIsTest:
+// the is_test stamp, then testpath.IsTestFile), not by a substring of the path.
+// So a pytest helper under tests/ is test code whose calls prove coverage, a
+// production package whose name merely contains "test_" (a pytest plugin) is
+// still a candidate, and a Rust #[test] function in a production file is a test
+// rather than an untested candidate.
+func TestGetUntestedSymbols_ClassifiesTestCodeLikeTheIndexer(t *testing.T) {
+	cases := []struct {
+		name           string
+		files          map[string]string
+		wantCandidates int
+		wantFlagged    []string
+	}{
+		{
+			name: "python tests/ helper and pytest_ package",
+			files: map[string]string{
+				"pytest_demo/__init__.py": "",
+				"pytest_demo/plugin.py":   "def make_default():\n    return {}\n\n\ndef unused():\n    return 1\n",
+				"tests/conftest.py":       "from pytest_demo.plugin import make_default\n\n\ndef default_model():\n    return make_default()\n",
+				"tests/test_plugin.py":    "def test_model(default_model):\n    assert default_model == {}\n",
+			},
+			wantCandidates: 2,
+			wantFlagged:    []string{"pytest_demo/plugin.py::unused"},
+		},
+		{
+			name: "rust #[test] in a production file",
+			files: map[string]string{
+				"src/lib.rs": "pub fn parse() -> i32 {\n    1\n}\n\npub fn unused() -> i32 {\n    2\n}\n\n" +
+					"#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn parses_one() {\n        assert_eq!(parse(), 1);\n    }\n}\n",
+			},
+			wantCandidates: 2,
+			wantFlagged:    []string{"src/lib.rs::unused"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, body := range tc.files {
+				path := filepath.Join(dir, filepath.FromSlash(name))
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+			}
+			g := graph.New()
+			idx := indexer.New(g, testRegistry(), config.Default().Index, zap.NewNop())
+			_, err := idx.Index(dir)
+			require.NoError(t, err)
+			srv := NewServer(query.NewEngine(g), g, idx, nil, zap.NewNop(), nil)
+
+			resp := decodeUntested(t, callTool(t, srv, "get_untested_symbols", nil))
+			var flagged []string
+			for _, e := range resp.Untested {
+				flagged = append(flagged, e.FilePath+"::"+e.Name)
+			}
+			assert.Equal(t, tc.wantCandidates, resp.TotalCandidates, "flagged: %v", flagged)
+			assert.Equal(t, tc.wantFlagged, flagged)
+		})
+	}
+}
