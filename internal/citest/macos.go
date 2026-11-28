@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/build"
 	"go/build/constraint"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -42,8 +44,8 @@ var (
 	// Daemon start, launch, socket and process-identity sources, by file
 	// name prefix. Their tests share the prefix and are included with them.
 	daemonFamilies = map[string][]string{
-		"internal/daemon/": {"autostart", "client", "server", "paths", "peer_pid", "pidfile", "runtime_files", "runtime_record", "fdlimit"},
-		"cmd/gortex/":      {"daemon.go", "daemon_test.go", "daemon_service", "daemon_supervisor", "daemon_detach", "daemon_handoff"},
+		"internal/daemon/": {"autostart", "client", "server", "paths", "peer_pid", "pidfile", "runtime_files", "runtime_record", "runtime_state", "fdlimit"},
+		"cmd/gortex/":      {"daemon.go", "daemon_test.go", "daemon_service", "daemon_supervisor", "daemon_detach", "daemon_handoff", "ensure_daemon", "cli_daemon", "daemon_stop_target"},
 	}
 )
 
@@ -64,7 +66,10 @@ func macOSPathRule(name string) string {
 		return "darwin file suffix"
 	case strings.HasPrefix(name, "internal/platform/"):
 		return "platform layer"
-	case strings.HasPrefix(name, "internal/pathkey/"):
+	case strings.HasPrefix(name, "internal/pathkey/"), strings.HasPrefix(name, "internal/pathguard/"),
+		path.Dir(name) == "internal/mcp" && strings.HasPrefix(base, "view_paths"):
+		// pathguard and view_paths canonicalise macOS /tmp and /var, which
+		// are symlinks into /private.
 		return "path keys and case folding"
 	case strings.HasPrefix(name, "internal/thirdparty/fswatcher/") || strings.HasPrefix(name, "internal/thirdparty/fsnotify/"):
 		return "file watcher backend"
@@ -113,11 +118,31 @@ func macOSContentRule(name string, data []byte) string {
 }
 
 // buildConstraint returns the file's //go:build (or legacy +build) expression.
+// It reads the header the way go/build does: blank lines, line comments and
+// block comments may precede the constraint, and a constraint inside a block
+// comment does not count.
 func buildConstraint(data []byte) constraint.Expr {
 	var plus []constraint.Expr
+	inBlock := false
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "/*") || strings.HasPrefix(line, "*") {
+		for line != "" {
+			if inBlock {
+				end := strings.Index(line, "*/")
+				if end < 0 {
+					line = ""
+					break
+				}
+				inBlock = false
+				line = strings.TrimSpace(line[end+2:])
+			} else if strings.HasPrefix(line, "/*") {
+				inBlock = true
+				line = line[2:]
+			} else {
+				break
+			}
+		}
+		if line == "" {
 			continue
 		}
 		if !strings.HasPrefix(line, "//") {
@@ -143,6 +168,15 @@ func buildConstraint(data []byte) constraint.Expr {
 		expr = &constraint.AndExpr{X: expr, Y: next}
 	}
 	return expr
+}
+
+// buildsOnDarwin reports whether go/build compiles the file on the macOS
+// runner (darwin, arm64, cgo), file name and header constraints included.
+func buildsOnDarwin(name string, data []byte) (bool, error) {
+	ctx := build.Default
+	ctx.GOOS, ctx.GOARCH, ctx.CgoEnabled, ctx.BuildTags = "darwin", "arm64", true, nil
+	ctx.OpenFile = func(string) (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil }
+	return ctx.MatchFile("/", path.Base(name))
 }
 
 func mentionsTag(expr constraint.Expr, tag string) bool {
@@ -181,6 +215,7 @@ func goosTags(goos string) func(string) bool {
 func (p *Planner) macOSMatches(ctx context.Context, base string, changes []Change) ([]MacOSMatch, error) {
 	matches := []MacOSMatch{}
 	for _, change := range changes {
+		before := len(matches)
 		for i, name := range change.Paths {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -199,8 +234,49 @@ func (p *Planner) macOSMatches(ctx context.Context, base string, changes []Chang
 				matches = append(matches, MacOSMatch{Path: name, Rule: rule})
 			}
 		}
+		if len(matches) == before {
+			if rule := p.removesFromDarwin(ctx, base, change); rule != "" {
+				matches = append(matches, MacOSMatch{Path: change.Paths[len(change.Paths)-1], Rule: rule})
+			}
+		}
 	}
 	return matches, nil
+}
+
+// removesFromDarwin names the rule when a modified or renamed Go file
+// compiled on macOS before the change and no longer does. The head side alone
+// cannot show this: a rename to foo_linux.go or a constraint narrowed to
+// linux looks like an ordinary Linux file. Deleted files are judged by the
+// content rule on their base side.
+func (p *Planner) removesFromDarwin(ctx context.Context, base string, change Change) string {
+	isRename := strings.HasPrefix(change.Status, "R")
+	if change.Status != "M" && !isRename {
+		return ""
+	}
+	oldName, newName := change.Paths[0], change.Paths[len(change.Paths)-1]
+	if !strings.HasSuffix(oldName, ".go") || !strings.HasSuffix(newName, ".go") {
+		return ""
+	}
+	oldData, err := p.changedContent(ctx, base, oldName, true)
+	if err != nil {
+		return "Go file that cannot be read"
+	}
+	newData, err := p.changedContent(ctx, base, newName, false)
+	if err != nil {
+		return "Go file that cannot be read"
+	}
+	before, err := buildsOnDarwin(oldName, oldData)
+	if err != nil {
+		return "Go file that does not parse"
+	}
+	after, err := buildsOnDarwin(newName, newData)
+	if err != nil {
+		return "Go file that does not parse"
+	}
+	if before && !after {
+		return "change removes a file from the darwin build"
+	}
+	return ""
 }
 
 func (p *Planner) changedContent(ctx context.Context, base, name string, oldSide bool) ([]byte, error) {

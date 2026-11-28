@@ -41,15 +41,21 @@ test partitions out of its matrix unless one of these holds:
     `_darwin_test.go`);
   - a Go file whose build constraint names `darwin`, or builds on macOS but not
     on Linux (`unix && !linux`), read from the file's header so new files are
-    covered without a list;
+    covered without a list. A change that removes a file from the darwin build
+    also counts: a rename such as `foo.go` to `foo_linux.go`, or a constraint
+    narrowed from `darwin || linux` to `linux`, judged on both the old and new
+    side the way `go/build` reads them (block-comment headers included);
   - a Go file with a `"darwin"` runtime check or with `import "C"`;
   - C, C++ and Objective-C sources outside `testdata/`;
-  - `internal/platform/`, `internal/pathkey/` (path identity and case folding),
+  - `internal/platform/`, `internal/pathkey/`, `internal/pathguard/` and
+    `internal/mcp/view_paths.go` (path identity, case folding and the macOS
+    `/tmp` and `/var` canonicalisation),
     the file watcher (watcher, storm, realtime and poller sources in
     `internal/indexer` and the vendored backends under
     `internal/thirdparty/fswatcher` and `internal/thirdparty/fsnotify`), and the
-    daemon start, launch, socket and process-identity sources in
-    `internal/daemon` and `cmd/gortex`;
+    daemon start, launch, lifecycle, socket and process-identity sources in
+    `internal/daemon` and `cmd/gortex` (including `ensure_daemon*`, `cli_daemon*`,
+    `daemon_stop_target*` and `runtime_state*`);
   - `go.mod`, `go.sum`, `go.work` and `go.work.sum` at any depth;
   - `.github/workflows/`, `scripts/ci-*/` and `internal/citest/`.
 - The PR asks for the full suite (`ci:full` or `CI_FULL_TESTS=true`), is a

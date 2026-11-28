@@ -172,41 +172,169 @@ func TestMacOSSelectionCLIReadsLabelsAndEmitsGateOutput(t *testing.T) {
 
 func TestMacOSPathAndContentRules(t *testing.T) {
 	for name, want := range map[string]string{
-		".github/workflows/ci.yml":                 "CI workflow",
-		"scripts/ci-select/main.go":                "CI command",
-		"internal/citest/policy.json":              "CI planner and runner",
-		"go.sum":                                   "Go module or checksum file",
-		"bench/load/metrics_darwin_test.go":        "darwin file suffix",
-		"internal/thirdparty/fswatcher/watcher.go": "file watcher backend",
-		"internal/indexer/watcher.go":              "file watcher",
-		"internal/indexer/poller.go":               "file watcher",
-		"internal/pathkey/pathkey.go":              "path keys and case folding",
-		"internal/daemon/client.go":                "daemon start, socket or process code",
-		"cmd/gortex/daemon_service.go":             "daemon start, socket or process code",
-		"internal/parser/scanner.c":                "C, C++ or Objective-C source",
-		"internal/resolver/testdata/server.h":      "",
-		"internal/indexer/indexer.go":              "",
-		"internal/daemon/federation.go":            "",
-		"scripts/install.sh":                       "",
-		".github/dependabot.yml":                   "",
+		".github/workflows/ci.yml":                      "CI workflow",
+		"scripts/ci-select/main.go":                     "CI command",
+		"internal/citest/policy.json":                   "CI planner and runner",
+		"go.sum":                                        "Go module or checksum file",
+		"bench/load/metrics_darwin_test.go":             "darwin file suffix",
+		"internal/thirdparty/fswatcher/watcher.go":      "file watcher backend",
+		"internal/indexer/watcher.go":                   "file watcher",
+		"internal/indexer/poller.go":                    "file watcher",
+		"internal/pathkey/pathkey.go":                   "path keys and case folding",
+		"internal/daemon/client.go":                     "daemon start, socket or process code",
+		"cmd/gortex/daemon_service.go":                  "daemon start, socket or process code",
+		"cmd/gortex/ensure_daemon.go":                   "daemon start, socket or process code",
+		"cmd/gortex/ensure_daemon_identity.go":          "daemon start, socket or process code",
+		"cmd/gortex/ensure_daemon_stale_test.go":        "daemon start, socket or process code",
+		"cmd/gortex/cli_daemon.go":                      "daemon start, socket or process code",
+		"cmd/gortex/cli_daemon_probe_test.go":           "daemon start, socket or process code",
+		"cmd/gortex/daemon_stop_target.go":              "daemon start, socket or process code",
+		"cmd/gortex/daemon_stop_target_unix_test.go":    "daemon start, socket or process code",
+		"internal/daemon/runtime_state.go":              "daemon start, socket or process code",
+		"internal/daemon/runtime_state_startup_test.go": "daemon start, socket or process code",
+		"internal/pathguard/pathguard.go":               "path keys and case folding",
+		"internal/mcp/view_paths.go":                    "path keys and case folding",
+		"cmd/gortex/daemon_stop_wait.go":                "",
+		"cmd/gortex/doctor.go":                          "",
+		"internal/mcp/tools_core.go":                    "",
+		"internal/parser/scanner.c":                     "C, C++ or Objective-C source",
+		"internal/resolver/testdata/server.h":           "",
+		"internal/indexer/indexer.go":                   "",
+		"internal/daemon/federation.go":                 "",
+		"scripts/install.sh":                            "",
+		".github/dependabot.yml":                        "",
 	} {
 		if got := macOSPathRule(name); got != want {
 			t.Errorf("macOSPathRule(%q) = %q, want %q", name, got, want)
 		}
 	}
 	for text, want := range map[string]string{
-		"//go:build !darwin\n\npackage x\n":                                     "darwin build constraint",
-		"// +build darwin\n\npackage x\n":                                       "darwin build constraint",
-		"//go:build unix && !linux\n\npackage x\n":                              "build constraint that differs on macOS",
-		"//go:build linux\n\npackage x\n":                                       "",
-		"//go:build windows\n\npackage x\n":                                     "",
-		"package x\n\nimport (\n\t\"C\"\n\t\"os\"\n)\n":                         "cgo source",
-		"package x\nimport \"runtime\"\nvar mac = runtime.GOOS == \"darwin\"\n": "darwin runtime check",
-		"package x\n// a comment\nfunc f() {}\n":                                "",
-		"package x\n//go:build darwin\n":                                        "",
+		"//go:build !darwin\n\npackage x\n":                                          "darwin build constraint",
+		"// +build darwin\n\npackage x\n":                                            "darwin build constraint",
+		"//go:build unix && !linux\n\npackage x\n":                                   "build constraint that differs on macOS",
+		"//go:build linux\n\npackage x\n":                                            "",
+		"//go:build windows\n\npackage x\n":                                          "",
+		"package x\n\nimport (\n\t\"C\"\n\t\"os\"\n)\n":                              "cgo source",
+		"package x\nimport \"runtime\"\nvar mac = runtime.GOOS == \"darwin\"\n":      "darwin runtime check",
+		"package x\n// a comment\nfunc f() {}\n":                                     "",
+		"package x\n//go:build darwin\n":                                             "",
+		"/* licence\n   text */\n//go:build darwin\n\npackage x\n":                   "darwin build constraint",
+		"/*\nlicence without star prefixes\n*/\n\n//go:build !darwin\n\npackage x\n": "darwin build constraint",
+		"/*\n//go:build darwin\n*/\npackage x\n":                                     "",
 	} {
 		if got := macOSContentRule("x.go", []byte(text)); got != want {
 			t.Errorf("macOSContentRule(%q) = %q, want %q", text, got, want)
 		}
+	}
+}
+
+func TestMacOSBlockCommentHeaderConstraintIsRead(t *testing.T) {
+	f := newFixture(t)
+	f.write("leaf/notify.go", "/*\nLicence text\nwithout star prefixes.\n*/\n\n//go:build darwin\n\npackage leaf\nfunc notify() int { return 42 }\n")
+	m := f.plan(f.commit())
+	if !m.MacOS.Selected || !slices.Contains(m.MacOS.Matched, MacOSMatch{Path: "leaf/notify.go", Rule: "darwin build constraint"}) {
+		t.Fatalf("darwin-only file behind a block comment did not select macOS: %+v", m.MacOS)
+	}
+}
+
+const removedFromDarwinRule = "change removes a file from the darwin build"
+
+func TestMacOSChangeThatRemovesAFileFromTheDarwinBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, old, new string
+		rename               string // new path when the file is renamed
+		want                 string // rule, or "" when macOS stays out
+	}{
+		{name: "rename to a linux file name", path: "leaf/helper.go", old: "package leaf\nfunc helper() int { return 1 }\n", rename: "leaf/helper_linux.go", want: removedFromDarwinRule},
+		{name: "rename to a windows file name", path: "leaf/helper.go", old: "package leaf\nfunc helper() int { return 1 }\n", rename: "leaf/helper_windows.go", want: removedFromDarwinRule},
+		{name: "rename keeping the darwin build", path: "leaf/helper.go", old: "package leaf\nfunc helper() int { return 1 }\n", rename: "leaf/other.go"},
+		{name: "rename from a darwin file name", path: "leaf/helper_darwin.go", old: "package leaf\nfunc helper() int { return 1 }\n", rename: "leaf/helper_linux.go", want: "darwin file suffix"},
+		{name: "constraint narrowed to linux", path: "leaf/notify.go", old: "//go:build darwin || linux\n\npackage leaf\nfunc notify() int { return 1 }\n", new: "//go:build linux\n\npackage leaf\nfunc notify() int { return 1 }\n", want: removedFromDarwinRule},
+		{name: "constraint narrowed behind a block comment", path: "leaf/notify.go", old: "/*\nLicence\n*/\n\n//go:build unix\n\npackage leaf\nfunc notify() int { return 1 }\n", new: "/*\nLicence\n*/\n\n//go:build linux\n\npackage leaf\nfunc notify() int { return 1 }\n", want: removedFromDarwinRule},
+		{name: "constraint widened", path: "leaf/notify.go", old: "//go:build linux\n\npackage leaf\nfunc notify() int { return 1 }\n", new: "//go:build linux || windows\n\npackage leaf\nfunc notify() int { return 1 }\n"},
+		{name: "ordinary edit", path: "leaf/helper.go", old: "package leaf\nfunc helper() int { return 1 }\n", new: "package leaf\nfunc helper() int { return 2 }\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.write(tc.path, tc.old)
+			f.base = f.commit()
+			if tc.rename != "" {
+				f.git("mv", tc.path, tc.rename)
+			} else {
+				f.write(tc.path, tc.new)
+			}
+			m := f.plan(f.commit())
+			if tc.want == "" {
+				if m.MacOS.Selected || len(m.MacOS.Matched) != 0 {
+					t.Fatalf("macOS selected without a darwin build change: %+v", m.MacOS)
+				}
+				return
+			}
+			if !m.MacOS.Selected || len(macOSRows(m)) == 0 {
+				t.Fatalf("macOS not selected: %+v", m.MacOS)
+			}
+			found := false
+			for _, match := range m.MacOS.Matched {
+				found = found || match.Rule == tc.want
+			}
+			if !found {
+				t.Fatalf("no %q match: %+v", tc.want, m.MacOS.Matched)
+			}
+		})
+	}
+}
+
+func TestMacOSDeletedFileThatBuiltOnDarwinSelectsPartitions(t *testing.T) {
+	f := newFixture(t)
+	f.write("leaf/notify.go", "//go:build darwin || linux\n\npackage leaf\nfunc notify() int { return 1 }\n")
+	f.base = f.commit()
+	if err := os.Remove(filepath.Join(f.root, "leaf", "notify.go")); err != nil {
+		t.Fatal(err)
+	}
+	m := f.plan(f.commit())
+	if !m.MacOS.Selected || !slices.Contains(m.MacOS.Matched, MacOSMatch{Path: "leaf/notify.go", Rule: "darwin build constraint"}) {
+		t.Fatalf("deleted darwin-built file did not select macOS: %+v", m.MacOS)
+	}
+}
+
+// macOSOnlyTestsPlan changes a source file of a package that builds only on
+// the macOS runner's architecture. No macOS path rule matches the change, yet
+// the package has no Linux or Windows test job.
+func macOSOnlyTestsPlan(f *fixture) Manifest {
+	f.write("macpkg/value_arm64.go", "package macpkg\nfunc Value() int { return 42 }\n")
+	f.write("macpkg/value_arm64_test.go", "package macpkg\nimport \"testing\"\nfunc TestMacPkg(t *testing.T) { if Value() != 42 { t.Fatal(\"bad\") } }\n")
+	f.base = f.commit()
+	return f.plan(f.change("macpkg/value_arm64.go"))
+}
+
+// A package whose sources and tests build only on macOS has no Linux or
+// Windows job. Leaving the macOS rows out would pass its change untested.
+func TestMacOSOnlyPackageKeepsMacOSPartitions(t *testing.T) {
+	f := newFixture(t)
+	m := macOSOnlyTestsPlan(f)
+	if !m.MacOS.Selected || len(m.MacOS.Matched) != 0 || !strings.Contains(m.MacOS.Reason, "test jobs only on macOS") || len(macOSRows(m)) == 0 || len(m.Matrix.Include) == 0 {
+		t.Fatalf("macOS-only package left without a test job: %+v %v", m.MacOS, m.Matrix)
+	}
+}
+
+func TestMacOSManifestWithoutTestJobsForSelectedPackagesIsRefused(t *testing.T) {
+	f := newFixture(t)
+	m := macOSOnlyTestsPlan(f)
+	policy, err := LoadPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := nativeTarget(t)
+	data, _ := json.Marshal(m)
+	var bad Manifest
+	if err := json.Unmarshal(data, &bad); err != nil {
+		t.Fatal(err)
+	}
+	bad.MacOS.Selected = false
+	bad.Matrix = policy.planMatrix(policy.SelectedMatrix(bad.Module, bad.Packages), false)
+	bad.SHA256 = bad.Seal()
+	_, err = f.planner.Validate(t.Context(), bad, target, bad.Census[target])
+	if err == nil || !strings.Contains(err.Error(), "no test jobs") {
+		t.Fatalf("manifest whose packages have no test job accepted: %v", err)
 	}
 }
