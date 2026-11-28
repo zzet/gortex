@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/zzet/gortex/bench/receiptproof"
@@ -41,7 +40,7 @@ func coalescedFunctionalRecordFixture(t *testing.T) (editProbeRecord, map[string
 		t.Fatal(err)
 	}
 	record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-	record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+	onlyAccountingShortfall(&record)
 	record.coalescedStatus = coalescedFunctionalStatus(decoded, raw, 34, record.Accounting)
 	record.Readback = measured(50, "ms")
 	record.MutationTiers = editProbeStatusTiers(decoded)
@@ -52,7 +51,7 @@ func coalescedFunctionalRecordFixture(t *testing.T) (editProbeRecord, map[string
 }
 
 func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
-	for _, mode := range []string{"qualified", "lossless_cap", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp"} {
+	for _, mode := range []string{"qualified", "lossless_cap", "unknown_scope", "isolated", "wrong_ACK", "read_error", "missing_file", "missing_oracle", "false_fresh", "cap", "deadline", "accepted_original", "foreign_rpc", "missing_A", "missing_P", "invented_B", "missing_tiers", "pending_tier", "failed_tier", "malformed_stamp", "another_error"} {
 		t.Run(mode, func(t *testing.T) {
 			record, _ := coalescedFunctionalRecordFixture(t)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
@@ -96,6 +95,8 @@ func TestEditProbeQualifiedCoalescedFunctionalNeverMasksFailures(t *testing.T) {
 				record.MutationTiers.Derived = "invalid"
 			case "invented_B":
 				record.Accounting.B = &editProbeWindow{WallNS: 1}
+			case "another_error":
+				record.Outcome, record.Errors = "diagnostic_failure", []string{"immediate file readback incorrect"}
 			}
 			p := record.Accounting.P
 			got := classifyCoalescedFunctionalRecord(&record, scope)

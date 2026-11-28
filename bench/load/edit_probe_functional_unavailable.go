@@ -105,7 +105,7 @@ func functionalUnavailableAccounting(a editProbeAccounting) bool {
 }
 
 func classifyFunctionalUnavailableRecord(record *editProbeRecord, scope *editProbePhysicalWriteScope) bool {
-	if !sharedFunctionalRecord(record, scope) || record.functionalUnavailableStatus == nil || record.Superseded != nil || record.CoalescedFunctional != nil || !functionalUnavailableAccounting(record.Accounting) || len(record.Errors) != 1 || record.Errors[0] != record.functionalUnavailableStatus.AccountingError {
+	if !sharedFunctionalRecord(record, scope) || record.functionalUnavailableStatus == nil || record.Superseded != nil || record.CoalescedFunctional != nil || !functionalUnavailableAccounting(record.Accounting) || !editProbeOnlyAccountingShortfall(record) || record.functionalUnavailableStatus.AccountingError != editProbeAccountingGap(record.Accounting) {
 		return false
 	}
 	for _, name := range editProbePhaseNames[8:] {

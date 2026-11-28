@@ -216,7 +216,7 @@ func (r *editProbeRuntime) finishRestart(ctx, callCtx context.Context, s *editPr
 		s.cancel = cancel
 		s.mu.Unlock()
 		r.probe(probeCtx, cancel, s)
-		end, correct := r.immediateReadbacks(callCtx, s, step, []string{"file", "source"}, nil)
+		end, correct := r.immediateReadbacks(callCtx, s, step, []string{"file", "source"}, nil, nil)
 		if correct {
 			s.mu.Lock()
 			s.record.Readback = measured(float64(end.Sub(started))/float64(time.Millisecond), "ms")

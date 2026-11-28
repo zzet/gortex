@@ -173,7 +173,7 @@ func TestEditProbeReceiptLoopStopsWhenAccountingStaysUnsettled(t *testing.T) {
 				slices.Contains(accounting.Reasons, editProbeAccountingUnsettledReason) != (tc.tiersAt == 0) {
 				t.Fatalf("accounting did not stay unavailable with the stop reason only where the bound applies: %+v", accounting)
 			}
-			wantErrors := []string{"A/P/B accounting unavailable: " + strings.Join(accounting.Reasons, "; ")}
+			wantErrors := []string{"A/P/B accounting not terminal: " + strings.Join(accounting.Reasons, "; ")}
 			if record.Outcome != "diagnostic_failure" || record.DeadlineReason != "" || !slices.Equal(record.Errors, wantErrors) {
 				t.Fatalf("record = %s (deadline reason %q) %q, want diagnostic_failure with only the accounting gap", record.Outcome, record.DeadlineReason, record.Errors)
 			}

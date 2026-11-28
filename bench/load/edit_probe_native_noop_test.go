@@ -87,7 +87,7 @@ func TestEditProbeQualifiedNativeNoOpRequiresPositiveUnexecutedEvidence(t *testi
 				t.Fatal(err)
 			}
 			record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-			record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+			onlyAccountingShortfall(&record)
 			record.coalescedStatus = coalescedFunctionalStatus(decoded, raw, 35, record.Accounting)
 			scope := &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4}
 			switch mode {

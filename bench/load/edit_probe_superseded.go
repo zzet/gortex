@@ -57,9 +57,7 @@ func classifySupersededRecord(record *editProbeRecord, scope *editProbePhysicalW
 	// remain observations; final readback/oracle failures and false-fresh
 	// content after ACK remain fatal below.
 	if record == nil || proof == nil || scope == nil || scope.Kind != "shared_worktree_file" || scope.File == "" || scope.Editors < 2 ||
-		record.Outcome != "diagnostic_failure" || len(record.Errors) != 1 ||
-		record.Errors[0] != "A/P/B accounting unavailable: "+strings.Join(record.Accounting.Reasons, "; ") ||
-		record.Accounting.State != "terminal_unavailable_background" || record.Accounting.A == nil || !record.Accounting.A.WithinFivePercent ||
+		record.Accounting.State != "terminal_unavailable_background" || !editProbeOnlyAccountingShortfall(record) || record.Accounting.A == nil || !record.Accounting.A.WithinFivePercent ||
 		record.Accounting.A.WallNS < 0 || record.Accounting.A.SumNS < 0 || record.Accounting.A.SumNS > record.Accounting.A.WallNS ||
 		record.Accounting.A.ResidualNS != record.Accounting.A.WallNS-record.Accounting.A.SumNS || record.Accounting.A.ResidualNS > record.Accounting.A.WallNS/20 ||
 		record.Accounting.P != nil || record.Accounting.B != nil || record.Accounting.R != nil || record.Accounting.Shared != nil ||
@@ -96,7 +94,7 @@ func classifySupersededRecord(record *editProbeRecord, scope *editProbePhysicalW
 	// Retain the exact old refusal and unavailable accounting, outside Errors so
 	// the new outcome is distinct without erasing why timing is absent.
 	candidate := *proof
-	candidate.AccountingError = record.Errors[0]
+	candidate.AccountingError = editProbeAccountingGap(record.Accounting)
 	if !candidate.Matches(record.Receipt, record.MutationID, record.Accounting.RPCID, record.Accounting.Requested, record.Accounting.Applied) {
 		return false
 	}

@@ -84,7 +84,7 @@ func TestEditProbeSupersededFinishKeepsPreACKObservations(t *testing.T) {
 				t.Fatalf("first-correct denominator=%d", len(oracles))
 			}
 			failReadback.Store(mode == "immediate_read_error")
-			_, correct := run.immediateReadbacks(ctx, state, step, []string{"source", "file", "summary", "search_visible", "text"}, nil)
+			_, correct := run.immediateReadbacks(ctx, state, step, []string{"source", "file", "summary", "search_visible", "text"}, nil, nil)
 			if correct == failReadback.Load() || len(state.record.Readbacks) != 5 {
 				t.Fatalf("actual readbacks correct=%v count=%d", correct, len(state.record.Readbacks))
 			}
@@ -107,11 +107,18 @@ func TestEditProbeSupersededFinishKeepsPreACKObservations(t *testing.T) {
 				t.Fatal(err)
 			}
 			state.record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-			state.record.Errors[0] = "A/P/B accounting unavailable: " + strings.Join(state.record.Accounting.Reasons, "; ")
 			state.record.supersededStatus = supersededStatus(decoded, raw, 34)
-			state.record.Outcome = "diagnostic_failure"
-			if state.record.supersededStatus == nil || len(state.record.Errors) != 1 && mode == "proven" {
-				t.Fatal("exact status or sole accounting error missing")
+			// A typed terminal accounting adds no record error; any other
+			// failure the loop records keeps the record failed.
+			if state.record.StaleClaimedFresh {
+				state.record.Errors = append(state.record.Errors, "stale answer explicitly claimed fresh after acknowledgement")
+			}
+			state.record.Outcome = "complete"
+			if len(state.record.Errors) != 0 {
+				state.record.Outcome = "diagnostic_failure"
+			}
+			if state.record.supersededStatus == nil || len(state.record.Errors) != 0 && mode == "proven" || state.record.Accounting.State != "terminal_unavailable_background" {
+				t.Fatal("exact status missing, or a proven record carries an error")
 			}
 			proof.Guard.Repo = "fixture"
 			guard, err := json.Marshal(proof.Guard)
@@ -131,7 +138,7 @@ func TestEditProbeSupersededFinishKeepsPreACKObservations(t *testing.T) {
 				if err != nil || got.Outcome != receiptproof.SupersededOutcome || got.Superseded == nil {
 					t.Fatalf("proven receipt rejected because of retained pre-ACK observations: %v", err)
 				}
-				if got.Accounting.P != nil || got.Accounting.B != nil || got.Superseded.AccountingError != record.Errors[0] || len(got.Accounting.Reasons) == 0 {
+				if got.Accounting.P != nil || got.Accounting.B != nil || got.Superseded.AccountingError != editProbeAccountingGap(got.Accounting) || len(got.Accounting.Reasons) == 0 {
 					t.Fatal("unavailable timing/refusal was erased")
 				}
 			} else if err == nil || got.Superseded != nil || got.Outcome == receiptproof.SupersededOutcome {

@@ -104,12 +104,16 @@ func TestEditProbeFunctionalUnavailablePreservesUnknownTimingAndRejectsExecutedO
 				t.Fatal(err)
 			}
 			record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-			record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+			cap := record.Outcome == "harness_evidence_incomplete"
+			onlyAccountingShortfall(&record)
+			if cap {
+				record.Outcome = "harness_evidence_incomplete"
+			}
 			if mode == "missing_A" {
 				record.Accounting.A = nil
 			}
 			if mode == "extra_error" {
-				record.Errors = append(record.Errors, "read failed")
+				record.Outcome, record.Errors = "diagnostic_failure", append(record.Errors, "read failed")
 			}
 			record.PhasesMS, record.MutationTiers = editProbePhases(decoded, "status exposes no phases_ms"), editProbeStatusTiers(decoded)
 			if mode == "pending_tier" {
@@ -163,7 +167,7 @@ func TestEditProbeFunctionalUnavailableFinishKeepsDenominatorAndUnavailableDeepP
 		t.Fatal(err)
 	}
 	record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-	record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+	onlyAccountingShortfall(&record)
 	record.PhasesMS, record.MutationTiers = editProbePhases(decoded, "status exposes no phases_ms"), editProbeStatusTiers(decoded)
 	record.functionalUnavailableStatus = functionalUnavailableStatus(decoded, raw, 42, record.Accounting)
 	if record.functionalUnavailableStatus == nil {

@@ -155,7 +155,7 @@ func TestEditProbeRoutedReadbacksAndRestoreKeepEachCheckoutOriginal(t *testing.T
 			t.Fatalf("own receipt missing: %v %v", body, err)
 		}
 		state.record.Receipt, state.record.GraphTerminal = receipt, true
-		_, correct := run.immediateReadbacks(ctx, state, state.step, []string{"file", "source"}, nil)
+		_, correct := run.immediateReadbacks(ctx, state, state.step, []string{"file", "source"}, nil, nil)
 		if !correct {
 			t.Errorf("checkout%d same-session readbacks used another fixture/callee: %+v", i, state.record.Readbacks)
 		}

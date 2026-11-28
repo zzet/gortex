@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -35,7 +34,7 @@ func TestEditProbeSeparateWinnerPreservesPreexistingOriginalBackgroundRefusal(t 
 				t.Fatal(err)
 			}
 			record.Accounting = checkEditProbeAccounting(decoded, record.Receipt)
-			record.Errors = []string{"A/P/B accounting unavailable: " + strings.Join(record.Accounting.Reasons, "; ")}
+			onlyAccountingShortfall(&record)
 			record.coalescedStatus = coalescedFunctionalStatus(decoded, raw, 38, record.Accounting)
 			got := classifyCoalescedFunctionalRecord(&record, &editProbePhysicalWriteScope{Kind: "shared_worktree_file", File: "sample.go", Editors: 4})
 			if got != (mode == "separate_winner") {
