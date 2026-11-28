@@ -1,8 +1,12 @@
 package indexer
 
 import (
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/zzet/gortex/internal/gitstate"
 )
 
 // requireCheckoutBackgroundRefusal checks a record's B is the frozen refusal
@@ -99,5 +103,80 @@ func TestCheckoutPublicationRecordsServingCycleAndBackgroundRefusal(t *testing.T
 		if window := record.Snapshot().EditTimings().Window; refusal != nil || window.PatchAccounting != nil {
 			t.Fatalf("%s: checkout accounting written: B %+v, P %+v", name, refusal, window.PatchAccounting)
 		}
+	}
+}
+
+// A batch's ticket, a batch edit's or a journal recovery's, publishes its whole
+// file set and keeps its own accounting: its completion records neither the
+// serving cycle as P nor the B refusal, which only a committed single-file
+// write's receipt closes from its cycle. A batch ticket keeps it even if it
+// named one file's content, as a single-file write's ticket does.
+func TestCheckoutBatchAndRecoveryTicketsKeepTheirAccounting(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		name := "batch_edit"
+		if recovery {
+			name = "journal_recovery"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, c, l := newCheckoutMutationFixture(t)
+			ctx := t.Context()
+			var m *CheckoutMutation
+			var err error
+			if recovery {
+				checkout, _, getErr := f.catalog.GetCheckout(ctx, f.checkoutID)
+				if getErr != nil {
+					t.Fatal(getErr)
+				}
+				m, err = l.BeginCheckoutRecovery(ctx, f.checkoutID, checkout.Incarnation, f.worktree,
+					gitstate.SamplePathEvidence(f.worktree).RootIdentity, f.route().DirtyGenerationID, "", "", "")
+				if err == nil {
+					err = m.PrepareRecovery(ctx)
+				}
+			} else {
+				m, err = l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
+				if err == nil {
+					err = m.Prepare(ctx)
+				}
+			}
+			if m != nil {
+				defer m.Close()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			builderWriteFile(t, f.worktree, "helper.go", chainHelperEdit)
+			path := filepath.Join(f.worktree, "helper.go")
+			origin := time.Now()
+			record := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("%s-%d", name, origin.UnixNano()), PublicationSourceMCPEdit, origin)
+			ticket, err := m.EnqueueBatchRefresh(WithPublicationRecord(ctx, record), []CheckoutBatchFile{{Path: path, SHA256: checkoutBatchHash(t, path)}})
+			m.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.refreshMu.Lock()
+			request := c.refreshWaiters[ticket.Ticket.Generation]
+			c.refreshMu.Unlock()
+			if request == nil || request.record != record || len(request.batchFiles) != 1 || request.ticket.Ticket.TierState().AckAt.IsZero() {
+				t.Fatalf("the batch ticket is not bound to its record with its acknowledgement: %+v", request)
+			}
+
+			c.cycle(ctx)
+			if result := awaitCheckoutRefresh(t, ticket); result.Err != nil || !result.Reindexed {
+				t.Fatalf("the batch did not publish: %+v", result)
+			}
+			snapshot := record.Snapshot()
+			if _, completed := phaseOffsets(snapshot)[PublicationTicketCompleted]; !completed {
+				t.Fatalf("the batch's record never completed: %+v", snapshot.Phases)
+			}
+			_, refusal := record.CoalescedPublicationEvidence()
+			if window := snapshot.EditTimings().Window; refusal != nil || window.PatchWallMS != nil || window.PatchAccounting != nil {
+				t.Fatalf("a batch ticket took a single-file write's accounting: B %+v, P %+v", refusal, window)
+			}
+			named := *request
+			named.contentHash = request.batchFiles[0].SHA256
+			if named.accountsCheckoutPublication() {
+				t.Fatal("a batch ticket that names a file's content would take a single-file write's accounting")
+			}
+		})
 	}
 }
