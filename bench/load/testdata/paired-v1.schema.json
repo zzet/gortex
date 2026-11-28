@@ -3180,6 +3180,101 @@
                               "raw_evidence": {
                                 "type": "string"
                               },
+                              "readback_pending": {
+                                "additionalProperties": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "first_exact_correct": {
+                                          "anyOf": [
+                                            {
+                                              "type": "boolean"
+                                            },
+                                            {
+                                              "type": "null"
+                                            }
+                                          ]
+                                        },
+                                        "first_exact_ms": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "reason": {
+                                              "type": "string"
+                                            },
+                                            "unit": {
+                                              "type": "string"
+                                            },
+                                            "value": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "number"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "value",
+                                            "unit",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "first_pending_ms": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "reason": {
+                                              "type": "string"
+                                            },
+                                            "unit": {
+                                              "type": "string"
+                                            },
+                                            "value": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "number"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            }
+                                          },
+                                          "required": [
+                                            "value",
+                                            "unit",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "pending_reason": {
+                                          "type": "string"
+                                        },
+                                        "rereads": {
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "pending_reason",
+                                        "first_pending_ms",
+                                        "rereads",
+                                        "first_exact_ms"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
                               "readbacks": {
                                 "items": {
                                   "additionalProperties": false,
@@ -3263,7 +3358,23 @@
                                         {
                                           "additionalProperties": false,
                                           "properties": {
+                                            "actual_view": {
+                                              "type": "string"
+                                            },
                                             "error_code": {
+                                              "type": "string"
+                                            },
+                                            "exact": {
+                                              "anyOf": [
+                                                {
+                                                  "type": "boolean"
+                                                },
+                                                {
+                                                  "type": "null"
+                                                }
+                                              ]
+                                            },
+                                            "fallback_reason": {
                                               "type": "string"
                                             },
                                             "freshness_complete": {
@@ -3277,6 +3388,9 @@
                                               ]
                                             },
                                             "freshness_reason": {
+                                              "type": "string"
+                                            },
+                                            "freshness_scope": {
                                               "type": "string"
                                             },
                                             "freshness_state": {
@@ -3303,6 +3417,9 @@
                                               ]
                                             },
                                             "reason": {
+                                              "type": "string"
+                                            },
+                                            "requested_view": {
                                               "type": "string"
                                             },
                                             "retriable": {
@@ -3380,8 +3497,17 @@
                                     "observation_only": {
                                       "type": "boolean"
                                     },
+                                    "pending": {
+                                      "type": "boolean"
+                                    },
+                                    "pending_reason": {
+                                      "type": "string"
+                                    },
                                     "refusal": {
                                       "type": "string"
+                                    },
+                                    "reread": {
+                                      "type": "boolean"
                                     }
                                   },
                                   "required": [
@@ -6134,6 +6260,360 @@
                                 "outcomes": {
                                   "additionalProperties": {
                                     "type": "integer"
+                                  },
+                                  "type": [
+                                    "object",
+                                    "null"
+                                  ]
+                                },
+                                "readback_pending": {
+                                  "additionalProperties": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "count": {
+                                        "type": "integer"
+                                      },
+                                      "first_exact_ms": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "bootstrap_resamples": {
+                                            "type": "integer"
+                                          },
+                                          "censored": {
+                                            "type": "integer"
+                                          },
+                                          "count": {
+                                            "type": "integer"
+                                          },
+                                          "max": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "reason": {
+                                                "type": "string"
+                                              },
+                                              "unit": {
+                                                "type": "string"
+                                              },
+                                              "value": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "number"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "required": [
+                                              "value",
+                                              "unit",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "not_applicable": {
+                                            "type": "integer"
+                                          },
+                                          "p50": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "reason": {
+                                                "type": "string"
+                                              },
+                                              "unit": {
+                                                "type": "string"
+                                              },
+                                              "value": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "number"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "required": [
+                                              "value",
+                                              "unit",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "p50_ci95": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "high": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "low": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              }
+                                            },
+                                            "required": [
+                                              "low",
+                                              "high"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "p95": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "reason": {
+                                                "type": "string"
+                                              },
+                                              "unit": {
+                                                "type": "string"
+                                              },
+                                              "value": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "number"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "required": [
+                                              "value",
+                                              "unit",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "p95_ci95": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "high": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "low": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              }
+                                            },
+                                            "required": [
+                                              "low",
+                                              "high"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "p99": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "reason": {
+                                                "type": "string"
+                                              },
+                                              "unit": {
+                                                "type": "string"
+                                              },
+                                              "value": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "number"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "required": [
+                                              "value",
+                                              "unit",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "p99_ci95": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "high": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "low": {
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                  "reason": {
+                                                    "type": "string"
+                                                  },
+                                                  "unit": {
+                                                    "type": "string"
+                                                  },
+                                                  "value": {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "null"
+                                                      }
+                                                    ]
+                                                  }
+                                                },
+                                                "required": [
+                                                  "value",
+                                                  "unit",
+                                                  "reason"
+                                                ],
+                                                "type": "object"
+                                              }
+                                            },
+                                            "required": [
+                                              "low",
+                                              "high"
+                                            ],
+                                            "type": "object"
+                                          }
+                                        },
+                                        "required": [
+                                          "count",
+                                          "censored",
+                                          "not_applicable",
+                                          "p50",
+                                          "p95",
+                                          "p99",
+                                          "max",
+                                          "p50_ci95",
+                                          "p95_ci95",
+                                          "p99_ci95",
+                                          "bootstrap_resamples"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "rereads": {
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "count",
+                                      "rereads",
+                                      "first_exact_ms"
+                                    ],
+                                    "type": "object"
                                   },
                                   "type": [
                                     "object",

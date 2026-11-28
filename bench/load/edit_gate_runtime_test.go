@@ -168,7 +168,7 @@ func TestEditGateImmediateSummaryPreservesReadError(t *testing.T) {
 				editors: []*socketClient{client},
 				origin:  time.Now(),
 			}
-			_, correct := run.immediateReadbacks(ctx, state, state.step, []string{"summary"}, nil)
+			_, correct := run.immediateReadbacks(ctx, state, state.step, []string{"summary"}, nil, nil)
 			if correct || len(state.record.Readbacks) != 1 || state.record.Readbacks[0].Correct {
 				t.Fatalf("failed summary became correct: %+v", state.record.Readbacks)
 			}

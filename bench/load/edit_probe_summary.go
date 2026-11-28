@@ -118,6 +118,18 @@ type editProbeSummary struct {
 	// busy refusals by call purpose. Outcome counts keep their meaning.
 	DeadlineReasons map[string]int `json:"deadline_reasons,omitempty"`
 	BusyRefusals    map[string]int `json:"busy_refusals,omitempty"`
+	// Linked immediate readbacks answered by the labelled fallback while the
+	// checkout republished, per kind; omitted when none was pending.
+	ReadbackPending map[string]editProbePendingCensus `json:"readback_pending,omitempty"`
+}
+
+// One pending kind across the run: how many records were pending, how many
+// re-reads they took, and the first exact answer's time from edit send. A
+// pending record that never answered exactly is censored.
+type editProbePendingCensus struct {
+	Count      int                `json:"count"`
+	Rereads    int                `json:"rereads"`
+	FirstExact editProbeQuantiles `json:"first_exact_ms"`
 }
 
 func editProbeRank(q float64, n int) int { return max(0, int(math.Ceil(q*float64(n)))-1) }
@@ -213,6 +225,9 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 		add("t_search_ms", record.Search)
 		add("t_derived_ms", record.Derived)
 		for _, readback := range record.Readbacks {
+			if readback.Reread {
+				continue // readback_ms keeps the immediate attempt's latency.
+			}
 			add("readback_ms."+readback.Kind, readback.Latency)
 		}
 		for name, metric := range record.PhasesMS {
@@ -227,5 +242,41 @@ func summarizeEditProbe(records []editProbeRecord, seed int64) *editProbeSummary
 	}
 	summarizeEditProbeTierAfterCommit(out, records, seed)
 	summarizeEditProbeAttribution(out, records)
+	summarizeEditProbeReadbackPending(out, records, seed)
 	return out
+}
+
+func summarizeEditProbeReadbackPending(out *editProbeSummary, records []editProbeRecord, seed int64) {
+	type kindValues struct {
+		count, rereads, censored int
+		observed                 []float64
+	}
+	kinds := map[string]*kindValues{}
+	for _, record := range records {
+		for kind, pending := range record.ReadbackPending {
+			if pending == nil {
+				continue
+			}
+			k := kinds[kind]
+			if k == nil {
+				k = &kindValues{}
+				kinds[kind] = k
+			}
+			k.count++
+			k.rereads += pending.Rereads
+			if pending.FirstExact.Value != nil {
+				k.observed = append(k.observed, *pending.FirstExact.Value)
+			} else {
+				k.censored++
+			}
+		}
+	}
+	for _, kind := range slices.Sorted(maps.Keys(kinds)) {
+		k := kinds[kind]
+		if out.ReadbackPending == nil {
+			out.ReadbackPending = make(map[string]editProbePendingCensus, len(kinds))
+		}
+		out.ReadbackPending[kind] = editProbePendingCensus{Count: k.count, Rereads: k.rereads,
+			FirstExact: editProbeQuantilesOf(k.observed, k.censored, 0, "ms", seed, "readback_pending."+kind+".first_exact_ms")}
+	}
 }

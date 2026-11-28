@@ -49,6 +49,13 @@ type editProbeReadback struct {
 	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 	Refusal         string `json:"refusal,omitempty"`
 	ObservationOnly bool   `json:"observation_only,omitempty"`
+	// A linked graph readback answered by the labelled fallback for the
+	// checkout's own view while it republishes (editProbeReadbackIsPending):
+	// not correct, yet no record error; re-read until exact. Reread marks
+	// the re-read row that ended the pending window.
+	Pending       bool   `json:"pending,omitempty"`
+	PendingReason string `json:"pending_reason,omitempty"`
+	Reread        bool   `json:"reread,omitempty"`
 	// Attribution only: neither field changes Correct, errors or outcomes.
 	Disposition       *editProbeReadbackDisposition `json:"disposition,omitempty"`
 	ConcurrentCommits *editProbeCommitWitness       `json:"concurrent_same_file_commits,omitempty"`
@@ -63,77 +70,78 @@ type editProbeRecord struct {
 	coalescedStatus             *receiptproof.Coalesced
 	functionalUnavailableStatus *receiptproof.FunctionalUnavailable
 	tierAfterCommitErr          error
-	FunctionalUnavailable       *receiptproof.FunctionalUnavailable `json:"functional_unavailable_receipt,omitempty"`
-	CoalescedFunctional         *receiptproof.Coalesced             `json:"coalesced_functional_receipt,omitempty"`
-	SearchACK                   map[string]any                      `json:"search_ack,omitempty"`
-	SearchQueuedNS              *int64                              `json:"search_queued_ns,omitempty"`
-	SearchQueueWaitNS           *int64                              `json:"search_queue_wait_ns,omitempty"`
-	SearchTurnReleasedNS        *int64                              `json:"search_turn_released_ns,omitempty"`
-	AdmittedTargetLines         *int                                `json:"admitted_target_lines,omitempty"`
-	MutationTiers               *editProbeLiveTiers                 `json:"mutation_tiers,omitempty"`
-	TierAfterCommit             *editProbeTierAfterCommit           `json:"tier_after_commit_ms,omitempty"`
-	GateReadback                *Metric                             `json:"t_gate_readback_ms,omitempty"`
-	ACKReadbackExact            *bool                               `json:"ack_readback_exact,omitempty"`
-	ACKStatus                   string                              `json:"ack_status,omitempty"`
-	ACKDiskStatus               string                              `json:"ack_disk_status,omitempty"`
-	ACKMutationID               string                              `json:"ack_mutation_id,omitempty"`
-	ACKCommitSeq                uint64                              `json:"ack_commit_seq,omitempty"`
-	ACKContentSHA256            string                              `json:"ack_content_sha256,omitempty"`
-	ProbeMode                   string                              `json:"probe_mode,omitempty"`
-	Ordinal                     int                                 `json:"ordinal"`
-	Editor                      int                                 `json:"editor,omitempty"`
-	Route                       string                              `json:"route,omitempty"`
-	CheckoutID                  string                              `json:"checkout_id,omitempty"`
-	Marker                      string                              `json:"marker"`
-	MutationID                  string                              `json:"mutation_id"`
-	PlannedDueNS                int64                               `json:"planned_due_ns"`
-	ActivatedNS                 *int64                              `json:"activated_ns"`
-	StartedNS                   *int64                              `json:"started_ns"`
-	StartLatenessNS             *int64                              `json:"start_lateness_ns"`
-	Outcome                     string                              `json:"outcome"`
-	Receipt                     string                              `json:"mutation_receipt"`
-	Batch                       *editProbeBatchReferences           `json:"batch,omitempty"`
-	BatchSet                    *editProbeBatchSetReferences        `json:"batch_set,omitempty"`
-	BatchAccounting             *editProbeBatchSetAccounting        `json:"batch_accounting,omitempty"`
-	Move                        *editProbeMoveReferences            `json:"move,omitempty"`
-	MoveAccounting              *editProbeMoveAccounting            `json:"move_accounting,omitempty"`
-	Restart                     *editProbeRestartRecord             `json:"restart,omitempty"`
-	NativeWrite                 *editProbeNativeWrite               `json:"native_write,omitempty"`
-	NotAdmitted                 string                              `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
-	GraphTerminalBasis          string                              `json:"graph_terminal_basis,omitempty"`
-	Ack                         Metric                              `json:"t_ack_ms"`
-	PhasesMS                    map[string]Metric                   `json:"phases_ms,omitempty"`
-	Readback                    Metric                              `json:"t_readback_ms,omitempty"`
-	FileGraph                   Metric                              `json:"t_file_graph_ms,omitempty"`
-	Relations                   Metric                              `json:"t_relations_ms,omitempty"`
-	Search                      Metric                              `json:"t_search_ms,omitempty"`
-	Derived                     Metric                              `json:"t_derived_ms,omitempty"`
-	Readbacks                   []editProbeReadback                 `json:"readbacks"`
-	FirstCorrect                map[string]Metric                   `json:"first_correct_ms"`
-	Accounting                  editProbeAccounting                 `json:"accounting"`
-	PendingReads                int                                 `json:"reads_while_receipt_observed_pending"`
-	RedialedCalls               int                                 `json:"redialed_calls,omitempty"` // this edit's calls that went through a re-dial, whatever the clock measured
-	RedialNS                    int64                               `json:"redial_ns,omitempty"`      // their time re-opening the session; inside t_ack, t_readback and probe timings
-	ExpectedRefusals            int                                 `json:"expected_refusals,omitempty"`
-	ProbeErrors                 int                                 `json:"probe_errors"`
-	StaleClaimedFresh           bool                                `json:"stale_claimed_fresh"`
-	PrecommitFreshMismatches    int                                 `json:"precommit_fresh_mismatches_unassessed"`
-	GraphTerminal               bool                                `json:"graph_terminal"`
-	GraphTerminalMS             *Metric                             `json:"t_graph_terminal_ms,omitempty"`
-	PostWorkloadReceipt         *editProbePostWorkloadReceipt       `json:"post_workload_receipt,omitempty"`
-	DeadlineReason              string                              `json:"deadline_reason,omitempty"`
-	BusyRefusals                map[string]int                      `json:"busy_refusals,omitempty"`
-	EditRefusalRetries          map[string]int                      `json:"edit_refusal_retries,omitempty"`
-	ResentEditReplayed          bool                                `json:"resent_edit_replayed,omitempty"` // see noteResentReplay
-	Evidence                    string                              `json:"raw_evidence"`
-	EvidenceWriteMS             float64                             `json:"evidence_write_ms"`
-	EvidenceEncodeMS            float64                             `json:"evidence_encode_ms"`
-	EvidenceCodec               string                              `json:"evidence_codec,omitempty"`
-	EvidenceLogicalBytes        int64                               `json:"evidence_logical_jsonl_bytes,omitempty"`
-	EvidenceBytes               int                                 `json:"evidence_bytes"`
-	EvidenceLimit               int                                 `json:"evidence_limit_bytes"`
-	EvidenceFoldedCalls         int                                 `json:"evidence_folded_repeat_calls,omitempty"`
-	Errors                      []string                            `json:"errors"`
+	FunctionalUnavailable       *receiptproof.FunctionalUnavailable  `json:"functional_unavailable_receipt,omitempty"`
+	CoalescedFunctional         *receiptproof.Coalesced              `json:"coalesced_functional_receipt,omitempty"`
+	SearchACK                   map[string]any                       `json:"search_ack,omitempty"`
+	SearchQueuedNS              *int64                               `json:"search_queued_ns,omitempty"`
+	SearchQueueWaitNS           *int64                               `json:"search_queue_wait_ns,omitempty"`
+	SearchTurnReleasedNS        *int64                               `json:"search_turn_released_ns,omitempty"`
+	AdmittedTargetLines         *int                                 `json:"admitted_target_lines,omitempty"`
+	MutationTiers               *editProbeLiveTiers                  `json:"mutation_tiers,omitempty"`
+	TierAfterCommit             *editProbeTierAfterCommit            `json:"tier_after_commit_ms,omitempty"`
+	GateReadback                *Metric                              `json:"t_gate_readback_ms,omitempty"`
+	ACKReadbackExact            *bool                                `json:"ack_readback_exact,omitempty"`
+	ACKStatus                   string                               `json:"ack_status,omitempty"`
+	ACKDiskStatus               string                               `json:"ack_disk_status,omitempty"`
+	ACKMutationID               string                               `json:"ack_mutation_id,omitempty"`
+	ACKCommitSeq                uint64                               `json:"ack_commit_seq,omitempty"`
+	ACKContentSHA256            string                               `json:"ack_content_sha256,omitempty"`
+	ProbeMode                   string                               `json:"probe_mode,omitempty"`
+	Ordinal                     int                                  `json:"ordinal"`
+	Editor                      int                                  `json:"editor,omitempty"`
+	Route                       string                               `json:"route,omitempty"`
+	CheckoutID                  string                               `json:"checkout_id,omitempty"`
+	Marker                      string                               `json:"marker"`
+	MutationID                  string                               `json:"mutation_id"`
+	PlannedDueNS                int64                                `json:"planned_due_ns"`
+	ActivatedNS                 *int64                               `json:"activated_ns"`
+	StartedNS                   *int64                               `json:"started_ns"`
+	StartLatenessNS             *int64                               `json:"start_lateness_ns"`
+	Outcome                     string                               `json:"outcome"`
+	Receipt                     string                               `json:"mutation_receipt"`
+	Batch                       *editProbeBatchReferences            `json:"batch,omitempty"`
+	BatchSet                    *editProbeBatchSetReferences         `json:"batch_set,omitempty"`
+	BatchAccounting             *editProbeBatchSetAccounting         `json:"batch_accounting,omitempty"`
+	Move                        *editProbeMoveReferences             `json:"move,omitempty"`
+	MoveAccounting              *editProbeMoveAccounting             `json:"move_accounting,omitempty"`
+	Restart                     *editProbeRestartRecord              `json:"restart,omitempty"`
+	NativeWrite                 *editProbeNativeWrite                `json:"native_write,omitempty"`
+	NotAdmitted                 string                               `json:"not_admitted,omitempty"` // see editProbeNotAdmitted
+	GraphTerminalBasis          string                               `json:"graph_terminal_basis,omitempty"`
+	Ack                         Metric                               `json:"t_ack_ms"`
+	PhasesMS                    map[string]Metric                    `json:"phases_ms,omitempty"`
+	Readback                    Metric                               `json:"t_readback_ms,omitempty"`
+	FileGraph                   Metric                               `json:"t_file_graph_ms,omitempty"`
+	Relations                   Metric                               `json:"t_relations_ms,omitempty"`
+	Search                      Metric                               `json:"t_search_ms,omitempty"`
+	Derived                     Metric                               `json:"t_derived_ms,omitempty"`
+	Readbacks                   []editProbeReadback                  `json:"readbacks"`
+	ReadbackPending             map[string]*editProbeReadbackPending `json:"readback_pending,omitempty"`
+	FirstCorrect                map[string]Metric                    `json:"first_correct_ms"`
+	Accounting                  editProbeAccounting                  `json:"accounting"`
+	PendingReads                int                                  `json:"reads_while_receipt_observed_pending"`
+	RedialedCalls               int                                  `json:"redialed_calls,omitempty"` // this edit's calls that went through a re-dial, whatever the clock measured
+	RedialNS                    int64                                `json:"redial_ns,omitempty"`      // their time re-opening the session; inside t_ack, t_readback and probe timings
+	ExpectedRefusals            int                                  `json:"expected_refusals,omitempty"`
+	ProbeErrors                 int                                  `json:"probe_errors"`
+	StaleClaimedFresh           bool                                 `json:"stale_claimed_fresh"`
+	PrecommitFreshMismatches    int                                  `json:"precommit_fresh_mismatches_unassessed"`
+	GraphTerminal               bool                                 `json:"graph_terminal"`
+	GraphTerminalMS             *Metric                              `json:"t_graph_terminal_ms,omitempty"`
+	PostWorkloadReceipt         *editProbePostWorkloadReceipt        `json:"post_workload_receipt,omitempty"`
+	DeadlineReason              string                               `json:"deadline_reason,omitempty"`
+	BusyRefusals                map[string]int                       `json:"busy_refusals,omitempty"`
+	EditRefusalRetries          map[string]int                       `json:"edit_refusal_retries,omitempty"`
+	ResentEditReplayed          bool                                 `json:"resent_edit_replayed,omitempty"` // see noteResentReplay
+	Evidence                    string                               `json:"raw_evidence"`
+	EvidenceWriteMS             float64                              `json:"evidence_write_ms"`
+	EvidenceEncodeMS            float64                              `json:"evidence_encode_ms"`
+	EvidenceCodec               string                               `json:"evidence_codec,omitempty"`
+	EvidenceLogicalBytes        int64                                `json:"evidence_logical_jsonl_bytes,omitempty"`
+	EvidenceBytes               int                                  `json:"evidence_bytes"`
+	EvidenceLimit               int                                  `json:"evidence_limit_bytes"`
+	EvidenceFoldedCalls         int                                  `json:"evidence_folded_repeat_calls,omitempty"`
+	Errors                      []string                             `json:"errors"`
 }
 type editProbeReport struct {
 	ConsumerBaseline   *editConsumerBaseline        `json:"consumer_baseline,omitempty"`
@@ -530,6 +538,9 @@ func prepareEditProbe(ctx context.Context, o runOptions, p *privateRun, readers,
 	phase.EditProbe = newEditProbeReport(plan, p.Repos[0].Corpus, !o.editProbeBaseline)
 	phase.EditProbe.AccountingRequired = r.requireAccounting
 	phase.EditProbe.PhysicalWriteScope = sharedEditProbePhysicalScope(p, plan, editors)
+	if plan.LinkedWorktrees > 0 {
+		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "linked immediate graph read-backs may be answered by the labelled base fallback while the checkout republishes (reindex_pending ACK); those are typed pending, re-read on the same session until exact, never counted as incorrect; t_readback_ms then measures the first exact answer; the pending census is in summary.readback_pending")
+	}
 	if plan.SearchReadbackAcceptance {
 		phase.EditProbe.Limitations = append(phase.EditProbe.Limitations, "search-readback acceptance covers immediate content/search correctness only; full A/P/B accounting is diagnostic and unclaimed, missing windows remain unavailable", "one shared setup/diagnostic client; zero per-offer ordinary oracle loops; post-required diagnostics are serial, at most one sample per editor and three calls per sample, within the remaining original phase window and a 1s diagnostic-only cap", "retained owned keep-state clones are NON-PRISTINE, not restored and never reusable as fresh acceptance seeds")
 	}
@@ -1431,8 +1442,10 @@ func (r *editProbeRuntime) finishEditAfterACK(ctx, callCtx context.Context, s *e
 	if step.Relocated {
 		readbackKinds = append(readbackKinds, "old_source_absent", "source_file_after_move")
 	}
-	readbackEnd, readbacksCorrect := r.immediateReadbacks(callCtx, s, step, readbackKinds, nil)
-	// The agent has its edit back once the last immediate readback is correct.
+	readbackEnd, readbacksCorrect := r.immediateReadbacks(callCtx, s, step, readbackKinds, nil, body)
+	// The agent has its edit back once every required immediate readback kind
+	// has answered exactly and correctly on its own session: a pending kind
+	// counts at its first exact correct reply.
 	s.mu.Lock()
 	s.record.Readback = unavailable("ms", "immediate readback missing or incorrect")
 	if readbacksCorrect {
@@ -1621,8 +1634,11 @@ func editProbeReadbackRequest(file string, step editProbeStep, kind string) requ
 
 // Immediate same editing session, with no sleep/receipt/freshness barrier.
 // Observation-only kinds are recorded but neither gate the readback time nor
-// fail the record.
-func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool) (time.Time, bool) {
+// fail the record. ack is the edit's decoded ACK, or nil where no ACK can
+// document a pending linked publication; only an ACK that does lets a graph
+// readback answered by the labelled fallback for the checkout's own view be
+// pending and re-read until exact (editProbeReadbackIsPending).
+func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editProbeState, step editProbeStep, readbackKinds []string, observeOnly map[string]bool, ack map[string]any) (time.Time, bool) {
 	repo, err := r.repoFor(step)
 	if err != nil {
 		s.mu.Lock()
@@ -1634,6 +1650,16 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 	file := repo.Corpus.File
 	if step.File != "" {
 		file = step.File
+	}
+	s.mu.Lock()
+	checkoutID, started := s.record.CheckoutID, s.started
+	s.mu.Unlock()
+	pendingACK := editProbeLinkedPendingACK(ack, step.MutationID, checkoutID)
+	sinceEdit := func(at time.Time) Metric {
+		if at.IsZero() || started.IsZero() || at.Before(started) {
+			return unavailable("ms", "reply endpoint unavailable")
+		}
+		return measured(float64(at.Sub(started))/float64(time.Millisecond), "ms")
 	}
 	for index, kind := range readbackKinds {
 		req := editProbeReadbackRequest(file, step, kind)
@@ -1661,41 +1687,49 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			req = searchReadbackRequest(kind, repo, step)
 		}
 		req = editProbeWithOutput(req, r.plan.Mode)
-		begin := time.Now()
-		raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
-		payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
-		back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, repo.Corpus, step, r.calleeFor(repo))}
-		if searchWitness {
-			back.ExpectedLine = step.ExpectedSearchLine
-			back.ExpectedPath = repo.Prefix + "/" + repo.Corpus.File
-			back.ExpectedID = back.ExpectedPath + "::" + step.Marker
-			back.Correct = readErr == nil && decodeErr == nil && exactSearchReadback(kind, payload, repo, step, r.calleeFor(repo))
-			var refused *rpcError
-			if errors.As(readErr, &refused) {
-				back.Refusal = refused.Message
+		read := func() (editProbeReadback, time.Time, wireCallIdentity, error) {
+			begin := time.Now()
+			raw, identity, readErr := r.perform(callCtx, s, r.editorFor(step), req, "readback:"+kind, "readback", 100+index)
+			payload, decodeErr := decodeEditProbeOutput(raw, editProbeRequestOutput(req), req.name())
+			back := editProbeReadback{Kind: kind, Latency: unavailable("ms", "response endpoint unavailable"), Correct: readErr == nil && decodeErr == nil && editProbeCorrect(kind, payload, repo.Corpus, step, r.calleeFor(repo))}
+			if searchWitness {
+				back.ExpectedLine = step.ExpectedSearchLine
+				back.ExpectedPath = repo.Prefix + "/" + repo.Corpus.File
+				back.ExpectedID = back.ExpectedPath + "::" + step.Marker
+				back.Correct = readErr == nil && decodeErr == nil && exactSearchReadback(kind, payload, repo, step, r.calleeFor(repo))
+				var refused *rpcError
+				if errors.As(readErr, &refused) {
+					back.Refusal = refused.Message
+				}
 			}
-		}
-		if !identity.Finished.IsZero() {
-			back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
-		}
-		back.Disposition = editProbeReadbackDispositionOf(kind, raw, payload, readErr, decodeErr)
-		back.sent, back.received = identity.WriteStarted, identity.Finished
-		if back.sent.IsZero() && !back.received.IsZero() {
-			back.sent = begin
-		}
-		absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
-		if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
-			back.Correct = true
-			back.ExpectedOutcome = "symbol_absent"
-			back.Refusal = absence.message
-		} else {
-			if readErr != nil {
-				back.Error = readErr.Error()
-			} else if decodeErr != nil {
-				back.Error = decodeErr.Error()
+			if !identity.Finished.IsZero() {
+				back.Latency = measured(float64(identity.Finished.Sub(begin))/float64(time.Millisecond), "ms")
 			}
+			back.Disposition = editProbeReadbackDispositionOf(kind, raw, payload, readErr, decodeErr)
+			back.sent, back.received = identity.WriteStarted, identity.Finished
+			if back.sent.IsZero() && !back.received.IsZero() {
+				back.sent = begin
+			}
+			absence, exactRefusal := readErr.(*editProbeExpectedAbsence)
+			if req.ExpectedAbsentSymbol != "" && exactRefusal && absence.symbol == repo.Prefix+"/"+req.ExpectedAbsentSymbol {
+				back.Correct = true
+				back.ExpectedOutcome = "symbol_absent"
+				back.Refusal = absence.message
+			} else {
+				if readErr != nil {
+					back.Error = readErr.Error()
+				} else if decodeErr != nil {
+					back.Error = decodeErr.Error()
+				}
+			}
+			back.ObservationOnly = observeOnly[kind]
+			return back, begin, identity, readErr
 		}
-		back.ObservationOnly = observeOnly[kind]
+		back, begin, identity, readErr := read()
+		back.Pending = editProbeReadbackIsPending(back, checkoutID, pendingACK)
+		if back.Pending {
+			back.PendingReason = back.Disposition.FallbackReason
+		}
 		if s.pairedTransaction != nil {
 			s.pairedTransaction.observeRead(req, begin, identity, back, readErr, callCtx.Err())
 		}
@@ -1708,22 +1742,72 @@ func (r *editProbeRuntime) immediateReadbacks(callCtx context.Context, s *editPr
 			s.record.GateReadback = &metric
 		}
 		s.record.Readbacks = append(s.record.Readbacks, back)
-		if !back.Correct && !back.ObservationOnly {
+		if !back.Correct && !back.ObservationOnly && !back.Pending {
 			s.record.Errors = append(s.record.Errors, "immediate "+kind+" readback incorrect")
 		}
 		s.mu.Unlock()
 		if back.ObservationOnly {
 			continue
 		}
-		readbacksCorrect = readbacksCorrect && back.Correct && !identity.Finished.IsZero()
-		if identity.Finished.After(readbackEnd) {
-			readbackEnd = identity.Finished
+		correct, finished := back.Correct && !identity.Finished.IsZero(), identity.Finished
+		if back.Pending {
+			correct, finished = r.rereadPendingReadback(callCtx, s, kind, back, identity.Finished, checkoutID, sinceEdit, read)
+		}
+		readbacksCorrect = readbacksCorrect && correct
+		if finished.After(readbackEnd) {
+			readbackEnd = finished
 		}
 		if r.plan.SearchReadbackAcceptance && index == 3 && kind == "old_text_absent" {
 			r.releaseSearchReadbackTurn(step)
 		}
 	}
 	return readbackEnd, readbacksCorrect
+}
+
+// rereadPendingReadback re-issues a pending kind's identical request on the
+// same editor session every editProbePeriod until the rider is exact for the
+// checkout's own view, the reply leaves the pending contract, or the edit's
+// deadline expires. Only the exact reply is scored and recorded as a second
+// row; identical pending replies are counted, and every call keeps its own
+// spool rows. It reports whether the exact reply was correct and its finish.
+func (r *editProbeRuntime) rereadPendingReadback(callCtx context.Context, s *editProbeState, kind string, first editProbeReadback, firstFinished time.Time, checkoutID string, sinceEdit func(time.Time) Metric, read func() (editProbeReadback, time.Time, wireCallIdentity, error)) (bool, time.Time) {
+	pending := &editProbeReadbackPending{PendingReason: first.PendingReason, FirstPending: sinceEdit(firstFinished), FirstExact: unavailable("ms", "no exact answer before the edit's deadline")}
+	s.mu.Lock()
+	if s.record.ReadbackPending == nil {
+		s.record.ReadbackPending = make(map[string]*editProbeReadbackPending)
+	}
+	s.record.ReadbackPending[kind] = pending
+	s.mu.Unlock()
+	for waitContext(callCtx, editProbePeriod) == nil {
+		back, _, identity, readErr := read()
+		if readErr != nil && callCtx.Err() != nil {
+			break // The deadline ended the re-read: the readback stays outstanding.
+		}
+		s.mu.Lock()
+		pending.Rereads++
+		switch {
+		case editProbeRiderPending(back.Disposition, checkoutID):
+			s.mu.Unlock()
+			continue
+		case editProbeRiderExact(back.Disposition, checkoutID):
+			correct := back.Correct && !identity.Finished.IsZero()
+			back.Reread = true
+			pending.FirstExact, pending.FirstExactCorrect = sinceEdit(identity.Finished), &correct
+			s.record.Readbacks = append(s.record.Readbacks, back)
+			if !correct {
+				s.record.Errors = append(s.record.Errors, kind+" readback incorrect after view published")
+			}
+			s.mu.Unlock()
+			return correct, identity.Finished
+		default:
+			back.Reread = true
+			s.record.Readbacks = append(s.record.Readbacks, back)
+			s.record.Errors = append(s.record.Errors, kind+" readback left the pending contract: "+editProbeRiderDeparture(back.Disposition))
+			s.mu.Unlock()
+			return false, identity.Finished
+		}
+	}
+	return false, time.Time{}
 }
 
 func (r *editProbeRuntime) run(ctx context.Context) error {

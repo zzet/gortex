@@ -84,7 +84,7 @@ func TestEditProbeSupersededFinishKeepsPreACKObservations(t *testing.T) {
 				t.Fatalf("first-correct denominator=%d", len(oracles))
 			}
 			failReadback.Store(mode == "immediate_read_error")
-			_, correct := run.immediateReadbacks(ctx, state, step, []string{"source", "file", "summary", "search_visible", "text"}, nil)
+			_, correct := run.immediateReadbacks(ctx, state, step, []string{"source", "file", "summary", "search_visible", "text"}, nil, nil)
 			if correct == failReadback.Load() || len(state.record.Readbacks) != 5 {
 				t.Fatalf("actual readbacks correct=%v count=%d", correct, len(state.record.Readbacks))
 			}

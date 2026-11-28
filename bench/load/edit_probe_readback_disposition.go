@@ -9,9 +9,10 @@ import (
 )
 
 // An immediate readback's typed disposition explains why a read was or was
-// not correct. It never changes Correct, the record's errors or its outcome:
-// a truthful pending answer and wrong content both stay incorrect, but they
-// are no longer indistinguishable in the report.
+// not correct. It never changes Correct: a truthful pending answer and wrong
+// content both stay incorrect, but they are no longer indistinguishable in
+// the report. Only the linked pending rule (editProbeReadbackIsPending) reads
+// its rider to decide that a fallback answer is pending rather than an error.
 type editProbeReadbackDisposition struct {
 	Kind                string         `json:"kind"`
 	ErrorCode           string         `json:"error_code,omitempty"`
@@ -24,6 +25,14 @@ type editProbeReadbackDisposition struct {
 	FreshnessComplete   *bool          `json:"freshness_complete,omitempty"`
 	NodeCount           *int           `json:"node_count,omitempty"`
 	ProjectionPredicate map[string]any `json:"projection_predicate,omitempty"`
+	// The result envelope's _meta.freshness rider, on answers and tool errors
+	// alike: which view was asked for, which one answered, whether the answer
+	// is exact for the requested view, and why another view answered.
+	RequestedView  string `json:"requested_view,omitempty"`
+	ActualView     string `json:"actual_view,omitempty"`
+	Exact          *bool  `json:"exact,omitempty"`
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	FreshnessScope string `json:"freshness_scope,omitempty"`
 }
 
 // Dispositions, in the order they are decided.
@@ -39,6 +48,12 @@ const (
 )
 
 func editProbeReadbackDispositionOf(kind string, raw json.RawMessage, payload map[string]any, readErr, decodeErr error) *editProbeReadbackDisposition {
+	out := editProbeReadbackDispositionKind(kind, raw, payload, readErr, decodeErr)
+	out.withRider(raw)
+	return out
+}
+
+func editProbeReadbackDispositionKind(kind string, raw json.RawMessage, payload map[string]any, readErr, decodeErr error) *editProbeReadbackDisposition {
 	if _, expected := readErr.(*editProbeExpectedAbsence); expected {
 		return &editProbeReadbackDisposition{Kind: editProbeReadbackExpectedAbsence}
 	}
@@ -79,6 +94,27 @@ func editProbeReadbackDispositionOf(kind string, raw json.RawMessage, payload ma
 		out.NodeCount = &count
 	}
 	return out
+}
+
+// withRider copies the reply's freshness rider. A reply without one, or with
+// a malformed field, leaves that field absent; exactness is never guessed.
+func (d *editProbeReadbackDisposition) withRider(raw json.RawMessage) {
+	var envelope struct {
+		Meta struct {
+			Freshness map[string]any `json:"freshness"`
+		} `json:"_meta"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &envelope) != nil {
+		return
+	}
+	rider := envelope.Meta.Freshness
+	d.RequestedView, _ = rider["requested_view"].(string)
+	d.ActualView, _ = rider["actual_view"].(string)
+	d.FallbackReason, _ = rider["fallback_reason"].(string)
+	d.FreshnessScope, _ = rider["freshness_scope"].(string)
+	if exact, ok := rider["exact"].(bool); ok {
+		d.Exact = &exact
+	}
 }
 
 // Only the product's StructuredError text body is typed; prose errors are not.

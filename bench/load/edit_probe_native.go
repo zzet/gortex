@@ -264,7 +264,7 @@ func (r *editProbeRuntime) doNativeWrite(ctx context.Context, step editProbeStep
 		}
 		// The file is on disk once the write returns; graph answers may lag
 		// the watcher, so they are recorded without gating anything.
-		end, correct := r.immediateReadbacks(callCtx, s, step, kinds, map[string]bool{"source": true, "old_source_absent": true})
+		end, correct := r.immediateReadbacks(callCtx, s, step, kinds, map[string]bool{"source": true, "old_source_absent": true}, nil)
 		if correct && !end.IsZero() {
 			s.mu.Lock()
 			s.record.Readback = measured(float64(end.Sub(started))/float64(time.Millisecond), "ms")

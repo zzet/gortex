@@ -254,6 +254,37 @@ probes and immediate same-editing-session file/source readbacks. Session setup
 is outside the edit window. Future arrivals do not wait for earlier ACKs or
 probe replies. Canceled/unstarted edits remain in the offered denominator.
 
+On a linked checkout the full ACK returns before the checkout's queued
+publication (`reindex_pending: true`, `graph_status: pending`), and until the
+checkout's route republishes a cwd-bound graph read on the same session is
+answered from the labelled read-only base fallback. An immediate graph
+readback (`source`, `old_source_absent`, `summary`, `search_visible`, `text`)
+is therefore **pending**, not incorrect, when all of these hold: the edit's
+route is the run's own admitted linked checkout; its ACK is applied,
+committed, carries the step's `mutation_id`, reports `reindex_pending: true`
+and `graph_status: pending`, names that checkout in its `freshness` view and is
+not replayed; the reply's `_meta.freshness` rider requests that checkout's own
+view (`worktree:<checkout_id>`), answers from another view with `exact: false`
+and gives `fallback_reason` `view_building` or `discovery_pending`; and the
+kind's oracle did not accept the reply. A pending row keeps `correct: false`
+with `pending: true` and `pending_reason`, and adds no record error. LOAD
+re-issues the identical request on the same session every 25 ms. The first
+reply whose rider is exact for the requested view is scored by the kind's
+oracle and recorded as a second row of the same kind with `reread: true`; a
+wrong exact answer is the record error `<kind> readback incorrect after view
+published`. A reply that names another view or reason, or carries no rider,
+is the record error `<kind> readback left the pending contract`. A view that
+never publishes before the edit's deadline makes the record a
+`product_deadline` with `deadline_reason: immediate_readbacks_outstanding`.
+Each re-read is an ordinary spool call with its own rows; pending re-reads are
+not folded, so every call keeps its wire interval. The record's
+`readback_pending.<kind>` gives `pending_reason`, `first_pending_ms` and
+`first_exact_ms` (edit send to the first pending and the first exact reply),
+`rereads` and `first_exact_correct`. A `file` or `source_file_after_move`
+readback is served from disk and is never pending. A primary edit, a wrong
+answer claimed exact, a fallback for `route_moved` or any other reason, and an
+ACK that waited for its publication all stay incorrect.
+
 `--edit-consumer-probes` adds opt-in dry-run rename, signature verification,
 dead-code and unstaged-change probes. It requires one primary Go
 `add_intrafile_call` / `edit.file` fixture with an unexported callee and an
@@ -608,8 +639,10 @@ reports each lap unavailable with that reason, a producer null keeps the
 producer's phase state as its reason, and a relocation keeps its per-file move
 accounting instead. Missing laps are never zero.
 
-Records also carry client times from edit send: `t_readback_ms` (last correct
-immediate same-session readback), `t_file_graph_ms` (source, summary, editing
+Records also carry client times from edit send: `t_readback_ms` (the agent has
+its edit back once every required immediate readback kind has answered exactly
+and correctly on its own session; for a pending linked kind that is its first
+exact correct reply, otherwise the immediate reply itself), `t_file_graph_ms` (source, summary, editing
 context and old-source absence), `t_relations_ms` (callers and call chain) and
 `t_search_ms` (symbol and text search). A group time is its slowest member's
 first-correct time; any member that never answered correctly leaves the group
@@ -637,16 +670,20 @@ completeness, and its node count, when the reply has them), `typed_refusal`
 (the structured `error_code`, `retriable`, `retry_scope` and `reason`),
 `untyped_tool_error`, `rpc_error` (numeric code, with the dispatcher's outcome
 and retryable flag when present), `deadline`, `transport_error`,
-`undecodable_answer` or `expected_absence`. A typed read-only
+`undecodable_answer` or `expected_absence`. Every disposition, tool errors
+included, also carries the reply's `_meta.freshness` rider when the product
+sent one: `requested_view`, `actual_view`, `exact`, `fallback_reason` and
+`freshness_scope`; an absent rider field stays absent. A typed read-only
 `projection_superseded` summary refusal adds the daemon's bounded projection
 predicate, which the daemon emits only under its refusal-evidence opt-in;
 otherwise the predicate is `unavailable`. `concurrent_same_file_commits` lists
 the other edits of the same file whose edit RPC overlapped the readback's wire
 window, with their ACK `commit_seq`, receipt and whether that ACK returned
 inside the window; `none_observed` and `unavailable` stay distinct. Neither
-field changes `correct`, the record's errors or its outcome: a truthful
-pending reply without the edited definition and wrong content both remain
-incorrect, but they are no longer indistinguishable.
+field changes `correct`: a truthful pending reply without the edited
+definition and wrong content both remain incorrect, but they are no longer
+indistinguishable. Only the linked pending rule above reads the rider to keep
+a labelled fallback reply from being a record error.
 
 The report `summary` covers the complete offered denominator: outcome counts
 and, for every per-record time, each readback, each `phases_ms` lap and each
@@ -663,7 +700,12 @@ record does not carry, is `not_applicable`. When any record carries
 on a record's final status had not been published yet, so it is censored even
 for a completed edit; a completed record without the figure does not apply.
 An interval needs at least 2, 20 or 100 ranked records for p50, p95 or p99 and
-is unavailable below that. Nothing is sampled as zero.
+is unavailable below that. Nothing is sampled as zero. `readback_ms.<kind>` is
+the immediate attempt's latency; a pending kind's exact re-read row is not
+ranked there. `summary.readback_pending.<kind>`, present when any record had a
+pending linked readback, counts those records (`count`) and their `rereads`
+and ranks `first_exact_ms` the same way; a pending record that never answered
+exactly is censored.
 
 Beside `stats_before` and `stats_after`, every edit-and-probe report carries
 `projection_before` and `projection_after`: the live
