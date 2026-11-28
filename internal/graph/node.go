@@ -307,6 +307,14 @@ var validNodeKinds = map[NodeKind]bool{
 	KindMacro:     true, KindAgent: true, KindContractBridge: true,
 }
 
+// Persisted lexical evidence on bare JS/TS call edges: the name is bound by an
+// enclosing scope, so a module import of that name cannot be the callee.
+const (
+	JSLexicalBindingMeta = "js_lexical_binding"
+	JSLexicalLocal       = "local"
+	JSPendingParameter   = "parameter"
+)
+
 type Node struct {
 	ID        string   `json:"id"`
 	Kind      NodeKind `json:"kind"`

@@ -312,6 +312,9 @@ func (p *resolveAllPassIndexes) refreshAfterInterleave(ctx context.Context, pend
 	// have changed node rows or repository name groups.
 	p.resolver.hotCache.flush()
 	p.resolver.missingNodeByID = nil
+	if force {
+		p.resolver.clearImportEvidence()
+	}
 	p.resetAfterInterleave()
 	sources := p.prepare(pending)
 	if err := p.resolver.warmLookupCacheWithSources(ctx, pending, sources); err != nil {
