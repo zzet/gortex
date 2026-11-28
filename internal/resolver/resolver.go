@@ -495,19 +495,9 @@ type Resolver struct {
 	namesMiss   map[resolverNameLookupScope]map[string][]*graph.Node
 	namesMissMu sync.RWMutex
 
-	// importFilesByCaller memoises, per caller file, the set of file
-	// paths that file imports (direct EdgeImports targets plus files
-	// reached through transitive EdgeReExports barrel hops). Built
-	// lazily inside the parallel resolve workers — importFilesMu guards
-	// it — and cleared with the per-pass lookup caches. Consulted by
-	// pickImportEvidenceCallee to disambiguate bare JS/TS calls; see
-	// import_evidence.go for the precedence design.
-	importFilesByCaller map[string]map[string]struct{}
-	// importOutByFile is the batched out-edge prefetch importedFilesFor
-	// reads before falling back to a point GetOutEdges: one
-	// GetOutEdgesByNodeIDs over every JS/TS caller file of a pass
-	// (prefetchImportEdges) instead of one point read per call edge.
-	// Guarded by importFilesMu, cleared with the per-pass caches.
+	// Page-local JS/TS binding and file evidence. Adjacency is prefetched
+	// for callers and loaded on demand for barrels outside that frontier.
+	importsByCaller map[string]*callerImportEvidence
 	importOutByFile map[string][]*graph.Edge
 	importFilesMu   sync.RWMutex
 
@@ -2468,10 +2458,7 @@ func (r *Resolver) clearLookupCache() {
 	r.namesMissMu.Lock()
 	r.namesMiss = nil
 	r.namesMissMu.Unlock()
-	r.importFilesMu.Lock()
-	r.importFilesByCaller = nil
-	r.importOutByFile = nil
-	r.importFilesMu.Unlock()
+	r.clearImportEvidence()
 	r.csharpNSMu.Lock()
 	r.csharpNSByFile = nil
 	r.csharpNSMu.Unlock()
@@ -4671,6 +4658,9 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 	}
 	callerRepo := r.callerRepoPrefix(e)
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
+	if r.handleJSLexicalBinding(e, funcName, candidates, stats) {
+		return
+	}
 	if len(candidates) == 0 {
 		// No same-repo candidate. A genuine cross-repo callee is left
 		// unresolved here for CrossRepoResolver — which alone carries the
@@ -4789,25 +4779,15 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 
-	// Import-evidence disambiguation (JS/TS only; see import_evidence.go
-	// for the full precedence design). The ES module system has no ambient
-	// directory scope, so before the locality cascade below can bind a
-	// same-dir shadow — and before cross-dir ambiguity guesses or refuses —
-	// ask the caller file's import closure. When the caller imports exactly
-	// one candidate's file (directly or through re-export/barrel hops) that
-	// import statement is structural, AST-grade evidence of the binding:
-	// resolve to it at OriginASTResolved, the tier resolveRendersChild's
-	// import-binding path already uses. A module-local candidate blocks the
-	// pick; no import or several imported candidates fall through to the
-	// existing cascade unchanged.
-	if pick := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
+	// Check JS/TS import evidence before directory locality (see import_evidence.go).
+	if pick, reason := r.pickImportEvidenceCallee(e.FilePath, funcName, candidates); pick != nil {
 		e.To = pick.ID
 		e.Origin = graph.OriginASTResolved
 		e.Confidence = 0.9
 		if e.Meta == nil {
 			e.Meta = map[string]any{}
 		}
-		e.Meta["resolution"] = "import_closure"
+		e.Meta["resolution"] = reason
 		stats.Resolved++
 		return
 	}

@@ -117,7 +117,8 @@ func (r *Resolver) takeCarriedReindexes() ([]graph.EdgeReindex, []reindexJob) {
 }
 
 func (r *Resolver) priorBindingFor(edge *graph.Edge) (PriorBinding, bool) {
-	if edge == nil || !graph.IsUnresolvedTarget(edge.To) || r.incrementalSkipped(edge) {
+	// An edit can add a shadow while the call keeps its line and spelling.
+	if edge == nil || !graph.IsUnresolvedTarget(edge.To) || edge.Meta[graph.JSLexicalBindingMeta] != nil || r.incrementalSkipped(edge) {
 		return PriorBinding{}, false
 	}
 	binding, ok := r.priorBindings[PriorBindingKey(edge.From, edge.Kind, edge.Line, edge.To)]

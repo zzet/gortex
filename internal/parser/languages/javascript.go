@@ -105,8 +105,8 @@ type jsDeferredCall struct {
 	receiver string // receiver text for member calls
 	line     int
 	isMember bool
-	// expr is the call_expression node, kept for member calls so the
-	// post-pass can inspect arguments for pub/sub topic detection.
+	// expr is the call_expression node: member calls use it to inspect
+	// pub/sub arguments, bare calls to read their lexical scope.
 	expr *sitter.Node
 	// returnUsage is how the call site consumes the return value
 	// (graph.ReturnUsage* label), classified at capture time and
@@ -138,6 +138,8 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 	}
 	fileID := fileNode.ID
 	result.Nodes = append(result.Nodes, fileNode)
+	var scopes jsScopeCache
+	localExports := jsLocalExportClauseNames(root, src)
 
 	arrowNames := make(map[string]bool)
 
@@ -177,13 +179,13 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 		switch {
 
 		case m.Captures["func.def"] != nil:
-			e.emitFunction(m, filePath, fileID, src, result, seenIDs)
+			e.emitFunction(m, filePath, fileID, src, result, seenIDs, localExports)
 
 		case m.Captures["fnexpr.def"] != nil:
-			e.emitFunctionExpression(m, filePath, fileID, src, result, seenIDs)
+			e.emitFunctionExpression(m, filePath, fileID, src, result, seenIDs, localExports)
 
 		case m.Captures["arrow.def"] != nil:
-			e.emitArrow(m, filePath, fileID, src, result, arrowNames, seenIDs)
+			e.emitArrow(m, filePath, fileID, src, result, arrowNames, seenIDs, localExports)
 
 		case m.Captures["class.def"] != nil:
 			e.emitClass(m, filePath, fileID, src, result)
@@ -207,11 +209,8 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			e.emitReExport(m, filePath, fileID, src, result)
 
 		case m.Captures["req.def"] != nil:
-			e.emitRequire(m, filePath, fileID, result)
-			if m.Captures["req.name"] != nil && m.Captures["req.name"].Text == "require" {
-				if p := m.Captures["req.path"]; p != nil {
-					importPaths = append(importPaths, p.Text)
-				}
+			if reqPath := e.emitRequire(m, filePath, fileID, src, &scopes, result); reqPath != "" {
+				importPaths = append(importPaths, reqPath)
 			}
 
 		case m.Captures["new.expr"] != nil:
@@ -248,6 +247,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			calls = append(calls, jsDeferredCall{
 				name:        m.Captures["call.name"].Text,
 				line:        expr.StartLine + 1,
+				expr:        expr.Node,
 				returnUsage: classifyReturnUsage(expr.Node, src, jsTSReturnUsageSpec),
 			})
 
@@ -302,6 +302,7 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 				}
 			}
 		}
+		node.Meta = jsNamedExportMeta(v.defNode, v.name, localExports, node.Meta)
 		result.Nodes = append(result.Nodes, node)
 		result.Edges = append(result.Edges, &graph.Edge{
 			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: v.line,
@@ -335,6 +336,11 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			From: callerID, To: "unresolved::" + c.name, Kind: graph.EdgeInstantiates,
 			FilePath: filePath, Line: c.line, Origin: graph.OriginASTResolved,
 		})
+	}
+	for _, c := range calls {
+		if !c.isMember {
+			scopes.noteCall(c.name)
+		}
 	}
 	for _, c := range calls {
 		callerID := findEnclosingFunc(funcRanges, c.line)
@@ -419,8 +425,10 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 			Kind: graph.EdgeCalls, FilePath: filePath, Line: c.line,
 		}
 		stampReturnUsage(edge, c.returnUsage)
+		scopes.stamp(edge, c.expr, c.name, src)
 		result.Edges = append(result.Edges, edge)
 	}
+	clearCollapsedJSShadows(result.Edges)
 
 	// --- Event pub/sub edges ---
 	var pubsubEvents []pubsubEvent
@@ -501,8 +509,8 @@ func (e *JavaScriptExtractor) Extract(filePath string, src []byte) (*parser.Extr
 
 // --- Per-match emit helpers -----------------------------------------
 
-func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
-	e.emitNamedFunction(m.Captures["func.name"], m.Captures["func.def"], filePath, fileID, src, result, seenIDs)
+func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
+	e.emitNamedFunction(m.Captures["func.name"], m.Captures["func.def"], filePath, fileID, src, result, seenIDs, localExports)
 }
 
 // emitFunctionExpression emits a *named* function expression — the
@@ -512,11 +520,11 @@ func (e *JavaScriptExtractor) emitFunction(m parser.QueryResult, filePath, fileI
 // named expression the same name/parameters/body shape as a
 // declaration, so it emits through the same path. Anonymous function
 // expressions carry no name field and never match the query pattern.
-func (e *JavaScriptExtractor) emitFunctionExpression(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
-	e.emitNamedFunction(m.Captures["fnexpr.name"], m.Captures["fnexpr.def"], filePath, fileID, src, result, seenIDs)
+func (e *JavaScriptExtractor) emitFunctionExpression(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
+	e.emitNamedFunction(m.Captures["fnexpr.name"], m.Captures["fnexpr.def"], filePath, fileID, src, result, seenIDs, localExports)
 }
 
-func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool) {
+func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNode, filePath, fileID string, src []byte, result *parser.ExtractionResult, seenIDs map[string]bool, localExports map[string]bool) {
 	if nameCap == nil || def == nil {
 		return
 	}
@@ -530,6 +538,7 @@ func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNod
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("function %s()", name)},
 	}
+	node.Meta = jsNamedExportMeta(def.Node, name, localExports, node.Meta)
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -541,7 +550,7 @@ func (e *JavaScriptExtractor) emitNamedFunction(nameCap, def *parser.CapturedNod
 	}
 }
 
-func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, arrowNames map[string]bool, seenIDs map[string]bool) {
+func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, arrowNames map[string]bool, seenIDs map[string]bool, localExports map[string]bool) {
 	name := m.Captures["arrow.name"].Text
 	def := m.Captures["arrow.def"]
 	arrowNames[name] = true
@@ -554,6 +563,7 @@ func (e *JavaScriptExtractor) emitArrow(m parser.QueryResult, filePath, fileID s
 		FilePath: filePath, StartLine: def.StartLine + 1, EndLine: def.EndLine + 1,
 		Language: "javascript", Meta: map[string]any{"signature": fmt.Sprintf("const %s = () =>", name)},
 	}
+	node.Meta = jsNamedExportMeta(def.Node, name, localExports, node.Meta)
 	result.Nodes = append(result.Nodes, node)
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: def.StartLine + 1,
@@ -872,16 +882,20 @@ func (e *JavaScriptExtractor) emitReExport(m parser.QueryResult, filePath, fileI
 	emitJSReExport(def.Node, importPath, fileID, filePath, "javascript", src, result)
 }
 
-func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, result *parser.ExtractionResult) {
-	if m.Captures["req.name"].Text != "require" {
-		return
+func (e *JavaScriptExtractor) emitRequire(m parser.QueryResult, filePath, fileID string, src []byte, scopes *jsScopeCache, result *parser.ExtractionResult) string {
+	def := m.Captures["req.def"]
+	if def == nil || def.Node == nil {
+		return ""
 	}
-	reqPath := m.Captures["req.path"].Text
-	line := m.Captures["req.def"].StartLine + 1
+	reqPath := scopes.staticRequireSpec(def.Node, src)
+	if reqPath == "" {
+		return ""
+	}
 	result.Edges = append(result.Edges, &graph.Edge{
 		From: fileID, To: "unresolved::import::" + reqPath,
-		Kind: graph.EdgeImports, FilePath: filePath, Line: line,
+		Kind: graph.EdgeImports, FilePath: filePath, Line: def.StartLine + 1,
 	})
+	return reqPath
 }
 
 // --- Helpers --------------------------------------------------------
