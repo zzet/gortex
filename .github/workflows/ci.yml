@@ -8,16 +8,16 @@ on:
   # Run on the merged commit to verify the extended parser regression gate (#991).
   workflow_dispatch:
 
-# One run per PR: a new push cancels the PR's older run. Every other event
-# (pushes to main, schedules) gets its own group from the run ID, so none of
-# those runs is ever cancelled or replaced while pending.
+# One group per PR and one per branch. A new push cancels the PR's older run.
+# On main a running run always finishes; GitHub keeps one pending run per
+# group, so a newer push replaces only the older run that has not started yet.
 #
 # Label events start a run because ci:macos and ci:full change the plan. Any
 # other label gets its own group, so it cannot cancel or replace the PR's
 # run, and every job below skips it (see the label gate on each job).
 concurrency:
-  group: ${{ github.workflow }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:macos' && github.event.label.name != 'ci:full' && format('label-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:macos' && github.event.label.name != 'ci:full' && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Match the release builds, including dependency grammars and C++ scanners (#821).
 env:

@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -388,6 +389,86 @@ func TestOwedEditCycleWindowOnACoarseClock(t *testing.T) {
 			t.Errorf("%s: refusal %q, want %q; phases %+v", tc.name, why, tc.want, snapshot.Phases)
 		}
 	}
+}
+
+// An edit whose ticket is admitted after a cycle has fixed what it owes rides
+// that cycle's publication. The cycle did not run for it, so the edit's receipt
+// names no P of that cycle, even though the edit was received before the cycle
+// started, as a watcher's coalesced receipt does not borrow its winner's P. Its
+// B is still the frozen refusal.
+func TestCheckoutEditRidingACycleBorrowsNoPatchWindow(t *testing.T) {
+	f, c, l := newCheckoutMutationFixture(t)
+	ctx := t.Context()
+	origin := time.Now()
+	record := DefaultPublicationPhases().Begin(f.checkoutID, fmt.Sprintf("riding-edit-%d", origin.UnixNano()), PublicationSourceMCPEdit, origin)
+	m, err := l.BeginCheckoutMutation(ctx, f.checkoutID, f.worktree, f.route().RouteEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	builderWriteFile(t, f.worktree, "helper.go", chainHelperEdit)
+
+	// While the edit holds its lease, a cycle starts for a require_fresh
+	// ticket and fixes what it owes before the edit's ticket exists.
+	owed, err := l.RequestBoundCheckoutRefresh(ctx, f.checkoutID, f.worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	c.cyclePreflight = func(context.Context) (CheckoutCycle, bool) {
+		close(entered)
+		<-release
+		return CheckoutCycle{}, false
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		c.cycle(ctx)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cycle never started")
+	}
+	edit, err := m.EnqueueRefresh(WithPublicationRecord(ctx, record), filepath.Join(f.worktree, "helper.go"))
+	m.Close()
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cycle never finished")
+	}
+	c.cyclePreflight = nil
+
+	for name, ticket := range map[string]*CheckoutRefreshTicket{"owed": owed, "riding edit": edit} {
+		select {
+		case result := <-ticket.Ticket.Done:
+			if result.Err != nil || !result.Reindexed {
+				t.Fatalf("%s ticket = %+v", name, result)
+			}
+		default:
+			t.Fatalf("the %s ticket was not served by the cycle in flight", name)
+		}
+	}
+	if edit.Ticket.Generation <= owed.Ticket.Generation {
+		t.Fatalf("the edit's ticket %d must follow the cycle's owed ticket %d", edit.Ticket.Generation, owed.Ticket.Generation)
+	}
+	snapshot := record.Snapshot()
+	// The cycle started after the edit was received, so only the rider rule,
+	// not the record's origin, keeps the cycle's window off the receipt.
+	if _, found := phaseOffsets(snapshot)[PublicationCycleStarted]; !found {
+		t.Fatalf("the riding edit's record lacks the cycle that published it: %+v", snapshot.Phases)
+	}
+	if window := snapshot.EditTimings().Window; window.PatchWallMS != nil || window.PatchAccounting != nil {
+		t.Fatalf("a riding edit borrowed its cycle's P: %+v", window)
+	}
+	requireCheckoutBackgroundRefusal(t, "riding edit", record, edit.Ticket.Generation, "no_accepted_witness")
 }
 
 func TestCheckoutMutationRefreshReportsTheLaneHolderItWaitedFor(t *testing.T) {

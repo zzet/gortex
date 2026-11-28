@@ -14,6 +14,10 @@ import (
 type workflowEventContract struct {
 	On          map[string]yaml.Node `yaml:"on"`
 	Permissions map[string]string    `yaml:"permissions"`
+	Concurrency struct {
+		Group  string `yaml:"group"`
+		Cancel string `yaml:"cancel-in-progress"`
+	} `yaml:"concurrency"`
 }
 
 func readWorkflowEvents(t *testing.T, name string) workflowEventContract {
@@ -47,6 +51,26 @@ func TestCodeChecksRunForEveryPullRequestBase(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Pushes to one branch share a group, so a newer push replaces the older
+// pending run instead of queueing another full matrix. Only pull request runs
+// are cancelled while running; a running main run always finishes.
+func TestMainPushRunsShareOneGroupAndFinishOnceStarted(t *testing.T) {
+	// ci.yml puts the unrelated-label group in front of the same
+	// pull-request-or-branch fallback (see TestUnrelatedLabelsDoNoCIWork...).
+	for name, want := range map[string]string{
+		"ci.yml":       "${{ github.workflow }}-${{ " + ciUnrelatedLabel + " && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}",
+		"security.yml": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+	} {
+		workflow := readWorkflowEvents(t, name)
+		if got := workflow.Concurrency.Group; got != want {
+			t.Errorf("%s concurrency group = %q, want %q", name, got, want)
+		}
+		if got, want := workflow.Concurrency.Cancel, "${{ github.event_name == 'pull_request' }}"; got != want {
+			t.Errorf("%s cancel-in-progress = %q, want %q", name, got, want)
+		}
 	}
 }
 
@@ -134,7 +158,7 @@ func TestUnrelatedLabelsDoNoCIWorkAndCannotCancelOrMaskTheRun(t *testing.T) {
 	}
 	// An unrelated label runs in a group of its own: it neither cancels the
 	// PR's running CI nor replaces its pending run.
-	wantGroup := "${{ github.workflow }}-${{ " + ciUnrelatedLabel + " && format('label-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
+	wantGroup := "${{ github.workflow }}-${{ " + ciUnrelatedLabel + " && format('label-{0}', github.run_id) || github.event.pull_request.number || github.ref }}"
 	if workflow.Concurrency.Group != wantGroup {
 		t.Errorf("concurrency group = %q, want %q", workflow.Concurrency.Group, wantGroup)
 	}

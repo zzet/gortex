@@ -1,0 +1,77 @@
+{
+  "ack_at": "2026-11-27T06:27:51.781564Z",
+  "ack_mode": "full",
+  "bytes_written": 42,
+  "commit_seq": 1,
+  "content_sha256": "5bd319ded3dfb74736868c4c6633e9f4764ad4a2ab4d20c2c5c376a47c26946e",
+  "disk_status": "committed",
+  "file_view": {
+    "counts": {
+      "added": 1,
+      "after": 1,
+      "before": 1,
+      "changed": 0,
+      "removed": 1,
+      "total_changes": 2
+    },
+    "delta_state": "available",
+    "state": "projected",
+    "symbols": [
+      {
+        "change": "added",
+        "end_line": 3,
+        "id": "repo/edit.go::LinkedAccounting0",
+        "kind": "function",
+        "signature": "func LinkedAccounting0()",
+        "start_line": 3
+      },
+      {
+        "change": "removed",
+        "end_line": 3,
+        "id": "repo/edit.go::New",
+        "kind": "function",
+        "signature": "func New()",
+        "start_line": 3
+      }
+    ],
+    "syntax_health": {
+      "checked": true,
+      "errors": 0,
+      "language": "go",
+      "state": "checked"
+    },
+    "truncated": false
+  },
+  "freshness": {
+    "actual_view": "worktree:01a21bb0-582b-79f7-8842-7947658e7bfd",
+    "checkout_id": "01a21bb0-582b-79f7-8842-7947658e7bfd",
+    "checkout_incarnation": "01a21bb0-582b-7a0c-847c-a5202d1ce285",
+    "commit_generation_id": 1,
+    "dirty_generation_id": 2,
+    "exact": true,
+    "graph_id": "graph-071ca2227754705837aa3ef9748ed59e",
+    "requested_view": "worktree:01a21bb0-582b-79f7-8842-7947658e7bfd",
+    "route_epoch": 2,
+    "source_fingerprint": "e09f03b87d765a9af3bcf4a7c1c5258f337a14f8067b5b3a980ec9e0ae204701",
+    "view_fingerprint": "1c410e5b156a1be6f2115ff0f02b5ea9b5c38f2891f7aaaaaeadb0a86a086632"
+  },
+  "graph_status": "pending",
+  "graph_status_hint": "file current; recorded graph status: pending",
+  "mutation_id": "load-edit-0000000000000001-001",
+  "mutation_receipt": "commit-1795760870887889001",
+  "new_sha": "75e82930e2c01273f0d23a764a5a222f4e3a886c",
+  "path": "repo/edit.go",
+  "readback_exact": true,
+  "reindex_generation": 1,
+  "reindex_pending": true,
+  "reindex_receipt": "mutation-1795760870887659001",
+  "reindexed": false,
+  "replacements": 1,
+  "status": "applied",
+  "tier_state": {
+    "derived": "pending",
+    "file": "fresh",
+    "file_graph": "pending",
+    "relations": "pending"
+  }
+}

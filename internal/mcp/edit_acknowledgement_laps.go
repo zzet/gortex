@@ -71,6 +71,15 @@ func beginEditAcknowledgementLap(a *editAcknowledgement, kind editAcknowledgemen
 	return a.beginLapAt(kind, time.Now())
 }
 
+// recordUnwaitedReindex counts an acknowledgement's publication wait as not
+// applicable, with no duration: the committed call returned without waiting
+// on its publication (a local ACK, or a queued checkout admission).
+func (s *Server) recordUnwaitedReindex(ctx context.Context) {
+	lap := s.beginAcknowledgementLap(ctx, editAckReindexWait)
+	lap.applicable = false
+	lap.finish()
+}
+
 // Keep the real old/new parse-gate work inside one interval. Callers retain
 // their existing enable/refusal/override policy; unsupported languages remain
 // the gate's existing Checked=false verdict, not a new parse implementation.
