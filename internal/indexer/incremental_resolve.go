@@ -436,6 +436,12 @@ func edgeReceiverType(e *graph.Edge) string {
 	if rb, ok := e.Meta["receiver_builtin"].(string); ok {
 		return rb
 	}
+	// A Python call on an object is kept off module-level functions, so its
+	// key must not share the binding a module-qualified call of the same name
+	// from the same caller resolved to.
+	if v, _ := e.Meta["py_object_receiver"].(bool); v {
+		return "py:object"
+	}
 	return ""
 }
 

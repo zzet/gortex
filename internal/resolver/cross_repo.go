@@ -1763,6 +1763,12 @@ func (cr *CrossRepoResolver) resolveMethodCall(e *graph.Edge, methodName string,
 		}
 		return
 	}
+	// A Python attribute call on an object never lands on a free function
+	// (see pythonObjectReceiverCall); only a module-qualified call may.
+	if pythonObjectReceiverCall(e) {
+		stats.Unresolved++
+		return
+	}
 	for _, c := range candidates {
 		if c.Kind == graph.KindFunction && c.RepoPrefix == callerRepo {
 			e.To = c.ID

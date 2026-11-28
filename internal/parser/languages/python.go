@@ -168,6 +168,10 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 	seen := make(map[string]bool)
 	annotationSeen := make(map[string]bool)
 	imports := map[string]string{} // alias → module path
+	// relBound holds the names a relative import binds (`from . import a`,
+	// `from .pkg import b as c`). A call through one (`a.f()`) is
+	// module-qualified; any other unbound attribute call is on an object.
+	relBound := map[string]bool{}
 	// Name→type bindings are collected flat here and bucketed into
 	// per-function scopes once the function ranges exist — the query walk
 	// runs in document order, before any function node is available to
@@ -194,7 +198,7 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 			e.emitImportFrom(m, filePath, fileID, src, result, imports)
 
 		case m.Captures["importfrom_rel.def"] != nil:
-			e.emitImportFromRelative(m, filePath, fileID, src, result, imports)
+			e.emitImportFromRelative(m, filePath, fileID, src, result, relBound)
 
 		case m.Captures["callattr.expr"] != nil:
 			expr := m.Captures["callattr.expr"]
@@ -387,6 +391,18 @@ func (e *PythonExtractor) Extract(filePath string, src []byte) (*parser.Extracti
 					stampFactoryChainReceiver(edge, c.receiver,
 						resolveChainType(c.receiver, scoped.flatten(ownerFunc), result))
 				}
+			}
+			// Absolute module calls took the extern path above, and a
+			// receiver bound by a relative import names a module
+			// (`from . import util; util.f()`). Any other receiver is an
+			// object, whose attribute is never a free function of some
+			// module; mark it so the resolver's name-only fallbacks keep
+			// `d.get()` off a module-level `get`.
+			if head, _, _ := strings.Cut(c.receiver, "."); !relBound[head] {
+				if edge.Meta == nil {
+					edge.Meta = map[string]any{}
+				}
+				edge.Meta["py_object_receiver"] = true
 			}
 			stampReturnUsage(edge, c.returnUsage)
 			result.Edges = append(result.Edges, edge)
@@ -991,11 +1007,11 @@ func (e *PythonExtractor) emitImportFrom(m parser.QueryResult, filePath, fileID 
 //
 // The handler maps the relative reference to a project-rooted file-path
 // stem so the resolver post-pass `resolveRelativeImports` can land the
-// edge on the actual `KindFile` node. Imported names are bound in the
-// per-file alias map with a `pyrel::<stem>` marker; the call-resolution
-// loop in Extract recognises that shape and emits dataflow edges that
-// the post-pass also rewrites onto internal file symbols.
-func (e *PythonExtractor) emitImportFromRelative(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, _ map[string]string) {
+// edge on the actual `KindFile` node. The names the statement binds are
+// recorded in relBound, so the call-resolution loop in Extract can tell an
+// attribute call through one (`util.f()`) from a call on an object, which it
+// marks `py_object_receiver` for the resolver.
+func (e *PythonExtractor) emitImportFromRelative(m parser.QueryResult, filePath, fileID string, src []byte, result *parser.ExtractionResult, relBound map[string]bool) {
 	relCap := m.Captures["importfrom.rel"]
 	if relCap.Node == nil {
 		return
@@ -1084,6 +1100,9 @@ func (e *PythonExtractor) emitImportFromRelative(m parser.QueryResult, filePath,
 				continue
 			}
 			name := child.Content(src)
+			if name != "" {
+				relBound[name] = true
+			}
 			emitSubmodule(name, "")
 		case "aliased_import":
 			var importedName, alias string
@@ -1095,6 +1114,11 @@ func (e *PythonExtractor) emitImportFromRelative(m parser.QueryResult, filePath,
 				case "identifier":
 					alias = cc.Content(src)
 				}
+			}
+			if alias != "" {
+				relBound[alias] = true
+			} else if importedName != "" {
+				relBound[importedName] = true
 			}
 			emitSubmodule(importedName, alias)
 		}

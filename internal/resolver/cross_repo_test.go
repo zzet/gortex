@@ -527,3 +527,36 @@ func TestCrossRepoResolveFilesAndIncoming_BatchesBothDirectionsWithOneIndexBuild
 	require.Equal(t, 1, g.dependencyIndexBuilds)
 	require.Equal(t, 1, g.reachabilityIndexBuilds)
 }
+
+// The cross-repo name-only fallback never lands a Python attribute call on an
+// object (`d.get()`, marked py_object_receiver by the extractor) on a free
+// function; unmarked calls — a module-qualified Python call, Go's
+// `pkg.Func()` — keep binding as before.
+func TestCrossRepoResolveAll_PythonObjectMethodCallSkipsFunctions(t *testing.T) {
+	cases := []struct {
+		name, ext, lang string
+		meta            map[string]any
+		bind            bool
+	}{
+		{"python object receiver", ".py", "python", map[string]any{"py_object_receiver": true}, false},
+		{"python module receiver", ".py", "python", nil, true},
+		{"go package call", ".go", "go", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.New()
+			caller, target := "repoA/pkg/b"+tc.ext, "repoA/pkg/a"+tc.ext+"::get"
+			g.AddNode(&graph.Node{ID: caller + "::use", Kind: graph.KindFunction, Name: "use", FilePath: caller, Language: tc.lang, RepoPrefix: "repoA"})
+			g.AddNode(&graph.Node{ID: target, Kind: graph.KindFunction, Name: "get", FilePath: "repoA/pkg/a" + tc.ext, Language: tc.lang, RepoPrefix: "repoA"})
+			edge := &graph.Edge{From: caller + "::use", To: "unresolved::*.get", Kind: graph.EdgeCalls, FilePath: caller, Line: 2, Meta: tc.meta}
+			g.AddEdge(edge)
+
+			NewCrossRepo(g).ResolveAll()
+			want := "unresolved::*.get"
+			if tc.bind {
+				want = target
+			}
+			assert.Equal(t, want, edge.To)
+		})
+	}
+}
