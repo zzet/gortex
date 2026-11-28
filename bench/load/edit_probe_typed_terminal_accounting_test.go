@@ -33,6 +33,11 @@ func finishLinkedReadbackRun(t *testing.T, got linkedReadbackResult) (editProbeR
 		}
 	}
 	// The cell dispatched one planned edit; the run's report covers it alone.
+	// Every planned state owns an open spool file, so the full set is put back
+	// before the run's cleanup closes them (an open file cannot be removed on
+	// Windows).
+	allStates, allSteps := run.states, run.plan.Steps
+	t.Cleanup(func() { run.states, run.plan.Steps = allStates, allSteps })
 	run.states, run.plan.Steps = []*editProbeState{kept}, []editProbeStep{kept.step}
 	finished := run.finish()
 	report := Report{Phases: []Phase{*run.phase}}
