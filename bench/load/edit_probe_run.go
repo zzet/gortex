@@ -1805,7 +1805,7 @@ func (r *editProbeRuntime) rereadPendingReadback(callCtx context.Context, s *edi
 		default:
 			back.Reread = true
 			s.record.Readbacks = append(s.record.Readbacks, back)
-			s.record.Errors = append(s.record.Errors, kind+" readback left the pending contract: "+editProbeRiderDeparture(back.Disposition))
+			s.record.Errors = append(s.record.Errors, kind+" readback left the pending contract: "+editProbeRiderDeparture(back))
 			s.mu.Unlock()
 			return false, identity.Finished
 		}

@@ -73,14 +73,24 @@ func editProbeReadbackIsPending(back editProbeReadback, checkoutID string, pendi
 		editProbeRiderPending(back.Disposition, checkoutID) && !back.Correct
 }
 
-// Why a re-read ended the pending contract without an exact answer.
-func editProbeRiderDeparture(d *editProbeReadbackDisposition) string {
-	if d == nil || d.RequestedView == "" && d.ActualView == "" && d.Exact == nil && d.FallbackReason == "" {
-		return "no freshness rider"
+// Why a re-read ended the pending contract without an exact answer: the
+// rider's fields, then the reply's disposition kind and transport or decode
+// error, so a failed re-read is not reported as a missing rider alone.
+func editProbeRiderDeparture(back editProbeReadback) string {
+	d := back.Disposition
+	out := "no freshness rider"
+	if d != nil && (d.RequestedView != "" || d.ActualView != "" || d.Exact != nil || d.FallbackReason != "") {
+		exact := "absent"
+		if d.Exact != nil {
+			exact = strconv.FormatBool(*d.Exact)
+		}
+		out = "requested_view " + d.RequestedView + ", actual_view " + d.ActualView + ", exact " + exact + ", fallback_reason " + d.FallbackReason
 	}
-	exact := "absent"
-	if d.Exact != nil {
-		exact = strconv.FormatBool(*d.Exact)
+	if d != nil && d.Kind != "" {
+		out += "; disposition " + d.Kind
 	}
-	return "requested_view " + d.RequestedView + ", actual_view " + d.ActualView + ", exact " + exact + ", fallback_reason " + d.FallbackReason
+	if back.Error != "" {
+		out += ": " + back.Error
+	}
+	return out
 }
