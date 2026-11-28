@@ -900,29 +900,6 @@ func requireClosureFiles(env jsRequireEnv, targetFile, lookupName string) (map[s
 	return files, npmSpecByFile
 }
 
-// pickDirectNamedExportCandidate selects a unique directly named export on
-// targetFile. Unexported declarations and re-export forwarders/CJS re-export
-// bindings on targetFile are skipped so private helpers and 2-step barrels
-// cannot shadow canonical targets.
-func pickDirectNamedExportCandidate(targetFile, funcName string, candidates []*graph.Node) (*graph.Node, bool) {
-	if targetFile == "" {
-		return nil, false
-	}
-	var pick *graph.Node
-	for _, c := range candidates {
-		if c.FilePath != targetFile || c.Meta["js_named_export"] != true ||
-			graph.IsReExportNode(c) || c.Meta["js_cjs_reexport_binding"] == true ||
-			!isImportableCallee(c, funcName) {
-			continue
-		}
-		if pick != nil && pick.ID != c.ID {
-			return nil, true
-		}
-		pick = c
-	}
-	return pick, false
-}
-
 // pickRequireClosureCandidate prefers a unique directly named export across
 // the required barrel closure, falling back to any unique importable symbol
 // (preferring canonical symbols over 2-step CJS re-export bindings) only when
@@ -1086,10 +1063,6 @@ func (cr *CrossRepoResolver) cachedOutEdges(file string) []*graph.Edge {
 	return edges
 }
 
-func (cr *CrossRepoResolver) resolveJSRequireTarget(e *graph.Edge, callerFile, callerRepo, callerWS, spec string) jsRequireTarget {
-	return cr.resolveJSRequireTargetWith(e, callerFile, callerRepo, callerWS, spec, cr.requireGetNode)
-}
-
 func (cr *CrossRepoResolver) resolveJSRequireTargetWith(e *graph.Edge, callerFile, callerRepo, callerWS, spec string, getNode func(string) *graph.Node) jsRequireTarget {
 	return cr.resolveJSRequireTargetMemo(e, callerFile, callerRepo, callerWS, spec, nil, getNode)
 }
@@ -1153,10 +1126,6 @@ func (cr *CrossRepoResolver) resolveJSRequireTargetUncached(e *graph.Edge, calle
 		return jsRequireTarget{}
 	}
 	return cr.resolveJSBareOrTrackedNpmTargetMemo(e, callerFile, callerRepo, callerWS, spec, memo, getNode)
-}
-
-func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTarget(e *graph.Edge, callerFile, callerRepo, callerWS, mod string, getNode func(string) *graph.Node) jsRequireTarget {
-	return cr.resolveJSBareOrTrackedNpmTargetMemo(e, callerFile, callerRepo, callerWS, mod, nil, getNode)
 }
 
 func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTargetMemo(e *graph.Edge, callerFile, callerRepo, callerWS, mod string, memo *npmImportMemo, getNode func(string) *graph.Node) jsRequireTarget {
@@ -1245,19 +1214,6 @@ func (cr *CrossRepoResolver) resolveJSBareOrTrackedNpmTargetUncached(e *graph.Ed
 	return jsRequireTarget{}
 }
 
-func (cr *CrossRepoResolver) nodeFilePath(id string) string {
-	return nodeFilePathWith(cr.requireGetNode, id)
-}
-
-func (cr *CrossRepoResolver) importedTargetOf(e *graph.Edge) string {
-	to, _ := cr.importedTargetOfWith(e, cr.requireGetNode)
-	return to
-}
-
-func (cr *CrossRepoResolver) importedTargetOfWith(e *graph.Edge, getNode func(string) *graph.Node) (string, string) {
-	return cr.importedTargetOfMemo(e, nil, getNode)
-}
-
 func (cr *CrossRepoResolver) importedTargetOfMemo(e *graph.Edge, memo *npmImportMemo, getNode func(string) *graph.Node) (string, string) {
 	to := e.To
 	if to == "" {
@@ -1325,14 +1281,6 @@ func (cr *CrossRepoResolver) importedTargetOfMemo(e *graph.Edge, memo *npmImport
 		}
 	}
 	return to, ""
-}
-
-func (cr *CrossRepoResolver) importClosureFiles(target string) map[string]struct{} {
-	return cr.importClosureFilesMemo(target, nil, cr.requireGetNode)
-}
-
-func (cr *CrossRepoResolver) importClosureFilesWith(target string, getNode func(string) *graph.Node) map[string]struct{} {
-	return cr.importClosureFilesMemo(target, nil, getNode)
 }
 
 func (cr *CrossRepoResolver) importClosureFilesMemo(target string, memo *npmImportMemo, getNode func(string) *graph.Node) map[string]struct{} {

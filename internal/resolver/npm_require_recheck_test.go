@@ -100,7 +100,7 @@ func (s *failingCheckedRecheckStore) GetEdgeCandidatesErr(ctx context.Context, e
 	if checked, ok := s.Store.(graph.CheckedEdgeCandidateLookup); ok {
 		return checked.GetEdgeCandidatesErr(ctx, endpoints, sites)
 	}
-	return s.Store.GetEdgeCandidates(endpoints, sites), nil
+	return s.GetEdgeCandidates(endpoints, sites), nil
 }
 
 func TestNpmRequireRecheckSkipsPlainESCrossRepoCalls(t *testing.T) {
