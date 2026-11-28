@@ -271,6 +271,8 @@ func contractCoreUnprobedCapabilities() []contractCoreCapName {
 		{"BulkLoader", capOf[graph.BulkLoader]},
 		{"CallableBindingNodeSequencer", capOf[graph.CallableBindingNodeSequencer]},
 		{"CheckedAllGenerationsRepoEvicter", capOf[graph.CheckedAllGenerationsRepoEvicter]},
+		{"CheckedEdgeCandidateLookup", capOf[graph.CheckedEdgeCandidateLookup]},
+		{"CheckedLightEdgeSequencer", capOf[graph.CheckedLightEdgeSequencer]},
 		{"ChurnEnrichmentWriter", capOf[graph.ChurnEnrichmentWriter]},
 		{"CloneCorpusInitialization", capOf[graph.CloneCorpusInitialization]},
 		{"CloneCorpusPager", capOf[graph.CloneCorpusPager]},

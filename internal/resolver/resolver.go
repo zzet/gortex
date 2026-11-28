@@ -499,6 +499,7 @@ type Resolver struct {
 	// for callers and loaded on demand for barrels outside that frontier.
 	importsByCaller map[string]*callerImportEvidence
 	importOutByFile map[string][]*graph.Edge
+	requireNodeByID map[string]*graph.Node
 	importFilesMu   sync.RWMutex
 
 	// csharpNSByFile memoises each C# file's visible namespaces (usings
@@ -2637,6 +2638,7 @@ func (r *Resolver) buildPassIndexes() (clear func()) {
 
 func (r *Resolver) clearPassIndexes() {
 	r.clearGoPackageOwnership()
+	r.clearImportEvidence()
 	r.scratchGeneration++
 	r.clearDirIndexes()
 	r.clearDepModuleIndex()
@@ -4384,7 +4386,9 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// import 'zustand', mapped by tsconfig paths onto ./src) must land on
 	// the in-repo source, not on its own installed dist inside
 	// node_modules.
-	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+	callerFile := jsTSImportCallerFile(e)
+	origImportPath := importPath
+	if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, importPath); to != "" && goOwnership.retainTarget(r, to) {
 		e.To = to
 		if callerRepo != "" {
 			if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -4401,12 +4405,12 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// locally-vendored `@acme/shared-lib` resolves to its real node
 	// instead of falling through to an external stub. A no-op for
 	// non-aliased specifiers and non-JS/TS callers.
-	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, e.FilePath, importPath)
+	importPath, npmAliased := rewriteNpmAliasImport(r.npmAlias, callerFile, importPath)
 	goOwnership.query.ImportPath = importPath
 	if npmAliased {
 		// The rewritten specifier may itself be tsconfig-paths/relative
 		// resolvable (an alias onto a workspace member).
-		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, jsTSImportCallerFile(e), importPath); to != "" && goOwnership.retainTarget(r, to) {
+		if to := resolveJSTSImportTarget(r.cachedGetNode, r.pathAlias, callerFile, importPath); to != "" && goOwnership.retainTarget(r, to) {
 			e.To = to
 			if callerRepo != "" {
 				if n := r.cachedGetNode(to); n != nil && n.RepoPrefix != "" && n.RepoPrefix != callerRepo {
@@ -4469,14 +4473,18 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	// only an `index.*` candidate is evidence — without this the cascade
 	// binds `import … from 'graphql'` to an arbitrary file under any
 	// same-named local directory (issue #450). See isJSTSDirEntryPoint.
-	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
+	bareJSTS := isJSTSBareSpecifier(callerFile, importPath)
 	// Stronger evidence when the manifest is readable: a bare specifier the
 	// importer declares as a registry / git / tarball dependency comes from
 	// node_modules by definition, so NO in-repo directory is a candidate —
 	// not even one holding an entry point. This is what closes the residual
 	// case the entry-point rule alone cannot: a repo that both depends on
 	// npm `graphql` and contains `src/feature/graphql/index.ts`.
-	externalNpmDep := bareJSTS && declaresExternalNpmDep(r.npmDep, jsTSImportCallerFile(e), importPath)
+	externalNpmDep := bareJSTS && (declaresExternalNpmDep(r.npmDep, callerFile, origImportPath) || declaresExternalNpmDep(r.npmDep, callerFile, importPath))
+	bareMod, bareSym := importPath, ""
+	if bareJSTS {
+		bareMod, bareSym = splitImportSpecSymbol(importPath)
+	}
 	source := r.nodeByID[e.From]
 	if source == nil && r.nodeByID == nil {
 		source = r.graph.GetNode(e.From)
@@ -4515,7 +4523,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 			// The directory index carries each file's language, so a folder
 			// match costs no store read.
 			if callerLanguage != "" && dir != "" && file.Language == callerLanguage &&
-				(dir == importPath || strings.HasSuffix(importPath, "/"+dir)) {
+				(dir == bareMod || strings.HasSuffix(bareMod, "/"+dir)) {
 				quality = folderMatch
 			}
 			if ownership == GoPackageOwnershipExact {
@@ -4542,7 +4550,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		// the last path component only, so without this gate an import
 		// of `.../tree-sitter-c/bindings/go` would resolve to whichever
 		// `*/bindings/go` directory sorts first.
-		if !crossRepoFound && dirMatchesImport(filePathDir(file.FilePath), importPath) {
+		if !crossRepoFound && dirMatchesImport(filePathDir(file.FilePath), bareMod) {
 			crossRepoFile, crossRepoFound = file, true
 		}
 	}
@@ -4554,14 +4562,14 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	if externalNpmDep {
 		// Declared node_modules package — skip the cascade outright.
 	} else if r.dirIndex != nil {
-		for _, file := range r.dirIndex[importPath] {
+		for _, file := range r.dirIndex[bareMod] {
 			consider(file)
 			if stop() {
 				break
 			}
 		}
 		if !stop() {
-			for _, file := range r.lastDirIndex[lastPathComponent(importPath)] {
+			for _, file := range r.lastDirIndex[lastPathComponent(bareMod)] {
 				consider(file)
 				if stop() {
 					break
@@ -4571,7 +4579,7 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	} else {
 		for file := range graph.FileNodeIdentitiesSeq(r.graph, nil) {
 			dir := filePathDir(file.FilePath)
-			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
+			if strings.HasSuffix(dir, lastPathComponent(bareMod)) || dir == bareMod {
 				consider(file)
 				if stop() {
 					break
@@ -4584,15 +4592,27 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 		// Name-collision tie-break: when several same-repo files match
 		// a bare import name, prefer the one in the importing file's
 		// own package-manager workspace.
-		if workspaceFile, ok := r.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ok {
+		if workspaceFile, ok := r.preferSameWorkspaceFile(callerFile, sameRepoAll); ok {
 			sameRepo = workspaceFile
 		}
-		e.To = sameRepo.ID
+		to := sameRepo.ID
+		if bareJSTS && bareSym != "" {
+			if symID := to + "::" + bareSym; r.cachedGetNode(symID) != nil {
+				to = symID
+			}
+		}
+		e.To = to
 		stats.Resolved++
 		return
 	}
 	if crossRepoFound {
-		e.To = crossRepoFile.ID
+		to := crossRepoFile.ID
+		if bareJSTS && bareSym != "" {
+			if symID := to + "::" + bareSym; r.cachedGetNode(symID) != nil {
+				to = symID
+			}
+		}
+		e.To = to
 		if callerRepo != "" && crossRepoFile.RepoPrefix != "" && crossRepoFile.RepoPrefix != callerRepo {
 			e.CrossRepo = true
 		}
@@ -4641,7 +4661,13 @@ func (r *Resolver) resolveImport(e *graph.Edge, importPath string, stats *Resolv
 	}
 
 	// External/unresolvable import — create a stub target ID.
-	e.To = "external::" + importPath
+	fallbackSpec := importPath
+	if npmAliased {
+		if _, origSym := splitImportSpecSymbol(origImportPath); origSym != "" {
+			fallbackSpec = origImportPath
+		}
+	}
+	e.To = "external::" + fallbackSpec
 	stats.External++
 }
 
@@ -4657,6 +4683,16 @@ func (r *Resolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *Re
 		return
 	}
 	callerRepo := r.callerRepoPrefix(e)
+	if e.Meta != nil {
+		switch e.Meta[graph.JSLexicalBindingMeta] {
+		case graph.JSPendingParameter:
+			stats.Unresolved++
+			return
+		case graph.JSLexicalRequire:
+			r.handleJSLexicalRequire(e, funcName, callerRepo, stats)
+			return
+		}
+	}
 	candidates := withoutReExportForwarders(r.cachedFindNodesByNameInRepoForEdge(funcName, callerRepo, e))
 	if r.handleJSLexicalBinding(e, funcName, candidates, stats) {
 		return

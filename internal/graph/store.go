@@ -79,6 +79,18 @@ type UnresolvedEdgeScan struct {
 	// same keep rule as the consumer's edgeInResolveScope, minus the shapes
 	// only Go can parse, which fail open.
 	ScopeFilter bool
+	// SourceOnly, when set with ScopeAnchors, keeps only rows whose source
+	// repo is in scope, so a consumer that only wants one repository's own
+	// unresolved edges does not hydrate the bare-target rows ScopeFilter
+	// keeps for every repository. NULL source repos still load (fail-open).
+	SourceOnly bool
+	// Kinds, when non-empty, keeps only rows of these edge kinds.
+	Kinds []EdgeKind
+	// MetaContains, when non-empty, restricts the scan to rows whose raw
+	// persisted meta bytes contain MetaContains as a substring (not promoted
+	// columns). Backends without raw-meta pushdown may ignore it; the caller's
+	// Go filter remains the semantic authority.
+	MetaContains string
 }
 
 // UnresolvedEdgePage is one bounded keyset page from an UnresolvedEdgeScan.
@@ -153,6 +165,14 @@ type AllGenerationsRepoEvicter interface {
 // instead of converting them to empty counts or a process panic.
 type CheckedAllGenerationsRepoEvicter interface {
 	EvictRepoAllGenerationsChecked(repoPrefix string) (nodesRemoved, edgesRemoved int, err error)
+}
+
+// CheckedEdgeCandidateLookup is the error-returning, context-aware sibling of
+// Store.GetEdgeCandidates. Callers that must distinguish an empty candidate
+// set from a teardown race, storage failure, or context cancellation use this
+// capability so a failed read is never mistaken for absence.
+type CheckedEdgeCandidateLookup interface {
+	GetEdgeCandidatesErr(ctx context.Context, endpoints []EdgeEndpoint, sites []EdgeSite) (EdgeCandidateSet, error)
 }
 
 type Store interface {

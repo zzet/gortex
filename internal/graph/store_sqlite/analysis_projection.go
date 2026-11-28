@@ -344,9 +344,143 @@ func (s *Store) NodeIDNamesByKindsSeq(repoPrefix string, kinds ...graph.NodeKind
 	}
 }
 
+// EdgesLightSeqErr is the context-aware, error-reporting sibling of
+// EdgesLightSeq. It checks store readiness before empty-kind short-circuits,
+// honors ctx cancellation in both snapshot and analysis-paged modes, and
+// surfaces query, scan, close, and cancellation errors through the returned
+// error function while leaving caller early-breaks error-free when ctx is live.
+func (s *Store) EdgesLightSeqErr(ctx context.Context, kinds ...graph.EdgeKind) (iter.Seq[*graph.Edge], func() error) {
+	if s.coreless() || s.db == nil {
+		return func(func(*graph.Edge) bool) {}, func() error { return sql.ErrConnDone }
+	}
+	if ctx == nil {
+		ctx = s.readContext()
+	}
+	if err := ctx.Err(); err != nil {
+		return func(func(*graph.Edge) bool) {}, func() error { return err }
+	}
+	_, kindsArgs := aggDedupeEdgeKinds(kinds)
+	if len(kindsArgs) == 0 {
+		return func(func(*graph.Edge) bool) {}, func() error { return nil }
+	}
+	var scanErr error
+	if s.analysisPaged {
+		seq := func(yield func(*graph.Edge) bool) {
+			if err := ctx.Err(); err != nil {
+				scanErr = err
+				return
+			}
+			indexed, err := s.analysisProjectionIndexPresent(ctx, edgesByGenerationIndexName)
+			if err != nil {
+				scanErr = err
+				return
+			}
+			var high int64
+			err = s.db.QueryRowContext(ctx, edgeGenerationHighWaterSQL(indexed), s.viewGen).Scan(&high)
+			if err != nil {
+				scanErr = err
+				return
+			}
+			var after int64
+			query := edgesLightPageSQL(indexed, len(kindsArgs))
+			for after < high {
+				if err := ctx.Err(); err != nil {
+					scanErr = err
+					return
+				}
+				args := make([]any, 0, 3+len(kindsArgs)+1)
+				args = append(args, s.viewGen, after, high)
+				args = append(args, kindsArgs...)
+				args = append(args, analysisProjectionPageSize)
+				page, scanned, last, err := s.edgesLightPage(ctx, query, args...)
+				if err != nil {
+					scanErr = err
+					return
+				}
+				for _, edge := range page {
+					if err := ctx.Err(); err != nil {
+						scanErr = err
+						return
+					}
+					if !yield(edge) {
+						if err := ctx.Err(); err != nil {
+							scanErr = err
+						}
+						return
+					}
+				}
+				if scanned < analysisProjectionPageSize {
+					break
+				}
+				after = last
+			}
+			if err := ctx.Err(); err != nil {
+				scanErr = err
+			}
+		}
+		return seq, func() error { return scanErr }
+	}
+	seq := func(yield func(*graph.Edge) bool) {
+		if err := ctx.Err(); err != nil {
+			scanErr = err
+			return
+		}
+		query := edgesLightSnapshotSQL(len(kindsArgs), s.viewGen)
+		queryArgs := make([]any, 0, len(kindsArgs)+1)
+		queryArgs = append(queryArgs, kindsArgs...)
+		queryArgs = append(queryArgs, s.viewGen)
+		rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+		if err != nil {
+			scanErr = err
+			return
+		}
+		stoppedEarly := false
+		for rows.Next() {
+			edge, err := s.scanEdgeLight(rows)
+			if err != nil {
+				_ = rows.Close()
+				scanErr = err
+				return
+			}
+			if err := ctx.Err(); err != nil {
+				_ = rows.Close()
+				scanErr = err
+				return
+			}
+			if edge != nil && !yield(edge) {
+				stoppedEarly = true
+				break
+			}
+		}
+		if stoppedEarly {
+			closeErr := rows.Close()
+			if err := ctx.Err(); err != nil {
+				scanErr = err
+			} else if closeErr != nil {
+				scanErr = closeErr
+			}
+			return
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			scanErr = err
+			return
+		}
+		if err := rows.Close(); err != nil {
+			scanErr = err
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			scanErr = err
+		}
+	}
+	return seq, func() error { return scanErr }
+}
+
 var (
 	_ graph.NodeLightSequencer          = (*Store)(nil)
 	_ graph.LightEdgeSequencer          = (*Store)(nil)
+	_ graph.CheckedLightEdgeSequencer   = (*Store)(nil)
 	_ graph.NodesByKindsSequencer       = (*Store)(nil)
 	_ graph.NodeIDNamesByKindsSequencer = (*Store)(nil)
 )

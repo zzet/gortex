@@ -126,6 +126,9 @@ type MultiIndexer struct {
 	goModuleRetry        resolver.GoModuleDepRetry
 	npmPackageMu         sync.Mutex
 	npmPackageCache      *npmPackageSnapshot
+	// npmRequireChecked is the package snapshot the last complete
+	// whole-graph require re-check ran against; see npmPackageLookups.
+	npmRequireChecked atomic.Pointer[npmPackageSnapshot]
 
 	// pendingRepositoryUntracks is guarded by mu. Entries are installed before
 	// a live repo is hidden and removed only after payload, vector, config, and
@@ -3085,7 +3088,7 @@ func (mi *MultiIndexer) trackPreparedRepoSourceCtx(
 		// The exists check above holds the stable lane, so this is the
 		// repository's first registration, never a rewrite of an entry.
 		mi.markRepoRegistered(prefix, absPath)
-		mi.runCrossRepoResolveFiles(mi.npmConsumerFilesForRepo(prefix))
+		mi.runCrossRepoResolveFiles(mi.npmConsumerFilesForRepoContext(ctx, prefix))
 
 		// Add to global config.
 		entry.Path = absPath
@@ -3428,7 +3431,7 @@ func (mi *MultiIndexer) ReconcileRepoCtx(ctx context.Context, entry config.RepoE
 			}
 		} else if result.FullRetrack {
 			if !batchMode.deferResolve {
-				mi.runCrossRepoResolveFiles(mi.npmConsumerFilesForRepo(prefix))
+				mi.runCrossRepoResolveFiles(mi.npmConsumerFilesForRepoContext(ctx, prefix))
 			}
 			if !batchMode.deferGlobalPasses {
 				if err := mi.postPublishGoModules(ctx, idx, false); err != nil {

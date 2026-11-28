@@ -54,6 +54,16 @@ func rewriteNpmAliasImport(fn NpmAliasResolver, callerFile, importPath string) (
 	if fn == nil || callerFile == "" || importPath == "" {
 		return importPath, false
 	}
+	if isJSTSPath(callerFile) {
+		spec, sym := splitImportSpecSymbol(importPath)
+		if real := fn(callerFile, spec); real != "" && real != spec {
+			if sym != "" {
+				return real + "::" + sym, true
+			}
+			return real, true
+		}
+		return importPath, false
+	}
 	if real := fn(callerFile, importPath); real != "" && real != importPath {
 		return real, true
 	}

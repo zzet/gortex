@@ -419,8 +419,8 @@ func reusableResolvedEdge(e *graph.Edge) bool {
 	if graph.IsUnresolvedTarget(e.To) || strings.HasPrefix(e.To, "external::") {
 		return false
 	}
-	// Lexical shadows depend on enclosing-scope declarations that reuseKey
-	// does not encode; always re-resolve them.
+	// Lexical shadows and local require() bindings depend on enclosing-scope
+	// declarations that reuseKey does not encode; always re-resolve them.
 	if e.Meta[graph.JSLexicalBindingMeta] != nil {
 		return false
 	}

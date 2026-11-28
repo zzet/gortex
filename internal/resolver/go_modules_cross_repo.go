@@ -15,11 +15,11 @@ func (cr *CrossRepoResolver) SetGoModules(modules map[string]string) {
 	cr.goModulePaths = indexGoModulePaths(modules)
 }
 
-func (cr *CrossRepoResolver) resolveGoExtern(e *graph.Edge, spec string, stats *CrossRepoStats) {
+func (cr *CrossRepoResolver) resolveGoExtern(e *graph.Edge, spec string, stats *CrossRepoStats) (demotedGoFile string) {
 	sep := strings.LastIndex(spec, "::")
 	if sep < 0 || !strings.HasSuffix(e.FilePath, ".go") {
 		stats.Unresolved++
-		return
+		return ""
 	}
 	match := cr.goModuleCandidate(spec[:sep], cr.cachedFindNodesByName(spec[sep+2:]), cr.callerRepoPrefix(e), cr.callerWorkspaceID(e))
 	if match == nil {
@@ -27,13 +27,18 @@ func (cr *CrossRepoResolver) resolveGoExtern(e *graph.Edge, spec string, stats *
 			e.To = graph.StubID(cr.callerRepoPrefix(e), graph.StubKindStdlib, spec[:sep], spec[sep+2:])
 		} else {
 			e.To = "dep::" + spec
-			cr.noteDemotedGoModuleCall(e)
+			if e.Meta != nil && e.Meta["go_import"] != nil && e.FilePath != "" {
+				demotedGoFile = e.FilePath
+			}
+		}
+		if e.Meta != nil {
+			e.Meta = maps.Clone(e.Meta)
 		}
 		graph.RestoreRestubProvenance(e)
 		delete(e.Meta, "go_import")
 		delete(e.Meta, "npm_import")
 		stats.Unresolved++
-		return
+		return demotedGoFile
 	}
 	bindGoModuleEdge(e, match, cr.callerRepoPrefix(e), cr.goModules[cr.callerRepoPrefix(e)], cr.goModuleReplacements)
 	stats.Resolved++
@@ -41,6 +46,7 @@ func (cr *CrossRepoResolver) resolveGoExtern(e *graph.Edge, spec string, stats *
 		stats.CrossRepoEdges++
 		stats.ByRepo[match.RepoPrefix]++
 	}
+	return ""
 }
 
 // GoModuleDepRetry remembers the last completed legacy-terminal sweep for a
@@ -650,12 +656,19 @@ func (cr *CrossRepoResolver) noteDemotedGoModuleCall(e *graph.Edge) {
 	if !strings.HasPrefix(e.To, "dep::") || e.Meta["go_import"] == nil || e.FilePath == "" {
 		return
 	}
+	cr.noteDemotedGoModuleFile(e.FilePath)
+}
+
+func (cr *CrossRepoResolver) noteDemotedGoModuleFile(file string) {
+	if file == "" {
+		return
+	}
 	cr.goModuleDemotedMu.Lock()
 	defer cr.goModuleDemotedMu.Unlock()
 	if cr.goModuleDemotedFiles == nil {
 		cr.goModuleDemotedFiles = make(map[string]struct{})
 	}
-	cr.goModuleDemotedFiles[e.FilePath] = struct{}{}
+	cr.goModuleDemotedFiles[file] = struct{}{}
 }
 
 // TakeDemotedGoModuleCallFiles drains caller files after the resolve lock is

@@ -157,9 +157,15 @@ func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
 	if stem == "" {
 		return ""
 	}
-	isFile := func(id string) bool {
+	return probeJSTSFileBy(func(id string) bool {
 		n := getNode(id)
 		return n != nil && n.Kind == graph.KindFile
+	}, stem)
+}
+
+func probeJSTSFileBy(isFile func(string) bool, stem string) string {
+	if stem == "" {
+		return ""
 	}
 	// An explicit source extension the author wrote (`./auth.js`) is tried
 	// verbatim first, then — when it names an emitted JavaScript file —
@@ -194,6 +200,61 @@ func probeJSTSFile(getNode func(string) *graph.Node, stem string) string {
 		}
 	}
 	return ""
+}
+
+// ProbeJSTSFileInSet probes stem against an in-memory file-path set with zero
+// store reads, matching probeJSTSFile's extension and index-file precedence.
+func ProbeJSTSFileInSet(files map[string]struct{}, stem string) string {
+	if len(files) == 0 || stem == "" {
+		return ""
+	}
+	return probeJSTSFileBy(func(id string) bool {
+		_, ok := files[id]
+		return ok
+	}, stem)
+}
+
+// MatchesJSTSFileSet reports whether callerFile's JS/TS import specifier
+// resolves (via relative join, tsconfig path alias, npm alias, or bare
+// directory entry point) to any file in files, using zero store reads.
+func MatchesJSTSFileSet(files map[string]struct{}, pathAlias PathAliasResolver, npmAlias NpmAliasResolver, callerFile, spec string) bool {
+	if len(files) == 0 || !isJSTSPath(callerFile) || spec == "" {
+		return false
+	}
+	spec, _ = splitImportSpecSymbol(spec)
+	if spec == "" {
+		return false
+	}
+	if stem := expandJSTSSpecifier(pathAlias, callerFile, spec); stem != "" {
+		if ProbeJSTSFileInSet(files, stem) != "" {
+			return true
+		}
+	}
+	rewritten, aliased := rewriteNpmAliasImport(npmAlias, callerFile, spec)
+	if aliased {
+		if stem := expandJSTSSpecifier(pathAlias, callerFile, rewritten); stem != "" {
+			if ProbeJSTSFileInSet(files, stem) != "" {
+				return true
+			}
+		}
+	}
+	if isJSTSBareSpecifier(callerFile, rewritten) && !isNodeCoreModule(rewritten) {
+		callerRepo := graph.RepoPrefixOfID(callerFile)
+		for f := range files {
+			if !isJSTSDirEntryPoint(f) {
+				continue
+			}
+			fileRepo := graph.RepoPrefixOfID(f)
+			if fileRepo == callerRepo {
+				if jsBareDirMatches(graph.FileNodeIdentity{FilePath: f, RepoPrefix: fileRepo}, rewritten) {
+					return true
+				}
+			} else if dirMatchesImport(filePathDir(f), rewritten) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // splitImportSpecSymbol splits an `import::` edge payload into the module

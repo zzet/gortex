@@ -207,7 +207,11 @@ type reparsePendingEnrichmentBatch struct {
 	relationsRead      *relationsReadFrontier
 	pointRebindRefused bool
 	// npmConsumerFiles are unchanged importers parked by this mutation.
-	npmConsumerFiles      []string
+	npmConsumerFiles []string
+	// renamedRequireCallers are unchanged files whose renamed/aliased
+	// JSLexicalRequire call edges were restubbed to their local name and need
+	// outgoing re-resolution plus dataflow/ref-facts refresh.
+	renamedRequireCallers []string
 	byFile                map[string]bool
 	deferResolverCatchup  bool
 	deferredAffectedFiles map[string]struct{}

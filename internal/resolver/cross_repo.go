@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,6 +112,13 @@ type CrossRepoResolver struct {
 	// same-repo name-only binding just because the repository is reachable.
 	importedDirsByFile map[string]map[string]struct{}
 	jsTSBindingsByFile map[string]map[string]string
+	// Per-pass cache for JS/TS local require() resolution so parallel workers
+	// share out-edge adjacency, node lookups, and tracked-npm target/probe lookups without N+1 reads.
+	requireCacheMu     sync.RWMutex
+	outEdgesByFile     map[string][]*graph.Edge
+	requireTargetCache map[string]jsRequireTarget
+	requireNodeByID    map[string]*graph.Node
+	npmProbeCache      map[npmProbeKey]*graph.Node
 	// depModuleIndex bridges Go imports to dep::<module> contract
 	// nodes from the caller's go.mod. Same shape and rationale as
 	// the field of the same name on Resolver — see resolver.go for
@@ -151,8 +157,9 @@ type CrossRepoResolver struct {
 	// importer as a dependency resolving outside the repository. Same
 	// contract as the field of the same name on Resolver — see
 	// npm_dependency.go.
-	npmDep      NpmDependencyLookup
-	npmPackages NpmPackageLookup
+	npmDep            NpmDependencyLookup
+	npmPackages       NpmPackageLookup
+	npmRequireRecheck NpmRequireRecheck
 	// pathAlias expands a JS/TS tsconfig/jsconfig path-alias / baseUrl
 	// import specifier to the repo-prefixed file stem it targets. Same
 	// contract as the field of the same name on Resolver — see
@@ -395,6 +402,8 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer cr.clearRequireCache()
+	defer cr.clearDirIndexes()
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -437,7 +446,6 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 	}
 
 	cr.buildDirIndexes()
-	defer cr.clearDirIndexes()
 	cr.buildDepModuleIndex()
 	defer cr.clearDepModuleIndex()
 	cr.buildReachableReposIndex()
@@ -526,7 +534,34 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			if workers < 1 {
 				workers = 1
 			}
+			cloneImports := cr.edgesEnabled && cr.prober != nil
+			if !cloneImports {
+				for _, e := range sc {
+					if e != nil && e.Meta != nil && e.Meta[graph.JSLexicalBindingMeta] == graph.JSLexicalRequire {
+						cloneImports = true
+						break
+					}
+				}
+			}
+			type crossRepoJob struct {
+				orig            *graph.Edge
+				oldTo           string
+				newTo           string
+				kind            graph.EdgeKind
+				crossRepo       bool
+				confidence      float64
+				confidenceLabel string
+				origin          string
+				tier            string
+				meta            map[string]any
+				demotedGoFile   string
+			}
 			perWorkerBatch := make([][]graph.EdgeReindex, workers)
+			perWorkerUndo := make([][]crossRepoEdgeUndo, workers)
+			var perWorkerJobs [][]crossRepoJob
+			if cloneImports {
+				perWorkerJobs = make([][]crossRepoJob, workers)
+			}
 			perWorkerStats := make([]*CrossRepoStats, workers)
 			var wg sync.WaitGroup
 			chunk := (len(sc) + workers - 1) / workers
@@ -544,25 +579,136 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 					defer wg.Done()
 					ws := &CrossRepoStats{ByRepo: make(map[string]int)}
 					var batch []graph.EdgeReindex
+					var undo []crossRepoEdgeUndo
+					var jobs []crossRepoJob
+					var scratchBatch []graph.EdgeReindex
 					for _, edge := range slice {
 						if ctx.Err() != nil {
 							break
 						}
-						cr.resolveEdge(edge, ws, &batch)
+						if cloneImports && (edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports) {
+							// Clone only import/re-export edges when sibling workers may
+							// walk adjacency (require() chunks or remote-stitch probes).
+							clone := cloneEdgeForResolve(edge)
+							scratchBatch = scratchBatch[:0]
+							demoted := cr.resolveEdge(clone, ws, &scratchBatch)
+							if len(scratchBatch) > 0 {
+								jobs = append(jobs, crossRepoJob{
+									orig:            edge,
+									oldTo:           scratchBatch[0].OldTo,
+									newTo:           clone.To,
+									kind:            clone.Kind,
+									crossRepo:       clone.CrossRepo,
+									confidence:      clone.Confidence,
+									confidenceLabel: clone.ConfidenceLabel,
+									origin:          clone.Origin,
+									tier:            clone.Tier,
+									meta:            clone.Meta,
+									demotedGoFile:   demoted,
+								})
+							}
+							releaseResolverClone(clone)
+						} else {
+							origTo := edge.To
+							origKind := edge.Kind
+							origCrossRepo := edge.CrossRepo
+							origConf := edge.Confidence
+							origConfLabel := edge.ConfidenceLabel
+							origOrigin := edge.Origin
+							origTier := edge.Tier
+							origMeta := edge.Meta
+							demoted := cr.resolveEdge(edge, ws, &batch)
+							if edge.To != origTo {
+								undo = append(undo, crossRepoEdgeUndo{
+									edge:            edge,
+									to:              origTo,
+									kind:            origKind,
+									crossRepo:       origCrossRepo,
+									confidence:      origConf,
+									confidenceLabel: origConfLabel,
+									origin:          origOrigin,
+									tier:            origTier,
+									meta:            origMeta,
+									demotedGoFile:   demoted,
+								})
+							}
+						}
 						processed.Add(1)
 					}
 					perWorkerStats[idx] = ws
 					perWorkerBatch[idx] = batch
+					perWorkerUndo[idx] = undo
+					if cloneImports {
+						perWorkerJobs[idx] = jobs
+					}
 				}(w, sc[start:end])
 			}
 			wg.Wait()
 			if err := ctx.Err(); err != nil {
+				for i := range perWorkerUndo {
+					for _, u := range perWorkerUndo[i] {
+						u.restore()
+					}
+				}
 				return stats, err
 			}
 
 			var scBatch []graph.EdgeReindex
+			var demotedByEdge map[*graph.Edge]string
+			var undoByEdge map[*graph.Edge]crossRepoEdgeUndo
 			for i := range perWorkerBatch {
 				scBatch = append(scBatch, perWorkerBatch[i]...)
+			}
+			for i := range perWorkerUndo {
+				for _, u := range perWorkerUndo[i] {
+					if u.demotedGoFile != "" {
+						if demotedByEdge == nil {
+							demotedByEdge = make(map[*graph.Edge]string)
+						}
+						demotedByEdge[u.edge] = u.demotedGoFile
+					}
+					if cr.validateLiveness {
+						if undoByEdge == nil {
+							undoByEdge = make(map[*graph.Edge]crossRepoEdgeUndo)
+						}
+						undoByEdge[u.edge] = u
+					}
+				}
+			}
+			for i := range perWorkerJobs {
+				for _, job := range perWorkerJobs[i] {
+					if cr.validateLiveness {
+						if undoByEdge == nil {
+							undoByEdge = make(map[*graph.Edge]crossRepoEdgeUndo)
+						}
+						undoByEdge[job.orig] = crossRepoEdgeUndo{
+							edge:            job.orig,
+							to:              job.orig.To,
+							kind:            job.orig.Kind,
+							crossRepo:       job.orig.CrossRepo,
+							confidence:      job.orig.Confidence,
+							confidenceLabel: job.orig.ConfidenceLabel,
+							origin:          job.orig.Origin,
+							tier:            job.orig.Tier,
+							meta:            job.orig.Meta,
+						}
+					}
+					job.orig.To = job.newTo
+					job.orig.Kind = job.kind
+					job.orig.CrossRepo = job.crossRepo
+					job.orig.Confidence = job.confidence
+					job.orig.ConfidenceLabel = job.confidenceLabel
+					job.orig.Origin = job.origin
+					job.orig.Tier = job.tier
+					job.orig.Meta = job.meta
+					if job.demotedGoFile != "" {
+						if demotedByEdge == nil {
+							demotedByEdge = make(map[*graph.Edge]string)
+						}
+						demotedByEdge[job.orig] = job.demotedGoFile
+					}
+					scBatch = append(scBatch, graph.EdgeReindex{Edge: job.orig, OldTo: job.oldTo})
+				}
 			}
 			for _, ws := range perWorkerStats {
 				if ws == nil {
@@ -577,14 +723,23 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 			}
 			if len(scBatch) > 0 {
 				if cr.validateLiveness {
-					scBatch = cr.filterLiveReindex(scBatch)
+					scBatch = cr.filterLiveReindexWithUndo(scBatch, undoByEdge)
 				}
-				cr.graph.ReindexEdges(scBatch)
-				// Moves wait for the last page, as in ResolveAll
-				// (placeholderSourceIndex.deferRepoints).
-				cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
-				reindexTotal += len(scBatch)
-				DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+				if len(scBatch) > 0 {
+					for _, ri := range scBatch {
+						cr.noteRetargetedCall(ri.Edge)
+						if f := demotedByEdge[ri.Edge]; f != "" {
+							cr.noteDemotedGoModuleFile(f)
+						}
+					}
+					cr.graph.ReindexEdges(scBatch)
+					// Moves wait for the last page, as in ResolveAll
+					// (placeholderSourceIndex.deferRepoints).
+					cr.placeholderSrcIdx.deferRepoints(cr.graph, scBatch)
+					reindexTotal += len(scBatch)
+					DetectCrossRepoEdgesForReindexes(cr.graph, scBatch)
+					cr.clearRequireCache()
+				}
 			}
 			if cr.validateLiveness && (hi < len(pending) || !streamDone) {
 				revBefore, revKnown := loadMutationRevision(cr.graph)
@@ -599,7 +754,10 @@ func (cr *CrossRepoResolver) ResolveAllContext(ctx context.Context) (*CrossRepoS
 						// An interleaving writer may have created nodes or
 						// changed name buckets; drop cross-page retention.
 						cr.hotCache.flush()
+						cr.clearRequireCache()
 					}
+				} else {
+					cr.clearRequireCache()
 				}
 			}
 		}
@@ -693,11 +851,31 @@ func (cr *CrossRepoResolver) ResolveForFile(repoPrefix, relPath string) *CrossRe
 // layer. Shared by repository, legacy file, and batched files-plus-incoming
 // scopes. Caller holds cr.mu.
 func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepoStats {
+	defer cr.clearRequireCache()
+	defer cr.clearDirIndexes()
 	stats := &CrossRepoStats{ByRepo: make(map[string]int)}
-	_ = cr.resolveTrackedNpmImports(context.Background(), slices.Values(edges), stats)
-	pending := make([]*graph.Edge, 0, len(edges))
+	if len(edges) == 0 {
+		return stats
+	}
+	restubbed, _ := cr.resolveTrackedNpmImportsScoped(context.Background(), edges, stats)
+	pending := make([]*graph.Edge, 0, len(edges)+len(restubbed))
+	seen := make(map[graph.EdgeIdentity]struct{}, len(edges)+len(restubbed))
 	for _, edge := range edges {
 		if edge != nil && graph.IsUnresolvedTarget(edge.To) {
+			id := graph.EdgeIdentityFor(edge)
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				pending = append(pending, edge)
+			}
+		}
+	}
+	for _, edge := range restubbed {
+		if edge == nil || !graph.IsUnresolvedTarget(edge.To) {
+			continue
+		}
+		id := graph.EdgeIdentityFor(edge)
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
 			pending = append(pending, edge)
 		}
 	}
@@ -705,24 +883,62 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 		return stats
 	}
 
+	var importPending, restPending []*graph.Edge
+	for _, edge := range pending {
+		if (edge.Kind == graph.EdgeImports || edge.Kind == graph.EdgeReExports) &&
+			strings.HasPrefix(graph.UnresolvedName(edge.To), "import::") {
+			importPending = append(importPending, edge)
+		} else {
+			restPending = append(restPending, edge)
+		}
+	}
+
 	cr.buildDirIndexes()
-	defer cr.clearDirIndexes()
 	cr.buildDepModuleIndex()
 	defer cr.clearDepModuleIndex()
-	cr.buildReachableReposIndex()
-	defer cr.clearReachableReposIndex()
 	cr.warmLookupCache(pending)
 	defer cr.clearLookupCache()
 
-	var reindexBatch []graph.EdgeReindex
-	for _, edge := range pending {
-		cr.resolveEdge(edge, stats, &reindexBatch)
+	if len(importPending) > 0 {
+		var importReindexBatch []graph.EdgeReindex
+		for _, edge := range importPending {
+			if demoted := cr.resolveEdge(edge, stats, &importReindexBatch); demoted != "" {
+				cr.noteDemotedGoModuleFile(demoted)
+			}
+		}
+		if len(importReindexBatch) > 0 {
+			for _, ri := range importReindexBatch {
+				cr.noteRetargetedCall(ri.Edge)
+			}
+			cr.graph.ReindexEdges(importReindexBatch)
+			reconcilePlaceholderSources(cr.graph, nil, importReindexBatch)
+			// Phase 1 committed resolved EdgeImports / EdgeReExports; invalidate
+			// per-file out-edge caches before Phase 2 inspects barrels/imports.
+			cr.clearRequireCache()
+		}
 	}
-	if len(reindexBatch) > 0 {
-		cr.graph.ReindexEdges(reindexBatch)
-		// nil index: scoped batches are repo- or file-sized, direct
-		// probes beat a whole-graph placeholder-source stream.
-		reconcilePlaceholderSources(cr.graph, nil, reindexBatch)
+
+	if len(restPending) > 0 {
+		// Build reachableReposByFile AFTER Phase 1 so newly resolved EdgeImports
+		// are visible to scopedCandidates; skipped completely when no Phase 2 edges exist.
+		cr.buildReachableReposIndex()
+		defer cr.clearReachableReposIndex()
+
+		var restReindexBatch []graph.EdgeReindex
+		for _, edge := range restPending {
+			if demoted := cr.resolveEdge(edge, stats, &restReindexBatch); demoted != "" {
+				cr.noteDemotedGoModuleFile(demoted)
+			}
+		}
+		if len(restReindexBatch) > 0 {
+			for _, ri := range restReindexBatch {
+				cr.noteRetargetedCall(ri.Edge)
+			}
+			cr.graph.ReindexEdges(restReindexBatch)
+			// nil index: scoped batches are repo- or file-sized, direct
+			// probes beat a whole-graph placeholder-source stream.
+			reconcilePlaceholderSources(cr.graph, nil, restReindexBatch)
+		}
 	}
 	return stats
 }
@@ -740,6 +956,9 @@ func (cr *CrossRepoResolver) resolveScopedLocked(edges []*graph.Edge) *CrossRepo
 // These maps are torn down via clearDirIndexes when the pass completes
 // so we don't keep ~N pointers alive between resolves.
 func (cr *CrossRepoResolver) buildDirIndexes() {
+	if cr.dirIndex != nil {
+		return
+	}
 	cr.dirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	cr.lastDirIndex = make(map[string][]graph.FileNodeIdentity, 128)
 	for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
@@ -918,6 +1137,16 @@ func (cr *CrossRepoResolver) clearReachableReposIndex() {
 	cr.reachableReposByFile = nil
 	cr.importedDirsByFile = nil
 	cr.jsTSBindingsByFile = nil
+	cr.clearRequireCache()
+}
+
+func (cr *CrossRepoResolver) clearRequireCache() {
+	cr.requireCacheMu.Lock()
+	cr.outEdgesByFile = nil
+	cr.requireTargetCache = nil
+	cr.requireNodeByID = nil
+	cr.npmProbeCache = nil
+	cr.requireCacheMu.Unlock()
 }
 
 // A package-guard refusal is stronger than the cross-repo pass's same-repo
@@ -1010,10 +1239,21 @@ func (cr *CrossRepoResolver) warmLookupCache(pending []*graph.Edge) {
 		if e == nil {
 			continue
 		}
+		bare := graph.UnresolvedName(e.To)
+		if b := jsLexicalCallBinding(e, bare); b != "" {
+			switch b {
+			case graph.JSPendingParameter, graph.JSLexicalLocal:
+				continue
+			case graph.JSLexicalRequire:
+				if e.From != "" {
+					idSet[e.From] = struct{}{}
+				}
+				continue
+			}
+		}
 		if e.From != "" {
 			idSet[e.From] = struct{}{}
 		}
-		bare := graph.UnresolvedName(e.To)
 		if name := identifierFromTarget(bare); name != "" {
 			nameSet[name] = struct{}{}
 		}
@@ -1118,6 +1358,7 @@ func (cr *CrossRepoResolver) clearLookupCache() {
 	cr.nodesByName = nil
 	cr.nodesByNameRepo = nil
 	cr.nodesByQualName = nil
+	cr.clearRequireCache()
 }
 
 // scopedCandidates returns the candidates named `name` the caller of e could
@@ -1213,13 +1454,40 @@ func (cr *CrossRepoResolver) cachedFindNodesByQualName(qualName string) []*graph
 	return cr.graph.GetNodesByQualNames([]string{qualName})[qualName]
 }
 
-func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) {
+type crossRepoEdgeUndo struct {
+	edge            *graph.Edge
+	to              string
+	kind            graph.EdgeKind
+	crossRepo       bool
+	confidence      float64
+	confidenceLabel string
+	origin          string
+	tier            string
+	meta            map[string]any
+	demotedGoFile   string
+}
+
+func (u crossRepoEdgeUndo) restore() {
+	if u.edge == nil {
+		return
+	}
+	u.edge.To = u.to
+	u.edge.Kind = u.kind
+	u.edge.CrossRepo = u.crossRepo
+	u.edge.Confidence = u.confidence
+	u.edge.ConfidenceLabel = u.confidenceLabel
+	u.edge.Origin = u.origin
+	u.edge.Tier = u.tier
+	u.edge.Meta = u.meta
+}
+
+func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, batch *[]graph.EdgeReindex) (demotedGoFile string) {
 	oldTo := e.To
 	// Shared with the master resolver: a derived tests clone is never
 	// bound independently on any path (see resolutionExempt).
 	if resolutionExempt(e) {
 		stats.Unresolved++
-		return
+		return ""
 	}
 	// UnresolvedName handles BOTH the bare `unresolved::X` and the
 	// multi-repo `<repo>::unresolved::X` forms; a plain TrimPrefix only
@@ -1235,7 +1503,7 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 
 	switch {
 	case strings.HasSuffix(e.FilePath, ".go") && strings.HasPrefix(target, "extern::"):
-		cr.resolveGoExtern(e, strings.TrimPrefix(target, "extern::"), stats)
+		demotedGoFile = cr.resolveGoExtern(e, strings.TrimPrefix(target, "extern::"), stats)
 	case strings.HasPrefix(target, "import::"):
 		cr.resolveImport(e, strings.TrimPrefix(target, "import::"), stats)
 	case strings.HasPrefix(target, "*."):
@@ -1253,9 +1521,8 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 		cr.resolveFunctionCall(e, target, stats)
 		// Last-resort cross-daemon proxy-edge stitch: only when local
 		// resolution left the edge unresolved, proxy-edge minting is on,
-		// and a prober is wired. The evidence gate inside tryRemoteStitch
-		// refuses to probe on a bare name. Never stitch a lexically shadowed
-		// JS/TS call.
+		// and a prober is wired. Never stitch a lexically shadowed or
+		// locally required JS/TS call.
 		if e.To == oldTo && cr.edgesEnabled && cr.prober != nil && e.Meta[graph.JSLexicalBindingMeta] == nil {
 			cr.tryRemoteStitch(e, target, stats)
 		}
@@ -1263,8 +1530,8 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 
 	if e.To != oldTo {
 		*batch = append(*batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
-		cr.noteRetargetedCall(e)
 	}
+	return demotedGoFile
 }
 
 // filterLiveReindex validates a resolved batch before applying it on the
@@ -1274,6 +1541,10 @@ func (cr *CrossRepoResolver) resolveEdge(e *graph.Edge, stats *CrossRepoStats, b
 // target is gone. O(batch) — only the edges that actually resolved, NOT the
 // whole pending set (an O(pending*out-degree) per-edge check stalled the pass).
 func (cr *CrossRepoResolver) filterLiveReindex(batch []graph.EdgeReindex) []graph.EdgeReindex {
+	return cr.filterLiveReindexWithUndo(batch, nil)
+}
+
+func (cr *CrossRepoResolver) filterLiveReindexWithUndo(batch []graph.EdgeReindex, undoByEdge map[*graph.Edge]crossRepoEdgeUndo) []graph.EdgeReindex {
 	sites := make([]graph.EdgeSite, 0, len(batch))
 	targetIDs := make([]string, 0, len(batch))
 	for _, reindex := range batch {
@@ -1306,7 +1577,11 @@ func (cr *CrossRepoResolver) filterLiveReindex(batch []graph.EdgeReindex) []grap
 			continue
 		}
 		if !isSyntheticResolveTarget(edge.To) && targets[edge.To] == nil {
-			edge.To = reindex.OldTo
+			if u, ok := undoByEdge[edge]; ok {
+				u.restore()
+			} else {
+				edge.To = reindex.OldTo
+			}
 			continue
 		}
 		out = append(out, reindex)
@@ -1389,8 +1664,14 @@ func (cr *CrossRepoResolver) csharpVerdictCaller(e *graph.Edge) bool {
 }
 
 func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string, stats *CrossRepoStats) {
-	// A lexically shadowed JS/TS call (parameter or local) has no cross-repo callee.
-	if e.Meta[graph.JSLexicalBindingMeta] != nil {
+	// Lexical shadows (parameters and non-require locals) have no cross-repo
+	// callee; local require() bindings resolve strictly against their own
+	// required module rather than unrelated file-wide ES imports.
+	if binding := e.Meta[graph.JSLexicalBindingMeta]; binding != nil {
+		if binding == graph.JSLexicalRequire {
+			cr.resolveJSRequireCall(e, funcName, stats)
+			return
+		}
 		stats.Unresolved++
 		return
 	}
@@ -1481,13 +1762,15 @@ func (cr *CrossRepoResolver) resolveFunctionCall(e *graph.Edge, funcName string,
 func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, stats *CrossRepoStats) {
 	callerRepo := cr.callerRepoPrefix(e)
 	callerWS := cr.callerWorkspaceID(e)
+	callerFile := jsTSImportCallerFile(e)
+	origImportPath := importPath
 	ambiguousQualName := false
 
 	// npm-alias rewrite: see Resolver.resolveImport. Applied here too
 	// so a JS/TS import of an alias key resolves cross-repo to a
 	// locally-vendored real package when the per-repo pass left it
 	// unresolved.
-	importPath, npmAliased := rewriteNpmAliasImport(cr.npmAlias, e.FilePath, importPath)
+	importPath, npmAliased := rewriteNpmAliasImport(cr.npmAlias, callerFile, importPath)
 
 	// JS/TS relative + tsconfig-path-alias / baseUrl import: resolve the
 	// specifier onto the in-repo file (or exported symbol) it names, the
@@ -1495,7 +1778,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// mostly a no-op once the per-repo pass has run; kept for parity so a
 	// JS/TS import edge reaching the cross-repo pass still unresolved gets
 	// the same treatment (issue #136).
-	if to := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, jsTSImportCallerFile(e), importPath); to != "" {
+	if to := resolveJSTSImportTarget(cr.cachedGetNode, cr.pathAlias, callerFile, importPath); to != "" {
 		e.To = to
 		if picked := cr.cachedGetNode(to); picked != nil && isCrossRepoHop(callerRepo, picked.RepoPrefix) {
 			e.CrossRepo = true
@@ -1547,10 +1830,14 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// A JS/TS bare specifier names a node_modules package or a workspace
 	// member — only a directory entry point is evidence. Mirrors
 	// Resolver.resolveImport; see isJSTSDirEntryPoint (issue #450).
-	bareJSTS := isJSTSBareSpecifier(jsTSImportCallerFile(e), importPath)
+	bareJSTS := isJSTSBareSpecifier(callerFile, importPath)
 	// Declared node_modules package — no in-repo directory is a candidate.
 	// Mirrors Resolver.resolveImport; see declaresExternalNpmDep.
-	externalNpmDep := bareJSTS && declaresExternalNpmDep(cr.npmDep, jsTSImportCallerFile(e), importPath)
+	externalNpmDep := bareJSTS && (declaresExternalNpmDep(cr.npmDep, callerFile, origImportPath) || declaresExternalNpmDep(cr.npmDep, callerFile, importPath))
+	bareMod, bareSym := importPath, ""
+	if bareJSTS {
+		bareMod, bareSym = splitImportSpecSymbol(importPath)
+	}
 	var sameRepo graph.FileNodeIdentity
 	var sameRepoFound bool
 	var sameRepoAll, crossRepoAll []graph.FileNodeIdentity
@@ -1574,7 +1861,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 		// `*/bindings/go` directory sorts first. Collect every match so
 		// the workspace-aware pick below can prefer the importer's own
 		// workspace instead of the first one encountered.
-		if dirMatchesImport(filePathDir(file.FilePath), importPath) {
+		if dirMatchesImport(filePathDir(file.FilePath), bareMod) {
 			crossRepoAll = append(crossRepoAll, file)
 		}
 	}
@@ -1582,14 +1869,14 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	if externalNpmDep {
 		// Declared node_modules package — skip the cascade outright.
 	} else if cr.dirIndex != nil {
-		for _, file := range cr.dirIndex[importPath] {
+		for _, file := range cr.dirIndex[bareMod] {
 			consider(file)
 			if stop() {
 				break
 			}
 		}
 		if !sameRepoFound || collectAll {
-			for _, file := range cr.lastDirIndex[lastPathComponent(importPath)] {
+			for _, file := range cr.lastDirIndex[lastPathComponent(bareMod)] {
 				consider(file)
 				if stop() {
 					break
@@ -1599,7 +1886,7 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	} else {
 		for file := range graph.FileNodeIdentitiesSeq(cr.graph, nil) {
 			dir := filePathDir(file.FilePath)
-			if strings.HasSuffix(dir, lastPathComponent(importPath)) || dir == importPath {
+			if strings.HasSuffix(dir, lastPathComponent(bareMod)) || dir == bareMod {
 				consider(file)
 				if stop() {
 					break
@@ -1611,10 +1898,16 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	if sameRepoFound {
 		// Name-collision tie-break: prefer the same-repo file in the
 		// importing file's own package-manager workspace.
-		if workspaceFile, ok := cr.preferSameWorkspaceFile(e.FilePath, sameRepoAll); ok {
+		if workspaceFile, ok := cr.preferSameWorkspaceFile(callerFile, sameRepoAll); ok {
 			sameRepo = workspaceFile
 		}
-		e.To = sameRepo.ID
+		to := sameRepo.ID
+		if bareJSTS && bareSym != "" {
+			if symID := to + "::" + bareSym; cr.cachedGetNode(symID) != nil {
+				to = symID
+			}
+		}
+		e.To = to
 		stats.Resolved++
 		return
 	}
@@ -1623,8 +1916,14 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	// on the first ineligible candidate — a same-workspace instance (a
 	// worktree of the imported module tracked under its own prefix) may
 	// appear later in the list.
-	if picked, ok := cr.pickImportCandidate(callerWS, importPath, crossRepoAll); ok {
-		e.To = picked.ID
+	if picked, ok := cr.pickImportCandidate(callerWS, bareMod, crossRepoAll); ok {
+		to := picked.ID
+		if bareJSTS && bareSym != "" {
+			if symID := to + "::" + bareSym; cr.cachedGetNode(symID) != nil {
+				to = symID
+			}
+		}
+		e.To = to
 		stats.Resolved++
 		if isCrossRepoHop(callerRepo, picked.RepoPrefix) {
 			e.CrossRepo = true
@@ -1671,7 +1970,13 @@ func (cr *CrossRepoResolver) resolveImport(e *graph.Edge, importPath string, sta
 	}
 
 	// External/unresolvable import.
-	e.To = "external::" + importPath
+	fallbackSpec := importPath
+	if npmAliased {
+		if _, origSym := splitImportSpecSymbol(origImportPath); origSym != "" {
+			fallbackSpec = origImportPath
+		}
+	}
+	e.To = "external::" + fallbackSpec
 	stats.Unresolved++
 }
 

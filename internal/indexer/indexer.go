@@ -5266,6 +5266,8 @@ func (idx *Indexer) indexFile(
 	priorNodes, legacyIDs, legacyPath := idx.filePriorWithLegacy(graphPath, idx.graph.GetFileNodes(graphPath))
 	var legacyCarried []*graph.Edge
 	var oldFuncIDs []string
+	var renamedRequireCallers []string
+	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	evictExisting := func(result *parser.ExtractionResult) {
 		idx.invalidateGoModuleSourceStamp(relPath)
 		var oldFTSNodeIDs []string
@@ -5285,33 +5287,52 @@ func (idx *Indexer) indexFile(
 		// batch replacement by deleting its prior documents explicitly;
 		// canonical contracts follow the store's owner-retention decision.
 		idx.deleteSymbolFTS(oldFTSNodeIDs)
-		var npmConsumers []string
+		var npmConsumers, batchRenamed []string
 		if len(legacyIDs) == 0 {
-			npmConsumers = idx.restubIncomingRefs(graphPath)
+			legacyCarried, npmConsumers, batchRenamed = idx.restubIncomingRefsWithCallers(graphPath, result)
 		} else {
 			// Extraction is still unprefixed here. Build only the identity surface
 			// needed by the same incoming frontier used by the structural batch.
-			fresh := &parser.ExtractionResult{}
-			for _, node := range extractionNodes(result) {
-				if node == nil {
-					continue
+			var fresh *parser.ExtractionResult
+			if result != nil {
+				fresh = &parser.ExtractionResult{}
+				for _, node := range extractionNodes(result) {
+					if node == nil {
+						continue
+					}
+					copied := *node
+					copied.ID = idx.prefixPath(node.ID)
+					fresh.Nodes = append(fresh.Nodes, &copied)
 				}
-				copied := *node
-				copied.ID = idx.prefixPath(node.ID)
-				fresh.Nodes = append(fresh.Nodes, &copied)
 			}
 			stage := &incrementalBatchStage{graphPath: graphPath, legacyPath: legacyPath, priorNodes: priorNodes, result: fresh}
 			stages := []*incrementalBatchStage{stage}
-			legacyCarried, npmConsumers = restubIncomingRefsFromView(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages))
+			legacyCarried, npmConsumers, batchRenamed = restubIncomingRefsFromViewWithCallers(idx.graph, stages, loadIncrementalPriorView(idx.graph, stages))
+		}
+		if len(batchRenamed) > 0 {
+			renamedRequireCallers = appendUniqueSorted(renamedRequireCallers, batchRenamed...)
 		}
 		if markerBatch != nil {
 			markerBatch.npmConsumerFiles = appendUniqueSorted(markerBatch.npmConsumerFiles, npmConsumers...)
+			markerBatch.renamedRequireCallers = appendUniqueSorted(markerBatch.renamedRequireCallers, batchRenamed...)
 		}
 		if len(legacyIDs) == 0 {
 			idx.graph.EvictFile(graphPath)
 		} else {
 			idx.evictFileIdentities([]string{graphPath}, legacyIDs, []string{legacyPath})
 		}
+	}
+	flushRenamedRequireCallers := func() {
+		if !resolve || deferredResolverCatchup || idx.resolver == nil || len(renamedRequireCallers) == 0 {
+			return
+		}
+		sameRepoRenamed := filterSameRepoPaths(idx.repoPrefix, renamedRequireCallers)
+		if len(sameRepoRenamed) == 0 {
+			return
+		}
+		idx.resolver.ResolveFilesOutgoing(sameRepoRenamed)
+		idx.materializeDataflowParamsForFiles(sameRepoRenamed)
+		idx.persistRefFactsForFiles(sameRepoRenamed)
 	}
 
 	// A delta probe already owns a shared admission lease together with its
@@ -5386,6 +5407,7 @@ func (idx *Indexer) indexFile(
 			}
 			evictExisting(result)
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			flushRenamedRequireCallers()
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
 				return idx.fileIndexFailureError(absPath)
 			}
@@ -5414,6 +5436,7 @@ func (idx *Indexer) indexFile(
 			}
 			evictExisting(result)
 			idx.graph.AddBatch([]*graph.Node{n}, nil)
+			flushRenamedRequireCallers()
 			if !idx.recordFileReadVersion(mtimeKey, absPath, readVersion) {
 				return idx.fileIndexFailureError(absPath)
 			}
@@ -5496,7 +5519,6 @@ func (idx *Indexer) indexFile(
 	var priorDeclarations resolver.DeclarationSurface
 	var priorVis csharpVisibilityStamp
 	visCaptured := false
-	deferredResolverCatchup := markerBatch != nil && markerBatch.deferResolverCatchup
 	if (resolve || deferredResolverCatchup) && !idx.deferGlobalPasses.Load() && !skipped {
 		snapshotStarted := time.Now()
 		abSnap = idx.snapshotAffectedBy(graphPath)
@@ -5664,6 +5686,7 @@ func (idx *Indexer) indexFile(
 		// out-edges — not a whole-graph AllEdges scan — so an
 		// incremental edit stays O(file), not O(all edges).
 		idx.materializeDataflowParamsForFile(graphPath, result.Edges)
+		flushRenamedRequireCallers()
 		// Clone detection. EvictFile above removed this file's
 		// EdgeSimilarTo edges in both directions. When the incremental
 		// clone index is built, re-bank just this file's bodies
@@ -6114,9 +6137,24 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 // resolver uses, so this behaves identically on the in-memory and disk
 // stores.
 func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
+	_, npmConsumers, _ := idx.restubIncomingRefsWithCallers(graphPath, nil)
+	return npmConsumers
+}
+
+func (idx *Indexer) restubIncomingRefsWithCallers(graphPath string, result *parser.ExtractionResult) ([]*graph.Edge, []string, []string) {
 	nodes := idx.graph.GetFileNodes(graphPath)
 	if len(nodes) == 0 {
-		return nil
+		return nil, nil, nil
+	}
+	var survivingIDs map[string]struct{}
+	if result != nil {
+		freshNodes := extractionNodes(result)
+		survivingIDs = make(map[string]struct{}, len(freshNodes))
+		for _, fn := range freshNodes {
+			if fn != nil && fn.ID != "" {
+				survivingIDs[idx.prefixPath(fn.ID)] = struct{}{}
+			}
+		}
 	}
 	evicted := make(map[string]struct{}, len(nodes))
 	refIDs := make([]string, 0, len(nodes))
@@ -6130,7 +6168,7 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
 		}
 	}
 	if len(refIDs) == 0 {
-		return nil
+		return nil, nil, nil
 	}
 	// Fetch the whole changed file's incoming adjacency in one bounded store
 	// operation. On SQLite this is chunked under the parameter limit; more
@@ -6138,12 +6176,45 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
 	inEdges := idx.graph.GetInEdgesByNodeIDs(refIDs)
 	npmConsumers := restubTrackedNpmImportsFromView(idx.graph, evicted, inEdges)
 	var batch []graph.EdgeReindex
+	var carried []*graph.Edge
+	var renamedCallers []string
+	carriedSeen := make(map[*graph.Edge]struct{})
 	for _, n := range nodes {
+		if n != nil && n.Kind == graph.KindFile {
+			if _, survives := survivingIDs[n.ID]; survives {
+				for _, e := range inEdges[n.ID] {
+					if e == nil || (e.Kind != graph.EdgeImports && e.Kind != graph.EdgeReExports) || e.To != n.ID {
+						continue
+					}
+					if _, fromEvicted := evicted[e.From]; fromEvicted {
+						continue
+					}
+					if _, dup := carriedSeen[e]; !dup {
+						carriedSeen[e] = struct{}{}
+						carried = append(carried, e)
+					}
+				}
+			}
+			continue
+		}
 		if n == nil || n.Name == "" || !graph.IsReferenceableSymbol(n.Kind) {
 			continue
 		}
-		stub := graph.UnresolvedMarker + n.Name
+		defaultStub := graph.UnresolvedMarker + n.Name
 		for _, e := range inEdges[n.ID] {
+			if e != nil && e.Kind == graph.EdgeReExports {
+				if _, fromEvicted := evicted[e.From]; !fromEvicted && survivingIDs != nil && e.To == n.ID {
+					if _, survives := survivingIDs[n.ID]; survives {
+						if _, dup := carriedSeen[e]; !dup {
+							carriedSeen[e] = struct{}{}
+							carried = append(carried, e)
+						}
+					} else if _, fileSurvives := survivingIDs[graphPath]; fileSurvives {
+						carried = append(carried, repointReExportToFile(e, graphPath, n.Name))
+					}
+				}
+				continue
+			}
 			if e == nil || !graph.IsResolvableRefEdge(e.Kind) {
 				continue
 			}
@@ -6154,20 +6225,36 @@ func (idx *Indexer) restubIncomingRefs(graphPath string) []string {
 				continue // already a pending stub
 			}
 			oldTo := e.To
-			// Stash + clear the edge's resolved provenance before restubbing:
-			// an `unresolved::` stub must not keep advertising a resolved
-			// tier. The incoming-resolve pass restores it verbatim if the stub
-			// rebinds to the same target (idempotent re-parse); a deleted or
-			// moved target leaves the stub honestly unresolved.
-			graph.StashRestubProvenance(e)
-			e.To = goModuleRestubTarget(e, stub)
+			edgeStub, isRenamed := restubStubForEdge(e, n.Name, defaultStub)
+			if isRenamed {
+				e.To = edgeStub
+				e.CrossRepo = false
+				e.Origin, e.Tier, e.Confidence, e.ConfidenceLabel = "", "", 0, ""
+				delete(e.Meta, "resolution")
+				delete(e.Meta, graph.EdgeMetaResolveTerminal)
+				delete(e.Meta, graph.EdgeMetaResolveTerminalReason)
+				if e.FilePath != "" {
+					renamedCallers = appendUniqueSorted(renamedCallers, e.FilePath)
+				}
+			} else {
+				// Stash + clear the edge's resolved provenance before restubbing:
+				// an `unresolved::` stub must not keep advertising a resolved
+				// tier. The incoming-resolve pass restores it verbatim if the stub
+				// rebinds to the same target (idempotent re-parse); a deleted or
+				// moved target leaves the stub honestly unresolved.
+				graph.StashRestubProvenance(e)
+				e.To = goModuleRestubTarget(e, edgeStub)
+				if e.To != edgeStub {
+					e.CrossRepo, e.ConfidenceLabel = false, ""
+				}
+			}
 			batch = append(batch, graph.EdgeReindex{Edge: e, OldTo: oldTo})
 		}
 	}
 	if len(batch) > 0 {
 		idx.graph.ReindexEdges(batch)
 	}
-	return npmConsumers
+	return mergeCarriedReExports(carried), npmConsumers, renamedCallers
 }
 
 // embeddingDimsOrDefault returns the embedder's reported vector width,

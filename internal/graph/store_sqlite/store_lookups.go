@@ -66,6 +66,7 @@ const lookupQualifiedEdgeCols = `e.from_id, e.to_id, e.kind, e.file_path, e.line
 // Compile-time assertion: *Store satisfies graph.NodeNameClassCounter.
 var _ graph.NodeNameClassCounter = (*Store)(nil)
 var _ graph.ExistingNodeIDFinder = (*Store)(nil)
+var _ graph.CheckedEdgeCandidateLookup = (*Store)(nil)
 
 // ExistingNodeIDs projects only primary keys for the requested nodes. It is
 // intentionally separate from GetNodesByIDs: warm attribution passes need to
@@ -446,6 +447,32 @@ func (s *Store) boundedInEdgesByNodeIDs(ctx context.Context, ids []string, limit
 // SQLite boundary and decode Meta; callers never materialize full adjacency
 // for every go/types use.
 func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) graph.EdgeCandidateSet {
+	out, err := s.getEdgeCandidates(context.Background(), endpoints, sites)
+	if err != nil {
+		panicOnFatal(err)
+	}
+	return out
+}
+
+// GetEdgeCandidatesErr is the context-aware, error-returning sibling of
+// GetEdgeCandidates. It checks store readiness before empty-input
+// short-circuits, respects ctx cancellation before queries and between chunks,
+// and surfaces storage/teardown errors instead of converting them into empty
+// candidate sets via panicOnFatal.
+func (s *Store) GetEdgeCandidatesErr(ctx context.Context, endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) (graph.EdgeCandidateSet, error) {
+	if s.coreless() || s.db == nil {
+		return graph.NewEdgeCandidateSet(), sql.ErrConnDone
+	}
+	if ctx == nil {
+		ctx = s.readContext()
+	}
+	if err := ctx.Err(); err != nil {
+		return graph.NewEdgeCandidateSet(), err
+	}
+	return s.getEdgeCandidates(ctx, endpoints, sites)
+}
+
+func (s *Store) getEdgeCandidates(ctx context.Context, endpoints []graph.EdgeEndpoint, sites []graph.EdgeSite) (graph.EdgeCandidateSet, error) {
 	out := graph.NewEdgeCandidateSet()
 	canonical := make(map[edgeAttributeKey]*graph.Edge, len(endpoints)+len(sites))
 	endpointAdded := make(map[edgeAttributeKey]struct{}, len(endpoints))
@@ -475,16 +502,18 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 		siteAdded[key] = struct{}{}
 		out.AddSite(edge)
 	}
-	collect := func(shape, query string, args []any, add func(*graph.Edge)) bool {
-		edges, err := s.queryEdgeCandidatesSQL(query, args...)
+	collect := func(shape, query string, args []any, add func(*graph.Edge)) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		edges, err := s.queryEdgeCandidatesSQLContext(ctx, query, args...)
 		if err != nil {
-			panicOnFatal(fmt.Errorf("query %s edge candidates: %w", shape, err))
-			return false
+			return fmt.Errorf("query %s edge candidates: %w", shape, err)
 		}
 		for _, edge := range edges {
 			add(edge)
 		}
-		return true
+		return nil
 	}
 
 	endpointSeen := make(map[graph.EdgeEndpoint]struct{}, len(endpoints))
@@ -519,8 +548,8 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 			args = append(args, key.From, key.To)
 		}
 		args = append(args, s.viewGen)
-		if !collect("endpoint", edgeCandidatesEndpointQuery(len(chunk)), args, addEndpoint) {
-			return out
+		if err := collect("endpoint", edgeCandidatesEndpointQuery(len(chunk)), args, addEndpoint); err != nil {
+			return out, err
 		}
 	}
 
@@ -563,8 +592,8 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 			args = append(args, key.From, key.Line, string(key.Kind))
 		}
 		args = append(args, s.viewGen)
-		if !collect("exact-site", edgeCandidatesExactSiteQuery(len(chunk)), args, addSite) {
-			return out
+		if err := collect("exact-site", edgeCandidatesExactSiteQuery(len(chunk)), args, addSite); err != nil {
+			return out, err
 		}
 	}
 	for i := 0; i < len(anySites); i += lookupChunkSize {
@@ -575,11 +604,11 @@ func (s *Store) GetEdgeCandidates(endpoints []graph.EdgeEndpoint, sites []graph.
 			args = append(args, key.From, key.Line)
 		}
 		args = append(args, s.viewGen)
-		if !collect("any-kind site", edgeCandidatesAnySiteQuery(len(chunk)), args, addSite) {
-			return out
+		if err := collect("any-kind site", edgeCandidatesAnySiteQuery(len(chunk)), args, addSite); err != nil {
+			return out, err
 		}
 	}
-	return out
+	return out, nil
 }
 
 // The three candidate-query builders are pure string assembly (no I/O) so
@@ -650,7 +679,11 @@ func edgeCandidateIdentity(edge *graph.Edge) edgeAttributeKey {
 // then applies the Store contract through panicOnFatal instead of silently
 // turning a corrupt or failed read into an apparently empty candidate set.
 func (s *Store) queryEdgeCandidatesSQL(query string, args ...any) ([]*graph.Edge, error) {
-	rows, err := s.db.Query(query, args...)
+	return s.queryEdgeCandidatesSQLContext(context.Background(), query, args...)
+}
+
+func (s *Store) queryEdgeCandidatesSQLContext(ctx context.Context, query string, args ...any) ([]*graph.Edge, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

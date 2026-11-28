@@ -200,6 +200,80 @@ func (idx *Indexer) persistRefFactsForFiles(graphPaths []string) {
 	}
 }
 
+// persistRefFactsForFilesInGraph re-derives and persists resolved-reference
+// facts for graphPaths under repoPrefix without requiring a repository Indexer.
+// Uses the atomic RefFactsRebuilder path when implemented and falls back to
+// delete-then-set via RefFactsWriter otherwise. Nil logger is safe.
+func persistRefFactsForFilesInGraph(g graph.Store, repoPrefix string, graphPaths []string, logger *zap.Logger) {
+	if g == nil {
+		return
+	}
+	graphPaths = uniqueSortedRefFactPaths(graphPaths)
+	if len(graphPaths) == 0 {
+		return
+	}
+	if rebuilder, ok := g.(graph.RefFactsRebuilder); ok {
+		if err := rebuilder.ReplaceRefFactsForFiles(repoPrefix, graphPaths); err != nil {
+			if logger != nil {
+				logger.Debug("ref-facts: set-oriented replace failed", zap.Error(err))
+			}
+		}
+		return
+	}
+	w, ok := g.(graph.RefFactsWriter)
+	if !ok {
+		return
+	}
+	for start := 0; start < len(graphPaths); start += refFactFileBatch {
+		end := min(start+refFactFileBatch, len(graphPaths))
+		paths := graphPaths[start:end]
+		byPath := g.GetFileNodesByPaths(paths)
+		nodesByRepo := make(map[string][]*graph.Node)
+		filesByRepo := make(map[string]map[string]struct{})
+		for _, path := range paths {
+			nodes := byPath[path]
+			seenRepos := make(map[string]struct{})
+			for _, node := range nodes {
+				if node == nil {
+					continue
+				}
+				repo := node.RepoPrefix
+				nodesByRepo[repo] = append(nodesByRepo[repo], node)
+				seenRepos[repo] = struct{}{}
+			}
+			if len(seenRepos) == 0 {
+				seenRepos[repoPrefix] = struct{}{}
+			}
+			for repo := range seenRepos {
+				if filesByRepo[repo] == nil {
+					filesByRepo[repo] = make(map[string]struct{})
+				}
+				filesByRepo[repo][path] = struct{}{}
+			}
+		}
+		for repo, fileSet := range filesByRepo {
+			files := make([]string, 0, len(fileSet))
+			for file := range fileSet {
+				files = append(files, file)
+			}
+			sort.Strings(files)
+			if err := w.DeleteRefFactsByFiles(repo, files); err != nil {
+				if logger != nil {
+					logger.Debug("ref-facts: delete failed", zap.Error(err))
+				}
+				continue
+			}
+			if err := walkRefFacts(g, nodesByRepo[repo], nil, func(facts []graph.RefFact) error {
+				return w.BulkSetRefFacts(repo, facts)
+			}); err != nil {
+				if logger != nil {
+					logger.Debug("ref-facts: persist failed", zap.Error(err))
+				}
+			}
+		}
+	}
+}
+
 // persistAllRefFacts persists reference facts for every indexed file. Called
 // once after a full resolve so a cold index seeds the durable sidecar.
 func (idx *Indexer) persistAllRefFacts() {

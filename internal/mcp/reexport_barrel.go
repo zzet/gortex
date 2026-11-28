@@ -50,33 +50,133 @@ func reExportBindingCanonical(g graph.Reader, id string, depth int) string {
 		if e == nil || e.Kind != graph.EdgeReExports {
 			continue
 		}
+		if ns, _ := e.Meta["reexport_namespace"].(bool); ns {
+			continue
+		}
 		spec, orig := parseReExportTarget(e.To)
-		if spec == "" || !strings.HasPrefix(spec, ".") {
-			continue // bare / aliased specifier — out of scope
+		resolvedTargetFile := ""
+		if spec != "" {
+			if !strings.HasPrefix(spec, ".") {
+				continue // bare / aliased specifier — out of scope
+			}
+		} else if !graph.IsUnresolvedTarget(e.To) && !strings.HasPrefix(e.To, "external::") {
+			tn := g.GetNode(e.To)
+			if tn == nil {
+				continue
+			}
+			if tn.Kind == graph.KindFile {
+				resolvedTargetFile = tn.ID
+			} else {
+				if targetOrig, hasBindings := lookupReExportBinding(e.Meta, name); hasBindings {
+					if targetOrig != "" {
+						if isReExportNode(tn) {
+							if canon := reExportNodeCanonical(g, tn.ID, depth+1); canon != "" {
+								return canon
+							}
+						}
+						return tn.ID
+					}
+					continue
+				}
+				if orig == "" {
+					orig, _ = e.Meta["reexport_original"].(string)
+				}
+				if orig == "" {
+					orig = tn.Name
+				}
+				alias := e.Alias
+				if alias == "" {
+					alias, _ = e.Meta["import_alias"].(string)
+				}
+				binding := alias
+				if binding == "" {
+					binding = orig
+				}
+				if binding == name {
+					if isReExportNode(tn) {
+						if canon := reExportNodeCanonical(g, tn.ID, depth+1); canon != "" {
+							return canon
+						}
+					}
+					return tn.ID
+				}
+				continue
+			}
+		} else {
+			continue
+		}
+		if orig == "" {
+			orig, _ = e.Meta["reexport_original"].(string)
+		}
+		alias := e.Alias
+		if alias == "" {
+			alias, _ = e.Meta["import_alias"].(string)
+		}
+		probe := func(targetOrig string) string {
+			if resolvedTargetFile != "" {
+				if canon := resolvedTargetFile + "::" + targetOrig; g.GetNode(canon) != nil {
+					return canon
+				}
+				return reExportBindingCanonical(g, resolvedTargetFile+"::"+targetOrig, depth+1)
+			}
+			return probeBindingInFile(g, barrelFile, spec, targetOrig, depth)
+		}
+		if targetOrig, hasBindings := lookupReExportBinding(e.Meta, name); hasBindings {
+			if targetOrig != "" {
+				if canon := probe(targetOrig); canon != "" {
+					return canon
+				}
+			}
+			if wc, _ := e.Meta["reexport_wildcard"].(bool); wc {
+				if canon := probe(name); canon != "" {
+					return canon
+				}
+			}
+			continue
 		}
 		switch {
 		case orig != "":
 			// Named (optionally aliased) re-export. The public binding name is
 			// the alias when renamed, else the original.
-			binding := e.Alias
+			binding := alias
 			if binding == "" {
 				binding = orig
 			}
 			if binding != name {
 				continue
 			}
-			if canon := probeBindingInFile(g, barrelFile, spec, orig, depth); canon != "" {
+			if canon := probe(orig); canon != "" {
 				return canon
 			}
-		case e.Alias == "":
+		case alias == "":
 			// `export * from './x'` — any of x's exports is forwarded under its
 			// own name, so probe the target for the queried name.
-			if canon := probeBindingInFile(g, barrelFile, spec, name, depth); canon != "" {
+			if canon := probe(name); canon != "" {
 				return canon
 			}
 		}
 	}
 	return ""
+}
+
+func lookupReExportBinding(meta map[string]any, name string) (orig string, hasBindings bool) {
+	if meta == nil {
+		return "", false
+	}
+	switch m := meta["reexport_bindings"].(type) {
+	case map[string]any:
+		if len(m) == 0 {
+			return "", false
+		}
+		s, _ := m[name].(string)
+		return s, true
+	case map[string]string:
+		if len(m) == 0 {
+			return "", false
+		}
+		return m[name], true
+	}
+	return "", false
 }
 
 // probeBindingInFile resolves the relative spec to a target file and returns

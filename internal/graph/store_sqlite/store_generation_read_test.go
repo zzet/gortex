@@ -850,6 +850,28 @@ func generationReadProbes() []genProbe {
 			}
 			return edgeTokens(out)
 		}},
+		{name: "EdgesLightSeqErr", run: func(t *testing.T, s *Store) []string {
+			var out []*graph.Edge
+			seq, errFn := s.EdgesLightSeqErr(context.Background(), graph.EdgeCalls, graph.EdgeReferences)
+			for e := range seq {
+				out = append(out, e)
+			}
+			if err := errFn(); err != nil {
+				t.Fatalf("EdgesLightSeqErr: %v", err)
+			}
+			bound, ok := s.BindAnalysisPages().(*Store)
+			if !ok || bound.ViewGeneration() != s.ViewGeneration() {
+				t.Fatalf("BindAnalysisPages left generation %d", s.ViewGeneration())
+			}
+			pSeq, pErrFn := bound.EdgesLightSeqErr(context.Background(), graph.EdgeCalls, graph.EdgeReferences)
+			for e := range pSeq {
+				out = append(out, e)
+			}
+			if err := pErrFn(); err != nil {
+				t.Fatalf("EdgesLightSeqErr (paged): %v", err)
+			}
+			return edgeTokens(out)
+		}},
 		{name: "EdgesByKind", run: func(t *testing.T, s *Store) []string {
 			var out []*graph.Edge
 			for e := range s.EdgesByKind(graph.EdgeCalls) {
@@ -892,6 +914,30 @@ func generationReadProbes() []genProbe {
 					{From: genReadShared, Line: 11},
 				},
 			)
+			var out []string
+			for _, mark := range []string{genZeroMark, genOneMark} {
+				out = append(out, edgeTokens([]*graph.Edge{set.Endpoint(genReadShared, genOnlyID(mark))})...)
+			}
+			out = append(out, edgeTokens([]*graph.Edge{set.Endpoint(genReadShared, genReadType)})...)
+			out = append(out, edgeTokens(set.Site(genReadShared, 12, graph.EdgeReferences))...)
+			return out
+		}},
+		{name: "GetEdgeCandidatesErr", run: func(t *testing.T, s *Store) []string {
+			set, err := s.GetEdgeCandidatesErr(
+				context.Background(),
+				[]graph.EdgeEndpoint{
+					{From: genReadShared, To: genOnlyID(genZeroMark)},
+					{From: genReadShared, To: genOnlyID(genOneMark)},
+					{From: genReadShared, To: genReadType},
+				},
+				[]graph.EdgeSite{
+					{From: genReadShared, Line: 12, Kind: graph.EdgeReferences},
+					{From: genReadShared, Line: 11},
+				},
+			)
+			if err != nil {
+				t.Fatalf("GetEdgeCandidatesErr: %v", err)
+			}
 			var out []string
 			for _, mark := range []string{genZeroMark, genOneMark} {
 				out = append(out, edgeTokens([]*graph.Edge{set.Endpoint(genReadShared, genOnlyID(mark))})...)
@@ -2153,6 +2199,8 @@ func generationCapabilityChecklist() []capabilityCase {
 		{iface: (*graph.Store)(nil), probe: "AllNodes"},
 		{iface: (*graph.AllGenerationsRepoEvicter)(nil), skip: skipAdmin},
 		{iface: (*graph.CheckedAllGenerationsRepoEvicter)(nil), skip: skipAdmin},
+		{iface: (*graph.CheckedEdgeCandidateLookup)(nil), probe: "GetEdgeCandidatesErr"},
+		{iface: (*graph.CheckedLightEdgeSequencer)(nil), probe: "EdgesLightSeqErr"},
 		{iface: (*graph.AnalysisGenerationStore)(nil), skip: skipSidecar},
 		{iface: (*graph.AnalysisPageBinder)(nil), probe: "BindAnalysisPages"},
 		{iface: (*graph.AnalysisQueryStore)(nil), skip: skipSidecar},
