@@ -45,7 +45,7 @@ type compactWitnessCall struct {
 func compactWitnessCalls() map[string]compactWitnessCall {
 	target := map[string]any{"symbol": "repo/target.go::Target"}
 	return map[string]compactWitnessCall{
-		"read.summary": {facade: "read", args: map[string]any{"operation": "summary", "target": map[string]any{"file": "repo/target.go"}}, relations: true},
+		"read.summary": {facade: "read", args: map[string]any{"operation": "summary", "target": map[string]any{"file": "repo/target.go"}}, relations: true, explicit: true},
 		"search.symbols": {facade: "search", args: map[string]any{"operation": "symbols", "query": "Target",
 			"options": map[string]any{"query_class": "symbol", "expand": "off", "limit": 1000, "max_per_file": 0}}, explicit: true},
 		"relations.callers": {facade: "relations", args: map[string]any{"operation": "callers", "target": target,
