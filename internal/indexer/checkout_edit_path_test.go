@@ -339,7 +339,10 @@ const windowsClockTick = 15625 * time.Microsecond
 // owes, so the edit's enqueue and the cycle's start can share a tick; that is
 // still the owed cycle's P. A cycle that started a tick before the enqueue, a
 // P that is not the marked cycle's window, a timeline without the cycle's
-// start, and a ticket without P are refused on the same clock.
+// start, a ticket without P, and a ticket carried from an earlier cycle are
+// refused on the same clock. Marks are first-wins, so cycle_started is the
+// first cycle that owed the ticket; one served by a later cycle was carried
+// and records no P.
 func TestOwedEditCycleWindowOnACoarseClock(t *testing.T) {
 	base := time.Now()
 	read := func(elapsed time.Duration) time.Time { return base.Add(elapsed.Truncate(windowsClockTick)) }
@@ -356,8 +359,10 @@ func TestOwedEditCycleWindowOnACoarseClock(t *testing.T) {
 		{name: "cycle starts a tick after the enqueue", enqueued: 17 * ms, started: 33 * ms, served: 33 * ms, completed: 70 * ms},
 		{name: "cycle starts a tick before the enqueue", enqueued: 17 * ms, started: 3 * ms, served: 3 * ms, completed: 70 * ms,
 			want: "the cycle started before the ticket was enqueued"},
-		{name: "P is not the marked cycle's window", enqueued: 17 * ms, started: 18 * ms, served: 40 * ms, completed: 70 * ms,
+		{name: "P is not the marked cycle's window", enqueued: 3 * ms, started: 18 * ms, served: 4 * ms, completed: 70 * ms,
 			want: "P does not span cycle_started..ticket_completed"},
+		{name: "ticket carried from a cycle a tick earlier", enqueued: 17 * ms, started: 18 * ms, served: 40 * ms, completed: 70 * ms,
+			want: "P does not name the checkout refresh cycle"},
 		{name: "cycle start unmarked", enqueued: 3 * ms, served: 4 * ms, completed: 70 * ms, unmarkedCycle: true,
 			want: "the timeline lacks ticket_enqueued, cycle_started or ticket_completed"},
 		{name: "ticket rode a cycle in flight", enqueued: 17 * ms, started: 18 * ms, completed: 70 * ms, rider: true,
