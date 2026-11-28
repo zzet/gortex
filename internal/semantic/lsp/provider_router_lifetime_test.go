@@ -371,7 +371,7 @@ func TestRouterConcurrentFirstAcquireStartsOneServer(t *testing.T) {
 	awaitLifetimeFile(t, h.entered)
 	awaitStartWaiters(t, r, spec, 1)
 	require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
-	first, second := <-results, <-results
+	first, second := receiveWithin(t, results), receiveWithin(t, results)
 	require.NotNil(t, first)
 	require.Same(t, first, second)
 	methods, err := os.ReadFile(h.trace)
@@ -392,20 +392,60 @@ func TestRouterFailedStartIsSharedWithWaiters(t *testing.T) {
 	}
 	awaitLifetimeFile(t, h.entered)
 	awaitStartWaiters(t, r, spec, 1)
-	beginLifetimeClose(t, r.BeginClose)
-	require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
-	var got []error
-	for range 2 {
-		select {
-		case err := <-errs:
-			require.Error(t, err)
-			got = append(got, err)
-		case <-time.After(3 * time.Second):
-			t.Fatal("acquire did not return after its start failed")
-		}
+	// Fail the start with the router still open, so a waiter that retried
+	// would be free to start a second server.
+	r.mu.Lock()
+	var starting *Provider
+	for p := range r.starting {
+		starting = p
 	}
-	require.Equal(t, got[0].Error(), got[1].Error(), "the waiter returns the failed start's error")
+	r.mu.Unlock()
+	require.NoError(t, ownedLifetimeClient(t, starting).transport.(*SpawnTransport).cmd.Process.Kill())
+	first, second := receiveWithin(t, errs), receiveWithin(t, errs)
+	require.Error(t, first)
+	require.Equal(t, first.Error(), second.Error(), "the waiter returns the failed start's error")
 	methods, err := os.ReadFile(h.trace)
 	require.NoError(t, err)
 	require.Equal(t, 1, strings.Count(string(methods), "initialize\n"))
+	require.Equal(t, uint64(1), r.TimingStats().Starts)
+}
+
+// A pinned waiter pins the provider it reuses: two pinned first acquires
+// hold two pins, and each release drops one.
+func TestRouterConcurrentPinnedAcquiresEachHoldAPin(t *testing.T) {
+	spec, h := lifetimeSpec(t, "pinned-start", helperLSPInitBarrier)
+	r := NewRouter(t.TempDir(), zap.NewNop())
+	t.Cleanup(func() { _ = r.Close() })
+	r.RegisterSpec(spec)
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := r.ProviderForSpecWorkspace(spec.Name, r.defaultWorkspace); errs <- err }()
+	}
+	awaitLifetimeFile(t, h.entered)
+	awaitStartWaiters(t, r, spec, 1)
+	require.NoError(t, os.WriteFile(h.release, []byte("release"), 0o600))
+	require.NoError(t, receiveWithin(t, errs))
+	require.NoError(t, receiveWithin(t, errs))
+	inUse := func() int {
+		stats := r.Stats()
+		require.Len(t, stats, 1)
+		return stats[0].InUse
+	}
+	require.Equal(t, 2, inUse())
+	r.ReleaseSpecWorkspace(spec.Name, r.defaultWorkspace)
+	require.Equal(t, 1, inUse())
+	r.ReleaseSpecWorkspace(spec.Name, r.defaultWorkspace)
+	require.Equal(t, 0, inUse())
+}
+
+func receiveWithin[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(3 * time.Second):
+		t.Fatal("acquire did not return")
+		var zero T
+		return zero
+	}
 }

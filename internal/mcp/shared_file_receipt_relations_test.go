@@ -49,7 +49,15 @@ type sharedReceiptOffer struct {
 
 // This observer forwards admission unchanged. The actual request context binds
 // one offered write to its own production ticket, never the latest path ticket.
-type sharedReceiptWatcher struct{ *indexer.Watcher }
+// When relations is set, it also records the watcher snapshots the server reads.
+type sharedReceiptWatcher struct {
+	*indexer.Watcher
+	relations *relationGenerationWitness
+}
+
+func (w *sharedReceiptWatcher) TierPaths() map[string]indexer.MutationTierState {
+	return w.relations.observe(w.Watcher.TierPaths())
+}
 
 func (w *sharedReceiptWatcher) EnqueueToolMutation(ctx context.Context, path string) (*indexer.MutationTicket, error) {
 	ticket, err := w.Watcher.EnqueueToolMutation(ctx, path)
@@ -109,7 +117,7 @@ func newSharedReceiptFixtureWithRetirement(tb testing.TB, autoRetirement bool) *
 	watcher, err := indexer.NewWatcher(idx, config.WatchConfig{Enabled: true, DebounceMs: 5}, logger)
 	require.NoError(tb, err)
 	require.NoError(tb, watcher.Start([]string{root}))
-	s.SetWatcher(&sharedReceiptWatcher{watcher})
+	s.SetWatcher(&sharedReceiptWatcher{Watcher: watcher, relations: newRelationGenerationWitness(filepath.Join(root, "main.go"))})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	f := &sharedReceiptFixture{server: s, root: root, native: native}
 	var sessions []string

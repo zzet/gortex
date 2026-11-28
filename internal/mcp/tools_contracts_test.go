@@ -100,6 +100,9 @@ func TestHandleContracts_ReflectsRuntimeTrackedRepos(t *testing.T) {
 		ConfigManager: cm,
 		MultiIndexer:  mi,
 	})
+	// The runtime track below hands a rollup rerun to the lifecycle's
+	// analysis lane, which outlives the call; join it before later tests run.
+	t.Cleanup(func() { require.NoError(t, srv.lifecycle.Close()) })
 	srv.PublishReadiness("ready", true, nil)
 
 	// Baseline: contracts from the provider repo are visible.

@@ -72,13 +72,21 @@ func TestEditProbeGateCompletionWaitsForPostACKCoverage(t *testing.T) {
 					return stubContent(map[string]any{"mutation_receipt": receipt, "readback_exact": true, "status": "applied", "disk_status": "committed", "mutation_id": step.MutationID, "commit_seq": 1, "content_sha256": hex.EncodeToString(sum[:])}), nil
 				}
 				if frame.Method == "tools/call" && frame.Params["name"] == "change" && args["operation"] == "receipt" {
-					if statuses.Add(1) == 2 {
+					n := statuses.Add(1)
+					if n == 2 {
 						close(secondStatus)
 					}
 					if terminalStatus != nil {
 						return stubContent(terminalStatus), nil
 					}
-					return stubContent(map[string]any{"receipt": receipt, "mutation_id": step.MutationID, "graph_status_terminal": true, "graph_status": "fresh"}), nil
+					status := map[string]any{"receipt": receipt, "mutation_id": step.MutationID, "graph_status_terminal": true, "graph_status": "fresh"}
+					if mode == "accounting_deadline" {
+						// Accounting that keeps changing is still awaited until
+						// the deadline; unchanged, it would end the wait after
+						// a bounded number of status cycles.
+						status["reindex_generation"] = n
+					}
+					return stubContent(status), nil
 				}
 				// The fixed editor is connection1; the original independent
 				// prober is connection2. Do not block the five editor readbacks.

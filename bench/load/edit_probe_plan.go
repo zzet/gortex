@@ -20,6 +20,10 @@ import (
 const editProbeScenario = "edit-and-probe"
 const editProbeMean = 15 * time.Second
 const editProbePeriod = 25 * time.Millisecond
+
+// editProbeReadBudget bounds one probe, receipt status or setup read, which
+// never gets longer than the product deadline either.
+const editProbeReadBudget = 20 * time.Second
 const editProbeMaxEditors = 32
 const editProbeFixedEditorModel = "fixed_editor_per_ordinal_plus_one_separate_prober_per_edit"
 
